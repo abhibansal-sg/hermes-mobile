@@ -989,67 +989,75 @@ struct ChatView: View {
                 // Explicit scroll-to-bottom request (pill / streaming follow /
                 // session-switch landing).
                 .onChange(of: tick) { _, _ in applyScroll(animated: animated) }
-                // OPEN-ON-NEWEST, POST-LAYOUT (SCROLL P0 r3/r4 — the async-seed fix),
-                // now a ONE-SHOT LANDING LATCH + BOUNDS CLAMP (FIX 1a / FIX 2).
+                // OPEN-ON-NEWEST, POST-LAYOUT — a ONE-SHOT LANDING LATCH layered on
+                // an ALWAYS-ON BOUNDS CLAMP (round-2 FIX A: the two are now SEPARATE
+                // mechanisms, not one `pendingLand`-gated block).
                 //
-                // While a fresh open is pending, defend the async-seed landing on
-                // every content-size OR container-size change — i.e. as the seeded
-                // LazyVStack rows lay out (content) AND as the drawer-close spring /
-                // safe-area transitions settle the viewport (container). This fires
-                // AFTER layout, so a seed that arrives after the ScrollView first
-                // appeared (network OR cache — both async), through any number of
-                // settle frames, still lands on the newest message.
+                // The bounds invariant `offset <= max(0, content - container)` must
+                // hold ALWAYS, not just while landing. Round-1 nested the clamp inside
+                // the `pendingLand` guard, so once the landing latch disarmed the
+                // geometry handler went fully inert. On real content the row heights
+                // RE-MEASURE and SHRINK after the latch disarms (images / code /
+                // markdown settling, a same-session reconcile to shorter content) →
+                // contentSize drops BELOW the resting offset → the viewport rests past
+                // the content edge = the user's persistent "blank page, chat above".
+                // Separating the clamp from the latch closes that hole.
                 //
-                // FIX 2 — the re-pin is a CLAMP, not a bare target scroll: when the
-                // current offset EXCEEDS the content ceiling (the stale large offset
-                // inherited from the previous session whose ScrollView identity
-                // persisted), snap DOWN to the ceiling. The ceiling is 0 when content
-                // fits, so a short chat is NEVER pulled to the bottom. Idempotent —
-                // re-applying at the ceiling is a no-op, so it cannot jitter against
-                // streaming growth the way a repeated target-scroll did.
+                //  • CLAMP (always-on, every geometry event): whenever the resting
+                //    offset EXCEEDS the ceiling, snap DOWN to the ceiling. Idempotent;
+                //    never fires during normal scrolling (a user drag can't exceed the
+                //    ceiling — UIScrollView already bounds it); never scrolls UP (it
+                //    only acts when offset > ceiling); independent of the latch. This
+                //    is the post-disarm row-shrink fix AND the stale-offset-across-
+                //    switch fix, now guaranteed for the whole session, not just landing.
                 //
-                // FIX 1a — ONE-SHOT: once the seeded content actually fills/exceeds
-                // the viewport (`content >= container`), the landing is complete, so
-                // DISARM the latch after re-pinning. The geometry re-pin then stops
-                // co-driving every subsequent streaming flush (the dual-writer that
-                // fought the natural anchored scroll). The existing `.interacting`
-                // release still applies for the reader-drag case. A short chat never
-                // crosses the predicate, so it keeps the (harmless, no-op) defence
-                // until it either grows past the viewport or the user drags.
+                //  • LATCH (one-shot, `pendingLand`): while a fresh open is pending,
+                //    re-pin UP to the bottom as the seeded LazyVStack rows lay out
+                //    below the ceiling (the async-seed open: offset still near the top).
+                //    Once the content fills the viewport AND we are resting at the true
+                //    bottom, DISARM — the natural bottom anchor then owns streaming
+                //    growth (no dual-writer fighting every flush). The `.interacting`
+                //    release still applies for the reader-drag case.
                 .onScrollGeometryChange(for: Geometry.self) {
                     Geometry(
                         content: $0.contentSize.height,
                         container: $0.containerSize.height,
                         offsetY: $0.contentOffset.y)
                 } action: { _, geo in
-                    guard pendingLand else { return }
                     let ceiling = max(0, geo.content - geo.container)
+
+                    // ── CLAMP (always-on bounds invariant) ───────────────────────
+                    // If the resting offset is PAST the content edge, snap down to the
+                    // ceiling. `scrollTo(edge:.bottom)` resolves to exactly the ceiling.
+                    // Guarded by `offsetY > ceiling + epsilon` so it (a) never scrolls
+                    // up, (b) is a no-op once at the ceiling (cannot jitter), and (c)
+                    // never fires during ordinary scrolling (the scroll view already
+                    // bounds the offset to the ceiling, so it can only be exceeded when
+                    // contentSize SHRANK under a resting offset, or a stale offset was
+                    // inherited across a session switch). This runs regardless of the
+                    // landing latch — the invariant holds for the whole session.
+                    if geo.offsetY > ceiling + 0.5 {
+                        applyScroll(animated: false)
+                        // Leave the latch state untouched; the clamp is orthogonal.
+                        return
+                    }
+
+                    // ── LATCH (one-shot landing follow) ──────────────────────────
+                    guard pendingLand else { return }
                     // Short chat (content fits ⇒ ceiling 0): NOTHING to land — never
                     // pull it away from the top. Stay armed (harmlessly) until it
-                    // grows past the viewport or the user drags. This is the
-                    // short-chat-stays-top-aligned invariant.
+                    // grows past the viewport or the user drags. Short-chat-stays-top.
                     guard geo.content > geo.container else { return }
-                    // The viewport is overflowed, so there IS a bottom to land on.
-                    // Re-pin to the bottom edge whenever the resting offset is not
-                    // already AT the ceiling — this is the CLAMP (FIX 2): it covers
-                    // BOTH the async-seed open (offset still near the top, below the
-                    // ceiling — the seeded rows just laid out) AND the stale offset
-                    // inherited across a session switch (offset ABOVE the ceiling).
-                    // `scrollTo(edge:.bottom)` resolves to exactly the ceiling, so
-                    // re-applying once already landed is a no-op (idempotent — it
-                    // cannot jitter against streaming growth the way the prior
-                    // unconditional target-scroll did).
+                    // The viewport is overflowed and the offset is at/below the ceiling
+                    // (the clamp above already handled offset > ceiling). If we are not
+                    // yet AT the bottom, the seeded rows are still laying out below the
+                    // resting offset — re-pin UP to the bottom and stay armed.
                     let landed = abs(geo.offsetY - ceiling) <= 0.5
                     if !landed {
                         applyScroll(animated: false)
-                        // Not yet at the bottom — stay armed so the next settle frame
-                        // (rows still measuring) keeps chasing the true content end.
                         return
                     }
-                    // ONE-SHOT disarm: the viewport is filled AND we are resting at
-                    // the true bottom — the landing is complete, so release the latch
-                    // and let the natural bottom anchor own subsequent growth (the
-                    // dual-writer that fought every streaming flush is gone).
+                    // ONE-SHOT disarm: filled AND resting at the true bottom.
                     pendingLand = false
                 }
                 // Release the open-pin the instant the user drives the scroll, so a

@@ -17,6 +17,14 @@ import Foundation
 ///   TOP-aligned under the header (not pinned to the bottom).
 /// - `long`: 40 messages (well over a viewport) — verifies open-on-newest lands
 ///   at the bottom and the scroll-to-bottom pill works after scrolling up.
+///
+/// ROUND-2 stress modes (measurement-first, DEBUG-only, no network):
+/// - `stream`: seed 10 messages then drive the REAL streaming path with
+///   markdown+code chunks at ~40ms cadence for ~30s — the streaming-jitter repro.
+/// - `heavy`: a static 60-message transcript of heavy markdown/code rows — the
+///   flick-scroll cost repro.
+/// - `shrinkland`: land tall content, then re-seed shorter content ~1s later so
+///   contentSize drops below the resting offset — the FIX A blank-page repro.
 enum UITestSeed {
     static var requestedMode: String? {
         ProcessInfo.processInfo.environment["HERMES_UITEST_SEED"]
@@ -37,6 +45,98 @@ enum UITestSeed {
             seeded.append(ChatMessage(role: role, text: body))
         }
         environment.connectionStore.phase = .connected
+
+        // ── ROUND-2 STRESS MODES (measurement-first) ──────────────────────────
+        // These reproduce the DEVICE costs the simulator masked: per-flush
+        // re-segmentation + markdown rebuilds during streaming, heavy-row scroll
+        // cost, and the post-disarm row-shrink that strands the viewport (FIX A).
+
+        // "stream" — seed a short transcript then drive the REAL streaming path
+        // (debugInjectDelta → handle(event:) → flushBuffers → mutateStreaming) by
+        // appending markdown+code-heavy content in ~40ms-cadence chunks for ~30s
+        // to a growing assistant message. This is the streaming-jitter repro.
+        if mode == "stream" {
+            var base: [ChatMessage] = []
+            for i in 0..<10 {
+                let isUser = i.isMultiple(of: 2)
+                base.append(ChatMessage(
+                    role: isUser ? .user : .assistant,
+                    text: isUser
+                        ? "Stress prompt #\(i + 1) — keep streaming markdown and code."
+                        : "Prior reply #\(i + 1). Lorem ipsum dolor sit amet."))
+            }
+            environment.sessionStore.activeStoredId = "uitest-stream"
+            environment.chatStore.debugSeedTranscript(base)
+            // Append a user turn, then drip the assistant reply through the real
+            // delta path. ~40ms cadence × ~750 chunks ≈ 30s of streaming.
+            environment.chatStore.debugSeedTranscript(base + [
+                ChatMessage(role: .user, text: "Now write a long markdown+code answer."),
+            ])
+            Task { @MainActor in
+                let chunks = Self.streamChunks(count: 750)
+                for chunk in chunks {
+                    try? await Task.sleep(nanoseconds: 40_000_000)  // 40ms cadence
+                    environment.chatStore.debugInjectDelta(chunk)
+                }
+                environment.chatStore.debugCompleteStream()
+            }
+            return
+        }
+
+        // "heavy" — a static 60-message transcript of HEAVY rows (long markdown
+        // with headers/lists/inline code, multi-line fenced code blocks, long
+        // paragraphs) for flick-scroll cost measurement. Fully laid-out at seed.
+        if mode == "heavy" {
+            var heavy: [ChatMessage] = []
+            for i in 0..<60 {
+                let isUser = i.isMultiple(of: 2)
+                if isUser {
+                    heavy.append(ChatMessage(
+                        role: .user,
+                        text: "Heavy prompt #\(i + 1) — explain \(Self.heavyTopics[i % Self.heavyTopics.count]) in depth."))
+                } else {
+                    heavy.append(ChatMessage(role: .assistant, text: Self.heavyReply(i + 1)))
+                }
+            }
+            environment.sessionStore.activeStoredId = "uitest-heavy"
+            environment.chatStore.debugSeedTranscript(heavy)
+            return
+        }
+
+        // "shrinkland" — reproduce the post-disarm row SHRINK (FIX A). Seed TALL
+        // placeholder content, land at the bottom (latch disarms), then ~1s later
+        // re-seed the SAME session with SHORTER content so contentSize drops below
+        // the resting offset. BEFORE FIX A: the viewport is stranded past the
+        // content edge → blank page, chat above. AFTER: the always-on clamp snaps
+        // the offset down to the new ceiling.
+        if mode == "shrinkland" {
+            var tall: [ChatMessage] = []
+            for i in 0..<40 {
+                let isUser = i.isMultiple(of: 2)
+                tall.append(ChatMessage(
+                    role: isUser ? .user : .assistant,
+                    text: isUser
+                        ? "Shrink prompt #\(i + 1)"
+                        : Self.heavyReply(i + 1)))  // tall multi-line rows
+            }
+            environment.sessionStore.activeStoredId = "uitest-shrink"
+            environment.chatStore.debugSeedTranscript(tall)
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 1_000_000_000)  // land, then shrink
+                // SAME session id (a same-session reconcile, not a switch) so the
+                // landing latch has already disarmed — only the always-on clamp can
+                // save the offset. Replace with much shorter rows.
+                var short: [ChatMessage] = []
+                for i in 0..<10 {
+                    let isUser = i.isMultiple(of: 2)
+                    short.append(ChatMessage(
+                        role: isUser ? .user : .assistant,
+                        text: isUser ? "Short prompt #\(i + 1)" : "Short reply #\(i + 1)."))
+                }
+                environment.chatStore.debugSeedTranscript(short)
+            }
+            return
+        }
 
         // "switchlong" — FAITHFUL repro of the REAL session-switch open: open
         // session A (content), then switch to a LONG session B exactly as
@@ -158,6 +258,84 @@ enum UITestSeed {
                 environment.chatStore.debugSeedTranscript(seeded)
             }
         }
+    }
+
+    // MARK: - Stress content generators (ROUND-2)
+
+    /// Topics to vary the heavy prompts/replies so segments differ row-to-row
+    /// (defeats any accidental whole-transcript content dedup).
+    static let heavyTopics = [
+        "async streams", "actor isolation", "structured concurrency",
+        "value semantics", "the responder chain", "Core Animation",
+    ]
+
+    /// A heavy assistant reply: headers, a list, inline code, a long paragraph,
+    /// and a multi-line fenced Swift code block — the row shape that costs the
+    /// most to segment + markdown-render on device.
+    static func heavyReply(_ n: Int) -> String {
+        let topic = heavyTopics[n % heavyTopics.count]
+        return """
+        ## Reply #\(n): \(topic)
+
+        Here is a thorough answer about **\(topic)**. The key points, with some \
+        `inline code` and *emphasis*, are below:
+
+        - First, the `Task` runs on the current actor unless detached.
+        - Second, a `for await` loop suspends when the buffer is empty.
+        - Third, back-pressure must be explicit — `AsyncStream` is unbounded.
+
+        A longer paragraph to force multi-line wrapping and real layout cost: \
+        lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod \
+        tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim \
+        veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip.
+
+        ```swift
+        func process(_ events: AsyncStream<Event>) async {
+            var budgetStart = ContinuousClock.now
+            for await event in events {
+                route(event)
+                if budgetStart.duration(to: .now) > .milliseconds(8) {
+                    await Task.yield()   // give UIKit a runloop turn
+                    budgetStart = .now
+                }
+            }
+        }
+        ```
+
+        That covers \(topic) — ask if you want the edge cases too.
+        """
+    }
+
+    /// ~`count` streaming chunks that together build a long markdown+code answer.
+    /// Chunks are small (a few words / code tokens) to mimic real token cadence,
+    /// and cycle through prose, list items, and fenced code so every flush
+    /// re-segments a growing body that contains both prose and code runs.
+    static func streamChunks(count: Int) -> [String] {
+        var chunks: [String] = []
+        let proseWords = [
+            "The ", "streaming ", "path ", "must ", "stay ", "smooth ", "even ",
+            "while ", "markdown ", "and ", "code ", "render ", "incrementally. ",
+        ]
+        var i = 0
+        while chunks.count < count {
+            // Every ~40 chunks, emit a header / list / code-fence boundary so the
+            // segmenter has to re-split prose vs code on the growing tail.
+            let phase = (chunks.count / 40) % 4
+            switch phase {
+            case 0:
+                chunks.append(proseWords[i % proseWords.count])
+            case 1:
+                chunks.append(chunks.count % 8 == 0 ? "\n- item " : "point ")
+            case 2:
+                if chunks.count % 40 == 80 % 40 { chunks.append("\n```swift\n") }
+                chunks.append("let x = \(i % 10); ")
+            default:
+                if chunks.count % 40 == 120 % 40 { chunks.append("\n```\n\n") }
+                chunks.append(proseWords[i % proseWords.count])
+            }
+            i += 1
+        }
+        return chunks
     }
 }
 #endif

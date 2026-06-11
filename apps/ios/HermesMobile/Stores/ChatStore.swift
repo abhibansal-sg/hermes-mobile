@@ -1754,6 +1754,32 @@ final class ChatStore {
         rebuildUserOrdinals()
         transcriptGeneration += 1
     }
+
+    /// DEBUG-ONLY: drive the REAL streaming path with a synthesized gateway
+    /// delta, exactly as a WS `message.delta` frame would. The event carries
+    /// neither a `session_id` nor a `stored_session_id`, so `ownership(of:)`
+    /// classifies it `.local` (the malformed/global-frame branch) and it flows
+    /// through `handle(event:)` → `beginLocalTurn` → `scheduleFlush` →
+    /// `flushBuffers` → `mutateStreaming` — the same coalesced 40ms render path
+    /// the device exercises. Used by the `stream` UITestSeed stress mode to make
+    /// the streaming jitter measurable on the sim without a live gateway.
+    func debugInjectDelta(_ text: String) {
+        guard let event = GatewayEvent(params: .object([
+            "type": .string("message.delta"),
+            "payload": .object(["text": .string(text)]),
+        ])) else { return }
+        handle(event: event)
+    }
+
+    /// DEBUG-ONLY: end the synthesized stream (a `message.complete`), so the
+    /// streaming row settles (cursor stops, action row appears) like a real turn.
+    func debugCompleteStream() {
+        guard let event = GatewayEvent(params: .object([
+            "type": .string("message.complete"),
+            "payload": .object([:]),
+        ])) else { return }
+        handle(event: event)
+    }
     #endif
 
     func seed(from stored: [StoredMessage]) {

@@ -80,11 +80,26 @@ struct HermesMobileApp: App {
                 .hermesThemed(environment.themeStore)
                 .task {
                     #if DEBUG
+                    // DEBUG-only main-thread hitch logger (HERMES_PERF_LOG=1). Cheap,
+                    // allocation-free in steady state; durable measurement tooling.
+                    // Started FIRST so it captures the seed/stream window too.
+                    if PerfHitchLogger.isEnabled {
+                        PerfHitchLogger.shared.start()
+                    }
                     // DEBUG-only deterministic seed: when HERMES_UITEST_SEED is set,
                     // bypass the network bootstrap AND the debug overlay/badge so
                     // seeded captures (demo footage) are clean.
                     if let seed = UITestSeed.requestedMode {
                         UITestSeed.apply(seed, environment: environment)
+                        // MEASUREMENT MODE: when BOTH the seed AND the debug bridge are
+                        // requested (HERMES_DEBUG_BRIDGE=1), start the bridge anyway so a
+                        // harness can drive scrolls (/swipe → setContentOffset) against
+                        // the seeded transcript. The on-device badge/overlay is fine
+                        // during measurement (it is not a demo capture). Clean seeded
+                        // captures simply omit HERMES_DEBUG_BRIDGE.
+                        if ProcessInfo.processInfo.environment["HERMES_DEBUG_BRIDGE"] == "1" {
+                            startGstackDebugBridge(environment: environment)
+                        }
                         return
                     }
                     // gstack debug bridge (task UI-G): loopback-only StateServer
