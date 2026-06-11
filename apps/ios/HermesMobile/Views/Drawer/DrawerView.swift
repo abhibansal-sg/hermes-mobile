@@ -1276,9 +1276,17 @@ struct DrawerView: View {
 
     /// Open an existing session and dismiss the drawer (compact). Activation is
     /// instant (transcript + resume continue in the background).
+    ///
+    /// FIX 4: fire the drawer-close (`onNavigate()`) FIRST so the close-spring's
+    /// `drawer.isOpen = false` mutation is committed to SwiftUI before `open()` runs
+    /// its (now-deferred) teardown — the spring owns the tap tick. `open()` defers
+    /// `clearSessionState()` + `chat.reset()` to the next runloop tick itself, so
+    /// even the cheap synchronous activation pointers it sets here land after the
+    /// close mutation is queued. Together the switch hitch (S2) is removed at the
+    /// source: nothing heavy executes on the spring's frame 0.
     private func open(_ summary: SessionSummary) {
-        sessions.open(summary)
         onNavigate()
+        sessions.open(summary)
     }
 
     /// Start a fresh local draft chat (B3 API) and dismiss the drawer. Draft

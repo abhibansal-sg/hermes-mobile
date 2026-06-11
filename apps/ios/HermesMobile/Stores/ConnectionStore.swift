@@ -366,6 +366,20 @@ final class ConnectionStore {
     private var sessionRefreshDebounceTask: Task<Void, Never>?
     /// Debounce interval for the coalesced session refresh (ABH-86 item 1).
     private static let sessionRefreshDebounceMs: Int = 400
+    /// FIX 5 — WS intake yield budget. The event router drains an UNBOUNDED stream
+    /// on the main actor; a queued frame burst (a long agentic turn, a reconnect
+    /// backfill colliding with a live stream) would otherwise hold the main actor
+    /// back-to-back with NO runloop turn between frames, freezing UIKit for the
+    /// burst's duration. After each `route()` returns, the loop yields the main actor
+    /// once a contiguous wall-clock budget is exceeded OR every `intakeYieldEveryK`
+    /// frames — converting one long hold into many short ones BY CONSTRUCTION (a yield
+    /// point, not timing luck), giving UIKit a runloop turn mid-burst. The stream stays
+    /// UNBOUNDED (lossless — no frame is dropped); only the HOLD is capped.
+    private static let intakeYieldBudget: Duration = .milliseconds(8)
+    /// Hard frame-count ceiling between yields, as a floor under the wall-clock budget
+    /// (so a run of cheap frames still yields periodically even if it never crosses the
+    /// time budget). Bursts of expensive frames cross the time budget first.
+    private static let intakeYieldEveryK = 32
     /// The in-flight reconnect loop, if any.
     private var reconnectTask: Task<Void, Never>?
     /// The in-flight post-connect hydration coordinator, if any (ABH-82). Owns
@@ -685,8 +699,26 @@ final class ConnectionStore {
         if eventRouterTask == nil {
             eventRouterTask = Task { [weak self] in
                 guard let self else { return }
+                // FIX 5 — bound the main-actor HOLD, not the buffer. Track the start
+                // of the current contiguous (un-yielded) drain and the frames since
+                // the last yield. The `for await` only suspends on its own when the
+                // buffer is EMPTY; for a queued burst we add an explicit yield once a
+                // wall-clock budget OR a frame count is exceeded, so UIKit gets a
+                // runloop turn mid-burst. Yielding ONLY AFTER `route()` returns means
+                // no event is ever half-applied — an interleaved session switch is
+                // already made safe by the openToken / streamingIsForeign ownership
+                // gates. Lossless: every frame is still routed in order.
+                var holdStart = ContinuousClock.now
+                var sinceYield = 0
                 for await event in self.client.events {
                     self.route(event: event)
+                    sinceYield += 1
+                    if sinceYield >= Self.intakeYieldEveryK
+                        || ContinuousClock.now - holdStart >= Self.intakeYieldBudget {
+                        await Task.yield()
+                        holdStart = ContinuousClock.now
+                        sinceYield = 0
+                    }
                 }
             }
         }

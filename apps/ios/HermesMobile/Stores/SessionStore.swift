@@ -367,6 +367,16 @@ final class SessionStore {
     /// pulsing dot next to a row whose conversation moved in the last few
     /// seconds (driven by this device or another client over the broadcast).
     private(set) var lastActivityAt: [String: Date] = [:]
+    /// FIX 6a — un-observed shadow of the most-recent stamp time per id, used purely
+    /// to COALESCE the per-delta `lastActivityAt` write (skip a re-stamp within
+    /// ``liveStampCoalesce``). `@ObservationIgnored` so consulting/updating it never
+    /// invalidates the always-mounted drawer; the observed `lastActivityAt` is the
+    /// drawer's actual live-dot source and is written at most once per coalesce window.
+    @ObservationIgnored private var lastActivityStampAt: [String: Date] = [:]
+    /// Minimum gap between observed `lastActivityAt` writes for one id. Far below the
+    /// ``liveWindow`` so the live dot is never wrong — only the redundant per-delta
+    /// re-stamps (which would change nothing observable) are dropped.
+    private static let liveStampCoalesce: TimeInterval = 0.1
     /// A row counts as "live" if it was stamped within this window.
     private static let liveWindow: TimeInterval = 10
     /// Periodic prune of stale entries so the registry can't grow unbounded and
@@ -1330,24 +1340,43 @@ final class SessionStore {
     func open(_ summary: SessionSummary) {
         // Leaving any draft: opening a stored session is no longer a draft.
         isDraft = false
-        // Per-session state belongs to the PREVIOUS session — clear it now so
-        // the pill falls back to the global default instead of showing the
-        // last chat's hot-swap (build-27 QA), and an abandoned draft's pended
-        // pick can't leak in. The resume echo below re-seeds the truth.
+        // Per-session state belongs to the PREVIOUS session — clear it now so the
+        // pill falls back to the global default instead of showing the last chat's
+        // hot-swap (build-27 QA), and an abandoned draft's pended pick can't leak in.
+        // The resume echo below re-seeds the truth. Kept SYNCHRONOUS on the tap tick:
+        // it is only 6 cheap @Observable writes on the composer chip, and the build-27
+        // contract (ModelVisibilityTests.testOpenClearsPreviousSessionPillState)
+        // requires the pill to never flash the previous model — far cheaper than the
+        // LazyVStack teardown, so it is NOT the switch-hitch cost FIX 4 targets.
         connection?.clearSessionState()
-        // Activate instantly — the chat view can present right away with a
-        // loading transcript instead of blocking navigation on the gateway.
+        // Activate instantly — the chat view can present right away with a loading
+        // transcript instead of blocking navigation on the gateway. These pointers are
+        // CHEAP and drive the drawer selection highlight + gate the composer + resolve
+        // the seed's stored id, so they MUST land synchronously on the tap tick.
         let token = UUID()
         openToken = token
         activeRuntimeId = nil          // gates the composer until resume lands
         activeStoredId = summary.id
-        chat?.reset()
 
-        // Fast path: the stored transcript over REST (local-network quick).
-        // Threads the open token so a fetch outlived by a newer open()/draft
-        // can never seed over the newer session's transcript (R1 #28).
+        // FIX 4 — DEFER the heavy transcript teardown off the drawer-tap runloop tick
+        // so the drawer-close spring (.spring response 0.40, RootView) owns the first
+        // frame ALONE. `chat.reset()` is a WHOLESALE LazyVStack teardown — it empties
+        // `messages`, dismantling every realized MessageBubble in one diff — which,
+        // run synchronously, collided head-on with the spring's frame 0 and hitched
+        // the switch (S2 dominant cost / ROOT B). Run it on the NEXT main-actor tick
+        // instead: the spring's first frames render against the still-intact
+        // (offscreen-displacing) OLD transcript rather than an emptied stack, and the
+        // teardown + seed land a tick later when the spring is already moving. The seed
+        // is dispatched FROM this deferred block, AFTER `reset()`, so reset always
+        // precedes the seed (no wipe race), and the whole block is guarded by
+        // `openToken` so a newer open()/draft that superseded this one in the same tick
+        // cancels the stale teardown+seed (R1 #28/#43 — the existing supersession gate).
         Task { [weak self] in
-            guard let self else { return }
+            guard let self, self.openToken == token else { return }
+            self.chat?.reset()
+            // Fast path: the stored transcript over REST (local-network quick).
+            // Threads the open token so a fetch outlived by a newer open()/draft
+            // can never seed over the newer session's transcript (R1 #28).
             await self.seedTranscript(storedId: summary.id, token: token)
         }
 
@@ -1942,7 +1971,27 @@ final class SessionStore {
     /// or empty id is ignored. Starts the prune task on the first entry.
     func noteActivity(storedSessionId: String?) {
         guard let id = storedSessionId, !id.isEmpty else { return }
-        lastActivityAt[id] = Date()
+        // FIX 6a — COALESCE the per-delta stamp. `lastActivityAt` is a TRACKED
+        // @Observable property and the drawer is ALWAYS mounted behind the chat card
+        // (RootView), reading it per visible row via `isLive(_:)`. Writing it on every
+        // streaming delta (a long turn is ~168 frames) therefore invalidated the whole
+        // drawer body ~25×/sec for the entire turn — pure main-actor load that deepens
+        // the S1/S4 contention. A delta only needs to keep the row's "live" dot lit,
+        // and the live window is 10s, so a sub-`liveStampCoalesce` re-stamp changes
+        // nothing observable: SKIP the write when the last stamp for this id is within
+        // the coalesce interval. This is a WRITE-SKIP (a value compare, not a timer):
+        // the FIRST delta of a turn stamps immediately (dot lights at once) and only
+        // the high-frequency repeats are dropped. `message.start`/`message.complete`
+        // re-stamp regardless (they are ≥ the interval apart in practice). The skip
+        // map is @ObservationIgnored so consulting it never itself triggers a
+        // drawer invalidation.
+        let now = Date()
+        if let last = lastActivityStampAt[id],
+           now.timeIntervalSince(last) < Self.liveStampCoalesce {
+            return
+        }
+        lastActivityStampAt[id] = now
+        lastActivityAt[id] = now
         startLiveCleanupIfNeeded()
     }
 
@@ -1969,6 +2018,9 @@ final class SessionStore {
                 guard let self, !Task.isCancelled else { return }
                 let cutoff = Date().addingTimeInterval(-Self.liveWindow)
                 self.lastActivityAt = self.lastActivityAt.filter { $0.value > cutoff }
+                // Keep the coalesce shadow in lock-step so it cannot grow unbounded
+                // and a re-activated id past the window stamps immediately (FIX 6a).
+                self.lastActivityStampAt = self.lastActivityStampAt.filter { $0.value > cutoff }
                 if self.lastActivityAt.isEmpty {
                     self.liveCleanupTask = nil
                     return

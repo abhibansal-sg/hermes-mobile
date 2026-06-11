@@ -103,6 +103,42 @@ enum UITestSeed {
             return
         }
 
+        // "demo" — curated, presentable content for the launch video: a power
+        // user's drawer + one rich active conversation. No real user data.
+        if mode == "demo" {
+            func summary(_ id: String, _ title: String, _ count: Int, _ ago: Double) -> SessionSummary? {
+                JSONValue.object([
+                    "id": .string(id), "title": .string(title),
+                    "message_count": .number(Double(count)),
+                    "last_active": .number(1_700_000_000 - ago),
+                    "started_at": .number(1_700_000_000 - ago - 1000),
+                    "source": .string("user"),
+                ]).decoded(as: SessionSummary.self)
+            }
+            let list = [
+                summary("demo-1", "Deploy health check", 4, 60),
+                summary("demo-2", "Refactor the auth module", 22, 3600),
+                summary("demo-3", "Tokyo trip — 5-day itinerary", 16, 7200),
+                summary("demo-4", "Fix the flaky websocket test", 31, 14400),
+                summary("demo-5", "Draft replies to investor emails", 12, 28800),
+                summary("demo-6", "Morning brief", 8, 86400),
+            ].compactMap { $0 }
+            let convo: [ChatMessage] = [
+                ChatMessage(role: .user, text: "Is the staging deploy healthy? Anything broken?"),
+                ChatMessage(
+                    role: .assistant,
+                    text: "Checking the last run and the gateway now.\n\nCI is green on "
+                        + "main — build #4821 passed 8 minutes ago. But staging is returning "
+                        + "502s: the last deploy left a worker wedged at 99% CPU. A clean "
+                        + "restart of staging-gateway will clear it.\n\nWant me to restart it?"),
+            ]
+            environment.sessionStore.sessions = list
+            environment.sessionStore.activeStoredId = "demo-1"
+            environment.connectionStore.phase = .connected
+            environment.chatStore.debugSeedTranscript(convo)
+            return
+        }
+
         environment.sessionStore.activeStoredId = "uitest-\(mode)"
         // Seed TIMING (scroll-race verification):
         //  • "long"/"short" — synchronous: content present at first layout.

@@ -80,17 +80,16 @@ struct HermesMobileApp: App {
                 .hermesThemed(environment.themeStore)
                 .task {
                     #if DEBUG
-                    // gstack debug bridge (task UI-G): loopback-only StateServer
-                    // + typed store accessors. DEBUG-only; absent in Release.
-                    startGstackDebugBridge(environment: environment)
-                    // DEBUG-only deterministic scroll-verification seed: when
-                    // HERMES_UITEST_SEED is set, bypass the network bootstrap and
-                    // render a seeded transcript so sim screenshots are reproducible
-                    // (short = top-aligned check, long = open-on-newest + pill check).
+                    // DEBUG-only deterministic seed: when HERMES_UITEST_SEED is set,
+                    // bypass the network bootstrap AND the debug overlay/badge so
+                    // seeded captures (demo footage) are clean.
                     if let seed = UITestSeed.requestedMode {
                         UITestSeed.apply(seed, environment: environment)
                         return
                     }
+                    // gstack debug bridge (task UI-G): loopback-only StateServer
+                    // + typed store accessors. DEBUG-only; absent in Release.
+                    startGstackDebugBridge(environment: environment)
                     #endif
                     environment.appLock.authenticateAtLaunch()
                     // Route notification taps (local + remote APNs) into the store

@@ -810,7 +810,19 @@ struct ChatView: View {
         // mechanism). On iOS 18+ `defaultScrollAnchor(.bottom)` already follows
         // growth natively; these handlers are the iOS-17 follow path AND the
         // session-identity reseed gate (Batch E) on every version.
-        .onChange(of: chatStore.messages.count) { _, _ in
+        .onChange(of: chatStore.messages.count) { oldCount, newCount in
+            // FIX 3 send-path guarantee: the user's OWN new turn must follow from
+            // the first token even if they had scrolled up before sending. `send`
+            // appends the user message while `localTurnInFlight` is held, so a row
+            // gained during a local turn is the user's intent to watch — re-park at
+            // the tail so the now-`atBottom`-gated follow sticks the streaming reply.
+            // A row gained from a FOREIGN/mirror frame (no local turn) does NOT
+            // force-follow, so a reader watching another session's broadcast is not
+            // yanked. (For iOS 18+ the bottom anchor follows growth natively; this is
+            // the explicit parked-at-tail signal the §3.6 gate reads.)
+            if newCount > oldCount, chatStore.localTurnInFlight {
+                atBottom = true
+            }
             scrollToBottomIfNeeded(proxy)
         }
         .onChange(of: lastMessageText) { _, _ in
@@ -962,8 +974,14 @@ struct ChatView: View {
         @ViewBuilder var inner: Inner
         @State private var position = ScrollPosition()
 
-        /// Content + container heights; re-pin fires when EITHER changes.
-        private struct GeometrySize: Equatable { let content: CGFloat; let container: CGFloat }
+        /// Content + container heights AND the live contentOffset; the re-pin/clamp
+        /// fires when ANY change (FIX 1/FIX 2). Offset is carried so the seed-boundary
+        /// clamp can detect a stale offset inherited across a session switch.
+        private struct Geometry: Equatable {
+            let content: CGFloat
+            let container: CGFloat
+            let offsetY: CGFloat
+        }
 
         var body: some View {
             inner
@@ -971,23 +989,68 @@ struct ChatView: View {
                 // Explicit scroll-to-bottom request (pill / streaming follow /
                 // session-switch landing).
                 .onChange(of: tick) { _, _ in applyScroll(animated: animated) }
-                // OPEN-ON-NEWEST, POST-LAYOUT (SCROLL P0 r3/r4 — the async-seed fix).
-                // While a fresh open is pending, re-pin to the bottom on every
-                // CONTENT-SIZE *or* CONTAINER-SIZE change — i.e. as the seeded
+                // OPEN-ON-NEWEST, POST-LAYOUT (SCROLL P0 r3/r4 — the async-seed fix),
+                // now a ONE-SHOT LANDING LATCH + BOUNDS CLAMP (FIX 1a / FIX 2).
+                //
+                // While a fresh open is pending, defend the async-seed landing on
+                // every content-size OR container-size change — i.e. as the seeded
                 // LazyVStack rows lay out (content) AND as the drawer-close spring /
                 // safe-area transitions settle the viewport (container). This fires
                 // AFTER layout, so a seed that arrives after the ScrollView first
                 // appeared (network OR cache — both async), through any number of
-                // settle frames (cache→network double-seed, late-measuring markdown/
-                // image rows, the open animation), still lands on the newest message
-                // — instead of one `scrollTo` racing the not-yet-expanded content
-                // (which left the transcript opening at the top). No-op when content
-                // fits the viewport, so short chats stay top-aligned. The pin is held
-                // until the user drags (.interacting), so it cannot self-disarm.
-                .onScrollGeometryChange(for: GeometrySize.self) {
-                    GeometrySize(content: $0.contentSize.height, container: $0.containerSize.height)
-                } action: { _, _ in
-                    if pendingLand { applyScroll(animated: false) }
+                // settle frames, still lands on the newest message.
+                //
+                // FIX 2 — the re-pin is a CLAMP, not a bare target scroll: when the
+                // current offset EXCEEDS the content ceiling (the stale large offset
+                // inherited from the previous session whose ScrollView identity
+                // persisted), snap DOWN to the ceiling. The ceiling is 0 when content
+                // fits, so a short chat is NEVER pulled to the bottom. Idempotent —
+                // re-applying at the ceiling is a no-op, so it cannot jitter against
+                // streaming growth the way a repeated target-scroll did.
+                //
+                // FIX 1a — ONE-SHOT: once the seeded content actually fills/exceeds
+                // the viewport (`content >= container`), the landing is complete, so
+                // DISARM the latch after re-pinning. The geometry re-pin then stops
+                // co-driving every subsequent streaming flush (the dual-writer that
+                // fought the natural anchored scroll). The existing `.interacting`
+                // release still applies for the reader-drag case. A short chat never
+                // crosses the predicate, so it keeps the (harmless, no-op) defence
+                // until it either grows past the viewport or the user drags.
+                .onScrollGeometryChange(for: Geometry.self) {
+                    Geometry(
+                        content: $0.contentSize.height,
+                        container: $0.containerSize.height,
+                        offsetY: $0.contentOffset.y)
+                } action: { _, geo in
+                    guard pendingLand else { return }
+                    let ceiling = max(0, geo.content - geo.container)
+                    // Short chat (content fits ⇒ ceiling 0): NOTHING to land — never
+                    // pull it away from the top. Stay armed (harmlessly) until it
+                    // grows past the viewport or the user drags. This is the
+                    // short-chat-stays-top-aligned invariant.
+                    guard geo.content > geo.container else { return }
+                    // The viewport is overflowed, so there IS a bottom to land on.
+                    // Re-pin to the bottom edge whenever the resting offset is not
+                    // already AT the ceiling — this is the CLAMP (FIX 2): it covers
+                    // BOTH the async-seed open (offset still near the top, below the
+                    // ceiling — the seeded rows just laid out) AND the stale offset
+                    // inherited across a session switch (offset ABOVE the ceiling).
+                    // `scrollTo(edge:.bottom)` resolves to exactly the ceiling, so
+                    // re-applying once already landed is a no-op (idempotent — it
+                    // cannot jitter against streaming growth the way the prior
+                    // unconditional target-scroll did).
+                    let landed = abs(geo.offsetY - ceiling) <= 0.5
+                    if !landed {
+                        applyScroll(animated: false)
+                        // Not yet at the bottom — stay armed so the next settle frame
+                        // (rows still measuring) keeps chasing the true content end.
+                        return
+                    }
+                    // ONE-SHOT disarm: the viewport is filled AND we are resting at
+                    // the true bottom — the landing is complete, so release the latch
+                    // and let the natural bottom anchor own subsequent growth (the
+                    // dual-writer that fought every streaming flush is gone).
+                    pendingLand = false
                 }
                 // Release the open-pin the instant the user drives the scroll, so a
                 // reader who scrolls up is never yanked back down (the §3.6 gate
@@ -1123,13 +1186,28 @@ struct ChatView: View {
         return atBottom ? .keepPinned : .preserveReaderPosition
     }
 
-    /// Auto-stick to the bottom only when already near the bottom or actively
-    /// streaming, so a user reading history isn't yanked down by new content
-    /// (PRESERVED §3.6 gate). On iOS 18+ `defaultScrollAnchor(.bottom)` follows
-    /// growth natively, so this is a belt; on iOS 17 it is the growth-follow path.
+    /// Auto-stick to the bottom only when the reader is currently PARKED at the
+    /// tail (`atBottom`), so a user reading history — or one who drags UP mid-stream
+    /// — is never yanked down by new content (§3.6 gate).
+    ///
+    /// FIX 3: the gate dropped the `|| chatStore.isStreaming` disjunct. While
+    /// streaming, `isStreaming` was unconditionally true, so the follow kept firing
+    /// even after `ScrollAtBottomTracker` set `atBottom = false` the instant the
+    /// user dragged up — a 280ms spring fought the finger (the S1 drag rubber-band).
+    /// Streaming should follow because the reader is AT the bottom, not because a
+    /// turn is in flight: a freshly-sent turn starts `atBottom = true` (the
+    /// `.landOnNewest` seed pins it, and `send` appends at the tail while parked at
+    /// bottom), so first-token follow still works; a mid-stream drag-up now halts
+    /// cleanly via `atBottom = false`.
+    ///
+    /// FIX 1b: streaming-growth follow is INSTANT (`animated: false`). The
+    /// transcript is bottom-anchored, so an instant edge re-pin per flush reads as
+    /// smooth continuous growth — the prior `animated: true` re-kicked a 280ms
+    /// `.snappy` spring every ~40ms before it could settle (the S1 jitter). The
+    /// animated spring is now reserved for the explicit pill tap (`scrollToBottomPill`).
     private func scrollToBottomIfNeeded(_ proxy: ScrollViewProxy) {
-        guard atBottom || chatStore.isStreaming else { return }
-        snapToBottom(proxy, animated: true)
+        guard atBottom else { return }
+        snapToBottom(proxy, animated: false)
     }
 
     /// Land the NEWEST message cleanly above the floating composer (SCROLL P0 r2).
