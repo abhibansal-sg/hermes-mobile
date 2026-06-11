@@ -1,0 +1,185 @@
+name: HermesMobile
+options:
+  bundleIdPrefix: ai.hermes
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    DEVELOPMENT_TEAM: 6J4Y9NKRQ2
+    CODE_SIGN_STYLE: Automatic
+    CURRENT_PROJECT_VERSION: 33
+    MARKETING_VERSION: 1.0.1
+packages:
+  # gstack iOS debug bridge (task UI-G). Local SPM package. Every source file
+  # is #if DEBUG-gated (Swift) / #if DEBUG (ObjC), so a Release build links
+  # empty modules and carries no StateServer/DebugBridge symbols. Remove via
+  # the ios-clean procedure (see HermesMobile/App/DebugBridgeWiring.swift).
+  DebugBridge:
+    path: DebugBridge
+  # Offline-first cache layer (P1/P2). HermesMobile only; NOT linked into
+  # HermesWidgets or HermesShare — neither extension has a persistence need.
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    from: "7.0.0"
+targets:
+  HermesMobile:
+    type: application
+    platform: iOS
+    sources:
+      - HermesMobile
+    dependencies:
+      - target: HermesWidgets
+        embed: true
+      - target: HermesShare
+        embed: true
+      # DEBUG-only debug bridge. Linked in all configs by XcodeGen, but its
+      # modules compile to nothing in Release (source-level #if DEBUG), so no
+      # bridge symbols ship. DebugBridgeUI transitively pulls Core + Touch.
+      - package: DebugBridge
+        product: DebugBridgeUI
+      # Offline-first SQLite cache (CONTRACT-OFFLINE-CACHE.md P1/P2).
+      # HermesMobile only; no extension target links this.
+      - package: GRDB
+        product: GRDB
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: Entitlements/HermesMobile.entitlements
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
+        INFOPLIST_KEY_UILaunchScreen_Generation: true
+    info:
+      path: HermesMobile/Info.plist
+      properties:
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleDisplayName: Hermes Agent
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSLocalNetworkUsageDescription: Hermes Agent connects to your own gateway server on your local network or tailnet.
+        NSCameraUsageDescription: Capture a photo to send to Hermes Agent.
+        NSPhotoLibraryUsageDescription: Attach photos from your library to Hermes Agent conversations.
+        NSMicrophoneUsageDescription: Dictate messages to Hermes Agent with your voice.
+        NSFaceIDUsageDescription: Unlock Hermes Agent with Face ID.
+        LSApplicationQueriesSchemes:
+          - tailscale
+        NSUserActivityTypes:
+          - ai.hermes.app.openSession
+        NSSupportsLiveActivities: true
+        CFBundleURLTypes:
+          - CFBundleURLName: ai.hermes.app
+            CFBundleURLSchemes:
+              - hermesapp
+        ITSAppUsesNonExemptEncryption: false
+  HermesWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - HermesWidgets
+      - HermesMobile/Support/SharedStore.swift
+      - HermesMobile/Support/HermesTurnAttributes.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.HermesWidgets
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_ENTITLEMENTS: Entitlements/HermesExtension.entitlements
+    info:
+      path: HermesWidgets/Info.plist
+      properties:
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleDisplayName: Hermes Agent
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+  HermesShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - HermesShare
+      - HermesMobile/Support/SharedStore.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.share
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_ENTITLEMENTS: Entitlements/HermesExtension.entitlements
+        APPLICATION_EXTENSION_API_ONLY: true
+    info:
+      path: HermesShare/Info.plist
+      properties:
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleDisplayName: Hermes Agent
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsText: true
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsImageWithMaxCount: 4
+  HermesMobileTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - HermesMobileTests
+    dependencies:
+      - target: HermesMobile
+      # GRDB direct link so CacheLayerTests can call DatabaseQueue(configuration:)
+      # directly for in-memory test setups.
+      - package: GRDB
+        product: GRDB
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.tests
+        GENERATE_INFOPLIST_FILE: true
+  HermesMobileUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - HermesMobileUITests
+    dependencies:
+      - target: HermesMobile
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.uitests
+        GENERATE_INFOPLIST_FILE: true
+schemes:
+  HermesMobile:
+    build:
+      targets:
+        HermesMobile: all
+        HermesMobileTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - HermesMobileTests
+        - HermesMobileUITests
+      # Live UI tests (ChatFlowUITests / CrossClientSyncUITests) read HERMES_URL /
+      # HERMES_TOKEN from the UI-test-runner process environment and forward them
+      # into the app's launchEnvironment. These are wired here so xcodebuild's
+      # `TEST_RUNNER_HERMES_URL` / `TEST_RUNNER_HERMES_TOKEN` overrides land in the
+      # runner env (the scheme env var is the macro-expanded sink for them); when
+      # the overrides are absent the tests self-skip, keeping CI green offline.
+      environmentVariables:
+        - variable: HERMES_URL
+          value: $(TEST_RUNNER_HERMES_URL)
+          isEnabled: true
+        - variable: HERMES_TOKEN
+          value: $(TEST_RUNNER_HERMES_TOKEN)
+          isEnabled: true

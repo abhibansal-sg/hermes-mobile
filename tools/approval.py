@@ -663,14 +663,33 @@ def unregister_gateway_notify(session_key: str) -> None:
         entry.event.set()
 
 
+# Seam S5 (hermes-mobile audit): observers notified after a gateway approval
+# resolution, with the resolver's auth context and the resolved entries'
+# request data. ``fn(session_key, choice, resolve_all, audit, entries_data)``
+# where entries_data is a list of the resolved entries' ``data`` dicts.
+# Best-effort: observer errors never stall a resolution. The stock
+# pre/post_approval_request hooks can't carry this because the resolver's
+# identity (which device approved) is only known here, not in the waiting
+# request thread those hooks fire in. See CONTRACT-DEPATCH.md.
+_RESOLVE_OBSERVERS: list = []
+
+
 def resolve_gateway_approval(session_key: str, choice: str,
-                             resolve_all: bool = False) -> int:
+                             resolve_all: bool = False,
+                             audit: Optional[dict] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
     When *resolve_all* is True every pending approval in the session is
     resolved at once (``/approve all``).  Otherwise only the oldest one
     is resolved (FIFO).
+
+    *audit* (optional): the resolver's auth context — a dict with
+    ``credential`` / ``device_id`` / ``device_name`` / ``token_prefix`` /
+    ``session_id`` / ``session_key``. When present it is forwarded to the
+    resolve observers (seam S5) AFTER the agent threads are unblocked, so an
+    observer failure can never stall a resolution. Existing callers pass
+    nothing (back-compat).
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
@@ -689,6 +708,15 @@ def resolve_gateway_approval(session_key: str, choice: str,
     for entry in targets:
         entry.result = choice
         entry.event.set()
+
+    if audit and targets:
+        entries_data = [getattr(entry, "data", None) for entry in targets]
+        for _obs in list(_RESOLVE_OBSERVERS):
+            try:
+                _obs(session_key, choice, resolve_all, audit, entries_data)
+            except Exception:  # pragma: no cover - best-effort, never fatal
+                logger.debug("approval resolve observer failed", exc_info=True)
+
     return len(targets)
 
 

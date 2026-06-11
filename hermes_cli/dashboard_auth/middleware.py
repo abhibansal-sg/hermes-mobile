@@ -78,6 +78,39 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+def _device_token_auth(request: Request) -> bool:
+    """Authenticate machine API requests via the pluggable token registry.
+
+    In OAuth-gated mode browser traffic authenticates with cookies, but
+    machine clients (e.g. the hermes-mobile plugin's paired devices) present
+    bearer tokens and have no dashboard cookie. This branch is intentionally
+    limited to ``/api/*`` paths and only accepts registry-backed tokens (seam
+    S5; see hermes_cli.dashboard_auth.token_auth); the legacy shared
+    dashboard token remains loopback-only under the legacy middleware.
+    """
+    if not request.url.path.startswith("/api/"):
+        return False
+
+    session_header = request.headers.get("X-Hermes-Session-Token", "")
+    auth = request.headers.get("authorization", "")
+    candidates = []
+    if session_header:
+        candidates.append(session_header)
+    if auth.startswith("Bearer "):
+        candidates.append(auth[len("Bearer "):])
+    if not candidates:
+        return False
+
+    from hermes_cli.dashboard_auth.token_auth import match_token
+
+    for candidate in candidates:
+        identity = match_token(candidate)
+        if identity is not None:
+            request.state.device = identity
+            return True
+    return False
+
+
 def _unauth_response(request: Request, *, reason: str) -> Response:
     """API routes → 401 JSON with ``login_url``; HTML routes → 302 → /login.
 
@@ -183,6 +216,9 @@ async def gated_auth_middleware(
 
     path = request.url.path
     if _path_is_public(path):
+        return await call_next(request)
+
+    if _device_token_auth(request):
         return await call_next(request)
 
     at, _rt = read_session_cookies(request)
@@ -365,4 +401,3 @@ def _attempt_refresh(request: Request, *, refresh_token):
         if new_session is not None:
             return new_session, provider.name
     return None
-

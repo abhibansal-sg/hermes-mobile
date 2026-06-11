@@ -100,6 +100,35 @@ def insecure_public_app():
     web_server.app.state.auth_required = prev_required
 
 
+@pytest.fixture
+def wired_device_tokens():
+    """The hermes-mobile plugin's device-token registry, wired into the S5
+    token-auth seam (ABH-88 de-patch W2b: without this wiring, device tokens
+    are not accepted anywhere — neither by the gated middleware nor by the
+    WS gates). Restores the seam registries + resets the device registry on
+    teardown."""
+    import sys
+
+    from hermes_cli.dashboard_auth import token_auth
+    from tests.plugins.hermes_mobile.conftest import load_plugin_module
+
+    device_tokens = load_plugin_module("device_tokens")
+    plugin = sys.modules["hermes_plugins.hermes_mobile"]
+    before = (
+        list(token_auth.TOKEN_AUTHENTICATORS),
+        list(token_auth.IDENTITY_VALIDATORS),
+        list(token_auth.SOCKET_OBSERVERS),
+    )
+    plugin._wire_token_auth()
+    try:
+        yield device_tokens
+    finally:
+        device_tokens._reset_for_tests()
+        token_auth.TOKEN_AUTHENTICATORS[:] = before[0]
+        token_auth.IDENTITY_VALIDATORS[:] = before[1]
+        token_auth.SOCKET_OBSERVERS[:] = before[2]
+
+
 def _logged_in(client: TestClient) -> None:
     """Drive the stub OAuth round trip so the client holds session cookies."""
     r1 = client.get("/auth/login?provider=stub", follow_redirects=False)
@@ -126,6 +155,85 @@ class TestWsTicketEndpoint:
         assert isinstance(body["ticket"], str)
         assert len(body["ticket"]) >= 32
         assert body["ttl_seconds"] == 30
+
+    def test_device_token_can_mint_gated_ws_ticket(
+        self, gated_app, wired_device_tokens
+    ):
+        device_tokens = wired_device_tokens
+
+        issued = device_tokens.issue(device_name="iPhone 15")
+        try:
+            gated_app.cookies.clear()
+            r = gated_app.post(
+                "/api/auth/ws-ticket",
+                headers={"X-Hermes-Session-Token": issued["token"]},
+            )
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["ttl_seconds"] == 30
+
+            ws = _fake_ws(query={"ticket": body["ticket"]})
+            assert web_server._ws_auth_ok(ws) is True
+            assert ws.state.device["device_id"] == issued["device_id"]
+            assert ws.state.device["token_prefix"] == issued["token"][:8]
+            assert ws.state.device["scopes"] == ["chat", "approve"]
+            active = web_server._ws_active_identity(ws)
+            assert active is not None
+            assert active["device_id"] == issued["device_id"]
+        finally:
+            device_tokens._reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_device_ticket_rechecks_active_device_before_ws_use(
+        self, gated_app, wired_device_tokens
+    ):
+        device_tokens = wired_device_tokens
+
+        issued = device_tokens.issue(device_name="Soon Revoked")
+        try:
+            gated_app.cookies.clear()
+            ticket = gated_app.post(
+                "/api/auth/ws-ticket",
+                headers={"X-Hermes-Session-Token": issued["token"]},
+            ).json()["ticket"]
+            device_tokens.revoke(issued["device_id"])
+
+            closed = {}
+            ws = _fake_ws(query={"ticket": ticket})
+
+            async def close(code=1000, reason=""):
+                closed["code"] = code
+                closed["reason"] = reason
+
+            ws.close = close
+            assert web_server._ws_auth_ok(ws) is True
+            assert web_server._ws_active_identity(ws) is None
+            assert await web_server._close_if_ws_device_revoked(ws) is True
+            assert closed == {"code": 4401, "reason": "device revoked"}
+        finally:
+            device_tokens._reset_for_tests()
+
+    def test_device_token_without_chat_scope_cannot_mint_ws_ticket(
+        self, gated_app, wired_device_tokens
+    ):
+        import json
+
+        device_tokens = wired_device_tokens
+
+        issued = device_tokens.issue(device_name="Approvals Only")
+        registry_path = device_tokens._device_registry_path()
+        registry = json.loads(registry_path.read_text())
+        registry[issued["device_id"]]["scopes"] = ["approve"]
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
+        try:
+            gated_app.cookies.clear()
+            r = gated_app.post(
+                "/api/auth/ws-ticket",
+                headers={"X-Hermes-Session-Token": issued["token"]},
+            )
+            assert r.status_code == 403
+        finally:
+            device_tokens._reset_for_tests()
 
     def test_unauthenticated_returns_401_or_redirect(self, gated_app):
         r = gated_app.post("/api/auth/ws-ticket", follow_redirects=False)
@@ -201,6 +309,7 @@ def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/p
         query_params=_QP(query),
         client=SimpleNamespace(host=client_host),
         url=SimpleNamespace(path=path),
+        state=SimpleNamespace(),
     )
 
 

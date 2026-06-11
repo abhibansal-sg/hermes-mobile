@@ -1,0 +1,10 @@
+{
+  "name": "hermes-mobile",
+  "label": "Hermes Mobile",
+  "description": "Backend API for the HermesMobile iOS app (no dashboard tab)",
+  "version": "1.0.0",
+  "tab": {
+    "hidden": true
+  },
+  "api": "api.py"
+}

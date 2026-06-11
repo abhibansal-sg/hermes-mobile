@@ -234,6 +234,15 @@ def _has_valid_session_token(request: Request) -> bool:
     already use ``Authorization`` (for example Caddy ``basic_auth``). We still
     accept the legacy Bearer path for backward compatibility with older
     dashboard bundles.
+
+    Seam S5 (migration-safe, purely additive): if NEITHER the shared-token
+    header nor the legacy Bearer path matches, a THIRD OR-branch consults the
+    pluggable token-authenticator registry (populated e.g. by the
+    hermes-mobile plugin's per-device tokens). The shared-token branches are
+    checked FIRST (fast path, the common live case) and are NEVER removed or
+    weakened — a registry miss falls through exactly as before. On a match
+    the resolved identity is stashed on ``request.state.device`` so the
+    approval-audit path can attribute the resolver, and True is returned.
     """
     session_header = request.headers.get(_SESSION_HEADER_NAME, "")
     if session_header and hmac.compare_digest(
@@ -244,7 +253,64 @@ def _has_valid_session_token(request: Request) -> bool:
 
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
-    return hmac.compare_digest(auth.encode(), expected.encode())
+    if hmac.compare_digest(auth.encode(), expected.encode()):
+        return True
+
+    # --- S5 additive token-registry OR-branch (after BOTH shared-token checks).
+    # Try the session header value first, then the Bearer value (strip the
+    # "Bearer " prefix). Authenticators are timing-safe + return None for an
+    # unknown token, so this can only ever ACCEPT extra credentials, never
+    # reject the shared token (which already returned True above).
+    from hermes_cli.dashboard_auth.token_auth import match_token
+
+    candidates = []
+    if session_header:
+        candidates.append(session_header)
+    if auth.startswith("Bearer "):
+        candidates.append(auth[len("Bearer "):])
+    for candidate in candidates:
+        identity = match_token(candidate)
+        if identity is not None:
+            # Stash for the audit path; the approval handler reads it.
+            try:
+                request.state.device = identity
+            except Exception:  # pragma: no cover - defensive
+                pass
+            return True
+
+    return False
+
+
+def _has_dashboard_api_auth(request: Request) -> bool:
+    """True when the active dashboard auth mode has accepted this request.
+
+    Loopback/insecure mode is still governed by the legacy injected session
+    token plus additive device-token branch. In OAuth-gated mode the middleware
+    is authoritative: browser requests arrive with ``request.state.session`` and
+    mobile device-token requests arrive with ``request.state.device``.
+    """
+    if getattr(request.app.state, "auth_required", False):
+        return (
+            getattr(request.state, "session", None) is not None
+            or getattr(request.state, "device", None) is not None
+        )
+    return _has_valid_session_token(request)
+
+
+def _request_device(request: Request) -> Optional[dict]:
+    device = getattr(request.state, "device", None)
+    return device if isinstance(device, dict) else None
+
+
+def _device_has_scope(request: Request, scope: str) -> bool:
+    device = _request_device(request)
+    if device is None:
+        return True
+    return scope in (device.get("scopes") or [])
+
+
+def _is_device_auth(request: Request) -> bool:
+    return _request_device(request) is not None
 
 
 def _require_token(request: Request) -> None:
@@ -266,14 +332,12 @@ def _require_token(request: Request) -> None:
       making plugin install/enable/disable and the other ``_require_token``
       endpoints permanently unreachable behind the gate. Defer to the gate.
     """
-    if getattr(request.app.state, "auth_required", False):
-        # Gate is authoritative. It attaches ``request.state.session`` on
-        # success and 401s otherwise, so a request that reached us is already
-        # authenticated. Belt-and-braces: confirm the session is present.
-        if getattr(request.state, "session", None) is not None:
-            return
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not _has_valid_session_token(request):
+    # Gate is authoritative in OAuth mode (it attaches ``request.state.session``
+    # on success and 401s otherwise); loopback mode validates the injected
+    # session token. ``_has_dashboard_api_auth`` composes both, and additively
+    # accepts a registry device-token identity (``request.state.device``) under
+    # seam S5 so mobile per-device tokens authenticate in either mode.
+    if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -2331,7 +2395,7 @@ async def get_profiles_sessions(
 
 
 @app.get("/api/sessions/search")
-async def search_sessions(q: str = "", limit: int = 20):
+async def search_sessions(q: str = "", limit: int = 20, scope: str = "all"):
     """Search sessions by ID plus full-text message content using FTS5.
 
     Direct session-id matches are surfaced first, then FTS message-content
@@ -2341,9 +2405,23 @@ async def search_sessions(q: str = "", limit: int = 20):
     logical chat can own many ``sessions`` rows that all match the same query.
     Branches also use ``parent_session_id``, but they are real alternate
     conversations; don't collapse branch-specific hits back into the parent.
+
+    ``scope`` narrows by message role so the result list isn't dominated by
+    tool/structured noise (mobile search scope toggle):
+      - ``all`` (default): every role, plus direct session-id matches.
+      - ``messages``: user + assistant prose only (excludes tool output).
+      - ``code``: tool messages only (command output / file contents /
+        structured results).
+    A non-``all`` scope drops the session-id match pass so the list stays a
+    pure content-scoped result.
     """
     if not q or not q.strip():
         return {"results": []}
+    scope_norm = (scope or "all").strip().lower()
+    role_filter = {
+        "messages": ["user", "assistant"],
+        "code": ["tool"],
+    }.get(scope_norm)  # None for "all" / unknown → no role filter
     try:
         from hermes_state import SessionDB
         db = SessionDB()
@@ -2441,7 +2519,14 @@ async def search_sessions(q: str = "", limit: int = 20):
             # logs, or another Hermes surface. FTS can't find those unless the
             # id happens to appear in message text. search_sessions_by_id is
             # SQL-bounded, so this stays cheap even with thousands of sessions.
-            for row in db.search_sessions_by_id(q, limit=safe_limit, include_archived=True):
+            # Skipped for a narrowed scope (messages/code) so the list stays a
+            # pure content-scoped result.
+            id_rows = (
+                db.search_sessions_by_id(q, limit=safe_limit, include_archived=True)
+                if role_filter is None
+                else []
+            )
+            for row in id_rows:
                 sid = row.get("id")
                 preview = (row.get("preview") or "").strip()
                 snippet = preview or f"Session ID: {sid}"
@@ -2470,7 +2555,13 @@ async def search_sessions(q: str = "", limit: int = 20):
             # Over-fetch so lineage dedup can still surface `limit` distinct
             # conversations even when several hits collapse onto one root.
             fetch_limit = max(safe_limit * 5, 50)
-            matches = db.search_messages(query=prefix_query, limit=fetch_limit)
+            # Pass role_filter only when a scope is active, so the default
+            # (scope="all") path calls search_messages exactly as stock Hermes
+            # does — keeps the search-scope seam additive and stock tests green.
+            search_kwargs = {"query": prefix_query, "limit": fetch_limit}
+            if role_filter is not None:
+                search_kwargs["role_filter"] = role_filter
+            matches = db.search_messages(**search_kwargs)
 
             for m in matches:
                 if len(seen) >= safe_limit:
@@ -9227,7 +9318,17 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            consume_ticket(ticket)
+            info = consume_ticket(ticket)
+            if info.get("provider") == "device" and info.get("user_id"):
+                try:
+                    ws.state.device = {
+                        "device_id": info.get("device_id") or info["user_id"],
+                        "device_name": info.get("device_name"),
+                        "token_prefix": info.get("token_prefix"),
+                        "scopes": list(info.get("scopes") or []),
+                    }
+                except Exception:  # pragma: no cover - defensive
+                    pass
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
@@ -9243,7 +9344,56 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         return "no_credential", "none"
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
         return None, "token"
+
+    # --- S5 additive token-registry OR-branch (after the shared-token check) --
+    # Single call-site: hand ?token= to the pluggable authenticators. It can
+    # only ever ACCEPT an extra credential, never reject the shared token
+    # (which already returned True above) — migration-safe by construction.
+    device = _ws_token_identity(token)
+    if device is not None:
+        # Stash the resolved identity on the connection state so the WS
+        # accept path can register the live socket for the revoke-cut index
+        # and approval.respond can attribute the resolver in the audit log.
+        try:
+            ws.state.device = device
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return None, "device"
     return "token_mismatch", "token"
+
+
+def _ws_token_identity(token: str) -> Optional[dict]:
+    """Return the registry identity dict for a valid ``?token=``, or None.
+
+    The THIN, SEPARABLE WS token-auth layer (seam S5): the gate folds the
+    result into its existing accept/reject decision. Never raises; a None
+    result NEVER implies the shared token is invalid."""
+    from hermes_cli.dashboard_auth.token_auth import match_token
+
+    return match_token(token)
+
+
+def _ws_active_identity(ws: "WebSocket") -> Optional[dict]:
+    """Return the authed registry identity only while it is still active."""
+    from hermes_cli.dashboard_auth.token_auth import identity_active
+
+    device = getattr(ws.state, "device", None)
+    if not isinstance(device, dict):
+        return None
+    if not identity_active(device):
+        return None
+    return device
+
+
+async def _close_if_ws_device_revoked(ws: "WebSocket") -> bool:
+    """Close and return True if a token-authed WS lost its active identity."""
+    device = getattr(ws.state, "device", None)
+    if not isinstance(device, dict):
+        return False
+    if _ws_active_identity(ws) is not None:
+        return False
+    await ws.close(code=4401, reason="device revoked")
+    return True
 
 
 def _ws_auth_ok(ws: "WebSocket") -> bool:
@@ -9455,6 +9605,9 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
         return
 
+    if await _close_if_ws_device_revoked(ws):
+        return
+
     await ws.accept()
     _log.info("pty accepted peer=%s mode=%s cred=%s", peer, mode, cred)
 
@@ -9515,6 +9668,19 @@ async def pty_ws(ws: WebSocket) -> None:
 
     reader_task = asyncio.create_task(pump_pty_to_ws())
 
+    # S5 live-WS-cut index: register a registry-authed PTY socket with the
+    # token-auth observers so a later credential revocation can close it
+    # immediately (paired with the deregister in the finally below).
+    # Shared-token sockets carry no ws.state.device and are never indexed
+    # (revoking a device must never cut the shared-token live session).
+    # Registered here (after spawn succeeded, on the path that owns the
+    # deregister-finally) so no early-return error path can leak an index entry.
+    from hermes_cli.dashboard_auth.token_auth import notify_socket as _notify_socket
+
+    _pty_identity = _ws_active_identity(ws)
+    if _pty_identity:
+        _notify_socket("register", _pty_identity, ws)
+
     # --- writer loop: WebSocket → PTY master ----------------------------
     try:
         while True:
@@ -9541,6 +9707,8 @@ async def pty_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        if _pty_identity:
+            _notify_socket("deregister", _pty_identity, ws)
         reader_task.cancel()
         try:
             await reader_task
@@ -9574,9 +9742,27 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
+    if await _close_if_ws_device_revoked(ws):
+        return
+
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws)
+    # S5 live-WS-cut index: if this socket authed via the token registry,
+    # register it with the token-auth observers so a later credential
+    # revocation can close it immediately. handle_ws owns accept + the
+    # lifecycle; we (de)register around it. Shared-token sockets carry no
+    # ws.state.device and are never indexed (revoking a device must never cut
+    # the shared-token live session).
+    from hermes_cli.dashboard_auth.token_auth import notify_socket as _notify_socket
+
+    identity = _ws_active_identity(ws)
+    if identity:
+        _notify_socket("register", identity, ws)
+    try:
+        await handle_ws(ws)
+    finally:
+        if identity:
+            _notify_socket("deregister", identity, ws)
 
 
 # ---------------------------------------------------------------------------
@@ -9605,6 +9791,9 @@ async def pub_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
+    if await _close_if_ws_device_revoked(ws):
+        return
+
     channel = _channel_or_close_code(ws)
     if not channel:
         await ws.close(code=4400)
@@ -9631,6 +9820,9 @@ async def events_ws(ws: WebSocket) -> None:
 
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
+        return
+
+    if await _close_if_ws_device_revoked(ws):
         return
 
     channel = _channel_or_close_code(ws)

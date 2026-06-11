@@ -33,6 +33,21 @@ from tui_gateway import server
 
 _log = logging.getLogger(__name__)
 
+# ── S1 seam: transport lifecycle observers (hermes-mobile plugin) ─────────────
+# Each observer is called with ``("connect" | "disconnect", transport)`` from
+# handle_ws. Populated by plugins (the hermes-mobile broadcast engine keeps its
+# live-transport registry off this); see CONTRACT-DEPATCH.md seam S1.
+TRANSPORT_OBSERVERS: list = []
+
+
+def _notify_transport_observers(action: str, transport: "WSTransport") -> None:
+    for _obs in list(TRANSPORT_OBSERVERS):
+        try:
+            _obs(action, transport)
+        except Exception:
+            _log.debug("transport observer failed", exc_info=True)
+
+
 # Max seconds a pool-dispatched handler will block waiting for the event loop
 # to flush a WS frame before we mark the transport dead. Protects handler
 # threads from a wedged socket.
@@ -175,6 +190,7 @@ async def handle_ws(ws: Any) -> None:
         _log.info("ws accepted peer=%s", peer)
 
         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        _notify_transport_observers("connect", transport)
 
         ready_ok = await transport.write_async(
             {
@@ -286,6 +302,7 @@ async def handle_ws(ws: Any) -> None:
         reaped_sessions = 0
         detached_sessions = 0
         if transport is not None:
+            _notify_transport_observers("disconnect", transport)
             transport.close()
 
             # Reap sessions this transport owned (close_on_disconnect sidecar

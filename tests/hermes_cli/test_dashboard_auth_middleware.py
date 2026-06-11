@@ -51,6 +51,17 @@ def gated_app():
     web_server.app.state.auth_required = prev_required
 
 
+def _login_stub(client: TestClient) -> None:
+    r1 = client.get("/auth/login?provider=stub", follow_redirects=False)
+    assert r1.status_code == 302
+    state = r1.headers["location"].split("state=")[1]
+    r2 = client.get(
+        f"/auth/callback?code=stub_code&state={state}",
+        follow_redirects=False,
+    )
+    assert r2.status_code == 302
+
+
 # ---------------------------------------------------------------------------
 # Allowlist (public) routes
 # ---------------------------------------------------------------------------
@@ -191,109 +202,59 @@ def test_full_login_round_trip_unlocks_gated_api(gated_app):
     )
 
 
-def _complete_stub_login(client) -> None:
-    """Walk the stub OAuth round trip so ``client`` carries a valid session.
+def test_gated_cookie_session_unlocks_mobile_rest_handlers(gated_app):
+    # ABH-88 de-patch (W1): the mobile REST handlers live under the
+    # hermes-mobile plugin prefix now; the middleware must gate/unlock the
+    # plugin-mounted /api/plugins/... routes exactly like core /api/ routes.
+    _login_stub(gated_app)
 
-    TestClient persists Set-Cookie across calls, so after this returns the
-    client's cookie jar holds ``hermes_session_at`` / ``hermes_session_rt``
-    and subsequent gated requests authenticate.
-    """
-    r1 = client.get("/auth/login?provider=stub", follow_redirects=False)
-    assert r1.status_code == 302
-    state = r1.headers["location"].split("state=")[1]
-    r2 = client.get(
-        f"/auth/callback?code=stub_code&state={state}",
-        follow_redirects=False,
+    r = gated_app.get("/api/plugins/hermes-mobile/devices")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"devices": []}
+
+
+@pytest.fixture
+def wired_device_tokens():
+    """The hermes-mobile plugin's device-token registry, wired into the S5
+    token-auth seam (ABH-88 de-patch W2b: without this wiring, device tokens
+    are not accepted anywhere). Restores the seam registries + resets the
+    device registry on teardown."""
+    import sys
+
+    from hermes_cli.dashboard_auth import token_auth
+    from tests.plugins.hermes_mobile.conftest import load_plugin_module
+
+    device_tokens = load_plugin_module("device_tokens")
+    plugin = sys.modules["hermes_plugins.hermes_mobile"]
+    before = (
+        list(token_auth.TOKEN_AUTHENTICATORS),
+        list(token_auth.IDENTITY_VALIDATORS),
+        list(token_auth.SOCKET_OBSERVERS),
     )
-    assert r2.status_code == 302
+    plugin._wire_token_auth()
+    try:
+        yield device_tokens
+    finally:
+        device_tokens._reset_for_tests()
+        token_auth.TOKEN_AUTHENTICATORS[:] = before[0]
+        token_auth.IDENTITY_VALIDATORS[:] = before[1]
+        token_auth.SOCKET_OBSERVERS[:] = before[2]
 
 
-def test_gated_require_token_endpoint_accepts_cookie_session(gated_app):
-    """Regression: ``_require_token`` endpoints must work under the OAuth gate.
+def test_gated_api_accepts_device_token_without_cookie(gated_app, wired_device_tokens):
+    device_tokens = wired_device_tokens
 
-    In gated mode the legacy ``_SESSION_TOKEN`` is NOT injected into the SPA
-    (it authenticates with the session cookie). Endpoints that call
-    ``_require_token`` directly — plugin install/enable/disable,
-    ``/api/dashboard/plugins/hub``, and others — used to re-check the absent
-    token and 401 every cookie-authenticated request, making them permanently
-    unreachable behind the gate (the dashboard surfaced a
-    ``401: {"detail":"Unauthorized"}`` popup on plugin install). The fix makes
-    ``_require_token`` defer to the gate, which has already verified the cookie
-    and attached ``request.state.session`` before the handler runs.
-
-    We POST a deliberately invalid plugin identifier: a passing auth layer
-    lets the request reach the handler, which rejects the identifier with a
-    400. The assertion is simply "not 401" — proving auth succeeded without
-    coupling to the validation message.
-    """
-    _complete_stub_login(gated_app)
-    r = gated_app.post(
-        "/api/dashboard/agent-plugins/install",
-        json={"identifier": "definitely not a valid identifier",
-              "force": False, "enable": False},
-    )
-    assert r.status_code != 401, (
-        "A _require_token endpoint 401'd a cookie-authenticated request under "
-        f"the OAuth gate (the install-popup bug). Body: {r.text}"
-    )
-    # And specifically: it reached the handler's own validation.
-    assert r.status_code == 400, (
-        f"Expected the install handler's 400 (bad identifier), got "
-        f"{r.status_code}: {r.text}"
-    )
-
-
-def test_gated_require_token_endpoint_still_rejects_no_cookie(gated_app):
-    """The gate must still 401 a ``_require_token`` endpoint with no session.
-
-    The fix defers to the gate — it does not make these endpoints public. A
-    request with no cookie is rejected by ``gated_auth_middleware`` before the
-    handler runs, so the install endpoint stays protected.
-    """
-    r = gated_app.post(
-        "/api/dashboard/agent-plugins/install",
-        json={"identifier": "owner/repo", "force": False, "enable": False},
-    )
-    assert r.status_code == 401, (
-        f"Expected 401 for an unauthenticated install POST under the gate, "
-        f"got {r.status_code}: {r.text}"
-    )
-
-
-# A representative spread of the OTHER ``_require_token`` endpoints (there are
-# 14 in total). The install popup was just the reported symptom; the same bug
-# made API-key reveal, provider validation, the OAuth-provider connect flow,
-# and the rest of plugin management unreachable behind the gate. Each entry is
-# (method, path, json_body); we assert only that a logged-in request is NOT
-# 401'd — i.e. it cleared the auth layer and reached the handler. The
-# handler's own status (400/404/429/etc.) is route-specific and not asserted.
-_GATED_REQUIRE_TOKEN_ROUTES = [
-    ("get", "/api/dashboard/plugins/hub", None),
-    ("post", "/api/env/reveal", {"key": "NONEXISTENT_ENV_VAR_FOR_TEST"}),
-    ("post", "/api/providers/validate", {"key": "OPENAI_API_KEY", "value": ""}),
-    ("delete", "/api/providers/oauth/__not_a_real_provider__", None),
-    ("post", "/api/dashboard/agent-plugins/__nope__/enable", None),
-]
-
-
-@pytest.mark.parametrize("method,path,body", _GATED_REQUIRE_TOKEN_ROUTES)
-def test_gated_require_token_routes_accept_cookie_session(
-    gated_app, method, path, body
-):
-    """Every ``_require_token`` route must clear auth for a logged-in caller.
-
-    Same root cause and fix as
-    ``test_gated_require_token_endpoint_accepts_cookie_session`` — this just
-    proves the fix covers the whole class, not only ``agent-plugins/install``.
-    """
-    _complete_stub_login(gated_app)
-    kwargs = {"json": body} if body is not None else {}
-    r = gated_app.request(method.upper(), path, **kwargs)
-    assert r.status_code != 401, (
-        f"{method.upper()} {path} 401'd a cookie-authenticated request under "
-        f"the OAuth gate — _require_token still rejecting a valid session. "
-        f"Body: {r.text}"
-    )
+    issued = device_tokens.issue("iPhone 15")
+    try:
+        gated_app.cookies.clear()
+        r = gated_app.get(
+            "/api/plugins/hermes-mobile/devices",
+            headers={"X-Hermes-Session-Token": issued["token"]},
+        )
+        assert r.status_code == 200, r.text
+        assert len(r.json()["devices"]) == 1
+    finally:
+        device_tokens._reset_for_tests()
 
 
 def test_login_unknown_provider_returns_404(gated_app):

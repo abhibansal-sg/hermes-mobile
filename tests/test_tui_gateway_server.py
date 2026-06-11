@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from tui_gateway import server
@@ -1911,6 +1913,9 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
 
 
 def test_config_set_fast_updates_live_agent_and_config(monkeypatch):
+    """Session-scoped fast toggle: updates THIS session's agent and emits
+    session.info, but never writes the global config (session scoping,
+    ABH-84 / the env-leak fix wave)."""
     writes = []
     emits = []
     agent = types.SimpleNamespace(
@@ -1944,7 +1949,8 @@ def test_config_set_fast_updates_live_agent_and_config(monkeypatch):
             "foo": "bar",
             "service_tier": "priority",
         }
-        assert ("agent.service_tier", "fast") in writes
+        # Session-scoped: the global config key is never written.
+        assert writes == []
         assert ("session.info", "sid", {"model": "x"}) in emits
 
         resp_normal = server.handle_request(
@@ -1957,7 +1963,151 @@ def test_config_set_fast_updates_live_agent_and_config(monkeypatch):
         assert resp_normal["result"]["value"] == "normal"
         assert agent.service_tier is None
         assert agent.request_overrides == {"foo": "bar"}
-        assert ("agent.service_tier", "normal") in writes
+        assert writes == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_config_set_fast_before_build_parks_override_for_agent_build(monkeypatch):
+    """S4 session-override pattern: fast toggled before the first turn must
+    NOT force an agent build and NOT write global config — it parks on the
+    session row and applies when the lazy agent is constructed."""
+    writes = []
+    session = _session()
+    session["agent"] = None
+    server._sessions["sid"] = session
+
+    monkeypatch.setattr(
+        server, "_write_config_key", lambda path, value: writes.append((path, value))
+    )
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda *a, **k: pytest.fail("fast pre-build must not force an agent build"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.resolve_fast_mode_overrides",
+        lambda _model_id: {"service_tier": "priority"},
+    )
+    monkeypatch.setattr(server, "_resolve_model", lambda: "openai/gpt-5.4")
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {"session_id": "sid", "key": "fast", "value": "fast"},
+            }
+        )
+        assert resp["result"]["value"] == "fast"
+        assert writes == []
+        assert session["fast_override"] == "fast"
+        assert session["fast_override_params"] == {"service_tier": "priority"}
+
+        # The build-time hook applies the parked override to the new agent.
+        agent = types.SimpleNamespace(
+            service_tier=None, request_overrides={"foo": "bar"}
+        )
+        server._apply_session_agent_overrides(agent, session)
+        assert agent.service_tier == "priority"
+        assert agent.request_overrides == {
+            "foo": "bar",
+            "service_tier": "priority",
+        }
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_config_set_reasoning_before_build_parks_override_for_agent_build(monkeypatch):
+    """S4: reasoning effort set before the first turn parks on the session row
+    (no build, no global write) and applies at agent construction."""
+    writes = []
+    session = _session()
+    session["agent"] = None
+    server._sessions["sid"] = session
+
+    monkeypatch.setattr(
+        server, "_write_config_key", lambda path, value: writes.append((path, value))
+    )
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda *a, **k: pytest.fail("reasoning pre-build must not force an agent build"),
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {"session_id": "sid", "key": "reasoning", "value": "low"},
+            }
+        )
+        assert resp["result"]["value"] == "low"
+        assert writes == []
+        assert session["reasoning_override"] == {"enabled": True, "effort": "low"}
+
+        agent = types.SimpleNamespace(reasoning_config=None)
+        server._apply_session_agent_overrides(agent, session)
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_config_set_fast_prebuild_status_toggle_and_get_reflect_parked_override(monkeypatch):
+    """S4 regression (adversarial gate): with the agent unbuilt, fast
+    status/toggle/config.get must reflect the PARKED session override, not the
+    global default — and a second toggle must flip back to normal."""
+    writes = []
+    session = _session()
+    session["agent"] = None
+    server._sessions["sid"] = session
+
+    monkeypatch.setattr(
+        server, "_write_config_key", lambda path, value: writes.append((path, value))
+    )
+    monkeypatch.setattr(
+        server,
+        "_start_agent_build",
+        lambda *a, **k: pytest.fail("pre-build fast must not force an agent build"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.resolve_fast_mode_overrides",
+        lambda _model_id: {"service_tier": "priority"},
+    )
+    monkeypatch.setattr(server, "_resolve_model", lambda: "openai/gpt-5.4")
+    monkeypatch.setattr(server, "_load_service_tier", lambda: None)
+
+    def _set(value):
+        return server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {"session_id": "sid", "key": "fast", "value": value},
+            }
+        )
+
+    try:
+        assert _set("fast")["result"]["value"] == "fast"
+        # status reflects the parked override, not the global default
+        assert _set("status")["result"]["value"] == "fast"
+        # config.get mirrors it
+        got = server.handle_request(
+            {
+                "id": "2",
+                "method": "config.get",
+                "params": {"session_id": "sid", "key": "fast"},
+            }
+        )
+        assert got["result"]["value"] == "fast"
+        # toggle flips the parked override OFF (was stuck-on pre-fix)
+        assert _set("toggle")["result"]["value"] == "normal"
+        assert session["fast_override"] == "normal"
+        assert _set("status")["result"]["value"] == "normal"
+        # double-toggle ends where it started
+        assert _set("toggle")["result"]["value"] == "fast"
+        assert _set("toggle")["result"]["value"] == "normal"
+        assert writes == []
     finally:
         server._sessions.pop("sid", None)
 
@@ -2455,6 +2605,9 @@ def test_complete_slash_details_args():
 
 
 def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
+    """Session-scoped reasoning: effort applies to THIS session's agent and
+    show/hide flips only the session flag — the GLOBAL display config is
+    never written (session scoping, ABH-84 review P1)."""
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     agent = types.SimpleNamespace(reasoning_config=None)
     server._sessions["sid"] = _session(agent=agent)
@@ -2478,7 +2631,8 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     )
     assert resp_show["result"]["value"] == "show"
     assert server._sessions["sid"]["show_reasoning"] is True
-    assert server._load_cfg()["display"]["sections"]["thinking"] == "expanded"
+    # Session-scoped: the global display config stays untouched.
+    assert "display" not in server._load_cfg()
 
     resp_hide = server.handle_request(
         {
@@ -2489,7 +2643,7 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     )
     assert resp_hide["result"]["value"] == "hide"
     assert server._sessions["sid"]["show_reasoning"] is False
-    assert server._load_cfg()["display"]["sections"]["thinking"] == "hidden"
+    assert "display" not in server._load_cfg()
 
 
 def test_config_set_verbose_updates_session_mode_and_agent(tmp_path, monkeypatch):
@@ -4003,7 +4157,97 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
             {"role": "assistant", "content": "edited reply"},
         ]
         assert server._sessions["sid"]["history_version"] == 2
-        assert stub_db.replaced == [("session-key", original_history[:2])]
+        # replace_messages is now called TWICE: first the truncate to the edit
+        # point, then the post-turn authoritative rewrite of the full final
+        # messages (the interrupt-persistence fix — the DB must equal
+        # result["messages"] so an interrupted/edited turn never loses the user
+        # prompt to a stale flush cursor).
+        final_messages = [
+            *original_history[:2],
+            {"role": "user", "content": "edited second"},
+            {"role": "assistant", "content": "edited reply"},
+        ]
+        assert stub_db.replaced == [
+            ("session-key", original_history[:2]),
+            ("session-key", final_messages),
+        ]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_truncate_resyncs_agent_flush_cursor(monkeypatch):
+    """Interrupt-persistence root cause: the reused per-session agent's
+    `_last_flushed_db_idx` must be resynced to the rewritten row count when the
+    truncate path calls replace_messages — otherwise the next turn's flush skips
+    every message below the stale cursor, dropping the user prompt."""
+
+    class _Agent:
+        def __init__(self):
+            # Clearly-stale cursor from a prior turn; the truncate rewrites the
+            # DB down to 2 rows and the turn ends at 4.
+            self._last_flushed_db_idx = 99
+
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            return {
+                "final_response": "ok",
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "ok"},
+                ],
+                "interrupted": False,
+            }
+
+    class _StubDb:
+        def __init__(self):
+            self.replaced = []
+
+        def replace_messages(self, session_id, messages):
+            self.replaced.append((session_id, list(messages)))
+
+    agent = _Agent()
+    stub_db = _StubDb()
+    original_history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second reply"},
+    ]
+    session = _session(agent=agent)
+    session["history"] = list(original_history)
+    server._sessions["sid"] = session
+
+    monkeypatch.setattr(server, "_get_db", lambda: stub_db)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+
+    try:
+        resp = server.handle_request({
+            "id": "1", "method": "prompt.submit",
+            "params": {
+                "session_id": "sid",
+                "text": "edited second",
+                "truncate_before_user_ordinal": 1,
+            },
+        })
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        import time as _t
+        # Wait for the background turn's post-turn authoritative rewrite (the
+        # 2nd replace_messages call).
+        for _ in range(100):
+            if len(stub_db.replaced) >= 2:
+                break
+            _t.sleep(0.02)
+        # Cursor was resynced off the stale 99 — first to the truncated length
+        # (2) under the lock, then to the final message count (4) by the
+        # post-turn rewrite. Never left stale, which would skip the user row on
+        # the next flush.
+        assert agent._last_flushed_db_idx == 4
+        # The post-turn rewrite persisted the FULL final messages incl. the user
+        # prompt (the user-visible guarantee), in addition to the truncate write.
+        assert stub_db.replaced[-1][1][-2] == {"role": "user", "content": "edited second"}
     finally:
         server._sessions.pop("sid", None)
 
@@ -4631,9 +4875,16 @@ def test_session_delete_returns_db_unavailable_when_no_db(monkeypatch):
     assert "state.db unavailable" in resp["error"]["message"]
 
 
-def test_session_delete_refuses_active_session(monkeypatch):
-    """Cannot delete a session currently bound to a live TUI session."""
+def test_session_delete_evicts_non_running_live_session(monkeypatch):
+    """A live but NON-running session is auto-evicted (teardown) then deleted.
+
+    Previously this returned 4023 and refused; the app registers every opened
+    session live via session.resume, so refusing made delete reliably fail for
+    anything the user had touched.  The fix tears the live row down via the
+    session.close pop+teardown idiom, then deletes the on-disk state.
+    """
     called: list[str] = []
+    torn: list[dict] = []
 
     class _DB:
         def delete_session(self, sid, sessions_dir=None):
@@ -4641,7 +4892,9 @@ def test_session_delete_refuses_active_session(monkeypatch):
             return True
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setitem(server._sessions, "live", {"session_key": "key-live"})
+    monkeypatch.setattr(server, "_teardown_session", lambda session: torn.append(session))
+    live_session = _session(running=False, session_key="key-live")
+    monkeypatch.setitem(server._sessions, "live-sid", live_session)
     try:
         resp = server.handle_request(
             {
@@ -4651,12 +4904,166 @@ def test_session_delete_refuses_active_session(monkeypatch):
             }
         )
     finally:
-        server._sessions.pop("live", None)
+        server._sessions.pop("live-sid", None)
+
+    assert "result" in resp, resp
+    assert resp["result"] == {"deleted": "key-live", "evicted": True}
+    assert called == ["key-live"], "delete_session must run after eviction"
+    assert len(torn) == 1, "the live row must be torn down exactly once"
+    # The live row must be popped from _sessions before delete.
+    assert "live-sid" not in server._sessions
+
+
+def test_session_delete_interrupts_running_live_session(monkeypatch):
+    """A live RUNNING session is interrupted (stop the spending runtime),
+    pending prompts/approvals released, then evicted and deleted."""
+    called: list[str] = []
+    interrupted = {"count": 0}
+    cleared: list[str] = []
+    approvals: list[tuple] = []
+    torn: list[dict] = []
+
+    class _DB:
+        def delete_session(self, sid, sessions_dir=None):
+            called.append(sid)
+            return True
+
+    class _Agent:
+        def interrupt(self):
+            interrupted["count"] += 1
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_teardown_session", lambda session: torn.append(session))
+    monkeypatch.setattr(server, "_clear_pending", lambda sid=None: cleared.append(sid))
+
+    import tools.approval as approval
+
+    monkeypatch.setattr(
+        approval,
+        "resolve_gateway_approval",
+        lambda key, decision, resolve_all=False: approvals.append(
+            (key, decision, resolve_all)
+        ),
+    )
+
+    live_session = _session(agent=_Agent(), running=True, session_key="key-run")
+    monkeypatch.setitem(server._sessions, "run-sid", live_session)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.delete",
+                "params": {"session_id": "key-run"},
+            }
+        )
+    finally:
+        server._sessions.pop("run-sid", None)
+
+    assert "result" in resp, resp
+    assert resp["result"] == {"deleted": "key-run", "evicted": True}
+    assert interrupted["count"] == 1, "the in-flight agent must be interrupted"
+    # _clear_pending is scoped to the RUNTIME sid, not the stored key.
+    assert cleared == ["run-sid"]
+    # Approval release is keyed on the STORED session key, deny-all.
+    assert approvals == [("key-run", "deny", True)]
+    assert called == ["key-run"]
+    assert len(torn) == 1
+    assert "run-sid" not in server._sessions
+
+
+def test_session_delete_does_not_interrupt_non_running_session(monkeypatch):
+    """Eviction of a non-running session must NOT call agent.interrupt — no
+    turn is in flight, so an interrupt-free teardown is correct."""
+
+    class _DB:
+        def delete_session(self, sid, sessions_dir=None):
+            return True
+
+    class _Agent:
+        def interrupt(self):
+            raise AssertionError("must not interrupt a non-running session")
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_teardown_session", lambda session: None)
+    live_session = _session(agent=_Agent(), running=False, session_key="key-idle")
+    monkeypatch.setitem(server._sessions, "idle-sid", live_session)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.delete",
+                "params": {"session_id": "key-idle"},
+            }
+        )
+    finally:
+        server._sessions.pop("idle-sid", None)
+
+    assert resp["result"] == {"deleted": "key-idle", "evicted": True}
+
+
+def test_session_delete_refuses_when_eviction_fails(monkeypatch):
+    """If teardown raises, refuse with 4023 rather than delete a half-torn
+    session — the 4023 string is preserved for this fallback."""
+    called: list[str] = []
+
+    class _DB:
+        def delete_session(self, sid, sessions_dir=None):
+            called.append(sid)
+            return True
+
+    def _boom(session):
+        raise RuntimeError("worker close hung")
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_teardown_session", _boom)
+    live_session = _session(running=False, session_key="key-fail")
+    monkeypatch.setitem(server._sessions, "fail-sid", live_session)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.delete",
+                "params": {"session_id": "key-fail"},
+            }
+        )
+    finally:
+        server._sessions.pop("fail-sid", None)
 
     assert "error" in resp
     assert resp["error"]["code"] == 4023
-    assert "active session" in resp["error"]["message"]
-    assert called == [], "delete_session must not be called for active sessions"
+    assert "could not evict" in resp["error"]["message"]
+    assert called == [], "delete_session must not run when eviction fails"
+
+
+def test_session_delete_skips_finalized_live_row(monkeypatch):
+    """A finalized live row is NOT treated as live — delete proceeds straight
+    to the DB and reports evicted=False (mirrors _find_live_session_by_key)."""
+    called: list[str] = []
+    torn: list[dict] = []
+
+    class _DB:
+        def delete_session(self, sid, sessions_dir=None):
+            called.append(sid)
+            return True
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_teardown_session", lambda session: torn.append(session))
+    finalized = _session(running=False, session_key="key-final", _finalized=True)
+    monkeypatch.setitem(server._sessions, "final-sid", finalized)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.delete",
+                "params": {"session_id": "key-final"},
+            }
+        )
+    finally:
+        server._sessions.pop("final-sid", None)
+
+    assert resp["result"] == {"deleted": "key-final", "evicted": False}
+    assert torn == [], "a finalized row must not be torn down again"
+    assert called == ["key-final"]
 
 
 def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
@@ -4735,7 +5142,8 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
     )
 
     assert "result" in resp, resp
-    assert resp["result"] == {"deleted": "old-1"}
+    # Stored-only session (no live row) → straight delete, evicted=False.
+    assert resp["result"] == {"deleted": "old-1", "evicted": False}
     assert captured["sid"] == "old-1"
     # sessions_dir must be forwarded so transcript files get cleaned up
     # too — not just the SQLite row.  The autouse _isolate_hermes_home
@@ -5522,11 +5930,12 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
         == "Chromium-family browser isn't running with remote debugging — attempting to launch..."
     )
     assert any(
-        "No supported Chromium-family browser executable was found" in line
-        for line in resp["result"]["messages"]
+        "--remote-debugging-port=9222" in line for line in resp["result"]["messages"]
     )
     assert any(
-        "--remote-debugging-port=9222" in line for line in resp["result"]["messages"]
+        "No supported Chromium-family browser executable was found" in line
+        or "Start a Chromium-family browser with remote debugging" in line
+        for line in resp["result"]["messages"]
     )
     assert "BROWSER_CDP_URL" not in os.environ
     progress = [p["message"] for evt, p in emitted if evt == "browser.progress"]

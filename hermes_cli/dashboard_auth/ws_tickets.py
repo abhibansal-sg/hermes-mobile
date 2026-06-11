@@ -59,7 +59,9 @@ class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
 
 
-def mint_ticket(*, user_id: str, provider: str) -> str:
+def mint_ticket(
+    *, user_id: str, provider: str, extra: Optional[Dict[str, Any]] = None
+) -> str:
     """Generate a one-shot ticket bound to this user identity.
 
     The returned token is base64url, 43 bytes of entropy (32-byte random
@@ -72,6 +74,8 @@ def mint_ticket(*, user_id: str, provider: str) -> str:
         "provider": provider,
         "minted_at": int(time.time()),
     }
+    if extra:
+        info.update(extra)
     with _lock:
         _tickets[ticket] = (int(time.time()) + TTL_SECONDS, info)
         _gc_expired_locked()

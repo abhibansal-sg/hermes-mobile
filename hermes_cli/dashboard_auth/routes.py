@@ -603,7 +603,34 @@ async def api_auth_ws_ticket(request: Request):
     expected pattern.
     """
     sess = getattr(request.state, "session", None)
-    if sess is None:
+    device = getattr(request.state, "device", None)
+    if sess is not None:
+        user_id = sess.user_id
+        provider = sess.provider
+        ticket_extra = None
+        audit_fields = {"provider": provider, "user_id": user_id}
+    elif isinstance(device, dict) and device.get("device_id"):
+        if "chat" not in (device.get("scopes") or []):
+            raise HTTPException(
+                status_code=403,
+                detail="Device token lacks chat scope",
+            )
+        user_id = str(device["device_id"])
+        provider = "device"
+        ticket_extra = {
+            "device_id": device.get("device_id"),
+            "device_name": device.get("device_name"),
+            "token_prefix": device.get("token_prefix"),
+            "scopes": list(device.get("scopes") or []),
+        }
+        audit_fields = {
+            "provider": provider,
+            "user_id": user_id,
+            "device_id": device.get("device_id"),
+            "device_name": device.get("device_name"),
+            "token_prefix": device.get("token_prefix"),
+        }
+    else:
         # Middleware should already have rejected, but check defensively.
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -611,11 +638,10 @@ async def api_auth_ws_ticket(request: Request):
     # don't load the ticket store.
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
 
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+    ticket = mint_ticket(user_id=user_id, provider=provider, extra=ticket_extra)
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
-        provider=sess.provider,
-        user_id=sess.user_id,
+        **audit_fields,
         ip=_client_ip(request),
     )
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
