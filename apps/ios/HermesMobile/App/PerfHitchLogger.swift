@@ -3,22 +3,8 @@ import Foundation
 import QuartzCore
 import os.log
 
-/// DEBUG-only activation counters for the imperative scroll machinery (ARCH37
-/// Step 1 risk gate). The redesign's claim is that per-session ScrollView identity
-/// (`.id(activeStoredId)`) makes the native `.defaultScrollAnchor(.bottom)` land
-/// the open BY CONSTRUCTION — so the always-on CLAMP and the one-shot LATCH should
-/// fire toward ZERO on a clean cached open. These counters let `PerfHitchLogger`
-/// print latch/clamp activations alongside the hitch numbers so the matrix proves
-/// the native anchor carries the open before Step 6 deletes the machinery. Plain
-/// nonisolated atomics-free counters (incremented only on the main actor from the
-/// geometry reader) — allocation-free, zero steady-state cost.
-enum ScrollInstrumentation {
-    nonisolated(unsafe) static var clampActivations = 0
-    nonisolated(unsafe) static var latchActivations = 0
-
-    static func clampFired() { clampActivations += 1 }
-    static func latchFired() { latchActivations += 1 }
-}
+// ScrollInstrumentation (clamp/latch counters) deleted with the imperative
+// scroll machinery (phase2 simplification). PerfHitchLogger retained.
 
 /// DEBUG-only main-thread hitch logger driven by a `CADisplayLink`.
 ///
@@ -105,10 +91,9 @@ final class PerfHitchLogger {
         // Emit a window summary every ~2 seconds.
         if now - windowStart >= 2.0 {
             let line = String(
-                format: "PERF window=2s frames=%d hitch1.5x=%d hitch3x=%d worst_ms=%.1f cacheHit=%d cacheMiss=%d clamp=%d latch=%d",
+                format: "PERF window=2s frames=%d hitch1.5x=%d hitch3x=%d worst_ms=%.1f cacheHit=%d cacheMiss=%d",
                 frameCount, hitch15Count, hitch3Count, worstFrameMs,
-                RenderCache.hits, RenderCache.misses,
-                ScrollInstrumentation.clampActivations, ScrollInstrumentation.latchActivations)
+                RenderCache.hits, RenderCache.misses)
             emit(line)
             windowStart = now
             frameCount = 0

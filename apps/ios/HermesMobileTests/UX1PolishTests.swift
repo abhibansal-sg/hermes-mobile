@@ -271,28 +271,18 @@ final class UX1PolishTests: XCTestCase {
             + "scrolled up reading history is not treated as parked at the tail")
     }
 
-    // MARK: - 6. at-bottom decision (drives pill visibility + auto-stick gate)
-
-    /// The iOS-17 fallback `atBottom` decision (anchor maxY vs viewport): when the
-    /// bottom anchor sits within the threshold of the viewport bottom the reader is
-    /// parked at the tail (pill hidden, auto-stick armed); when it sits far below the
-    /// viewport (scrolled up reading history) it is NOT at the tail (pill shown,
-    /// auto-stick disarmed so a streaming turn never yanks the reader — Batch E §3.6).
-    func testAtBottomDecisionFromAnchorGeometry() {
-        let vh: CGFloat = 800
-        let th = ChatView.atBottomThreshold
-        // Anchor right at the viewport bottom → at bottom.
-        XCTAssertTrue(ChatView.atBottom(anchorMaxY: vh, viewportHeight: vh, threshold: th))
-        // Anchor a hair below (within threshold) → still at bottom (jitter absorbed).
-        XCTAssertTrue(ChatView.atBottom(anchorMaxY: vh + th - 1, viewportHeight: vh, threshold: th))
-        // Anchor a full screen below the viewport (scrolled up) → NOT at bottom.
-        XCTAssertFalse(ChatView.atBottom(anchorMaxY: vh + 600, viewportHeight: vh, threshold: th))
-    }
-
-    /// Before the viewport is measured (`viewportHeight == 0`), the decision defaults
-    /// to at-bottom so a fresh open does not flash the scroll-to-bottom pill before
-    /// `defaultScrollAnchor(.bottom)` has rested the content.
-    func testAtBottomDefaultsTrueBeforeMeasurement() {
-        XCTAssertTrue(ChatView.atBottom(anchorMaxY: 9999, viewportHeight: 0, threshold: 80))
-    }
+    // MARK: - 6. at-bottom decision
+    //
+    // The iOS-17 fallback `atBottom(anchorMaxY:viewportHeight:threshold:)` static
+    // method was deleted with the phase-2 simplification (the R2 bottom-anchor
+    // onGeometryChange fallback is no longer needed — the fleet is iOS 26 and the
+    // R1 `ScrollAtBottomTracker`/`onScrollGeometryChange` is the sole signal;
+    // iOS 17 degrades gracefully with atBottom defaulting true). The two tests
+    // that called it are retired:
+    //
+    //   testAtBottomDecisionFromAnchorGeometry  — deleted (no static atBottom method)
+    //   testAtBottomDefaultsTrueBeforeMeasurement — deleted
+    //
+    // The `atBottomThreshold` constant is still tested by
+    // `testAtBottomThresholdIsModestPositive`.
 }

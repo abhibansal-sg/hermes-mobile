@@ -70,40 +70,19 @@ final class ChatStoreBatchETests: XCTestCase {
 
     private func settle() async { try? await Task.sleep(for: .milliseconds(120)) }
 
-    // MARK: - 1. SCROLL P0 — seed-scroll policy gate
-
-    /// A FRESH session OPEN always lands on the newest message, regardless of the
-    /// PREVIOUS session's scroll position. This is the open-on-newest acceptance:
-    /// opening a long session must NOT land mid-conversation or blank.
-    func testFreshOpenAlwaysLandsOnNewest() {
-        // No prior session (first open).
-        XCTAssertEqual(
-            ChatView.seedScrollDecision(seededSession: "A", lastSeededSession: nil, atBottom: true),
-            .landOnNewest)
-        // Even if the (previous) reader was scrolled UP, opening a DIFFERENT
-        // session lands on its newest message — the scroll state belonged to the
-        // session we navigated away from.
-        XCTAssertEqual(
-            ChatView.seedScrollDecision(seededSession: "B", lastSeededSession: "A", atBottom: false),
-            .landOnNewest)
-    }
-
-    /// A SAME-session reseed while the reader is at the bottom keeps them pinned to
-    /// the newest message (a backfill/mirror reconcile of the live tail).
-    func testSameSessionReseedAtBottomKeepsPinned() {
-        XCTAssertEqual(
-            ChatView.seedScrollDecision(seededSession: "A", lastSeededSession: "A", atBottom: true),
-            .keepPinned)
-    }
-
-    /// §3.6 / D13 — a SAME-session reseed while the reader scrolled UP must NOT
-    /// yank them to the bottom. The reconnect/foreground/mirror backfill preserves
-    /// the reader's position.
-    func testSameSessionReseedScrolledUpPreservesPosition() {
-        XCTAssertEqual(
-            ChatView.seedScrollDecision(seededSession: "A", lastSeededSession: "A", atBottom: false),
-            .preserveReaderPosition)
-    }
+    // MARK: - 1. Open-on-newest (now handled natively by .defaultScrollAnchor(.bottom))
+    //
+    // The imperative seed-scroll gate (`seedScrollDecision`/`handleSeedScroll`) was
+    // deleted with the phase-2 simplification. `.defaultScrollAnchor(.bottom)` +
+    // per-session ScrollView identity (.id(activeStoredSessionId)) now give
+    // open-on-newest natively. The three policy-gate unit tests below are retired:
+    //
+    //   testFreshOpenAlwaysLandsOnNewest      — deleted (no SeedScrollDecision)
+    //   testSameSessionReseedAtBottomKeepsPinned — deleted
+    //   testSameSessionReseedScrolledUpPreservesPosition — deleted
+    //
+    // The behavioural contract (open-on-newest, reader-not-yanked) is verified by
+    // the harness matrix (long/asynclong/netlong/switchlong/iddrift/stream cases).
 
     // MARK: - 2. §3.7 foreign-mirror in-place reconcile (D9)
 

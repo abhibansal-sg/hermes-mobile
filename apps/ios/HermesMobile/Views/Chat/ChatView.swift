@@ -83,30 +83,6 @@ struct ChatView: View {
     /// imperative scroll overshoot into a white void. A measured threshold is
     /// settle-correct: it reflects the REAL content geometry, not lazy-row luck.
     @State private var atBottom = true
-    /// The stored-session id of the LAST transcript we landed a seed-scroll on
-    /// (SCROLL P0). Lets `handleSeedScroll` tell a FRESH session OPEN (always land
-    /// on the newest message) from a SAME-session reseed (reconnect / mirror
-    /// reconcile — gate to near-bottom, §3.6, so a reader scrolled up is not
-    /// yanked). `nil` until the first seed lands.
-    @State private var lastSeededSessionID: String?
-    /// Scroll-to-bottom REQUEST counter (SCROLL P0 r2). Bumped by `snapToBottom`;
-    /// the iOS-18 `BottomEdgeScroll` modifier observes it and scrolls to the true
-    /// content BOTTOM EDGE via `ScrollPosition.scrollTo(edge: .bottom)`. Edge-scroll
-    /// reaches the real content end regardless of LazyVStack realization — unlike
-    /// `proxy.scrollTo(bottomAnchor)`, which no-ops when the trailing 1pt anchor is
-    /// outside the realized lazy window (the scroll-to-bottom pill no-op, build 13).
-    @State private var bottomScrollTick = 0
-    /// Whether the pending `bottomScrollTick` scroll should animate (pill / stream
-    /// follow = animated; fresh open = instant snap).
-    @State private var bottomScrollAnimated = false
-    /// Armed by `handleSeedScroll` on a FRESH OPEN (`.landOnNewest`). While armed,
-    /// `BottomEdgeScroll` re-pins to the bottom on every content-size change (the
-    /// seeded rows laying out) so the open lands on the newest message AFTER layout
-    /// — the fix for the async-seed race where the seed arrives after the
-    /// ScrollView first appeared (network/cache). Released the instant the user
-    /// drives the scroll (so a scrolled-up reader is never yanked). Released ONLY
-    /// by a genuine user drag (`.interacting`), never by layout/offset changes.
-    @State private var pendingLandOnNewest = false
     /// The MEASURED height of the floating composer card (the `bottomStack`),
     /// replacing the fixed `composerFloatInset` estimate as the resting clearance
     /// (desktop `--composer-measured-height` analog). Floors at `composerFloatInset`
@@ -156,16 +132,6 @@ struct ChatView: View {
     private let secureAuthenticator: BiometricAuthenticating = LAContextAuthenticator()
 
     private let bottomAnchor = "hermes.chat.bottom"
-    /// Named coordinate space for the transcript ScrollView, so the bottom anchor's
-    /// frame can be measured relative to the viewport (the settle-correct
-    /// distance-from-bottom that drives `atBottom`).
-    /// `nonisolated` so the `@Sendable` onGeometryChange closure (bottom-anchor
-    /// measurement) can reference it without a Swift-6 strict-concurrency warning;
-    /// it is an immutable Sendable String, so this is safe.
-    private nonisolated static let scrollSpace = "hermes.chat.scroll"
-    /// The transcript viewport (container) height, captured via a background
-    /// GeometryReader. Used with the anchor's measured `maxY` to decide `atBottom`.
-    @State private var viewportHeight: CGFloat = 0
 
     /// Whether this surface is in the compact (iPhone) layout. The chat chrome is
     /// now a SYSTEM `.toolbar` on both widths (I1); `isCompact` only selects the
@@ -714,24 +680,10 @@ struct ChatView: View {
                         composerHeight: composerHeight,
                         keyboardHeight: keyboardHeight))
                     .accessibilityHidden(true)
-                // The TRUE content-end anchor (1pt). On iOS 17 it is the imperative
-                // `proxy.scrollTo` target (the floor fallback); on iOS 18+ the
-                // ScrollPosition edge-scroll reaches the content edge directly and does
-                // not need it. `atBottom` is NO LONGER derived from this element's
-                // appear/disappear (a lazy mis-firing signal) — it is MEASURED from
-                // the anchor's frame in the scroll coordinate space (settle-correct):
-                // when the anchor's bottom sits within `atBottomThreshold` of the
-                // viewport's bottom, the reader is parked at the tail. This reflects
-                // the REAL content geometry, so the pill visibility + the streaming
-                // auto-stick gate never mis-fire and the pill can never overshoot.
+                // True content-end anchor (1pt) — search-jump target.
                 Color.clear
                     .frame(height: 1)
                     .id(bottomAnchor)
-                    .onGeometryChange(for: CGFloat.self) { proxy in
-                        proxy.frame(in: .named(Self.scrollSpace)).maxY
-                    } action: { anchorMaxY in
-                        updateAtBottom(anchorMaxY: anchorMaxY)
-                    }
             }
             .padding(.horizontal, 16)
             // TOP CLEARANCE (FIX 2): the first element must REST below the floating
@@ -767,180 +719,59 @@ struct ChatView: View {
             // `composerFloatInset`), so the at-rest full-bleed layout is identical;
             // only the anchor's position relative to the inset moved.
         }
-        // SCROLL P0 — OPEN-ON-NEWEST without bottom-aligning SHORT content.
-        //
-        // `OpenOnNewestAnchor` applies `.defaultScrollAnchor(.bottom, for:
-        // .initialOffset)` on iOS 18+ (the TestFlight fleet runs iOS 26): it sets
-        // ONLY the INITIAL scroll offset to the bottom, so a long chat opens on the
-        // newest message, while the resting ALIGNMENT stays at the top — a short
-        // chat that does not fill the viewport sits under the header instead of
-        // being pinned to the bottom with an empty upper half. (Plain
-        // `.defaultScrollAnchor(.bottom)` ALSO sets the `.alignment` role, which is
-        // exactly what bottom-aligned short chats — the regression this fixes.)
-        // Streaming-growth follow + session-switch landing are handled IMPERATIVELY
-        // (`snapToBottom`/`scrollToBottomIfNeeded`, gated by the §3.6 near-bottom
-        // rule), so they are NOT forced by the `.sizeChanges` role (which would yank
-        // a reader who scrolled up). On iOS 17 the role API is unavailable, so the
-        // transcript stays top-aligned and the imperative seed scroll lands the open.
-        // DEBUG conic-stroke hunt: optionally hide the iOS-26 gradient-stroked
-        // scroll indicator to attribute the per-frame conic-gradient render cost.
+        // Stock scroll anchor: open-at-bottom, follow streaming growth while parked
+        // at bottom, release on user scroll-up, re-anchor on late content. Short
+        // chats bottom-align (iMessage/WhatsApp behaviour — accepted by design).
+        // DEBUG: optionally hide the iOS-26 gradient-stroked indicator.
         .perfScrollIndicators()
-        .modifier(OpenOnNewestAnchor())
-        // SCROLL P0 r2 — on-demand scroll to the true content bottom edge (pill /
-        // streaming follow / session-switch landing). iOS 18+ uses
-        // `ScrollPosition.scrollTo(edge: .bottom)` (reaches the real edge, immune to
-        // lazy realization, no-op when content fits); iOS 17 uses the proxy fallback.
-        .modifier(BottomEdgeScroll(tick: bottomScrollTick, animated: bottomScrollAnimated, pendingLand: $pendingLandOnNewest))
+        .defaultScrollAnchor(.bottom)
         .scrollContentBackground(.hidden)
-        // Name the scroll coordinate space so the bottom anchor's frame can be
-        // measured against the viewport (the iOS-17 `atBottom` fallback signal).
-        .coordinateSpace(.named(Self.scrollSpace))
-        // PRIMARY `atBottom` signal on iOS 18+: `onScrollGeometryChange` reports the
-        // real contentOffset / contentSize / containerSize, so the distance from the
-        // true bottom is exact and ROBUST to LazyVStack unloading (the bottom-anchor
-        // `onGeometryChange` fallback stops firing once the anchor scrolls far out of
-        // the lazy window — which left the pill mis-hidden when scrolled up). This
-        // makes the pill visibility + the streaming auto-stick gate reflect the real
-        // scroll position on every modern device (the TestFlight fleet runs iOS 26).
+        // R1 atBottom tracker (iOS 18+): feeds the pill + queue banner. Degrades
+        // gracefully on iOS 17 — atBottom defaults true (no pill machinery for 17,
+        // fleet is iOS 26).
         .modifier(ScrollAtBottomTracker(threshold: Self.atBottomThreshold) { nowAtBottom in
-            setAtBottom(nowAtBottom)
+            if nowAtBottom != atBottom { atBottom = nowAtBottom }
         })
-        // STRIKE P0: the transcript background runs full-bleed (the card stack
-        // ignores the safe area, so this paints to the physical edges). It matches
-        // the card surface (`theme.bg`) so the canvas reads as one continuous
-        // surface, and content scrolls under the floating header / composer. The
-        // GeometryReader captures the viewport height for the measured `atBottom`.
-        .background {
-            theme.bg
-                .ignoresSafeArea()
-                .overlay {
-                    GeometryReader { geo in
-                        Color.clear
-                            .onAppear { viewportHeight = geo.size.height }
-                            .onChange(of: geo.size.height) { _, h in viewportHeight = h }
-                    }
-                }
-        }
-        // KEYBOARD (SCROLL P0): observe the keyboard height explicitly and feed it
-        // into the composer-clearance spacer (`composerClearance`). The transcript
-        // is bottom-anchored, so growing that spacer rises the content WITH the
-        // composer — deterministic, not inferred across the overlay boundary.
+        // Full-bleed background (no viewport-capture GeometryReader needed).
+        .background { theme.bg.ignoresSafeArea() }
+        // KEYBOARD: observe height, feed into clearance spacer.
         .modifier(KeyboardHeightReader(height: $keyboardHeight))
-        // Streaming auto-stick + reseed gate (PRESERVED policy, deterministic
-        // mechanism). On iOS 18+ `defaultScrollAnchor(.bottom)` already follows
-        // growth natively; these handlers are the iOS-17 follow path AND the
-        // session-identity reseed gate (Batch E) on every version.
+        // FIX 3: re-park atBottom on user's own outgoing turn so the streaming
+        // reply is followed from the first token.
         .onChange(of: chatStore.messages.count) { oldCount, newCount in
-            // FIX 3 send-path guarantee: the user's OWN new turn must follow from
-            // the first token even if they had scrolled up before sending. `send`
-            // appends the user message while `localTurnInFlight` is held, so a row
-            // gained during a local turn is the user's intent to watch — re-park at
-            // the tail so the now-`atBottom`-gated follow sticks the streaming reply.
-            // A row gained from a FOREIGN/mirror frame (no local turn) does NOT
-            // force-follow, so a reader watching another session's broadcast is not
-            // yanked. (For iOS 18+ the bottom anchor follows growth natively; this is
-            // the explicit parked-at-tail signal the §3.6 gate reads.)
-            if newCount > oldCount, chatStore.localTurnInFlight {
-                atBottom = true
-            }
-            scrollToBottomIfNeeded(proxy)
+            if newCount > oldCount, chatStore.localTurnInFlight { atBottom = true }
         }
-        .onChange(of: lastMessageText) { _, _ in
-            scrollToBottomIfNeeded(proxy)
+        // STREAM-FOLLOW: `.defaultScrollAnchor(.bottom)` only sets the INITIAL
+        // offset; it does NOT track growth from an in-place mutation of the last
+        // row's text (the streaming reply grows via `parts`, not a new row, so
+        // `messages.count` stays flat after the first token). Follow that growth
+        // here: when parked at the tail (`atBottom`), re-pin to the true content
+        // end on every flush. Gated by `atBottom`, so a reader who scrolled up
+        // mid-stream is never yanked (the §3.6 rule). The subtree
+        // `.transaction { animation = nil }` makes this an INSTANT edge re-pin —
+        // continuous smooth growth, no per-flush spring fighting the 40ms cadence.
+        .onChange(of: chatStore.messages.last?.text) { _, _ in
+            guard atBottom else { return }
+            proxy.scrollTo(bottomAnchor, anchor: .bottom)
         }
-        .onChange(of: chatStore.isStreaming) { _, streaming in
-            if streaming { scrollToBottomIfNeeded(proxy) }
-        }
+        // Jump-to-search-match on transcriptGeneration bump (search open).
         .onChange(of: chatStore.transcriptGeneration) { _, _ in
-            // Jump-to-match takes precedence over the land-on-newest seed scroll
-            // when the session was opened from a search result.
             if sessionStore.pendingSearchScroll != nil, !chatStore.messages.isEmpty {
                 jumpToSearchMatchIfNeeded(proxy)
-            } else {
-                handleSeedScroll(proxy)
             }
         }
         .onAppear {
-            // First landing — treat like a fresh seed so a session opened directly
-            // (deep link / restored selection) lands on the newest message. With
-            // `defaultScrollAnchor(.bottom)` the open already rests at the bottom;
-            // `handleSeedScroll` then arms the seed-identity gate (Batch E) and
-            // belts the imperative position on 18+ for the same-frame seed case.
-            handleSeedScroll(proxy)
+            // On remount (per-session identity swap) atBottom resets to true so the
+            // pill stays hidden and the native anchor owns the open landing.
+            atBottom = true
         }
-        // NOTE: deliberately NO `.scrollPosition(id:)` binding here. It conflicted
-        // with the imperative `proxy.scrollTo` — when a `.scrollPosition` binding owns
-        // the offset, a `scrollTo` to the lazy 1pt `bottomAnchor` is countermanded, so
-        // the scroll-to-bottom pill became a no-op (and a stuck binding value made the
-        // re-request a no-change). Open-on-newest is handled declaratively by
-        // `OpenOnNewestAnchor` (initial offset) plus the imperative seed scroll; the
-        // pill + streaming growth use `proxy.scrollTo` directly, now unobstructed.
-        //
-        // ARCH37 STEP 1 — PER-SESSION SCROLLVIEW IDENTITY (the keystone).
-        //
-        // Key the transcript ScrollView SUBTREE on the active stored session id so
-        // each open MOUNTS A FRESH ScrollView. Its `.defaultScrollAnchor(.bottom,
-        // for: .initialOffset)` (OpenOnNewestAnchor) then resolves "bottom" at THIS
-        // session's first real layout — landing on the newest message NATIVELY for a
-        // cache-first (synchronous) open, with zero imperative help. Previously the
-        // ScrollView was ONE persistent identity for the app's life (RootView hosts a
-        // single ChatView, no `.id(session)`), so the initial-offset anchor fired only
-        // on the FIRST open and every switch #2..N rode entirely on the imperative
-        // latch/clamp against a settling contentSize (the white-page / mid-conversation
-        // landing root). A fresh mount has NO surviving cross-session offset to strand.
-        //
-        // SCOPED to the ScrollView only (NOT ChatView): the composer, header, pills,
-        // toolbar, connection state, and all per-session @State above live OUTSIDE
-        // `transcript(proxy:)` and are untouched by this remount. The chain-tip
-        // storedId swap (SessionStore.open → activeStoredId = chainTip) re-mounts
-        // exactly once more, landing the tip natively too.
-        //
-        // BELT-AND-SUSPENDERS (this round): ALL existing latch/clamp/anchor machinery
-        // stays in place — the `.id` makes the native anchor carry the open, the
-        // imperative path is a backstop until Step 6 (the deletion drop) verifies on
-        // device that the native anchor is sufficient. nil id (draft) collapses to a
-        // single stable identity so a draft does not thrash.
+        // PER-SESSION SCROLLVIEW IDENTITY: each session open mounts a fresh ScrollView.
+        // `.defaultScrollAnchor(.bottom)` resolves at first layout → native open-on-newest.
+        // The `.transaction { $0.animation = nil }` on the subtree blocks any
+        // ambient spring (e.g. the drawer-close spring) from riding the id swap,
+        // eliminating the cross-fade "morph" on drawer-select.
+        .transaction { $0.animation = nil }
         .id(chatStore.activeStoredSessionId ?? "hermes.chat.draft")
-    }
-
-    /// Recompute `atBottom` from the MEASURED distance between the bottom anchor and
-    /// the viewport bottom — the iOS-17 FALLBACK signal (the iOS-18 primary is
-    /// `ScrollAtBottomTracker` / `onScrollGeometryChange`). The anchor's `maxY` in the
-    /// scroll coordinate space is its position relative to the viewport top;
-    /// subtracting the viewport height gives the distance the anchor sits BELOW the
-    /// visible bottom. Within `atBottomThreshold` ⇒ parked at the tail.
-    ///
-    /// On iOS 18+ this is superseded by `ScrollAtBottomTracker` (which reads the real
-    /// scroll offset and is robust to LazyVStack unloading); it stays as the floor
-    /// signal so the iOS-17 deployment target keeps a working pill/auto-stick gate.
-    /// Pure decision factored out for the unit test.
-    static func atBottom(anchorMaxY: CGFloat, viewportHeight: CGFloat, threshold: CGFloat) -> Bool {
-        guard viewportHeight > 0 else { return true }
-        return (anchorMaxY - viewportHeight) <= threshold
-    }
-
-    private func updateAtBottom(anchorMaxY: CGFloat) {
-        guard viewportHeight > 0 else { return }
-        if #available(iOS 18.0, *) { return }  // iOS 18+ uses ScrollAtBottomTracker.
-        let nowAtBottom = Self.atBottom(
-            anchorMaxY: anchorMaxY, viewportHeight: viewportHeight, threshold: Self.atBottomThreshold)
-        setAtBottom(nowAtBottom)
-    }
-
-    /// Update `atBottom` (drives the pill + the §3.6 streaming auto-stick gate).
-    ///
-    /// SCROLL P0 r4: this NO LONGER releases the fresh-open pin. The earlier
-    /// offset-driven release (release `pendingLandOnNewest` on any move-away after
-    /// landing) was a race hazard — a content-size jump during settle momentarily
-    /// reports not-at-bottom and could self-disarm the pin before the real content
-    /// landed. The open-pin is now released ONLY by a genuine USER drag
-    /// (`.onScrollPhaseChange == .interacting` in `BottomEdgeScroll`), which is the
-    /// one signal that cannot be tripped by layout/animation. So the open stays
-    /// glued to the newest message through ALL settling (double-seed, variable-
-    /// height rows, the drawer-close animation) and is let go the instant the user
-    /// scrolls — correct by construction, no timing race.
-    private func setAtBottom(_ nowAtBottom: Bool) {
-        if nowAtBottom != atBottom { atBottom = nowAtBottom }
     }
 
     /// iOS 18+ `atBottom` tracker: reads the real scroll geometry (contentOffset,
@@ -963,205 +794,17 @@ struct ChatView: View {
                     onChange(nowAtBottom)
                 }
             } else {
-                content  // iOS 17 uses the bottom-anchor onGeometryChange fallback.
+                content  // iOS 17: atBottom stays default true; pill always available.
             }
         }
     }
 
-    /// Open-on-newest WITHOUT bottom-aligning short content (SCROLL P0 fix).
-    ///
-    /// On iOS 18+ the `.initialOffset` role sets ONLY the initial scroll offset to
-    /// the bottom — a long chat opens on the newest message, but the resting
-    /// alignment stays at the top, so a short chat that does not fill the viewport
-    /// sits under the header instead of being pinned to the bottom with an empty
-    /// upper half. The `.alignment` and `.sizeChanges` roles are deliberately NOT
-    /// set: `.alignment(.bottom)` is what pinned short chats to the bottom (the
-    /// regression), and `.sizeChanges(.bottom)` would force-stick on growth and yank
-    /// a reader who scrolled up (the §3.6 near-bottom gate handles streaming follow
-    /// imperatively instead). On iOS 17 the role API is unavailable; the transcript
-    /// stays top-aligned and the imperative seed scroll (`handleSeedScroll` →
-    /// `snapToBottom`) lands the open.
-    private struct OpenOnNewestAnchor: ViewModifier {
-        func body(content: Content) -> some View {
-            if #available(iOS 18.0, *) {
-                content.defaultScrollAnchor(.bottom, for: .initialOffset)
-            } else {
-                content
-            }
-        }
-    }
-
-    /// Scroll to the true content BOTTOM EDGE on demand (SCROLL P0 r2, iOS 18+).
-    /// Observes `tick`; on each bump it calls `ScrollPosition.scrollTo(edge: .bottom)`,
-    /// which reaches the real content end with no item id — immune to LazyVStack
-    /// realization (the cause of the trailing-anchor `proxy.scrollTo` pill no-op) and
-    /// a no-op when content fits the viewport (short chats stay top-aligned). iOS 17
-    /// uses the imperative `proxy.scrollTo(bottomAnchor)` fallback in `snapToBottom`.
-    private struct BottomEdgeScroll: ViewModifier {
-        let tick: Int
-        let animated: Bool
-        @Binding var pendingLand: Bool
-
-        @ViewBuilder
-        func body(content: Content) -> some View {
-            if #available(iOS 18.0, *) {
-                BottomEdgeScrollHost(tick: tick, animated: animated, pendingLand: $pendingLand) { content }
-            } else {
-                content
-            }
-        }
-    }
-
-    @available(iOS 18.0, *)
-    private struct BottomEdgeScrollHost<Inner: View>: View {
-        let tick: Int
-        let animated: Bool
-        @Binding var pendingLand: Bool
-        @ViewBuilder var inner: Inner
-        @State private var position = ScrollPosition()
-
-        /// Content + container heights AND the live contentOffset; the re-pin/clamp
-        /// fires when ANY change (FIX 1/FIX 2). Offset is carried so the seed-boundary
-        /// clamp can detect a stale offset inherited across a session switch.
-        private struct Geometry: Equatable {
-            let content: CGFloat
-            let container: CGFloat
-            let offsetY: CGFloat
-        }
-
-        var body: some View {
-            inner
-                .scrollPosition($position)
-                // Explicit scroll-to-bottom request (pill / streaming follow /
-                // session-switch landing).
-                .onChange(of: tick) { _, _ in applyScroll(animated: animated) }
-                // OPEN-ON-NEWEST, POST-LAYOUT — a ONE-SHOT LANDING LATCH layered on
-                // an ALWAYS-ON BOUNDS CLAMP (round-2 FIX A: the two are now SEPARATE
-                // mechanisms, not one `pendingLand`-gated block).
-                //
-                // The bounds invariant `offset <= max(0, content - container)` must
-                // hold ALWAYS, not just while landing. Round-1 nested the clamp inside
-                // the `pendingLand` guard, so once the landing latch disarmed the
-                // geometry handler went fully inert. On real content the row heights
-                // RE-MEASURE and SHRINK after the latch disarms (images / code /
-                // markdown settling, a same-session reconcile to shorter content) →
-                // contentSize drops BELOW the resting offset → the viewport rests past
-                // the content edge = the user's persistent "blank page, chat above".
-                // Separating the clamp from the latch closes that hole.
-                //
-                //  • CLAMP (always-on, every geometry event): whenever the resting
-                //    offset EXCEEDS the ceiling, snap DOWN to the ceiling. Idempotent;
-                //    never fires during normal scrolling (a user drag can't exceed the
-                //    ceiling — UIScrollView already bounds it); never scrolls UP (it
-                //    only acts when offset > ceiling); independent of the latch. This
-                //    is the post-disarm row-shrink fix AND the stale-offset-across-
-                //    switch fix, now guaranteed for the whole session, not just landing.
-                //
-                //  • LATCH (one-shot, `pendingLand`): while a fresh open is pending,
-                //    re-pin UP to the bottom as the seeded LazyVStack rows lay out
-                //    below the ceiling (the async-seed open: offset still near the top).
-                //    Once the content fills the viewport AND we are resting at the true
-                //    bottom, DISARM — the natural bottom anchor then owns streaming
-                //    growth (no dual-writer fighting every flush). The `.interacting`
-                //    release still applies for the reader-drag case.
-                .onScrollGeometryChange(for: Geometry.self) {
-                    Geometry(
-                        content: $0.contentSize.height,
-                        container: $0.containerSize.height,
-                        offsetY: $0.contentOffset.y)
-                } action: { _, geo in
-                    let ceiling = max(0, geo.content - geo.container)
-
-                    // ── CLAMP (always-on bounds invariant) ───────────────────────
-                    // If the resting offset is PAST the content edge, snap down to the
-                    // ceiling. `scrollTo(edge:.bottom)` resolves to exactly the ceiling.
-                    // Guarded by `offsetY > ceiling + epsilon` so it (a) never scrolls
-                    // up, (b) is a no-op once at the ceiling (cannot jitter), and (c)
-                    // never fires during ordinary scrolling (the scroll view already
-                    // bounds the offset to the ceiling, so it can only be exceeded when
-                    // contentSize SHRANK under a resting offset, or a stale offset was
-                    // inherited across a session switch). This runs regardless of the
-                    // landing latch — the invariant holds for the whole session.
-                    if geo.offsetY > ceiling + 0.5 {
-                        #if DEBUG
-                        ScrollInstrumentation.clampFired()
-                        #endif
-                        applyScroll(animated: false)
-                        // Leave the latch state untouched; the clamp is orthogonal.
-                        return
-                    }
-
-                    // ── LATCH (one-shot landing follow) ──────────────────────────
-                    guard pendingLand else { return }
-                    // Short chat (content fits ⇒ ceiling 0): NOTHING to land — never
-                    // pull it away from the top. Stay armed (harmlessly) until it
-                    // grows past the viewport or the user drags. Short-chat-stays-top.
-                    guard geo.content > geo.container else { return }
-                    // The viewport is overflowed and the offset is at/below the ceiling
-                    // (the clamp above already handled offset > ceiling). If we are not
-                    // yet AT the bottom, the seeded rows are still laying out below the
-                    // resting offset — re-pin UP to the bottom and stay armed.
-                    let landed = abs(geo.offsetY - ceiling) <= 0.5
-                    if !landed {
-                        #if DEBUG
-                        ScrollInstrumentation.latchFired()
-                        #endif
-                        applyScroll(animated: false)
-                        return
-                    }
-                    // ONE-SHOT disarm: filled AND resting at the true bottom.
-                    pendingLand = false
-                }
-                // Release the open-pin the instant the user drives the scroll, so a
-                // reader who scrolls up is never yanked back down (the §3.6 gate
-                // then governs streaming follow). Programmatic re-pins do not enter
-                // the `.interacting` phase, so they never self-disarm.
-                .onScrollPhaseChange { _, newPhase in
-                    if newPhase == .interacting { pendingLand = false }
-                }
-        }
-
-        private func applyScroll(animated: Bool) {
-            if animated {
-                withAnimation(.snappy(duration: 0.28, extraBounce: 0)) { position.scrollTo(edge: .bottom) }
-            } else {
-                var txn = Transaction()
-                txn.disablesAnimations = true
-                withTransaction(txn) { position.scrollTo(edge: .bottom) }
-            }
-        }
-    }
-
-    /// SCROLL P0 #1 (contract Batch E §3.6) — land a (re)seeded transcript on the
-    /// newest message, but never YANK a reader who scrolled up.
-    ///
-    /// `transcriptGeneration` bumps on every wholesale transcript replace: the
-    /// open seed, a reconnect/foreground backfill, and the foreign-mirror reconcile.
-    /// Two distinct policies, keyed on the SESSION IDENTITY (not `messages.count`,
-    /// which the OLD count-keyed auto-scroll could not observe on a bulk seed —
-    /// hence the blank/mid-conversation open):
-    ///
-    ///  • FRESH session (the seeded stored id differs from the last one we landed,
-    ///    or there was none): this is an OPEN. Land on the newest message — now
-    ///    DETERMINISTICALLY, not via a timer. `defaultScrollAnchor(.bottom)` already
-    ///    rests a freshly-laid-out ScrollView at the bottom; `snapToBottom` re-asserts
-    ///    the bottom via the SETTLE-CORRECT scroll-position binding for the case where
-    ///    the ScrollView's view identity persists across a session switch (content
-    ///    replaced, view not remade) so the anchor would not otherwise re-resolve.
-    ///    No `DispatchQueue`, no `0.05s` guess — SwiftUI resolves the request after
-    ///    layout, so a slow LazyVStack / late-settling image heights still land.
-    ///
-    ///  • SAME session reseeded (backfill / mirror reconcile / foreground refresh):
-    ///    gate to near-bottom (§3.6 / D13) — only auto-scroll if the reader was
-    ///    already at the bottom. A user scrolled UP reading history must NOT be
-    ///    pulled down by a reconnect or a desktop-driven mirror reconcile. Stable
-    ///    ids (Batch A/B) keep the turns from restacking under the reader.
     /// Search jump-to-match: when the session was opened from a search result
     /// (`SessionStore.pendingSearchScroll` holds the query), scroll the
     /// transcript to the FIRST message whose prose contains the query instead of
     /// landing on the newest message. Consumes the request either way. A query
     /// that only matched non-prose content (a Code/tool hit) finds no prose
-    /// message → falls through to the normal land-on-newest seed scroll.
+    /// message → no-op (native anchor already rested at bottom).
     private func jumpToSearchMatchIfNeeded(_ proxy: ScrollViewProxy) {
         guard let query = sessionStore.pendingSearchScroll,
               !query.isEmpty,
@@ -1174,135 +817,7 @@ struct ChatView: View {
             withAnimation(.easeInOut(duration: 0.25)) {
                 proxy.scrollTo(match.id, anchor: .center)
             }
-        } else {
-            handleSeedScroll(proxy)
         }
-    }
-
-    private func handleSeedScroll(_ proxy: ScrollViewProxy) {
-        // SCROLL P0 r4 — IGNORE the empty `reset()` frame. open() sets
-        // activeStoredId=NEW then calls chat.reset(), which bumps
-        // transcriptGeneration with an EMPTY transcript BEFORE the content seeds.
-        // Classifying that empty frame consumed the single `.landOnNewest` (it set
-        // lastSeededSessionID to the new id while empty, demoting the real content
-        // seeds to same-session `.keepPinned`) AND latched hasLandedOpen=true (an
-        // empty transcript reads as at-bottom), so the real content's growth then
-        // RELEASED the open-pin — the device-only open-on-newest failure. Skip the
-        // empty frame entirely: do NOT classify, arm, or advance lastSeededSessionID
-        // here. The first NON-EMPTY seed (cache or network) is the one that lands.
-        guard !chatStore.messages.isEmpty else { return }
-        let seededSession = chatStore.activeStoredSessionId
-        let decision = Self.seedScrollDecision(
-            seededSession: seededSession,
-            lastSeededSession: lastSeededSessionID,
-            atBottom: atBottom
-        )
-        lastSeededSessionID = seededSession
-        switch decision {
-        case .landOnNewest:
-            // OPEN of a fresh session: land on the newest message. Pin `atBottom`
-            // so subsequent streaming auto-sticks. ARM `pendingLandOnNewest` so the
-            // bottom is re-asserted AFTER the seeded rows lay out (the post-layout
-            // re-pin in BottomEdgeScroll) — this is what makes an ASYNC seed (one
-            // that arrives after the ScrollView first appeared: network OR cache)
-            // land on the newest message instead of opening at the top. The
-            // immediate `snapToBottom` covers the synchronous-seed + iOS-17 paths.
-            atBottom = true
-            pendingLandOnNewest = true
-            snapToBottom(proxy, animated: false)
-        case .keepPinned:
-            // Same session reconciled while the reader was at the bottom — keep
-            // them pinned (settle-correct, no timer).
-            snapToBottom(proxy, animated: false)
-        case .preserveReaderPosition:
-            break  // same session, reader scrolled up — do NOT yank (§3.6).
-        }
-    }
-
-    /// The seed-scroll policy decision (SCROLL P0 / §3.6), factored pure + static
-    /// so the fresh-open-vs-reseed gate is unit-testable without a live view.
-    ///
-    ///  - `.landOnNewest`   — a FRESH session OPEN (the seeded stored id differs
-    ///    from the last one we landed on, or there was none): always snap to the
-    ///    newest message after layout, no matter where the previous session was
-    ///    scrolled. This is the open-on-newest acceptance.
-    ///  - `.keepPinned`     — the SAME session reseeded (backfill / mirror reconcile
-    ///    / foreground refresh) while the reader was already at the bottom: keep
-    ///    them pinned to the newest message.
-    ///  - `.preserveReaderPosition` — the SAME session reseeded while the reader was
-    ///    scrolled UP reading history: do NOT yank them down (§3.6 / D13).
-    enum SeedScrollDecision: Equatable {
-        case landOnNewest
-        case keepPinned
-        case preserveReaderPosition
-    }
-
-    static func seedScrollDecision(
-        seededSession: String?,
-        lastSeededSession: String?,
-        atBottom: Bool
-    ) -> SeedScrollDecision {
-        if seededSession != lastSeededSession { return .landOnNewest }
-        return atBottom ? .keepPinned : .preserveReaderPosition
-    }
-
-    /// Auto-stick to the bottom only when the reader is currently PARKED at the
-    /// tail (`atBottom`), so a user reading history — or one who drags UP mid-stream
-    /// — is never yanked down by new content (§3.6 gate).
-    ///
-    /// FIX 3: the gate dropped the `|| chatStore.isStreaming` disjunct. While
-    /// streaming, `isStreaming` was unconditionally true, so the follow kept firing
-    /// even after `ScrollAtBottomTracker` set `atBottom = false` the instant the
-    /// user dragged up — a 280ms spring fought the finger (the S1 drag rubber-band).
-    /// Streaming should follow because the reader is AT the bottom, not because a
-    /// turn is in flight: a freshly-sent turn starts `atBottom = true` (the
-    /// `.landOnNewest` seed pins it, and `send` appends at the tail while parked at
-    /// bottom), so first-token follow still works; a mid-stream drag-up now halts
-    /// cleanly via `atBottom = false`.
-    ///
-    /// FIX 1b: streaming-growth follow is INSTANT (`animated: false`). The
-    /// transcript is bottom-anchored, so an instant edge re-pin per flush reads as
-    /// smooth continuous growth — the prior `animated: true` re-kicked a 280ms
-    /// `.snappy` spring every ~40ms before it could settle (the S1 jitter). The
-    /// animated spring is now reserved for the explicit pill tap (`scrollToBottomPill`).
-    private func scrollToBottomIfNeeded(_ proxy: ScrollViewProxy) {
-        guard atBottom else { return }
-        snapToBottom(proxy, animated: false)
-    }
-
-    /// Land the NEWEST message cleanly above the floating composer (SCROLL P0 r2).
-    ///
-    /// iOS 18+ (the TestFlight fleet runs iOS 26): request a scroll to the true
-    /// content BOTTOM EDGE by bumping `bottomScrollTick`, which `BottomEdgeScroll`
-    /// turns into `ScrollPosition.scrollTo(edge: .bottom)`. Edge-scroll reaches the
-    /// real content end — the in-stack clearance spacer's bottom, so the last
-    /// message lands exactly the clearance height above the composer — REGARDLESS of
-    /// LazyVStack realization. The prior `proxy.scrollTo(bottomAnchor)` no-opped when
-    /// the trailing 1pt anchor was outside the realized lazy window (the pill no-op).
-    /// For content that fits the viewport the edge is already visible, so it is a
-    /// no-op and the transcript stays top-aligned (short-chat correctness).
-    ///
-    /// iOS 17 floor (no `ScrollPosition`): best-effort imperative scroll to the
-    /// trailing anchor — works for the open (laid-out content) and near-bottom
-    /// follows; the deep-scroll-up pill is a known floor limitation (no iOS-17
-    /// tester on the fleet).
-    private func snapToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
-        bottomScrollAnimated = animated
-        bottomScrollTick &+= 1
-        if #unavailable(iOS 18.0) {
-            let apply = { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
-            if animated {
-                withAnimation(.snappy(duration: 0.28, extraBounce: 0)) { apply() }
-            } else {
-                apply()
-            }
-        }
-    }
-
-    /// The trailing text of the last message — changing while streaming drives
-    /// auto-scroll without observing the whole array.
-    private var lastMessageText: String {
-        chatStore.messages.last?.text ?? ""
     }
 
     // MARK: - Draft empty state
@@ -1780,7 +1295,9 @@ struct ChatView: View {
             Spacer(minLength: 0)
             if #available(iOS 26.0, *) {
                 Button {
-                    snapToBottom(proxy, animated: true)
+                    withAnimation(.snappy(duration: 0.28, extraBounce: 0)) {
+                        proxy.scrollTo(bottomAnchor, anchor: .bottom)
+                    }
                 } label: {
                     Image(systemName: "arrow.down")
                         .font(.system(size: 15, weight: .semibold))
@@ -1795,7 +1312,9 @@ struct ChatView: View {
                 .accessibilityIdentifier("scrollToBottom")
             } else {
                 Button {
-                    snapToBottom(proxy, animated: true)
+                    withAnimation(.snappy(duration: 0.28, extraBounce: 0)) {
+                        proxy.scrollTo(bottomAnchor, anchor: .bottom)
+                    }
                 } label: {
                     Image(systemName: "arrow.down")
                         .font(.system(size: 15, weight: .semibold))
