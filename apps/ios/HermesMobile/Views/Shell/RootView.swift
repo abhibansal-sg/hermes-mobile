@@ -131,7 +131,20 @@ struct RootView: View {
             // legitimate pre-`hasConnected` exception is the launch reconnect of
             // a SAVED config (`isBootstrapping`): a returning user sees the
             // splash, not a flash of Welcome.
-            if connection.hasConnected || connection.isBootstrapping {
+            //
+            // CACHE-FIRST (WhatsApp bar): a previously-paired user
+            // (`hasSavedConfiguration`) ALSO earns the shell in these phases — even
+            // after `isBootstrapping` clears (the cold-launch-offline window the
+            // old gate dropped to WelcomeView, the reported bug: a paired user
+            // launching offline saw the PAIRING screen). The cache-first drawer +
+            // cached transcripts + offline ribbon render; Welcome is now reserved
+            // for a genuinely-unconfigured install. The validation-bypass guarantee
+            // is preserved: a failed manual/QR `configure` persists nothing and
+            // leaves `serverURLString` empty, so `hasSavedConfiguration` is false
+            // and the user stays in onboarding behind the inline error.
+            if connection.hasConnected
+                || connection.isBootstrapping
+                || connection.hasSavedConfiguration {
                 mainUI
             } else {
                 WelcomeView()

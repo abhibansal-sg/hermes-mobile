@@ -5,19 +5,17 @@ import GRDB
 
 // MARK: - CacheLayerTests
 //
-// Unit tests for P1 (CacheStore) + P2 (SyncEngine).
+// Unit tests for the CacheStore actor (P1) + the WhatsApp-bar additions.
 // All tests use in-memory DatabaseQueues — no filesystem access, no live gateway.
-// Injectable SessionListFetcher and TranscriptFetcher seams keep tests hermetic.
 //
 // Covered:
 //   - Round-trip persistence: write page -> read back identical (ordinal order)
-//   - List diff: added/dirty/removed/unchanged classification
 //   - Cursor advance: maxMessageId tracks across saves
 //   - Eviction: recent sessions exempt, old sessions evicted, session row preserved
 //   - Migration v1: tables + fingerprint created; idempotent second apply
 //   - Cron-exclusion: cron sessions never get transcript rows
-//   - Dirty-set management via broadcast frames
-//   - Eviction throttle: second call within 24h is a no-op
+//   - Eviction throttle: second call within 24h is a no-op (CacheStore-native)
+//   - Transcript freshness: the prefetch skip-gate (transcriptIsFresh)
 
 // MARK: - Helpers
 
@@ -62,18 +60,6 @@ private func makeStoredMessage(
         content: .string(content),
         timestamp: 1_000_000
     )
-}
-
-// MARK: - Mock fetchers
-
-private final class MockListFetcher: SessionListFetcher, @unchecked Sendable {
-    var sessions: [SessionSummary] = []
-    func fetchSessionList() async throws -> [SessionSummary] { sessions }
-}
-
-private final class MockTranscriptFetcher: TranscriptFetcher, @unchecked Sendable {
-    var messages: [StoredMessage] = []
-    func fetchTranscript(sessionId: String) async throws -> [StoredMessage] { messages }
 }
 
 // MARK: - Migration Tests
@@ -321,222 +307,105 @@ final class CacheEvictionTests: XCTestCase {
     }
 }
 
-// MARK: - List Diff Tests
+// MARK: - Eviction Throttle Tests (CacheStore-native — WhatsApp bar hygiene)
+//
+// The throttle that previously lived in the never-wired `SyncEngine` now lives in
+// `CacheStore.evictStaleTranscriptsIfNeeded`, which is actually called post-
+// hydration. These tests pin its once/24h throttle directly on CacheStore.
 
-final class SyncEngineListDiffTests: XCTestCase {
+final class CacheEvictionThrottleTests: XCTestCase {
 
-    private func makeEngine() throws -> (SyncEngine, MockListFetcher, MockTranscriptFetcher) {
+    func testEvictionStampsTimestampOnFirstRun() async throws {
         let store = try makeInMemoryStore()
-        let listFetcher = MockListFetcher()
-        let txFetcher = MockTranscriptFetcher()
-        let engine = SyncEngine(
-            cache: store,
-            listFetcher: listFetcher,
-            transcriptFetcher: txFetcher,
-            scope: testScope
-        )
-        return (engine, listFetcher, txFetcher)
+        let before = try await store.readMeta(SyncMetaRecord.Key.evictionLastRunAt)
+        XCTAssertNil(before)
+
+        _ = try await store.evictStaleTranscriptsIfNeeded()
+        let stamped = try await store.readMeta(SyncMetaRecord.Key.evictionLastRunAt)
+        XCTAssertNotNil(stamped, "First eviction run must stamp the lastRunAt timestamp")
     }
-
-    func testNewSessionClassifiedAsAdded() async throws {
-        let (engine, _, _) = try makeEngine()
-        let live = [makeSession(id: "new1")]
-        let diff = try await engine.diffSessionList(live)
-        XCTAssertTrue(diff.added.contains(where: { $0.id == "new1" }))
-        XCTAssertTrue(diff.dirty.isEmpty)
-    }
-
-    func testChangedLastActiveMarksDirty() async throws {
-        let (engine, listFetcher, _) = try makeEngine()
-        listFetcher.sessions = [makeSession(id: "s1", lastActive: 100, messageCount: 5)]
-        try await engine.syncSessionList()
-
-        let updated = [makeSession(id: "s1", lastActive: 200, messageCount: 6)]
-        let diff = try await engine.diffSessionList(updated)
-        XCTAssertTrue(diff.dirty.contains(where: { $0.id == "s1" }))
-        XCTAssertTrue(diff.added.isEmpty)
-        XCTAssertTrue(diff.unchanged.isEmpty)
-    }
-
-    func testIdenticalRowClassifiedAsUnchanged() async throws {
-        let (engine, listFetcher, _) = try makeEngine()
-        listFetcher.sessions = [makeSession(id: "s2", lastActive: 100, messageCount: 5, title: "Same")]
-        try await engine.syncSessionList()
-
-        let same = [makeSession(id: "s2", lastActive: 100, messageCount: 5, title: "Same")]
-        let diff = try await engine.diffSessionList(same)
-        XCTAssertTrue(diff.unchanged.contains(where: { $0.id == "s2" }))
-        XCTAssertTrue(diff.dirty.isEmpty)
-    }
-
-    func testAbsentSessionsAppearInRemoved() async throws {
-        let (engine, listFetcher, _) = try makeEngine()
-        listFetcher.sessions = [
-            makeSession(id: "a", lastActive: 100),
-            makeSession(id: "b", lastActive: 100),
-        ]
-        try await engine.syncSessionList()
-
-        let live = [makeSession(id: "a", lastActive: 100)]
-        let diff = try await engine.diffSessionList(live)
-        XCTAssertTrue(diff.removed.contains("b"))
-        XCTAssertFalse(diff.removed.contains("a"))
-    }
-
-    func testMixedDiffAllClassifications() async throws {
-        let (engine, listFetcher, _) = try makeEngine()
-        listFetcher.sessions = [
-            makeSession(id: "keep",   lastActive: 100, messageCount: 5),
-            makeSession(id: "change", lastActive: 100, messageCount: 5),
-            makeSession(id: "drop",   lastActive: 100, messageCount: 5),
-        ]
-        try await engine.syncSessionList()
-
-        let live = [
-            makeSession(id: "keep",      lastActive: 100, messageCount: 5),
-            makeSession(id: "change",    lastActive: 200, messageCount: 6),
-            makeSession(id: "brand_new", lastActive: 300),
-        ]
-        let diff = try await engine.diffSessionList(live)
-        XCTAssertTrue(diff.unchanged.contains(where: { $0.id == "keep" }))
-        XCTAssertTrue(diff.dirty.contains(where: { $0.id == "change" }))
-        XCTAssertTrue(diff.added.contains(where: { $0.id == "brand_new" }))
-        XCTAssertTrue(diff.removed.contains("drop"))
-    }
-}
-
-// MARK: - Broadcast Frame Tests
-
-final class SyncEngineBroadcastTests: XCTestCase {
-
-    func testMessageCompleteMarksDirty() async throws {
-        let store = try makeInMemoryStore()
-        let engine = SyncEngine(
-            cache: store,
-            listFetcher: MockListFetcher(),
-            transcriptFetcher: MockTranscriptFetcher(),
-            scope: testScope
-        )
-        await engine.applyBroadcastFrame(.messageComplete(sessionId: "sess99"))
-        let dirty = await engine.isDirty("sess99")
-        XCTAssertTrue(dirty)
-    }
-
-    func testMessageDeltaIsIgnored() async throws {
-        let store = try makeInMemoryStore()
-        let engine = SyncEngine(
-            cache: store,
-            listFetcher: MockListFetcher(),
-            transcriptFetcher: MockTranscriptFetcher(),
-            scope: testScope
-        )
-        await engine.applyBroadcastFrame(.messageDelta)
-        let snapshot = await engine.dirtySnapshot()
-        XCTAssertTrue(snapshot.isEmpty)
-    }
-}
-
-// MARK: - Eviction Throttle Tests
-
-final class SyncEngineEvictionThrottleTests: XCTestCase {
 
     func testEvictionThrottledAfterRecentRun() async throws {
         let store = try makeInMemoryStore()
-        let engine = SyncEngine(
-            cache: store,
-            listFetcher: MockListFetcher(),
-            transcriptFetcher: MockTranscriptFetcher(),
-            scope: testScope
-        )
 
-        // First run stamps the timestamp
-        try await engine.runEvictionIfNeeded()
-        let first = try await store.readMeta(SyncMetaRecord.Key.evictionLastRunAt)
-        XCTAssertNotNil(first)
-
-        // Stamp a "just ran" time so the second call is throttled
+        // Stamp a "just ran" time so the next call is throttled.
         let justNow = String(Date().timeIntervalSince1970)
         try await store.writeMeta(SyncMetaRecord.Key.evictionLastRunAt, value: justNow)
 
-        // Second call should be a no-op (throttled); lastRunAt unchanged
-        try await engine.runEvictionIfNeeded()
-        let second = try await store.readMeta(SyncMetaRecord.Key.evictionLastRunAt)
-        XCTAssertEqual(second, justNow, "Throttled: second run must not overwrite the timestamp")
+        // The throttled call is a no-op and must not overwrite the timestamp.
+        let evicted = try await store.evictStaleTranscriptsIfNeeded()
+        XCTAssertEqual(evicted, 0, "A throttled run evicts nothing")
+        let after = try await store.readMeta(SyncMetaRecord.Key.evictionLastRunAt)
+        XCTAssertEqual(after, justNow, "Throttled: second run must not overwrite the timestamp")
+    }
+
+    func testEvictionRunsAfter24h() async throws {
+        let store = try makeInMemoryStore()
+        // Seed an OLD (non-pinned, stale) session whose transcript should evict.
+        try await store.saveSessionList(
+            [makeSession(id: "ancient", lastActive: 1)], scope: testScope)
+        try await store.saveTranscript(
+            sessionId: "ancient",
+            messages: [makeStoredMessage(content: "old")])
+        let hadAncient = try await store.hasTranscript("ancient")
+        XCTAssertTrue(hadAncient)
+
+        // Stamp lastRunAt to >24h ago so the throttle lets the sweep proceed.
+        let twoDaysAgo = String(Date().timeIntervalSince1970 - 2 * 86400)
+        try await store.writeMeta(SyncMetaRecord.Key.evictionLastRunAt, value: twoDaysAgo)
+
+        let evicted = try await store.evictStaleTranscriptsIfNeeded(horizonDays: 365)
+        XCTAssertEqual(evicted, 1, "A >24h-old throttle window must let the sweep run")
+        let hasAncient = try await store.hasTranscript("ancient")
+        XCTAssertFalse(hasAncient, "The stale transcript body is evicted")
     }
 }
 
-// MARK: - Lazy Transcript Tests
+// MARK: - Transcript freshness (WhatsApp bar prefetch skip-gate)
 
-final class SyncEngineEnsureTranscriptTests: XCTestCase {
+final class CacheTranscriptFreshnessTests: XCTestCase {
 
-    func testEnsureTranscriptFetchesAndCachesOnFirstCall() async throws {
+    func testFreshWhenCachedAfterLastActive() async throws {
         let store = try makeInMemoryStore()
-        try await store.saveSessionList([makeSession(id: "et1")], scope: testScope)
-
-        let txFetcher = MockTranscriptFetcher()
-        txFetcher.messages = [makeStoredMessage(role: "user", content: "cached content")]
-
-        let engine = SyncEngine(
-            cache: store,
-            listFetcher: MockListFetcher(),
-            transcriptFetcher: txFetcher,
-            scope: testScope
-        )
-        let messages = try await engine.ensureTranscript(sessionId: "et1")
-
-        XCTAssertEqual(messages.count, 1)
-        XCTAssertEqual(messages[0].content, .string("cached content"))
-        let hasEt1 = try await store.hasTranscript("et1")
-        XCTAssertTrue(hasEt1)
+        try await store.saveSessionList(
+            [makeSession(id: "f1", lastActive: 100)], scope: testScope)
+        // saveTranscript stamps transcriptCachedAt = now (>> 100), so it is fresh.
+        try await store.saveTranscript(
+            sessionId: "f1", messages: [makeStoredMessage()])
+        let fresh = try await store.transcriptIsFresh("f1", lastActive: 100)
+        XCTAssertTrue(fresh)
     }
 
-    func testEnsureTranscriptReturnsCachedWithoutFetchWhenClean() async throws {
+    func testStaleWhenLastActiveAdvancedPastCache() async throws {
         let store = try makeInMemoryStore()
-        try await store.saveSessionList([makeSession(id: "et2")], scope: testScope)
-
-        let stale = MockTranscriptFetcher()
-        stale.messages = [makeStoredMessage(role: "assistant", content: "stale")]
-        let seedEngine = SyncEngine(
-            cache: store,
-            listFetcher: MockListFetcher(),
-            transcriptFetcher: stale,
-            scope: testScope
-        )
-        _ = try await seedEngine.ensureTranscript(sessionId: "et2")
-
-        // A fresh engine with different content — NOT dirty, so cache wins
-        let fresh = MockTranscriptFetcher()
-        fresh.messages = [makeStoredMessage(role: "assistant", content: "fresh")]
-        let engine = SyncEngine(cache: store, listFetcher: MockListFetcher(), transcriptFetcher: fresh, scope: testScope)
-
-        let messages = try await engine.ensureTranscript(sessionId: "et2")
-        XCTAssertEqual(messages[0].content, .string("stale"),
-                       "Clean cache must be served without hitting the network")
+        try await store.saveSessionList(
+            [makeSession(id: "f2", lastActive: 1)], scope: testScope)
+        try await store.saveTranscript(
+            sessionId: "f2", messages: [makeStoredMessage()])
+        // A NEW turn lands far in the future, after the cache stamp → stale.
+        let future = Date().timeIntervalSince1970 + 10_000
+        let fresh = try await store.transcriptIsFresh("f2", lastActive: future)
+        XCTAssertFalse(fresh)
     }
 
-    func testEnsureTranscriptRefetchesWhenDirty() async throws {
+    func testNotFreshWhenNoTranscript() async throws {
         let store = try makeInMemoryStore()
-        try await store.saveSessionList([makeSession(id: "et3")], scope: testScope)
+        try await store.saveSessionList(
+            [makeSession(id: "f3", lastActive: 100)], scope: testScope)
+        // Session row exists but no transcript was ever cached.
+        let fresh = try await store.transcriptIsFresh("f3", lastActive: 100)
+        XCTAssertFalse(fresh)
+    }
 
-        let stale = MockTranscriptFetcher()
-        stale.messages = [makeStoredMessage(role: "assistant", content: "stale")]
-        let seedEngine = SyncEngine(
-            cache: store,
-            listFetcher: MockListFetcher(),
-            transcriptFetcher: stale,
-            scope: testScope
-        )
-        _ = try await seedEngine.ensureTranscript(sessionId: "et3")
-
-        // Now set up fresh engine AND mark dirty
-        let fresh = MockTranscriptFetcher()
-        fresh.messages = [makeStoredMessage(role: "assistant", content: "updated")]
-        let engine = SyncEngine(cache: store, listFetcher: MockListFetcher(), transcriptFetcher: fresh, scope: testScope)
-        await engine.markDirty("et3")
-
-        let messages = try await engine.ensureTranscript(sessionId: "et3")
-        XCTAssertEqual(messages[0].content, .string("updated"),
-                       "Dirty session must re-fetch from the gateway")
+    func testNilLastActiveFallsBackToHasTranscript() async throws {
+        let store = try makeInMemoryStore()
+        try await store.saveSessionList(
+            [makeSession(id: "f4", lastActive: nil)], scope: testScope)
+        try await store.saveTranscript(
+            sessionId: "f4", messages: [makeStoredMessage()])
+        // Can't prove staleness without lastActive → "has any transcript" wins.
+        let fresh = try await store.transcriptIsFresh("f4", lastActive: nil)
+        XCTAssertTrue(fresh)
     }
 }
 

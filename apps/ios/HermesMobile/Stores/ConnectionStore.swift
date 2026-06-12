@@ -413,6 +413,34 @@ final class ConnectionStore {
     /// `.needsSetup` → `WelcomeView`. (ABH-82 follow-up.)
     private(set) var isBootstrapping = false
 
+    /// True when this install has a SAVED connection configuration — a previously-
+    /// paired user. Read by `RootView` so the CACHE-FIRST shell (WhatsApp bar)
+    /// renders for a paired user in `.offline`/`.connecting`/`.reconnecting` even
+    /// after `isBootstrapping` has cleared (the cold-launch-offline window the old
+    /// `hasConnected || isBootstrapping` gate dropped to `WelcomeView`).
+    ///
+    /// The signal is the persisted server URL: `configure()` writes it to
+    /// UserDefaults ONLY after a verified connection, so a genuinely-unconfigured
+    /// install (or one whose only `configure` attempt FAILED validation — nothing
+    /// persisted) reports `false` and still routes to `WelcomeView`. The in-memory
+    /// `serverURLString` is the cache-first early-set fallback (set in
+    /// `paintCacheFirst` before any persistence) so the gate holds during the very
+    /// first launch frames too. A deliberate `disconnect()` clears the persisted
+    /// URL elsewhere? — no: `disconnect()` returns to `.needsSetup`, which routes
+    /// to `WelcomeView` directly, so this gate is never consulted there.
+    var hasSavedConfiguration: Bool {
+        if let saved = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL),
+           !saved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return true
+        }
+        // Cache-first early-set (pre-persistence) fallback — set by
+        // `paintCacheFirst` from the saved/dev-env URL before `configure()`
+        // persists. A failed `configure()` never reaches this set with a value
+        // that outlives the launch (it returns early before any non-bootstrap
+        // path), so a garbage manual entry does not spuriously flip the gate.
+        return !serverURLString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     init(sessionStore: SessionStore, chatStore: ChatStore) {
         self.sessionStore = sessionStore
         self.chatStore = chatStore
@@ -434,6 +462,13 @@ final class ConnectionStore {
             // window so the shell shows the splash rather than `WelcomeView` even
             // while the reconnect is still in flight (ABH-82 follow-up).
             isBootstrapping = true
+            // CACHE-FIRST (WhatsApp bar): bind the cache scope to this server and
+            // paint the drawer from disk BEFORE the REST probe, so the session
+            // list renders instantly regardless of whether the probe succeeds,
+            // fails, or hangs. `serverURLString` is what `currentCacheScope`
+            // resolves from, so it must be set before the paint — the later
+            // `configure()` re-stamps it (trimmed) verbatim on a verified connect.
+            await paintCacheFirst(serverURLString: url)
             _ = await configure(urlString: url, token: token)
             isBootstrapping = false
             return
@@ -444,12 +479,36 @@ final class ConnectionStore {
         if let savedURL, !savedURL.isEmpty,
            let token = KeychainService.loadToken(server: savedURL) {
             isBootstrapping = true
+            // CACHE-FIRST (WhatsApp bar): paint the drawer from disk BEFORE the
+            // REST probe — this is the fix for the empty-drawer / Welcome-on-
+            // offline cold start. The probe's early-return offline path no longer
+            // strands an empty drawer because the cache read already ran here.
+            await paintCacheFirst(serverURLString: savedURL)
             _ = await configure(urlString: savedURL, token: token)
             isBootstrapping = false
             return
         }
 
         phase = .needsSetup
+    }
+
+    /// Bind the session cache scope to `serverURLString` and paint the drawer from
+    /// the local cache (WhatsApp bar — cache-first launch).
+    ///
+    /// `serverURLString` drives `SessionStore.currentCacheScope`; it is set HERE
+    /// (trimmed, matching the Keychain/cache identity) so the cold read partitions
+    /// correctly before any network call. `configure()` re-stamps the SAME trimmed
+    /// value on a verified connection, so this early set is consistent with the
+    /// post-connect state and is harmless if the connection later fails (the saved
+    /// URL is the one the cache was written under). The paint itself is idempotent
+    /// (`didColdReadCache`-latched), so the `refresh()` inside hydration collapses
+    /// onto this same read rather than doing a second one.
+    private func paintCacheFirst(serverURLString url: String) async {
+        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Only the cache-scope identity is set here — NOT the persisted credential
+        // (configure() still owns persistence after a verified connect).
+        self.serverURLString = trimmed
+        await sessionStore.paintFromCache()
     }
 
     // MARK: - Configure
@@ -648,6 +707,14 @@ final class ConnectionStore {
         if activeModelName == nil {
             Task { [weak self] in await self?.refreshActiveModel() }
         }
+        // CACHE-FIRST coverage (WhatsApp bar): hydration has settled and the
+        // session list is populated — warm the top-N recent transcripts in the
+        // background so nearly every subsequent drawer tap is a disk hit. Paced +
+        // cancellable; a no-op when offline (no REST client) or on a cold cache.
+        sessionStore.prefetchRecentTranscripts()
+        // Hygiene (WhatsApp bar): run the daily-throttled eviction sweep so the
+        // cache never grows unbounded. Self-throttled to once/24h in CacheStore.
+        sessionStore.runEvictionIfNeeded()
     }
 
     // MARK: - Disconnect
@@ -681,6 +748,9 @@ final class ConnectionStore {
         activeModelName = nil
         // Clear the per-session hot-swap state so the next session starts clean.
         clearSessionState()
+        // CACHE-FIRST coverage (WhatsApp bar): stop any paced background prefetch
+        // so it never outlives the connection it ran under.
+        sessionStore.cancelPrefetch()
         // Finalize any in-flight stream explicitly and SYNCHRONOUSLY (R1
         // #9/#42), before the teardown await opens a suspension window. The
         // live state observer will also see the `.closed` transition below and
@@ -1173,6 +1243,9 @@ final class ConnectionStore {
             }
         }
         await sessionStore.refresh()
+        // CACHE-FIRST coverage (WhatsApp bar): re-warm the recent transcripts now
+        // the list is current again — covers sessions that moved while offline.
+        sessionStore.prefetchRecentTranscripts()
     }
 
     // MARK: - Scene phase
@@ -1184,10 +1257,15 @@ final class ConnectionStore {
     /// IMMEDIATE reconnect attempt — the client must not sit in a multi-second
     /// backoff window while the user is staring at the screen. Then always
     /// backfill the transcript over REST to re-sync with other clients.
-    /// `.background`/`.inactive`: no-op — the socket may be killed and we recover
-    /// on the next foreground.
+    /// `.background`/`.inactive`: cancel the paced transcript prefetch (WhatsApp
+    /// bar) so it doesn't run against a socket iOS is about to kill; otherwise a
+    /// no-op — the socket may be killed and we recover on the next foreground.
     func handleScenePhase(_ scenePhase: ScenePhase) {
-        guard scenePhase == .active else { return }
+        guard scenePhase == .active else {
+            // Leaving the foreground: stop any in-flight prefetch sweep.
+            sessionStore.cancelPrefetch()
+            return
+        }
         guard hasConnected else { return }
 
         Task { [weak self] in

@@ -148,6 +148,26 @@ actor CacheStore {
         }
     }
 
+    /// Whether the cached transcript for `sessionId` is FRESH relative to the
+    /// session's `lastActive` — i.e. a transcript exists AND it was cached at or
+    /// after the session's most recent activity. Used by the WhatsApp-bar
+    /// prefetch to SKIP sessions whose disk copy is already current (so a warm
+    /// cache costs zero network), while still re-fetching a session whose
+    /// `lastActive` advanced since it was cached (a new turn landed elsewhere).
+    ///
+    /// `lastActive == nil` (the WS RPC shape omits it) ⇒ falls back to "has any
+    /// cached transcript" (can't prove staleness, so don't re-fetch needlessly).
+    func transcriptIsFresh(_ sessionId: String, lastActive: Double?) throws -> Bool {
+        try db.read { db in
+            guard let record = try SessionCacheRecord.fetchOne(db, key: sessionId),
+                  let cachedAt = record.transcriptCachedAt else {
+                return false
+            }
+            guard let lastActive else { return true }
+            return cachedAt >= lastActive
+        }
+    }
+
     /// Load the cached transcript for `sessionId` as an ordered array of
     /// StoredMessage values (sorted by ordinal ASC). Returns nil if no rows
     /// exist. The caller reconstructs [ChatMessage] via toChatMessages.
@@ -302,6 +322,28 @@ actor CacheStore {
 
             return staleIds.count
         }
+    }
+
+    /// Run the eviction sweep if it hasn't run in the last 24 hours (WhatsApp bar
+    /// hygiene). Safe to call on every connect; internally throttled via the
+    /// `eviction.lastRunAt` sync_meta key. Returns the count of sessions whose
+    /// transcripts were evicted (0 when throttled or nothing was stale).
+    ///
+    /// This inlines the throttle that previously lived only in the never-wired
+    /// `SyncEngine.runEvictionIfNeeded`, so eviction now actually runs — no dead
+    /// code, no extra fetcher dependencies.
+    @discardableResult
+    func evictStaleTranscriptsIfNeeded(horizonDays: Int = 365) throws -> Int {
+        let oneDayAgo = Date().timeIntervalSince1970 - 86400
+        if let raw = try readMeta(SyncMetaRecord.Key.evictionLastRunAt),
+           let lastRun = Double(raw),
+           lastRun > oneDayAgo {
+            return 0  // Ran recently; skip.
+        }
+        let evicted = try evictStaleTranscripts(horizonDays: horizonDays)
+        let now = String(Date().timeIntervalSince1970)
+        try writeMeta(SyncMetaRecord.Key.evictionLastRunAt, value: now)
+        return evicted
     }
 
     // MARK: - Sync meta

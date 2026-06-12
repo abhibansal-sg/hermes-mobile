@@ -167,14 +167,20 @@ final class ConnectionPhaseTests: XCTestCase {
         XCTAssertEqual(connection.phase, .offline("Missing token"))
     }
 
-    // MARK: - P0 validation-bypass gate (ABH-82 follow-up)
+    // MARK: - P0 validation-bypass gate (ABH-82 follow-up + WhatsApp-bar cache-first)
     //
     // The reported bug: garbage URL/token entered on the manual sheet (or a
     // garbage QR) transitioned the app INTO the main UI in a disconnected state.
     // Root cause was `RootView` routing `.offline` → `mainUI` unconditionally.
-    // `RootView` now gates the shell on `hasConnected || isBootstrapping`; these
-    // tests pin the store-side discriminators that gate proves on, plus the
-    // end-to-end "failed configure never sets hasConnected" guarantee.
+    // `RootView` now gates the shell on
+    //   `hasConnected || isBootstrapping || hasSavedConfiguration`
+    // (the third condition is the CACHE-FIRST addition: a previously-paired user
+    // launching offline gets the cached drawer + ribbon instead of WelcomeView).
+    // These tests pin the store-side discriminators the gate proves on, plus the
+    // end-to-end "failed configure never sets hasConnected / hasSavedConfiguration"
+    // guarantee — a garbage configure persists nothing, so ALL THREE stay false and
+    // the user remains in onboarding. (The `hasSavedConfiguration` discriminator is
+    // exercised directly in CacheFirstLaunchTests.)
 
     func testFreshStoreHasNotConnectedAndIsNotBootstrapping() {
         // The clean first-run state the `RootView` gate reads: a brand-new store

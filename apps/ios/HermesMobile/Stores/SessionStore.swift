@@ -1,6 +1,11 @@
 import Foundation
 #if DEBUG
+import os
 import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-G)
+
+/// DEBUG-only logger for SessionStore open→painted latency instrumentation
+/// (WhatsApp bar). Absent in Release.
+private let sessionLog = Logger(subsystem: "ai.hermes.HermesMobile", category: "SessionStore")
 #endif
 
 /// Observable owner of the session list and the active-session pointers.
@@ -446,6 +451,11 @@ final class SessionStore {
     /// Debounce handle for `.searchable` input → search fetch.
     private var searchTask: Task<Void, Never>?
 
+    /// In-flight transcript prefetch sweep (WhatsApp bar — coverage). Cancelled on
+    /// disconnect/background so a paced background fetch never outlives the
+    /// connection it was started under. At most one sweep runs at a time.
+    private var prefetchTask: Task<Void, Never>?
+
     init() {
         let defaults = UserDefaults.standard
         if let stored = defaults.array(forKey: DefaultsKeys.pinnedSessions) as? [String] {
@@ -660,6 +670,161 @@ final class SessionStore {
         return SessionSummary.basename(of: key) ?? key
     }
 
+    // MARK: - Cache-first paint (WhatsApp bar)
+
+    /// CACHE-FIRST cold read: paint `sessions` from the local cache, UNCONDITIONALLY
+    /// of connection state, so the drawer renders from disk the instant the app
+    /// launches — exactly as WhatsApp shows the chat list before any network round
+    /// trip. Lifted out of ``refresh()`` (where it only ran once a `refresh()` was
+    /// reached, which the offline-launch early-return path NEVER did — the empty-
+    /// drawer hole) so it can be driven directly from `ConnectionStore.bootstrap()`
+    /// BEFORE the REST probe.
+    ///
+    /// Idempotent and self-gating, preserving the exact `didColdReadCache`
+    /// semantics the network merge relies on:
+    ///   - fires at most once per (server) binding — the `didColdReadCache` latch;
+    ///   - paints ONLY while `sessions` is still empty, so a warm in-memory list
+    ///     (or a network refresh that already populated it) is never clobbered by a
+    ///     disk snapshot;
+    ///   - records `lastColdReadServerId` so a later SERVER switch is detected at
+    ///     the top of `refresh()` (the clear-other-servers policy).
+    ///
+    /// No cache (tests/previews) or no scope yet (unconfigured) ⇒ a no-op, so the
+    /// network-only path stays byte-identical to today. Safe to call repeatedly:
+    /// `refresh()` still calls it on every invocation, and `bootstrap()` calls it
+    /// once up front — the latch collapses both to a single disk read.
+    func paintFromCache() async {
+        guard !didColdReadCache else { return }
+        didColdReadCache = true
+        if sessions.isEmpty, let cacheStore, let scope = currentCacheScope {
+            lastColdReadServerId = scope.serverId
+            if let cached = try? await cacheStore.loadSessionList(scope: scope), !cached.isEmpty {
+                // Re-check emptiness after the await: a concurrent network
+                // refresh may have populated the list while we were reading
+                // disk — never overwrite fresher server data with the cache.
+                if sessions.isEmpty {
+                    sessions = cached
+                    // The cold cache paint is a real first page for the
+                    // pagination cursors and the initial-fill fast-path.
+                    loadedCount = cached.count
+                    loadedOffset = cached.count
+                }
+            }
+        } else if let scope = currentCacheScope {
+            // Even when we skip the disk read (warm list already populated),
+            // record the server we're now bound to so a later server switch
+            // is detected.
+            lastColdReadServerId = scope.serverId
+        }
+    }
+
+    // MARK: - Transcript prefetch (WhatsApp bar — coverage)
+
+    /// How many most-recent non-cron sessions the post-hydration sweep warms.
+    private static let prefetchSessionCount = 30
+    /// Concurrency ceiling for the prefetch sweep — gentle pacing so it never
+    /// contends with a live turn or the user's own open. 3 in flight at a time.
+    private static let prefetchConcurrency = 3
+
+    /// Background-prefetch transcripts for the top ~30 most-recent non-cron
+    /// sessions so nearly every drawer tap is a DISK hit (cache-first open paints
+    /// instantly). Called after connect + hydration settles and after a reconnect.
+    ///
+    /// Discipline (per the WhatsApp-bar spec):
+    ///   - skips sessions already cached FRESH for their current `lastActive`
+    ///     (`CacheStore.transcriptIsFresh`), so a warm cache costs zero network;
+    ///   - skips cron sessions (never transcript-cached) and the actively-open one
+    ///     (its own open path owns the fetch);
+    ///   - paces at `prefetchConcurrency` (3) in flight, LOW priority;
+    ///   - cancels on disconnect/background via ``cancelPrefetch()``;
+    ///   - writes through the existing `saveTranscript` (cron-guarded in CacheStore).
+    ///
+    /// A no-op when there is no cache or no REST client (tests/previews/offline) —
+    /// purely additive coverage, never a correctness dependency. At most one sweep
+    /// runs at a time; a new call supersedes any in-flight sweep.
+    func prefetchRecentTranscripts() {
+        guard let cacheStore, let fetch = resolvedPrefetchFetch else { return }
+
+        // Snapshot the prefetch targets on the main actor (newest-first, non-cron,
+        // excluding the open session). `visibleSessions` already excludes cron and
+        // sorts by recency, so it is the right source. Map to a Sendable tuple so
+        // the detached sweep captures plain values, not SessionSummary state.
+        let openId = activeStoredId
+        let targets: [(id: String, lastActive: Double?)] = visibleSessions
+            .filter { $0.id != openId }
+            .prefix(Self.prefetchSessionCount)
+            .map { ($0.id, $0.lastActive) }
+        guard !targets.isEmpty else { return }
+
+        let concurrency = Self.prefetchConcurrency
+        prefetchTask?.cancel()
+        // The sweep captures only Sendable values: the `@Sendable` fetch closure,
+        // the `CacheStore` actor, and the (id, lastActive) tuples. No MainActor
+        // store state crosses the boundary, so it is Swift-6 strict-concurrency
+        // clean without hopping back per session.
+        prefetchTask = Task(priority: .utility) {
+            await withTaskGroup(of: Void.self) { group in
+                var inFlight = 0
+                for target in targets {
+                    if Task.isCancelled { break }
+                    // Skip a session whose disk copy is already current.
+                    if (try? await cacheStore.transcriptIsFresh(
+                        target.id, lastActive: target.lastActive)) == true {
+                        continue
+                    }
+                    if inFlight >= concurrency {
+                        await group.next()
+                        inFlight -= 1
+                    }
+                    let sessionId = target.id
+                    group.addTask(priority: .utility) {
+                        if Task.isCancelled { return }
+                        guard let stored = try? await fetch(sessionId) else { return }
+                        if Task.isCancelled { return }
+                        try? await cacheStore.saveTranscript(
+                            sessionId: sessionId, messages: stored)
+                    }
+                    inFlight += 1
+                }
+                await group.waitForAll()
+            }
+        }
+    }
+
+    /// Injectable `@Sendable` transcript fetch for the prefetch sweep (tests stage
+    /// a recorder without a live gateway). Distinct from ``transcriptFetch`` (the
+    /// open-path seam, MainActor-bound and non-Sendable) because the prefetch runs
+    /// in a detached task group where every captured value must be Sendable. `nil`
+    /// (default) resolves the live REST client below.
+    var prefetchFetch: (@Sendable (String) async throws -> [StoredMessage])?
+
+    /// The injected ``prefetchFetch``, or a `@Sendable` closure built from the live
+    /// `RestClient` (a Sendable value struct — safe to capture across the task-group
+    /// boundary). `nil` when unconfigured/offline, which makes the whole sweep a
+    /// no-op (purely additive coverage, never a correctness dependency).
+    private var resolvedPrefetchFetch: (@Sendable (String) async throws -> [StoredMessage])? {
+        if let prefetchFetch { return prefetchFetch }
+        guard let rest = connection?.rest else { return nil }
+        return { sessionId in try await rest.messages(sessionId: sessionId) }
+    }
+
+    /// Cancel any in-flight prefetch sweep (WhatsApp bar). Called on disconnect /
+    /// background so a paced background fetch never outlives its connection.
+    func cancelPrefetch() {
+        prefetchTask?.cancel()
+        prefetchTask = nil
+    }
+
+    /// Run the daily-throttled transcript eviction sweep (WhatsApp bar hygiene).
+    /// Fire-and-forget, OFF the UI path; CacheStore self-throttles to once/24h, so
+    /// this is safe to call on every connect. A no-op without a cache.
+    func runEvictionIfNeeded() {
+        guard let cacheStore else { return }
+        Task(priority: .utility) {
+            _ = try? await cacheStore.evictStaleTranscriptsIfNeeded()
+        }
+    }
+
     // MARK: - Listing
 
     /// Refresh the session list via `session.list` (limit 100).
@@ -716,29 +881,7 @@ final class SessionStore {
             didColdReadCache = false
         }
 
-        if !didColdReadCache {
-            didColdReadCache = true
-            if sessions.isEmpty, let cacheStore, let scope = currentCacheScope {
-                lastColdReadServerId = scope.serverId
-                if let cached = try? await cacheStore.loadSessionList(scope: scope), !cached.isEmpty {
-                    // Re-check emptiness after the await: a concurrent network
-                    // refresh may have populated the list while we were reading
-                    // disk — never overwrite fresher server data with the cache.
-                    if sessions.isEmpty {
-                        sessions = cached
-                        // The cold cache paint is a real first page for the
-                        // pagination cursors and the initial-fill fast-path.
-                        loadedCount = cached.count
-                        loadedOffset = cached.count
-                    }
-                }
-            } else if let scope = currentCacheScope {
-                // Even when we skip the disk read (warm list already populated),
-                // record the server we're now bound to so a later server switch
-                // is detected.
-                lastColdReadServerId = scope.serverId
-            }
-        }
+        await paintFromCache()
 
         // Bump and capture the token for this request. Any response that arrives
         // with a smaller captured value was superseded and is discarded.
@@ -1366,18 +1509,24 @@ final class SessionStore {
         // the switch (S2 dominant cost / ROOT B). Run it on the NEXT main-actor tick
         // instead: the spring's first frames render against the still-intact
         // (offscreen-displacing) OLD transcript rather than an emptied stack, and the
-        // teardown + seed land a tick later when the spring is already moving. The seed
-        // is dispatched FROM this deferred block, AFTER `reset()`, so reset always
-        // precedes the seed (no wipe race), and the whole block is guarded by
-        // `openToken` so a newer open()/draft that superseded this one in the same tick
-        // cancels the stale teardown+seed (R1 #28/#43 — the existing supersession gate).
+        // teardown + seed land a tick later when the spring is already moving. The
+        // whole block is guarded by `openToken` so a newer open()/draft that
+        // superseded this one in the same tick cancels the stale teardown+seed
+        // (R1 #28/#43 — the existing supersession gate).
+        //
+        // CACHE-FIRST OPEN (WhatsApp bar — kills the white void): the cache read is
+        // now the FIRST operation, and for a CACHE HIT it seeds the cached content
+        // as a single in-place reconcile WITHOUT a preceding `reset()`. So the first
+        // painted frame of the new session is the cached transcript — never the
+        // empty stack the old `reset()`-then-seed ordering flashed (the open-race
+        // that, combined with the network fetch, produced the 2.5–4s white void).
+        // For a CACHE MISS the transcript IS reset to empty (so a stale prior
+        // session's rows can't linger), which is the state ChatView renders as the
+        // skeleton/placeholder until the network seed lands. The deferred network
+        // fetch then reconciles in place over either starting point.
         Task { [weak self] in
             guard let self, self.openToken == token else { return }
-            self.chat?.reset()
-            // Fast path: the stored transcript over REST (local-network quick).
-            // Threads the open token so a fetch outlived by a newer open()/draft
-            // can never seed over the newer session's transcript (R1 #28).
-            await self.seedTranscript(storedId: summary.id, token: token)
+            await self.seedTranscriptCacheFirst(storedId: summary.id, token: token)
         }
 
         // Slow path: gateway resume — spins up the agent server-side; only
@@ -2105,31 +2254,37 @@ final class SessionStore {
     /// live `connection?.rest` lazily on each call.
     var transcriptFetch: ((String) async throws -> [StoredMessage])?
 
-    /// Load full history over REST and seed it into the chat transcript.
+    /// CACHE-FIRST session open (WhatsApp bar — kills the white void).
     ///
-    /// `token` is the ``openToken`` captured by the `open()` that started this
-    /// seed. It is re-checked AFTER the REST await (R1 #28/#43): a newer
-    /// `open()`/`startDraft()` may have activated a different session while
-    /// the fetch was in flight, and the stale result — fast-path or
-    /// compression-chain-tip alike — must be dropped, never seeded over the
-    /// newer session's transcript.
-    private func seedTranscript(storedId: String?, token: UUID) async {
+    /// The cold-open seed for ``open(_:)``. It reads the local cache FIRST and:
+    ///   - CACHE HIT → seeds the cached transcript as a single in-place reconcile
+    ///     with NO preceding `reset()`, so the cached content is the FIRST painted
+    ///     frame of the new session (no empty-stack flash — the open-race that fed
+    ///     the 2.5–4s white void). The drawer-close spring renders against the
+    ///     displaced old transcript, then snaps to the cached content atomically.
+    ///   - CACHE MISS → `reset()`s to an empty transcript (so a stale prior
+    ///     session's rows can't linger), which ChatView renders as the
+    ///     theme-consistent skeleton until the network seed lands. NEVER white.
+    ///
+    /// Then it runs the network fetch and reconciles in place over either starting
+    /// point (identity-preserving — no remount, no flicker). `token` is the
+    /// ``openToken`` re-checked after every await so a newer open/draft supersedes
+    /// a stale seed (R1 #28/#43).
+    private func seedTranscriptCacheFirst(storedId: String, token: UUID) async {
         guard let chat else { return }
-        guard let storedId, let fetch = resolvedTranscriptFetch else {
-            chat.reset()
-            return
-        }
 
-        // P3 warm-open read-through: SEED the transcript from the local cache
-        // FIRST — before the (remote-Tailscale) REST fetch — so the chat paints
-        // instantly from disk on open. This is the earliest seed in the open
-        // path: it runs ahead of the network round-trip so `ChatStore.seed` /
-        // `transcriptGeneration` fire with cached content present, and the later
-        // live fetch reconciles in place via the existing `reconcileMessages`
-        // (identity-preserving — no remount, no flicker). The cron-only sessions
-        // are never transcript-cached (CacheStore guards the write), so this read
-        // simply misses for them and the live fetch is the sole seed. No cache
-        // (tests/previews) ⇒ skipped, network-only path unchanged byte-for-byte.
+        #if DEBUG
+        // OPEN→PAINTED LATENCY instrumentation (WhatsApp bar): measure where the
+        // open cost goes — disk read vs REST round-trip vs paint — so the 2.5–4s
+        // white void is quantified, not guessed. DEBUG-only; absent in Release.
+        let openClock = ContinuousClock.now
+        #endif
+
+        // Phase 1 — cache paint (or reset on miss). The cron-only sessions are
+        // never transcript-cached (CacheStore guards the write), so this misses
+        // for them and the network fetch is the sole seed. No cache (tests/
+        // previews) ⇒ treated as a miss (reset), network-only path preserved.
+        var paintedFromCache = false
         if let cacheStore {
             // `touchSession` bumps `lastAccessedAt` so an actively-opened session
             // never ages out of the eviction horizon.
@@ -2139,6 +2294,78 @@ final class SessionStore {
                openToken == token,
                let cached = try? await cacheStore.loadTranscript(storedId),
                openToken == token {          // re-check after every await
+                chat.seed(from: cached)      // in-place reconcile — FIRST frame
+                paintedFromCache = true
+            }
+        }
+        if !paintedFromCache, openToken == token {
+            // Cache miss (or no cache): empty the transcript so ChatView shows the
+            // skeleton, not a stale prior session's rows, while the network loads.
+            chat.reset()
+        }
+        #if DEBUG
+        Self.logOpenLatency(
+            phase: paintedFromCache ? "cache-paint(HIT)" : "cache-miss(reset)",
+            storedId: storedId, since: openClock)
+        #endif
+
+        // Phase 2 — authoritative network seed, reconciled in place.
+        guard let fetch = resolvedTranscriptFetch else { return }
+        do {
+            let stored = try await fetch(storedId)
+            guard openToken == token else { return }  // superseded (R1 #28/#43)
+            chat.seed(from: stored)
+            #if DEBUG
+            Self.logOpenLatency(
+                phase: "network-painted", storedId: storedId, since: openClock)
+            #endif
+            // P3 write-through: persist the freshly-fetched transcript so the
+            // next open paints it from disk. Fire-and-forget, OFF the UI path.
+            if let cacheStore {
+                Task { try? await cacheStore.saveTranscript(sessionId: storedId, messages: stored) }
+            }
+        } catch {
+            guard openToken == token else { return }  // superseded (R1 #28/#43)
+            // History fetch failed. If the cache already painted, KEEP it (offline-
+            // with-cache is a fully usable read) and stay silent. Only an EMPTY
+            // transcript needs the recoverable error state — never an infinite
+            // "Loading…" spinner (R1 #79).
+            if !paintedFromCache {
+                chat.reset()
+                let description = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                chat.noteTranscriptLoadFailure(description)
+            }
+        }
+    }
+
+    /// Load full history over REST and seed it into the chat transcript.
+    ///
+    /// The compression-chain-tip seed (a resume that projected onto a newer
+    /// continuation) reuses this: it reconciles cache-then-network in place over
+    /// whatever ``seedTranscriptCacheFirst`` already painted for the original id,
+    /// so there is no `reset()` here — `seed(from:)` is identity-preserving.
+    ///
+    /// `token` is the ``openToken`` re-checked AFTER the REST await (R1 #28/#43):
+    /// a newer `open()`/`startDraft()` may have activated a different session while
+    /// the fetch was in flight, and the stale result must be dropped.
+    private func seedTranscript(storedId: String?, token: UUID) async {
+        guard let chat else { return }
+        guard let storedId, let fetch = resolvedTranscriptFetch else {
+            chat.reset()
+            return
+        }
+
+        // Cache read-through first (identical to the cold-open phase 1, minus the
+        // reset-on-miss: a chain-tip seed reconciles over already-painted content,
+        // so a miss simply leaves it for the network fetch below).
+        if let cacheStore {
+            try? await cacheStore.touchSession(storedId)
+            if openToken == token,
+               (try? await cacheStore.hasTranscript(storedId)) == true,
+               openToken == token,
+               let cached = try? await cacheStore.loadTranscript(storedId),
+               openToken == token {
                 chat.seed(from: cached)
             }
         }
@@ -2147,13 +2374,6 @@ final class SessionStore {
             let stored = try await fetch(storedId)
             guard openToken == token else { return }  // superseded (R1 #28/#43)
             chat.seed(from: stored)
-            // P3 write-through: persist the freshly-fetched transcript so the
-            // next open paints it from disk. Fire-and-forget, OFF the UI path.
-            // CacheStore no-ops for cron sessions (cron is never transcript
-            // cached, per the decided scope). `wireIds` is nil: the wire `id`
-            // global cursor is not parsed into `StoredMessage`, so v1
-            // (full-fetch-diff) leaves `maxMessageId` nil — the cursor is only
-            // consumed by the OUT-OF-CONTRACT v2 delta path.
             if let cacheStore {
                 Task { try? await cacheStore.saveTranscript(sessionId: storedId, messages: stored) }
             }
@@ -2169,6 +2389,22 @@ final class SessionStore {
             chat.noteTranscriptLoadFailure(description)
         }
     }
+
+    #if DEBUG
+    /// DEBUG-only open→painted latency log (WhatsApp bar instrumentation). Emits
+    /// one line per phase so the device console reveals where the open cost lives
+    /// (disk read vs REST round-trip vs paint). Never compiled into Release.
+    private static func logOpenLatency(
+        phase: String, storedId: String, since start: ContinuousClock.Instant
+    ) {
+        let d = ContinuousClock.now - start
+        let comps = d.components
+        let ms = Double(comps.seconds) * 1000
+            + Double(comps.attoseconds) / 1_000_000_000_000_000
+        sessionLog.debug(
+            "open-latency \(phase, privacy: .public) session=\(storedId, privacy: .public) +\(ms, format: .fixed(precision: 1))ms")
+    }
+    #endif
 
     /// The injected `transcriptFetch`, or the default that resolves the live
     /// REST client (mirrors `ChatStore.resolvedBackfillFetch`).

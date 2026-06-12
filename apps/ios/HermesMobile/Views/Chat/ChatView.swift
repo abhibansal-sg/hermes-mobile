@@ -616,10 +616,17 @@ struct ChatView: View {
                     }
                     .padding(.top, 40)
                 } else {
-                    // Transcript still seeding after an instant open.
-                    ProgressView("Loading conversation…")
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 80)
+                    // CACHE-MISS open (WhatsApp bar — never white): the transcript
+                    // is seeding from the network after an instant open with no
+                    // cached content. Render a theme-consistent skeleton (the same
+                    // static muted-bar design language as the drawer's
+                    // `sessionSkeletonRows`) instead of a bare spinner over a white
+                    // void — so a cache-miss open reads as "content arriving", not
+                    // a blank screen. A cache HIT never reaches here: the cached
+                    // transcript painted as the first frame.
+                    TranscriptSkeletonView(theme: theme)
+                        .padding(.top, 12)
+                        .accessibilityLabel("Loading conversation")
                 }
             }
             // TURN-AWARE SPACING (ABH-87 Batch D / contract §3.4, fixes D11):
