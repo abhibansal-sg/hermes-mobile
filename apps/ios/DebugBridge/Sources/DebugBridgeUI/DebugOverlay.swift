@@ -58,28 +58,40 @@ private struct OverlayRoot: View {
     @State private var phase: CGFloat = 0
     let recording: Bool
 
+    /// Perf-measurement opt-out: the animated AngularGradient border is a per-frame
+    /// conic-gradient screen-perimeter STROKE that, on the SIMULATOR's software CG
+    /// rasterizer, dominates the main thread (~84% in `argb32_shade_conic_RGB`)
+    /// during any scroll/stream. It is a DEBUG-bridge instrument and is absent from
+    /// Release (the user's TestFlight build) entirely. Set HERMES_NO_DEBUG_BORDER=1
+    /// so a perf harness that needs the bridge (to drive scrolls) does not have its
+    /// own measurement contaminated by the instrument's render cost.
+    private static let suppressBorder =
+        ProcessInfo.processInfo.environment["HERMES_NO_DEBUG_BORDER"] == "1"
+
     var body: some View {
         ZStack {
-            // Animated brand border
-            BorderShape()
-                .stroke(
-                    AngularGradient(
-                        gradient: Gradient(colors: [
-                            BrandColor.accent.opacity(0.0),
-                            BrandColor.accent.opacity(0.8),
-                            BrandColor.accent.opacity(0.0),
-                        ]),
-                        center: .center,
-                        angle: .degrees(phase * 360)
-                    ),
-                    lineWidth: 4
-                )
-                .ignoresSafeArea()
-                .onAppear {
-                    withAnimation(.linear(duration: 2.0).repeatForever(autoreverses: false)) {
-                        phase = 1.0
+            // Animated brand border (suppressible for clean perf measurement).
+            if !Self.suppressBorder {
+                BorderShape()
+                    .stroke(
+                        AngularGradient(
+                            gradient: Gradient(colors: [
+                                BrandColor.accent.opacity(0.0),
+                                BrandColor.accent.opacity(0.8),
+                                BrandColor.accent.opacity(0.0),
+                            ]),
+                            center: .center,
+                            angle: .degrees(phase * 360)
+                        ),
+                        lineWidth: 4
+                    )
+                    .ignoresSafeArea()
+                    .onAppear {
+                        withAnimation(.linear(duration: 2.0).repeatForever(autoreverses: false)) {
+                            phase = 1.0
+                        }
                     }
-                }
+            }
 
             // Attribution chip (top safe area)
             VStack {

@@ -1022,20 +1022,32 @@ struct ComposerCardSurface: ViewModifier {
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius)
+        #if DEBUG
+        // Round-2 conic-stroke hunt (see RenderCache.expNoGlass*).
+        if RenderCache.expNoGlass {
+            return AnyView(content
+                .background(theme.card, in: shape)
+                .shadow(color: .black.opacity(0.06), radius: 8, x: 0, y: 2))
+        }
+        #endif
         if #available(iOS 26.0, *) {
             // Untinted, touch-reactive glass clipped to the card silhouette. Glass
             // adapts to the active scheme; the forced-dark themes pin `.dark` at
             // their root (`hermesThemed`), so the glass renders dark and does not
             // fight the forced scheme.
-            content
-                .glassEffect(.regular.interactive(), in: shape)
+            #if DEBUG
+            let glass: Glass = RenderCache.expNoGlassInteractive ? .regular : .regular.interactive()
+            return AnyView(content.glassEffect(glass, in: shape))
+            #else
+            return AnyView(content.glassEffect(.regular.interactive(), in: shape))
+            #endif
         } else {
             // iOS 17–25 (and visionOS): the established solid composer card — the
             // same fill + shadow the card shipped with (the border stroke remains
             // the caller's focus-ring overlay).
-            content
+            return AnyView(content
                 .background(theme.card, in: shape)
-                .shadow(color: .black.opacity(0.06), radius: 8, x: 0, y: 2)
+                .shadow(color: .black.opacity(0.06), radius: 8, x: 0, y: 2))
         }
     }
 }
@@ -1069,12 +1081,22 @@ private struct ChipCapsuleSurface: ViewModifier {
     let theme: HermesTheme
 
     func body(content: Content) -> some View {
+        #if DEBUG
+        if RenderCache.expNoGlass {
+            return AnyView(content.background(theme.secondary, in: Capsule()))
+        }
+        #endif
         if #available(iOS 26.0, *) {
-            content
-                .glassEffect(.regular.tint(theme.secondary).interactive(), in: Capsule())
+            #if DEBUG
+            let glass: Glass = RenderCache.expNoGlassInteractive
+                ? .regular.tint(theme.secondary)
+                : .regular.tint(theme.secondary).interactive()
+            return AnyView(content.glassEffect(glass, in: Capsule()))
+            #else
+            return AnyView(content.glassEffect(.regular.tint(theme.secondary).interactive(), in: Capsule()))
+            #endif
         } else {
-            content
-                .background(theme.secondary, in: Capsule())
+            return AnyView(content.background(theme.secondary, in: Capsule()))
         }
     }
 }

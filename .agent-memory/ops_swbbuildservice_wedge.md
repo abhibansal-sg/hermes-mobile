@@ -59,3 +59,23 @@ to reboot rather than stack another frozen build. In Conductor's parallel-worktr
 model the concurrent-build trigger is easy to hit, so this wrapper is the standing
 guard — don't call `xcodebuild` for the app directly. See [[feedback_no_computer_use_for_sim]],
 [[project_hermes_mobile]], [[project_translation_app]].
+
+**MUTEX GAP — `xcodebuildmcp` bypasses the guard (recurred 2026-06-12):** During
+the round-2 iOS smoothness pass the wedge recurred even though my build went
+through `scripts/ios-build.sh`. Root: the script's mutex only serializes builds
+*that go through the script*. Other Conductor worktrees on this repo
+(`abh-88-depatch-w1`, `phase2-upstream-rebase`, `valencia`) had idle
+`xcodebuildmcp@latest mcp` servers (Codex-CLI MCP build servers) running; one of
+those (or Xcode.app) can issue a **direct `xcodebuild`** that races a script-driven
+build and wedges the shared SWBBuildService session-wide. Signature was textbook:
+two consecutive clean builds (a pre-existing one + my fresh retry) BOTH parked at
+`CreateBuildDescription` with `swift-frontend`=0, SWBBuildService at 0% CPU, 0
+compiles, for >4 min each. Both reaped cleanly via SIGTERM (TaskStop, never -9);
+the live dashboard on :9119 stayed HTTP-200 throughout. **Lesson:** the mutex is
+necessary but NOT sufficient — when ANY tool can call `xcodebuild` directly
+(xcodebuildmcp, a Codex session, Xcode.app), the only complete prevention is to
+ensure no other worktree/agent builds the app concurrently, OR to route every iOS
+build (incl. MCP servers) through the wrapper. Until then, a wedge is the user's
+reboot call. Fast detection: a Monitor until-loop that declares WEDGE after ~240s
+if `SWBBuildService>0 && swift-frontend==0 && compiles==0 && xcodebuild alive` —
+far cheaper than waiting out the full build timeout.

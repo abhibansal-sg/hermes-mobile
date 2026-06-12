@@ -765,6 +765,9 @@ struct ChatView: View {
         // rule), so they are NOT forced by the `.sizeChanges` role (which would yank
         // a reader who scrolled up). On iOS 17 the role API is unavailable, so the
         // transcript stays top-aligned and the imperative seed scroll lands the open.
+        // DEBUG conic-stroke hunt: optionally hide the iOS-26 gradient-stroked
+        // scroll indicator to attribute the per-frame conic-gradient render cost.
+        .perfScrollIndicators()
         .modifier(OpenOnNewestAnchor())
         // SCROLL P0 r2 — on-demand scroll to the true content bottom edge (pill /
         // streaming follow / session-switch landing). iOS 18+ uses
@@ -1996,7 +1999,16 @@ private struct TranscriptEdgeEffect: ViewModifier {
         // Custom mask is the SHIPPED look on every OS version — it is the only
         // path that delivers the tunable 135/150 pt eased band with a legible
         // header (see the type doc for the pixel-verified native rejection).
-        let masked = content.modifier(EdgeFadeMask(enabled: true))
+        //
+        // DEBUG experiment (round-2 scroll forensics): HERMES_EXP_NO_EDGEMASK=1
+        // disables the full-transcript `.mask` to measure how much the mask's
+        // per-frame offscreen re-rasterization of the scrolling content costs.
+        #if DEBUG
+        let maskEnabled = ProcessInfo.processInfo.environment["HERMES_EXP_NO_EDGEMASK"] != "1"
+        #else
+        let maskEnabled = true
+        #endif
+        let masked = content.modifier(EdgeFadeMask(enabled: maskEnabled))
         // Debug-only: opt IN to compositing native `.soft` for A/B re-testing.
         // Ships OFF; the mask alone is the production path.
         let nativeOn = ProcessInfo.processInfo.environment["HERMES_NATIVE_EDGE_ON"] == "1"

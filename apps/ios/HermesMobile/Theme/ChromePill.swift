@@ -42,6 +42,13 @@ struct ChromePillBackground<S: InsettableShape>: ViewModifier {
     let shape: S
 
     func body(content: Content) -> some View {
+        #if DEBUG
+        // Round-2 conic-stroke hunt: strip glass / interactivity to attribute the
+        // per-frame angular-gradient cost (see RenderCache.expNoGlass*).
+        if RenderCache.expNoGlass {
+            return AnyView(content.background(solidFallback))
+        }
+        #endif
         if #available(iOS 26.0, *) {
             // System Liquid Glass clipped to the pill silhouette. `.interactive()`
             // gives the touch-reactive shimmer the reference chrome has; we leave
@@ -50,12 +57,15 @@ struct ChromePillBackground<S: InsettableShape>: ViewModifier {
             // active color scheme — for the forced-dark themes (midnight, ember,
             // …) the root pins `.dark` via `hermesThemed`, so the glass renders in
             // dark mode and does not fight the forced scheme.
-            content
-                .glassEffect(.regular.interactive(), in: shape)
+            #if DEBUG
+            let glass: Glass = RenderCache.expNoGlassInteractive ? .regular : .regular.interactive()
+            return AnyView(content.glassEffect(glass, in: shape))
+            #else
+            return AnyView(content.glassEffect(.regular.interactive(), in: shape))
+            #endif
         } else {
             // iOS 17–25 (and visionOS): the established solid chrome.
-            content
-                .background(solidFallback)
+            return AnyView(content.background(solidFallback))
         }
     }
 

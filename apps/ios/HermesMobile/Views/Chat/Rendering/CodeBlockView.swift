@@ -27,16 +27,43 @@ struct CodeBlockView: View {
     @State private var measuredHeight: CGFloat = 0
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        #if DEBUG
+        if RenderCache.expNoCodeCardChrome {
+            // Conic-stroke hunt: strip ALL card chrome (bg fill + border stroke +
+            // divider) to attribute the per-frame conic-gradient cost.
+            return AnyView(VStack(alignment: .leading, spacing: 0) {
+                header
+                codeBody
+            })
+        }
+        #endif
+        return AnyView(VStack(alignment: .leading, spacing: 0) {
             header
             Divider().overlay(theme.border)
             codeBody
         }
-        .background(theme.codeBg, in: RoundedRectangle(cornerRadius: 12))
+        .background(theme.codeBg, in: cardShape)
         .overlay(
-            RoundedRectangle(cornerRadius: 12)
+            cardShape
                 .strokeBorder(theme.border, lineWidth: 1)
         )
+        .perfRasterizeCard())
+    }
+
+    /// The card's rounded-rect shape. The corner STYLE is the round-2 scroll
+    /// forensics lever: SwiftUI's default `RoundedRectangle(cornerRadius:)` uses
+    /// `.continuous` (squircle) corners, whose stroke antialiasing RenderBox
+    /// rasterizes via a per-pixel CONIC-GRADIENT coverage pass (`atan2f` per
+    /// pixel). That pass dominated the main thread during scroll. `.circular`
+    /// corners rasterize as cheap arcs. Default = circular; DEBUG
+    /// `HERMES_EXP_CONTINUOUS_CORNERS=1` restores the old continuous look for A/B.
+    private var cardShape: RoundedRectangle {
+        #if DEBUG
+        if RenderCache.expContinuousCorners {
+            return RoundedRectangle(cornerRadius: 12, style: .continuous)
+        }
+        #endif
+        return RoundedRectangle(cornerRadius: 12, style: .circular)
     }
 
     // MARK: - Header
@@ -103,7 +130,7 @@ struct CodeBlockView: View {
     private var codeBody: some View {
         ScrollView(.horizontal, showsIndicators: true) {
             Text(highlighted)
-                .textSelection(.enabled)
+                .perfTextSelection()
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
                 .fixedSize(horizontal: true, vertical: true)
@@ -118,10 +145,14 @@ struct CodeBlockView: View {
                     }
                 )
         }
+        .perfScrollIndicators()
         .frame(maxHeight: heightCap, alignment: .top)
-        .mask(RoundedRectangle(cornerRadius: 12).padding(.top, 0))
+        .perfClampClip()
         .onPreferenceChange(CodeHeightKey.self) { height in
-            measuredHeight = height
+            // Only publish a meaningfully-changed height. The measured natural
+            // height is stable once laid out; re-publishing the same value on
+            // every layout pass invalidated the view needlessly during scroll.
+            if abs(height - measuredHeight) > 0.5 { measuredHeight = height }
         }
         .overlay(alignment: .bottom) {
             if isClampable && !isExpanded {
@@ -151,7 +182,12 @@ struct CodeBlockView: View {
         if code.contains("\u{1B}") {
             return AnsiText.stripOrRender(code, baseColor: theme.fg)
         }
-        return SyntaxHighlighter.highlight(code, language: language, baseColor: theme.fg)
+        // Memoized highlight (RenderCache): `highlighted` is a computed property
+        // re-evaluated on every body pass, so a flick-scroll re-realizing this
+        // code block previously re-ran the full regex highlight from scratch.
+        // The cache keys on (code, language, baseColor) so a re-render of
+        // unchanged code is an O(1) lookup; a theme change yields a new key.
+        return RenderCache.highlight(code, language: language, baseColor: theme.fg)
     }
 
     /// True when the natural height exceeds the cap (so the toggle is useful).

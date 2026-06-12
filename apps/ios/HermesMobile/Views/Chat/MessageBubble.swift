@@ -218,11 +218,7 @@ struct MessageBubble: View {
                     .accessibilityHint("Double-tap to \(userBubbleExpanded ? "collapse message" : "expand message")")
                 }
             }
-            .background(theme.userBubble, in: RoundedRectangle(cornerRadius: 18))
-            .overlay(
-                RoundedRectangle(cornerRadius: 18)
-                    .strokeBorder(theme.userBubbleBorder, lineWidth: 1)
-            )
+            .modifier(PerfUserBubbleChrome())
             .frame(maxWidth: maxBubbleWidth, alignment: .trailing)
         }
     }
@@ -352,13 +348,11 @@ struct MessageBubble: View {
     /// stands alone when the streaming tail is a code block, so the code card
     /// never gets a stray glyph.
     private func assistantText(_ text: String, showsCursor: Bool) -> some View {
-        let segments = MessageSegmenter.segments(text)
-        let lastProseIndex = segments.lastIndex {
-            if case .prose = $0 { return true } else { return false }
-        }
-        let tailIsCode: Bool = {
-            if case .code = segments.last { return true } else { return false }
-        }()
+        // Memoized segmentation (RenderCache): a flick-scroll re-realizes this
+        // row without changing `text`, so the segment scan is an O(1) cache hit
+        // instead of an O(n) re-scan of the whole body. A streaming flush extends
+        // `text` → new key → fresh scan only for the genuinely-new content.
+        let segments = RenderCache.segments(text)
 
         return VStack(alignment: .leading, spacing: Self.segmentSpacing) {
             // POSITIONAL identity (release audit P1): keying on `\.element.id`
@@ -372,43 +366,35 @@ struct MessageBubble: View {
                 case .prose(let body):
                     // Serif applies ONLY to prose segments (F3 / Amendment E) —
                     // never code (`CodeBlockView`, mono) nor the streaming cursor
-                    // (its own `Text` keeps the system face). When the cursor
-                    // rides this segment it is concatenated as a separate run, so
-                    // the `.serif` design on this `Text` styles the prose run; the
-                    // cursor run carries its own non-serif font.
-                    let withCursor = index == lastProseIndex && showsCursor && !tailIsCode
-                    // CC-01: when the cursor rides this prose segment, animate the
-                    // combined Text's opacity so the trailing cursor glyph reads as
-                    // live. `cursorPulseOpacity` runs 0.25–1.0 (strong pulse).
-                    // Mapped to 0.74–1.0 on the prose block so the text stays fully
-                    // legible while the cursor glyph clearly breathes.
-                    (Text(Self.prose(body)).font(Self.proseFont)
-                        + (withCursor ? cursorText : Text("")))
+                    // (its own `Text` keeps the system face).
+                    //
+                    // CC-01 / round-2 ROOT D: the streaming cursor is NO LONGER an
+                    // animated `.opacity` on this prose `Text`. Previously the
+                    // riding-cursor case wrapped the (large, growing) prose block in
+                    // `.opacity(0.65 + cursorPulseOpacity*0.35)` driven by a 0.6s
+                    // `.repeatForever` animation — forcing SwiftUI to re-composite
+                    // the entire prose Text on every pulse frame AND on every flush.
+                    // The pulse is now lifted onto a SEPARATE standalone cursor
+                    // sibling (`cursorView`, appended after the segment stack
+                    // below), so this prose `Text` is static: it renders at full
+                    // opacity, carries no animation, and its `RenderCache`-memoized
+                    // AttributedString is composited once per text value.
+                    (Text(RenderCache.prose(body)).font(Self.proseFont))
                         .foregroundStyle(theme.fg)
                         .lineSpacing(Self.proseLineSpacing)
-                        .textSelection(.enabled)
+                        .perfTextSelection()
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .opacity(withCursor ? (0.65 + cursorPulseOpacity * 0.35) : 1.0)
-                        .onAppear {
-                            guard withCursor else { return }
-                            startCursorPulse()
-                        }
-                        .onChange(of: message.isStreaming) { _, streaming in
-                            guard withCursor else { return }
-                            if streaming { startCursorPulse() }
-                            else {
-                                withAnimation(.easeOut(duration: 0.15)) {
-                                    cursorPulseOpacity = 1.0
-                                }
-                            }
-                        }
                 case .code(let language, let body):
                     CodeBlockView(language: language, code: body)
                 }
             }
-            // CC-01: Streaming tail is code (or there is no prose yet): show a
-            // standalone animated cursor view (cursorView, not bare cursorText).
-            if showsCursor && (tailIsCode || lastProseIndex == nil) {
+            // CC-01 / round-2: the breathing streaming cursor is a single
+            // standalone sibling for ALL cases (rides prose, tail-is-code, or
+            // no-prose-yet). Keeping it OFF the prose `Text` means the pulse
+            // animation never re-composites the (large) prose block — only this
+            // tiny glyph view animates. It sits just after the segment stack,
+            // reading as the live tail of the turn.
+            if showsCursor {
                 cursorView
                     .font(.body)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -428,16 +414,9 @@ struct MessageBubble: View {
 
     // MARK: - CC-01: Streaming cursor
 
-    /// A `Text` span of the cursor glyph — used inline in `Text` concatenation
-    /// (prose segment building). Carries no animation state; the opacity is
-    /// applied by the enclosing view via `cursorView` or the prose run's own
-    /// `.opacity` modifier.
-    private var cursorText: Text {
-        Text(" ▌").foregroundColor(theme.midground)
-    }
-
-    /// A standalone animated cursor view — used when the cursor stands alone
-    /// (no prose segment yet, or tail-is-code case). Starts/stops the pulse
+    /// A standalone animated cursor view — the single breathing cursor glyph for
+    /// the streaming tail (round-2 ROOT D: lifted off the prose `Text` so the
+    /// pulse never re-composites the prose block). Starts/stops the pulse
     /// animation in sync with `message.isStreaming`.
     private var cursorView: some View {
         Text(" ▌")
@@ -659,5 +638,26 @@ private extension Array where Element == ChatMessagePart {
             if case .text(let id, _) = part { return id }
         }
         return nil
+    }
+}
+
+/// The user-bubble background + border chrome. Factored into a modifier so the
+/// DEBUG conic-stroke hunt can strip it (`HERMES_EXP_NO_BUBBLE_BG`) and attribute
+/// the per-frame angular-gradient render cost. Production = bg fill + stroke.
+private struct PerfUserBubbleChrome: ViewModifier {
+    @Environment(\.hermesTheme) private var theme
+
+    func body(content: Content) -> some View {
+        #if DEBUG
+        if RenderCache.expNoBubbleBg {
+            return AnyView(content)
+        }
+        #endif
+        return AnyView(content
+            .background(theme.userBubble, in: RoundedRectangle(cornerRadius: 18))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18)
+                    .strokeBorder(theme.userBubbleBorder, lineWidth: 1)
+            ))
     }
 }

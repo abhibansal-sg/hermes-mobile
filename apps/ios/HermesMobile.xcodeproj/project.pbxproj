@@ -114,6 +114,7 @@
 		9D0E00631B43B40704597185 /* StatusWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = C299C64894901C6605966532 /* StatusWidget.swift */; };
 		9D7372A382EA62311E5ED209 /* RestClient+Audio.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2701298B025669C6BA63EA03 /* RestClient+Audio.swift */; };
 		9F35057C56AE3F73AE513F91 /* DocumentScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20EB0665F7B449305DB0FF7F /* DocumentScanner.swift */; };
+		A01E67929C52A0E64905241F /* PerfHitchLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36A1AFAE0510FE099925C178 /* PerfHitchLogger.swift */; };
 		A0580A5DDE956E58669DAE6E /* DebugBridgeUI in Frameworks */ = {isa = PBXBuildFile; productRef = D7B7C98D6D9744C4C63FD11A /* DebugBridgeUI */; };
 		A12D4D30BBC90E1D34D82856 /* TailscaleHint.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2773490F4AAB597813CD38ED /* TailscaleHint.swift */; };
 		A2515EC12E8908E570E8CB97 /* HydrationLoadingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 770AB1AEE920970C238FC68B /* HydrationLoadingView.swift */; };
@@ -138,6 +139,7 @@
 		B7B2D0DC4C7D5B89B224296E /* DeviceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B688B30EDC0D211592AFA560 /* DeviceModels.swift */; };
 		BB96B106E7F853FFD2E9050B /* CacheStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C857D8802D9AE3D720CE706A /* CacheStore.swift */; };
 		BE280FFE9F7F1D5BCE674862 /* ThinkingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A9FA328FF7771B7CD32DCE4 /* ThinkingView.swift */; };
+		BE3A0BBEF190834ABE1FF6B8 /* RenderCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEA27F5DA2514ED03A75B7B7 /* RenderCache.swift */; };
 		BE54165FFE96DDBF320D2CCA /* PanelSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9EC36474D91C79C209F5633 /* PanelSupport.swift */; };
 		C06866C4CFAC3307CA796C50 /* HermesWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = D39251038AB4B700D2241FE4 /* HermesWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		C2516F5A6002A1CB8BCF4CC8 /* PendingIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 255CDADA7A910CD22C7239F1 /* PendingIntent.swift */; };
@@ -274,6 +276,7 @@
 		3154F94BA54D788E73210763 /* ShareSheetView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareSheetView.swift; sourceTree = "<group>"; };
 		34B0F0396DEF0F7B304DB58A /* PanelL6T12Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PanelL6T12Tests.swift; sourceTree = "<group>"; };
 		36500DDDD7B917A3A3C1A3FC /* InboxStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxStore.swift; sourceTree = "<group>"; };
+		36A1AFAE0510FE099925C178 /* PerfHitchLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerfHitchLogger.swift; sourceTree = "<group>"; };
 		389E9BFD5D355E9F4ECDDD8A /* HermesTurnAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesTurnAttributes.swift; sourceTree = "<group>"; };
 		38D01EE1803BE817A6924FC8 /* AppLock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLock.swift; sourceTree = "<group>"; };
 		39D8214ACA6EF804EE0DBD38 /* StoredMessageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StoredMessageTests.swift; sourceTree = "<group>"; };
@@ -412,6 +415,7 @@
 		E9EC36474D91C79C209F5633 /* PanelSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PanelSupport.swift; sourceTree = "<group>"; };
 		EACAB4835668BF4558E384AB /* DrawerDeleteConfirmationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DrawerDeleteConfirmationTests.swift; sourceTree = "<group>"; };
 		EB04EDFCBE7CEDA7E07B7FE7 /* SyntaxHighlighter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyntaxHighlighter.swift; sourceTree = "<group>"; };
+		EEA27F5DA2514ED03A75B7B7 /* RenderCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderCache.swift; sourceTree = "<group>"; };
 		EF63F9311AD1D62193BEC8F1 /* ConnectionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionStore.swift; sourceTree = "<group>"; };
 		EFB934C75067DF5DFC64B358 /* SpotlightIndexer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpotlightIndexer.swift; sourceTree = "<group>"; };
 		F236DEE2390C68258176235E /* WSURLBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WSURLBuilder.swift; sourceTree = "<group>"; };
@@ -550,6 +554,7 @@
 				E4CE3EAC7CF2A0C18EF11EB1 /* DebugBridgeWiring.swift */,
 				3034D2768EF8C995688C02DC /* HermesMobileApp.swift */,
 				704D657E978543CEE9FEDD16 /* HermesURLRouter.swift */,
+				36A1AFAE0510FE099925C178 /* PerfHitchLogger.swift */,
 				666D7B883B44E88FCDE19752 /* UITestSeed.swift */,
 			);
 			path = App;
@@ -791,6 +796,7 @@
 				BE595B3D5BD7CE915E2E2112 /* AnsiText.swift */,
 				6A60E8ABAAC1CD00A2F23FBF /* CodeBlockView.swift */,
 				6453C39B6601B43A4039649D /* MessageSegmenter.swift */,
+				EEA27F5DA2514ED03A75B7B7 /* RenderCache.swift */,
 				EB04EDFCBE7CEDA7E07B7FE7 /* SyntaxHighlighter.swift */,
 			);
 			path = Rendering;
@@ -1182,6 +1188,7 @@
 				BE54165FFE96DDBF320D2CCA /* PanelSupport.swift in Sources */,
 				C2516F5A6002A1CB8BCF4CC8 /* PendingIntent.swift in Sources */,
 				FEDED4C391B8BAF0A519F8EE /* PendingIntentRouter.swift in Sources */,
+				A01E67929C52A0E64905241F /* PerfHitchLogger.swift in Sources */,
 				C6D2C333F4C6018FBF06469B /* PersonalityPickerView.swift in Sources */,
 				DB235F9AA8DBC08038722359 /* ProtocolTypes.swift in Sources */,
 				ED88F8A8FC7BB44182EC8C1F /* PushRegistrar.swift in Sources */,
@@ -1189,6 +1196,7 @@
 				6D751B47EFF8B73905F2D407 /* QRScannerView.swift in Sources */,
 				8EA9EE46C6796932679FF1D7 /* QueueStore.swift in Sources */,
 				D598097A3F46032659A81FAF /* RecordingControls.swift in Sources */,
+				BE3A0BBEF190834ABE1FF6B8 /* RenderCache.swift in Sources */,
 				AE80E84E590EDF219A047C3D /* RestClient+Approvals.swift in Sources */,
 				9D7372A382EA62311E5ED209 /* RestClient+Audio.swift in Sources */,
 				61BADB96AEABA72B4FD71926 /* RestClient+Control.swift in Sources */,

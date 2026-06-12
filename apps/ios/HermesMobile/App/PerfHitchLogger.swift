@@ -88,8 +88,9 @@ final class PerfHitchLogger {
         // Emit a window summary every ~2 seconds.
         if now - windowStart >= 2.0 {
             let line = String(
-                format: "PERF window=2s frames=%d hitch1.5x=%d hitch3x=%d worst_ms=%.1f",
-                frameCount, hitch15Count, hitch3Count, worstFrameMs)
+                format: "PERF window=2s frames=%d hitch1.5x=%d hitch3x=%d worst_ms=%.1f cacheHit=%d cacheMiss=%d",
+                frameCount, hitch15Count, hitch3Count, worstFrameMs,
+                RenderCache.hits, RenderCache.misses)
             emit(line)
             windowStart = now
             frameCount = 0
