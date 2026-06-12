@@ -1783,6 +1783,21 @@ final class ChatStore {
     #endif
 
     func seed(from stored: [StoredMessage]) {
+        // ARCH37 STEP 2 — normalize on the CURRENT actor (main here, for the
+        // synchronous/foreign-mirror callers) then apply. The off-main open/backfill
+        // path instead pre-normalizes on its fetch Task and calls `seed(normalized:)`
+        // directly (one main-actor hop for the assignment only). Both routes funnel
+        // through `seed(normalized:)` so the foreign-mirror bail + in-place reconcile
+        // semantics are identical regardless of where the normalize ran.
+        seed(normalized: Self.toChatMessages(stored))
+    }
+
+    /// Apply an ALREADY-NORMALIZED seed (`toChatMessages` output) onto the
+    /// transcript. The pure `toChatMessages` transform may have run OFF the main
+    /// actor (ARCH37 Step 2 — the off-main open/backfill path), so this method is the
+    /// single MAIN-ACTOR hop that mutates `messages`: the foreign-mirror bail, the
+    /// in-place reconcile, the ordinal rebuild, and the `transcriptGeneration` bump.
+    func seed(normalized: [ChatMessage]) {
         // A slow REST seed must never wipe a LIVE adopted foreign mirror
         // (R1 #61): open() the session another client is driving, the foreign
         // `message.start` adopts mid-fetch, then the stale seed lands here and
@@ -1801,7 +1816,7 @@ final class ChatStore {
         // restacked. The merge keeps identity for rows whose deterministic ids
         // match across reseeds (no restack), and adopts the foreign placeholder's
         // slot for the reconciled trailing reply (no blink, no count churn).
-        reconcileMessages(with: Self.toChatMessages(stored))
+        reconcileMessages(with: normalized)
         rebuildUserOrdinals()
         transcriptGeneration += 1
     }
@@ -1935,7 +1950,17 @@ final class ChatStore {
     // Machine scaffolding (cron preambles, system prompts, raw tool dumps that
     // surface as standalone collapsible rows) keeps its `.collapsed` presentation
     // (an iOS-native affordance with no desktop conflict).
-    static func toChatMessages(_ stored: [StoredMessage]) -> [ChatMessage] {
+    // ARCH37 STEP 2 — `nonisolated` so the seed normalize runs OFF the main actor.
+    // `toChatMessages` is a pure transform `[StoredMessage] → [ChatMessage]` over
+    // Sendable value types with NO instance state, so it is safe to run on the
+    // background fetch Task; SessionStore hops to main ONLY for the `messages =`
+    // assignment (`seed(from:normalized:)`). This removes the single largest
+    // unyielded main-actor block on the open/backfill path (the rare-freeze root —
+    // `mergeToolResult`'s scan + `withUniqueSeedPartIds`' nested loops + the dict
+    // build all ran on main inside one @Observable write). The whole transitive
+    // static helper set below is `nonisolated` for the same reason. Output is
+    // byte-identical (SeedParityTests / RenderingTests exercise the pure path).
+    nonisolated static func toChatMessages(_ stored: [StoredMessage]) -> [ChatMessage] {
         var result: [ChatMessage] = []
         // Tool-call activities buffered from tool-only assistant rows and
         // synthetic unmatched tool results, awaiting flush onto an assistant.
@@ -1986,6 +2011,27 @@ final class ChatStore {
         // Merge a role:tool result onto a tool activity, searching the pending
         // buffer first, then emitted assistant messages backward. Returns true if
         // merged.
+        //
+        // ARCH37 STEP 2 — mergeToolResult COMPLEXITY VERDICT: kept O(rows) backward
+        // scan; NOT linearized to a reverse index map. A map cannot preserve
+        // semantics here without per-step mutation tracking (which IS a semantic
+        // change):
+        //  • the by-NAME branch matches the first `state == .running` activity, so a
+        //    static `name → index` map goes stale the instant the first result flips
+        //    that slot to `.done` — the next same-name result must skip it, which a
+        //    build-time map cannot express.
+        //  • the by-callId branch relies on the NEWEST-first scan to land on the most
+        //    recent occurrence of a DUPLICATE call id (the wire can carry dupes; they
+        //    are only de-duped in the later `withUniqueSeedPartIds` pass). A
+        //    forward-built `callId → index` map would resolve to the OLDEST, inverting
+        //    the order.
+        // The realistic cost is bounded anyway: the common case (a result following
+        // its own assistant's pending tools) hits the O(pending) `pendingTools` fast
+        // path below and never reaches the backward scan — which is the fallback only
+        // for results whose cluster was already flushed into `result`. Crucially, the
+        // ENTIRE normalize now runs OFF the main actor (Step 2), so even the worst-
+        // case tool-dense scan no longer blocks the UI — the actual freeze root.
+        // SeedParityTests/RenderingTests must stay green, which a map risks breaking.
         func mergeToolResult(_ row: StoredMessage) -> Bool {
             let callId = row.toolCallId
             let name = row.toolName ?? "tool"
@@ -2039,7 +2085,14 @@ final class ChatStore {
             // 2. Build this row's parts in fixed within-row order.
             let display = Self.seedDisplayContent(role: role, stored: row)
             var rowParts: [ChatMessagePart] = []
-            let baseID = Self.seedMessageID(timestamp: row.timestamp, index: index, role: role)
+            // ARCH37 STEP 4 — prefer the STABLE WIRE ID for identity. When the
+            // gateway emitted a per-row `id`, key both the message id and every part
+            // id on it (`w{wireId}-{role}`), so the same wire row maps to the same
+            // identity across cache<->network drift — no positional re-key, no tail
+            // remount. Falls back to the positional `{ts}-{index}-{role}` key when
+            // the wire id is absent (stock/old gateways) — unchanged behavior.
+            let baseID = Self.seedMessageID(
+                timestamp: row.timestamp, index: index, role: role, wireId: row.wireId)
 
             if role == .assistant, let reasoning = row.reasoning, !reasoning.isEmpty {
                 rowParts.append(.reasoning(id: "\(baseID)-reasoning-0", text: reasoning))
@@ -2154,7 +2207,7 @@ final class ChatStore {
     /// among same-kind runs in the FINAL coalesced bubble — matching the stream
     /// reducer's `newRunID`. (Per-row construction can only mint `-0`; coalescing
     /// is when the true ordinal is known.)
-    private static func renumberRunIDs(in message: ChatMessage) -> ChatMessage {
+    nonisolated private static func renumberRunIDs(in message: ChatMessage) -> ChatMessage {
         var copy = message
         var textRun = 0
         var reasoningRun = 0
@@ -2174,9 +2227,16 @@ final class ChatStore {
         return copy
     }
 
-    /// Deterministic seed message id (`"{ts}-{index}-{role}"`, contract §2.2). A
-    /// missing timestamp degrades gracefully to a stable per-index key.
-    private static func seedMessageID(timestamp: Double?, index: Int, role: ChatRole) -> String {
+    /// Deterministic seed message id. ARCH37 STEP 4: when the gateway emitted a
+    /// stable per-row `wireId`, key on it (`"w{wireId}-{role}"`) — STABLE across
+    /// count/compression/truncation drift, so a cache<->network reconcile preserves
+    /// identity in place. Otherwise fall back to the legacy positional key
+    /// (`"{ts}-{index}-{role}"`, contract §2.2; a missing timestamp degrades to a
+    /// stable per-index key) — byte-identical to pre-ARCH37 for stock gateways.
+    nonisolated private static func seedMessageID(
+        timestamp: Double?, index: Int, role: ChatRole, wireId: Int? = nil
+    ) -> String {
+        if let wireId { return "w\(wireId)-\(role.rawValue)" }
         let ts = timestamp.map { String(Int($0 * 1000)) } ?? "0"
         return "\(ts)-\(index)-\(role.rawValue)"
     }
@@ -2195,7 +2255,7 @@ final class ChatStore {
     /// ids. This pass is the global de-dup safety net: it walks every part id and
     /// every tool id, and on a collision mints a unique suffix — never re-keying a
     /// non-colliding part, so identity is preserved across reseed.
-    static func withUniqueSeedPartIds(_ messages: [ChatMessage]) -> [ChatMessage] {
+    nonisolated static func withUniqueSeedPartIds(_ messages: [ChatMessage]) -> [ChatMessage] {
         var seenPartIDs = Set<String>()
         var seenToolIDs = Set<String>()
         return messages.map { message in
@@ -2248,7 +2308,7 @@ final class ChatStore {
 
     /// Whether a stored tool-result row indicates failure (mirrors the streaming
     /// `indicatesFailure`, but reads from the stored `content` envelope).
-    private static func seedIndicatesFailure(name: String, content: JSONValue) -> Bool {
+    nonisolated private static func seedIndicatesFailure(name: String, content: JSONValue) -> Bool {
         if let object = content.objectValue, object["error"] != nil,
            !(object["error"]?.isNull ?? true) {
             return true
@@ -2260,7 +2320,7 @@ final class ChatStore {
     /// Displayable body for a seed row. Assistant/system/tool: the flattened
     /// `content`. User: desktop `displayContentForMessage` — strip
     /// Attached-Context / Context-Warnings scaffolding and hoist `@ref` chips.
-    private static func seedDisplayContent(role: ChatRole, stored: StoredMessage) -> String {
+    nonisolated private static func seedDisplayContent(role: ChatRole, stored: StoredMessage) -> String {
         let raw = stored.text
         guard role == .user else { return raw }
         return displayContentForUserMessage(raw)
@@ -2270,7 +2330,7 @@ final class ChatStore {
     /// `.collapsed` machine-scaffolding affordance for system prompts and cron /
     /// automation preambles (a standalone tool dump is never emitted by the
     /// producer — tool rows merge — so only system/user-cron collapse here).
-    private static func seedPresentation(
+    nonisolated private static func seedPresentation(
         role: ChatRole, stored: StoredMessage, display: String
     ) -> ChatMessage.Presentation {
         switch role {
@@ -2287,14 +2347,17 @@ final class ChatStore {
     }
 
     // Desktop `displayContentForMessage` user-row markers (chat-messages.ts:113-115).
-    private static let attachedContextMarker = "--- Attached Context ---"
-    private static let contextWarningsMarker = "--- Context Warnings ---"
+    // ARCH37 Step 2 — `nonisolated` so the now-nonisolated `displayContentForUserMessage`
+    // (run off-main in the seed normalize) can reference them. Immutable Sendable
+    // Strings, so this is safe.
+    nonisolated private static let attachedContextMarker = "--- Attached Context ---"
+    nonisolated private static let contextWarningsMarker = "--- Context Warnings ---"
 
     /// Port of desktop `displayContentForMessage` for user rows: strip the
     /// `--- Attached Context ---` / `--- Context Warnings ---` scaffolding and
     /// hoist deduped `@ref` chips (`@file:`/`@folder:`/`@url:`/`@image:`/`@tool:`/
     /// `@terminal:`) above the visible text.
-    static func displayContentForUserMessage(_ text: String) -> String {
+    nonisolated static func displayContentForUserMessage(_ text: String) -> String {
         // Strip a trailing Context-Warnings block wherever it appears.
         func stripWarnings(_ s: String) -> String {
             guard let range = s.range(of: contextWarningsMarker) else { return s }
@@ -2314,7 +2377,7 @@ final class ChatStore {
 
     /// `@kind:value` chip extraction (desktop CONTEXT_REF_RE), order-preserving +
     /// deduped.
-    private static func extractContextRefs(_ text: String) -> [String] {
+    nonisolated private static func extractContextRefs(_ text: String) -> [String] {
         let kinds = ["file", "folder", "url", "image", "tool", "terminal"]
         let pattern = "@(?:\(kinds.joined(separator: "|"))):(?:\"[^\"\\n]+\"|'[^'\\n]+'|`[^`\\n]+`|\\S+)"
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }

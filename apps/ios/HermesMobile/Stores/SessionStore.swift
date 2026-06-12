@@ -2294,7 +2294,11 @@ final class SessionStore {
                openToken == token,
                let cached = try? await cacheStore.loadTranscript(storedId),
                openToken == token {          // re-check after every await
-                chat.seed(from: cached)      // in-place reconcile — FIRST frame
+                // ARCH37 STEP 2 — normalize the cached rows OFF main, hop to main
+                // only for the in-place reconcile (the FIRST painted frame).
+                let normalized = await Self.normalizeOffMain(cached)
+                guard openToken == token else { return }
+                chat.seed(normalized: normalized)  // in-place reconcile — FIRST frame
                 paintedFromCache = true
             }
         }
@@ -2312,9 +2316,32 @@ final class SessionStore {
         // Phase 2 — authoritative network seed, reconciled in place.
         guard let fetch = resolvedTranscriptFetch else { return }
         do {
+            // ARCH37 STEP 3 — skip the redundant network seed when the cache copy
+            // is FRESH. A fresh cache paint is the ONLY seed on open; the existing
+            // reconnect/foreground `backfill()` reconciles any later drift. This
+            // halves the open-time normalize cost AND removes the second async
+            // @Observable write the scroll machinery used to race against (the
+            // double-seed mid-conversation-landing window). Staleness is proven
+            // against the session's `lastActive`; a nil `lastActive` is treated as
+            // STALE (Step 3 / CacheStore change), so "fresh" is never over-broad.
+            if paintedFromCache, let cacheStore,
+               let lastActive = sessions.first(where: { $0.id == storedId })?.lastActive,
+               (try? await cacheStore.transcriptIsFresh(storedId, lastActive: lastActive)) == true {
+                guard openToken == token else { return }
+                #if DEBUG
+                Self.logOpenLatency(
+                    phase: "network-seed-skipped(fresh)", storedId: storedId, since: openClock)
+                #endif
+                return
+            }
             let stored = try await fetch(storedId)
             guard openToken == token else { return }  // superseded (R1 #28/#43)
-            chat.seed(from: stored)
+            // ARCH37 STEP 2 — normalize OFF the main actor (the pure `toChatMessages`
+            // transform), hop to main only for the in-place reconcile assignment with
+            // a fresh openToken re-check (a superseded open's normalize is dropped).
+            let normalized = await Self.normalizeOffMain(stored)
+            guard openToken == token else { return }  // superseded during normalize
+            chat.seed(normalized: normalized)
             #if DEBUG
             Self.logOpenLatency(
                 phase: "network-painted", storedId: storedId, since: openClock)
@@ -2366,14 +2393,18 @@ final class SessionStore {
                openToken == token,
                let cached = try? await cacheStore.loadTranscript(storedId),
                openToken == token {
-                chat.seed(from: cached)
+                let normalized = await Self.normalizeOffMain(cached)
+                guard openToken == token else { return }
+                chat.seed(normalized: normalized)
             }
         }
 
         do {
             let stored = try await fetch(storedId)
             guard openToken == token else { return }  // superseded (R1 #28/#43)
-            chat.seed(from: stored)
+            let normalized = await Self.normalizeOffMain(stored)
+            guard openToken == token else { return }  // superseded during normalize
+            chat.seed(normalized: normalized)
             if let cacheStore {
                 Task { try? await cacheStore.saveTranscript(sessionId: storedId, messages: stored) }
             }
@@ -2405,6 +2436,19 @@ final class SessionStore {
             "open-latency \(phase, privacy: .public) session=\(storedId, privacy: .public) +\(ms, format: .fixed(precision: 1))ms")
     }
     #endif
+
+    /// ARCH37 STEP 2 — run the pure `toChatMessages` seed normalize OFF the main
+    /// actor. `SessionStore` is `@MainActor`, so a bare call would normalize on
+    /// main; `Task.detached` hops to a background executor for the transform (the
+    /// largest unyielded main-actor block on the open/backfill path — the rare-
+    /// freeze root) and `await` brings the Sendable `[ChatMessage]` result back.
+    /// The caller re-checks `openToken` after this await and applies via
+    /// `chat.seed(normalized:)` (the single main-actor mutation hop).
+    nonisolated static func normalizeOffMain(_ stored: [StoredMessage]) async -> [ChatMessage] {
+        await Task.detached(priority: .userInitiated) {
+            ChatStore.toChatMessages(stored)
+        }.value
+    }
 
     /// The injected `transcriptFetch`, or the default that resolves the live
     /// REST client (mirrors `ChatStore.resolvedBackfillFetch`).

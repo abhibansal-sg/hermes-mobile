@@ -203,6 +203,68 @@ enum UITestSeed {
             return
         }
 
+        // "iddrift" — ARCH37 Step 1 risk gate: open a session whose CACHE copy is
+        // 1+ rows SHORTER than the NETWORK copy (count drift), so the Phase-2 network
+        // seed reconciles a LONGER row set onto the already-landed cache content. With
+        // the OLD positional-id scheme this re-keys the whole tail from the divergence
+        // → mass remount with new heights AFTER the open parked (the mid-conversation
+        // landing root). This verifies the per-session ScrollView identity (.id) +
+        // native anchor land on NEWEST despite the re-keyed tail — and (under
+        // HERMES_PERF_LOG=1) that the remount hitch is <1 frame and latch/clamp fire
+        // toward zero.
+        //
+        // Faithful repro: OPEN session A (short), then SWITCH to the drift session B
+        // — exactly as the device does it (activeStoredId flips, so the per-session
+        // `.id` REMOUNTS the ScrollView and `.landOnNewest` arms). On B's open the
+        // CACHE copy (34 rows) paints first (Phase-1), then ~600ms later the NETWORK
+        // copy (40 rows) reconciles in place (Phase-2). With the OLD positional id +
+        // shared ScrollView this lands MID-CONVERSATION (the network grows under a
+        // disarmed latch). With Step 1's per-session remount + Step 4's stable wire
+        // id, the open is FRESH (.landOnNewest), so the view re-pins through the grow
+        // and lands on the NEWEST (#40); the shared wire ids keep the tail identity
+        // (no remount of matching rows).
+        if mode == "iddrift" {
+            func stored(_ role: String, _ text: String, _ i: Int) -> StoredMessage? {
+                StoredMessage(json: .object([
+                    "role": .string(role),
+                    "content": .string(text),
+                    "id": .number(Double(i)),                 // stable wire id (Step 4)
+                    "timestamp": .number(Double(1_700_000_000 + i)),
+                ]))
+            }
+            func transcript(_ tag: String, _ n: Int) -> [StoredMessage] {
+                (0..<n).compactMap { i in
+                    stored(i.isMultiple(of: 2) ? "user" : "assistant",
+                           "\(tag) message #\(i + 1) — Lorem ipsum dolor sit amet, consectetur "
+                           + "adipiscing elit, sed do eiusmod tempor incididunt ut labore et "
+                           + "dolore magna aliqua. Ut enim ad minim veniam.",
+                           i)
+                }
+            }
+            // Session B cache copy: 34 rows. Network copy: 40 rows (6-row tail drift),
+            // sharing wire ids 0..33. The injected transcriptFetch returns the 40-row
+            // network copy for B; the 34-row cache copy is painted directly first.
+            let bCache = transcript("Drift", 34)
+            let bNetwork = transcript("Drift", 40)
+            environment.connectionStore.phase = .connected
+            // Session A — a short prior session to land on before the switch.
+            environment.sessionStore.activeStoredId = "uitest-iddrift-A"
+            environment.chatStore.debugSeedTranscript(
+                ChatStore.toChatMessages(transcript("A", 6)))
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 1_000_000_000)  // read A
+                // SWITCH to B: flip activeStoredId (the `.id` remount), paint the
+                // CACHE copy (Phase 1), reset lastSeeded via the new id so the open
+                // classifies .landOnNewest, then grow to the NETWORK copy (Phase 2).
+                environment.sessionStore.activeStoredId = "uitest-iddrift-B"
+                environment.chatStore.reset()                     // clear A (as open() does)
+                environment.chatStore.seed(from: bCache)          // Phase 1 cache paint
+                try? await Task.sleep(nanoseconds: 600_000_000)   // network-like delay
+                environment.chatStore.seed(from: bNetwork)        // grow 34 → 40, in place
+            }
+            return
+        }
+
         // "demo" — curated, presentable content for the launch video: a power
         // user's drawer + one rich active conversation. No real user data.
         if mode == "demo" {

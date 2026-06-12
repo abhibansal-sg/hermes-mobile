@@ -236,6 +236,15 @@ struct StoredMessage: Sendable {
     let content: JSONValue
     let timestamp: Double?
 
+    /// ARCH37 STEP 4 — STABLE WIRE IDENTITY. A server-assigned monotonic ordinal
+    /// (`id` on the wire), stable across fetches because the gateway's row order is
+    /// authoritative (`_history_to_messages`). When present, the seed producer keys
+    /// row identity on this (`deterministicID(wireKey:)`) instead of the positional
+    /// `{ts}-{index}-{role}` key — so a cache->network reconcile is in-place across
+    /// count drift (no tail remount). ADDITIVE: `nil` on stock/old gateways that do
+    /// not emit it, where the producer falls back to the positional key (unchanged).
+    let wireId: Int?
+
     // MARK: - ABH-87 Batch B (§2.3) — fields the seed producer reconstructs from
     //
     // The live REST payload (`/api/sessions/{id}/messages`, re-verified against
@@ -269,6 +278,8 @@ struct StoredMessage: Sendable {
         self.role = role
         self.content = json["content"] ?? .null
         self.timestamp = json["timestamp"]?.doubleValue
+        // ARCH37 STEP 4 — stable per-row wire id (additive; nil on stock gateways).
+        self.wireId = json["id"]?.intValue
 
         // tool_calls[]: keep only well-formed calls; an empty/absent array → nil.
         let calls = (json["tool_calls"]?.arrayValue ?? []).compactMap(WireToolCall.init(json:))
@@ -289,6 +300,7 @@ struct StoredMessage: Sendable {
         role: String,
         content: JSONValue,
         timestamp: Double? = nil,
+        wireId: Int? = nil,
         toolCalls: [WireToolCall]? = nil,
         toolCallId: String? = nil,
         toolName: String? = nil,
@@ -298,6 +310,7 @@ struct StoredMessage: Sendable {
         self.role = role
         self.content = content
         self.timestamp = timestamp
+        self.wireId = wireId
         self.toolCalls = toolCalls
         self.toolCallId = toolCallId
         self.toolName = toolName

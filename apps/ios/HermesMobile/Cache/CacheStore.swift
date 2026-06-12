@@ -153,17 +153,27 @@ actor CacheStore {
     /// after the session's most recent activity. Used by the WhatsApp-bar
     /// prefetch to SKIP sessions whose disk copy is already current (so a warm
     /// cache costs zero network), while still re-fetching a session whose
-    /// `lastActive` advanced since it was cached (a new turn landed elsewhere).
+    /// `lastActive` advanced since it was cached (a new turn landed elsewhere) —
+    /// and (ARCH37 Step 3) to gate the open-time NETWORK-SEED SKIP: a fresh cache
+    /// copy is the only seed on open, so freshness here MUST be conservative.
     ///
-    /// `lastActive == nil` (the WS RPC shape omits it) ⇒ falls back to "has any
-    /// cached transcript" (can't prove staleness, so don't re-fetch needlessly).
+    /// ARCH37 STEP 3 — `lastActive == nil` now means STALE (was: fresh-on-any-rows).
+    /// The old false-fresh shortcut silently served a STALE disk copy whenever the
+    /// session summary lacked `lastActive`, and starved prefetch of exactly the
+    /// sessions most likely to have drifted — feeding the positional-id remount on
+    /// the network reconcile. Treating unknown freshness as STALE costs a little
+    /// extra network but collapses the freshness contract to ONE rule (cachedAt >=
+    /// lastActive) and never skips a reconcile on an unprovable copy. The caller's
+    /// fast-path gate also requires a non-nil `lastActive` before consulting this,
+    /// so a nil here both fails the skip AND keeps the session in the prefetch set.
     func transcriptIsFresh(_ sessionId: String, lastActive: Double?) throws -> Bool {
         try db.read { db in
             guard let record = try SessionCacheRecord.fetchOne(db, key: sessionId),
                   let cachedAt = record.transcriptCachedAt else {
                 return false
             }
-            guard let lastActive else { return true }
+            // Unknown freshness ⇒ STALE (cannot prove the disk copy is current).
+            guard let lastActive else { return false }
             return cachedAt >= lastActive
         }
     }
@@ -208,7 +218,11 @@ actor CacheStore {
             // Insert fresh rows
             var maxWireId: Int? = nil
             for (ordinal, message) in messages.enumerated() {
-                let wireId = wireIds?[ordinal] ?? nil
+                // ARCH37 STEP 4 — the wire id now travels ON the StoredMessage, so an
+                // explicit parallel `wireIds` array is optional: fall back to the
+                // message's own `wireId` (the gateway-emitted stable ordinal) so the
+                // cursor column + the persisted-row identity stay in sync.
+                let wireId = wireIds?[ordinal] ?? message.wireId
                 let row = try MessageRowRecord.make(
                     sessionId: sessionId,
                     ordinal: ordinal,

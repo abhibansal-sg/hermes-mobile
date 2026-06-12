@@ -56,6 +56,18 @@ final class ChatStoreBatchETests: XCTestCase {
         ]))!
     }
 
+    /// A stored row carrying a stable wire `id` (ARCH37 Step 4) — the shape the
+    /// patched gateway emits. `ts` lets a cache copy (older) and network copy share
+    /// content while differing in count, exercising the in-place reconcile.
+    private func storedMessage(role: String, text: String, wireId: Int, ts: Double = 1_700_000_000) -> StoredMessage {
+        StoredMessage(json: .object([
+            "role": .string(role),
+            "content": .string(text),
+            "id": .number(Double(wireId)),
+            "timestamp": .number(ts),
+        ]))!
+    }
+
     private func settle() async { try? await Task.sleep(for: .milliseconds(120)) }
 
     // MARK: - 1. SCROLL P0 — seed-scroll policy gate
@@ -217,5 +229,114 @@ final class ChatStoreBatchETests: XCTestCase {
         XCTAssertEqual(Array(chat.messages.prefix(2)).map(\.id), baseIDs,
                        "existing rows keep identity across an appending reseed")
         XCTAssertEqual(chat.messages.map(\.text), ["q1", "a1", "q2", "a2"])
+    }
+
+    // MARK: - 4. ARCH37 Step 4 — stable wire identity reconcile
+
+    /// THE keystone gate: a CACHE copy that is SHORTER than the NETWORK copy (count
+    /// drift) reconciles IN PLACE on the rows whose content matches, with NO remount
+    /// of the matching tail — because both copies carry the stable per-row wire `id`,
+    /// so identity is keyed on the id, not the positional `{ts}-{index}-{role}`.
+    /// With the OLD positional scheme the extra network rows would shift the indices
+    /// and re-key every row from the divergence → mass remount.
+    func testWireIdReconcileKeepsIdentityAcrossCountDrift() {
+        let (chat, _) = makeStore()
+        // Cache copy: 3 rows (older fetch), each with its stable wire id.
+        let cache = [
+            storedMessage(role: "user", text: "q1", wireId: 0),
+            storedMessage(role: "assistant", text: "a1", wireId: 1),
+            storedMessage(role: "user", text: "q2", wireId: 2),
+        ]
+        chat.seed(from: cache)
+        let cacheIDs = chat.messages.map(\.id)
+        XCTAssertEqual(chat.messages.map(\.text), ["q1", "a1", "q2"])
+
+        // Network copy: the SAME 3 rows (identical wire ids) PLUS a new turn. The
+        // first three rows MUST keep their identity (in-place), only the new rows
+        // append — no tail remount despite the count growing.
+        let network = cache + [
+            storedMessage(role: "assistant", text: "a2", wireId: 3),
+            storedMessage(role: "user", text: "q3", wireId: 4),
+        ]
+        chat.seed(from: network)
+
+        XCTAssertEqual(Array(chat.messages.prefix(3)).map(\.id), cacheIDs,
+                       "rows matched by stable wire id keep identity across count drift (no remount)")
+        XCTAssertEqual(chat.messages.map(\.text), ["q1", "a1", "q2", "a2", "q3"])
+    }
+
+    /// The wire id makes identity INVARIANT to a positional shift: if a network
+    /// fetch drops an early empty row (so later rows' POSITIONS change) but the
+    /// surviving rows keep their wire ids, identity is preserved — the exact case
+    /// the positional key got wrong (gateway compresses / drops empty-content rows).
+    func testWireIdReconcileSurvivesPositionalShift() {
+        let (chat, _) = makeStore()
+        // Cache copy keyed on wire ids 10, 11, 12 (note: non-contiguous start to
+        // prove identity does not depend on the array index).
+        let cache = [
+            storedMessage(role: "user", text: "hello", wireId: 10),
+            storedMessage(role: "assistant", text: "world", wireId: 11),
+        ]
+        chat.seed(from: cache)
+        let helloID = chat.messages.first { $0.text == "hello" }?.id
+        let worldID = chat.messages.first { $0.text == "world" }?.id
+        XCTAssertNotNil(helloID); XCTAssertNotNil(worldID)
+
+        // Network copy PREPENDS an older row (id 9) — every cached row's array index
+        // shifts by 1, but their wire ids are unchanged, so identity holds.
+        let network = [
+            storedMessage(role: "assistant", text: "earlier", wireId: 9),
+        ] + cache
+        chat.seed(from: network)
+
+        XCTAssertEqual(chat.messages.first { $0.text == "hello" }?.id, helloID,
+                       "wire-id identity survives a positional shift (index changed, id did not)")
+        XCTAssertEqual(chat.messages.first { $0.text == "world" }?.id, worldID,
+                       "wire-id identity survives a positional shift")
+        XCTAssertEqual(chat.messages.map(\.text), ["earlier", "hello", "world"])
+    }
+
+    /// FALLBACK: rows WITHOUT a wire id (stock/old gateway) still key on the legacy
+    /// positional `{ts}-{index}-{role}` — unchanged behavior, no regression.
+    func testNoWireIdFallsBackToPositionalIdentity() {
+        let (chat, _) = makeStore()
+        let history = [
+            storedMessage(role: "user", text: "hi"),       // no wire id
+            storedMessage(role: "assistant", text: "yo"),  // no wire id
+        ]
+        chat.seed(from: history)
+        let first = chat.messages.map(\.id)
+        chat.seed(from: history)
+        XCTAssertEqual(chat.messages.map(\.id), first,
+                       "stock-gateway rows (no wire id) keep stable positional identity across reseed")
+    }
+
+    /// CACHE-WITHOUT-IDS vs NETWORK-WITH-IDS (the realistic interim): a cache copy
+    /// written by a PRE-Step-4 build (no wire ids) reconciles against a network copy
+    /// from the PATCHED gateway (with wire ids). The rows whose CONTENT matches must
+    /// reconcile without churning their text — even though the identity key flips
+    /// from positional to wire-id (a one-time re-key on the first patched fetch,
+    /// after which both sides carry ids and stay in place). Asserts content integrity
+    /// (no blink/duplication), which is the user-visible contract.
+    func testCacheWithoutIdsReconcilesAgainstNetworkWithIds() {
+        let (chat, _) = makeStore()
+        // Cache copy (pre-Step-4): positional identity, no wire ids.
+        let cache = [
+            storedMessage(role: "user", text: "q1"),
+            storedMessage(role: "assistant", text: "a1"),
+        ]
+        chat.seed(from: cache)
+        XCTAssertEqual(chat.messages.map(\.text), ["q1", "a1"])
+
+        // Network copy (patched gateway): same content, now WITH wire ids, plus a
+        // new turn. Content must end up correct with no duplication.
+        let network = [
+            storedMessage(role: "user", text: "q1", wireId: 0),
+            storedMessage(role: "assistant", text: "a1", wireId: 1),
+            storedMessage(role: "user", text: "q2", wireId: 2),
+        ]
+        chat.seed(from: network)
+        XCTAssertEqual(chat.messages.map(\.text), ["q1", "a1", "q2"],
+                       "cache(no ids)->network(ids) reconciles to correct content, no duplication")
     }
 }

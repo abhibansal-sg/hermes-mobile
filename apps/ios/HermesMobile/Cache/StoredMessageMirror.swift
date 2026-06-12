@@ -18,6 +18,12 @@ struct StoredMessageMirror: Codable, Sendable {
     var role: String
     var content: JSONValue
     var timestamp: Double?
+    /// ARCH37 STEP 4 — stable wire id persisted through the cache so a cache-seeded
+    /// row carries the same identity key as its network counterpart (in-place
+    /// reconcile across cache<->network drift). Optional + defaulted so older cached
+    /// rows (encoded before this field existed) decode with `wireId == nil` and fall
+    /// back to the positional key — no cache migration needed.
+    var wireId: Int? = nil
     var toolCalls: [WireToolCallMirror]?
     var toolCallId: String?
     var toolName: String?
@@ -33,6 +39,7 @@ struct StoredMessageMirror: Codable, Sendable {
             role: role,
             content: content,
             timestamp: timestamp,
+            wireId: wireId,
             toolCalls: wireCalls?.isEmpty == false ? wireCalls : nil,
             toolCallId: toolCallId,
             toolName: toolName,
@@ -65,6 +72,7 @@ extension StoredMessage {
             role: role,
             content: content,
             timestamp: timestamp,
+            wireId: wireId,
             toolCalls: callMirrors?.isEmpty == false ? callMirrors : nil,
             toolCallId: toolCallId,
             toolName: toolName,

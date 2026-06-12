@@ -397,15 +397,19 @@ final class CacheTranscriptFreshnessTests: XCTestCase {
         XCTAssertFalse(fresh)
     }
 
-    func testNilLastActiveFallsBackToHasTranscript() async throws {
+    func testNilLastActiveIsStale() async throws {
+        // ARCH37 STEP 3 — `lastActive == nil` now means STALE (was: fresh-on-any-
+        // rows). Unknown freshness cannot prove the disk copy is current, so the
+        // freshness gate must NOT skip the network reconcile and prefetch must NOT
+        // skip the session. This collapses the freshness contract to one rule
+        // (cachedAt >= lastActive) and closes the stale-cache→positional-id-drift path.
         let store = try makeInMemoryStore()
         try await store.saveSessionList(
             [makeSession(id: "f4", lastActive: nil)], scope: testScope)
         try await store.saveTranscript(
             sessionId: "f4", messages: [makeStoredMessage()])
-        // Can't prove staleness without lastActive → "has any transcript" wins.
         let fresh = try await store.transcriptIsFresh("f4", lastActive: nil)
-        XCTAssertTrue(fresh)
+        XCTAssertFalse(fresh, "nil lastActive ⇒ STALE (cannot prove the cache is current)")
     }
 }
 

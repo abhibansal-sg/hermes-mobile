@@ -3472,6 +3472,19 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                     msg[key] = m.get(key)
         messages.append(msg)
 
+    # ARCH37 STEP 4 — STABLE WIRE IDENTITY (additive). Stamp each emitted row with
+    # a stable per-row `id`: a monotonic ordinal over the FINAL emitted array. Row
+    # order is authoritative and the build above is deterministic from `history`, so
+    # the ordinal is stable ACROSS CALLS for the same conversation — the same wire
+    # row maps to the same id on every fetch, even when history grows/compresses/
+    # drops empty rows. The iOS client keys its seed identity on this id (when
+    # present), so a cache->network reconcile is truly in-place regardless of count
+    # drift — killing the positional-id tail remount. This is PURELY ADDITIVE: a row
+    # gains an `id` key; every existing consumer (and any stock/old client that does
+    # not read it) is unaffected.
+    for ordinal, msg in enumerate(messages):
+        msg["id"] = ordinal
+
     return messages
 
 

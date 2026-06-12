@@ -20,6 +20,22 @@ struct CodeBlockView: View {
     /// expand affordance.
     private static let maxCollapsedHeight: CGFloat = 400
 
+    /// ARCH37 STEP 5 — FIRST-PAINT-STABLE HEIGHT. A conservative line-height used to
+    /// ESTIMATE the natural height from the code's line count BEFORE the
+    /// GeometryReader measures it, so the clamp decision is correct on the FIRST
+    /// layout pass (no full-height-then-shrink). The monospaced body renders at
+    /// `.body` with vertical padding (10pt top + 10pt bottom); ~18pt per line is a
+    /// safe-but-tight per-line height at the default Dynamic Type size. Using a
+    /// per-line height that is at/above the real line height makes the estimate an
+    /// UPPER bound on the natural content height, so a block tall enough to clamp is
+    /// caught on the first pass; a block comfortably under the cap is never
+    /// mis-clamped (and even a near-boundary false positive cannot SHRINK content
+    /// already under the cap — `.frame(maxHeight:)` only caps, never expands).
+    private static let estimatedLineHeight: CGFloat = 18
+    /// Vertical chrome around the code text inside the scroll view (10pt top + 10pt
+    /// bottom padding), added to the line estimate for the natural-height guess.
+    private static let codeBodyVerticalPadding: CGFloat = 20
+
     @Environment(\.hermesTheme) private var theme
 
     @State private var isExpanded = false
@@ -190,9 +206,30 @@ struct CodeBlockView: View {
         return RenderCache.highlight(code, language: language, baseColor: theme.fg)
     }
 
+    /// A conservative UPPER-bound estimate of the code's natural rendered height,
+    /// from its line count — available BEFORE the GeometryReader measures, so the
+    /// first layout pass can already clamp a tall block (ARCH37 Step 5). Counts
+    /// newlines + 1 for the final line; a long single line that soft-wraps only
+    /// makes the REAL height larger, so this stays a lower bound on the line count
+    /// but the per-line height is set at/above the real line height — net, for a
+    /// block whose line count alone exceeds the cap, the estimate reliably crosses
+    /// the clamp threshold on first paint, which is the case that produced the shrink.
+    private var estimatedNaturalHeight: CGFloat {
+        let lineCount = code.reduce(into: 1) { count, ch in if ch == "\n" { count += 1 } }
+        return CGFloat(lineCount) * Self.estimatedLineHeight + Self.codeBodyVerticalPadding
+    }
+
+    /// The best-known natural height: the MEASURED value once it has landed
+    /// (authoritative), else the line-count ESTIMATE. So the clamp decision is
+    /// stable from the FIRST layout pass and only ever refines toward the truth —
+    /// it never flips from "full height" to "clamped" a pass later (the shrink).
+    private var effectiveNaturalHeight: CGFloat {
+        measuredHeight > 0 ? measuredHeight : estimatedNaturalHeight
+    }
+
     /// True when the natural height exceeds the cap (so the toggle is useful).
     private var isClampable: Bool {
-        measuredHeight > Self.maxCollapsedHeight + 1
+        effectiveNaturalHeight > Self.maxCollapsedHeight + 1
     }
 
     private var heightCap: CGFloat? {

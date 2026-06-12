@@ -842,10 +842,10 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
     ]
 
     assert server._history_to_messages(history) == [
-        {"role": "user", "text": "first prompt"},
-        {"context": "resume", "name": "search_files", "role": "tool"},
-        {"role": "assistant", "text": "first answer"},
-        {"role": "user", "text": "second prompt"},
+        {"role": "user", "text": "first prompt", "id": 0},
+        {"context": "resume", "name": "search_files", "role": "tool", "id": 1},
+        {"role": "assistant", "text": "first answer", "id": 2},
+        {"role": "user", "text": "second prompt", "id": 3},
     ]
 
 
@@ -866,8 +866,52 @@ def test_history_to_messages_renders_multimodal_content():
     ]
 
     assert server._history_to_messages(history) == [
-        {"role": "user", "text": "look here\ndata:image/png;base64,abc"},
-        {"role": "assistant", "text": "saw it"},
+        {"role": "user", "text": "look here\ndata:image/png;base64,abc", "id": 0},
+        {"role": "assistant", "text": "saw it", "id": 1},
+    ]
+
+
+def test_history_to_messages_emits_stable_ids_across_growth():
+    # ARCH37 STEP 4 — the per-row `id` is a monotonic ordinal over the emitted
+    # array, and the build is deterministic from history order, so the id of a row
+    # that already existed is IDENTICAL after the conversation grows by new turns.
+    # This is what lets the iOS client reconcile cache (shorter) against network
+    # (longer) in place — the row whose content matches keeps its id, no remount.
+    base = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+    ]
+    grown = base + [
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "q3"},
+    ]
+
+    base_msgs = server._history_to_messages(base)
+    grown_msgs = server._history_to_messages(grown)
+
+    # Every row carries an id.
+    assert [m["id"] for m in base_msgs] == [0, 1, 2]
+    assert [m["id"] for m in grown_msgs] == [0, 1, 2, 3, 4]
+    # The first three rows kept their ids AND content across the growth (in-place
+    # reconcilable); only new rows were appended with new ids.
+    assert base_msgs == grown_msgs[: len(base_msgs)]
+
+
+def test_history_to_messages_id_stable_when_empty_rows_dropped():
+    # Dropping an empty-content assistant row (no text, no tool_calls) does not
+    # shift the ids of the rows that ARE emitted relative to a clean fetch of the
+    # same surviving rows — the ordinal is over the OUTPUT array, which is the
+    # stable, authoritative order the client reconciles against.
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": ""},  # dropped (empty, no tool_calls)
+        {"role": "assistant", "content": "answer"},
+    ]
+    msgs = server._history_to_messages(history)
+    assert msgs == [
+        {"role": "user", "text": "hi", "id": 0},
+        {"role": "assistant", "text": "answer", "id": 1},
     ]
 
 
@@ -915,8 +959,8 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     )
 
     assert resp["result"]["messages"] == [
-        {"role": "user", "text": "root prompt"},
-        {"role": "assistant", "text": "root answer"},
+        {"role": "user", "text": "root prompt", "id": 0},
+        {"role": "assistant", "text": "root answer", "id": 1},
     ]
     assert captured["history_calls"] == [("tip", False), ("tip", True)]
 
@@ -5628,8 +5672,8 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         )
         assert completed["result"].get("inflight") is None
         assert completed["result"]["messages"] == [
-            {"role": "user", "text": "write a long answer"},
-            {"role": "assistant", "text": "partial answer complete"},
+            {"role": "user", "text": "write a long answer", "id": 0},
+            {"role": "assistant", "text": "partial answer complete", "id": 1},
         ]
     finally:
         release.set()
@@ -5666,8 +5710,8 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
         assert resp["result"]["status"] == "working"
         assert resp["result"]["info"] == {"model": "model-b"}
         assert resp["result"]["messages"] == [
-            {"role": "user", "text": "new prompt"},
-            {"role": "assistant", "text": "new answer"},
+            {"role": "user", "text": "new prompt", "id": 0},
+            {"role": "assistant", "text": "new answer", "id": 1},
         ]
     finally:
         server._sessions.pop("sid-a", None)

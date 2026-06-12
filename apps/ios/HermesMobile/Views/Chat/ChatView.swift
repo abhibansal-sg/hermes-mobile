@@ -647,8 +647,18 @@ struct ChatView: View {
             // full-bleed / EdgeFadeMask / header / composer-baseline code is in
             // this region.
             LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(chatStore.messages.enumerated()), id: \.element.id) { index, message in
-                    let previous = index > 0 ? chatStore.messages[index - 1] : nil
+                // ARCH37 STEP 1 — capture the enumerated snapshot ONCE so the
+                // previous-row lookup indexes the SAME array the `ForEach` iterates,
+                // never the live `@Observable` `chatStore.messages`. The old
+                // `chatStore.messages[index - 1]` re-indexed the live array with an
+                // `index` from the captured snapshot; when `messages` shrinks between
+                // the snapshot and a body re-eval (e.g. the per-session `.id` remount
+                // racing a `reset()` on a session switch — the switchlong repro), that
+                // re-index was out of range and crashed. Reading `previous` from the
+                // captured `rows` array is index-consistent by construction.
+                let rows = Array(chatStore.messages.enumerated())
+                ForEach(rows, id: \.element.id) { index, message in
+                    let previous = index > 0 ? rows[index - 1].element : nil
                     MessageBubble(
                         message: message,
                         onEdit: editHandler,
@@ -865,6 +875,32 @@ struct ChatView: View {
         // re-request a no-change). Open-on-newest is handled declaratively by
         // `OpenOnNewestAnchor` (initial offset) plus the imperative seed scroll; the
         // pill + streaming growth use `proxy.scrollTo` directly, now unobstructed.
+        //
+        // ARCH37 STEP 1 — PER-SESSION SCROLLVIEW IDENTITY (the keystone).
+        //
+        // Key the transcript ScrollView SUBTREE on the active stored session id so
+        // each open MOUNTS A FRESH ScrollView. Its `.defaultScrollAnchor(.bottom,
+        // for: .initialOffset)` (OpenOnNewestAnchor) then resolves "bottom" at THIS
+        // session's first real layout — landing on the newest message NATIVELY for a
+        // cache-first (synchronous) open, with zero imperative help. Previously the
+        // ScrollView was ONE persistent identity for the app's life (RootView hosts a
+        // single ChatView, no `.id(session)`), so the initial-offset anchor fired only
+        // on the FIRST open and every switch #2..N rode entirely on the imperative
+        // latch/clamp against a settling contentSize (the white-page / mid-conversation
+        // landing root). A fresh mount has NO surviving cross-session offset to strand.
+        //
+        // SCOPED to the ScrollView only (NOT ChatView): the composer, header, pills,
+        // toolbar, connection state, and all per-session @State above live OUTSIDE
+        // `transcript(proxy:)` and are untouched by this remount. The chain-tip
+        // storedId swap (SessionStore.open → activeStoredId = chainTip) re-mounts
+        // exactly once more, landing the tip natively too.
+        //
+        // BELT-AND-SUSPENDERS (this round): ALL existing latch/clamp/anchor machinery
+        // stays in place — the `.id` makes the native anchor carry the open, the
+        // imperative path is a backstop until Step 6 (the deletion drop) verifies on
+        // device that the native anchor is sufficient. nil id (draft) collapses to a
+        // single stable identity so a draft does not thrash.
+        .id(chatStore.activeStoredSessionId ?? "hermes.chat.draft")
     }
 
     /// Recompute `atBottom` from the MEASURED distance between the bottom anchor and
@@ -1047,6 +1083,9 @@ struct ChatView: View {
                     // inherited across a session switch). This runs regardless of the
                     // landing latch — the invariant holds for the whole session.
                     if geo.offsetY > ceiling + 0.5 {
+                        #if DEBUG
+                        ScrollInstrumentation.clampFired()
+                        #endif
                         applyScroll(animated: false)
                         // Leave the latch state untouched; the clamp is orthogonal.
                         return
@@ -1064,6 +1103,9 @@ struct ChatView: View {
                     // resting offset — re-pin UP to the bottom and stay armed.
                     let landed = abs(geo.offsetY - ceiling) <= 0.5
                     if !landed {
+                        #if DEBUG
+                        ScrollInstrumentation.latchFired()
+                        #endif
                         applyScroll(animated: false)
                         return
                     }

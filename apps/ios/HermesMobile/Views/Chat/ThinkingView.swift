@@ -28,8 +28,27 @@ struct ThinkingView: View {
     /// toggle, which from then on wins over the default (desktop first-toggle-wins).
     @State private var userExpanded: Bool?
 
+    /// ARCH37 STEP 5 — SUPPRESS THE COLLAPSE ANIMATION ON THE SEED PATH. The
+    /// `.animation(value: streaming)` below eases the height change when a turn
+    /// settles (`streaming` true -> false). On a SEED OPEN the row is built already-
+    /// settled (`streaming == false` from the first render), so a pure seed never
+    /// animates — but a row that is seeded WHILE a foreign mirror is mid-settle, or
+    /// re-created on the per-session remount (Step 1), could animate a height delta
+    /// AFTER first paint (a post-paint contentSize change the open must not see).
+    /// This latch suppresses the animation until the view has appeared once: the
+    /// FIRST render (the seed paint) is never animated, so the collapsed height is
+    /// final at first paint; only a live `streaming` transition AFTER appearance
+    /// animates (the watch-it-settle UX during an in-view turn).
+    @State private var hasAppeared = false
+
     /// Auto behavior: open while streaming, collapsed once settled.
     private var autoExpanded: Bool { streaming }
+
+    /// The animation to apply to the settle transition — `nil` (no animation) until
+    /// the view has appeared once, so the seed-path first paint lands final.
+    private var settleAnimation: Animation? {
+        hasAppeared ? .snappy(duration: 0.2) : nil
+    }
 
     /// Binding the DisclosureGroup drives: reads the user's choice when set, else
     /// the streaming default; a write is always an explicit user toggle, so it
@@ -61,13 +80,17 @@ struct ThinkingView: View {
                 .font(.caption)
                 .italic()
                 .foregroundStyle(theme.mutedFg)
-                .animation(.snappy(duration: 0.2), value: streaming)
+                .animation(settleAnimation, value: streaming)
                 .accessibilityHint("Double-tap to expand chain of thought")
         }
         .tint(theme.mutedFg)
         // When the turn settles, animate the auto-collapse so an untouched
         // accordion eases shut rather than snapping. A user who has taken manual
         // control (`userExpanded != nil`) is unaffected — their state is sticky.
-        .animation(.snappy(duration: 0.2), value: streaming)
+        // ARCH37 Step 5: `settleAnimation` is nil until the view has appeared, so
+        // the SEED-PATH first paint lands at its final (collapsed) height with no
+        // animated height delta — only a live in-view settle animates.
+        .animation(settleAnimation, value: streaming)
+        .onAppear { hasAppeared = true }
     }
 }
