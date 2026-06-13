@@ -94,6 +94,15 @@ struct ChatView: View {
     /// keyboard inset across the composer-overlay boundary (which it does NOT do
     /// deterministically, the device-confirmed "last message behind keyboard" bug).
     @State private var keyboardHeight: CGFloat = 0
+    /// SMOOTHNESS R39 (Defect 2) — how many of the NEWEST messages the transcript
+    /// renders EAGERLY (plain `VStack`, no lazy estimation). The tail window starts
+    /// at `Self.transcriptWindow` and grows by `Self.transcriptWindow` each time the
+    /// "Load earlier messages" chip is tapped. Messages beyond the window stay in
+    /// `ChatStore` (full memory) — only VIEW construction is windowed, so the
+    /// bottom-anchored `ScrollView` resolves "bottom" against EXACT (not estimated)
+    /// row heights and never parks against a bad estimate. Reset to the base window
+    /// on every per-session remount (the `.id` swap re-inits `@State`).
+    @State private var windowSize: Int = ChatView.transcriptWindow
     /// The error currently shown in the toast, if any.
     @State private var toastError: String?
     /// Cancels the in-flight toast auto-dismiss when a new error arrives.
@@ -189,6 +198,17 @@ struct ChatView: View {
     /// geometry: small enough that a reader who scrolled up a screen disarms it,
     /// large enough to absorb sub-row jitter at the tail.
     static let atBottomThreshold: CGFloat = 80
+
+    /// SMOOTHNESS R39 (Defect 2) — the EAGER transcript-tail window size. The plain
+    /// `VStack` renders the last `transcriptWindow` messages with NO lazy height
+    /// estimation, so the bottom anchor resolves against EXACT content geometry and
+    /// the open lands precisely on the newest row (the lazy-estimation strander is
+    /// removed by construction). Older messages are reachable via the "Load earlier
+    /// messages" chip, which grows the window by this same step. 150 covers the vast
+    /// majority of real sessions in a single window while keeping eager construction
+    /// cheap (RenderCache memoizes segmentation + prose, so an off-screen tail row
+    /// costs little). Pinned by `UX1PolishTests` so the value is a deliberate choice.
+    static let transcriptWindow = 150
 
     // MARK: - Header-clearance top inset (FIX 2)
 
@@ -612,7 +632,18 @@ struct ChatView: View {
             // and every scroll handler below are untouched — none of the
             // full-bleed / EdgeFadeMask / header / composer-baseline code is in
             // this region.
-            LazyVStack(alignment: .leading, spacing: 0) {
+            // SMOOTHNESS R39 (Defect 2) — EAGER WINDOWED VStack (was `LazyVStack`).
+            // The lazy stack estimated the heights of unrealized rows above the
+            // bottom-anchored viewport; markdown/code rows estimate badly, so the
+            // anchor resolved "bottom" against a WRONG contentSize and parked the
+            // open mid/blank — then realizing the rows on scroll corrected the offset
+            // (the user's "scroll-up-then-snap"). A plain `VStack` over a BOUNDED
+            // tail window removes estimation from the window entirely: every rendered
+            // row is fully laid out, so the bottom anchor resolves against EXACT
+            // geometry and the open lands precisely on newest. Older messages stay in
+            // `ChatStore` (full memory); only VIEW construction is windowed, and
+            // `RenderCache` keeps eager construction cheap.
+            VStack(alignment: .leading, spacing: 0) {
                 // ARCH37 STEP 1 — capture the enumerated snapshot ONCE so the
                 // previous-row lookup indexes the SAME array the `ForEach` iterates,
                 // never the live `@Observable` `chatStore.messages`. The old
@@ -622,9 +653,30 @@ struct ChatView: View {
                 // racing a `reset()` on a session switch — the switchlong repro), that
                 // re-index was out of range and crashed. Reading `previous` from the
                 // captured `rows` array is index-consistent by construction.
-                let rows = Array(chatStore.messages.enumerated())
+                //
+                // R39: the snapshot is the WINDOWED tail — the last `windowSize`
+                // messages. `windowStart` is the index of the first windowed row in
+                // the full transcript; the `previous`-row lookup uses it so the FIRST
+                // windowed row still gets the correct turn-aware `topGap` relative to
+                // the (possibly off-window) message just above it.
+                let allRows = Array(chatStore.messages.enumerated())
+                let windowStart = max(0, allRows.count - windowSize)
+                let rows = Array(allRows[windowStart...])
+                // "Load earlier messages" chip — only when the window does not
+                // already cover the whole transcript. Tapping grows the window by
+                // another `transcriptWindow`. The grow is anchored to the previously
+                // first-visible row id via `ScrollViewReader` so the content above
+                // appears WITHOUT yanking the reader's current position.
+                if windowStart > 0, let firstId = rows.first?.element.id {
+                    loadEarlierChip(anchorTo: firstId, proxy: proxy)
+                        .id("hermes.chat.loadEarlier")
+                }
                 ForEach(rows, id: \.element.id) { index, message in
-                    let previous = index > 0 ? rows[index - 1].element : nil
+                    // `index` here is the ABSOLUTE index into the full transcript
+                    // (preserved by `enumerated()` before the slice), so the previous
+                    // row is `allRows[index - 1]` — correct even for the first
+                    // windowed row, which looks back at the off-window message above.
+                    let previous = index > 0 ? allRows[index - 1].element : nil
                     MessageBubble(
                         message: message,
                         onEdit: editHandler,
@@ -765,6 +817,15 @@ struct ChatView: View {
             // pill stays hidden and the native anchor owns the open landing.
             atBottom = true
         }
+        // R39 (Defect 2): reset the eager-tail window to its base size when the
+        // session changes. `ChatView`'s `@State` outlives the per-session ScrollView
+        // `.id` remount (the id is on the inner ScrollView, not ChatView), so a
+        // window grown by "Load earlier" in session A would otherwise carry into
+        // session B. Snapping back to `transcriptWindow` keeps every open landing on
+        // the exact-geometry tail window.
+        .onChange(of: chatStore.activeStoredSessionId) { _, _ in
+            windowSize = Self.transcriptWindow
+        }
         // PER-SESSION SCROLLVIEW IDENTITY: each session open mounts a fresh ScrollView.
         // `.defaultScrollAnchor(.bottom)` resolves at first layout → native open-on-newest.
         // The `.transaction { $0.animation = nil }` on the subtree blocks any
@@ -818,6 +879,41 @@ struct ChatView: View {
                 proxy.scrollTo(match.id, anchor: .center)
             }
         }
+    }
+
+    // MARK: - Load-earlier chip (R39 / Defect 2)
+
+    /// "Load earlier messages" affordance shown above the eager tail window when the
+    /// window does not cover the whole transcript. Tapping grows the window by one
+    /// `transcriptWindow` step. The grow is anchored to the previously-first windowed
+    /// row (`anchorTo`) via `ScrollViewReader`: after the older rows are constructed
+    /// above, the view re-pins that same row to `.top` so the reader's position is
+    /// preserved (no visible jump). Wrapped in `withAnimation(nil)` so the grow is an
+    /// instant content swap, not an animated reflow fighting the anchor.
+    private func loadEarlierChip(anchorTo firstId: ChatMessage.ID, proxy: ScrollViewProxy) -> some View {
+        Button {
+            withAnimation(nil) {
+                windowSize += Self.transcriptWindow
+            }
+            // Re-pin the previously-first row to the top after the older rows lay
+            // out above it, so the reader stays put. A runloop hop lets the grown
+            // window construct before the scroll resolves.
+            DispatchQueue.main.async {
+                proxy.scrollTo(firstId, anchor: .top)
+            }
+        } label: {
+            Text("Load earlier messages")
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(theme.mutedFg)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .chromePill(theme, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 6)
+        .accessibilityLabel("Load earlier messages")
+        .accessibilityIdentifier("loadEarlierMessages")
     }
 
     // MARK: - Draft empty state

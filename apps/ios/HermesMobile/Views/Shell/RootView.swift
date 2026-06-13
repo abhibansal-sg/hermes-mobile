@@ -525,7 +525,15 @@ private struct CompactLayout: View {
                 // CONTENT (`chatStack`) is clipped separately and keeps its own
                 // safe-area insets, so the composer still sits above the home
                 // indicator and the transcript still clears the status bar.
-                chatCardSurface(cornerRadius: openProgress > 0 ? cardCornerRadius : 0,
+                //
+                // SMOOTHNESS R39 (Defect 1): the radius is a CONTINUOUS function of
+                // `openProgress` (0 → cardCornerRadius), not a `openProgress > 0`
+                // boolean jump. The boolean flipped 0→28 in a single frame at the
+                // very start of the drag, snapping the clip shape (and forcing a
+                // discrete relayout of the clipped content) — one of the "snapping
+                // from the inside" sources. A linear ramp tracks the finger so the
+                // corners round in lockstep with the slide, no discrete jump.
+                chatCardSurface(cornerRadius: cardCornerRadius * openProgress,
                                 openProgress: openProgress,
                                 safeTop: safeTop)
                     // While open, a tap anywhere on the displaced card closes the
@@ -545,6 +553,26 @@ private struct CompactLayout: View {
                         }
                     }
                     .offset(x: offset)
+                    // SMOOTHNESS R39 (Defect 1) — the settle spring is scoped to
+                    // the CARD OFFSET ALONE, not the whole ZStack. Previously two
+                    // `.animation(value:)` modifiers wrapped the entire subtree
+                    // (drawer + card + transcript): on a drawer open/close EVERY
+                    // animatable change inside the transcript received that spring
+                    // transaction — but the transcript subtree nulls animation
+                    // (`.transaction { animation = nil }`), so those interior changes
+                    // SNAPPED per frame instead of riding the slide. That mismatch is
+                    // the reported "transcript moving/snapping from the inside." Here
+                    // the spring animates ONLY the rigid `.offset`; nothing inside the
+                    // card is in the animation's scope, so the card translates as one
+                    // rigid surface and the interior never re-animates.
+                    //
+                    // The interactive drag itself carries NO animation: `offset`
+                    // tracks `dragTranslation` 1:1 (see `currentOffset`), so the card
+                    // follows the finger exactly. Only the release → settle to the
+                    // committed open/closed state (`drawer.isOpen`) springs. The prior
+                    // `.animation(value: dragTranslation)` made a spring CHASE the
+                    // finger every frame (rubber-band lag) — deleted.
+                    .animation(.spring(response: 0.40, dampingFraction: 0.86), value: drawer.isOpen)
                     // Focus-trap PRESERVED (Amendment E): the displaced chat card
                     // is hidden from assistive tech while the drawer is open.
                     .accessibilityHidden(drawer.isOpen)
@@ -559,8 +587,6 @@ private struct CompactLayout: View {
             // captured `safeTop` (floating header) / `controlBottomBaseline`
             // (composer), so nothing collides with the status bar or home indicator.
             .ignoresSafeArea(.container, edges: .all)
-            .animation(.spring(response: 0.40, dampingFraction: 0.86), value: drawer.isOpen)
-            .animation(.interactiveSpring(response: 0.30, dampingFraction: 0.9), value: dragTranslation)
             .contentShape(Rectangle())
             // simultaneousGesture (not .gesture) so the transcript's vertical
             // scroll and any horizontal sub-scrollers (code blocks, attachment

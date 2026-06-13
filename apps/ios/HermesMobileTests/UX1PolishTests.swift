@@ -285,4 +285,21 @@ final class UX1PolishTests: XCTestCase {
     //
     // The `atBottomThreshold` constant is still tested by
     // `testAtBottomThresholdIsModestPositive`.
+
+    // MARK: - 7. Eager transcript window (R39 / Defect 2)
+
+    /// The eager-tail window (the last `transcriptWindow` messages rendered with NO
+    /// lazy height estimation) is a positive, substantial size — large enough to
+    /// cover the vast majority of real sessions in a single window (so the open
+    /// lands on exact geometry without a "Load earlier" tap), but bounded so eager
+    /// construction stays cheap. A deliberate, pinned choice: changing it is a
+    /// perf/UX decision, not an accident.
+    func testTranscriptWindowIsBoundedPositive() {
+        XCTAssertGreaterThanOrEqual(ChatView.transcriptWindow, 50,
+            "the eager window must cover most real sessions in a single window so "
+            + "the open lands on exact-geometry tail content without a Load-earlier tap")
+        XCTAssertLessThanOrEqual(ChatView.transcriptWindow, 500,
+            "the eager window must stay bounded so eager row construction (even with "
+            + "RenderCache memoization) does not regress hitch counts on a huge session")
+    }
 }
