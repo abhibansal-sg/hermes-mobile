@@ -463,6 +463,17 @@ private struct CompactLayout: View {
     /// Reset to `nil` on `onEnded`.
     @State private var horizontalDominant: Bool?
 
+    /// SMOOTHNESS R40 (Defect: "card snaps to the right on open"). The finger
+    /// position (cumulative `translation.width`) at the instant this gesture
+    /// LATCHED as the drawer driver. The card's offset tracks `dx - dragAnchor`,
+    /// not raw `dx`, so the very first driven frame is offset 0 and the card
+    /// starts from where the finger is — not from touch-down. Without it, the
+    /// pre-latch travel (the `minimumDistance` dead-zone + the dominance-
+    /// classification distance, ~12–30pt) was applied as a single step the
+    /// instant we took over: the visible "snap to the right" on open (and its
+    /// mirror jump on close). Reset to 0 on `onEnded`.
+    @State private var dragAnchor: CGFloat = 0
+
     /// Fraction of the screen width the chat card is pushed by when open (≈78%,
     /// observed reference). The drawer beneath occupies this leading band.
     private let widthFraction: CGFloat = 0.78
@@ -772,32 +783,45 @@ private struct CompactLayout: View {
                         horizontalDominant = false
                         return
                     }
+                    // Just latched: anchor here so the card tracks from the finger's
+                    // CURRENT position (offset 0 this frame), not from touch-down —
+                    // kills the pre-latch dead-zone step ("snaps to the right").
+                    dragAnchor = dx
                 }
                 guard horizontalDominant == true else { return }
 
+                // Displacement measured from the anchor: the card is glued to the
+                // finger from the moment we took over, with no opening step.
+                let eff = dx - dragAnchor
                 if drawer.isOpen {
                     // Track leftward (closing) drags from the displaced card.
-                    dragTranslation = min(0, dx)
+                    dragTranslation = min(0, eff)
                 } else {
-                    dragTranslation = max(0, dx)
+                    dragTranslation = max(0, eff)
                 }
             }
             .onEnded { value in
+                let anchor = dragAnchor
                 defer {
                     dragTranslation = nil
                     horizontalDominant = nil
+                    dragAnchor = 0
                 }
                 // Only a drag this gesture actually drove can commit.
                 guard horizontalDominant == true else { return }
-                let predicted = value.predictedEndTranslation.width
+                // Measure displacement from the anchor (finger position at latch),
+                // matching the on-screen card travel, so the pre-latch dead-zone
+                // never counts toward the commit threshold.
+                let dragged = value.translation.width - anchor
+                let predicted = value.predictedEndTranslation.width - anchor
                 if drawer.isOpen {
                     // Close if dragged/flicked left past ~30% of the width.
-                    if value.translation.width < -drawerWidth * 0.3 || predicted < -drawerWidth * 0.5 {
+                    if dragged < -drawerWidth * 0.3 || predicted < -drawerWidth * 0.5 {
                         close()
                     }
                 } else {
                     // Open if dragged/flicked right past ~30% of the width.
-                    if value.translation.width > drawerWidth * 0.3 || predicted > drawerWidth * 0.5 {
+                    if dragged > drawerWidth * 0.3 || predicted > drawerWidth * 0.5 {
                         open()
                     }
                 }

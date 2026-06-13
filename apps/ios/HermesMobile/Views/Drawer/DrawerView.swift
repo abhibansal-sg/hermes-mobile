@@ -1277,16 +1277,18 @@ struct DrawerView: View {
     /// Open an existing session and dismiss the drawer (compact). Activation is
     /// instant (transcript + resume continue in the background).
     ///
-    /// FIX 4: fire the drawer-close (`onNavigate()`) FIRST so the close-spring's
-    /// `drawer.isOpen = false` mutation is committed to SwiftUI before `open()` runs
-    /// its (now-deferred) teardown — the spring owns the tap tick. `open()` defers
-    /// `clearSessionState()` + `chat.reset()` to the next runloop tick itself, so
-    /// even the cheap synchronous activation pointers it sets here land after the
-    /// close mutation is queued. Together the switch hitch (S2) is removed at the
-    /// source: nothing heavy executes on the spring's frame 0.
+    /// R40 — REVEAL-ON-PAINT (supersedes FIX 4). Keep the drawer OPEN through the
+    /// tap and hand `open(_:)` the close as `revealOnFirstPaint`: the store fires
+    /// it the instant the new transcript's first frame is painted (cache hit ≈ one
+    /// frame; miss = the skeleton), so the rigid close-slide uncovers SETTLED
+    /// content. The prior FIX-4 order closed on frame 0 while the async cache paint
+    /// landed a frame later — mid-slide — which the user saw as "the transcript
+    /// moves on its own beat before the chat-view layer." The switch-hitch FIX 4
+    /// targeted is still avoided: `open()` keeps deferring its heavy teardown, and
+    /// nothing heavy runs on the close-spring's frame 0 (the slide now even starts
+    /// a frame later, fully clear of the activation work).
     private func open(_ summary: SessionSummary) {
-        onNavigate()
-        sessions.open(summary)
+        sessions.open(summary) { onNavigate() }
     }
 
     /// Start a fresh local draft chat (B3 API) and dismiss the drawer. Draft

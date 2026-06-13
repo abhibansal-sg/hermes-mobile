@@ -1480,7 +1480,19 @@ final class SessionStore {
     /// superseded open (the user tapped another session) checks it and bails.
     private var openToken = UUID()
 
-    func open(_ summary: SessionSummary) {
+    /// - Parameter revealOnFirstPaint: SMOOTHNESS R40 (Defect: "the transcript
+    ///   moves before the chat-view layer on close"). When the drawer hands off a
+    ///   row tap it passes its close here instead of firing it itself. We invoke
+    ///   it exactly once, on the main actor, the moment the new transcript's FIRST
+    ///   frame is painted (cache hit = the cached rows; miss = the empty skeleton)
+    ///   — see ``seedTranscriptCacheFirst``. So the rigid close-slide uncovers
+    ///   settled content instead of reconciling mid-slide. The prior order (FIX 4:
+    ///   close on frame 0, async cache paint lands a frame later) let the content
+    ///   swap land while the card was already moving — the reported desync.
+    ///   Guarded by `openToken`, so a newer open()/draft that supersedes this tap
+    ///   in the same window never fires a stale close. `nil` (the default, every
+    ///   non-drawer caller) preserves the exact prior behavior.
+    func open(_ summary: SessionSummary, revealOnFirstPaint: (@MainActor () -> Void)? = nil) {
         // Leaving any draft: opening a stored session is no longer a draft.
         isDraft = false
         // Per-session state belongs to the PREVIOUS session — clear it now so the
@@ -1526,7 +1538,8 @@ final class SessionStore {
         // fetch then reconciles in place over either starting point.
         Task { [weak self] in
             guard let self, self.openToken == token else { return }
-            await self.seedTranscriptCacheFirst(storedId: summary.id, token: token)
+            await self.seedTranscriptCacheFirst(
+                storedId: summary.id, token: token, onFirstPaint: revealOnFirstPaint)
         }
 
         // Slow path: gateway resume — spins up the agent server-side; only
@@ -2270,8 +2283,19 @@ final class SessionStore {
     /// point (identity-preserving — no remount, no flicker). `token` is the
     /// ``openToken`` re-checked after every await so a newer open/draft supersedes
     /// a stale seed (R1 #28/#43).
-    private func seedTranscriptCacheFirst(storedId: String, token: UUID) async {
-        guard let chat else { return }
+    private func seedTranscriptCacheFirst(
+        storedId: String, token: UUID, onFirstPaint: (@MainActor () -> Void)? = nil
+    ) async {
+        // R40 reveal-on-paint: fire the caller's reveal (drawer close) exactly
+        // once, after phase 1 lands the first frame — even on the early-out paths
+        // below, so a missing `chat` can never strand the drawer open.
+        var firstPaintSignalled = false
+        func signalFirstPaint() {
+            guard !firstPaintSignalled else { return }
+            firstPaintSignalled = true
+            if openToken == token { onFirstPaint?() }
+        }
+        guard let chat else { signalFirstPaint(); return }
 
         #if DEBUG
         // OPEN→PAINTED LATENCY instrumentation (WhatsApp bar): measure where the
@@ -2312,6 +2336,11 @@ final class SessionStore {
             phase: paintedFromCache ? "cache-paint(HIT)" : "cache-miss(reset)",
             storedId: storedId, since: openClock)
         #endif
+
+        // Phase 1 done — the new session's first frame is on screen. Reveal it:
+        // the drawer (if it handed us its close) slides away NOW, uncovering
+        // settled content rather than reconciling mid-slide (R40).
+        signalFirstPaint()
 
         // Phase 2 — authoritative network seed, reconciled in place.
         guard let fetch = resolvedTranscriptFetch else { return }
