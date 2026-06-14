@@ -49,7 +49,15 @@ stay in sync. (The project key is the path-encoded dir under
 **LINEAR** (team ABH, project "Hermes Mobile — Engineering") is the cloud source
 of truth for tasks — nothing to clone; just sign in.
 
-**WHERE THINGS STAND (2026-06-09):** TestFlight build 22 (1.0.1) is VALID and on
-device; trunk = `feat/group-collapse-pin` @ `3edeffeca`; the gateway `session.info`
-emit (model hot-swap) is live. Phase = finalize/consolidation. See
-`.agent-memory/project_hermes_mobile.md` for the live detail.
+**WHERE THINGS STAND (2026-06-14):** TestFlight build 40 (1.0.1) is VALID; work
+branch = `phase2-upstream-rebase` @ `cb96cdc9a` (Phase-2 rebased plugin gateway,
+pushed to origin backup mirror); trunk = `feat/group-collapse-pin`; live :9119
+carries the rebased gateway + `session.info` model hot-swap + stable wire-id
+ordinal stamp. Phase = SMOOTHNESS saga at device-verdict — builds 36→40 fixed the
+chat-surface jank (cache-first → boring rebuild → eager 150-msg window → drawer
+choreography). User confirmed build 39 "loading fine, always at newest, perfect";
+build 40 adds drawer drag-anchor + reveal-on-paint close, awaiting the user's
+device feel-test of the finger-drag. Linear tracker = ABH-153. After the verdict:
+STOP drawer polish, MOVE ON to broader small-bug list + launch. NEW: user bringing
+a faster-dev approach next session (get it at start). See
+`.agent-memory/project_hermes_mobile.md` (top block) for the live detail.

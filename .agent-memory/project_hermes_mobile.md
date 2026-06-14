@@ -7,6 +7,62 @@ metadata:
   originSessionId: 6b6cabb9-b6d9-4f9e-9125-9451fe1d94bc
 ---
 
+**=== WHERE THINGS STAND (2026-06-14) — BUILD 40 VALID, SMOOTHNESS SAGA AT DEVICE-VERDICT ===**
+Trunk = `feat/group-collapse-pin`. Active work branch = `phase2-upstream-rebase`
+(HEAD `cb96cdc9a` build 40, pushed to origin/backup mirror). Live gateway :9119
+carries the Phase-2 rebased plugin gateway + `session.info` model hot-swap +
+stable wire-id `_history_to_messages` ordinal stamp.
+
+**THE SMOOTHNESS ARC (builds 34→40), now essentially closed pending the user's
+device feel-test of build 40:** the user fought chat-surface jank for days —
+scroll jank, session-switch jank, chats opening on a BLANK page (scroll-up-then-
+snap), opening mid-conversation, rare freeze. Root causes were a STACK of three
+platform-fights, each masking the next:
+ - Build 36 = cache-first architecture (paintFromCache before the REST probe;
+   killed the 2.5–4s white void = full-transcript network fetch painted as
+   nothing).
+ - Build 38 = "the boring rebuild" — deleted ~540 lines of custom scroll
+   machinery for stock `ScrollView+LazyVStack+.defaultScrollAnchor(.bottom)` +
+   per-session `.id` + `.transaction{animation=nil}`.
+ - Build 39 = eager VStack over a bounded 150-msg tail window (killed LazyVStack
+   HEIGHT-ESTIMATION = the blank/scroll-up-then-snap) + rigid drawer card (scoped
+   the settle spring to the card `.offset` alone, continuous corner-radius ramp).
+   **USER VERDICT on 39: "loading fine, always at the newest message, perfect."
+   The load blocker — the thing actually gating community launch — is SOLVED.**
+ - Build 40 = drawer CHOREOGRAPHY (the last polish): (1) open "card snaps right"
+   = drag-latch dead-zone applied as a step → FIXED with `dragAnchor` (card tracks
+   `dx - dragAnchor`, glued to finger at handoff); (2) close "transcript moves
+   before the card" = FIX-4 closed on frame 0 while the async cache paint landed
+   mid-slide → FIXED with reveal-on-paint (`SessionStore.open(_:revealOnFirstPaint:)`
+   fires the drawer close only after phase-1 first paint; `DrawerView.open` =
+   `sessions.open(summary){onNavigate()}`). Files: RootView CompactLayout,
+   SessionStore.open + seedTranscriptCacheFirst, DrawerView.open. Full test suite
+   GREEN; sim-verified on live gateway/real data (correct chat at newest, ONE
+   coherent close spring, no mid-slide reflow per frame-diff, no blank/strand/
+   crash). DEVICE-ONLY remaining: the finger-DRAG feel of fix (1) — cliclick
+   cannot synthesize a real pan; the user's thumb is the judge. Also for the user
+   to judge: keyboard-rise smoothness, short-chat bottom-align acceptance.
+
+**PROCESS RECKONING (this matters for continuity):** 4 prior "verified" builds
+failed on the user's device because every gate judged STILLS + unit tests +
+SYNTHETIC seeds — and the complaints were about MOTION + REAL chats. New standing
+bar (build-39 onward): no ship until the orchestrator personally watches VIDEO of
+the exact reported motions, on recordings from the sim, against the user's REAL
+sessions (live gateway :9119, token ~/.hermes/dashboard.token, cliclick for mouse
+pans on the Simulator window). Stills/agent-claims are insufficient for motion
+defects. Harness: /tmp/myverify/. The SWBBuildService wedge recurred mid-build-40
+and was cleared by a user logout/login (per [[ops-swbbuildservice-wedge]] — the
+window also RELOCATED on relaunch from x=737 to x=1255, silently breaking every
+cliclick coord until re-pinned; ALWAYS re-read window origin after a sim relaunch).
+
+**IMMEDIATE NEXT (2026-06-14):** user is concluding this session to COMPACT and
+bring a NEW APPROACH to make dev faster (not yet specified — get it at session
+start). Per user ruling, after the build-40 device verdict we STOP hand-polishing
+the drawer and MOVE ON: triage the broader small-bug list (batch into a couple of
+builds) + return to LAUNCH (public repo ~/hermes-mobile-public, copy + assets
+~/hermes-demo-video/, PR0 drafted, video footage waits on the now-smooth app).
+Smoothness resume detail also in the auto-memory file [[smoothness-round2-resume]].
+
 Native SwiftUI iOS/iPadOS client for hermes-agent, built 2026-06-05 on local branch `hermes-mobile` in ~/.hermes/hermes-agent (upstream NousResearch/hermes-agent — do NOT push).
 
 **TAKEOVER 2026-06-07 (FULL — user ruling):** Claude owns BOTH lanes; dual-executor retired (CLAUDE.md + CODEX-LANE.md amended in repo). UX Gameboard on Linear (parent ABH-59, levels ABH-60..72): L00-05 Done w/ feedback; L06+ pending — user switched to FIX-FIRST level-by-level, live-cockpit mode (user at Mac, direct device installs to iPhone Air `1D51F2FB…`/hw `00008150-000911CA0240401C`, ~2min loop, no TestFlight). Wave UX-1 issues: ABH-73..84 in "Hermes Mobile — Engineering" (P0 bugs ABH-73 delete / ABH-74 mic; batches ABH-79 glass shell→ABH-83 inline approvals; ABH-84 deferred UX-2). LANDED: `6fb76c612` ABH-73 iOS half (close-before-delete + error surface + interrupt rider), `c7743dc9c` ABH-74 voice (gesture re-host, hold-strip stop, 120s watchdog, interruption/disconnect/timeout) — gate GREEN 377/0. Server half (evict-before-delete) lands separately; INERT until 9119 restart (ask user). Subtitle locked: "Your agent, on the go." Archived-chats placement + swipe-anywhere-vs-codeblock questions asked, pending answer. INCIDENTS (both attributed to USER-DRIVEN Codex desktop session while Claude unreachable): 10:54 bulk revert of 27 files to pre-R1 blobs → quarantined `stash@{1}` "QUARANTINE 2026-06-07" (never pop); 12:38 ChatMessagePart ordered-transcript work (+ doc apps/ios/CHAT-THREAD-PARTS-2026-06-07.md) → user ruled adopt-after-adversarial-review (was stash@{0}, integrator applies+drops it on green). Model tiering policy active per [[model-tiering-policy]]; velocity model per [[velocity-model]].
