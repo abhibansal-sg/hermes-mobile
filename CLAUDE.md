@@ -49,15 +49,24 @@ stay in sync. (The project key is the path-encoded dir under
 **LINEAR** (team ABH, project "Hermes Mobile — Engineering") is the cloud source
 of truth for tasks — nothing to clone; just sign in.
 
-**WHERE THINGS STAND (2026-06-14):** TestFlight build 40 (1.0.1) is VALID; work
-branch = `phase2-upstream-rebase` @ `cb96cdc9a` (Phase-2 rebased plugin gateway,
-pushed to origin backup mirror); trunk = `feat/group-collapse-pin`; live :9119
-carries the rebased gateway + `session.info` model hot-swap + stable wire-id
-ordinal stamp. Phase = SMOOTHNESS saga at device-verdict — builds 36→40 fixed the
-chat-surface jank (cache-first → boring rebuild → eager 150-msg window → drawer
-choreography). User confirmed build 39 "loading fine, always at newest, perfect";
-build 40 adds drawer drag-anchor + reveal-on-paint close, awaiting the user's
-device feel-test of the finger-drag. Linear tracker = ABH-153. After the verdict:
-STOP drawer polish, MOVE ON to broader small-bug list + launch. NEW: user bringing
-a faster-dev approach next session (get it at start). See
-`.agent-memory/project_hermes_mobile.md` (top block) for the live detail.
+**WHERE THINGS STAND (2026-06-16):** TestFlight **build 41 (1.0.1) is VALID**; work
+branch = `phase2-upstream-rebase` @ `a1ab20c63`, pushed to origin backup mirror;
+trunk = `feat/group-collapse-pin`. Build 41 = the research-driven build-out: studied
+11 open-source chat apps (`~/chat-research/REPORT.md` + `REPORT-DATA.md`) →
+`PROPOSAL.md`/`PLAN.md` → built. SHIPPED in 41: **A1 per-bubble `Equatable`
+short-circuit on MessageBubble** (settled bubbles stop re-evaluating; streaming
+~150 body-evals/40ms → 1) + **A2 finalize anim-suppress** (no turn-end flash) —
+the chat-view smoothness win; **plugin-side transcript DELTA** route
+(`/api/plugins/hermes-mobile/sessions/{id}/messages?after_id&prefix_count&shape`,
+read-only generation guard, 14 pytests) + iOS delta-aware fetch w/ safe full-fetch
+fallback; **skeleton/light payload shaping** (backend). **ZERO stock-gateway edits**
+(all backend plugin-side, `SessionDB(read_only=True)`). iOS build + full test suite
+GREEN. Linear **ABH-154** (build-out), ABH-153 (smoothness saga). Full writeup
+`~/chat-research/BUILDOUT-SUMMARY.md`. **DELTA ACTIVATION:** only fires once the
+gateway runs the updated plugin (redeploy :9119 or a test instance) — until then iOS
+falls back to full fetch (safe). DEFERRED (need device loop): iOS skeleton client
+tiering (backend ready), keyboard rewrite (works on iPhone fleet), Phase-5 offline
+outbox. DECIDED: keep eager VStack (A1 validated it), keep drawer. NEXT: user's
+device verdict on build 41 smoothness; then optionally redeploy gateway to activate
+delta + tackle deferred items device-verified. See
+`.agent-memory/project_hermes_mobile.md` for the live detail.

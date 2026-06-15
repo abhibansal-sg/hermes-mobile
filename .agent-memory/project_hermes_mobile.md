@@ -7,6 +7,21 @@ metadata:
   originSessionId: 6b6cabb9-b6d9-4f9e-9125-9451fe1d94bc
 ---
 
+**=== WHERE THINGS STAND (2026-06-16) — BUILD 41 VALID, RESEARCH-DRIVEN BUILD-OUT SHIPPED ===**
+Build 41 (1.0.1) VALID on TestFlight; branch `phase2-upstream-rebase` @ `a1ab20c63` (pushed origin backup mirror).
+Came from studying 11 open-source chat apps (`~/chat-research/REPORT.md`, `REPORT-DATA.md`, `BUILDOUT-SUMMARY.md`)
+→ `PROPOSAL.md`/`PLAN.md` → build. SHIPPED: A1 per-bubble `Equatable` short-circuit on MessageBubble (settled bubbles
+stop re-evaluating; streaming ~150 body-evals/40ms→1) + A2 `withTransaction(animation:nil)` finalize (no turn-end
+flash) — the chat-view smoothness win; plugin-side transcript DELTA route (read-only generation guard,
+`plugins/hermes-mobile/transcript_sync.py` decide_delta+shape_messages, 14 pytests; route in dashboard/api.py at
+`/api/plugins/hermes-mobile/sessions/{id}/messages?after_id&prefix_count&shape`) + iOS delta-aware fetch
+(RestClient.messagesDelta + fetchTranscriptDeltaAware) on open+reconnect with SAFE full-fetch fallback; skeleton/light
+shaping. ZERO stock-gateway edits (SessionDB read_only). iOS build+full-test GREEN. Linear ABH-154 (+ABH-153 saga).
+DELTA ACTIVATES only when the gateway runs the updated plugin (redeploy :9119 or test instance) — else iOS full-fetch
+fallback (safe). DEFERRED (need device loop): iOS skeleton client tiering (backend ready), keyboard rewrite (works on
+iPhone fleet), Phase-5 offline outbox. DECIDED: keep eager VStack (A1 validated), keep drawer. NEXT: user device
+verdict on 41; then optionally redeploy gateway to activate delta + do deferred items device-verified.
+
 **=== WHERE THINGS STAND (2026-06-14) — BUILD 40 VALID, SMOOTHNESS SAGA AT DEVICE-VERDICT ===**
 Trunk = `feat/group-collapse-pin`. Active work branch = `phase2-upstream-rebase`
 (HEAD `cb96cdc9a` build 40, pushed to origin/backup mirror). Live gateway :9119
