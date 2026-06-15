@@ -20,6 +20,14 @@ struct ChatView: View {
     /// its themed opaque bar; compact lets the system default the background so
     /// the full-bleed chat card (geometry fix) shows through beneath the chrome.
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    /// Folded into each `MessageBubble`'s `Equatable` value (A1) so a theme or
+    /// Dynamic-Type change re-renders every bubble even though `.equatable()`
+    /// short-circuits content-equal updates — `MessageBubble` reads the theme via
+    /// `@Environment`, which the static `==` cannot see, so it travels as a value.
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    /// Paired with the theme id in each bubble's `Equatable` value (A1): catches an
+    /// adaptive theme's light↔dark flip, where the theme name is unchanged.
+    @Environment(\.colorScheme) private var colorScheme
 
     /// Optional hook invoked when the user chooses "Speak" on an assistant
     /// message. Wiring to the speech player happens during integration; nil
@@ -684,8 +692,15 @@ struct ChatView: View {
                         onSpeak: onSpeak,
                         onRestoreCheckpoint: restoreCheckpointHandler,
                         onBranch: branchHandler,
-                        menuActionsEnabled: menuActionsEnabled
+                        menuActionsEnabled: menuActionsEnabled,
+                        appearance: BubbleAppearance(themeID: theme.id, colorScheme: colorScheme, typeSize: dynamicTypeSize)
                     )
+                    // A1 (scarf): settled bubbles short-circuit their body — only the
+                    // streaming bubble (whose `message` changed) re-evaluates. Drops the
+                    // per-flush cost from O(window) bodies to O(1). The `==` compares
+                    // `message` + menu-action gating + the `appearance` token; a theme /
+                    // Dynamic-Type switch flips `appearance` so it never strands stale.
+                    .equatable()
                     .padding(.top, Self.topGap(above: message, after: previous))
                     .id(message.id)
                 }

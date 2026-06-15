@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI  // A2: withTransaction(Transaction(animation: nil)) on the finalize flip
 import os
 #if DEBUG
 import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-G)
@@ -846,6 +847,13 @@ final class ChatStore {
         let id = ensureStreamingMessage()
         // Wall-clock the turn took, used to label a collapsed tool cluster.
         let elapsed = turnStartedAt.map { Date().timeIntervalSince($0) }
+        // A2 (scarf): suppress the implicit animation on the streaming→final flip.
+        // The finalized content is value-equal to what streamed (isStreaming=false +
+        // per-cluster tool collapse + authoritative final text), so SwiftUI would
+        // otherwise animate a no-op structural diff — the turn-end flash / height
+        // jump on the last bubble. The cursor's own fade (cursorView.onChange) is a
+        // separate in-view `withAnimation` and is unaffected by this transaction.
+        withTransaction(Transaction(animation: nil)) {
         mutateStreaming { message in
             if let text = completion?.text, !text.isEmpty {
                 message.applyFinalText(text)
@@ -882,6 +890,7 @@ final class ChatStore {
             // transcripts never reach this path.
             message.collapseFinishedToolClusters(turnElapsed: elapsed)
         }
+        }  // withTransaction(animation: nil) — A2
         if streamingMessageID == id { streamingMessageID = nil }
         // The local turn finalized. This path is only ever reached for a LOCAL
         // frame — a foreign `message.complete` is intercepted in
@@ -2462,7 +2471,11 @@ final class ChatStore {
     private var resolvedBackfillFetch: ((String) async throws -> [StoredMessage])? {
         if let backfillFetch { return backfillFetch }
         guard let rest = connection?.rest else { return nil }
-        return { sessionId in try await rest.messages(sessionId: sessionId) }
+        // Phase 3: delta-aware reconnect/foreground reconcile (tail-only when the
+        // plugin mount serves it; full fetch otherwise). Full list returned either way.
+        return { [cacheStore] sessionId in
+            try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId)
+        }
     }
 
     // MARK: - Reset

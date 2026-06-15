@@ -2484,7 +2484,12 @@ final class SessionStore {
     private var resolvedTranscriptFetch: ((String) async throws -> [StoredMessage])? {
         if let transcriptFetch { return transcriptFetch }
         guard let rest = connection?.rest else { return nil }
-        return { sessionId in try await rest.messages(sessionId: sessionId) }
+        // Phase 3: fetch only the tail beyond the cache cursor when the plugin
+        // mount serves the delta route; falls back to the full fetch otherwise.
+        // Returns the full StoredMessage list either way (delta invisible downstream).
+        return { [cacheStore] sessionId in
+            try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId)
+        }
     }
 
     /// The injected ``rpcSend``, or the default that forwards to the live gateway

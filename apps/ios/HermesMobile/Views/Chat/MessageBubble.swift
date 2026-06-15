@@ -22,32 +22,66 @@ struct MessageBubble: View {
     /// Trigger sentinel for `.sensoryFeedback` — toggled on every copy.
     @State private var copyHapticTrigger = false
 
+    // A1: action closures are `let` (immutable inputs). They are NOT read by the
+    // `nonisolated ==` (closures aren't Sendable); only their nil-ness affects what
+    // renders, and that is stable per call site (ChatView passes the same handlers
+    // every render), so omitting them from `==` never strands a real update.
     /// Invoked when the user chooses "Edit" on their own bubble. The host
     /// (`ChatView`) presents an edit sheet and calls `ChatStore.editAndResend`.
     /// `nil` (default) hides the Edit action — used in previews / pre-wiring.
-    var onEdit: ((ChatMessage) -> Void)?
+    let onEdit: ((ChatMessage) -> Void)?
     /// Invoked when the user chooses "Retry" on an assistant message. The host
     /// calls `ChatStore.retry(fromAssistantId:)`. `nil` hides the action.
-    var onRetry: ((ChatMessage) -> Void)?
+    let onRetry: ((ChatMessage) -> Void)?
     /// Invoked when the user chooses "Speak" on an assistant message. Wiring to
     /// the speech player happens later; `nil` hides the action.
-    var onSpeak: ((ChatMessage) -> Void)?
+    let onSpeak: ((ChatMessage) -> Void)?
     /// Invoked when the user chooses "Restore checkpoint" on their own bubble
     /// (F4A-A2): re-run the conversation from this user message, dropping later
     /// turns. The host calls `ChatStore.restoreCheckpoint(toUserMessageId:)`.
     /// `nil` hides the action.
-    var onRestoreCheckpoint: ((ChatMessage) -> Void)?
+    let onRestoreCheckpoint: ((ChatMessage) -> Void)?
     /// Invoked when the user chooses "Branch from here" on any message (F4A-A2):
     /// open a NEW chat seeded with history up to this message. The host calls
     /// `ChatStore.branchSeed(upToMessageId:)` + `SessionStore.branchSession`.
     /// `nil` hides the action.
-    var onBranch: ((ChatMessage) -> Void)?
+    let onBranch: ((ChatMessage) -> Void)?
     /// Whether mutable context-menu actions (Edit, Restore checkpoint, Branch from
     /// here, Retry) are currently executable. When `false` the actions are SHOWN
-    /// but disabled — the user sees them exist and can understand what they do, but
-    /// the tap has no effect. Copy and Speak are always enabled. Defaults to `true`
-    /// so previews / legacy call sites are unaffected.
-    var menuActionsEnabled: Bool = true
+    /// but disabled. Read by `==` (a Sendable `let`), so a change re-renders.
+    let menuActionsEnabled: Bool
+
+    /// Appearance identity (theme + Dynamic Type), folded into `Equatable` (A1) so
+    /// a theme/type-size switch re-renders the bubble even though `.equatable()`
+    /// short-circuits content-equal updates. The bubble reads the theme via
+    /// `@Environment`, which the static `==` cannot observe — so it travels here as
+    /// a value, supplied by `ChatView`. Defaults keep previews / standalone call
+    /// sites compiling unchanged.
+    let appearance: BubbleAppearance
+
+    /// Explicit memberwise init so every comparison input can be an immutable
+    /// `Sendable` `let` (required for the `nonisolated ==` under Swift 6 strict
+    /// concurrency — a `View` is main-actor-isolated, so `Equatable.==` may only
+    /// read immutable Sendable storage) while keeping the prior call-site defaults.
+    init(
+        message: ChatMessage,
+        onEdit: ((ChatMessage) -> Void)? = nil,
+        onRetry: ((ChatMessage) -> Void)? = nil,
+        onSpeak: ((ChatMessage) -> Void)? = nil,
+        onRestoreCheckpoint: ((ChatMessage) -> Void)? = nil,
+        onBranch: ((ChatMessage) -> Void)? = nil,
+        menuActionsEnabled: Bool = true,
+        appearance: BubbleAppearance = BubbleAppearance()
+    ) {
+        self.message = message
+        self.onEdit = onEdit
+        self.onRetry = onRetry
+        self.onSpeak = onSpeak
+        self.onRestoreCheckpoint = onRestoreCheckpoint
+        self.onBranch = onBranch
+        self.menuActionsEnabled = menuActionsEnabled
+        self.appearance = appearance
+    }
 
     var body: some View {
         if case .collapsed(let label) = message.presentation {
@@ -659,5 +693,35 @@ private struct PerfUserBubbleChrome: ViewModifier {
                 RoundedRectangle(cornerRadius: 18)
                     .strokeBorder(theme.userBubbleBorder, lineWidth: 1)
             ))
+    }
+}
+
+// MARK: - A1: Equatable short-circuit (scarf RichMessageBubble pattern)
+
+/// Appearance inputs that affect a bubble's render but reach `MessageBubble` via
+/// `@Environment` (theme, color scheme, Dynamic Type). They are carried as a value
+/// so the static `==` can compare them — otherwise `.equatable()` could skip the
+/// body on a theme/scheme/type-size change and strand stale styling. `ChatView`
+/// builds this from `\.hermesTheme.id` + `\.colorScheme` + `\.dynamicTypeSize`.
+/// `themeID` catches theme switches; `colorScheme` catches an adaptive theme's
+/// light↔dark flip (where the name is unchanged); `typeSize` catches Dynamic Type.
+struct BubbleAppearance: Equatable, Sendable {
+    var themeID: String = ""
+    var colorScheme: ColorScheme = .dark
+    var typeSize: DynamicTypeSize = .large
+}
+
+extension MessageBubble: Equatable {
+    /// Two bubbles render identically iff their content (`message`), the menu-action
+    /// gating, and the appearance token match. `nonisolated` is required under
+    /// Swift 6 strict concurrency: `Equatable.==` is a nonisolated requirement but a
+    /// `View` is main-actor-isolated, so the witness may only read immutable
+    /// `Sendable` storage — all three reads below are `let`s of `Sendable` type.
+    /// The action closures are intentionally excluded (not `Sendable`; their nil-ness
+    /// is stable per call site), so they cannot strand a real update.
+    nonisolated static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
+        lhs.message == rhs.message
+            && lhs.menuActionsEnabled == rhs.menuActionsEnabled
+            && lhs.appearance == rhs.appearance
     }
 }

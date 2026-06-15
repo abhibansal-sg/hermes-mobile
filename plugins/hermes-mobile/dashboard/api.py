@@ -819,3 +819,73 @@ async def unregister_live_activity(body: LiveActivityBody, request: Request) -> 
     engine = _plugin_module("push_engine")
     removed = engine.unregister_live_activity_token(body.session_id)
     return {"ok": True, "removed": removed}
+
+
+# ---------------------------------------------------------------------------
+# Transcript delta-sync — incremental message fetch for the iOS on-device mirror.
+#
+# The iOS app caches each session's transcript in SQLite + a per-session cursor.
+# Today it refetches the FULL transcript on every change (the stock
+# /api/sessions/{id}/messages takes no params). This route serves only the
+# missing tail when the client's cached prefix is provably unchanged, else the
+# full transcript for a clean re-seed. 100% plugin-side: read-only against the
+# stock state.db (no write lock, no schema change, no stock-file edit). The
+# generation guard is DERIVED read-only — see transcript_sync.decide_delta.
+#
+# Response rows mirror the stock endpoint exactly (so StoredMessage parses both
+# the same), plus is_delta / prefix_count / max_id for the cursor handshake.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/sessions/{session_id}/messages")
+async def session_messages_delta(
+    session_id: str,
+    request: Request,
+    after_id: int = 0,
+    prefix_count: int = -1,
+    shape: str = "full",
+):
+    """Incremental transcript fetch. ``after_id`` + ``prefix_count`` are the
+    client's cursor; omit them (cold fetch) to get the full transcript. The
+    ``shape`` param is reserved for skeleton/light tiering (Phase 4); ``full`` for
+    now. Returns ``{session_id, is_delta, prefix_count, max_id, shape, messages}``.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    from hermes_state import SessionDB, DEFAULT_DB_PATH
+
+    if not DEFAULT_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="state.db unavailable")
+
+    db = None
+    try:
+        db = SessionDB(read_only=True)
+        full = db.get_messages(session_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning("session_messages_delta read failed for %s: %s", session_id, exc)
+        raise HTTPException(status_code=503, detail="transcript read failed")
+    finally:
+        # Best-effort close of the per-request read-only connection (no write lock
+        # held; GC would also collect it, but close promptly under polling load).
+        try:
+            if db is not None and getattr(db, "_conn", None) is not None:
+                db._conn.close()
+        except Exception:
+            pass
+
+    transcript_sync = _plugin_module("transcript_sync")
+    is_delta, messages, total, max_id = transcript_sync.decide_delta(
+        full, after_id, prefix_count
+    )
+    # Phase 4: tier the payload (skeleton/light) for a faster cold-open. Rows are
+    # never dropped, so prefix_count/max_id (the cursor) are unaffected by shaping.
+    messages = transcript_sync.shape_messages(messages, shape)
+    return {
+        "session_id": session_id,
+        "is_delta": is_delta,
+        "prefix_count": total,
+        "max_id": max_id,
+        "shape": shape if shape in ("skeleton", "light") else "full",
+        "messages": messages,
+    }

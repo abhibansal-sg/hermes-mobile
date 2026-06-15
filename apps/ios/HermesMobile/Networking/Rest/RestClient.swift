@@ -202,6 +202,52 @@ struct RestClient: Sendable {
         return array.compactMap(StoredMessage.init(json:))
     }
 
+    /// Response of the plugin-mount incremental transcript fetch
+    /// (``messagesDelta``). `isDelta` true → `messages` is only the tail beyond the
+    /// client's cursor; false → `messages` is the full transcript (the server
+    /// detected a prefix reshape and forced a re-sync). `prefixCount`/`maxId` are
+    /// the new cursor the client persists.
+    struct TranscriptDelta: Sendable {
+        let isDelta: Bool
+        let prefixCount: Int
+        let maxId: Int
+        let messages: [StoredMessage]
+    }
+
+    /// `GET <plugin>/sessions/{id}/messages?after_id&prefix_count` — incremental
+    /// transcript fetch (Phase 3). Only the hermes-mobile PLUGIN mount serves this,
+    /// so it is a no-op (returns nil) unless this client speaks `.plugin`; the
+    /// caller then falls back to the full ``messages(sessionId:)``. Any failure
+    /// (404 on an older plugin build, transport, decode) also returns nil → full
+    /// fetch. The wire rows mirror the stock endpoint, so ``StoredMessage`` parses
+    /// both identically.
+    func messagesDelta(
+        sessionId: String,
+        afterId: Int,
+        prefixCount: Int
+    ) async -> TranscriptDelta? {
+        guard pathStyle == .plugin else { return nil }
+        let encodedId = sessionId.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? sessionId
+        let path = "\(mobileAPIPrefix)/sessions/\(encodedId)/messages"
+            + "?after_id=\(afterId)&prefix_count=\(prefixCount)"
+        do {
+            let data = try await get(path: path)
+            let root = try decodeJSONValue(from: data, context: "messagesDelta")
+            guard let isDelta = root["is_delta"]?.boolValue,
+                  let array = root["messages"]?.arrayValue else { return nil }
+            return TranscriptDelta(
+                isDelta: isDelta,
+                prefixCount: root["prefix_count"]?.intValue ?? -1,
+                maxId: root["max_id"]?.intValue ?? 0,
+                messages: array.compactMap(StoredMessage.init(json:))
+            )
+        } catch {
+            return nil  // legacy/older plugin (404), transport, or decode → full fetch
+        }
+    }
+
     /// Outcome of the zero-side-effect ``probeUploadEndpoint()`` capability check.
     enum UploadProbeResult: Sendable, Equatable {
         /// `400` — the endpoint exists and rejected the missing multipart field.
@@ -422,4 +468,53 @@ private extension Data {
             append(data)
         }
     }
+}
+
+// MARK: - Delta-aware transcript fetch (Phase 3)
+
+/// When the on-device cache holds a cursor for `sessionId` AND the gateway speaks
+/// the hermes-mobile plugin mount, fetch only the messages beyond the cursor and
+/// merge them onto the cached transcript — cutting the over-the-wire payload from
+/// "the whole transcript on every change" to "just the new tail". In every other
+/// case (no cursor, legacy gateway, a server-detected prefix reshape, or any delta
+/// failure) it falls back to the full stock fetch.
+///
+/// It returns the FULL `[StoredMessage]` list to seed, so the delta is invisible to
+/// everything downstream: the same `toChatMessages` normalize, the same in-place
+/// `chat.seed` reconcile (by deterministic wire id), and the same `saveTranscript`
+/// write-through all run exactly as before. The win is purely the bytes fetched —
+/// no new merge path, no cache-schema migration.
+///
+/// Safety: the cached prefix and the server delta concatenate cleanly because the
+/// cache holds COMPLETED server rows (streaming content arrives over WS, never via
+/// this path) and the plugin route's generation guard forces a full re-sync
+/// (`isDelta == false`) the instant the prefix is reshaped server-side.
+func fetchTranscriptDeltaAware(
+    rest: RestClient,
+    cacheStore: CacheStore?,
+    sessionId: String
+) async throws -> [StoredMessage] {
+    if let cacheStore,
+       let cursor = try? await cacheStore.deltaCursor(for: sessionId),
+       cursor.afterId > 0,
+       let delta = await rest.messagesDelta(
+           sessionId: sessionId,
+           afterId: cursor.afterId,
+           prefixCount: cursor.prefixCount
+       ) {
+        if delta.isDelta {
+            // Tail-only payload: append onto the cached prefix and seed the union.
+            // An empty tail (client already caught up) returns the cache unchanged.
+            var cached: [StoredMessage] = []
+            // `try?` flattens loadTranscript's `[StoredMessage]?` to a single optional.
+            if let rows = try? await cacheStore.loadTranscript(sessionId) {
+                cached = rows
+            }
+            return cached + delta.messages
+        }
+        // Server forced a full re-sync (prefix reshaped): use its authoritative list.
+        return delta.messages
+    }
+    // No cursor / legacy gateway / delta unavailable → full stock fetch (unchanged).
+    return try await rest.messages(sessionId: sessionId)
 }

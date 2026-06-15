@@ -41,7 +41,7 @@ enum ChatMessagePart: Identifiable, Sendable, Equatable {
 /// One transcript entry. Assistant messages accumulate streamed text,
 /// thinking, and a tool-activity timeline into `parts` while `isStreaming` is
 /// true.
-struct ChatMessage: Identifiable, Sendable {
+struct ChatMessage: Identifiable, Sendable, Equatable {
     /// How the entry is displayed.
     ///
     /// `.collapsed` renders as a dimmed disclosure row instead of a full

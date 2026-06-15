@@ -385,4 +385,24 @@ actor CacheStore {
             try SessionCacheRecord.fetchOne(db, key: sessionId)?.maxMessageId
         }
     }
+
+    /// The delta-sync cursor for `sessionId` (Phase 3): `afterId` = the max cached
+    /// wireId (the durable gateway DB id, via the stock REST path), `prefixCount` =
+    /// the number of cached rows that carry a wireId. The plugin delta route
+    /// validates `prefixCount` against its own `count(active id <= afterId)`; for a
+    /// clean mirror they are equal, so any server-side prefix reshape (retry /
+    /// rewind / compaction) is detected and forces a full re-sync. Returns nil when
+    /// there is no cached transcript or no wire-backed rows — the caller then does a
+    /// full fetch (no cursor to send).
+    func deltaCursor(for sessionId: String) throws -> (afterId: Int, prefixCount: Int)? {
+        try db.read { db in
+            guard let record = try SessionCacheRecord.fetchOne(db, key: sessionId),
+                  let afterId = record.maxMessageId else { return nil }
+            let prefixCount = try MessageRowRecord
+                .filter(Column("sessionId") == sessionId)
+                .filter(Column("wireId") != nil)
+                .fetchCount(db)
+            return (afterId, prefixCount)
+        }
+    }
 }
