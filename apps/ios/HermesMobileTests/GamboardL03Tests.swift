@@ -10,7 +10,7 @@ import XCTest
 ///      `MessageBubble.menuActionsEnabled` pathway.
 ///
 /// 03D  Read More — the `MessageBubble.isLongUserMessage` threshold function.
-final class ABH81GamboardL03Tests: XCTestCase {
+final class GamboardL03Tests: XCTestCase {
 
     // MARK: - 03E: menuActionsGate predicate
 

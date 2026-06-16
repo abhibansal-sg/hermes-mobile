@@ -4,7 +4,7 @@ import XCTest
 /// ABH-87 Batch D — render contract: per-cluster collapse (§3.2), turn-aware
 /// spacing (§3.4). These exercise the PURE, testable surfaces of the render
 /// contract (the SwiftUI-bound auto-open thinking and the action-row gate are
-/// covered structurally elsewhere — ProtocolParityABH46Tests — since the test
+/// covered structurally elsewhere — ProtocolParityTests — since the test
 /// target has no view-inspection harness).
 @MainActor
 final class RenderContractBatchDTests: XCTestCase {

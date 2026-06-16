@@ -5,8 +5,6 @@ notifications + Live Activities, device pairing, and file/attachment support —
 talking directly to **your own** `hermes-agent` gateway. No third‑party servers:
 the app connects only to the gateway you run.
 
-> _[ screenshots go here ]_
-
 ---
 
 ## What you need first
@@ -164,3 +162,12 @@ Apple's APNs using **your** gateway's signing key.
 ## Support
 
 Questions / bugs: open an issue at https://github.com/ab0991-oss/hermes-ios/issues.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE). The gateway seam patch
+(`dist/hermes-mobile/seams.patch`) derives from
+[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) (MIT);
+that copyright notice is retained.

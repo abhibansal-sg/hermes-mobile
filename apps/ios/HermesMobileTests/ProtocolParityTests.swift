@@ -5,7 +5,7 @@ import XCTest
 /// a REAL gateway emission (file:line citations inline) — never a fictional
 /// shape (the ABH-45 lesson).
 @MainActor
-final class ProtocolParityABH46Tests: XCTestCase {
+final class ProtocolParityTests: XCTestCase {
 
     private let activeRuntime = "rt-active"
     private let storedId = "stored-abc"

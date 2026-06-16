@@ -980,7 +980,7 @@ struct ChatView: View {
     }
 
     /// Compose the greeting from a time phrase and an optional display name. With
-    /// a name: "Evening, Abhinav". Without one: the bare phrase plus a period —
+    /// a name: "Evening, Sam". Without one: the bare phrase plus a period —
     /// "Evening." (Amendment E — the explicit fallback the test gates on). Pure +
     /// static so the period fallback is unit-testable.
     static func greeting(phrase: String, name: String?) -> String {

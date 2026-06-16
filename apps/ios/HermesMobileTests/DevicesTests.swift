@@ -128,7 +128,7 @@ final class DevicesTests: XCTestCase {
         // `token`/`token_hash`; `scopes` defaults to the full set when absent.
         let json = """
         {"devices":[
-          {"device_id":"dev_abc123","device_name":"Abhinav's iPhone","platform":"ios",
+          {"device_id":"dev_abc123","device_name":"Test iPhone","platform":"ios",
            "created_at":1700000000.0,"last_seen":1700000500.5,"token_prefix":"ab12cd34",
            "scopes":["chat","approve"]},
           {"device_id":"dev_xyz789","device_name":"iPad","platform":"ios",
@@ -139,7 +139,7 @@ final class DevicesTests: XCTestCase {
         XCTAssertEqual(result.devices.count, 2)
         let first = result.devices[0]
         XCTAssertEqual(first.deviceId, "dev_abc123")
-        XCTAssertEqual(first.deviceName, "Abhinav's iPhone")
+        XCTAssertEqual(first.deviceName, "Test iPhone")
         XCTAssertEqual(first.platform, "ios")
         XCTAssertEqual(first.tokenPrefix, "ab12cd34")
         XCTAssertEqual(first.scopes, ["chat", "approve"])
@@ -191,7 +191,7 @@ final class DevicesTests: XCTestCase {
         {"entries":[
           {"ts":1700002000.0,"session_id":"s1","session_key":"sk1","choice":"once",
            "resolve_all":false,"credential":"device","device_id":"dev_abc123",
-           "device_name":"Abhinav's iPhone","token_prefix":"ab12cd34",
+           "device_name":"Test iPhone","token_prefix":"ab12cd34",
            "command_preview":"rm -rf /tmp/build"},
           {"ts":1700001000.0,"session_id":"s2","session_key":"sk2","choice":"deny",
            "resolve_all":true,"credential":"shared","device_id":null,
@@ -204,7 +204,7 @@ final class DevicesTests: XCTestCase {
         let device = result.entries[0]
         XCTAssertEqual(device.credential, "device")
         XCTAssertEqual(device.deviceId, "dev_abc123")
-        XCTAssertEqual(device.deviceName, "Abhinav's iPhone")
+        XCTAssertEqual(device.deviceName, "Test iPhone")
         XCTAssertEqual(device.tokenPrefix, "ab12cd34")
         XCTAssertEqual(device.tokenPrefix?.count, 8)  // 8-char prefix, never full
         XCTAssertEqual(device.choice, "once")

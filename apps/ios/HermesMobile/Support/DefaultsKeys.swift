@@ -260,7 +260,7 @@ enum DefaultsKeys {
     // MARK: Identity (F2 / Amendment E)
 
     /// `String` — the user's first name, used as the greeting source on the draft
-    /// chat ("Evening, Abhinav"). Edited in the Settings sheet's account card
+    /// chat ("Evening, Sam"). Edited in the Settings sheet's account card
     /// (``SettingsView``) and read by the chat draft greeting (F3 / ChatView).
     /// **Default empty**: when unset/blank the greeting falls back to the
     /// time-of-day phrase alone, with a trailing period ("Evening.").

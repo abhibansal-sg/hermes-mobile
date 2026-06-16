@@ -41,7 +41,7 @@ final class ToolRowLiveUITests: XCTestCase {
         // Deliberately phrased WITHOUT the word "terminal": the tool-row
         // assertion below matches the row's tool-name label exactly, and the
         // user bubble must not be able to satisfy it.
-        composer.typeText("Run the shell command `echo ABH45LIVE` and report its output verbatim.")
+        composer.typeText("Run the shell command `echo HERMESLIVE` and report its output verbatim.")
 
         let send = app.buttons["Send"]
         XCTAssertTrue(send.waitForExistence(timeout: 10), "Send button missing")
@@ -63,7 +63,7 @@ final class ToolRowLiveUITests: XCTestCase {
 
         // 2. The reply lands (the agent echoes the nonce back).
         let reply = app.staticTexts.containing(
-            NSPredicate(format: "label CONTAINS[c] %@", "ABH45LIVE")
+            NSPredicate(format: "label CONTAINS[c] %@", "HERMESLIVE")
         ).firstMatch
         XCTAssertTrue(reply.waitForExistence(timeout: 120),
                       "Assistant reply with tool output did not appear")

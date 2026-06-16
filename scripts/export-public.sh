@@ -320,6 +320,44 @@ scrub '
   s{abhinavbansal\@mac\.com}{}g;
 '
 
+# ---- (j2) private gateway/desktop repo path+line citations --------------------
+# iOS comments cross-reference the gateway source by path+line. The stock file
+# NAMES are already public (seams.patch is a diff against them; INSTALL.md lists
+# them), so keep the name — strip only the volatile LINE NUMBERS, which drift on
+# every upstream rebase and are useless to a reader. The desktop app source is NOT
+# part of the published patch surface, so generalize those refs away.
+scrub '
+  s{((?:tui_gateway|hermes_cli)/[A-Za-z0-9_./]+\.py):\d+(?:-\d+)?}{$1}g;
+  s{\b((?:server|web_server|ws)\.py):\d+(?:-\d+)?}{$1}g;
+  s{\bapps/desktop/[A-Za-z0-9_./-]+}{the desktop app}g;
+'
+
+# ---- (j3) deploy narrative + private test-instance port -----------------------
+scrub '
+  s{\bthe live dashboard until its (?:next )?redeploy\b}{a gateway that has not applied the seam patch yet}gi;
+  s{\buntil its next redeploy\b}{until it applies the seam patch}gi;
+  s{\bthe live dashboard\b}{the gateway}gi;
+  s{\bon 9123\b}{on a test gateway}g;
+  s{9123}{8080}g;
+'
+
+# ---- (j4) internal review jargon (case-insensitive) + contract anchors --------
+scrub '
+  s{//\s*MARK:\s*-\s*Judge round[^\n]*}{// MARK: - Regression re-verification}gi;
+  s{\bJudge round\b}{regression re-verification}gi;
+  s{\bpost-fix adversarial re-verification\b}{post-fix re-verification}gi;
+  s{\badversarial re-verification\b}{re-verification}gi;
+  s{\bthe contract\b}{the spec}g;
+  s{\s*§\s*[\d.]+(?:\.test)?(?:\s+\d+(?:[-\x{2013}]\d+)?)?}{}g;
+  s{\bBatch [A-H] gate scrutiny\b}{review}g;
+'
+
+# ---- (j5) defensive: residual bare first name / no-hyphen ABH id --------------
+scrub '
+  s{\bAbhinav\b}{Sam}g;
+  s{\s*\bABH[-_ ]?\d+\b}{}g;
+'
+
 # Collapse double-spaces / dangling " :" left by token removal inside single-line
 # // and # comments (cosmetic, keeps comments readable). LEADING indentation is
 # preserved — we split off the indent + comment marker and only tidy the comment
@@ -367,8 +405,11 @@ echo "scrubs applied."
 
 # --- 3. VERIFY -----------------------------------------------------------------
 echo "== verification grep =="
-VERIFY_PAT='ab0991-oss/hermes-mobile|ABH-[0-9]|R1 ?#[0-9]|127\.0\.0\.1:9119|:9119|/Users/abbhinnav|abhinavbansal|3DHXXG4GHQ|TQQF7DKKX8|6J4Y9NKRQ2|d7deff8e-5489|SHIP-TESTFLIGHT|SEAM-LEDGER|CONTRACT-'
-if grep -rnE "$VERIFY_PAT" "$OUT" ; then
+# seams.patch is a controlled unified diff (its +++ headers MUST name the stock
+# gateway files, and it has its own patch-safe scrub); exclude it from the prose
+# verify so legitimate diff headers don't read as leaks.
+VERIFY_PAT='ab0991-oss/hermes-mobile|ABH[-_ ]?[0-9]|R1 ?#[0-9]|127\.0\.0\.1:9119|:9119|9123|/Users/abbhinnav|[Aa]bhinav|3DHXXG4GHQ|TQQF7DKKX8|6J4Y9NKRQ2|d7deff8e-5489|SHIP-TESTFLIGHT|SEAM-LEDGER|CONTRACT-|(server|web_server|ws)\.py:[0-9]|apps/desktop/|[Jj]udge round|redeploy'
+if grep -rnE --exclude='seams.patch' "$VERIFY_PAT" "$OUT" ; then
   echo ""
   echo "!! VERIFY: remaining hits above — review before publishing."
   rc=1

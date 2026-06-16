@@ -19,7 +19,7 @@ import XCTest
 /// 6. **Total decoded and exposed** — `totalSessions` is populated from the fetch
 ///    result; `nil` total preserves the previously-known value.
 @MainActor
-final class ABH86SessionRefreshTests: XCTestCase {
+final class SessionRefreshTests: XCTestCase {
 
     // MARK: - Helpers
 

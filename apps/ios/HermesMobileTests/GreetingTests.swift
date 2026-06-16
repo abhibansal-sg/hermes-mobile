@@ -40,7 +40,7 @@ final class GreetingTests: XCTestCase {
     // MARK: - Greeting composition
 
     func testGreetingWithNameUsesComma() {
-        XCTAssertEqual(ChatView.greeting(phrase: "Evening", name: "Abhinav"), "Evening, Abhinav")
+        XCTAssertEqual(ChatView.greeting(phrase: "Evening", name: "Sam"), "Evening, Sam")
         XCTAssertEqual(ChatView.greeting(phrase: "Morning", name: "Sam"), "Morning, Sam")
     }
 
