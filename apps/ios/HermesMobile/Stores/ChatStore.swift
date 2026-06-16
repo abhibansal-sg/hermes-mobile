@@ -1439,7 +1439,18 @@ final class ChatStore {
             }
         }
 
-        guard let sessionId = activeSessionId else {
+        // Resolve the runtime id, self-healing the "No active session" trap. A
+        // desktop-driven / cold-path session can leave `activeRuntimeId` nil (its
+        // gateway resume timed out or never landed), and NOTHING on the send/drain
+        // path re-attempts the resume — so every send AND every queue drain wedges
+        // here forever. Re-resume on demand before giving up; the queue drain calls
+        // send too, so this single edge fixes both.
+        let sessionId: String
+        if let rid = activeSessionId {
+            sessionId = rid
+        } else if let rid = await sessions?.ensureActiveRuntime() {
+            sessionId = rid
+        } else {
             lastError = "No active session"
             return false
         }

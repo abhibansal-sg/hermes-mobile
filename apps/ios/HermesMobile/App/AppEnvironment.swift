@@ -55,6 +55,19 @@ final class AppEnvironment {
             guard let queueStore, let chatStore else { return }
             Task { await queueStore.drain(chat: chatStore) }
         }
+        // Queue self-heal seams (the "No active session" / queues-forever trap on
+        // desktop-driven sessions). A resume that BINDS a live runtime drains the
+        // outbox — prompts the composer queued while activeRuntimeId was nil (an
+        // idle cold-path session emits no turn-completion to trigger a drain).
+        sessionStore.onActiveRuntimeBound = { [weak queueStore, weak chatStore] in
+            guard let queueStore, let chatStore else { return }
+            Task { await queueStore.drain(chat: chatStore) }
+        }
+        // A resume that follows a compression chain tip re-stamps queued prompts
+        // parent → continuation so drain's session-affinity guard doesn't skip them.
+        sessionStore.onStoredIdMigrated = { [weak queueStore] oldId, newId in
+            queueStore?.restamp(from: oldId, to: newId)
+        }
         // Live Activity turn-lifecycle seams (X3): start on the first turn event,
         // track the running tool, and reflect a pending approval. The manager
         // no-ops when Live Activities are disabled/unavailable.

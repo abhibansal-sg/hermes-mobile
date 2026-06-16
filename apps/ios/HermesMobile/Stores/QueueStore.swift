@@ -111,6 +111,30 @@ final class QueueStore {
         persist()
     }
 
+    /// Re-stamp queued prompts from an old stored-session id to its compression
+    /// continuation (chain tip). When a `session.resume` follows a chain tip, the
+    /// active stored id swaps parent → continuation; a prompt queued under the
+    /// parent would then be skipped by ``drain(chat:)``'s session-affinity guard
+    /// FOREVER (its `storedSessionId` no longer matches the active one). Migrating
+    /// it to the continuation lets it drain. No-op if `oldId == newId` or nothing
+    /// matches. `storedSessionId` is a `let`, so a matching item is rebuilt
+    /// preserving its id/text/createdAt (and thus its FIFO position).
+    func restamp(from oldId: String, to newId: String) {
+        guard oldId != newId else { return }
+        var changed = false
+        for index in items.indices where items[index].storedSessionId == oldId {
+            let prompt = items[index]
+            items[index] = QueuedPrompt(
+                id: prompt.id,
+                text: prompt.text,
+                createdAt: prompt.createdAt,
+                storedSessionId: newId
+            )
+            changed = true
+        }
+        if changed { persist() }
+    }
+
     // MARK: - Draining
 
     /// Send queued prompts through `chat` in FIFO order, one at a time.

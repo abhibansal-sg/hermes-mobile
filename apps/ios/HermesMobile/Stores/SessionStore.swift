@@ -392,6 +392,47 @@ final class SessionStore {
     private var connection: ConnectionStore?
     private var chat: ChatStore?
 
+    // MARK: - Runtime self-heal (queue "No active session" escape edge)
+
+    /// Wired by ``AppEnvironment`` to drain the offline outbox the moment a resume
+    /// binds a live runtime. The composer queues prompts whenever `activeRuntimeId`
+    /// is nil (`ChatView.isConnected == false`); on an idle desktop-driven session
+    /// whose resume took the gateway cold path, no turn-completion ever fires to
+    /// trigger a drain, so those prompts would sit forever. Firing this on a
+    /// successful bind flushes them automatically. Mirrors `ChatStore.onTurnComplete`.
+    var onActiveRuntimeBound: (() -> Void)?
+
+    /// Wired by ``AppEnvironment`` to re-stamp queued prompts when a resume follows
+    /// a compression chain tip (parent stored id → continuation). Queue affinity is
+    /// keyed on the stored id, so without this a prompt queued under the parent is
+    /// skipped by `drain` forever after the swap.
+    var onStoredIdMigrated: ((String, String) -> Void)?
+
+    /// Coalesces concurrent on-demand re-resumes (a live send and a queue drain
+    /// racing) onto a single `session.resume` RPC.
+    private var ensureRuntimeTask: Task<String?, Never>?
+    /// Per-session attempt budget for ``ensureActiveRuntime()`` so a genuinely
+    /// unresumable session can't spin. Reset on a fresh ``open(_:revealOnFirstPaint:)``
+    /// (new user intent) or a successful bind.
+    private var ensureRuntimeAttempts = 0
+    private var ensureRuntimeTargetId: String?
+    private static let maxEnsureRuntimeAttempts = 3
+
+    /// Injectable `session.resume` RPC (tests). Defaults to the live gateway
+    /// request; a test stages a `SessionOpenResult` so the supersession guard in
+    /// ``resumeActiveAfterReconnect()`` is exercisable without a network.
+    var resumeRPC: ((_ storedId: String, _ params: [String: JSONValue]) async throws -> SessionOpenResult)?
+
+    /// Supersede any in-flight on-demand re-resume (``ensureActiveRuntime()``) so a
+    /// stale result can't bind a runtime into a session the user has navigated away
+    /// from, and a later ``ensureActiveRuntime()`` for a different target can't
+    /// coalesce onto it. The supersession guard in ``resumeActiveAfterReconnect()``
+    /// is the correctness backstop; this also avoids the wasted RPC.
+    private func cancelEnsureRuntime() {
+        ensureRuntimeTask?.cancel()
+        ensureRuntimeTask = nil
+    }
+
     // MARK: - Offline cache (P3 read-through / write-through)
 
     /// The offline-first local cache (P1/P2 layer). Optional and defaulting to
@@ -1512,6 +1553,13 @@ final class SessionStore {
         openToken = token
         activeRuntimeId = nil          // gates the composer until resume lands
         activeStoredId = summary.id
+        // Fresh user intent to use this session: supersede any in-flight on-demand
+        // re-resume (it was for the PREVIOUS session — its result must not bind
+        // here) and reset the budget so a session that exhausted its retries
+        // earlier can self-heal again.
+        cancelEnsureRuntime()
+        ensureRuntimeTargetId = summary.id
+        ensureRuntimeAttempts = 0
 
         // FIX 4 — DEFER the heavy transcript teardown off the drawer-tap runloop tick
         // so the drawer-close spring (.spring response 0.40, RootView) owns the first
@@ -1571,6 +1619,10 @@ final class SessionStore {
                 // Compression-chain projection: the gateway may resume a
                 // newer continuation of this conversation — follow it.
                 if let chainTip = result.storedSessionId, chainTip != summary.id {
+                    // Re-stamp prompts queued under the parent id to the
+                    // continuation BEFORE the swap, so drain's affinity guard
+                    // doesn't skip them forever once activeStoredId moves.
+                    self.onStoredIdMigrated?(summary.id, chainTip)
                     self.activeStoredId = chainTip
                     // Same token: the chain-tip seed's REST await is just as
                     // outrunnable by a newer open() as the fast path (R1 #43).
@@ -1580,6 +1632,13 @@ final class SessionStore {
                     Task { [weak self] in await self?.refresh() }
                 }
                 self.lastError = nil
+                // Runtime bound: clear the self-heal budget and flush anything the
+                // composer queued during this resume window (an idle desktop-driven
+                // session emits no turn-completion to trigger a drain otherwise).
+                // The drain no-ops while a foreign turn streams and is re-entrancy
+                // guarded, so this is safe to fire unconditionally on a bind.
+                self.ensureRuntimeAttempts = 0
+                self.onActiveRuntimeBound?()
                 // Seed the context-window meter from session.status so a resumed
                 // session shows occupancy before its first new turn (H1). Runs
                 // after the resume lands the runtime id; guarded against a newer
@@ -1599,8 +1658,10 @@ final class SessionStore {
     /// / `ChatStore.send`). This is what "New chat" and launch land on, so an
     /// abandoned draft never litters the session list with an empty session.
     func startDraft() {
-        // Supersede any in-flight `open()` so its resume can't reactivate.
+        // Supersede any in-flight `open()` so its resume can't reactivate, and any
+        // on-demand re-resume so its result can't bind into this fresh draft.
         openToken = UUID()
+        cancelEnsureRuntime()
         isDraft = true
         activeRuntimeId = nil
         activeStoredId = nil
@@ -1865,19 +1926,38 @@ final class SessionStore {
     /// id on success, or `nil` if there is no active session to resume.
     @discardableResult
     func resumeActiveAfterReconnect() async -> String? {
-        guard let client, let storedId = activeStoredId else { return nil }
+        guard let storedId = activeStoredId, client != nil || resumeRPC != nil else { return nil }
         do {
             // Re-resume into the same profile scope so a reconnect keeps the
             // session in its per-profile home. Omitted for the default/all scope.
             var resumeParams: [String: JSONValue] = ["session_id": .string(storedId)]
             applyProfileScope(to: &resumeParams)
-            let result: SessionOpenResult = try await client.request(
-                "session.resume",
-                params: .object(resumeParams),
-                timeout: .seconds(120)
-            )
+            let result: SessionOpenResult
+            if let resumeRPC {
+                result = try await resumeRPC(storedId, resumeParams)
+            } else if let client {
+                result = try await client.request(
+                    "session.resume",
+                    params: .object(resumeParams),
+                    timeout: .seconds(120)
+                )
+            } else {
+                return nil
+            }
+            // SUPERSESSION GUARD: the active session may have changed across the
+            // (up to 120 s) resume await — the user tapped another drawer row
+            // (`open`), started a draft, or cleared the active session. Do NOT
+            // clobber the now-active session's pointers with this stale resume's
+            // result; otherwise a live send would misroute into the resumed
+            // session (the R1 #17 class, on the un-affinity-guarded live path).
+            // Mirrors open()'s `openToken` re-check after its own resume await.
+            guard activeStoredId == storedId else { return nil }
             activeRuntimeId = result.sessionId
-            activeStoredId = result.storedSessionId ?? storedId
+            // A resume can follow a compression chain tip (parent → continuation);
+            // re-stamp queued prompts so affinity-stamped ones aren't skipped forever.
+            let newStored = result.storedSessionId ?? storedId
+            if newStored != storedId { onStoredIdMigrated?(storedId, newStored) }
+            activeStoredId = newStored
             confirmActiveProfile(from: result.info)
             // Keep the composer pill session-true on this resume path too.
             if let info = result.info { connection?.applyRuntimeInfo(info) }
@@ -1886,6 +1966,47 @@ final class SessionStore {
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             return nil
         }
+    }
+
+    /// Ensure the active session has a live runtime id, re-resuming on demand when
+    /// a prior resume failed/timed-out and left `activeRuntimeId` nil. This is the
+    /// escape edge out of the "No active session" trap: a desktop-driven session
+    /// whose gateway resume took the slow cold path (or timed out) leaves every
+    /// `ChatStore.send` AND queue `drain` wedged with no path back to a runtime —
+    /// nothing on the send/drain path re-attempts the resume. `ChatStore.send`
+    /// calls this before surfacing "No active session", so the session self-heals
+    /// instead of staying stuck. Concurrent callers (a live send and a drain
+    /// racing) coalesce onto one RPC; bounded per session so it can't spin.
+    /// Returns the bound runtime id, or `nil` if there is nothing to resume or the
+    /// attempt budget is exhausted.
+    @discardableResult
+    func ensureActiveRuntime() async -> String? {
+        if let rid = activeRuntimeId { return rid }
+        if let task = ensureRuntimeTask { return await task.value }
+        guard client != nil || resumeRPC != nil, let target = activeStoredId else { return nil }
+        // Reset the budget when the target session changes; cap per session.
+        if ensureRuntimeTargetId != target {
+            ensureRuntimeTargetId = target
+            ensureRuntimeAttempts = 0
+        }
+        guard ensureRuntimeAttempts < Self.maxEnsureRuntimeAttempts else { return nil }
+        ensureRuntimeAttempts += 1
+        let task = Task { [weak self] () -> String? in
+            // resumeActiveAfterReconnect re-resumes `activeStoredId`, binds the
+            // runtime, follows the chain tip (re-stamping the queue), and seeds the
+            // pill — exactly the work needed here.
+            await self?.resumeActiveAfterReconnect()
+        }
+        ensureRuntimeTask = task
+        let rid = await task.value
+        ensureRuntimeTask = nil
+        if rid != nil {
+            ensureRuntimeAttempts = 0
+            // A runtime just bound — flush anything the composer queued while it
+            // was nil (the drain re-entrancy guard makes a redundant call a no-op).
+            onActiveRuntimeBound?()
+        }
+        return rid
     }
 
     // MARK: - Search
@@ -2243,6 +2364,9 @@ final class SessionStore {
     }
 
     private func clearActive() {
+        // Supersede any in-flight on-demand re-resume so it can't re-bind a runtime
+        // into a session we're detaching from.
+        cancelEnsureRuntime()
         isDraft = false
         activeRuntimeId = nil
         activeStoredId = nil
