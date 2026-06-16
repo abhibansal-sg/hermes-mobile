@@ -51,12 +51,14 @@ of truth for tasks — nothing to clone; just sign in.
 
 **WHERE THINGS STAND (2026-06-16, NIGHT — current):** Work branch
 `phase2-upstream-rebase` @ `a574c270d` (build 48 committed + pushed origin).
-TestFlight **builds 44–48 all VALID** (1.0.1) — **build 48 uploaded +
-ASC-confirmed VALID** (2026-06-16 night), pending user device-verify. Deploy
-`~/.hermes/hermes-agent` (trunk `feat/group-collapse-pin`) live on `:9119`, healthy.
+TestFlight **builds 44–49 all VALID** (1.0.1) — **build 49 uploaded +
+ASC-confirmed VALID** (2026-06-17), pending user device-verify (notifications
+can-enable + onboarding). Deploy `~/.hermes/hermes-agent` (trunk
+`feat/group-collapse-pin`) live on `:9119`, healthy.
 
-**>> LAUNCH PREP — BUILD 49 WORK IN PROGRESS (UNCOMMITTED in working tree; iOS
-BUILD WEDGED — see below). Plan file: ~/.claude/plans/concurrent-popping-narwhal.md.**
+**>> LAUNCH PREP — BUILD 49 SHIPPED (VALID on TestFlight) @ `8c0370338`. iOS build
+wedge was CLEARED by the logout/login. Plan file:
+~/.claude/plans/concurrent-popping-narwhal.md.**
 User goal: clean up app + solidify notifications/Live-Activity, then ship a
 **first public release as an EXTERNAL TestFlight beta** (public link) for
 **self-hosters**. Staged but NOT yet built/committed:
