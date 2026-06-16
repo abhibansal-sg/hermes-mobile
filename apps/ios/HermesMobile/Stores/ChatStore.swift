@@ -677,6 +677,11 @@ final class ChatStore {
             return
         }
 
+        // A live foreign frame just landed — (re)arm the staleness watchdog so a
+        // mirror whose source goes silent is ended instead of spinning forever
+        // (the "can't send after the desktop touched the session" bug).
+        armForeignMirrorWatchdog()
+
         // Apply the adopted foreign frame through the same transcript switch a
         // local frame uses — begin/delta/tool — so the mirrored turn renders live.
         switch event.type {
@@ -2558,7 +2563,43 @@ final class ChatStore {
     ///  - `false` (the connection-DROP path, where a successful backfill is NOT
     ///    guaranteed): the placeholder is REMOVED as before, so a drop that never
     ///    reconciles does not strand a blank streaming bubble.
+    /// Watchdog that ends an adopted FOREIGN mirror whose source went silent. A
+    /// foreign stream (mirroring e.g. the desktop's turn) is normally torn down by
+    /// its `message.complete`; if the source disconnects mid-turn that frame never
+    /// arrives and the mirror spins forever — `isStreaming` stays true, the composer
+    /// is stuck in queue-mode, and the outbox can never drain ("can't send after the
+    /// desktop touched the session"). Re-armed on every adopted foreign frame; after
+    /// `foreignMirrorStaleTimeout` of silence it runs the SAME teardown + backfill +
+    /// drain a real completion would. Foreign-only — a local turn is never touched.
+    private var foreignMirrorWatchdog: Task<Void, Never>?
+    private static let foreignMirrorStaleTimeout: Duration = .seconds(30)
+
+    /// (Re)arm the foreign-mirror staleness watchdog.
+    private func armForeignMirrorWatchdog() {
+        foreignMirrorWatchdog?.cancel()
+        foreignMirrorWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: ChatStore.foreignMirrorStaleTimeout)
+            guard let self, !Task.isCancelled, self.streamingIsForeign else { return }
+            self.fireForeignMirrorWatchdog()
+        }
+    }
+
+    /// The adopted foreign mirror went silent past the staleness window: end the
+    /// mirrored turn exactly as a `message.complete` would — teardown, authoritative
+    /// REST reconcile, then drain the outbox into the now-idle session.
+    private func fireForeignMirrorWatchdog() {
+        guard streamingIsForeign else { return }
+        chatLog.warning("foreign-mirror watchdog fired: mirrored turn went silent past the staleness window — ending it so queued sends unblock")
+        teardownForeignStream(preservePlaceholderForReconcile: true)
+        Task { [weak self] in
+            await self?.backfill()
+            self?.onTurnComplete?()
+        }
+    }
+
     private func teardownForeignStream(preservePlaceholderForReconcile: Bool = false) {
+        foreignMirrorWatchdog?.cancel()
+        foreignMirrorWatchdog = nil
         mirroringRuntimeId = nil
         guard streamingIsForeign else { return }
         // A foreign-owned stream can never be a local turn. This pins the
