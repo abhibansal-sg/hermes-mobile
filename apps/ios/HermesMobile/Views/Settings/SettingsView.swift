@@ -90,6 +90,10 @@ struct SettingsView: View {
     /// matched by `navigationDestination(for:)` — the native list-cell push.
     @State private var path = NavigationPath()
 
+    /// Dynamic-Type-scaled size for the disconnected-state "Reconnect" label
+    /// (base value preserves the default-size layout; grows with Larger Text).
+    @ScaledMetric(relativeTo: .subheadline) private var reconnectLabelFontSize: CGFloat = 14
+
     // MARK: Identity (F2 / Amendment E)
 
     /// The user's first name, the greeting source on the draft chat. Bound to the
@@ -322,7 +326,7 @@ struct SettingsView: View {
                         reconnect()
                     } label: {
                         Label("Reconnect", systemImage: "arrow.clockwise")
-                            .font(.system(size: 14, weight: .medium))
+                            .font(.system(size: reconnectLabelFontSize, weight: .medium))
                             .foregroundStyle(theme.midground)
                     }
                     .buttonStyle(.plain)

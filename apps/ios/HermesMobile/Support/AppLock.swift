@@ -281,6 +281,10 @@ struct AppLockOverlay: View {
     @Environment(AppLock.self) private var appLock
     @Environment(ThemeStore.self) private var themeStore
 
+    /// Dynamic-Type-scaled lock-glyph size (base value preserves the default-size
+    /// layout; grows with Larger Text).
+    @ScaledMetric(relativeTo: .largeTitle) private var lockGlyphSize: CGFloat = 44
+
     var body: some View {
         let theme = themeStore.current
         ZStack {
@@ -293,7 +297,7 @@ struct AppLockOverlay: View {
 
             VStack(spacing: 16) {
                 Image(systemName: "lock.fill")
-                    .font(.system(size: 44, weight: .semibold))
+                    .font(.system(size: lockGlyphSize, weight: .semibold))
                     .foregroundStyle(theme.mutedFg)
                     .accessibilityHidden(true)
 

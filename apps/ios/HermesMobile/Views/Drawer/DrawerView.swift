@@ -111,6 +111,17 @@ struct DrawerView: View {
     /// initials. `nil`/blank → a neutral person glyph.
     @AppStorage(DefaultsKeys.displayName) private var displayName = ""
 
+    // Dynamic-Type-scaled icon/glyph sizes. Base values preserve the exact
+    // layout at the default text size; they grow when the user sets Larger Text.
+    /// Settings gear glyph (header avatar button).
+    @ScaledMetric(relativeTo: .title3) private var gearGlyphSize: CGFloat = 20
+    /// Search-field magnifying-glass glyph.
+    @ScaledMetric(relativeTo: .subheadline) private var searchIconSize: CGFloat = 14
+    /// Search field text + clear ("xmark") glyph.
+    @ScaledMetric(relativeTo: .subheadline) private var searchFieldFontSize: CGFloat = 15
+    /// Recents "…" filter menu glyph.
+    @ScaledMetric(relativeTo: .footnote) private var recentsFilterGlyphSize: CGFloat = 13
+
     var body: some View {
         NavigationStack(path: $path) {
             VStack(spacing: 0) {
@@ -393,7 +404,7 @@ struct DrawerView: View {
             }
         } label: {
             Image(systemName: "gearshape")
-                .font(.system(size: 20, weight: .regular))
+                .font(.system(size: gearGlyphSize, weight: .regular))
                 .foregroundStyle(theme.fg)
                 .frame(width: 34, height: 34)
                 .contentShape(Rectangle())
@@ -437,11 +448,11 @@ struct DrawerView: View {
         return VStack(spacing: 8) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 14))
+                    .font(.system(size: searchIconSize))
                     .foregroundStyle(theme.mutedFg)
                 TextField("Search", text: $sessions.searchQuery)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 15))
+                    .font(.system(size: searchFieldFontSize))
                     .foregroundStyle(theme.fg)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
@@ -453,7 +464,7 @@ struct DrawerView: View {
                         sessions.clearSearch()
                     } label: {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 15))
+                            .font(.system(size: searchFieldFontSize))
                             .foregroundStyle(theme.mutedFg)
                     }
                     .buttonStyle(.plain)
@@ -907,7 +918,7 @@ struct DrawerView: View {
             }
         } label: {
             Image(systemName: "line.3.horizontal.decrease")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: recentsFilterGlyphSize, weight: .semibold))
                 .foregroundStyle(theme.mutedFg)
                 .frame(width: 28, height: 22)
                 .contentShape(Rectangle())
@@ -1426,6 +1437,13 @@ private struct DrawerWorkspaceHeader: View {
     /// Called when the "Pin" / "Unpin" context-menu item is chosen.
     var onPin: (() -> Void)? = nil
 
+    // Dynamic-Type-scaled subheader glyph sizes (base values preserve the
+    // default-size layout; grow with Larger Text).
+    /// Folder glyph leading the workspace label.
+    @ScaledMetric(relativeTo: .caption2) private var folderGlyphSize: CGFloat = 10
+    /// Pin / chevron trailing glyphs.
+    @ScaledMetric(relativeTo: .caption2) private var trailingGlyphSize: CGFloat = 9
+
     var body: some View {
         Button {
             onToggle?()
@@ -1434,7 +1452,7 @@ private struct DrawerWorkspaceHeader: View {
             // subheaders sit closer to the preceding row.
             HStack(spacing: 5) {
                 Image(systemName: "folder")
-                    .font(.system(size: 10))
+                    .font(.system(size: folderGlyphSize))
                     .foregroundStyle(theme.mutedFg.opacity(0.65))
                 Text(label)
                     .font(.footnote.weight(.semibold))
@@ -1443,11 +1461,11 @@ private struct DrawerWorkspaceHeader: View {
                 Spacer(minLength: 0)
                 if isPinned {
                     Image(systemName: "pin.fill")
-                        .font(.system(size: 9))
+                        .font(.system(size: trailingGlyphSize))
                         .foregroundStyle(theme.midground.opacity(0.7))
                 }
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(.system(size: trailingGlyphSize, weight: .semibold))
                     .foregroundStyle(theme.mutedFg.opacity(0.55))
                     // Rotate 90° when expanded (chevron.right → chevron.down).
                     .rotationEffect(.degrees(isCollapsed ? 0 : 90))

@@ -116,6 +116,13 @@ struct ChatView: View {
     /// Cancels the in-flight toast auto-dismiss when a new error arrives.
     @State private var toastDismissTask: Task<Void, Never>?
 
+    // Dynamic-Type-scaled sizes (base values preserve the default-size layout;
+    // grow with Larger Text). `@ScaledMetric` must be stored on the View struct.
+    /// Inline nav-title text (non-empty transcript).
+    @ScaledMetric(relativeTo: .subheadline) private var navTitleFontSize: CGFloat = 15
+    /// Scroll-to-bottom pill ↓ glyph (both the iOS 26 glass + pre-26 fallback).
+    @ScaledMetric(relativeTo: .subheadline) private var scrollPillGlyphSize: CGFloat = 15
+
     /// The user message currently being edited (drives the edit sheet), or nil.
     @State private var editingMessage: ChatMessage?
     /// Working text for the edit sheet.
@@ -1184,7 +1191,7 @@ struct ChatView: View {
             Color.clear.frame(width: 1, height: 1)
         } else {
             Text(navigationTitle)
-                .font(.system(size: 15, weight: .semibold))
+                .font(.system(size: navTitleFontSize, weight: .semibold))
                 .foregroundStyle(theme.fg)
                 .lineLimit(1)
         }
@@ -1411,7 +1418,7 @@ struct ChatView: View {
                     }
                 } label: {
                     Image(systemName: "arrow.down")
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.system(size: scrollPillGlyphSize, weight: .semibold))
                         .foregroundStyle(theme.navBarTint)
                         .frame(width: 36, height: 36)
                         .contentShape(Circle())
@@ -1428,7 +1435,7 @@ struct ChatView: View {
                     }
                 } label: {
                     Image(systemName: "arrow.down")
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.system(size: scrollPillGlyphSize, weight: .semibold))
                         .foregroundStyle(theme.navBarTint)
                         .frame(width: 36, height: 36)
                         .chromePill(theme, in: Circle())
