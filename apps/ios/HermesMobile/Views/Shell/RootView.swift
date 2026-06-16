@@ -564,26 +564,31 @@ private struct CompactLayout: View {
                         }
                     }
                     .offset(x: offset)
-                    // SMOOTHNESS R39 (Defect 1) — the settle spring is scoped to
-                    // the CARD OFFSET ALONE, not the whole ZStack. Previously two
-                    // `.animation(value:)` modifiers wrapped the entire subtree
-                    // (drawer + card + transcript): on a drawer open/close EVERY
-                    // animatable change inside the transcript received that spring
-                    // transaction — but the transcript subtree nulls animation
-                    // (`.transaction { animation = nil }`), so those interior changes
-                    // SNAPPED per frame instead of riding the slide. That mismatch is
-                    // the reported "transcript moving/snapping from the inside." Here
-                    // the spring animates ONLY the rigid `.offset`; nothing inside the
-                    // card is in the animation's scope, so the card translates as one
-                    // rigid surface and the interior never re-animates.
+                    // SMOOTHNESS R41 — there is NO modifier-level settle animation.
+                    // A `.animation(.spring(...), value: drawer.isOpen)` here always
+                    // started the settle from ZERO initial velocity, so a flick (card
+                    // moving fast at release) hit a velocity discontinuity at the
+                    // drag→spring handoff = the visible "snap to end position." It
+                    // also could not animate the failed-threshold snap-back at all
+                    // (isOpen unchanged ⇒ modifier silent ⇒ single-frame teleport).
                     //
-                    // The interactive drag itself carries NO animation: `offset`
-                    // tracks `dragTranslation` 1:1 (see `currentOffset`), so the card
-                    // follows the finger exactly. Only the release → settle to the
-                    // committed open/closed state (`drawer.isOpen`) springs. The prior
-                    // `.animation(value: dragTranslation)` made a spring CHASE the
-                    // finger every frame (rubber-band lag) — deleted.
-                    .animation(.spring(response: 0.40, dampingFraction: 0.86), value: drawer.isOpen)
+                    // The settle is now driven EXPLICITLY, in one place each:
+                    //  • GESTURE release → `onEnded` wraps the offset's state change
+                    //    (`dragTranslation = nil` + the RAW `isOpen` flip) in ONE
+                    //    `withAnimation(velocity-matched interpolatingSpring)`, so the
+                    //    card continues from the finger's velocity (commit AND
+                    //    snap-back), no discontinuity.
+                    //  • PROGRAMMATIC open/close/toggle → animated inside DrawerState
+                    //    with the SAME spring SHAPE at zero velocity (identical feel;
+                    //    button starts from rest so zero velocity is correct there).
+                    // Both wrap the STATE mutation (not just `.offset`), so the body
+                    // re-evaluates and the `openProgress`-derived corner radius +
+                    // shadow ride the SAME transaction as the offset — corners and
+                    // shadow stay locked to the slide, never popping.
+                    //
+                    // The interactive drag still carries NO animation: `offset` tracks
+                    // `dragTranslation` 1:1 (see `currentOffset`), so the card follows
+                    // the finger exactly until release.
                     // Focus-trap PRESERVED (Amendment E): the displaced chat card
                     // is hidden from assistive tech while the drawer is open.
                     .accessibilityHidden(drawer.isOpen)
@@ -802,32 +807,81 @@ private struct CompactLayout: View {
             }
             .onEnded { value in
                 let anchor = dragAnchor
+                // Universal latch/anchor reset on EVERY exit path. Registered BEFORE
+                // the guard so it can never leak and pre-latch the next gesture from
+                // touch-down. `dragTranslation` is DELIBERATELY excluded here:
+                // clearing it outside a transaction would teleport the offset
+                // un-animated (a last-writer-wins beats any withAnimation that has
+                // already returned). It is cleared exactly once, INSIDE the settle
+                // transaction, on each real path below.
                 defer {
-                    dragTranslation = nil
                     horizontalDominant = nil
                     dragAnchor = 0
                 }
-                // Only a drag this gesture actually drove can commit.
-                guard horizontalDominant == true else { return }
-                // Measure displacement from the anchor (finger position at latch),
-                // matching the on-screen card travel, so the pre-latch dead-zone
-                // never counts toward the commit threshold.
+                // A drag this gesture never drove still animates its (zero) drag
+                // contribution away, so there is never a raw final-frame jump.
+                guard horizontalDominant == true else {
+                    withAnimation(DrawerState.standardSpring) { dragTranslation = nil }
+                    return
+                }
+
+                // Anchor-corrected displacement for the COMMIT decision (unchanged
+                // thresholds). The anchor removes the pre-latch dead-zone so it never
+                // counts toward the 30%/50% commit fractions.
                 let dragged = value.translation.width - anchor
                 let predicted = value.predictedEndTranslation.width - anchor
-                if drawer.isOpen {
-                    // Close if dragged/flicked left past ~30% of the width.
-                    if dragged < -drawerWidth * 0.3 || predicted < -drawerWidth * 0.5 {
-                        close()
-                    }
+
+                // Committed target. A FAILED threshold settles BACK to the current
+                // state — the case the old modifier left UN-animated (it keyed on a
+                // `drawer.isOpen` change that never happened).
+                let wasOpen = drawer.isOpen
+                let commitOpen: Bool
+                if wasOpen {
+                    commitOpen = !(dragged < -drawerWidth * 0.3 || predicted < -drawerWidth * 0.5)
                 } else {
-                    // Open if dragged/flicked right past ~30% of the width.
-                    if dragged > drawerWidth * 0.3 || predicted > drawerWidth * 0.5 {
-                        open()
-                    }
+                    commitOpen = (dragged > drawerWidth * 0.3 || predicted > drawerWidth * 0.5)
+                }
+
+                // SMOOTHNESS R41 — velocity hand-off. The card's offset at release and
+                // the SIGNED travel still to go to the committed target, both in
+                // POINTS. `currentOffset` reads the live (still-unmutated) `isOpen` +
+                // `dragTranslation`, so it is the true release position.
+                let releaseOffset = currentOffset(drawerWidth: drawerWidth)
+                let target: CGFloat = commitOpen ? drawerWidth : 0
+                let remaining = target - releaseOffset           // +toward open, −toward closed
+
+                // Release velocity in pt/s (`DragGesture.Value.velocity`; on this SDK
+                // it is 4·(predictedEndTranslation − translation), so the anchor
+                // cancels and no anchor term belongs on it). Normalize to the spring's
+                // fraction-of-remaining space: (pt/s) ÷ (pt) = 1/s. SIGNED on purpose —
+                // positive when the finger moves TOWARD the committed target (carry the
+                // momentum through), negative when it moves away (a fast-but-short
+                // flick is sprung back, fighting the flick). Guard a release essentially
+                // AT the target (no travel ⇒ no velocity) against NaN/∞, and clamp so a
+                // near-target hard flick can't inject a violent over-fast settle.
+                let v0: Double = abs(remaining) < 0.5
+                    ? 0
+                    : max(-30, min(30, Double(value.velocity.width / remaining)))
+                let settle = Animation.interpolatingSpring(
+                    Spring(response: 0.40, dampingRatio: 0.86), initialVelocity: v0)
+
+                // ONE transaction: flip `isOpen` (RAW — no nested DrawerState spring)
+                // and drop the drag contribution together, so the offset (and the
+                // `openProgress`-derived corner radius + shadow, which re-evaluate with
+                // it) spring CONTINUOUSLY from the finger's last position to the target.
+                // Covers BOTH commit and snap-back (commitOpen == wasOpen).
+                withAnimation(settle) {
+                    drawer.setOpenRaw(commitOpen)
+                    dragTranslation = nil
                 }
             }
     }
 
+    // PROGRAMMATIC drawer control (animated by DrawerState's standard spring).
+    // `close` is wired into `DrawerView(onNavigate: close)` above → the
+    // reveal-on-paint close fires through here. The GESTURE path does NOT use
+    // these — it flips `isOpen` via `drawer.setOpenRaw(_:)` inside its own
+    // velocity spring (see `onEnded`) to avoid nesting two transactions on one flip.
     private func open() { drawer.open() }
     private func close() { drawer.close() }
 }
