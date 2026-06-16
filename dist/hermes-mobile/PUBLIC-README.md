@@ -45,12 +45,13 @@ Hermes agent** and let it set everything up:
 ```
 Set up the HermesMobile iOS app support on this Hermes gateway for me.
 
-1. From the root of this hermes-agent checkout, run the HermesMobile installer:
-   bash <(curl -fsSL https://raw.githubusercontent.com/<REPO_OWNER>/<REPO_NAME>/HEAD/dist/hermes-mobile/install.sh)
-   (add --dry-run first if you want to preview the changes).
-2. Make sure these are exported, then restart the gateway:
-   export HERMES_ENABLE_PROJECT_PLUGINS=1
+1. Clone the project and run its installer against this hermes-agent checkout:
+   git clone https://github.com/ab0991-oss/hermes-ios.git
+   hermes-ios/dist/hermes-mobile/install.sh "$(pwd)"
+   (add --dry-run after the path first if you want to preview the changes.)
+2. Export these (the installer prints the exact values), then restart the gateway:
    export HERMES_GATEWAY_BROADCAST=1
+   export HERMES_DASHBOARD_SESSION_TOKEN="$(cat ~/.hermes/dashboard.token)"
 3. Verify with `hermes plugins list` — "hermes-mobile" should be "enabled".
 4. Run `hermes mobile-pair` and show me the QR code / pairing link so I can scan
    it from the iOS app.
@@ -66,13 +67,14 @@ pairing QR.
 From the root of your `hermes-agent` checkout:
 
 ```bash
-# 1. Install the HermesMobile plugin (additive — stock files are only extended;
-#    `--dry-run` previews every change first).
-bash <(curl -fsSL https://raw.githubusercontent.com/<REPO_OWNER>/<REPO_NAME>/HEAD/dist/hermes-mobile/install.sh)
+# 1. Clone this repo and run the installer against your hermes-agent checkout
+#    (additive — stock files are only extended; add --dry-run to preview).
+git clone https://github.com/ab0991-oss/hermes-ios.git
+hermes-ios/dist/hermes-mobile/install.sh  /path/to/your/hermes-agent
 
-# 2. Enable plugin discovery + multi-client broadcast, then restart the gateway.
-export HERMES_ENABLE_PROJECT_PLUGINS=1
+# 2. Export these (the installer prints them), then restart the gateway.
 export HERMES_GATEWAY_BROADCAST=1
+export HERMES_DASHBOARD_SESSION_TOKEN="$(cat ~/.hermes/dashboard.token)"
 
 # 3. Verify + get a pairing code.
 hermes plugins list      # hermes-mobile -> enabled
@@ -98,8 +100,8 @@ Pick one:
 Requirements: a Mac with **Xcode 26+**, an Apple ID for signing.
 
 ```bash
-git clone https://github.com/<REPO_OWNER>/<REPO_NAME>.git
-cd <REPO_NAME>/apps/ios
+git clone https://github.com/ab0991-oss/hermes-ios.git
+cd hermes-ios/apps/ios
 brew install xcodegen           # if you don't have it
 xcodegen generate               # generates HermesMobile.xcodeproj
 open HermesMobile.xcodeproj
@@ -149,9 +151,14 @@ accessibility pass is in progress.
 - **Can't connect / "Is Tailscale connected?"** — the phone must reach the
   gateway. Confirm the URL works in the phone's browser, and that Tailscale (if
   used) is connected on both ends.
-- **No notifications** — open the app's **Settings → Notifications**, toggle it
-  on, and grant the iOS permission prompt. Push requires the gateway's APNs to be
-  configured (the installer/agent sets this up).
+- **No notifications** — first, open the app's **Settings → Notifications**,
+  toggle it on, and grant the iOS permission prompt. Note: **push needs an APNs
+  signing key for the app you're running**, which only the app's signer holds. If
+  you **built the app yourself**, set your team's key on the gateway
+  (`HERMES_APNS_KEY_FILE` / `HERMES_APNS_KEY_ID` / `HERMES_APNS_TEAM_ID`). On the
+  **TestFlight build**, remote push isn't available from a self-hosted gateway
+  (its push key belongs to the app's publisher) — live chat, sync, and the
+  on-device Live Activity timer still work.
 - **Desktop sessions not visible** — run the desktop attached to the same shared
   gateway the phone paired with (Known issues).
 
@@ -167,4 +174,4 @@ Apple's APNs using **your** gateway's signing key.
 
 ## Support
 
-Questions / bugs: <SUPPORT_CONTACT>.
+Questions / bugs: open an issue at https://github.com/ab0991-oss/hermes-ios/issues.
