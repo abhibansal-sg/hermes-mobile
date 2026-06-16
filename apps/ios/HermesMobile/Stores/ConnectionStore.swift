@@ -387,6 +387,15 @@ final class ConnectionStore {
     /// cancelled on disconnect so a teardown mid-hydration can't later flip the
     /// phase back to `.connected`.
     private var hydrationTask: Task<Void, Never>?
+    /// Whether the session-list `refresh()` kicked off in ``startHydration`` actually
+    /// COMPLETED, vs being cancelled by the hard-`hydrationTimeout` race. For a large
+    /// account the list pull (hundreds/thousands of sessions) reliably loses the 8s
+    /// race, so the refresh is cancelled and the drawer is left on STALE cache even
+    /// though the phase flips to `.connected` (reported: cold-launch sessions stuck at
+    /// an old timestamp, new messages not visible). ``finishHydration`` re-fires the
+    /// refresh in the background when this is false — the same safety net the running-
+    /// model probe already has.
+    private var hydrationRefreshCompleted = false
     /// True once a connection has been established at least once, so that a
     /// later `.closed`/`.failed` should trigger reconnection rather than be
     /// treated as a clean initial idle state.
@@ -645,8 +654,19 @@ final class ConnectionStore {
     /// the branded loading screen NEVER strands even if a probe is slow or hangs.
     /// Idempotent in effect — `finishHydration()` only acts while still
     /// `.hydrating`, so the losing branch of the race is a no-op.
+    /// The hydration session-list refresh, wrapped so its COMPLETION (vs being
+    /// cancelled by the timeout race) is recorded on the main actor. `refresh()`
+    /// returns early on cancellation, so `Task.isCancelled` distinguishes a real
+    /// completion from a cancelled one; `finishHydration` re-fires the refresh in
+    /// the background when this never set the flag.
+    private func runHydrationRefresh() async {
+        await sessionStore.refresh()
+        if !Task.isCancelled { hydrationRefreshCompleted = true }
+    }
+
     private func startHydration() {
         hydrationTask?.cancel()
+        hydrationRefreshCompleted = false
         hydrationTask = Task { [weak self] in
             guard let self else { return }
             await withTaskGroup(of: Void.self) { group in
@@ -663,7 +683,7 @@ final class ConnectionStore {
                 // done) while letting the chip resolve in parallel. (ABH-84 QA.)
                 group.addTask { [weak self] in
                     guard let self else { return }
-                    async let sessions: Void = self.sessionStore.refresh()
+                    async let sessions: Void = self.runHydrationRefresh()
                     async let model: Void = self.refreshActiveModel()
                     _ = await (sessions, model)
                 }
@@ -706,6 +726,19 @@ final class ConnectionStore {
         // after connect instead of staying blank until a force-quit. (ABH-84 QA.)
         if activeModelName == nil {
             Task { [weak self] in await self?.refreshActiveModel() }
+        }
+        // STALE-DRAWER FIX: the hydration race cancels the session-list `refresh()`
+        // when the 8s timeout branch wins — which it reliably does for a large account
+        // (the list pull eats the whole budget). Without recovery the drawer stays on
+        // STALE cache while the UI shows "connected" (reported: cold-launch sessions
+        // stuck at an old timestamp; new messages not visible until a manual pull).
+        // The model probe above already has this exact safety net; give the session
+        // list one too — re-run the refresh in the BACKGROUND (off the reveal path,
+        // phase is already `.connected`) so the drawer reconciles to the gateway's
+        // fresh state shortly after connect. Opening a session then fetches its fresh
+        // transcript on its own (the delta route falls back to a full resync).
+        if !hydrationRefreshCompleted {
+            Task { [weak self] in await self?.sessionStore.refresh() }
         }
         // CACHE-FIRST coverage (WhatsApp bar): hydration has settled and the
         // session list is populated — warm the top-N recent transcripts in the
