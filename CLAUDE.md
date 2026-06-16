@@ -54,6 +54,54 @@ of truth for tasks — nothing to clone; just sign in.
 TestFlight **builds 44–48 all VALID** (1.0.1) — **build 48 uploaded +
 ASC-confirmed VALID** (2026-06-16 night), pending user device-verify. Deploy
 `~/.hermes/hermes-agent` (trunk `feat/group-collapse-pin`) live on `:9119`, healthy.
+
+**>> LAUNCH PREP — BUILD 49 WORK IN PROGRESS (UNCOMMITTED in working tree; iOS
+BUILD WEDGED — see below). Plan file: ~/.claude/plans/concurrent-popping-narwhal.md.**
+User goal: clean up app + solidify notifications/Live-Activity, then ship a
+**first public release as an EXTERNAL TestFlight beta** (public link) for
+**self-hosters**. Staged but NOT yet built/committed:
+- **NOTIFICATIONS — root-caused "can't enable the toggle" (the user's bug).**
+  SettingsView `.disabled(pushUnsupported || notifAuthStatus == .notDetermined)`
+  — `.notDetermined` is BOTH the transient probe state AND the permanent
+  never-granted state → fresh install = PERMANENTLY disabled toggle (catch-22:
+  greyed out exactly when tapping should fire the OS prompt). FIX: added
+  `notifAuthProbed` flag; disable only while the FIRST probe is in flight
+  (SettingsView.swift). + `requestAuthorizationIfNeeded(force:)` re-prompts on
+  explicit toggle-ON (NotificationService + PushRegistrar `enableIfAllowed(forcePrompt:)`).
+  Pipeline itself is HEALTHY (deploy armed, 4 device tokens + 1 LA token, all
+  env=production → production APNs; TestFlight re-signs to production so the
+  local archive's `aps-environment=development` is irrelevant on-device).
+  `HERMES_APNS_USE_SANDBOX=1` on the deploy is a benign misconfig (only the default
+  for env-less tokens; per-token routing sends production→production). Capability
+  latch self-heals per build (cache keys on "1.0.1 (48)" incl build#).
+- **ONBOARDING (A1):** `Support/HelpLinks.swift` (single-source URL, defaults to
+  hermes-agent.nousresearch.com — MUST point to a PUBLIC mobile-installer page
+  before the public beta; installer currently only in the PRIVATE origin mirror)
+  + WelcomeView "How to set up a gateway" link + ConnectionSetupView footer
+  "Set one up" recovery link + `hermes mobile-pair` help text.
+- **DOCS:** `apps/ios/KNOWN-ISSUES.md` + `dist/hermes-mobile/PUBLIC-README.md`
+  (public repo readme + the copy-paste "magic setup prompt" — fill `<REPO_OWNER>/
+  <REPO_NAME>` + `<TESTFLIGHT_PUBLIC_LINK>`).
+- **iOS BUILD WEDGED (ops_swbbuildservice_wedge):** every `xcodebuild` hangs at the
+  toolchain probe (`swiftc --version`) BEFORE compiling — but the probes run
+  INSTANTLY standalone (proven), so it's the SWBBuildService coordination, not the
+  toolchain/code. Tried: clear DerivedData build caches, shut down sim, kill a
+  runaway PerfPowerServices (170% CPU), bounce build-service launchd jobs (they're
+  on-demand XPC, not registered). NONE cleared it. FIX = **logout/login** (preferred
+  over reboot — FileVault). After cycling: build+test via scripts/ios-build.sh →
+  bump CURRENT_PROJECT_VERSION 48→49, xcodegen, archive+upload (SHIP-TESTFLIGHT.md)
+  → build 49 for device-verify (can-enable + receive notifications; new onboarding).
+- **#3 (remote/local gateway) SCOPED:** the desktop TUI runs its OWN isolated
+  gateway by default ("local"); iOS pairs with the shared dashboard gateway. They
+  share sessions only when the desktop ATTACHES to the shared gateway ("remote
+  connect mode" = `HERMES_TUI_GATEWAY_URL` set, ui-tui/src/gatewayClient.ts:515-521).
+  SMALL fix (Option A, ~1-2d, no iOS change): make the desktop attach by default.
+  LARGE alt (iOS multi-gateway discovery): not for the beta. → do Option A or doc
+  it (in KNOWN-ISSUES).
+- **STILL TODO post-build:** A2 a11y sweep (needs visual validation), B1 unit
+  tests for the notification fixes, B2/C device-verify (push + Live Activity),
+  D ship build 49 external-TF (External group + Beta App Review + public link +
+  fresh-install onboarding dry run).
 - **BUILD 48 — three iOS-only fixes (no gateway edits), each root-caused via a
   grounded live investigation (3-lens workflow) + adversarially reviewed (5-lens
   workflow, SHIP-AFTER-MUSTFIX) before commit:**

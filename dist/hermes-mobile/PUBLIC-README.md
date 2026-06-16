@@ -1,0 +1,170 @@
+<!--
+  DRAFT public README for the HermesMobile project's PUBLIC GitHub repo.
+  Fill the <PLACEHOLDERS> before publishing:
+    <REPO_OWNER>/<REPO_NAME>  — the PUBLIC repo slug (e.g. hermes-ai/hermes-mobile).
+                                The install.sh one-liner pulls from it, so it MUST
+                                be public + contain dist/hermes-mobile/.
+    <TESTFLIGHT_PUBLIC_LINK>  — the external TestFlight public invite URL
+                                (created when external testing is turned on).
+    <SUPPORT_CONTACT>         — issues URL / email / Discord, your choice.
+  This is the public face of the project — it carries NO secrets. Copy it to the
+  public repo as README.md when ready.
+-->
+
+# Hermes Agent — iOS app (HermesMobile)
+
+Your Hermes agent, on your phone. Live-streaming chat, approvals, push
+notifications + Live Activities, device pairing, and file/attachment support —
+talking directly to **your own** `hermes-agent` gateway. No third‑party servers:
+the app connects only to the gateway you run.
+
+> _[ screenshots go here ]_
+
+---
+
+## What you need first
+
+HermesMobile is a **client for a gateway you host**. Before installing the app
+you need:
+
+1. A machine running **[hermes-agent](https://hermes-agent.nousresearch.com)**
+   (your Mac, a Linux box, etc.).
+2. That gateway running the **HermesMobile plugin** (adds multi‑client streaming,
+   pairing, and push). The plugin is a self‑contained add‑on — see **Set up the
+   gateway** below.
+3. The phone able to **reach the gateway** — same Wi‑Fi/LAN, or over
+   [Tailscale](https://tailscale.com) (recommended for "anywhere" access).
+
+---
+
+## Set up the gateway — the easy way (let your agent do it)
+
+If you already run Hermes, the fastest path is to **paste this prompt into your
+Hermes agent** and let it set everything up:
+
+```
+Set up the HermesMobile iOS app support on this Hermes gateway for me.
+
+1. From the root of this hermes-agent checkout, run the HermesMobile installer:
+   bash <(curl -fsSL https://raw.githubusercontent.com/<REPO_OWNER>/<REPO_NAME>/HEAD/dist/hermes-mobile/install.sh)
+   (add --dry-run first if you want to preview the changes).
+2. Make sure these are exported, then restart the gateway:
+   export HERMES_ENABLE_PROJECT_PLUGINS=1
+   export HERMES_GATEWAY_BROADCAST=1
+3. Verify with `hermes plugins list` — "hermes-mobile" should be "enabled".
+4. Run `hermes mobile-pair` and show me the QR code / pairing link so I can scan
+   it from the iOS app.
+
+If any step errors, diagnose and fix it, then continue. Summarize what you did.
+```
+
+That's it — your agent applies the plugin, restarts the gateway, and hands you a
+pairing QR.
+
+### …or set it up by hand
+
+From the root of your `hermes-agent` checkout:
+
+```bash
+# 1. Install the HermesMobile plugin (additive — stock files are only extended;
+#    `--dry-run` previews every change first).
+bash <(curl -fsSL https://raw.githubusercontent.com/<REPO_OWNER>/<REPO_NAME>/HEAD/dist/hermes-mobile/install.sh)
+
+# 2. Enable plugin discovery + multi-client broadcast, then restart the gateway.
+export HERMES_ENABLE_PROJECT_PLUGINS=1
+export HERMES_GATEWAY_BROADCAST=1
+
+# 3. Verify + get a pairing code.
+hermes plugins list      # hermes-mobile -> enabled
+hermes mobile-pair       # prints a QR + hermesapp://pair deep-link
+```
+
+Full installer details + rollback: [`dist/hermes-mobile/INSTALL.md`](dist/hermes-mobile/INSTALL.md).
+
+---
+
+## Get the app on your phone
+
+Pick one:
+
+### Option 1 — Join the TestFlight beta (easiest)
+
+1. Install Apple's **TestFlight** app.
+2. Open the public invite link: **<TESTFLIGHT_PUBLIC_LINK>**
+3. Install "Hermes Agent" from TestFlight.
+
+### Option 2 — Build it yourself (full control)
+
+Requirements: a Mac with **Xcode 26+**, an Apple ID for signing.
+
+```bash
+git clone https://github.com/<REPO_OWNER>/<REPO_NAME>.git
+cd <REPO_NAME>/apps/ios
+brew install xcodegen           # if you don't have it
+xcodegen generate               # generates HermesMobile.xcodeproj
+open HermesMobile.xcodeproj
+```
+
+In Xcode: pick your team under **Signing & Capabilities**, select your iPhone,
+and **Run**. (First run on a personal team: trust the developer profile under
+Settings → General → VPN & Device Management.)
+
+---
+
+## Pair the app to your gateway
+
+1. On the gateway host, run `hermes mobile-pair`.
+2. In the app, tap **Scan pairing code** and scan the QR — or **Enter manually**
+   with the URL + token it prints.
+3. You're in. Sessions stream live; start chatting.
+
+> **Tip:** for sessions you start in the Hermes **desktop** to show up on the
+> phone, the desktop must share the same gateway (see Known issues).
+
+---
+
+## Features
+
+- Live multi‑client streaming — desktop ↔ phone mirror the same sessions.
+- Approvals + clarifications inline and via push (approve/deny from the lock
+  screen).
+- Push notifications for approvals, questions, and long turns finishing.
+- Live Activities + Dynamic Island — watch a turn run from the lock screen.
+- Home‑screen widgets (status, usage).
+- File browse + attachment upload, voice dictation, Face ID lock.
+
+---
+
+## Known issues
+
+See [`KNOWN-ISSUES.md`](apps/ios/KNOWN-ISSUES.md). Highlights for the first beta:
+desktop must share the gateway for its sessions to appear on the phone; a
+rare "stuck on reconnecting" after a long background (force‑quit recovers); an
+accessibility pass is in progress.
+
+---
+
+## Troubleshooting
+
+- **Can't connect / "Is Tailscale connected?"** — the phone must reach the
+  gateway. Confirm the URL works in the phone's browser, and that Tailscale (if
+  used) is connected on both ends.
+- **No notifications** — open the app's **Settings → Notifications**, toggle it
+  on, and grant the iOS permission prompt. Push requires the gateway's APNs to be
+  configured (the installer/agent sets this up).
+- **Desktop sessions not visible** — run the desktop attached to the same shared
+  gateway the phone paired with (Known issues).
+
+---
+
+## Privacy & security
+
+The app talks **only** to the gateway you run — there is no HermesMobile cloud
+service. Your pairing token is stored in the iOS Keychain. Push goes through
+Apple's APNs using **your** gateway's signing key.
+
+---
+
+## Support
+
+Questions / bugs: <SUPPORT_CONTACT>.
