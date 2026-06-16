@@ -23,11 +23,18 @@ this file. Each item links to its tracker where one exists.
 
 ## Notifications
 
-- **You must grant the iOS permission once.** Open **Settings → Notifications** in
-  the app and toggle it on to trigger the system permission prompt. (Build ≤48 had
-  a bug where the toggle was stuck disabled; fixed in the next build.)
-- Push fires for: approvals, clarifications, and long turns finishing while
-  backgrounded — per-event toggles are in Settings.
+- **In-app approvals & clarifications always work** — when the agent needs you, it
+  surfaces live in the app, on any gateway.
+- **Background push (notifications when the app is closed) needs the app's own APNs
+  signing key, which only the app's publisher holds.** So on the **TestFlight
+  build**, background push (long-turn-done / approval-while-away) and *remote* Live
+  Activity updates are **not available from your self-hosted gateway** — you still
+  get live chat, sync, in-app approvals, and the **on-device** Live Activity timer.
+  If you **build the app yourself** with your own Apple Developer team + APNs key,
+  set it on the gateway (`HERMES_APNS_*`) and background push works. (A hosted push
+  relay that enables push for TestFlight testers is on the roadmap.)
+- **Enabling:** Settings → Notifications → toggle on → grant the iOS prompt.
+  (Builds ≤48 had the toggle stuck disabled; fixed in 49+.)
 
 ## UI polish (cosmetic, self-correcting)
 
