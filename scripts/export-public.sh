@@ -108,6 +108,12 @@ if [ -f dist/hermes-mobile/PUBLIC-README.md ]; then
   copied=$((copied + 1))
 fi
 
+# LICENSE (MIT, dual copyright: Nous Research + HermesMobile) -> export root
+if [ -f dist/hermes-mobile/LICENSE ]; then
+  cp dist/hermes-mobile/LICENSE "$OUT/LICENSE"
+  copied=$((copied + 1))
+fi
+
 echo "copied $copied files into staging"
 
 # --- 2. SCRUBS -----------------------------------------------------------------

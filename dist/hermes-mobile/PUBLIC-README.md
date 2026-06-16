@@ -1,16 +1,3 @@
-<!--
-  DRAFT public README for the HermesMobile project's PUBLIC GitHub repo.
-  Fill the <PLACEHOLDERS> before publishing:
-    <REPO_OWNER>/<REPO_NAME>  — the PUBLIC repo slug (e.g. hermes-ai/hermes-mobile).
-                                The install.sh one-liner pulls from it, so it MUST
-                                be public + contain dist/hermes-mobile/.
-    <TESTFLIGHT_PUBLIC_LINK>  — the external TestFlight public invite URL
-                                (created when external testing is turned on).
-    <SUPPORT_CONTACT>         — issues URL / email / Discord, your choice.
-  This is the public face of the project — it carries NO secrets. Copy it to the
-  public repo as README.md when ready.
--->
-
 # Hermes Agent — iOS app (HermesMobile)
 
 Your Hermes agent, on your phone. Live-streaming chat, approvals, push
@@ -92,7 +79,9 @@ Pick one:
 ### Option 1 — Join the TestFlight beta (easiest)
 
 1. Install Apple's **TestFlight** app.
-2. Open the public invite link: **<TESTFLIGHT_PUBLIC_LINK>**
+2. Open the public invite link — **coming soon.** The external TestFlight beta is
+   in Apple's Beta App Review; the link will be posted here (and in the release
+   announcement) the moment it's approved. Until then, use **Option 2** below.
 3. Install "Hermes Agent" from TestFlight.
 
 ### Option 2 — Build it yourself (full control)
