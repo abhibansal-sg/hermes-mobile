@@ -111,7 +111,9 @@ extension RestClient {
         // Drawer bifurcation: Recents (aggregate rail) excludes automation runs;
         // an automation-runs feed would pass source: "cron".
         if !excludeSource.isEmpty {
-            items.append(URLQueryItem(name: "exclude_source", value: excludeSource.joined(separator: ",")))
+            // PLURAL `exclude_sources` — the gateway's actual param name (see
+            // RestClient.sessionsWithTotal). The singular form is silently dropped.
+            items.append(URLQueryItem(name: "exclude_sources", value: excludeSource.joined(separator: ",")))
         }
         if let source, !source.isEmpty {
             items.append(URLQueryItem(name: "source", value: source))

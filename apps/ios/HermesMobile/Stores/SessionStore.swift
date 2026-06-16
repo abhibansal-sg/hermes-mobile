@@ -83,7 +83,7 @@ final class SessionStore {
 
     /// Sources excluded from the human-chat Recents list (drawer bifurcation).
     /// Automation RUNS (`source == "cron"`) live in their own Automation-runs feed,
-    /// not the chat list — so the server filters them via `exclude_source` and the
+    /// not the chat list — so the server filters them via `exclude_sources` and the
     /// client never fetches OR caches them (no more cron-dense windows / cache
     /// bloat). The automation-runs surface fetches `source: "cron"` separately.
     static let recentsExcludeSources = ["cron"]
@@ -589,7 +589,7 @@ final class SessionStore {
         var rows = sessions
         // Recents is human-chat-only BY CONSTRUCTION (drawer bifurcation):
         // automation runs (source == "cron") live in the Automation Runs feed,
-        // never the chat list. The server also filters them via `exclude_source`
+        // never the chat list. The server also filters them via `exclude_sources`
         // for efficiency (no cron fetched/cached); this client-side filter
         // guarantees the invariant even against a gateway that predates that param.
         rows = rows.filter { ($0.source ?? "").lowercased() != "cron" }
@@ -1118,8 +1118,23 @@ final class SessionStore {
         let priorLastActive: [String: Double] = sessions.reduce(into: [:]) { acc, s in
             if let la = s.lastActive { acc[s.id] = la }
         }
+        // ABH-157 — gate the carry-forward on the LIVE WINDOW. `noteActivity`
+        // bumps `lastActive` to the DEVICE clock; if the device runs even slightly
+        // ahead of the gateway, an UNCONDITIONAL `max(local, server)` pins that
+        // device-now value above the row's true server `lastActive` FOREVER —
+        // nothing ever advances the server value past a future-dated bump — so an
+        // idle local session permanently outranks a genuinely-fresher foreign
+        // (desktop-driven) one AND displays a stale (future) timestamp. Both the
+        // drawer SORT and the row TIMESTAMP key on `lastActive`, so this one defect
+        // produced both reported symptoms. `lastActivityAt[id]` is re-stamped on
+        // every live frame (ConnectionStore.scheduleSessionRefresh), so a row that
+        // is genuinely mid-turn keeps its optimistic position (no flicker), and the
+        // instant the turn settles the bump DECAYS to the authoritative server
+        // value — restoring correct recency order and the true last-active time.
+        let liveCutoff = Date().addingTimeInterval(-Self.liveWindow)
         let reconciled = incoming.map { row -> SessionSummary in
             guard let prior = priorLastActive[row.id],
+                  let liveAt = lastActivityAt[row.id], liveAt > liveCutoff,
                   prior > (row.lastActive ?? -.greatestFiniteMagnitude) else { return row }
             var bumped = row
             bumped.lastActive = prior
@@ -1150,6 +1165,14 @@ final class SessionStore {
         if (sessions[idx].lastActive ?? -.greatestFiniteMagnitude) < now {
             sessions[idx].lastActive = now
         }
+        // ABH-157 — the optimistic bump and the LIVE WINDOW are the same signal: a
+        // row is only "ahead of the server" while it is actively being driven.
+        // Stamp `lastActivityAt` here too so `mergeSessionPage`'s carry-forward
+        // (gated on the live window) keeps this bump until the turn SETTLES, then
+        // lets it decay to the authoritative server value. Without this unifying
+        // stamp the bump would be carried forward FOREVER (device-clock skew →
+        // never converges: stale sort + stale timestamp).
+        lastActivityAt[id] = Date()
     }
 
     /// P3 write-through: persist the current `sessions` array into the local
@@ -1180,12 +1203,13 @@ final class SessionStore {
     ///   request is `limit = loadedCount + PAGE_SIZE, offset=0, min_messages=1`.
     ///   The server window expands; we deduplicate the overlap by id so rows
     ///   already in the list are not duplicated.
-    /// - No server-side source/cron filter exists (investigated: `/api/sessions`
-    ///   has `min_messages` and `offset` but no `source` param). Client-side
-    ///   `hideCron` filter is therefore applied after fetch. Because the server
-    ///   returns a dense cron-heavy window, `loadMore` keeps fetching in a loop
-    ///   until `visibleSessions` grows OR there are no more server rows — so the
-    ///   user is never stranded at a wall of hidden cron rows.
+    /// - A patched gateway server-filters cron via `exclude_sources` (plural — the
+    ///   real FastAPI param, see `RestClient.sessionsWithTotal`), so the window is
+    ///   already cron-free and this loop converges fast. The client-side `hideCron`
+    ///   filter remains the hard invariant guarantee against a STOCK/older gateway
+    ///   that ignores the param and returns a dense cron-heavy window: `loadMore`
+    ///   keeps fetching in a loop until `visibleSessions` grows OR there are no more
+    ///   server rows — so the user is never stranded at a wall of hidden cron rows.
     /// - A fetch is a no-op when already at the server total, already loading, or
     ///   when a first-page refresh is in flight (`isLoading`).
     /// - The same `refreshToken` / stale-response guard from `refresh()` protects

@@ -147,7 +147,7 @@ struct RestClient: Sendable {
     /// `excludeSource` / `source` filter by session origin (ABH drawer
     /// bifurcation): the human-chat Recents passes `excludeSource: ["cron"]` so
     /// automation runs never enter the list (or its cache); the automation-runs
-    /// feed passes `source: "cron"`. The server splits `exclude_source` on commas.
+    /// feed passes `source: "cron"`. The server splits `exclude_sources` on commas.
     func sessionsWithTotal(
         limit: Int = 100,
         offset: Int = 0,
@@ -163,7 +163,15 @@ struct RestClient: Sendable {
         if minMessages > 0 { parts.append("min_messages=\(minMessages)") }
         if offset > 0       { parts.append("offset=\(offset)") }
         if !excludeSource.isEmpty {
-            parts.append("exclude_source=\(excludeSource.joined(separator: ","))")
+            // Gateway FastAPI param is `exclude_sources` (PLURAL) — see
+            // web_server.py /api/sessions. iOS historically sent the singular
+            // `exclude_source`, which FastAPI silently dropped, so cron runs were
+            // never server-filtered and dominated the first page (only the
+            // client-side `visibleSessions` filter hid them — wasting the loaded
+            // window on cron and making a freshly-active desktop session far less
+            // likely to be in it). Backward-safe: a stock gateway ignores an
+            // unknown param, and the client-side filter remains the guarantee.
+            parts.append("exclude_sources=\(excludeSource.joined(separator: ","))")
         }
         if let source, !source.isEmpty {
             parts.append("source=\(source)")

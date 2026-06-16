@@ -107,6 +107,87 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         #endif
     }
 
+    /// ABH-159 — the foreign turn's USER prompt must surface at message.START
+    /// (before any message.complete), and must NOT be duplicated when the
+    /// authoritative complete-time backfill later reconciles the same transcript.
+    /// The gateway never broadcasts the user message as a frame, so without this
+    /// the user bubble is absent until a force-quit reseed whenever
+    /// `message.complete` is dropped/late.
+    func testForeignUserRowSurfacesAtStartAndIsNotDuplicated() async {
+        let (chat, _) = makeStore { _ in
+            [
+                self.storedMessage(role: "user", text: "hello from desktop"),
+                self.storedMessage(role: "assistant", text: "MIRRORTEST reply"),
+            ]
+        }
+
+        // Foreign START only — NO complete yet. The OLD behavior deferred the user
+        // bubble to the complete-time backfill, so it would be absent right here.
+        chat.handle(event: foreignFrame(
+            type: "message.start", runtime: foreignRuntime, stored: storedId,
+            payload: ["role": "assistant"]))
+        await settle()  // let the detached mergeForeignUserRows fetch + apply run
+
+        XCTAssertTrue(
+            chat.messages.contains { $0.role == .user && $0.text.contains("hello from desktop") },
+            "the foreign user prompt must surface at message.start, before message.complete")
+        XCTAssertEqual(
+            chat.messages.filter { $0.role == .user && $0.text.contains("hello from desktop") }.count, 1,
+            "exactly one user row at start time")
+
+        // The turn completes: the authoritative backfill reconciles the SAME
+        // transcript. Because the start-time row carried the deterministic id the
+        // backfill also computes, it reconciles in place — never a duplicate.
+        chat.handle(event: foreignFrame(
+            type: "message.complete", runtime: foreignRuntime, stored: storedId,
+            payload: ["text": "MIRRORTEST reply", "status": "completed"]))
+        await settle()
+
+        XCTAssertEqual(
+            chat.messages.filter { $0.role == .user && $0.text.contains("hello from desktop") }.count, 1,
+            "the start-time user row reconciles in place — the complete-time backfill must not duplicate it")
+    }
+
+    /// ABH-159 — index-stability / in-place-reconcile contract. The start-time
+    /// fetch sees only the just-committed user row; the complete-time backfill
+    /// sees the FULL turn (assistant appended AFTER the user prompt). The user
+    /// row's deterministic id must be IDENTICAL across both (its index doesn't
+    /// shift — the reply appends after it), so it reconciles in place: exactly one
+    /// bubble AND the same row identity (no remount/blink), not just no duplicate.
+    func testForeignUserRowIdentityStableAcrossGrowingTranscript() async {
+        var calls = 0
+        let (chat, _) = makeStore { _ in
+            calls += 1
+            if calls == 1 {
+                return [self.storedMessage(role: "user", text: "hello from desktop")]
+            }
+            return [
+                self.storedMessage(role: "user", text: "hello from desktop"),
+                self.storedMessage(role: "assistant", text: "MIRRORTEST reply"),
+            ]
+        }
+
+        chat.handle(event: foreignFrame(
+            type: "message.start", runtime: foreignRuntime, stored: storedId,
+            payload: ["role": "assistant"]))
+        await settle()
+        let userRowsAtStart = chat.messages.filter { $0.role == .user && $0.text.contains("hello from desktop") }
+        XCTAssertEqual(userRowsAtStart.count, 1, "user row surfaces once at start time")
+        let idAtStart = userRowsAtStart.first?.id
+
+        chat.handle(event: foreignFrame(
+            type: "message.complete", runtime: foreignRuntime, stored: storedId,
+            payload: ["text": "MIRRORTEST reply", "status": "completed"]))
+        await settle()
+        let userRowsAfter = chat.messages.filter { $0.role == .user && $0.text.contains("hello from desktop") }
+        XCTAssertEqual(userRowsAfter.count, 1,
+            "a growing complete-time transcript reconciles the start-time user row in place — exactly one bubble")
+        XCTAssertEqual(userRowsAfter.first?.id, idAtStart,
+            "the user row's identity is STABLE across start→complete (reconciled in place, not remounted)")
+        XCTAssertTrue(chat.messages.contains { $0.role == .assistant && $0.text.contains("MIRRORTEST") },
+            "the assistant reply lands via the complete-time backfill")
+    }
+
     /// Live foreign deltas of the adopted stream must be applied, not dropped,
     /// even though `isStreaming` is true for the foreign stream the app adopted.
     func testForeignDeltasAppliedWhileStreaming() async {

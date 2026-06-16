@@ -687,6 +687,16 @@ final class ChatStore {
         switch event.type {
         case .messageStart:
             beginStreamingMessage(foreign: true)
+            // ABH-159 — surface the foreign turn's USER prompt NOW. The gateway
+            // never broadcasts the user message as a frame (only assistant
+            // frames), so a mirror's ONLY delivery of the user bubble is the
+            // message.complete backfill — a single fragile point that's missed
+            // whenever `complete` is dropped/late (the same "mirror goes silent"
+            // failure the watchdog compensates for), leaving the user bubble
+            // absent until a force-quit reseed. Append-only by deterministic id,
+            // so the later backfill reconciles in place — never a duplicate — and
+            // it never tears down or races the live foreign assistant stream.
+            mergeForeignUserRows()
         case .messageDelta:
             if let text = event.payload["text"]?.stringValue, !text.isEmpty {
                 textBuffer += text
@@ -2491,6 +2501,53 @@ final class ChatStore {
         // plugin mount serves it; full fetch otherwise). Full list returned either way.
         return { [cacheStore] sessionId in
             try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId)
+        }
+    }
+
+    /// ABH-159 — surface a foreign-mirrored turn's USER prompt at message.start,
+    /// instead of waiting for the (fragile) complete-time `backfill()`.
+    ///
+    /// The gateway broadcasts ONLY assistant frames (message.start has no payload,
+    /// then deltas/tool/complete); the user's prompt text is written to the
+    /// session DB but never `_emit`'d, so the S1 fan-out can never deliver it to a
+    /// mirror. Today the foreign user bubble's only delivery is the complete-time
+    /// `backfill()` reconcile — a single point that's missed whenever
+    /// `message.complete` is dropped/late, leaving the user bubble absent until a
+    /// force-quit reseed.
+    ///
+    /// This is APPEND-ONLY and uses the SAME `toChatMessages` transform the
+    /// authoritative backfill uses, so the surfaced user row carries the exact
+    /// DETERMINISTIC id (`deterministicID(seedKey:)`, never `UUID()`) the later
+    /// `reconcileMessages` keys on — it matches by id and updates in place, NEVER
+    /// a duplicate. It never calls `cancelStreaming()`/`seed()` (which bail on a
+    /// live foreign mirror anyway), and the streaming row is located by id on
+    /// every flush (`mutateStreaming`), so inserting a row ahead of it cannot
+    /// corrupt the live assistant stream.
+    private func mergeForeignUserRows() {
+        guard streamingIsForeign, let storedId = sessions?.activeStoredId else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            guard let fetch = self.resolvedBackfillFetch else { return }
+            guard let stored = try? await fetch(storedId) else { return }
+            // The world may have moved during the fetch: only apply if THIS
+            // foreign mirror for THIS session is still live (otherwise the
+            // authoritative seed owns the transcript). Same guard shape as
+            // `backfill()`'s post-await check.
+            guard self.streamingIsForeign,
+                  storedId == self.sessions?.activeStoredId else { return }
+            let normalized = Self.toChatMessages(stored)
+            // The current foreign turn's prompt is the TRAILING user row. Surface
+            // only that one if it isn't already present — appending an older row
+            // here could mis-position it, and the complete-time reconcile remains
+            // the authoritative full rebuild for everything else.
+            guard let userRow = normalized.last(where: { $0.role == .user }),
+                  !self.messages.contains(where: { $0.id == userRow.id }) else { return }
+            if let placeholderIdx = self.messages.firstIndex(where: { $0.isStreaming }) {
+                self.messages.insert(userRow, at: placeholderIdx)
+            } else {
+                self.messages.append(userRow)
+            }
+            self.rebuildUserOrdinals()
         }
     }
 

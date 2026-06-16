@@ -72,6 +72,61 @@ final class ABH86SessionRefreshTests: XCTestCase {
         XCTAssertEqual(ids, ["B", "A"])
     }
 
+    // MARK: - ABH-157: stale device-clock bump must decay (sort + timestamp)
+
+    /// A SETTLED (not live) optimistic device-clock bump must DECAY to the server
+    /// value on merge, so a genuinely-fresher foreign (desktop-driven) session
+    /// outranks it. This pins the drawer recency-sort AND stale-timestamp fix —
+    /// both key on `lastActive`, so one decay fixes both. The bug: `noteActivity`
+    /// bumps to the DEVICE clock and the old unconditional `max(local, server)`
+    /// carry-forward pinned that future-dated value above the true server value
+    /// forever, so an idle local row outranked a fresher desktop one.
+    func testSettledStaleBumpDecaysSoFresherForeignOutranks() async {
+        let store = makeStore()
+        // "mine": the user's own session, optimistically bumped to a device-now
+        // value ABOVE its true server lastActive (clock skew). No live frame is in
+        // flight — `lastActivityAt` is NOT stamped, i.e. the turn has settled.
+        let mineStale = makeSummary(id: "mine", lastActive: 100_000, startedAt: 1)
+        let deskOld   = makeSummary(id: "desk", lastActive:  90_000, startedAt: 1)
+        store.sessions = [mineStale, deskOld]
+
+        // Server authority: desk was JUST active (fresher); mine's TRUE value is
+        // lower than its stale local bump.
+        let deskFresh = makeSummary(id: "desk", lastActive: 95_000, startedAt: 1)
+        let mineTrue  = makeSummary(id: "mine", lastActive: 80_000, startedAt: 1)
+        store.sessionsFetch = { ([deskFresh, mineTrue], 2) }
+
+        await store.refresh()
+
+        XCTAssertEqual(store.visibleSessions.map(\.id).first, "desk",
+            "a settled stale device-clock bump must decay to the server value so a fresher foreign session sorts above it")
+        XCTAssertEqual(store.visibleSessions.first(where: { $0.id == "mine" })?.lastActive, 80_000,
+            "the displayed timestamp converges to the authoritative server value, not the stale future bump")
+    }
+
+    /// While a row is GENUINELY live (a frame just landed, so `lastActivityAt` is
+    /// fresh), the optimistic bump is STILL carried forward over a lagging server
+    /// value — so the row does not flicker down on the debounced refresh that
+    /// fires right after message.start. This guards the anti-flicker behavior the
+    /// decay must not regress.
+    func testLiveBumpStillCarriedForwardToPreventFlicker() async {
+        let store = makeStore()
+        let mineBumped = makeSummary(id: "mine",  lastActive: 100_000, startedAt: 1)
+        let other      = makeSummary(id: "other", lastActive:  90_000, startedAt: 1)
+        store.sessions = [mineBumped, other]
+        store.noteActivity(storedSessionId: "mine")  // mark genuinely live
+
+        // The debounced refresh returns the OLD (lower) server value for mine.
+        let mineOldServer = makeSummary(id: "mine",  lastActive: 50_000, startedAt: 1)
+        let otherSame     = makeSummary(id: "other", lastActive: 90_000, startedAt: 1)
+        store.sessionsFetch = { ([otherSame, mineOldServer], 2) }
+
+        await store.refresh()
+
+        XCTAssertEqual(store.visibleSessions.map(\.id).first, "mine",
+            "while genuinely live, the optimistic bump is carried forward so the row doesn't flicker down before the server catches up")
+    }
+
     /// When `lastActive` is absent, sort falls back to `startedAt` DESC.
     func testVisibleSessionsSortsByStartedAtWhenNoLastActive() async {
         let store = makeStore()
