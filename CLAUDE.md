@@ -49,10 +49,36 @@ stay in sync. (The project key is the path-encoded dir under
 **LINEAR** (team ABH, project "Hermes Mobile — Engineering") is the cloud source
 of truth for tasks — nothing to clone; just sign in.
 
-**WHERE THINGS STAND (2026-06-16, LATE — current):** Work branch
-`phase2-upstream-rebase` @ `acfc4c5ca`, pushed origin. TestFlight **builds 44, 45,
-46, 47 all VALID** (1.0.1). Deploy `~/.hermes/hermes-agent` (trunk
-`feat/group-collapse-pin`) live on `:9119`, healthy.
+**WHERE THINGS STAND (2026-06-16, NIGHT — current):** Work branch
+`phase2-upstream-rebase` @ `a574c270d` (build 48 committed + pushed origin).
+TestFlight **builds 44–47 VALID** (1.0.1); **build 48 ARCHIVED, gate-green,
+upload PENDING user go** (the SHIP-TESTFLIGHT runbook gates the upload as a
+release action). Deploy `~/.hermes/hermes-agent` (trunk `feat/group-collapse-pin`)
+live on `:9119`, healthy.
+- **BUILD 48 — three iOS-only fixes (no gateway edits), each root-caused via a
+  grounded live investigation (3-lens workflow) + adversarially reviewed (5-lens
+  workflow, SHIP-AFTER-MUSTFIX) before commit:**
+  - **Bug C (drawer not sorted by recency + STALE TIMESTAMP for desktop-active
+    sessions — ONE root, both symptoms):** `noteActivity` bumped `lastActive` to the
+    DEVICE clock and `mergeSessionPage` carried the higher local value forward
+    UNCONDITIONALLY (`max(local,server)`); under normal device>gateway clock skew the
+    bump NEVER converged → an idle local session outranked a fresher desktop one AND
+    showed a stale (future) timestamp (sort + displayDate both key on `lastActive`).
+    FIX: gate the carry-forward on the LIVE WINDOW (`lastActivityAt` within
+    `liveWindow`) so a settled bump decays to server authority; unify the bump with
+    the live stamp in `noteActivity(storedId:)`. + `exclude_source`→`exclude_sources`
+    (iOS sent the SINGULAR key; gateway reads PLURAL `exclude_sources` at
+    web_server.py:2208 → cron was never server-filtered). 2 new SessionStore tests.
+  - **Bug D (mirrored turn's USER prompt didn't appear until force-quit, both
+    directions):** gateway broadcasts ONLY assistant frames (user text persisted to DB,
+    never `_emit`'d), so the mirror's only user-row delivery was the fragile
+    complete-time backfill (missed when `message.complete` dropped/late). FIX:
+    `ChatStore.mergeForeignUserRows()` at foreign `.messageStart` — append-only via the
+    SAME `toChatMessages` transform → deterministic id → complete-time `reconcileMessages`
+    matches in place (no dup, stable identity); never calls cancelStreaming/seed;
+    streaming row located by id so insert can't corrupt the live stream. 2 new
+    foreign-mirror tests. (Live :9119 emits wireId → immune to the stock-gateway
+    positional-id nit the review flagged.)
 - **THE BIG FIX — desktop-touched sessions wouldn't accept iOS messages (user-
   confirmed FIXED):** gateway provider-resolution bug, NOT iOS. A session the
   desktop touched is stored `billing_provider="custom"` + empty `model_config`;
@@ -79,15 +105,33 @@ of truth for tasks — nothing to clone; just sign in.
   safety-net refresh in `finishHydration` (the model probe already had one).
 - **S1 broadcast / mirroring:** RE-ENABLED on `:9119` (deploy `a9be71317`); provider
   fix intact. Sends + mirroring both working.
-- **OPEN — Bug A (foreground-after-long-background stuck on "reconnecting"):** narrowed
-  (gateway DOES send gateway.ready; client-side reconnect `awaitReady` times out) but
-  NOT fixed — needs a real DEVICE repro before touching the fragile reconnect/stream
-  code (task #51). Workaround: force-quit → reopen.
-- **DEBUG LESSON (now in memory):** reproduce the iOS RPC directly over WS against the
-  live gateway (`~/.hermes/hermes-agent/venv/bin/python` + `websockets`; auth = the
-  desktop `connection.json` token) — that surfaced the 5000 error in 2 min after many
-  turns of wrong code-theory. Get the live error FIRST.
-NEXT: user device-verify builds 46/47; then pin Bug A with a device repro.
+- **OPEN — Bug A (foreground-after-long-background stuck on "reconnecting") — build-48
+  escalation TRIED then REVERTED (adversarial review):** the fix idea (handleScenePhase
+  `.reconnecting` → `configure()`) reuses the SAME frozen ephemeral `URLSession`
+  (HermesGatewayClient `session`+`client` created ONCE, never recreated), so on a
+  genuinely-wedged socket `configure()`→`client.connect()` re-triggers the same 15s
+  `awaitReady` stall → `.offline` flash → bounces back to `.reconnecting`. Cold launch
+  works only because force-quit = a fresh PROCESS = a fresh URLSession. CORRECT FIX:
+  (a) device-repro proving a fresh `webSocketTask` on the reused session recovers, OR
+  (b) recreate the HermesGatewayClient/URLSession on escalation (`invalidateAndCancel`
+  old + new) = replicate force-quit. Also uncovered: the silent-`.connected`-dead-socket
+  tail (foreground hits the `.connected` branch → only REST backfill, never probes the
+  dead WS) — wants a liveness ping. Touches fragile reconnect/stream code → DEVICE REPRO
+  FIRST (task #51). Workaround: force-quit → reopen.
+- **C-PRIMARY follow-up (not a blocker, build-49 candidate):** the carry-forward gate
+  reuses `liveWindow` (10s live-DOT) as a "turn-in-progress" proxy; a long agent turn
+  with a >10s SILENT inter-frame gap + a refresh landing in the gap can flicker the row
+  down mid-turn (self-corrects at message.complete; strictly better than the never-
+  converge bug it replaces). Cleaner: gate on an explicit per-id turn-in-progress flag
+  set on message.start / cleared on message.complete.
+- **DEBUG LESSON (in memory):** reproduce the iOS RPC directly over WS against the live
+  gateway (`~/.hermes/hermes-agent/venv/bin/python` + `websockets`; auth = the desktop
+  `connection.json` token) FIRST — surfaced the 5000 error in 2 min after many wrong
+  code-theories. And: ADVERSARIALLY REVIEW fragile-path fixes (reconnect/foreign-mirror/
+  merge) before ship — the build-48 review caught the unproven Bug-A escalation.
+NEXT: (1) user go for the build-48 TestFlight upload (archived + CFBundleVersion-48-gated,
+ready); (2) user device-verify build 48 (drawer sort + timestamp now correct; user msg
+mirrors live); (3) Bug A — device repro, then URLSession-recreation fix.
 
 **BUILD 41 (history):** TestFlight build 41 (1.0.1) was VALID; work
 branch = `phase2-upstream-rebase` @ `a1ab20c63`, pushed to origin backup mirror;
