@@ -49,7 +49,47 @@ stay in sync. (The project key is the path-encoded dir under
 **LINEAR** (team ABH, project "Hermes Mobile — Engineering") is the cloud source
 of truth for tasks — nothing to clone; just sign in.
 
-**WHERE THINGS STAND (2026-06-16):** TestFlight **build 41 (1.0.1) is VALID**; work
+**WHERE THINGS STAND (2026-06-16, LATE — current):** Work branch
+`phase2-upstream-rebase` @ `acfc4c5ca`, pushed origin. TestFlight **builds 44, 45,
+46, 47 all VALID** (1.0.1). Deploy `~/.hermes/hermes-agent` (trunk
+`feat/group-collapse-pin`) live on `:9119`, healthy.
+- **THE BIG FIX — desktop-touched sessions wouldn't accept iOS messages (user-
+  confirmed FIXED):** gateway provider-resolution bug, NOT iOS. A session the
+  desktop touched is stored `billing_provider="custom"` + empty `model_config`;
+  `_stored_session_runtime_overrides` forced `provider="custom"` (a billing label,
+  not a resolvable provider) with no `base_url` → `_make_agent` failed `session.resume`
+  with **5000 "No LLM provider configured"** → iOS `activeRuntimeId` stayed nil →
+  queue-mode + "No active session". A fresh `session.create` on the global
+  `hermes-anthropic-proxy` (:18802) provider builds fine — only RESUME of custom-
+  billing sessions failed. FIX: `if provider == "custom" and not base_url: provider=""`
+  → fall back to global. Deploy commit `b22d22ff5` (live, proven via WS probe);
+  worktree `d71f7f04e` + 3 tests. Upstream-PR candidate. (Earlier theories —
+  broadcast/ownership/compression/profile/foreign-mirror — were ALL WRONG.)
+- **Build 44 (drawer flick):** velocity hand-off (interpolatingSpring + DragGesture
+  velocity) — flick open/close no longer snaps.
+- **Build 45 (queue self-heal):** ChatStore.send re-resumes on demand + auto-drain +
+  chain-tip restamp + supersession guard. (Couldn't fix the desktop-send bug because
+  the resume itself failed — see provider fix.)
+- **Build 46 (drawer, user-confirmed GOOD):** `geometryGroup()` on the chat content
+  (transcript rides the card rigidly — fixes the OLD detached-transcript) + drawer
+  parallax (glides in 30%, Telegram ratio).
+- **Build 47 (cold-launch stale data, FIXED):** `startHydration` raced the session
+  refresh vs an 8s timeout and cancelled the loser — with 5,874 sessions the refresh
+  always lost → drawer stuck on stale cache despite "connected". Added a background
+  safety-net refresh in `finishHydration` (the model probe already had one).
+- **S1 broadcast / mirroring:** RE-ENABLED on `:9119` (deploy `a9be71317`); provider
+  fix intact. Sends + mirroring both working.
+- **OPEN — Bug A (foreground-after-long-background stuck on "reconnecting"):** narrowed
+  (gateway DOES send gateway.ready; client-side reconnect `awaitReady` times out) but
+  NOT fixed — needs a real DEVICE repro before touching the fragile reconnect/stream
+  code (task #51). Workaround: force-quit → reopen.
+- **DEBUG LESSON (now in memory):** reproduce the iOS RPC directly over WS against the
+  live gateway (`~/.hermes/hermes-agent/venv/bin/python` + `websockets`; auth = the
+  desktop `connection.json` token) — that surfaced the 5000 error in 2 min after many
+  turns of wrong code-theory. Get the live error FIRST.
+NEXT: user device-verify builds 46/47; then pin Bug A with a device repro.
+
+**BUILD 41 (history):** TestFlight build 41 (1.0.1) was VALID; work
 branch = `phase2-upstream-rebase` @ `a1ab20c63`, pushed to origin backup mirror;
 trunk = `feat/group-collapse-pin`. Build 41 = the research-driven build-out: studied
 11 open-source chat apps (`~/chat-research/REPORT.md` + `REPORT-DATA.md`) →
