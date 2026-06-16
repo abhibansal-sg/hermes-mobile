@@ -339,7 +339,12 @@ struct DrawerView: View {
                     .font(.footnote.weight(.medium))
                     .lineLimit(1)
             }
-            .foregroundStyle(theme.accent)
+            // Bug fix: `theme.accent` and `theme.secondary` are neighbouring
+            // low-contrast shades in every preset, so the chip read as muffled /
+            // near-invisible. `theme.midground` is THE brand accent (tint / send
+            // button / active pill) — high-contrast against `secondary` in every
+            // theme, so the profile chip is clearly legible while staying branded.
+            .foregroundStyle(theme.midground)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(theme.secondary, in: Capsule())
