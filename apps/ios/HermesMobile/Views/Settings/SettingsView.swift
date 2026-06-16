@@ -119,6 +119,16 @@ struct SettingsView: View {
     /// Cached UNAuthorizationStatus — probed on appear and after the alert
     /// dismisses (so re-granting in Settings is reflected immediately on return).
     @State private var notifAuthStatus: UNAuthorizationStatus = .notDetermined
+    /// Whether the FIRST authorization probe has completed. The toggle is
+    /// disabled only until this is true (a brief "probing" window) — NOT on the
+    /// settled status. Critical fix: `.notDetermined` is BOTH the transient
+    /// pre-probe state AND the permanent "user never granted" state, so gating
+    /// the toggle on `notifAuthStatus == .notDetermined` left a user who had
+    /// never been asked with a PERMANENTLY disabled toggle — they could never tap
+    /// it to trigger the OS permission prompt (chicken-and-egg lockout). Gating on
+    /// `notifAuthProbed` instead enables the toggle once probed, so a
+    /// `.notDetermined` user can tap it and the `set` handler requests auth.
+    @State private var notifAuthProbed = false
     /// Whether to show the "notifications denied — open Settings" alert.
     @State private var showNotifDeniedAlert = false
 
@@ -358,8 +368,11 @@ struct SettingsView: View {
             )) {
                 SettingsRowLabel(icon: "bell", title: "Notifications")
             }
-            // Disable while .notDetermined (probing) or server doesn't support push.
-            .disabled(pushUnsupported || notifAuthStatus == .notDetermined)
+            // Disable only while the FIRST probe is in flight, or when the server
+            // genuinely doesn't support push. A settled `.notDetermined` (user
+            // never granted) leaves the toggle ENABLED so tapping it triggers the
+            // OS permission prompt via the `set` handler above.
+            .disabled(pushUnsupported || !notifAuthProbed)
             .listRowBackground(theme.card)
 
             // Per-event push prefs (A4): three native Toggles, shown only when
@@ -653,6 +666,7 @@ struct SettingsView: View {
     private func probeNotifStatus() async {
         let settings = await UNUserNotificationCenter.current().notificationSettings()
         notifAuthStatus = settings.authorizationStatus
+        notifAuthProbed = true
     }
 
     // MARK: - Reconnect

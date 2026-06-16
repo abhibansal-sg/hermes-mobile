@@ -348,15 +348,26 @@ enum NotificationService {
         return false
     }
 
-    /// Ask for notification authorization at most once per install. Safe to call
-    /// repeatedly; only the first call presents the system prompt. Also installs
-    /// the foreground-presentation delegate so notifications fired while the app
-    /// is active still show a banner + play a sound.
-    static func requestAuthorizationIfNeeded() {
+    /// Ask for notification authorization. Also installs the foreground-
+    /// presentation delegate so notifications fired while the app is active still
+    /// show a banner + play a sound.
+    ///
+    /// `force` distinguishes the once-per-install LAUNCH path (`false` — suppress
+    /// the prompt after the first ask so we never nag on every cold start) from an
+    /// EXPLICIT user action (`true` — toggling notifications ON in Settings).
+    /// `requestAuthorization` only presents the system dialog when status is
+    /// `.notDetermined`, so re-calling with `force` is safe: it lets a user who
+    /// dismissed the first prompt ("Don't Allow"/"Ask Next Time") get it again by
+    /// toggling ON (the latch previously swallowed that forever). When already
+    /// `.denied`, the OS returns the denial without a prompt and Settings surfaces
+    /// its "Open Settings" path.
+    static func requestAuthorizationIfNeeded(force: Bool = false) {
         installDelegateIfNeeded()
         registerCategories()
         let defaults = UserDefaults.standard
-        guard !defaults.bool(forKey: DefaultsKeys.notificationsDidRequestAuthorization) else { return }
+        if !force {
+            guard !defaults.bool(forKey: DefaultsKeys.notificationsDidRequestAuthorization) else { return }
+        }
         UNUserNotificationCenter.current().requestAuthorization(
             options: [.alert, .sound, .badge]
         ) { _, _ in

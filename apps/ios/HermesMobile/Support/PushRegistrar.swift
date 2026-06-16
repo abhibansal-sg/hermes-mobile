@@ -57,7 +57,10 @@ final class PushRegistrar {
         isEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: DefaultsKeys.pushEnabled)
         if enabled {
-            enableIfAllowed()
+            // Explicit user toggle-ON — force the auth prompt so a user who
+            // declined the first time gets it again (the once-per-install latch
+            // only applies to the silent launch path).
+            enableIfAllowed(forcePrompt: true)
         } else {
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastDeviceToken)
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEvents)
@@ -70,10 +73,10 @@ final class PushRegistrar {
     /// If push is enabled, request authorization and kick off APNs registration.
     /// Safe to call every launch — APNs registration is cheap and idempotent, and
     /// the system re-delivers the current token to the delegate each time.
-    func enableIfAllowed() {
+    func enableIfAllowed(forcePrompt: Bool = false) {
         guard isEnabled else { return }
         #if canImport(UIKit)
-        NotificationService.requestAuthorizationIfNeeded()
+        NotificationService.requestAuthorizationIfNeeded(force: forcePrompt)
         UIApplication.shared.registerForRemoteNotifications()
         #endif
     }

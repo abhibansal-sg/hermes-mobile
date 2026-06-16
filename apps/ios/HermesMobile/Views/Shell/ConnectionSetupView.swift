@@ -90,11 +90,23 @@ struct ConnectionSetupView: View {
                 } header: {
                     Text("Gateway")
                 } footer: {
-                    if let errorText {
-                        Text(errorText)
-                            .foregroundStyle(theme.destructive)
-                    } else {
-                        Text("Find the token in the hermes gateway logs, or run \u{201C}hermes token\u{201D} on the host.")
+                    // A1 — the help text doubles as the setup-recovery path. The
+                    // `Set one up` link is ALWAYS present (not gated on a failure
+                    // count), so a new self-hoster who fails to connect — or who
+                    // has no gateway at all — always has the way forward in view.
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let errorText {
+                            Text(errorText)
+                                .foregroundStyle(theme.destructive)
+                        } else {
+                            Text("On the gateway host, run \u{201C}hermes mobile-pair\u{201D} to print the server URL and token (or scan its QR from the welcome screen). \u{201C}hermes token\u{201D} prints the token alone.")
+                        }
+                        Link(destination: HelpLinks.setupGuide) {
+                            Text("Don\u{2019}t have a gateway yet? Set one up \u{2192}")
+                                .font(.footnote.weight(.medium))
+                                .foregroundStyle(theme.midground)
+                        }
+                        .accessibilityHint("Opens the Hermes Agent setup guide in your browser")
                     }
                 }
 

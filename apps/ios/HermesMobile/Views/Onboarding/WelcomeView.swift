@@ -176,6 +176,20 @@ struct WelcomeView: View {
             )
             // ESC-03: manual-entry hint for VoiceOver users.
             .accessibilityHint("Opens a form to enter the gateway URL and token directly")
+
+            // A1 — onboarding for self-hosters with NO gateway yet. The two
+            // buttons above both assume a running hermes-agent gateway; a new
+            // user from the public TestFlight link needs to be told what that is
+            // and how to get one. Tertiary, text-only so it never competes with
+            // the primary scan/manual CTAs.
+            Link(destination: HelpLinks.setupGuide) {
+                Text("New to Hermes? How to set up a gateway")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(theme.midground)
+                    .frame(maxWidth: .infinity)
+                    .frame(minHeight: 36)
+            }
+            .accessibilityHint("Opens the Hermes Agent setup guide in your browser")
         }
     }
 }
