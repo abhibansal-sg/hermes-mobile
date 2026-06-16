@@ -492,6 +492,11 @@ private struct CompactLayout: View {
     private let dominanceRatio: CGFloat = 1.2
     /// Corner radius applied to the displaced chat card (observed ≈28).
     private let cardCornerRadius: CGFloat = 28
+    /// Drawer parallax depth (R42): the revealed drawer glides in at this fraction
+    /// of the card's travel (Telegram/ChatGPT/Claude-iOS ratio = 0.30), so the
+    /// reveal reads with depth instead of a static occlusion. 0 = static (the old
+    /// behavior). Cheap now that the drawer is geometry-grouped.
+    private let parallaxFraction: CGFloat = 0.30
 
     var body: some View {
         GeometryReader { proxy in
@@ -519,6 +524,16 @@ private struct CompactLayout: View {
                     .frame(width: drawerWidth, alignment: .leading)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                     .background(themeStore.current.listBg.ignoresSafeArea())
+                    // PARALLAX (R42): the drawer glides in from the left as the card
+                    // slides right, travelling at `parallaxFraction` (30%) of the
+                    // card's travel — the depth cue the reference apps (ChatGPT /
+                    // Claude-iOS / Telegram) all use, vs the old dead-static reveal.
+                    // At rest (openProgress 0) it sits −parallaxFraction·drawerWidth
+                    // to the left (hidden behind the card anyway); fully open it rests
+                    // at 0. `.geometryGroup()` flattens the drawer so the offset moves
+                    // it as ONE layer — its List rows are never re-laid-out per frame.
+                    .offset(x: -drawerWidth * parallaxFraction * (1 - openProgress))
+                    .geometryGroup()
                     .accessibilityHidden(!drawer.isOpen)
 
                 // Chat is home — the full surface as a card riding above the
@@ -735,6 +750,19 @@ private struct CompactLayout: View {
                         radius: 18, x: -6, y: 0)
             chatStack(safeTop: safeTop)
                 .clipShape(shape)
+                // R42 — DETACHED-TRANSCRIPT FIX. Flatten the chat content into ONE
+                // geometry unit so it rides the card's `.offset(x:)` RIGIDLY. Without
+                // this, the transcript's interior layout resolves independently of the
+                // card during the slide (and, since build 44, the ambient
+                // `withAnimation(settle)` transaction reaches the transcript, which
+                // nulls animation via `.transaction{ $0.animation = nil }` and so
+                // SNAPS relative to the springing card) — the "transcript moving
+                // independently of the chat viewer" report. geometryGroup() (iOS 16+,
+                // our floor is 17) makes the content a single rigid passenger of the
+                // offset WITHOUT rasterizing it (unlike drawingGroup, so live
+                // streaming text stays crisp) and preserves build-44's velocity
+                // hand-off (offset/radius/shadow still spring on the card).
+                .geometryGroup()
         }
     }
 
