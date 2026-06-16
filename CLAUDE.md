@@ -51,10 +51,9 @@ of truth for tasks — nothing to clone; just sign in.
 
 **WHERE THINGS STAND (2026-06-16, NIGHT — current):** Work branch
 `phase2-upstream-rebase` @ `a574c270d` (build 48 committed + pushed origin).
-TestFlight **builds 44–47 VALID** (1.0.1); **build 48 ARCHIVED, gate-green,
-upload PENDING user go** (the SHIP-TESTFLIGHT runbook gates the upload as a
-release action). Deploy `~/.hermes/hermes-agent` (trunk `feat/group-collapse-pin`)
-live on `:9119`, healthy.
+TestFlight **builds 44–48 all VALID** (1.0.1) — **build 48 uploaded +
+ASC-confirmed VALID** (2026-06-16 night), pending user device-verify. Deploy
+`~/.hermes/hermes-agent` (trunk `feat/group-collapse-pin`) live on `:9119`, healthy.
 - **BUILD 48 — three iOS-only fixes (no gateway edits), each root-caused via a
   grounded live investigation (3-lens workflow) + adversarially reviewed (5-lens
   workflow, SHIP-AFTER-MUSTFIX) before commit:**
@@ -129,9 +128,8 @@ live on `:9119`, healthy.
   `connection.json` token) FIRST — surfaced the 5000 error in 2 min after many wrong
   code-theories. And: ADVERSARIALLY REVIEW fragile-path fixes (reconnect/foreign-mirror/
   merge) before ship — the build-48 review caught the unproven Bug-A escalation.
-NEXT: (1) user go for the build-48 TestFlight upload (archived + CFBundleVersion-48-gated,
-ready); (2) user device-verify build 48 (drawer sort + timestamp now correct; user msg
-mirrors live); (3) Bug A — device repro, then URLSession-recreation fix.
+NEXT: (1) user device-verify build 48 on TestFlight (drawer sort + timestamp now correct;
+user msg mirrors live); (2) Bug A — device repro, then URLSession-recreation fix.
 
 **BUILD 41 (history):** TestFlight build 41 (1.0.1) was VALID; work
 branch = `phase2-upstream-rebase` @ `a1ab20c63`, pushed to origin backup mirror;
