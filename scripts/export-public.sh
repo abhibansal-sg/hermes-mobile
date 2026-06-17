@@ -114,6 +114,40 @@ if [ -f dist/hermes-mobile/LICENSE ]; then
   copied=$((copied + 1))
 fi
 
+# .gitignore for the public repo (contributors). The committed .xcodeproj stays;
+# only per-user Xcode state, build artifacts, and any local secret material are
+# ignored.
+cat > "$OUT/.gitignore" <<'GITIGNORE'
+# macOS
+.DS_Store
+
+# Xcode / iOS
+*.xcuserstate
+xcuserdata/
+build/
+DerivedData/
+.derivedData/
+*.xcarchive
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Python (gateway plugin)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets / local config — never commit
+*.p8
+*.pem
+*.mobileprovision
+dashboard.token
+.env
+GITIGNORE
+copied=$((copied + 1))
+
 echo "copied $copied files into staging"
 
 # --- 2. SCRUBS -----------------------------------------------------------------
@@ -212,7 +246,11 @@ scrub '
 # ---- (d) R1 #NN review-round ids ----------------------------------------------
 # RNUM matches the id incl. multi-refs like "#12/#21" and "#9/#42".
 scrub '
-  my $RNUM = qr/R1 ?\#\d+(?:[\/\#\d ]*\d)?/;
+  my $RNUM = qr/R1[ -]?\#\d+(?:[\/\#\d ]*\d)?/;
+  # "pre-R1-#92" / "post-R1 #17" narrative -> neutral (BEFORE the generic strip,
+  # else the "pre-"/"post-" prefix is orphaned).
+  s/\bpre-$RNUM/before a fix/g;
+  s/\bpost-$RNUM/after a fix/g;
   # whole self-contained paren incl. a trailing ", Batch C" or " — note":
   #   "(R1 #30, Batch C)" -> ""   "(R1 #92)" -> ""   "(R1 #29 — note)" -> ""
   s/\s*\($RNUM(?:\s*[,—–-][^()]*)?\)//g;
@@ -368,7 +406,12 @@ perl -CSD -i -pe '
     my ($lead, $body) = ($1, $2);
     $body =~ s/[ \t]{2,}/ /g;          # squeeze interior runs of spaces
     $body =~ s/\(\s+/(/g; $body =~ s/\s+\)/)/g;  # "( foo )" -> "(foo)"
-    $body =~ s/\s+([:.,;])/$1/g;        # " :" -> ":"
+    $body =~ s/\s+([,;])/$1/g;          # " ," -> ","   " ;" -> ";"
+    $body =~ s/\s+:(?![\/])/:/g;        # " :" -> ":" but keep "://"
+    $body =~ s/\s+\.(?![A-Za-z_(])/./g; # " ." -> "." but keep " .method" / " .(foo"
+    $body =~ s/\(\s*,\s*/(/g;           # "( , x" -> "(x"  (orphaned by citation strip)
+    $body =~ s/,\s*\)/)/g;              # "x, )" -> "x)"
+    $body =~ s/,\s*,/,/g;               # "x,, y" -> "x, y"
     $body =~ s/[ \t]+$//;              # trailing ws
     $_ = $lead . $body . "\n";
   }
