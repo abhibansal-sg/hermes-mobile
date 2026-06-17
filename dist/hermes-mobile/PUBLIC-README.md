@@ -155,7 +155,8 @@ accessibility pass is in progress.
 
 The app talks **only** to the gateway you run — there is no HermesMobile cloud
 service. Your pairing token is stored in the iOS Keychain. Push goes through
-Apple's APNs using **your** gateway's signing key.
+Apple's APNs using **your** gateway's signing key. Full policy:
+[PRIVACY.md](PRIVACY.md).
 
 ---
 

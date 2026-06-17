@@ -114,6 +114,12 @@ if [ -f dist/hermes-mobile/LICENSE ]; then
   copied=$((copied + 1))
 fi
 
+# PRIVACY.md (privacy policy — also serves as the TestFlight privacy URL) -> root
+if [ -f dist/hermes-mobile/PRIVACY.md ]; then
+  cp dist/hermes-mobile/PRIVACY.md "$OUT/PRIVACY.md"
+  copied=$((copied + 1))
+fi
+
 # .gitignore for the public repo (contributors). The committed .xcodeproj stays;
 # only per-user Xcode state, build artifacts, and any local secret material are
 # ignored.
