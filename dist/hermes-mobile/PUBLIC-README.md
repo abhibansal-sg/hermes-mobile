@@ -76,11 +76,9 @@ Pick one:
 
 ### Option 1 — Join the TestFlight beta (easiest)
 
-1. Install Apple's **TestFlight** app.
-2. Open the public invite link — **coming soon.** The external TestFlight beta is
-   in Apple's Beta App Review; the link will be posted here (and in the release
-   announcement) the moment it's approved. Until then, use **Option 2** below.
-3. Install "Hermes Agent" from TestFlight.
+1. Install Apple's **TestFlight** app (from the App Store).
+2. Open the public invite link: **https://testflight.apple.com/join/TeMvfFaS**
+3. Tap **Install** to get the app.
 
 ### Option 2 — Build it yourself (full control)
 
