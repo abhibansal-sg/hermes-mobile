@@ -49,16 +49,23 @@ stay in sync. (The project key is the path-encoded dir under
 **LINEAR** (team ABH, project "Hermes Mobile — Engineering") is the cloud source
 of truth for tasks — nothing to clone; just sign in.
 
-**WHERE THINGS STAND (2026-06-16, NIGHT — current):** Work branch
-`phase2-upstream-rebase` @ `a574c270d` (build 48 committed + pushed origin).
-TestFlight **builds 44–49 all VALID** (1.0.1) — **build 49 uploaded +
-ASC-confirmed VALID** (2026-06-17), pending user device-verify (notifications
-can-enable + onboarding). Deploy `~/.hermes/hermes-agent` (trunk
-`feat/group-collapse-pin`) live on `:9119`, healthy.
+**WHERE THINGS STAND (2026-06-17 — PUBLIC LAUNCH SHIPPED):** Full current state in
+`.agent-memory/project_hermes_mobile.md` (top block). Summary: **public repo LIVE**
+(github.com/ab0991-oss/hermes-ios — MIT, clean history, PRIVACY.md), **build 50
+VALID on TestFlight** (1.0.1) and **submitted for EXTERNAL Beta App Review**. **3
+upstream PRs** to NousResearch — #47530 session.delete evict (S6), #47535
+role-scoped search, #47538 fast/reasoning session-scope (S4) — + **issue #47541**
+(observability-hooks appetite; gates the hook + 2 auth PRs). Fork =
+`ab0991-oss/hermes-agent`; PR worktrees `/tmp/hermes-pr-{main,s4,search}`; PR-author
+email `268141382+ab0991-oss@users.noreply.github.com`. Linear tracker **ABH-162**.
+Deploy `~/.hermes/hermes-agent` (trunk `feat/group-collapse-pin`) live on `:9119`,
+healthy. Waiting on Apple review + NousResearch maintainers; nothing blocked locally.
 
-**>> LAUNCH PREP — BUILD 49 SHIPPED (VALID on TestFlight) @ `8c0370338`. iOS build
-wedge was CLEARED by the logout/login. Plan file:
-~/.claude/plans/concurrent-popping-narwhal.md.**
+**>> The detailed build-48/49 + launch-prep notes BELOW are now HISTORICAL** (build
+50 shipped, repo public). Key launch files: export pipeline
+`scripts/export-public.sh`; posts `dist/hermes-mobile/LAUNCH-POSTS.md`; upstream PR
+plan `dist/hermes-mobile/UPSTREAM-PR-PLAN.md`; TestFlight beta copy
+`dist/hermes-mobile/TESTFLIGHT-BETA-NOTES.md`.
 User goal: clean up app + solidify notifications/Live-Activity, then ship a
 **first public release as an EXTERNAL TestFlight beta** (public link) for
 **self-hosters**. Staged but NOT yet built/committed:
