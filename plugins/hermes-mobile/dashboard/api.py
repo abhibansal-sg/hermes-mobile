@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json as _json
 import logging
 import os
+import re as _re
 import secrets
 import stat
 import sys
@@ -1054,4 +1056,482 @@ async def session_messages_delta(
         "max_id": max_id,
         "shape": shape if shape in ("skeleton", "light") else "full",
         "messages": messages,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Artifacts gallery — GET /artifacts
+#
+# Cross-session scan for images, file paths, and URLs found in message
+# transcripts.  Entirely plugin-side: read-only against state.db, zero
+# stock-core edits.
+#
+# Params:
+#   type   — all | images | files | links (default: all)
+#   limit  — max results per page (default 50, max 200)
+#   offset — pagination cursor (default 0)
+#   q      — optional substring filter applied to url_or_path / filename
+#
+# Response:
+#   {type, results:[{session_id, session_title, message_id, kind, url_or_path,
+#                    filename?, mime?, size?, snippet?, timestamp}],
+#    total, offset}
+#
+# Extraction strategy (pure / deterministic, no FTS needed):
+#   images — multimodal content parts whose "type" is "image" or "image_url"
+#             (content stored as "\x00json:..." JSON-encoded list of parts)
+#   files  — tool_calls JSON whose function.arguments contains path-like keys
+#             ("path", "file_path", "filepath", "filename") pointing to
+#             non-trivially-short strings that start with "/" or "~/"
+#   links  — URL regex (http/https) over plain-text prose in any role's
+#             content field
+#
+# All extraction helpers are pure functions so they are directly unit-testable
+# and composable.
+# ---------------------------------------------------------------------------
+
+_ARTIFACTS_LIMIT_MAX = 200
+_ARTIFACTS_LIMIT_DEFAULT = 50
+
+# Multimodal part types that represent visual/attachment artifacts.
+_IMAGE_PART_TYPES = frozenset(("image", "image_url", "document"))
+
+# Tool-call argument keys whose values are expected to be file paths.
+_FILE_PATH_KEYS = frozenset(("path", "file_path", "filepath", "filename", "output_path"))
+
+# Minimum length for a value to count as a "real" file path (avoids "a", etc.)
+_FILE_PATH_MIN_LEN = 3
+
+_URL_RE = _re.compile(r"https?://[^\s\"'<>()[\]{},;\\]+", _re.IGNORECASE)
+_CONTENT_JSON_PREFIX = "\x00json:"
+
+
+def _decode_content_local(raw: Any) -> Any:
+    """Decode a potentially JSON-prefixed content field without importing
+    hermes_state.  Mirrors ``SessionDB._decode_content`` but kept plugin-local
+    so we have zero coupling to the stock internals beyond what the DB schema
+    exposes.
+    """
+    if isinstance(raw, str) and raw.startswith(_CONTENT_JSON_PREFIX):
+        try:
+            return _json.loads(raw[len(_CONTENT_JSON_PREFIX):])
+        except Exception:
+            return raw
+    return raw
+
+
+def _extract_images(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return image artifact dicts found in one message row.
+
+    Handles both top-level multimodal lists and nested ``content`` lists inside
+    parts (e.g. Claude document parts).  Skips malformed / unexpected shapes
+    silently.
+    """
+    artifacts: List[Dict[str, Any]] = []
+    raw_content = row.get("content")
+    if not raw_content:
+        return artifacts
+    content = _decode_content_local(raw_content)
+    if not isinstance(content, list):
+        return artifacts
+
+    for part in content:
+        # Per-part try/except: one malformed part must not drop the rest.
+        try:
+            if not isinstance(part, dict):
+                continue
+            ptype = (part.get("type") or "").lower()
+            if ptype not in _IMAGE_PART_TYPES:
+                continue
+
+            url_or_path = ""
+            filename = None
+            mime = None
+            size = None
+
+            if ptype in ("image", "image_url"):
+                # image_url parts: {"type":"image_url","image_url":{"url":"..."}}
+                # image parts (base64): {"type":"image","source":{"type":"base64","media_type":"...","data":"..."}}
+                img_block = part.get("image_url") or part.get("source") or {}
+                raw_url = img_block.get("url")
+                if raw_url:
+                    url_or_path = raw_url
+                else:
+                    # data is base64; only safe to slice if it is a string.
+                    raw_data = img_block.get("data")
+                    url_or_path = raw_data[:80] if isinstance(raw_data, str) else ""
+                mime = img_block.get("media_type")
+            elif ptype == "document":
+                # Document attachments: {"type":"document","source":{"type":"url","url":"..."}}
+                src = part.get("source") or {}
+                raw_url = src.get("url")
+                if raw_url:
+                    url_or_path = raw_url
+                else:
+                    raw_data = src.get("data")
+                    url_or_path = raw_data[:80] if isinstance(raw_data, str) else ""
+                mime = src.get("media_type")
+                filename = part.get("name") or part.get("title")
+                size = part.get("size")
+
+            if not url_or_path:
+                continue
+
+            artifacts.append({
+                "kind": "image",
+                "url_or_path": url_or_path,
+                "filename": filename,
+                "mime": mime,
+                "size": size,
+                "snippet": None,
+            })
+        except Exception:
+            # Skip this part; continue extracting from remaining parts.
+            continue
+
+    return artifacts
+
+
+def _extract_files(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return file-path artifact dicts found in a tool-call message row.
+
+    Scans ``tool_calls`` (JSON string), extracting function.arguments values
+    for recognised path-like keys.  Falls back to scanning ``content`` for
+    tool-result rows (role=tool) that carry a path key in their JSON body.
+    """
+    artifacts: List[Dict[str, Any]] = []
+
+    def _push_path(raw_path: Any) -> None:
+        if not isinstance(raw_path, str):
+            return
+        p = raw_path.strip()
+        if len(p) < _FILE_PATH_MIN_LEN:
+            return
+        if not (p.startswith("/") or p.startswith("~/") or p.startswith(".")):
+            return
+        fname = Path(p).name or None
+        artifacts.append({
+            "kind": "file",
+            "url_or_path": p,
+            "filename": fname,
+            "mime": None,
+            "size": None,
+            "snippet": None,
+        })
+
+    # Scan tool_calls JSON (assistant messages that call tools).
+    raw_tc = row.get("tool_calls")
+    if raw_tc:
+        try:
+            tc_list = _json.loads(raw_tc) if isinstance(raw_tc, str) else raw_tc
+            if isinstance(tc_list, list):
+                for tc in tc_list:
+                    if not isinstance(tc, dict):
+                        continue
+                    func = tc.get("function") or {}
+                    raw_args = func.get("arguments") or "{}"
+                    try:
+                        args = _json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                    except Exception:
+                        continue
+                    if not isinstance(args, dict):
+                        continue
+                    for key, val in args.items():
+                        if key.lower() in _FILE_PATH_KEYS:
+                            _push_path(val)
+        except Exception:
+            pass
+
+    # Scan tool result content (role=tool, plain JSON or multimodal list).
+    raw_content = row.get("content")
+    if raw_content:
+        content = _decode_content_local(raw_content)
+        candidates: List[Any] = content if isinstance(content, list) else [content]
+        for part in candidates:
+            if isinstance(part, dict):
+                for key in _FILE_PATH_KEYS:
+                    _push_path(part.get(key))
+            elif isinstance(part, str):
+                try:
+                    obj = _json.loads(part)
+                    if isinstance(obj, dict):
+                        for key in _FILE_PATH_KEYS:
+                            _push_path(obj.get(key))
+                except Exception:
+                    pass
+
+    return artifacts
+
+
+def _extract_links(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return URL artifact dicts found in the plain-text portions of a message.
+
+    Matches http/https URLs in any text part of the content (including plain
+    string content) and in tool result content.  Skips data URIs and
+    truncated base64 blobs.
+    """
+    artifacts: List[Dict[str, Any]] = []
+
+    raw_content = row.get("content")
+    if not raw_content:
+        return artifacts
+    content = _decode_content_local(raw_content)
+
+    texts: List[str] = []
+    if isinstance(content, str):
+        texts.append(content)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, str):
+                texts.append(part)
+            elif isinstance(part, dict):
+                ptype = (part.get("type") or "").lower()
+                if ptype == "text":
+                    texts.append(part.get("text") or "")
+                elif ptype in ("tool_result", "tool_use"):
+                    # Nested content arrays in tool_result parts.
+                    inner = part.get("content") or []
+                    if isinstance(inner, str):
+                        texts.append(inner)
+                    elif isinstance(inner, list):
+                        for ip in inner:
+                            if isinstance(ip, dict) and ip.get("type") == "text":
+                                texts.append(ip.get("text") or "")
+
+    seen: set = set()
+    for text in texts:
+        for m in _URL_RE.finditer(text):
+            url = m.group(0).rstrip(".,;:!?)")
+            if url in seen or url.startswith("data:"):
+                continue
+            seen.add(url)
+            snippet_start = max(0, m.start() - 60)
+            snippet = text[snippet_start: m.start() + len(url) + 60].strip()
+            artifacts.append({
+                "kind": "link",
+                "url_or_path": url,
+                "filename": None,
+                "mime": None,
+                "size": None,
+                "snippet": snippet[:200],
+            })
+
+    return artifacts
+
+
+_ARTIFACT_EXTRACTORS: Dict[str, Any] = {
+    "images": _extract_images,
+    "files": _extract_files,
+    "links": _extract_links,
+}
+
+
+# Maximum artifact matches to scan before stopping the total count.  When hit,
+# ``total_capped`` is True in the response (same tradeoff as search_sessions
+# which returns a page-size ``count`` rather than a grand total).  Caps CPU
+# cost on large DBs: at 10× the max page size the iOS client has ample data
+# for pagination decisions without a full 168k-row scan.
+_ARTIFACTS_SCAN_CAP = 2000
+
+
+def _scan_artifacts_sync(
+    db_path: "Path",
+    type_norm: str,
+    limit: int,
+    offset: int,
+    q_lower: "Optional[str]",
+) -> Dict[str, Any]:
+    """Blocking artifact scan — run via asyncio.to_thread, never on the event loop.
+
+    Opens the DB via URI read-only mode (``mode=ro``) with a 1s timeout so it
+    never acquires a write lock and is structurally incapable of mutating the
+    live :9119 DB even under a code bug.
+
+    Uses a streaming row-by-row cursor that stops collecting after
+    ``offset + limit`` matching artifacts have been found (O(limit) memory).
+    Continues scanning until ``total == _ARTIFACTS_SCAN_CAP`` to report an
+    accurate count for pagination, then stops early and sets ``total_capped``
+    so the iOS client can display "2000+" rather than waiting for a full
+    table scan on a 168k-row DB.
+    """
+    import sqlite3
+
+    active_extractors: List[Tuple[str, Any]]
+    if type_norm == "all":
+        active_extractors = list(_ARTIFACT_EXTRACTORS.items())
+    else:
+        active_extractors = [(type_norm, _ARTIFACT_EXTRACTORS[type_norm])]
+
+    # MUSTFIX-A: URI read-only + 1s timeout — structurally enforces no writes,
+    # no write-lock contention with the running WAL backend, and matches the
+    # hermes_state.py:625 RO open contract (file:{path}?mode=ro).
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        # Streaming cursor — fetchone() so we never load the full table.
+        # active=1 filters rewound/soft-deleted turns (same as get_messages /
+        # search_messages).  No ORDER BY — avoids a full temp B-tree; the
+        # table is naturally ordered by insertion rowid which tracks time well
+        # enough for an artifact gallery.
+        cur = conn.execute(
+            """
+            SELECT m.id, m.session_id, m.role, m.content, m.tool_calls, m.timestamp
+            FROM messages m
+            JOIN sessions s ON s.id = m.session_id
+            WHERE m.active = 1
+              AND (s.source IS NULL OR s.source != 'tool')
+            """
+        )
+
+        # Collect session titles lazily as we encounter new session ids.
+        title_cache: Dict[str, str] = {}
+
+        def _get_title(sid: str) -> str:
+            if sid not in title_cache:
+                t_cur = conn.execute(
+                    "SELECT title FROM sessions WHERE id = ?", (sid,)
+                )
+                t_row = t_cur.fetchone()
+                title_cache[sid] = (t_row["title"] or "") if t_row else ""
+            return title_cache[sid]
+
+        # Two-phase accumulation:
+        #   Phase 1 (skip)   : discard the first ``offset`` matching artifacts.
+        #   Phase 2 (collect): collect the next ``limit`` into ``page``.
+        #   Phase 3 (count)  : continue scanning until total == SCAN_CAP, then
+        #                      stop early and set total_capped=True.
+        skipped = 0
+        page: List[Dict[str, Any]] = []
+        total = 0
+        total_capped = False
+
+        while True:
+            raw = cur.fetchone()
+            if raw is None:
+                break
+            row = dict(raw)
+            sid = row.get("session_id") or ""
+            msg_id = row.get("id")
+            ts = row.get("timestamp") or 0
+
+            for _kind, extractor in active_extractors:
+                try:
+                    hits = extractor(row)
+                except Exception:
+                    hits = []
+                for hit in hits:
+                    if q_lower:
+                        url_l = (hit.get("url_or_path") or "").lower()
+                        fn_l = (hit.get("filename") or "").lower()
+                        if q_lower not in url_l and q_lower not in fn_l:
+                            continue
+                    total += 1
+                    if skipped < offset:
+                        skipped += 1
+                    elif len(page) < limit:
+                        page.append({
+                            "session_id": sid,
+                            "session_title": _get_title(sid),
+                            "message_id": msg_id,
+                            "kind": hit["kind"],
+                            "url_or_path": hit["url_or_path"],
+                            "filename": hit.get("filename"),
+                            "mime": hit.get("mime"),
+                            "size": hit.get("size"),
+                            "snippet": hit.get("snippet"),
+                            "timestamp": ts,
+                        })
+                    # MUSTFIX-B: cap the total-count scan so we don't do a
+                    # full per-row JSON-decode+regex over 168k rows on every
+                    # request. Stop once we've counted SCAN_CAP matches.
+                    if total >= _ARTIFACTS_SCAN_CAP:
+                        total_capped = True
+                        break
+                if total_capped:
+                    break
+            if total_capped:
+                break
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return {"results": page, "total": total, "total_capped": total_capped}
+
+
+@router.get("/artifacts")
+async def artifacts_gallery(
+    request: Request,
+    type: str = "all",
+    limit: int = _ARTIFACTS_LIMIT_DEFAULT,
+    offset: int = 0,
+    q: Optional[str] = None,
+):
+    """Cross-session artifact gallery (images, files, links).
+
+    Scans message transcripts plugin-side (read-only) for:
+    - ``images`` — multimodal content parts of type image/image_url/document
+    - ``files``  — tool-call arguments containing path-like keys
+    - ``links``  — http/https URLs found in prose content
+
+    ``type`` selects which kinds to include (``all`` = all three).
+    ``q`` filters by substring match on ``url_or_path`` / ``filename``.
+    Pagination via ``limit`` / ``offset``; ``total`` is the matched-result
+    count before pagination.
+
+    The blocking scan runs off the event loop via ``asyncio.to_thread`` so it
+    cannot pin the dashboard's async request loop.  The SQL cursor streams
+    row-by-row and stops collecting after ``offset + limit`` matches, capping
+    peak memory regardless of DB size.
+    """
+    import asyncio
+
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Validate type.
+    type_norm = (type or "all").strip().lower()
+    if type_norm not in ("all", "images", "files", "links"):
+        raise HTTPException(
+            status_code=400,
+            detail="type must be one of: all, images, files, links",
+        )
+
+    # Clamp limit.
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = _ARTIFACTS_LIMIT_DEFAULT
+    limit = max(1, min(limit, _ARTIFACTS_LIMIT_MAX))
+
+    # Normalise offset.
+    try:
+        offset = int(offset)
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
+
+    q_lower = q.strip().lower() if q and q.strip() else None
+
+    from hermes_state import DEFAULT_DB_PATH
+
+    if not DEFAULT_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="state.db unavailable")
+
+    db_path = DEFAULT_DB_PATH
+    try:
+        payload = await asyncio.to_thread(
+            _scan_artifacts_sync, db_path, type_norm, limit, offset, q_lower
+        )
+    except Exception as exc:
+        _log.warning("artifacts/gallery scan failed: %s", exc)
+        raise HTTPException(status_code=503, detail="artifact read failed")
+
+    return {
+        "type": type_norm,
+        "results": payload["results"],
+        "total": payload["total"],
+        "total_capped": payload["total_capped"],
+        "offset": offset,
     }
