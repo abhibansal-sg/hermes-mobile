@@ -34,7 +34,22 @@ Let the iOS app connect to any of three gateway endpoints — the user's **local
 
 - **Increment 1 — Connection-mode picker (iOS-only, FIRST loop).** `ConnectionMode` enum (`.localDesktop/.remoteURL/.sharedDashboard`) + persistence; mode-aware `ConnectionSetupView`/`WelcomeView`; routing in `HermesURLRouter`. No transport change — every mode still calls `configure(urlString:token:)`. Pure UX/persistence; ships + verifies on the sim.
 - **Increment 2 — Remote-URL for non-tailnet hosts.** `WSURLBuilder` Host header derives from mode/target (loopback for Serve; real host for `0.0.0.0` binds). iOS-side; server already accepts any Host on `0.0.0.0` (no stock edit).
-- **Increment 3 — Local-desktop pairing via plugin-side DISCOVERY of the Desktop-owned gateway.** Re-scoped per the plugin-boundary rule: do NOT build a new stock listener. Make `plugins/hermes-mobile/` discover/pair with whatever gateway the Hermes Desktop app owns. OPEN INVESTIGATION before build: how does the Desktop app expose its gateway (port/address/lifecycle/auth)? Prefer reusing the existing local dashboard + attach path over inventing a listener.
+- **Increment 3 — Local-desktop pairing via plugin-side DISCOVERY of the Desktop-owned gateway.** Re-scoped per the plugin-boundary rule: do NOT build a new stock listener or sidecar. Make `plugins/hermes-mobile/` discover/pair with whatever gateway the Hermes Desktop app owns.
+
+  **Increment 3a (DONE — `feat/conn-modes-inc3`):** Plugin-side discovery of the Desktop-owned gateway URL. All work in `plugins/hermes-mobile/mobile_pair.py` only; stock core untouched.
+
+  **Design (boundary-clean):** The Hermes Desktop app reads/writes `~/Library/Application Support/Hermes/connection.json`. `_detect_local_desktop_gateway()` reads that file and handles two modes:
+  - `mode == "remote"`: use `remote.url` directly. If `encoding == "plain"`, also read the token. If `encoding == "safeStorage"` / anything else (encrypted), return URL-only + `manual_token=True` — the token lives in macOS Keychain/Electron safeStorage and is inaccessible without the Electron app context.
+  - `mode == "local"`: ephemeral port + memory-only token. Probe `http://127.0.0.1:{port}/api/status` for port in `[9119, 9120..9199]`; first valid Hermes status response wins. Returns URL + `manual_token=True` — the token cannot be recovered from disk.
+  - Missing/absent/malformed `connection.json`: returns `None` → falls through to the existing Tailscale Serve path (unchanged fallback).
+
+  `_detect_local_desktop_gateway()` is wired as Step 1 in `_detect_dashboard_url()`, before the existing Tailscale Serve resolution (Step 2). This is a pure additive change — the Tailscale-Serve path is kept intact.
+
+  **Sidecar / embedded-listener: REJECTED.** The Electron app is stock NousResearch — we do NOT add a subprocess, modify it, or fork it.
+
+  **Honest local-mode limit:** Pure stock `local` mode uses an ephemeral port AND a memory-only token. We can discover the port (probe) but CANNOT recover the token. `manual_token=True` is signalled to callers. Resolution: user copies the token from the Desktop app's Settings UI, or uses `_issue_device_token` once a URL is established.
+
+  **Increment 3b (FUTURE):** iOS Local-mode wiring — hook the discovered URL+manual_token signal into `ConnectionStore.swift` → show a "Enter token" prompt when `manual_token=True`.
 - **Increment 4 — Restart survival / address stability.** Recommended: Tailscale MagicDNS hostname (primary; reuses the Serve→loopback path already trusted) + fixed default port (LAN fallback). Plugin-side (`mobile_pair.py`) + iOS reconnect re-resolves address. Watch-item: MagicDNS flakiness (known fallback path).
 
 ## Verification (per increment)

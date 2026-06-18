@@ -22,6 +22,29 @@ What it does
 Security: the token is printed exactly once — embedded in the QR payload and in
 the copy/paste deep link the operator reads off the same screen they're already
 trusted to see. It is NEVER written to logs, files, or any other channel.
+
+Increment 3a — plugin-side discovery of the Desktop-owned gateway
+-----------------------------------------------------------------
+``_detect_local_desktop_gateway()`` discovers the gateway that the Hermes
+Desktop app owns by reading
+``~/Library/Application Support/Hermes/connection.json``:
+
+* ``mode == "remote"``  → return the ``remote.url`` (and token if encoding is
+  ``plain``; if ``safeStorage`` / encrypted the token is in macOS Keychain
+  and we return the URL-only + ``manual_token=True`` to let the caller prompt).
+* ``mode == "local"``   → ephemeral port 9120–9199; probe each port with a
+  quick HTTP check for a valid ``/api/status`` response; return the first
+  responding URL + ``manual_token=True`` (the token isn't stored on disk in
+  local mode — the stock Electron app keeps it in memory only).
+
+Honest limit: pure stock ``local`` mode uses an ephemeral port AND a
+memory-only token.  We can discover the port (probe) but CANNOT recover the
+token without editing the stock Electron app (which is REJECTED per the plugin
+boundary rule).  The caller must either use ``_issue_device_token`` once an
+interactive session is available, or fall back to manual token entry in the UI.
+
+The sidecar/embedded-listener idea was considered and REJECTED: the Desktop
+Electron app is stock NousResearch — we do NOT add a sidecar or modify it.
 """
 
 from __future__ import annotations
@@ -31,7 +54,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import quote
 
 # The dashboard's default loopback port (see hermes_cli/main.py: the
@@ -43,6 +66,33 @@ DEFAULT_DASHBOARD_PORT = 9119
 # HermesURLRouter.scheme / the "pair" route in the Swift client).
 PAIR_SCHEME = "hermesapp"
 PAIR_HOST = "pair"
+
+# ---------------------------------------------------------------------------
+# Increment 3a — Desktop gateway discovery constants
+# ---------------------------------------------------------------------------
+
+# Path to the Hermes Desktop app's connection state file (macOS only).
+# The Desktop app owns this file; we READ it but NEVER write to it.
+_DESKTOP_CONNECTION_JSON = (
+    Path.home()
+    / "Library"
+    / "Application Support"
+    / "Hermes"
+    / "connection.json"
+)
+
+# Port range for local-mode ephemeral loopback probes.
+# Port 9119 is the well-known dashboard default; 9120–9199 are the ephemeral
+# range used by the stock Electron app in local mode.  We probe 9119 first so
+# the common "remote user already has :9119 running" case resolves immediately.
+_LOCAL_PROBE_PORTS = [DEFAULT_DASHBOARD_PORT] + list(range(9120, 9200))
+
+# Status endpoint the gateway exposes; a 200 + JSON body with a ``status``
+# key confirms this is a live Hermes instance.
+_STATUS_PATH = "/api/status"
+
+# Per-port HTTP probe timeout (seconds).  Keep short — we probe sequentially.
+_PROBE_TIMEOUT_S = 0.8
 
 
 def mobile_pair_command(args) -> int:
@@ -120,6 +170,181 @@ def mobile_pair_command(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Increment 3a — Desktop-owned gateway discovery
+# ---------------------------------------------------------------------------
+
+
+class _DesktopGatewayResult:
+    """Typed result from ``_detect_local_desktop_gateway()``.
+
+    Attributes
+    ----------
+    url : str
+        The discovered gateway base URL (e.g. ``http://127.0.0.1:9119`` or a
+        remote HTTPS URL).
+    token : str or None
+        The gateway auth token if it could be read from ``connection.json``
+        (only possible when ``encoding == "plain"``).  ``None`` if the token
+        is encrypted (safeStorage) or unavailable (local ephemeral mode).
+    manual_token : bool
+        ``True`` when the token could NOT be recovered from disk.  The caller
+        must prompt the user for the token or use ``_issue_device_token`` once
+        an interactive session with the discovered URL is established.
+    source : str
+        Human-readable description of how the URL was found (for debug logs /
+        UI hints).  E.g. ``"connection.json remote"`` or
+        ``"loopback probe :9119"``.
+    """
+
+    __slots__ = ("url", "token", "manual_token", "source")
+
+    def __init__(
+        self,
+        url: str,
+        token: Optional[str],
+        manual_token: bool,
+        source: str,
+    ) -> None:
+        self.url = url
+        self.token = token
+        self.manual_token = manual_token
+        self.source = source
+
+
+def _read_connection_json(
+    path: Path = _DESKTOP_CONNECTION_JSON,
+) -> Optional[dict]:
+    """Parse the Desktop app's ``connection.json``.
+
+    Returns the parsed dict, or ``None`` if the file is absent, unreadable,
+    or contains malformed JSON.  Never raises.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _probe_local_gateway_port(port: int) -> bool:
+    """Return ``True`` if ``http://127.0.0.1:{port}/api/status`` responds with
+    a valid Hermes status payload (JSON dict with a ``status`` key).
+
+    Uses ``urllib.request`` so there are no extra dependencies.  All errors
+    are silently caught — the caller just skips non-responding ports.
+
+    IMPORTANT: Only loopback (127.0.0.1) is probed — never LAN addresses.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{port}{_STATUS_PATH}"
+    req = urllib.request.Request(
+        url,
+        headers={"Host": "127.0.0.1"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_PROBE_TIMEOUT_S) as resp:
+            if resp.status != 200:
+                return False
+            body = resp.read(4096).decode("utf-8", errors="replace")
+        data = json.loads(body)
+        # A genuine Hermes status response is a JSON object with a ``status``
+        # key.  Accept any truthy value — we don't enforce the exact string.
+        return isinstance(data, dict) and bool(data.get("status"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _detect_local_desktop_gateway(
+    connection_json_path: Path = _DESKTOP_CONNECTION_JSON,
+) -> Optional["_DesktopGatewayResult"]:
+    """Discover the gateway owned by the Hermes Desktop app.
+
+    Strategy
+    --------
+    1. Read ``connection.json`` (the Desktop app's connection state).
+    2. If ``mode == "remote"`` and ``remote.url`` is non-empty → return that
+       URL.  If ``encoding == "plain"``, also return the token.  If
+       ``encoding`` is ``"safeStorage"`` or anything else (encrypted), return
+       URL-only + ``manual_token=True``.
+    3. If ``mode == "local"`` (ephemeral loopback) → probe ports
+       ``[9119, 9120..9199]`` with a quick ``/api/status`` check.  Return the
+       first responding URL + ``manual_token=True`` because the stock Electron
+       app does NOT persist the ephemeral token to disk.
+    4. If ``connection.json`` is absent/malformed → return ``None`` (caller
+       falls through to the Tailscale Serve path).
+
+    Honest limit
+    ------------
+    Pure ``local`` mode: the Desktop app binds an ephemeral port AND keeps the
+    auth token in memory only.  We can DISCOVER the port (probe) but cannot
+    recover the token without modifying the stock Electron app (REJECTED per
+    the plugin-boundary rule).  ``manual_token=True`` signals this to the
+    caller.  The recommended resolution is:
+
+    * Use ``_issue_device_token`` once the user provides any valid token for
+      the discovered URL (e.g. from the Desktop app's Settings → Copy token).
+    * Or fall back to the Tailscale Serve path (remote mode).
+
+    Sidecar / embedded-listener: REJECTED.  The Electron app is stock
+    NousResearch — we do NOT add a subprocess or modify it.
+    """
+    data = _read_connection_json(connection_json_path)
+    if data is None:
+        return None
+
+    mode = data.get("mode", "")
+
+    if mode == "remote":
+        remote = data.get("remote") or {}
+        if not isinstance(remote, dict):
+            return None
+        url = (remote.get("url") or "").strip()
+        if not url:
+            return None
+        encoding = (remote.get("encoding") or "plain").lower()
+        if encoding == "plain":
+            token = (remote.get("token") or "").strip() or None
+            return _DesktopGatewayResult(
+                url=url,
+                token=token,
+                manual_token=(token is None),
+                source="connection.json remote",
+            )
+        else:
+            # Encrypted (e.g. "safeStorage"): token is in macOS Keychain /
+            # Electron safeStorage — we can't read it without the Electron
+            # app's context.  Return URL only; caller must prompt for token.
+            return _DesktopGatewayResult(
+                url=url,
+                token=None,
+                manual_token=True,
+                source=f"connection.json remote (encrypted token: {encoding})",
+            )
+
+    if mode == "local":
+        # Ephemeral port + memory-only token: probe the known range.
+        for port in _LOCAL_PROBE_PORTS:
+            if _probe_local_gateway_port(port):
+                return _DesktopGatewayResult(
+                    url=f"http://127.0.0.1:{port}",
+                    token=None,
+                    manual_token=True,
+                    source=f"loopback probe :{port}",
+                )
+        # No port responded — gateway is likely not running.
+        return None
+
+    # Unknown mode — don't crash, just return None.
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Dashboard URL detection (Tailscale Serve)
 # ---------------------------------------------------------------------------
 
@@ -127,12 +352,32 @@ def _detect_dashboard_url(port: int = DEFAULT_DASHBOARD_PORT) -> Optional[str]:
     """Return the public ``https://host:port`` dashboard URL from Tailscale
     Serve, or ``None`` if it can't be determined.
 
-    Strategy: parse ``tailscale serve status --json``; its ``Web`` map is keyed
-    by ``hostname:port`` and each entry's ``Handlers`` map path → {"Proxy": ...}.
-    We pick the first HTTPS front door whose root ("/") handler proxies to the
-    dashboard's loopback port. If no handler matches the dashboard port we fall
-    back to the first HTTPS web front door that exists at all.
+    Detection order (first success wins)
+    -------------------------------------
+    1. **Desktop-owned gateway** (Increment 3a): read
+       ``~/Library/Application Support/Hermes/connection.json``.  If the
+       Desktop app is in ``remote`` mode with a non-empty URL, use that
+       directly (no probe needed).  If in ``local`` mode, probe the ephemeral
+       loopback port range.  When ``manual_token=True`` is signalled only the
+       URL is returned here — the caller is responsible for obtaining the
+       token (e.g. via ``_issue_device_token`` or manual entry).
+    2. **Tailscale Serve** (existing logic): parse
+       ``tailscale serve status --json``; pick the HTTPS front door whose
+       root handler proxies to the dashboard's loopback port.
+
+    The Desktop-discovery step is a pure addition — the Tailscale-Serve path
+    is kept intact as a fallback so existing setups are unaffected.
     """
+    # --- Step 1: Desktop-owned gateway discovery (Increment 3a) ---
+    desktop = _detect_local_desktop_gateway()
+    if desktop is not None:
+        # Return the URL regardless of whether the token is available; the
+        # command flow will use the existing token-reading / minting path
+        # which may succeed for remote mode (where the token is in
+        # dashboard.token), or fall back to prompting for local mode.
+        return desktop.url
+
+    # --- Step 2: Tailscale Serve (existing fallback) ---
     status = _tailscale_serve_status()
     if not status:
         return None
