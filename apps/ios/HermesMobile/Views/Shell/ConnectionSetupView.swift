@@ -106,6 +106,10 @@ struct ConnectionSetupView: View {
                     .focused($focusedField, equals: .url)
                     .onSubmit { focusedField = .token }
                     .focusRing(active: focusedField == .url, color: theme.composerRing)
+                    // A11y: placeholder text is not read as a label on all VoiceOver
+                    // configurations; an explicit label guarantees "Gateway URL, text field".
+                    .accessibilityLabel("Gateway URL")
+                    .accessibilityIdentifier("gatewayURLField")
 
                     SecureField("Session token", text: $token)
                         .textContentType(.password)
@@ -115,6 +119,11 @@ struct ConnectionSetupView: View {
                         .focused($focusedField, equals: .token)
                         .onSubmit { if canConnect { connect() } }
                         .focusRing(active: focusedField == .token, color: theme.composerRing)
+                        // A11y: explicit label for SecureField (placeholder alone is
+                        // insufficient when the field is filled — VoiceOver reads the
+                        // secure-entry-replacement bullets, not the placeholder).
+                        .accessibilityLabel("Session token")
+                        .accessibilityIdentifier("sessionTokenField")
                 } header: {
                     Text("Gateway")
                 } footer: {

@@ -179,10 +179,21 @@ struct ToolActivityRow: View {
                         // smoothly with the expand/collapse gesture.
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .animation(.snappy(duration: 0.2), value: isExpanded)
+                        // The chevron is a decorative affordance; the parent
+                        // Button already announces "Tool details" + expanded state.
+                        .accessibilityHidden(true)
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            // A11y: surface as a named button whose value reflects expanded state;
+            // VoiceOver reads "Tool details, expanded/collapsed, button" and swipe
+            // to toggle. Uses .isButton (already implied on Button but explicit here
+            // for `.accessibilityAddTraits` completeness per DrawerSessionRow pattern).
+            .accessibilityLabel("Tool details")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityValue(isExpanded ? "expanded" : "collapsed")
+            .accessibilityIdentifier("toolDetailDisclosure")
 
             if isExpanded {
                 expandedDetail

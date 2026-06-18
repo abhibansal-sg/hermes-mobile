@@ -450,6 +450,9 @@ struct DrawerView: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: searchIconSize))
                     .foregroundStyle(theme.mutedFg)
+                    // Decorative — the adjacent TextField already announces "Search";
+                    // hiding prevents VoiceOver from double-reading the icon.
+                    .accessibilityHidden(true)
                 TextField("Search", text: $sessions.searchQuery)
                     .textFieldStyle(.plain)
                     .font(.system(size: searchFieldFontSize))
