@@ -1727,6 +1727,96 @@ final class ChatStore {
     /// so the routing fact (R1 #2) is directly assertable in tests.
     var interruptTarget: String? { mirroringRuntimeId ?? activeSessionId }
 
+    // MARK: - Steer
+
+    /// Outcome of a `session.steer` RPC call.
+    ///
+    /// - `queued`: the gateway accepted the steering text and will inject it
+    ///   into the running turn's next context window.
+    /// - `rejected`: the gateway declined (e.g. turn already completing or the
+    ///   session is not currently streaming). The UI should keep the text so the
+    ///   user can queue it instead.
+    /// - `error(String)`: transport or RPC failure; the message is also written
+    ///   to `lastError` for the standard error-banner path.
+    enum SteerOutcome: Equatable, Sendable {
+        case queued
+        case rejected
+        case error(String)
+    }
+
+    /// Gateway response shape for `session.steer`.
+    struct SessionSteerResponse: Decodable, Sendable {
+        let status: String
+        /// Optional human-readable note from the gateway (not currently surfaced
+        /// in UI but preserved for future diagnostic use).
+        let text: String?
+    }
+
+    #if DEBUG
+    /// Injectable hook for tests — replaces the live `session.steer` RPC when
+    /// set. `nil` in production (inert). Receives `(sessionId, trimmedText)` and
+    /// returns the response that `steer(text:)` maps to a `SteerOutcome`.
+    ///
+    /// Pattern mirrors `ConnectionStore.connectRPC` (the reconnect-test seam).
+    var steerRPC: ((_ sessionId: String, _ text: String) async throws -> SessionSteerResponse)?
+    #endif
+
+    /// Inject steering text into the turn that owns the VISIBLE stream
+    /// (`session.steer`).
+    ///
+    /// Routing follows ``interrupt()`` exactly: an adopted foreign mirror streams
+    /// from its OWN runtime, so `interruptTarget` (= `mirroringRuntimeId ??
+    /// activeSessionId`) is the correct target — NOT `activeSessionId` alone,
+    /// which would miss a foreign turn or be `nil` during the resume window.
+    ///
+    /// This is fire-and-forget from the iOS client's perspective: the gateway
+    /// owns the running turn and decides whether to accept the steer text. iOS
+    /// MUST NOT call `beginLocalTurn`, `setStreaming`, or `cancelStreaming` — the
+    /// turn's streaming context is entirely server-managed.
+    ///
+    /// - Returns: `.queued` if accepted, `.rejected` if the gateway declined,
+    ///   `.error` on transport/RPC failure (also sets `lastError`).
+    func steer(text: String) async -> SteerOutcome {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .rejected }
+        guard let client, let sessionId = interruptTarget else {
+            return .error("No active session")
+        }
+        do {
+            let response: SessionSteerResponse
+            #if DEBUG
+            if let hook = steerRPC {
+                response = try await hook(sessionId, trimmed)
+            } else {
+                response = try await client.request(
+                    "session.steer",
+                    params: .object(["session_id": .string(sessionId),
+                                     "text": .string(trimmed)])
+                )
+            }
+            #else
+            response = try await client.request(
+                "session.steer",
+                params: .object(["session_id": .string(sessionId),
+                                 "text": .string(trimmed)])
+            )
+            #endif
+            switch response.status {
+            case "queued":   return .queued
+            case "rejected": return .rejected
+            default:
+                // Defensive: unknown status from a future gateway version is
+                // treated as a soft rejection — don't clear the user's text.
+                return .rejected
+            }
+        } catch {
+            let msg = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            lastError = msg
+            return .error(msg)
+        }
+    }
+
     /// Answer a pending approval (`approval.respond`) and clear it.
     func respondApproval(approve: Bool, all: Bool) async {
         // Answer against the session the approval came from — for mirrored
