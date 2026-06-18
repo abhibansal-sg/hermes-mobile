@@ -93,14 +93,19 @@ actor HermesGatewayClient {
     /// frame (`gateway.ready`). Resolves once the connection is `open`; throws
     /// `GatewayError` on transport failure or if no ready frame arrives within
     /// 15 seconds. Any existing connection is torn down first.
-    func connect(baseURL: URL, token: String) async throws {
+    ///
+    /// - Parameter mode: the active connection mode, used to derive the correct
+    ///   `Host` header (loopback for Serve/sharedDashboard; real host for a
+    ///   non-loopback remoteURL target). Defaults to `.remoteURL` so callers that
+    ///   do not supply a mode keep the conservative real-host behaviour.
+    func connect(baseURL: URL, token: String, mode: ConnectionMode = .remoteURL) async throws {
         // Drop any prior connection (and its receive loop) cleanly.
         teardown(state: .connecting, failPendingWith: GatewayError.notConnected)
 
         generation &+= 1
         let myGeneration = generation
 
-        let request = WSURLBuilder.wsRequest(baseURL: baseURL, token: token)
+        let request = WSURLBuilder.wsRequest(baseURL: baseURL, token: token, mode: mode)
         let task = transportFactory(request)
         self.task = task
         task.resume()

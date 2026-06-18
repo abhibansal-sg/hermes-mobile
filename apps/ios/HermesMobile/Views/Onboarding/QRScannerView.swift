@@ -35,6 +35,9 @@ struct QRScannerView: View {
     /// Bumped to force a fresh `QRCameraView` (and thus re-arm the one-shot scan
     /// latch) after a failed configure so the user can scan again.
     @State private var scannerGeneration = 0
+    /// Holds the in-flight pairing poll so it can be cancelled on dismiss or
+    /// re-scan — prevents an orphaned poll writing to a dismissed view. [Inc2 fix]
+    @State private var connectTask: Task<Void, Never>?
 
     var body: some View {
         ZStack {
@@ -47,6 +50,7 @@ struct QRScannerView: View {
         .task {
             permission = await CameraPermission.request()
         }
+        .onDisappear { connectTask?.cancel() }
     }
 
     // MARK: - Content by permission state
@@ -213,22 +217,56 @@ struct QRScannerView: View {
 
         errorText = nil
         isConnecting = true
-        Task {
-            let failure = await connection.configure(
-                urlString: parsed.url,
-                token: parsed.token,
-                issuedDeviceId: parsed.deviceId
-            )
+        connectTask?.cancel()
+        connectTask = Task {
+            // Inc 2 (Follow-up A): route through applyPair so in-app QR scans
+            // tag `.sharedDashboard` (and v2 device payloads keep their existing
+            // `.sharedDashboard` tag too). Previously this called configure()
+            // directly, which skipped the mode-tagging in applyPair and left the
+            // connection in whatever mode was last persisted. applyPair sets the
+            // mode BEFORE configure() so the transport picks the right Host header.
+            //
+            // applyPair itself fires a Task, so we cannot await it to learn the
+            // result. Instead we observe the connection phase: on a first-run scan
+            // (connection.rest == nil) applyPair calls configure() immediately —
+            // we watch for the phase to leave .connecting/.needsSetup.
+            HermesURLRouter.applyPair(parsed, connection: connection)
+
+            // Poll the phase briefly for up to 30 s — applyPair's inner Task
+            // calls configure() which is async; phase transitions to .hydrating /
+            // .connected on success or .offline / .needsSetup on failure.
+            let deadline = ContinuousClock.now + .seconds(30)
+            var succeeded = false
+            var errorMessage: String? = nil
+            phaseWatch: while ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(200))
+                if Task.isCancelled { return }
+                switch connection.phase {
+                case .hydrating, .connected:
+                    succeeded = true
+                    break phaseWatch
+                case .offline(let msg):
+                    errorMessage = msg
+                    break phaseWatch
+                case .needsSetup:
+                    errorMessage = "Connection failed. Try scanning again."
+                    break phaseWatch
+                case .connecting, .reconnecting:
+                    continue phaseWatch
+                }
+            }
+
+            if Task.isCancelled { return }
             isConnecting = false
-            if failure == nil {
+            if succeeded {
                 // ESC-04: success haptic — confirms the pairing landed before the
                 // view transitions away. `.notificationOccurred(.success)` is the
                 // correct feedback type for a completed async operation.
                 UINotificationFeedbackGenerator().notificationOccurred(.success)
-                // Phase flipped to .connected; RootView swaps away from Welcome.
+                // Phase flipped to .hydrating/.connected; RootView swaps away from Welcome.
                 dismiss()
             } else {
-                errorText = failure
+                errorText = errorMessage ?? "Connection timed out. Try again."
                 reArmAfterFailure()
             }
         }

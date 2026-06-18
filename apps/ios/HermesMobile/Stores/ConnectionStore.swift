@@ -69,10 +69,22 @@ final class ConnectionStore {
 
     /// The active connection mode (persisted in UserDefaults alongside
     /// ``serverURLString``). Defaults to `.remoteURL` for existing installs
-    /// (no-migration). Writing persists immediately via the setter.
-    var connectionMode: ConnectionMode {
-        get { DefaultsKeys.connectionModeValue() }
-        set { UserDefaults.standard.set(newValue.rawValue, forKey: DefaultsKeys.connectionMode) }
+    /// (no-migration).
+    ///
+    /// **Inc 2 — observed stored property:** promoted from a computed
+    /// UserDefaults pass-through to a `@Observable`-tracked stored property
+    /// so that views bind to it live and `configure`/reconnect always reads the
+    /// current mode at call-time (the old computed getter was not observed by
+    /// `@Observable`, causing a stale-mode connect when the transport now
+    /// branches on it). The stored value is mirrored to UserDefaults on every
+    /// write (same key, same raw-value encoding as before).
+    var connectionMode: ConnectionMode = DefaultsKeys.connectionModeValue() {
+        didSet {
+            UserDefaults.standard.set(
+                connectionMode.rawValue,
+                forKey: DefaultsKeys.connectionMode
+            )
+        }
     }
 
     /// Set when a *configured* connection is rejected for authentication
@@ -591,7 +603,7 @@ final class ConnectionStore {
         }
 
         do {
-            try await client.connect(baseURL: url, token: trimmedToken)
+            try await client.connect(baseURL: url, token: trimmedToken, mode: connectionMode)
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             phase = .offline(message)
@@ -1056,7 +1068,7 @@ final class ConnectionStore {
                 }
 
                 do {
-                    try await self.client.connect(baseURL: url, token: token)
+                    try await self.client.connect(baseURL: url, token: token, mode: self.connectionMode)
                     if Task.isCancelled { return }
                     await self.recoverActiveSession()
                     self.phase = .connected

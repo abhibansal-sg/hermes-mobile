@@ -301,15 +301,21 @@ enum HermesURLRouter {
     }
 
     /// Apply a parsed pairing payload: (re)configure the connection from a
-    /// pairing deep link. Shared by the direct (unconfigured) path and the
-    /// confirmed (was-connected) path so both run byte-identical `configure`s.
+    /// pairing deep link or in-app QR scan. Shared by the direct (unconfigured)
+    /// path, the confirmed (was-connected) path, and the in-app QR scanner so
+    /// all three run byte-identical `configure`s with the correct mode tag.
+    ///
+    /// **Inc 2 (Follow-up A):** all pair payloads — v1 (shared token) AND v2
+    /// (device token) — set `.sharedDashboard` so the mode picker reflects the
+    /// scan, and the transport uses loopback Host for the Tailscale-Serve path.
+    /// Previously only v2 payloads tagged the mode, leaving v1 scans on whatever
+    /// mode the picker last persisted (a stale `.remoteURL` would then emit the
+    /// wrong Host header once Inc 2 transport-branches on the mode).
     static func applyPair(_ payload: PairPayload, connection: ConnectionStore) {
-        // A `kind=device` QR payload comes from `hermes mobile-pair` (shared
-        // dashboard flow) — mark the mode so the picker reflects what the user
-        // actually did. A v1 (no kind) payload keeps whatever mode was selected.
-        if payload.isDeviceToken {
-            connection.connectionMode = .sharedDashboard
-        }
+        // All QR / deep-link pair payloads come from the shared-dashboard flow —
+        // tag the mode so the picker reflects the action AND so the transport
+        // derives the correct loopback Host header (Tailscale Serve path).
+        connection.connectionMode = .sharedDashboard
         Task {
             _ = await connection.configure(
                 urlString: payload.url,
