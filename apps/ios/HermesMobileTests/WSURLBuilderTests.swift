@@ -187,4 +187,172 @@ final class WSURLBuilderTests: XCTestCase {
             "REGRESSION: shared-dashboard REST request must pin loopback Host"
         )
     }
+
+    // MARK: - isPrivateOrLocalHost (Inc-4 hardening)
+    //
+    // Table-driven: every accept/reject class has at least one representative.
+    // The function is pure so these are synchronous and always run (no skip guards).
+
+    func testPrivateHost_loopbackIPv4_accepted() {
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("127.0.0.1"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("127.0.0.2"))   // full /8
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("127.255.255.255"))
+    }
+
+    func testPrivateHost_localhost_accepted() {
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("localhost"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("LOCALHOST"))
+    }
+
+    func testPrivateHost_loopbackIPv6_accepted() {
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("::1"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("[::1]"))        // URL bracket form
+    }
+
+    func testPrivateHost_rfc1918_10slash8_accepted() {
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("10.0.0.1"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("10.255.255.255"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("10.1.2.3"))
+    }
+
+    func testPrivateHost_rfc1918_172_16slash12_accepted() {
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("172.16.0.1"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("172.20.0.1"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("172.31.255.255"))
+    }
+
+    func testPrivateHost_rfc1918_192_168_accepted() {
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("192.168.0.1"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("192.168.1.42"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("192.168.255.255"))
+    }
+
+    func testPrivateHost_linkLocal_169_254_accepted() {
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("169.254.0.1"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("169.254.1.100"))
+    }
+
+    func testPrivateHost_dotLocal_mDNS_accepted() {
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("mymac.local"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("MYMAC.LOCAL"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("raspberrypi.local"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("gateway.internal"))
+    }
+
+    func testPrivateHost_bareHostname_noDots_accepted() {
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("mymac"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("desktop"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("hermes-box"))
+    }
+
+    func testPrivateHost_ipv6ULA_accepted() {
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("fd00::1"))    // ULA fd
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("fc80::1"))    // ULA fc
+    }
+
+    func testPrivateHost_ipv6LinkLocal_accepted() {
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("fe80::1"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("[fe80::1]"))   // URL bracket form
+    }
+
+    // MARK: - isPrivateOrLocalHost — rejected (public)
+
+    func testPrivateHost_publicIPv4_rejected() {
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("8.8.8.8"))
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("1.1.1.1"))
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("203.0.113.1"))  // TEST-NET-3
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("172.32.0.1"))   // just outside 172.16/12
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("172.15.255.255")) // just below 172.16/12
+    }
+
+    func testPrivateHost_publicHostname_rejected() {
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("myserver.example.com"))
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("api.openai.com"))
+    }
+
+    func testPrivateHost_tailscaleMagicDNS_accepted() {
+        // Lane 4a (Inc-4 plugin) makes the gateway prefer a MagicDNS hostname
+        // (<host>.<tailnet>.ts.net) as the stable pair address. .ts.net hosts
+        // are only reachable by enrolled tailnet members (ACL-enforced), so
+        // they are trusted targets for manual_token pairing.
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("mymac.tailnet.ts.net"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("mydesktop.example-corp.ts.net"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("GATEWAY.MYNET.TS.NET")) // case-insensitive
+    }
+
+    func testPrivateHost_malformedOrNil_rejected() {
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost(nil))
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost(""))
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("not an ip at all .com.example"))
+    }
+
+    // MARK: - Bypass regressions (Opus security review must-fix)
+
+    func testPrivateHost_integerIPLiteral_rejected() {
+        // BYPASS-1: dotless all-digit strings are integer IP literals that the OS
+        // resolves to public addresses — must NOT be classified as LAN hostnames.
+        // 134744072 == 8.8.8.8, 16843009 == 1.1.1.1 (big-endian 32-bit).
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("134744072"),
+                       "integer form of 8.8.8.8 must be rejected")
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("16843009"),
+                       "integer form of 1.1.1.1 must be rejected")
+    }
+
+    func testPrivateHost_hexIPLiteral_rejected() {
+        // BYPASS-1 (hex variant): 0x-prefixed all-hex dotless strings are hex IP
+        // literals (e.g. 0x08080808 == 8.8.8.8).
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("0x08080808"),
+                       "hex form of 8.8.8.8 must be rejected")
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("0X08080808"),
+                       "uppercase 0X hex form must also be rejected")
+    }
+
+    func testPrivateHost_alphaLANHostname_stillAccepted() {
+        // BYPASS-1 regression guard: real LAN hostnames (non-digit chars) must
+        // still pass through — the fix must not break the legitimate case.
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("homeserver"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("raspberrypi"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("hermes-box"))
+    }
+
+    func testPrivateHost_trailingLabelIPv4_rejected() {
+        // BYPASS-2: "192.168.1.1.evil.com" was previously mis-classified as
+        // private because compactMap silently dropped "evil"/"com" and left
+        // [192,168,1,1]. Now the raw split count must also be exactly 4.
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("192.168.1.1.evil.com"),
+                       "trailing-label IPv4 disguise must be rejected")
+        XCTAssertFalse(WSURLBuilder.isPrivateOrLocalHost("10.0.0.1.attacker.com"),
+                       "trailing-label IPv4 disguise (10/8) must be rejected")
+        // Regression guard: plain private IPv4 quads must still accept.
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("192.168.1.1"))
+        XCTAssertTrue(WSURLBuilder.isPrivateOrLocalHost("10.0.0.1"))
+    }
+
+    // MARK: - isSafeForManualTokenPair (end-to-end via URL string)
+
+    func testSafeForManualTokenPair_privateURLs_accepted() {
+        XCTAssertTrue(WSURLBuilder.isSafeForManualTokenPair("http://127.0.0.1:9123"))
+        XCTAssertTrue(WSURLBuilder.isSafeForManualTokenPair("http://192.168.1.42:9119"))
+        XCTAssertTrue(WSURLBuilder.isSafeForManualTokenPair("http://10.0.0.5:9119"))
+        XCTAssertTrue(WSURLBuilder.isSafeForManualTokenPair("http://mymac.local:9119"))
+        XCTAssertTrue(WSURLBuilder.isSafeForManualTokenPair("http://localhost:9123"))
+        // Tailscale MagicDNS — the stable-address path from lane 4a.
+        XCTAssertTrue(WSURLBuilder.isSafeForManualTokenPair("http://mymac.tailnet.ts.net:9119"))
+    }
+
+    func testSafeForManualTokenPair_publicURLs_rejected() {
+        XCTAssertFalse(WSURLBuilder.isSafeForManualTokenPair("http://8.8.8.8:9119"))
+        XCTAssertFalse(WSURLBuilder.isSafeForManualTokenPair("http://myserver.example.com:9119"))
+        XCTAssertFalse(WSURLBuilder.isSafeForManualTokenPair("https://api.openai.com/gateway"))
+        // Bypass-1 end-to-end: integer + hex IP literals via full URL.
+        XCTAssertFalse(WSURLBuilder.isSafeForManualTokenPair("http://134744072:9119"),
+                       "integer-IP URL for 8.8.8.8 must be rejected")
+        XCTAssertFalse(WSURLBuilder.isSafeForManualTokenPair("http://16843009:9119"),
+                       "integer-IP URL for 1.1.1.1 must be rejected")
+    }
+
+    func testSafeForManualTokenPair_malformedURL_rejected() {
+        XCTAssertFalse(WSURLBuilder.isSafeForManualTokenPair("not a url"))
+        XCTAssertFalse(WSURLBuilder.isSafeForManualTokenPair(""))
+    }
 }

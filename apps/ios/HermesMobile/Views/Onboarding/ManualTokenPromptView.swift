@@ -59,16 +59,21 @@ struct ManualTokenPromptView: View {
                 Section {
                     // URL is pre-filled and read-only — the user can see where
                     // they are connecting. The token is the only editable field.
-                    HStack {
+                    // Non-truncatable URL display: the full host:port must be
+                    // visible so the user can verify the gateway address before
+                    // pasting their token. A truncated address is a security
+                    // risk — a MITM could swap the visible part while hiding a
+                    // public host in the clipped suffix. (Inc-4 hardening.)
+                    VStack(alignment: .leading, spacing: 2) {
                         Text("Gateway")
                             .font(.subheadline)
                             .foregroundStyle(theme.mutedFg)
-                        Spacer(minLength: 8)
                         Text(discoveredURL)
                             .font(.subheadline.monospaced())
                             .foregroundStyle(theme.fg)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                            .multilineTextAlignment(.leading)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("manualTokenDiscoveredURL")
                     }
                     .listRowBackground(theme.card)
@@ -148,8 +153,19 @@ struct ManualTokenPromptView: View {
     private func connect() {
         guard canConnect else { return }
         tokenFieldFocused = false
-        isConnecting = true
         errorText = nil
+
+        // Inc-4 hardening: a manual_token payload should ONLY target a private
+        // or local host. The plugin produces these payloads exclusively for
+        // LAN/loopback discovery; a public host here almost certainly means a
+        // tampered payload (MITM or QR substitution), and the user would be
+        // pasting their token to a remote server. Reject before any network call.
+        guard WSURLBuilder.isSafeForManualTokenPair(discoveredURL) else {
+            errorText = "This gateway address appears to be a public internet host. Manual token pairing is only supported for local or LAN addresses (e.g. 192.168.x.x, 10.x.x.x, or *.local)."
+            return
+        }
+
+        isConnecting = true
         Task {
             let failure = await connection.configure(
                 urlString: discoveredURL,
