@@ -15,6 +15,16 @@ Current limitations and rough edges in the external TestFlight beta.
   app has been backgrounded for a long time, foregrounding occasionally stays on
   "Reconnecting…"; **force-quit + reopen** recovers. Not currently reproducing
   after recent fixes.
+- **Local-mode restart requires re-entering the token (stock gateway without `devices` capability).**
+  The app persists the gateway address and automatically re-resolves it on reconnect
+  (MagicDNS ensures the hostname remains stable even if the gateway's IP changes).
+  However, token persistence is handled server-side: when the gateway advertises the
+  `devices` capability it mints a **per-device token** that survives a gateway
+  restart. On a **stock gateway without `devices`**, the gateway issues an
+  ephemeral shared token that is lost on restart — after the gateway restarts, the
+  app will prompt you to re-enter the token. The HermesMobile plugin enables the
+  `devices` capability, so self-hosters running the full plugin stack get persistent
+  tokens. Bare/stock gateway deployments require a manual re-pair after each restart.
 - **Tailnet reachability.** The phone must be able to reach your gateway (same LAN
   or Tailscale). A `*.ts.net` connection failure surfaces an "Is Tailscale
   connected?" hint.
