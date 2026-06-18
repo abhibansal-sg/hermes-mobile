@@ -209,6 +209,46 @@ struct SessionSearchResult: Decodable, Identifiable, Sendable, Equatable {
     }
 }
 
+// MARK: - Plugin search result
+
+/// One row from `GET /api/plugins/hermes-mobile/sessions/search` (`results[]`).
+///
+/// The plugin endpoint is per-message, not per-session; the iOS call site
+/// collapses multiple rows for the same `sessionId` down to a single
+/// ``SessionSearchResult`` (first/best snippet, by server-ranking order) before
+/// handing them to the drawer UI.
+struct PluginSessionSearchResult: Decodable, Sendable {
+    let sessionId: String
+    let sessionTitle: String?
+    let sessionStartedAt: Double?
+    let messageId: Int?
+    let role: String?
+    let snippet: String?
+    let timestamp: Double?
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionId       = "session_id"
+        case sessionTitle    = "session_title"
+        case sessionStartedAt = "session_started_at"
+        case messageId       = "message_id"
+        case role, snippet, timestamp
+    }
+
+    /// Convert to the existing `SessionSearchResult` shape so the drawer UI
+    /// needs no changes. `source`/`model` are not returned by the plugin endpoint;
+    /// they decode as nil and the row renders without the source glyph.
+    var asSessionSearchResult: SessionSearchResult {
+        SessionSearchResult(
+            id: sessionId,
+            snippet: snippet,
+            role: role,
+            source: nil,
+            model: nil,
+            sessionStarted: sessionStartedAt
+        )
+    }
+}
+
 // MARK: - Endpoints
 
 extension RestClient {
@@ -247,6 +287,75 @@ extension RestClient {
         return try decode(
             Wrapper.self, from: data, context: "search", strategy: .useDefaultKeys
         ).results
+    }
+
+    /// `GET /api/plugins/hermes-mobile/sessions/search?q=&limit=&sort=&role=` —
+    /// richer FTS5 search via the hermes-mobile plugin endpoint.
+    ///
+    /// The plugin endpoint returns one row per MATCHING MESSAGE (with full context
+    /// and session title). This method collapses them to one per session (first/best
+    /// snippet by server-ranking order, deterministic dedup) so the result list is
+    /// compatible with the existing `DrawerSearchResultRow` UI.
+    ///
+    /// Scope→role mapping:
+    /// - `.all`      → no `role` param (server returns all roles)
+    /// - `.messages` → `role=user&role=assistant`
+    /// - `.code`     → `role=tool`
+    ///
+    /// Only available when this client speaks `.plugin` path style. Callers
+    /// (``SessionStore/searchQueryChanged()``) try this first and fall back to
+    /// the stock ``searchSessions(query:limit:scope:)`` on 404 (older gateways
+    /// without the plugin). A real 500/transport error is re-thrown so genuine
+    /// failures surface and are NOT silently masked.
+    func searchSessionsPlugin(
+        query: String,
+        limit: Int = 25,
+        sort: String? = nil,
+        roles: [String] = []
+    ) async throws -> [SessionSearchResult] {
+        guard pathStyle == .plugin else {
+            throw RestError.badStatus(404, body: "plugin path style not active")
+        }
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return [] }
+
+        var items: [URLQueryItem] = [
+            URLQueryItem(name: "q", value: trimmed),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+        if let sort, !sort.isEmpty {
+            items.append(URLQueryItem(name: "sort", value: sort))
+        }
+        for role in roles {
+            items.append(URLQueryItem(name: "role", value: role))
+        }
+        var components = URLComponents()
+        components.queryItems = items
+        let encodedQuery = components.percentEncodedQuery ?? ""
+        let base = "\(mobileAPIPrefix)/sessions/search"
+        let path = encodedQuery.isEmpty ? base : "\(base)?\(encodedQuery)"
+
+        let data = try await get(path: path)
+
+        struct Wrapper: Decodable { let results: [PluginSessionSearchResult] }
+        // PluginSessionSearchResult has explicit snake_case CodingKeys — use
+        // .useDefaultKeys to avoid the global double-conversion.
+        let rows = try decode(
+            Wrapper.self, from: data, context: "pluginSearch", strategy: .useDefaultKeys
+        ).results
+
+        // Collapse per-message rows to one per session (first occurrence wins —
+        // the server returns them in relevance order, so the first hit for each
+        // session_id is the best snippet). Dedup is deterministic: insertion order
+        // of the first occurrence of each session_id.
+        var seen = Set<String>()
+        var collapsed: [SessionSearchResult] = []
+        for row in rows {
+            guard !row.sessionId.isEmpty, !seen.contains(row.sessionId) else { continue }
+            seen.insert(row.sessionId)
+            collapsed.append(row.asSessionSearchResult)
+        }
+        return collapsed
     }
 
     /// `PATCH /api/sessions/{id}` with `{ "title": ... }` — rename a session.

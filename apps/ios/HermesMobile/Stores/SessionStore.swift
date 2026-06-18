@@ -2059,8 +2059,10 @@ final class SessionStore {
     // MARK: - Search
 
     /// React to a change in `searchQuery` from the `.searchable` field. Debounces
-    /// 300ms, then fetches `/api/sessions/search`; queries under two characters
-    /// clear the results immediately. Call from the view's `onChange(of:)`.
+    /// 300ms, then tries the plugin endpoint first with graceful fallback to the
+    /// stock `/api/sessions/search` on 404 (older gateways without the plugin).
+    /// Queries under two characters clear the results immediately.
+    /// Call from the view's `onChange(of:)`.
     func searchQueryChanged() {
         searchTask?.cancel()
 
@@ -2083,9 +2085,7 @@ final class SessionStore {
             self.isSearching = true
             defer { self.isSearching = false }
             do {
-                let results = try await api.searchSessions(
-                    query: trimmed, scope: self.searchScope.rawValue
-                )
+                let results = try await self.fetchSearch(query: trimmed, api: api)
                 if Task.isCancelled { return }
                 // Guard against a stale response landing after the user typed on.
                 guard self.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed else {
@@ -2099,6 +2099,36 @@ final class SessionStore {
                 self.lastError = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
             }
+        }
+    }
+
+    /// Execute the search against the best available endpoint: plugin first (richer
+    /// results + role-scoped), stock on 404 (older gateways). Only falls back on a
+    /// true 404/not-found — real 500/transport errors are re-thrown so they surface
+    /// as `lastError` and are not silently masked.
+    ///
+    /// Extracted so tests can call it directly without spinning a Task.
+    func fetchSearch(query: String, api: RestClient) async throws -> [SessionSearchResult] {
+        let roles = Self.roles(for: searchScope)
+        do {
+            return try await api.searchSessionsPlugin(query: query, roles: roles)
+        } catch RestError.badStatus(404, _) {
+            // Plugin endpoint not available on this gateway — fall back to stock.
+            return try await api.searchSessions(
+                query: query, scope: searchScope.rawValue
+            )
+        }
+        // Any other error (500, transport, decode) propagates to the caller.
+    }
+
+    /// Map the UI search scope to a list of `role` values for the plugin endpoint.
+    /// `all` sends no filter (server returns every role); `messages` returns user +
+    /// assistant prose; `code` returns tool output.
+    static func roles(for scope: SearchScope) -> [String] {
+        switch scope {
+        case .all:      return []
+        case .messages: return ["user", "assistant"]
+        case .code:     return ["tool"]
         }
     }
 
