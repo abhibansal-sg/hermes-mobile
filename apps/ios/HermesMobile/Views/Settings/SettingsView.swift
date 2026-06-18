@@ -540,13 +540,13 @@ struct SettingsView: View {
     /// live control surface; `about` is the local version page (no control
     /// client needed) and is excluded from ``pushable``.
     private enum ControlPanel: String, Identifiable, Hashable {
-        case appearance, model, personality, usage, cron, skills, gateway, about
+        case appearance, model, personality, usage, cron, skills, gateway, artifacts, about
         var id: String { rawValue }
 
         /// The panels that need a live control client (`appearance` + `about` do
         /// NOT — they are local pages, excluded from ``pushable``).
         static var pushable: [ControlPanel] {
-            [.model, .personality, .usage, .cron, .skills, .gateway]
+            [.model, .personality, .usage, .cron, .skills, .gateway, .artifacts]
         }
 
         var title: String {
@@ -558,6 +558,7 @@ struct SettingsView: View {
             case .cron: return "Automations"
             case .skills: return "Skills"
             case .gateway: return "Gateway Status"
+            case .artifacts: return "Artifacts"
             case .about: return "About"
             }
         }
@@ -571,6 +572,7 @@ struct SettingsView: View {
             case .cron: return "clock.arrow.circlepath"
             case .skills: return "wand.and.stars"
             case .gateway: return "network"
+            case .artifacts: return "photo.on.rectangle.angled"
             case .about: return "info.circle"
             }
         }
@@ -627,6 +629,13 @@ struct SettingsView: View {
                     SkillsBrowserView(control: control)
                 case .gateway:
                     GatewayStatusView(control: control)
+                case .artifacts:
+                    ArtifactsGalleryView(
+                        control: control,
+                        serverId: connectionStore.serverURLString,
+                        profileId: sessionStore.activeProfile,
+                        sessions: sessionStore
+                    )
                 case .appearance, .about:
                     EmptyView() // handled by the outer switch
                 }
