@@ -37,9 +37,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from typing import Annotated
 
 _log = logging.getLogger(__name__)
 
@@ -819,6 +820,171 @@ async def unregister_live_activity(body: LiveActivityBody, request: Request) -> 
     engine = _plugin_module("push_engine")
     removed = engine.unregister_live_activity_token(body.session_id)
     return {"ok": True, "removed": removed}
+
+
+# ---------------------------------------------------------------------------
+# Session full-text search — GET /sessions/search
+#
+# Read-only FTS5-backed search across all session messages.  Uses
+# ``SessionDB(read_only=True).search_messages()`` — the same FTS5 index the
+# desktop's role-scoped search uses (upstream ABH upstream PR).  The endpoint
+# is entirely plugin-side: zero stock-core edits.
+#
+# Params: q (required), limit (default 20, max 100), offset (default 0),
+#         sort (newest|oldest|rank — default rank = BM25 relevance),
+#         role (user|assistant|tool — optional, repeatable).
+#
+# Response: {query, results[{session_id, session_title, session_started_at,
+#            message_id, role, snippet, timestamp, context}], count, offset}
+#
+# ``count`` is the row count of THIS page (len(results)), not a DB grand total —
+# SessionDB.search_messages does not run a separate COUNT query and we do not
+# add one.  Clients paginate by bumping offset until results is empty.
+#
+# IMPORTANT — _fts_enabled probe:
+# SessionDB.__init__ skips _init_schema (and therefore the FTS probe that sets
+# _fts_enabled) when read_only=True.  This leaves _fts_enabled=False, which
+# causes search_messages() to return [] unconditionally even though the FTS5
+# table is fully queryable on a read-only connection.  Plugin-clean fix:
+# probe _fts_table_exists() after opening the read-only connection and set
+# _fts_enabled=True when the table is present.  This is plugin-only — we do
+# NOT modify hermes_state.py.
+#
+# IMPORTANT — session_title lookup:
+# search_messages() SELECT does not return s.title.  We look it up with a
+# separate read-only query after collecting the matching session_ids, then join
+# in Python.  We do NOT modify search_messages (it is stock + shared with the
+# desktop search path).
+# ---------------------------------------------------------------------------
+
+_SEARCH_LIMIT_MAX = 100
+_SEARCH_LIMIT_DEFAULT = 20
+
+
+@router.get("/sessions/search")
+async def search_sessions(
+    request: Request,
+    q: Optional[str] = None,
+    limit: int = _SEARCH_LIMIT_DEFAULT,
+    offset: int = 0,
+    sort: Optional[str] = None,
+    role: Annotated[Optional[List[str]], Query()] = None,
+):
+    """Full-text search across all session messages (read-only, FTS5).
+
+    ``q`` is required; missing or empty → 400. Auth is the standard dashboard
+    session token. ``sort`` accepts ``newest``, ``oldest``, or ``rank``
+    (BM25 relevance, the default). ``role`` may be repeated (e.g.
+    ``?role=user&role=assistant``). A malformed FTS5 query is sanitised by
+    ``SessionDB._sanitize_fts5_query`` and returns a graceful 200 empty result
+    rather than a 500. ``count`` in the response is the page size (not a grand
+    total); paginate by bumping ``offset`` until ``results`` is empty.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not q or not q.strip():
+        return JSONResponse(
+            status_code=400, content={"error": "q is required"}
+        )
+
+    # Clamp limit.
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = _SEARCH_LIMIT_DEFAULT
+    limit = max(1, min(limit, _SEARCH_LIMIT_MAX))
+
+    # Normalise offset.
+    try:
+        offset = int(offset)
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
+
+    # Normalise sort: pass None (BM25) for any unrecognised value including
+    # the explicit "rank" alias so the DB default applies.
+    sort_norm: Optional[str]
+    if sort and sort.strip().lower() in ("newest", "oldest"):
+        sort_norm = sort.strip().lower()
+    else:
+        sort_norm = None
+
+    # role is already a list from FastAPI query-param binding (repeatable).
+    role_filter = [r.strip() for r in (role or []) if r and r.strip()] or None
+
+    from hermes_state import SessionDB, DEFAULT_DB_PATH
+
+    if not DEFAULT_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="state.db unavailable")
+
+    db = None
+    try:
+        db = SessionDB(read_only=True)
+
+        # FIX #1 — enable FTS on the read-only connection.
+        # SessionDB skips _init_schema (and the FTS probe) when read_only=True,
+        # so _fts_enabled stays False even though the FTS5 table is fully
+        # queryable.  Probe the table directly and set the flag so
+        # search_messages can run.  Plugin-only: no hermes_state edit.
+        if not db._fts_enabled and db._fts_table_exists("messages_fts"):
+            db._fts_enabled = True
+
+        # Exclude sub-agent "tool" source sessions — same rationale as session.list.
+        matches = db.search_messages(
+            query=q.strip(),
+            exclude_sources=["tool"],
+            role_filter=role_filter,
+            limit=limit,
+            offset=offset,
+            sort=sort_norm,
+        )
+
+        # FIX #2 — look up session titles separately.
+        # search_messages SELECT does not return s.title (and we do not modify
+        # that query — it is stock + shared).  Collect the distinct session_ids
+        # from this page and fetch their titles in one query.
+        title_map: Dict[str, str] = {}
+        session_ids = list({m["session_id"] for m in matches if m.get("session_id")})
+        if session_ids:
+            placeholders = ",".join("?" for _ in session_ids)
+            cur = db._conn.execute(
+                f"SELECT id, title FROM sessions WHERE id IN ({placeholders})",
+                session_ids,
+            )
+            for row in cur.fetchall():
+                title_map[row["id"]] = row["title"] or ""
+
+    except Exception as exc:
+        _log.warning("sessions/search failed: %s", exc)
+        raise HTTPException(status_code=503, detail="search failed")
+    finally:
+        try:
+            if db is not None and getattr(db, "_conn", None) is not None:
+                db._conn.close()
+        except Exception:
+            pass
+
+    results = []
+    for m in matches:
+        sid = m.get("session_id") or ""
+        results.append({
+            "session_id": sid,
+            "session_title": title_map.get(sid, ""),
+            "session_started_at": m.get("session_started") or 0,
+            "message_id": m.get("id"),
+            "role": m.get("role"),
+            "snippet": m.get("snippet") or "",
+            "timestamp": m.get("timestamp") or 0,
+            "context": m.get("context") or [],
+        })
+
+    return {
+        "query": q.strip(),
+        "results": results,
+        "count": len(results),
+        "offset": offset,
+    }
 
 
 # ---------------------------------------------------------------------------
