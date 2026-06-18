@@ -158,16 +158,21 @@ final class LocalDesktopManualTokenUITests: XCTestCase {
         XCTAssertTrue(cancelBtn.waitForExistence(timeout: 5), "Cancel button not found")
         cancelBtn.tap()
 
-        // The prompt should be gone; WelcomeView should still be visible
-        // (the Local desktop mode button reappears after dismiss).
+        // The sheet must actually dismiss. Wait for the token field to
+        // disappear rather than asserting `.exists` synchronously: with a
+        // `.medium` detent the WelcomeView sits *behind* the sheet, so its
+        // button is already in the AX tree and a bare `.exists` check races
+        // the dismiss animation (passes locally, flakes on slower cloud VMs).
+        XCTAssertTrue(
+            tokenField.waitForNonExistence(timeout: 10),
+            "ManualTokenPromptView is still visible after Cancel — the sheet did not dismiss"
+        )
+
+        // WelcomeView should be visible again (the Local desktop mode button).
         let localBtn = app.buttons["connectionModeButton_localDesktop"]
         XCTAssertTrue(
             localBtn.waitForExistence(timeout: 5),
             "WelcomeView did not reappear after cancelling manual-token prompt"
-        )
-        XCTAssertFalse(
-            tokenField.exists,
-            "ManualTokenPromptView is still visible after Cancel — the sheet did not dismiss"
         )
     }
 }
