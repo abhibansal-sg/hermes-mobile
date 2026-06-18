@@ -150,7 +150,13 @@ final class ChatStoreBatchDTests: XCTestCase {
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: .object(["text": .string("done")])
         ))
+        // Deterministic drain: await the foreign-complete backfill Task so the
+        // reconcile seed fires onTurnDiscarded + onTurnComplete.
+        #if DEBUG
+        await chat.waitForPendingForeignBackfillForTesting()
+        #else
         await settle()
+        #endif
 
         // The reconcile seed's cancelStreaming fires the discard, and the
         // Batch C foreign-complete trigger fires the completion — both routes

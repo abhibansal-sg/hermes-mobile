@@ -132,7 +132,10 @@ final class ChatStoreBatchBTests: XCTestCase {
         }
 
         let backfillTask = Task { await chat.backfill() }
-        await settle()
+        // Let the backfillTask start and reach gate.wait() before we handle
+        // local frames. The Gate is race-safe (released=true flag handles early
+        // release), so a yield is sufficient to give backfill a scheduling slot.
+        await Task.yield()
 
         // The user starts a local turn while the fetch is in flight.
         chat.handle(event: frame(type: "message.start", runtime: activeRuntime))
@@ -144,7 +147,8 @@ final class ChatStoreBatchBTests: XCTestCase {
 
         gate.release()
         await backfillTask.value
-        await settle()
+        // One yield so any MainActor mutations from the completed task propagate.
+        await Task.yield()
 
         // The stale fetch result was dropped: the live local turn is intact.
         XCTAssertTrue(chat.isStreaming, "stale seed must not cancel the live local turn")
@@ -165,14 +169,17 @@ final class ChatStoreBatchBTests: XCTestCase {
         }
 
         let backfillTask = Task { await chat.backfill() }
-        await settle()
+        // Let the backfillTask reach gate.wait() before switching sessions.
+        // Gate is race-safe; a yield gives the task a scheduling slot.
+        await Task.yield()
 
         // The user switches sessions while session A's fetch is in flight.
         sessions.activeStoredId = "stored-session-2"
 
         gate.release()
         await backfillTask.value
-        await settle()
+        // Yield so MainActor mutations from the completed task propagate.
+        await Task.yield()
 
         XCTAssertTrue(chat.messages.isEmpty, "A's stale history must not seed over B")
         XCTAssertEqual(chat.transcriptGeneration, 0)
@@ -189,7 +196,8 @@ final class ChatStoreBatchBTests: XCTestCase {
         }
 
         let backfillTask = Task { await chat.backfill() }
-        await settle()
+        // Yield so the backfillTask reaches gate.wait(); Gate is race-safe.
+        await Task.yield()
         sessions.activeStoredId = "stored-session-2"
         gate.release()
         await backfillTask.value
@@ -253,7 +261,13 @@ final class ChatStoreBatchBTests: XCTestCase {
             type: "message.delta", runtime: activeRuntime,
             payload: .object(["text": .string("half a reply…")])
         ))
+        // Deterministic drain: flush the 40ms coalescing buffer so the delta
+        // lands; isStreaming is already set synchronously by message.start.
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertTrue(chat.isStreaming)
 
         // The transport drops mid-turn (server restart / network loss).
@@ -310,7 +324,13 @@ final class ChatStoreBatchBTests: XCTestCase {
             type: "message.delta", runtime: foreignRuntime, stored: storedId,
             payload: .object(["text": .string("live mirror text")])
         ))
+        // Deterministic drain: flush the 40ms coalescing buffer so the foreign
+        // delta's text lands before sampling the state.
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertTrue(chat.isStreaming)
         let generationBefore = chat.transcriptGeneration
         let messagesBefore = chat.messages.map(\.text)
@@ -338,7 +358,9 @@ final class ChatStoreBatchBTests: XCTestCase {
         }
 
         sessions.open(summary("stored-A"))   // fast-path fetch suspends
-        await settle()
+        // Let A's open Task start and reach gate.wait(). The Gate is
+        // race-safe (released=true flag), so a yield is sufficient here.
+        await Task.yield()
         sessions.open(summary("stored-B"))   // newer open supersedes A
         // Deterministic await: wait for stored-B's seed Task (including the
         // normalizeOffMain Task.detached) to complete — no wall-clock dependency.
@@ -364,7 +386,13 @@ final class ChatStoreBatchBTests: XCTestCase {
         sessions.transcriptFetch = { _ in throw URLError(.notConnectedToInternet) }
 
         sessions.open(summary("stored-A"))
+        // Deterministic await: wait for the open's seed Task (and its internal
+        // normalizeOffMain Task.detached) to complete — no wall-clock dependency.
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
         await settle()
+        #endif
 
         XCTAssertTrue(chat.messages.isEmpty)
         XCTAssertEqual(chat.transcriptGeneration, 0)
@@ -474,7 +502,13 @@ final class ChatStoreBatchBTests: XCTestCase {
         let (chat, sessions) = makeStore()
         sessions.transcriptFetch = { _ in throw URLError(.timedOut) }
         sessions.open(summary("stored-A"))
+        // Deterministic await: wait for the open's seed Task to fail and surface
+        // the error on lastBackfillError — no wall-clock dependency.
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertNotNil(chat.lastBackfillError)
 
         chat.reset()

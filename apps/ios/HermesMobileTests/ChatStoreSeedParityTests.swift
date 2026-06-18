@@ -188,7 +188,14 @@ final class ChatStoreSeedParityTests: XCTestCase {
                 switch step {
                 case .text(let t):
                     chat.handle(event: frame(type: "message.delta", payload: .object(["text": .string(t)])))
+                    // Deterministic drain: flush the 40ms coalescing buffer so
+                    // the text delta lands before the next tool event — no
+                    // wall-clock dependency (CI-safe).
+                    #if DEBUG
+                    chat.drainFlushForTesting()
+                    #else
                     try? await Task.sleep(for: .milliseconds(50))  // let the flush land before a tool
+                    #endif
                 case .tool(let name, let callId, let result, let failed):
                     chat.handle(event: frame(type: "tool.start", payload: .object([
                         "tool_id": .string(callId), "name": .string(name)])))
@@ -208,7 +215,9 @@ final class ChatStoreSeedParityTests: XCTestCase {
             } else {
                 chat.handle(event: frame(type: "message.complete", payload: .object(completePayload)))
             }
-            try? await Task.sleep(for: .milliseconds(120))
+            // handleMessageComplete calls flushBuffersImmediately() synchronously;
+            // a yield lets any remaining MainActor mutations propagate.
+            await Task.yield()
         }
         return chat.messages
     }

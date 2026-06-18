@@ -106,7 +106,13 @@ final class ChatStoreBatchETests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.delta", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "MIRR"]))
+        // Deterministic drain: flush the 40ms coalescing buffer so the delta's
+        // text lands and the placeholder row exists before we capture its id.
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #else
         await settle()
+        #endif
 
         // The live placeholder is the trailing assistant row; capture its identity.
         guard let placeholder = chat.messages.last(where: { $0.role == .assistant }) else {
@@ -119,7 +125,12 @@ final class ChatStoreBatchETests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "MIRRORTEST reply", "status": "completed"]))
+        // Deterministic drain: await the foreign-complete backfill Task.
+        #if DEBUG
+        await chat.waitForPendingForeignBackfillForTesting()
+        #else
         await settle()
+        #endif
 
         XCTAssertFalse(chat.isStreaming, "streaming clears after the mirror reconciles")
         // The reconciled assistant reply kept the placeholder's identity (in-place
@@ -151,11 +162,22 @@ final class ChatStoreBatchETests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.delta", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "partial"]))
+        // Deterministic drain: flush the delta buffer so the placeholder exists.
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #else
         await settle()
+        #endif
         chat.handle(event: foreignFrame(
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "final", "status": "completed"]))
+        // Deterministic drain: await the foreign-complete backfill Task (which
+        // throws and surfaces the error, then clears the placeholder spinner).
+        #if DEBUG
+        await chat.waitForPendingForeignBackfillForTesting()
+        #else
         await settle()
+        #endif
 
         XCTAssertFalse(chat.isStreaming, "store streaming flag clears on teardown")
         XCTAssertEqual(chat.lastBackfillError, "REST 503", "the reconcile failure surfaces")

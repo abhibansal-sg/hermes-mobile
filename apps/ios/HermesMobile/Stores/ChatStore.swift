@@ -1421,6 +1421,20 @@ final class ChatStore {
         await lastForeignBackfillTask?.value
         await Task.yield()
     }
+
+    /// DEBUG-only handle to the most recent `mergeForeignUserRows` Task.
+    /// Stored by `mergeForeignUserRows()` when a foreign `message.start` fires
+    /// the start-time user-bubble fetch. Tests await this to deterministically
+    /// wait for the user row to land without wall-clock settle().
+    /// Never compiled into Release.
+    private(set) var lastForeignUserRowMergeTask: Task<Void, Never>?
+
+    /// DEBUG-only: await the most recently spawned foreign user-row merge Task,
+    /// then yield once so any main-actor mutations have propagated before assertions.
+    func waitForPendingForeignUserRowMergeForTesting() async {
+        await lastForeignUserRowMergeTask?.value
+        await Task.yield()
+    }
     #endif
 
     // MARK: - Streaming-message mutation helpers
@@ -2559,7 +2573,7 @@ final class ChatStore {
     /// corrupt the live assistant stream.
     private func mergeForeignUserRows() {
         guard streamingIsForeign, let storedId = sessions?.activeStoredId else { return }
-        Task { [weak self] in
+        let mergeTask = Task { [weak self] in
             guard let self else { return }
             guard let fetch = self.resolvedBackfillFetch else { return }
             guard let stored = try? await fetch(storedId) else { return }
@@ -2583,6 +2597,9 @@ final class ChatStore {
             }
             self.rebuildUserOrdinals()
         }
+        #if DEBUG
+        lastForeignUserRowMergeTask = mergeTask
+        #endif
     }
 
     // MARK: - Reset

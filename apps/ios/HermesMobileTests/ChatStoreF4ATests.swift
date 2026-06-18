@@ -48,8 +48,12 @@ final class ChatStoreF4ATests: XCTestCase {
         ]))!
     }
 
+    /// All event handlers tested in this file (`subagent.*`, `secret.request`,
+    /// `sudo.request`, local `message.start`) are fully synchronous on the
+    /// MainActor. A single yield is sufficient to propagate any MainActor
+    /// mutations before asserting — no wall-clock dependency.
     private func settle() async {
-        try? await Task.sleep(for: .milliseconds(80))
+        await Task.yield()
     }
 
     // MARK: - Event decode round-trips

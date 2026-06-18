@@ -163,7 +163,13 @@ final class ChatStoreBatchCTests: XCTestCase {
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: .object(["text": .string("done")])
         ))
+        // Deterministic drain: await the foreign-complete backfill Task — onTurnComplete
+        // fires AFTER the reconcile inside that Task.
+        #if DEBUG
+        await chat.waitForPendingForeignBackfillForTesting()
+        #else
         await settle()
+        #endif
 
         XCTAssertEqual(
             transcriptAtTrigger, ["mirror reconciled"],
