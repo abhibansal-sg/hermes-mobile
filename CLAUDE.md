@@ -211,3 +211,21 @@ outbox. DECIDED: keep eager VStack (A1 validated it), keep drawer. NEXT: user's
 device verdict on build 41 smoothness; then optionally redeploy gateway to activate
 delta + tackle deferred items device-verified. See
 `.agent-memory/project_hermes_mobile.md` for the live detail.
+
+## Claude Code OS substrate (added 2026-06-18)
+
+Verification-first, low-babysitting scaffolding for work in this repo:
+- **`.claude/skills/verify-loop/`** — the keystone: RUN/USE/PROVE/UNBLOCK with hard
+  evidence + the isolated-gateway rig + a self-improving Known-Blockers ledger.
+  Source of truth for HOW to verify the iOS app + gateway end-to-end.
+- **`.claude/agents/`** — model-tiered helpers: `verifier` (Sonnet, drives the loop),
+  `reviewer-correctness` + `reviewer-security-perf` (Opus judgment gates), `planner`
+  (Opus, turns intent → a verifiable spec). Sonnet builds, Opus judges; never default-inherit.
+- **`.claude/hooks/guard.sh`** (PreToolUse) — blocks force-push, `rm -rf`, push-to-upstream,
+  and the HELD trunk merge. Run a genuinely-intended command yourself in a terminal.
+- **Verify rig:** isolated gateway on `:9123` (`HERMES_GATEWAY_BROADCAST=1`) +
+  `TEST_RUNNER_HERMES_URL`/`TEST_RUNNER_HERMES_TOKEN` + `scripts/ios-build.sh test`.
+  NEVER point test traffic at the live `:9119` dashboard.
+
+Portable method docs: github.com/ab0991-oss/claude-code-os. Adoption tracked in the
+Linear project "Claude Code Operating System" (ABH-164).
