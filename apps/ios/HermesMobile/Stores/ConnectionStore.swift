@@ -380,6 +380,20 @@ final class ConnectionStore {
     /// make the loop deterministic without a live socket.
     var connectRPC: ((_ url: URL, _ token: String, _ mode: ConnectionMode) async throws -> Void)?
 
+    #if DEBUG
+    /// Injectable auth-revoke probe (tests). When non-nil, replaces the live
+    /// `probeIsAuthRevoked` REST call with this closure's return value so unit
+    /// tests can drive the threshold → `reauthRequired` flip without a server.
+    /// `nil` in production (the nil-check is free). Pattern mirrors `connectRPC`.
+    var probeIsAuthRevokedRPC: (() async -> Bool)?
+
+    /// Injectable backoff override (tests). When non-nil, `backoffDelay(attempt:)`
+    /// returns this value instead of the exponential schedule, so tests that
+    /// must drive multiple consecutive failures (threshold ≥ 3) do not stall
+    /// for seconds of wall-clock time. `nil` = normal exponential schedule.
+    var reconnectBackoffOverride: Double?
+    #endif
+
     /// Tasks that live as long as the client: the event router and the
     /// state-change observer. Started once on the first successful configure.
     private var eventRouterTask: Task<Void, Never>?
@@ -1055,7 +1069,11 @@ final class ConnectionStore {
                 // adding even the base 0.5s delay is perceptible dead air.
                 // Subsequent attempts back off normally.
                 if attempt > 0 {
+                    #if DEBUG
+                    let delay = self.reconnectBackoffOverride ?? Self.backoffDelay(attempt: attempt)
+                    #else
                     let delay = Self.backoffDelay(attempt: attempt)
+                    #endif
                     try? await Task.sleep(for: .seconds(delay))
                 }
                 if Task.isCancelled { return }
@@ -1114,6 +1132,9 @@ final class ConnectionStore {
     /// reconnect loop keeps retrying rather than dumping the user to re-pair on a
     /// transient outage.
     private func probeIsAuthRevoked(url: URL, token: String) async -> Bool {
+        #if DEBUG
+        if let hook = probeIsAuthRevokedRPC { return await hook() }
+        #endif
         do {
             _ = try await RestClient(baseURL: url, token: token).status()
             return false

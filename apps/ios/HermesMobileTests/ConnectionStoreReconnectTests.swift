@@ -1,7 +1,8 @@
 import XCTest
 @testable import HermesMobile
 
-/// Inc-4 lane 4b — deterministic proof of gateway-restart survival.
+/// Inc-4 lane 4b — deterministic proof of gateway-restart survival + auth-revoke
+/// threshold (Task #5 follow-up).
 ///
 /// SPEC (SPEC-INC4-RESTART-SURVIVAL.md §Lane 4b): a gateway restart at a
 /// STABLE address+token must drive the reconnect loop to `.connected` with
@@ -16,9 +17,16 @@ import XCTest
 ///   2. `reauthRequired == false` — the app does NOT prompt for re-pair.
 ///   3. `hasConnected` stays `true` — no first-run onboarding bounce.
 ///
-/// The `reauthRequired` flip (definitively revoked token after threshold
-/// failures) is also tested so the guard that separates "gateway bounced"
-/// from "token revoked" is explicitly covered.
+/// Auth-revoke threshold (Task #5):
+///   4. After ≥ authReprobeThreshold consecutive WS failures + REST probe
+///      returning true → `reauthRequired` flips `true` (re-pair prompt fires).
+///   5. Below the threshold: stays `.reconnecting`, `reauthRequired == false`.
+///   6. Success after a sub-threshold blip clears the failure count (no
+///      spurious re-pair on the next failure run).
+///
+/// These use the `#if DEBUG probeIsAuthRevokedRPC` + `reconnectBackoffOverride`
+/// seams added alongside `connectRPC` to drive multiple consecutive failures
+/// without live servers or real wall-clock backoff.
 @MainActor
 final class ConnectionStoreReconnectTests: XCTestCase {
 
@@ -162,24 +170,103 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         await connection.disconnect()
     }
 
-    // MARK: - Guard: reauthRequired flips only after authReprobeThreshold consecutive failures
+    // MARK: - Auth-revoke threshold (Task #5) — deterministic coverage
 
-    /// After `authReprobeThreshold` consecutive failures AND a REST probe that
-    /// returns a definitive 401/403, the loop sets `reauthRequired = true` and
-    /// routes to `.needsSetup`.
+    /// BELOW threshold: one or two consecutive WS failures do NOT trigger the
+    /// auth-revoke probe. The loop stays in `.reconnecting` with
+    /// `reauthRequired == false` — the app keeps retrying, not re-pairing.
     ///
-    /// This pins the re-pair escalation path so a refactor cannot accidentally
-    /// drop it. The `connectRPC` always throws; we need ≥ threshold calls.
-    /// `probeIsAuthRevoked` is NOT hookable (private) so this test only asserts
-    /// the behaviour BEFORE the threshold is reached (we rely on the unit tests
-    /// in `ConnectionPhaseTests` for the after-threshold auth path, which
-    /// requires a live REST probe — out of scope for this deterministic test).
-    func testHasConnectedFlagSurvivesBelowAuthReprobeThreshold() async {
+    /// Uses `reconnectBackoffOverride = 0` so attempts 0 and 1 both fire within
+    /// the 600ms settle window (no real backoff delay).
+    func testBelowAuthReprobeThresholdStaysReconnecting() async {
         let (connection, _, _) = makeStore()
 
-        // Always-failing transport (non-auth).
+        // Zero-delay backoff so multiple attempts fit in the settle window.
+        connection.reconnectBackoffOverride = 0
+        // Always-failing, but probe returns false (not a revocation) — should
+        // never even be called below the threshold.
+        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.probeIsAuthRevokedRPC = { false }
+
+        connection._seedAndStartReconnect(
+            serverURL: "http://localhost:9123",
+            token: "test-stable-token"
+        )
+
+        await settle()
+
+        // Loop is still retrying — not routed to re-pair.
+        if case .reconnecting = connection.phase { /* expected */ } else {
+            XCTFail("expected .reconnecting below threshold, got \(connection.phase)")
+        }
+        XCTAssertFalse(connection.reauthRequired,
+                       "reauthRequired must be false below authReprobeThreshold")
+        XCTAssertTrue(connection.hasConnected,
+                      "hasConnected must stay true while below threshold")
+
+        await connection.disconnect()
+    }
+
+    /// AT/ABOVE threshold with a positive REST probe: the loop sets
+    /// `reauthRequired = true` and routes to `.needsSetup` — the re-pair prompt
+    /// fires. This is the DEFINITIVE Task #5 assertion.
+    ///
+    /// `connectRPC` always throws (token revoked at the WS level).
+    /// `reconnectBackoffOverride = 0` makes all ≥ threshold attempts fire fast.
+    /// `probeIsAuthRevokedRPC` returns `true` on the first call (definitive 401).
+    func testAtAuthReprobeThresholdWithRevocationSetsReauthRequired() async {
+        let (connection, _, _) = makeStore()
+
+        // Zero-delay backoff: threshold (3) consecutive failures fire quickly.
+        connection.reconnectBackoffOverride = 0
+        // Always failing — simulates a permanently revoked token at the WS gate.
+        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        // REST probe confirms revocation.
+        connection.probeIsAuthRevokedRPC = { true }
+
+        connection._seedAndStartReconnect(
+            serverURL: "http://localhost:9123",
+            token: "revoked-token"
+        )
+
+        // With zero backoff and threshold = 3, 3 attempts complete in < 50ms on
+        // the main actor. A 600ms settle window is more than sufficient.
+        await settle()
+
+        // The loop must have escalated to re-pair.
+        XCTAssertTrue(connection.reauthRequired,
+                      "reauthRequired must flip true at authReprobeThreshold with revocation")
+        XCTAssertEqual(connection.phase, .needsSetup,
+                       "phase must be .needsSetup after auth revocation")
+        // hasConnected is intentionally cleared when reauthRequired is set —
+        // the user must go through re-pair, not be left on the shell.
+        // (The loop sets phase = .needsSetup AND reconnectTask = nil, so the
+        // loop has exited; hasConnected is NOT cleared by the loop itself —
+        // it is cleared by disconnect() or a fresh configure().)
+    }
+
+    /// A sub-threshold auth blip followed by a successful connect clears the
+    /// failure counter — a later run of failures starts fresh without a spurious
+    /// re-pair trigger.
+    ///
+    /// This pins that `consecutiveReconnectFailures` is reset to 0 on success,
+    /// so two separate 2-failure episodes (each below threshold) do not
+    /// accumulate to trigger a false revocation.
+    func testSuccessAfterSubThresholdBlipClearsFailureCount() async {
+        let (connection, _, _) = makeStore()
+
+        connection.reconnectBackoffOverride = 0
+        // Probe always returns false — a spurious call would be a bug.
+        connection.probeIsAuthRevokedRPC = { false }
+
+        var callCount = 0
         connection.connectRPC = { _, _, _ in
-            throw URLError(.cannotConnectToHost)
+            callCount += 1
+            if callCount <= 2 {
+                // Two sub-threshold failures (threshold = 3).
+                throw URLError(.cannotConnectToHost)
+            }
+            // Third attempt succeeds — clears the counter.
         }
 
         connection._seedAndStartReconnect(
@@ -189,15 +276,15 @@ final class ConnectionStoreReconnectTests: XCTestCase {
 
         await settle()
 
-        // Below the threshold (< 3 consecutive failures in 120ms since each
-        // retry waits ≥ 0.5s of backoff), hasConnected must still be true and
-        // reauthRequired must still be false.
-        XCTAssertTrue(connection.hasConnected,
-                      "hasConnected must stay true while below authReprobeThreshold")
+        // Loop converged — failure count must have been cleared.
+        XCTAssertEqual(connection.phase, .connected,
+                       "loop must reach .connected after sub-threshold blip + success")
         XCTAssertFalse(connection.reauthRequired,
-                       "reauthRequired must stay false before the auth-revocation probe")
-
-        await connection.disconnect()
+                       "a sub-threshold blip followed by success must not set reauthRequired")
+        XCTAssertTrue(connection.hasConnected,
+                      "hasConnected must stay true through a blip-then-recover cycle")
+        XCTAssertEqual(callCount, 3,
+                       "exactly 3 connect attempts: 2 fail + 1 succeed")
     }
 
     // MARK: - Stable URL is preserved after a reconnect (hardening)
