@@ -172,19 +172,21 @@ final class ConnectionStoreReconnectTests: XCTestCase {
 
     // MARK: - Auth-revoke threshold (Task #5) — deterministic coverage
 
-    /// BELOW threshold: one or two consecutive WS failures do NOT trigger the
-    /// auth-revoke probe. The loop stays in `.reconnecting` with
-    /// `reauthRequired == false` — the app keeps retrying, not re-pairing.
+    /// Probe returning false → loop stays `.reconnecting` with `reauthRequired == false`.
     ///
-    /// Uses `reconnectBackoffOverride = 0` so attempts 0 and 1 both fire within
-    /// the 600ms settle window (no real backoff delay).
+    /// The WS always throws (`cannotConnectToHost`) so the loop hits
+    /// `authReprobeThreshold` (3) quickly and calls `probeIsAuthRevoked`.
+    /// With `probeIsAuthRevokedRPC = { false }` (no revocation) the loop must
+    /// keep retrying, never flipping `reauthRequired` or routing to `.needsSetup`.
+    ///
+    /// `reconnectBackoffOverride = 0` eliminates backoff delay so many attempts
+    /// fire within the 600ms settle window.
     func testBelowAuthReprobeThresholdStaysReconnecting() async {
         let (connection, _, _) = makeStore()
 
-        // Zero-delay backoff so multiple attempts fit in the settle window.
+        // Zero-delay backoff so multiple attempts complete inside the settle window.
         connection.reconnectBackoffOverride = 0
-        // Always-failing, but probe returns false (not a revocation) — should
-        // never even be called below the threshold.
+        // Always-failing WS; probe returns false — gateway unreachable, not revoked.
         connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
         connection.probeIsAuthRevokedRPC = { false }
 
@@ -197,12 +199,12 @@ final class ConnectionStoreReconnectTests: XCTestCase {
 
         // Loop is still retrying — not routed to re-pair.
         if case .reconnecting = connection.phase { /* expected */ } else {
-            XCTFail("expected .reconnecting below threshold, got \(connection.phase)")
+            XCTFail("expected .reconnecting when probe returns false, got \(connection.phase)")
         }
         XCTAssertFalse(connection.reauthRequired,
-                       "reauthRequired must be false below authReprobeThreshold")
+                       "reauthRequired must be false when probe returns false")
         XCTAssertTrue(connection.hasConnected,
-                      "hasConnected must stay true while below threshold")
+                      "hasConnected must stay true while retrying")
 
         await connection.disconnect()
     }
