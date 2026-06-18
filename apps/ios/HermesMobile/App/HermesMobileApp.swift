@@ -131,6 +131,32 @@ struct HermesMobileApp: App {
                         }
                     }
                     await environment.connectionStore.bootstrap()
+                    #if DEBUG
+                    // Inc-3b UITest seam: HERMES_UITEST_DEEPLINK fires a deep link
+                    // immediately after bootstrap, exactly as if onOpenURL had been
+                    // called with that URL. Allows the UITest harness to trigger deep
+                    // links (including manual_token pair payloads) from the test
+                    // runner without relying on xcrun simctl (not available inside
+                    // the iOS test runner process). Gated on DEBUG so it is never
+                    // compiled into Release.
+                    if let deepLinkStr = ProcessInfo.processInfo.environment["HERMES_UITEST_DEEPLINK"],
+                       !deepLinkStr.isEmpty,
+                       let deepLinkURL = URL(string: deepLinkStr) {
+                        HermesURLRouter.route(
+                            deepLinkURL,
+                            connection: environment.connectionStore,
+                            sessions: environment.sessionStore,
+                            chat: environment.chatStore,
+                            inbox: environment.inboxStore,
+                            requestPairConfirmation: { payload in
+                                deepLink.requestPairConfirmation(payload)
+                            },
+                            requestManualTokenPair: { payload in
+                                deepLink.requestManualTokenPair(payload)
+                            }
+                        )
+                    }
+                    #endif
                     // Push is opt-in; this no-ops unless the user enabled it.
                     PushRegistrar.shared.enableIfAllowed()
                     // First-launch usage figures for the widgets, once connected.
@@ -172,6 +198,12 @@ struct HermesMobileApp: App {
                         // inside `route`, never reaching this seam).
                         requestPairConfirmation: { payload in
                             deepLink.requestPairConfirmation(payload)
+                        },
+                        // Inc-3b: Local-desktop pairing when the token cannot be
+                        // recovered by the plugin (manual_token=true). Stash the
+                        // payload and let ManualTokenPromptView ask the user.
+                        requestManualTokenPair: { payload in
+                            deepLink.requestManualTokenPair(payload)
                         }
                     )
                 }

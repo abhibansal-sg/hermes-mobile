@@ -201,19 +201,130 @@ final class DeepLinkRouterTests: XCTestCase {
         XCTAssertNil(coordinator.pendingPair)
 
         let first = HermesURLRouter.PairPayload(
-            url: "https://a:9119", token: "t1", isDeviceToken: false, deviceId: nil
+            url: "https://a:9119", token: "t1", isDeviceToken: false, deviceId: nil, manualToken: false
         )
         coordinator.requestPairConfirmation(first)
         XCTAssertEqual(coordinator.pendingPair?.token, "t1")
 
         // Last-write-wins: a second link before the user answers replaces the first.
         let second = HermesURLRouter.PairPayload(
-            url: "https://b:9119", token: "t2", isDeviceToken: false, deviceId: nil
+            url: "https://b:9119", token: "t2", isDeviceToken: false, deviceId: nil, manualToken: false
         )
         coordinator.requestPairConfirmation(second)
         XCTAssertEqual(coordinator.pendingPair?.token, "t2")
 
         coordinator.clear()
+        XCTAssertNil(coordinator.pendingPair)
+    }
+
+    // MARK: - Inc-3b: manual_token pairing (Local-desktop)
+
+    /// `manual_token=true` with no `token` param should parse successfully and set
+    /// `manualToken = true` with an empty token string.
+    func testManualTokenPairPayloadParsesWithNoToken() {
+        let payload = "hermesapp://pair?url=http%3A%2F%2F127.0.0.1%3A9123&manual_token=true"
+        let parsed = HermesURLRouter.parsePairPayload(payload)
+        XCTAssertNotNil(parsed, "manual_token=true payload must parse even when token is absent")
+        XCTAssertEqual(parsed?.url, "http://127.0.0.1:9123")
+        XCTAssertEqual(parsed?.token, "")
+        XCTAssertTrue(parsed?.manualToken == true, "manualToken must be true")
+        XCTAssertFalse(parsed?.isDeviceToken == true)
+    }
+
+    /// A standard payload (no `manual_token` param) should have `manualToken == false`.
+    func testStandardPairPayloadHasManualTokenFalse() {
+        let payload = "hermesapp://pair?url=https%3A%2F%2Fh%3A9119&token=tok"
+        let parsed = HermesURLRouter.parsePairPayload(payload)
+        XCTAssertNotNil(parsed)
+        XCTAssertFalse(parsed?.manualToken == true)
+        XCTAssertEqual(parsed?.token, "tok")
+    }
+
+    /// A `manual_token=true` payload without a URL should still return nil.
+    func testManualTokenWithNoURLReturnsNil() {
+        let payload = "hermesapp://pair?manual_token=true"
+        let parsed = HermesURLRouter.parsePairPayload(payload)
+        XCTAssertNil(parsed, "URL is always required; manual_token=true without url must be nil")
+    }
+
+    /// When a `manual_token=true` link arrives, the router must call
+    /// `requestManualTokenPair` and NOT call `requestPairConfirmation` or configure.
+    func testManualTokenPairRouteCallsManualTokenSeam() {
+        let s = makeStores()
+        XCTAssertNil(s.connection.rest, "fresh store must be unconfigured")
+
+        var manualTokenRequested = false
+        var confirmationRequested = false
+
+        HermesURLRouter.route(
+            URL(string: "hermesapp://pair?url=http%3A%2F%2F127.0.0.1%3A9123&manual_token=true")!,
+            connection: s.connection,
+            sessions: s.sessions,
+            chat: s.chat,
+            inbox: s.inbox,
+            requestPairConfirmation: { _ in confirmationRequested = true },
+            requestManualTokenPair: { _ in manualTokenRequested = true }
+        )
+
+        XCTAssertTrue(
+            manualTokenRequested,
+            "manual_token=true must trigger requestManualTokenPair"
+        )
+        XCTAssertFalse(
+            confirmationRequested,
+            "manual_token=true must NOT trigger requestPairConfirmation"
+        )
+    }
+
+    /// When a `manual_token=true` link arrives but no `requestManualTokenPair`
+    /// seam is wired, the router must silently drop the link (no crash, no configure).
+    func testManualTokenPairDroppedWithoutSeam() {
+        let s = makeStores()
+        let phaseBefore = s.connection.phase
+        // Provide no requestManualTokenPair seam.
+        HermesURLRouter.route(
+            URL(string: "hermesapp://pair?url=http%3A%2F%2F127.0.0.1%3A9123&manual_token=true")!,
+            connection: s.connection,
+            sessions: s.sessions,
+            chat: s.chat,
+            inbox: s.inbox
+        )
+        // Phase must be unchanged — no configure attempt (configure would set it to .connecting
+        // then .offline or .connected; both differ from the initial state which is .connecting,
+        // but crucially no REST/WS call should have been fired). The phase is unchanged.
+        XCTAssertEqual(s.connection.phase, phaseBefore,
+                       "Dropping the link should leave the phase unchanged")
+        // No session activation, no inbox request.
+        XCTAssertNil(s.sessions.activeStoredId)
+        XCTAssertEqual(s.inbox.presentationRequestToken, 0)
+    }
+
+    /// `DeepLinkCoordinator.requestManualTokenPair` stashes the payload; `clear()`
+    /// wipes it. `clearManualTokenPair()` wipes only the manual-token payload.
+    func testDeepLinkCoordinatorManualTokenStashAndClear() {
+        let coordinator = DeepLinkCoordinator()
+        XCTAssertNil(coordinator.pendingManualTokenPair)
+
+        let payload = HermesURLRouter.PairPayload(
+            url: "http://127.0.0.1:9123", token: "", isDeviceToken: false, deviceId: nil, manualToken: true
+        )
+        coordinator.requestManualTokenPair(payload)
+        XCTAssertNotNil(coordinator.pendingManualTokenPair)
+        XCTAssertEqual(coordinator.pendingManualTokenPair?.url, "http://127.0.0.1:9123")
+
+        // clearManualTokenPair() leaves pendingPair untouched.
+        let pending = HermesURLRouter.PairPayload(
+            url: "https://b:9119", token: "t2", isDeviceToken: false, deviceId: nil, manualToken: false
+        )
+        coordinator.requestPairConfirmation(pending)
+        coordinator.clearManualTokenPair()
+        XCTAssertNil(coordinator.pendingManualTokenPair, "clearManualTokenPair must wipe the manual-token payload")
+        XCTAssertNotNil(coordinator.pendingPair, "clearManualTokenPair must not touch pendingPair")
+
+        // clear() wipes both.
+        coordinator.requestManualTokenPair(payload)
+        coordinator.clear()
+        XCTAssertNil(coordinator.pendingManualTokenPair)
         XCTAssertNil(coordinator.pendingPair)
     }
 
