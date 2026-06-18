@@ -373,6 +373,13 @@ final class ConnectionStore {
     /// The token for the active connection (kept in memory; also in Keychain).
     private var currentToken: String?
 
+    /// Injectable connect implementation (tests). When non-nil the reconnect
+    /// loop calls this closure instead of `client.connect(...)` — the same
+    /// pattern as `SessionStore.resumeRPC`. Defaults to `nil`; the live path
+    /// is taken in production (the nil-check is free). Set by unit tests to
+    /// make the loop deterministic without a live socket.
+    var connectRPC: ((_ url: URL, _ token: String, _ mode: ConnectionMode) async throws -> Void)?
+
     /// Tasks that live as long as the client: the event router and the
     /// state-change observer. Started once on the first successful configure.
     private var eventRouterTask: Task<Void, Never>?
@@ -1068,7 +1075,11 @@ final class ConnectionStore {
                 }
 
                 do {
-                    try await self.client.connect(baseURL: url, token: token, mode: self.connectionMode)
+                    if let hook = self.connectRPC {
+                        try await hook(url, token, self.connectionMode)
+                    } else {
+                        try await self.client.connect(baseURL: url, token: token, mode: self.connectionMode)
+                    }
                     if Task.isCancelled { return }
                     await self.recoverActiveSession()
                     self.phase = .connected
@@ -1225,6 +1236,20 @@ final class ConnectionStore {
     /// gate's stock-degradation step asserts this is `false` on a stock server.
     var devicesSectionVisible: Bool {
         capabilities.devices == .available
+    }
+
+    /// DEBUG-only test seam: seed the in-memory connection state as if a prior
+    /// `configure()` succeeded (stable URL + token stored, `hasConnected` true)
+    /// then arm and fire the reconnect loop. Exercises the restart-survival path
+    /// (4b) without a live socket: pair with `connectRPC` to inject a fake
+    /// transport sequence (fail-once-then-succeed, immediate auth-revocation, …).
+    ///
+    /// Must only be called from unit tests — absent in Release.
+    func _seedAndStartReconnect(serverURL: String, token: String) {
+        serverURLString = serverURL
+        currentToken = token
+        hasConnected = true
+        startReconnectLoop()
     }
     #endif
 

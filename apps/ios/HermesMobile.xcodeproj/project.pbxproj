@@ -145,6 +145,7 @@
 		B793C7AAA1032E48C1B4B364 /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = 10CB53B81CF0D9F21F2290DD /* GRDB */; };
 		B7B2D0DC4C7D5B89B224296E /* DeviceModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B688B30EDC0D211592AFA560 /* DeviceModels.swift */; };
 		BB96B106E7F853FFD2E9050B /* CacheStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C857D8802D9AE3D720CE706A /* CacheStore.swift */; };
+		BCB59825F9154396928FE6D9 /* ConnectionStoreReconnectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24872443B57B418F80C270E9 /* ConnectionStoreReconnectTests.swift */; };
 		BE280FFE9F7F1D5BCE674862 /* ThinkingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A9FA328FF7771B7CD32DCE4 /* ThinkingView.swift */; };
 		BE3A0BBEF190834ABE1FF6B8 /* RenderCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEA27F5DA2514ED03A75B7B7 /* RenderCache.swift */; };
 		BE54165FFE96DDBF320D2CCA /* PanelSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9EC36474D91C79C209F5633 /* PanelSupport.swift */; };
@@ -272,6 +273,7 @@
 		20EB0665F7B449305DB0FF7F /* DocumentScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentScanner.swift; sourceTree = "<group>"; };
 		22C028DF3C7C7CB7A5B0B9D8 /* ChromePill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChromePill.swift; sourceTree = "<group>"; };
 		236D30E205F8C4A5505670A0 /* HermesGatewayClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesGatewayClient.swift; sourceTree = "<group>"; };
+		24872443B57B418F80C270E9 /* ConnectionStoreReconnectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionStoreReconnectTests.swift; sourceTree = "<group>"; };
 		2549F85CE5DA277D62A84F5E /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		255CDADA7A910CD22C7239F1 /* PendingIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PendingIntent.swift; sourceTree = "<group>"; };
 		2643141FADF9A0BBA41EB4B0 /* MentionPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MentionPicker.swift; sourceTree = "<group>"; };
@@ -774,6 +776,7 @@
 				B4BB9FEA0A68AA2D6AB23F3B /* ChatStoreForeignMirrorTests.swift */,
 				FDE99B5373A56D4136876F8A /* ChatStoreSeedParityTests.swift */,
 				7F204B0D2DECE61198DC0214 /* ConnectionPhaseTests.swift */,
+				24872443B57B418F80C270E9 /* ConnectionStoreReconnectTests.swift */,
 				185C959B33CC2105062209B4 /* ContextMeterTests.swift */,
 				E11A41924097383D37603684 /* DeepLinkRouterTests.swift */,
 				E9D4BC09BAEC3E5BCC546F66 /* DevicesLiveTests.swift */,
@@ -1108,6 +1111,7 @@
 				3232D7ACF32443BBD3CF8DC2 /* ChatStoreForeignMirrorTests.swift in Sources */,
 				D240AECBED85AA6D2B161A83 /* ChatStoreSeedParityTests.swift in Sources */,
 				06147AA99077BD3C371688C3 /* ConnectionPhaseTests.swift in Sources */,
+				BCB59825F9154396928FE6D9 /* ConnectionStoreReconnectTests.swift in Sources */,
 				903A90AEE635376F613D0A73 /* ContextMeterTests.swift in Sources */,
 				C8FDBABB61DF3EEAC609590C /* DeepLinkRouterTests.swift in Sources */,
 				B50A5D2449D815A3E5C59264 /* DevicesLiveTests.swift in Sources */,
