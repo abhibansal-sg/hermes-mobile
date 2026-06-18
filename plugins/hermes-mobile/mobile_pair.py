@@ -57,6 +57,38 @@ from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import quote
 
+# ---------------------------------------------------------------------------
+# Increment 4a — Address stability types
+# ---------------------------------------------------------------------------
+
+# Stability values for ``_PairAddress.address_stability``.
+STABILITY_STABLE = "stable"       # MagicDNS hostname or fixed configured port
+STABILITY_EPHEMERAL = "ephemeral" # loopback ephemeral (short-lived port or IP)
+
+
+class _PairAddress:
+    """Result of ``_detect_pair_address()``.
+
+    Attributes
+    ----------
+    url : str
+        The resolved gateway URL to embed in the pair QR code.
+    address_stability : str
+        ``"stable"`` when the address is a MagicDNS hostname (``*.ts.net``) or
+        a fixed configured port that survives gateway restarts.
+        ``"ephemeral"`` when the address is loopback-ephemeral and may change
+        after a restart.
+    source : str
+        Human-readable description of how the address was resolved.
+    """
+
+    __slots__ = ("url", "address_stability", "source")
+
+    def __init__(self, url: str, address_stability: str, source: str) -> None:
+        self.url = url
+        self.address_stability = address_stability
+        self.source = source
+
 # The dashboard's default loopback port (see hermes_cli/main.py: the
 # `dashboard` subcommand defaults --port to 9119). A Tailscale Serve handler
 # whose Proxy targets this port is the dashboard's public HTTPS front door.
@@ -99,7 +131,17 @@ def mobile_pair_command(args) -> int:
     """Handle ``hermes mobile-pair``. Returns a process exit code."""
     override_url = getattr(args, "url", None)
 
-    dashboard_url = override_url or _detect_dashboard_url()
+    # Increment 4a: use _detect_pair_address() to get a stable address when
+    # possible.  An explicit --url override bypasses discovery (the operator
+    # chose the address; we trust it and mark it stable).
+    if override_url:
+        dashboard_url = override_url
+        address_stability = STABILITY_STABLE
+    else:
+        pair_addr = _detect_pair_address()
+        dashboard_url = pair_addr.url
+        address_stability = pair_addr.address_stability
+
     if not dashboard_url:
         _print_no_url_instructions()
         return 1
@@ -139,14 +181,20 @@ def mobile_pair_command(args) -> int:
             issued["token"],
             kind="device",
             device_id=issued["device_id"],
+            address_stability=address_stability,
         )
     else:
-        deep_link = _build_pair_link(dashboard_url, token)
+        deep_link = _build_pair_link(
+            dashboard_url,
+            token,
+            address_stability=address_stability,
+        )
 
     print()
     print("  Pair HermesMobile")
     print("  ─────────────────")
     print(f"  Server: {dashboard_url}")
+    print(f"  Address stability: {address_stability}")
     print("  Chat: start the dashboard with --tui or set HERMES_DASHBOARD_TUI=1.")
     print()
 
@@ -435,6 +483,187 @@ def _tailscale_serve_status() -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
+# ---------------------------------------------------------------------------
+# Increment 4a — Tailscale node status (MagicDNS resolution)
+# ---------------------------------------------------------------------------
+
+
+def _tailscale_node_status() -> Optional[dict]:
+    """Run ``tailscale status --json`` and return the parsed dict.
+
+    This is distinct from ``_tailscale_serve_status()`` (which calls
+    ``tailscale serve status --json``).  The node-status command exposes the
+    ``Self`` block which carries ``DNSName`` (the MagicDNS hostname, e.g.
+    ``mymac.tailnet.ts.net.``) and ``MagicDNSSuffix`` (e.g.
+    ``tailnet.ts.net``).  These are the two stable fields we read for address
+    stability.
+
+    Returns ``None`` on any failure (binary missing, non-zero exit, bad JSON,
+    timeout, or non-dict body).  Never raises.
+    """
+    binary = shutil.which("tailscale")
+    if not binary:
+        return None
+    try:
+        proc = subprocess.run(
+            [binary, "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _resolve_magicdns_hostname(port: int = DEFAULT_DASHBOARD_PORT) -> Optional[str]:
+    """Return a stable ``https://<magicdns-host>:<port>`` URL when this node is
+    on a Tailscale tailnet with MagicDNS enabled, or ``None`` otherwise.
+
+    Reads ``Self.DNSName`` from ``tailscale status --json``.  The DNSName
+    value typically has a trailing dot (e.g. ``mymac.tailnet.ts.net.``); we
+    strip it so the resulting URL is valid.
+
+    We require that ``MagicDNSSuffix`` is non-empty (confirming MagicDNS is
+    active on this tailnet) and that ``DNSName`` ends with the suffix.
+    If either condition fails we return ``None`` so the caller falls through
+    to the LAN / loopback path.
+
+    The port argument uses the same default as ``_detect_dashboard_url()``
+    (the dashboard's well-known loopback port) so callers don't need to pass
+    it unless they have a different serve port.
+    """
+    status = _tailscale_node_status()
+    if not isinstance(status, dict):
+        return None
+
+    self_node = status.get("Self")
+    if not isinstance(self_node, dict):
+        return None
+
+    dns_name: str = (self_node.get("DNSName") or "").strip().rstrip(".")
+    magic_suffix: str = (status.get("MagicDNSSuffix") or "").strip().rstrip(".")
+
+    if not dns_name or not magic_suffix:
+        return None
+
+    # Sanity: the hostname must end with the tailnet's MagicDNS suffix.
+    if not dns_name.endswith(magic_suffix):
+        return None
+
+    return f"https://{dns_name}:{port}"
+
+
+def _detect_serve_url(port: int = DEFAULT_DASHBOARD_PORT) -> Optional[str]:
+    """Extract the Tailscale Serve HTTPS front-door URL (without the Desktop
+    gateway discovery step).  Used internally by ``_detect_pair_address()`` so
+    the Tailscale Serve step is only reached when both MagicDNS and Desktop
+    discovery have already been tried.
+
+    Logic mirrors the Tailscale-Serve block in ``_detect_dashboard_url()``
+    exactly — kept in sync by construction (one helper, two callers).
+    """
+    status = _tailscale_serve_status()
+    if not status:
+        return None
+
+    web = status.get("Web") or {}
+    if not isinstance(web, dict):
+        return None
+
+    proxy_needle = f":{port}"
+    fallback: Optional[str] = None
+
+    for host_port, entry in web.items():
+        if not isinstance(entry, dict):
+            continue
+        handlers = entry.get("Handlers") or {}
+        if not isinstance(handlers, dict):
+            continue
+
+        if fallback is None:
+            fallback = f"https://{host_port}"
+
+        for _path, handler in handlers.items():
+            if not isinstance(handler, dict):
+                continue
+            proxy = handler.get("Proxy")
+            if isinstance(proxy, str) and proxy_needle in proxy:
+                return f"https://{host_port}"
+
+    return fallback
+
+
+def _detect_pair_address(port: int = DEFAULT_DASHBOARD_PORT) -> "_PairAddress":
+    """Resolve the best available pairing/dashboard URL with an explicit
+    ``address_stability`` signal.
+
+    Priority (first success wins)
+    --------------------------------
+    1. **Tailscale MagicDNS hostname** (``stable``) — ``tailscale status --json``
+       ``Self.DNSName``.  Reuses the same trusted Tailscale binary and JSON
+       parsing already used by ``_tailscale_serve_status()``; no new dependency.
+    2. **Desktop-owned gateway** (stability depends on source) — reads
+       ``connection.json`` as in Increment 3a.  A ``remote`` URL is ``stable``
+       (explicit configured address); a loopback probe result is ``ephemeral``.
+    3. **Tailscale Serve HTTPS front door** (``stable``) — existing Serve path
+       (``tailscale serve status --json``); Serve publishes over the MagicDNS
+       hostname so its result is stable.
+    4. **Loopback ephemeral fallback** (``ephemeral``) — ``None``-returning
+       fallback: returns a loopback URL on the default port, marked ephemeral.
+
+    This function is the increment-4a entry point.  ``_detect_dashboard_url()``
+    is kept UNCHANGED (returns ``Optional[str]``) so existing callers and tests
+    are unaffected.
+    """
+    # --- Priority 1: MagicDNS hostname ---
+    magicdns_url = _resolve_magicdns_hostname(port)
+    if magicdns_url:
+        return _PairAddress(
+            url=magicdns_url,
+            address_stability=STABILITY_STABLE,
+            source="tailscale magicdns",
+        )
+
+    # --- Priority 2: Desktop-owned gateway (connection.json) ---
+    desktop = _detect_local_desktop_gateway()
+    if desktop is not None:
+        # A remote URL is a configured, stable address.
+        # A loopback probe result is ephemeral (port may change after restart).
+        if "remote" in desktop.source:
+            stability = STABILITY_STABLE
+        else:
+            stability = STABILITY_EPHEMERAL
+        return _PairAddress(
+            url=desktop.url,
+            address_stability=stability,
+            source=f"connection.json ({desktop.source})",
+        )
+
+    # --- Priority 3: Tailscale Serve HTTPS front door ---
+    # Use _detect_serve_url() directly so we don't re-run Desktop discovery.
+    serve_url = _detect_serve_url(port)
+    if serve_url:
+        return _PairAddress(
+            url=serve_url,
+            address_stability=STABILITY_STABLE,
+            source="tailscale serve",
+        )
+
+    # --- Priority 4: Ephemeral loopback fallback ---
+    return _PairAddress(
+        url=f"http://127.0.0.1:{port}",
+        address_stability=STABILITY_EPHEMERAL,
+        source="loopback fallback",
+    )
+
+
 def _print_no_url_instructions() -> None:
     print(
         "\n  Couldn't auto-detect a public HTTPS URL for the dashboard.\n\n"
@@ -480,6 +709,7 @@ def _build_pair_link(
     *,
     kind: Optional[str] = None,
     device_id: Optional[str] = None,
+    address_stability: Optional[str] = None,
 ) -> str:
     """Build the ``hermesapp://pair`` deep link with percent-encoded query
     values so the scheme/host stay clean.
@@ -488,12 +718,21 @@ def _build_pair_link(
     ``--device-token``): ADDITIVE keys ``kind=device&device_id=<id>`` carrying a
     per-device token. ``token`` stays the credential key in BOTH versions so a
     v1 parser never breaks — it ignores the unknown ``kind``/``device_id`` keys
-    and treats ``token`` as before."""
+    and treats ``token`` as before.
+
+    Increment 4a: ``address_stability`` is an ADDITIVE optional key
+    (``addr_stability=stable|ephemeral``).  Absent when ``None`` so v1/v2
+    parsers that don't know about it are completely unaffected.  The iOS client
+    uses this hint to decide whether to persist the URL as a stable long-term
+    address or treat it as ephemeral.
+    """
     url_q = quote(dashboard_url, safe="")
     token_q = quote(token, safe="")
     link = f"{PAIR_SCHEME}://{PAIR_HOST}?url={url_q}&token={token_q}"
     if kind == "device" and device_id:
         link += f"&kind=device&device_id={quote(device_id, safe='')}"
+    if address_stability:
+        link += f"&addr_stability={quote(address_stability, safe='')}"
     return link
 
 
