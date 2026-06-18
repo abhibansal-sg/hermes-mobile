@@ -760,6 +760,14 @@ final class ConnectionStore {
             sessionStore.startDraft()
         }
         phase = .connected
+        // Enforce the invariant `phase == .connected ⟹ hasConnected == true`.
+        // The normal path (configure() → client.connect() succeeds) already sets
+        // `hasConnected = true` before finishHydration() runs, so this is
+        // idempotent there. The direct-call path (unit tests, and any future
+        // re-hydration shortcut) was missing this set — the tests in #23 and the
+        // RootView gate both rely on the invariant, so we enforce it here rather
+        // than relying on the caller to have set it first.
+        hasConnected = true
         // Safety net: if the hydration race was won by the hard timeout branch,
         // branch 1's model probe was cancelled mid-flight and the composer chip
         // would render empty. Re-run the probe (best-effort, off the reveal path)
