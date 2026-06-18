@@ -31,7 +31,13 @@ final class ChatStoreBatchCStreamTests: XCTestCase {
             type: "reasoning.delta", payload: .object(["text": .string("think ")])))
         chat.handle(event: localFrame(
             type: "message.delta", payload: .object(["text": .string("answer")])))
-        try await Task.sleep(for: .milliseconds(120))  // let the one flush land
+        // Deterministic drain: cancel the 40ms coalescing Task and call
+        // flushBuffers() directly — no wall-clock dependency (CI-safe).
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #else
+        try await Task.sleep(for: .milliseconds(120))
+        #endif
 
         let message = try XCTUnwrap(chat.messages.last)
         let kinds = message.parts.map { part -> String in

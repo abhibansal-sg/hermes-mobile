@@ -340,7 +340,13 @@ final class ChatStoreBatchBTests: XCTestCase {
         sessions.open(summary("stored-A"))   // fast-path fetch suspends
         await settle()
         sessions.open(summary("stored-B"))   // newer open supersedes A
+        // Deterministic await: wait for stored-B's seed Task (including the
+        // normalizeOffMain Task.detached) to complete — no wall-clock dependency.
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertEqual(chat.messages.map(\.text), ["SESSION B"])
 
         gate.release()                        // A's stale fetch finally lands

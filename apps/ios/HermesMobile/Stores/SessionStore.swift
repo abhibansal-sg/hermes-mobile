@@ -1545,6 +1545,26 @@ final class SessionStore {
     /// superseded open (the user tapped another session) checks it and bails.
     private var openToken = UUID()
 
+    #if DEBUG
+    /// DEBUG-only handle to the most recent open-seed Task. Stored so tests can
+    /// `await` it without depending on wall-clock `settle()`. Set by `open()`
+    /// before the seed Task is spawned; `nil` when no open is in flight.
+    /// Never compiled into Release.
+    private(set) var lastOpenSeedTask: Task<Void, Never>?
+
+    /// DEBUG-only: await the most recently spawned open-seed Task, then yield
+    /// once so any main-actor mutations it enqueued have a chance to propagate.
+    /// Call this in tests INSTEAD OF (or after) `settle()` to deterministically
+    /// wait for the seed to land without a wall-clock timeout.
+    func waitForPendingOpenForTesting() async {
+        await lastOpenSeedTask?.value
+        // One additional cooperative yield so `@Observable` write propagations
+        // that happen synchronously inside the seed Task's final await have
+        // settled before the test asserts.
+        await Task.yield()
+    }
+    #endif
+
     /// - Parameter revealOnFirstPaint: SMOOTHNESS R40 (Defect: "the transcript
     ///   moves before the chat-view layer on close"). When the drawer hands off a
     ///   row tap it passes its close here instead of firing it itself. We invoke
@@ -1608,11 +1628,14 @@ final class SessionStore {
         // session's rows can't linger), which is the state ChatView renders as the
         // skeleton/placeholder until the network seed lands. The deferred network
         // fetch then reconciles in place over either starting point.
-        Task { [weak self] in
+        let seedTask = Task { [weak self] in
             guard let self, self.openToken == token else { return }
             await self.seedTranscriptCacheFirst(
                 storedId: summary.id, token: token, onFirstPaint: revealOnFirstPaint)
         }
+        #if DEBUG
+        lastOpenSeedTask = seedTask
+        #endif
 
         // Slow path: gateway resume — spins up the agent server-side; only
         // prompt submission depends on it.

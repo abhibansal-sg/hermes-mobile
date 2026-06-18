@@ -660,7 +660,7 @@ final class ChatStore {
             // records the placeholder id in `pendingForeignReconcileID`; the seed's
             // `reconcileMessages` consumes it.
             teardownForeignStream(preservePlaceholderForReconcile: true)
-            Task {
+            let backfillTask = Task {
                 await self.backfill()
                 // A foreign-mirrored turn ending is a turn completion too: the
                 // stored session just went idle, so let the queue drain into it
@@ -671,6 +671,9 @@ final class ChatStore {
                 // would discard the mirror's reconciled text).
                 self.onTurnComplete?()
             }
+            #if DEBUG
+            lastForeignBackfillTask = backfillTask
+            #endif
             // The REST backfill is the authoritative reconcile for a mirrored turn;
             // we do not also run the frame through `handleMessageComplete` (which
             // would mutate a now torn-down streaming message).
@@ -1388,6 +1391,37 @@ final class ChatStore {
         flushTask = nil
         flushBuffers()
     }
+
+    #if DEBUG
+    /// DEBUG-only deterministic drain hook for unit tests.
+    ///
+    /// Cancels the pending 40ms coalescing Task and calls the SAME `flushBuffers()`
+    /// the production path would call — guaranteeing the buffered text/thinking is
+    /// applied to `messages` synchronously, with no wall-clock dependency.
+    ///
+    /// Zero production-behavior change: the method is `#if DEBUG`-gated and only
+    /// force-runs logic that already runs in production (on the flush Task's
+    /// natural firing). Never compiled into Release.
+    func drainFlushForTesting() {
+        flushTask?.cancel()
+        flushTask = nil
+        flushBuffers()
+    }
+
+    /// DEBUG-only handle to the most recent foreign-complete backfill Task.
+    /// Stored by `handleForeignFrame` when a foreign `message.complete` (or
+    /// `error`) fires the `Task { await backfill() }`. Tests await this to
+    /// deterministically wait for the REST reconcile without wall-clock settle().
+    /// Never compiled into Release.
+    private(set) var lastForeignBackfillTask: Task<Void, Never>?
+
+    /// DEBUG-only: await the most recently spawned foreign-backfill Task, then
+    /// yield once so any main-actor mutations have propagated before assertions.
+    func waitForPendingForeignBackfillForTesting() async {
+        await lastForeignBackfillTask?.value
+        await Task.yield()
+    }
+    #endif
 
     // MARK: - Streaming-message mutation helpers
 

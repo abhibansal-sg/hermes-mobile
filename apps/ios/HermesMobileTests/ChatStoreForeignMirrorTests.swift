@@ -202,7 +202,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
             type: "message.delta", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "TEST"]))
 
-        await settle()  // let the 40ms flush apply the buffered deltas
+        // Deterministic drain: cancel the 40ms coalescing Task and call
+        // flushBuffers() directly — no wall-clock dependency (CI-safe).
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #else
+        await settle()
+        #endif
 
         XCTAssertTrue(
             chat.messages.contains { $0.role == .assistant && $0.text.contains("MIRRORTEST") },
@@ -405,7 +411,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.delta", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "TEST"]))
+        // Deterministic drain: cancel the 40ms coalescing Task and call
+        // flushBuffers() directly — no wall-clock dependency (CI-safe).
+        #if DEBUG
+        chat.drainFlushForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertTrue(
             chat.messages.contains { $0.role == .assistant && $0.text.contains("MIRRORTEST") },
             "adopted foreign deltas must render even though they arrived while runtime was nil")
@@ -418,7 +430,13 @@ final class ChatStoreForeignMirrorTests: XCTestCase {
         chat.handle(event: foreignFrame(
             type: "message.complete", runtime: foreignRuntime, stored: storedId,
             payload: ["text": "MIRRORTEST reply", "status": "completed"]))
+        // Deterministic backfill drain: await the Task { await backfill() } that
+        // handleForeignFrame spawns on message.complete — no wall-clock settle().
+        #if DEBUG
+        await chat.waitForPendingForeignBackfillForTesting()
+        #else
         await settle()
+        #endif
         XCTAssertTrue(fetched, "foreign complete must reconcile via backfill")
         XCTAssertFalse(chat.isStreaming, "streaming must clear after the mirrored turn reconciles")
         XCTAssertTrue(
