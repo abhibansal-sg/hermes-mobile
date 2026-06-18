@@ -52,7 +52,9 @@ of truth for tasks — nothing to clone; just sign in.
 **WHERE THINGS STAND (2026-06-17 — PUBLIC LAUNCH SHIPPED):** Full current state in
 `.agent-memory/project_hermes_mobile.md` (top block). Summary: **public repo LIVE**
 (github.com/ab0991-oss/hermes-ios — MIT, clean history, PRIVACY.md), **build 50
-VALID on TestFlight** (1.0.1) and **submitted for EXTERNAL Beta App Review**. **3
+VALID on TestFlight** (1.0.1); **EXTERNAL beta is LIVE — public link
+https://testflight.apple.com/join/TeMvfFaS** (README Option 1 + LAUNCH-POSTS.md
+finalized with the link; user about to post the X/Discord announcement). **3
 upstream PRs** to NousResearch — #47530 session.delete evict (S6), #47535
 role-scoped search, #47538 fast/reasoning session-scope (S4) — + **issue #47541**
 (observability-hooks appetite; gates the hook + 2 auth PRs). Fork =
