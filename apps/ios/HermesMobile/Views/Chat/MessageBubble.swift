@@ -252,6 +252,19 @@ struct MessageBubble: View {
                     .accessibilityHint("Double-tap to \(userBubbleExpanded ? "collapse message" : "expand message")")
                 }
             }
+            // A11y: settled user bubbles get a combined VoiceOver element so the
+            // turn reads as one utterance ("You said: …") rather than separate
+            // focus stops for the text and the "Read more" button. Streaming is
+            // never true for a user message today, but the guard mirrors the
+            // assistant path so the contract is explicit and future-safe.
+            .if(!message.isStreaming) { bubble in
+                bubble
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(MessageBubble.bubbleAccessibilityLabel(
+                        role: message.role,
+                        text: message.text
+                    ))
+            }
             .modifier(PerfUserBubbleChrome())
             .frame(maxWidth: maxBubbleWidth, alignment: .trailing)
         }
@@ -301,15 +314,40 @@ struct MessageBubble: View {
 
         // CC-05/CC-07: bump part spacing from 8 → 10 for consistent vertical
         // rhythm that matches the user bubble's ~9pt vertical breathing room.
+        //
+        // A11y: the outer VStack holds TWO distinct concerns:
+        //   1. `proseContainer` — all rendered parts (reasoning, tools, text,
+        //      warning, usage). Gets `.accessibilityElement(children: .combine)`
+        //      on SETTLED turns so VoiceOver reads the turn as one utterance
+        //      ("Assistant said: …"). No combine while streaming — zero extra
+        //      work on the hot streaming path.
+        //   2. `assistantActionRow` — copy / share / speak / retry buttons.
+        //      Kept OUTSIDE the combined element so each action remains a
+        //      separately-reachable VoiceOver target.
         return VStack(alignment: .leading, spacing: 10) {
-            ForEach(parts) { part in
-                assistantPart(part, showsCursor: message.isStreaming && part.id == lastTextPartID)
+            // --- Prose / parts container (combine target) ---
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(parts) { part in
+                    assistantPart(part, showsCursor: message.isStreaming && part.id == lastTextPartID)
+                }
+                if needsStandaloneCursor {
+                    // CC-01: standalone cursor inherits the pulse animation.
+                    cursorView
+                        .font(.body)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
-            if needsStandaloneCursor {
-                // CC-01: standalone cursor inherits the pulse animation.
-                cursorView
-                    .font(.body)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            // A11y: combine ONLY on settled turns. Streaming bubbles keep their
+            // children individually accessible (and the Equatable short-circuit in
+            // ChatView already skips re-evaluating settled bubbles entirely, so
+            // this branch never runs at streaming frequency for settled rows).
+            .if(!message.isStreaming) { prose in
+                prose
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(MessageBubble.bubbleAccessibilityLabel(
+                        role: message.role,
+                        text: message.text
+                    ))
             }
 
             // Action row under each COMPLETED assistant turn (F3): thin line
@@ -664,6 +702,32 @@ struct MessageBubble: View {
         guard usage.input != nil || usage.output != nil else { return nil }
         return (usage.input ?? 0) + (usage.output ?? 0)
     }
+
+    // MARK: - A11y: combined element label construction
+
+    /// Returns the VoiceOver label for a settled bubble's combined accessibility
+    /// element: "You said: {text}" for user turns, "Assistant said: {text}" for
+    /// assistant turns. Extracted as a testable `static` so unit tests can verify
+    /// the label without instantiating a View.
+    ///
+    /// `nonisolated` so the function can be called from any concurrency context
+    /// (e.g. test cases running off the main actor) without a warning — it is a
+    /// pure function over two `Sendable` value types.
+    ///
+    /// `text` should be the concatenated prose from `ChatMessage.text` (the ordered
+    /// `.text`-part concat); callers pass it in so the function is pure.
+    nonisolated static func bubbleAccessibilityLabel(role: ChatRole, text: String) -> String {
+        switch role {
+        case .user:
+            return "You said: \(text)"
+        case .assistant:
+            return "Assistant said: \(text)"
+        case .system:
+            return "System: \(text)"
+        case .tool:
+            return "Tool: \(text)"
+        }
+    }
 }
 
 private extension Array where Element == ChatMessagePart {
@@ -719,9 +783,40 @@ extension MessageBubble: Equatable {
     /// `Sendable` storage — all three reads below are `let`s of `Sendable` type.
     /// The action closures are intentionally excluded (not `Sendable`; their nil-ness
     /// is stable per call site), so they cannot strand a real update.
+    ///
+    /// A11y note: `bubbleAccessibilityLabel` is derived from `message.role` and
+    /// `message.text`, both of which are already compared via `message ==` above —
+    /// so the combined element's label is implicitly covered by the existing `==`.
+    /// No changes to the short-circuit logic are needed.
     nonisolated static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
         lhs.message == rhs.message
             && lhs.menuActionsEnabled == rhs.menuActionsEnabled
             && lhs.appearance == rhs.appearance
+    }
+}
+
+// MARK: - View.if conditional modifier
+
+private extension View {
+    /// Conditionally applies a modifier transform to a View.
+    ///
+    /// Used in `MessageBubble` to apply `.accessibilityElement(children: .combine)`
+    /// ONLY on settled (non-streaming) bubbles, so the streaming hot-path carries
+    /// zero accessibility overhead. Swift's type system requires the conditional to
+    /// return the same opaque type in both branches — `@ViewBuilder` achieves that.
+    ///
+    /// - Parameters:
+    ///   - condition: When `true` the transform is applied; `false` returns the
+    ///     receiver unchanged.
+    ///   - transform: A `@ViewBuilder` closure that applies the desired modifier(s).
+    @ViewBuilder func `if`<T: View>(
+        _ condition: Bool,
+        transform: (Self) -> T
+    ) -> some View {
+        if condition {
+            transform(self)
+        } else {
+            self
+        }
     }
 }
