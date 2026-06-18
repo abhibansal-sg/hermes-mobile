@@ -168,35 +168,66 @@ async function cmdTrigger(workflowId, gitRef) {
     die('Usage: asc-cloud.mjs trigger <workflowId> <gitRef>\n  e.g. trigger abc123 refs/heads/phase2-upstream-rebase');
   }
 
-  // Normalize bare branch names to full refs
-  const ref = gitRef.startsWith('refs/') ? gitRef : `refs/heads/${gitRef}`;
+  // Normalize: strip refs/heads/ prefix to get a plain branch name
+  const branchName = gitRef.startsWith('refs/heads/')
+    ? gitRef.slice('refs/heads/'.length)
+    : gitRef;
 
-  console.log(`Triggering workflow ${workflowId} on ${ref}…`);
+  console.log(`Triggering workflow ${workflowId} on branch "${branchName}"…`);
 
+  // Step 1: Resolve the workflow's repository
+  console.log(`  Resolving repository for workflow ${workflowId}…`);
+  const wfData = await ascFetch('GET', `/ciWorkflows/${workflowId}?include=repository`);
+  const repoRel = wfData?.data?.relationships?.repository?.data;
+  if (!repoRel?.id) {
+    throw new Error(`Could not resolve repository for workflow ${workflowId}. Response: ${JSON.stringify(wfData)}`);
+  }
+  const repoId = repoRel.id;
+  console.log(`  Repository id: ${repoId}`);
+
+  // Step 2: List git references for the repository and find the matching branch
+  console.log(`  Fetching git references for repository ${repoId}…`);
+  const allRefs = await ascFetchAll(`/scmRepositories/${repoId}/gitReferences?limit=200`);
+  const matchedRef = allRefs.find(
+    r => r.attributes?.kind === 'BRANCH' && r.attributes?.name === branchName
+  );
+
+  if (!matchedRef) {
+    const availableBranches = allRefs
+      .filter(r => r.attributes?.kind === 'BRANCH')
+      .map(r => r.attributes?.name)
+      .filter(Boolean)
+      .slice(0, 10);
+    throw new Error(
+      `Branch "${branchName}" not found in scmGitReferences for repository ${repoId}.\n` +
+      `Available branches (first 10): ${availableBranches.join(', ')}\n` +
+      `Total refs fetched: ${allRefs.length}`
+    );
+  }
+
+  const gitReferenceId = matchedRef.id;
+  console.log(`  Resolved branch "${branchName}" → scmGitReferences id: ${gitReferenceId}`);
+
+  // Step 3: POST /v1/ciBuildRuns with sourceBranchOrTag relationship (no sourceCommitSha)
   const body = {
     data: {
       type: 'ciBuildRuns',
       relationships: {
         workflow: { data: { type: 'ciWorkflows', id: workflowId } },
-      },
-      attributes: {
-        sourceCommitSha: null, // use latest on the ref
+        sourceBranchOrTag: { data: { type: 'scmGitReferences', id: gitReferenceId } },
       },
     },
-  };
-
-  // The gitReference relationship selects the branch/tag
-  body.data.relationships.sourceBranchOrTag = {
-    data: { type: 'scmGitReferences', id: ref },
   };
 
   const res = await ascFetch('POST', '/ciBuildRuns', body);
   const run = res?.data;
   if (!run) throw new Error('Unexpected empty response from ciBuildRuns POST');
 
+  const buildNumber = run.attributes?.number ?? '—';
   console.log(`\nBuild run created:`);
-  console.log(`  ID:     ${run.id}`);
-  console.log(`  Status: ${run.attributes?.executionProgress ?? 'PENDING'}`);
+  console.log(`  ID:          ${run.id}`);
+  console.log(`  Build #:     ${buildNumber}`);
+  console.log(`  Status:      ${run.attributes?.executionProgress ?? 'PENDING'}`);
   console.log(`\nUse: node asc-cloud.mjs wait ${run.id}`);
 }
 
