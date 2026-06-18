@@ -1282,6 +1282,11 @@ private struct QueueSheet: View {
                                 queueStore.remove(id: queueStore.items[index].id)
                             }
                         }
+                        // Drag-to-reorder: tapping the EditButton (leading toolbar)
+                        // shows grab handles; releasing persists the new order.
+                        .onMove { source, destination in
+                            queueStore.move(fromOffsets: source, toOffset: destination)
+                        }
                     }
                     .scrollContentBackground(.hidden)
                     .background(theme.bg)
@@ -1292,6 +1297,10 @@ private struct QueueSheet: View {
             .navigationTitle("Queued (\(queueStore.items.count))")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                // EditButton toggles the List's edit mode so drag handles appear.
+                ToolbarItem(placement: .topBarLeading) {
+                    EditButton()
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }

@@ -111,6 +111,16 @@ final class QueueStore {
         persist()
     }
 
+    /// Reorder queued prompts using the standard `IndexSet → Int` move idiom
+    /// (produced by SwiftUI's `List` `.onMove` handler). No-op on a 0- or
+    /// 1-item queue. The new order is persisted immediately, so a force-quit
+    /// after reorder does not revert the user's arrangement.
+    func move(fromOffsets source: IndexSet, toOffset destination: Int) {
+        guard items.count > 1 else { return }
+        items.move(fromOffsets: source, toOffset: destination)
+        persist()
+    }
+
     /// Re-stamp queued prompts from an old stored-session id to its compression
     /// continuation (chain tip). When a `session.resume` follows a chain tip, the
     /// active stored id swaps parent → continuation; a prompt queued under the
