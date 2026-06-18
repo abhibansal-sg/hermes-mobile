@@ -278,4 +278,19 @@ enum DefaultsKeys {
         return raw
     }
 
+    // MARK: Connection mode (Increment 1 — Topology B)
+
+    /// `String` (raw value of `ConnectionMode`) — the chosen connection mode.
+    /// Absent/unrecognised values fall back to `.remoteURL` (the legacy default:
+    /// the URL+token form the app already uses for all pairing). Owned by
+    /// ``ConnectionStore``.
+    static let connectionMode = "hermes.connectionMode"
+
+    /// Read + decode the persisted ``ConnectionMode``. Returns `.remoteURL` when
+    /// unset (existing installs keep the existing behaviour unchanged).
+    static func connectionModeValue(_ defaults: UserDefaults = .standard) -> ConnectionMode {
+        let raw = defaults.string(forKey: connectionMode) ?? ""
+        return ConnectionMode(rawValue: raw) ?? .remoteURL
+    }
+
 }

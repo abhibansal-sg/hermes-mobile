@@ -2,21 +2,16 @@ import SwiftUI
 
 /// First-run brand moment shown when ``ConnectionStore/Phase`` is `.needsSetup`.
 ///
-/// Owns the `needsSetup` surface (B1 routes to it from ``RootView``). Two paths
-/// off the welcome screen:
-///   - **Scan pairing code** (primary) — presents ``QRScannerView`` full-screen,
-///     which scans `hermesapp://pair?url=…&token=…` and calls
-///     `ConnectionStore.configure`. On success the phase flips to `.connected`
-///     and `RootView` re-renders into the main UI.
-///   - **Enter manually** (secondary) — presents the existing
-///     ``ConnectionSetupView`` (the URL+token form, kept as the manual fallback)
-///     in a native slide-up `.sheet` with `[.medium, .large]` detents (ABH-75),
-///     wrapped in its own `NavigationStack` with a Cancel toolbar item and the
-///     theme re-installed inside the sheet.
+/// Owns the `needsSetup` surface (B1 routes to it from ``RootView``). Three
+/// paths off the welcome screen — one per ``ConnectionMode``:
+///   - **Shared dashboard** (QR) — presents ``QRScannerView`` full-screen.
+///   - **Remote URL / Local desktop** — presents ``ConnectionSetupView`` (the
+///     URL+token form) in a native slide-up sheet. Local desktop defaults the
+///     URL field to a LAN/loopback hint; real discovery is Increment 3.
 ///
-/// Hosts its own `NavigationStack` (it is a phase root, mirroring the old
-/// `ConnectionSetupView`), re-installs the theme at the root, and pins the brand
-/// accent to `theme.midground` per the contract.
+/// The user first picks a mode via the segmented mode picker; the CTA below
+/// it adapts to that choice. The selected mode is persisted so a relaunch
+/// lands on the same mode.
 struct WelcomeView: View {
     @Environment(ConnectionStore.self) private var connection
     @Environment(ThemeStore.self) private var themeStore
@@ -25,9 +20,12 @@ struct WelcomeView: View {
     /// Drives the full-screen QR scanner presentation.
     @State private var showingScanner = false
 
-    /// Drives the slide-up manual-setup sheet (ABH-75). Replaces the prior
-    /// navigation-push path off "Enter manually".
+    /// Drives the slide-up manual-setup sheet.
     @State private var showingManualSetup = false
+
+    /// The mode the user is picking. Initialized from the persisted value so
+    /// relaunches land on the previously-chosen mode.
+    @State private var selectedMode: ConnectionMode = .remoteURL
 
     var body: some View {
         NavigationStack {
@@ -48,6 +46,10 @@ struct WelcomeView: View {
 
                 Spacer(minLength: 24)
 
+                modePicker
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 16)
+
                 actionButtons
                     .padding(.horizontal, 24)
                     .padding(.bottom, 24)
@@ -55,19 +57,22 @@ struct WelcomeView: View {
             .animation(.easeInOut(duration: 0.2), value: connection.reauthRequired)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(theme.bg)
+            .onAppear {
+                // Sync from persisted value on every appearance.
+                selectedMode = connection.connectionMode
+            }
             .fullScreenCover(isPresented: $showingScanner) {
                 QRScannerView()
                     .hermesThemed(themeStore)
             }
-            // ABH-75: the manual URL+token form slides up as a native sheet with
-            // medium/large detents and a drag indicator, instead of a nav push.
-            // Its own NavigationStack hosts the form's inline title + a Cancel
-            // toolbar item; the theme is re-installed inside the sheet because
-            // SwiftUI does not reliably inherit custom environment values across
-            // presentation boundaries (mirrors RootView's inbox-sheet pattern).
+            // The manual URL+token form slides up as a native sheet with
+            // medium/large detents and a drag indicator. Its own NavigationStack
+            // hosts the form's inline title + a Cancel toolbar item; the theme is
+            // re-installed inside the sheet because SwiftUI does not reliably
+            // inherit custom environment values across presentation boundaries.
             .sheet(isPresented: $showingManualSetup) {
                 NavigationStack {
-                    ConnectionSetupView()
+                    ConnectionSetupView(initialMode: selectedMode)
                         .toolbar {
                             ToolbarItem(placement: .cancellationAction) {
                                 Button("Cancel") { showingManualSetup = false }
@@ -80,6 +85,57 @@ struct WelcomeView: View {
             }
         }
         .hermesThemed(themeStore)
+    }
+
+    // MARK: - Mode picker
+
+    /// A segmented-style picker that lets the user choose between the three
+    /// connection topologies. Persists the choice immediately so the next
+    /// relaunch lands on the same mode.
+    private var modePicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("How do you want to connect?")
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(theme.mutedFg)
+
+            HStack(spacing: 8) {
+                ForEach(ConnectionMode.allCases, id: \.self) { mode in
+                    modeButton(mode)
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private func modeButton(_ mode: ConnectionMode) -> some View {
+        let selected = selectedMode == mode
+        return Button {
+            selectedMode = mode
+            connection.connectionMode = mode
+        } label: {
+            VStack(spacing: 4) {
+                Image(systemName: mode.systemImage)
+                    .font(.body)
+                Text(mode.label)
+                    .font(.caption.weight(.medium))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .padding(.horizontal, 4)
+        }
+        .foregroundStyle(selected ? theme.midground.contrastingForeground : theme.fg)
+        .background(
+            selected ? theme.midground : theme.secondary,
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(selected ? Color.clear : theme.border, lineWidth: 1)
+        )
+        .accessibilityIdentifier("connectionModeButton_\(mode.rawValue)")
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
     }
 
     // MARK: - Re-pair banner
@@ -144,44 +200,70 @@ struct WelcomeView: View {
 
     // MARK: - Actions
 
+    /// The CTA adapts to the selected mode:
+    /// - Shared dashboard → primary = scan QR, secondary = enter manually.
+    /// - Remote URL / Local desktop → primary = enter URL+token form.
+    @ViewBuilder
     private var actionButtons: some View {
         VStack(spacing: 12) {
-            Button {
-                showingScanner = true
-            } label: {
-                Label("Scan pairing code", systemImage: "qrcode.viewfinder")
+            switch selectedMode {
+            case .sharedDashboard:
+                Button {
+                    showingScanner = true
+                } label: {
+                    Label("Scan pairing code", systemImage: "qrcode.viewfinder")
+                        .font(.body.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 52)
+                }
+                .foregroundStyle(theme.midground.contrastingForeground)
+                .background(theme.midground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                // ESC-03: surface the scanner intent via an a11y hint so VoiceOver
+                // users understand this opens a camera before activating.
+                .accessibilityHint("Opens the camera to scan a QR code from hermes mobile-pair")
+                .accessibilityIdentifier("scanQRButton")
+
+                Button {
+                    showingManualSetup = true
+                } label: {
+                    Text("Enter manually")
+                        .font(.body.weight(.medium))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 52)
+                }
+                .foregroundStyle(theme.fg)
+                .background(theme.secondary, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(theme.border, lineWidth: 1)
+                )
+                // ESC-03: manual-entry hint for VoiceOver users.
+                .accessibilityHint("Opens a form to enter the gateway URL and token directly")
+                .accessibilityIdentifier("enterManuallyButton")
+
+            case .remoteURL, .localDesktop:
+                Button {
+                    showingManualSetup = true
+                } label: {
+                    Label(
+                        selectedMode == .localDesktop
+                            ? "Enter local gateway address"
+                            : "Enter gateway URL",
+                        systemImage: selectedMode == .localDesktop ? "desktopcomputer" : "link"
+                    )
                     .font(.body.weight(.semibold))
                     .frame(maxWidth: .infinity)
                     .frame(height: 52)
+                }
+                .foregroundStyle(theme.midground.contrastingForeground)
+                .background(theme.midground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .accessibilityIdentifier("enterURLButton")
             }
-            .foregroundStyle(theme.midground.contrastingForeground)
-            .background(theme.midground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            // ESC-03: surface the scanner intent via an a11y hint so VoiceOver
-            // users understand this opens a camera before activating.
-            .accessibilityHint("Opens the camera to scan a QR code from hermes mobile-pair")
 
-            Button {
-                showingManualSetup = true
-            } label: {
-                Text("Enter manually")
-                    .font(.body.weight(.medium))
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 52)
-            }
-            .foregroundStyle(theme.fg)
-            .background(theme.secondary, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(theme.border, lineWidth: 1)
-            )
-            // ESC-03: manual-entry hint for VoiceOver users.
-            .accessibilityHint("Opens a form to enter the gateway URL and token directly")
-
-            // A1 — onboarding for self-hosters with NO gateway yet. The two
-            // buttons above both assume a running hermes-agent gateway; a new
-            // user from the public TestFlight link needs to be told what that is
-            // and how to get one. Tertiary, text-only so it never competes with
-            // the primary scan/manual CTAs.
+            // A1 — onboarding for self-hosters with NO gateway yet. The button
+            // above assumes a running hermes-agent gateway; a new user from the
+            // public TestFlight link needs to be told what that is and how to get
+            // one. Tertiary, text-only so it never competes with the primary CTAs.
             Link(destination: HelpLinks.setupGuide) {
                 Text("New to Hermes? How to set up a gateway")
                     .font(.footnote.weight(.medium))

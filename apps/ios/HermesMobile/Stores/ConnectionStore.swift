@@ -67,6 +67,14 @@ final class ConnectionStore {
     #endif
     var serverURLString: String = ""
 
+    /// The active connection mode (persisted in UserDefaults alongside
+    /// ``serverURLString``). Defaults to `.remoteURL` for existing installs
+    /// (no-migration). Writing persists immediately via the setter.
+    var connectionMode: ConnectionMode {
+        get { DefaultsKeys.connectionModeValue() }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: DefaultsKeys.connectionMode) }
+    }
+
     /// Set when a *configured* connection is rejected for authentication
     /// (HTTP 401/403 on the REST probe, or the WS handshake is rejected for auth
     /// repeatedly). The shell reads this alongside `.needsSetup` to route to

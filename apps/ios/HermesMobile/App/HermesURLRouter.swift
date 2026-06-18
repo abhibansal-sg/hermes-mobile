@@ -304,6 +304,12 @@ enum HermesURLRouter {
     /// pairing deep link. Shared by the direct (unconfigured) path and the
     /// confirmed (was-connected) path so both run byte-identical `configure`s.
     static func applyPair(_ payload: PairPayload, connection: ConnectionStore) {
+        // A `kind=device` QR payload comes from `hermes mobile-pair` (shared
+        // dashboard flow) — mark the mode so the picker reflects what the user
+        // actually did. A v1 (no kind) payload keeps whatever mode was selected.
+        if payload.isDeviceToken {
+            connection.connectionMode = .sharedDashboard
+        }
         Task {
             _ = await connection.configure(
                 urlString: payload.url,

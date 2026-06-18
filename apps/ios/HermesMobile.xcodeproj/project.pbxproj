@@ -40,6 +40,7 @@
 		283558C51FB90E1A8E08814B /* CodeBlockView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A60E8ABAAC1CD00A2F23FBF /* CodeBlockView.swift */; };
 		293F5F6A9DB97C16CF2EF885 /* JSONValue.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9C6A3451D3909FDD94C1468 /* JSONValue.swift */; };
 		2AA0F8C66F1C9F752A029150 /* ApprovalCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4045A9693A851AB3BB7589A8 /* ApprovalCard.swift */; };
+		2CA4860A835ADF0F01EAE69F /* ConnectionModePickerUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D029CC4EA55FAAB71D3AA4D3 /* ConnectionModePickerUITests.swift */; };
 		2CDBD606C806A0897D6C70F0 /* DevicesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7415F1022EC37DEE884D4629 /* DevicesView.swift */; };
 		2ECBBD89549D0E2916F1DBF2 /* BatchGTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48DF3123FEA22B7F3DA2A38C /* BatchGTests.swift */; };
 		31165D99B641B1D3DE678F62 /* MentionCompletion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01E6D69ED0E4210BAF05D00F /* MentionCompletion.swift */; };
@@ -93,6 +94,7 @@
 		7B03EA34CA03E97F1BDFF6B9 /* SharedStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F68ABDFD79AE8CA0E12069F5 /* SharedStore.swift */; };
 		7B5BF26785CFA4741743C94B /* ChatStoreF4ATests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AED0A12B048B9FFDDAEF815 /* ChatStoreF4ATests.swift */; };
 		7BB35989069A769F80A8412C /* WorkingDirectory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FB2B9112BE331DC9936D694 /* WorkingDirectory.swift */; };
+		7F5D97CEBF633C917292FB2C /* ConnectionMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CC10F89B2FA3A66A6A5977C /* ConnectionMode.swift */; };
 		82EAFBE8ADF099C70D5CB431 /* GamboardL03Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B53D03C61746CA48FDD7B53D /* GamboardL03Tests.swift */; };
 		82FE37F2F85AE0F236380F0E /* AttachmentStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7EE5F3863A3EA975DE8F9296 /* AttachmentStore.swift */; };
 		849B0B579AA10A849453A709 /* ChatStoreBatchCTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B6EBAF51189FE222559CCBC1 /* ChatStoreBatchCTests.swift */; };
@@ -252,6 +254,7 @@
 		0346A7AF6A3646150E131961 /* ClarifyBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClarifyBanner.swift; sourceTree = "<group>"; };
 		0B493ECAAA09AFD2AA200978 /* SecurePromptView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecurePromptView.swift; sourceTree = "<group>"; };
 		0C028EAA9312823746769CE4 /* VoiceRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRecorder.swift; sourceTree = "<group>"; };
+		0CC10F89B2FA3A66A6A5977C /* ConnectionMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionMode.swift; sourceTree = "<group>"; };
 		0FB2B9112BE331DC9936D694 /* WorkingDirectory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkingDirectory.swift; sourceTree = "<group>"; };
 		1157F2DBE43C1E8EDF3C3B58 /* FileSystemModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileSystemModels.swift; sourceTree = "<group>"; };
 		119BCB282CC9BB93ABB7210A /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
@@ -394,6 +397,7 @@
 		CC94FDD251C876AFDBD6305E /* HermesMobileTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = HermesMobileTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		CD2AFC880F1727BFF35C8C35 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		CEB90654C53490C9790A3E36 /* CrossSessionBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CrossSessionBanner.swift; sourceTree = "<group>"; };
+		D029CC4EA55FAAB71D3AA4D3 /* ConnectionModePickerUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionModePickerUITests.swift; sourceTree = "<group>"; };
 		D0BC2E7064E5AA360C0470FF /* SettingsL07Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsL07Tests.swift; sourceTree = "<group>"; };
 		D0C8CBD8C7BDCFA9E6CB4D58 /* SubagentTreeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubagentTreeView.swift; sourceTree = "<group>"; };
 		D38A71D2C5A30B5D7B86D5AF /* DefaultsKeys.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DefaultsKeys.swift; sourceTree = "<group>"; };
@@ -621,6 +625,7 @@
 			isa = PBXGroup;
 			children = (
 				8F6A943F0BC5448AEDCEE0AC /* ChatFlowUITests.swift */,
+				D029CC4EA55FAAB71D3AA4D3 /* ConnectionModePickerUITests.swift */,
 				3F08F8ACDEE165624EE32ADF /* CrossClientSyncUITests.swift */,
 				D97320D9266236F10B399364 /* ToolRowLiveUITests.swift */,
 			);
@@ -837,6 +842,7 @@
 			isa = PBXGroup;
 			children = (
 				DC870774BFA97C8D77373DBD /* ChatModels.swift */,
+				0CC10F89B2FA3A66A6A5977C /* ConnectionMode.swift */,
 				B688B30EDC0D211592AFA560 /* DeviceModels.swift */,
 				1157F2DBE43C1E8EDF3C3B58 /* FileSystemModels.swift */,
 				9F71339DD287CB3578CF78E7 /* GatewayEvent.swift */,
@@ -1065,6 +1071,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				E53597632C7D8EAFFA84A490 /* ChatFlowUITests.swift in Sources */,
+				2CA4860A835ADF0F01EAE69F /* ConnectionModePickerUITests.swift in Sources */,
 				B04D98152FE6C71B9341E8B4 /* CrossClientSyncUITests.swift in Sources */,
 				87898B15A49596D3EFDDE223 /* ToolRowLiveUITests.swift in Sources */,
 			);
@@ -1152,6 +1159,7 @@
 				283558C51FB90E1A8E08814B /* CodeBlockView.swift in Sources */,
 				F361753EC922ED7D58D7A4B6 /* Color+Hex.swift in Sources */,
 				FDC59A3AB4BB2483D0E930B7 /* ComposerView.swift in Sources */,
+				7F5D97CEBF633C917292FB2C /* ConnectionMode.swift in Sources */,
 				A2943D1F2A04330B46D480B0 /* ConnectionSetupView.swift in Sources */,
 				440C33BD9C58044D9284450A /* ConnectionStatusBanner.swift in Sources */,
 				1D573FA3E60DD0CAFBD1865A /* ConnectionStore.swift in Sources */,

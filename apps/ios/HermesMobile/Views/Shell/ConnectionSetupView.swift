@@ -6,6 +6,11 @@ import SwiftUI
 /// any failure inline. On success the phase flips to `.connected` and
 /// ``RootView`` re-renders into the main UI automatically.
 struct ConnectionSetupView: View {
+    /// The connection mode this form is serving. Influences the URL placeholder
+    /// text (Local desktop gets a LAN/loopback hint) and the form title. Does
+    /// NOT change transport behaviour — all modes call `configure(urlString:token:)`.
+    var initialMode: ConnectionMode = .remoteURL
+
     @Environment(ConnectionStore.self) private var connection
     @Environment(ThemeStore.self) private var themeStore
     @Environment(\.hermesTheme) private var theme
@@ -29,6 +34,25 @@ struct ConnectionSetupView: View {
         !urlString.trimmingCharacters(in: .whitespaces).isEmpty
             && !token.trimmingCharacters(in: .whitespaces).isEmpty
             && !isConnecting
+    }
+
+    /// URL placeholder text — adapts to the connection mode.
+    private var urlPlaceholder: String {
+        switch initialMode {
+        case .localDesktop:
+            return "http://192.168.x.x:9119"
+        case .remoteURL, .sharedDashboard:
+            return "https://your-mac.tailnet.ts.net:9443"
+        }
+    }
+
+    /// Navigation title — adapts to the connection mode.
+    private var formTitle: String {
+        switch initialMode {
+        case .localDesktop:    return "Local gateway"
+        case .remoteURL:       return "Connect to Hermes"
+        case .sharedDashboard: return "Connect to Hermes"
+        }
     }
 
     var body: some View {
@@ -68,7 +92,7 @@ struct ConnectionSetupView: View {
                     TextField(
                         "Server URL",
                         text: $urlString,
-                        prompt: Text(verbatim: "https://your-mac.tailnet.ts.net:9443")
+                        prompt: Text(verbatim: urlPlaceholder)
                     )
                     .textContentType(.URL)
                     .keyboardType(.URL)
@@ -141,9 +165,15 @@ struct ConnectionSetupView: View {
             }
             .scrollContentBackground(.hidden)
             .background(theme.bg)
-            .navigationTitle("Connect to Hermes")
+            .navigationTitle(formTitle)
             .navigationBarTitleDisplayMode(.inline)
-            .onAppear { focusedField = .url }
+            .onAppear {
+                focusedField = .url
+                // Persist the mode the user chose before they connect — so if they
+                // dismiss without connecting, the picker still reflects their intent
+                // on the next appearance. configure() does not touch the mode key.
+                connection.connectionMode = initialMode
+            }
             .hermesThemed(themeStore)
     }
 
