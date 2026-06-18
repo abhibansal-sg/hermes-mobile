@@ -22,6 +22,10 @@ struct ConnectionSetupView: View {
     /// A Tailscale hint surfaced when a connection to a `*.ts.net` host fails;
     /// `nil` clears the banner.
     @State private var tailscaleHint: TailscaleHint?
+    /// Set to `true` when the user taps "Connect" while already paired to a
+    /// gateway — presents the destructive-confirmation alert before proceeding.
+    /// (Inc-4 hardening: a re-connect must not silently swap the gateway.)
+    @State private var showingReplaceConfirmation = false
 
     @FocusState private var focusedField: Field?
 
@@ -175,9 +179,37 @@ struct ConnectionSetupView: View {
                 connection.connectionMode = initialMode
             }
             .hermesThemed(themeStore)
+            // Inc-4 hardening: when the user is already paired, confirm before
+            // silently swapping the gateway out from under them. Mirrors the
+            // `pendingPair` alert in RootView (QR/deep-link re-pair path).
+            .alert("Replace current connection?", isPresented: $showingReplaceConfirmation) {
+                Button("Disconnect & Connect", role: .destructive) {
+                    performConnect()
+                }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                if let host = URL(string: connection.serverURLString)?.host(percentEncoded: false),
+                   !host.isEmpty {
+                    Text("This will disconnect from \(host) and pair with the new gateway.")
+                } else {
+                    Text("This will disconnect your current session and pair with the new gateway.")
+                }
+            }
     }
 
     private func connect() {
+        guard canConnect else { return }
+        // If already paired to a gateway, require explicit confirmation before
+        // proceeding — a silent swap is surprising and can drop an active session.
+        if connection.hasConnected {
+            showingReplaceConfirmation = true
+            return
+        }
+        performConnect()
+    }
+
+    /// Performs the actual `configure` call after any confirmation gate has passed.
+    private func performConnect() {
         guard canConnect else { return }
         focusedField = nil
         isConnecting = true

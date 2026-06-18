@@ -31,6 +31,9 @@ struct ManualTokenPromptView: View {
     @State private var token = ""
     @State private var errorText: String?
     @State private var isConnecting = false
+    /// Set to `true` when the user taps "Connect" while already paired — presents
+    /// the destructive-confirmation alert before proceeding. (Inc-4 hardening.)
+    @State private var showingReplaceConfirmation = false
 
     @FocusState private var tokenFieldFocused: Bool
 
@@ -146,11 +149,37 @@ struct ManualTokenPromptView: View {
             }
             .hermesThemed(themeStore)
         }
+        // Inc-4 hardening: when the user is already paired, confirm before
+        // silently swapping the gateway. Mirrors the `pendingPair` alert in RootView.
+        .alert("Replace current connection?", isPresented: $showingReplaceConfirmation) {
+            Button("Disconnect & Connect", role: .destructive) {
+                performConnect()
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            if let host = URL(string: connection.serverURLString)?.host(percentEncoded: false),
+               !host.isEmpty {
+                Text("This will disconnect from \(host) and pair with the new Desktop gateway.")
+            } else {
+                Text("This will disconnect your current session and pair with the new Desktop gateway.")
+            }
+        }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
     }
 
     private func connect() {
+        guard canConnect else { return }
+        // If already paired, require explicit confirmation before swapping.
+        if connection.hasConnected {
+            showingReplaceConfirmation = true
+            return
+        }
+        performConnect()
+    }
+
+    /// Performs the validated `configure` call after any confirmation gate has passed.
+    private func performConnect() {
         guard canConnect else { return }
         tokenFieldFocused = false
         errorText = nil

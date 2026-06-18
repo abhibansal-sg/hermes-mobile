@@ -240,4 +240,59 @@ final class ConnectionPhaseTests: XCTestCase {
         XCTAssertEqual(connection.serverURLString, "")
         XCTAssertNil(connection.rest)
     }
+
+    // MARK: - Replace-connection confirmation gate (Inc-4 Hardening #2)
+    //
+    // `ConnectionSetupView.connect()` and `ManualTokenPromptView.connect()` gate
+    // on `connection.hasConnected` before calling `configure()` — showing a
+    // destructive-confirmation alert instead of silently swapping the gateway.
+    // These tests pin the store-side discriminators the view logic reads.
+
+    func testFreshStoreDoesNotGateReplaceConfirmation() {
+        // A brand-new store (never verified a connection) should NOT trigger the
+        // replace-confirmation gate: the view's `if connection.hasConnected` is
+        // false, so `connect()` proceeds directly to `performConnect()`.
+        let (connection, _, _) = makeStore()
+        XCTAssertFalse(connection.hasConnected,
+                       "fresh store: no prior verified session → no confirmation needed")
+    }
+
+    func testConnectedStoreGatesReplaceConfirmation() {
+        // Once the hydration convergence point is reached (= a verified session),
+        // `hasConnected` is true and the view SHOULD show the confirmation alert
+        // before calling `configure()`. The test drives the store to that state
+        // and confirms the flag is set.
+        let (connection, _, _) = makeStore()
+        connection.phase = .hydrating
+        connection.finishHydration()
+        XCTAssertEqual(connection.phase, .connected)
+        XCTAssertTrue(connection.hasConnected,
+                      "after verified session: hasConnected == true → confirmation gate fires")
+    }
+
+    func testConnectedStoreExposesCurrentHostForAlertMessage() {
+        // The confirmation alert message shows the CURRENT host being replaced.
+        // This test verifies the host is derivable from `serverURLString` — the
+        // property the view reads to populate the alert body.
+        let (connection, _, _) = makeStore()
+        // Directly set the persisted URL (simulating a previously-configured store).
+        connection.serverURLString = "https://mymac.tailnet.ts.net:9443"
+        let host = URL(string: connection.serverURLString)?.host(percentEncoded: false)
+        XCTAssertEqual(host, "mymac.tailnet.ts.net",
+                       "host is extractable from serverURLString for the alert message")
+    }
+
+    func testDisconnectResetsGateSoNextPairIsUnconfirmed() async {
+        // After `disconnect()`, `hasConnected` is cleared — the NEXT configure
+        // attempt is treated as first-run (no replace-confirmation shown).
+        let (connection, _, _) = makeStore()
+        connection.phase = .hydrating
+        connection.finishHydration()
+        XCTAssertTrue(connection.hasConnected)
+
+        await connection.disconnect()
+
+        XCTAssertFalse(connection.hasConnected,
+                       "after disconnect: hasConnected resets → next pair skips confirmation")
+    }
 }
