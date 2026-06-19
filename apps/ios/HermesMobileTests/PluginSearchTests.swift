@@ -93,7 +93,7 @@ final class PluginSearchTests: XCTestCase {
         SearchStubProtocol.responses = [(json.data(using: .utf8)!, 200)]
         let client = pluginClient()
 
-        let results = try await client.searchSessionsPlugin(query: "hello")
+        let (results, _) = try await client.searchSessionsPlugin(query: "hello")
 
         XCTAssertEqual(results.count, 2, "Both session rows must be decoded")
         let first = results[0]
@@ -153,11 +153,12 @@ final class PluginSearchTests: XCTestCase {
         let store = SessionStore()
         store.searchScope = .all
 
-        let (results, servedByPlugin) = try await store.fetchSearch(query: "found", api: api)
+        let (results, rawPageFull) = try await store.fetchSearch(query: "found", api: api)
 
         XCTAssertEqual(results.count, 1, "Stock fallback result must be returned")
         XCTAssertEqual(results[0].id, "s1", "Stock result session_id must parse correctly")
-        XCTAssertFalse(servedByPlugin, "Fallback to stock must report servedByPlugin = false")
+        // 1 result < searchPageLimit(20) → short page → rawPageFull = false.
+        XCTAssertFalse(rawPageFull, "A short stock page must report rawPageFull = false")
         // lastError is untouched (fetchSearch doesn't write it; the caller Task does).
         XCTAssertEqual(SearchStubProtocol.capturedURLs.count, 2,
                        "Both plugin and stock endpoints must be called")
@@ -280,7 +281,7 @@ final class PluginSearchTests: XCTestCase {
         SearchStubProtocol.responses = [(json.data(using: .utf8)!, 200)]
         let client = pluginClient()
 
-        let results = try await client.searchSessionsPlugin(query: "dup")
+        let (results, _) = try await client.searchSessionsPlugin(query: "dup")
 
         XCTAssertEqual(results.count, 2,
                        "Two distinct session_ids must produce exactly two rows")

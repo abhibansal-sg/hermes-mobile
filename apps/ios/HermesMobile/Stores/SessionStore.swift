@@ -562,7 +562,10 @@ final class SessionStore {
     /// `loadMoreSearchResults` — mirrors the `sessionsFetch` / `transcriptFetch`
     /// seam pattern so tests drive the real Task-based methods without a gateway.
     ///
-    /// Signature: `(query, offset) async throws -> (results, servedByPlugin)`.
+    /// Signature: `(query, offset) async throws -> (results, rawPageFull)`.
+    /// `rawPageFull` must reflect whether the raw (pre-collapse for plugin, direct
+    /// for stock) server page was full — callers use it to determine whether more
+    /// pages may exist via `searchHasMore`.
     var searchFetch: ((String, Int) async throws -> ([SessionSearchResult], Bool))?
     #endif
 
@@ -2180,18 +2183,18 @@ final class SessionStore {
             defer { self.isSearching = false }
             do {
                 #if DEBUG
-                let (results, servedByPlugin): ([SessionSearchResult], Bool)
+                let (results, rawPageFull): ([SessionSearchResult], Bool)
                 if let seam = self.searchFetch {
-                    (results, servedByPlugin) = try await seam(trimmed, 0)
+                    (results, rawPageFull) = try await seam(trimmed, 0)
                 } else if let api = apiOrNil {
-                    (results, servedByPlugin) = try await self.fetchSearch(
+                    (results, rawPageFull) = try await self.fetchSearch(
                         query: trimmed, offset: 0, api: api
                     )
                 } else {
                     return
                 }
                 #else
-                let (results, servedByPlugin) = try await self.fetchSearch(
+                let (results, rawPageFull) = try await self.fetchSearch(
                     query: trimmed, offset: 0, api: api
                 )
                 #endif
@@ -2199,12 +2202,12 @@ final class SessionStore {
                 // Guard against a stale response landing after the user typed on.
                 guard self.searchGeneration == generation else { return }
                 self.searchResults = results
-                self.searchOffset = results.count
-                // Plugin path does not support load-more (no offset param); force
-                // false so the DrawerView sentinel never fires load-more there.
-                // Stock path: a full page means more may exist; short = done.
-                self.searchHasMore = !servedByPlugin
-                    && results.count == Self.searchPageLimit
+                // Advance offset by the page limit (not collapsed count) so
+                // the next load-more request starts at the correct message offset.
+                self.searchOffset = Self.searchPageLimit
+                // rawPageFull: true when the raw (pre-collapse for plugin, direct
+                // for stock) server page was full — more messages may exist.
+                self.searchHasMore = rawPageFull
                     && self.searchOffset < Self.searchOffsetCap
                 self.lastError = nil
             } catch {
@@ -2244,33 +2247,35 @@ final class SessionStore {
             defer { self.isSearchLoadingMore = false }
             do {
                 #if DEBUG
-                let (page, servedByPlugin): ([SessionSearchResult], Bool)
+                let (page, rawPageFull): ([SessionSearchResult], Bool)
                 if let seam = self.searchFetch {
-                    (page, servedByPlugin) = try await seam(trimmed, offset)
+                    (page, rawPageFull) = try await seam(trimmed, offset)
                 } else if let api = apiForMore {
-                    (page, servedByPlugin) = try await self.fetchSearch(
+                    (page, rawPageFull) = try await self.fetchSearch(
                         query: trimmed, offset: offset, api: api
                     )
                 } else {
                     return
                 }
                 #else
-                let (page, servedByPlugin) = try await self.fetchSearch(
+                let (page, rawPageFull) = try await self.fetchSearch(
                     query: trimmed, offset: offset, api: api
                 )
                 #endif
                 if Task.isCancelled { return }
                 // Discard if the user changed the query while this was in flight.
                 guard self.searchGeneration == generation else { return }
-                // Append, deduplicating by session id in case the result window
-                // shifted between the first and second page requests.
+                // Append, deduplicating by session id — handles same session
+                // appearing in two message-pages (plugin) or window shift (stock).
                 let existingIds = Set(self.searchResults.map(\.id))
                 let fresh = page.filter { !existingIds.contains($0.id) }
                 self.searchResults.append(contentsOf: fresh)
-                self.searchOffset = offset + page.count
-                // Same plugin-guard as the initial fetch: force false on plugin path.
-                self.searchHasMore = !servedByPlugin
-                    && page.count == Self.searchPageLimit
+                // Advance by the page limit (not collapsed count) so the next
+                // load-more starts at the correct message-level offset.
+                self.searchOffset = offset + Self.searchPageLimit
+                // rawPageFull drives has-more: a full raw page means the server
+                // may have more messages, even if collapse produced few sessions.
+                self.searchHasMore = rawPageFull
                     && self.searchOffset < Self.searchOffsetCap
             } catch {
                 if Task.isCancelled { return }
@@ -2281,38 +2286,38 @@ final class SessionStore {
     }
 
     /// Execute the search against the best available endpoint: plugin first (richer
-    /// results + role-scoped), stock on 404 (older gateways). Only falls back on a
-    /// true 404/not-found — real 500/transport errors are re-thrown so they surface
-    /// as `lastError` and are not silently masked.
+    /// results + role-scoped + offset pagination), stock on 404 (older gateways).
+    /// Only falls back on a true 404/not-found — real 500/transport errors are
+    /// re-thrown so they surface as `lastError` and are not silently masked.
     ///
-    /// `offset` is forwarded only to the stock endpoint — the plugin does not yet
-    /// support pagination, so it always fetches from offset 0.
+    /// `offset` is forwarded to both the plugin and stock endpoints.
     ///
-    /// Returns `(results, servedByPlugin)` so callers can gate `searchHasMore`
-    /// correctly: the plugin path does not support load-more, so `searchHasMore`
-    /// must be forced to `false` when `servedByPlugin` is true regardless of page
-    /// size. This prevents the DrawerView sentinel from spinning on the plugin path.
+    /// Returns `(results, rawPageFull)` where `rawPageFull` indicates whether the
+    /// underlying server page was full at the message level (for plugin) or session
+    /// level (for stock). Callers use `rawPageFull` to set `searchHasMore` — this
+    /// correctly handles plugin pages that collapse to fewer sessions than the raw
+    /// message limit but still have more messages to return.
     ///
     /// Extracted so tests can call it directly without spinning a Task.
     func fetchSearch(
         query: String, offset: Int = 0, api: RestClient
-    ) async throws -> (results: [SessionSearchResult], servedByPlugin: Bool) {
+    ) async throws -> (results: [SessionSearchResult], rawPageFull: Bool) {
         let roles = Self.roles(for: searchScope)
         do {
-            // Plugin path: no offset support — always fetches page 1 at limit 20.
-            // Unified limit matches searchPageLimit so the hasMore comparison is
-            // coherent if pagination is ever added to the plugin later.
-            let results = try await api.searchSessionsPlugin(
-                query: query, limit: Self.searchPageLimit, roles: roles
+            // Plugin path: forward offset so load-more fetches subsequent
+            // message pages. rawPageFull keys on the raw (pre-collapse) count.
+            let (results, rawPageFull) = try await api.searchSessionsPlugin(
+                query: query, limit: Self.searchPageLimit, offset: offset, roles: roles
             )
-            return (results, true)
+            return (results, rawPageFull)
         } catch RestError.badStatus(404, _) {
             // Plugin endpoint not available on this gateway — fall back to stock.
             let results = try await api.searchSessions(
                 query: query, limit: Self.searchPageLimit, offset: offset,
                 scope: searchScope.rawValue
             )
-            return (results, false)
+            // Stock path: rawPageFull = full session page (no pre-collapse step).
+            return (results, results.count == Self.searchPageLimit)
         }
         // Any other error (500, transport, decode) propagates to the caller.
     }

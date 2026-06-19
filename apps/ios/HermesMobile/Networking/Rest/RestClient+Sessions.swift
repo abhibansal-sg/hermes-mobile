@@ -293,13 +293,19 @@ extension RestClient {
         ).results
     }
 
-    /// `GET /api/plugins/hermes-mobile/sessions/search?q=&limit=&sort=&role=` —
-    /// richer FTS5 search via the hermes-mobile plugin endpoint.
+    /// `GET /api/plugins/hermes-mobile/sessions/search?q=&limit=&sort=&role=&offset=` —
+    /// richer FTS5 search via the hermes-mobile plugin endpoint with offset pagination.
     ///
     /// The plugin endpoint returns one row per MATCHING MESSAGE (with full context
     /// and session title). This method collapses them to one per session (first/best
     /// snippet by server-ranking order, deterministic dedup) so the result list is
     /// compatible with the existing `DrawerSearchResultRow` UI.
+    ///
+    /// Returns `(results, rawPageFull)` where `rawPageFull` reflects whether the RAW
+    /// message-level response was a full page (decoded row count == limit) BEFORE
+    /// session collapse. Callers must use `rawPageFull` — not the collapsed session
+    /// count — to determine whether more pages may exist, because a full message page
+    /// can collapse to far fewer unique sessions.
     ///
     /// Scope→role mapping:
     /// - `.all`      → no `role` param (server returns all roles)
@@ -307,26 +313,30 @@ extension RestClient {
     /// - `.code`     → `role=tool`
     ///
     /// Only available when this client speaks `.plugin` path style. Callers
-    /// (``SessionStore/searchQueryChanged()``) try this first and fall back to
-    /// the stock ``searchSessions(query:limit:scope:)`` on 404 (older gateways
+    /// (``SessionStore/fetchSearch(query:offset:api:)``) try this first and fall back
+    /// to the stock ``searchSessions(query:limit:scope:)`` on 404 (older gateways
     /// without the plugin). A real 500/transport error is re-thrown so genuine
     /// failures surface and are NOT silently masked.
     func searchSessionsPlugin(
         query: String,
         limit: Int = 25,
+        offset: Int = 0,
         sort: String? = nil,
         roles: [String] = []
-    ) async throws -> [SessionSearchResult] {
+    ) async throws -> (results: [SessionSearchResult], rawPageFull: Bool) {
         guard pathStyle == .plugin else {
             throw RestError.badStatus(404, body: "plugin path style not active")
         }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= 2 else { return [] }
+        guard trimmed.count >= 2 else { return ([], false) }
 
         var items: [URLQueryItem] = [
             URLQueryItem(name: "q", value: trimmed),
             URLQueryItem(name: "limit", value: String(limit)),
         ]
+        if offset > 0 {
+            items.append(URLQueryItem(name: "offset", value: String(offset)))
+        }
         if let sort, !sort.isEmpty {
             items.append(URLQueryItem(name: "sort", value: sort))
         }
@@ -348,6 +358,11 @@ extension RestClient {
             Wrapper.self, from: data, context: "pluginSearch", strategy: .useDefaultKeys
         ).results
 
+        // Record raw (pre-collapse) fullness BEFORE deduplication.
+        // Has-more must key on this — a 25-message page can collapse to far
+        // fewer sessions but still means the server has more messages to return.
+        let rawPageFull = rows.count == limit
+
         // Collapse per-message rows to one per session (first occurrence wins —
         // the server returns them in relevance order, so the first hit for each
         // session_id is the best snippet). Dedup is deterministic: insertion order
@@ -359,7 +374,7 @@ extension RestClient {
             seen.insert(row.sessionId)
             collapsed.append(row.asSessionSearchResult)
         }
-        return collapsed
+        return (collapsed, rawPageFull)
     }
 
     /// `PATCH /api/sessions/{id}` with `{ "title": ... }` — rename a session.
