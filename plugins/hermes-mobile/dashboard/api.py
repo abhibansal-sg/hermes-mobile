@@ -897,12 +897,13 @@ async def search_sessions(
         limit = _SEARCH_LIMIT_DEFAULT
     limit = max(1, min(limit, _SEARCH_LIMIT_MAX))
 
-    # Normalise offset.
+    # Normalise offset — clamp to [0, 500] (mirrors the stock endpoint cap;
+    # prevents a huge offset from driving an unbounded FTS scan / DoS).
     try:
         offset = int(offset)
     except (TypeError, ValueError):
         offset = 0
-    offset = max(0, offset)
+    offset = max(0, min(offset, 500))
 
     # Normalise sort: pass None (BM25) for any unrecognised value including
     # the explicit "rank" alias so the DB default applies.

@@ -549,3 +549,121 @@ class TestSortParameter:
         assert timestamps == sorted(timestamps), (
             f"sort=oldest did not return ascending timestamps: {timestamps}"
         )
+
+
+# ---------------------------------------------------------------------------
+# ABH-191 — offset upper-bound cap (DoS hardening)
+# ---------------------------------------------------------------------------
+
+class TestOffsetCap:
+    """offset=10_000 must be clamped to 500 before reaching SessionDB.search_messages.
+
+    Uses a monkeypatch spy on SessionDB.search_messages to record the ``offset``
+    kwarg actually passed to the DB layer.  Mirrors the pattern used by the stock
+    test_web_server_session_search.py offset-cap test.
+    """
+
+    def test_huge_offset_clamped_to_500_at_db_layer(
+        self, client, _token_header, search_db, monkeypatch
+    ):
+        """offset=10_000 must arrive at search_messages as 500 (the cap), not 10_000."""
+        recorded: list[int] = []
+        import hermes_state as hs
+
+        original_search = hs.SessionDB.search_messages
+
+        def spy_search(self_db, *args, **kwargs):
+            recorded.append(kwargs.get("offset", 0))
+            return original_search(self_db, *args, **kwargs)
+
+        monkeypatch.setattr(hs.SessionDB, "search_messages", spy_search)
+
+        r = client.get(
+            _SEARCH_URL,
+            params={"q": "the", "offset": 10_000},
+            headers=_token_header,
+        )
+        assert r.status_code == 200
+        assert recorded, "search_messages must have been called"
+        assert recorded[0] == 500, (
+            f"Expected offset clamped to 500, but search_messages received offset={recorded[0]}. "
+            "The DoS cap (max(0, min(offset, 500))) was not applied."
+        )
+
+    def test_normal_offset_passes_through_unchanged(
+        self, client, _token_header, search_db, monkeypatch
+    ):
+        """A small valid offset (e.g. 1) must NOT be clamped — it passes through as-is."""
+        recorded: list[int] = []
+        import hermes_state as hs
+
+        original_search = hs.SessionDB.search_messages
+
+        def spy_search(self_db, *args, **kwargs):
+            recorded.append(kwargs.get("offset", 0))
+            return original_search(self_db, *args, **kwargs)
+
+        monkeypatch.setattr(hs.SessionDB, "search_messages", spy_search)
+
+        r = client.get(
+            _SEARCH_URL,
+            params={"q": "the", "offset": 1},
+            headers=_token_header,
+        )
+        assert r.status_code == 200
+        assert recorded, "search_messages must have been called"
+        assert recorded[0] == 1, (
+            f"Expected offset=1 to pass through unchanged, got {recorded[0]}"
+        )
+
+    def test_offset_at_boundary_500_passes_through(
+        self, client, _token_header, search_db, monkeypatch
+    ):
+        """offset=500 is exactly at the cap — must pass through unchanged."""
+        recorded: list[int] = []
+        import hermes_state as hs
+
+        original_search = hs.SessionDB.search_messages
+
+        def spy_search(self_db, *args, **kwargs):
+            recorded.append(kwargs.get("offset", 0))
+            return original_search(self_db, *args, **kwargs)
+
+        monkeypatch.setattr(hs.SessionDB, "search_messages", spy_search)
+
+        r = client.get(
+            _SEARCH_URL,
+            params={"q": "the", "offset": 500},
+            headers=_token_header,
+        )
+        assert r.status_code == 200
+        assert recorded, "search_messages must have been called"
+        assert recorded[0] == 500, (
+            f"Expected offset=500 to pass through unchanged, got {recorded[0]}"
+        )
+
+    def test_offset_501_clamped_to_500(
+        self, client, _token_header, search_db, monkeypatch
+    ):
+        """offset=501 is one above the cap — must be clamped to 500."""
+        recorded: list[int] = []
+        import hermes_state as hs
+
+        original_search = hs.SessionDB.search_messages
+
+        def spy_search(self_db, *args, **kwargs):
+            recorded.append(kwargs.get("offset", 0))
+            return original_search(self_db, *args, **kwargs)
+
+        monkeypatch.setattr(hs.SessionDB, "search_messages", spy_search)
+
+        r = client.get(
+            _SEARCH_URL,
+            params={"q": "the", "offset": 501},
+            headers=_token_header,
+        )
+        assert r.status_code == 200
+        assert recorded, "search_messages must have been called"
+        assert recorded[0] == 500, (
+            f"Expected offset=501 clamped to 500, got {recorded[0]}"
+        )
