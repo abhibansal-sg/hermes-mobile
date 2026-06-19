@@ -105,6 +105,10 @@ PAIR_HOST = "pair"
 
 # Path to the Hermes Desktop app's connection state file (macOS only).
 # The Desktop app owns this file; we READ it but NEVER write to it.
+#
+# Env override for tests/E2E: if HERMES_MOBILE_CONNECTION_JSON is set and
+# non-empty, discovery uses that path instead of the Desktop app's file.
+# Defaults to the Desktop app's canonical path; we still only READ, never write.
 _DESKTOP_CONNECTION_JSON = (
     Path.home()
     / "Library"
@@ -112,6 +116,20 @@ _DESKTOP_CONNECTION_JSON = (
     / "Hermes"
     / "connection.json"
 )
+
+
+def _resolve_connection_json_path() -> Path:
+    """Return the effective connection.json path for gateway discovery.
+
+    Reads ``HERMES_MOBILE_CONNECTION_JSON`` on each call so that tests and E2E
+    rigs can override discovery without re-importing the module.  When the env
+    var is unset or empty, returns the Desktop app's canonical path
+    (``_DESKTOP_CONNECTION_JSON``).
+    """
+    override = os.environ.get("HERMES_MOBILE_CONNECTION_JSON", "")
+    if override:
+        return Path(override)
+    return _DESKTOP_CONNECTION_JSON
 
 # Port range for local-mode ephemeral loopback probes.
 # Port 9119 is the well-known dashboard default; 9120–9199 are the ephemeral
@@ -260,13 +278,15 @@ class _DesktopGatewayResult:
 
 
 def _read_connection_json(
-    path: Path = _DESKTOP_CONNECTION_JSON,
+    path: Optional[Path] = None,
 ) -> Optional[dict]:
     """Parse the Desktop app's ``connection.json``.
 
     Returns the parsed dict, or ``None`` if the file is absent, unreadable,
     or contains malformed JSON.  Never raises.
     """
+    if path is None:
+        path = _resolve_connection_json_path()
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError:
@@ -309,7 +329,7 @@ def _probe_local_gateway_port(port: int) -> bool:
 
 
 def _detect_local_desktop_gateway(
-    connection_json_path: Path = _DESKTOP_CONNECTION_JSON,
+    connection_json_path: Optional[Path] = None,
 ) -> Optional["_DesktopGatewayResult"]:
     """Discover the gateway owned by the Hermes Desktop app.
 
@@ -342,6 +362,8 @@ def _detect_local_desktop_gateway(
     Sidecar / embedded-listener: REJECTED.  The Electron app is stock
     NousResearch — we do NOT add a subprocess or modify it.
     """
+    if connection_json_path is None:
+        connection_json_path = _resolve_connection_json_path()
     data = _read_connection_json(connection_json_path)
     if data is None:
         return None
