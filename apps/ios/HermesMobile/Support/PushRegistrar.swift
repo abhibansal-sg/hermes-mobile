@@ -64,6 +64,7 @@ final class PushRegistrar {
         } else {
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastDeviceToken)
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEvents)
+            UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEnv)
             #if canImport(UIKit)
             UIApplication.shared.unregisterForRemoteNotifications()
             #endif
@@ -90,11 +91,15 @@ final class PushRegistrar {
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
         guard !hex.isEmpty else { return }
         let events = DefaultsKeys.pushEventList()
-        // Skip a redundant POST only when BOTH the token AND the event prefs are
-        // unchanged from the last successful register — a prefs change (A4) must
-        // re-POST even though the token is identical.
+        let env = PushTokenPoster.apnsEnvironment
+        // Skip a redundant POST only when the token, event prefs, AND APNs
+        // environment are all unchanged from the last successful register. An env
+        // flip (e.g. Xcode sandbox → TestFlight production on the same token)
+        // must force a re-POST so the gateway re-routes the token to the correct
+        // APNs host. A prefs change (A4) must re-POST even when token+env match.
         if UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken) == hex,
-           lastRegisteredEvents == events {
+           lastRegisteredEvents == events,
+           lastRegisteredEnv == env {
             return
         }
 
@@ -113,6 +118,7 @@ final class PushRegistrar {
                 if case .success = outcome {
                     UserDefaults.standard.set(hex, forKey: DefaultsKeys.pushLastDeviceToken)
                     lastRegisteredEvents = events
+                    lastRegisteredEnv = env
                 }
             case .hardFail:
                 // Transport error: inconclusive for the capability gate, nothing
@@ -155,6 +161,21 @@ final class PushRegistrar {
                 UserDefaults.standard.set(newValue, forKey: DefaultsKeys.pushLastEvents)
             } else {
                 UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEvents)
+            }
+        }
+    }
+
+    /// The APNs environment string last successfully registered. `nil` for legacy
+    /// installs that pre-date this key (treated as a dedupe miss so the next
+    /// `didRegister` re-POSTs once to stamp the env). Persisted so it survives
+    /// relaunch.
+    private var lastRegisteredEnv: String? {
+        get { UserDefaults.standard.string(forKey: DefaultsKeys.pushLastEnv) }
+        set {
+            if let newValue {
+                UserDefaults.standard.set(newValue, forKey: DefaultsKeys.pushLastEnv)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEnv)
             }
         }
     }

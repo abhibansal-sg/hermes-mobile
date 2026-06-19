@@ -92,6 +92,13 @@ enum DefaultsKeys {
     /// token is unchanged. Owned by ``PushRegistrar``.
     static let pushLastEvents = "hermes.push.lastEvents"
 
+    /// `String` — the APNs environment (`"sandbox"` / `"production"`) under which
+    /// the last successful registration was issued. Added to the dedupe key so that
+    /// a sandbox→production transition (Xcode → TestFlight on the same token) forces
+    /// a re-POST and the gateway routes the token to the correct APNs host. Owned by
+    /// ``PushRegistrar``.
+    static let pushLastEnv = "hermes.push.lastEnv"
+
     /// `Bool` — whether notification authorization has already been requested once,
     /// so the prompt isn't re-shown. Owned by ``NotificationService``.
     static let notificationsDidRequestAuthorization =

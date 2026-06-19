@@ -235,6 +235,178 @@ final class PushEventPrefsTests: XCTestCase {
     }
 }
 
+// MARK: - Push-token registration dedupe: env key (ABH-182 Inc-2)
+
+/// Verifies that the `pushLastEnv` key is part of the registration dedupe key,
+/// so a sandbox→production flip forces a re-POST even when the token and event
+/// prefs are identical. Tests are pure and deterministic: they exercise the
+/// `DefaultsKeys.pushLastEnv` round-trip and the 3-way guard condition that
+/// `PushRegistrar.didRegister` evaluates against `UserDefaults`. No network or
+/// device needed.
+///
+/// The guard condition (simplified):
+///   savedToken == token && savedEvents == events && savedEnv == env → SKIP
+///   any mismatch → RE-POST
+final class PushRegistrarEnvDedupeTests: XCTestCase {
+
+    private var defaults: UserDefaults!
+    private let suiteName = "PushRegistrarEnvDedupeTests"
+
+    // Mirrors the 3-way dedupe guard in `PushRegistrar.didRegister` so tests can
+    // evaluate it against a controlled `UserDefaults` suite without touching
+    // `UserDefaults.standard` or the network.
+    private func wouldSkip(
+        token hex: String,
+        events: [String],
+        env: String,
+        defaults: UserDefaults
+    ) -> Bool {
+        defaults.string(forKey: DefaultsKeys.pushLastDeviceToken) == hex
+            && defaults.stringArray(forKey: DefaultsKeys.pushLastEvents) == events
+            && defaults.string(forKey: DefaultsKeys.pushLastEnv) == env
+    }
+
+    override func setUp() {
+        super.setUp()
+        defaults = UserDefaults(suiteName: suiteName)
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    override func tearDown() {
+        defaults.removePersistentDomain(forName: suiteName)
+        defaults = nil
+        super.tearDown()
+    }
+
+    // MARK: - pushLastEnv round-trip
+
+    func testEnvKeyRoundTrips() {
+        // Absent → nil (never registered).
+        XCTAssertNil(defaults.string(forKey: DefaultsKeys.pushLastEnv))
+
+        // Written → readable.
+        defaults.set("sandbox", forKey: DefaultsKeys.pushLastEnv)
+        XCTAssertEqual(defaults.string(forKey: DefaultsKeys.pushLastEnv), "sandbox")
+
+        // Overwrite.
+        defaults.set("production", forKey: DefaultsKeys.pushLastEnv)
+        XCTAssertEqual(defaults.string(forKey: DefaultsKeys.pushLastEnv), "production")
+
+        // Cleared → nil.
+        defaults.removeObject(forKey: DefaultsKeys.pushLastEnv)
+        XCTAssertNil(defaults.string(forKey: DefaultsKeys.pushLastEnv))
+    }
+
+    // MARK: - env missing → always a dedupe miss
+
+    func testEnvKeyAbsentCausesDedupeMiss() {
+        // Simulate the state written by a pre-ABH-182 install: token + events
+        // persisted, but `pushLastEnv` never written. The guard must miss so
+        // the next `didRegister` re-POSTs and stamps the env.
+        let token = "aabbcc"
+        let events = ["approval", "clarify", "turn_complete"]
+        defaults.set(token, forKey: DefaultsKeys.pushLastDeviceToken)
+        defaults.set(events, forKey: DefaultsKeys.pushLastEvents)
+        // pushLastEnv intentionally absent.
+
+        XCTAssertFalse(
+            wouldSkip(token: token, events: events, env: "production", defaults: defaults),
+            "missing env key must NOT skip — legacy installs must re-POST once to stamp the env"
+        )
+    }
+
+    // MARK: - env change → dedupe miss (the core bug fix)
+
+    func testEnvChangeForcesRePost() {
+        // Same token + events that were registered under sandbox. Now the env
+        // flipped to production (Xcode → TestFlight on the same device). The
+        // dedupe must miss so the gateway receives a re-registration with the
+        // correct env.
+        let token = "deadbeef"
+        let events = ["approval", "turn_complete"]
+        defaults.set(token, forKey: DefaultsKeys.pushLastDeviceToken)
+        defaults.set(events, forKey: DefaultsKeys.pushLastEvents)
+        defaults.set("sandbox", forKey: DefaultsKeys.pushLastEnv)
+
+        XCTAssertFalse(
+            wouldSkip(token: token, events: events, env: "production", defaults: defaults),
+            "env sandbox→production must be a dedupe miss even when token+events are identical"
+        )
+    }
+
+    func testReverseEnvChangeForcesRePost() {
+        // Symmetric: production → sandbox (e.g. side-loading a dev build after
+        // a TestFlight install). The dedupe must still miss.
+        let token = "cafebabe"
+        let events: [String] = []
+        defaults.set(token, forKey: DefaultsKeys.pushLastDeviceToken)
+        defaults.set(events, forKey: DefaultsKeys.pushLastEvents)
+        defaults.set("production", forKey: DefaultsKeys.pushLastEnv)
+
+        XCTAssertFalse(
+            wouldSkip(token: token, events: events, env: "sandbox", defaults: defaults),
+            "env production→sandbox must be a dedupe miss"
+        )
+    }
+
+    // MARK: - all three unchanged → dedupe hit
+
+    func testIdenticalTokenEventsEnvSkips() {
+        // All three fields match: the gateway already has the correct
+        // registration → skip the redundant POST.
+        let token = "112233"
+        let events = ["approval", "clarify", "turn_complete"]
+        let env = "production"
+        defaults.set(token, forKey: DefaultsKeys.pushLastDeviceToken)
+        defaults.set(events, forKey: DefaultsKeys.pushLastEvents)
+        defaults.set(env, forKey: DefaultsKeys.pushLastEnv)
+
+        XCTAssertTrue(
+            wouldSkip(token: token, events: events, env: env, defaults: defaults),
+            "identical token+events+env must skip the POST"
+        )
+    }
+
+    func testIdenticalStateSandboxSkips() {
+        // Sandbox variant: simulator / Xcode dev builds must also dedupe when
+        // token+events+env are all unchanged.
+        let token = "00ff00"
+        let events = ["clarify"]
+        defaults.set(token, forKey: DefaultsKeys.pushLastDeviceToken)
+        defaults.set(events, forKey: DefaultsKeys.pushLastEvents)
+        defaults.set("sandbox", forKey: DefaultsKeys.pushLastEnv)
+
+        XCTAssertTrue(
+            wouldSkip(token: token, events: events, env: "sandbox", defaults: defaults),
+            "identical sandbox registration must skip"
+        )
+    }
+
+    // MARK: - token or events change still misses (existing behaviour preserved)
+
+    func testTokenChangeMissesRegardlessOfEnv() {
+        defaults.set("aaa", forKey: DefaultsKeys.pushLastDeviceToken)
+        defaults.set(["approval"], forKey: DefaultsKeys.pushLastEvents)
+        defaults.set("production", forKey: DefaultsKeys.pushLastEnv)
+
+        XCTAssertFalse(
+            wouldSkip(token: "bbb", events: ["approval"], env: "production", defaults: defaults),
+            "different token must be a miss even when events+env match"
+        )
+    }
+
+    func testEventsChangeMissesRegardlessOfEnv() {
+        defaults.set("aaa", forKey: DefaultsKeys.pushLastDeviceToken)
+        defaults.set(["approval"], forKey: DefaultsKeys.pushLastEvents)
+        defaults.set("production", forKey: DefaultsKeys.pushLastEnv)
+
+        XCTAssertFalse(
+            wouldSkip(token: "aaa", events: ["approval", "clarify"], env: "production", defaults: defaults),
+            "different events must be a miss even when token+env match"
+        )
+    }
+}
+
 // MARK: - Approval respond outcome shape
 
 /// Pins the `RestClient.ApprovalRespondOutcome` cases the action handler branches
