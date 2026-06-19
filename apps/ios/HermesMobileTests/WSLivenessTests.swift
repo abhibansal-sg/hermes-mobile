@@ -378,6 +378,98 @@ final class WSLivenessTests: XCTestCase {
         await client.disconnect()
     }
 
+    // MARK: - (g) ABH-178 WIRING: clearAllTurnsInProgress is called by both abandon paths
+
+    /// `handleScenePhase(.active)` with a `.closed` socket state (the `dead` branch)
+    /// must clear `turnsInProgress` so a stale carry-forward flag can't lock the
+    /// session list into a never-converge loop (ABH-157 regression guard).
+    ///
+    /// Isolation: uses `clientStateOverrideForScenePhase = .closed` to force the
+    /// `dead` branch without a real transport. `connectRPC` throws so the reconnect
+    /// loop stays in `.reconnecting` and does not race back to `.connected`.
+    @MainActor
+    func testDeadSocketBranchClearsTurnsInProgress() async {
+        let (connection, sessions, _) = makeConnectionStore()
+
+        // Reach .connected via the reconnect seam.
+        connection.connectRPC = { _, _, _ in }
+        connection._seedAndStartReconnect(
+            serverURL: "http://127.0.0.1:9123",
+            token: "test-token"
+        )
+        await settle()
+        XCTAssertEqual(connection.phase, .connected,
+            "precondition: must be .connected before scene-phase test")
+
+        // Mark a session as mid-turn so turnsInProgress is non-empty.
+        sessions.markTurnStarted(storedId: "sess-abc")
+        XCTAssertFalse(sessions.turnsInProgressIds.isEmpty,
+            "precondition: turnsInProgress must be non-empty before scene-phase fires")
+
+        // Force the `dead` branch by injecting .closed state.
+        connection.clientStateOverrideForScenePhase = .closed(reason: nil)
+        // Throw in connectRPC so the reconnect loop stays in .reconnecting.
+        connection.reconnectBackoffOverride = 0
+        connection.connectRPC = { _, _, _ in
+            throw URLError(.cannotConnectToHost)
+        }
+
+        connection.handleScenePhase(.active)
+        await settle()
+
+        // The `dead` branch must have cleared all in-progress turn flags.
+        XCTAssertTrue(sessions.turnsInProgressIds.isEmpty,
+            "handleScenePhase dead branch must clear turnsInProgress (ABH-178)")
+    }
+
+    /// `handleScenePhase(.active)` with `probeLivenessRPC` returning `false`
+    /// (the dead-probe branch, ABH-177) must also clear `turnsInProgress`.
+    ///
+    /// In the real path, `probeLiveness()` transitions the client to `.failed` and
+    /// the state observer calls `clearAllTurnsInProgress`. In the injected-hook
+    /// path the observer is never driven, so the explicit `clearAllTurnsInProgress()`
+    /// in the `guard alive else` branch must do it instead.
+    @MainActor
+    func testDeadProbeBranchClearsTurnsInProgress() async {
+        let (connection, sessions, _) = makeConnectionStore()
+
+        // Reach .connected via the reconnect seam.
+        connection.connectRPC = { _, _, _ in }
+        connection._seedAndStartReconnect(
+            serverURL: "http://127.0.0.1:9123",
+            token: "test-token"
+        )
+        await settle()
+        XCTAssertEqual(connection.phase, .connected,
+            "precondition: must be .connected before scene-phase test")
+
+        // Mark two sessions as mid-turn.
+        sessions.markTurnStarted(storedId: "sess-1")
+        sessions.markTurnStarted(storedId: "sess-2")
+        XCTAssertEqual(sessions.turnsInProgressIds.count, 2,
+            "precondition: turnsInProgress must have 2 entries")
+
+        // Inject a dead liveness probe (hook path — state observer never fires).
+        connection.probeLivenessRPC = { _ in false }
+        // Throw in connectRPC so the reconnect loop stays in .reconnecting.
+        connection.reconnectBackoffOverride = 0
+        connection.connectRPC = { _, _, _ in
+            throw URLError(.cannotConnectToHost)
+        }
+
+        connection.handleScenePhase(.active)
+        await settle()
+
+        // The `guard alive else` branch must have cleared all in-progress turn flags.
+        XCTAssertTrue(sessions.turnsInProgressIds.isEmpty,
+            "handleScenePhase dead-probe branch must clear turnsInProgress (ABH-178)")
+
+        // And the reconnect loop must be running — belt-and-suspenders sanity.
+        if case .reconnecting = connection.phase { /* expected */ } else {
+            XCTFail("expected .reconnecting after dead probe, got \(connection.phase)")
+        }
+    }
+
     // MARK: - (f) REAL ROUTING: handleScenePhase dead-probe → phase transitions to .reconnecting
 
     /// The routing test for Must-Fix #2b.

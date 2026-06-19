@@ -146,9 +146,10 @@ final class UX1DrawerFeedTests: XCTestCase {
     // MARK: - ABH-86 optimistic activity bump + re-sort
 
     /// `noteActivity` re-sorts a session to the top immediately, and a refresh
-    /// returning a STALE (older) server `lastActive` must NOT knock it back —
-    /// `mergeSessionPage` carries the higher local value forward until the server
-    /// catches up (the send → top-of-list expectation, flicker-free).
+    /// returning a STALE (older) server `lastActive` must NOT knock it back while
+    /// the turn is in flight. `mergeSessionPage` carries the higher local value
+    /// forward via the `turnsInProgress` flag (ABH-178: explicit flag replaced the
+    /// old liveWindow time-proxy). Once the turn completes the server authority wins.
     func testNoteActivityReSortsAndSurvivesStaleRefresh() async {
         let store = makeStore()
         store.hideCron = false
@@ -163,15 +164,18 @@ final class UX1DrawerFeedTests: XCTestCase {
             "baseline order is lastActive DESC")
 
         // User sends into A → optimistic bump to NOW → A jumps to the top.
+        // ABH-178: the carry-forward now requires an explicit turn-in-flight flag.
         store.noteActivity(storedId: "A")
+        store.markTurnStarted(storedId: "A")
         XCTAssertEqual(store.visibleSessions.first?.id, "A",
             "noteActivity re-sorts the bumped session to the top immediately")
 
         // The ~400ms debounced refresh returns A's STALE server lastActive (100).
+        // The turn is still in flight → carry-forward holds.
         store.sessionsFetch = { (rows(100), 3) }
         await store.refresh()
         XCTAssertEqual(store.visibleSessions.first?.id, "A",
-            "a stale refresh must not knock the just-active session back down (merge-max)")
+            "a stale refresh must not knock the just-active session back down while the turn is in flight")
 
         // Server finally advances A past the bump → converges on server authority.
         let serverCaughtUp = Date().timeIntervalSince1970 + 60

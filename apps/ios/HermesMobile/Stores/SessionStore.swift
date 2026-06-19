@@ -389,6 +389,49 @@ final class SessionStore {
     /// one entry exists; cancelled when the registry empties.
     private var liveCleanupTask: Task<Void, Never>?
 
+    // MARK: - Turn-in-progress registry (ABH-178)
+
+    /// Stored session ids whose turn is currently in flight. A row with a local
+    /// `lastActive` bump is carried forward over a server refresh IFF its id is
+    /// present here — so the carry-forward is gated on a REAL per-turn lifecycle
+    /// event rather than the 10s time-proxy. Cleared by every turn-end path
+    /// (complete/error/cancel/disconnect) so a stuck flag can never revive the
+    /// old infinite-carry-forward bug.
+    /// `@ObservationIgnored` so writes never trigger a drawer invalidation on
+    /// their own; the carry-forward effect lands via `mergeSessionPage`.
+    @ObservationIgnored private var turnsInProgress: Set<String> = []
+
+    /// Mark a turn started for `storedId`. Called by `ConnectionStore` on
+    /// `message.start`. A `nil`/empty id is a no-op.
+    func markTurnStarted(storedId: String?) {
+        guard let id = storedId, !id.isEmpty else { return }
+        turnsInProgress.insert(id)
+    }
+
+    /// Mark a turn completed (or failed/cancelled) for `storedId`. Called by
+    /// `ConnectionStore` on `message.complete`, the gateway `error` terminal,
+    /// and every turn-abort path. A `nil`/empty id is a no-op.
+    func markTurnCompleted(storedId: String?) {
+        guard let id = storedId, !id.isEmpty else { return }
+        turnsInProgress.remove(id)
+    }
+
+    /// Clear ALL in-progress turn flags. Belt-and-suspenders: called on
+    /// disconnect/reconnect so a mid-turn transport drop can never leave a flag
+    /// stuck, which would revive the infinite-carry-forward bug.
+    func clearAllTurnsInProgress() {
+        turnsInProgress.removeAll()
+    }
+
+    #if DEBUG
+    /// Test-only: the set of stored session ids currently flagged as having a
+    /// turn in flight. Exposed so wiring tests can assert that every abandon path
+    /// (socket drop, foreground-reconnect `dead` branch, dead-probe branch) leaves
+    /// the set empty — proving the anti-stuck-flag invariant without relying on
+    /// carry-forward timing.
+    var turnsInProgressIds: Set<String> { turnsInProgress }
+    #endif
+
     private var connection: ConnectionStore?
     private var chat: ChatStore?
 
@@ -1118,23 +1161,22 @@ final class SessionStore {
         let priorLastActive: [String: Double] = sessions.reduce(into: [:]) { acc, s in
             if let la = s.lastActive { acc[s.id] = la }
         }
-        // ABH-157 — gate the carry-forward on the LIVE WINDOW. `noteActivity`
-        // bumps `lastActive` to the DEVICE clock; if the device runs even slightly
-        // ahead of the gateway, an UNCONDITIONAL `max(local, server)` pins that
-        // device-now value above the row's true server `lastActive` FOREVER —
-        // nothing ever advances the server value past a future-dated bump — so an
-        // idle local session permanently outranks a genuinely-fresher foreign
-        // (desktop-driven) one AND displays a stale (future) timestamp. Both the
-        // drawer SORT and the row TIMESTAMP key on `lastActive`, so this one defect
-        // produced both reported symptoms. `lastActivityAt[id]` is re-stamped on
-        // every live frame (ConnectionStore.scheduleSessionRefresh), so a row that
-        // is genuinely mid-turn keeps its optimistic position (no flicker), and the
-        // instant the turn settles the bump DECAYS to the authoritative server
-        // value — restoring correct recency order and the true last-active time.
-        let liveCutoff = Date().addingTimeInterval(-Self.liveWindow)
+        // ABH-178 — gate the carry-forward on an EXPLICIT per-turn flag
+        // (turnsInProgress) instead of the 10s liveWindow time-proxy. The
+        // time-proxy worked well for the common case (frequent delta frames keep
+        // lastActivityAt fresh) but opened a residual flicker window when a turn
+        // had a >liveWindow silent inter-frame gap: the carry-forward decayed mid-turn
+        // and a refresh would temporarily drop the row to server authority. The
+        // explicit flag is toggled on message.start (set) and cleared on every
+        // turn-end path: message.complete, gateway error, user cancel, and — as a
+        // belt-and-suspenders — disconnect/reconnect (clearAllTurnsInProgress).
+        // That final path ensures a mid-turn socket drop can NEVER leave the flag
+        // stuck, which would bring back the infinite-carry-forward bug from ABH-157.
+        // NOTE: `lastActivityAt` / `liveWindow` are PRESERVED for the live-dot
+        // (the pulsing row indicator) — only this carry-forward gate has changed.
         let reconciled = incoming.map { row -> SessionSummary in
             guard let prior = priorLastActive[row.id],
-                  let liveAt = lastActivityAt[row.id], liveAt > liveCutoff,
+                  turnsInProgress.contains(row.id),
                   prior > (row.lastActive ?? -.greatestFiniteMagnitude) else { return row }
             var bumped = row
             bumped.lastActive = prior

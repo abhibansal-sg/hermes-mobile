@@ -400,6 +400,14 @@ final class ConnectionStore {
     /// is `let`/init-time). A `false` result exercises the full detection →
     /// reconcile → reconnect routing. Pattern mirrors `connectRPC`/`steerRPC`.
     var probeLivenessRPC: ((_ timeout: Duration) async -> Bool)?
+
+    /// Injectable socket-state override for `handleScenePhase` (tests). When
+    /// non-nil, `handleScenePhase` uses this value instead of reading
+    /// `client.state` — which is not injectable because `client` is a `let`
+    /// property created at init time. Allows the `dead` branch (socket
+    /// `.closed`/`.failed`) to be exercised without a real transport. Pattern
+    /// mirrors `probeLivenessRPC`.
+    var clientStateOverrideForScenePhase: GatewayConnectionState?
     #endif
 
     /// Tasks that live as long as the client: the event router and the
@@ -848,6 +856,9 @@ final class ConnectionStore {
         // its reconnect guard stays quiet because `hasConnected` was cleared
         // above, BEFORE the close.
         chatStore.handleConnectionDrop()
+        // ABH-178: clear any stuck turn flags on explicit disconnect so a later
+        // re-pair starts with a clean carry-forward slate.
+        sessionStore.clearAllTurnsInProgress()
         await client.disconnect()
         phase = .needsSetup
     }
@@ -977,7 +988,25 @@ final class ConnectionStore {
                     ?? (event.sessionId == sessionStore.activeRuntimeId
                         ? sessionStore.activeStoredId : nil)
                 sessionStore.noteActivity(storedId: activityStoredId)
+                // ABH-178: maintain the explicit turn-in-progress registry so
+                // mergeSessionPage's carry-forward gate is gated on a real
+                // lifecycle event, not the 10s liveWindow time-proxy.
+                if event.type == .messageStart {
+                    sessionStore.markTurnStarted(storedId: activityStoredId)
+                } else {
+                    // .messageComplete — turn finished; server lastActive is now
+                    // authoritative, so the carry-forward can release.
+                    sessionStore.markTurnCompleted(storedId: activityStoredId)
+                }
                 scheduleSessionRefresh()
+            case .error:
+                // A gateway error is a turn TERMINAL (ChatStore also handles it).
+                // Clear the turn-in-progress flag so the carry-forward releases
+                // and the server's lastActive becomes authoritative again.
+                let errorStoredId = event.storedSessionId
+                    ?? (event.sessionId == sessionStore.activeRuntimeId
+                        ? sessionStore.activeStoredId : nil)
+                sessionStore.markTurnCompleted(storedId: errorStoredId)
             default:
                 break
             }
@@ -1058,6 +1087,10 @@ final class ConnectionStore {
             // (R1 #9/#42). Idempotent, so the repeated `.failed` transitions
             // of the reconnect loop's own attempts are harmless.
             chatStore.handleConnectionDrop()
+            // ABH-178 belt-and-suspenders: a mid-turn socket drop must NOT leave
+            // any session's turnInProgress flag stuck — that would permanently
+            // carry-forward a local lastActive bump, reviving the ABH-157 bug.
+            sessionStore.clearAllTurnsInProgress()
             // A drop after we were connected → reconnect. An expected close
             // (disconnect/needsSetup) leaves `hasConnected` false.
             guard hasConnected, reconnectTask == nil else { return }
@@ -1385,7 +1418,12 @@ final class ConnectionStore {
 
         Task { [weak self] in
             guard let self else { return }
+            #if DEBUG
+            let _liveState = await self.client.state
+            let socketState = self.clientStateOverrideForScenePhase ?? _liveState
+            #else
             let socketState = await self.client.state
+            #endif
             let dead: Bool
             switch socketState {
             case .closed, .failed: dead = true
@@ -1409,6 +1447,11 @@ final class ConnectionStore {
                 // before reconnecting so the recovery backfill isn't no-op'd
                 // (R1 #9/#42).
                 self.chatStore.handleConnectionDrop()
+                // ABH-178: the state observer's clearAllTurnsInProgress() may not
+                // have fired either (same reason as handleConnectionDrop above).
+                // Clear here so the subsequent recoverActiveSession→refresh→
+                // mergeSessionPage doesn't carry a stale lastActive forward.
+                self.sessionStore.clearAllTurnsInProgress()
                 // ABH-182 Inc-1: a dead socket means any in-progress turn is
                 // interrupted; reconcile the LA so an orphaned "Thinking" activity
                 // is dismissed rather than expiring on the lock screen at staleAfter.
@@ -1443,6 +1486,11 @@ final class ConnectionStore {
                     // call `handleSocketFailure`, so we start the loop explicitly here to
                     // keep the routing correct in both code paths.
                     LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
+                    // ABH-178: in the real path the state observer's .failed transition
+                    // fires clearAllTurnsInProgress(); in the injected-hook test path the
+                    // observer is never driven, so clear explicitly here to guarantee the
+                    // flag can't stay stuck and revive the ABH-157 never-converge bug.
+                    self.sessionStore.clearAllTurnsInProgress()
                     if self.reconnectTask != nil {
                         self.reconnectTask?.cancel()
                         self.reconnectTask = nil

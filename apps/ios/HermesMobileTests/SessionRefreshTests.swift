@@ -104,17 +104,17 @@ final class SessionRefreshTests: XCTestCase {
             "the displayed timestamp converges to the authoritative server value, not the stale future bump")
     }
 
-    /// While a row is GENUINELY live (a frame just landed, so `lastActivityAt` is
-    /// fresh), the optimistic bump is STILL carried forward over a lagging server
-    /// value — so the row does not flicker down on the debounced refresh that
-    /// fires right after message.start. This guards the anti-flicker behavior the
-    /// decay must not regress.
+    /// While a turn is genuinely in flight (markTurnStarted called), the optimistic
+    /// bump is STILL carried forward over a lagging server value — so the row does
+    /// not flicker down on the debounced refresh that fires right after message.start.
+    /// This guards the anti-flicker behavior the ABH-178 change must not regress.
     func testLiveBumpStillCarriedForwardToPreventFlicker() async {
         let store = makeStore()
         let mineBumped = makeSummary(id: "mine",  lastActive: 100_000, startedAt: 1)
         let other      = makeSummary(id: "other", lastActive:  90_000, startedAt: 1)
         store.sessions = [mineBumped, other]
-        store.noteActivity(storedSessionId: "mine")  // mark genuinely live
+        // ABH-178: carry-forward now gates on the explicit turn-in-progress flag.
+        store.markTurnStarted(storedId: "mine")
 
         // The debounced refresh returns the OLD (lower) server value for mine.
         let mineOldServer = makeSummary(id: "mine",  lastActive: 50_000, startedAt: 1)
@@ -124,7 +124,7 @@ final class SessionRefreshTests: XCTestCase {
         await store.refresh()
 
         XCTAssertEqual(store.visibleSessions.map(\.id).first, "mine",
-            "while genuinely live, the optimistic bump is carried forward so the row doesn't flicker down before the server catches up")
+            "while a turn is in flight (markTurnStarted), the optimistic bump is carried forward so the row doesn't flicker down before the server catches up")
     }
 
     /// When `lastActive` is absent, sort falls back to `startedAt` DESC.
@@ -282,5 +282,145 @@ final class SessionRefreshTests: XCTestCase {
         // Non-destructive merge must keep "activeSession".
         XCTAssertTrue(store.sessions.map(\.id).contains("activeSession"),
             "Hard-replace is no longer acceptable — active session must survive the merge")
+    }
+}
+
+// MARK: - ABH-178: explicit turnInProgress carry-forward gate
+
+/// Tests for the explicit `turnsInProgress` flag that replaced the 10s liveWindow
+/// time-proxy as the carry-forward gate in `mergeSessionPage`. All tests are
+/// deterministic: no real timestamps, no async waits beyond the `await store.refresh()`.
+///
+/// The invariant under test: `mergeSessionPage` carries a higher local `lastActive`
+/// forward over the incoming server value IFF the session's stored id is in
+/// `turnsInProgress`. The live-dot (`lastActivityAt`/`liveWindow`) is untouched
+/// — only this carry-forward gate changed.
+@MainActor
+final class TurnInProgressCarryForwardTests: XCTestCase {
+
+    private func makeSummary(id: String, lastActive: Double) -> SessionSummary {
+        SessionSummary(
+            id: id, title: id, preview: nil, startedAt: 1,
+            messageCount: nil, source: nil, lastActive: lastActive, cwd: nil
+        )
+    }
+
+    // MARK: (a) No prior local value → no carry-forward regardless of flag
+
+    func testNoLocalPriorNeverCarriesForward() async {
+        let store = SessionStore()
+        // No local sessions; server returns a fresh row. Turn flag is set, but
+        // there is no prior local lastActive to carry forward.
+        store.markTurnStarted(storedId: "sess")
+        store.sessionsFetch = { ([self.makeSummary(id: "sess", lastActive: 500)], 1) }
+        await store.refresh()
+        XCTAssertEqual(
+            store.sessions.first(where: { $0.id == "sess" })?.lastActive, 500,
+            "when no prior local lastActive exists, the server value must win regardless of the turn flag"
+        )
+    }
+
+    // MARK: (b) turnInProgress set + local > server → carry-forward applies
+
+    func testTurnInProgressCarriesLocalForwardWhenHigher() async {
+        let store = SessionStore()
+        // Seed a locally-bumped row.
+        store.sessions = [makeSummary(id: "mine", lastActive: 100_000)]
+        store.markTurnStarted(storedId: "mine")
+        // Server returns a lower (stale) value — the turn hasn't completed yet.
+        store.sessionsFetch = { ([self.makeSummary(id: "mine", lastActive: 50_000)], 1) }
+        await store.refresh()
+        XCTAssertEqual(
+            store.sessions.first(where: { $0.id == "mine" })?.lastActive, 100_000,
+            "while a turn is in flight the local bump must be carried forward, keeping the row at the top"
+        )
+    }
+
+    // MARK: (c) turnInProgress NOT set + local > server → carry-forward does NOT apply
+
+    func testNoTurnFlagDropsCarryForward() async {
+        let store = SessionStore()
+        // Seed a locally-bumped row. No turn flag — simulates a settled/idle session.
+        store.sessions = [makeSummary(id: "mine", lastActive: 100_000)]
+        // NO markTurnStarted — flag is absent.
+        store.sessionsFetch = { ([self.makeSummary(id: "mine", lastActive: 50_000)], 1) }
+        await store.refresh()
+        XCTAssertEqual(
+            store.sessions.first(where: { $0.id == "mine" })?.lastActive, 50_000,
+            "without a turn-in-progress flag the server value must win (no carry-forward for settled sessions)"
+        )
+    }
+
+    // MARK: (d) markTurnCompleted clears the flag → subsequent refresh decays
+
+    func testMarkTurnCompletedClearsCarryForward() async {
+        let store = SessionStore()
+        store.sessions = [makeSummary(id: "mine", lastActive: 100_000)]
+        store.markTurnStarted(storedId: "mine")
+
+        // While the turn is in flight, refresh carries the bump forward.
+        store.sessionsFetch = { ([self.makeSummary(id: "mine", lastActive: 50_000)], 1) }
+        await store.refresh()
+        XCTAssertEqual(
+            store.sessions.first(where: { $0.id == "mine" })?.lastActive, 100_000,
+            "carry-forward must hold while turn is in flight"
+        )
+
+        // Turn completes → flag cleared.
+        store.markTurnCompleted(storedId: "mine")
+
+        // Next refresh (e.g. the post-complete one): server value now wins.
+        store.sessionsFetch = { ([self.makeSummary(id: "mine", lastActive: 75_000)], 1) }
+        await store.refresh()
+        XCTAssertEqual(
+            store.sessions.first(where: { $0.id == "mine" })?.lastActive, 75_000,
+            "after markTurnCompleted the carry-forward must not apply — server lastActive must win"
+        )
+    }
+
+    // MARK: (d2) clearAllTurnsInProgress (disconnect/reconnect path)
+
+    func testClearAllTurnsInProgressUnblocksDecay() async {
+        let store = SessionStore()
+        store.sessions = [
+            makeSummary(id: "sess-a", lastActive: 200_000),
+            makeSummary(id: "sess-b", lastActive: 180_000),
+        ]
+        store.markTurnStarted(storedId: "sess-a")
+        store.markTurnStarted(storedId: "sess-b")
+
+        // Simulate a disconnect mid-turn (e.g. socket drop).
+        store.clearAllTurnsInProgress()
+
+        // Post-reconnect refresh: server authority must win for both rows.
+        store.sessionsFetch = {
+            ([
+                self.makeSummary(id: "sess-a", lastActive: 100_000),
+                self.makeSummary(id: "sess-b", lastActive: 90_000),
+            ], 2)
+        }
+        await store.refresh()
+        XCTAssertEqual(
+            store.sessions.first(where: { $0.id == "sess-a" })?.lastActive, 100_000,
+            "after clearAllTurnsInProgress, sess-a must decay to server value (no stuck flag)"
+        )
+        XCTAssertEqual(
+            store.sessions.first(where: { $0.id == "sess-b" })?.lastActive, 90_000,
+            "after clearAllTurnsInProgress, sess-b must decay to server value (no stuck flag)"
+        )
+    }
+
+    // MARK: - live-dot preserved (lastActivityAt unaffected by this change)
+
+    func testLiveDotStillWorksThroughNoteActivity() {
+        // noteActivity still stamps lastActivityAt for the live-dot — the
+        // carry-forward change must NOT have removed that side-effect.
+        let store = SessionStore()
+        store.sessions = [makeSummary(id: "live", lastActive: 100)]
+        store.noteActivity(storedSessionId: "live")
+        XCTAssertTrue(
+            store.isLive(storedSessionId: "live"),
+            "live-dot (isLive) must still work via noteActivity — the carry-forward change must not break it"
+        )
     }
 }
