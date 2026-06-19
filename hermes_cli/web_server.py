@@ -2395,7 +2395,7 @@ async def get_profiles_sessions(
 
 
 @app.get("/api/sessions/search")
-async def search_sessions(q: str = "", limit: int = 20, scope: str = "all"):
+async def search_sessions(q: str = "", limit: int = 20, offset: int = 0, scope: str = "all"):
     """Search sessions by ID plus full-text message content using FTS5.
 
     Direct session-id matches are surfaced first, then FTS message-content
@@ -2414,6 +2414,9 @@ async def search_sessions(q: str = "", limit: int = 20, scope: str = "all"):
         structured results).
     A non-``all`` scope drops the session-id match pass so the list stays a
     pure content-scoped result.
+
+    ``offset`` is a 0-based pagination offset into the deduped result list;
+    default 0 = current behavior (returns the first ``limit`` results).
     """
     if not q or not q.strip():
         return {"results": []}
@@ -2427,6 +2430,8 @@ async def search_sessions(q: str = "", limit: int = 20, scope: str = "all"):
         db = SessionDB()
         try:
             safe_limit = max(1, min(int(limit or 20), 100))
+            safe_offset = max(0, min(int(offset or 0), 500))
+            window = safe_offset + safe_limit
 
             # Walk parent_session_id to the compression root, memoized so a
             # chain of compression segments only costs one walk. We deliberately
@@ -2508,7 +2513,7 @@ async def search_sessions(q: str = "", limit: int = 20, scope: str = "all"):
                 if not raw_sid:
                     return
                 root = compression_root(raw_sid)
-                if root in seen or len(seen) >= safe_limit:
+                if root in seen or len(seen) >= window:
                     return
                 payload = dict(payload)
                 payload["session_id"] = lineage_tip(root)
@@ -2522,7 +2527,7 @@ async def search_sessions(q: str = "", limit: int = 20, scope: str = "all"):
             # Skipped for a narrowed scope (messages/code) so the list stays a
             # pure content-scoped result.
             id_rows = (
-                db.search_sessions_by_id(q, limit=safe_limit, include_archived=True)
+                db.search_sessions_by_id(q, limit=window, include_archived=True)
                 if role_filter is None
                 else []
             )
@@ -2554,7 +2559,7 @@ async def search_sessions(q: str = "", limit: int = 20, scope: str = "all"):
             prefix_query = " ".join(terms)
             # Over-fetch so lineage dedup can still surface `limit` distinct
             # conversations even when several hits collapse onto one root.
-            fetch_limit = max(safe_limit * 5, 50)
+            fetch_limit = max(window * 5, 50)
             # Pass role_filter only when a scope is active, so the default
             # (scope="all") path calls search_messages exactly as stock Hermes
             # does — keeps the search-scope seam additive and stock tests green.
@@ -2564,7 +2569,7 @@ async def search_sessions(q: str = "", limit: int = 20, scope: str = "all"):
             matches = db.search_messages(**search_kwargs)
 
             for m in matches:
-                if len(seen) >= safe_limit:
+                if len(seen) >= window:
                     break
                 add_lineage_result(
                     m["session_id"],
@@ -2576,7 +2581,7 @@ async def search_sessions(q: str = "", limit: int = 20, scope: str = "all"):
                         "session_started": m.get("session_started"),
                     },
                 )
-            return {"results": list(seen.values())}
+            return {"results": list(seen.values())[safe_offset:]}
         finally:
             db.close()
     except Exception:
