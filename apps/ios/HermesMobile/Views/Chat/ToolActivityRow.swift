@@ -82,6 +82,13 @@ struct ToolClusterView: View {
                 summaryCapsule
             }
             .buttonStyle(.plain)
+            // A11y: the capsule contains a decorative gearshape + text fragments;
+            // without an explicit label VoiceOver reads the image name. Provide a
+            // synthesised label matching the visible text, plus the expanded state.
+            .accessibilityLabel(summaryText)
+            .accessibilityValue(isExpanded ? "expanded" : "collapsed")
+            .accessibilityHint("Double-tap to \(isExpanded ? "collapse" : "expand") tool details")
+            .accessibilityAddTraits(.isButton)
 
             if isExpanded {
                 liveCluster
@@ -116,13 +123,20 @@ struct ToolClusterView: View {
 
     /// "N tool calls · Xs". Elapsed prefers the turn wall-clock; otherwise sums
     /// the per-tool durations; otherwise omits the time tail entirely.
-    private var summaryText: String {
-        let count = tools.count
-        let noun = count == 1 ? "tool call" : "tool calls"
+    ///
+    /// Extracted as `nonisolated static` (matching ``MessageBubble/bubbleAccessibilityLabel``
+    /// pattern) so unit tests can verify the a11y label format without constructing
+    /// a SwiftUI view or entering an actor context.
+    nonisolated static func summaryLabel(toolCount: Int, elapsedSeconds: TimeInterval?) -> String {
+        let noun = toolCount == 1 ? "tool call" : "tool calls"
         if let seconds = elapsedSeconds {
-            return String(format: "%d %@ · %.0fs", count, noun, seconds)
+            return String(format: "%d %@ · %.0fs", toolCount, noun, seconds)
         }
-        return "\(count) \(noun)"
+        return "\(toolCount) \(noun)"
+    }
+
+    private var summaryText: String {
+        Self.summaryLabel(toolCount: tools.count, elapsedSeconds: elapsedSeconds)
     }
 
     /// Turn wall-clock if known, else the sum of per-tool `durationMs`.

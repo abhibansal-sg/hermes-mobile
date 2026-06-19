@@ -135,6 +135,11 @@ struct WelcomeView: View {
                 .strokeBorder(selected ? Color.clear : theme.border, lineWidth: 1)
         )
         .accessibilityIdentifier("connectionModeButton_\(mode.rawValue)")
+        // A11y: explicit label so VoiceOver reads the human-readable mode name
+        // rather than the SF Symbol image name. Selection state is carried by
+        // the .isSelected TRAIT alone — adding it to the label too would cause
+        // VoiceOver to double-announce "selected, selected".
+        .accessibilityLabel(mode.label)
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
     }
 

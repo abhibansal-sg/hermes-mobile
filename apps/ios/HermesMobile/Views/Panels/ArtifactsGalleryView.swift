@@ -264,6 +264,10 @@ private struct ArtifactThumbnail: View {
     @Environment(\.hermesTheme) private var theme
 
     private let cellSize: CGFloat = 100
+    // Dynamic-Type-scaled icon/label sizes so tile text grows with Larger Text
+    // (base values preserve the default-size layout).
+    @ScaledMetric(relativeTo: .title) private var iconGlyphSize: CGFloat = 28
+    @ScaledMetric(relativeTo: .caption2) private var tileNameFontSize: CGFloat = 10
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -326,10 +330,10 @@ private struct ArtifactThumbnail: View {
             theme.card
             VStack(spacing: 6) {
                 Image(systemName: systemName)
-                    .font(.system(size: 28))
+                    .font(.system(size: iconGlyphSize))
                     .foregroundStyle(color)
                 Text(artifact.displayName)
-                    .font(.system(size: 10))
+                    .font(.system(size: tileNameFontSize))
                     .foregroundStyle(theme.mutedFg)
                     .lineLimit(2)
                     .multilineTextAlignment(.center)
@@ -340,7 +344,7 @@ private struct ArtifactThumbnail: View {
 
     private var nameLabel: some View {
         Text(artifact.displayName)
-            .font(.system(size: 10, weight: .medium))
+            .font(.system(size: tileNameFontSize, weight: .medium))
             .foregroundStyle(.white)
             .lineLimit(1)
             .padding(.horizontal, 4)
