@@ -82,10 +82,18 @@ final class LiveActivityManager {
     /// Stale horizon for live frames (R1 #26): if neither local events nor
     /// server pushes refresh the activity within this window, ActivityKit
     /// marks it stale — so a frame orphaned by a dead app/server can't sit on
-    /// the Dynamic Island as a fresh-looking "Thinking" forever. Generous
-    /// enough that any genuinely-running turn (whose every event refreshes the
-    /// horizon) never goes stale.
-    private static let staleAfter: TimeInterval = 15 * 60
+    /// the Dynamic Island as a fresh-looking "Thinking" forever.
+    ///
+    /// SAFE to be short (ABH-182 Inc-3): this is a per-frame rolling window, NOT
+    /// a max-age. Every live-turn event (`update(toolName:)`, `markNeedsApproval()`,
+    /// etc.) pushes a new `ActivityContent(staleDate: now + staleAfter)`, so a
+    /// genuinely-running turn refreshes the horizon on every frame and never stales.
+    /// The window only expires after REAL silence — the orphaned-activity case.
+    /// 5 min clears ghost "Thinking" activities ~3× faster than 15 min.
+    ///
+    /// `internal` (not `private`) so unit tests can assert the threshold value
+    /// without needing ActivityKit.
+    static let staleAfter: TimeInterval = 5 * 60
     /// Stale horizon for the terminal "Done" frame: just past the dismissal
     /// grace, as a belt against the finish itself being lost.
     private static let endStaleAfter: TimeInterval = 30

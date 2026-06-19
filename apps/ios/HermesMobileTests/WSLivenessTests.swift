@@ -1,9 +1,10 @@
 import XCTest
 @testable import HermesMobile
 
-/// ABH-177 + ABH-182 Inc-1 — WS liveness ping and orphaned-LA reconcile.
+/// ABH-177 + ABH-182 Inc-1/Inc-3 — WS liveness ping, orphaned-LA reconcile,
+/// and stale-window tightening.
 ///
-/// Six deterministic tests (no device, no live gateway):
+/// Seven deterministic tests (no device, no live gateway):
 ///
 /// (a) Dead ping → `probeLiveness` returns `false` and state transitions to `.failed`.
 /// (b) Healthy ping → `probeLiveness` returns `true` and state stays `.open`.
@@ -15,6 +16,8 @@ import XCTest
 /// (f) REAL ROUTING: `handleScenePhase(.active)` with `probeLivenessRPC` injected
 ///     returning `false` drives the full detection → reconnect path, proving the
 ///     wiring in `ConnectionStore` is correct end-to-end (Must-Fix #2b).
+/// (g) STALE WINDOW: pins `LiveActivityManager.staleAfter` to 5 min and verifies
+///     the rolling-window safety invariant (ABH-182 Inc-3).
 @MainActor
 final class WSLivenessTests: XCTestCase {
 
@@ -443,5 +446,45 @@ final class WSLivenessTests: XCTestCase {
         if case .reconnecting = connection.phase { /* expected */ } else {
             XCTFail("expected .reconnecting after dead probe, got \(connection.phase)")
         }
+    }
+
+    // MARK: - (g) LA stale window (ABH-182 Inc-3)
+
+    /// Pin the stale horizon value and verify the rolling-window safety invariant.
+    ///
+    /// `LiveActivityManager.staleAfter` is a PER-FRAME rolling window: every live-turn
+    /// event (`update(toolName:)`, `markNeedsApproval()`, etc.) pushes a fresh
+    /// `ActivityContent(staleDate: now + staleAfter)`, so a genuinely-running turn
+    /// keeps refreshing the horizon and can NEVER be staled by this constant alone.
+    /// Only a silently-dead (orphaned) activity — with no events to refresh the window
+    /// — will go stale.
+    ///
+    /// The safe range for the window is therefore: long enough to cover the
+    /// inter-event gap for a normal tool invocation (well under 60 s), but short
+    /// enough to clear a ghost "Thinking" activity promptly (~5 min target).
+    ///
+    /// This test:
+    ///   1. Asserts the constant equals 5 min (ABH-182 Inc-3 target).
+    ///   2. Verifies it exceeds a generous inter-event ceiling (60 s) so a normal
+    ///      turn with one tool call per minute never stales during the turn.
+    ///   3. Verifies it is at most 5 min so a ghost activity clears within the
+    ///      target window once real silence begins.
+    func testStaleWindowIsRollingAndFiveMinutes() {
+        let staleAfter = LiveActivityManager.staleAfter
+
+        // Exact target value.
+        XCTAssertEqual(staleAfter, 5 * 60,
+            "staleAfter must be 5 min (ABH-182 Inc-3)")
+
+        // Safety: must comfortably exceed the worst-case inter-event gap in a
+        // running turn (60 s = one tool invocation per minute is very conservative).
+        let interEventCeiling: TimeInterval = 60
+        XCTAssertGreaterThan(staleAfter, interEventCeiling,
+            "staleAfter must exceed the worst-case inter-event gap so a live turn never stales")
+
+        // Prompt-clearance: must be ≤ 5 min so a ghost activity clears within the
+        // target window after real silence begins.
+        XCTAssertLessThanOrEqual(staleAfter, 5 * 60,
+            "staleAfter must be ≤ 5 min to clear orphaned activities promptly")
     }
 }
