@@ -392,6 +392,14 @@ final class ConnectionStore {
     /// must drive multiple consecutive failures (threshold ≥ 3) do not stall
     /// for seconds of wall-clock time. `nil` = normal exponential schedule.
     var reconnectBackoffOverride: Double?
+
+    /// Injectable liveness probe (tests). When non-nil, replaces the live
+    /// `client.probeLiveness()` call in `handleScenePhase` with this closure's
+    /// return value so unit tests can drive the dead-socket routing path without
+    /// needing to inject a full mock transport into the store's own client (which
+    /// is `let`/init-time). A `false` result exercises the full detection →
+    /// reconcile → reconnect routing. Pattern mirrors `connectRPC`/`steerRPC`.
+    var probeLivenessRPC: ((_ timeout: Duration) async -> Bool)?
     #endif
 
     /// Tasks that live as long as the client: the event router and the
@@ -1401,8 +1409,51 @@ final class ConnectionStore {
                 // before reconnecting so the recovery backfill isn't no-op'd
                 // (R1 #9/#42).
                 self.chatStore.handleConnectionDrop()
+                // ABH-182 Inc-1: a dead socket means any in-progress turn is
+                // interrupted; reconcile the LA so an orphaned "Thinking" activity
+                // is dismissed rather than expiring on the lock screen at staleAfter.
+                LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
                 self.startReconnectLoop()
             } else if case .connected = self.phase {
+                // ABH-177: verify the socket is still alive with a read-only ping
+                // before attempting the REST backfill. A silent-dead socket that
+                // reports `.connected` at the transport level would otherwise pass
+                // the `dead` check above, enter the backfill path, and then stall
+                // or fail there. `probeLiveness` calls `handleSocketFailure` on a
+                // dead ping, flipping transport state to `.failed` so the existing
+                // state-observer–driven reconnect loop starts immediately.
+                //
+                // In DEBUG builds, `probeLivenessRPC` can be injected by tests to
+                // exercise the full detection → reconcile → reconnect routing path
+                // without needing to drive the real URLSession ping machinery.
+                let alive: Bool
+                #if DEBUG
+                if let hook = self.probeLivenessRPC {
+                    alive = await hook(HermesGatewayClient.livenessPingTimeout)
+                } else {
+                    alive = await self.client.probeLiveness()
+                }
+                #else
+                alive = await self.client.probeLiveness()
+                #endif
+                guard alive else {
+                    // ABH-177: the real `probeLiveness` path calls `handleSocketFailure`
+                    // which sets transport state to `.failed`; the existing state observer
+                    // then starts the reconnect loop. In tests the injected hook does NOT
+                    // call `handleSocketFailure`, so we start the loop explicitly here to
+                    // keep the routing correct in both code paths.
+                    LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
+                    if self.reconnectTask != nil {
+                        self.reconnectTask?.cancel()
+                        self.reconnectTask = nil
+                    }
+                    self.startReconnectLoop()
+                    return
+                }
+                // ABH-182 Inc-1: on a healthy foreground, reconcile the LA so
+                // any orphaned activity (e.g. from a previous backgrounded turn
+                // whose message.complete was missed) is dismissed.
+                LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
                 await self.chatStore.backfill()
                 // ABH-86 item 5: refresh the session list on foreground so the
                 // drawer reflects changes made on other clients while the app

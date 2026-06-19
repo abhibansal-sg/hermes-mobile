@@ -16,14 +16,48 @@ protocol GatewayWebSocketTask: AnyObject, Sendable {
     /// satisfies both natively; mocks fall back to the inert defaults.
     var closeCode: URLSessionWebSocketTask.CloseCode { get }
     var closeReason: Data? { get }
+    /// Send a WebSocket ping. Used by `HermesGatewayClient.probeLiveness` to
+    /// check whether the socket is still alive without sending application data.
+    /// `URLSessionWebSocketTask` satisfies this natively; mocks fall back to the
+    /// default no-op-success extension below so existing tests compile unchanged.
+    func sendPing() async throws
 }
 
 extension GatewayWebSocketTask {
     var closeCode: URLSessionWebSocketTask.CloseCode { .invalid }
     var closeReason: Data? { nil }
+    /// Default: succeed immediately (no-op). Mocks that do not override this
+    /// report a live socket — override in tests that need a failing ping.
+    func sendPing() async throws {}
 }
 
-extension URLSessionWebSocketTask: GatewayWebSocketTask {}
+extension URLSessionWebSocketTask: GatewayWebSocketTask {
+    func sendPing() async throws {
+        // MUST use withTaskCancellationHandler: when `probeLiveness` times out
+        // and `cancelAll()` fires on the task group, the Swift task is cancelled
+        // but the underlying URLSession ping callback would never fire without an
+        // explicit cancel — leaving the continuation permanently suspended for up
+        // to `timeoutIntervalForRequest` (30 s). Cancelling the task here causes
+        // URLSession to call the callback with an error immediately, so the
+        // continuation resolves and `probeLiveness` returns within ~livenessPingTimeout.
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                self.sendPing { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+        } onCancel: {
+            // Abort the underlying URLSession task so the ping callback fires
+            // immediately with a cancellation error rather than hanging until the
+            // session's own timeout elapses.
+            self.cancel(with: .goingAway, reason: nil)
+        }
+    }
+}
 
 /// Builds the WebSocket transport for a given request. The default factory hands
 /// back a real `URLSessionWebSocketTask`; tests substitute a mock.
@@ -84,6 +118,49 @@ actor HermesGatewayClient {
         self.session = session
         self.transportFactory = transportFactory ?? { request in
             session.webSocketTask(with: request)
+        }
+    }
+
+    // MARK: - Liveness probe (ABH-177)
+
+    /// How long `probeLiveness` waits for the ping pong before declaring the
+    /// socket dead. Kept as a named constant so tests can reason about its value
+    /// without depending on a magic number.
+    static let livenessPingTimeout: Duration = .seconds(4)
+
+    /// Probe whether the current socket is still alive by sending a WebSocket
+    /// ping and waiting for the pong (or a timeout). Read-only: if the ping
+    /// succeeds we return `true` and leave the connection untouched; if it
+    /// fails or times out we call `handleSocketFailure` so the transport
+    /// transitions to `.failed` and the existing state-observer–driven
+    /// reconnect loop takes over — reusing the EXISTING drop→reconnect
+    /// machinery rather than adding a parallel path.
+    ///
+    /// Returns `true` when the socket is alive, `false` when it is dead (the
+    /// failure has already been fed to `handleSocketFailure` by this point).
+    func probeLiveness(timeout: Duration = livenessPingTimeout) async -> Bool {
+        guard let task, state == .open else {
+            // Not in a connected state — treat as dead so callers skip backfill.
+            return false
+        }
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask { try await task.sendPing() }
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    throw GatewayError.timeout(method: "ping")
+                }
+                // First to finish wins; the other is cancelled.
+                try await group.next()
+                group.cancelAll()
+            }
+            return true
+        } catch {
+            // Ping failed (transport error) or timed out: feed the EXISTING
+            // failure handler so state → .failed and the state-observer
+            // starts the reconnect loop. Do NOT add a second reconnect path.
+            handleSocketFailure(error)
+            return false
         }
     }
 

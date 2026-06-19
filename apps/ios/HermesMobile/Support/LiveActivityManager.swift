@@ -91,6 +91,50 @@ final class LiveActivityManager {
     private static let endStaleAfter: TimeInterval = 30
     #endif
 
+    // MARK: - Orphan reconciliation (ABH-182 Inc-1)
+
+    /// Pure-function decision: should an orphaned activity be ended?
+    ///
+    /// Factored out of the call site so it is unit-testable WITHOUT ActivityKit
+    /// (ActivityKit cannot run in the unit-test host). Mirrors the pattern used
+    /// by `NotificationService.approveChoice` / `decodeTap`.
+    ///
+    /// - Parameters:
+    ///   - hasActiveTurn: the caller's best knowledge of whether a gateway turn
+    ///     is currently in-progress. When `true` the activity is NOT orphaned;
+    ///     ending it would cut short a live turn. This guard makes teardown
+    ///     STRICTLY ADDITIVE — it can only end an already-orphaned activity.
+    ///   - isLive: whether the manager currently tracks a running activity.
+    ///
+    /// - Returns: `true` when the activity should be ended (it is live AND there
+    ///   is no active gateway turn to justify it).
+    nonisolated static func shouldEndOrphan(hasActiveTurn: Bool, isLive: Bool) -> Bool {
+        isLive && !hasActiveTurn
+    }
+
+    /// End the running activity if it is orphaned (no active gateway turn).
+    ///
+    /// Safe to call when no activity is running — `end()` is already idempotent.
+    /// The `hasActiveTurn` guard is the only safety property that matters: when
+    /// it is `true` this is a no-op, so a correct caller can NEVER end a live turn.
+    func endIfOrphaned(hasActiveTurn: Bool) {
+        #if canImport(ActivityKit)
+        let live = activity != nil || pendingEnd != nil
+        guard Self.shouldEndOrphan(hasActiveTurn: hasActiveTurn, isLive: live) else { return }
+        end()
+        #endif
+    }
+
+    /// Reconcile the live activity state on a foreground event.
+    ///
+    /// Called from `ConnectionStore.handleScenePhase` on every foreground, both
+    /// when the socket is healthy (liveness probe passed) and after a dead-socket
+    /// detection by `probeLiveness`. `hasActiveTurn` is the caller's authoritative
+    /// view of whether a gateway turn is in progress.
+    func reconcile(hasActiveTurn: Bool) {
+        endIfOrphaned(hasActiveTurn: hasActiveTurn)
+    }
+
     // MARK: - Lifecycle
 
     /// Start a Live Activity for a new turn, if activities are enabled and none
