@@ -24,6 +24,12 @@ The unit of leverage. A PR/feature that emerges from a closed loop actually work
 - **PROVE** — hard evidence only: `simctl io screenshot` before/after, log lines, a DB/REST row, an exit code, an XCUITest assertion. **Never accept "it should work."**
 - **UNBLOCK** — inject a test identity (DEBUG bridge / launch args / `?token=`) and seed state via a debug deep link or REST; reset between iterations so runs are deterministic.
 
+## CI gate model (ABH-189 — hybrid)
+
+**LOCAL FULL PLAN is the per-PR gate.** Run `scripts/ios-build.sh test -scheme HermesMobile` (all unit + UITests, no `-only-testing`). Gateway-dependent tests skip-guard on missing `TEST_RUNNER_HERMES_URL`/`TEST_RUNNER_HERMES_TOKEN`, so the gate is gateway-free and passes deterministically on any dev machine or CI node. A PR merges only when this full local plan is green.
+
+**Xcode Cloud = nightly + pre-ship clean-room only** (NOT per-PR). Trigger manually before archiving: `node apps/ios/ci_scripts/asc-cloud.mjs trigger <workflowId> <branch>`. Red nightly = halt + escalate. Rationale: the blocking gate must be fast enough to be honored — per-PR cloud (15–20 min) accumulated 13h of ignored red before ABH-188.
+
 ## The rig (gateway-dependent UITests)
 
 1. Isolated gateway on **port 9123** — `HERMES_GATEWAY_BROADCAST=1`, own token. **NEVER point test traffic at the live `:9119` dashboard.** Poll `/health` for 200; SIGTERM-kill it when done.

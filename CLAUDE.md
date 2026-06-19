@@ -223,6 +223,13 @@ Verification-first, low-babysitting scaffolding for work in this repo:
   (Opus, turns intent → a verifiable spec). Sonnet builds, Opus judges; never default-inherit.
 - **`.claude/hooks/guard.sh`** (PreToolUse) — blocks force-push, `rm -rf`, push-to-upstream,
   and the HELD trunk merge. Run a genuinely-intended command yourself in a terminal.
+- **Gate model (ABH-189):** LOCAL FULL PLAN is the per-PR gate —
+  `scripts/ios-build.sh test -scheme HermesMobile` (all unit + UITests; gateway-dependent
+  tests skip-guard on missing `HERMES_URL`/`HERMES_TOKEN`, so the gate is gateway-free).
+  Xcode Cloud = **nightly + pre-ship clean-room only** (NOT per-PR). Manual pre-ship
+  trigger: `node apps/ios/ci_scripts/asc-cloud.mjs trigger <workflowId> <branch>`. Red
+  nightly = halt + escalate. Rationale: the blocking gate must be fast enough to be
+  honored (per-PR cloud was 15–20 min + got 13h of red ignored — ABH-188).
 - **Verify rig:** isolated gateway on `:9123` (`HERMES_GATEWAY_BROADCAST=1`) +
   `TEST_RUNNER_HERMES_URL`/`TEST_RUNNER_HERMES_TOKEN` + `scripts/ios-build.sh test`.
   NEVER point test traffic at the live `:9119` dashboard.
