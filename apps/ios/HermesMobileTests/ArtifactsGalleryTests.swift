@@ -1,9 +1,10 @@
 import XCTest
 @testable import HermesMobile
 
-/// Unit tests for Task #14: artifacts gallery iOS grid.
+/// Unit tests for Task #14: artifacts gallery iOS grid + ABH-180 load-more.
 ///
-/// All requests are intercepted via ``ArtifactStubProtocol`` — no live server.
+/// All requests are intercepted via ``ArtifactStubProtocol`` (existing tests) or
+/// the ``ArtifactsGalleryModel/fetchPage`` seam (pagination tests) — no live server.
 /// Covers the required criteria:
 ///   1. ``testArtifactPageDecodes``           — envelope fields parse correctly.
 ///   2. ``testFilterTypeBuildsURL``           — `type=` param matches the filter.
@@ -15,6 +16,14 @@ import XCTest
 ///   8. ``testTotalIsGrandCount``             — `total` from envelope preserved (not page size).
 ///   9. ``testSharedMessageIdAllArtifactsUnique`` — M1: two artifacts sharing one message_id
 ///      have distinct composite ids (ForEach must not drop either).
+///  10. ``testLoadMoreAppendsPageTwoWithOffset`` — ABH-180: load-more fetches offset=50 and
+///      appends new artifacts; `hasMore` reflects remaining count vs total.
+///  11. ``testLoadMoreStopsWhenTotalReached``    — ABH-180: `loadMore` no-ops once
+///      `artifacts.count >= galleryTotal`.
+///  12. ``testFilterChangeResetsOffsetAndResults`` — ABH-180: `load()` clears prior results
+///      and resets offset and generation.
+///  13. ``testNoDuplicateArtifactIdsAcrossPages`` — ABH-180: an artifact id appearing in
+///      both message-pages is appended only once.
 @MainActor
 final class ArtifactsGalleryTests: XCTestCase {
 
@@ -288,6 +297,188 @@ final class ArtifactsGalleryTests: XCTestCase {
         // messageId is preserved for navigation
         XCTAssertEqual(page.results[0].messageId, 99)
         XCTAssertEqual(page.results[1].messageId, 99)
+    }
+
+    // MARK: - 10. ABH-180: load-more appends page 2 with correct offset
+
+    /// ``ArtifactsGalleryModel/load(type:api:)`` populates page 1;
+    /// ``ArtifactsGalleryModel/loadMore(type:api:)`` must fetch with `offset=50`
+    /// and append new artifacts. `hasMore` must reflect remaining count vs total.
+    func testLoadMoreAppendsPageTwoWithOffset() async {
+        let limit = ArtifactsGalleryModel.pageLimit   // 50
+        var capturedOffsets: [Int] = []
+
+        let model = ArtifactsGalleryModel()
+        model.fetchPage = { type, offset in
+            capturedOffsets.append(offset)
+            // Page 1 (offset 0): 50 items, total = 80 → has-more after page 1.
+            // Page 2 (offset 50): 30 items, total = 80 → done after page 2.
+            let count = offset == 0 ? limit : 30
+            let results = (offset..<offset + count).map { i in
+                Artifact.stub(messageId: i, urlOrPath: "https://example.com/a\(i)")
+            }
+            return ArtifactPage(type: type, results: results, total: 80, offset: offset)
+        }
+
+        let dummyClient = RestClient(baseURL: URL(string: "http://127.0.0.1:9123")!,
+                                     token: "t")
+
+        // Page 1.
+        await model.load(type: "all", api: dummyClient)
+        XCTAssertEqual(model.artifacts.count, limit, "Page 1 must have \(limit) artifacts")
+        XCTAssertTrue(model.hasMore, "hasMore must be true when artifacts.count < galleryTotal")
+        XCTAssertEqual(capturedOffsets, [0], "Page-1 must use offset=0")
+        XCTAssertEqual(model.galleryOffset, limit, "galleryOffset must advance to pageLimit")
+
+        // Load-more.
+        await model.loadMore(type: "all", api: dummyClient)
+        XCTAssertEqual(capturedOffsets.count, 2, "loadMore must fire one more fetch")
+        XCTAssertEqual(capturedOffsets[1], limit,
+                       "Page-2 fetch must use offset=\(limit)")
+        XCTAssertEqual(model.artifacts.count, 80, "Both pages must be combined")
+        XCTAssertFalse(model.hasMore,
+                       "hasMore must be false when artifacts.count == galleryTotal")
+    }
+
+    // MARK: - 11. ABH-180: loadMore no-ops when total reached
+
+    /// Once `artifacts.count >= galleryTotal`, ``loadMore(type:api:)`` must be a
+    /// no-op — no additional fetch must fire.
+    func testLoadMoreStopsWhenTotalReached() async {
+        let limit = ArtifactsGalleryModel.pageLimit
+        var fetchCount = 0
+
+        let model = ArtifactsGalleryModel()
+        model.fetchPage = { type, offset in
+            fetchCount += 1
+            // Single page (30 items), total = 30 → no more pages.
+            let results = (0..<30).map { i in
+                Artifact.stub(messageId: i, urlOrPath: "https://example.com/b\(i)")
+            }
+            return ArtifactPage(type: type, results: results, total: 30, offset: 0)
+        }
+
+        let dummyClient = RestClient(baseURL: URL(string: "http://127.0.0.1:9123")!,
+                                     token: "t")
+
+        await model.load(type: "all", api: dummyClient)
+        XCTAssertEqual(model.artifacts.count, 30)
+        XCTAssertFalse(model.hasMore, "hasMore must be false: 30 artifacts == total 30")
+        XCTAssertEqual(fetchCount, 1)
+
+        // loadMore must no-op.
+        await model.loadMore(type: "all", api: dummyClient)
+        XCTAssertEqual(fetchCount, 1,
+                       "loadMore must not fire when hasMore is false")
+        XCTAssertEqual(model.artifacts.count, 30,
+                       "Artifact count must not change after no-op loadMore")
+        _ = limit  // suppress unused warning
+    }
+
+    // MARK: - 12. ABH-180: filter change resets offset and results
+
+    /// A second call to ``load(type:api:)`` (filter change) must clear prior
+    /// results, reset ``galleryOffset`` to 0, and bump the generation counter
+    /// so any in-flight load-more is discarded.
+    func testFilterChangeResetsOffsetAndResults() async {
+        var lastType = "all"
+
+        let model = ArtifactsGalleryModel()
+        model.fetchPage = { type, _ in
+            lastType = type
+            let results = [
+                Artifact.stub(messageId: 1, urlOrPath: "https://example.com/\(type)/1")
+            ]
+            return ArtifactPage(type: type, results: results, total: 1, offset: 0)
+        }
+
+        let dummyClient = RestClient(baseURL: URL(string: "http://127.0.0.1:9123")!,
+                                     token: "t")
+        let firstGeneration = model.generation
+
+        // Initial load (all).
+        await model.load(type: "all", api: dummyClient)
+        XCTAssertEqual(model.artifacts.count, 1)
+        XCTAssertTrue(model.artifacts[0].urlOrPath.contains("/all/"))
+
+        // Filter change → load images.
+        await model.load(type: "images", api: dummyClient)
+        XCTAssertFalse(model.artifacts.contains(where: { $0.urlOrPath.contains("/all/") }),
+                       "Old filter results must not survive a filter change")
+        XCTAssertEqual(model.artifacts.count, 1,
+                       "New filter must produce fresh results")
+        XCTAssertTrue(model.artifacts[0].urlOrPath.contains("/images/"),
+                      "Results must be from the new filter type")
+        XCTAssertEqual(model.galleryOffset, ArtifactsGalleryModel.pageLimit,
+                       "galleryOffset must be reset and then advanced by pageLimit")
+        XCTAssertGreaterThan(model.generation, firstGeneration,
+                             "generation must increment on each load() call")
+        XCTAssertEqual(lastType, "images", "Fetch must use the new filter type")
+    }
+
+    // MARK: - 13. ABH-180: no duplicate artifact ids across pages
+
+    /// An artifact composite id appearing in both page 1 and page 2 must appear
+    /// only once in the accumulated ``ArtifactsGalleryModel/artifacts`` list.
+    func testNoDuplicateArtifactIdsAcrossPages() async {
+        let limit = ArtifactsGalleryModel.pageLimit
+        var callCount = 0
+
+        let model = ArtifactsGalleryModel()
+        model.fetchPage = { type, offset in
+            callCount += 1
+            if offset == 0 {
+                // Page 1: unique items + one "shared" artifact.
+                var results = (0..<limit - 1).map { i in
+                    Artifact.stub(messageId: i, urlOrPath: "https://example.com/unique/\(i)")
+                }
+                results.append(Artifact.stub(messageId: 999, urlOrPath: "https://shared.example/art"))
+                return ArtifactPage(type: type, results: results, total: 100, offset: 0)
+            } else {
+                // Page 2: shared artifact re-appears + new items.
+                var results = [
+                    Artifact.stub(messageId: 999, urlOrPath: "https://shared.example/art")
+                ]
+                results.append(contentsOf: (100..<100 + limit - 1).map { i in
+                    Artifact.stub(messageId: i, urlOrPath: "https://example.com/new/\(i)")
+                })
+                return ArtifactPage(type: type, results: results, total: 100, offset: offset)
+            }
+        }
+
+        let dummyClient = RestClient(baseURL: URL(string: "http://127.0.0.1:9123")!,
+                                     token: "t")
+
+        await model.load(type: "all", api: dummyClient)
+        await model.loadMore(type: "all", api: dummyClient)
+
+        XCTAssertEqual(callCount, 2, "Both pages must be fetched")
+
+        let sharedId = "999:https://shared.example/art"
+        let duplicates = model.artifacts.filter { $0.id == sharedId }
+        XCTAssertEqual(duplicates.count, 1,
+                       "Shared artifact must appear exactly once across both pages")
+
+        let allIds = model.artifacts.map(\.id)
+        XCTAssertEqual(allIds.count, Set(allIds).count,
+                       "All artifact ids must be unique across both pages")
+    }
+}
+
+// MARK: - Artifact test helper
+
+private extension Artifact {
+    /// Minimal stub for pagination tests — avoids JSON round-trip boilerplate.
+    static func stub(messageId: Int, urlOrPath: String) -> Artifact {
+        let json = """
+        {
+          "session_id": "sess-\(messageId)", "message_id": \(messageId),
+          "kind": "link", "url_or_path": "\(urlOrPath)",
+          "session_title": null, "filename": null, "mime": null,
+          "size": null, "snippet": null, "timestamp": null
+        }
+        """.data(using: .utf8)!
+        return try! JSONDecoder().decode(Artifact.self, from: json)
     }
 }
 

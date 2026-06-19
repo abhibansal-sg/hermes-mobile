@@ -1,4 +1,5 @@
 import SwiftUI
+import Observation
 
 /// Cross-session artifacts gallery — images, files, and links collected from
 /// all message transcripts, displayed in a ``LazyVGrid`` thumbnail grid.
@@ -16,8 +17,9 @@ import SwiftUI
 /// errors.
 ///
 /// Filter row: a segmented ``Picker`` with All / Images / Files / Links. Each
-/// selection re-fetches. Results are flat (one artifact per grid cell),
-/// matching the plugin's per-artifact response shape.
+/// selection re-fetches and resets the accumulated artifact list. Scrolling to
+/// the bottom triggers load-more via ``ArtifactsGalleryModel/loadMore(type:api:)``
+/// — a sentinel `onAppear` on the last grid item fires the next page.
 struct ArtifactsGalleryView: View {
     let control: RestClient
     /// Server URL string, forwarded to ``AttachmentBlobCache/Key`` scoping.
@@ -34,15 +36,14 @@ struct ArtifactsGalleryView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var filter: ArtifactFilter = .all
-    @State private var phase: GalleryPhase = .loading
-    /// Set to `true` on a 404 response — plugin not deployed on this gateway.
-    @State private var pluginUnavailable = false
+    /// Observable model that owns all gallery state and fetch logic.
+    @State private var model = ArtifactsGalleryModel()
 
     // MARK: - Body
 
     var body: some View {
         Group {
-            if pluginUnavailable {
+            if model.pluginUnavailable {
                 unavailableView
             } else {
                 contentView
@@ -50,8 +51,8 @@ struct ArtifactsGalleryView: View {
         }
         .navigationTitle("Artifacts")
         .navigationBarTitleDisplayMode(.inline)
-        .task { await load() }
-        .onChange(of: filter) { Task { await load() } }
+        .task { await model.load(type: filter.rawValue, api: control) }
+        .onChange(of: filter) { Task { await model.load(type: filter.rawValue, api: control) } }
     }
 
     // MARK: - Content phases
@@ -67,7 +68,7 @@ struct ArtifactsGalleryView: View {
                 .padding(.top, 12)
                 .padding(.bottom, 8)
 
-            switch phase {
+            switch model.phase {
             case .loading:
                 ZStack {
                     theme.bg.ignoresSafeArea()
@@ -84,20 +85,29 @@ struct ArtifactsGalleryView: View {
                         Text(msg)
                             .accessibilityLabel(msg)
                     } actions: {
-                        Button("Try Again") { Task { await load() } }
+                        Button("Try Again") {
+                            Task { await model.load(type: filter.rawValue, api: control) }
+                        }
                     }
                 }
                 .frame(maxHeight: .infinity)
-            case .loaded(let page):
-                if page.results.isEmpty {
+            case .loaded:
+                if model.artifacts.isEmpty {
                     emptyState
                         .frame(maxHeight: .infinity)
                 } else {
                     ScrollView {
-                        artifactGrid(page.results)
+                        artifactGrid(model.artifacts)
+                        if model.isLoadingMore {
+                            ProgressView()
+                                .tint(theme.midground)
+                                .padding(.vertical, 12)
+                        }
                     }
                     .background(theme.bg)
-                    .refreshable { await load() }
+                    .refreshable {
+                        await model.load(type: filter.rawValue, api: control)
+                    }
                 }
             }
         }
@@ -144,9 +154,9 @@ struct ArtifactsGalleryView: View {
     ]
 
     @ViewBuilder
-    private func artifactGrid(_ artifacts: [Artifact]) -> some View {
+    private func artifactGrid(_ items: [Artifact]) -> some View {
         LazyVGrid(columns: gridColumns, spacing: 6) {
-            ForEach(artifacts) { artifact in
+            ForEach(items) { artifact in
                 ArtifactThumbnail(
                     artifact: artifact,
                     serverId: serverId,
@@ -156,29 +166,18 @@ struct ArtifactsGalleryView: View {
                 .onTapGesture { openSourceSession(for: artifact) }
                 .accessibilityLabel(artifact.displayName)
                 .accessibilityAddTraits(.isButton)
+                .onAppear {
+                    // Sentinel: when the last item appears, load the next page.
+                    if artifact.id == items.last?.id {
+                        Task {
+                            await model.loadMore(type: filter.rawValue, api: control)
+                        }
+                    }
+                }
             }
         }
         .padding(.horizontal, 6)
         .padding(.bottom, 16)
-    }
-
-    // MARK: - Load
-
-    @MainActor
-    private func load() async {
-        phase = .loading
-        do {
-            let page = try await control.artifacts(type: filter.rawValue)
-            phase = .loaded(page)
-        } catch RestError.badStatus(404, _) {
-            // Plugin endpoint absent on this gateway — degrade silently.
-            pluginUnavailable = true
-        } catch {
-            phase = .failed(
-                (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
-            )
-        }
     }
 
     // MARK: - Open source session
@@ -212,12 +211,165 @@ struct ArtifactsGalleryView: View {
     }
 }
 
+// MARK: - ArtifactsGalleryModel
+
+/// Observable model that owns all gallery state and fetch logic.
+///
+/// Separated from the view so tests can instantiate and drive it directly
+/// without spinning a SwiftUI render tree. The view holds it as `@State`.
+///
+/// ## Pagination contract
+///
+/// - ``load(type:api:)`` always starts from `offset=0` (resets state). Call
+///   it on initial appearance and after a filter change.
+/// - ``loadMore(type:api:)`` fetches the next page using the stored
+///   ``galleryOffset``. It is guarded by ``isLoadingMore``, ``hasMore``, and a
+///   generation counter — stale pages arriving after a ``load()`` call are
+///   discarded.
+/// - ``hasMore`` is `true` when the accumulated count is less than the
+///   server-reported ``galleryTotal``. Uses `total` (more precise than a
+///   short-page heuristic).
+@MainActor
+@Observable
+final class ArtifactsGalleryModel {
+
+    // MARK: - Published state
+
+    var phase: GalleryPhase = .loading
+    var artifacts: [Artifact] = []
+    /// Server-reported total matched count (before pagination).
+    var galleryTotal: Int = 0
+    /// Offset for the NEXT fetch (advanced by ``pageLimit`` after each page lands).
+    var galleryOffset: Int = 0
+    var isLoadingMore: Bool = false
+    /// Set to `true` on a 404 response — plugin not deployed on this gateway.
+    var pluginUnavailable: Bool = false
+
+    // MARK: - Constants
+
+    static let pageLimit: Int = 50
+
+    // MARK: - Derived
+
+    /// More pages exist when fewer results have landed than the server total.
+    var hasMore: Bool { artifacts.count < galleryTotal }
+
+    // MARK: - Seam (DEBUG only)
+
+    /// Injectable fetch closure for unit tests. When set, bypasses the live
+    /// ``RestClient`` call inside ``load(type:api:)`` and ``loadMore(type:api:)``.
+    ///
+    /// Signature: `(type: String, offset: Int) async throws -> ArtifactPage`
+    ///
+    /// The `api` parameter to `load`/`loadMore` is ignored when the seam is set,
+    /// so tests do NOT need a real `RestClient`.
+    #if DEBUG
+    var fetchPage: ((String, Int) async throws -> ArtifactPage)?
+    #endif
+
+    // MARK: - Generation counter (stale-page guard)
+
+    /// Incremented on each ``load()`` call. ``loadMore()`` snapshots the value
+    /// before the async fetch and discards the result if the generation changed
+    /// (i.e. the user changed the filter while the request was in flight).
+    private(set) var generation: Int = 0
+
+    // MARK: - Load (page 0, resets state)
+
+    /// Fetch the first page for `type`. Resets all accumulated state.
+    ///
+    /// - Parameters:
+    ///   - type: `ArtifactFilter.rawValue` (e.g. `"all"`, `"images"`).
+    ///   - api: Live ``RestClient``; ignored when ``fetchPage`` seam is set.
+    func load(type: String, api: RestClient) async {
+        phase = .loading
+        artifacts = []
+        galleryTotal = 0
+        galleryOffset = 0
+        generation &+= 1
+
+        do {
+            let page = try await fetchOnePage(type: type, offset: 0, api: api)
+            artifacts = page.results
+            galleryTotal = page.total
+            galleryOffset = Self.pageLimit
+            phase = .loaded
+        } catch RestError.badStatus(404, _) {
+            pluginUnavailable = true
+        } catch {
+            phase = .failed(
+                (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+            )
+        }
+    }
+
+    // MARK: - Load more (subsequent pages)
+
+    /// Fetch the next page and append results (deduped by composite artifact id).
+    ///
+    /// No-ops when ``hasMore`` is false, ``isLoadingMore`` is true, or the
+    /// offset would exceed the server total. A generation counter discards pages
+    /// that arrive after a ``load()`` call (filter change).
+    ///
+    /// - Parameters:
+    ///   - type: Current filter type string.
+    ///   - api: Live ``RestClient``; ignored when ``fetchPage`` seam is set.
+    func loadMore(type: String, api: RestClient) async {
+        guard hasMore, !isLoadingMore else { return }
+
+        let offset = galleryOffset
+        let gen    = generation
+
+        isLoadingMore = true
+        defer { isLoadingMore = false }
+
+        do {
+            let page = try await fetchOnePage(type: type, offset: offset, api: api)
+            // Discard if the user changed the filter while this was in flight.
+            guard generation == gen else { return }
+
+            // Append, deduplicating by composite artifact id — the same artifact
+            // (same message_id + url_or_path) must never appear twice in the grid.
+            let existing = Set(artifacts.map(\.id))
+            let fresh = page.results.filter { !existing.contains($0.id) }
+            artifacts.append(contentsOf: fresh)
+
+            // Advance by page limit (not appended count — same message-level
+            // offset logic as search pagination).
+            galleryOffset = offset + Self.pageLimit
+            // Update total in case the server's count changed between pages.
+            galleryTotal = page.total
+        } catch {
+            // Load-more failure is silent — the user can scroll back up and the
+            // existing gallery is still readable.
+            if Task.isCancelled { return }
+        }
+    }
+
+    // MARK: - Internal
+
+    /// Dispatches to the ``fetchPage`` seam (DEBUG) or the live endpoint.
+    private func fetchOnePage(
+        type: String, offset: Int, api: RestClient
+    ) async throws -> ArtifactPage {
+        #if DEBUG
+        if let seam = fetchPage {
+            return try await seam(type, offset)
+        }
+        #endif
+        return try await api.artifacts(
+            type: type, limit: Self.pageLimit, offset: offset
+        )
+    }
+}
+
 // MARK: - GalleryPhase
 
 /// Load state for the gallery.
-private enum GalleryPhase: Sendable {
+enum GalleryPhase: Sendable {
     case loading
-    case loaded(ArtifactPage)
+    case loaded
     case failed(String)
 }
 
