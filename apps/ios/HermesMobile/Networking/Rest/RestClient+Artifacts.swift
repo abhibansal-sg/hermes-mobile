@@ -37,13 +37,23 @@ struct Artifact: Decodable, Identifiable, Sendable, Equatable {
     /// Unix-seconds message timestamp.
     let timestamp: Double?
 
-    /// Composite identity: `message_id + ":" + url_or_path`.
+    /// Gallery-position index — assigned by ``ArtifactsGalleryModel`` when a
+    /// page lands, NOT decoded from JSON (it is absent from `CodingKeys`).
     ///
-    /// A single message can yield multiple artifacts (several links, or an image
-    /// part alongside a link in `type=all`), so `message_id` alone is not unique.
-    /// The composite key is stable across re-fetches and collision-free because
-    /// two artifacts in the same message always have distinct `url_or_path` values.
-    var id: String { "\(messageId):\(urlOrPath)" }
+    /// Zero by default; always overwritten before the artifact enters
+    /// ``ArtifactsGalleryModel/artifacts``.
+    var galleryIndex: Int = 0
+
+    /// Positional identity: `gallery_position + ":" + message_id + ":" + url_or_path`.
+    ///
+    /// Three-part key so that two genuinely-distinct artifacts from the SAME
+    /// message with the SAME url (e.g. the same link mentioned twice in one
+    /// message, or an image URL reused in two content parts) are not silently
+    /// collapsed by SwiftUI's `ForEach` or the cross-page dedupe. The
+    /// `galleryIndex` makes every position unique while `messageId:urlOrPath`
+    /// still identifies TRUE cross-page duplicates when the indices match (same
+    /// page position → same artifact from the same fetch).
+    var id: String { "\(galleryIndex):\(messageId):\(urlOrPath)" }
 
     private enum CodingKeys: String, CodingKey {
         case messageId    = "message_id"

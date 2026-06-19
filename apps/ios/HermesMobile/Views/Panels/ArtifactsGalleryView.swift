@@ -290,7 +290,7 @@ final class ArtifactsGalleryModel {
 
         do {
             let page = try await fetchOnePage(type: type, offset: 0, api: api)
-            artifacts = page.results
+            artifacts = assignIndices(page.results, startingAt: 0)
             galleryTotal = page.total
             galleryOffset = Self.pageLimit
             phase = .loaded
@@ -306,20 +306,28 @@ final class ArtifactsGalleryModel {
 
     // MARK: - Load more (subsequent pages)
 
-    /// Fetch the next page and append results (deduped by composite artifact id).
+    /// Fetch the next page and append results (deduped by `messageId:urlOrPath`).
     ///
-    /// No-ops when ``hasMore`` is false, ``isLoadingMore`` is true, or the
-    /// offset would exceed the server total. A generation counter discards pages
-    /// that arrive after a ``load()`` call (filter change).
+    /// No-ops when ``hasMore`` is false, ``isLoadingMore`` is true, or
+    /// ``galleryOffset`` has already reached ``galleryTotal``. A generation
+    /// counter discards pages that arrive after a ``load()`` call (filter change).
+    ///
+    /// ## Dedup key
+    ///
+    /// Cross-page dedup uses `"\(messageId):\(urlOrPath)"` (NOT `artifact.id`)
+    /// because `artifact.id` is positional — a true cross-page duplicate has a
+    /// different ``galleryIndex`` and therefore a different `id`.
     ///
     /// - Parameters:
     ///   - type: Current filter type string.
     ///   - api: Live ``RestClient``; ignored when ``fetchPage`` seam is set.
     func loadMore(type: String, api: RestClient) async {
-        guard hasMore, !isLoadingMore else { return }
+        guard hasMore, !isLoadingMore,
+              galleryOffset < galleryTotal else { return }
 
-        let offset = galleryOffset
-        let gen    = generation
+        let offset    = galleryOffset
+        let gen       = generation
+        let nextStart = artifacts.count   // base index for this page
 
         isLoadingMore = true
         defer { isLoadingMore = false }
@@ -329,21 +337,35 @@ final class ArtifactsGalleryModel {
             // Discard if the user changed the filter while this was in flight.
             guard generation == gen else { return }
 
-            // Append, deduplicating by composite artifact id — the same artifact
-            // (same message_id + url_or_path) must never appear twice in the grid.
-            let existing = Set(artifacts.map(\.id))
-            let fresh = page.results.filter { !existing.contains($0.id) }
+            // Dedup by messageId:urlOrPath — positional ids differ across pages
+            // so we must use the content key, not artifact.id.
+            let existing = Set(artifacts.map { "\($0.messageId):\($0.urlOrPath)" })
+            let freshRaw = page.results.filter {
+                !existing.contains("\($0.messageId):\($0.urlOrPath)")
+            }
+            // Assign stable gallery positions continuing from current count.
+            let fresh = assignIndices(freshRaw, startingAt: nextStart)
             artifacts.append(contentsOf: fresh)
 
-            // Advance by page limit (not appended count — same message-level
-            // offset logic as search pagination).
+            // Advance by page limit (not appended count — message-level offset).
             galleryOffset = offset + Self.pageLimit
             // Update total in case the server's count changed between pages.
             galleryTotal = page.total
         } catch {
-            // Load-more failure is silent — the user can scroll back up and the
-            // existing gallery is still readable.
+            // Load-more failure is silent — existing gallery remains readable.
             if Task.isCancelled { return }
+        }
+    }
+
+    // MARK: - Internal
+
+    /// Assigns sequential ``Artifact/galleryIndex`` values starting at `base`,
+    /// returning new `Artifact` values with the index field set.
+    private func assignIndices(_ items: [Artifact], startingAt base: Int) -> [Artifact] {
+        items.enumerated().map { pair in
+            var art = pair.element
+            art.galleryIndex = base + pair.offset
+            return art
         }
     }
 

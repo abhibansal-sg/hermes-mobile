@@ -22,8 +22,12 @@ import XCTest
 ///      `artifacts.count >= galleryTotal`.
 ///  12. ``testFilterChangeResetsOffsetAndResults`` — ABH-180: `load()` clears prior results
 ///      and resets offset and generation.
-///  13. ``testNoDuplicateArtifactIdsAcrossPages`` — ABH-180: an artifact id appearing in
-///      both message-pages is appended only once.
+///  12b.``testStaleMidFlightLoadMoreIsDiscarded`` — cor-A2: slow load-more overtaken by
+///      filter change → generation guard discards the stale page.
+///  13. ``testNoDuplicateArtifactIdsAcrossPages`` — ABH-180/cor-A3: cross-page dedup by
+///      content key; positional ids ensure same-url-in-one-message artifacts are kept.
+///  9b. ``testSameUrlTwiceInOneMessageGetsDistinctIds`` — cor-A3: P1 fix — two artifacts
+///      with the same url in one message get distinct positional ``Artifact/id`` values.
 @MainActor
 final class ArtifactsGalleryTests: XCTestCase {
 
@@ -88,9 +92,11 @@ final class ArtifactsGalleryTests: XCTestCase {
 
         let art = page.results[0]
         XCTAssertEqual(art.messageId, 42)
-        // Composite id must encode message_id + url_or_path so multiple artifacts
-        // from the same message have distinct ForEach identities.
-        XCTAssertEqual(art.id, "42:https://example.com/photo.png")
+        // Positional id: galleryIndex (default 0 before model assigns it) +
+        // message_id + url_or_path.  Two artifacts from the same message still
+        // have distinct ids (different url_or_path), and position makes same-url
+        // duplicates within one message distinguishable.
+        XCTAssertEqual(art.id, "0:42:https://example.com/photo.png")
         XCTAssertEqual(art.sessionId, "sess-abc")
         XCTAssertEqual(art.sessionTitle, "My Session")
         XCTAssertEqual(art.kind, "image")
@@ -291,12 +297,47 @@ final class ArtifactsGalleryTests: XCTestCase {
         XCTAssertEqual(page.results.count, 2, "Both artifacts must be in the response")
         let ids = page.results.map(\.id)
         XCTAssertEqual(Set(ids).count, 2,
-                       "Two artifacts sharing message_id 99 must have DISTINCT composite ids")
-        XCTAssertEqual(ids[0], "99:https://example.com/photo.png")
-        XCTAssertEqual(ids[1], "99:https://example.com/page")
+                       "Two artifacts sharing message_id 99 must have DISTINCT positional ids")
+        // galleryIndex defaults to 0 before the model assigns it; url_or_path
+        // differs so the ids are still distinct.
+        XCTAssertEqual(ids[0], "0:99:https://example.com/photo.png")
+        XCTAssertEqual(ids[1], "0:99:https://example.com/page")
         // messageId is preserved for navigation
         XCTAssertEqual(page.results[0].messageId, 99)
         XCTAssertEqual(page.results[1].messageId, 99)
+    }
+
+    // MARK: - 9b. Positional id: same url twice in one message → distinct ids (model-level)
+
+    /// Two artifacts from the SAME message with the SAME url (e.g. the same link
+    /// mentioned twice) must get DISTINCT ids when passed through the model's
+    /// ``ArtifactsGalleryModel/load(type:api:)`` which assigns sequential
+    /// ``Artifact/galleryIndex`` values.
+    ///
+    /// This is the P1 fix: prior to the positional id, `messageId:urlOrPath`
+    /// would be identical for both rows → SwiftUI `ForEach` would silently drop
+    /// one. After the fix, they get indices 0 and 1 → distinct ids.
+    func testSameUrlTwiceInOneMessageGetsDistinctIds() async {
+        let model = ArtifactsGalleryModel()
+        model.fetchPage = { type, _ in
+            // Two artifacts: same message_id AND same url_or_path (same link twice).
+            let results = [
+                Artifact.stub(messageId: 7, urlOrPath: "https://dup.example/link"),
+                Artifact.stub(messageId: 7, urlOrPath: "https://dup.example/link"),
+            ]
+            return ArtifactPage(type: type, results: results, total: 2, offset: 0)
+        }
+        let dummyClient = RestClient(baseURL: URL(string: "http://127.0.0.1:9123")!, token: "t")
+
+        await model.load(type: "all", api: dummyClient)
+
+        XCTAssertEqual(model.artifacts.count, 2,
+                       "Both same-url artifacts must be present in the gallery")
+        let ids = model.artifacts.map(\.id)
+        XCTAssertEqual(Set(ids).count, 2,
+                       "Same-url-twice artifacts must have distinct positional ids")
+        XCTAssertEqual(ids[0], "0:7:https://dup.example/link")
+        XCTAssertEqual(ids[1], "1:7:https://dup.example/link")
     }
 
     // MARK: - 10. ABH-180: load-more appends page 2 with correct offset
@@ -416,10 +457,69 @@ final class ArtifactsGalleryTests: XCTestCase {
         XCTAssertEqual(lastType, "images", "Fetch must use the new filter type")
     }
 
+    // MARK: - 12b. Stale load-more page is discarded after filter change
+
+    /// A load-more page arriving AFTER a ``load()`` call (filter change bumps
+    /// generation) must be discarded — not appended to the new filter's results.
+    ///
+    /// This drives the generation guard: the slow load-more seam sleeps so that
+    /// ``load(type:api:)`` can run on the main actor at the suspension point and
+    /// increment the generation before the page is committed. The guard then rejects
+    /// the stale page. Mirrors ``SearchPaginationTests/testStaleLoadMorePageIsIgnored``.
+    func testStaleMidFlightLoadMoreIsDiscarded() async {
+        let limit = ArtifactsGalleryModel.pageLimit
+        let model = ArtifactsGalleryModel()
+        var blockLoadMore = false
+
+        model.fetchPage = { type, offset in
+            if offset > 0 && blockLoadMore {
+                // Sleep long enough for a competing load() call to run.
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+            let results = (offset..<offset + limit).map { i in
+                Artifact.stub(messageId: i, urlOrPath: "https://example.com/\(type)/\(i)")
+            }
+            return ArtifactPage(type: type, results: results, total: 200, offset: offset)
+        }
+
+        let dummyClient = RestClient(baseURL: URL(string: "http://127.0.0.1:9123")!, token: "t")
+
+        // Page 1 of "all".
+        await model.load(type: "all", api: dummyClient)
+        XCTAssertEqual(model.artifacts.count, limit)
+        XCTAssertTrue(model.hasMore)
+
+        // Fire a slow load-more in an unstructured Task so it suspends at the seam,
+        // then immediately call load("images") which bumps generation.  The load-more
+        // will resume after the sleep and see a mismatched generation → discard.
+        blockLoadMore = true
+        let t = Task { await model.loadMore(type: "all", api: dummyClient) }
+        // Small yield so the Task picks up and enters the seam (suspends at sleep).
+        try? await Task.sleep(for: .milliseconds(30))
+        // Filter change: bumps generation while load-more is sleeping.
+        await model.load(type: "images", api: dummyClient)
+        // Wait for the stale task to finish (it returns without appending).
+        await t.value
+
+        // "images" results must be intact; no "all" page-2 rows leaked in.
+        XCTAssertFalse(
+            model.artifacts.contains(where: { $0.urlOrPath.contains("/all/") }),
+            "Stale all-filter page-2 rows must not appear after switching to images"
+        )
+        XCTAssertLessThanOrEqual(
+            model.artifacts.count, limit,
+            "Only one images-filter page must be present"
+        )
+    }
+
     // MARK: - 13. ABH-180: no duplicate artifact ids across pages
 
-    /// An artifact composite id appearing in both page 1 and page 2 must appear
-    /// only once in the accumulated ``ArtifactsGalleryModel/artifacts`` list.
+    /// A TRUE cross-page duplicate (same messageId + urlOrPath) must appear only
+    /// once in the accumulated ``ArtifactsGalleryModel/artifacts`` list.
+    ///
+    /// After the positional-id fix, dedup is keyed on `messageId:urlOrPath`
+    /// (NOT `artifact.id`) inside the model — positions differ across pages but
+    /// the content key identifies a true duplicate.
     func testNoDuplicateArtifactIdsAcrossPages() async {
         let limit = ArtifactsGalleryModel.pageLimit
         var callCount = 0
@@ -454,14 +554,19 @@ final class ArtifactsGalleryTests: XCTestCase {
 
         XCTAssertEqual(callCount, 2, "Both pages must be fetched")
 
-        let sharedId = "999:https://shared.example/art"
-        let duplicates = model.artifacts.filter { $0.id == sharedId }
+        // Dedup is keyed on messageId:urlOrPath (content key), not artifact.id
+        // (positional). One occurrence of the shared artifact must survive.
+        let sharedContentKey = "999:https://shared.example/art"
+        let duplicates = model.artifacts.filter {
+            "\($0.messageId):\($0.urlOrPath)" == sharedContentKey
+        }
         XCTAssertEqual(duplicates.count, 1,
                        "Shared artifact must appear exactly once across both pages")
 
+        // All positional ids must be unique (galleryIndex is sequential).
         let allIds = model.artifacts.map(\.id)
         XCTAssertEqual(allIds.count, Set(allIds).count,
-                       "All artifact ids must be unique across both pages")
+                       "All positional artifact ids must be unique across both pages")
     }
 }
 
