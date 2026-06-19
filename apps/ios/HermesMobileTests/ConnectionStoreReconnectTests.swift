@@ -78,8 +78,8 @@ final class ConnectionStoreReconnectTests: XCTestCase {
             token: "test-stable-token"
         )
 
-        // Let attempt 0 (no delay) complete on the main executor.
-        await settle()
+        // Await the task directly — deterministic on any VM speed.
+        await connection.waitForReconnectForTesting()
 
         // §1: loop converges to .connected.
         XCTAssertEqual(connection.phase, .connected,
@@ -101,6 +101,10 @@ final class ConnectionStoreReconnectTests: XCTestCase {
     func testReconnectLoopRetriesAndConvergesAfterTransientFailure() async {
         let (connection, _, _) = makeStore()
 
+        // Zero-delay backoff so attempt 1 fires immediately after the failure,
+        // regardless of VM speed.
+        connection.reconnectBackoffOverride = 0
+
         var callCount = 0
         connection.connectRPC = { _, _, _ in
             callCount += 1
@@ -116,10 +120,8 @@ final class ConnectionStoreReconnectTests: XCTestCase {
             token: "test-stable-token"
         )
 
-        // Wait for attempt 0 (fail) + backoff + attempt 1 (succeed).
-        // Backoff for attempt 1 = min(0.5 * 2^1, 30) + jitter ~ 1.0–1.5s.
-        // Use a generous ceiling that keeps the test fast while absorbing jitter.
-        try? await Task.sleep(for: .seconds(2))
+        // Await the task directly — no fixed sleep, deterministic on any VM.
+        await connection.waitForReconnectForTesting()
 
         XCTAssertEqual(connection.phase, .connected,
                        "a transient connect failure must not prevent recovery")
@@ -276,7 +278,8 @@ final class ConnectionStoreReconnectTests: XCTestCase {
             token: "test-stable-token"
         )
 
-        await settle()
+        // Await the task directly — deterministic on any VM speed.
+        await connection.waitForReconnectForTesting()
 
         // Loop converged — failure count must have been cleared.
         XCTAssertEqual(connection.phase, .connected,
@@ -311,7 +314,7 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         }
 
         connection._seedAndStartReconnect(serverURL: stableURL, token: "tok")
-        await settle()
+        await connection.waitForReconnectForTesting()
 
         XCTAssertEqual(connection.phase, .connected)
         XCTAssertEqual(connection.serverURLString, stableURL,

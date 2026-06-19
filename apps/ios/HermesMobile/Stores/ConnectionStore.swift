@@ -408,6 +408,14 @@ final class ConnectionStore {
     /// `.closed`/`.failed`) to be exercised without a real transport. Pattern
     /// mirrors `probeLivenessRPC`.
     var clientStateOverrideForScenePhase: GatewayConnectionState?
+
+    /// Retains the most recent reconnect `Task` even after completion, so tests
+    /// can `await waitForReconnectForTesting()` to deterministically block until
+    /// the loop exits rather than racing a fixed `Task.sleep`. Unlike
+    /// `reconnectTask` (niled on completion inside the task), this is only
+    /// written — never cleared — so `await value` resolves once and only once.
+    var lastReconnectTask: Task<Void, Never>?
+    func waitForReconnectForTesting() async { await lastReconnectTask?.value }
     #endif
 
     /// Tasks that live as long as the client: the event router and the
@@ -1173,6 +1181,9 @@ final class ConnectionStore {
                 }
             }
         }
+        #if DEBUG
+        lastReconnectTask = reconnectTask
+        #endif
     }
 
     /// Re-probe REST to determine whether the saved token has been revoked.
