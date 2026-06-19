@@ -182,6 +182,25 @@ final class SessionStore {
     var searchResults: [SessionSearchResult] = []
     /// True while a search request is in flight (after the debounce fires).
     var isSearching: Bool = false
+    /// True while a load-more page fetch is in flight.
+    var isSearchLoadingMore: Bool = false
+    /// `true` when the last fetched page was full (== limit), meaning more
+    /// results may exist. `false` once a short page (< limit) is received or
+    /// when offset would exceed the server cap (500).
+    var searchHasMore: Bool = false
+    /// Current page offset for the active query. Reset to 0 on each new query.
+    /// `internal` (not `private(set)`) so unit tests can prime state directly.
+    var searchOffset: Int = 0
+    /// Monotonically-increasing generation counter. Incremented on every new
+    /// query so a stale load-more page from a prior query can be discarded.
+    /// `internal` for unit-test assertion (SearchPaginationTests).
+    var searchGeneration: Int = 0
+    /// Page size used for both the initial fetch and load-more pages. The stock
+    /// endpoint caps at 100; the plugin does not paginate (offset not forwarded
+    /// there), so this only applies to the stock path.
+    static let searchPageLimit: Int = 20
+    /// Server-enforced offset cap. Requests with offset >= this value return [].
+    static let searchOffsetCap: Int = 500
     /// `true` once `searchQuery` is long enough to be an active search — the view
     /// swaps the normal list for `searchResults` while this holds.
     var isSearchActive: Bool { searchQuery.trimmingCharacters(in: .whitespaces).count >= 2 }
@@ -534,6 +553,18 @@ final class SessionStore {
 
     /// Debounce handle for `.searchable` input → search fetch.
     private var searchTask: Task<Void, Never>?
+    /// In-flight load-more handle. At most one load-more runs at a time.
+    private var searchLoadMoreTask: Task<Void, Never>?
+
+    #if DEBUG
+    /// Injectable search fetch for unit tests. When set, replaces the live
+    /// `fetchSearch(query:offset:api:)` call in both `searchQueryChanged` and
+    /// `loadMoreSearchResults` — mirrors the `sessionsFetch` / `transcriptFetch`
+    /// seam pattern so tests drive the real Task-based methods without a gateway.
+    ///
+    /// Signature: `(query, offset) async throws -> (results, servedByPlugin)`.
+    var searchFetch: ((String, Int) async throws -> ([SessionSearchResult], Bool))?
+    #endif
 
     /// In-flight transcript prefetch sweep (WhatsApp bar — coverage). Cancelled on
     /// disconnect/background so a paced background fetch never outlives the
@@ -2107,17 +2138,38 @@ final class SessionStore {
     /// Call from the view's `onChange(of:)`.
     func searchQueryChanged() {
         searchTask?.cancel()
+        // Cancel any in-flight load-more from the previous query.
+        searchLoadMoreTask?.cancel()
+        searchLoadMoreTask = nil
 
         let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2 else {
             searchResults = []
             isSearching = false
+            searchOffset = 0
+            searchHasMore = false
             return
         }
+        #if DEBUG
+        let apiOrNil: RestClient? = restAPI
+        // Allow the seam to bypass the restAPI requirement in tests.
+        guard apiOrNil != nil || searchFetch != nil else {
+            searchResults = []
+            return
+        }
+        #else
         guard let api = restAPI else {
             searchResults = []
             return
         }
+        #endif
+
+        // Reset pagination state for the new query and bump the generation so
+        // any stale load-more page from the prior query is discarded on arrival.
+        searchOffset = 0
+        searchHasMore = false
+        searchGeneration &+= 1
+        let generation = searchGeneration
 
         searchTask = Task { [weak self] in
             // Debounce.
@@ -2127,13 +2179,33 @@ final class SessionStore {
             self.isSearching = true
             defer { self.isSearching = false }
             do {
-                let results = try await self.fetchSearch(query: trimmed, api: api)
-                if Task.isCancelled { return }
-                // Guard against a stale response landing after the user typed on.
-                guard self.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed else {
+                #if DEBUG
+                let (results, servedByPlugin): ([SessionSearchResult], Bool)
+                if let seam = self.searchFetch {
+                    (results, servedByPlugin) = try await seam(trimmed, 0)
+                } else if let api = apiOrNil {
+                    (results, servedByPlugin) = try await self.fetchSearch(
+                        query: trimmed, offset: 0, api: api
+                    )
+                } else {
                     return
                 }
+                #else
+                let (results, servedByPlugin) = try await self.fetchSearch(
+                    query: trimmed, offset: 0, api: api
+                )
+                #endif
+                if Task.isCancelled { return }
+                // Guard against a stale response landing after the user typed on.
+                guard self.searchGeneration == generation else { return }
                 self.searchResults = results
+                self.searchOffset = results.count
+                // Plugin path does not support load-more (no offset param); force
+                // false so the DrawerView sentinel never fires load-more there.
+                // Stock path: a full page means more may exist; short = done.
+                self.searchHasMore = !servedByPlugin
+                    && results.count == Self.searchPageLimit
+                    && self.searchOffset < Self.searchOffsetCap
                 self.lastError = nil
             } catch {
                 if Task.isCancelled { return }
@@ -2144,21 +2216,103 @@ final class SessionStore {
         }
     }
 
+    /// Append the next page of search results for the active query.
+    ///
+    /// No-op when: already loading more, last page was short, offset has reached
+    /// the server cap, or no active query. Guards against stale pages from a
+    /// prior query via the `searchGeneration` counter.
+    func loadMoreSearchResults() {
+        guard searchHasMore,
+              !isSearchLoadingMore,
+              !isSearching,
+              searchOffset < Self.searchOffsetCap else { return }
+        #if DEBUG
+        let apiForMore: RestClient? = restAPI
+        guard apiForMore != nil || searchFetch != nil else { return }
+        #else
+        guard let api = restAPI else { return }
+        #endif
+        let trimmed = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return }
+        let offset = searchOffset
+        let generation = searchGeneration
+
+        searchLoadMoreTask?.cancel()
+        searchLoadMoreTask = Task { [weak self] in
+            guard let self else { return }
+            self.isSearchLoadingMore = true
+            defer { self.isSearchLoadingMore = false }
+            do {
+                #if DEBUG
+                let (page, servedByPlugin): ([SessionSearchResult], Bool)
+                if let seam = self.searchFetch {
+                    (page, servedByPlugin) = try await seam(trimmed, offset)
+                } else if let api = apiForMore {
+                    (page, servedByPlugin) = try await self.fetchSearch(
+                        query: trimmed, offset: offset, api: api
+                    )
+                } else {
+                    return
+                }
+                #else
+                let (page, servedByPlugin) = try await self.fetchSearch(
+                    query: trimmed, offset: offset, api: api
+                )
+                #endif
+                if Task.isCancelled { return }
+                // Discard if the user changed the query while this was in flight.
+                guard self.searchGeneration == generation else { return }
+                // Append, deduplicating by session id in case the result window
+                // shifted between the first and second page requests.
+                let existingIds = Set(self.searchResults.map(\.id))
+                let fresh = page.filter { !existingIds.contains($0.id) }
+                self.searchResults.append(contentsOf: fresh)
+                self.searchOffset = offset + page.count
+                // Same plugin-guard as the initial fetch: force false on plugin path.
+                self.searchHasMore = !servedByPlugin
+                    && page.count == Self.searchPageLimit
+                    && self.searchOffset < Self.searchOffsetCap
+            } catch {
+                if Task.isCancelled { return }
+                // Leave existing results intact; a load-more failure is silent
+                // (the user can scroll back up and the list is still readable).
+            }
+        }
+    }
+
     /// Execute the search against the best available endpoint: plugin first (richer
     /// results + role-scoped), stock on 404 (older gateways). Only falls back on a
     /// true 404/not-found — real 500/transport errors are re-thrown so they surface
     /// as `lastError` and are not silently masked.
     ///
+    /// `offset` is forwarded only to the stock endpoint — the plugin does not yet
+    /// support pagination, so it always fetches from offset 0.
+    ///
+    /// Returns `(results, servedByPlugin)` so callers can gate `searchHasMore`
+    /// correctly: the plugin path does not support load-more, so `searchHasMore`
+    /// must be forced to `false` when `servedByPlugin` is true regardless of page
+    /// size. This prevents the DrawerView sentinel from spinning on the plugin path.
+    ///
     /// Extracted so tests can call it directly without spinning a Task.
-    func fetchSearch(query: String, api: RestClient) async throws -> [SessionSearchResult] {
+    func fetchSearch(
+        query: String, offset: Int = 0, api: RestClient
+    ) async throws -> (results: [SessionSearchResult], servedByPlugin: Bool) {
         let roles = Self.roles(for: searchScope)
         do {
-            return try await api.searchSessionsPlugin(query: query, roles: roles)
+            // Plugin path: no offset support — always fetches page 1 at limit 20.
+            // Unified limit matches searchPageLimit so the hasMore comparison is
+            // coherent if pagination is ever added to the plugin later.
+            let results = try await api.searchSessionsPlugin(
+                query: query, limit: Self.searchPageLimit, roles: roles
+            )
+            return (results, true)
         } catch RestError.badStatus(404, _) {
             // Plugin endpoint not available on this gateway — fall back to stock.
-            return try await api.searchSessions(
-                query: query, scope: searchScope.rawValue
+            let results = try await api.searchSessions(
+                query: query, limit: Self.searchPageLimit, offset: offset,
+                scope: searchScope.rawValue
             )
+            return (results, false)
         }
         // Any other error (500, transport, decode) propagates to the caller.
     }
@@ -2188,13 +2342,18 @@ final class SessionStore {
         open(summary)
     }
 
-    /// Cancel any in-flight search and reset the search UI state.
+    /// Cancel any in-flight search (and load-more) and reset the search UI state.
     func clearSearch() {
         searchTask?.cancel()
         searchTask = nil
+        searchLoadMoreTask?.cancel()
+        searchLoadMoreTask = nil
         searchQuery = ""
         searchResults = []
         isSearching = false
+        isSearchLoadingMore = false
+        searchHasMore = false
+        searchOffset = 0
     }
 
     // MARK: - Pins

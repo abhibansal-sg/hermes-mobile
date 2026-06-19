@@ -264,17 +264,21 @@ extension RestClient {
     /// `all` (every role + session-id matches), `messages` (user + assistant
     /// prose), `code` (tool output / structured results).
     func searchSessions(
-        query: String, limit: Int = 20, scope: String = "all"
+        query: String, limit: Int = 20, offset: Int = 0, scope: String = "all"
     ) async throws -> [SessionSearchResult] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2 else { return [] }
 
         var components = URLComponents()
-        components.queryItems = [
+        var items: [URLQueryItem] = [
             URLQueryItem(name: "q", value: trimmed),
             URLQueryItem(name: "limit", value: String(limit)),
             URLQueryItem(name: "scope", value: scope),
         ]
+        if offset > 0 {
+            items.append(URLQueryItem(name: "offset", value: String(offset)))
+        }
+        components.queryItems = items
         let encodedQuery = components.percentEncodedQuery ?? ""
         let path = encodedQuery.isEmpty
             ? "/api/sessions/search"

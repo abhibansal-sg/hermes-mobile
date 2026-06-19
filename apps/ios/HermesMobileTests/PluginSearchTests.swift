@@ -153,10 +153,11 @@ final class PluginSearchTests: XCTestCase {
         let store = SessionStore()
         store.searchScope = .all
 
-        let results = try await store.fetchSearch(query: "found", api: api)
+        let (results, servedByPlugin) = try await store.fetchSearch(query: "found", api: api)
 
         XCTAssertEqual(results.count, 1, "Stock fallback result must be returned")
         XCTAssertEqual(results[0].id, "s1", "Stock result session_id must parse correctly")
+        XCTAssertFalse(servedByPlugin, "Fallback to stock must report servedByPlugin = false")
         // lastError is untouched (fetchSearch doesn't write it; the caller Task does).
         XCTAssertEqual(SearchStubProtocol.capturedURLs.count, 2,
                        "Both plugin and stock endpoints must be called")
@@ -223,7 +224,7 @@ final class PluginSearchTests: XCTestCase {
         // Simulate the user typing on: searchQuery has moved past the in-flight "old".
         store.searchQuery = "new query"
 
-        let results = try await store.fetchSearch(query: "old", api: api)
+        let (results, _) = try await store.fetchSearch(query: "old", api: api)
 
         // (a) fetchSearch returns the decoded rows — the stale guard is the caller's job.
         XCTAssertFalse(results.isEmpty, "fetchSearch itself must return the decoded rows")

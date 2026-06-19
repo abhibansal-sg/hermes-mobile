@@ -1075,6 +1075,27 @@ struct DrawerView: View {
                         .sensoryFeedback(.selection, trigger: searchResultFeedbackTrigger)
                     }
                 }
+                // Infinite-scroll sentinel: fires loadMoreSearchResults() when the
+                // last result row scrolls into view. While a load-more is in flight
+                // a small spinner replaces the sentinel so the user knows more rows
+                // are coming. Hidden once searchHasMore is false (short page or cap).
+                if sessions.searchHasMore || sessions.isSearchLoadingMore {
+                    plainRow {
+                        HStack {
+                            Spacer()
+                            if sessions.isSearchLoadingMore {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                            Spacer()
+                        }
+                        .frame(height: 36)
+                        .onAppear {
+                            sessions.loadMoreSearchResults()
+                        }
+                    }
+                    .accessibilityHidden(true)
+                }
             } header: {
                 DrawerSectionHeader(title: "Results")
             }
