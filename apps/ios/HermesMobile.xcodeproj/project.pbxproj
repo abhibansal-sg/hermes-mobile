@@ -97,6 +97,7 @@
 		7332D05F32989F9EC7F742DB /* LiveActivityManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4987981420D718F41C87C1FF /* LiveActivityManager.swift */; };
 		748B5E14D95D8403BD076CAB /* KeyboardHeightReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B5CDDA14EE60DEF97892819 /* KeyboardHeightReader.swift */; };
 		74EBFB6D505626109F7DC00A /* SessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F0F4D0D8002319D627E02DD /* SessionStore.swift */; };
+		754443420BD5C9BA84CB2D29 /* SessionStoreTokenSourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0D7DF96B6D98FE332025CFE /* SessionStoreTokenSourceTests.swift */; };
 		766B752D68ACF78389D103D2 /* GatewayRequestRaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4135CE0AB1B15A4137780192 /* GatewayRequestRaceTests.swift */; };
 		7864C5A052E7FFA8D23874F7 /* JSONRPCFramingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6A0932D05CF706A2082F527 /* JSONRPCFramingTests.swift */; };
 		7967EF3FCFB8FF62F5A6A11C /* ViewA11yTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF23BF6299D648E0914BCBE7 /* ViewA11yTests.swift */; };
@@ -458,6 +459,7 @@
 		EEA27F5DA2514ED03A75B7B7 /* RenderCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderCache.swift; sourceTree = "<group>"; };
 		EF63F9311AD1D62193BEC8F1 /* ConnectionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionStore.swift; sourceTree = "<group>"; };
 		EFB934C75067DF5DFC64B358 /* SpotlightIndexer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpotlightIndexer.swift; sourceTree = "<group>"; };
+		F0D7DF96B6D98FE332025CFE /* SessionStoreTokenSourceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionStoreTokenSourceTests.swift; sourceTree = "<group>"; };
 		F236DEE2390C68258176235E /* WSURLBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WSURLBuilder.swift; sourceTree = "<group>"; };
 		F3E84AB5BACF7F2423156966 /* RestClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RestClient.swift; sourceTree = "<group>"; };
 		F46748EDF1C6701ACB8E5CA1 /* HelpLinks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HelpLinks.swift; sourceTree = "<group>"; };
@@ -836,6 +838,7 @@
 				6DDEB01DDD7FC16A9058F4B9 /* SessionArchiveLoadTests.swift */,
 				9D444FC01F883C8D30A5B451 /* SessionDeleteFlowTests.swift */,
 				29A99A94621F89A94E68CC08 /* SessionRefreshTests.swift */,
+				F0D7DF96B6D98FE332025CFE /* SessionStoreTokenSourceTests.swift */,
 				D0BC2E7064E5AA360C0470FF /* SettingsL07Tests.swift */,
 				39D8214ACA6EF804EE0DBD38 /* StoredMessageTests.swift */,
 				493CC7559EC337DC66FFB7C0 /* UX1DrawerFeedTests.swift */,
@@ -1180,6 +1183,7 @@
 				691AF81561E55CE70053E70B /* SessionArchiveLoadTests.swift in Sources */,
 				F530DA6FF7E57CC39DE722DB /* SessionDeleteFlowTests.swift in Sources */,
 				376EA85EFF333D74C40429A4 /* SessionRefreshTests.swift in Sources */,
+				754443420BD5C9BA84CB2D29 /* SessionStoreTokenSourceTests.swift in Sources */,
 				3500EA43F01E459FED4A244E /* SettingsL07Tests.swift in Sources */,
 				0BF1C756EC4336826742044A /* StoredMessageTests.swift in Sources */,
 				FB64C88DF8275780B692E4DC /* UX1DrawerFeedTests.swift in Sources */,

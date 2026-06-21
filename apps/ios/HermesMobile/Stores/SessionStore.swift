@@ -620,29 +620,42 @@ final class SessionStore {
 
     /// A ``RestClient`` for the session-management endpoints (search / rename /
     /// archive / export — now ``RestClient`` extension members), resolved from the
-    /// active connection. The token comes from the dev env override first
-    /// (`HERMES_TOKEN`, which never touches the Keychain) and the Keychain second,
-    /// mirroring how ``ConnectionStore`` bootstraps a connection.
+    /// active connection's live token via ``ConnectionStore/rest``.
+    ///
+    /// ABH-194: this previously re-read ``KeychainService/loadToken(server:)``
+    /// directly, creating a second token source that could diverge from
+    /// ``ConnectionStore/currentToken`` (the authoritative in-memory token).
+    /// Divergence scenarios: a re-pair that wrote `currentToken` before the
+    /// Keychain item was updated, a device-token upgrade whose Keychain write
+    /// failed (the `try?` path in ``ConnectionStore/configure(_:token:…)``), or
+    /// a simulator reinstall that cleared UserDefaults but left a stale Keychain
+    /// item. In all cases `SessionStore.restAPI` sent the stale/wrong token on
+    /// REST calls and received HTTP 401, while everything routed through
+    /// `connection.rest` / `currentToken` worked (including the WS auth and the
+    /// transcript-fetch paths that correctly used `connection?.rest`).
+    ///
+    /// Fix: source the token from the single authoritative live path
+    /// (`ConnectionStore.rest`) so there is only one token source. The
+    /// HERMES_TOKEN dev-env override is already handled: `ConnectionStore.bootstrap`
+    /// reads it and calls `configure()` with it, setting `currentToken` from the
+    /// env value, so `connection?.rest` returns a client carrying the env token.
+    /// Cold-launch safety is preserved: before `configure()` succeeds,
+    /// `ConnectionStore.rest` returns `nil` exactly as the old Keychain read did
+    /// (before any token existed), so callers' nil-guard / "Not connected." paths
+    /// are unchanged.
     private var restAPI: RestClient? {
-        guard let connection else { return nil }
-        let urlString = connection.serverURLString
-        guard !urlString.isEmpty, let url = URL(string: urlString), url.scheme != nil else {
-            return nil
-        }
-        let env = ProcessInfo.processInfo.environment
-        let token: String?
-        if let envURL = env["HERMES_URL"], envURL == urlString,
-           let envToken = env["HERMES_TOKEN"], !envToken.isEmpty {
-            token = envToken
-        } else {
-            token = KeychainService.loadToken(server: urlString)
-        }
-        guard let token, !token.isEmpty else { return nil }
-        return RestClient(
-            baseURL: url, token: token,
-            pathStyle: connection.capabilities.resolvedPathStyle
-        )
+        connection?.rest
     }
+
+    #if DEBUG
+    /// DEBUG-only test accessor: the token string that ``restAPI`` would use for
+    /// the next session-management REST call, or `nil` when there is no live
+    /// connection. Exposed so regression tests can assert the single-source-of-truth
+    /// invariant (ABH-194) without going through a real network call — the value
+    /// equals ``ConnectionStore/rest``'s token, which is the authoritative
+    /// in-memory ``ConnectionStore/currentToken``.
+    var restAPITokenForTesting: String? { restAPI?.token }
+    #endif
 
     // MARK: - Derived list slices
 
