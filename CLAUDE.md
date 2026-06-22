@@ -49,25 +49,27 @@ stay in sync. (The project key is the path-encoded dir under
 **LINEAR** (team ABH, project "Hermes Mobile — Engineering") is the cloud source
 of truth for tasks — nothing to clone; just sign in.
 
-**WHERE THINGS STAND (2026-06-17 — PUBLIC LAUNCH SHIPPED):** Full current state in
-`.agent-memory/project_hermes_mobile.md` (top block). Summary: **public repo LIVE**
-(github.com/ab0991-oss/hermes-ios — MIT, clean history, PRIVACY.md), **build 50
-VALID on TestFlight** (1.0.1); **EXTERNAL beta is LIVE — public link
-https://testflight.apple.com/join/TeMvfFaS** (README Option 1 + LAUNCH-POSTS.md
-finalized with the link; user about to post the X/Discord announcement). **3
-upstream PRs** to NousResearch — #47530 session.delete evict (S6), #47535
-role-scoped search, #47538 fast/reasoning session-scope (S4) — + **issue #47541**
-(observability-hooks appetite; gates the hook + 2 auth PRs). Fork =
-`ab0991-oss/hermes-agent`; PR worktrees `/tmp/hermes-pr-{main,s4,search}`; PR-author
-email `268141382+ab0991-oss@users.noreply.github.com`. Linear tracker **ABH-162**.
-Deploy `~/.hermes/hermes-agent` (trunk `feat/group-collapse-pin`) live on `:9119`,
-healthy. Waiting on Apple review + NousResearch maintainers; nothing blocked locally.
+**WHERE THINGS STAND (2026-06-23 — CONSOLIDATED):** Full state in
+`.agent-memory/project_hermes_mobile.md` (top block). Trunk `phase2-upstream-rebase`
+@ **`27db1ee7c`** (synced). **Build 51 (1.0.1) VALID on TestFlight** + on the user's
+iPhone Air; external beta LIVE: https://testflight.apple.com/join/TeMvfFaS . The
+Jun 18–21 agent-team sprint shipped PRs #19–#51: **connection-modes completed**
+(Inc-4 + hardening), **search** (FTS + pagination), **artifacts gallery**, **a11y**
+(3 passes), **reconnect resilience** (WS liveness ping), **CI hybrid gate**. Agent
+Teams ENABLED — `.claude/TEAM-BOOTSTRAP.md` = live handoff, `apps/ios/VISION.md` =
+loop anchor. **Open:** ABH-187 reconnect (held, device-repro), ABH-192 jump-to-msg,
+C2 ASC nightly toggle, device-verify tails. Upstream PRs #47530/#47535/#47538 +
+issue #47541 in NousResearch's court. **Canonical locations** (the user may MOVE the
+test gateway + app checkout — see the memory block's CANONICAL LOCATIONS section for
+the live `:9119` deploy, `:9123` test rig, this worktree, remotes, public repo).
+Linear **ABH-162** is the launch tracker; Linear is the task source of truth.
 
-**>> The detailed build-48/49 + launch-prep notes BELOW are now HISTORICAL** (build
-50 shipped, repo public). Key launch files: export pipeline
-`scripts/export-public.sh`; posts `dist/hermes-mobile/LAUNCH-POSTS.md`; upstream PR
-plan `dist/hermes-mobile/UPSTREAM-PR-PLAN.md`; TestFlight beta copy
+**>> Everything below is HISTORICAL** (launch-prep + build-48/49 detail). Key launch
+files: export pipeline `scripts/export-public.sh`; posts
+`dist/hermes-mobile/LAUNCH-POSTS.md`; upstream PR plan
+`dist/hermes-mobile/UPSTREAM-PR-PLAN.md`; TestFlight beta copy
 `dist/hermes-mobile/TESTFLIGHT-BETA-NOTES.md`.
+
 User goal: clean up app + solidify notifications/Live-Activity, then ship a
 **first public release as an EXTERNAL TestFlight beta** (public link) for
 **self-hosters**. Staged but NOT yet built/committed:

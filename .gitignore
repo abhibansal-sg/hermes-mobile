@@ -130,3 +130,11 @@ scripts/out/
 # committed to the repo root. See the hermes-release skill.
 RELEASE_v*.md
 .gstack/
+
+# Xcode / iOS (per-user editor state + build artifacts; never commit)
+*.xcuserstate
+xcuserdata/
+DerivedData/
+*.xcarchive
+apps/ios/.derivedData/
+

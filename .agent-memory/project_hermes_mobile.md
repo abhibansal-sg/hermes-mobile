@@ -7,7 +7,61 @@ metadata:
   originSessionId: 6b6cabb9-b6d9-4f9e-9125-9451fe1d94bc
 ---
 
-**=== PUBLIC LAUNCH SHIPPED (2026-06-17) — READ FIRST ===**
+**=== CONSOLIDATED 2026-06-23 — READ FIRST (current) ===**
+Post-launch sprint consolidated; tip + docs reconciled. Trunk `phase2-upstream-rebase`
+@ **`27db1ee7c`** (synced origin ↔ local valencia 2026-06-23 after a 31-commit
+catch-up; valencia had been left behind by the terminal sprint).
+- **App:** **build 51 (1.0.1) VALID on TestFlight + installed on the user's iPhone
+  Air** (shipped 2026-06-18). `apps/ios/project.yml` CURRENT_PROJECT_VERSION=51.
+  External beta still LIVE: https://testflight.apple.com/join/TeMvfFaS
+- **What the Jun 18–21 agent-team sprint shipped (PRs #19–#51, ~30 squash-merges):**
+  connection-modes COMPLETED (Inc-4 lane 4a MagicDNS address-stability + 4b
+  reconnect-survival proof + 2 hardening: manual_token loopback/RFC1918 allowlist,
+  "replaces your connection" confirm) → ABH-169 done; **search** (plugin FTS endpoint
+  + iOS wiring + offset pagination incl. the authorized surgical STOCK-core
+  `offset` cap = ABH-179); **artifacts gallery** (plugin endpoint + iOS grid +
+  load-more); **a11y** (mechanical sweep + MessageBubble combined element + code-side
+  VoiceOver/Dynamic Type, ~9 tests); **reconnect/restart resilience** (WS liveness
+  ping `probeLiveness` = the build-48 Bug-A detector + orphaned-LA reconcile + drawer
+  `turnInProgress` flicker fix + LA stale 15→5min); **CI hybrid gate** (local full-plan
+  per-PR + cloud nightly/pre-ship); ABH-194 (single-source REST token → fixes 401 on
+  re-pair); queue drag-reorder; `session.steer`; `HERMES_MOBILE_CONNECTION_JSON` override.
+- **Claude Code OS substrate installed** (`.claude/skills/verify-loop/`, model-tiered
+  agents in `.claude/agents/`, PreToolUse `guard.sh`). **Agent Teams ENABLED**
+  project-local; **`.claude/TEAM-BOOTSTRAP.md` = live handoff doc**, **`apps/ios/VISION.md`
+  = loop north-star** (both now tracked). Team: ios-engineer + gateway-plugin-engineer
+  (Sonnet builders) + verifier + 2 Opus reviewers + planner. Memories written this
+  sprint: feedback_autonomous_dev_loop, feedback_hermes_plugin_boundary,
+  feedback_full_suite_independent_run, feedback_ci_gate_discipline,
+  feedback_loop_hardening, ops_stale_worktree_inspection, ops_real_gateway_e2e_sim_tooling.
+- **CANONICAL LOCATIONS (⚠️ the user plans to MOVE the test gateway + possibly the
+  app checkout soon — update THIS block when they move):**
+  - Live shared dashboard gateway: `~/.hermes/hermes-agent` checkout, branch
+    `feat/group-collapse-pin` (a9be71317), served on **`127.0.0.1:9119`** (launchd
+    `ai.hermes.dashboard`). NEVER restart/stop/test-traffic without the user's go.
+  - Test/isolated gateway rig: **`:9123+`** (own token; kill when done).
+  - Lead work tree (this repo): **`/Users/abbhinnav/conductor/workspaces/hermes-agent/valencia`**,
+    branch `phase2-upstream-rebase`.
+  - Remotes: `origin` = PRIVATE mirror github.com/ab0991-oss/hermes-mobile (push OK);
+    `upstream` = NousResearch/hermes-agent (FETCH-ONLY, dead push URL).
+  - Public open-source repo: github.com/ab0991-oss/hermes-ios (separate clean history;
+    built via `scripts/export-public.sh`).
+  - iOS sim UI-drive: idb (`brew install facebook/fb/idb-companion` + fb-idb in py3.11 venv).
+  - Usage pacing: `~/bin/cc-usage status`.
+- **OPEN / next (nothing blocked locally):** ABH-187 reconnect-stuck (HELD for a
+  careful device-repro cycle; candidate = recreate URLSession on escalation);
+  ABH-192 jump-to-exact-message; C2 ASC nightly-workflow UI toggle (only outstanding
+  piece of the CI pivot — user's click); device-verify tails (a11y VoiceOver/contrast,
+  ABH-190 Tier-2 Desktop-coordinated E2E); ABH-194 follow-up (audit other direct
+  Keychain readers). Upstream: PRs #47530/#47535/#47538 + issue #47541 still in
+  NousResearch maintainers' court. Trunk merge (phase2-upstream-rebase →
+  feat/group-collapse-pin deploy branch) INTENTIONALLY HELD.
+- **LESSON reaffirmed 2026-06-23:** valencia was 31 commits behind origin → this
+  Conductor session + the docs it wrote were STALE. Always `git status`/fetch + check
+  `origin/<branch>..HEAD` before trusting a worktree; read current files via origin ref
+  if behind. (= `ops_stale_worktree_inspection`.)
+
+**=== PUBLIC LAUNCH SHIPPED (2026-06-17) — HISTORICAL (one build behind; see above) ===**
 The first PUBLIC release is OUT. Branch `phase2-upstream-rebase` (pushed origin).
 - **Public repo LIVE: github.com/ab0991-oss/hermes-ios** — PUBLIC, MIT dual-copyright (Nous 2025 + ab0991-oss 2026), fresh clean history, has PRIVACY.md. Built from valencia via **`scripts/export-public.sh`** (allowlist + deterministic scrub → /tmp/hermes-ios-export → fresh `git init` + `gh repo create`). Author on ALL public commits = `ab0991-oss <268141382+ab0991-oss@users.noreply.github.com>` (NEVER the real name/email). A 7-lens adversarial publish audit caught the bare first name hardcoded in 4 files (test fixtures + greeting test + 2 doc comments) that the token-scrub MISSED → fixed in source; 3 ABH##-prefixed test files renamed; export scrub hardened (case-insensitive jargon, gateway line-number strip keeping file names, orphan-comma cleanup, `.method`-space protect). Re-audit GO/clean.
 - **Build 50 VALID on TestFlight** (1.0.1; CFBundleVersion 50 across app + both extensions). = build 49 (notification can-enable fix + onboarding) + a11y + the public-repo onboarding link (`Support/HelpLinks.swift` → hermes-ios). project.yml=50. **Beta App Review CLEARED — public TestFlight link LIVE + joinable: https://testflight.apple.com/join/TeMvfFaS** (app shows as "Hermes Mobile Gateway"). README Option 1 + `dist/hermes-mobile/LAUNCH-POSTS.md` (X→Nous+founder, Discord "mobile companion to Hermes desktop") are FINALIZED with the link; **awaiting the user to POST the announcement** (recommended: self-install via the link first to smoke-test build 50). Beta copy + privacy URL (github.com/ab0991-oss/hermes-ios/blob/main/PRIVACY.md) in `dist/hermes-mobile/TESTFLIGHT-BETA-NOTES.md`.
