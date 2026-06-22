@@ -108,11 +108,11 @@ if [ -f dist/hermes-mobile/PUBLIC-README.md ]; then
   copied=$((copied + 1))
 fi
 
-# LICENSE (MIT, dual copyright: Nous Research + HermesMobile) -> export root
-if [ -f dist/hermes-mobile/LICENSE ]; then
-  cp dist/hermes-mobile/LICENSE "$OUT/LICENSE"
-  copied=$((copied + 1))
-fi
+# LICENSE is NOT imposed by the export: the public repo (ab0991-oss/hermes-ios)
+# maintains its OWN canonical, GitHub-detectable MIT LICENSE + NOTICE (committed
+# directly there). Re-imposing dist/hermes-mobile/LICENSE here would clobber that
+# (the older verbose dual-copyright draft) on every re-export. The first-publish
+# bootstrapped it; from here the public repo owns its license.
 
 # PRIVACY.md (privacy policy — also serves as the TestFlight privacy URL) -> root
 if [ -f dist/hermes-mobile/PRIVACY.md ]; then
@@ -397,9 +397,11 @@ scrub '
 '
 
 # ---- (j5) defensive: residual bare first name / no-hyphen ABH id --------------
+# Case-INSENSITIVE + consume a preceding -/_ so lowercase ticket ids embedded in
+# test fixtures (e.g. "live-abh194-token") collapse to "live-token", not "live--token".
 scrub '
   s{\bAbhinav\b}{Sam}g;
-  s{\s*\bABH[-_ ]?\d+\b}{}g;
+  s{[-_ ]?\b[Aa][Bb][Hh][-_ ]?\d+\b}{}g;
 '
 
 # Collapse double-spaces / dangling " :" left by token removal inside single-line
@@ -457,7 +459,14 @@ echo "== verification grep =="
 # seams.patch is a controlled unified diff (its +++ headers MUST name the stock
 # gateway files, and it has its own patch-safe scrub); exclude it from the prose
 # verify so legitimate diff headers don't read as leaks.
-VERIFY_PAT='ab0991-oss/hermes-mobile|ABH[-_ ]?[0-9]|R1 ?#[0-9]|127\.0\.0\.1:9119|:9119|9123|/Users/abbhinnav|[Aa]bhinav|3DHXXG4GHQ|TQQF7DKKX8|6J4Y9NKRQ2|d7deff8e-5489|SHIP-TESTFLIGHT|SEAM-LEDGER|CONTRACT-|(server|web_server|ws)\.py:[0-9]|apps/desktop/|[Jj]udge round|redeploy'
+# Note on ports: 9119 is the hermes-agent `dashboard` CLI's DOCUMENTED DEFAULT port
+# (public knowledge, same as 8080/3000), so bare ":9119" default-port mentions and
+# the "192.168.x.x:9119" placeholder example are KEPT (self-hosters need them). We
+# only flag a REAL deploy ADDRESS — 127.0.0.1:9119, localhost:9119, or a real
+# numeric-IP:9119 (which "[0-9]{1,3}(.[0-9]{1,3}){3}:9119" matches, but NOT the
+# "192.168.x.x" placeholder — the x's aren't digits). 9123 (the private test rig)
+# is always flagged.
+VERIFY_PAT='ab0991-oss/hermes-mobile|ABH[-_ ]?[0-9]|R1 ?#[0-9]|127\.0\.0\.1:9119|localhost:9119|[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:9119|9123|/Users/abbhinnav|[Aa]bhinav|3DHXXG4GHQ|TQQF7DKKX8|6J4Y9NKRQ2|d7deff8e-5489|SHIP-TESTFLIGHT|SEAM-LEDGER|CONTRACT-|(server|web_server|ws)\.py:[0-9]|apps/desktop/|[Jj]udge round|redeploy'
 if grep -rnE --exclude='seams.patch' "$VERIFY_PAT" "$OUT" ; then
   echo ""
   echo "!! VERIFY: remaining hits above — review before publishing."
