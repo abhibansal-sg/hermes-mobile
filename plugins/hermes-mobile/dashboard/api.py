@@ -1536,3 +1536,539 @@ async def artifacts_gallery(
         "total_capped": payload["total_capped"],
         "offset": offset,
     }
+
+
+# ---------------------------------------------------------------------------
+# Provider / API-key entry (ABH-183) — mobile-side key onboarding for the iOS
+# app's provider setup screen. Additive plugin routes only; ZERO stock-core
+# edits. Reuses the SAME stock mutators the desktop ``model.save_key`` /
+# ``model.disconnect`` RPCs use (hermes_cli.config.save_env_value /
+# remove_env_value / set_config_value / is_managed, and the inventory
+# ``build_models_payload`` builder), so the credential store and the refreshed
+# model list stay in lock-step with the desktop surface. The gateway is the
+# source of truth; the client POSTs the key once over the existing TLS
+# connection then can clear its transient Keychain copy.
+#
+# Two tiers mirror the stock flows:
+#   Tier A (registered api_key provider): save_env_value(pconfig.api_key_env_vars[0], key)
+#   Tier B (custom OpenAI/Anthropic-compatible provider):
+#       set_config_value("providers.<name>.{base_url,api_mode,api_key,name}")
+#
+# SECURITY (non-negotiable):
+#   * every route requires the standard dashboard session token AND a device
+#     scope (the same belt-and-suspenders as /devices/issue + /approvals/respond);
+#   * is_managed() is honoured on every mutator → 4006 read-only for managed
+#     installs (parity with stock model.save_key);
+#   * OAuth-only providers (auth_type != "api_key") are REJECTED with a 4003
+#     "set up on desktop" error — they cannot be provisioned from a key alone
+#     (parity with stock model.save_key);
+#   * the api_key value is NEVER logged, NEVER echoed in any response body,
+#     and NEVER surfaced in the /providers list (which reveals names + the
+#     authenticated? boolean only). The audit seam records the EVENT only
+#     ("provider <slug> key set/removed by device <Y>");
+#   * inputs are validated (slug against PROVIDER_REGISTRY; base_url is a URL;
+#     api_mode in the allowed set; provider name is a safe dotted-key segment).
+# ---------------------------------------------------------------------------
+
+# auth_type values that CANNOT be provisioned from a raw key on mobile — the
+# user must complete them on the desktop (OAuth device code / external OAuth /
+# external process / minimax OAuth). Parity with stock model.save_key's
+# `auth_type != "api_key"` reject branch, surfaced as the same 4003-class.
+_PROVIDER_OAUTH_AUTH_TYPES = frozenset(
+    {"oauth_device_code", "oauth_external", "oauth_minimax", "external_process"}
+)
+
+# Allowed wire protocols for a Tier B custom provider (matches the stock
+# custom-provider transport vocabulary: openai = chat/completions,
+# anthropic_messages = Anthropic messages API). Mirrors the accepted values in
+# hermes_cli.config._normalize_custom_provider_entry's api_mode handling.
+_CUSTOM_PROVIDER_API_MODES = frozenset({"openai", "anthropic_messages"})
+
+# A safe name for the providers.<name>.* dotted config key: alnum + dash +
+# underscore only (no dots/brackets that could escape the providers subtree).
+_CUSTOM_PROVIDER_NAME_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$")
+
+
+def _custom_provider_env_var(name: str) -> str:
+    """Derive a stable env-var NAME for a custom provider's api_key.
+
+    The raw key is written to the secure .env under this name (chmod 0600, never
+    printed by ``save_env_value``), and the NAME is stored under
+    ``providers.<name>.key_env`` so the runtime resolves the key from the env
+    (``runtime_provider.resolve_custom_provider`` reads ``key_env`` →
+    ``os.getenv``). Derivation MUST be stable across calls so the POST (set) and
+    DELETE (clear) handlers agree on the same var: uppercase the sanitized name,
+    collapse non-alnum runs to a single underscore, and append ``_API_KEY``.
+    Examples: ``myco`` → ``MYCO_API_KEY``, ``Acme-Local`` → ``ACME_LOCAL_API_KEY``.
+    """
+    sanitized = _re.sub(r"[^0-9A-Za-z]+", "_", name.strip()).strip("_").upper()
+    if not sanitized:
+        sanitized = "CUSTOM"
+    return f"{sanitized}_API_KEY"
+
+
+def _provider_provider_rows() -> List[Dict[str, Any]]:
+    """Build the provider universe rows via the stock inventory builder.
+
+    ``picker_hints=True`` is what makes each row carry the
+    ``authenticated`` boolean the mobile list surface keys off (same flag the
+    TUI frontend + the stock model.save_key refresh use). Imported lazily so
+    the module stays importable without the host inventory loaded (tests).
+    """
+    from hermes_cli.inventory import build_models_payload, load_picker_context
+
+    ctx = load_picker_context()
+    payload = build_models_payload(ctx, picker_hints=True, max_models=50)
+    return payload.get("providers", []) or []
+
+
+def _provider_audit(request: Request, event: str, slug: str) -> None:
+    """Audit-log the EVENT only (never the key value).
+
+    Reuses the plugin's existing append-only audit seam (approval_audit.jsonl).
+    Records which device/shared credential performed a key mutation and against
+    which provider — nothing about the key itself. Best-effort (never raises),
+    matching the seam's availability-over-auditability contract.
+    """
+    try:
+        device = _request_device(request)
+        device_id = None
+        device_name = None
+        token_prefix = None
+        credential = "shared"
+        if isinstance(device, dict) and device.get("device_id"):
+            credential = "device"
+            device_id = device.get("device_id")
+            device_name = device.get("device_name")
+            token_prefix = device.get("token_prefix")
+        audit_log = _plugin_module("audit_log")
+        audit_log.append(
+            session_id="",
+            session_key="",
+            choice="",
+            credential=credential,
+            device_id=device_id,
+            device_name=device_name,
+            token_prefix=token_prefix,
+            command_preview=f"provider {slug} {event}",
+        )
+    except Exception:  # pragma: no cover - best-effort, never fatal
+        _log.debug("provider-key audit append failed", exc_info=True)
+
+
+@router.get("/providers")
+async def list_providers(request: Request) -> Dict[str, Any]:
+    """List the provider universe + per-provider authenticated? flag.
+
+    Reveals provider names + slugs + auth_type + an ``authenticated`` boolean
+    ONLY. NEVER reveals a key value, env-var contents, or a base_url secret.
+    A managed install still lists providers (read-only) — only the mutators
+    below honour is_managed(). Auth is the standard dashboard token; a device
+    token also needs the ``approve`` scope (the credential-mutation scope).
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(
+            status_code=403, detail="Device token lacks approve scope"
+        )
+
+    try:
+        rows = _provider_provider_rows()
+    except Exception as exc:  # pragma: no cover - inventory unavailable
+        _log.warning("providers/list inventory build failed: %s", exc)
+        raise HTTPException(status_code=503, detail="provider list unavailable")
+
+    # Project to the mobile-safe shape: NEVER forward api_key / key_env values
+    # or any credential material. ``authenticated`` is the only auth signal.
+    safe: List[Dict[str, Any]] = []
+    for row in rows:
+        slug = row.get("slug") or ""
+        if not slug:
+            continue
+        safe.append(
+            {
+                "slug": slug,
+                "name": row.get("name") or slug,
+                "auth_type": row.get("auth_type") or "",
+                "is_current": bool(row.get("is_current")),
+                "authenticated": bool(row.get("authenticated")),
+                "total_models": int(row.get("total_models") or 0),
+            }
+        )
+    return {"providers": safe}
+
+
+class ProviderKeyBody(BaseModel):
+    api_key: str
+
+
+@router.post("/providers/{slug}/key")
+async def set_provider_key(
+    slug: str, body: ProviderKeyBody, request: Request
+) -> Dict[str, Any]:
+    """Tier A — save an API key for a REGISTERED api_key provider.
+
+    Validates ``slug`` is a known PROVIDER_REGISTRY entry with
+    ``auth_type == "api_key"`` (else 4003 "set up on desktop" for OAuth-only
+    providers — they cannot be provisioned from a key alone). Honours
+    is_managed() (4006 read-only for managed installs). Persists via the stock
+    ``save_env_value`` + mirrors into os.environ so the refreshed inventory
+    sees it immediately (parity with stock model.save_key). Returns the
+    refreshed provider row with models populated. NEVER echoes the key.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(
+            status_code=403, detail="Device token lacks approve scope"
+        )
+
+    slug = (slug or "").strip()
+    api_key = (body.api_key or "").strip()
+    if not slug:
+        return JSONResponse(status_code=400, content={"error": "slug required", "code": 4001})
+    if not api_key:
+        return JSONResponse(
+            status_code=400, content={"error": "api_key required", "code": 4001}
+        )
+
+    from hermes_cli.auth import PROVIDER_REGISTRY
+    from hermes_cli.config import is_managed, save_env_value
+
+    if is_managed():
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "managed install — credentials are read-only",
+                "code": 4006,
+            },
+        )
+
+    pconfig = PROVIDER_REGISTRY.get(slug)
+    if not pconfig:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"unknown provider: {slug}", "code": 4002},
+        )
+    if pconfig.auth_type in _PROVIDER_OAUTH_AUTH_TYPES or pconfig.auth_type != "api_key":
+        # OAuth-only / non-key providers cannot be set up from a raw key on
+        # mobile — parity with stock model.save_key's 4003 branch.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": (
+                    f"{pconfig.name} uses {pconfig.auth_type} auth — "
+                    f"set it up on the desktop"
+                ),
+                "code": 4003,
+            },
+        )
+    if not pconfig.api_key_env_vars:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"no env var defined for {pconfig.name}",
+                "code": 4004,
+            },
+        )
+
+    env_var = pconfig.api_key_env_vars[0]
+    try:
+        save_env_value(env_var, api_key)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400, content={"error": str(exc), "code": 4001}
+        )
+    # Mirror into the live process so the refreshed inventory row sees the key
+    # (parity with stock model.save_key).
+    os.environ[env_var] = api_key
+
+    _provider_audit(request, "key set", slug)
+
+    # Refresh via the shared inventory builder; project to the mobile-safe
+    # provider shape (NEVER carries the key value).
+    provider_data = _refresh_provider_row(slug, fallback_name=pconfig.name)
+    provider_data["authenticated"] = True
+    return {"provider": provider_data}
+
+
+class CustomProviderBody(BaseModel):
+    name: str
+    base_url: str
+    api_mode: str  # "openai" | "anthropic_messages"
+    api_key: str
+
+
+@router.post("/providers/custom")
+async def add_custom_provider(
+    body: CustomProviderBody, request: Request
+) -> Dict[str, Any]:
+    """Tier B — register a custom OpenAI/Anthropic-compatible provider.
+
+    Writes ``providers.<name>.{name,base_url,api_mode,key_env}`` to config.yaml
+    via the stock ``set_config_value`` (the same path the desktop ``hermes set``
+    uses for a custom provider), and writes the RAW api_key to the secure
+    ``~/.hermes/.env`` (chmod 0600, NEVER printed) via ``save_env_value``. The
+    runtime resolves the key at request time from ``key_env``
+    (``runtime_provider.resolve_custom_provider`` reads ``providers.<name>
+    .key_env`` → ``os.getenv``), so the key is usable WITHOUT ever landing in
+    config.yaml or a log line. Validates: name is a safe dotted-key segment,
+    base_url is a URL, api_mode is in the allowed set, api_key is non-empty.
+    Honours is_managed() (4006). NEVER echoes the key.
+
+    SECURITY (ABH-183 review): the previous implementation wrote the raw key
+    via ``set_config_value("providers.<name>.api_key", ...)``. That dotted key
+    does NOT match stock ``set_config_value``'s ``_API_KEY``-suffix routing
+    check (the suffix test needs a leading underscore: ``key.upper().endswith
+    (('_API_KEY','_TOKEN'))``), so it fell through to the config.yaml branch
+    whose final statement prints ``Set providers.<name>.api_key = <RAW KEY>``
+    to stdout — captured at rest by the launchd plists into the dashboard /
+    dev-gateway logs. The key_env + save_env_value path below closes that leak.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(
+            status_code=403, detail="Device token lacks approve scope"
+        )
+
+    from hermes_cli.config import is_managed, save_env_value, set_config_value
+
+    name = (body.name or "").strip()
+    base_url = (body.base_url or "").strip()
+    api_mode = (body.api_mode or "").strip()
+    api_key = (body.api_key or "").strip()
+
+    if not name or not _CUSTOM_PROVIDER_NAME_RE.match(name):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid provider name", "code": 4001},
+        )
+    if not base_url or not _looks_like_url(base_url):
+        return JSONResponse(
+            status_code=400, content={"error": "invalid base_url", "code": 4001}
+        )
+    if api_mode not in _CUSTOM_PROVIDER_API_MODES:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "api_mode must be 'openai' or 'anthropic_messages'",
+                "code": 4001,
+            },
+        )
+    if not api_key:
+        return JSONResponse(
+            status_code=400, content={"error": "api_key required", "code": 4001}
+        )
+
+    if is_managed():
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "managed install — credentials are read-only",
+                "code": 4006,
+            },
+        )
+
+    # Persist the custom-provider subtree via the stock config mutator (the
+    # same path the desktop ``hermes set providers.<name>.*`` uses), but route
+    # the RAW api_key to the secure .env (chmod 0600, never printed) and store
+    # ONLY the env-var NAME under ``providers.<name>.key_env``. The runtime
+    # resolves the key from key_env at request time
+    # (runtime_provider.resolve_custom_provider: ``key_env = entry.get(
+    # "key_env")`` → ``os.getenv(key_env)``), so the key is usable WITHOUT a
+    # raw secret ever touching config.yaml or a log line. This mirrors the
+    # hygiene of the desktop's key_env-backed custom providers.
+    env_var = _custom_provider_env_var(name)
+    try:
+        save_env_value(env_var, api_key)
+        set_config_value(f"providers.{name}.name", name)
+        set_config_value(f"providers.{name}.base_url", base_url)
+        set_config_value(f"providers.{name}.api_mode", api_mode)
+        set_config_value(f"providers.{name}.key_env", env_var)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400, content={"error": str(exc), "code": 4001}
+        )
+
+    _provider_audit(request, "custom provider added", name)
+
+    provider_data = _refresh_provider_row(name, fallback_name=name)
+    provider_data["authenticated"] = True
+    return {"provider": provider_data}
+
+
+@router.delete("/providers/{slug}/key")
+async def remove_provider_key(
+    slug: str, request: Request
+) -> Dict[str, Any]:
+    """Remove credentials for a provider (parity with stock model.disconnect).
+
+    For a registered api_key provider: ``remove_env_value`` on each of its
+    api_key_env_vars. For a CUSTOM provider (not in PROVIDER_REGISTRY): the
+    key was persisted under ``providers.<name>.key_env`` (POST /providers/custom)
+    pointing at a secure .env var — so in addition to ``clear_provider_auth`` we
+    ALSO clear that persisted state: remove the .env var, blank the inline
+    ``api_key``, and drop ``key_env`` from config.yaml. Without this, the key
+    would persist in .env + config.yaml while the route returned
+    ``disconnected:true``. Honours is_managed() (4006). Returns the provider's
+    slug + name + a ``disconnected`` flag. NEVER echoes a key.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(
+            status_code=403, detail="Device token lacks approve scope"
+        )
+
+    from hermes_cli.auth import PROVIDER_REGISTRY, clear_provider_auth
+    from hermes_cli.config import (
+        is_managed,
+        remove_env_value,
+        set_config_value,
+    )
+
+    slug = (slug or "").strip()
+    if not slug:
+        return JSONResponse(
+            status_code=400, content={"error": "slug required", "code": 4001}
+        )
+
+    if is_managed():
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "managed install — credentials are read-only",
+                "code": 4006,
+            },
+        )
+
+    pconfig = PROVIDER_REGISTRY.get(slug)
+    is_custom = pconfig is None
+    cleared_env = False
+    cleared_config = False
+    cleared_auth = False
+
+    if pconfig and pconfig.api_key_env_vars:
+        for ev in pconfig.api_key_env_vars:
+            try:
+                if remove_env_value(ev):
+                    cleared_env = True
+            except ValueError:
+                continue
+
+    if is_custom:
+        # A custom provider (POST /providers/custom) persists its key under
+        # ``providers.<slug>.key_env`` (an env-var NAME) with the raw key in the
+        # secure .env. clear_provider_auth only mutates the auth_store JSON —
+        # it never touches config.yaml or the .env — so we clear the persisted
+        # state explicitly here. The key MUST actually be gone after a 200.
+        env_var = _custom_provider_env_var(slug)
+        try:
+            if remove_env_value(env_var):
+                cleared_env = True
+        except ValueError:
+            pass
+        # Blank the inline api_key (defensive: a legacy entry may carry one)
+        # and overwrite key_env with an empty string so the runtime no longer
+        # resolves a key for this provider. set_config_value writes to
+        # config.yaml (no leak — these are key NAMES / empty, not secrets).
+        try:
+            set_config_value(f"providers.{slug}.api_key", "")
+            set_config_value(f"providers.{slug}.key_env", "")
+            cleared_config = True
+        except ValueError:
+            pass
+
+    # Clear OAuth / credential pool state + custom-provider credentials. This
+    # is a no-op when the slug has no such state.
+    try:
+        cleared_auth = bool(clear_provider_auth(slug))
+    except Exception:  # pragma: no cover - defensive, never fatal
+        cleared_auth = False
+
+    if not cleared_env and not cleared_config and not cleared_auth:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"no credentials found for {slug}", "code": 4005},
+        )
+
+    _provider_audit(request, "key removed", slug)
+
+    provider_name = pconfig.name if pconfig else slug
+    return {
+        "slug": slug,
+        "name": provider_name,
+        "disconnected": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Provider/key helpers (pure — unit-testable without a gateway).
+# ---------------------------------------------------------------------------
+
+
+def _looks_like_url(value: str) -> bool:
+    """Light URL validation for a custom-provider base_url.
+
+    Accepts ``http://`` and ``https://`` URLs with a non-empty host. Deliberately
+    permissive (no DNS/TLS probe) so a self-hosted LAN endpoint or a localhost
+    dev gateway passes — we are validating SHAPE, not reachability. Rejects
+    ``file://``, bare hosts, and anything with whitespace.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    lowered = value.lower()
+    if not (lowered.startswith("http://") or lowered.startswith("https://")):
+        return False
+    if any(ch.isspace() for ch in value):
+        return False
+    # Strip the scheme, then require a non-empty host before the next '/'.
+    # A bare ``localhost`` (no dot) is a valid host for a dev gateway, as is an
+    # IPv4 literal — so require a non-empty host that either contains a dot or
+    # is exactly ``localhost``. The previous expression reduced to ``bool(host)``
+    # by operator precedence (the dot-check was dead code); this is the intended
+    # shape and still admits https://api.openai.com, http://localhost:8080, and
+    # https://192.168.1.5/v1 while rejecting scheme-only garbage like "https://".
+    rest = value.split("://", 1)[1]
+    host = rest.split("/", 1)[0]
+    if not host:
+        return False
+    # Strip an optional port before the dot/IP checks.
+    host_no_port = host.rsplit(":", 1)[0] if ":" in host else host
+    return "." in host_no_port or host_no_port == "localhost"
+
+
+def _refresh_provider_row(slug: str, *, fallback_name: str = "") -> Dict[str, Any]:
+    """Return the mobile-safe provider row for ``slug`` after a mutation.
+
+    Rebuilds the inventory and projects to the same safe shape as
+    ``list_providers`` (NEVER a key value). Falls back to a minimal row when the
+    slug does not surface in the inventory (the key was still persisted — parity
+    with stock model.save_key's "still return success" branch).
+    """
+    try:
+        rows = _provider_provider_rows()
+    except Exception:  # pragma: no cover - inventory unavailable
+        rows = []
+    for row in rows:
+        if row.get("slug") == slug:
+            return {
+                "slug": row.get("slug") or slug,
+                "name": row.get("name") or fallback_name or slug,
+                "auth_type": row.get("auth_type") or "",
+                "is_current": bool(row.get("is_current")),
+                "authenticated": bool(row.get("authenticated")),
+                "total_models": int(row.get("total_models") or 0),
+                "models": row.get("models") or [],
+            }
+    return {
+        "slug": slug,
+        "name": fallback_name or slug,
+        "auth_type": "",
+        "is_current": False,
+        "authenticated": True,
+        "total_models": 0,
+        "models": [],
+    }

@@ -143,6 +143,7 @@ struct SettingsView: View {
                 appearanceAndPanelsSection
                 notificationsAndSecuritySection
                 devicesSection
+                modelProviderSection
                 connectionSection
                 aboutSection
             }
@@ -473,6 +474,40 @@ struct SettingsView: View {
                 .accessibilityIdentifier("settingsDevices")
             } footer: {
                 Text("Manage the devices paired with this server and review who approved what.")
+            }
+        }
+    }
+
+    // MARK: - Model Provider (ABH-183 — feature-detected; plugin-mount only)
+
+    /// The ABH-183 Model Provider section — a single push to
+    /// ``ProviderListView`` (the provider universe + authenticated? + add-key /
+    /// custom-provider / disconnect affordances). Rendered ONLY when the
+    /// connected gateway advertises the plugin mount (these routes live on
+    /// `/api/plugins/hermes-mobile/providers`); on a stock hermes-agent
+    /// (`pluginMount != .available`) the whole section is absent (graceful stock
+    /// degradation). On a plugin-mount gateway that PREDATES the provider routes,
+    /// the list surfaces the 404 as an inline error.
+    @ViewBuilder
+    private var modelProviderSection: some View {
+        if connectionStore.capabilities.pluginMount == .available,
+           let rest = connectionStore.rest {
+            Section {
+                NavigationLink {
+                    ProviderListView(rest: rest) {
+                        // Re-resolve the running model + repopulate the Model
+                        // picker so a newly-authenticated provider's models (or a
+                        // just-disconnected provider's removal) is reflected.
+                        Task { await connectionStore.refreshActiveModel() }
+                    }
+                    .background(theme.bg)
+                } label: {
+                    SettingsRow(icon: "key.horizontal", title: "Model Provider", value: nil)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsModelProvider")
+            } footer: {
+                Text("Add or remove API keys for model providers. New chats use the provider you pick in Model.")
             }
         }
     }
