@@ -1,0 +1,67 @@
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index 1b2ff0d97..7b82609e2 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -347,6 +347,23 @@ def _notify_session_boundary(event_type: str, session_id: str | None) -> None:
+         pass
+ 
+ 
++# ── S2 seam: post-emit observers (hermes-mobile plugin) ────────────────────────
++# Generic observer list notified after every emitted event. Populated by plugins
++# (the hermes-mobile push engine appends ``handle_gateway_event`` here); empty on
++# stock gateways so this is a strict no-op when no plugin is loaded.
++# See CONTRACT-DEPATCH.md seam S2.
++_EMIT_OBSERVERS: list = []
++
++
++def _notify_emit_observers(event: str, sid: str, payload: dict | None = None) -> None:
++    """Best-effort fan-out of an emitted event to every S2 observer."""
++    for _obs in list(_EMIT_OBSERVERS):
++        try:
++            _obs(event, sid, payload)
++        except Exception:
++            logger.debug("emit observer failed", exc_info=True)
++
++
+ def _claim_active_session_slot(
+     session_key: str,
+     *,
+@@ -723,6 +740,15 @@ def _profile_configured_cwd(profile_home: Path | None) -> str | None:
+         return None
+ 
+ 
++# S1a seam (hermes-mobile broadcast plugin): write_json fan-out subscribers.
++# ``broadcast.activate()`` appends ``on_owner_write`` here; each subscriber is
++# called with ``(obj, sid, owner_transport)`` AFTER the owner write so that
++# session-scoped event frames mirror to every OTHER connected client (multi-client
++# desktop<->mobile sync). Empty on stock gateways (no fan-out, identical behaviour).
++# See CONTRACT-DEPATCH.md seam S1a.
++_EVENT_FANOUT_SUBSCRIBERS: list = []
++
++
+ def write_json(obj: dict) -> bool:
+     """Emit one JSON frame. Routes via the most-specific transport available.
+ 
+@@ -739,6 +765,14 @@ def write_json(obj: dict) -> bool:
+     if obj.get("method") == "event":
+         sid = ((obj.get("params") or {}).get("session_id")) or ""
+         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
++            # S1a: mirror this session-scoped frame to every OTHER connected client.
++            # Each subscriber is isolated + non-blocking; a fan-out failure degrades
++            # ONLY the mirror, never the owner write below.
++            for _fanout in _EVENT_FANOUT_SUBSCRIBERS:
++                try:
++                    _fanout(obj, sid, t)
++                except Exception:
++                    pass
+             return t.write(obj)
+ 
+     return (current_transport() or _stdio_transport).write(obj)
+@@ -749,6 +783,7 @@ def _emit(event: str, sid: str, payload: dict | None = None):
+     if payload is not None:
+         params["payload"] = payload
+     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
++    _notify_emit_observers(event, sid, payload)
+ 
+ 
+ def _status_update(sid: str, kind: str, text: str | None = None):

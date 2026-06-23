@@ -55,6 +55,24 @@ cmd_install() {
   [ -x "$VENV_HERMES" ] || die "no hermes at $VENV_HERMES — run 'uv sync' / install the repo venv first."
   [ -d "$PLUGIN_SRC" ]  || die "plugin source missing at $PLUGIN_SRC"
 
+  # Apply the hermes-mobile broadcast SEAMS to the working tree (idempotent).
+  # The branch must STAY stock-clean, so the S1a (_EVENT_FANOUT_SUBSCRIBERS)
+  # and S2 (_EMIT_OBSERVERS) hooks ride as scripts/seams.patch instead of a
+  # commit. --check first: if it passes the seams aren't applied yet → apply;
+  # if it fails (already applied OR would conflict) → skip. Never commits.
+  # The seams are pure no-ops on stock (empty list + guarded loop) so a stock
+  # gateway behaves identically when the plugin isn't loaded.
+  local seams="$REPO_ROOT/scripts/seams.patch"
+  if [ -f "$seams" ]; then
+    if git -C "$REPO_ROOT" apply --check "$seams" >/dev/null 2>&1; then
+      git -C "$REPO_ROOT" apply "$seams" && say "seams applied to working tree (uncommitted): $seams"
+    else
+      say "seams already applied (or patch context drifted) — left as-is: $seams"
+    fi
+  else
+    say "⚠ $seams missing — broadcast seams NOT applied (multi-client mirror will be dead)"
+  fi
+
   say "provisioning isolated dev HOME at $DEV_HOME"
   mkdir -p "$DEV_HOME"/{bin,logs,plugins,sessions}
 
