@@ -39,7 +39,17 @@ catch-up; valencia had been left behind by the terminal sprint).
   - Live shared dashboard gateway: `~/.hermes/hermes-agent` checkout, branch
     `feat/group-collapse-pin` (a9be71317), served on **`127.0.0.1:9119`** (launchd
     `ai.hermes.dashboard`). NEVER restart/stop/test-traffic without the user's go.
-  - Test/isolated gateway rig: **`:9123+`** (own token; kill when done).
+  - **DEV GATEWAY (standard test target, 2026-06-23):** isolated developer gateway
+    on **`127.0.0.1:9200`**, `HERMES_HOME=~/Developer/.hermes-dev` (own data/token;
+    zero `~/.hermes` overlap). Runs THIS valencia checkout's source+venv (full
+    HermesMobile plugin SYMLINKED in → live plugin edits; `git pull` here updates
+    it). launchd `ai.hermes.dev-gateway` (auto-start + KeepAlive). Manage via
+    **`scripts/dev-gateway.sh {install|start|stop|restart|status|token|pair|logs}`**.
+    Token: `~/Developer/.hermes-dev/dashboard.token`. Pair the app:
+    `scripts/dev-gateway.sh pair`. **Use THIS for app testing — not the live :9119,
+    and it supersedes the old ephemeral `:9123` rig** (the verify-loop's `:9123`
+    instructions still work but `:9200` is the persistent standard now).
+  - Old ephemeral test rig: `:9123+` (still valid for throwaway one-offs; kill when done).
   - Lead work tree (this repo): **`/Users/abbhinnav/conductor/workspaces/hermes-agent/valencia`**,
     branch `phase2-upstream-rebase`.
   - Remotes: `origin` = PRIVATE mirror github.com/ab0991-oss/hermes-mobile (push OK);
