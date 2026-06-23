@@ -138,3 +138,6 @@ DerivedData/
 *.xcarchive
 apps/ios/.derivedData/
 
+
+# In-tree developer-gateway data home (runtime state; scripts/dev-gateway.sh)
+.hermes-dev/

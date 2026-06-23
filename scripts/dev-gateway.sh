@@ -27,14 +27,16 @@
 set -euo pipefail
 
 # --- config (the canonical dev-gateway facts; update here if relocating) ------
-DEV_HOME="${HERMES_DEV_HOME:-$HOME/Developer/.hermes-dev}"
+# This checkout (the dev gateway runs THIS source via THIS venv).
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# DEV_HOME defaults to an IN-TREE .hermes-dev so the whole dev environment — code,
+# gateway data, sessions, token — lives under ONE root (this worktree) and travels
+# with any future move. Override with HERMES_DEV_HOME if you ever want it elsewhere.
+DEV_HOME="${HERMES_DEV_HOME:-$REPO_ROOT/.hermes-dev}"
 DEV_PORT="${HERMES_DEV_PORT:-9200}"
 DEV_HOST="127.0.0.1"
 LABEL="ai.hermes.dev-gateway"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-
-# This checkout (the dev gateway runs THIS source via THIS venv).
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_HERMES="$REPO_ROOT/.venv/bin/hermes"
 VENV_PY="$REPO_ROOT/.venv/bin/python"
 PLUGIN_SRC="$REPO_ROOT/plugins/hermes-mobile"
