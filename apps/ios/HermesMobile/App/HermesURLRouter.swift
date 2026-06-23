@@ -231,11 +231,23 @@ enum HermesURLRouter {
 
         case "session":
             // `hermesapp://session/<storedId>` — the stored id is the first path
-            // component after the host.
+            // component after the host. ABH-192: an optional `?message=<n>` query
+            // carries a wire message_id to scroll the opened transcript to
+            // (jump-to-exact-message); when present it is stashed on
+            // `SessionStore.pendingMessageJump` before the open so ChatView's
+            // transcript-generation observer resolves it once the rows load.
             let storedId = url.pathComponents
                 .first { $0 != "/" }?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !storedId.isEmpty else { return }
+            if let messageParam = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "message" })?.value,
+               let messageId = Int(messageParam),
+               messageId > 0 {  // N2: wire message_id is a positive ordinal;
+                                // reject 0/negatives/NaN. Graceful — invalid
+                                // just means no jump (native bottom anchor).
+                sessions.pendingMessageJump = messageId
+            }
             openSession(storedId: storedId, sessions: sessions, inbox: inbox)
 
         case "pair":

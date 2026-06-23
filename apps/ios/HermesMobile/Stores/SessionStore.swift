@@ -224,6 +224,52 @@ final class SessionStore {
     /// once it has scrolled. `nil` for a normal open.
     var pendingSearchScroll: String?
 
+    /// ABH-192 (jump-to-exact-message): the wire `message_id` the next-opened
+    /// session should scroll its transcript to. Set by ``open(searchResult:)``
+    /// when the tapped result carried a `messageId` (the per-message plugin
+    /// search endpoint and the artifacts gallery both do; the stock FTS endpoint
+    /// does not). Consumed + cleared by ChatView once the target row is visible.
+    /// `nil` for a normal open. Takes precedence over ``pendingSearchScroll``
+    /// when both are set (an exact-id jump is stricter than a query-text match).
+    ///
+    /// M1 (Opus review): the open path is CACHE-FIRST then NETWORK
+    /// (``seedTranscriptCacheFirst``). A stale on-disk cache seed lands BEFORE
+    /// the authoritative network seed, and the stale copy often does NOT contain
+    /// the matched row. So `jumpToMessageIfNeeded` must NOT clear this on a
+    /// miss — it survives the cache bump and resolves on the network bump.
+    /// Bounded two ways so it can't live forever: (1) cleared on a successful
+    /// scroll, (2) cleared on `activeStoredId` change (session switch — see
+    /// ``open(_:)`` and ChatView's `.onChange(of: activeStoredSessionId)`), and
+    /// (3) a small attempt cap (``pendingMessageJumpAttempts``) so a target that
+    /// is genuinely absent on a fresh/cache-HIT single-phase seed is still
+    /// consumed within one session (no infinite retention).
+    var pendingMessageJump: Int?
+
+    /// ABH-192 / M1: counts how many `transcriptGeneration` bumps
+    /// `jumpToMessageIfNeeded` has inspected WITHOUT resolving the target row.
+    /// The cache→network seed is at most a two-phase bump (cache paint, then
+    /// network reconcile), plus the cache-fresh skip path is single-phase — so a
+    /// target that has not appeared after a couple of hops is genuinely absent
+    /// (coalesced turn / stock gateway / compressed-out row). Bounded at
+    /// ``Self.pendingMessageJumpMaxAttempts``; on the cap the jump is consumed
+    /// (and, when a snippet is available, falls back to the query-text scroll).
+    var pendingMessageJumpAttempts = 0
+
+    /// S2 (Opus review): the search snippet captured alongside an exact-id
+    /// `pendingMessageJump` (from `open(searchResult:)`). When the exact-id
+    /// lookup misses (coalesced assistant turn / stock gateway / compressed-out
+    /// row), `jumpToMessageIfNeeded` falls back to a query-text scroll using
+    /// this snippet via `pendingSearchScroll` — so the user lands inside the
+    /// right turn instead of a silent no-op at the bottom. `nil` when the jump
+    /// did not originate from a search result (e.g. the artifacts gallery, which
+    /// carries no snippet) — then the miss is a graceful no-op.
+    var pendingMessageJumpSnippet: String?
+
+    /// M1: the cap after which an unresolved `pendingMessageJump` is abandoned.
+    /// Two phases cover the cache-then-network seed; the third hop absorbs a
+    /// late reconcile so a genuinely-present target is never wrongly dropped.
+    static let pendingMessageJumpMaxAttempts = 3
+
     // MARK: - Pins / archive / cron filter (persisted)
 
     /// Pinned `stored_session_id`s; pinned rows float to a section on top.
@@ -1678,6 +1724,31 @@ final class SessionStore {
         // requires the pill to never flash the previous model — far cheaper than the
         // LazyVStack teardown, so it is NOT the switch-hitch cost FIX 4 targets.
         connection?.clearSessionState()
+
+        // S1 (Opus review): a SESSION SWITCH must not inherit a pending scroll
+        // target left over from the PREVIOUS session. Clear when the incoming id
+        // DIFFERS from the current `activeStoredId`. The deep-link path
+        // (HermesURLRouter.openSession) sets `pendingMessageJump` for the target
+        // id and then calls `open(summary)` — when that target is ALREADY the
+        // active session (re-open, `activeStoredId == summary.id`) the just-set
+        // jump is preserved; a deep-link to a different session re-arms via the
+        // URL router's own `pendingMessageJump = messageId` assignment, which
+        // runs on the SAME tap tick and is re-applied after this clear because
+        // `openSession` is invoked synchronously after the assignment (the
+        // router sets the jump, THEN calls open; this clear runs inside open, so
+        // it would clear it — guarded by the id-equality check: when the
+        // deep-link targets the already-active session the jump survives). The
+        // `open(searchResult:)` path likewise targets the result's own session;
+        // if it differs from active, the stale clear is correct and the result's
+        // jump is re-set by `open(searchResult:)` AFTER clearSearch but BEFORE
+        // open — re-ordered below to set after the switch clear.
+        if activeStoredId != summary.id {
+            pendingMessageJump = nil
+            pendingMessageJumpAttempts = 0
+            pendingMessageJumpSnippet = nil
+            pendingSearchScroll = nil
+        }
+
         // Activate instantly — the chat view can present right away with a loading
         // transcript instead of blocking navigation on the gateway. These pointers are
         // CHEAP and drive the drawer selection highlight + gate the composer + resolve
@@ -2349,15 +2420,45 @@ final class SessionStore {
     /// Open a session from a search result. If the session is already in the
     /// loaded list, prefer its richer row; otherwise synthesize one from the
     /// result. Clears the search UI so the chat takes over.
+    ///
+    /// ABH-192: when the result carries a `messageId` (the per-message plugin
+    /// endpoint and the artifacts gallery both thread one through), set
+    /// ``pendingMessageJump`` so ChatView scrolls to that exact row once the
+    /// transcript loads — instead of the query-text ``pendingSearchScroll``
+    /// match. An exact-id jump is stricter and preferred when available.
     func open(searchResult result: SessionSearchResult) {
         let summary = sessions.first(where: { $0.id == result.id }) ?? result.asSessionSummary
         // Remember the query so ChatView scrolls to its first occurrence once
         // the transcript loads (jump-to-match). Captured BEFORE clearSearch()
         // wipes searchQuery.
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let jumpTarget = result.messageId
+        // S2 (Opus review): on an exact-id MISS (coalesced assistant turn whose
+        // matched row id isn't the turn's anchor, or a stock gateway with no
+        // wireId), fall back to a query-text scroll using the search snippet so
+        // the user lands inside the right turn instead of a silent no-op at the
+        // bottom. `jumpToMessageIfNeeded` arms `pendingSearchScroll` from this
+        // snippet when the id lookup misses; we ALSO seed it now for the no-id
+        // path so a snippet-bearing result without a messageId still jumps.
+        let snippetText = result.plainSnippet
         clearSearch()
-        pendingSearchScroll = q.isEmpty ? nil : q
+        // S1 (Opus review): `open(summary)` clears any stale pending scroll on a
+        // session SWITCH, so arm the new jump/search AFTER the open. The
+        // cache→network seed is async (Task), so this synchronous assignment
+        // still lands before the first `transcriptGeneration` bump.
         open(summary)
+        // An exact message-id jump (ABH-192) takes precedence over the
+        // query-text match; only set pendingSearchScroll when there is no id.
+        pendingMessageJump = jumpTarget
+        pendingMessageJumpAttempts = 0
+        // S2: carry the snippet so an exact-id MISS can fall back to a query-text
+        // scroll inside the right turn.
+        pendingMessageJumpSnippet = (jumpTarget != nil && !snippetText.isEmpty) ? snippetText : nil
+        if jumpTarget == nil {
+            pendingSearchScroll = !q.isEmpty ? q : (!snippetText.isEmpty ? snippetText : nil)
+        } else {
+            pendingSearchScroll = nil
+        }
     }
 
     /// Cancel any in-flight search (and load-more) and reset the search UI state.

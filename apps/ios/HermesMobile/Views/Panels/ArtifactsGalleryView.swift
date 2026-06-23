@@ -192,9 +192,11 @@ struct ArtifactsGalleryView: View {
     /// ``DrawerView`` search results.
     ///
     /// Note: ``SessionStore/pendingSearchScroll`` is set by `open(searchResult:)`
-    /// from the live `searchQuery` value, which is empty here → no message-level
-    /// scroll. The tap opens the session; scrolling to a specific artifact is a
-    /// future enhancement.
+    /// from the live `searchQuery` value, which is empty here → no query-text
+    /// scroll. ABH-192: the artifact's `messageId` IS threaded through, so
+    /// ``SessionStore/open(searchResult:)`` sets ``SessionStore/pendingMessageJump``
+    /// and the opened transcript scrolls to the exact message that produced the
+    /// artifact.
     private func openSourceSession(for artifact: Artifact) {
         guard let sessions else { return }
         let synth = SessionSearchResult(
@@ -203,7 +205,8 @@ struct ArtifactsGalleryView: View {
             role: nil,
             source: nil,
             model: nil,
-            sessionStarted: artifact.timestamp
+            sessionStarted: artifact.timestamp,
+            messageId: artifact.messageId
         )
         sessions.open(searchResult: synth)
         // Dismiss the Settings sheet so the activated session becomes visible.

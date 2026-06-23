@@ -828,9 +828,15 @@ struct ChatView: View {
             guard atBottom else { return }
             proxy.scrollTo(bottomAnchor, anchor: .bottom)
         }
-        // Jump-to-search-match on transcriptGeneration bump (search open).
+        // Jump-to-exact-message / jump-to-search-match on transcriptGeneration
+        // bump (a search result or artifact tap opened this session). The exact-
+        // message jump (ABH-192) takes precedence when set; it grows the eager
+        // tail window until the target row is realized, then scrolls to it.
         .onChange(of: chatStore.transcriptGeneration) { _, _ in
-            if sessionStore.pendingSearchScroll != nil, !chatStore.messages.isEmpty {
+            guard !chatStore.messages.isEmpty else { return }
+            if sessionStore.pendingMessageJump != nil {
+                jumpToMessageIfNeeded(proxy)
+            } else if sessionStore.pendingSearchScroll != nil {
                 jumpToSearchMatchIfNeeded(proxy)
             }
         }
@@ -847,6 +853,15 @@ struct ChatView: View {
         // the exact-geometry tail window.
         .onChange(of: chatStore.activeStoredSessionId) { _, _ in
             windowSize = Self.transcriptWindow
+            // M1 (Opus review): a session switch must not carry a pending jump
+            // from the previous session into the new one. This is the
+            // deterministic bound for `pendingMessageJump` — unlike the attempt
+            // cap (which bounds it within one session), this fires exactly on
+            // the active-session change so a stale jump can't outlive its
+            // session. The search-scroll and snippet are cleared for parity.
+            sessionStore.pendingMessageJump = nil
+            sessionStore.pendingMessageJumpAttempts = 0
+            sessionStore.pendingMessageJumpSnippet = nil
         }
         // PER-SESSION SCROLLVIEW IDENTITY: each session open mounts a fresh ScrollView.
         // `.defaultScrollAnchor(.bottom)` resolves at first layout → native open-on-newest.
@@ -899,6 +914,105 @@ struct ChatView: View {
         }) {
             withAnimation(.easeInOut(duration: 0.25)) {
                 proxy.scrollTo(match.id, anchor: .center)
+            }
+        }
+    }
+
+    /// ABH-192 (jump-to-exact-message): scroll the transcript to the row whose
+    /// wire `message_id` matches `SessionStore.pendingMessageJump`. The row id
+    /// is the deterministic seed digest of `"w{messageId}-{role}"`
+    /// (``ChatStore/messageJumpCandidateIDs(for:)``); because the role is part of
+    /// the seed key and a tap may not carry it (the artifacts gallery has none),
+    /// we resolve the id against the LOADED transcript rather than assuming one.
+    ///
+    /// Load-until-visible: the VStack only constructs the last `windowSize` rows.
+    /// If the target sits outside that tail window, grow the window in one shot
+    /// to cover the target (plus one `transcriptWindow` of context below it,
+    /// capped at the full transcript), then scroll. The grow reuses the same
+    /// `windowSize` knob "Load earlier" uses — no new loading path.
+    ///
+    /// M1 (Opus review): when the target row is NOT in the loaded transcript,
+    /// the jump is NOT consumed on the first miss. The open path is cache-first
+    /// then network (`seedTranscriptCacheFirst`), so the first
+    /// `transcriptGeneration` bump is often a stale cache seed that lacks the
+    /// matched row; consuming on that bump dropped the jump before the network
+    /// seed could land the target. The jump now survives across the cache→network
+    /// bumps and is bounded by an attempt cap + a session-switch reset (see the
+    /// miss branch below and `.onChange(of: chatStore.activeStoredSessionId)`).
+    /// On a gateway that did NOT emit stable wire ids (`wireId == nil`,
+    /// stock/old), no seeded row matches the candidate id; after the attempt cap
+    /// the jump falls back to the snippet scroll (S2) or is consumed as a no-op.
+    private func jumpToMessageIfNeeded(_ proxy: ScrollViewProxy) {
+        guard let messageId = sessionStore.pendingMessageJump,
+              !chatStore.messages.isEmpty else { return }
+
+        // Resolve the target row id from the loaded transcript. The seed key
+        // embeds role, so without a role hint consider both user/assistant.
+        let candidates = Set(ChatStore.messageJumpCandidateIDs(for: messageId))
+        let target = chatStore.messages.first { candidates.contains($0.id) }?.id
+
+        guard let target else {
+            // M1 (Opus review): the target row is NOT in the currently-loaded
+            // transcript. The open path is CACHE-FIRST then NETWORK
+            // (`SessionStore.seedTranscriptCacheFirst`): the FIRST
+            // `transcriptGeneration` bump is often a STALE on-disk-cache partial
+            // seed that does not contain the matched row, while the SECOND bump
+            // (the authoritative network reconcile) usually does. Clearing the
+            // jump here would drop it on the stale cache bump and the scroll
+            // would silently never happen in the common stale-cache case.
+            //
+            // So: leave `pendingMessageJump` set and return — the next bump
+            // (after the network seed) re-runs this resolver. Bounded three ways
+            // so it can't live forever / loop:
+            //   (1) a successful scroll clears it (below),
+            //   (2) a session switch clears it (`.onChange(of: chatStore
+            //       .activeStoredSessionId)` + `SessionStore.open` switch clear),
+            //   (3) a small attempt cap (`pendingMessageJumpMaxAttempts`) —
+            //       after the cache + network + a late-reconcile hop a target
+            //       that is still absent is genuinely missing (coalesced turn /
+            //       stock gateway / compressed-out row). On the cap, fall back to
+            //       a snippet scroll (S2) then consume.
+            sessionStore.pendingMessageJumpAttempts += 1
+            if sessionStore.pendingMessageJumpAttempts
+                >= SessionStore.pendingMessageJumpMaxAttempts {
+                // S2: exact-id miss fallback — scroll to the search snippet's
+                // first occurrence so the user lands inside the right turn
+                // instead of a silent no-op at the bottom. Reuses the existing
+                // query-text scroll path (no new scroll machinery).
+                let snippet = sessionStore.pendingMessageJumpSnippet
+                sessionStore.pendingMessageJump = nil
+                sessionStore.pendingMessageJumpAttempts = 0
+                sessionStore.pendingMessageJumpSnippet = nil
+                if let snippet, !snippet.isEmpty {
+                    sessionStore.pendingSearchScroll = snippet
+                    jumpToSearchMatchIfNeeded(proxy)
+                }
+            }
+            return
+        }
+
+        // Grow the eager tail window until the target row is constructed, so
+        // `scrollTo` has a laid-out anchor to resolve against. The window caps
+        // at the full transcript; once it covers the target there is nothing
+        // more to load.
+        let total = chatStore.messages.count
+        let targetIndex = chatStore.messages.firstIndex(where: { $0.id == target }) ?? 0
+        let distanceFromBottom = total - targetIndex
+        if distanceFromBottom > windowSize {
+            withAnimation(nil) {
+                windowSize = min(total, distanceFromBottom + Self.transcriptWindow)
+            }
+        }
+
+        // Consume the request, then scroll on the next runloop hop so the grown
+        // window has a chance to construct the target row before scrollTo
+        // resolves the anchor (mirrors loadEarlierChip's hop).
+        sessionStore.pendingMessageJump = nil
+        sessionStore.pendingMessageJumpAttempts = 0
+        sessionStore.pendingMessageJumpSnippet = nil
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.25)) {
+                proxy.scrollTo(target, anchor: .center)
             }
         }
     }

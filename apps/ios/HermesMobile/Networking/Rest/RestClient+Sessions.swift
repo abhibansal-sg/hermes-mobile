@@ -28,11 +28,50 @@ struct SessionSearchResult: Decodable, Identifiable, Sendable, Equatable {
     let model: String?
     /// Session start time (epoch seconds), when the server includes it.
     let sessionStarted: Double?
+    /// ABH-192 (jump-to-exact-message): the wire `message_id` of the matched
+    /// message, surfaced so a tap can scroll the open transcript to that exact
+    /// row. Only the per-message plugin endpoint (`PluginSessionSearchResult`)
+    /// emits it; the stock FTS endpoint groups by session and leaves this nil
+    /// (then a tap just opens the session, no message-level scroll). Additive:
+    /// nil on older responses → unchanged behavior.
+    ///
+    /// NOTE: a stored `let` with an inline `= nil` default is NOT exposed as a
+    /// parameter by the synthesized memberwise initializer (Swift treats it as a
+    /// fixed default), which makes passing `messageId:` from the
+    /// `PluginSessionSearchResult` and `ArtifactsGalleryView` call sites an
+    /// "Extra argument" compile error. Instead we declare it without the inline
+    /// default and provide an explicit memberwise init that defaults it to nil —
+    /// that keeps every caller working: omitting it (tests, synthesizers) yields
+    /// nil, passing it (ABH-192 taps) threads the id through.
+    let messageId: Int?
 
     private enum CodingKeys: String, CodingKey {
         case id = "session_id"
         case snippet, role, source, model
         case sessionStarted = "session_started"
+        case messageId = "message_id"
+    }
+
+    /// Memberwise init with `messageId` defaulted to nil so existing call sites
+    /// that omit it are unaffected, while ABH-192 tap-through sites pass it.
+    /// `sessionStarted` is also defaulted for parity with the old inline-default
+    /// behavior and the test synthesizers that omit it.
+    init(
+        id: String,
+        snippet: String?,
+        role: String?,
+        source: String?,
+        model: String?,
+        sessionStarted: Double?,
+        messageId: Int? = nil
+    ) {
+        self.id = id
+        self.snippet = snippet
+        self.role = role
+        self.source = source
+        self.model = model
+        self.sessionStarted = sessionStarted
+        self.messageId = messageId
     }
 
     /// Snippet with FTS5 `<b>…</b>` highlight markers removed and newlines
@@ -237,6 +276,8 @@ struct PluginSessionSearchResult: Decodable, Sendable {
     /// Convert to the existing `SessionSearchResult` shape so the drawer UI
     /// needs no changes. `source`/`model` are not returned by the plugin endpoint;
     /// they decode as nil and the row renders without the source glyph.
+    /// ABH-192: the per-message `messageId` is threaded through so a tap can
+    /// jump to the exact matched message in the opened transcript.
     var asSessionSearchResult: SessionSearchResult {
         SessionSearchResult(
             id: sessionId,
@@ -244,7 +285,8 @@ struct PluginSessionSearchResult: Decodable, Sendable {
             role: role,
             source: nil,
             model: nil,
-            sessionStarted: sessionStartedAt
+            sessionStarted: sessionStartedAt,
+            messageId: messageId
         )
     }
 }

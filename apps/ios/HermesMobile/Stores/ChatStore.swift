@@ -2414,6 +2414,30 @@ final class ChatStore {
         return "\(ts)-\(index)-\(role.rawValue)"
     }
 
+    /// ABH-192 (jump-to-exact-message): the deterministic `ChatMessage.id` a
+    /// seeded row with wire id `messageId` and the given role would receive.
+    /// Mirrors the `"w{wireId}-{role}"` key the seed producer
+    /// (``seedMessageID``) folds through ``ChatMessage/deterministicID(seedKey:)``.
+    /// Used by the jump-to-message scroll to resolve the target row id WITHOUT a
+    /// scan when the role is known (the per-message plugin search carries it).
+    /// `role` is required because it is part of the seed key; callers without a
+    /// role hint should try both `user` and `assistant` via
+    /// ``messageJumpCandidateIDs(for:)``.
+    nonisolated static func messageJumpID(wireMessageId messageId: Int, role: ChatRole) -> UUID {
+        ChatMessage.deterministicID(seedKey: "w\(messageId)-\(role.rawValue)")
+    }
+
+    /// ABH-192: the set of `ChatMessage.id` candidates a wire `messageId` could
+    /// map to when the role is unknown. The seed key embeds the role, so without
+    /// a role hint the jump must consider both `user` and `assistant`. Ordered
+    /// user-first (the more common jump target from search). Tool rows are never
+    /// their own message (the seed producer folds them onto an assistant turn),
+    /// so they are not candidates.
+    nonisolated static func messageJumpCandidateIDs(for wireMessageId: Int) -> [UUID] {
+        [messageJumpID(wireMessageId: wireMessageId, role: .user),
+         messageJumpID(wireMessageId: wireMessageId, role: .assistant)]
+    }
+
     /// The `withUniqueToolCallIds` analogue (desktop chat-messages.ts:625-659,
     /// contract §2.2 + Batch A gate scrutiny note #1).
     ///
