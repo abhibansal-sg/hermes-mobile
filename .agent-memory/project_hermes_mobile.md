@@ -54,9 +54,21 @@ catch-up; valencia had been left behind by the terminal sprint).
     **`~/conductor/repos/hermes-agent`** (own git object store, cloned `--no-local`, ZERO
     tie to `~/.hermes`). The OLD `…/valencia` worktree (tethered into
     `~/.hermes/hermes-agent/.git`) is RETIRED — cleanup commands in `DEV-ENV-MIGRATION.md`.
-  - **Daily driver (UNTOUCHED):** `~/.hermes/hermes-agent` on `:9119`, still the modified
-    `feat/group-collapse-pin` branch. PHASE 2 (deferred): transition to STOCK once the user
-    defines "stock" — now safe because dev no longer lives inside it.
+  - **Daily driver = PRISTINE STOCK (Phase 2 DONE 2026-06-23):** `~/.hermes/hermes-agent`
+    on `:9119` now runs **pristine upstream `v2026.6.19` (v0.17.0)**, detached HEAD at
+    `2bd1977d8` — NO mobile plugin, NO seams, NO local fixes (was `feat/group-collapse-pin`
+    @ a9be71317, v2026.6.5). The 3GB `state.db` migrated forward cleanly (HERMES_DASHBOARD_READY,
+    no errors). Mobile plugin disabled in config + the leftover dir parked in backups.
+    **ROLLBACK (fully reversible):** `git -C ~/.hermes/hermes-agent checkout
+    backup/daily-driver-20260623-pre-stock` (= a9be71317) + restore
+    `~/.hermes/backups/pre-stock-20260623-pre-stock/state.db` + re-enable the plugin +
+    restart `ai.hermes.dashboard`. Backups: code tag `backup/daily-driver-20260623-pre-stock`,
+    branch `backup/group-collapse-pin-20260623-pre-stock`, DB+config in
+    `~/.hermes/backups/pre-stock-20260623-pre-stock/`. **Dropped local fixes the user may
+    later miss:** b22d22ff5 (custom-billing resume→global-provider fallback for the :18802
+    proxy), c82aaae78 (persist user msg on interrupted turns), 383da3367 (session-scoped
+    model-switch env leak), "Hermes Agent" branding. Billing proxy :18802 still UP + working
+    so far. All 3 services healthy post-switch: :9119 stock, :9200 dev, :18802 billing.
   - Remotes: `origin` = PRIVATE mirror github.com/ab0991-oss/hermes-mobile (push OK);
     `fork` = ab0991-oss/hermes-agent; `upstream` = NousResearch/hermes-agent (FETCH-ONLY, dead push URL).
   - Public open-source repo: github.com/ab0991-oss/hermes-ios (separate clean history;
