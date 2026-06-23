@@ -1,4 +1,4 @@
-# hermes-agent (local fork — trunk: feat/group-collapse-pin)
+# hermes-agent (local fork — work branch: phase2-upstream-rebase; live :9119 = upstream stock)
 
 - Remote policy (updated 2026-06-08):
   - `upstream` = NousResearch/hermes-agent — **FETCH-ONLY, NEVER push.** Its push
@@ -11,7 +11,13 @@
     still never reach `upstream`.
 - The user's LIVE shared dashboard runs on 127.0.0.1:9119 (launchd
   ai.hermes.dashboard) — never restart, stop, or point test traffic at it without
-  the user's go-ahead. Own test instances: port 9123+, kill when done.
+  the user's go-ahead. As of 2026-06-23 it runs **pristine upstream stock** (branch
+  `main`, NO mobile plugin/seams) — do NOT expect plugin behavior there.
+- **Standard dev/test target = the isolated dev gateway on `127.0.0.1:9200`** (launchd
+  `ai.hermes.dev-gateway`), `HERMES_HOME` in-tree at THIS worktree's `.hermes-dev`,
+  running this worktree's source + symlinked plugin. Manage via
+  `scripts/dev-gateway.sh {status|start|stop|restart|logs|pair}`. Supersedes the old
+  ephemeral `:9123+` rig (still fine for throwaway one-offs; kill when done).
 - **Single-executor (user ruling, 2026-06-07): Claude owns BOTH lanes** —
   backend Python (tui_gateway/, hermes_cli/, tools/, tests/) and frontend
   (apps/ios/) alike. The dual-executor split is retired; CODEX-LANE.md is
@@ -49,20 +55,24 @@ stay in sync. (The project key is the path-encoded dir under
 **LINEAR** (team ABH, project "Hermes Mobile — Engineering") is the cloud source
 of truth for tasks — nothing to clone; just sign in.
 
-**WHERE THINGS STAND (2026-06-23 — CONSOLIDATED):** Full state in
-`.agent-memory/project_hermes_mobile.md` (top block). Trunk `phase2-upstream-rebase`
-@ **`27db1ee7c`** (synced). **Build 51 (1.0.1) VALID on TestFlight** + on the user's
-iPhone Air; external beta LIVE: https://testflight.apple.com/join/TeMvfFaS . The
-Jun 18–21 agent-team sprint shipped PRs #19–#51: **connection-modes completed**
-(Inc-4 + hardening), **search** (FTS + pagination), **artifacts gallery**, **a11y**
-(3 passes), **reconnect resilience** (WS liveness ping), **CI hybrid gate**. Agent
-Teams ENABLED — `.claude/TEAM-BOOTSTRAP.md` = live handoff, `apps/ios/VISION.md` =
-loop anchor. **Open:** ABH-187 reconnect (held, device-repro), ABH-192 jump-to-msg,
-C2 ASC nightly toggle, device-verify tails. Upstream PRs #47530/#47535/#47538 +
-issue #47541 in NousResearch's court. **Canonical locations** (the user may MOVE the
-test gateway + app checkout — see the memory block's CANONICAL LOCATIONS section for
-the live `:9119` deploy, `:9123` test rig, this worktree, remotes, public repo).
-Linear **ABH-162** is the launch tracker; Linear is the task source of truth.
+**WHERE THINGS STAND (2026-06-23 — CONSOLIDATED; refreshed this session):** Full state in
+`.agent-memory/project_hermes_mobile.md` (top block) + the ACTIVE ROADMAP in
+`~/.claude/plans/understand-the-entire-project-snappy-willow.md`. Work branch
+`phase2-upstream-rebase` (origin tip `8c7e7bb24`; this Conductor worktree may sit on a
+branch equal to that tip). **Build 51 (1.0.1) VALID on TestFlight** + on the user's iPhone
+Air; external beta LIVE: https://testflight.apple.com/join/TeMvfFaS . The public launch
+(**ABH-162**) is **DONE**. The Jun 18–21 agent-team sprint shipped PRs #19–#51
+(connection-modes, search FTS+pagination, artifacts gallery, a11y, reconnect resilience,
+CI hybrid gate). Agent Teams ENABLED — `.claude/TEAM-BOOTSTRAP.md` = handoff,
+`apps/ios/VISION.md` = loop anchor. **CURRENT GOAL:** drive the app to the VISION
+'mature & stable v1' bar + a wider release, operated via the claude-code-os ladder with a
+Level-4 autonomy push under a tightly-governed loop system (see the plan file). **Open
+backlog (Linear, all Backlog):** ABH-187 reconnect-recovery (device-repro FIRST), ABH-186
+push relay, ABH-185 desktop-share (stock-edit→checkpoint), ABH-183 provider/key entry,
+ABH-192 jump-to-msg, ABH-184 MCP mgmt, ABH-193 test-infra. Upstream PRs #47530/#47535/#47538
++ issue #47541 parked in NousResearch's court (**LOW priority**). **Canonical locations: see
+the memory block's CANONICAL LOCATIONS section** (live `:9119` = stock; `:9200` dev gateway
+in THIS worktree; remotes; public repo). Linear is the task source of truth.
 
 **>> Everything below is HISTORICAL** (launch-prep + build-48/49 detail). Key launch
 files: export pipeline `scripts/export-public.sh`; posts

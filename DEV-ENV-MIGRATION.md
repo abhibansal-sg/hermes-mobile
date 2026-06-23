@@ -1,5 +1,13 @@
 # Dev environment migration — 2026-06-23 (READ FIRST in this worktree)
 
+> **UPDATE 2026-06-23 (later same day):** the dev environment MOVED AGAIN. The lead worktree
+> + the `:9200` dev gateway now live at
+> **`/Users/abbhinnav/conductor/workspaces/developer/indianapolis`** — its own in-tree
+> `.hermes-dev`, the launchd `ai.hermes.dev-gateway` job was repointed here, and the dev token
+> was transferred (the paired iPhone still works). The `…/workspaces/hermes-agent/developer`
+> path named below is the PRIOR location; its `.hermes-dev` is now orphaned (kept as backup).
+> Everything else below still describes the architecture correctly.
+
 This worktree (`…/workspaces/hermes-agent/developer`) is the NEW, isolated developer
 environment. It replaces the old `…/valencia` worktree, which was tethered into the
 live daily-driver gateway's git store. Open a fresh Conductor/terminal session HERE.

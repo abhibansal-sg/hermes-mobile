@@ -39,24 +39,28 @@ catch-up; valencia had been left behind by the terminal sprint).
   - Live shared dashboard gateway: `~/.hermes/hermes-agent` checkout, branch
     `feat/group-collapse-pin` (a9be71317), served on **`127.0.0.1:9119`** (launchd
     `ai.hermes.dashboard`). NEVER restart/stop/test-traffic without the user's go.
-  - **DEV GATEWAY (standard test target; relocated 2026-06-23):** isolated developer
-    gateway on **`127.0.0.1:9200`**, `HERMES_HOME` = **in-tree**
-    `…/workspaces/hermes-agent/developer/.hermes-dev` (own data/token; zero `~/.hermes`
-    overlap). Runs THIS `developer` worktree's source+venv (full HermesMobile plugin
-    SYMLINKED in → live plugin edits; `git pull` here updates it). launchd
-    `ai.hermes.dev-gateway` (auto-start + KeepAlive). Manage via
-    **`scripts/dev-gateway.sh {install|start|stop|restart|status|token|pair|logs}`**.
+  - **DEV GATEWAY (standard test target; relocated AGAIN 2026-06-23, this session):** isolated
+    developer gateway on **`127.0.0.1:9200`**, `HERMES_HOME` = **in-tree**
+    `/Users/abbhinnav/conductor/workspaces/developer/indianapolis/.hermes-dev` (own data/token;
+    zero `~/.hermes` overlap). Runs THIS `indianapolis` worktree's source+venv (full HermesMobile
+    plugin SYMLINKED in → live plugin edits; `git pull` here updates it). launchd
+    `ai.hermes.dev-gateway` was REPOINTED here (wrapper + plist now under this worktree); the
+    prior `…/workspaces/hermes-agent/developer/.hermes-dev` is now ORPHANED (data left on disk as
+    backup). The dev **token was TRANSFERRED** (same token + URL → the paired iPhone still works).
+    Manage via **`scripts/dev-gateway.sh {install|start|stop|restart|status|token|pair|logs}`**.
     Token: `./.hermes-dev/dashboard.token`. Pair the app: `scripts/dev-gateway.sh pair`.
     **Use THIS for app testing — not the live :9119; supersedes the old ephemeral `:9123` rig.**
   - Old ephemeral test rig: `:9123+` (still valid for throwaway one-offs; kill when done).
-  - **Lead work tree (MOVED 2026-06-23):** **`/Users/abbhinnav/conductor/workspaces/hermes-agent/developer`**,
-    branch `phase2-upstream-rebase`. Now an INDEPENDENT Conductor worktree of base repo
-    **`~/conductor/repos/hermes-agent`** (own git object store, cloned `--no-local`, ZERO
-    tie to `~/.hermes`). The OLD `…/valencia` worktree (tethered into
-    `~/.hermes/hermes-agent/.git`) is RETIRED — cleanup commands in `DEV-ENV-MIGRATION.md`.
+  - **Lead work tree (MOVED AGAIN 2026-06-23, this session):** **`/Users/abbhinnav/conductor/workspaces/developer/indianapolis`**
+    (branch currently `environment-and-workflows-overview`, equal to origin/`phase2-upstream-rebase`
+    tip `8c7e7bb24`). An INDEPENDENT Conductor worktree of base repo
+    **`~/conductor/repos/hermes-agent`** (own git object store, cloned `--no-local`, ZERO tie to
+    `~/.hermes`). The prior `…/workspaces/hermes-agent/developer` worktree still exists at the same
+    commit but its dev gateway is now orphaned (see DEV GATEWAY above); the older `…/valencia`
+    worktree is RETIRED. The dev gateway + app testing now live in THIS `indianapolis` worktree.
   - **Daily driver = PRISTINE STOCK (Phase 2 DONE 2026-06-23):** `~/.hermes/hermes-agent`
-    on `:9119` now runs **pristine upstream `v2026.6.19` (v0.17.0)**, detached HEAD at
-    `2bd1977d8` — NO mobile plugin, NO seams, NO local fixes (was `feat/group-collapse-pin`
+    on `:9119` now runs **pristine upstream stock on branch `main` @ `bb7ff7dc3`** (has advanced
+    from the Phase-2 switch point `2bd1977d8` / v2026.6.19) — NO mobile plugin, NO seams, NO local fixes (was `feat/group-collapse-pin`
     @ a9be71317, v2026.6.5). The 3GB `state.db` migrated forward cleanly (HERMES_DASHBOARD_READY,
     no errors). Mobile plugin disabled in config + the leftover dir parked in backups.
     **ROLLBACK (fully reversible):** `git -C ~/.hermes/hermes-agent checkout
@@ -75,14 +79,17 @@ catch-up; valencia had been left behind by the terminal sprint).
     built via `scripts/export-public.sh`).
   - iOS sim UI-drive: idb (`brew install facebook/fb/idb-companion` + fb-idb in py3.11 venv).
   - Usage pacing: `~/bin/cc-usage status`.
-- **OPEN / next (nothing blocked locally):** ABH-187 reconnect-stuck (HELD for a
-  careful device-repro cycle; candidate = recreate URLSession on escalation);
-  ABH-192 jump-to-exact-message; C2 ASC nightly-workflow UI toggle (only outstanding
-  piece of the CI pivot — user's click); device-verify tails (a11y VoiceOver/contrast,
-  ABH-190 Tier-2 Desktop-coordinated E2E); ABH-194 follow-up (audit other direct
-  Keychain readers). Upstream: PRs #47530/#47535/#47538 + issue #47541 still in
-  NousResearch maintainers' court. Trunk merge (phase2-upstream-rebase →
-  feat/group-collapse-pin deploy branch) INTENTIONALLY HELD.
+- **OPEN / next — CURRENT GOAL = drive the app to the VISION 'mature & stable v1' bar + a wider
+  release, operated via the claude-code-os ladder with a Level-4 autonomy push under a tightly-
+  governed loop system. ACTIVE ROADMAP:** `~/.claude/plans/understand-the-entire-project-snappy-willow.md`.
+  Open Linear backlog (all `Backlog` in "Hermes Mobile — Engineering"): **ABH-187** reconnect-recovery
+  (device-repro FIRST; candidate = recreate URLSession on escalation), **ABH-186** hosted push relay,
+  **ABH-185** desktop always-share (stock-edit → CHECKPOINT), **ABH-183** provider/API-key entry,
+  **ABH-192** jump-to-exact-message, **ABH-184** MCP-server mgmt, **ABH-193** plugin-pytest venv.
+  (DONE since last consolidation: ABH-162 launch, ABH-194 REST-token, ABH-190 E2E proof, ABH-188/189
+  CI gate.) Upstream PRs #47530/#47535/#47538 + issue #47541 parked in NousResearch's court (**LOW
+  priority**). Trunk merge (phase2-upstream-rebase → feat/group-collapse-pin) INTENTIONALLY HELD —
+  now largely moot since :9119 is stock.
 - **LESSON reaffirmed 2026-06-23:** valencia was 31 commits behind origin → this
   Conductor session + the docs it wrote were STALE. Always `git status`/fetch + check
   `origin/<branch>..HEAD` before trusting a worktree; read current files via origin ref
