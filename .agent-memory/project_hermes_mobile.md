@@ -39,21 +39,26 @@ catch-up; valencia had been left behind by the terminal sprint).
   - Live shared dashboard gateway: `~/.hermes/hermes-agent` checkout, branch
     `feat/group-collapse-pin` (a9be71317), served on **`127.0.0.1:9119`** (launchd
     `ai.hermes.dashboard`). NEVER restart/stop/test-traffic without the user's go.
-  - **DEV GATEWAY (standard test target, 2026-06-23):** isolated developer gateway
-    on **`127.0.0.1:9200`**, `HERMES_HOME=~/Developer/.hermes-dev` (own data/token;
-    zero `~/.hermes` overlap). Runs THIS valencia checkout's source+venv (full
-    HermesMobile plugin SYMLINKED in → live plugin edits; `git pull` here updates
-    it). launchd `ai.hermes.dev-gateway` (auto-start + KeepAlive). Manage via
+  - **DEV GATEWAY (standard test target; relocated 2026-06-23):** isolated developer
+    gateway on **`127.0.0.1:9200`**, `HERMES_HOME` = **in-tree**
+    `…/workspaces/hermes-agent/developer/.hermes-dev` (own data/token; zero `~/.hermes`
+    overlap). Runs THIS `developer` worktree's source+venv (full HermesMobile plugin
+    SYMLINKED in → live plugin edits; `git pull` here updates it). launchd
+    `ai.hermes.dev-gateway` (auto-start + KeepAlive). Manage via
     **`scripts/dev-gateway.sh {install|start|stop|restart|status|token|pair|logs}`**.
-    Token: `~/Developer/.hermes-dev/dashboard.token`. Pair the app:
-    `scripts/dev-gateway.sh pair`. **Use THIS for app testing — not the live :9119,
-    and it supersedes the old ephemeral `:9123` rig** (the verify-loop's `:9123`
-    instructions still work but `:9200` is the persistent standard now).
+    Token: `./.hermes-dev/dashboard.token`. Pair the app: `scripts/dev-gateway.sh pair`.
+    **Use THIS for app testing — not the live :9119; supersedes the old ephemeral `:9123` rig.**
   - Old ephemeral test rig: `:9123+` (still valid for throwaway one-offs; kill when done).
-  - Lead work tree (this repo): **`/Users/abbhinnav/conductor/workspaces/hermes-agent/valencia`**,
-    branch `phase2-upstream-rebase`.
+  - **Lead work tree (MOVED 2026-06-23):** **`/Users/abbhinnav/conductor/workspaces/hermes-agent/developer`**,
+    branch `phase2-upstream-rebase`. Now an INDEPENDENT Conductor worktree of base repo
+    **`~/conductor/repos/hermes-agent`** (own git object store, cloned `--no-local`, ZERO
+    tie to `~/.hermes`). The OLD `…/valencia` worktree (tethered into
+    `~/.hermes/hermes-agent/.git`) is RETIRED — cleanup commands in `DEV-ENV-MIGRATION.md`.
+  - **Daily driver (UNTOUCHED):** `~/.hermes/hermes-agent` on `:9119`, still the modified
+    `feat/group-collapse-pin` branch. PHASE 2 (deferred): transition to STOCK once the user
+    defines "stock" — now safe because dev no longer lives inside it.
   - Remotes: `origin` = PRIVATE mirror github.com/ab0991-oss/hermes-mobile (push OK);
-    `upstream` = NousResearch/hermes-agent (FETCH-ONLY, dead push URL).
+    `fork` = ab0991-oss/hermes-agent; `upstream` = NousResearch/hermes-agent (FETCH-ONLY, dead push URL).
   - Public open-source repo: github.com/ab0991-oss/hermes-ios (separate clean history;
     built via `scripts/export-public.sh`).
   - iOS sim UI-drive: idb (`brew install facebook/fb/idb-companion` + fb-idb in py3.11 venv).
