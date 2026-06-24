@@ -303,6 +303,107 @@ final class JumpToMessageCacheFirstTests: XCTestCase {
                        "open(searchResult:) must switch to the result's session")
     }
 
+    // MARK: - ABH-192 regression: coalesced-turn artifact miss → snippet fallback
+
+    /// A tool-bearing assistant row (so the next text-only assistant row coalesces
+    /// into it — `toChatMessages` merges consecutive assistant rows when EITHER
+    /// side carries a tool, keeping one agentic turn as ONE bubble).
+    private func storedAssistantWithTool(text: String, wireId: Int) -> StoredMessage {
+        StoredMessage(
+            role: "assistant",
+            content: .string(text),
+            timestamp: 1_700_000_000,
+            wireId: wireId,
+            toolCalls: [WireToolCall(json: .object([
+                "call_id": .string("call-\(wireId)"),
+                "function": .object([
+                    "name": .string("read_file"),
+                    "arguments": .string("{}"),
+                ]),
+            ]))!]
+        )
+    }
+
+    /// ABH-192 — THE artifact-jump bug this fix targets. An agentic assistant turn
+    /// COALESCES several wire rows into ONE `ChatMessage` (id = the FIRST/anchor
+    /// row's `w{wireId}-assistant`). An artifact records the wire `message_id` of
+    /// a NON-anchor row of that turn (the row that actually produced the file).
+    /// `messageJumpCandidateIDs(for: nonAnchorWireId)` therefore matches NOTHING in
+    /// the loaded transcript — the exact-id jump no-ops forever. The fix carries the
+    /// artifact's prose `jumpSnippet` as `pendingMessageJumpSnippet`, so after the
+    /// id-miss attempt cap the jump FALLS BACK to a prose-snippet scroll that lands
+    /// inside the (coalesced) turn instead of silently doing nothing.
+    ///
+    /// This pins the whole chain at the store level:
+    ///  (1) the two rows really coalesce into ONE bubble (precondition),
+    ///  (2) the non-anchor wire id is NOT a resolvable jump candidate (the bug),
+    ///  (3) the id-jump misses every hop and the snippet fallback arms
+    ///      `pendingSearchScroll`,
+    ///  (4) that snippet substring-matches the coalesced bubble's prose — i.e. the
+    ///      `jumpToSearchMatchIfNeeded` resolver WILL find a target (the jump
+    ///      resolves rather than no-op'ing).
+    func testCoalescedTurnArtifactMissResolvesViaSnippetFallback() {
+        let chatStore = ChatStore()
+        let sessionStore = SessionStore()
+
+        // Anchor row (wire id 60) carries a tool call; the NON-anchor row (wire id
+        // 61) is the one that produced the artifact and holds the artifact prose.
+        let anchorWireId = 60
+        let artifactWireId = 61
+        let artifactProse = "wrote the report to report.md"
+
+        let normalized = ChatStore.toChatMessages([
+            stored(role: "user", text: "make me a report", wireId: 59),
+            storedAssistantWithTool(text: "Reading the inputs…", wireId: anchorWireId),
+            // Text-only assistant row — coalesces into the tool-bearing anchor.
+            stored(role: "assistant", text: artifactProse, wireId: artifactWireId),
+        ])
+        chatStore.seed(normalized: normalized)
+
+        // (1) PRECONDITION — the two assistant rows coalesced into ONE bubble.
+        let assistantBubbles = chatStore.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(assistantBubbles.count, 1,
+                       "the tool-bearing + text assistant rows must coalesce into ONE bubble")
+        let anchorID = ChatStore.messageJumpID(wireMessageId: anchorWireId, role: .assistant)
+        XCTAssertEqual(assistantBubbles[0].id, anchorID,
+                       "the coalesced bubble's id is the ANCHOR (first) row's wire-id digest")
+        XCTAssertTrue(assistantBubbles[0].text.contains(artifactProse),
+                      "the coalesced bubble must carry the NON-anchor row's prose")
+
+        // (2) THE BUG — the non-anchor wire id resolves to no row in the transcript.
+        let artifactCandidates = Set(ChatStore.messageJumpCandidateIDs(for: artifactWireId))
+        XCTAssertNil(chatStore.messages.first { artifactCandidates.contains($0.id) },
+                     "ABH-192 root cause: a NON-anchor coalesced row's wire id has no matching ChatMessage.id — the pure exact-id jump can only no-op")
+
+        // (3) Arm the jump exactly as `open(searchResult:)` does for an artifact tap:
+        // the non-anchor wire id + the prose snippet, NO query-text scroll.
+        sessionStore.pendingMessageJump = artifactWireId
+        sessionStore.pendingMessageJumpAttempts = 0
+        sessionStore.pendingMessageJumpSnippet = artifactProse
+        sessionStore.pendingSearchScroll = nil
+
+        // The id-jump misses on every hop (cache + network + late reconcile) because
+        // the target row genuinely is not its own ChatMessage. After the attempt cap
+        // the snippet fallback must arm `pendingSearchScroll`.
+        for _ in 0..<SessionStore.pendingMessageJumpMaxAttempts {
+            XCTAssertFalse(resolveJump(chatStore: chatStore, sessionStore: sessionStore),
+                           "the exact-id jump must MISS — the non-anchor row is not its own bubble")
+        }
+        XCTAssertNil(sessionStore.pendingMessageJump,
+                     "after the attempt cap the unresolvable id-jump must be consumed")
+        XCTAssertEqual(sessionStore.pendingSearchScroll, artifactProse,
+                       "S2: on the coalesced-turn id-miss the prose snippet must arm the query-text scroll fallback (NOT a silent no-op)")
+
+        // (4) The fallback RESOLVES — `jumpToSearchMatchIfNeeded` substring-matches
+        // the snippet against the loaded transcript and WOULD scroll to a real row.
+        let needle = sessionStore.pendingSearchScroll!.lowercased()
+        let fallbackTarget = chatStore.messages.first { $0.text.lowercased().contains(needle) }
+        XCTAssertNotNil(fallbackTarget,
+                        "the snippet fallback must resolve to the coalesced bubble — the jump lands inside the right turn instead of no-op'ing")
+        XCTAssertEqual(fallbackTarget?.id, anchorID,
+                       "the resolved fallback row is the coalesced bubble carrying the artifact prose")
+    }
+
     /// S1: a pure session switch (drawer tap) with a stale pending jump from
     /// the previous session clears it — the stale jump does NOT carry into the
     /// new session.

@@ -92,6 +92,39 @@ struct Artifact: Decodable, Identifiable, Sendable, Equatable {
         return URL(string: urlOrPath)
     }
 
+    /// ABH-192 (coalesced-turn jump fallback): a prose fragment likely to appear
+    /// in ``ChatMessage/text`` — used as ``SessionStore/pendingMessageJumpSnippet``
+    /// so the S2 substring-search fallback can land inside the right coalesced
+    /// assistant turn when the exact wire-id lookup misses.
+    ///
+    /// Priority:
+    /// 1. `snippet` — the server-supplied surrounding prose fragment (links only,
+    ///    extracted from the message text). This is guaranteed prose.
+    /// 2. `filename` — the file's name as it typically appears in the assistant's
+    ///    prose ("I'll analyse `report.pdf`..."). Only used when not URL-like (no
+    ///    `://` or `data:` prefix) so we don't accidentally pass a URL.
+    /// 3. `nil` — no usable prose hint; the S2 path gracefully no-ops rather than
+    ///    searching for a raw URL that is never in `.text`.
+    ///
+    /// `urlOrPath` is intentionally excluded: raw URLs / filesystem paths are
+    /// never part of a ``ChatMessage/text`` value, so passing them caused the
+    /// S2 fallback to always miss → silent no-op at the bottom of the transcript.
+    var jumpSnippet: String? {
+        // 1. Prose snippet (links carry the surrounding message text).
+        if let s = snippet, !s.isEmpty { return s }
+        // 2. Filename — appears in prose; exclude anything that looks URL-like or
+        //    is a data-URL fragment so we don't carry garbage into the search.
+        if let fn = filename,
+           !fn.isEmpty,
+           !fn.hasPrefix("http://"),
+           !fn.hasPrefix("https://"),
+           !fn.hasPrefix("data:") {
+            return fn
+        }
+        // 3. No usable prose hint.
+        return nil
+    }
+
     /// Build an ``AttachmentBlobCache/Key`` for thumbnail look-up / storage.
     /// Returns `nil` when `serverId` is empty or `size` is absent (links never
     /// carry a size, so they are never cached).

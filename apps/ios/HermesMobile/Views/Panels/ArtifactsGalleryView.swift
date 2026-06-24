@@ -197,11 +197,18 @@ struct ArtifactsGalleryView: View {
     /// ``SessionStore/open(searchResult:)`` sets ``SessionStore/pendingMessageJump``
     /// and the opened transcript scrolls to the exact message that produced the
     /// artifact.
+    ///
+    /// The `snippet:` passed here becomes ``SessionStore/pendingMessageJumpSnippet``
+    /// — the S2 fallback text used by ``ChatView`` when the exact wire-id lookup
+    /// misses (common for coalesced multi-row assistant turns whose anchor row id
+    /// does not match the artifact's `messageId`). We use ``Artifact/jumpSnippet``
+    /// (prose fragment or filename) rather than `urlOrPath` (a raw URL/path that
+    /// is never part of ``ChatMessage/text`` → always missed the substring search).
     private func openSourceSession(for artifact: Artifact) {
         guard let sessions else { return }
         let synth = SessionSearchResult(
             id: artifact.sessionId,
-            snippet: artifact.urlOrPath,
+            snippet: artifact.jumpSnippet,
             role: nil,
             source: nil,
             model: nil,

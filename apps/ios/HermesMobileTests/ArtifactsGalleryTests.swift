@@ -237,6 +237,69 @@ final class ArtifactsGalleryTests: XCTestCase {
                        "displayName must fall back to the last path component")
     }
 
+    // MARK: - 7b. jumpSnippet — ABH-192 coalesced-turn fallback
+
+    /// ``Artifact/jumpSnippet`` must return the prose `snippet` field when present
+    /// (link artifacts carry surrounding message text), the `filename` for file
+    /// artifacts (appears in prose), and `nil` when neither is available — never
+    /// the raw `url_or_path` which is never in ``ChatMessage/text``.
+    func testJumpSnippetPriority() {
+        let decoder = JSONDecoder()
+
+        // 1. Link with a prose snippet → snippet takes priority.
+        let linkWithSnippet = """
+        {
+          "session_id": "s1", "message_id": 1, "kind": "link",
+          "url_or_path": "https://example.com/page",
+          "session_title": null, "filename": null, "mime": null,
+          "size": null, "snippet": "check out this great article",
+          "timestamp": null
+        }
+        """.data(using: .utf8)!
+        let linkArt = try! decoder.decode(Artifact.self, from: linkWithSnippet)
+        XCTAssertEqual(linkArt.jumpSnippet, "check out this great article",
+                       "jumpSnippet must return the prose snippet for links")
+
+        // 2. File with a filename but no snippet → filename is the fallback.
+        let fileWithName = """
+        {
+          "session_id": "s2", "message_id": 2, "kind": "file",
+          "url_or_path": "/home/user/report.pdf",
+          "session_title": null, "filename": "report.pdf", "mime": null,
+          "size": 512, "snippet": null, "timestamp": null
+        }
+        """.data(using: .utf8)!
+        let fileArt = try! decoder.decode(Artifact.self, from: fileWithName)
+        XCTAssertEqual(fileArt.jumpSnippet, "report.pdf",
+                       "jumpSnippet must return the filename when snippet is absent")
+
+        // 3. Image with no snippet and no filename → nil (not urlOrPath).
+        let imageNoHints = """
+        {
+          "session_id": "s3", "message_id": 3, "kind": "image",
+          "url_or_path": "https://example.com/img.png",
+          "session_title": null, "filename": null, "mime": "image/png",
+          "size": 1024, "snippet": null, "timestamp": null
+        }
+        """.data(using: .utf8)!
+        let imageArt = try! decoder.decode(Artifact.self, from: imageNoHints)
+        XCTAssertNil(imageArt.jumpSnippet,
+                     "jumpSnippet must return nil when no prose hint is available (not the URL)")
+
+        // 4. File whose filename looks like a URL → nil (not used as prose search).
+        let fileUrlName = """
+        {
+          "session_id": "s4", "message_id": 4, "kind": "file",
+          "url_or_path": "/tmp/artifact",
+          "session_title": null, "filename": "https://cdn.example.com/file.txt",
+          "mime": null, "size": 100, "snippet": null, "timestamp": null
+        }
+        """.data(using: .utf8)!
+        let fileUrlArt = try! decoder.decode(Artifact.self, from: fileUrlName)
+        XCTAssertNil(fileUrlArt.jumpSnippet,
+                     "jumpSnippet must return nil when filename is itself a URL")
+    }
+
     // MARK: - 8. total is grand count
 
     /// `ArtifactPage.total` is the server's full matched count BEFORE pagination;
