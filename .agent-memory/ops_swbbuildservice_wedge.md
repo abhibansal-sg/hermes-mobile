@@ -30,14 +30,26 @@ SourcePackages/build.db-wal locks, killing SourceKit indexers, bouncing
 `cfprefsd`/`previewsd`, quitting Simulator. The toolchain itself is FINE —
 a direct `swiftc -sdk <simsdk> -c file.swift -o x.o` compiles in <1s.
 
-**Exact mechanism (traced 2026-06-08):** During `CreateBuildDescription`,
-SWBBuildService spawns clang capability probes (`clang -v -E -dM … -c /dev/null`).
-The `-dM` output is ~16358 bytes vs a 16384-byte pipe buffer (razor's edge).
-clang blocks in `write()` to its stdout/stderr pipe; SWBBuildService HOLDS the
-read-ends (its fd 6/12 ↔ clang fd 1/2) but never drains them — its Swift
-concurrency cooperative pool won't spawn worker threads (process shows only 2
-threads, parked in `swift_task_asyncMainDrainQueue → CFRunLoopRun → mach_msg`).
-Classic pipe deadlock; happens in a FRESH SWBBuildService every time.
+**ROOT CAUSE — CONFIRMED EXTERNALLY (2026-06-24, manaflow-ai/cmux#2980 + PR#2981):**
+**Xcode 26 made `SWBBuildService` a per-user SINGLETON Mach service.** Concurrent
+`xcodebuild` invocations each spawn their own `SWBBuildService` child but RACE to
+register on the same well-known per-user XPC name; the loser's IPC handshake never
+completes and BOTH ends park forever in `mach_msg2_trap` (xcodebuild in
+`waitForBuildWithBuildLog:`, the service in `RunLoopExecutor.run`). **`-derivedDataPath`
+isolates build OUTPUT but does NOT isolate the daemon** — which is exactly why our
+per-worktree DerivedData never prevented the wedge. cmux hit the identical signature
+(hang at `CreateBuildDescription`, 0% CPU, even with distinct `-derivedDataPath`) on a
+totally different codebase, started after the Xcode-16→26 upgrade. Their fix = a global
+`flock` serializing `xcodebuild` — mechanically identical to our `scripts/ios-build.sh`
+mutex, confirming our architecture is the right one (their second fix, fetching a
+prebuilt framework to avoid a NESTED xcodebuild, is cmux-specific; we have no nested build).
+
+**Older mechanism note (2026-06-08, now SUPERSEDED as the primary cause):** we had
+traced a plausible clang `-dM` pipe-buffer deadlock (~16358 B output vs 16384 B pipe,
+SWBBuildService holding the read-ends undrained). That may be a contributing surface,
+but the per-user-singleton REGISTRATION RACE above is the real trigger (it explains why
+concurrency + a per-user daemon, not output size, is what matters, and why serialization
+is the fix).
 
 **The ONLY reliable fix:** reboot (cleanest) or logout/login — resets the
 launchd user-session substrate. NOT fixed by: QoS unthrottle (`taskpolicy -B`),
@@ -73,9 +85,29 @@ two consecutive clean builds (a pre-existing one + my fresh retry) BOTH parked a
 compiles, for >4 min each. Both reaped cleanly via SIGTERM (TaskStop, never -9);
 the live dashboard on :9119 stayed HTTP-200 throughout. **Lesson:** the mutex is
 necessary but NOT sufficient — when ANY tool can call `xcodebuild` directly
-(xcodebuildmcp, a Codex session, Xcode.app), the only complete prevention is to
-ensure no other worktree/agent builds the app concurrently, OR to route every iOS
-build (incl. MCP servers) through the wrapper. Until then, a wedge is the user's
-reboot call. Fast detection: a Monitor until-loop that declares WEDGE after ~240s
-if `SWBBuildService>0 && swift-frontend==0 && compiles==0 && xcodebuild alive` —
-far cheaper than waiting out the full build timeout.
+(xcodebuildmcp, a Codex session, Xcode.app, even SourceKit background indexing), the
+only complete prevention is to ensure no other worktree/agent builds the app
+concurrently, OR to route every iOS build (incl. MCP servers) through the wrapper.
+
+**RECURRED 2026-06-24 on a SINGLE wrapper-driven archive (build 52):** the archive went
+through `scripts/ios-build.sh` yet still wedged (20 min at `CreateBuildDescription`,
+xcodebuild 0% CPU, 0 swift-frontend, log frozen, but the toolchain probes ran INSTANTLY
+standalone). Confirms the per-user daemon was poisoned by something OUTSIDE the mutex
+BEFORE our build started (xcodebuildmcp from a sibling worktree and/or SourceKit — the
+stale "Cannot find type" SourceKit diagnostics earlier in the session were an early tell
+the build service was already unhappy). Reaped with SIGTERM (never -9). **Recovery: a
+logout/login is enough (resets the per-user SWBBuildService); a full reboot is NOT
+required** (lighter than the 2026-06-08 reboot).
+
+**WRAPPER HARDENED 2026-06-24 (closes the detection gap):** `scripts/ios-build.sh` now
+(1) **pre-flight ABORTs** (exit 75) when the wedge signature is already present instead
+of only warning — don't stack a build on a poisoned daemon (override
+`HERMES_BUILD_ALLOW_WEDGED=1`); (2) warns when a **foreign xcodebuild** is already
+running (the concurrency-race trigger); (3) **EARLY WEDGE DETECT** in the watchdog —
+after `HERMES_WEDGE_GRACE` (240s) it SIGTERM-reaps a build that is parked with 0
+swift-frontend + no recent `.o` + idle xcodebuild + log still at CreateBuildDescription,
+and returns **exit 75** (distinct from a normal build failure) with a "log out/in" message.
+So a wedge now self-detects at ~270s instead of running out the full `HERMES_BUILD_TIMEOUT`
+(the prior watchdog only acted at the hard timeout — why the build-52 wedge sat 20 min in
+the background). The governor loop can branch on rc=75 ("needs human logout/login") vs a
+real failure.
