@@ -44,12 +44,21 @@ totally different codebase, started after the Xcode-16→26 upgrade. Their fix =
 mutex, confirming our architecture is the right one (their second fix, fetching a
 prebuilt framework to avoid a NESTED xcodebuild, is cmux-specific; we have no nested build).
 
-**Older mechanism note (2026-06-08, now SUPERSEDED as the primary cause):** we had
-traced a plausible clang `-dM` pipe-buffer deadlock (~16358 B output vs 16384 B pipe,
-SWBBuildService holding the read-ends undrained). That may be a contributing surface,
-but the per-user-singleton REGISTRATION RACE above is the real trigger (it explains why
-concurrency + a per-user daemon, not output size, is what matters, and why serialization
-is the fix).
+**Xcode 26 actually has ≥2 DISTINCT hang bugs — don't over-unify them (2026-06-24):**
+- **(1) Concurrent-registration race (OURS + cmux#2980):** the per-user-singleton race
+  above. Triggered by CONCURRENT xcodebuilds; parks EARLY at `CreateBuildDescription`,
+  never reaches SUCCEEDED. Fix = serialize (our mutex) + logout/login to recover. This is
+  the PRIMARY trigger for our case.
+- **(2) Pipe-not-closing AFTER success (react-native-community/cli#2768):** on Xcode 26.2+
+  / macOS 26.3, xcodebuild/SWBBuildService keeps its pipes open AFTER `BUILD SUCCEEDED`,
+  so the close event never fires and the process hangs at the END of an otherwise-successful
+  build. RN's workaround: detect `BUILD SUCCEEDED` in the log and proactively reap the
+  process instead of waiting for it to exit. (We adopted this in the wrapper — see below.)
+  This RESURRECTS the pipe-deadlock angle as a REAL but SEPARATE failure mode.
+- **Older note (2026-06-08):** a clang `-dM` pipe-buffer deadlock (~16358 B vs 16384 B pipe,
+  read-ends undrained) — plausibly a contributing surface to (1)/(2), but NOT the headline
+  cause of the concurrent case. Tell the two apart by WHERE it parks: `CreateBuildDescription`
+  (never compiled) = (1); after `BUILD SUCCEEDED` (built fine, won't exit) = (2).
 
 **The ONLY reliable fix:** reboot (cleanest) or logout/login — resets the
 launchd user-session substrate. NOT fixed by: QoS unthrottle (`taskpolicy -B`),

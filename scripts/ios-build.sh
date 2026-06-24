@@ -144,17 +144,38 @@ log "derivedData=${DEFAULT_DD} (unless overridden) | timeout=${TIMEOUT}s | log=$
 xcodebuild "${args[@]}" >"$LOG" 2>&1 &
 BUILD_PID=$!
 
-# Watchdog: two triggers, both SIGTERM-only (NEVER -9).
+# Watchdog: three triggers, all SIGTERM-only (NEVER -9).
 #   (A) EARLY WEDGE DETECT — after WEDGE_GRACE, if the build is parked with 0
 #       swift-frontend AND the log tail is still at CreateBuildDescription/toolchain
 #       probes AND no new .o is being produced AND xcodebuild is ~idle, it's the
-#       SWBBuildService wedge. Reap now (~270s) instead of waiting out TIMEOUT, and
-#       leave a WEDGE marker in the log so the parent returns WEDGE_EXIT.
-#   (B) HARD TIMEOUT — the original backstop for a genuinely slow-but-alive build.
+#       SWBBuildService CONCURRENT-REGISTRATION wedge (cmux#2980). Reap now (~270s)
+#       instead of waiting out TIMEOUT; leave a WEDGE marker so the parent returns WEDGE_EXIT.
+#   (B) POST-SUCCEEDED HANG — Xcode 26.2+ / macOS 26.3 keep xcodebuild's pipes open
+#       AFTER "* SUCCEEDED", so it never exits (react-native-community/cli#2768, a
+#       SEPARATE Xcode-26 bug from A). If the log shows a SUCCEEDED line but the process
+#       is still alive a few ticks later, proactively reap it and report SUCCESS (the
+#       build genuinely finished; only the exit is stuck). Saves waiting out TIMEOUT on
+#       a build that actually worked.
+#   (C) HARD TIMEOUT — the original backstop for a genuinely slow-but-alive build.
 WEDGE_MARKER="$LOG.WEDGED"
-rm -f "$WEDGE_MARKER" 2>/dev/null
-( slept=0
+SUCCESS_MARKER="$LOG.SUCCEEDED"
+rm -f "$WEDGE_MARKER" "$SUCCESS_MARKER" 2>/dev/null
+( slept=0; success_seen=0
   while kill -0 "$BUILD_PID" 2>/dev/null; do
+    # (B) post-SUCCEEDED pipe-hang: confirm across one tick so we don't reap a build
+    # that is legitimately mid-teardown for <WEDGE_TICK seconds.
+    if grep -qE "BUILD SUCCEEDED|ARCHIVE SUCCEEDED|EXPORT SUCCEEDED|TEST SUCCEEDED|TEST EXECUTE SUCCEEDED" "$LOG" 2>/dev/null; then
+      if [ "$success_seen" -ge 1 ]; then
+        log "POST-SUCCEEDED HANG (~${slept}s): log shows '* SUCCEEDED' but xcodebuild won't exit"
+        log "  (Xcode-26.2+ pipe-not-closing, react-native-community/cli#2768). Proactively"
+        log "  SIGTERM $BUILD_PID (NEVER -9) and reporting SUCCESS — the build DID finish."
+        echo "SUCCEEDED" > "$SUCCESS_MARKER"
+        kill -TERM "$BUILD_PID" 2>/dev/null
+        sleep 5; kill -TERM "$BUILD_PID" 2>/dev/null
+        break
+      fi
+      success_seen=$((success_seen+1))
+    fi
     if [ "$slept" -ge "$WEDGE_GRACE" ] && _stuck_at_build_description; then
       sf=$(pgrep -x swift-frontend 2>/dev/null | wc -l | tr -d ' ')
       # objects compiled in the last ~2·WEDGE_TICK secs (real progress = NOT wedged)
@@ -191,6 +212,15 @@ if [ -f "$WEDGE_MARKER" ]; then
   log "RESULT: SWBBuildService WEDGE (rc->$WEDGE_EXIT). The build was reaped, not failed."
   log "        Recover with logout/login, then re-run this exact command."
   exit "$WEDGE_EXIT"
+fi
+# Post-SUCCEEDED pipe-hang (trigger B): we reaped a build that had already printed
+# SUCCEEDED. The SIGTERM makes `wait` return non-zero, but the build genuinely passed —
+# report success (rc 0) so callers/loops don't misread a finished build as a failure.
+if [ -f "$SUCCESS_MARKER" ]; then
+  rm -f "$SUCCESS_MARKER" 2>/dev/null
+  log "SUCCESS (post-SUCCEEDED pipe-hang reaped; treating as rc=0):"
+  grep -E "SUCCEEDED" "$LOG" | tail -3 >&2
+  exit 0
 fi
 if grep -qE "BUILD SUCCEEDED|ARCHIVE SUCCEEDED|EXPORT SUCCEEDED|TEST SUCCEEDED|TEST EXECUTE SUCCEEDED" "$LOG"; then
   log "SUCCESS (rc=$rc):"; grep -E "SUCCEEDED" "$LOG" | tail -3 >&2
