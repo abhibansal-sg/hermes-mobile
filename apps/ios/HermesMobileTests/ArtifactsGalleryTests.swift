@@ -240,13 +240,18 @@ final class ArtifactsGalleryTests: XCTestCase {
     // MARK: - 7b. jumpSnippet — ABH-192 coalesced-turn fallback
 
     /// ``Artifact/jumpSnippet`` must return the prose `snippet` field when present
-    /// (link artifacts carry surrounding message text), the `filename` for file
-    /// artifacts (appears in prose), and `nil` when neither is available — never
-    /// the raw `url_or_path` which is never in ``ChatMessage/text``.
+    /// (link artifacts carry surrounding message text) and `nil` for file/image
+    /// artifacts whose server-supplied `snippet` is nil — never the bare filename
+    /// and never the raw `url_or_path`.
+    ///
+    /// Bug 1 fix (ABH-192): a bare filename (e.g. "report.md") is too weak a
+    /// signal — the same name appears in earlier user bubbles ("create report.md
+    /// for me"), so `messages.first(where:)` lands on the WRONG (earliest) bubble.
+    /// Returning nil makes the S2 fallback a safe no-op for file/image artifacts.
     func testJumpSnippetPriority() {
         let decoder = JSONDecoder()
 
-        // 1. Link with a prose snippet → snippet takes priority.
+        // 1. Link with a prose snippet → snippet returned.
         let linkWithSnippet = """
         {
           "session_id": "s1", "message_id": 1, "kind": "link",
@@ -260,7 +265,8 @@ final class ArtifactsGalleryTests: XCTestCase {
         XCTAssertEqual(linkArt.jumpSnippet, "check out this great article",
                        "jumpSnippet must return the prose snippet for links")
 
-        // 2. File with a filename but no snippet → filename is the fallback.
+        // 2. File with a filename but no snippet → nil (Bug 1 fix: bare filename
+        //    is too weak — would match wrong earlier user bubble).
         let fileWithName = """
         {
           "session_id": "s2", "message_id": 2, "kind": "file",
@@ -270,8 +276,8 @@ final class ArtifactsGalleryTests: XCTestCase {
         }
         """.data(using: .utf8)!
         let fileArt = try! decoder.decode(Artifact.self, from: fileWithName)
-        XCTAssertEqual(fileArt.jumpSnippet, "report.pdf",
-                       "jumpSnippet must return the filename when snippet is absent")
+        XCTAssertNil(fileArt.jumpSnippet,
+                     "Bug 1 fix: jumpSnippet must return nil for file artifacts with no prose snippet — bare filename risks wrong-message scroll to an earlier user bubble")
 
         // 3. Image with no snippet and no filename → nil (not urlOrPath).
         let imageNoHints = """

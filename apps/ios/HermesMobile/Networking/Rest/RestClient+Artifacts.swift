@@ -100,11 +100,18 @@ struct Artifact: Decodable, Identifiable, Sendable, Equatable {
     /// Priority:
     /// 1. `snippet` — the server-supplied surrounding prose fragment (links only,
     ///    extracted from the message text). This is guaranteed prose.
-    /// 2. `filename` — the file's name as it typically appears in the assistant's
-    ///    prose ("I'll analyse `report.pdf`..."). Only used when not URL-like (no
-    ///    `://` or `data:` prefix) so we don't accidentally pass a URL.
-    /// 3. `nil` — no usable prose hint; the S2 path gracefully no-ops rather than
-    ///    searching for a raw URL that is never in `.text`.
+    /// 2. `nil` — no usable prose hint; the S2 path gracefully no-ops rather
+    ///    than risking a confident wrong-message scroll.
+    ///
+    /// `filename` is intentionally excluded as a fallback (Bug 1 — ABH-192):
+    /// the server returns `snippet=nil` for FILE and IMAGE artifacts, so the only
+    /// candidate would be the bare filename (e.g. "report.md"). A bare filename
+    /// almost always appears in an EARLIER user bubble ("create report.md for me")
+    /// too — so `chatStore.messages.first(where:)` finds the wrong (earliest)
+    /// bubble and scrolls there. A tool-only file whose path appears only in
+    /// tool-call arguments is never in any bubble's `.text` → silent no-op.
+    /// Both outcomes are worse than the graceful no-op. Return `nil` so the S2
+    /// path is a safe no-op for file/image artifacts that carry no prose snippet.
     ///
     /// `urlOrPath` is intentionally excluded: raw URLs / filesystem paths are
     /// never part of a ``ChatMessage/text`` value, so passing them caused the
@@ -112,16 +119,8 @@ struct Artifact: Decodable, Identifiable, Sendable, Equatable {
     var jumpSnippet: String? {
         // 1. Prose snippet (links carry the surrounding message text).
         if let s = snippet, !s.isEmpty { return s }
-        // 2. Filename — appears in prose; exclude anything that looks URL-like or
-        //    is a data-URL fragment so we don't carry garbage into the search.
-        if let fn = filename,
-           !fn.isEmpty,
-           !fn.hasPrefix("http://"),
-           !fn.hasPrefix("https://"),
-           !fn.hasPrefix("data:") {
-            return fn
-        }
-        // 3. No usable prose hint.
+        // 2. No usable prose hint — a bare filename is too weak a signal (see
+        //    above). Return nil so the S2 path is a graceful no-op.
         return nil
     }
 

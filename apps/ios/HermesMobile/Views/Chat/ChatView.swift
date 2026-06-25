@@ -907,15 +907,32 @@ struct ChatView: View {
         guard let query = sessionStore.pendingSearchScroll,
               !query.isEmpty,
               !chatStore.messages.isEmpty else { return }
-        let needle = query.lowercased()
+        // Bug 2 (ABH-192): the server link snippet is a raw ±60-char slice that
+        // can contain a literal newline (URL at end-of-line / in a list). The
+        // plainSnippet pass in RestClient+Sessions.swift converts \n→space in the
+        // needle, but ChatMessage.text retains \n, so a naive .contains() misses
+        // whenever the surrounding prose spans a line break. Fix: normalise
+        // whitespace (collapse ALL whitespace runs — tabs, newlines, multiple
+        // spaces) in BOTH the needle and each message's text before matching.
+        let needle = Self.collapseWhitespace(query).lowercased()
         sessionStore.pendingSearchScroll = nil
         if let match = chatStore.messages.first(where: {
-            $0.text.lowercased().contains(needle)
+            Self.collapseWhitespace($0.text).lowercased().contains(needle)
         }) {
             withAnimation(.easeInOut(duration: 0.25)) {
                 proxy.scrollTo(match.id, anchor: .center)
             }
         }
+    }
+
+    /// Collapse all whitespace runs (spaces, tabs, newlines) to a single space
+    /// and trim. Used by ``jumpToSearchMatchIfNeeded`` so a needle derived from
+    /// a server snippet (newlines already replaced with spaces) can match the
+    /// same prose in ``ChatMessage/text`` (which retains the original newlines).
+    private static func collapseWhitespace(_ s: String) -> String {
+        s.components(separatedBy: .whitespacesAndNewlines)
+         .filter { !$0.isEmpty }
+         .joined(separator: " ")
     }
 
     /// ABH-192 (jump-to-exact-message): scroll the transcript to the row whose

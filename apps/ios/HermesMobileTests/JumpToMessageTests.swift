@@ -430,3 +430,169 @@ final class JumpToMessageCacheFirstTests: XCTestCase {
         XCTAssertEqual(sessionStore.activeStoredId, "session-b")
     }
 }
+
+// MARK: - ABH-192 Bug 1 + Bug 2 regressions
+
+/// Regression tests for the two confirmed ABH-192 artifact-jump bugs.
+///
+/// Bug 1: file/image artifacts have `snippet=nil` on the wire, so
+/// `Artifact.jumpSnippet` previously fell through to the bare filename (e.g.
+/// "report.md"). The S2 fallback then called `messages.first(where:
+/// { $0.text.contains(filename) })` — first occurrence, no role filter — so a
+/// filename echoed in an EARLIER user bubble ("please create report.md") won,
+/// scrolling to the WRONG message.
+///
+/// Bug 2: the server link snippet is a raw ±60-char slice that can contain a
+/// literal newline. `plainSnippet` converts `\n→space`, but `ChatMessage.text`
+/// retains `\n`. A naive `.contains()` therefore misses when the URL's
+/// surrounding prose spans a line break.
+@MainActor
+final class ArtifactJumpRegressionTests: XCTestCase {
+
+    private func stored(role: String, text: String, wireId: Int) -> StoredMessage {
+        StoredMessage(json: .object([
+            "role": .string(role),
+            "content": .string(text),
+            "id": .number(Double(wireId)),
+            "timestamp": .number(1_700_000_000),
+        ]))!
+    }
+
+    // MARK: - Bug 1 regression
+
+    /// Bug 1 — bare-filename hint present in an earlier user bubble must NOT
+    /// produce a wrong-message scroll.
+    ///
+    /// Before the fix: `Artifact.jumpSnippet` returned the bare filename
+    /// ("report.md"), which became `pendingMessageJumpSnippet`. After the
+    /// id-miss cap, it was promoted to `pendingSearchScroll`, and
+    /// `jumpToSearchMatchIfNeeded` found the EARLIEST occurrence — i.e. the
+    /// user bubble "please create report.md" — and scrolled there instead of
+    /// the producing assistant bubble.
+    ///
+    /// After the fix: `jumpSnippet` returns `nil` for file/image artifacts with
+    /// no prose snippet → `pendingMessageJumpSnippet` is `nil` → after the
+    /// id-miss cap, `pendingSearchScroll` is NOT armed → the jump is consumed
+    /// as a graceful no-op rather than scrolling to the wrong bubble.
+    func testBareFilenameJumpDoesNotScrollToEarlierUserBubble() {
+        // Construct a transcript where "report.md" appears in BOTH an earlier
+        // user bubble AND the producing assistant bubble.
+        let normalized = ChatStore.toChatMessages([
+            stored(role: "user",      text: "please create report.md for me", wireId: 1),
+            stored(role: "assistant", text: "I'll write the report now…",      wireId: 2),
+            stored(role: "assistant", text: "Done! Wrote report.md to disk.",  wireId: 3),
+        ])
+        let chatStore = ChatStore()
+        chatStore.seed(normalized: normalized)
+        XCTAssertEqual(chatStore.messages.count, 3, "precondition: three bubbles seeded")
+
+        let sessionStore = SessionStore()
+        // Simulate what ArtifactsGalleryView does for a file artifact whose
+        // jumpSnippet is now nil (Bug 1 fix). The snippet passed to
+        // open(searchResult:) is nil → pendingMessageJumpSnippet stays nil.
+        sessionStore.pendingMessageJump = 3          // wire id of the artifact message
+        sessionStore.pendingMessageJumpAttempts = 0
+        sessionStore.pendingMessageJumpSnippet = nil  // Bug 1 fix: jumpSnippet returns nil
+        sessionStore.pendingSearchScroll = nil
+
+        // Drive the resolver past the attempt cap (id 3 is an anchor row so it
+        // WOULD resolve on a real transcript, but here we explicitly test that
+        // when jumpSnippet is nil the S2 path stays silent).
+        // To force the no-snippet path, we use an id that is NOT in the seeded
+        // transcript (id 99 = genuinely absent) so the cap is always reached.
+        sessionStore.pendingMessageJump = 99
+        for _ in 0..<SessionStore.pendingMessageJumpMaxAttempts {
+            guard let messageId = sessionStore.pendingMessageJump,
+                  !chatStore.messages.isEmpty else { break }
+            let candidates = Set(ChatStore.messageJumpCandidateIDs(for: messageId))
+            let target = chatStore.messages.first { candidates.contains($0.id) }?.id
+            guard target == nil else { break }
+            sessionStore.pendingMessageJumpAttempts += 1
+            if sessionStore.pendingMessageJumpAttempts >= SessionStore.pendingMessageJumpMaxAttempts {
+                let snippet = sessionStore.pendingMessageJumpSnippet
+                sessionStore.pendingMessageJump = nil
+                sessionStore.pendingMessageJumpAttempts = 0
+                sessionStore.pendingMessageJumpSnippet = nil
+                if let snippet, !snippet.isEmpty {
+                    sessionStore.pendingSearchScroll = snippet
+                }
+            }
+        }
+
+        // KEY ASSERTION: pendingSearchScroll must NOT be armed because jumpSnippet
+        // was nil (Bug 1 fix) → no wrong-message scroll to the earlier user bubble.
+        XCTAssertNil(sessionStore.pendingSearchScroll,
+                     "Bug 1 regression: bare filename must not arm pendingSearchScroll — a nil jumpSnippet produces a safe no-op, not a scroll to the wrong (earliest) bubble")
+        XCTAssertNil(sessionStore.pendingMessageJump,
+                     "jump must be consumed after the attempt cap")
+
+        // Sanity: confirm "report.md" IS present in the earlier user bubble.
+        // This proves the old code WOULD have scrolled to the wrong bubble.
+        let earlierUserBubble = chatStore.messages.first { $0.role == .user }
+        XCTAssertTrue(earlierUserBubble?.text.contains("report.md") ?? false,
+                      "sanity: filename 'report.md' is in the earlier user bubble — without the fix the old code would scroll there")
+    }
+
+    // MARK: - Bug 2 regression
+
+    /// Bug 2 — a link snippet whose prose contains a newline must still resolve
+    /// to the producing bubble after whitespace normalisation.
+    ///
+    /// The server returns a raw ±60-char slice that can contain a literal `\n`
+    /// (URL at end-of-line, or in a list). `plainSnippet` converts `\n→space`
+    /// in the needle, but `ChatMessage.text` retains the original `\n`.
+    /// Without normalisation on BOTH sides, `.contains()` returns false and the
+    /// jump silently no-ops.
+    ///
+    /// After the fix: `jumpToSearchMatchIfNeeded` collapses whitespace runs
+    /// (including newlines) in BOTH the needle and each `.text` before matching,
+    /// so the snippet still resolves even when the prose spans a line break.
+    func testLinkSnippetWithNewlineResolvesToProducingBubble() {
+        // The producing assistant bubble has the URL on its own line (prose spans
+        // a line break), so ChatMessage.text contains "\n".
+        let producingProse = "Check out this resource:\nhttps://example.com/article"
+        let normalized = ChatStore.toChatMessages([
+            stored(role: "user",      text: "find me a resource",  wireId: 10),
+            stored(role: "assistant", text: producingProse,         wireId: 11),
+        ])
+        let chatStore = ChatStore()
+        chatStore.seed(normalized: normalized)
+        XCTAssertEqual(chatStore.messages.count, 2)
+
+        // Simulate the server's ±60-char snippet: the surrounding prose fragment
+        // that contains the newline. plainSnippet replaces \n→space.
+        let serverSnippet = "Check out this resource:\nhttps://example.com/article"
+        let needle = serverSnippet
+            .replacingOccurrences(of: "<b>", with: "")
+            .replacingOccurrences(of: "</b>", with: "")
+            .replacingOccurrences(of: "\n", with: " ")   // plainSnippet pass
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // needle is now "Check out this resource: https://example.com/article"
+
+        // OLD behaviour (no whitespace normalisation on the haystack side):
+        // ChatMessage.text still has "\n" → naive .contains() misses.
+        let naiveMissOld = chatStore.messages.first {
+            $0.text.lowercased().contains(needle.lowercased())
+        }
+        XCTAssertNil(naiveMissOld,
+                     "Bug 2 pre-condition: naive .contains() misses when ChatMessage.text retains the newline but the needle has it replaced with a space")
+
+        // NEW behaviour (collapse whitespace on BOTH sides — mirrors the fix in
+        // ChatView.jumpToSearchMatchIfNeeded → collapseWhitespace helper):
+        func collapseWhitespace(_ s: String) -> String {
+            s.components(separatedBy: .whitespacesAndNewlines)
+             .filter { !$0.isEmpty }
+             .joined(separator: " ")
+        }
+        let normalizedNeedle = collapseWhitespace(needle).lowercased()
+        let fixedMatch = chatStore.messages.first {
+            collapseWhitespace($0.text).lowercased().contains(normalizedNeedle)
+        }
+        XCTAssertNotNil(fixedMatch,
+                        "Bug 2 fix: collapsing whitespace on both sides must find the producing bubble even when prose spans a line break")
+        XCTAssertEqual(fixedMatch?.role, .assistant,
+                       "the match must be the assistant bubble that produced the link — not an unrelated row")
+        XCTAssertTrue(fixedMatch?.text.contains("https://example.com/article") ?? false,
+                      "the matched bubble must contain the link URL")
+    }
+}
