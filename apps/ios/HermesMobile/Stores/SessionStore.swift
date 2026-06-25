@@ -265,6 +265,21 @@ final class SessionStore {
     /// carries no snippet) — then the miss is a graceful no-op.
     var pendingMessageJumpSnippet: String?
 
+    /// BUG6 fix: when `true`, ``pendingSearchScroll`` was populated from a
+    /// server-supplied snippet (prose slice that may contain newlines normalised
+    /// to spaces via `plainSnippet`) and ``ChatView/jumpToSearchMatchIfNeeded``
+    /// should collapse whitespace runs in BOTH the needle and each message's text
+    /// before matching — so a snippet like "foo bar" (space-normalised from
+    /// "foo\nbar") still finds "foo\nbar" in the raw transcript.
+    ///
+    /// When `false` (the default), the scroll was set from the user's literal
+    /// drawer-search query and must be matched verbatim (literal substring, no
+    /// collapse) — collapsing would widen the match, potentially scrolling to an
+    /// EARLIER wrong message that happens to contain the same words once tabs /
+    /// double-spaces / newlines are removed. Cleared alongside
+    /// ``pendingSearchScroll``.
+    var pendingSearchScrollIsSnippet: Bool = false
+
     /// M1: the cap after which an unresolved `pendingMessageJump` is abandoned.
     /// Two phases cover the cache-then-network seed; the third hop absorbs a
     /// late reconcile so a genuinely-present target is never wrongly dropped.
@@ -1747,6 +1762,7 @@ final class SessionStore {
             pendingMessageJumpAttempts = 0
             pendingMessageJumpSnippet = nil
             pendingSearchScroll = nil
+            pendingSearchScrollIsSnippet = false
         }
 
         // Activate instantly — the chat view can present right away with a loading
@@ -2455,9 +2471,21 @@ final class SessionStore {
         // scroll inside the right turn.
         pendingMessageJumpSnippet = (jumpTarget != nil && !snippetText.isEmpty) ? snippetText : nil
         if jumpTarget == nil {
-            pendingSearchScroll = !q.isEmpty ? q : (!snippetText.isEmpty ? snippetText : nil)
+            if !q.isEmpty {
+                // Literal user query — do NOT collapse whitespace on match.
+                pendingSearchScroll = q
+                pendingSearchScrollIsSnippet = false
+            } else if !snippetText.isEmpty {
+                // No user query, fall back to the server snippet — collapse OK.
+                pendingSearchScroll = snippetText
+                pendingSearchScrollIsSnippet = true
+            } else {
+                pendingSearchScroll = nil
+                pendingSearchScrollIsSnippet = false
+            }
         } else {
             pendingSearchScroll = nil
+            pendingSearchScrollIsSnippet = false
         }
     }
 

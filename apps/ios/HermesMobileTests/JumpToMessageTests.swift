@@ -533,6 +533,102 @@ final class ArtifactJumpRegressionTests: XCTestCase {
                       "sanity: filename 'report.md' is in the earlier user bubble — without the fix the old code would scroll there")
     }
 
+    // MARK: - BUG6 regression: whitespace-collapse scoped to snippet path only
+
+    /// BUG6 — `open(searchResult:)` with a user query (no messageId) must set
+    /// `pendingSearchScrollIsSnippet = false` so `jumpToSearchMatchIfNeeded`
+    /// uses verbatim substring match.  Collapsing whitespace on a literal user
+    /// query widens the match: a query containing a double-space or tab would
+    /// match messages it didn't before, potentially scrolling to an EARLIER
+    /// wrong message.
+    ///
+    /// Assertion (a): drawer-search path does NOT enable collapse.
+    func testDrawerSearchQuerySetsIsSnippetFalse() {
+        let sessionStore = SessionStore()
+
+        // Simulate a drawer search result without a messageId (pure FTS result).
+        let result = SessionSearchResult(
+            id: "session-x", snippet: "some context around result",
+            role: "assistant", source: nil, model: nil, sessionStarted: nil,
+            messageId: nil   // no exact id → pendingSearchScroll gets the query
+        )
+        sessionStore.sessions = [result.asSessionSummary]
+        sessionStore.searchQuery = "hello  world"  // literal user query with double-space
+
+        sessionStore.open(searchResult: result)
+
+        XCTAssertEqual(sessionStore.pendingSearchScroll, "hello  world",
+                       "drawer-search: pendingSearchScroll must be the verbatim user query")
+        XCTAssertFalse(sessionStore.pendingSearchScrollIsSnippet,
+                       "BUG6 regression: a literal drawer-search query must NOT set isSnippet — collapsing would widen the match to wrong earlier messages")
+    }
+
+    /// BUG6 — when `open(searchResult:)` has no user query but a server snippet
+    /// (no-id path), `pendingSearchScrollIsSnippet` must be `true` — so
+    /// `jumpToSearchMatchIfNeeded` collapses whitespace on both sides.
+    ///
+    /// Assertion (a) companion: no-query snippet path DOES enable collapse.
+    func testNoQuerySnippetPathSetsIsSnippetTrue() {
+        let sessionStore = SessionStore()
+
+        let result = SessionSearchResult(
+            id: "session-y", snippet: "prose with newline\nin it",
+            role: "assistant", source: nil, model: nil, sessionStarted: nil,
+            messageId: nil   // no exact id
+        )
+        sessionStore.sessions = [result.asSessionSummary]
+        sessionStore.searchQuery = ""   // no user query → snippet fallback
+
+        sessionStore.open(searchResult: result)
+
+        // pendingSearchScroll should be the plainSnippet (HTML stripped), flag true.
+        XCTAssertNotNil(sessionStore.pendingSearchScroll,
+                        "when the user query is empty and a snippet is present, pendingSearchScroll must be armed")
+        XCTAssertTrue(sessionStore.pendingSearchScrollIsSnippet,
+                      "BUG6: a snippet-derived scroll must set isSnippet=true so whitespace is collapsed on match")
+    }
+
+    /// BUG6 assertion (b): the snippet path still resolves across a newline.
+    /// Mirrors the Bug 2 pre-condition check but uses `ChatView.collapseWhitespace`
+    /// directly (now `internal`) to confirm the helper is unchanged and accessible.
+    func testCollapseWhitespaceHelperNormalizesNewlines() {
+        // The server-supplied snippet has \n replaced with a space (plainSnippet).
+        let snippetNeedle = "Check out this resource: https://example.com/article"
+        // The ChatMessage.text retains the original \n.
+        let messageText = "Check out this resource:\nhttps://example.com/article"
+
+        // Without collapse: no match (the Bug 2 pre-condition).
+        XCTAssertFalse(messageText.lowercased().contains(snippetNeedle.lowercased()),
+                       "pre-condition: naive .contains() misses when haystack has newline and needle has space")
+
+        // With collapse on both sides: match found.
+        let collapsedNeedle = ChatView.collapseWhitespace(snippetNeedle).lowercased()
+        let collapsedHaystack = ChatView.collapseWhitespace(messageText).lowercased()
+        XCTAssertTrue(collapsedHaystack.contains(collapsedNeedle),
+                      "BUG6 assertion (b): snippet path must resolve across a newline using collapseWhitespace on both sides")
+    }
+
+    /// BUG6: the `isSnippet` flag is cleared alongside `pendingSearchScroll` by
+    /// a session switch, so it does not persist stale into the next session.
+    func testIsSnippetFlagClearedOnSessionSwitch() {
+        let sessionStore = SessionStore()
+        sessionStore.activeStoredId = "session-a"
+        sessionStore.pendingSearchScroll = "some text"
+        sessionStore.pendingSearchScrollIsSnippet = true
+
+        let summaryB = SessionSummary(
+            id: "session-b", title: "B", preview: nil, startedAt: 1_700_000_000,
+            messageCount: nil, source: nil, lastActive: 1_700_000_000,
+            cwd: nil
+        )
+        sessionStore.open(summaryB)
+
+        XCTAssertNil(sessionStore.pendingSearchScroll,
+                     "session switch must clear pendingSearchScroll")
+        XCTAssertFalse(sessionStore.pendingSearchScrollIsSnippet,
+                       "BUG6: session switch must also clear pendingSearchScrollIsSnippet to prevent stale collapse on the new session")
+    }
+
     // MARK: - Bug 2 regression
 
     /// Bug 2 — a link snippet whose prose contains a newline must still resolve

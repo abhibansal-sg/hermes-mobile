@@ -903,33 +903,55 @@ struct ChatView: View {
     /// landing on the newest message. Consumes the request either way. A query
     /// that only matched non-prose content (a Code/tool hit) finds no prose
     /// message → no-op (native anchor already rested at bottom).
+    ///
+    /// BUG6 fix: whitespace-collapse is scoped to SNIPPET-derived needles only
+    /// (`pendingSearchScrollIsSnippet == true`). A snippet is a server-supplied
+    /// prose slice whose newlines were replaced with spaces by `plainSnippet`,
+    /// while `ChatMessage.text` retains the original newlines — so collapsing
+    /// both sides lets the needle match. A LITERAL user-query needle (drawer
+    /// search, `pendingSearchScrollIsSnippet == false`) is matched verbatim:
+    /// collapsing it would widen the match (a query with a tab or double-space
+    /// would match messages it didn't before), regressing the drawer-search path
+    /// that was confirmed working.
     private func jumpToSearchMatchIfNeeded(_ proxy: ScrollViewProxy) {
         guard let query = sessionStore.pendingSearchScroll,
               !query.isEmpty,
               !chatStore.messages.isEmpty else { return }
-        // Bug 2 (ABH-192): the server link snippet is a raw ±60-char slice that
-        // can contain a literal newline (URL at end-of-line / in a list). The
-        // plainSnippet pass in RestClient+Sessions.swift converts \n→space in the
-        // needle, but ChatMessage.text retains \n, so a naive .contains() misses
-        // whenever the surrounding prose spans a line break. Fix: normalise
-        // whitespace (collapse ALL whitespace runs — tabs, newlines, multiple
-        // spaces) in BOTH the needle and each message's text before matching.
-        let needle = Self.collapseWhitespace(query).lowercased()
+        let isSnippet = sessionStore.pendingSearchScrollIsSnippet
         sessionStore.pendingSearchScroll = nil
-        if let match = chatStore.messages.first(where: {
-            Self.collapseWhitespace($0.text).lowercased().contains(needle)
-        }) {
-            withAnimation(.easeInOut(duration: 0.25)) {
-                proxy.scrollTo(match.id, anchor: .center)
+        sessionStore.pendingSearchScrollIsSnippet = false
+        if isSnippet {
+            // Snippet path (S2 fallback or no-id snippetText): collapse whitespace
+            // on both sides so a needle whose \n was replaced with a space still
+            // matches the same prose in ChatMessage.text (which retains \n).
+            let needle = Self.collapseWhitespace(query).lowercased()
+            if let match = chatStore.messages.first(where: {
+                Self.collapseWhitespace($0.text).lowercased().contains(needle)
+            }) {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(match.id, anchor: .center)
+                }
+            }
+        } else {
+            // Literal drawer-search query: verbatim substring match — no collapse.
+            let needle = query.lowercased()
+            if let match = chatStore.messages.first(where: {
+                $0.text.lowercased().contains(needle)
+            }) {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(match.id, anchor: .center)
+                }
             }
         }
     }
 
     /// Collapse all whitespace runs (spaces, tabs, newlines) to a single space
-    /// and trim. Used by ``jumpToSearchMatchIfNeeded`` so a needle derived from
-    /// a server snippet (newlines already replaced with spaces) can match the
-    /// same prose in ``ChatMessage/text`` (which retains the original newlines).
-    private static func collapseWhitespace(_ s: String) -> String {
+    /// and trim. Used by ``jumpToSearchMatchIfNeeded`` for SNIPPET-derived
+    /// needles only (BUG6 fix — see that method's doc). A snippet supplied by
+    /// the server had its `\n` replaced with a space by `plainSnippet`, while
+    /// `ChatMessage.text` retains the original newlines; collapsing both sides
+    /// makes them comparable. NOT applied to raw user-query drawer-search needles.
+    static func collapseWhitespace(_ s: String) -> String {
         s.components(separatedBy: .whitespacesAndNewlines)
          .filter { !$0.isEmpty }
          .joined(separator: " ")
@@ -1001,7 +1023,11 @@ struct ChatView: View {
                 sessionStore.pendingMessageJumpAttempts = 0
                 sessionStore.pendingMessageJumpSnippet = nil
                 if let snippet, !snippet.isEmpty {
+                    // BUG6 fix: this is a snippet-derived needle (prose slice from
+                    // pendingMessageJumpSnippet), not a literal user query — mark it
+                    // so jumpToSearchMatchIfNeeded collapses whitespace on both sides.
                     sessionStore.pendingSearchScroll = snippet
+                    sessionStore.pendingSearchScrollIsSnippet = true
                     jumpToSearchMatchIfNeeded(proxy)
                 }
             }

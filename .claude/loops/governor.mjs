@@ -46,11 +46,27 @@ function load() {
 }
 function save(cfg) { fs.writeFileSync(CONFIG, JSON.stringify(cfg, null, 2) + '\n'); }
 
+// Sentinel returned by arg() when a flag is present but has NO value (it's the
+// last token, or the next token is itself a flag like `--foo`). Distinct from a
+// real string value of "true" — callers (e.g. the evidence gate) must be able to
+// tell "flag present, no value attached" from "the value happens to be 'true'".
+const FLAG_NO_VALUE = Symbol('flag-present-no-value');
+
 function arg(name, def = null) {
   const i = process.argv.indexOf(name);
-  return i >= 0 ? (process.argv[i + 1] ?? true) : def;
+  if (i < 0) return def;
+  const next = process.argv[i + 1];
+  // No following token, or the following token is another flag → value-less flag.
+  if (next === undefined || (typeof next === 'string' && next.startsWith('--'))) return FLAG_NO_VALUE;
+  return next;
 }
 function has(flag) { return process.argv.includes(flag); }
+
+// True iff arg() returned the value-less-flag sentinel (flag present, no value).
+function isFlagNoValue(v) { return v === FLAG_NO_VALUE; }
+// Coerce an arg() result to a plain string, mapping the no-value sentinel and
+// null/undefined to a caller-supplied fallback (default empty string).
+function strOr(v, fb = '') { return (v === FLAG_NO_VALUE || v == null) ? fb : String(v); }
 
 // Headroom: read `cc-usage status`, parse the WORST headroom %. Conservative: if we
 // can't read it, treat as 0 (fail closed → don't start a cycle on an unknown budget).
@@ -62,12 +78,47 @@ function headroomPct() {
   } catch { return 0; }
 }
 
+// ── Concurrency state: instance-keyed, backward-tolerant ──────────────────────
+// active_action_loops holds one entry PER RUNNING INSTANCE (not per loop NAME), so
+// two same-named loops each occupy a distinct slot and the cap binds for them too.
+// Entries are { id, ts } where id is a unique instance id (`${loop}#${pid}` or any
+// uuid the caller passes) and ts is the ISO time of (re)registration, used to reap a
+// slot leaked by a signal-killed loop. Legacy bare-string entries (e.g. "auto") are
+// tolerated on read and migrated to {id, ts} on the next write.
+function normalizeActive(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(e => {
+    if (typeof e === 'string') return { id: e, ts: null };       // legacy bare string
+    if (e && typeof e === 'object' && typeof e.id === 'string')
+      return { id: e.id, ts: typeof e.ts === 'string' ? e.ts : null };
+    return null;
+  }).filter(Boolean);
+}
+
+// Drop entries older than the heartbeat silence window — a slot leaked by a
+// SIGTERM/SIGINT-killed loop self-heals here without needing a perfect signal
+// handler. A legacy bare-string (ts:null) has no timestamp → it is NOT reaped
+// (we can't prove it's stale; the live "auto" loop must survive).
+function reapStale(entries, silenceMin) {
+  if (!silenceMin || silenceMin <= 0) return entries;
+  const cutoff = Date.now() - silenceMin * 60_000;
+  return entries.filter(e => {
+    if (e.ts == null) return true;            // legacy / no timestamp → keep
+    const t = Date.parse(e.ts);
+    if (Number.isNaN(t)) return true;         // unparseable → keep (fail safe)
+    return t >= cutoff;
+  });
+}
+
 const cfg = load();
 const cmd = process.argv[2];
 
 switch (cmd) {
   case 'preflight': {
-    const loop = arg('--loop', 'loop');
+    const loop = strOr(arg('--loop', 'loop'), 'loop');
+    // Identify THIS process by its unique instance id (defaults to the loop name
+    // when no --instance is supplied, preserving old single-instance behavior).
+    const instance = strOr(arg('--instance', loop), loop);
     const isAction = has('--action');
     if (!cfg.enabled) {
       console.error(`[governor] DISABLED (kill switch). ${loop} exits without working.`);
@@ -80,21 +131,24 @@ switch (cmd) {
       process.exit(11);
     }
     if (isAction) {
-      const active = cfg.concurrency_state?.active_action_loops ?? [];
+      const silenceMin = cfg.heartbeat?.silence_alert_min ?? 0;
+      const active = reapStale(normalizeActive(cfg.concurrency_state?.active_action_loops), silenceMin);
       const cap = cfg.caps?.max_concurrent_action_loops ?? 1;
-      const others = active.filter(l => l !== loop);
+      // Self-exclude by INSTANCE id (not loop name): every OTHER running instance
+      // counts toward the cap, even one sharing this loop's name.
+      const others = active.filter(e => e.id !== instance);
       if (others.length >= cap) {
-        console.error(`[governor] concurrency cap ${cap} reached (active: ${others.join(', ')}) — ${loop} waits.`);
+        console.error(`[governor] concurrency cap ${cap} reached (active: ${others.map(e => e.id).join(', ')}) — ${loop} (${instance}) waits.`);
         process.exit(12);
       }
     }
-    console.error(`[governor] preflight OK for ${loop} (enabled, headroom ${have}%≥${need}%${isAction ? ', under concurrency cap' : ''}).`);
+    console.error(`[governor] preflight OK for ${loop} (${instance}) (enabled, headroom ${have}%≥${need}%${isAction ? ', under concurrency cap' : ''}).`);
     process.exit(0);
   }
 
   case 'spin': {
-    const prev = String(arg('--prev', ''));
-    const cur  = String(arg('--cur', ''));
+    const prev = strOr(arg('--prev', ''));
+    const cur  = strOr(arg('--cur', ''));
     if (prev && cur && prev === cur) {
       console.error(`[governor] SPIN: identical failure signature twice ("${cur}") → STOP + escalate (never retry the same approach).`);
       process.exit(20);
@@ -104,23 +158,27 @@ switch (cmd) {
   }
 
   case 'evidence': {
-    // Coerce required values to String + reject the boolean-true sentinel that
-    // arg() returns for a trailing value-less flag (e.g. `--artifact` / `--kind`
-    // as the last token). Otherwise a value-less `--artifact` slips through as a
-    // truthy boolean → a false green with no real evidence.
-    const kind = String(arg('--kind', '')).trim();
-    const artifact = String(arg('--artifact', '')).trim();
+    // Disambiguate at PARSE time: arg() returns the FLAG_NO_VALUE sentinel for a
+    // value-less flag (e.g. a trailing `--artifact`), so we can tell "flag present,
+    // no value" (reject — no real evidence) from a genuine value that happens to be
+    // the string "true" (a legitimate artifact, e.g. an exit-code/boolean result).
+    const rawKind = arg('--kind', '');
+    const rawArtifact = arg('--artifact', '');
+    const kindMissing = isFlagNoValue(rawKind);
+    const artifactMissing = isFlagNoValue(rawArtifact);
+    const kind = strOr(rawKind).trim();
+    const artifact = strOr(rawArtifact).trim();
     const accepted = cfg.evidence_gate?.accepted_kinds ?? [];
     if (!cfg.evidence_gate?.required) { console.error('[governor] evidence gate off.'); process.exit(0); }
-    if (!kind || kind === 'true') {
-      console.error(`[governor] NO GREEN: --kind requires a value (got ${kind ? '"true"' : 'empty'}). Accepted: ${accepted.join(', ')}.`);
+    if (kindMissing || !kind) {
+      console.error(`[governor] NO GREEN: --kind requires a value. Accepted: ${accepted.join(', ')}.`);
       process.exit(30);
     }
     if (!accepted.includes(kind)) {
       console.error(`[governor] NO GREEN: "${kind}" is not hard evidence. Accepted: ${accepted.join(', ')}.`);
       process.exit(30);
     }
-    if (!artifact || artifact === 'true') {
+    if (artifactMissing || !artifact) {
       console.error(`[governor] NO GREEN: evidence kind "${kind}" given but no artifact value attached.`);
       process.exit(30);
     }
@@ -129,7 +187,7 @@ switch (cmd) {
   }
 
   case 'attempts': {
-    const current = Number(arg('--current', '0'));
+    const current = Number(strOr(arg('--current', '0'), '0'));
     const cap = cfg.caps?.retries_per_stage ?? 1;
     // --current is the 1-indexed attempt number. Allowed attempts = 1 initial +
     // retries_per_stage retries → the highest allowed attempt number is cap + 1.
@@ -144,23 +202,34 @@ switch (cmd) {
   }
 
   case 'register': {
-    const loop = String(arg('--loop', ''));
+    const loop = strOr(arg('--loop', ''));
     if (!loop) { console.error('[governor] register needs --loop NAME'); process.exit(2); }
+    // Register by unique INSTANCE id (defaults to the loop name for old callers).
+    const instance = strOr(arg('--instance', loop), loop);
+    const silenceMin = cfg.heartbeat?.silence_alert_min ?? 0;
     cfg.concurrency_state ??= { active_action_loops: [] };
-    cfg.concurrency_state.active_action_loops ??= [];
-    if (!cfg.concurrency_state.active_action_loops.includes(loop))
-      cfg.concurrency_state.active_action_loops.push(loop);
+    // Migrate legacy bare strings to {id, ts} on write + reap any leaked stale slot.
+    let active = reapStale(normalizeActive(cfg.concurrency_state.active_action_loops), silenceMin);
+    // Drop a prior entry with the SAME instance id, then add a fresh timestamped one
+    // (so a re-register refreshes the heartbeat ts rather than duplicating).
+    active = active.filter(e => e.id !== instance);
+    active.push({ id: instance, ts: new Date().toISOString() });
+    cfg.concurrency_state.active_action_loops = active;
     save(cfg);
-    console.error(`[governor] registered ${loop}. active: ${cfg.concurrency_state.active_action_loops.join(', ')}`);
+    console.error(`[governor] registered ${loop} (${instance}). active: ${active.map(e => e.id).join(', ')}`);
     process.exit(0);
   }
   case 'deregister': {
-    const loop = String(arg('--loop', ''));
+    const loop = strOr(arg('--loop', ''));
+    // Remove ONLY this caller's instance id — never every entry sharing the name.
+    const instance = strOr(arg('--instance', loop), loop);
+    const silenceMin = cfg.heartbeat?.silence_alert_min ?? 0;
     cfg.concurrency_state ??= { active_action_loops: [] };
-    cfg.concurrency_state.active_action_loops =
-      (cfg.concurrency_state.active_action_loops ?? []).filter(l => l !== loop);
+    const active = reapStale(normalizeActive(cfg.concurrency_state.active_action_loops), silenceMin)
+      .filter(e => e.id !== instance);
+    cfg.concurrency_state.active_action_loops = active;
     save(cfg);
-    console.error(`[governor] deregistered ${loop}. active: ${cfg.concurrency_state.active_action_loops.join(', ') || '(none)'}`);
+    console.error(`[governor] deregistered ${loop} (${instance}). active: ${active.map(e => e.id).join(', ') || '(none)'}`);
     process.exit(0);
   }
 
@@ -176,11 +245,15 @@ switch (cmd) {
   }
 
   case 'status': {
+    const silenceMin = cfg.heartbeat?.silence_alert_min ?? 0;
+    const norm = normalizeActive(cfg.concurrency_state?.active_action_loops);
+    const live = reapStale(norm, silenceMin);
     console.log(JSON.stringify({
       enabled: cfg.enabled,
       shadow_mode: cfg.shadow_mode,
       caps: cfg.caps,
-      active_action_loops: cfg.concurrency_state?.active_action_loops ?? [],
+      active_action_loops: norm,                       // as stored (incl. any stale)
+      active_action_loops_live: live.map(e => e.id),    // after stale-reap (counts toward cap)
       headroom_pct_now: headroomPct(),
     }, null, 2));
     process.exit(0);

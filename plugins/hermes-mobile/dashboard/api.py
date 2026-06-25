@@ -2008,7 +2008,18 @@ async def remove_provider_key(
         config = load_config_readonly()
     except Exception:
         config = {}
-    has_custom_entry = slug in (config.get("providers") or {})
+    _providers_cfg = config.get("providers") or {}
+    _entry = _providers_cfg.get(slug)
+    # BUG5 fix: restrict the custom-clear branch to entries that are actually
+    # CUSTOM-PROVIDER CREDENTIAL entries — i.e. they have an ``api_key`` or
+    # ``key_env`` field (the markers POST /providers/custom writes). A registered
+    # provider can legitimately have a providers.<slug> tuning-only entry (e.g.
+    # a ``base_url`` or ``model`` override) without any credential fields. Firing
+    # the custom-clear on such a tuning-only entry would inject bogus empty
+    # ``api_key``/``key_env`` keys and try to remove a phantom env var.
+    has_custom_entry = bool(
+        _entry and ("api_key" in _entry or "key_env" in _entry)
+    )
 
     if has_custom_entry:
         # A custom provider (POST /providers/custom) persists its key under

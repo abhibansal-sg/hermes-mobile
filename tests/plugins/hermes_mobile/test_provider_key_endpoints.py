@@ -1021,3 +1021,76 @@ def test_delete_invalid_slug_returns_4001(loopback_client, monkeypatch):
     assert calls["set_config"] == [], (
         f"BUG 4: config written for invalid slug: {calls['set_config']}"
     )
+
+
+# ===========================================================================
+# BUG5 — registered provider with a tuning-only providers.<slug> entry must
+# NOT trigger the custom-clear branch.
+# ===========================================================================
+
+
+def test_delete_registered_provider_with_tuning_only_entry_uses_registered_path(
+    loopback_client, monkeypatch
+):
+    """BUG5: A REGISTERED api_key provider that has a providers.<slug> config
+    entry containing ONLY tuning overrides (e.g. base_url / model — no api_key
+    or key_env field) must be DELETEd via the normal registered path
+    (remove_env_value on its api_key_env_vars + clear_provider_auth).
+
+    The BUG3 broadening made has_custom_entry fire whenever any
+    providers.<slug> config entry exists. That caused this code path to:
+      1. derive a phantom env var (DEEPSEEK_<hash>_API_KEY) and attempt to
+         remove it — a no-op but an incorrect remove_env_value call;
+      2. call set_config_value("providers.deepseek.api_key", "") and
+         set_config_value("providers.deepseek.key_env", ""), injecting bogus
+         empty credential keys into a tuning-only config subtree.
+
+    FIX: the custom-clear branch now fires only when providers.<slug> has an
+    api_key or key_env field (the markers a custom provider sets via POST
+    /providers/custom). A tuning-only entry (no api_key / key_env) must go
+    through the registered path.
+    """
+    # deepseek is a well-known registered api_key provider.
+    _patch_inventory(monkeypatch, rows=[_DEEPSEEK_ROW])
+
+    # Simulate a tuning-only entry: providers.deepseek has a base_url override
+    # but NO api_key / key_env field — a legitimate non-credential tweak.
+    calls = _patch_config(
+        monkeypatch,
+        providers_in_config={"deepseek": {"base_url": "https://proxy.internal/deepseek"}},
+    )
+    _patch_clear_auth(monkeypatch, returns=False)
+
+    r = loopback_client.request(
+        "DELETE",
+        "/api/plugins/hermes-mobile/providers/deepseek/key",
+        headers=_TOKEN_HEADER,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["slug"] == "deepseek"
+    assert body["disconnected"] is True
+
+    # Registered path: DEEPSEEK_API_KEY must have been passed to remove_env_value.
+    assert "DEEPSEEK_API_KEY" in calls["remove_env"], (
+        f"BUG5: registered env var not removed; remove_env calls: {calls['remove_env']}"
+    )
+
+    # Custom-clear must NOT have fired: no bogus api_key / key_env written to config.
+    set_keys = {k for k, _ in calls["set_config"]}
+    assert "providers.deepseek.api_key" not in set_keys, (
+        f"BUG5: bogus providers.deepseek.api_key injected into tuning-only entry; "
+        f"set_config calls: {calls['set_config']}"
+    )
+    assert "providers.deepseek.key_env" not in set_keys, (
+        f"BUG5: bogus providers.deepseek.key_env injected into tuning-only entry; "
+        f"set_config calls: {calls['set_config']}"
+    )
+
+    # The phantom derived env var must NOT have been passed to remove_env_value.
+    import hashlib as _hashlib
+    phantom_env = "DEEPSEEK_" + _hashlib.sha1(b"deepseek").hexdigest()[:6] + "_API_KEY"
+    assert phantom_env not in calls["remove_env"], (
+        f"BUG5: phantom custom env var {phantom_env!r} was incorrectly removed; "
+        f"remove_env calls: {calls['remove_env']}"
+    )
