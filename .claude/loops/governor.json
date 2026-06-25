@@ -3,8 +3,8 @@
   "_comment": "Machine-readable governor config for the Hermes autonomous loop system. GOVERNOR.md is the human/loop runbook; this file is the single source of truth for the numbers. Every loop skill MUST read this at the start of every cycle and obey it. Local-only working file (commit to origin; NEVER upstream).",
   "enabled": true,
   "_enabled": "MASTER KILL SWITCH. While false, NO loop does any work — it logs 'governor disabled' and exits. Set true only after the governor is built + proven. Flip to false to pause everything instantly.",
-  "shadow_mode": true,
-  "_shadow_mode": "While true, action-taking loops are PROPOSE-ONLY: they write to the Linear issue what they WOULD do (proposed transition + evidence plan) but do NOT act. Read-only watchers (asc-poll, digest) ignore this. Flip per-loop to live only after a day of good proposals.",
+  "shadow_mode": false,
+  "_shadow_mode": "ACT MODE (2026-06-24, user: 'start the loop'). Action-taking loops may commit + transition, still gated by preflight + the evidence gate + the guard hook. Flip back to true to return to propose-only; kill switch (enabled:false) pauses everything.",
   "caps": {
     "retries_per_stage": 1,
     "_retries_per_stage": "After the first failed attempt at a stage, at most ONE retry — and only with a genuinely DIFFERENT approach. A 2nd failure -> blocked:needs-human + escalate.",
