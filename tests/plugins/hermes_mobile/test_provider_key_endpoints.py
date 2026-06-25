@@ -87,8 +87,16 @@ def _patch_inventory(monkeypatch, *, rows):
     return captured
 
 
-def _patch_config(monkeypatch):
-    """Patch the hermes_cli.config mutators + is_managed, capturing calls."""
+def _patch_config(monkeypatch, *, providers_in_config=None):
+    """Patch the hermes_cli.config mutators + is_managed + load_config_readonly,
+    capturing calls.
+
+    ``providers_in_config`` is a dict of {slug: entry} to include in the fake
+    config returned by ``load_config_readonly``. Defaults to an empty dict (no
+    custom-provider entries), which is the normal state for registered-provider
+    tests. Pass a non-empty dict for tests that need a custom providers.<slug>
+    entry to be present in config (simulating a prior POST /providers/custom).
+    """
     import hermes_cli.config as config
 
     calls = {"save_env": [], "remove_env": [], "set_config": [], "managed": False}
@@ -106,10 +114,14 @@ def _patch_config(monkeypatch):
     def _is_managed():
         return calls["managed"]
 
+    def _load_config_readonly():
+        return {"providers": dict(providers_in_config or {})}
+
     monkeypatch.setattr(config, "save_env_value", _save_env)
     monkeypatch.setattr(config, "remove_env_value", _remove_env)
     monkeypatch.setattr(config, "set_config_value", _set_config)
     monkeypatch.setattr(config, "is_managed", _is_managed)
+    monkeypatch.setattr(config, "load_config_readonly", _load_config_readonly)
     return calls
 
 
@@ -653,12 +665,17 @@ def test_delete_custom_provider_clears_key_everywhere(loopback_client, monkeypat
     persisted and the runtime could still resolve the key while the route
     returned disconnected:true.
     """
-    _patch_config(monkeypatch)
-    cap_clear = _patch_clear_auth(monkeypatch, returns=True)
-
     import hashlib as _hashlib
     slug = "acme-local"
     expected_env = "ACME_LOCAL_" + _hashlib.sha1(b"acme-local").hexdigest()[:6] + "_API_KEY"
+
+    # Simulate that POST /providers/custom already wrote a providers.acme-local
+    # entry to config.yaml (required by BUG 4 fix: only clear when entry exists).
+    _patch_config(
+        monkeypatch,
+        providers_in_config={"acme-local": {"key_env": expected_env, "base_url": "https://api.acme.example/v1"}},
+    )
+    cap_clear = _patch_clear_auth(monkeypatch, returns=True)
 
     r = loopback_client.request(
         "DELETE",
@@ -673,16 +690,14 @@ def test_delete_custom_provider_clears_key_everywhere(loopback_client, monkeypat
 
     # The handler MUST have recognized this as a custom provider (slug not in
     # PROVIDER_REGISTRY) by deriving the env var and removing it from .env.
-    calls = _patch_config(monkeypatch)  # fresh capture of current patches
-    # Re-issue against the same patched module state to inspect captured calls.
-    # (The patches above captured into `calls`; verify the FIRST DELETE's calls
-    # via the cap_clear + a direct re-assert using a fresh patch + re-DELETE.)
 
-    # To inspect the actual calls made by the DELETE above, re-patch with a
-    # capturing recorder and DELETE again — the handler is idempotent-ish for
-    # this assertion (it still attempts the clears; remove_env_value returns
-    # True under the patch so disconnected stays true).
-    calls2 = _patch_config(monkeypatch)
+    # Re-patch with a capturing recorder and DELETE again to inspect calls.
+    # The handler is idempotent for this assertion (it still attempts the clears;
+    # remove_env_value returns True under the patch so disconnected stays true).
+    calls2 = _patch_config(
+        monkeypatch,
+        providers_in_config={"acme-local": {"key_env": expected_env, "base_url": "https://api.acme.example/v1"}},
+    )
     _patch_clear_auth(monkeypatch, returns=True)
     r2 = loopback_client.request(
         "DELETE",
@@ -712,14 +727,20 @@ def test_delete_custom_provider_clears_key_everywhere(loopback_client, monkeypat
 
 
 def test_delete_custom_provider_4005_when_nothing_to_clear(loopback_client, monkeypatch):
-    """A custom-provider DELETE where NOTHING is clearable (remove_env_value
-    returns False, set_config still 'succeeds' under the patch so cleared_config
-    is True) still reports disconnected. This test pins the precedence: the
-    config blanking (set_config_value) counts as a clear, so a custom-provider
-    DELETE never spuriously 4005s just because the .env var was already gone —
-    the persisted config.yaml state is still durably cleared."""
-    calls = _patch_config(monkeypatch)
-    # Simulate remove_env_value finding nothing in .env.
+    """A custom-provider DELETE where the entry IS present in config but
+    remove_env_value finds nothing in .env still returns 200 disconnected:true —
+    config blanking (set_config_value) counts as a clear even when .env was
+    already empty (e.g. manually removed). The key IS gone from config after the
+    DELETE even though .env was already clean."""
+    slug = "ghost-custom"
+    import hashlib as _hashlib
+    expected_env = "GHOST_CUSTOM_" + _hashlib.sha1(b"ghost-custom").hexdigest()[:6] + "_API_KEY"
+
+    calls = _patch_config(
+        monkeypatch,
+        providers_in_config={slug: {"key_env": expected_env, "base_url": "https://example.com/v1"}},
+    )
+    # Simulate remove_env_value finding nothing in .env (already removed).
     import hermes_cli.config as config
 
     def _remove_env(_key):
@@ -731,11 +752,12 @@ def test_delete_custom_provider_4005_when_nothing_to_clear(loopback_client, monk
 
     r = loopback_client.request(
         "DELETE",
-        "/api/plugins/hermes-mobile/providers/ghost-custom/key",
+        f"/api/plugins/hermes-mobile/providers/{slug}/key",
         headers=_TOKEN_HEADER,
     )
-    # cleared_config is True (set_config_value blanked the config keys), so the
-    # route returns 200 disconnected:true — the key really IS gone from config.
+    # cleared_config is True (config entry exists → set_config_value blanks the
+    # config keys), so the route returns 200 disconnected:true — the persisted
+    # config.yaml state is durably cleared even though .env was already empty.
     assert r.status_code == 200, r.text
     assert r.json()["disconnected"] is True
 
@@ -843,6 +865,20 @@ def test_custom_provider_env_var_collision_resistance(loopback_client, monkeypat
     )
 
     # DELETE my-co: only its env var must be removed; my_co's var must survive.
+    # BUG 4 fix: the DELETE now reads config first to verify the entry exists.
+    # Simulate both providers having been written (as POST /providers/custom
+    # would have done). Only my-co needs to be present for the DELETE to proceed,
+    # but include both to reflect realistic state.
+    import hermes_cli.config as _config_mod
+    monkeypatch.setattr(
+        _config_mod,
+        "load_config_readonly",
+        lambda: {"providers": {
+            "my-co": {"key_env": env_dash, "base_url": "https://api.my-co.example/v1"},
+            "my_co": {"key_env": env_under, "base_url": "https://api.my-co.example/v1"},
+        }},
+    )
+
     r3 = loopback_client.request(
         "DELETE",
         "/api/plugins/hermes-mobile/providers/my-co/key",
@@ -858,4 +894,130 @@ def test_custom_provider_env_var_collision_resistance(loopback_client, monkeypat
     # my_co's env var was NOT touched by the DELETE.
     assert env_under not in calls["remove_env"], (
         f"DELETE my-co incorrectly removed {env_under!r} (my_co's var)"
+    )
+
+
+# ===========================================================================
+# ABH-183 BUG 3 + BUG 4 — DELETE /providers/{slug}/key correctness
+# ===========================================================================
+
+
+def test_delete_custom_named_after_registered_slug_clears_key(
+    loopback_client, monkeypatch
+):
+    """BUG 3: A custom provider whose name equals a registered slug (e.g. 'anthropic')
+    must have its config entry cleared on DELETE. Previously the custom-clear block
+    only ran when the slug was absent from PROVIDER_REGISTRY — a custom 'anthropic'
+    would return 200 disconnected:true while its key persisted in .env + config.yaml.
+
+    Fix: custom-clear also runs when providers.<slug> exists in config, regardless of
+    registry membership. The registry's own ANTHROPIC_API_KEY env-var removal also
+    fires (it's a registered api_key provider), but the custom-derived var and the
+    config entries must also be cleared.
+    """
+    import hashlib as _hashlib
+
+    # Use 'anthropic' — a well-known registered api_key slug — as the custom provider
+    # name. A user might name a local Ollama/LM Studio proxy 'anthropic' to shadow
+    # the registered provider.
+    slug = "anthropic"
+    expected_custom_env = (
+        "ANTHROPIC_" + _hashlib.sha1(b"anthropic").hexdigest()[:6] + "_API_KEY"
+    )
+
+    # Simulate that POST /providers/custom with name='anthropic' has been called:
+    # config.yaml has a providers.anthropic entry.
+    calls = _patch_config(
+        monkeypatch,
+        providers_in_config={
+            "anthropic": {"key_env": expected_custom_env, "base_url": "http://localhost:11434/v1"},
+        },
+    )
+    _patch_clear_auth(monkeypatch, returns=False)
+
+    r = loopback_client.request(
+        "DELETE",
+        f"/api/plugins/hermes-mobile/providers/{slug}/key",
+        headers=_TOKEN_HEADER,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["slug"] == slug
+    assert body["disconnected"] is True
+
+    # The custom-derived env var MUST have been removed from .env — previously
+    # this was silently skipped because 'anthropic' is in PROVIDER_REGISTRY.
+    assert expected_custom_env in calls["remove_env"], (
+        f"BUG 3: DELETE did not remove custom .env var {expected_custom_env!r}; "
+        f"remove_env calls: {calls['remove_env']}"
+    )
+    # config.yaml entries MUST have been blanked.
+    set_config_keys = {k for k, _ in calls["set_config"]}
+    assert f"providers.{slug}.api_key" in set_config_keys, (
+        f"BUG 3: providers.{slug}.api_key was not blanked in config"
+    )
+    assert f"providers.{slug}.key_env" in set_config_keys, (
+        f"BUG 3: providers.{slug}.key_env was not blanked in config"
+    )
+
+
+def test_delete_never_created_slug_returns_4005_no_config_written(
+    loopback_client, monkeypatch
+):
+    """BUG 4 (part 2): DELETE a slug that was never created (no providers.<slug>
+    config entry) must return 4005 'no credentials found' and MUST NOT write any
+    config entries. Previously the custom block ran unconditionally, writing bogus
+    providers.<slug>.{api_key,key_env} entries for a slug that never existed.
+    """
+    # _patch_config defaults to empty providers_in_config (no custom entries).
+    calls = _patch_config(monkeypatch)
+    _patch_clear_auth(monkeypatch, returns=False)
+
+    # 'nevercreated' is not in PROVIDER_REGISTRY and has no config entry.
+    r = loopback_client.request(
+        "DELETE",
+        "/api/plugins/hermes-mobile/providers/nevercreated/key",
+        headers=_TOKEN_HEADER,
+    )
+    assert r.status_code == 400, r.text
+    assert r.json()["code"] == 4005
+
+    # MUST NOT have written any config entries (no config pollution).
+    assert calls["set_config"] == [], (
+        f"BUG 4: DELETE wrote config entries for a never-created slug: {calls['set_config']}"
+    )
+    # MUST NOT have called remove_env_value for the derived custom var.
+    assert calls["remove_env"] == [], (
+        f"BUG 4: DELETE called remove_env_value for a never-created slug: {calls['remove_env']}"
+    )
+
+
+def test_delete_invalid_slug_returns_4001(loopback_client, monkeypatch):
+    """BUG 4 (part 1): A DELETE with a dotted or otherwise invalid slug must
+    return 4001 immediately, before any config read or write. Dotted slugs
+    would create junk nested config subtrees (e.g. providers.foo.bar.api_key
+    instead of providers.foobar.api_key).
+    """
+    calls = _patch_config(monkeypatch)
+    _patch_clear_auth(monkeypatch, returns=False)
+
+    # A slug with a dot — invalid per _CUSTOM_PROVIDER_NAME_RE.
+    r = loopback_client.request(
+        "DELETE",
+        "/api/plugins/hermes-mobile/providers/foo.bar/key",
+        headers=_TOKEN_HEADER,
+    )
+    # FastAPI will 404 on 'foo.bar' because the path param stops at '/';
+    # 'foo.bar' in a path segment is a valid URL character sequence but the
+    # regex ^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$ rejects it.
+    # Either a 400 (4001) or a 422 (FastAPI validation) is acceptable — the
+    # key requirement is that it is NOT 200 and NO config is written.
+    assert r.status_code in (400, 422), (
+        f"Expected 400 or 422 for dotted slug, got {r.status_code}: {r.text}"
+    )
+    if r.status_code == 400:
+        assert r.json().get("code") == 4001
+    # No config must have been written.
+    assert calls["set_config"] == [], (
+        f"BUG 4: config written for invalid slug: {calls['set_config']}"
     )

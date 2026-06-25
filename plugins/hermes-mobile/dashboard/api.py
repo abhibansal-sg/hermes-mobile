@@ -1919,14 +1919,26 @@ async def remove_provider_key(
     """Remove credentials for a provider (parity with stock model.disconnect).
 
     For a registered api_key provider: ``remove_env_value`` on each of its
-    api_key_env_vars. For a CUSTOM provider (not in PROVIDER_REGISTRY): the
-    key was persisted under ``providers.<name>.key_env`` (POST /providers/custom)
+    api_key_env_vars. For a CUSTOM provider (not in PROVIDER_REGISTRY, or a
+    registered slug that also has a ``providers.<slug>`` config entry): the key
+    was persisted under ``providers.<name>.key_env`` (POST /providers/custom)
     pointing at a secure .env var — so in addition to ``clear_provider_auth`` we
     ALSO clear that persisted state: remove the .env var, blank the inline
     ``api_key``, and drop ``key_env`` from config.yaml. Without this, the key
     would persist in .env + config.yaml while the route returned
-    ``disconnected:true``. Honours is_managed() (4006). Returns the provider's
-    slug + name + a ``disconnected`` flag. NEVER echoes a key.
+    ``disconnected:true``.
+
+    BUG 3 fix: custom-clear is now also triggered when slug IS in PROVIDER_REGISTRY
+    but also has a ``providers.<slug>`` config entry — e.g. a local proxy named
+    'anthropic'. Registry membership alone no longer suppresses the config-clear.
+
+    BUG 4 fix: slug is validated against _CUSTOM_PROVIDER_NAME_RE before any
+    operation (reject 4001 on dotted/invalid slugs). In the custom-clear branch,
+    config is read first; if no ``providers.<slug>`` entry exists, the handler
+    does NOT write any config entries and returns 4005 instead.
+
+    Honours is_managed() (4006). Returns the provider's slug + name + a
+    ``disconnected`` flag. NEVER echoes a key.
     """
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -1938,6 +1950,7 @@ async def remove_provider_key(
     from hermes_cli.auth import PROVIDER_REGISTRY, clear_provider_auth
     from hermes_cli.config import (
         is_managed,
+        load_config_readonly,
         remove_env_value,
         set_config_value,
     )
@@ -1946,6 +1959,17 @@ async def remove_provider_key(
     if not slug:
         return JSONResponse(
             status_code=400, content={"error": "slug required", "code": 4001}
+        )
+
+    # BUG 4 fix (part 1): reject slugs that contain characters that could escape
+    # the providers.<slug>.* config subtree (e.g. dots that create junk nested
+    # trees, or other chars outside the safe name alphabet). Dotted slugs arrive
+    # as multi-segment URL paths, which FastAPI resolves before the handler, but
+    # we validate defensively here since config keys are built from this value.
+    if not _CUSTOM_PROVIDER_NAME_RE.match(slug):
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"invalid provider slug: {slug!r}", "code": 4001},
         )
 
     if is_managed():
@@ -1958,7 +1982,6 @@ async def remove_provider_key(
         )
 
     pconfig = PROVIDER_REGISTRY.get(slug)
-    is_custom = pconfig is None
     cleared_env = False
     cleared_config = False
     cleared_auth = False
@@ -1971,7 +1994,23 @@ async def remove_provider_key(
             except ValueError:
                 continue
 
-    if is_custom:
+    # BUG 3 fix: run the custom-clear block whenever a providers.<slug> config
+    # entry exists — NOT only when the slug is absent from PROVIDER_REGISTRY.
+    # A custom provider named 'anthropic' (which IS in the registry) would
+    # otherwise skip the config/env clear and return 200 disconnected:true
+    # while its raw key persisted in .env + config.yaml.
+    #
+    # BUG 4 fix (part 2): read config BEFORE writing anything. Only proceed with
+    # the clear when a providers.<slug> entry actually exists. If absent, do not
+    # write bogus config entries and do not set cleared_config = True (which
+    # would cause a never-created slug to get a spurious 200 disconnected:true).
+    try:
+        config = load_config_readonly()
+    except Exception:
+        config = {}
+    has_custom_entry = slug in (config.get("providers") or {})
+
+    if has_custom_entry:
         # A custom provider (POST /providers/custom) persists its key under
         # ``providers.<slug>.key_env`` (an env-var NAME) with the raw key in the
         # secure .env. clear_provider_auth only mutates the auth_store JSON —

@@ -45,9 +45,28 @@ function gov(args) {
   catch (e) { return e.status ?? 1; }
 }
 
+// Concurrency registration. Once we register this loop into the governor's
+// active_action_loops, we MUST deregister on the way out (success OR failure OR
+// crash) so the cap doesn't leak a stale entry. A single-host single-user loop,
+// so a check-then-register race is acceptable; we lean on the governor's own
+// register/deregister commands for the atomic write-back.
+let registered = false;
+function deregister() {
+  if (!registered) return;
+  registered = false;
+  gov(['deregister', '--loop', loop]);
+}
+process.on('exit', deregister);
+
 // 1) governor preflight (kill-switch / headroom / concurrency) — fail closed.
 const pf = gov(['preflight', '--loop', loop, '--action']);
 if (pf !== 0) { console.error(`shadow-propose: preflight refused (exit ${pf}) — cycle aborts.`); process.exit(pf); }
+
+// 1b) preflight PASSED → register this action loop so the concurrency cap binds
+// for any concurrent loop. Deregistered via the exit handler above.
+const rg = gov(['register', '--loop', loop]);
+if (rg !== 0) { console.error(`shadow-propose: could not register loop (exit ${rg}) — cycle aborts.`); process.exit(rg); }
+registered = true;
 
 // 2) evidence gate — no green without a hard-evidence artifact.
 const eg = gov(['evidence', '--kind', evKind, '--artifact', evidence || '']);

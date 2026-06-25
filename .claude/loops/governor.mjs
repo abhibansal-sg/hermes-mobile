@@ -19,8 +19,9 @@
  *   evidence --kind KIND [--artifact X]  exit 0 if KIND is an accepted hard-evidence kind
  *                                          AND an artifact value is present; else 30 (no
  *                                          green without evidence).
- *   attempts --current N                 exit 31 if N would exceed retries_per_stage (cap),
- *                                          else 0.
+ *   attempts --current N                 N is the 1-indexed attempt number. exit 31 if N
+ *                                          exceeds 1 initial + retries_per_stage retries
+ *                                          (i.e. N > cap+1), else 0.
  *   register --loop NAME                 add NAME to active_action_loops (after a passed
  *                                          preflight); deregister --loop NAME removes it.
  *   status                               print the live governor state (enabled, shadow,
@@ -103,15 +104,23 @@ switch (cmd) {
   }
 
   case 'evidence': {
-    const kind = String(arg('--kind', ''));
-    const artifact = arg('--artifact', null);
+    // Coerce required values to String + reject the boolean-true sentinel that
+    // arg() returns for a trailing value-less flag (e.g. `--artifact` / `--kind`
+    // as the last token). Otherwise a value-less `--artifact` slips through as a
+    // truthy boolean → a false green with no real evidence.
+    const kind = String(arg('--kind', '')).trim();
+    const artifact = String(arg('--artifact', '')).trim();
     const accepted = cfg.evidence_gate?.accepted_kinds ?? [];
     if (!cfg.evidence_gate?.required) { console.error('[governor] evidence gate off.'); process.exit(0); }
+    if (!kind || kind === 'true') {
+      console.error(`[governor] NO GREEN: --kind requires a value (got ${kind ? '"true"' : 'empty'}). Accepted: ${accepted.join(', ')}.`);
+      process.exit(30);
+    }
     if (!accepted.includes(kind)) {
       console.error(`[governor] NO GREEN: "${kind}" is not hard evidence. Accepted: ${accepted.join(', ')}.`);
       process.exit(30);
     }
-    if (!artifact) {
+    if (!artifact || artifact === 'true') {
       console.error(`[governor] NO GREEN: evidence kind "${kind}" given but no artifact value attached.`);
       process.exit(30);
     }
@@ -122,12 +131,15 @@ switch (cmd) {
   case 'attempts': {
     const current = Number(arg('--current', '0'));
     const cap = cfg.caps?.retries_per_stage ?? 1;
-    // attempts allowed = 1 initial + retries_per_stage. exceed → block.
-    if (current > cap) {
-      console.error(`[governor] attempt ${current} exceeds retries_per_stage ${cap} → set blocked:needs-human + escalate.`);
+    // --current is the 1-indexed attempt number. Allowed attempts = 1 initial +
+    // retries_per_stage retries → the highest allowed attempt number is cap + 1.
+    // e.g. retries_per_stage=1: attempt 1 (initial) PASS, attempt 2 (the retry)
+    // PASS, attempt 3 BLOCK. Block only once current exceeds (cap + 1).
+    if (current > cap + 1) {
+      console.error(`[governor] attempt ${current} exceeds 1 initial + ${cap} retries (max attempt ${cap + 1}) → set blocked:needs-human + escalate.`);
       process.exit(31);
     }
-    console.error(`[governor] attempt ${current} within cap (${cap} retries).`);
+    console.error(`[governor] attempt ${current} within cap (1 initial + ${cap} retries = ${cap + 1} attempts).`);
     process.exit(0);
   }
 
