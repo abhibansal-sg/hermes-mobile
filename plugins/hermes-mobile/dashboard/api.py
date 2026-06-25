@@ -26,6 +26,7 @@ the W2 auth-provider conversion).
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import json as _json
@@ -1590,21 +1591,33 @@ _CUSTOM_PROVIDER_NAME_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$")
 
 
 def _custom_provider_env_var(name: str) -> str:
-    """Derive a stable env-var NAME for a custom provider's api_key.
+    """Derive a stable, collision-resistant env-var NAME for a custom provider's api_key.
 
     The raw key is written to the secure .env under this name (chmod 0600, never
     printed by ``save_env_value``), and the NAME is stored under
     ``providers.<name>.key_env`` so the runtime resolves the key from the env
     (``runtime_provider.resolve_custom_provider`` reads ``key_env`` →
     ``os.getenv``). Derivation MUST be stable across calls so the POST (set) and
-    DELETE (clear) handlers agree on the same var: uppercase the sanitized name,
-    collapse non-alnum runs to a single underscore, and append ``_API_KEY``.
-    Examples: ``myco`` → ``MYCO_API_KEY``, ``Acme-Local`` → ``ACME_LOCAL_API_KEY``.
+    DELETE (clear) handlers agree on the same var.
+
+    Collision-resistance (ABH-201): names that differ only by separator characters
+    (e.g. ``my-co`` vs ``my_co``) both sanitize to ``MY_CO`` and would share the
+    same env var under a pure sanitize + suffix scheme. We append a 6-hex-char
+    SHA-1 short-hash of the EXACT provider name so each distinct name gets its own
+    slot. The hash is deterministic (stable across restarts, depends only on the
+    name bytes) and human-readable via the sanitized prefix.
+
+    Examples:
+      ``myco``       → ``MYCO_8bad28_API_KEY``
+      ``my-co``      → ``MY_CO_6664ff_API_KEY``
+      ``my_co``      → ``MY_CO_5e9c77_API_KEY``
+      ``Acme-Local`` → ``ACME_LOCAL_adff0c_API_KEY``
     """
     sanitized = _re.sub(r"[^0-9A-Za-z]+", "_", name.strip()).strip("_").upper()
     if not sanitized:
         sanitized = "CUSTOM"
-    return f"{sanitized}_API_KEY"
+    shorthash = hashlib.sha1(name.encode()).hexdigest()[:6]
+    return f"{sanitized}_{shorthash}_API_KEY"
 
 
 def _provider_provider_rows() -> List[Dict[str, Any]]:

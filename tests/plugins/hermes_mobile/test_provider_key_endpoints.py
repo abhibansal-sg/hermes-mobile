@@ -412,12 +412,15 @@ def test_custom_dispatches_set_config(loopback_client, monkeypatch):
     # key_env (the env-var NAME) lands in config.yaml — NOT the raw api_key.
     assert "providers.myco.key_env" in keys
     assert "providers.myco.api_key" not in keys
-    # The env-var NAME is derived from the provider name (MYCO_API_KEY).
+    # The env-var NAME is derived from the provider name (collision-resistant:
+    # MYCO_<shorthash>_API_KEY).
+    import hashlib as _hashlib
+    expected_env_var = "MYCO_" + _hashlib.sha1(b"myco").hexdigest()[:6] + "_API_KEY"
     key_env_call = [v for k, v in calls["set_config"] if k == "providers.myco.key_env"]
-    assert key_env_call == ["MYCO_API_KEY"]
+    assert key_env_call == [expected_env_var]
     # The RAW key value is forwarded ONLY to save_env_value (the secure .env
     # writer, chmod 0600, never printed). It must NEVER touch set_config_value.
-    assert ("MYCO_API_KEY", "sk-custom-1") in calls["save_env"]
+    assert (expected_env_var, "sk-custom-1") in calls["save_env"]
     raw_key_in_config = any(v == "sk-custom-1" for _, v in calls["set_config"])
     assert not raw_key_in_config
     assert "sk-custom-1" not in r.text
@@ -613,8 +616,10 @@ def test_custom_key_never_in_config_or_log_or_response(
     assert r.status_code == 200, r.text
 
     # 1. The raw key was written to the SECURE .env via save_env_value under the
-    #    derived env-var name (MYCO_API_KEY).
-    assert ("MYCO_API_KEY", secret) in calls["save_env"]
+    #    collision-resistant derived env-var name (MYCO_<shorthash>_API_KEY).
+    import hashlib as _hashlib
+    expected_env_myco = "MYCO_" + _hashlib.sha1(b"myco").hexdigest()[:6] + "_API_KEY"
+    assert (expected_env_myco, secret) in calls["save_env"]
 
     # 2. The raw key was NEVER forwarded to set_config_value (which is the leaky
     #    config.yaml path). config.yaml may carry the env-var NAME under key_env
@@ -629,7 +634,7 @@ def test_custom_key_never_in_config_or_log_or_response(
     key_env_vals = [
         v for k, v in calls["set_config"] if k == "providers.myco.key_env"
     ]
-    assert key_env_vals == ["MYCO_API_KEY"]
+    assert key_env_vals == [expected_env_myco]
 
     # 4. The raw key is NOT in the log output (caplog captures the plugin
     #    logger at DEBUG).
@@ -651,8 +656,9 @@ def test_delete_custom_provider_clears_key_everywhere(loopback_client, monkeypat
     _patch_config(monkeypatch)
     cap_clear = _patch_clear_auth(monkeypatch, returns=True)
 
+    import hashlib as _hashlib
     slug = "acme-local"
-    expected_env = "ACME_LOCAL_API_KEY"
+    expected_env = "ACME_LOCAL_" + _hashlib.sha1(b"acme-local").hexdigest()[:6] + "_API_KEY"
 
     r = loopback_client.request(
         "DELETE",
@@ -755,3 +761,101 @@ def test_looks_like_url_rejects_scheme_only_empty_host():
     assert f("https://api.openai.com")
     assert f("http://localhost:8080")
     assert f("https://192.168.1.5/v1")
+
+
+# ===========================================================================
+# ABH-201 — collision-resistance: separator-differing names get distinct vars.
+# ===========================================================================
+
+
+def test_custom_provider_env_var_collision_resistance(loopback_client, monkeypatch):
+    """Regression (ABH-201): two custom provider names that differ ONLY by a
+    separator character (``my-co`` vs ``my_co``) both sanitize to ``MY_CO``
+    under the pure sanitize-and-suffix scheme, so they would share the same env
+    var and the second POST silently overwrites the first provider's key.
+
+    The fix appends a 6-hex-char SHA-1 short-hash of the EXACT name, making
+    the derived var unique per exact name while keeping it human-readable.
+
+    This test:
+    1. POSTs both providers and asserts their keys land in DISTINCT env vars
+       (neither overwrites the other).
+    2. DELETEs one and asserts only ITS env var is removed (the other survives).
+    """
+    import hashlib as _hashlib
+
+    calls = _patch_config(monkeypatch)
+    _patch_inventory(monkeypatch, rows=[])
+    _patch_clear_auth(monkeypatch, returns=False)
+
+    # Expected derived env vars (collision-resistant, hash-disambiguated).
+    env_dash = "MY_CO_" + _hashlib.sha1(b"my-co").hexdigest()[:6] + "_API_KEY"
+    env_under = "MY_CO_" + _hashlib.sha1(b"my_co").hexdigest()[:6] + "_API_KEY"
+
+    # Sanity: the two env vars must be DISTINCT (the whole point of the fix).
+    assert env_dash != env_under, (
+        f"Test pre-condition failed: {env_dash!r} == {env_under!r}; "
+        "SHA-1 collision or wrong hash input"
+    )
+
+    # POST my-co.
+    r1 = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/custom",
+        json={
+            "name": "my-co",
+            "base_url": "https://api.my-co.example/v1",
+            "api_mode": "openai",
+            "api_key": "sk-myco-dash-key",
+        },
+        headers=_TOKEN_HEADER,
+    )
+    assert r1.status_code == 200, r1.text
+
+    # POST my_co.
+    r2 = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/custom",
+        json={
+            "name": "my_co",
+            "base_url": "https://api.my-co.example/v1",
+            "api_mode": "openai",
+            "api_key": "sk-myco-under-key",
+        },
+        headers=_TOKEN_HEADER,
+    )
+    assert r2.status_code == 200, r2.text
+
+    # Both keys must have landed in DIFFERENT env vars.
+    saved_env_vars = {k for k, _ in calls["save_env"]}
+    assert env_dash in saved_env_vars, (
+        f"my-co key not saved under {env_dash!r}; save_env calls: {calls['save_env']}"
+    )
+    assert env_under in saved_env_vars, (
+        f"my_co key not saved under {env_under!r}; save_env calls: {calls['save_env']}"
+    )
+
+    # Verify the key values match what was POSTed (not overwritten).
+    saved_map = dict(calls["save_env"])
+    assert saved_map[env_dash] == "sk-myco-dash-key", (
+        f"my-co key was overwritten: {saved_map[env_dash]!r}"
+    )
+    assert saved_map[env_under] == "sk-myco-under-key", (
+        f"my_co key was overwritten: {saved_map[env_under]!r}"
+    )
+
+    # DELETE my-co: only its env var must be removed; my_co's var must survive.
+    r3 = loopback_client.request(
+        "DELETE",
+        "/api/plugins/hermes-mobile/providers/my-co/key",
+        headers=_TOKEN_HEADER,
+    )
+    assert r3.status_code == 200, r3.text
+    assert r3.json()["disconnected"] is True
+
+    # my-co's env var was removed.
+    assert env_dash in calls["remove_env"], (
+        f"DELETE my-co did not remove {env_dash!r}; remove_env calls: {calls['remove_env']}"
+    )
+    # my_co's env var was NOT touched by the DELETE.
+    assert env_under not in calls["remove_env"], (
+        f"DELETE my-co incorrectly removed {env_under!r} (my_co's var)"
+    )
