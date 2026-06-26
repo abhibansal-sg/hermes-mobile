@@ -1095,3 +1095,333 @@ def test_print_tui_exit_summary_prefers_actual_active_session_file(
     assert seen == ["actual_session"]
     assert "hermes --tui --resume actual_session" in out
     assert "startup_resume" not in out
+
+
+# ---------------------------------------------------------------------------
+# _maybe_attach_tui_to_shared_gateway — config bridge so ``hermes --tui`` can
+# attach to the dashboard's shared gateway via one config key
+# (``gateway.tui_shared_attach``), without editing the stock TS client. The
+# bridge injects ``HERMES_TUI_GATEWAY_URL`` (read by gatewayClient.ts
+# ``resolveGatewayAttachUrl``) so the child attaches instead of spawning its
+# own embedded gateway.
+#
+# Invariants under test:
+#   * additive — unset/false config is a no-op (byte-identical to today)
+#   * never clobbers an already-set ``HERMES_TUI_GATEWAY_URL`` (e.g. the
+#     dashboard's own PTY injection at web_server.py)
+#   * no-op when discovery finds nothing reachable
+#   * never raises into the launch path (all failures swallowed)
+# ---------------------------------------------------------------------------
+
+
+def _fake_mobile_pair(*, url="https://tail.example:443", token="tok123"):
+    """Stand-in for plugins/hermes-mobile/mobile_pair.py discovery. Only the
+    two functions the bridge calls are needed."""
+    return types.SimpleNamespace(
+        _detect_dashboard_url=lambda: url,
+        _read_dashboard_token=lambda: token,
+    )
+
+
+def test_dashboard_url_to_ws_upgrades_https_to_wss(main_mod):
+    assert (
+        main_mod._dashboard_url_to_ws("https://tail.example:443", "tok123")
+        == "wss://tail.example:443/api/ws?token=tok123"
+    )
+
+
+def test_dashboard_url_to_ws_http_to_ws(main_mod):
+    assert (
+        main_mod._dashboard_url_to_ws("http://127.0.0.1:9119", "tok123")
+        == "ws://127.0.0.1:9119/api/ws?token=tok123"
+    )
+
+
+def test_dashboard_url_to_ws_strips_trailing_slash(main_mod):
+    assert (
+        main_mod._dashboard_url_to_ws("https://tail.example/", "t")
+        == "wss://tail.example/api/ws?token=t"
+    )
+
+
+def test_dashboard_url_to_ws_url_encodes_token(main_mod):
+    url = main_mod._dashboard_url_to_ws("http://h", "a b&c")
+    assert url is not None
+    assert "token=a+b%26c" in url
+
+
+def test_dashboard_url_to_ws_rejects_unparseable(main_mod):
+    assert main_mod._dashboard_url_to_ws("not a url", "t") is None
+    assert main_mod._dashboard_url_to_ws("", "t") is None
+
+
+def test_dashboard_url_to_ws_rejects_non_http_schemes(main_mod):
+    assert main_mod._dashboard_url_to_ws("ftp://tail.example", "t") is None
+    assert main_mod._dashboard_url_to_ws("ws://tail.example", "t") is None
+
+
+def test_shared_attach_swallows_mobile_pair_loader_exception(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    config_path.write_text("gateway:\n  tui_shared_attach: true\n", encoding="utf-8")
+
+    def boom():
+        raise RuntimeError("plugin import exploded")
+
+    monkeypatch.setattr(main_mod, "_load_mobile_pair_module", boom)
+    env = {}
+    main_mod._maybe_attach_tui_to_shared_gateway(env)
+    assert "HERMES_TUI_GATEWAY_URL" not in env
+
+
+def test_shared_attach_noop_when_dashboard_target_not_verified(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    config_path.write_text("gateway:\n  tui_shared_attach: true\n", encoding="utf-8")
+    monkeypatch.setattr(main_mod, "_load_mobile_pair_module", lambda: _fake_mobile_pair())
+    monkeypatch.setattr(
+        main_mod,
+        "_verify_tui_shared_attach_target",
+        lambda base, token: False,
+    )
+    env = {}
+    main_mod._maybe_attach_tui_to_shared_gateway(env)
+    assert "HERMES_TUI_GATEWAY_URL" not in env
+
+
+def test_shared_attach_verification_requires_matching_hermes_home(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    status = {
+        "version": "test",
+        "hermes_home": "/tmp/some-other-profile",
+        "auth_required": False,
+    }
+    calls = []
+
+    def fake_fetch(url, *, token=None, timeout=1.0):
+        calls.append((url, token, timeout))
+        return status
+
+    monkeypatch.setattr(main_mod, "_fetch_dashboard_json", fake_fetch)
+
+    assert main_mod._verify_tui_shared_attach_target("https://tail.example", "tok") is False
+    assert calls == [("https://tail.example/api/status", None, 1.0)]
+
+
+def test_shared_attach_verification_rejects_oauth_gated_dashboard(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    status = {
+        "version": "test",
+        "hermes_home": os.environ["HERMES_HOME"],
+        "auth_required": True,
+    }
+    calls = []
+
+    def fake_fetch(url, *, token=None, timeout=1.0):
+        calls.append((url, token, timeout))
+        return status
+
+    monkeypatch.setattr(main_mod, "_fetch_dashboard_json", fake_fetch)
+
+    assert main_mod._verify_tui_shared_attach_target("https://tail.example", "tok") is False
+    assert calls == [("https://tail.example/api/status", None, 1.0)]
+
+
+def test_shared_attach_verification_checks_token_after_public_status_matches(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    status = {
+        "version": "test",
+        "hermes_home": os.environ["HERMES_HOME"],
+        "auth_required": False,
+    }
+    stats = {"platform": "Darwin"}
+    calls = []
+
+    def fake_fetch(url, *, token=None, timeout=1.0):
+        calls.append((url, token, timeout))
+        return stats if token else status
+
+    monkeypatch.setattr(main_mod, "_fetch_dashboard_json", fake_fetch)
+
+    assert main_mod._verify_tui_shared_attach_target("https://tail.example/", "tok") is True
+    assert calls == [
+        ("https://tail.example/api/status", None, 1.0),
+        ("https://tail.example/api/system/stats", "tok", 1.0),
+    ]
+
+
+def test_shared_attach_never_clobbers_existing_env(monkeypatch, main_mod):
+    """The dashboard's own PTY injection sets HERMES_TUI_GATEWAY_URL; the
+    config bridge must NEVER overwrite it, even when tui_shared_attach is on
+    and discovery resolves. This is the load-bearing constraint."""
+    monkeypatch.setattr(main_mod, "_load_mobile_pair_module", lambda: _fake_mobile_pair())
+    env = {"HERMES_TUI_GATEWAY_URL": "ws://dashboard-injected/api/ws?token=x"}
+    main_mod._maybe_attach_tui_to_shared_gateway(env)
+    assert env["HERMES_TUI_GATEWAY_URL"] == "ws://dashboard-injected/api/ws?token=x"
+
+
+def test_shared_attach_noop_when_disabled_by_default(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    """Default config (tui_shared_attach unset/false) must be byte-identical
+    to today: no injection even when discovery WOULD resolve.
+
+    Use isolated HERMES_HOME so the assertion cannot be affected by a user's
+    real config enabling the option.
+    """
+    monkeypatch.setattr(main_mod, "_load_mobile_pair_module", lambda: _fake_mobile_pair())
+    env = {}
+    main_mod._maybe_attach_tui_to_shared_gateway(env)
+    assert "HERMES_TUI_GATEWAY_URL" not in env
+
+
+def test_shared_attach_injects_when_enabled_and_discovery_resolves(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    config_path.write_text("gateway:\n  tui_shared_attach: true\n", encoding="utf-8")
+    monkeypatch.setattr(
+        main_mod,
+        "_load_mobile_pair_module",
+        lambda: _fake_mobile_pair(url="https://tail.example", token="sek ret"),
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "_verify_tui_shared_attach_target",
+        lambda base, token: True,
+    )
+    env = {}
+    main_mod._maybe_attach_tui_to_shared_gateway(env)
+    assert env["HERMES_TUI_GATEWAY_URL"] == "wss://tail.example/api/ws?token=sek+ret"
+
+
+def test_shared_attach_noop_when_discovery_finds_no_url(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    config_path.write_text("gateway:\n  tui_shared_attach: true\n", encoding="utf-8")
+    monkeypatch.setattr(
+        main_mod,
+        "_load_mobile_pair_module",
+        lambda: _fake_mobile_pair(url=None, token="tok"),
+    )
+    env = {}
+    main_mod._maybe_attach_tui_to_shared_gateway(env)
+    assert "HERMES_TUI_GATEWAY_URL" not in env
+
+
+def test_shared_attach_noop_when_token_missing(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    config_path.write_text("gateway:\n  tui_shared_attach: true\n", encoding="utf-8")
+    monkeypatch.setattr(
+        main_mod,
+        "_load_mobile_pair_module",
+        lambda: _fake_mobile_pair(url="https://tail.example", token=None),
+    )
+    env = {}
+    main_mod._maybe_attach_tui_to_shared_gateway(env)
+    assert "HERMES_TUI_GATEWAY_URL" not in env
+
+
+def test_shared_attach_noop_when_module_unavailable(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    config_path.write_text("gateway:\n  tui_shared_attach: true\n", encoding="utf-8")
+    monkeypatch.setattr(main_mod, "_load_mobile_pair_module", lambda: None)
+    env = {}
+    main_mod._maybe_attach_tui_to_shared_gateway(env)
+    assert "HERMES_TUI_GATEWAY_URL" not in env
+
+
+def test_shared_attach_swallows_discovery_exception(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    config_path.write_text("gateway:\n  tui_shared_attach: true\n", encoding="utf-8")
+
+    def boom():
+        raise RuntimeError("tailscale binary exploded")
+
+    monkeypatch.setattr(
+        main_mod,
+        "_load_mobile_pair_module",
+        lambda: types.SimpleNamespace(
+            _detect_dashboard_url=boom, _read_dashboard_token=lambda: "t"
+        ),
+    )
+    env = {}
+    # Must not raise into the launch path.
+    main_mod._maybe_attach_tui_to_shared_gateway(env)
+    assert "HERMES_TUI_GATEWAY_URL" not in env
+
+
+def test_launch_tui_shared_attach_wires_into_child_env(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    """End-to-end: with tui_shared_attach enabled, the spawned TUI child
+    receives HERMES_TUI_GATEWAY_URL so the stock gatewayClient.ts attaches
+    to the shared dashboard gateway instead of spawning its own."""
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    config_path.write_text("gateway:\n  tui_shared_attach: true\n", encoding="utf-8")
+    monkeypatch.setattr(
+        main_mod,
+        "_load_mobile_pair_module",
+        lambda: _fake_mobile_pair(url="https://tail.example", token="tok"),
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "_verify_tui_shared_attach_target",
+        lambda base, token: True,
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    captured = {}
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert captured["env"]["HERMES_TUI_GATEWAY_URL"] == "wss://tail.example/api/ws?token=tok"
+
+
+def test_launch_tui_shared_attach_off_leaves_env_clean(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    """Default (off): the child env has no HERMES_TUI_GATEWAY_URL even when
+    discovery would resolve — proving the feature is truly additive.
+
+    Use isolated HERMES_HOME so the assertion cannot be affected by a user's
+    real config enabling the option.
+    """
+    monkeypatch.setattr(main_mod, "_load_mobile_pair_module", lambda: _fake_mobile_pair())
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    captured = {}
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert "HERMES_TUI_GATEWAY_URL" not in captured["env"]
