@@ -4,12 +4,15 @@ Status: foundation design, not yet enabled.
 
 This document defines the long-term architecture for autonomous development on
 Hermes Mobile. It supersedes the earlier “one loop per lifecycle stage” mental
-model with the design Abhi settled on in-session: **feature-sliced autonomous
-loops**.
+model with the design Abhi settled on in-session: **Linear-planned,
+feature-sliced autonomous loops**.
 
-The core idea: an approved idea is decomposed into small, safe feature slices.
-Each slice can run end-to-end — spec → build → verify → review → PR — in its
-own worktree. Multiple slices run in parallel only when their module/file
+The core idea: **Linear is the product/source-of-truth layer; Kanban is the
+execution layer.** We plan build-wise waves in Linear, with each wave describing
+the features/fixes intended for a build. Only when a Linear issue/slice is
+approved to start does it get promoted into Hermes Kanban for execution. Once in
+Kanban, each slice can run end-to-end — spec → build → verify → review → PR — in
+its own worktree. Multiple slices run in parallel only when their module/file
 boundaries do not collide.
 
 ## Non-negotiables
@@ -31,7 +34,9 @@ boundaries do not collide.
 
 Production Hermes gateway:
 
-- owns Kanban dispatch,
+- reads Linear as the roadmap/wave source of truth,
+- promotes approved Linear work into Kanban,
+- owns Kanban dispatch for active execution,
 - owns profiles,
 - owns Linear/GitHub orchestration,
 - drives external coding CLIs in worktrees,
@@ -123,14 +128,48 @@ profiles.
 - Model: GLM-5.2
 - Job: independent adversarial review from a different provider/model family.
 
-## Card lifecycle
+## Linear ↔ Kanban lifecycle
+
+Linear is the durable project-management system:
+
+- Linear Project = product/build track, e.g. “Hermes Mobile”.
+- Linear Cycle or custom wave label = build wave, e.g. “Build 18”.
+- Linear Issues = features/fixes/bugs that may eventually become execution
+  slices.
+- Linear status/labels own planning state: proposed, scoped, approved for wave,
+  ready for execution, in progress, done.
+
+Hermes Kanban is the short-lived execution board:
+
+- Kanban cards are created only for work that is about to start or is actively
+  being decomposed for start.
+- Kanban carries execution state: assigned worker, worktree, run evidence,
+  verifier/reviewer handoffs, and stop conditions.
+- Kanban cards must reference their Linear issue identifiers and post evidence
+  back to Linear.
+- Closed/archived Kanban cards do not replace Linear history; Linear remains the
+  durable record.
+
+Promotion rule:
 
 ```text
-Scout proposal / user idea
-  ↓ user approves
-Architect creates build plan and slice cards
-  ↓ user approves decomposition
-Orchestrator routes ready slices to engineer profiles
+Linear wave issue approved for execution
+  ↓
+Orchestrator/Abhi promotes it to Kanban as an unassigned gate card
+  ↓ explicit approval to run
+Kanban card gets an assignee/profile and may dispatch
+```
+
+## Execution lifecycle
+
+```text
+Linear wave / issue / user idea
+  ↓ user approves scope for the build wave
+Architect creates build plan and execution slices linked to Linear issues
+  ↓ user approves decomposition and promotion to execution
+Orchestrator creates unassigned Kanban gate cards for approved slices
+  ↓ user approves assignment/profile
+Kanban routes ready slices to engineer profiles
   ↓
 Engineer drives external CLI in isolated worktree
   ↓ PR + evidence
@@ -201,7 +240,8 @@ Operational rule:
   `unassigned -> assign/promote -> dispatcher may run`.
 
 This preserves stock behavior and gives us reliable human gates without carrying
-a local Kanban patch.
+a local Kanban patch. Planning gates should normally live in Linear; Kanban gates
+exist only when work is being promoted into execution.
 
 ## Trust ladder
 
@@ -230,11 +270,14 @@ No rung is skipped.
 
 ## Immediate next build tasks
 
-1. Add `.hermes/PROJECT.yaml` to define project-specific routing.
-2. Create Hermes profiles with clear descriptions.
-3. Create/verify coding-lane skills:
+1. Define the Linear wave schema for Hermes Mobile builds: project/cycle/labels,
+   issue templates, and the “approved for execution” transition.
+2. Add Linear identifiers/wave metadata to `docs/autonomous/PROJECT.yaml`.
+3. Create Hermes profiles with clear descriptions.
+4. Create/verify coding-lane skills:
    - existing: `glm-opencode-coding-lane`,
    - needed: `claude-code-coding-lane`,
    - needed: `codex-coding-lane`.
-4. Create a Kanban proof card for one small slice in shadow mode.
-5. Run the first true Kanban-dispatched profile manually and evaluate.
+5. Create one Linear build wave and one approved issue, then promote that issue
+   into a Kanban proof card in shadow mode.
+6. Run the first true Kanban-dispatched profile manually and evaluate.

@@ -11,6 +11,30 @@ project:
   github_repo: ab0991-oss/hermes-mobile
   linear_team_key: ABH
 
+planning:
+  source_of_truth: linear
+  execution_board: hermes-kanban
+  linear_project: Hermes Mobile
+  wave_model: >-
+    Build-wise waves live in Linear. Each wave defines the features and fixes
+    intended for a specific build. Kanban is created only when a Linear issue is
+    approved to start execution.
+  linear_issue_requirements:
+    - build wave / cycle or wave label
+    - feature or fix scope
+    - user-facing acceptance criteria
+    - module area label
+    - explicit approved-for-execution signal before Kanban promotion
+  kanban_promotion:
+    rule: >-
+      Promote a Linear issue/slice into Hermes Kanban only when work is actually
+      starting. The initial Kanban card remains unassigned until Abhi approves
+      the execution profile/assignee.
+    required_backlinks:
+      - Linear issue identifier and URL on the Kanban card
+      - Kanban card id/comment on the Linear issue
+      - PR URL/evidence posted back to Linear when available
+
 runtime:
   production_hermes: /Users/abbhinnav/.hermes
   dev_gateway_home: /Users/abbhinnav/Developer/products/hermes-mobile/.hermes-dev
