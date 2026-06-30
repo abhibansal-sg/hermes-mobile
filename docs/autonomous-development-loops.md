@@ -7,13 +7,59 @@ Hermes Mobile. It supersedes the earlier “one loop per lifecycle stage” ment
 model with the design Abhi settled on in-session: **Linear-planned,
 feature-sliced autonomous loops**.
 
-The core idea: **Linear is the product/source-of-truth layer; Kanban is the
-execution layer.** We plan build-wise waves in Linear, with each wave describing
-the features/fixes intended for a build. Only when a Linear issue/slice is
-approved to start does it get promoted into Hermes Kanban for execution. Once in
-Kanban, each slice can run end-to-end — spec → build → verify → review → PR — in
-its own worktree. Multiple slices run in parallel only when their module/file
-boundaries do not collide.
+The core idea: **Linear is the product/source-of-truth layer; built-in Hermes
+Kanban is the execution layer.** We plan build-wise waves in Linear, with each
+wave describing the features/fixes intended for a build. Only when a Linear
+issue/slice is approved to start does it get promoted into Hermes Kanban for
+execution. Once in Kanban, each slice can run end-to-end — spec → build → verify
+→ review → PR — in its own worktree. Multiple slices run in parallel only when
+their module/file boundaries do not collide.
+
+## Built-in Kanban substrate
+
+Do **not** reinvent the dispatcher/orchestration layer. Hermes already provides
+the durable substrate we need:
+
+- dashboard Triage cards for raw ideas,
+- `hermes kanban specify` to turn one-liners into executable specs,
+- `hermes kanban decompose` to create a dependency graph of child cards routed
+  by profile descriptions,
+- gateway-embedded dispatch (`kanban.dispatch_in_gateway`) to spawn profile
+  workers,
+- worker `kanban_*` tools for comments, blocks, completion, heartbeats, and
+  follow-up card creation,
+- dependency promotion, run logs, retries, crash/stale-claim recovery,
+  diagnostics, attachments, and dashboard visibility.
+
+The Hermes Mobile layer adds policy on top of that substrate: Linear approval,
+profile contracts, model/fallback rules, provider-diverse review, verifier
+evidence, and Abhi-owned merge/release gates.
+
+Current conservative policy:
+
+```yaml
+kanban:
+  dispatch_in_gateway: true
+  auto_decompose: false          # manual until the decomposer proves itself
+  auto_decompose_per_tick: 1
+  auto_promote_children: false   # inspect generated graphs before dispatch
+  orchestrator_profile: orchestrator
+  default_assignee: architect
+```
+
+Manual intake flow while on the trust ladder:
+
+```text
+Linear-approved issue or dashboard raw idea
+  ↓
+Kanban Triage card
+  ↓ manual `hermes kanban decompose <task_id>`
+Generated child graph inspected by architect/orchestrator/Abhi
+  ↓
+Execution cards assigned deliberately to specialist profiles
+  ↓
+Built-in dispatcher spawns the profile workers
+```
 
 ## Non-negotiables
 

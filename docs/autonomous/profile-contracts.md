@@ -37,6 +37,37 @@ improvise.
 8. **All autonomous writes are project-scoped.** Worktrees live under
    `~/Developer/worktrees`; the permanent checkout lives under
    `~/Developer/products/hermes-mobile`.
+9. **Use built-in Kanban mechanics before adding custom orchestration.** Triage,
+   specify, decompose, dependency links, dispatcher spawning, logs, retries,
+   attachments, and dashboard state are Hermes Kanban responsibilities. Profiles
+   add role judgment and policy; they do not replace the Kanban state machine.
+
+## Built-in Kanban responsibilities vs. profile responsibilities
+
+Hermes Kanban already owns the mechanics:
+
+- `triage` cards for raw ideas,
+- `specify` for single-card spec tightening,
+- `decompose` for child-card graphs routed by profile descriptions,
+- parent/child dependency promotion,
+- gateway dispatcher spawning profiles,
+- `kanban_*` worker tools, comments, blocks, completion, heartbeats,
+- worker logs, run history, retries, stale-claim/crash recovery,
+- dashboard state and attachments.
+
+The profiles in this document own policy and judgment:
+
+- when Linear work is approved for execution,
+- which profile/model is appropriate,
+- whether a generated decomposition is safe,
+- which reviewer carries provider-diversity authority,
+- whether evidence is sufficient,
+- when to escalate to an unassigned human gate.
+
+Current live-policy default is manual decomposition: `kanban.auto_decompose=false`
+until the decomposer has passed at least one architect-quality proof on Hermes
+Mobile. Raw Triage cards must not silently become assigned execution work during
+this trust-ladder phase.
 
 ## Profile roster summary
 

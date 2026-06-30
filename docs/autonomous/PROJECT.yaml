@@ -42,6 +42,24 @@ planning:
       - Kanban card id/comment on the Linear issue
       - PR URL/evidence posted back to Linear when available
 
+  kanban_substrate:
+    rule: >-
+      Use Hermes' built-in Kanban triage/specify/decompose/dispatcher machinery
+      as the execution substrate. Do not build a parallel custom dispatcher unless
+      a missing built-in capability is explicitly identified and reviewed.
+    live_config_policy:
+      dispatch_in_gateway: true
+      auto_decompose: false
+      auto_decompose_per_tick: 1
+      auto_promote_children: false
+      orchestrator_profile: orchestrator
+      default_assignee: architect
+    rationale: >-
+      Dashboard Triage cards are useful for raw ideas, but automatic
+      decomposition is disabled while the fleet is on the trust ladder. Run
+      `hermes kanban decompose <task_id>` manually after Linear/Abhi approval,
+      inspect the generated graph, then assign execution cards deliberately.
+
 runtime:
   production_hermes: /Users/abbhinnav/.hermes
   dev_gateway_home: /Users/abbhinnav/Developer/products/hermes-mobile/.hermes-dev
