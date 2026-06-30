@@ -23,24 +23,136 @@ planning:
     Build-wise waves live in Linear. Each wave defines the features and fixes
     intended for a specific build. Kanban is created only when a Linear issue is
     approved to start execution.
+  workflow_states:
+    backlog:
+      name: Backlog
+      type: backlog
+      id: d9e0bb16-307e-41e9-9106-c652bc05e69d
+    todo:
+      name: Todo
+      type: unstarted
+      id: dbfa1e34-5319-40b8-adc3-472b92cbbdf8
+    in_progress:
+      name: In Progress
+      type: started
+      id: 9ac741b8-f77a-4776-8914-745e9abfc4c4
+    in_review:
+      name: In Review
+      type: started
+      id: 9a3d33dd-61d9-42c5-9245-4aea1efb82fa
+    done:
+      name: Done
+      type: completed
+      id: f74b6f75-1ce5-4714-b1ef-0c991dc6813f
+    canceled:
+      name: Canceled
+      type: canceled
+      id: c38edaa8-55d0-4aa9-8659-85a31c19a4f4
+
+  taxonomy:
+    wave_labels:
+      active: wave:build-53
+      pattern: wave:build-N
+      rule: >-
+        Every execution candidate must carry exactly one active wave label. Before
+        changing the active wave, verify App Store Connect/TestFlight or the
+        relevant release source so stale build labels are not reused.
+    status_labels:
+      approved_for_execution: status:approved-for-execution
+    loop_labels:
+      promoted_to_kanban: loop:promoted-to-kanban
+      blocked_human: loop:blocked-human
+      verified: loop:verified
+    area_labels:
+      - area:ios
+      - area:server
+      - area:desktop
+      - area:infra
+    lane_labels:
+      - lane:claude
+      - lane:glm
+      - lane:codex
+    type_labels:
+      - type:feature
+      - type:fix
+      - type:polish
+      - type:backfill
+
   active_execution_labels:
     - status:approved-for-execution
     - wave:build-53
+
   linear_issue_requirements:
-    - build wave / cycle or wave label
-    - feature or fix scope
-    - user-facing acceptance criteria
-    - module area label
-    - explicit approved-for-execution signal before Kanban promotion
+    required_before_promotion:
+      - canonical project: Hermes Mobile — Engineering
+      - exactly one active wave label, currently wave:build-53
+      - status:approved-for-execution label
+      - at least one area label
+      - at least one type label
+      - clear user-facing acceptance criteria
+      - concrete evidence requirements for verifier/reviewer
+      - affected module/path or explicit discovery task
+      - forbidden irreversible actions stated when relevant
+    optional_routing_hints:
+      - lane:claude for Claude Code / Anthropic engineer lane
+      - lane:glm for OpenCode / GLM engineer lane
+      - lane:codex for Codex fallback or OpenAI lane
+    blocks_promotion_when_present:
+      - loop:blocked-human
+
+  issue_template:
+    sections:
+      - Goal
+      - Acceptance Criteria
+      - Evidence Required
+      - Scope / Paths
+      - Risks / Forbidden Actions
+      - Suggested Lane / Profile
+      - Kanban Handoff
+    kanban_handoff_placeholder: >-
+      Kanban: not promoted yet. When promoted, add board name, card id, child
+      graph if decomposed, assigned profile(s), PR URL, and verification/review
+      evidence links.
+
   kanban_promotion:
     rule: >-
       Promote a Linear issue/slice into Hermes Kanban only when work is actually
-      starting. The initial Kanban card remains unassigned until Abhi approves
-      the execution profile/assignee.
+      starting. Promotion creates a Kanban Triage/unassigned gate first; child
+      execution cards remain unassigned until Abhi or the orchestrator explicitly
+      approves the graph and profile assignment.
+    input_query: >-
+      project = Hermes Mobile — Engineering AND label contains
+      status:approved-for-execution AND label contains wave:build-53 AND state
+      is not Done/Canceled AND label does not contain loop:blocked-human.
+    initial_card:
+      board: hermes-mobile
+      status: triage
+      assignee: null
+      title_format: "{LINEAR_ID}: {Linear title}"
+      required_body_fields:
+        - Linear identifier and URL
+        - Build wave label
+        - Linear state and labels
+        - Acceptance criteria
+        - Affected module/area/path
+        - Required evidence
+        - Suggested lane/profile, if any
+        - Next card on success/failure
+        - Irreversible actions forbidden without Abhi approval
+    decompose_step: >-
+      Run `hermes kanban decompose <task_id>` manually while
+      kanban.auto_decompose=false. Inspect the generated graph before assigning
+      any child execution card.
     required_backlinks:
-      - Linear issue identifier and URL on the Kanban card
+      - Linear issue identifier and URL on every Kanban card
       - Kanban card id/comment on the Linear issue
+      - loop:promoted-to-kanban label after a card exists
       - PR URL/evidence posted back to Linear when available
+    state_updates:
+      on_promotion: In Progress
+      on_pr_open_or_review_gate: In Review
+      on_merge_and_verified: Done
+      on_human_block: keep current state and add loop:blocked-human
 
   kanban_substrate:
     rule: >-

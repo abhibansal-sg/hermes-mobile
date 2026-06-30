@@ -185,15 +185,18 @@ profiles.
 
 Linear is the durable project-management system:
 
-- Linear Project = product/build track, e.g. “Hermes Mobile”.
-- Linear Cycle or custom wave label = build wave, e.g. “Build 18”.
+- Canonical team: `ABH`.
+- Canonical project: `Hermes Mobile — Engineering`
+  (`020087b9-2942-458d-98fa-85649bd8edc3`).
+- Workflow states: `Backlog`, `Todo`, `In Progress`, `In Review`, `Done`,
+  `Canceled`.
 - Linear Issues = features/fixes/bugs that may eventually become execution
   slices.
-- Linear status/labels own planning state: proposed, scoped, approved for wave,
-  ready for execution, in progress, done.
+- Linear labels own wave, area, type, lane, and planning/execution status.
 
 Hermes Kanban is the short-lived execution board:
 
+- Board: `hermes-mobile`.
 - Kanban cards are created only for work that is about to start or is actively
   being decomposed for start.
 - Kanban carries execution state: assigned worker, worktree, run evidence,
@@ -203,15 +206,56 @@ Hermes Kanban is the short-lived execution board:
 - Closed/archived Kanban cards do not replace Linear history; Linear remains the
   durable record.
 
-Promotion rule:
+### Linear taxonomy
+
+Current live taxonomy for execution candidates:
+
+- Wave: `wave:build-53` (`wave:build-N` pattern for future waves).
+- Status: `status:approved-for-execution`.
+- Loop: `loop:promoted-to-kanban`, `loop:blocked-human`, `loop:verified`.
+- Area: `area:ios`, `area:server`, `area:desktop`, `area:infra`.
+- Lane: `lane:claude`, `lane:glm`, `lane:codex`.
+- Type: `type:feature`, `type:fix`, `type:polish`, `type:backfill`.
+
+Promotion eligibility:
 
 ```text
-Linear wave issue approved for execution
-  ↓
-Orchestrator/Abhi promotes it to Kanban as an unassigned gate card
-  ↓ explicit approval to run
-Kanban card gets an assignee/profile and may dispatch
+project = Hermes Mobile — Engineering
+state not in Done/Canceled
+label includes current wave, e.g. wave:build-53
+label includes status:approved-for-execution
+label includes at least one area:* and one type:*
+label does not include loop:blocked-human
+acceptance criteria + evidence requirements are clear
 ```
+
+### Promotion rule
+
+```text
+Eligible Linear issue
+  ↓
+Create Kanban Triage/unassigned gate card with Linear URL + criteria + evidence
+  ↓
+Comment back on Linear with Kanban card id and add loop:promoted-to-kanban
+  ↓
+Manual `hermes kanban decompose <task_id>` while auto_decompose=false
+  ↓
+Architect/orchestrator/Abhi inspect generated child graph
+  ↓ explicit approval to run
+Assign child execution cards to profiles; built-in dispatcher spawns workers
+```
+
+Kanban card bodies must include: Linear identifier/URL, wave, state/labels,
+acceptance criteria, affected module/path, required evidence, suggested
+lane/profile, next card on success/failure, and irreversible actions forbidden
+without Abhi approval.
+
+Linear state updates:
+
+- Promotion/start: move to `In Progress`.
+- PR open or explicit review gate: move to `In Review`.
+- Merge + verifier/reviewer evidence posted: move to `Done`.
+- Human block: keep current state and add `loop:blocked-human`.
 
 ## Execution lifecycle
 
