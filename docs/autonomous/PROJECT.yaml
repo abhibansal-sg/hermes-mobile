@@ -1,0 +1,143 @@
+# Hermes project manifest for autonomous development loops.
+# This file is intentionally project-specific. The profile architecture is portable;
+# these commands/module boundaries are not.
+
+project:
+  name: hermes-mobile
+  permanent_root: /Users/abbhinnav/Developer/products/hermes-mobile
+  worktree_root: /Users/abbhinnav/Developer/worktrees
+  base_branch: environment-and-workflows-overview
+  github_remote: origin
+  github_repo: ab0991-oss/hermes-mobile
+  linear_team_key: ABH
+
+runtime:
+  production_hermes: /Users/abbhinnav/.hermes
+  dev_gateway_home: /Users/abbhinnav/Developer/products/hermes-mobile/.hermes-dev
+  dev_gateway_port: 9200
+  dev_gateway_launchd_label: ai.hermes.dev-gateway
+  note: >-
+    Production Hermes owns Kanban/orchestration. The dev gateway is a test target
+    for the iOS app and verifier smoke tests, not the loop controller.
+
+modules:
+  ios_app:
+    paths:
+      - apps/ios/
+    default_engineer: iossonnet
+    complex_engineer: engopus
+    reviewer_required: true
+    notes: >-
+      Swift/iOS app work. Mechanical UI/state changes can go to Sonnet. Complex
+      concurrency, persistence, auth, or cross-cutting session logic goes to Opus.
+
+  hermes_mobile_plugin:
+    paths:
+      - plugins/hermes-mobile/
+    default_engineer: pythonglm
+    complex_engineer: engopus
+    reviewer_required: true
+    notes: >-
+      Python plugin code for mobile pairing, APNs, devices, dashboard routes,
+      broadcast fan-out, approvals, attachment upload, and transcript sync.
+
+  dev_gateway:
+    paths:
+      - tui_gateway/
+      - scripts/dev-gateway.sh
+    default_engineer: engopus
+    stock_core: true
+    autonomous_edits: blocked
+    notes: >-
+      Live dev gateway path is sensitive. Autonomous agents may analyze and propose,
+      but edits require explicit human approval because this can break the phone.
+
+  hermes_cli_core:
+    paths:
+      - hermes_cli/
+      - gateway/
+      - hermes_state.py
+      - run_agent.py
+      - model_tools.py
+    default_engineer: engopus
+    stock_core: true
+    autonomous_edits: blocked
+    notes: >-
+      Stock Hermes core. Prefer plugin/skill/config extensions. Autonomous edits
+      require human approval and upstream-safety review.
+
+  docs_and_governance:
+    paths:
+      - docs/
+      - .hermes/
+      - .claude/loops/
+    default_engineer: pythonglm
+    autonomous_edits: allowed
+    notes: >-
+      Design docs, project manifest, loop governance, and local-only operating docs.
+
+commands:
+  python_targeted_tests: scripts/run_tests.sh {path} -- -q
+  hermes_cli_tests: scripts/run_tests.sh tests/hermes_cli -- -q
+  changed_py_lint: ruff check {changed_files}
+  py_compile: python3 -m py_compile {changed_py_files}
+  ios_build: scripts/ios-build.sh
+  git_status: git status --short --branch
+
+verification:
+  default_evidence:
+    - git diff/stat
+    - exact test command and exit code
+    - changed files list
+    - PR URL when opened
+  ios_evidence:
+    - ios build/test output
+    - simulator screenshot when UI-visible
+    - dev gateway health when connectivity-related
+  dev_gateway_health:
+    port: 9200
+    expected_home: /Users/abbhinnav/Developer/products/hermes-mobile/.hermes-dev
+
+external_coding_lanes:
+  glm_opencode:
+    profile: pythonglm
+    model: zai-coding-plan/glm-5.2
+    command_pattern: env -u SSL_CERT_FILE opencode run -m zai-coding-plan/glm-5.2 "$(cat PROMPT_FILE)"
+    notes: >-
+      Proven on ABH-185. Hermes environment sets SSL_CERT_FILE in a way that breaks
+      GLM-5.2 streaming; always unset it for OpenCode.
+
+  claude_code:
+    profiles:
+      - iossonnet
+      - engopus
+    status: needs_skill
+    notes: >-
+      Need a claude-code-coding-lane skill mirroring the GLM lane: worktree,
+      prompt staging, process monitoring, diff/test collection, PR evidence.
+
+  codex:
+    profile: engcodex
+    status: needs_skill
+    notes: >-
+      Fallback/alternate build lane, not the primary path.
+
+human_gates:
+  never_autonomous:
+    - merge to base/shared branch
+    - TestFlight upload or release
+    - force-push or destructive git operations
+    - pushing to upstream NousResearch
+    - stock-core edits without explicit approval
+    - device-only repro requiring Abhi's iPhone
+    - direction forks not covered by the spec
+
+labels:
+  area:
+    ios: area:ios
+    server: area:server
+  loop:
+    shadow: loop:shadow
+    verified: loop:verified
+    approved: loop:approved
+    blocked: blocked:needs-human
