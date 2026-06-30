@@ -123,10 +123,16 @@ profiles.
 - Model: Opus 4.8
 - Job: adversarial correctness, architecture, security/performance review.
 
+### reviewer-codex
+
+- Model: GPT-5.5 / Codex
+- Job: independent adversarial review from a different provider/model family.
+- Default second reviewer paired with `reviewer-opus` / `reviewopus`.
+
 ### reviewer-glm
 
 - Model: GLM-5.2
-- Job: independent adversarial review from a different provider/model family.
+- Job: backup adversarial reviewer when Codex is unavailable or when Abhi explicitly wants a GLM cross-check.
 
 ## Linear ↔ Kanban lifecycle
 
@@ -175,7 +181,7 @@ Engineer drives external CLI in isolated worktree
   ↓ PR + evidence
 Verifier runs hard evidence checks
   ↓
-Reviewer Opus + Reviewer GLM run in parallel
+Reviewer Opus + Reviewer Codex run in parallel
   ↓
 Orchestrator reconciles:
   - both approve → escalate to Abhi for merge
