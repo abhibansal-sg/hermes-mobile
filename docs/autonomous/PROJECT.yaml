@@ -10,6 +10,7 @@ project:
   github_remote: origin
   github_repo: ab0991-oss/hermes-mobile
   linear_team_key: ABH
+  profile_contracts: docs/autonomous/profile-contracts.md
 
 planning:
   source_of_truth: linear

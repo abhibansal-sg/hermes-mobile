@@ -22,8 +22,9 @@ boundaries do not collide.
 2. **Coding happens in dedicated coding CLIs.** Engineer profiles drive Claude
    Code, OpenCode, or Codex. Hermes profiles do not write production code
    directly with raw file tools except for tiny scaffolding/metadata tasks.
-3. **Builder and reviewer should be different providers.** Model diversity is a
-   quality feature; same-provider self-review is weaker.
+3. **At least one verdict-carrying reviewer must be a different provider than
+   the builder.** Model diversity is a quality feature; same-provider-only
+   approval is not allowed unless Abhi explicitly waives the conflict for that PR.
 4. **The user owns the 5%.** Merge, TestFlight, force-push/destructive actions,
    stock-core edits, device-only repro, and direction forks remain human-gated.
 5. **No green without evidence.** A stage cannot advance on self-report; it
@@ -69,7 +70,7 @@ Dev Hermes gateway (`:9200`, `.hermes-dev`):
 - Job:
   - propose product ideas/features/bug-investigation leads,
   - ground proposals in codebase/product context,
-  - create triage cards only.
+  - create Linear proposals or draft issues only; no Kanban/triage cards.
 - Human gate: Abhi approves/rejects proposals before architecture begins.
 
 ### architect
@@ -182,6 +183,7 @@ Engineer drives external CLI in isolated worktree
 Verifier runs hard evidence checks
   ↓
 Reviewer Opus + Reviewer Codex run in parallel
+  (see docs/autonomous/profile-contracts.md for which reviewer carries the binding diversity verdict by builder)
   ↓
 Orchestrator reconciles:
   - both approve → escalate to Abhi for merge
@@ -276,14 +278,17 @@ No rung is skipped.
 
 ## Immediate next build tasks
 
-1. Define the Linear wave schema for Hermes Mobile builds: project/cycle/labels,
+1. Maintain the profile contracts in `docs/autonomous/profile-contracts.md` as
+   the source of truth for model assignment, fallback, profile boundaries, and
+   loop contracts.
+2. Define the Linear wave schema for Hermes Mobile builds: project/cycle/labels,
    issue templates, and the “approved for execution” transition.
-2. Add Linear identifiers/wave metadata to `docs/autonomous/PROJECT.yaml`.
-3. Create Hermes profiles with clear descriptions.
-4. Create/verify coding-lane skills:
+3. Add Linear identifiers/wave metadata to `docs/autonomous/PROJECT.yaml`.
+4. Create Hermes profiles with clear descriptions.
+5. Create/verify coding-lane skills:
    - existing: `glm-opencode-coding-lane`,
    - needed: `claude-code-coding-lane`,
    - needed: `codex-coding-lane`.
-5. Create one Linear build wave and one approved issue, then promote that issue
+6. Create one Linear build wave and one approved issue, then promote that issue
    into a Kanban proof card in shadow mode.
-6. Run the first true Kanban-dispatched profile manually and evaluate.
+7. Run the first true Kanban-dispatched profile manually and evaluate.
