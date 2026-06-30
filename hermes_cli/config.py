@@ -2248,6 +2248,19 @@ DEFAULT_CONFIG = {
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
         # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
+        # When true, ``hermes --tui`` tries to attach to the dashboard's
+        # shared gateway over WebSocket instead of spawning its own embedded
+        # gateway subprocess. The launch path discovers the dashboard URL +
+        # session token via the same mobile_pair discovery used by
+        # ``hermes mobile-pair`` and injects ``HERMES_TUI_GATEWAY_URL``
+        # (ws(s)://host/api/ws?token=<token>) into the TUI child's env so the
+        # stock gatewayClient.ts attaches. Before injecting, the launcher
+        # verifies the URL is this local dashboard profile and that the token
+        # is accepted; OAuth-gated/stale/wrong targets no-op and fall through
+        # to the normal embedded spawn. Never clobbers an already-set URL
+        # (e.g. the dashboard's own PTY injection).
+        # Default false: additive — unset is byte-identical to today's behavior.
+        "tui_shared_attach": False,
     },
 
     # Real-time token streaming to messaging platforms (Telegram, Discord,

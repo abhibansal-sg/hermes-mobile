@@ -1807,6 +1807,194 @@ def _resolve_tui_heap_mb(default_mb: int = 8192) -> int:
     return max(1536, sized) if limit_mb > 2048 else sized
 
 
+def _load_mobile_pair_module():
+    """Return the hermes-mobile ``mobile_pair`` discovery module, or ``None``.
+
+    Prefers the already-imported namespace module the PluginManager registers
+    (``hermes_plugins.hermes_mobile.mobile_pair``); falls back to loading the
+    file directly from the repo so the bridge works even before plugin
+    discovery has run. The module is import-side-effect-free (it only defines
+    functions/constants), so a direct file load is safe.
+    """
+    import importlib.util
+
+    cached = sys.modules.get("hermes_plugins.hermes_mobile.mobile_pair")
+    if cached is not None:
+        return cached
+    try:
+        from importlib import import_module
+
+        return import_module("hermes_plugins.hermes_mobile.mobile_pair")
+    except Exception:
+        logger.debug("tui_shared_attach: namespace mobile_pair import failed", exc_info=True)
+    path = PROJECT_ROOT / "plugins" / "hermes-mobile" / "mobile_pair.py"
+    if not path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("hermes_mobile_pair_bridge", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        logger.debug("tui_shared_attach: direct mobile_pair load failed", exc_info=True)
+        return None
+    return module
+
+
+def _dashboard_http_url(base: str, path: str) -> Optional[str]:
+    """Return ``base`` with ``path`` appended, only for http(s) dashboard URLs."""
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse((base or "").strip())
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    suffix = path if path.startswith("/") else f"/{path}"
+    full_path = parsed.path.rstrip("/") + suffix
+    return urlunparse((scheme, parsed.netloc, full_path, "", "", ""))
+
+
+def _dashboard_url_to_ws(base: str, token: str) -> Optional[str]:
+    """Convert a verified dashboard ``http(s)://`` URL into the TUI WS URL.
+
+    Returns ``None`` for unparseable bases or non-HTTP schemes so token-bearing
+    attach URLs are never manufactured for arbitrary protocols.
+    """
+    from urllib.parse import urlencode, urlparse, urlunparse
+
+    http_url = _dashboard_http_url(base, "/api/ws")
+    if http_url is None:
+        return None
+    parsed = urlparse(http_url)
+    scheme = "wss" if parsed.scheme.lower() == "https" else "ws"
+    query = urlencode({"token": token})
+    return urlunparse((scheme, parsed.netloc, parsed.path, "", query, ""))
+
+
+def _fetch_dashboard_json(url: str, *, token: Optional[str] = None, timeout: float = 1.0) -> dict:
+    """Fetch a small dashboard JSON endpoint.
+
+    The session token, when supplied, is sent in the dashboard's header form,
+    not in a query string, so failed verification does not put the credential in
+    URL logs or proxy access lines.
+    """
+    import json as _json
+    import urllib.request as _urllib_request
+
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["X-Hermes-Session-Token"] = token
+    req = _urllib_request.Request(url, headers=headers)
+    with _urllib_request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read(65536)
+    parsed = _json.loads(data.decode("utf-8"))
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _same_local_hermes_home(remote_home: object) -> bool:
+    if not isinstance(remote_home, str) or not remote_home.strip():
+        return False
+    try:
+        from hermes_constants import get_hermes_home
+
+        local_home = str(get_hermes_home())
+    except (OSError, RuntimeError, ValueError, TypeError):
+        local_home = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    return os.path.normcase(os.path.realpath(remote_home)) == os.path.normcase(
+        os.path.realpath(local_home)
+    )
+
+
+def _verify_tui_shared_attach_target(base: str, token: str) -> bool:
+    """Verify ``base`` is this local dashboard before injecting a bearer URL.
+
+    The public status check carries no credential and must identify the same
+    local Hermes profile. Only then do we send the session token in a header to
+    a protected endpoint, confirming the token is accepted and preserving the
+    documented fallback-to-embedded behavior when discovery is stale, OAuth
+    gated, or otherwise unusable.
+    """
+    status_url = _dashboard_http_url(base, "/api/status")
+    stats_url = _dashboard_http_url(base, "/api/system/stats")
+    if status_url is None or stats_url is None:
+        return False
+    try:
+        status = _fetch_dashboard_json(status_url, timeout=1.0)
+    except (OSError, ValueError, TypeError):
+        logger.debug("tui_shared_attach: dashboard status probe failed", exc_info=True)
+        return False
+    if not status.get("version") or not _same_local_hermes_home(status.get("hermes_home")):
+        logger.debug("tui_shared_attach: dashboard status did not match local Hermes home")
+        return False
+    if bool(status.get("auth_required")):
+        logger.debug("tui_shared_attach: dashboard is OAuth-gated; token attach disabled")
+        return False
+    try:
+        stats = _fetch_dashboard_json(stats_url, token=token, timeout=1.0)
+    except (OSError, ValueError, TypeError):
+        logger.debug("tui_shared_attach: dashboard token probe failed", exc_info=True)
+        return False
+    return isinstance(stats, dict) and bool(stats)
+
+
+def _maybe_attach_tui_to_shared_gateway(env: dict) -> None:
+    """Python-side config bridge so ``hermes --tui`` can attach to the shared
+    dashboard gateway via one config key (``gateway.tui_shared_attach``),
+    without editing the stock TS client.
+
+    Behaviour
+    ---------
+    * If ``HERMES_TUI_GATEWAY_URL`` is already set in ``env`` (e.g. the
+      dashboard's own PTY injection at ``web_server.py``), do nothing — that
+      explicit injection is authoritative and must never be clobbered.
+    * If ``gateway.tui_shared_attach`` is falsy (the default), do nothing —
+      the TUI spawns its own embedded gateway as before (byte-identical).
+    * Otherwise reuse the mobile_pair discovery (``_detect_dashboard_url`` /
+      ``_read_dashboard_token``) to resolve the dashboard URL + session token.
+      The URL is accepted only after a credential-free ``/api/status`` confirms
+      the same local Hermes profile, the dashboard is not OAuth-gated, and a
+      header-token probe succeeds. Unverified targets no-op so the TUI falls
+      through to the embedded spawn instead of failing in forced attach mode.
+
+    The discovery functions and this helper are self-contained and never
+    raise into the launch path (all failures are swallowed at debug level).
+    """
+    if env.get("HERMES_TUI_GATEWAY_URL"):
+        return
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        cfg = load_config_readonly()
+    except Exception:
+        logger.debug("tui_shared_attach: could not read config", exc_info=True)
+        return
+    if not cfg_get(cfg, "gateway", "tui_shared_attach", default=False):
+        return
+    try:
+        module = _load_mobile_pair_module()
+    except Exception:
+        logger.debug("tui_shared_attach: mobile_pair loader raised", exc_info=True)
+        return
+    if module is None:
+        logger.debug("tui_shared_attach: mobile_pair discovery unavailable")
+        return
+    try:
+        base = module._detect_dashboard_url()
+        token = module._read_dashboard_token()
+    except Exception:
+        logger.debug("tui_shared_attach: discovery raised", exc_info=True)
+        return
+    if not base or not token:
+        return
+    if not _verify_tui_shared_attach_target(base, token):
+        logger.debug("tui_shared_attach: dashboard target/token verification failed")
+        return
+    ws_url = _dashboard_url_to_ws(base, token)
+    if ws_url:
+        env["HERMES_TUI_GATEWAY_URL"] = ws_url
+
+
 def _launch_tui(
     resume_session_id: Optional[str] = None,
     tui_dev: bool = False,
@@ -1835,6 +2023,7 @@ def _launch_tui(
         apply_terminal_config_to_env(env=env)
     except Exception:
         logger.debug("Failed to apply terminal config bridge for TUI launch", exc_info=True)
+    _maybe_attach_tui_to_shared_gateway(env)
     active_session_fd, active_session_file = tempfile.mkstemp(
         prefix="hermes-tui-active-session-", suffix=".json"
     )
