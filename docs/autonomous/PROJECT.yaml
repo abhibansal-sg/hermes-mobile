@@ -14,11 +14,17 @@ project:
 planning:
   source_of_truth: linear
   execution_board: hermes-kanban
-  linear_project: Hermes Mobile
+  linear_project: Hermes Mobile — Engineering
+  linear_project_id: 020087b9-2942-458d-98fa-85649bd8edc3
+  linear_project_url: https://linear.app/abhinav-bansal/project/hermes-mobile-engineering-3044581b07e4
+  current_wave_label: wave:build-52
   wave_model: >-
     Build-wise waves live in Linear. Each wave defines the features and fixes
     intended for a specific build. Kanban is created only when a Linear issue is
     approved to start execution.
+  active_execution_labels:
+    - status:approved-for-execution
+    - wave:build-52
   linear_issue_requirements:
     - build wave / cycle or wave label
     - feature or fix scope
