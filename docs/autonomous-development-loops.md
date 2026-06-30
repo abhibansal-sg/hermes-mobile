@@ -179,7 +179,27 @@ Required mappings:
 - `retries_per_stage`: max retries per card/profile before escalation.
 - spin detector: same failure signature twice means stop and escalate.
 - evidence gate: no transition without artifact.
-- 5% list: always `kanban_block(reason="review-required: ...")`.
+- 5% list: stock Kanban human gates are represented as **triage or unassigned
+  cards**, not as `blocked+assignee` cards at creation time.
+
+## Stock Kanban gate policy
+
+We are keeping the production Hermes gateway and Kanban implementation stock.
+Do not modify core/gateway semantics just to support this loop system. The loop
+architecture must fit the installed Kanban primitives.
+
+Operational rule:
+
+- Human-gated cards start in `triage` or with no assignee.
+- A card gets an assignee only when it is approved to run.
+- Do not create approval-gated cards as `--initial-status blocked --assignee ...`.
+- Use `blocked` only after a worker/run has already started and needs to stop
+  for real input, capability, dependency, or review.
+- The transition from proposal/spec to execution is explicit:
+  `triage/unassigned -> assign/promote -> dispatcher may run`.
+
+This preserves stock behavior and gives us reliable human gates without carrying
+a local Kanban patch.
 
 ## Trust ladder
 

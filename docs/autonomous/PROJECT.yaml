@@ -123,6 +123,11 @@ external_coding_lanes:
       Fallback/alternate build lane, not the primary path.
 
 human_gates:
+  stock_kanban_policy: >-
+    Keep the production Hermes gateway/Kanban implementation stock. Do not use
+    blocked+assignee as an initial human gate because stock recompute/dispatch
+    may treat blocked cards without a sticky block event as promotable. Human
+    gates start in triage or unassigned; assign/promote only after approval.
   never_autonomous:
     - merge to base/shared branch
     - TestFlight upload or release
