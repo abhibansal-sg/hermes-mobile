@@ -347,6 +347,23 @@ def _notify_session_boundary(event_type: str, session_id: str | None) -> None:
         pass
 
 
+# ── S2 seam: post-emit observers (hermes-mobile plugin) ────────────────────────
+# Generic observer list notified after every emitted event. Populated by plugins
+# (the hermes-mobile push engine appends ``handle_gateway_event`` here); empty on
+# stock gateways so this is a strict no-op when no plugin is loaded.
+# See CONTRACT-DEPATCH.md seam S2.
+_EMIT_OBSERVERS: list = []
+
+
+def _notify_emit_observers(event: str, sid: str, payload: dict | None = None) -> None:
+    """Best-effort fan-out of an emitted event to every S2 observer."""
+    for _obs in list(_EMIT_OBSERVERS):
+        try:
+            _obs(event, sid, payload)
+        except Exception:
+            logger.debug("emit observer failed", exc_info=True)
+
+
 def _claim_active_session_slot(
     session_key: str,
     *,
@@ -405,6 +422,12 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
     _notify_session_boundary("on_session_finalize", session_id)
+    runtime_sid = str(session.get("_runtime_sid") or session.get("session_id") or session_key or session_id or "")
+    _notify_emit_observers(
+        "session.finalize",
+        runtime_sid,
+        {"session_id": session_id, "session_key": session_key},
+    )
 
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
     # Use session_id (from agent.session_id) not session_key — after compression,
@@ -723,6 +746,15 @@ def _profile_configured_cwd(profile_home: Path | None) -> str | None:
         return None
 
 
+# S1a seam (hermes-mobile broadcast plugin): write_json fan-out subscribers.
+# ``broadcast.activate()`` appends ``on_owner_write`` here; each subscriber is
+# called with ``(obj, sid, owner_transport)`` AFTER the owner write so that
+# session-scoped event frames mirror to every OTHER connected client (multi-client
+# desktop<->mobile sync). Empty on stock gateways (no fan-out, identical behaviour).
+# See CONTRACT-DEPATCH.md seam S1a.
+_EVENT_FANOUT_SUBSCRIBERS: list = []
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
@@ -739,6 +771,14 @@ def write_json(obj: dict) -> bool:
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
+            # S1a: mirror this session-scoped frame to every OTHER connected client.
+            # Each subscriber is isolated + non-blocking; a fan-out failure degrades
+            # ONLY the mirror, never the owner write below.
+            for _fanout in _EVENT_FANOUT_SUBSCRIBERS:
+                try:
+                    _fanout(obj, sid, t)
+                except Exception:
+                    pass
             return t.write(obj)
 
     return (current_transport() or _stdio_transport).write(obj)
@@ -749,6 +789,7 @@ def _emit(event: str, sid: str, payload: dict | None = None):
     if payload is not None:
         params["payload"] = payload
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
+    _notify_emit_observers(event, sid, payload)
 
 
 def _status_update(sid: str, kind: str, text: str | None = None):
@@ -4182,12 +4223,45 @@ def _(rid, params: dict) -> dict:
     # raises, fail closed (refuse the delete) rather than fail open.
     try:
         with _sessions_lock:
-            snapshot = list(_sessions.values())
+            snapshot = list(_sessions.items())
     except Exception as e:
         return _err(rid, 5036, f"could not enumerate active sessions: {e}")
-    active = {s.get("session_key") for s in snapshot if s.get("session_key")}
-    if target in active:
-        return _err(rid, 4023, "cannot delete an active session")
+    live_sid = None
+    live_session = None
+    for sid, session in snapshot:
+        if session.get("_finalized"):
+            continue
+        if session.get("session_key") == target:
+            live_sid = sid
+            live_session = session
+            break
+    evicted = False
+    if live_sid is not None and live_session is not None:
+        try:
+            if live_session.get("running"):
+                agent = live_session.get("agent")
+                if agent is not None and hasattr(agent, "interrupt"):
+                    try:
+                        agent.interrupt()
+                    except Exception:
+                        pass
+                _clear_pending(live_sid)
+                try:
+                    from tools.approval import resolve_gateway_approval
+
+                    resolve_gateway_approval(target, "deny", resolve_all=True)
+                except Exception:
+                    pass
+                _notify_emit_observers("session.interrupt", live_sid, None)
+            with _sessions_lock:
+                if _sessions.get(live_sid) is live_session:
+                    _sessions.pop(live_sid, None)
+                else:
+                    return _err(rid, 4023, "could not evict active session before delete")
+            _teardown_session(live_session)
+            evicted = True
+        except Exception as e:
+            return _err(rid, 4023, f"could not evict active session before delete: {e}")
     sessions_dir = get_hermes_home() / "sessions"
     try:
         deleted = db.delete_session(target, sessions_dir=sessions_dir)
@@ -4195,7 +4269,8 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5036, f"delete failed: {e}")
     if not deleted:
         return _err(rid, 4007, "session not found")
-    return _ok(rid, {"deleted": target})
+    _notify_emit_observers("session.deleted", target, None)
+    return _ok(rid, {"deleted": target, "evicted": evicted})
 
 
 @method("session.title")
