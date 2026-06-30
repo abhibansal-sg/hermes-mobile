@@ -124,10 +124,12 @@ external_coding_lanes:
 
 human_gates:
   stock_kanban_policy: >-
-    Keep the production Hermes gateway/Kanban implementation stock. Do not use
-    blocked+assignee as an initial human gate because stock recompute/dispatch
-    may treat blocked cards without a sticky block event as promotable. Human
-    gates start in triage or unassigned; assign/promote only after approval.
+    Keep the production Hermes gateway/Kanban implementation stock. Human gates
+    start as unassigned cards. Do not use blocked+assignee as an initial human
+    gate because stock recompute/dispatch may treat blocked cards without a
+    sticky block event as promotable. Do not use triage as a parking state on a
+    live board where auto-specifier or auto-decomposer is active; stock Hermes
+    may specify/promote triage cards. Assign/promote only after approval.
   never_autonomous:
     - merge to base/shared branch
     - TestFlight upload or release
