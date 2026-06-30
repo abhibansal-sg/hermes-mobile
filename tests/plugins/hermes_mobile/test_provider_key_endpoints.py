@@ -898,6 +898,76 @@ def test_custom_provider_env_var_collision_resistance(loopback_client, monkeypat
 
 
 # ===========================================================================
+# ABH-201 backward-compat — DELETE must remove the STORED key_env, not the
+# re-derived (new-scheme) var, so pre-fix providers' keys don't leak in .env.
+# ===========================================================================
+
+
+def test_delete_legacy_custom_provider_removes_stored_key_env(
+    loopback_client, monkeypatch
+):
+    """Regression (ABH-201 back-compat): a custom provider created BEFORE the
+    collision-resistance fix has its key stored under the OLD, hash-less env-var
+    name (e.g. ``MY_CO_API_KEY``), recorded in ``providers.<slug>.key_env``.
+
+    After the fix, ``_custom_provider_env_var("my-co")`` returns the NEW hashed
+    name (``MY_CO_6664ff_API_KEY``). If DELETE re-derived the name instead of
+    reading the stored ``key_env``, it would remove the non-existent new var and
+    leave the legacy key orphaned in .env — a secret leak.
+
+    This test proves DELETE uses the STORED ``key_env``: it removes the legacy
+    var name and does NOT touch the re-derived new var.
+    """
+    import hashlib as _hashlib
+
+    calls = _patch_config(monkeypatch)
+    _patch_inventory(monkeypatch, rows=[])
+    _patch_clear_auth(monkeypatch, returns=False)
+
+    # The legacy provider's stored key_env is the OLD (hash-less) name.
+    legacy_env = "MY_CO_API_KEY"
+    # The new-scheme derived name (what a naive re-derivation would compute).
+    new_env = "MY_CO_" + _hashlib.sha1(b"my-co").hexdigest()[:6] + "_API_KEY"
+    assert legacy_env != new_env, "test pre-condition: schemes must differ"
+
+    # Simulate a legacy config entry: key_env points at the OLD var name, and a
+    # raw api_key is also present inline (defensive legacy shape).
+    import hermes_cli.config as _config_mod
+
+    monkeypatch.setattr(
+        _config_mod,
+        "load_config_readonly",
+        lambda: {
+            "providers": {
+                "my-co": {
+                    "key_env": legacy_env,
+                    "api_key": "legacy-inline",
+                    "base_url": "https://api.my-co.example/v1",
+                }
+            }
+        },
+    )
+
+    r = loopback_client.request(
+        "DELETE",
+        "/api/plugins/hermes-mobile/providers/my-co/key",
+        headers=_TOKEN_HEADER,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["disconnected"] is True
+
+    # The STORED legacy var must be removed — not the re-derived new var.
+    assert legacy_env in calls["remove_env"], (
+        f"DELETE did not remove the stored legacy key_env {legacy_env!r}; "
+        f"remove_env calls: {calls['remove_env']}"
+    )
+    assert new_env not in calls["remove_env"], (
+        f"DELETE removed the re-derived {new_env!r} instead of the stored "
+        f"key_env — legacy key would leak in .env"
+    )
+
+
+# ===========================================================================
 # ABH-183 BUG 3 + BUG 4 — DELETE /providers/{slug}/key correctness
 # ===========================================================================
 
