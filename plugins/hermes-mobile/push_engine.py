@@ -841,21 +841,6 @@ def notify(
                 source=relay_payload.get("source"),
             )
             return 1
-        except relay_client.RelayConfigurationError as exc:
-            _log.error(
-                "relay push is misconfigured: HERMES_MOBILE_RELAY_URL "
-                "unreachable or invalid: %s",
-                exc,
-                exc_info=True,
-            )
-            return 0
-        except relay_client.NeedsAttestation as exc:
-            _log.warning(
-                "relay requires device re-enrollment via App Attest: %s",
-                exc,
-                exc_info=True,
-            )
-            return 0
         except Exception:
             _log.debug("relay push notify failed", exc_info=True)
             return 0
@@ -967,21 +952,6 @@ def notify_live_activity(
                 end=end,
             )
             return True
-        except relay_client.RelayConfigurationError as exc:
-            _log.error(
-                "relay push is misconfigured: HERMES_MOBILE_RELAY_URL "
-                "unreachable or invalid: %s",
-                exc,
-                exc_info=True,
-            )
-            return False
-        except relay_client.NeedsAttestation as exc:
-            _log.warning(
-                "relay requires device re-enrollment via App Attest: %s",
-                exc,
-                exc_info=True,
-            )
-            return False
         except Exception:
             _log.debug("relay live activity notify failed", exc_info=True)
             return False

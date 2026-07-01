@@ -926,6 +926,28 @@ def test_notify_passes_category_to_payload(monkeypatch, isolated_home):
 # ABH-208 Slice B — relay push transport selection (relay-on vs direct-off)
 # ===========================================================================
 
+def _reset_relay_async_observability(relay) -> None:
+    with relay._delivery_failure_lock:
+        setattr(relay, "_delivery_failure_count", 0)
+    with relay._recent_lock:
+        relay._recent.clear()
+
+
+def _wait_for_relay_failure_log(
+    relay, caplog, needle: str, *, expected: int = 1
+) -> list[logging.LogRecord]:
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        matching = [record for record in caplog.records if needle in record.getMessage()]
+        if relay.relay_delivery_failure_count() >= expected and matching:
+            return matching
+        time.sleep(0.01)
+    raise AssertionError(
+        "timed out waiting for relay background failure log "
+        f"{needle!r}; failures={relay.relay_delivery_failure_count()}"
+    )
+
+
 def test_notify_relay_on_routes_to_relay_client(monkeypatch):
     relay = load_plugin_module("relay_client")
     calls = []
@@ -975,17 +997,24 @@ def test_notify_relay_logs_static_failures_distinctly(monkeypatch, caplog, exc, 
         else relay.NeedsAttestation("attestation required")
     )
 
-    def fail_send_event_background(**kwargs):
-        raise error
+    class FailingClient:
+        async def send_event(self, **kwargs):
+            raise error
 
     monkeypatch.setenv("HERMES_MOBILE_RELAY_URL", "https://relay.example.test")
-    monkeypatch.setattr(relay, "send_event_background", fail_send_event_background)
+    monkeypatch.setattr(relay, "relay_client", lambda hermes_home=None: FailingClient())
+    _reset_relay_async_observability(relay)
 
-    with caplog.at_level(logging.WARNING):
-        assert pn.notify("approval", "t", "b", {"session_id": "sess-1"}) == 0
+    with caplog.at_level(logging.WARNING, logger="hermes_mobile.relay"):
+        assert pn.notify(
+            "approval",
+            "t",
+            f"body-{exc}",
+            {"session_id": f"sess-{exc}"},
+        ) == 1
+        matching = _wait_for_relay_failure_log(relay, caplog, needle)
 
-    matching = [record for record in caplog.records if needle in record.getMessage()]
-    assert matching
+    assert relay.relay_delivery_failure_count() == 1
     assert matching[-1].levelno == level
 
 
@@ -1014,19 +1043,19 @@ def test_notify_live_activity_relay_logs_static_failures_distinctly(
         else relay.NeedsAttestation("attestation required")
     )
 
-    def fail_send_live_activity_background(**kwargs):
-        raise error
+    class FailingClient:
+        async def send_event(self, **kwargs):
+            raise error
 
     monkeypatch.setenv("HERMES_MOBILE_RELAY_URL", "https://relay.example.test")
-    monkeypatch.setattr(
-        relay, "send_live_activity_background", fail_send_live_activity_background
-    )
+    monkeypatch.setattr(relay, "relay_client", lambda hermes_home=None: FailingClient())
+    _reset_relay_async_observability(relay)
 
-    with caplog.at_level(logging.WARNING):
-        assert pn.notify_live_activity("sess-1", {"phase": "waiting"}) is False
+    with caplog.at_level(logging.WARNING, logger="hermes_mobile.relay"):
+        assert pn.notify_live_activity(f"sess-live-{exc}", {"phase": "waiting"}) is True
+        matching = _wait_for_relay_failure_log(relay, caplog, needle)
 
-    matching = [record for record in caplog.records if needle in record.getMessage()]
-    assert matching
+    assert relay.relay_delivery_failure_count() == 1
     assert matching[-1].levelno == level
 
 
