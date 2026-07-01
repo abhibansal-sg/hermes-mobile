@@ -905,3 +905,93 @@ def test_notify_passes_category_to_payload(monkeypatch, isolated_home):
     monkeypatch.setattr(httpx, "Client", lambda **kw: _CapConn())
     pn.notify("approval", "t", "b", {"session_id": "s"}, category="HERMES_APPROVAL")
     assert captured["body"]["aps"]["category"] == "HERMES_APPROVAL"
+
+
+# ===========================================================================
+# ABH-208 Slice B — relay push transport selection (relay-on vs direct-off)
+# ===========================================================================
+
+def test_notify_relay_on_routes_to_relay_client(monkeypatch):
+    relay = load_plugin_module("relay_client")
+    calls = []
+
+    def fake_send_event_background(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setenv("HERMES_MOBILE_RELAY_URL", "https://relay.example.test")
+    monkeypatch.setattr(relay, "send_event_background", fake_send_event_background)
+
+    assert pn.notify(
+        "approval",
+        "Approval needed",
+        "Review in Hermes",
+        {"session_id": "sess-1", "source": "telegram"},
+        category="HERMES_APPROVAL",
+    ) == 1
+    assert calls == [{
+        "kind": "attention",
+        "session_id": "sess-1",
+        "title": "Approval needed",
+        "body": "Review in Hermes",
+        "source": "telegram",
+    }]
+
+
+def test_notify_relay_off_uses_existing_direct_apns_path(monkeypatch, isolated_home):
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    _arm_push(monkeypatch, isolated_home)
+    pn.register_token(_VALID_TOKEN, env="sandbox")
+    monkeypatch.setattr(pn, "_get_provider_jwt", lambda config: "JWT")
+
+    fake = _FakeConn(status_code=200)
+    import httpx
+    monkeypatch.setattr(httpx, "Client", lambda **kw: fake)
+
+    assert pn.notify("turn_complete", "Done", "Finished", {"session_id": "sess-1"}) == 1
+    assert fake.calls[0]["path"] == f"/3/device/{_VALID_TOKEN}"
+    assert fake.calls[0]["headers"]["apns-push-type"] == "alert"
+
+
+def test_notify_live_activity_relay_on_routes_to_relay_client(monkeypatch):
+    relay = load_plugin_module("relay_client")
+    calls = []
+
+    def fake_send_live_activity_background(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setenv("HERMES_MOBILE_RELAY_URL", "https://relay.example.test")
+    monkeypatch.setattr(
+        relay, "send_live_activity_background", fake_send_live_activity_background
+    )
+    content_state = {
+        "phase": "waiting", "toolName": None, "elapsedSeconds": 4,
+        "needsApproval": True,
+    }
+
+    assert pn.notify_live_activity("sess-1", content_state, end=True) is True
+    assert calls == [{
+        "session_id": "sess-1",
+        "content_state": content_state,
+        "end": True,
+    }]
+
+
+def test_notify_live_activity_relay_off_uses_existing_direct_apns_path(
+    monkeypatch, isolated_home
+):
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    _arm_push(monkeypatch, isolated_home)
+    pn.register_live_activity_token("sess-1", _VALID_TOKEN, env="sandbox")
+    monkeypatch.setattr(pn, "_get_provider_jwt", lambda config: "JWT")
+
+    fake = _FakeConn(status_code=200)
+    import httpx
+    monkeypatch.setattr(httpx, "Client", lambda **kw: fake)
+    content_state = {
+        "phase": "tool", "toolName": "terminal", "elapsedSeconds": 5,
+        "needsApproval": False,
+    }
+
+    assert pn.notify_live_activity("sess-1", content_state) is True
+    assert fake.calls[0]["path"] == f"/3/device/{_VALID_TOKEN}"
+    assert fake.calls[0]["headers"]["apns-push-type"] == "liveactivity"
