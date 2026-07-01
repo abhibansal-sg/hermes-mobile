@@ -104,6 +104,25 @@ def _patch_inventory(monkeypatch, *, rows):
     return captured
 
 
+def _patch_stock_inventory(monkeypatch, *, rows):
+    """Patch the stock inventory functions used by _provider_provider_rows."""
+    import hermes_cli.inventory as inventory
+
+    captured = {"called": False, "kwargs": None}
+
+    def _fake_context():
+        return object()
+
+    def _fake_payload(_ctx, **kwargs):
+        captured["called"] = True
+        captured["kwargs"] = kwargs
+        return {"providers": list(rows)}
+
+    monkeypatch.setattr(inventory, "load_picker_context", _fake_context)
+    monkeypatch.setattr(inventory, "build_models_payload", _fake_payload)
+    return captured
+
+
 def _patch_config(monkeypatch, *, providers_in_config=None):
     """Patch the hermes_cli.config mutators + is_managed + config readers/writer,
     capturing calls.
@@ -292,6 +311,85 @@ def test_list_providers_returns_safe_shape(loopback_client, monkeypatch):
     assert "sk-" not in dumped
     assert "_api_key" not in dumped  # env-var names like DEEPSEEK_API_KEY
     assert "key_env" not in dumped
+
+
+def test_list_providers_drops_unprovisionable_unconfigured_rows(
+    loopback_client, monkeypatch
+):
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    assert "novita" in PROVIDER_REGISTRY
+    cap = _patch_stock_inventory(
+        monkeypatch,
+        rows=[
+            {
+                "slug": "openrouter",
+                "name": "OpenRouter",
+                "auth_type": "api_key",
+                "is_current": False,
+                "authenticated": False,
+                "total_models": 0,
+            },
+            {
+                "slug": "custom",
+                "name": "Custom",
+                "auth_type": "api_key",
+                "is_current": False,
+                "authenticated": False,
+                "total_models": 0,
+            },
+            {
+                "slug": "novita",
+                "name": "NovitaAI",
+                "auth_type": "api_key",
+                "is_current": False,
+                "authenticated": False,
+                "total_models": 0,
+            },
+        ],
+    )
+
+    r = loopback_client.get(
+        "/api/plugins/hermes-mobile/providers", headers=_TOKEN_HEADER
+    )
+
+    assert r.status_code == 200, r.text
+    assert cap["called"] is True
+    assert cap["kwargs"] == {
+        "picker_hints": True,
+        "include_unconfigured": True,
+        "max_models": 50,
+    }
+    slugs = {p["slug"] for p in r.json()["providers"]}
+    assert "openrouter" not in slugs
+    assert "custom" not in slugs
+    assert "novita" in slugs
+
+
+def test_list_providers_keeps_authenticated_unregistered_rows(
+    loopback_client, monkeypatch
+):
+    cap = _patch_stock_inventory(
+        monkeypatch,
+        rows=[
+            {
+                "slug": "custom",
+                "name": "Custom",
+                "auth_type": "api_key",
+                "is_current": False,
+                "authenticated": True,
+                "total_models": 1,
+            },
+        ],
+    )
+
+    r = loopback_client.get(
+        "/api/plugins/hermes-mobile/providers", headers=_TOKEN_HEADER
+    )
+
+    assert r.status_code == 200, r.text
+    assert cap["called"] is True
+    assert [p["slug"] for p in r.json()["providers"]] == ["custom"]
 
 
 def test_provider_rows_include_unconfigured_stock_providers(monkeypatch):

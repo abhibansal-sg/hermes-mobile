@@ -1754,13 +1754,19 @@ def _provider_provider_rows() -> List[Dict[str, Any]]:
     TUI frontend + the stock model.save_key refresh use). Imported lazily so
     the module stays importable without the host inventory loaded (tests).
     """
+    from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.inventory import build_models_payload, load_picker_context
 
     ctx = load_picker_context()
     payload = build_models_payload(
         ctx, picker_hints=True, include_unconfigured=True, max_models=50
     )
-    return payload.get("providers", []) or []
+    rows = payload.get("providers", []) or []
+    return [
+        row for row in rows
+        if bool(row.get("authenticated"))
+        or str(row.get("slug") or "") in PROVIDER_REGISTRY
+    ]
 
 
 def _provider_audit(request: Request, event: str, slug: str) -> None:
@@ -2273,6 +2279,8 @@ def _refresh_provider_row(slug: str, *, fallback_name: str = "") -> Dict[str, An
         rows = []
     for row in rows:
         if row.get("slug") == slug:
+            if not row.get("authenticated"):
+                continue
             return {
                 "slug": row.get("slug") or slug,
                 "name": row.get("name") or fallback_name or slug,
