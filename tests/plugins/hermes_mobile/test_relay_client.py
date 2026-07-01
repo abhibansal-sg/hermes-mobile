@@ -112,6 +112,31 @@ def test_write_credentials_is_atomic_owner_only(tmp_path):
     assert not path.with_suffix(".tmp").exists()
 
 
+def test_write_credentials_remains_owner_only_when_final_chmod_fails(monkeypatch, tmp_path):
+    path = tmp_path / "push" / "relay.json"
+    client = relay.RelayClient(relay_url="https://relay", credentials_path=path)
+
+    def chmod_fails(*args, **kwargs):
+        raise OSError("simulated chmod failure")
+
+    monkeypatch.setattr(relay.os, "chmod", chmod_fails)
+    old_umask = relay.os.umask(0o022)
+    try:
+        client._write_credentials(
+            relay.RelayCredentials(
+                relay_url="https://relay",
+                agent_id="agent-1",
+                agent_secret="secret-1",
+                pairing="pair-1",
+            )
+        )
+    finally:
+        relay.os.umask(old_umask)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert json.loads(path.read_text())["agent_secret"] == "secret-1"
+
+
 def test_credentials_registration_posts_hermes_app_and_token(monkeypatch, tmp_path):
     fake = _install_fake_httpx(
         monkeypatch,

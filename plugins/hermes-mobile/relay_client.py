@@ -24,6 +24,8 @@ from typing import Any
 
 import httpx
 
+from utils import atomic_json_write
+
 log = logging.getLogger("hermes_mobile.relay")
 
 # No hosted default: relay transport is self-hosted / explicitly configured.
@@ -364,8 +366,6 @@ class RelayClient:
         )
 
     def _write_credentials(self, creds: RelayCredentials) -> None:
-        self.credentials_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.credentials_path.with_suffix(".tmp")
         payload = {
             "relay_url": creds.relay_url,
             "agent_id": creds.agent_id,
@@ -373,15 +373,7 @@ class RelayClient:
         }
         if creds.pairing:
             payload["pairing"] = creds.pairing
-        tmp.write_text(
-            json.dumps(payload, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, self.credentials_path)
+        atomic_json_write(self.credentials_path, payload, indent=2, mode=0o600)
 
     def _clear_credentials(self) -> None:
         try:
