@@ -112,6 +112,26 @@
     "destructive (rm -rf) / force-push / push to upstream",
     "a direction fork the issue spec is silent on"
   ],
+  "forbidden_paths": {
+    "_comment": "HARD scope fence (added 2026-07-01 after Slice B run: an engineer worker drifted from a plugin task into editing tui_gateway/server.py, a stock-core file. The edit was caught at review + contained in a throwaway worktree, but the worker should never have written it. These globs are a PRE-WRITE block: a worker MUST NOT create/modify any path matching these unless the card body explicitly names the path AND carries Abhi's approval. The verifier MUST reject any diff touching these paths that the card did not authorize.",
+    "block_globs": [
+      "tui_gateway/**",
+      "hermes_cli/**",
+      "gateway/**",
+      "run_agent.py",
+      "hermes_state.py",
+      "model_tools.py",
+      "apps/desktop/**",
+      "ui-tui/**",
+      ".claude/loops/governor.json",
+      "docs/autonomous/PROJECT.yaml"
+    ],
+    "enforcement": {
+      "worker_prompt": "Every dispatched card body MUST embed the SCOPE FENCE block (see card template). The worker treats block_globs as read-only: it may READ them for context but MUST NOT edit them. If the task appears to require such an edit, the worker STOPS and blocks with `needs-human`, naming the file — it does NOT edit and does NOT chase unrelated failing tests into fenced files.",
+      "verifier_gate": "The verifier runs `git diff --name-only` against the card's declared scope. ANY changed path matching block_globs that the card did not explicitly authorize = automatic REJECT, regardless of test results.",
+      "rationale": "Descriptive `autonomous_edits: blocked` in PROJECT.yaml was not enough — it was prose the worker never enforced. This is the machine-checkable fence."
+    }
+  },
   "concurrency_state": {
     "active_action_loops": [],
     "_note": "Loops register here on start and deregister on exit so the concurrency cap is enforceable. A stale entry past heartbeat silence = a crashed loop; reap + alert."
