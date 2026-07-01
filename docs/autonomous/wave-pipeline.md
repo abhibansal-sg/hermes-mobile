@@ -256,3 +256,13 @@ profile sees the actual code:
   are read-only). For parallel stages that both write, give each its own worktree.
 - `hermes kanban link <parent> <child>` creates the dependency edge so the child
   auto-promotes when the parent completes (the hands-off auto-advance primitive).
+- **The board REAPS the builder's worktree once a downstream stage completes**
+  (learned 2026-07-02: an ABH-205 reviewer card spawn_failed twice → auto-blocked
+  because the shared `workspaces/<builder_task_id>` dir it pointed at had been pruned
+  after the verifier finished — `git worktree list` showed it `prunable`). The
+  committed BRANCH survives; only the checkout dir is reaped. So: chain each
+  downstream stage on a **freshly (re)created** worktree of the builder's branch, not
+  on the previous stage's worktree path. Recipe: `git worktree prune` →
+  `git worktree add "$(pwd)/.worktrees/<slug>" <builder_branch>` → point the card at
+  that absolute path. One-stage-at-a-time is safest (each stage recreates before it
+  runs); don't assume the path a prior stage used still exists.
