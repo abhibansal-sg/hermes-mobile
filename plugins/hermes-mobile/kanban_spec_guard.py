@@ -44,6 +44,24 @@ def _card_body(args: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _allows_thin_body(args: Any) -> bool:
+    """Return True for documented kanban_create shapes with thin bodies."""
+    if not isinstance(args, dict):
+        return False
+
+    triage = args.get("triage")
+    if triage is True:
+        return True
+    if isinstance(triage, str) and triage.strip().lower() in {"true", "1", "yes"}:
+        return True
+
+    if args.get("initial_status") == "blocked":
+        return True
+
+    idempotency_key = args.get("idempotency_key")
+    return isinstance(idempotency_key, str) and bool(idempotency_key.strip())
+
+
 def _block_message(body: str) -> str:
     stripped = body.strip()
     if not stripped:
@@ -67,6 +85,8 @@ def _on_pre_tool_call(
     if tool_name != "kanban_create":
         return None
     if not _is_agent_initiated(**context):
+        return None
+    if _allows_thin_body(args):
         return None
 
     body = _card_body(args)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from tests.plugins.hermes_mobile.conftest import load_plugin_module
 
-
 AGENT_KWARGS = {
     "task_id": "t_parent",
     "session_id": "session-1",
@@ -50,6 +49,19 @@ def test_agent_kanban_create_with_too_short_body_is_blocked():
     assert "too short" in result["message"].lower()
 
 
+def test_agent_kanban_create_title_only_without_thin_body_marker_is_blocked():
+    guard = _guard()
+
+    result = guard._on_pre_tool_call(
+        tool_name="kanban_create",
+        args={"title": "do thing", "assignee": "engineer"},
+        **AGENT_KWARGS,
+    )
+
+    assert result is not None
+    assert result["action"] == "block"
+
+
 def test_agent_kanban_create_with_good_body_is_allowed():
     guard = _guard()
 
@@ -59,6 +71,50 @@ def test_agent_kanban_create_with_good_body_is_allowed():
             "title": "do thing",
             "assignee": "engineer",
             "body": "Goal: build the thing. Scope: only this module. Acceptance: tests pass and reviewer can reproduce.",
+        },
+        **AGENT_KWARGS,
+    )
+
+    assert result is None
+
+
+def test_agent_kanban_create_with_triage_true_and_thin_body_is_allowed():
+    guard = _guard()
+
+    result = guard._on_pre_tool_call(
+        tool_name="kanban_create",
+        args={"title": "triage idea", "assignee": "specifier", "triage": True},
+        **AGENT_KWARGS,
+    )
+
+    assert result is None
+
+
+def test_agent_kanban_create_with_blocked_initial_status_and_thin_body_is_allowed():
+    guard = _guard()
+
+    result = guard._on_pre_tool_call(
+        tool_name="kanban_create",
+        args={
+            "title": "urgent human escalation",
+            "assignee": "ops",
+            "initial_status": "blocked",
+        },
+        **AGENT_KWARGS,
+    )
+
+    assert result is None
+
+
+def test_agent_kanban_create_with_idempotency_key_and_thin_body_is_allowed():
+    guard = _guard()
+
+    result = guard._on_pre_tool_call(
+        tool_name="kanban_create",
+        args={
+            "title": "retry-safe automation card",
+            "assignee": "engineer",
+            "idempotency_key": "retry-safe-card",
         },
         **AGENT_KWARGS,
     )
