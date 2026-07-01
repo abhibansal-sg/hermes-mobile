@@ -241,11 +241,26 @@ Learned 2026-07-02 (cost 3 failed verifier cards). To hand a committed branch
 from one stage to the next (engineer → verifier → reviewer) so the downstream
 profile sees the actual code:
 
-- The board auto-anchors the FIRST card's worktree (no flag needed) at
-  `.worktrees/<task_id>/` on a deterministic branch. The builder MUST `git commit`
-  its work to that branch before blocking — an uncommitted worktree is invisible
-  to downstream stages. (Engineer contract gap: it verified but did not commit;
-  patch the engineer prompt to commit-before-block.)
+- CORRECTION (2026-07-02, orchestrator tick — cost 3 archived scratch cards): a
+  bare `hermes kanban create ... --assignee engineer` does NOT auto-anchor a repo
+  worktree. It lands `workspace_kind: scratch` at
+  `~/.hermes/kanban/boards/<board>/workspaces/<task_id>` — NOT a git checkout — so
+  the engineer cannot edit repo files or commit a branch downstream stages can see.
+  And plain `--workspace worktree` (no path) resolves to
+  `~/Developer/worktrees`, which is NOT inside this repo ("not inside a git repo"
+  spawn_failed — the same class as the reaped-worktree failure below).
+  THE WORKING RECIPE for the FIRST (engineer) card, matching the last green build
+  (ABH-204 t_2d912bf7): pass BOTH an in-repo absolute worktree path AND a branch:
+    `hermes kanban --board hermes-mobile create "<title> (engineer)" \
+       --body "<card>" --assignee engineer \
+       --workspace worktree:/ABS/REPO/.worktrees/<slug> \
+       --branch wt/<slug>`
+  This creates a real `git worktree` at `.worktrees/<slug>` branched off the base
+  tip. Verify with `git worktree list` before dispatch, and `hermes kanban dispatch
+  --dry-run` should list the card as spawnable.
+- The builder MUST `git commit` its work to that branch before blocking — an
+  uncommitted worktree is invisible to downstream stages. (Engineer contract gap:
+  it verified but did not commit; patch the engineer prompt to commit-before-block.)
 - Downstream stages point at that SAME worktree with:
     `--workspace worktree:<ABSOLUTE_PATH_to_.worktrees/<builder_task_id>>`
   The path MUST be absolute (relative fails: "non-absolute worktree path").
