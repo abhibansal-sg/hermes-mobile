@@ -37,6 +37,8 @@ import secrets
 import stat
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1620,6 +1622,130 @@ def _custom_provider_env_var(name: str) -> str:
     return f"{sanitized}_{shorthash}_API_KEY"
 
 
+_PROVIDER_KEY_VALIDATION_TIMEOUT_SECONDS = 1.5
+_PROVIDER_CREDENTIAL_CONFIG_KEYS = frozenset({"api_key", "key_env"})
+
+
+def _provider_key_validation_payload(
+    validated: Any, detail: str, *, persisted: bool = True
+) -> Dict[str, Any]:
+    return {
+        "validated": validated,
+        "validation_detail": detail,
+        "persisted": persisted,
+    }
+
+
+def _provider_validation_bases(base_url: str) -> List[str]:
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        return []
+    bases = [normalized]
+    alternate = normalized[:-3].rstrip("/") if normalized.endswith("/v1") else normalized + "/v1"
+    if alternate and alternate not in bases:
+        bases.append(alternate)
+    return bases
+
+
+def _validate_provider_key(
+    *,
+    api_key: str,
+    base_url: str,
+    api_mode: Optional[str] = None,
+    timeout: float = _PROVIDER_KEY_VALIDATION_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Lightweight provider-key liveness check for mobile credential entry.
+
+    The check hits the cheapest auth-gated model-list endpoint with a short
+    timeout. Definitive auth rejection (401/403) returns ``validated:false``;
+    unreachable/slow/ambiguous failures return ``validated:'skipped'`` so a
+    transient network issue never turns the save request into a 500.
+    """
+    bases = _provider_validation_bases(base_url)
+    if not bases:
+        return _provider_key_validation_payload(
+            "skipped", "key saved; no validation endpoint is configured"
+        )
+
+    headers: Dict[str, str] = {"User-Agent": "hermes-mobile-dashboard"}
+    if api_key and api_mode == "anthropic_messages":
+        headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
+    elif api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    last_error = ""
+    for base in bases:
+        url = base.rstrip("/") + "/models"
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                try:
+                    _json.loads(resp.read().decode() or "{}")
+                except Exception:
+                    pass
+                return _provider_key_validation_payload(
+                    True, "provider accepted the API key"
+                )
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return _provider_key_validation_payload(
+                    False, f"provider rejected the API key (HTTP {exc.code})"
+                )
+            last_error = f"HTTP {exc.code}"
+            continue
+        except Exception as exc:
+            # Timeout, DNS, refused connection, TLS, and malformed responses are
+            # validation-skipped — the key remains persisted for recovery.
+            last_error = str(exc) or exc.__class__.__name__
+            continue
+
+    detail = "key saved; provider validation could not be completed"
+    if last_error:
+        detail += f" ({last_error})"
+    return _provider_key_validation_payload("skipped", detail)
+
+
+def _custom_provider_tuning_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Return non-empty, non-credential config from a custom provider entry."""
+    tuning: Dict[str, Any] = {}
+    for key, value in entry.items():
+        if key in _PROVIDER_CREDENTIAL_CONFIG_KEYS:
+            continue
+        if value in (None, ""):
+            continue
+        if isinstance(value, (dict, list, tuple, set)) and not value:
+            continue
+        tuning[key] = value
+    return tuning
+
+
+def _remove_custom_provider_credentials_from_config(slug: str) -> bool:
+    """Delete credentials from providers.<slug>, removing pure-credential husks.
+
+    If the entry has only credential fields, remove the entire providers.<slug>
+    subtree so stock provider discovery cannot resurface it as a ghost user-config
+    provider. If it carries tuning (base_url/api_mode/model/name/etc.), preserve
+    that tuning and remove only credential fields.
+    """
+    from hermes_cli.config import load_config, save_config
+
+    config = load_config()
+    providers = config.get("providers")
+    if not isinstance(providers, dict):
+        return False
+    entry = providers.get(slug)
+    if not isinstance(entry, dict):
+        return False
+    tuning = _custom_provider_tuning_entry(entry)
+    if tuning:
+        providers[slug] = tuning
+    else:
+        providers.pop(slug, None)
+    save_config(config)
+    return True
+
+
 def _provider_provider_rows() -> List[Dict[str, Any]]:
     """Build the provider universe rows via the stock inventory builder.
 
@@ -1799,13 +1925,24 @@ async def set_provider_key(
     # (parity with stock model.save_key).
     os.environ[env_var] = api_key
 
+    base_url = ""
+    if getattr(pconfig, "base_url_env_var", ""):
+        base_url = os.environ.get(pconfig.base_url_env_var, "") or ""
+    if not base_url:
+        base_url = getattr(pconfig, "inference_base_url", "") or ""
+    validation = _validate_provider_key(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=_PROVIDER_KEY_VALIDATION_TIMEOUT_SECONDS,
+    )
+
     _provider_audit(request, "key set", slug)
 
     # Refresh via the shared inventory builder; project to the mobile-safe
     # provider shape (NEVER carries the key value).
     provider_data = _refresh_provider_row(slug, fallback_name=pconfig.name)
-    provider_data["authenticated"] = True
-    return {"provider": provider_data}
+    provider_data["authenticated"] = validation.get("validated") is not False
+    return {"provider": provider_data, **validation}
 
 
 class CustomProviderBody(BaseModel):
@@ -1907,11 +2044,19 @@ async def add_custom_provider(
             status_code=400, content={"error": str(exc), "code": 4001}
         )
 
+    os.environ[env_var] = api_key
+    validation = _validate_provider_key(
+        api_key=api_key,
+        base_url=base_url,
+        api_mode=api_mode,
+        timeout=_PROVIDER_KEY_VALIDATION_TIMEOUT_SECONDS,
+    )
+
     _provider_audit(request, "custom provider added", name)
 
     provider_data = _refresh_provider_row(name, fallback_name=name)
-    provider_data["authenticated"] = True
-    return {"provider": provider_data}
+    provider_data["authenticated"] = validation.get("validated") is not False
+    return {"provider": provider_data, **validation}
 
 
 @router.delete("/providers/{slug}/key")
@@ -1954,7 +2099,6 @@ async def remove_provider_key(
         is_managed,
         load_config_readonly,
         remove_env_value,
-        set_config_value,
     )
 
     slug = (slug or "").strip()
@@ -2047,14 +2191,12 @@ async def remove_provider_key(
                 cleared_env = True
         except ValueError:
             pass
-        # Blank the inline api_key (defensive: a legacy entry may carry one)
-        # and overwrite key_env with an empty string so the runtime no longer
-        # resolves a key for this provider. set_config_value writes to
-        # config.yaml (no leak — these are key NAMES / empty, not secrets).
+        # Remove credential fields from config.yaml. Pure credential-only custom
+        # entries are deleted entirely so stock model discovery cannot resurface
+        # an empty providers.<slug> husk as a ghost user-config row. Entries with
+        # non-credential tuning keep that tuning and lose only api_key/key_env.
         try:
-            set_config_value(f"providers.{slug}.api_key", "")
-            set_config_value(f"providers.{slug}.key_env", "")
-            cleared_config = True
+            cleared_config = _remove_custom_provider_credentials_from_config(slug)
         except ValueError:
             pass
 

@@ -49,6 +49,23 @@ def loopback_client():
     web_server.app.state.auth_required = prev_required
 
 
+@pytest.fixture(autouse=True)
+def no_live_provider_key_validation(monkeypatch, request):
+    """Endpoint tests should not perform real provider network probes."""
+    if request.node.name.startswith("test_validate_provider_key_"):
+        return
+    monkeypatch.setattr(
+        _api(),
+        "_validate_provider_key",
+        lambda **_kw: {
+            "validated": True,
+            "validation_detail": "provider accepted the API key",
+            "persisted": True,
+        },
+        raising=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Stock-function patches. Each captures its call args so a test can assert the
 # route dispatched to the RIGHT stock mutator (Tier A vs B vs delete) WITHOUT
@@ -88,18 +105,28 @@ def _patch_inventory(monkeypatch, *, rows):
 
 
 def _patch_config(monkeypatch, *, providers_in_config=None):
-    """Patch the hermes_cli.config mutators + is_managed + load_config_readonly,
+    """Patch the hermes_cli.config mutators + is_managed + config readers/writer,
     capturing calls.
 
     ``providers_in_config`` is a dict of {slug: entry} to include in the fake
-    config returned by ``load_config_readonly``. Defaults to an empty dict (no
-    custom-provider entries), which is the normal state for registered-provider
-    tests. Pass a non-empty dict for tests that need a custom providers.<slug>
-    entry to be present in config (simulating a prior POST /providers/custom).
+    config returned by ``load_config_readonly`` / ``load_config``. Defaults to an
+    empty dict (no custom-provider entries), which is the normal state for
+    registered-provider tests. Pass a non-empty dict for tests that need a custom
+    providers.<slug> entry to be present in config (simulating a prior POST
+    /providers/custom).
     """
+    import copy
     import hermes_cli.config as config
 
-    calls = {"save_env": [], "remove_env": [], "set_config": [], "managed": False}
+    state = {"providers": copy.deepcopy(providers_in_config or {})}
+    calls = {
+        "save_env": [],
+        "remove_env": [],
+        "set_config": [],
+        "save_config": [],
+        "config_state": state,
+        "managed": False,
+    }
 
     def _save_env(key, value):
         calls["save_env"].append((key, value))
@@ -115,13 +142,23 @@ def _patch_config(monkeypatch, *, providers_in_config=None):
         return calls["managed"]
 
     def _load_config_readonly():
-        return {"providers": dict(providers_in_config or {})}
+        return copy.deepcopy(state)
+
+    def _load_config():
+        return copy.deepcopy(state)
+
+    def _save_config(new_config):
+        calls["save_config"].append(copy.deepcopy(new_config))
+        state.clear()
+        state.update(copy.deepcopy(new_config))
 
     monkeypatch.setattr(config, "save_env_value", _save_env)
     monkeypatch.setattr(config, "remove_env_value", _remove_env)
     monkeypatch.setattr(config, "set_config_value", _set_config)
     monkeypatch.setattr(config, "is_managed", _is_managed)
     monkeypatch.setattr(config, "load_config_readonly", _load_config_readonly)
+    monkeypatch.setattr(config, "load_config", _load_config)
+    monkeypatch.setattr(config, "save_config", _save_config)
     return calls
 
 
@@ -419,7 +456,7 @@ def test_set_key_never_logs_key_value(loopback_client, monkeypatch, caplog):
 
     _patch_inventory(monkeypatch, rows=[_DEEPSEEK_ROW])
     _patch_config(monkeypatch)
-    secret = "sk-NEVER-LOG-ME-12345"
+    secret = "test-secret-never-log-me-12345"
 
     with caplog.at_level(logging.DEBUG, logger="plugins.hermes_mobile.dashboard.api"):
         r = loopback_client.post(
@@ -429,6 +466,113 @@ def test_set_key_never_logs_key_value(loopback_client, monkeypatch, caplog):
         )
     assert r.status_code == 200
     assert secret not in caplog.text
+
+
+def test_set_key_rejected_key_reports_validation_false_and_persists(
+    loopback_client, monkeypatch
+):
+    """ABH-219: a definitively rejected provider key must not look like a silent
+    success. The key is still persisted so the user can replace/retry, but the
+    response carries validated:false + a recovery reason.
+    """
+    api = _api()
+    monkeypatch.setattr(
+        api,
+        "_validate_provider_key",
+        lambda **_kw: {
+            "validated": False,
+            "validation_detail": "provider rejected the API key (401)",
+            "persisted": True,
+        },
+        raising=False,
+    )
+    _patch_inventory(monkeypatch, rows=[_DEEPSEEK_ROW])
+    calls = _patch_config(monkeypatch)
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/deepseek/key",
+        json={"api_key": "sk-rejected"},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert ("DEEPSEEK_API_KEY", "sk-rejected") in calls["save_env"]
+    assert body["persisted"] is True
+    assert body["validated"] is False
+    assert "rejected" in body["validation_detail"].lower()
+    assert body["provider"]["authenticated"] is False
+    assert "sk-rejected" not in r.text
+
+
+def test_set_key_timeout_reports_validation_skipped_without_500(
+    loopback_client, monkeypatch
+):
+    """ABH-219: timeout/unreachable validation is non-fatal. The persisted key
+    survives and callers get validated:'skipped' instead of a 500.
+    """
+    api = _api()
+    monkeypatch.setattr(
+        api,
+        "_validate_provider_key",
+        lambda **_kw: {
+            "validated": "skipped",
+            "validation_detail": "validation timed out; key saved but not confirmed",
+            "persisted": True,
+        },
+        raising=False,
+    )
+    _patch_inventory(monkeypatch, rows=[_DEEPSEEK_ROW])
+    _patch_config(monkeypatch)
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/deepseek/key",
+        json={"api_key": "sk-timeout"},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["persisted"] is True
+    assert body["validated"] == "skipped"
+    assert "saved" in body["validation_detail"].lower()
+    assert body["provider"]["authenticated"] is True
+
+
+def test_set_key_validation_is_additive_to_existing_success_shape(
+    loopback_client, monkeypatch
+):
+    """ABH-219 backward compat: callers that only read provider still get the
+    success shape, with validation fields added alongside it.
+    """
+    api = _api()
+    monkeypatch.setattr(
+        api,
+        "_validate_provider_key",
+        lambda **_kw: {
+            "validated": True,
+            "validation_detail": "provider accepted the API key",
+            "persisted": True,
+        },
+        raising=False,
+    )
+    _patch_inventory(monkeypatch, rows=[_DEEPSEEK_ROW])
+    _patch_config(monkeypatch)
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/deepseek/key",
+        json={"api_key": "sk-good"},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["provider"]["slug"] == "deepseek"
+    assert body["provider"]["authenticated"] is True
+    assert body["persisted"] is True
+    assert body["validated"] is True
+    assert body["validation_detail"]
+    assert "sk-good" not in r.text
 
 
 # ===========================================================================
@@ -588,6 +732,94 @@ def test_delete_key_rejects_managed_4006(loopback_client, monkeypatch):
     assert r.json()["code"] == 4006
 
 
+def test_delete_pure_credential_custom_provider_removes_config_entry_and_picker_ghost(
+    loopback_client, monkeypatch
+):
+    """ABH-218: a custom provider whose config entry contains only credential
+    fields is removed from config.yaml entirely, so model_switch no longer emits
+    a ghost authenticated/user-config row for the empty providers.<slug> husk.
+    """
+    import hashlib as _hashlib
+
+    slug = "ghost-custom"
+    expected_env = "GHOST_CUSTOM_" + _hashlib.sha1(slug.encode()).hexdigest()[:6] + "_API_KEY"
+    calls = _patch_config(
+        monkeypatch,
+        providers_in_config={slug: {"key_env": expected_env, "api_key": "legacy-inline"}},
+    )
+    _patch_clear_auth(monkeypatch, returns=False)
+
+    r = loopback_client.request(
+        "DELETE",
+        f"/api/plugins/hermes-mobile/providers/{slug}/key",
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["disconnected"] is True
+    assert expected_env in calls["remove_env"]
+    assert calls["save_config"], "DELETE should persist removal of providers.<slug>"
+    saved = calls["save_config"][-1]
+    assert slug not in saved.get("providers", {})
+    assert calls["set_config"] == []
+
+    import agent.models_dev as models_dev
+    import hermes_cli.models as models
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    monkeypatch.setattr(models_dev, "fetch_models_dev", lambda: {})
+    monkeypatch.setattr(models, "get_curated_nous_model_ids", lambda: [])
+    rows = list_authenticated_providers(
+        user_providers=saved.get("providers", {}),
+        custom_providers=[],
+        max_models=1,
+    )
+    assert slug not in {row.get("slug") for row in rows}
+
+
+def test_delete_tuning_bearing_custom_provider_preserves_tuning_keys(
+    loopback_client, monkeypatch
+):
+    """ABH-218 A2: disconnecting a custom provider with non-credential tuning
+    keeps the tuning subtree but removes api_key/key_env.
+    """
+    import hashlib as _hashlib
+
+    slug = "tuned-custom"
+    expected_env = "TUNED_CUSTOM_" + _hashlib.sha1(slug.encode()).hexdigest()[:6] + "_API_KEY"
+    calls = _patch_config(
+        monkeypatch,
+        providers_in_config={
+            slug: {
+                "name": "Tuned Custom",
+                "base_url": "https://api.tuned.example/v1",
+                "api_mode": "openai",
+                "model": "tuned/model",
+                "key_env": expected_env,
+                "api_key": "legacy-inline",
+            }
+        },
+    )
+    _patch_clear_auth(monkeypatch, returns=False)
+
+    r = loopback_client.request(
+        "DELETE",
+        f"/api/plugins/hermes-mobile/providers/{slug}/key",
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    assert expected_env in calls["remove_env"]
+    saved = calls["save_config"][-1]
+    assert saved["providers"][slug] == {
+        "name": "Tuned Custom",
+        "base_url": "https://api.tuned.example/v1",
+        "api_mode": "openai",
+        "model": "tuned/model",
+    }
+    assert calls["set_config"] == []
+
+
 # ===========================================================================
 # Pure helpers
 # ===========================================================================
@@ -623,6 +855,59 @@ def test_refresh_provider_row_projects_safe_shape(monkeypatch):
     }
     assert row["slug"] == "deepseek"
     assert row["authenticated"] is True
+
+
+def test_validate_provider_key_classifies_http_auth_rejection(monkeypatch):
+    """The real validation helper maps 401/403 from /models to validated:false."""
+    import urllib.error
+    import urllib.request
+
+    from email.message import Message
+
+    def _reject(req, timeout):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            401,
+            "Unauthorized",
+            hdrs=Message(),
+            fp=None,
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _reject)
+
+    result = _api()._validate_provider_key(
+        api_key="sk-rejected",
+        base_url="https://api.example.test/v1",
+        timeout=0.01,
+    )
+
+    assert result["persisted"] is True
+    assert result["validated"] is False
+    assert "401" in result["validation_detail"]
+
+
+def test_validate_provider_key_classifies_timeout_as_skipped(monkeypatch):
+    """The real validation helper never hard-fails slow/unreachable probes."""
+    import urllib.request
+
+    calls = []
+
+    def _timeout(req, timeout):
+        calls.append((req.full_url, timeout))
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _timeout)
+
+    result = _api()._validate_provider_key(
+        api_key="sk-timeout",
+        base_url="https://api.example.test/v1",
+        timeout=0.01,
+    )
+
+    assert calls
+    assert result["persisted"] is True
+    assert result["validated"] == "skipped"
+    assert "could not be completed" in result["validation_detail"]
 
 
 # ===========================================================================
@@ -696,11 +981,11 @@ def test_custom_key_never_in_config_or_log_or_response(
 def test_delete_custom_provider_clears_key_everywhere(loopback_client, monkeypatch):
     """Regression (security review DEFECT 2): DELETE on a CUSTOM provider must
     actually remove the persisted key — from .env (remove_env_value on the
-    derived env var) AND from config.yaml (set_config_value blanks api_key +
-    key_env). The pre-fix code only called clear_provider_auth (which mutates
-    the auth_store JSON, never config.yaml/.env), so providers.<name>.key_env
-    persisted and the runtime could still resolve the key while the route
-    returned disconnected:true.
+    stored env var) AND from config.yaml (remove api_key/key_env while preserving
+    non-credential tuning). The pre-fix code only called clear_provider_auth
+    (which mutates the auth_store JSON, never config.yaml/.env), so
+    providers.<name>.key_env persisted and the runtime could still resolve the
+    key while the route returned disconnected:true.
     """
     import hashlib as _hashlib
     slug = "acme-local"
@@ -748,18 +1033,15 @@ def test_delete_custom_provider_clears_key_everywhere(loopback_client, monkeypat
         f"DELETE did not remove the custom provider's .env var {expected_env}; "
         f"remove_env_value calls: {calls2['remove_env']}"
     )
-    # config.yaml api_key was blanked AND key_env was blanked (the runtime
-    # resolves the key via key_env → os.getenv, so key_env MUST be cleared).
-    set_config_keys = {k for k, _ in calls2["set_config"]}
-    assert f"providers.{slug}.api_key" in set_config_keys
-    assert f"providers.{slug}.key_env" in set_config_keys
-    for k, v in calls2["set_config"]:
-        if k in (f"providers.{slug}.api_key", f"providers.{slug}.key_env"):
-            assert v == "", f"{k} was not blanked on DELETE (got {v!r})"
+    # config.yaml credential fields were removed while non-credential tuning was
+    # preserved (no empty api_key/key_env husk remains).
+    assert calls2["save_config"], "DELETE did not persist config credential removal"
+    saved_provider = calls2["save_config"][-1]["providers"][slug]
+    assert saved_provider == {"base_url": "https://api.acme.example/v1"}
+    assert calls2["set_config"] == []
 
-    # The raw value under those keys is never a secret (only "" / the env NAME
-    # was cleared, never the raw key) — and clear_provider_auth was still
-    # invoked for the auth_store JSON state.
+    # The raw value under those keys is never a secret — and clear_provider_auth
+    # was still invoked for the auth_store JSON state.
     assert cap_clear.get("slug") == slug
 
 
@@ -1058,14 +1340,12 @@ def test_delete_custom_named_after_registered_slug_clears_key(
         f"BUG 3: DELETE did not remove custom .env var {expected_custom_env!r}; "
         f"remove_env calls: {calls['remove_env']}"
     )
-    # config.yaml entries MUST have been blanked.
-    set_config_keys = {k for k, _ in calls["set_config"]}
-    assert f"providers.{slug}.api_key" in set_config_keys, (
-        f"BUG 3: providers.{slug}.api_key was not blanked in config"
-    )
-    assert f"providers.{slug}.key_env" in set_config_keys, (
-        f"BUG 3: providers.{slug}.key_env was not blanked in config"
-    )
+    # config.yaml credential fields MUST have been removed while the custom
+    # endpoint tuning survives.
+    assert calls["save_config"], "BUG 3: config credential removal was not saved"
+    saved_provider = calls["save_config"][-1]["providers"][slug]
+    assert saved_provider == {"base_url": "http://localhost:11434/v1"}
+    assert calls["set_config"] == []
 
 
 def test_delete_never_created_slug_returns_4005_no_config_written(
