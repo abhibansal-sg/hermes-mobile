@@ -812,7 +812,9 @@ def notify(
 
     Silent no-op (returns 0) unless push is enabled AND the APNs key file
     exists. Tokens that APNs rejects with ``410 Unregistered`` are pruned from
-    the registry. Returns the count of pushes accepted (HTTP 200).
+    the registry. Returns the count of pushes accepted (HTTP 200). In relay
+    mode, returns 1 only when background relay delivery was kicked off; relay
+    delivery failures are surfaced via relay warnings/failure counters.
 
     ``event_type`` is also used as the per-event preference key (one of
     :data:`PUSH_EVENT_KINDS` — ``approval``/``clarify``/``turn_complete``):
@@ -826,7 +828,10 @@ def notify(
     if os.environ.get("HERMES_MOBILE_RELAY_URL"):
         try:
             from . import relay_client
-
+        except Exception:
+            _log.debug("relay push notify failed", exc_info=True)
+            return 0
+        try:
             relay_payload = payload if isinstance(payload, dict) else {}
             relay_client.send_event_background(
                 kind=relay_client.map_push_kind(event_type),
@@ -836,6 +841,21 @@ def notify(
                 source=relay_payload.get("source"),
             )
             return 1
+        except relay_client.RelayConfigurationError as exc:
+            _log.error(
+                "relay push is misconfigured: HERMES_MOBILE_RELAY_URL "
+                "unreachable or invalid: %s",
+                exc,
+                exc_info=True,
+            )
+            return 0
+        except relay_client.NeedsAttestation as exc:
+            _log.warning(
+                "relay requires device re-enrollment via App Attest: %s",
+                exc,
+                exc_info=True,
+            )
+            return 0
         except Exception:
             _log.debug("relay push notify failed", exc_info=True)
             return 0
@@ -924,7 +944,9 @@ def notify_live_activity(
     Targets the activity's push token registered for this session. Silent
     no-op (returns False) unless push is armed AND a token is registered. The
     token is pruned only on APNs ``410 Unregistered``, matching alert-token
-    pruning semantics. Returns True iff APNs accepted the push (HTTP 200).
+    pruning semantics. Returns True iff APNs accepted the push (HTTP 200). In
+    relay mode, returns True only when background relay delivery was kicked off;
+    relay delivery failures are surfaced via relay warnings/failure counters.
 
     ``content_state`` MUST use the ``HermesTurnAttributes.ContentState`` Codable
     field names (``phase``, ``toolName``, ``elapsedSeconds``, ``needsApproval``).
@@ -935,13 +957,31 @@ def notify_live_activity(
     if os.environ.get("HERMES_MOBILE_RELAY_URL"):
         try:
             from . import relay_client
-
+        except Exception:
+            _log.debug("relay live activity notify failed", exc_info=True)
+            return False
+        try:
             relay_client.send_live_activity_background(
                 session_id=session_id,
                 content_state=content_state,
                 end=end,
             )
             return True
+        except relay_client.RelayConfigurationError as exc:
+            _log.error(
+                "relay push is misconfigured: HERMES_MOBILE_RELAY_URL "
+                "unreachable or invalid: %s",
+                exc,
+                exc_info=True,
+            )
+            return False
+        except relay_client.NeedsAttestation as exc:
+            _log.warning(
+                "relay requires device re-enrollment via App Attest: %s",
+                exc,
+                exc_info=True,
+            )
+            return False
         except Exception:
             _log.debug("relay live activity notify failed", exc_info=True)
             return False

@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import logging
 import os
 import sys
 import time
@@ -949,6 +950,84 @@ def test_notify_relay_on_routes_to_relay_client(monkeypatch):
         "body": "Review in Hermes",
         "source": "telegram",
     }]
+
+
+@pytest.mark.parametrize(
+    ("exc", "level", "needle"),
+    [
+        (
+            "config",
+            logging.ERROR,
+            "relay push is misconfigured: HERMES_MOBILE_RELAY_URL",
+        ),
+        (
+            "attestation",
+            logging.WARNING,
+            "relay requires device re-enrollment via App Attest",
+        ),
+    ],
+)
+def test_notify_relay_logs_static_failures_distinctly(monkeypatch, caplog, exc, level, needle):
+    relay = load_plugin_module("relay_client")
+    error = (
+        relay.RelayConfigurationError("bad relay URL")
+        if exc == "config"
+        else relay.NeedsAttestation("attestation required")
+    )
+
+    def fail_send_event_background(**kwargs):
+        raise error
+
+    monkeypatch.setenv("HERMES_MOBILE_RELAY_URL", "https://relay.example.test")
+    monkeypatch.setattr(relay, "send_event_background", fail_send_event_background)
+
+    with caplog.at_level(logging.WARNING):
+        assert pn.notify("approval", "t", "b", {"session_id": "sess-1"}) == 0
+
+    matching = [record for record in caplog.records if needle in record.getMessage()]
+    assert matching
+    assert matching[-1].levelno == level
+
+
+@pytest.mark.parametrize(
+    ("exc", "level", "needle"),
+    [
+        (
+            "config",
+            logging.ERROR,
+            "relay push is misconfigured: HERMES_MOBILE_RELAY_URL",
+        ),
+        (
+            "attestation",
+            logging.WARNING,
+            "relay requires device re-enrollment via App Attest",
+        ),
+    ],
+)
+def test_notify_live_activity_relay_logs_static_failures_distinctly(
+    monkeypatch, caplog, exc, level, needle
+):
+    relay = load_plugin_module("relay_client")
+    error = (
+        relay.RelayConfigurationError("bad relay URL")
+        if exc == "config"
+        else relay.NeedsAttestation("attestation required")
+    )
+
+    def fail_send_live_activity_background(**kwargs):
+        raise error
+
+    monkeypatch.setenv("HERMES_MOBILE_RELAY_URL", "https://relay.example.test")
+    monkeypatch.setattr(
+        relay, "send_live_activity_background", fail_send_live_activity_background
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert pn.notify_live_activity("sess-1", {"phase": "waiting"}) is False
+
+    matching = [record for record in caplog.records if needle in record.getMessage()]
+    assert matching
+    assert matching[-1].levelno == level
 
 
 def test_notify_relay_off_uses_existing_direct_apns_path(monkeypatch, isolated_home):

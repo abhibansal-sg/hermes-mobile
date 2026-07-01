@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import stat
 from pathlib import Path
 
@@ -200,3 +201,60 @@ def test_dedupe_window(monkeypatch):
 
     monkeypatch.setattr(relay.time, "time", lambda: 111.0)
     assert relay._is_duplicate("same") is False
+
+
+def _reset_delivery_failure_count() -> None:
+    with relay._delivery_failure_lock:
+        setattr(relay, "_delivery_failure_count", 0)
+
+
+def test_send_sync_generic_failure_is_observable(monkeypatch, caplog):
+    class FailingClient:
+        async def send_event(self, **kwargs):
+            raise RuntimeError("relay down")
+
+    _reset_delivery_failure_count()
+    monkeypatch.setattr(relay, "relay_client", lambda hermes_home=None: FailingClient())
+
+    with caplog.at_level(logging.WARNING, logger="hermes_mobile.relay"):
+        relay._send_sync("attention", "sess-1", "t", "b", None, None)
+
+    assert relay.relay_delivery_failure_count() == 1
+    matching = [
+        record for record in caplog.records
+        if "Hermes relay push event delivery failed" in record.getMessage()
+    ]
+    assert matching
+    assert matching[-1].levelno == logging.WARNING
+
+
+@pytest.mark.parametrize(
+    ("exc", "level", "needle"),
+    [
+        (
+            relay.RelayConfigurationError("bad relay URL"),
+            logging.ERROR,
+            "Hermes relay push is misconfigured: HERMES_MOBILE_RELAY_URL",
+        ),
+        (
+            relay.NeedsAttestation("attestation required"),
+            logging.WARNING,
+            "Hermes relay requires device re-enrollment via App Attest",
+        ),
+    ],
+)
+def test_send_sync_static_failures_are_logged_distinctly(monkeypatch, caplog, exc, level, needle):
+    class FailingClient:
+        async def send_event(self, **kwargs):
+            raise exc
+
+    _reset_delivery_failure_count()
+    monkeypatch.setattr(relay, "relay_client", lambda hermes_home=None: FailingClient())
+
+    with caplog.at_level(logging.WARNING, logger="hermes_mobile.relay"):
+        relay._send_sync("attention", "sess-1", "t", "b", None, None)
+
+    assert relay.relay_delivery_failure_count() == 1
+    matching = [record for record in caplog.records if needle in record.getMessage()]
+    assert matching
+    assert matching[-1].levelno == level

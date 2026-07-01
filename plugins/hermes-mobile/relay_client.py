@@ -38,6 +38,20 @@ _HERMES_TO_RELAY_KIND = {
     "clarify": "attention",
     "turn_complete": "replies",
 }
+_delivery_failure_count = 0
+_delivery_failure_lock = threading.Lock()
+
+
+def relay_delivery_failure_count() -> int:
+    """Return the number of relay push delivery failures observed in-process."""
+    with _delivery_failure_lock:
+        return _delivery_failure_count
+
+
+def _record_delivery_failure() -> None:
+    global _delivery_failure_count
+    with _delivery_failure_lock:
+        _delivery_failure_count += 1
 
 
 def _hermes_home(hermes_home: Path | None = None) -> Path:
@@ -500,5 +514,21 @@ def _send_sync(
                 source=source,
             )
         )
-    except Exception:
-        log.debug("Hermes relay push event delivery failed", exc_info=True)
+    except RelayConfigurationError as exc:
+        _record_delivery_failure()
+        log.error(
+            "Hermes relay push is misconfigured: HERMES_MOBILE_RELAY_URL "
+            "unreachable or invalid: %s",
+            exc,
+            exc_info=True,
+        )
+    except NeedsAttestation as exc:
+        _record_delivery_failure()
+        log.warning(
+            "Hermes relay requires device re-enrollment via App Attest: %s",
+            exc,
+            exc_info=True,
+        )
+    except Exception as exc:
+        _record_delivery_failure()
+        log.warning("Hermes relay push event delivery failed: %s", exc, exc_info=True)
