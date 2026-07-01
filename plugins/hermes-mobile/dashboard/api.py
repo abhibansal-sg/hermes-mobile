@@ -2027,7 +2027,19 @@ async def remove_provider_key(
         # secure .env. clear_provider_auth only mutates the auth_store JSON —
         # it never touches config.yaml or the .env — so we clear the persisted
         # state explicitly here. The key MUST actually be gone after a 200.
-        env_var = _custom_provider_env_var(slug)
+        #
+        # Backward-compat (ABH-201): ``_custom_provider_env_var`` used to emit a
+        # hash-less name (e.g. ``MY_CO_API_KEY``); the collision fix appended a
+        # 6-hex SHA-1 short-hash (``MY_CO_6664ff_API_KEY``). Providers created
+        # BEFORE the fix therefore carry the OLD env-var NAME in their stored
+        # ``key_env`` AND have their raw key sitting under that OLD name in .env.
+        # Re-deriving the name here would compute the NEW (hashed) var and
+        # remove a non-existent entry while the legacy key leaked in .env. So we
+        # prefer the STORED ``key_env`` when present (covers both legacy and
+        # current schemes) and only fall back to re-derivation for an entry
+        # that has an inline ``api_key`` but no recorded env-var name.
+        stored_key_env = _entry.get("key_env") if isinstance(_entry, dict) else None
+        env_var = stored_key_env or _custom_provider_env_var(slug)
         try:
             if remove_env_value(env_var):
                 cleared_env = True
