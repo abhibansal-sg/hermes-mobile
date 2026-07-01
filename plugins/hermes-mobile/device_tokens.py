@@ -57,6 +57,15 @@ _registry_lock = threading.Lock()
 _ws_index_lock = threading.Lock()
 _ws_device_sockets: Dict[str, Set[Any]] = {}
 
+# Runtime-session attribution for mobile WS turns. A token-authenticated WS is
+# first indexed in ``_ws_device_sockets`` by the auth seam. Separately, the TUI
+# gateway session table tells us which transport serves runtime session S. This
+# plugin-owned map composes the two signals without relying on core-owned
+# ``ws.state.device``: {runtime_session_id: (device_id, ws)}. If either side is
+# missing or ambiguous, lookups fail closed.
+_session_index_lock = threading.Lock()
+_session_device_sockets: Dict[str, tuple[str, Any]] = {}
+
 # In-process deny-set of REVOKED ``token_hash`` values. A revocation is recorded
 # here BEFORE (and independent of) the on-disk write, so a revoked token stops
 # authenticating for the lifetime of THIS process even if ``_save`` fails to
@@ -296,6 +305,7 @@ def revoke(device_id: str) -> bool:
             if isinstance(token_hash, str) and token_hash:
                 _revoked_hashes.add(token_hash)
         registry.pop(device_id, None)
+        _clear_session_mappings_for_device(device_id)
         if not _save(registry):
             _log.warning(
                 "device revoke held in-process (deny-set) but disk write failed "
@@ -407,6 +417,7 @@ def deregister_ws_socket(device_id: str, ws: Any) -> None:
         socks.discard(ws)
         if not socks:
             _ws_device_sockets.pop(device_id, None)
+    _clear_session_mappings_for_ws(ws)
 
 
 def get_device_sockets(device_id: str) -> List[Any]:
@@ -417,11 +428,124 @@ def get_device_sockets(device_id: str) -> List[Any]:
         return list(_ws_device_sockets.get(device_id, ()))
 
 
+def _normalize_session_id(session_id: Any) -> str:
+    return session_id.strip() if isinstance(session_id, str) else ""
+
+
+def _device_ids_for_ws_socket(ws: Any) -> List[str]:
+    if ws is None:
+        return []
+    with _ws_index_lock:
+        return [
+            device_id
+            for device_id, sockets in _ws_device_sockets.items()
+            if ws in sockets
+        ]
+
+
+def _single_active_device_for_ws_socket(ws: Any) -> Optional[str]:
+    device_ids = _device_ids_for_ws_socket(ws)
+    if len(device_ids) != 1:
+        return None
+    device_id = device_ids[0]
+    if not is_device_active(device_id):
+        return None
+    return device_id
+
+
+def _clear_session_mappings_for_ws(ws: Any) -> None:
+    with _session_index_lock:
+        stale = [
+            session_id
+            for session_id, (_device_id, mapped_ws) in _session_device_sockets.items()
+            if mapped_ws is ws
+        ]
+        for session_id in stale:
+            _session_device_sockets.pop(session_id, None)
+
+
+def _clear_session_mappings_for_device(device_id: str) -> None:
+    with _session_index_lock:
+        stale = [
+            session_id
+            for session_id, (mapped_device_id, _ws) in _session_device_sockets.items()
+            if mapped_device_id == device_id
+        ]
+        for session_id in stale:
+            _session_device_sockets.pop(session_id, None)
+
+
+def record_session_transport(session_id: Any, transport: Any) -> Optional[Dict[str, Any]]:
+    """Correlate a runtime TUI session with a mobile device-token WS, if any.
+
+    The gateway only exposes ``AIAgent(platform="tui")`` for both desktop and
+    iOS turns. This helper composes plugin-owned state instead: runtime session
+    S is mobile only when its serving transport wraps a WebSocket that is
+    already indexed as exactly one live device-token socket. Shared-token
+    desktop sessions, missing transports, and ambiguous socket attribution clear
+    any prior mapping and return None.
+    """
+    sid = _normalize_session_id(session_id)
+    if not sid:
+        return None
+    ws = getattr(transport, "_ws", None)
+    device_id = _single_active_device_for_ws_socket(ws)
+    with _session_index_lock:
+        if device_id is None:
+            _session_device_sockets.pop(sid, None)
+            return None
+        _session_device_sockets[sid] = (device_id, ws)
+    return {"device_id": device_id}
+
+
+def clear_session_transport(session_id: Any = "", transport: Any = None) -> None:
+    """Drop session→device correlation for a session or all sessions on a transport."""
+    sid = _normalize_session_id(session_id)
+    ws = getattr(transport, "_ws", None) if transport is not None else None
+    with _session_index_lock:
+        if sid:
+            mapped = _session_device_sockets.get(sid)
+            if ws is None or mapped is None or mapped[1] is ws:
+                _session_device_sockets.pop(sid, None)
+            return
+        if ws is None:
+            return
+        stale = [
+            mapped_session_id
+            for mapped_session_id, (_device_id, mapped_ws) in _session_device_sockets.items()
+            if mapped_ws is ws
+        ]
+        for mapped_session_id in stale:
+            _session_device_sockets.pop(mapped_session_id, None)
+
+
+def device_identity_for_session(session_id: Any) -> Optional[Dict[str, Any]]:
+    """Return a mobile device identity for a correlated TUI runtime session."""
+    sid = _normalize_session_id(session_id)
+    if not sid:
+        return None
+    with _session_index_lock:
+        mapped = _session_device_sockets.get(sid)
+    if mapped is None:
+        return None
+    device_id, ws = mapped
+    device_ids = _device_ids_for_ws_socket(ws)
+    if len(device_ids) != 1 or device_ids[0] != device_id:
+        clear_session_transport(sid)
+        return None
+    if not is_device_active(device_id):
+        clear_session_transport(sid)
+        return None
+    return {"device_id": device_id}
+
+
 def _reset_for_tests() -> None:
     """Clear the in-process WS index + revoked-hash deny-set (the registry itself
     lives on disk per HERMES_HOME)."""
     with _ws_index_lock:
         _ws_device_sockets.clear()
+    with _session_index_lock:
+        _session_device_sockets.clear()
     with _deny_lock:
         _revoked_hashes.clear()
         _revoked_device_ids.clear()

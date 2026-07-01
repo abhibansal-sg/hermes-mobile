@@ -24,10 +24,10 @@ def _device_identity_for_tui_session(session_id: Any) -> Optional[dict]:
     Current WS-backed iOS turns build ``AIAgent(platform="tui")`` (see
     ``tui_gateway.server._make_agent``), so the hook's primary platform kwarg is
     not distinct from desktop/dashboard TUI. The reliable plugin-owned signal is
-    the authenticated device-token WS identity stashed on the session's owning
-    transport by the hermes-mobile token-auth seam. Desktop/CLI/shared-token
-    sessions do not carry ``ws.state.device``; if anything is missing or
-    ambiguous, fail closed and inject nothing.
+    the composition of (a) the gateway session's serving transport and (b) the
+    hermes-mobile device-token socket index. Desktop/CLI/shared-token sessions
+    are not indexed as device sockets; if anything is missing or ambiguous, fail
+    closed and inject nothing.
     """
     sid = session_id.strip() if isinstance(session_id, str) else ""
     if not sid:
@@ -35,6 +35,7 @@ def _device_identity_for_tui_session(session_id: Any) -> Optional[dict]:
 
     try:
         from tui_gateway import server as _server
+        from . import device_tokens
     except Exception:
         return None
 
@@ -46,12 +47,10 @@ def _device_identity_for_tui_session(session_id: Any) -> Optional[dict]:
         return None
 
     transport = session.get("transport")
-    ws = getattr(transport, "_ws", None)
-    state = getattr(ws, "state", None)
-    device = getattr(state, "device", None)
-    if isinstance(device, dict) and device.get("device_id"):
+    device = device_tokens.record_session_transport(sid, transport)
+    if device is not None:
         return device
-    return None
+    return device_tokens.device_identity_for_session(sid)
 
 
 def _should_inject(*, platform: Any = "", session_id: Any = "", **_: Any) -> bool:

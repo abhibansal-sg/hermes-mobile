@@ -55,12 +55,46 @@ def live_transports() -> "list[Any]":
         return [t for t in _live_transports if not t._closed]
 
 
+def _session_ids_for_transport(transport: Any) -> "list[str]":
+    sessions = _gw_sessions()
+    return [
+        sid
+        for sid, session in sessions.items()
+        if isinstance(sid, str)
+        and isinstance(session, dict)
+        and session.get("transport") is transport
+    ]
+
+
+def _record_mobile_session_transport(session_id: str, transport: Any) -> None:
+    try:
+        from . import device_tokens
+
+        device_tokens.record_session_transport(session_id, transport)
+    except Exception:
+        _log.debug("mobile session/device correlation failed", exc_info=True)
+
+
+def _clear_mobile_session_transport(session_id: str = "", transport: Any = None) -> None:
+    try:
+        from . import device_tokens
+
+        device_tokens.clear_session_transport(session_id, transport)
+    except Exception:
+        _log.debug("mobile session/device correlation clear failed", exc_info=True)
+
+
 def on_transport(action: str, transport: Any) -> None:
     """S1b transport-lifecycle observer (wired by :func:`activate`)."""
     if action == "connect":
         with _live_lock:
             _live_transports.add(transport)
+        for sid in _session_ids_for_transport(transport):
+            _record_mobile_session_transport(sid, transport)
     elif action == "disconnect":
+        for sid in _session_ids_for_transport(transport):
+            _clear_mobile_session_transport(sid, transport)
+        _clear_mobile_session_transport(transport=transport)
         with _live_lock:
             _live_transports.discard(transport)
         _bcast_states.pop(transport, None)
@@ -292,6 +326,7 @@ def _broadcast_event(obj: dict, sid: str, exclude: Any) -> None:
 
 def on_owner_write(obj: dict, sid: str, owner: Any) -> None:
     """S1a write_json fan-out subscriber (wired by :func:`activate`)."""
+    _record_mobile_session_transport(sid, owner)
     if _broadcast_enabled():
         _broadcast_event(obj, sid, exclude=owner)
 
