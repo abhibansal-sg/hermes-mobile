@@ -18,11 +18,34 @@ planning:
   linear_project: Hermes Mobile — Engineering
   linear_project_id: 020087b9-2942-458d-98fa-85649bd8edc3
   linear_project_url: https://linear.app/abhinav-bansal/project/hermes-mobile-engineering-3044581b07e4
-  current_wave_label: wave:build-53
+  # WAVE LEDGER (supersedes the old single current_wave_label pointer).
+  # Multiple waves coexist, each carrying its own stage. The active-execution
+  # pointer advances on SHIP, not on VERIFY — a wave shipped and awaiting Abhi's
+  # device-verify does NOT block the next wave from building. See
+  # docs/autonomous/wave-pipeline.md rule 1.
+  wave_ledger:
+    - label: wave:build-53
+      build_no: 53
+      stage: awaiting-device-verify   # shipped to TestFlight, VALID, in Abhi's parking lot
+      shipped: true
+    - label: wave:build-54
+      build_no: 54
+      stage: planning                  # architect assembling; not yet promoted to Kanban
+      shipped: false
+  active_execution_wave: wave:build-54  # advances to N+1 the moment N ships
+  wave_stages:
+    - planning            # architect assembling the wave in Linear (basket 1)
+    - approved            # slices carry status:approved-for-execution
+    - building            # promoted to Kanban, engineer/verifier/reviewer active (basket 2)
+    - awaiting-ship       # merged, waiting on Abhi's gated TestFlight upload
+    - awaiting-device-verify  # shipped + VALID, in Abhi's async parking lot (basket 4)
+    - verified            # Abhi confirmed on device; wave closed
   wave_model: >-
     Build-wise waves live in Linear. Each wave defines the features and fixes
     intended for a specific build. Kanban is created only when a Linear issue is
-    approved to start execution.
+    approved to start execution. Waves are pipelined: the active_execution_wave
+    pointer advances on SHIP so a shipped-but-unverified wave never blocks the
+    next wave's build.
   workflow_states:
     backlog:
       name: Backlog
@@ -51,7 +74,7 @@ planning:
 
   taxonomy:
     wave_labels:
-      active: wave:build-53
+      active: wave:build-54
       pattern: wave:build-N
       rule: >-
         Every execution candidate must carry exactly one active wave label. Before
@@ -80,12 +103,12 @@ planning:
 
   active_execution_labels:
     - status:approved-for-execution
-    - wave:build-53
+    - wave:build-54
 
   linear_issue_requirements:
     required_before_promotion:
       - canonical project: Hermes Mobile — Engineering
-      - exactly one active wave label, currently wave:build-53
+      - exactly one active wave label, currently wave:build-54
       - status:approved-for-execution label
       - at least one area label
       - at least one type label
@@ -122,7 +145,7 @@ planning:
       approves the graph and profile assignment.
     input_query: >-
       project = Hermes Mobile — Engineering AND label contains
-      status:approved-for-execution AND label contains wave:build-53 AND state
+      status:approved-for-execution AND label contains wave:build-54 AND state
       is not Done/Canceled AND label does not contain loop:blocked-human.
     initial_card:
       board: hermes-mobile

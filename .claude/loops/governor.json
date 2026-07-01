@@ -115,5 +115,46 @@
   "concurrency_state": {
     "active_action_loops": [],
     "_note": "Loops register here on start and deregister on exit so the concurrency cap is enforceable. A stale entry past heartbeat silence = a crashed loop; reap + alert."
+  },
+  "pipeline": {
+    "_comment": "Buffered-basket pipeline rules (locked 2026-07-01). Full contract: docs/autonomous/wave-pipeline.md. These make the chain unbreakable: nothing Abhi owns can freeze the machine.",
+    "ship_advances_pointer": true,
+    "_ship_advances_pointer": "RULE 1. The active_execution_wave pointer (PROJECT.yaml) advances to N+1 the MOMENT wave N uploads to TestFlight — NOT when Abhi device-verifies it. Verify is a separate async consumer reading the parking-lot buffer. A shipped-but-unverified wave never blocks the next wave's build.",
+    "bump_blocked_slices": true,
+    "_bump_blocked_slices": "RULE 2. A slice that hits loop:blocked-human does NOT hold its wave hostage. Eject it into the next wave's candidate pool; close the current wave with its unblocked slices. The blocked task falls out of the moving basket into a side basket — the basket keeps rolling.",
+    "pending_abhi_is_async": true,
+    "_pending_abhi_is_async": "RULE 3. Every human gate (merge approval, device-verify, direction fork) writes to the pending-abhi parking lot he drains whenever. The orchestrator NEVER idles waiting on it — it returns to basket 0 and pulls the next thing.",
+    "wip_caps": {
+      "shipped_unverified_builds": 2,
+      "_shipped_unverified_builds": "BACKPRESSURE. At this many builds shipped-but-not-device-verified, the SHIP stage THROTTLES (stops uploading new builds) but BUILD and PLAN keep running into their buffers. Draining a verify un-throttles ship automatically. Soft slowdown at one stage, never a chain break.",
+      "building_waves": 1,
+      "_building_waves": "At most this many waves in the 'building' stage at once while on the trust ladder (max_concurrent_action_loops still governs profiles within a wave)."
+    }
+  },
+  "roster": {
+    "_comment": "Locked 2026-07-01 (Abhi). ONE model per profile, NO per-task branching — route to a different profile if a harder brain is needed. A profile is a full agent that JUDGES worker output (runs tests itself, accept/reject/retry, escalates), not a button-pusher.",
+    "profiles": {
+      "scout": "sonnet-5",
+      "architect": "opus-4.8",
+      "engineer": "gpt-5.5",
+      "verifier": "gpt-5.5",
+      "reviewer": "gpt-5.5",
+      "orchestrator": "opus-4.8"
+    },
+    "worker_lanes": {
+      "claude_code": { "model": "opus-4.8", "effort": "ultracode", "launch": "claude --settings '{\"ultracode\": true}'" },
+      "opencode": { "model": "glm-5.2", "effort": "max", "launch": "env -u SSL_CERT_FILE opencode run -m zai-coding-plan/glm-5.2" },
+      "codex": { "model": "gpt-5.5", "effort": "high", "launch": "codex exec --full-auto" }
+    },
+    "cross_provider_review": {
+      "opus_built": "gpt-5.5",
+      "gpt_built": "opus-4.8",
+      "glm_built": "gpt-5.5 then opus-4.8 if high-risk"
+    },
+    "spof_fallback": {
+      "_note": "3/6 profiles ride GPT-5.5. If the OpenAI lane is unavailable, Opus 4.8 is the NAMED fallback for verifier and reviewer so review capacity degrades gracefully instead of hard-stalling.",
+      "verifier": "opus-4.8",
+      "reviewer": "opus-4.8"
+    }
   }
 }
