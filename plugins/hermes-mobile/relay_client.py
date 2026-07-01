@@ -299,30 +299,15 @@ class RelayClient:
         return self.relay_url, creds.agent_id, pairing
 
     async def tunnel_status(self) -> dict:
-        """Return the relay's view of this agent's tunnel readiness."""
-        creds = await self._credentials()
-        headers = {
-            "X-Hermes-Agent-Id": creds.agent_id,
-            "Authorization": f"Bearer {creds.agent_secret}",
-        }
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(
-                f"{self.relay_url}/v1/agents/tunnel/status", headers=headers
-            )
-        if response.status_code == 404:
-            return {"ok": False, "reason": "status_unavailable", "status_code": 404}
-        if response.status_code in {200, 503}:
-            try:
-                return response.json()
-            except ValueError:
-                return {"ok": False, "reason": "invalid_status_response"}
-        response.raise_for_status()
-        return response.json()
+        """Return tunnel readiness when ABH-202 adds the relay status surface."""
+        # ABH-202 owns the real reverse-tunnel status contract. Until that server
+        # route exists, be honest and avoid calling a guaranteed-404 endpoint.
+        return {"ok": False, "reason": "tunnel_status_unimplemented"}
 
     async def wait_for_tunnel_online(
         self, *, timeout_s: float = 20.0, interval_s: float = 0.5
     ) -> dict:
-        """Poll until the relay sees this agent's tunnel uplink or time expires."""
+        """Poll tunnel readiness, returning promptly while ABH-202 is unimplemented."""
         deadline = time.monotonic() + max(0.0, timeout_s)
         last: dict = {"ok": False, "reason": "not_checked"}
         while True:
@@ -330,6 +315,8 @@ class RelayClient:
                 last = await self.tunnel_status()
             except Exception as exc:
                 last = {"ok": False, "reason": type(exc).__name__}
+            if last.get("reason") == "tunnel_status_unimplemented":
+                return last
             if bool(last.get("ok") or last.get("agent_online")):
                 return last
             if time.monotonic() >= deadline:

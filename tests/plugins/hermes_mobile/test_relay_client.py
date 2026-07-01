@@ -192,6 +192,39 @@ def test_credentials_raise_needs_attestation(monkeypatch, tmp_path):
         asyncio.run(client._credentials())
 
 
+def test_tunnel_status_reports_unimplemented_without_status_request(monkeypatch, tmp_path):
+    fake = _install_fake_httpx(monkeypatch, [_FakeResponse(404, text="not found")])
+    client = relay.RelayClient(relay_url="https://relay", credentials_path=tmp_path / "push" / "relay.json")
+    client._write_credentials(
+        relay.RelayCredentials("https://relay", "agent-1", "secret-1")
+    )
+
+    status = asyncio.run(client.tunnel_status())
+
+    assert status == {"ok": False, "reason": "tunnel_status_unimplemented"}
+    assert fake.calls == []
+
+
+def test_wait_for_tunnel_online_returns_unimplemented_without_sleep(monkeypatch, tmp_path):
+    client = relay.RelayClient(relay_url="https://relay", credentials_path=tmp_path / "push" / "relay.json")
+    statuses_checked: list[str] = []
+
+    async def fake_tunnel_status():
+        statuses_checked.append("checked")
+        return {"ok": False, "reason": "tunnel_status_unimplemented"}
+
+    async def fail_sleep(delay):
+        raise AssertionError(f"wait_for_tunnel_online should not sleep {delay}s for unimplemented tunnel status")
+
+    monkeypatch.setattr(client, "tunnel_status", fake_tunnel_status)
+    monkeypatch.setattr(relay.asyncio, "sleep", fail_sleep)
+
+    status = asyncio.run(client.wait_for_tunnel_online())
+
+    assert status == {"ok": False, "reason": "tunnel_status_unimplemented"}
+    assert statuses_checked == ["checked"]
+
+
 def test_dedupe_window(monkeypatch):
     relay._recent.clear()
     monkeypatch.setattr(relay.time, "time", lambda: 100.0)
