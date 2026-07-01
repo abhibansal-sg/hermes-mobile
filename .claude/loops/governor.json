@@ -144,6 +144,16 @@
     ],
     "_never_autonomous_even_now": "Full autonomy = through PR + merge-to-fork-base. The IRREVERSIBLE 5% above still files-to-Abhi-and-continues (escalation.never_block_the_chain), it does NOT execute autonomously. Autonomous merge to a revertible fork branch is fine (veto-by-revert); shipping to real users / editing stock core / spending money are not."
   },
+  "upstream_policy": {
+    "_comment": "ARMED 2026-07-02 (Abhi: 'always be at the latest Hermes, all commits, daily'). The loop-upstream-watch beat (daily 06:00 SGT, profile scout-upstream=sonnet-5) fetches upstream NousResearch/hermes-agent main and keeps our FORK base (environment-and-workflows-overview) continuously synced. GOAL = stay current with ALL upstream commits so we never go stale. Clean merges auto-merge after the verifier proves the fork still builds+passes; conflicts get an engineer-resolve card then the same gate; unresolvable conflicts file to Abhi + continue. An upstream SYNC updating stock-core files is EXPECTED and allowed (importing NousResearch's own vetted commits, NOT a worker inventing core edits) — the real gate is build+tests green. NEVER push to upstream (hard-disabled). Everything is in the fork; the live gateway (~/.hermes/hermes-agent) is a separate checkout, never touched.",
+    "autonomous_sync_active": true,
+    "source": "upstream/main (NousResearch/hermes-agent)",
+    "target": "environment-and-workflows-overview (fork base)",
+    "cadence": "daily 06:00 SGT",
+    "sync_gate": "verifier proves fork builds+passes on the synced branch; then merge_policy 4 conditions; a sync that breaks build/tests does NOT merge (file + continue)",
+    "conflict_handling": "engineer-resolve card (scope=conflicting files) → verify → review → merge; unresolvable → file to Abhi (loop:blocked-human) + continue",
+    "never": "push to upstream; that remote's push is structurally DISABLED"
+  },
   "ship_policy": {
     "_comment": "ARMED 2026-07-02 (Abhi: 'even TestFlight auto'). When a build WAVE is fully merged to base, the orchestrator runs scripts/ship-testflight.sh <N> to archive+upload the completed wave to INTERNAL TestFlight (Abhi's own device group). INTERNAL ONLY — no external beta testers, no App Store release; those need Apple Beta App Review and stay Abhi's gate. Internal ship is reversible-in-effect (only Abhi's phone receives it) so it fits the veto-by-revert model; external ship puts code in front of OTHER humans and is NOT autonomous.",
     "autonomous_ship_active": true,
