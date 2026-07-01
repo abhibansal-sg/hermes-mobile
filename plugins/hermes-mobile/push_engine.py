@@ -823,6 +823,23 @@ def notify(
     Never raises: transport / credential errors are logged and swallowed so a
     push failure can never break the calling gateway hook.
     """
+    if os.environ.get("HERMES_MOBILE_RELAY_URL"):
+        try:
+            from . import relay_client
+
+            relay_payload = payload if isinstance(payload, dict) else {}
+            relay_client.send_event_background(
+                kind=relay_client.map_push_kind(event_type),
+                session_id=relay_payload.get("session_id"),
+                title=title,
+                body=body,
+                source=relay_payload.get("source"),
+            )
+            return 1
+        except Exception:
+            _log.debug("relay push notify failed", exc_info=True)
+            return 0
+
     config = APNsConfig.from_env()
     if not config.is_armed():
         _log.debug("push notify: not armed (enabled=%s) — no-op", config.enabled)
@@ -915,6 +932,20 @@ def notify_live_activity(
     Never raises: errors are logged and swallowed so a failed LA push can never
     break the calling gateway hook.
     """
+    if os.environ.get("HERMES_MOBILE_RELAY_URL"):
+        try:
+            from . import relay_client
+
+            relay_client.send_live_activity_background(
+                session_id=session_id,
+                content_state=content_state,
+                end=end,
+            )
+            return True
+        except Exception:
+            _log.debug("relay live activity notify failed", exc_info=True)
+            return False
+
     config = APNsConfig.from_env()
     if not config.is_armed():
         _log.debug("live activity: not armed — no-op")
