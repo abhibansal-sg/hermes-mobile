@@ -51,9 +51,12 @@ fi
 
 # --- GATE 2: has HEAD already shipped? (avoid burning a build number) ---------
 CUR=$(grep -E "CURRENT_PROJECT_VERSION:" apps/ios/project.yml | head -1 | grep -oE "[0-9]+")
-LAST_SHIP=$(git log -1 --grep="ship: TestFlight build" --format="%s" 2>/dev/null | grep -oE "build [0-9]+" | grep -oE "[0-9]+")
-if [ -n "$LAST_SHIP" ] && [ "$LAST_SHIP" = "$CUR" ]; then
-  echo "  SHIP SKIPPED: build $CUR already shipped (no new merges since last ship)"; exit 0
+LAST_SHIP_SHA=$(git log -1 --grep="ship: TestFlight build" --format="%H" 2>/dev/null)
+if [ -n "$LAST_SHIP_SHA" ]; then
+  COMMITS_SINCE_LAST_SHIP=$(git rev-list --count "$LAST_SHIP_SHA"..HEAD)
+  if [ "$COMMITS_SINCE_LAST_SHIP" = "0" ]; then
+    echo "  SHIP SKIPPED: build $CUR already shipped (no new merges since last ship)"; exit 0
+  fi
 fi
 
 # --- STEP 1: bump build number (ONLY place it changes) -----------------------
