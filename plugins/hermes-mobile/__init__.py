@@ -153,6 +153,14 @@ def register(ctx) -> None:
         # broken plugin hook must not take down the host process.
         _log.warning("hermes-mobile: kanban-spec guard wiring failed", exc_info=True)
     try:
+        from . import ios_turn_context
+
+        ios_turn_context.activate(ctx)
+    except Exception:
+        # Mobile formatting guidance is optional; a hook wiring failure must
+        # never take down the host process or affect non-mobile sessions.
+        _log.warning("hermes-mobile: iOS turn-context wiring failed", exc_info=True)
+    try:
         _wire_token_auth()
     except Exception:
         # Without this wiring the dashboard simply doesn't accept device
