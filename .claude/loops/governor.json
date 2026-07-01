@@ -105,13 +105,25 @@
     }
   },
   "the_5_percent_never_autonomous": [
-    "git merge to a shared/trunk branch",
     "TestFlight ship / altool upload / asc-cloud trigger",
     "any edit to stock NousResearch core (tui_gateway core, hermes_cli core, ui-tui, apps/desktop)",
     "device-repro (needs the user's iPhone)",
     "destructive (rm -rf) / force-push / push to upstream",
+    "spending money / buying anything / provisioning paid infra",
     "a direction fork the issue spec is silent on"
   ],
+  "merge_policy": {
+    "_comment": "Decision (a), 2026-07-01: Abhi stepped OUT of the planning + merge gates for normal work, keeping only the safety gates (destructive / stock-core / ship / spend). The orchestrator MAY merge a PR to the shared branch autonomously, but ONLY when ALL FOUR conditions hold. Any PR failing any one condition escalates to Abhi instead of merging. This replaces the old blanket 'git merge is never autonomous' rule.",
+    "autonomous_merge_allowed_when_ALL": [
+      "verified: the verifier posted hard green evidence (tests pass, exit 0) on the actual PR head",
+      "cross_provider_reviewed: at least one verdict-carrying reviewer of a DIFFERENT provider than the builder posted APPROVE (Opus-built -> GPT-5.5 reviewer; GPT/GLM-built -> Opus reviewer)",
+      "zero_fenced_paths: git diff --name-only touches NOTHING in forbidden_paths.block_globs (run scripts/loop-scope-check.sh)",
+      "revertible: the PR is a clean single-branch merge with no migration/irreversible side effect; `git revert` of the merge commit would cleanly undo it"
+    ],
+    "on_any_condition_fail": "Do NOT merge. Escalate to Abhi via the daily digest + a push notification, naming which condition failed and why.",
+    "post_merge": "Log the merge in the daily digest. A merge is revertible, so Abhi's control is after-the-fact veto (revert), not pre-merge approval.",
+    "visibility_replaces_approval": "Because Abhi no longer approves each wave/merge, a DAILY DIGEST to Telegram is mandatory: what was triaged, what is building, what merged, what is parked for Abhi. Abhi stays in command by seeing everything + veto-by-revert, not by gating each step."
+  },
   "forbidden_paths": {
     "_comment": "HARD scope fence (added 2026-07-01 after Slice B run: an engineer worker drifted from a plugin task into editing tui_gateway/server.py, a stock-core file. The edit was caught at review + contained in a throwaway worktree, but the worker should never have written it. These globs are a PRE-WRITE block: a worker MUST NOT create/modify any path matching these unless the card body explicitly names the path AND carries Abhi's approval. The verifier MUST reject any diff touching these paths that the card did not authorize.",
     "block_globs": [
