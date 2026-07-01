@@ -1063,6 +1063,17 @@ _LA_BLOCKING_STATUS_KINDS = frozenset(
 )
 
 
+def _is_kanban_worker() -> bool:
+    """True when this process is a dispatched Hermes kanban worker.
+
+    The dispatcher pins ``HERMES_KANBAN_TASK`` in the worker's environment
+    (board-scoped isolation — see AGENTS.md "Kanban"). Worker turns must not
+    spam the user's phone with turn-complete alerts; approval requests still
+    push (handled in their own branch of :func:`_process_push_event`).
+    """
+    return bool(os.environ.get("HERMES_KANBAN_TASK"))
+
+
 def _push_safe_text(
     value: Any, fallback: str, *, max_chars: int = _PUSH_TEXT_MAX
 ) -> str:
@@ -1293,6 +1304,14 @@ def _push_hook(event: str, sid: str, payload: dict | None) -> None:
             if session is not None:
                 session["_push_turn_started"] = event_time
         turn_started = (session or {}).get("_push_turn_started")
+        # ABH-204: a dispatched kanban worker's internal turn / tool / status /
+        # message.complete events must not enqueue a phone push. Approval
+        # requests still enqueue (and push) so the user can act on them. The
+        # message.complete branch in _process_push_event keeps its own guard as
+        # defense-in-depth. Live Activity is a no-op for workers in practice
+        # (no registered activity token), and approvals still flow regardless.
+        if _is_kanban_worker() and event != "approval.request":
+            return
         if event in _PUSH_ALERT_EVENTS or event in _LIVE_ACTIVITY_EVENTS:
             _enqueue_push_event(
                 event,
@@ -1361,6 +1380,11 @@ def _process_push_event(
                 return
             if session is not None and session.get("_push_turn_started") == started:
                 session.pop("_push_turn_started", None)
+            # ABH-204: a dispatched kanban worker's internal turns must not
+            # spam the phone with a turn-complete alert. Approval requests
+            # still push (their own branch above); Live Activity is unaffected.
+            if _is_kanban_worker():
+                return
             text = str(data.get("text") or "")
             preview = (
                 _push_safe_text(text.strip().splitlines()[0], "Turn finished")

@@ -8,7 +8,7 @@ session; decision (a) = orchestrator self-merges safe PRs.
 
 ```
 scout-bugs / scout-parity / scout-research   (3 profiles, Sonnet 5, continuous+gated)
-   │ each files well-tagged RAW issues -> Linear, state: needs-triage
+   │ each files well-tagged RAW issues -> Linear Backlog (NO approval label = untriaged)
    ▼
 ORCHESTRATOR (PM, Opus 4.8): triage -> dedup -> prioritize -> form + APPROVE wave -> dispatch
    │
@@ -43,6 +43,45 @@ cite-don't-refile (the ABH-186/ABH-208 dup lesson).
 
 ---
 
+## FILING CONTRACT (binding — every beat that creates a Linear issue MUST obey)
+
+An issue is NOT "filed" until it has a project AND canonical labels. A profile
+that creates an orphaned or free-text-labelled issue has FAILED its beat, even
+if the issue text is good. This block is the contract; the doc above it explains
+why.
+
+**1. PROJECT is mandatory — never null.** Every hermes-mobile issue you create
+   MUST set `projectId` to:
+   - **Hermes Mobile — Engineering** = `020087b9-2942-458d-98fa-85649bd8edc3`
+   (default for all bug/feature/polish/parity work). Only use another project if
+   the work is genuinely off-product, and if so name it explicitly.
+
+**2. LABELS must be CANONICAL taxonomy only. NEVER the free-text duplicates.**
+   Linear has trap duplicates — use the LEFT column, never the RIGHT:
+
+   | USE (canonical id) | NEVER (free-text noise) |
+   |---|---|
+   | `type:feature` 2ffa217a-76af-46d5-8aba-353030b80adc | `Feature`, `Improvement` |
+   | `type:fix` e54d5299-cf0e-481c-8517-fb8231ab7247 | `Bug` |
+   | `type:polish` e859ea8a-0424-4c53-b28c-bf09ca95e4b2 | — |
+   | `area:ios` f1214dde-e71b-40e0-809d-1535d66d0ef4 | `iOS` |
+   | `area:server` 8d8e13e1-5ff6-46ac-b6b4-eaeb9b1059f4 | — |
+   | `area:infra` c780d527-b200-4cfe-950f-84237c3b5aef | — |
+
+   Every issue needs exactly one `type:*` and at least one `area:*`. Choose
+   `area:server` for `plugins/hermes-mobile/` Python work, `area:ios` for Swift
+   `apps/ios/` work, both if it spans the seam.
+
+**3. SELF-CHECK before you consider a beat done:** re-query your just-created
+   issues and confirm each has a non-null project and only canonical labels. If
+   any is orphaned or carries a free-text label, FIX IT before finishing. Zero
+   orphans, zero free-text labels — that is the pass condition.
+
+**4. Approval labels are the PM's, not yours.** Scouts NEVER set
+   `status:approved-for-execution` or `wave:*`. Those are the orchestrator's.
+
+---
+
 ## BEAT 1 — scout-bugs (goal-loop prompt)
 
 ```
@@ -67,7 +106,8 @@ SURVEY (read-only, do NOT edit code):
   - walk each user-facing feature in apps/ios and trace its interaction paths
 
 PER ISSUE, create in Linear (team ABH, project "Hermes Mobile — Engineering",
-state = needs-triage, NO wave label, NO approval label):
+state = Backlog, NO wave label, NO status:approved-for-execution label —
+"untriaged" = in Backlog without the approval label; the PM triages from there):
   - title: user-facing outcome
   - type:fix OR type:polish(+fitness); area:ios / area:server / area:infra
   - body: what's broken/missing, the exact file:line or screen, repro or the
@@ -100,7 +140,7 @@ SURVEY (read-only):
   - the delta: a stock feature (a slash command, a gateway capability, a desktop
     affordance) with no mobile equivalent = a parity candidate.
 
-PER CANDIDATE, file to Linear (needs-triage, tagged type:feature, area:ios and/or
+PER CANDIDATE, file to Linear (Backlog, no approval label, tagged type:feature, area:ios and/or
 area:server): what stock has, what mobile lacks, the user value of closing it,
 rough size, and any dependency. Cite the stock file/command you're mirroring.
 
@@ -140,7 +180,7 @@ THE DAILY-ONE GATE (the whole point):
     a quota. If you produce zero for ~5 consecutive days, note that the well may
     be dry or the bar miscalibrated (surface it; don't silently stall).
 
-PER PICK, file to Linear (needs-triage, type:feature, area labels): the feature,
+PER PICK, file to Linear (Backlog, no approval label, type:feature, area labels): the feature,
 the outside-world demand signal (link the X post / repo), why it fits our
 self-hosted app specifically, rough size, and the "why this over the others" line.
 
@@ -163,7 +203,8 @@ verify, or review code. You manage the board and the flow. Abhi is OUT of the
 planning + merge path for normal work; you own it, fenced by the governor.
 
 TRIAGE (the judgment that replaces Abhi's wave approval):
-  - Read Linear issues in state needs-triage (filed by scout-bugs/parity/research).
+  - Read Linear issues in Backlog WITHOUT status:approved-for-execution (the
+    untriaged pool — filed by scout-bugs/parity/research or by hand).
   - For each: VALIDATE (is the claim real + grounded?), DEDUP (does an open issue
     already cover it? merge/close if so), PRIORITIZE (leverage vs risk vs cost),
     and set area/type/size if the scout under-tagged.
@@ -196,7 +237,7 @@ is building, what merged (with revert instructions), what is parked for Abhi and
 why. Abhi controls by veto-revert, not pre-approval — so the digest must be
 honest and complete.
 
-GOAL / LOOP: continuous board management. Each tick: drain needs-triage, advance
+GOAL / LOOP: continuous board management. Each tick: drain the untriaged Backlog, advance
 ready cards, honor WIP caps, reconcile reviews, merge the safe, escalate the 5%,
 and once/day emit the digest. You are the supervisor over loops that already run.
 ```

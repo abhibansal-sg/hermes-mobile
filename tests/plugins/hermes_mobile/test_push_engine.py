@@ -527,6 +527,20 @@ def test_push_routes_401_without_dashboard_auth(monkeypatch, isolated_home):
 
 
 # ===========================================================================
+# ABH-204 — _is_kanban_worker() env detection (worker turn-complete suppression)
+# ===========================================================================
+
+def test_is_kanban_worker_true_when_task_env_set(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
+    assert pn._is_kanban_worker() is True
+
+
+def test_is_kanban_worker_false_when_task_env_absent(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    assert pn._is_kanban_worker() is False
+
+
+# ===========================================================================
 # F2-S S2 — aps.category on build_alert_payload
 # ===========================================================================
 

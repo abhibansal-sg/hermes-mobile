@@ -124,6 +124,79 @@ def test_push_hook_message_start_snapshot_prevents_stale_elapsed(monkeypatch, pu
     assert captured[0][2] != 10.0
 
 
+def test_push_hook_kanban_worker_suppresses_intake_except_approval(
+    monkeypatch, push_engine
+):
+    """ABH-204: a kanban worker's internal turn/tool/status/message-complete
+    events must not enqueue a phone push, but its approval requests still do.
+
+    Drives _push_hook directly so the assertion is about intake (enqueue), not
+    about the downstream _process_push_event guard (which stays as
+    defense-in-depth). HERMES_KANBAN_TASK pins the worker env; teardown clears
+    the session table.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
+
+    enqueued = []
+
+    def _fake_enqueue(event, sid, payload, event_time=None, turn_started=None):
+        enqueued.append(event)
+
+    monkeypatch.setattr(push_engine, "_enqueue_push_event", _fake_enqueue)
+    monkeypatch.setattr(
+        push_engine,
+        "_process_push_event",
+        lambda *a, **k: pytest.fail("_push_hook must not process inline"),
+    )
+
+    server._sessions["sid_worker"] = {
+        "session_key": "kw",
+        "_push_turn_started": time.time() - 100,
+    }
+    try:
+        # Worker internal events are suppressed at intake.
+        push_engine._push_hook("message.start", "sid_worker", None)
+        push_engine._push_hook("tool.start", "sid_worker", {"name": "edit_file"})
+        push_engine._push_hook("tool.complete", "sid_worker", {"name": "edit_file"})
+        push_engine._push_hook("status.update", "sid_worker", {"kind": "process"})
+        push_engine._push_hook(
+            "message.complete", "sid_worker", {"text": "All done"}
+        )
+        # Approval requests still enqueue even for a worker.
+        push_engine._push_hook(
+            "approval.request", "sid_worker", {"command": "rm -rf /"}
+        )
+    finally:
+        server._sessions.pop("sid_worker", None)
+
+    assert enqueued == ["approval.request"]
+
+
+def test_push_hook_kanban_worker_suppression_is_env_gated(monkeypatch, push_engine):
+    """ABH-204: suppression only applies when HERMES_KANBAN_TASK is set — a
+    normal user session's message.complete still enqueues."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    enqueued = []
+
+    def _fake_enqueue(event, sid, payload, event_time=None, turn_started=None):
+        enqueued.append(event)
+
+    monkeypatch.setattr(push_engine, "_enqueue_push_event", _fake_enqueue)
+    server._sessions["sid_user"] = {
+        "session_key": "ku",
+        "_push_turn_started": time.time() - 100,
+    }
+    try:
+        push_engine._push_hook(
+            "message.complete", "sid_user", {"text": "All done"}
+        )
+    finally:
+        server._sessions.pop("sid_user", None)
+
+    assert enqueued == ["message.complete"]
+
+
 def test_push_hook_approval_enriched_and_categorized(monkeypatch, push_engine):
     calls = _capture_notify(monkeypatch, push_engine)
     server._sessions["sid_appr"] = {"session_key": "stored-key-1"}
@@ -229,6 +302,66 @@ def test_process_push_event_does_not_clear_newer_turn_start(monkeypatch, push_en
     finally:
         server._sessions.pop("sid_race", None)
     assert calls[0]["event_type"] == "turn_complete"
+
+
+# ===========================================================================
+# ABH-204 — a dispatched kanban worker's internal turns must NOT push a phone
+# alert, but its approval requests must still push. Normal user-session push
+# behavior is unchanged when HERMES_KANBAN_TASK is absent.
+# ===========================================================================
+
+def test_worker_long_turn_complete_produces_no_alert_push(monkeypatch, push_engine):
+    # HERMES_KANBAN_TASK set ⇒ this process is a dispatched kanban worker.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
+    calls = _capture_notify(monkeypatch, push_engine)
+    server._sessions["sid_worker"] = {"session_key": "kw"}
+    # Stamp a turn start well past the 30s long-turn threshold.
+    server._sessions["sid_worker"]["_push_turn_started"] = time.time() - 100
+    try:
+        push_engine._process_push_event(
+            "message.complete", "sid_worker", {"text": "All done\nmore"}
+        )
+    finally:
+        server._sessions.pop("sid_worker", None)
+    # No alert push for a worker's internal turn completion.
+    assert calls == []
+
+
+def test_worker_approval_request_still_pushes(monkeypatch, push_engine):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_abc")
+    calls = _capture_notify(monkeypatch, push_engine)
+    server._sessions["sid_wa"] = {"session_key": "kwa"}
+    try:
+        push_engine._process_push_event(
+            "approval.request",
+            "sid_wa",
+            {"description": "rm -rf /", "command": "rm -rf /",
+             "pattern_keys": ["rm_rf"]},
+        )
+    finally:
+        server._sessions.pop("sid_wa", None)
+    # Worker approval requests must still push with HERMES_APPROVAL category.
+    assert len(calls) == 1
+    assert calls[0]["event_type"] == "approval"
+    assert calls[0]["category"] == "HERMES_APPROVAL"
+
+
+def test_non_worker_long_turn_complete_still_pushes(monkeypatch, push_engine):
+    # HERMES_KANBAN_TASK absent ⇒ normal user session; behavior unchanged.
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls = _capture_notify(monkeypatch, push_engine)
+    server._sessions["sid_user"] = {"session_key": "ku"}
+    server._sessions["sid_user"]["_push_turn_started"] = time.time() - 100
+    try:
+        push_engine._process_push_event(
+            "message.complete", "sid_user", {"text": "All done\nmore"}
+        )
+    finally:
+        server._sessions.pop("sid_user", None)
+    assert len(calls) == 1
+    assert calls[0]["event_type"] == "turn_complete"
+    assert calls[0]["category"] == "HERMES_TURN"
+    assert calls[0]["body"] == "All done"
 
 
 # ===========================================================================
