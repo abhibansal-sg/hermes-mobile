@@ -232,3 +232,27 @@ joints are seen to move.
    output is NOT delivered back into the TUI session).
 
 No rung is skipped.
+
+---
+
+## 10. Chaining stages onto an existing branch (verify/review after build)
+
+Learned 2026-07-02 (cost 3 failed verifier cards). To hand a committed branch
+from one stage to the next (engineer → verifier → reviewer) so the downstream
+profile sees the actual code:
+
+- The board auto-anchors the FIRST card's worktree (no flag needed) at
+  `.worktrees/<task_id>/` on a deterministic branch. The builder MUST `git commit`
+  its work to that branch before blocking — an uncommitted worktree is invisible
+  to downstream stages. (Engineer contract gap: it verified but did not commit;
+  patch the engineer prompt to commit-before-block.)
+- Downstream stages point at that SAME worktree with:
+    `--workspace worktree:<ABSOLUTE_PATH_to_.worktrees/<builder_task_id>>`
+  The path MUST be absolute (relative fails: "non-absolute worktree path").
+- Do NOT pass `--project` (not a real `kanban create` flag — silently ignored).
+- Do NOT use bare `--branch <name>` expecting it to check out an existing branch;
+  it lands on the base tip, not the builder's commit.
+- Sharing the builder's worktree is safe once the builder is DONE (verifier/reviewer
+  are read-only). For parallel stages that both write, give each its own worktree.
+- `hermes kanban link <parent> <child>` creates the dependency edge so the child
+  auto-promotes when the parent completes (the hands-off auto-advance primitive).

@@ -48,7 +48,15 @@
       "push",
       "linear"
     ],
-    "_channels": "User decision D2=C. Escalate the 5% / walls via BOTH a push notification AND a Linear assign+comment carrying a decision (tried A/B/C; here's the wall), not a debugging dump."
+    "_channels": "User decision D2=C. Escalate the 5% / walls via BOTH a push notification AND a Linear assign+comment carrying a decision (tried A/B/C; here's the wall), not a debugging dump.",
+    "never_block_the_chain": true,
+    "_never_block_the_chain": "STANDING RULE (Abhi, 2026-07-02): escalation FILES + ASSIGNS + NOTIFIES, then the loop CONTINUES. It never halts the pipeline waiting on Abhi. A 5% / fenced-path / stock-core finding is filed as a Linear issue assigned to Abhi (label loop:blocked-human, assigneeId 3b5a41e6-f907-4d10-8137-7dc6b678a3c3) and the current work proceeds on its OWN merits. Pending-Abhi is an async parking-lot item, NEVER a chain link (pipeline rule 3). Do NOT stop and ask; file-and-continue.",
+    "abhi_linear_user_id": "3b5a41e6-f907-4d10-8137-7dc6b678a3c3"
+  },
+  "verify_gate_scope": {
+    "_comment": "STANDING RULE (Abhi, 2026-07-02): the verifier's evidence gate is scoped to REGRESSION, not to a globally-green suite. A pre-existing failure that (a) reproduces on the base branch without the change AND (b) is outside the change's scope does NOT fail the change. The verifier files the pre-existing failure as its own Linear issue (assigned to Abhi if the fix is in a forbidden_path; to the backlog otherwise), records the proof (base-branch repro), and PASSES the change on its own merits. Only a failure the change ITSELF introduced is a FAIL.",
+    "pass_when": "targeted tests green + false-green check passed + any broader-suite failure proven pre-existing (base-branch repro) and out-of-scope",
+    "on_preexisting_failure": "file it (forbidden_path fix -> assign Abhi + loop:blocked-human; else backlog), then PASS the change and advance the chain"
   },
   "linear": {
     "team": "Abhinav Bansal",
@@ -122,7 +130,19 @@
     ],
     "on_any_condition_fail": "Do NOT merge. Escalate to Abhi via the daily digest + a push notification, naming which condition failed and why.",
     "post_merge": "Log the merge in the daily digest. A merge is revertible, so Abhi's control is after-the-fact veto (revert), not pre-merge approval.",
-    "visibility_replaces_approval": "Because Abhi no longer approves each wave/merge, a DAILY DIGEST to Telegram is mandatory: what was triaged, what is building, what merged, what is parked for Abhi. Abhi stays in command by seeing everything + veto-by-revert, not by gating each step."
+    "visibility_replaces_approval": "Because Abhi no longer approves each wave/merge, a DAILY DIGEST to Telegram is mandatory: what was triaged, what is building, what merged, what is parked for Abhi. Abhi stays in command by seeing everything + veto-by-revert, not by gating each step.",
+    "autonomous_merge_active": true,
+    "_autonomous_merge_active": "ARMED 2026-07-02 (Abhi: 'everything end-to-end autonomous'). The orchestrator MAY open a PR and merge it to base_branch via `gh pr merge --squash` WITHOUT Abhi when ALL FOUR conditions hold. base_branch is the merge target; NEVER merge to a remote's default/main if that differs, and NEVER push to upstream (git remote 'upstream' push is hard-disabled). Merge is to the FORK (origin=ab0991-oss/hermes-mobile) only.",
+    "base_branch": "environment-and-workflows-overview",
+    "merge_command": "gh pr merge <n> --squash --delete-branch --repo ab0991-oss/hermes-mobile",
+    "never_autonomous_even_now": [
+      "TestFlight ship / altool upload / asc-cloud trigger (the actual App Store release)",
+      "any edit to stock NousResearch core (forbidden_paths) — file to Abhi, continue",
+      "git push to upstream NousResearch (structurally disabled)",
+      "spending money / provisioning paid infra",
+      "destructive rm -rf / force-push / history rewrite"
+    ],
+    "_never_autonomous_even_now": "Full autonomy = through PR + merge-to-fork-base. The IRREVERSIBLE 5% above still files-to-Abhi-and-continues (escalation.never_block_the_chain), it does NOT execute autonomously. Autonomous merge to a revertible fork branch is fine (veto-by-revert); shipping to real users / editing stock core / spending money are not."
   },
   "forbidden_paths": {
     "_comment": "HARD scope fence (added 2026-07-01 after Slice B run: an engineer worker drifted from a plugin task into editing tui_gateway/server.py, a stock-core file. The edit was caught at review + contained in a throwaway worktree, but the worker should never have written it. These globs are a PRE-WRITE block: a worker MUST NOT create/modify any path matching these unless the card body explicitly names the path AND carries Abhi's approval. The verifier MUST reject any diff touching these paths that the card did not authorize.",

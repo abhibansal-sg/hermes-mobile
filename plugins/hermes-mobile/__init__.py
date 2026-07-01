@@ -145,6 +145,14 @@ def register(ctx) -> None:
         # behaves like stock (no fan-out, no push) and logs why.
         _log.warning("hermes-mobile: seam wiring failed", exc_info=True)
     try:
+        from . import kanban_spec_guard
+
+        kanban_spec_guard.activate(ctx)
+    except Exception:
+        # Spec enforcement is safety-critical for agent-created cards, but a
+        # broken plugin hook must not take down the host process.
+        _log.warning("hermes-mobile: kanban-spec guard wiring failed", exc_info=True)
+    try:
         _wire_token_auth()
     except Exception:
         # Without this wiring the dashboard simply doesn't accept device
