@@ -257,6 +257,42 @@ def test_list_providers_returns_safe_shape(loopback_client, monkeypatch):
     assert "key_env" not in dumped
 
 
+def test_provider_rows_include_unconfigured_stock_providers(monkeypatch):
+    """Mobile provider rows request canonical skeleton providers too.
+
+    A zero-credential canonical provider only appears when the stock inventory
+    builder is called with include_unconfigured=True; otherwise the mobile list
+    has no row the user can tap to reach Add key.
+    """
+    import hermes_cli.inventory as inventory
+
+    ctx = object()
+    captured = {}
+
+    def _load_picker_context():
+        return ctx
+
+    def _build_models_payload(received_ctx, **kwargs):
+        captured["ctx"] = received_ctx
+        captured["kwargs"] = kwargs
+        return {"providers": [_DEEPSEEK_ROW]}
+
+    monkeypatch.setattr(inventory, "load_picker_context", _load_picker_context)
+    monkeypatch.setattr(inventory, "build_models_payload", _build_models_payload)
+
+    rows = _api()._provider_provider_rows()
+
+    assert rows == [_DEEPSEEK_ROW]
+    assert captured == {
+        "ctx": ctx,
+        "kwargs": {
+            "picker_hints": True,
+            "include_unconfigured": True,
+            "max_models": 50,
+        },
+    }
+
+
 # ===========================================================================
 # Tier A — POST /providers/{slug}/key
 # ===========================================================================
@@ -572,20 +608,21 @@ def test_looks_like_url_rejects_non_http():
     assert not f("")
 
 
-def test_refresh_provider_row_projects_safe_shape():
-    _refresh_provider_row = _api()._refresh_provider_row
+def test_refresh_provider_row_projects_safe_shape(monkeypatch):
+    api = _api()
+    _refresh_provider_row = api._refresh_provider_row
+    monkeypatch.setattr(api, "_provider_provider_rows", lambda: [])
 
-    # When patched inventory has the slug, the row is projected (no key).
     row = _refresh_provider_row("deepseek", fallback_name="DeepSeek")
-    # _refresh_provider_row calls the real _provider_provider_rows which builds
-    # the real inventory; in a gateway-free test env it may return [] and hit
-    # the fallback. Either way the shape is the safe shape.
+    # When the refreshed inventory cannot surface the slug, the fallback still
+    # reports the just-set provider as authenticated while preserving the safe
+    # response shape.
     assert set(row.keys()) == {
         "slug", "name", "auth_type", "is_current",
         "authenticated", "total_models", "models",
     }
     assert row["slug"] == "deepseek"
-    assert row["authenticated"] is True  # fallback forces True after a set
+    assert row["authenticated"] is True
 
 
 # ===========================================================================

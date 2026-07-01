@@ -1631,7 +1631,9 @@ def _provider_provider_rows() -> List[Dict[str, Any]]:
     from hermes_cli.inventory import build_models_payload, load_picker_context
 
     ctx = load_picker_context()
-    payload = build_models_payload(ctx, picker_hints=True, max_models=50)
+    payload = build_models_payload(
+        ctx, picker_hints=True, include_unconfigured=True, max_models=50
+    )
     return payload.get("providers", []) or []
 
 
