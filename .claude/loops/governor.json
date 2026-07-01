@@ -136,13 +136,23 @@
     "base_branch": "environment-and-workflows-overview",
     "merge_command": "gh pr merge <n> --squash --delete-branch --repo ab0991-oss/hermes-mobile",
     "never_autonomous_even_now": [
-      "TestFlight ship / altool upload / asc-cloud trigger (the actual App Store release)",
+      "EXTERNAL TestFlight beta submission / App Store release (Apple Beta App Review, reaches real users) — internal-only ship IS now autonomous per ship_policy",
       "any edit to stock NousResearch core (forbidden_paths) — file to Abhi, continue",
       "git push to upstream NousResearch (structurally disabled)",
       "spending money / provisioning paid infra",
       "destructive rm -rf / force-push / history rewrite"
     ],
     "_never_autonomous_even_now": "Full autonomy = through PR + merge-to-fork-base. The IRREVERSIBLE 5% above still files-to-Abhi-and-continues (escalation.never_block_the_chain), it does NOT execute autonomously. Autonomous merge to a revertible fork branch is fine (veto-by-revert); shipping to real users / editing stock core / spending money are not."
+  },
+  "ship_policy": {
+    "_comment": "ARMED 2026-07-02 (Abhi: 'even TestFlight auto'). When a build WAVE is fully merged to base, the orchestrator runs scripts/ship-testflight.sh <N> to archive+upload the completed wave to INTERNAL TestFlight (Abhi's own device group). INTERNAL ONLY — no external beta testers, no App Store release; those need Apple Beta App Review and stay Abhi's gate. Internal ship is reversible-in-effect (only Abhi's phone receives it) so it fits the veto-by-revert model; external ship puts code in front of OTHER humans and is NOT autonomous.",
+    "autonomous_ship_active": true,
+    "track": "internal",
+    "trigger": "a wave is fully merged: zero issues tagged wave:build-N remain in a non-completed state",
+    "ship_command": "scripts/ship-testflight.sh <N>",
+    "build_number_rule": "the ship script bumps CURRENT_PROJECT_VERSION (project.yml) — the ONLY place the build number changes — then archives via scripts/ios-build.sh (wedge-safe, never raw xcodebuild, never kill -9), runs the CFBundleVersion app+extensions gate, exports+uploads via ExportOptions-TestFlight.plist, polls ASC (app 6777140135) until VALID.",
+    "external_ship_is_abhi": "Submitting a build to EXTERNAL TestFlight beta testers (or App Store release) requires Apple Beta App Review and reaches real users — file to Abhi + continue, never autonomous.",
+    "wip_cap": "respect pipeline.wip_caps.shipped_unverified_builds — at the cap the ship stage throttles (stops shipping new builds) but build/plan keep running; a device-verify drains it."
   },
   "forbidden_paths": {
     "_comment": "HARD scope fence (added 2026-07-01 after Slice B run: an engineer worker drifted from a plugin task into editing tui_gateway/server.py, a stock-core file. The edit was caught at review + contained in a throwaway worktree, but the worker should never have written it. These globs are a PRE-WRITE block: a worker MUST NOT create/modify any path matching these unless the card body explicitly names the path AND carries Abhi's approval. The verifier MUST reject any diff touching these paths that the card did not authorize.",
