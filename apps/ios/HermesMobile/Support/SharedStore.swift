@@ -75,6 +75,29 @@ enum SharedStore {
         }
     }
 
+    static func removeInboxItem(id: UUID) {
+        var items = readInbox()
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        let removed = items.remove(at: index)
+
+        if items.isEmpty {
+            defaults?.removeObject(forKey: inboxKey)
+        } else if let data = try? JSONEncoder().encode(items) {
+            defaults?.set(data, forKey: inboxKey)
+        } else {
+            return
+        }
+
+        removeSharedImages(named: removed.imageFiles)
+    }
+
+    private static func removeSharedImages(named imageFiles: [String]) {
+        guard !imageFiles.isEmpty, let dir = sharedImagesDirectory else { return }
+        for name in imageFiles {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(name, isDirectory: false))
+        }
+    }
+
     static func clearInbox() {
         defaults?.removeObject(forKey: inboxKey)
         if let dir = sharedImagesDirectory {

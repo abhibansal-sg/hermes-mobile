@@ -7,8 +7,8 @@ import Foundation
 /// ``SharedStore/SharedInboxItem`` JSON (plus any image files) into the
 /// `group.ai.hermes.app` app group. On foreground the app reads those items and,
 /// for each, opens a brand-new session and submits a "Shared from iPhone" prompt
-/// (attaching any images through the normal upload pipeline), then clears the
-/// inbox. Items are processed **serially, oldest first** so the newest share
+/// (attaching any images through the normal upload pipeline), then removes only
+/// that delivered item from the inbox. Items are processed **serially, oldest first** so the newest share
 /// ends up as the most recent session — matching how the user just queued them.
 ///
 /// Landing (C3): each item needs a *real* session to send into, so this uses the
@@ -20,9 +20,9 @@ import Foundation
 ///
 /// Concurrency: every store touched here is `@MainActor`, and a single in-flight
 /// drain is enforced so two foreground events can't double-process the inbox.
-/// The drain is best-effort: a per-item failure is logged via the count callback
-/// but does not abort the batch, and the inbox is cleared once the batch is
-/// attempted (the queue is a one-shot handoff, not a retry buffer).
+/// The drain is best-effort: a per-item failure does not abort the batch, but it
+/// stays queued for the next drain. Delivered items are removed immediately so a
+/// mid-batch app kill retries only the undelivered remainder.
 ///
 /// Hook point (wired by the parent — see integration notes): call ``drain(...)``
 /// from `scenePhase == .active`, after the connection is (re)established, much
@@ -40,7 +40,7 @@ enum SharedInboxDrainer {
     private static var isDraining = false
 
     /// Read every queued shared item, turn each into a new Hermes session, then
-    /// clear the inbox. No-op when the gateway isn't connected (the items stay
+    /// remove each item after its own send succeeds. No-op when the gateway isn't connected (the items stay
     /// queued for the next good foreground) or when already draining.
     ///
     /// - Parameters:
@@ -50,7 +50,7 @@ enum SharedInboxDrainer {
     ///   - attachments: normalises + uploads any shared images.
     ///   - onDrained: optional toast hook called with the number of items that
     ///     were processed (≥1). Not called when there was nothing to drain.
-    ///   - readInbox/clearInbox/processItem: injectable seams for unit tests;
+    ///   - readInbox/removeInboxItem/processItem: injectable seams for unit tests;
     ///     app calls use the shared app-group inbox + real session-send path.
     static func drain(
         connection: ConnectionStore,
@@ -59,7 +59,12 @@ enum SharedInboxDrainer {
         attachments: AttachmentStore,
         onDrained: ((Int) -> Void)? = nil,
         readInbox: () -> [SharedStore.SharedInboxItem] = { SharedStore.readInbox() },
-        clearInbox: @escaping @MainActor () -> Void = { SharedStore.clearInbox() },
+        // Legacy test hook retained as a no-op by default; app calls no longer
+        // clear the whole inbox at batch end.
+        clearInbox: @escaping @MainActor () -> Void = {},
+        removeInboxItem: @escaping @MainActor (SharedStore.SharedInboxItem) -> Void = { item in
+            SharedStore.removeInboxItem(id: item.id)
+        },
         processItem: ProcessItemOverride? = nil
     ) {
         guard !isDraining else { return }
@@ -95,21 +100,17 @@ enum SharedInboxDrainer {
                 }
                 if let created {
                     lastLanded = created
+                    removeInboxItem(item)
+                    processed += 1
                 }
-                processed += 1
             }
             // Navigate to the newest shared session (C3). No-op-preserving when it's
             // already active, so the just-submitted turn keeps streaming.
             if let lastLanded {
                 sessions.land(storedId: lastLanded.storedId, runtimeId: lastLanded.runtimeId)
             }
-            // One-shot handoff — but only when at least one item landed. A
-            // TOTAL failure (e.g. gateway briefly unreachable on foreground)
-            // keeps the queue for the next foreground instead of silently
-            // dropping every share (release audit P2). Partial success still
-            // clears (re-draining would double-submit the successes); a
-            // poisoned single item retrying forever is the lesser evil vs
-            // silent data loss.
+            // Only successful sends are counted and removed. Failed items stay
+            // queued for the next foreground instead of being silently dropped.
             if processed > 0 {
                 clearInbox()
                 onDrained?(processed)
@@ -119,7 +120,8 @@ enum SharedInboxDrainer {
 
     /// Process a single shared item: open a new session, attach images, submit.
     /// Returns the created session's `(storedId, runtimeId)` on success so the
-    /// caller can land on the last one; `nil` when the session couldn't be created.
+    /// caller can land on the last one; `nil` when the session couldn't be created
+    /// or the send did not reach the gateway.
     @discardableResult
     private static func process(
         _ item: SharedStore.SharedInboxItem,
@@ -135,8 +137,8 @@ enum SharedInboxDrainer {
         do {
             try await sessions.createSessionNow()
         } catch {
-            // Couldn't create a session for this item — skip it (the batch
-            // continues; the inbox is cleared at the end either way).
+            // Couldn't create a session for this item — skip it and leave it
+            // queued for the next drain.
             return nil
         }
         guard sessions.activeRuntimeId != nil else { return nil }
@@ -153,7 +155,8 @@ enum SharedInboxDrainer {
         let prompt = composePrompt(for: item)
         // `send` substitutes a default caption if `prompt` is empty but images
         // are attached, so an image-only share still produces a valid turn.
-        await chat.send(text: prompt)
+        let didSend = await chat.send(text: prompt)
+        guard didSend else { return nil }
         return (storedId: storedId, runtimeId: runtimeId)
     }
 
