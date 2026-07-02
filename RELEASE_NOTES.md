@@ -1,3 +1,27 @@
+Build 59 — "Malacca" — 2026-07-03
+RELIABILITY
+
+WHAT'S NEW
+- Remote gateway restart/update recovery (ABH-292, wave build-73) (ABH-292)
+
+FIXED
+- Atomic share-inbox drain — no silent data loss, no duplicate sends (ABH-310, ABH-311) (ABH-310)
+- Widget/Live-Activity tap resumes running turn instead of wiping it (ABH-312) (ABH-312)
+- Late-wire plugin seam registries
+- Show sent image attachment thumbnails
+- Render generated image tool results inline
+- Truthful device revocation — self-revoke re-pair + persist-failure distinction (ABH-256, ABH-255) (ABH-256)
+- Surface failed session resume/open via observed channel (ABH-295) (ABH-295)
+
+WORTH TRYING
+- Try: Remote gateway restart/update recovery (ABH-292, wave build-73) (ABH-292)
+- Try: Atomic share-inbox drain — no silent data loss, no duplicate sends (ABH-310, ABH-311) (ABH-310)
+- Try: Widget/Live-Activity tap resumes running turn instead of wiping it (ABH-312) (ABH-312)
+
+(+5 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 58 — "Malacca" — 2026-07-03
 RELIABILITY
 
