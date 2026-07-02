@@ -1,3 +1,14 @@
+Build 58 — "Malacca" — 2026-07-03
+RELIABILITY
+
+WHAT'S NEW
+- Add iOS slash command launcher
+
+WORTH TRYING
+- Try: Add iOS slash command launcher
+
+---
+
 Build 57 — "Malacca" — 2026-07-03
 RELIABILITY
 

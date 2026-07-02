@@ -125,7 +125,7 @@ node scripts/asc-poll.mjs 2>&1 | tail -4 || echo "  (poll wrapper returned non-z
 # Generate human-readable notes from merges since last ship, prepend to
 # RELEASE_NOTES.md, and push to TestFlight's "What to Test" so the user knows
 # what to expect when updating.
-echo "  generating release notes for build $NEXT…"
+echo "  generating release notes for build ${NEXT}…"
 bash scripts/gen-release-notes.sh "$NEXT" "/tmp/notes-$NEXT.txt" >/dev/null 2>&1 || echo "  (notes gen failed — ship continues, notes to be backfilled)"
 node scripts/asc-notes.mjs --build "$NEXT" --notes-file "/tmp/notes-$NEXT.txt" 2>&1 | tail -1 || echo "  (What-to-Test push failed — notes exist in RELEASE_NOTES.md; backfill via asc-notes.mjs)"
 

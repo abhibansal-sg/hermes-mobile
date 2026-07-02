@@ -10,7 +10,7 @@ settings:
     SWIFT_STRICT_CONCURRENCY: complete
     DEVELOPMENT_TEAM: 6J4Y9NKRQ2
     CODE_SIGN_STYLE: Automatic
-    CURRENT_PROJECT_VERSION: 57
+    CURRENT_PROJECT_VERSION: 58
     MARKETING_VERSION: 1.0.1
 packages:
   # gstack iOS debug bridge (task UI-G). Local SPM package. Every source file
