@@ -19,6 +19,7 @@ ASC_KEY=/Users/abbhinnav/.appstoreconnect/private_keys/AuthKey_3DHXXG4GHQ.p8
 ASC_ISSUER=d7deff8e-5489-4d18-995d-c8a10f854118
 ASC_KEYID=3DHXXG4GHQ
 APP_ID=6777140135
+TOKEN="$("$HOME/.hermes/scripts/linear-app-token.sh" 2>/dev/null || true)"
 BASE=environment-and-workflows-overview
 ARCH=/tmp/hermes-tf/HermesMobile.xcarchive
 
@@ -58,12 +59,16 @@ fi
 # --- GATE 1: wave fully merged? (no open/approved issues left in the wave) ----
 git fetch origin "$BASE" -q 2>/dev/null
 if [ -n "$WAVE" ]; then
-  OPEN=$(curl -s -X POST https://api.linear.app/graphql \
-    -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json" \
-    -d "{\"query\":\"{ issues(first:20, filter:{ labels:{ name:{ eq:\\\"wave:build-${WAVE}\\\" } }, state:{ type:{ nin:[\\\"completed\\\",\\\"canceled\\\"] } } }){ nodes{ identifier state{name} } } }\"}" 2>/dev/null \
-    | python3 -c "import sys,json;
+  if [ -z "$TOKEN" ]; then
+    OPEN=ERR
+  else
+    OPEN=$(curl -s -X POST https://api.linear.app/graphql \
+      -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+      -d "{\"query\":\"{ issues(first:20, filter:{ labels:{ name:{ eq:\\\"wave:build-${WAVE}\\\" } }, state:{ type:{ nin:[\\\"completed\\\",\\\"canceled\\\"] } } }){ nodes{ identifier state{name} } } }\"}" 2>/dev/null \
+      | python3 -c "import sys,json;
 try: print(len(json.load(sys.stdin)['data']['issues']['nodes']))
 except: print('ERR')")
+  fi
   if [ "$OPEN" = "ERR" ]; then echo "  SHIP SKIPPED: could not read wave state"; exit 0; fi
   if [ "$OPEN" != "0" ]; then echo "  SHIP SKIPPED: wave-${WAVE} has $OPEN unmerged/incomplete issues"; exit 0; fi
 fi
