@@ -50,6 +50,12 @@ else
 fi
 
 # 2. fast-forward the staging checkout.
+# Stale index.lock guard (soak finding 2026-07-03): a prior crashed run can leave
+# a 0-byte .git/index.lock that blocks every git op. Clear it ONLY when no git
+# process is actually running — a live lock is respected.
+if [ -f "$STG_REPO/.git/index.lock" ] && ! pgrep -f "git.*$(basename "$STG_REPO")" >/dev/null 2>&1; then
+  rm -f "$STG_REPO/.git/index.lock" && say "cleared stale index.lock (no live git process)"
+fi
 git -C "$STG_REPO" fetch origin staging --quiet || fail "fetch failed in staging checkout"
 LOCAL=$(git -C "$STG_REPO" rev-parse HEAD)
 REMOTE=$(git -C "$STG_REPO" rev-parse origin/staging)
