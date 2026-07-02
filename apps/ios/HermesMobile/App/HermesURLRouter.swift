@@ -69,9 +69,8 @@ final class DeepLinkCoordinator {
 ///   route does NOT silently dead-end: it surfaces the inbox (the one approval-
 ///   reachable surface on both width classes), mirroring the push `attention`
 ///   fallback, so the tap always lands somewhere usable.
-/// - `hermesapp://` (bare root)       → no navigation; the app opens to the
-///   session list, which already surfaces pending approvals (the activity's
-///   "Review approval" link lands here).
+/// - `hermesapp://review`              → surface the pending-approval inbox.
+/// - `hermesapp://` (bare root)       → start a usable draft surface.
 /// - `hermesapp://pair?url=<u>&token=<t>` → configure the connection from a
 ///   pairing deep link (the `hermes mobile-pair` QR / link, owned by B4). The
 ///   same params the in-app QR scanner produces, so a tapped link and a scan
@@ -249,6 +248,12 @@ enum HermesURLRouter {
                 sessions.pendingMessageJump = messageId
             }
             openSession(storedId: storedId, sessions: sessions, inbox: inbox)
+
+        case "review":
+            // Explicit widget / Live Activity approval affordance. Keep this
+            // separate from the bare root route, whose contract is to start a
+            // usable draft, so "Review approval" taps surface the pending prompt.
+            inbox.requestPresentation()
 
         case "pair":
             // `?url=` + `?token=` carry the pairing payload (v1); a v2 payload

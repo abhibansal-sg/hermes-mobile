@@ -12,9 +12,11 @@ enum HermesWidgetLink {
     /// Opens the app to start a brand-new session.
     static var newSession: URL { URL(string: "\(scheme)://new-session")! }
 
-    /// Opens the app and surfaces the active/most-recent work. Defaults to the
-    /// app root, where pending approvals are shown.
+    /// Opens the app at the default root route.
     static var open: URL { URL(string: "\(scheme)://")! }
+
+    /// Opens the app directly to the pending approvals inbox.
+    static var review: URL { URL(string: "\(scheme)://review")! }
 
     /// Quick-capture entry point (text optional).
     static func capture(text: String? = nil) -> URL {
@@ -121,7 +123,7 @@ struct StatusWidgetView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .widgetURL(pendingApprovals > 0 ? HermesWidgetLink.open : HermesWidgetLink.newSession)
+        .widgetURL(pendingApprovals > 0 ? HermesWidgetLink.review : HermesWidgetLink.newSession)
     }
 
     private var mediumBody: some View {
@@ -135,7 +137,7 @@ struct StatusWidgetView: View {
             VStack(alignment: .trailing, spacing: 12) {
                 metric(value: "\(activeSessions)",
                        label: activeSessions == 1 ? "active session" : "active sessions")
-                Link(destination: HermesWidgetLink.open) {
+                Link(destination: pendingApprovals > 0 ? HermesWidgetLink.review : HermesWidgetLink.open) {
                     if pendingApprovals > 0 {
                         approvalLine
                     } else {

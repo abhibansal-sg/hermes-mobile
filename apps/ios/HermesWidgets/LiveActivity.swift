@@ -84,6 +84,7 @@ struct HermesTurnLiveActivity: Widget {
                 state: context.state
             )
             .activityBackgroundTint(Color.black.opacity(0.30))
+            .widgetURL(context.state.needsApproval ? HermesWidgetLink.review : HermesWidgetLink.open)
             .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
             DynamicIsland {
@@ -114,7 +115,7 @@ struct HermesTurnLiveActivity: Widget {
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     if context.state.needsApproval {
-                        Link(destination: HermesWidgetLink.open) {
+                        Link(destination: HermesWidgetLink.review) {
                             Label("Review approval", systemImage: "arrow.up.forward.app.fill")
                                 .font(.caption.weight(.semibold))
                                 .frame(maxWidth: .infinity)
@@ -133,7 +134,7 @@ struct HermesTurnLiveActivity: Widget {
                 Image(systemName: context.state.needsApproval ? "exclamationmark.triangle.fill" : "bolt.horizontal.fill")
                     .foregroundStyle(context.state.tintColor)
             }
-            .widgetURL(HermesWidgetLink.open)
+            .widgetURL(context.state.needsApproval ? HermesWidgetLink.review : HermesWidgetLink.open)
             .keylineTint(context.state.tintColor)
         }
     }
