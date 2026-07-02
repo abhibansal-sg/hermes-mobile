@@ -1,52 +1,121 @@
 {
-  "_comment": "scout-bugs coverage map — least-recently-audited cluster gets picked each run. The scout updates last_audited + last_findings after each run. Clusters are USER-PATH shaped, not file-shaped.",
+  "_comment": "scout-bugs coverage map \u2014 least-recently-audited cluster gets picked each run. The scout updates last_audited + last_findings after each run. Clusters are USER-PATH shaped, not file-shaped.",
   "clusters": {
     "auth-pairing": {
-      "flows": ["scan-and-pair a new device", "token issue/revoke lifecycle", "re-pair after self-revoke", "device limit handling"],
-      "surfaces": ["apps/ios/HermesMobile/Networking (DeviceAuth, pairing)", "plugins/hermes-mobile/dashboard/api.py device routes", "device_tokens.py"],
+      "flows": [
+        "scan-and-pair a new device",
+        "token issue/revoke lifecycle",
+        "re-pair after self-revoke",
+        "device limit handling"
+      ],
+      "surfaces": [
+        "apps/ios/HermesMobile/Networking (DeviceAuth, pairing)",
+        "plugins/hermes-mobile/dashboard/api.py device routes",
+        "device_tokens.py"
+      ],
       "last_audited": "2026-07-02",
       "note": "heavily audited 2026-07-02 (ABH-254/255/256/263/268/275 lineage)"
     },
     "push-relay": {
-      "flows": ["approval arrives as push while app backgrounded", "push tap -> correct session", "relay mode end-to-end (enable/pair/confirm/recover)", "notification toggles actually toggling"],
-      "surfaces": ["push_engine.py", "relay_client.py", "apps/ios ... NotificationService/LiveActivity"],
+      "flows": [
+        "approval arrives as push while app backgrounded",
+        "push tap -> correct session",
+        "relay mode end-to-end (enable/pair/confirm/recover)",
+        "notification toggles actually toggling"
+      ],
+      "surfaces": [
+        "push_engine.py",
+        "relay_client.py",
+        "apps/ios ... NotificationService/LiveActivity"
+      ],
       "last_audited": "2026-07-01",
       "note": "ABH-269/270 found here; relay on-device path still open (ABH-215)"
     },
     "approvals": {
-      "flows": ["approve from lock screen widget", "approve from Live Activity", "approve in-app vs REST vs WS parity", "deny/all paths", "audit trail correctness"],
-      "surfaces": ["tui_gateway approval.respond (READ-ONLY - stock core)", "dashboard/api.py approval routes", "iOS ApprovalViews/widgets"],
+      "flows": [
+        "approve from lock screen widget",
+        "approve from Live Activity",
+        "approve in-app vs REST vs WS parity",
+        "deny/all paths",
+        "audit trail correctness"
+      ],
+      "surfaces": [
+        "tui_gateway approval.respond (READ-ONLY - stock core)",
+        "dashboard/api.py approval routes",
+        "iOS ApprovalViews/widgets"
+      ],
       "last_audited": "2026-07-02"
     },
     "chat-steer-sessions": {
-      "flows": ["send message mid-turn (steer)", "queue prompt", "session list/resume/rename", "interrupt then continue", "long-turn progress display"],
-      "surfaces": ["iOS chat views + WS client", "session routes"],
+      "flows": [
+        "send message mid-turn (steer)",
+        "queue prompt",
+        "session list/resume/rename",
+        "interrupt then continue",
+        "long-turn progress display"
+      ],
+      "surfaces": [
+        "iOS chat views + WS client",
+        "session routes"
+      ],
       "last_audited": "2026-07-01",
       "note": "ABH-239 (dropped steer) found here - likely more in this family"
     },
     "cron-surface": {
-      "flows": ["create/edit cron from iOS", "delivery target picking", "run-status truthfulness", "cron output viewing"],
-      "surfaces": ["iOS cron views", "cron API routes"],
+      "flows": [
+        "create/edit cron from iOS",
+        "delivery target picking",
+        "run-status truthfulness",
+        "cron output viewing"
+      ],
+      "surfaces": [
+        "iOS cron views",
+        "cron API routes"
+      ],
       "last_audited": "2026-07-02",
       "note": "ABH-264/265 found here"
     },
     "providers-credentials": {
-      "flows": ["add/validate/rotate/disconnect each provider tier", "key rejection UX", "toolset credentials"],
-      "surfaces": ["ProviderListView + RestClient+Providers.swift", "provider/toolset-config routes"],
+      "flows": [
+        "add/validate/rotate/disconnect each provider tier",
+        "key rejection UX",
+        "toolset credentials"
+      ],
+      "surfaces": [
+        "ProviderListView + RestClient+Providers.swift",
+        "provider/toolset-config routes"
+      ],
       "last_audited": "2026-07-02",
       "note": "SATURATED today - do not re-audit before 2026-07-05"
     },
     "share-widgets-capture": {
-      "flows": ["share sheet -> queued item -> visible outcome", "widget deep links", "quick capture round-trip"],
-      "surfaces": ["ShareExtension", "HermesWidget*", "capture routes"],
+      "flows": [
+        "share sheet -> queued item -> visible outcome",
+        "widget deep links",
+        "quick capture round-trip"
+      ],
+      "surfaces": [
+        "ShareExtension",
+        "HermesWidget*",
+        "capture routes"
+      ],
       "last_audited": "never",
       "note": "ABH-267/271 hint at gaps; never had a dedicated pass"
     },
     "reconnect-offline": {
-      "flows": ["network flap mid-turn", "app suspend/resume with live WS", "gateway restart while app open", "stale-session recovery"],
-      "surfaces": ["WS client reconnect machinery", "RestClient retry", "ABH-187 lineage"],
-      "last_audited": "never",
-      "note": "never had a dedicated pass; highest-value unexplored territory"
+      "flows": [
+        "network flap mid-turn",
+        "app suspend/resume with live WS",
+        "gateway restart while app open",
+        "stale-session recovery"
+      ],
+      "surfaces": [
+        "WS client reconnect machinery",
+        "RestClient retry",
+        "ABH-187 lineage"
+      ],
+      "last_audited": "2026-07-02",
+      "note": "audited 2026-07-02 (manual, swarm CLI produced empty output that run): 4 flows traced; 3 CLEAN (flap mid-turn, suspend/resume, gateway restart backoff); 1 finding filed as ABH-295 (SessionStore.lastError unobserved -> silent resume failures). Filed 2026-07-03 by supervisor sweep."
     }
   }
 }
