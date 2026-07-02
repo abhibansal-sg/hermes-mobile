@@ -44,6 +44,45 @@ final class RelayStatusStoreTests: XCTestCase {
     }
 }
 
+@MainActor
+final class GatewayActionPollingTests: XCTestCase {
+    func testActionPollingStopsOnNotRunningAndDisplaysReconnectingWhileInFlight() async {
+        var remainingStatuses = [
+            ActionStatus(name: "gateway-restart", running: true, exitCode: nil, pid: 123, lines: ["stopping gateway"]),
+            ActionStatus(name: "gateway-restart", running: false, exitCode: 0, pid: 123, lines: ["gateway restarted"]),
+        ]
+        var requestedNames: [String] = []
+        var observedInFlightState: GatewayBadgeSnapshot?
+        var runner: GatewayActionRunner!
+        runner = GatewayActionRunner(
+            startAction: { action in
+                ActionResponse(ok: true, pid: 123, name: action.statusName, error: nil, message: nil)
+            },
+            fetchStatus: { name, _ in
+                requestedNames.append(name)
+                return remainingStatuses.removeFirst()
+            },
+            sleep: { _ in
+                observedInFlightState = runner.gatewayBadgeState(
+                    fallback: GatewayStatus(json: .object([
+                        "gateway_state": .string("connected"),
+                        "gateway_running": .bool(true),
+                    ]))
+                )
+            }
+        )
+
+        await runner.perform(.restartGateway, pollIntervalNanoseconds: 1)
+
+        XCTAssertEqual(requestedNames, ["gateway-restart", "gateway-restart"])
+        XCTAssertEqual(runner.progressLines, ["gateway restarted"])
+        XCTAssertFalse(runner.isRunning)
+        XCTAssertNil(runner.errorMessage)
+        XCTAssertEqual(observedInFlightState?.state, "reconnecting")
+        XCTAssertNil(observedInFlightState?.running)
+    }
+}
+
 final class RelayStatusStubProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var nextResponse: (data: Data, status: Int)?
     nonisolated(unsafe) static var requestedPath: String?

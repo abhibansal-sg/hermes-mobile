@@ -209,6 +209,56 @@ struct PlatformStatus: Identifiable, Sendable, Equatable {
     }
 }
 
+/// `POST /api/gateway/restart` and `POST /api/hermes/update` response.
+struct ActionResponse: Codable, Sendable, Equatable {
+    let ok: Bool
+    let pid: Int?
+    let name: String
+    let error: String?
+    let message: String?
+
+    init(ok: Bool, pid: Int?, name: String, error: String?, message: String?) {
+        self.ok = ok
+        self.pid = pid
+        self.name = name
+        self.error = error
+        self.message = message
+    }
+
+    init(json: JSONValue) {
+        self.ok = json["ok"]?.boolValue ?? false
+        self.pid = json["pid"]?.intValue
+        self.name = json["name"]?.stringValue ?? ""
+        self.error = json["error"]?.stringValue
+        self.message = json["message"]?.stringValue
+    }
+}
+
+/// `GET /api/actions/{name}/status?lines=N` response for background actions.
+struct ActionStatus: Codable, Sendable, Equatable {
+    let name: String
+    let running: Bool
+    let exitCode: Int?
+    let pid: Int?
+    let lines: [String]
+
+    init(name: String, running: Bool, exitCode: Int?, pid: Int?, lines: [String]) {
+        self.name = name
+        self.running = running
+        self.exitCode = exitCode
+        self.pid = pid
+        self.lines = lines
+    }
+
+    init(json: JSONValue) {
+        self.name = json["name"]?.stringValue ?? ""
+        self.running = json["running"]?.boolValue ?? false
+        self.exitCode = json["exit_code"]?.intValue
+        self.pid = json["pid"]?.intValue
+        self.lines = json["lines"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+}
+
 // MARK: Usage analytics
 
 /// `GET /api/analytics/usage` response.
@@ -454,6 +504,25 @@ extension RestClient {
     /// `GET /api/status` — rich gateway snapshot for the status panel.
     func gatewayStatus() async throws -> GatewayStatus {
         GatewayStatus(json: try await getJSON(path: "/api/status"))
+    }
+
+    /// `POST /api/gateway/restart` — kick off a background gateway restart.
+    @discardableResult
+    func restartGateway() async throws -> ActionResponse {
+        ActionResponse(json: try await postJSON(path: "/api/gateway/restart"))
+    }
+
+    /// `POST /api/hermes/update` — kick off a background Hermes update.
+    @discardableResult
+    func updateHermes() async throws -> ActionResponse {
+        ActionResponse(json: try await postJSON(path: "/api/hermes/update"))
+    }
+
+    /// `GET /api/actions/{name}/status?lines=N` — tail a background action log.
+    func actionStatus(name: String, lines: Int = 200) async throws -> ActionStatus {
+        let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+        let clampedLines = max(1, min(lines, 2_000))
+        return ActionStatus(json: try await getJSON(path: "/api/actions/\(encoded)/status?lines=\(clampedLines)"))
     }
 
     // MARK: Usage

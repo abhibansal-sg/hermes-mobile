@@ -42,6 +42,7 @@ TestFlight + Abhi catch taste (layer 5).
 | CUJ-16 | YOLO/flow-state approval-bypass toggle honored | toggle write + approval behavior contract (ABH-227) | build 55 |
 | CUJ-17 | Device-limit 409 surfaced without composer lock | `/api/devices/issue` at limit → 409 contract (ABH-254) | fix lineage |
 | CUJ-18 | Debug share bundle from settings | `/api/debug-share` produces a bundle (#90) | support |
+| CUJ-19 | Recover the gateway from the phone (restart + update) with honest reconnecting state | POST /api/gateway/restart → poll /api/actions/gateway-restart/status until running:false; badge reads reconnecting while in-flight | Malacca |
 
 `smoke: ios-sim` (covered by iOS test suite, skipped by gateway smoke): stale
 'Connection lost' warning clears on clean resume (ABH-289 tests), per-event
