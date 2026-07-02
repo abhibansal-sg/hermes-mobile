@@ -278,7 +278,7 @@ actor HermesGatewayClient {
         let timeoutTask = Task { [weak self] in
             try? await Task.sleep(for: timeout)
             guard !Task.isCancelled else { return }
-            await self?.failPending(id: id, with: GatewayError.timeout(method: method))
+            await self?.failPendingAndHandleRequestTimeout(id: id, method: method)
         }
         defer { timeoutTask.cancel() }
 
@@ -318,6 +318,19 @@ actor HermesGatewayClient {
                 )
             }
         }
+    }
+
+    /// A request timeout means the foreground socket may be silently dead: the
+    /// send appeared to succeed, but no response or receive-loop error arrived.
+    /// Preserve the caller-facing `.timeout` for the request that detected it,
+    /// then feed the same socket-failure path used by `probeLiveness` so the
+    /// state observer starts the existing reconnect machinery. Returning early
+    /// when the pending entry is already gone makes this idempotent for races
+    /// with a real response, cancellation, or another timeout on the same socket.
+    private func failPendingAndHandleRequestTimeout(id: String, method: String) {
+        let error = GatewayError.timeout(method: method)
+        guard failPending(id: id, with: error) else { return }
+        handleSocketFailure(error)
     }
 
     // MARK: - Receive loop
@@ -436,10 +449,13 @@ actor HermesGatewayClient {
         pending[id] = continuation
     }
 
-    private func failPending(id: String, with error: Error) {
+    @discardableResult
+    private func failPending(id: String, with error: Error) -> Bool {
         if let continuation = pending.removeValue(forKey: id) {
             continuation.resume(throwing: error)
+            return true
         }
+        return false
     }
 
     private func failAllPending(with error: Error) {

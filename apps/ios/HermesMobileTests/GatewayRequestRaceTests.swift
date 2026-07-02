@@ -176,6 +176,56 @@ final class GatewayRequestRaceTests: XCTestCase {
         }
     }
 
+    /// Opens normally but never answers application RPCs. This simulates a
+    /// silently-dead socket where `send` appears to succeed, `receive` never
+    /// errors, and only the per-request timeout can detect the dead connection.
+    private final class RequestTimeoutTransport: GatewayWebSocketTask, @unchecked Sendable {
+
+        private var inbox: [URLSessionWebSocketTask.Message] = []
+        private var waiter: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+        private let lock = NSLock()
+
+        init() {
+            enqueue(.string(
+                #"{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready"}}"#
+            ))
+        }
+
+        func resume() {}
+        func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {}
+
+        func receive() async throws -> URLSessionWebSocketTask.Message {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                if !inbox.isEmpty {
+                    let next = inbox.removeFirst()
+                    lock.unlock()
+                    continuation.resume(returning: next)
+                } else {
+                    waiter = continuation
+                    lock.unlock()
+                }
+            }
+        }
+
+        /// The send path succeeds, but no response is ever enqueued.
+        func send(_ message: URLSessionWebSocketTask.Message) async throws {
+            await Task.yield()
+        }
+
+        private func enqueue(_ message: URLSessionWebSocketTask.Message) {
+            lock.lock()
+            if let waiter {
+                self.waiter = nil
+                lock.unlock()
+                waiter.resume(returning: message)
+            } else {
+                inbox.append(message)
+                lock.unlock()
+            }
+        }
+    }
+
     private struct Echo: Decodable, Sendable {
         let value: String
     }
@@ -262,6 +312,40 @@ final class GatewayRequestRaceTests: XCTestCase {
         // Second call: send succeeds, response is matched against a clean table.
         let echo: Echo = try await client.request("second", timeout: .seconds(5))
         XCTAssertEqual(echo.value, "recovered")
+
+        await client.disconnect()
+    }
+
+    /// A per-request timeout is evidence that the foreground socket may be
+    /// silently dead. It must therefore feed the same drop-to-reconnect path as a
+    /// failed liveness probe, not merely fail the one caller while leaving state
+    /// `.open` forever.
+    func testRequestTimeoutDropsSocketToFailedForReconnect() async throws {
+        let transport = RequestTimeoutTransport()
+        let client = HermesGatewayClient { _ in transport }
+        try await client.connect(baseURL: URL(string: "ws://127.0.0.1:9999")!, token: "t")
+
+        let stateBefore = await client.state
+        XCTAssertEqual(stateBefore, .open, "precondition: socket must be .open before request timeout")
+
+        let start = ContinuousClock.now
+        do {
+            let _: Echo = try await client.request("dead.socket", timeout: .milliseconds(100))
+            XCTFail("Expected unanswered request to time out")
+        } catch let error as GatewayError {
+            guard case .timeout(let method) = error else {
+                return XCTFail("Expected request timeout, got \(error)")
+            }
+            XCTAssertEqual(method, "dead.socket")
+        }
+        let elapsed = start.duration(to: .now)
+        XCTAssertLessThan(elapsed, .seconds(2), "request timeout regression test must fail fast")
+
+        let stateAfter = await client.state
+        guard case .failed(let message) = stateAfter else {
+            return XCTFail("expected .failed after request timeout, got \(stateAfter)")
+        }
+        XCTAssertTrue(message.contains("dead.socket"), "failed state should preserve timeout context, got \(message)")
 
         await client.disconnect()
     }
