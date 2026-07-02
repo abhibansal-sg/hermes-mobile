@@ -102,9 +102,17 @@ xcodebuild -exportArchive -archivePath "$ARCH" \
 echo "  polling ASC for build $NEXT to reach VALID…"
 node scripts/asc-poll.mjs 2>&1 | tail -4 || echo "  (poll wrapper returned non-zero; check ASC manually)"
 
-# --- STEP 6: commit the build-number bump (records the ship) -----------------
-git add apps/ios/project.yml apps/ios/*.xcodeproj 2>/dev/null
+# --- STEP 5b: RELEASE NOTES (Abhi mandate 2026-07-02: no ship without notes) ---
+# Generate human-readable notes from merges since last ship, prepend to
+# RELEASE_NOTES.md, and push to TestFlight's "What to Test" so the user knows
+# what to expect when updating.
+echo "  generating release notes for build $NEXT…"
+bash scripts/gen-release-notes.sh "$NEXT" "/tmp/notes-$NEXT.txt" >/dev/null 2>&1 || echo "  (notes gen failed — ship continues, notes to be backfilled)"
+node scripts/asc-notes.mjs --build "$NEXT" --notes-file "/tmp/notes-$NEXT.txt" 2>&1 | tail -1 || echo "  (What-to-Test push failed — notes exist in RELEASE_NOTES.md; backfill via asc-notes.mjs)"
+
+# --- STEP 6: commit the build-number bump + release notes (records the ship) ---
+git add apps/ios/project.yml apps/ios/*.xcodeproj RELEASE_NOTES.md 2>/dev/null
 git commit -q -m "ship: TestFlight build $NEXT (wave ${WAVE:-adhoc}, internal, autonomous)" 2>/dev/null
 git push origin HEAD:"$BASE" 2>&1 | tail -2
 
-echo "✅ SHIPPED build $NEXT to internal TestFlight (wave ${WAVE:-adhoc})."
+echo "✅ SHIPPED build $NEXT to internal TestFlight (wave ${WAVE:-adhoc}) with release notes."
