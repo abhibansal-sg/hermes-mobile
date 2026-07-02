@@ -41,6 +41,7 @@ struct ComposerView: View {
     @Environment(ThemeStore.self) private var themeStore
 
     @State private var text = ""
+    @State private var slashStore = SlashCommandStore()
     @FocusState private var isFocused: Bool
 
     /// Incremented each time a message is sent (or queued) to trigger
@@ -184,6 +185,14 @@ struct ComposerView: View {
                 )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
+            if showSlashCommandPicker {
+                SlashCommandPicker(
+                    sections: slashStore.sections,
+                    isLoading: slashStore.isLoading,
+                    onSelect: selectSlashCommand
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
             composerCard
         }
         .padding(.horizontal, 12)
@@ -195,6 +204,7 @@ struct ComposerView: View {
         // bottomStack .background modifier (iOS 17-25) or the system
         // scrollEdgeEffectStyle (iOS 26).
         .animation(.easeInOut(duration: 0.16), value: activeMention != nil)
+        .animation(.easeInOut(duration: 0.16), value: showSlashCommandPicker)
         .animation(.easeInOut(duration: 0.18), value: isCapturing)
         .animation(.easeInOut(duration: 0.18), value: queueStore.items.count)
         .animation(.easeInOut(duration: 0.18), value: steerNote)
@@ -335,6 +345,7 @@ struct ComposerView: View {
             recorder.onSalvagedTranscript = { transcript in
                 appendTranscript(transcript)
             }
+            refreshSlashCommands()
         }
     }
 
@@ -571,6 +582,14 @@ struct ComposerView: View {
             .padding(.horizontal, 2)
             .padding(.top, 2)
             .submitLabel(.return)
+            .onChange(of: text) { _, _ in refreshSlashCommands() }
+            .onChange(of: isFocused) { _, focused in
+                if focused {
+                    refreshSlashCommands()
+                } else {
+                    slashStore.reset()
+                }
+            }
     }
 
     // MARK: - Model chip (relocated from the nav header — F3 / Amendment E)
@@ -868,6 +887,27 @@ struct ComposerView: View {
     /// the live composer state).
     private var canQueue: Bool { !trimmed.isEmpty }
 
+    private var showSlashCommandPicker: Bool {
+        guard isFocused, isConnected, !isCapturing else { return false }
+        guard SlashCommandStore.activeSlashText(in: text) != nil else { return false }
+        return slashStore.isLoading || !slashStore.sections.isEmpty
+    }
+
+    private func refreshSlashCommands() {
+        guard isFocused else {
+            slashStore.reset()
+            return
+        }
+        slashStore.update(input: text, client: connection.client)
+    }
+
+    private func selectSlashCommand(_ item: SlashCommandItem) {
+        let insertion = item.insertionText
+        text = insertion.contains(" ") ? insertion : insertion + " "
+        isFocused = true
+        refreshSlashCommands()
+    }
+
     private func send() {
         guard canSend else { return }
         let outgoing = trimmed
@@ -875,6 +915,18 @@ struct ComposerView: View {
         // Fire the send haptic before the async send so the feedback lands
         // at the moment of the tap, not after the network round-trip.
         sendFeedbackTrigger &+= 1
+        if SlashCommandInvocation.parse(outgoing) != nil {
+            slashStore.reset()
+            Task {
+                let outcome = await chatStore.executeSlashCommand(outgoing)
+                if case .prefill(let draft) = outcome {
+                    text = draft
+                    isFocused = true
+                    refreshSlashCommands()
+                }
+            }
+            return
+        }
         // ChatStore consumes the queued attachments; it clears them on success.
         Task { await chatStore.send(text: outgoing) }
     }

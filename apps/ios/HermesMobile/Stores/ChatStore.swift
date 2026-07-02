@@ -1480,6 +1480,147 @@ final class ChatStore {
 
     // MARK: - Outbound actions
 
+    enum SlashCommandOutcome: Equatable, Sendable {
+        case handled
+        case prefill(String)
+        case failed(String)
+    }
+
+    /// Run a slash command through the gateway's generic slash-command surface.
+    ///
+    /// Read-only commands render their textual output as a system row. Commands
+    /// that resolve to a prompt (`send` / skill invocations) flow through the
+    /// normal ``send(text:includeAttachments:)`` path so the transcript and
+    /// streaming lifecycle stay identical to a typed prompt.
+    func executeSlashCommand(_ rawCommand: String, depth: Int = 0) async -> SlashCommandOutcome {
+        guard depth < 5 else {
+            let message = "Slash command alias loop"
+            appendSystemNotice(message)
+            return .failed(message)
+        }
+        guard let invocation = SlashCommandInvocation.parse(rawCommand) else {
+            let message = "Invalid slash command"
+            appendSystemNotice(message)
+            return .failed(message)
+        }
+        guard let client else {
+            let message = "No active session"
+            lastError = message
+            return .failed(message)
+        }
+        guard let sessionId = await activeSlashSessionId() else {
+            let message = "No active session"
+            lastError = message
+            return .failed(message)
+        }
+
+        let command = rawCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            let result = try await client.executeSlash(sessionId: sessionId, command: command)
+            if let dispatch = SlashCommandDispatch(json: result) {
+                return await handleSlashDispatch(dispatch, invocation: invocation, depth: depth)
+            }
+            let output = slashOutput(from: result, commandName: invocation.name)
+            appendSystemNotice(output)
+            return .handled
+        } catch {
+            // Fall back to command.dispatch for skill/send/alias directives, matching
+            // the desktop implementation and covering slash-worker failures.
+        }
+
+        do {
+            let result = try await client.dispatchCommand(
+                sessionId: sessionId,
+                name: invocation.name,
+                arg: invocation.arg
+            )
+            guard let dispatch = SlashCommandDispatch(json: result) else {
+                let message = "error: invalid response: command.dispatch"
+                appendSystemNotice(message)
+                return .failed(message)
+            }
+            return await handleSlashDispatch(dispatch, invocation: invocation, depth: depth)
+        } catch {
+            let message = "error: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+            appendSystemNotice(message)
+            lastError = message
+            return .failed(message)
+        }
+    }
+
+    private func activeSlashSessionId() async -> String? {
+        if sessions?.isDraft == true {
+            do {
+                try await sessions?.createDraftSession()
+            } catch {
+                lastError = sessions?.lastError
+                    ?? (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                return nil
+            }
+        }
+        if let activeSessionId { return activeSessionId }
+        return await sessions?.ensureActiveRuntime()
+    }
+
+    private func handleSlashDispatch(
+        _ dispatch: SlashCommandDispatch,
+        invocation: SlashCommandInvocation,
+        depth: Int
+    ) async -> SlashCommandOutcome {
+        switch dispatch.kind {
+        case .exec, .plugin:
+            appendSystemNotice(dispatch.output?.trimmedNonEmpty ?? "(no output)")
+            return .handled
+        case .alias:
+            guard let target = dispatch.target?.trimmedNonEmpty else {
+                let message = "/\(invocation.name): alias target missing"
+                appendSystemNotice(message)
+                return .failed(message)
+            }
+            let next = "/\(target)\(invocation.arg.isEmpty ? "" : " \(invocation.arg)")"
+            return await executeSlashCommand(next, depth: depth + 1)
+        case .send, .skill:
+            if let notice = dispatch.notice?.trimmedNonEmpty {
+                appendSystemNotice(notice)
+            }
+            guard let message = dispatch.message?.trimmedNonEmpty else {
+                let error = "/\(invocation.name): empty message"
+                appendSystemNotice(error)
+                return .failed(error)
+            }
+            if dispatch.kind == .skill, let name = dispatch.name?.trimmedNonEmpty {
+                appendSystemNotice("⚡ loading skill: \(name)")
+            }
+            guard !localTurnInFlight else {
+                let error = "session busy — interrupt the current turn before sending this command"
+                appendSystemNotice(error)
+                return .failed(error)
+            }
+            let accepted = await send(text: message, includeAttachments: false)
+            return accepted ? .handled : .failed(lastError ?? "Slash command send failed")
+        case .prefill:
+            if let notice = dispatch.notice?.trimmedNonEmpty {
+                appendSystemNotice(notice)
+            }
+            return .prefill(dispatch.message ?? "")
+        }
+    }
+
+    private func slashOutput(from result: JSONValue, commandName: String) -> String {
+        let output = result["output"]?.stringValue?.trimmedNonEmpty ?? "/\(commandName): no output"
+        if let warning = result["warning"]?.stringValue?.trimmedNonEmpty {
+            return "warning: \(warning)\n\(output)"
+        }
+        return output
+    }
+
+    private func appendSystemNotice(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        messages.append(ChatMessage(role: .system, text: trimmed))
+    }
+
     /// Send a user prompt: optionally upload queued image attachments, append the
     /// user bubble immediately, then `prompt.submit`.
     ///
