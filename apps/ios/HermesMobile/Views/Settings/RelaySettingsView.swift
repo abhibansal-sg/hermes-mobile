@@ -20,6 +20,7 @@ struct RelaySettingsView: View {
             statusSection
             urlSection
             tokenSection
+            pairSection
             saveSection
         }
         .listStyle(.insetGrouped)
@@ -142,6 +143,47 @@ struct RelaySettingsView: View {
             Text("Registration Token")
         } footer: {
             Text("The token is never shown by the gateway. Enter a new token to replace it, leave blank to keep it, or clear it explicitly.")
+        }
+    }
+
+    @ViewBuilder
+    private var pairSection: some View {
+        Section {
+            if let pairingMessage = store.pairingMessage {
+                Label(pairingMessage, systemImage: "checkmark.circle")
+                    .foregroundStyle(theme.midground)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("relayPairReady")
+            }
+
+            if let pairingSummary = store.pairingSummary {
+                Text(pairingSummary)
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+                    .textSelection(.enabled)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("relayPairSummary")
+            }
+
+            Button {
+                Task { await store.pair() }
+            } label: {
+                HStack {
+                    Label("Pair this device", systemImage: "link.badge.plus")
+                    Spacer(minLength: 8)
+                    if store.isPairing {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+            }
+            .disabled(!store.enabled || store.isLoading || store.isSaving || store.isPairing)
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("relayPairDevice")
+        } header: {
+            Text("Device Pairing")
+        } footer: {
+            Text("Uses the saved relay URL to mint a fresh pairing token for this phone. Save relay setting changes before pairing.")
         }
     }
 

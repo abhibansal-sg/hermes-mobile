@@ -940,6 +940,34 @@ async def set_relay_config(body: RelayConfigBody, request: Request) -> Any:
     return _relay_config_payload()
 
 
+@router.post("/relay/pair")
+async def pair_relay_device(request: Request) -> Any:
+    """Mint a relay pairing tuple without revealing the agent secret."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
+
+    relay = _plugin_module("relay_client")
+    if not relay.relay_url_configured():
+        return JSONResponse(
+            status_code=400,
+            content={"error": "relay URL is not configured", "code": 4001},
+        )
+
+    try:
+        relay_url_value, agent_id, pairing_secret = await relay.relay_client().relay_pairing()
+    except relay.RelayConfigurationError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc), "code": 4001})
+
+    return {
+        "kind": "relay",
+        "relay": relay_url_value,
+        "agent": agent_id,
+        "pairing": pairing_secret,
+    }
+
+
 @router.post("/push/register")
 async def register_push_token(body: PushRegisterBody, request: Request) -> Dict[str, Any]:
     """Register an iOS APNs device token for server push."""

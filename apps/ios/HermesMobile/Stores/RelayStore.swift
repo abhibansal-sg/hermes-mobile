@@ -23,8 +23,11 @@ final class RelayStore {
 
     var isLoading = false
     var isSaving = false
+    var isPairing = false
     var errorMessage: String?
     var savedMessage: String?
+    var pairingMessage: String?
+    var relayPairing: RelayPairingPayload?
 
     init(rest: RestClient) {
         self.rest = rest
@@ -50,10 +53,16 @@ final class RelayStore {
         pushKinds.isEmpty ? "—" : pushKinds.joined(separator: ", ")
     }
 
+    var pairingSummary: String? {
+        guard let relayPairing else { return nil }
+        return "Relay \(relayPairing.relayURL), agent \(relayPairing.agentID), pairing prefix \(relayPairing.pairingPrefix)…"
+    }
+
     func load() async {
         isLoading = true
         errorMessage = nil
         savedMessage = nil
+        pairingMessage = nil
         defer { isLoading = false }
         do {
             apply(try await fetchConfig())
@@ -67,6 +76,7 @@ final class RelayStore {
         guard !isSaving else { return }
         errorMessage = nil
         savedMessage = nil
+        pairingMessage = nil
 
         let trimmedURL = relayURLDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         if enabled && trimmedURL.isEmpty {
@@ -98,6 +108,23 @@ final class RelayStore {
         }
     }
 
+    func pair() async {
+        guard !isPairing else { return }
+        errorMessage = nil
+        savedMessage = nil
+        pairingMessage = nil
+        isPairing = true
+        defer { isPairing = false }
+        do {
+            let payload = try await fetchPairing()
+            relayPairing = payload
+            pairingMessage = "Relay pairing ready for this device."
+        } catch {
+            errorMessage = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+        }
+    }
+
     private func apply(_ config: RelayConfig) {
         enabled = !(config.relayURL ?? "").isEmpty
         relayURLDraft = config.relayURL ?? ""
@@ -106,6 +133,7 @@ final class RelayStore {
         registrationTokenSet = config.registrationTokenSet
         registrationTokenPrefix = config.registrationTokenPrefix
         pushKinds = config.pushKinds
+        relayPairing = nil
     }
 
     private func fetchConfig() async throws -> RelayConfig {
@@ -135,6 +163,16 @@ final class RelayStore {
         let root = try rest.decodeJSONValue(from: data, context: "relay.config")
         return RelayConfig(json: root)
     }
+
+    private func fetchPairing() async throws -> RelayPairingPayload {
+        let request = rest.makeRequest(
+            path: "\(rest.mobileAPIPrefix)/relay/pair",
+            method: "POST"
+        )
+        let data = try await rest.perform(request)
+        let root = try rest.decodeJSONValue(from: data, context: "relay.pair")
+        return RelayPairingPayload(json: root)
+    }
 }
 
 struct RelayConfig: Sendable, Equatable {
@@ -149,5 +187,19 @@ struct RelayConfig: Sendable, Equatable {
         self.registrationTokenSet = json["registration_token_set"]?.boolValue ?? false
         self.registrationTokenPrefix = json["registration_token_prefix"]?.stringValue
         self.pushKinds = json["push_kinds"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+}
+
+struct RelayPairingPayload: Sendable, Equatable {
+    let relayURL: String
+    let agentID: String
+    let pairingSecret: String
+
+    var pairingPrefix: String { String(pairingSecret.prefix(8)) }
+
+    init(json: JSONValue) {
+        self.relayURL = json["relay"]?.stringValue ?? ""
+        self.agentID = json["agent"]?.stringValue ?? ""
+        self.pairingSecret = json["pairing"]?.stringValue ?? ""
     }
 }

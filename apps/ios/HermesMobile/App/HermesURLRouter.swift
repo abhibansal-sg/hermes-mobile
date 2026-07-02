@@ -107,6 +107,12 @@ enum HermesURLRouter {
     /// `kind` (or `kind` != `"device"`) is treated as a SHARED pairing exactly
     /// as v1 — the app pairs with `token` and then (on a W3a server) auto-upgrades
     /// to a device token. `kind`/`device_id` are purely additive.
+    struct RelayPairPayload: Equatable, Sendable {
+        let relayURL: String
+        let agentID: String
+        let pairingSecret: String
+    }
+
     struct PairPayload: Equatable, Identifiable, Sendable {
         /// Stable identity for `Identifiable` conformance (needed by `.sheet(item:)`
         /// in `RootView`). Keyed on the URL so re-tapping the same link produces
@@ -134,6 +140,28 @@ enum HermesURLRouter {
         ///
         /// (Inc-3b: wires the plugin's `manual_token=True` signal into the iOS UX.)
         let manualToken: Bool
+        /// Relay pairing payload (`kind=relay`) minted by the configured relay.
+        /// Kept separate from the dashboard-token path so callers do not confuse
+        /// a relay pairing secret for a dashboard session token.
+        let relayPair: RelayPairPayload?
+
+        var isRelayPairing: Bool { relayPair != nil }
+
+        init(
+            url: String,
+            token: String,
+            isDeviceToken: Bool,
+            deviceId: String?,
+            manualToken: Bool,
+            relayPair: RelayPairPayload? = nil
+        ) {
+            self.url = url
+            self.token = token
+            self.isDeviceToken = isDeviceToken
+            self.deviceId = deviceId
+            self.manualToken = manualToken
+            self.relayPair = relayPair
+        }
     }
 
     /// Parse a `hermesapp://pair?url=…&token=…[&kind=device&device_id=…]` payload
@@ -165,6 +193,27 @@ enum HermesURLRouter {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
+        let kind = value("kind")?.lowercased()
+
+        if kind == "relay" {
+            let relayURL = value("relay") ?? ""
+            let agentID = value("agent") ?? ""
+            let pairingSecret = value("pairing") ?? ""
+            guard !relayURL.isEmpty, !agentID.isEmpty, !pairingSecret.isEmpty else { return nil }
+            return PairPayload(
+                url: relayURL,
+                token: pairingSecret,
+                isDeviceToken: false,
+                deviceId: nil,
+                manualToken: false,
+                relayPair: RelayPairPayload(
+                    relayURL: relayURL,
+                    agentID: agentID,
+                    pairingSecret: pairingSecret
+                )
+            )
+        }
+
         let urlValue = value("url") ?? ""
         guard !urlValue.isEmpty else { return nil }
 
@@ -178,7 +227,6 @@ enum HermesURLRouter {
         if !manualTokenFlag && tokenValue.isEmpty { return nil }
 
         // v2 additive keys (a v1 payload simply has neither).
-        let kind = value("kind")?.lowercased()
         let deviceId = value("device_id")
         let isDevice = (kind == "device") && (deviceId?.isEmpty == false)
 
@@ -410,6 +458,7 @@ enum HermesURLRouter {
     /// mode the picker last persisted (a stale `.remoteURL` would then emit the
     /// wrong Host header once Inc 2 transport-branches on the mode).
     static func applyPair(_ payload: PairPayload, connection: ConnectionStore) {
+        guard !payload.isRelayPairing else { return }
         // All QR / deep-link pair payloads come from the shared-dashboard flow —
         // tag the mode so the picker reflects the action AND so the transport
         // derives the correct loopback Host header (Tailscale Serve path).
