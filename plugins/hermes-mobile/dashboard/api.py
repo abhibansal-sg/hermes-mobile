@@ -317,6 +317,12 @@ class ApprovalRespondBody(BaseModel):
     all: bool = False
 
 
+class ApprovalReplyBody(BaseModel):
+    session_id: str
+    approval_id: str
+    answer: str
+
+
 @router.post("/approvals/respond")
 async def respond_to_approval(body: ApprovalRespondBody, request: Request):
     """Resolve a pending gateway approval for a runtime session.
@@ -367,6 +373,60 @@ async def respond_to_approval(body: ApprovalRespondBody, request: Request):
         return {"resolved": False}
 
     return {"resolved": bool(resolved)}
+
+
+@router.post("/approvals/reply")
+async def reply_to_clarify_approval(body: ApprovalReplyBody, request: Request):
+    """Resolve a pending clarify.request from a notification text reply.
+
+    This intentionally does NOT resolve generic prompt gates. Sudo / secret /
+    terminal prompts share the same ``_block(...)`` mechanism, so the prompt kind
+    must be verified under ``_prompt_lock`` before writing ``_answers`` or setting
+    the event.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
+
+    try:
+        from tui_gateway.server import (
+            _answers,
+            _pending,
+            _pending_prompt_payloads,
+            _prompt_lock,
+            _sessions,
+        )
+    except Exception as exc:  # pragma: no cover - gateway import unavailable
+        raise HTTPException(status_code=503, detail=f"Gateway unavailable: {exc}")
+
+    session = _sessions.get(body.session_id)
+    if session is None or not session.get("session_key"):
+        raise HTTPException(status_code=404, detail="Unknown session")
+    if not _device_owns_session(request, body.session_id):
+        raise HTTPException(status_code=403, detail="Device token does not own session")
+
+    answer = str(body.answer or "").strip()
+    if not answer:
+        return {"resolved": False}
+
+    rid = str(body.approval_id or "").strip()
+    if not rid:
+        return {"resolved": False}
+
+    with _prompt_lock:
+        pending = _pending.get(rid)
+        if pending is None:
+            return {"resolved": False}
+        owner_sid, ev = pending
+        if owner_sid != body.session_id:
+            return {"resolved": False}
+        event, _payload = _pending_prompt_payloads.get(rid, ("", {}))
+        if event != "clarify.request":
+            return {"resolved": False}
+        _answers[rid] = answer
+        ev.set()
+    return {"resolved": True}
 
 
 def _build_resolve_audit(

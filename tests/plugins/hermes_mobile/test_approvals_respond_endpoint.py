@@ -15,6 +15,8 @@ into ``plugins/hermes-mobile/dashboard/api.py``, auto-mounted at
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -178,6 +180,62 @@ def test_respond_session_without_key_404(loopback_client, monkeypatch):
         assert r.status_code == 404
     finally:
         gateway._sessions.pop("no-key", None)
+
+
+# ---------------------------------------------------------------------------
+# Clarify reply — resolves only clarify.request prompt gates
+# ---------------------------------------------------------------------------
+
+def test_reply_resolves_pending_clarify_request(loopback_client, session):
+    ev = threading.Event()
+    gateway._pending["rid-clarify"] = (session, ev)
+    gateway._pending_prompt_payloads["rid-clarify"] = (
+        "clarify.request", {"question": "Which file?"}
+    )
+    try:
+        r = loopback_client.post(
+            "/api/plugins/hermes-mobile/approvals/reply",
+            json={
+                "session_id": session,
+                "approval_id": "rid-clarify",
+                "answer": "use api.py",
+            },
+            headers=_TOKEN_HEADER,
+        )
+        assert r.status_code == 200
+        assert r.json() == {"resolved": True}
+        assert gateway._answers["rid-clarify"] == "use api.py"
+        assert ev.is_set()
+    finally:
+        gateway._pending.pop("rid-clarify", None)
+        gateway._pending_prompt_payloads.pop("rid-clarify", None)
+        gateway._answers.pop("rid-clarify", None)
+
+
+@pytest.mark.parametrize("event", ["sudo.request", "secret.request"])
+def test_reply_rejects_non_clarify_prompt_kinds(loopback_client, session, event):
+    ev = threading.Event()
+    rid = f"rid-{event.split('.')[0]}"
+    gateway._pending[rid] = (session, ev)
+    gateway._pending_prompt_payloads[rid] = (event, {"prompt": "sensitive"})
+    try:
+        r = loopback_client.post(
+            "/api/plugins/hermes-mobile/approvals/reply",
+            json={
+                "session_id": session,
+                "approval_id": rid,
+                "answer": "do not leak into this prompt",
+            },
+            headers=_TOKEN_HEADER,
+        )
+        assert r.status_code == 200
+        assert r.json() == {"resolved": False}
+        assert rid not in gateway._answers
+        assert not ev.is_set()
+    finally:
+        gateway._pending.pop(rid, None)
+        gateway._pending_prompt_payloads.pop(rid, None)
+        gateway._answers.pop(rid, None)
 
 
 # ===========================================================================

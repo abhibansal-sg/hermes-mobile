@@ -35,7 +35,8 @@ enum NotificationService {
     // BINDING (contract A1): registered exactly as
     //   HERMES_APPROVAL → APPROVE [.authenticationRequired],
     //                     DENY    [.destructive, .authenticationRequired]
-    //   HERMES_CLARIFY / HERMES_TURN → no actions (open-app only).
+    //   HERMES_CLARIFY  → REPLY   [text input]
+    //   HERMES_TURN     → no actions (open-app only).
     //
     // `.authenticationRequired` is the OS-level half of the BINDING "no approval
     // action may fire from a locked, unauthenticated device": iOS will not even
@@ -60,6 +61,8 @@ enum NotificationService {
     nonisolated static let approveActionIdentifier = "APPROVE"
     /// Action id for the inline "Deny" button on a `HERMES_APPROVAL` push.
     nonisolated static let denyActionIdentifier = "DENY"
+    /// Action id for the inline text reply on a `HERMES_CLARIFY` push.
+    nonisolated static let replyActionIdentifier = "REPLY"
 
     // MARK: - Tap routing (B5)
 
@@ -218,6 +221,164 @@ enum NotificationService {
                 title: "Couldn't respond",
                 body: "The request didn't go through. Open Hermes to respond."
             )
+        }
+    }
+
+    // MARK: - Clarify text reply handling (ABH-296)
+
+    /// The fields a `REPLY` text action needs from a `HERMES_CLARIFY` push.
+    struct ClarifyReplyActionPayload: Sendable, Equatable {
+        /// Runtime session id — used for session ownership/auth checks server-side.
+        let sessionId: String
+        /// `_block(...)` request id (`approval_id` in the mobile push payload).
+        let approvalId: String
+    }
+
+    #if DEBUG
+    /// Injectable sender for notification-reply unit tests. `nil` in production.
+    nonisolated(unsafe) static var clarifyReplySender:
+        ((ActionEndpoint, ClarifyReplyActionPayload, String) async -> RestClient.ApprovalRespondOutcome)?
+    #endif
+
+    /// Decode the clarify-reply payload from a notification's `userInfo`.
+    nonisolated static func decodeClarifyReplyAction(
+        from userInfo: [AnyHashable: Any]
+    ) -> ClarifyReplyActionPayload? {
+        guard let block = userInfo["hermes"] as? [AnyHashable: Any] else { return nil }
+        guard
+            let sessionId = (block["session_id"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            !sessionId.isEmpty
+        else { return nil }
+        let rawApprovalId = (block["approval_id"] as? String)
+            ?? (block["request_id"] as? String)
+        guard
+            let approvalId = rawApprovalId?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !approvalId.isEmpty
+        else { return nil }
+        let responseAction = (block["response_action"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard responseAction == nil || responseAction == "reply" else { return nil }
+        return ClarifyReplyActionPayload(sessionId: sessionId, approvalId: approvalId)
+    }
+
+    /// Handle a `REPLY` text action on a `HERMES_CLARIFY` notification.
+    @MainActor
+    static func handleClarifyReplyAction(
+        text: String,
+        action: ClarifyReplyActionPayload
+    ) async {
+        let answer = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !answer.isEmpty else {
+            postFeedbackNotification(
+                title: "Couldn't reply",
+                body: "Type a reply, or open Hermes to answer this question."
+            )
+            return
+        }
+        guard let endpoint = endpointProvider?() else {
+            postFeedbackNotification(
+                title: "Couldn't reply",
+                body: "Open Hermes to answer this question."
+            )
+            return
+        }
+
+        let outcome: RestClient.ApprovalRespondOutcome
+        #if DEBUG
+        if let sender = clarifyReplySender {
+            outcome = await sender(endpoint, action, answer)
+        } else {
+            outcome = await sendClarifyReply(endpoint: endpoint, action: action, answer: answer)
+        }
+        #else
+        outcome = await sendClarifyReply(endpoint: endpoint, action: action, answer: answer)
+        #endif
+
+        switch outcome {
+        case .resolved:
+            LiveActivityManager.shared.clearNeedsApproval()
+        case .alreadyHandled:
+            postFeedbackNotification(
+                title: "Already handled elsewhere",
+                body: "This question was already answered."
+            )
+        case .failed:
+            postFeedbackNotification(
+                title: "Couldn't reply",
+                body: "The reply didn't go through. Open Hermes to answer."
+            )
+        }
+    }
+
+    private enum ClarifyReplyAttempt {
+        case outcome(RestClient.ApprovalRespondOutcome)
+        case routeMiss
+
+        var outcome: RestClient.ApprovalRespondOutcome {
+            switch self {
+            case .outcome(let value): return value
+            case .routeMiss: return .alreadyHandled
+            }
+        }
+    }
+
+    private static func sendClarifyReply(
+        endpoint: ActionEndpoint,
+        action: ClarifyReplyActionPayload,
+        answer: String
+    ) async -> RestClient.ApprovalRespondOutcome {
+        let first = await sendClarifyReplyAttempt(
+            endpoint: endpoint, style: endpoint.pathStyle, action: action, answer: answer
+        )
+        guard case .routeMiss = first else { return first.outcome }
+        let second = await sendClarifyReplyAttempt(
+            endpoint: endpoint, style: endpoint.pathStyle.alternate, action: action, answer: answer
+        )
+        return second.outcome
+    }
+
+    private static func sendClarifyReplyAttempt(
+        endpoint: ActionEndpoint,
+        style: APIPathStyle,
+        action: ClarifyReplyActionPayload,
+        answer: String
+    ) async -> ClarifyReplyAttempt {
+        let rest = RestClient(
+            baseURL: endpoint.baseURL,
+            token: endpoint.token,
+            pathStyle: style
+        )
+        var request = rest.makeRequest(path: "\(style.mobileAPIPrefix)/approvals/reply", method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: JSONValue = .object([
+            "session_id": .string(action.sessionId),
+            "approval_id": .string(action.approvalId),
+            "answer": .string(answer),
+        ])
+        guard let payload = try? rest.encodeBody(body, context: "approvals/reply") else {
+            return .outcome(.failed)
+        }
+        request.httpBody = payload
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await rest.session.data(for: request)
+        } catch {
+            return .outcome(.failed)
+        }
+        guard let http = response as? HTTPURLResponse else { return .outcome(.failed) }
+        switch http.statusCode {
+        case 200, 201:
+            let root = try? rest.decodeJSONValue(from: data, context: "approvals/reply")
+            let resolved = root?["resolved"]?.boolValue ?? false
+            return .outcome(resolved ? .resolved : .alreadyHandled)
+        case 404:
+            return .routeMiss
+        default:
+            return .outcome(.failed)
         }
     }
 
@@ -415,6 +576,14 @@ enum NotificationService {
         didRegisterCategories = true
         installDelegateIfNeeded()
 
+        UNUserNotificationCenter.current().setNotificationCategories(
+            remoteNotificationCategoriesForTesting()
+        )
+    }
+
+    /// Build the remote APNs categories. Exposed internally for host tests;
+    /// `registerCategories()` is still the only production registration path.
+    nonisolated static func remoteNotificationCategoriesForTesting() -> Set<UNNotificationCategory> {
         let approve = UNNotificationAction(
             identifier: approveActionIdentifier,
             title: "Approve",
@@ -427,17 +596,22 @@ enum NotificationService {
             // forces a device unlock before the action reaches the app.
             options: [.destructive, .authenticationRequired]
         )
+        let reply = UNTextInputNotificationAction(
+            identifier: replyActionIdentifier,
+            title: "Reply",
+            options: [],
+            textInputButtonTitle: "Send",
+            textInputPlaceholder: "Reply to Hermes"
+        )
         let approvalCat = UNNotificationCategory(
             identifier: remoteApprovalCategory,
             actions: [approve, deny],
             intentIdentifiers: [],
             options: []
         )
-        // Clarify + turn-complete are open-app only: a tap launches the app and
-        // routes via `decodeTap`; no inline actions.
         let clarifyCat = UNNotificationCategory(
             identifier: remoteClarifyCategory,
-            actions: [],
+            actions: [reply],
             intentIdentifiers: [],
             options: []
         )
@@ -447,9 +621,7 @@ enum NotificationService {
             intentIdentifiers: [],
             options: []
         )
-        UNUserNotificationCenter.current().setNotificationCategories(
-            [approvalCat, clarifyCat, turnCat]
-        )
+        return [approvalCat, clarifyCat, turnCat]
     }
 
     /// Fire a local notification for an approval request, immediately.
@@ -585,6 +757,29 @@ enum NotificationService {
                         NotificationService.postFeedbackNotification(
                             title: "Couldn't respond",
                             body: "Open Hermes to respond to this request."
+                        )
+                    }
+                    completion.handler()
+                }
+                return
+            }
+
+            // Inline REPLY text action for HERMES_CLARIFY. Only this category
+            // carries the action; approval pushes stay Approve/Deny only.
+            if actionId == NotificationService.replyActionIdentifier {
+                let action = NotificationService.decodeClarifyReplyAction(from: userInfo)
+                let text = (response as? UNTextInputNotificationResponse)?.userText ?? ""
+                let completion = CompletionBox(handler: completionHandler)
+                Task { @MainActor in
+                    if let action {
+                        await NotificationService.handleClarifyReplyAction(
+                            text: text,
+                            action: action
+                        )
+                    } else {
+                        NotificationService.postFeedbackNotification(
+                            title: "Couldn't reply",
+                            body: "Open Hermes to answer this question."
                         )
                     }
                     completion.handler()

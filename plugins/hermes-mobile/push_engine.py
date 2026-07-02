@@ -1419,11 +1419,17 @@ def _process_push_event(
                 category="HERMES_APPROVAL",
             )
         elif event == "clarify.request":
+            clarify_payload = {"session_id": sid}
+            request_id = str(data.get("request_id") or "").strip()
+            if request_id:
+                clarify_payload.update(
+                    {"approval_id": request_id, "response_action": "reply"}
+                )
             notify(
                 "clarify",
                 "Hermes has a question",
                 _push_safe_text(data.get("question"), "Input needed"),
-                {"session_id": sid},
+                clarify_payload,
                 category="HERMES_CLARIFY",
             )
         else:  # message.complete — only for long turns

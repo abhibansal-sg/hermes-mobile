@@ -345,10 +345,19 @@ def test_push_hook_approval_destructive_false_without_pattern(monkeypatch, push_
 
 def test_push_hook_clarify_category(monkeypatch, push_engine):
     calls = _capture_notify(monkeypatch, push_engine)
-    push_engine._process_push_event("clarify.request", "sid_c", {"question": "Which file?"})
+    push_engine._process_push_event(
+        "clarify.request",
+        "sid_c",
+        {"question": "Which file?", "request_id": "rid-123"},
+    )
     assert calls[0]["event_type"] == "clarify"
     assert calls[0]["category"] == "HERMES_CLARIFY"
     assert calls[0]["body"] == "Which file?"
+    assert calls[0]["payload"] == {
+        "session_id": "sid_c",
+        "approval_id": "rid-123",
+        "response_action": "reply",
+    }
 
 
 def test_push_hook_bounds_and_scrubs_lock_screen_body(monkeypatch, push_engine):
