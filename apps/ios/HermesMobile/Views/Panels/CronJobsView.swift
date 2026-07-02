@@ -270,7 +270,7 @@ private struct CronJobRow: View {
                 }
 
                 if let status = job.lastStatus {
-                    lastRunLine(status: status)
+                    lastRunLine(status: status, deliveryFailed: deliveryFailed)
                 }
 
                 // Last error (ABH-76)
@@ -284,6 +284,18 @@ private struct CronJobRow: View {
                     }
                     .font(.caption2)
                     .foregroundStyle(theme.statusError)
+                }
+
+                if let err = deliveryError, deliveryFailed {
+                    HStack(alignment: .top, spacing: 4) {
+                        Image(systemName: "paperplane.circle.fill")
+                            .foregroundStyle(theme.statusWarn)
+                            .imageScale(.small)
+                        Text("Delivery failed: \(err)")
+                            .lineLimit(2)
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(theme.statusWarn)
                 }
 
                 HStack(spacing: 16) {
@@ -333,7 +345,26 @@ private struct CronJobRow: View {
                     Label("Copy error", systemImage: "exclamationmark.triangle")
                 }
             }
+            if let err = deliveryError {
+                Button {
+                    UIPasteboard.general.string = err
+                } label: {
+                    Label("Copy delivery error", systemImage: "paperplane.circle")
+                }
+            }
         }
+    }
+
+    private var deliveryError: String? {
+        guard let err = job.lastDeliveryError?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !err.isEmpty else {
+            return nil
+        }
+        return err
+    }
+
+    private var deliveryFailed: Bool {
+        job.lastStatus?.lowercased() == "ok" && deliveryError != nil
     }
 
     private var stateBadge: some View {
@@ -351,19 +382,22 @@ private struct CronJobRow: View {
     }
 
     @ViewBuilder
-    private func lastRunLine(status: String) -> some View {
+    private func lastRunLine(status: String, deliveryFailed: Bool) -> some View {
         let ok = status.lowercased() == "ok"
+        let tint = ok ? (deliveryFailed ? theme.statusWarn : theme.statusOK) : theme.statusError
+        let icon = ok ? (deliveryFailed ? "paperplane.circle" : "checkmark.circle") : "exclamationmark.triangle"
+        let label = deliveryFailed ? "ok · delivery failed" : status
         HStack(spacing: 4) {
-            Image(systemName: ok ? "checkmark.circle" : "exclamationmark.triangle")
-                .foregroundStyle(ok ? theme.statusOK : theme.statusError)
+            Image(systemName: icon)
+                .foregroundStyle(tint)
             if let when = PanelFormat.relative(fromISO: job.lastRunAt) {
-                Text("Last run \(when) \u{2014} \(status)")
+                Text("Last run \(when) \u{2014} \(label)")
             } else {
-                Text("Last run: \(status)")
+                Text("Last run: \(label)")
             }
         }
         .font(.caption2)
-        .foregroundStyle(theme.mutedFg)
+        .foregroundStyle(deliveryFailed ? theme.statusWarn : theme.mutedFg)
     }
 }
 

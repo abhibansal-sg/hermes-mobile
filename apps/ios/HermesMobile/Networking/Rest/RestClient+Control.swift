@@ -336,6 +336,7 @@ struct CronJob: Identifiable, Sendable, Equatable {
     /// "ok" / "error" / nil (never run).
     let lastStatus: String?
     let lastError: String?
+    let lastDeliveryError: String?
     let source: String?
     let profile: String?
 
@@ -351,6 +352,7 @@ struct CronJob: Identifiable, Sendable, Equatable {
         self.lastRunAt = json["last_run_at"]?.stringValue
         self.lastStatus = json["last_status"]?.stringValue
         self.lastError = json["last_error"]?.stringValue
+        self.lastDeliveryError = json["last_delivery_error"]?.stringValue
         self.source = json["source"]?.stringValue
         self.profile = json["profile"]?.stringValue ?? json["profile_name"]?.stringValue
     }
