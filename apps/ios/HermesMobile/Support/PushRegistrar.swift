@@ -51,8 +51,9 @@ final class PushRegistrar {
     /// `setEnabled`).
     private(set) var isEnabled: Bool
 
-    /// Flip the opt-in flag and (un)register accordingly. Disabling clears the
-    /// remembered token so a later re-enable forces a fresh server register.
+    /// Flip the opt-in flag and (un)register accordingly. Disabling unregisters
+    /// the remembered token server-side, then clears it locally so a later
+    /// re-enable forces a fresh server register.
     func setEnabled(_ enabled: Bool) {
         isEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: DefaultsKeys.pushEnabled)
@@ -62,6 +63,25 @@ final class PushRegistrar {
             // only applies to the silent launch path).
             enableIfAllowed(forcePrompt: true)
         } else {
+            let lastDeviceToken = UserDefaults.standard.string(
+                forKey: DefaultsKeys.pushLastDeviceToken
+            )
+            let poster = makePoster()
+            if let lastDeviceToken, !lastDeviceToken.isEmpty, let poster {
+                Task { @MainActor in
+                    let outcome = await poster.unregister(token: lastDeviceToken)
+                    switch outcome {
+                    case .success, .softFail, .validationRejected:
+                        connection?.capabilities.notePushRegistry(
+                            available: outcome.provesEndpointPresent
+                        )
+                    case .hardFail:
+                        // Best-effort network cleanup: keep the Settings toggle
+                        // responsive and still clear local opt-out state.
+                        break
+                    }
+                }
+            }
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastDeviceToken)
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEvents)
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEnv)
