@@ -370,6 +370,8 @@ async def list_device_tokens(request: Request):
     server with no device routes."""
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
 
     device_tokens = _plugin_module("device_tokens")
 

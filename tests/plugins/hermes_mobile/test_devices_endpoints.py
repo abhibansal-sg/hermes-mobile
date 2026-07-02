@@ -105,6 +105,23 @@ def test_aad_no_credential_is_rejected(client, home):
     assert client.get(f"{_PREFIX}/devices").status_code == 401
 
 
+def test_get_devices_device_token_without_approve_scope_is_403(
+    client, home, wired_token_auth
+):
+    issued = device_tokens.issue(device_name="Chat Only")
+    registry_path = home / "device_tokens.json"
+    registry = json.loads(registry_path.read_text())
+    registry[issued["device_id"]]["scopes"] = ["chat"]
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+    r = client.get(
+        f"{_PREFIX}/devices",
+        headers={"X-Hermes-Session-Token": issued["token"]},
+    )
+
+    assert r.status_code == 403
+
+
 # ===========================================================================
 # 1. Endpoint round-trip: issue → list → revoke → revoked-token 401
 # ===========================================================================
