@@ -681,13 +681,13 @@ struct SettingsView: View {
     /// live control surface; `about` is the local version page (no control
     /// client needed) and is excluded from ``pushable``.
     private enum ControlPanel: String, Identifiable, Hashable {
-        case appearance, model, personality, usage, cron, skills, gateway, artifacts, about
+        case appearance, model, personality, usage, cron, skills, learning, gateway, artifacts, about
         var id: String { rawValue }
 
         /// The panels that need a live control client (`appearance` + `about` do
         /// NOT — they are local pages, excluded from ``pushable``).
         static var pushable: [ControlPanel] {
-            [.model, .personality, .usage, .cron, .skills, .gateway, .artifacts]
+            [.model, .personality, .usage, .cron, .skills, .learning, .gateway, .artifacts]
         }
 
         var title: String {
@@ -698,6 +698,7 @@ struct SettingsView: View {
             case .usage: return "Usage"
             case .cron: return "Automations"
             case .skills: return "Skills"
+            case .learning: return "Learning Journey"
             case .gateway: return "Gateway Status"
             case .artifacts: return "Artifacts"
             case .about: return "About"
@@ -712,6 +713,7 @@ struct SettingsView: View {
             case .usage: return "chart.bar"
             case .cron: return "clock.arrow.circlepath"
             case .skills: return "wand.and.stars"
+            case .learning: return "sparkles"
             case .gateway: return "network"
             case .artifacts: return "photo.on.rectangle.angled"
             case .about: return "info.circle"
@@ -768,6 +770,8 @@ struct SettingsView: View {
                     CronJobsView(control: control)
                 case .skills:
                     SkillsBrowserView(control: control)
+                case .learning:
+                    LearningJourneyView(client: connectionStore.client)
                 case .gateway:
                     GatewayStatusView(control: control)
                 case .artifacts:
