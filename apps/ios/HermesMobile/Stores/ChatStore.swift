@@ -1021,6 +1021,7 @@ final class ChatStore {
         let sessionId = event.sessionId ?? activeSessionId ?? ""
         pendingApproval = PendingApproval(id: request.id, sessionId: sessionId, request: request)
         onApprovalChange?(true)
+        guard DefaultsKeys.pushEventEnabled(DefaultsKeys.pushEventApproval) else { return }
         // First approval/clarify of the session is when we ask for permission.
         NotificationService.requestAuthorizationIfNeeded()
         NotificationService.postApprovalNotification(
@@ -1034,6 +1035,7 @@ final class ChatStore {
         let request = ClarifyRequestPayload(payload: event.payload)
         let sessionId = event.sessionId ?? activeSessionId ?? ""
         pendingClarification = PendingClarification(sessionId: sessionId, request: request)
+        guard DefaultsKeys.pushEventEnabled(DefaultsKeys.pushEventClarify) else { return }
         // First approval/clarify of the session is when we ask for permission.
         NotificationService.requestAuthorizationIfNeeded()
         NotificationService.postClarifyNotification(question: request.question)
