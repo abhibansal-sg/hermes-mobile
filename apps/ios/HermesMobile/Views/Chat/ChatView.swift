@@ -115,6 +115,12 @@ struct ChatView: View {
     @State private var toastError: String?
     /// Cancels the in-flight toast auto-dismiss when a new error arrives.
     @State private var toastDismissTask: Task<Void, Never>?
+    /// Success toast shown after a manual context compression finishes.
+    @State private var compressionToast: String?
+    /// Cancels the in-flight compression toast auto-dismiss when a new one arrives.
+    @State private var compressionToastDismissTask: Task<Void, Never>?
+    /// Prevents duplicate `session.compress` RPCs from the overflow menu.
+    @State private var isCompressingContext = false
 
     // Dynamic-Type-scaled sizes (base values preserve the default-size layout;
     // grow with Larger Text). `@ScaledMetric` must be stored on the View struct.
@@ -1181,6 +1187,10 @@ struct ChatView: View {
                 errorToast(toastError)
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
+            if let compressionToast {
+                compressionToastBanner(compressionToast)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
         }
         .padding(.horizontal, 12)
         .animation(.spring(response: 0.35, dampingFraction: 0.85),
@@ -1192,6 +1202,7 @@ struct ChatView: View {
         .animation(.spring(response: 0.35, dampingFraction: 0.85),
                    value: crossSessionItems.isEmpty)
         .animation(.easeInOut(duration: 0.25), value: toastError)
+        .animation(.easeInOut(duration: 0.25), value: compressionToast)
     }
 
     /// Pending inbox items belonging to a session OTHER than the one open here
@@ -1255,6 +1266,22 @@ struct ChatView: View {
         .background(theme.popover, in: RoundedRectangle(cornerRadius: 12))
     }
 
+    private func compressionToastBanner(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(theme.midground)
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(theme.fg)
+                .lineLimit(3)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.popover, in: RoundedRectangle(cornerRadius: 12))
+    }
+
     /// Show a transient error toast and schedule its auto-dismiss after 4s.
     private func presentToast(_ message: String?) {
         toastDismissTask?.cancel()
@@ -1267,6 +1294,17 @@ struct ChatView: View {
             try? await Task.sleep(for: .seconds(4))
             guard !Task.isCancelled else { return }
             toastError = nil
+        }
+    }
+
+    /// Show a transient success toast and schedule its auto-dismiss after 4s.
+    private func presentCompressionToast(_ message: String) {
+        compressionToastDismissTask?.cancel()
+        compressionToast = message
+        compressionToastDismissTask = Task {
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled else { return }
+            compressionToast = nil
         }
     }
 
@@ -1479,6 +1517,15 @@ struct ChatView: View {
 
     @ViewBuilder
     private var sessionActionsMenu: some View {
+        Button {
+            compressContext()
+        } label: {
+            Label(isCompressingContext ? "Compressing context…" : "Compress context",
+                  systemImage: "rectangle.compress.vertical")
+        }
+        .disabled(!canCompressContext)
+        .accessibilityIdentifier("compressContextMenuItem")
+        Divider()
         if showSubagentAffordance {
             Button {
                 showingSubagentTree = true
@@ -1544,6 +1591,28 @@ struct ChatView: View {
     private var activeSummary: SessionSummary? {
         guard let id = sessionStore.activeStoredId ?? sessionStore.activeRuntimeId else { return nil }
         return sessionStore.sessions.first { $0.id == id }
+    }
+
+    private var canCompressContext: Bool {
+        !isCompressingContext && (sessionStore.activeRuntimeId?.isEmpty == false)
+    }
+
+    private func compressContext() {
+        guard canCompressContext else { return }
+        isCompressingContext = true
+        Task {
+            let outcome = await chatStore.compressContext()
+            isCompressingContext = false
+            switch outcome {
+            case .compressed(let beforeTokens, let afterTokens, _):
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                presentCompressionToast(
+                    "Compressed context: \(UsageStats.formatK(beforeTokens)) → \(UsageStats.formatK(afterTokens)) tokens"
+                )
+            case .error:
+                break
+            }
+        }
     }
 
     /// Copy the whole transcript to the pasteboard (export affordance).

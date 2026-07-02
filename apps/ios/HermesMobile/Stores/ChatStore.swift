@@ -1727,6 +1727,59 @@ final class ChatStore {
     /// so the routing fact (R1 #2) is directly assertable in tests.
     var interruptTarget: String? { mirroringRuntimeId ?? activeSessionId }
 
+    // MARK: - Manual context compression
+
+    /// Outcome of a user-initiated `session.compress` RPC call.
+    enum ContextCompressionOutcome: Sendable {
+        case compressed(beforeTokens: Int, afterTokens: Int, removedMessages: Int)
+        case error(String)
+    }
+
+    /// Gateway response shape for `session.compress`.
+    struct SessionCompressResponse: Decodable, Sendable {
+        let status: String
+        let removed: Int
+        let beforeMessages: Int
+        let afterMessages: Int
+        let beforeTokens: Int
+        let afterTokens: Int
+        let usage: UsageStats?
+    }
+
+    /// Force context compression for the active runtime (`session.compress`).
+    ///
+    /// This is a manual maintenance action, not a chat turn: iOS must not start
+    /// or stop local streaming state. The gateway owns the compression lifecycle
+    /// and returns before/after token counts for user feedback.
+    func compressContext(focus: String? = nil) async -> ContextCompressionOutcome {
+        guard let client, let sessionId = activeSessionId else {
+            return .error("No active session")
+        }
+        var params: [String: JSONValue] = ["session_id": .string(sessionId)]
+        let trimmedFocus = focus?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmedFocus.isEmpty {
+            params["focus_topic"] = .string(trimmedFocus)
+        }
+        do {
+            let response: SessionCompressResponse = try await client.request(
+                "session.compress",
+                params: .object(params),
+                timeout: .seconds(180)
+            )
+            applyContextUsage(from: response.usage)
+            return .compressed(
+                beforeTokens: response.beforeTokens,
+                afterTokens: response.afterTokens,
+                removedMessages: response.removed
+            )
+        } catch {
+            let msg = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            lastError = msg
+            return .error(msg)
+        }
+    }
+
     // MARK: - Steer
 
     /// Outcome of a `session.steer` RPC call.
