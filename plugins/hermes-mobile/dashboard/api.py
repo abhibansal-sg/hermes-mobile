@@ -1892,6 +1892,10 @@ async def get_toolset_config(name: str, request: Request) -> Any:
     """Return provider matrix + env-var key status for a toolset config panel."""
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(
+            status_code=403, detail="Device token lacks approve scope"
+        )
 
     name = (name or "").strip()
     if name not in _valid_toolset_config_names():

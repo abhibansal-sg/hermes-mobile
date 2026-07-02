@@ -188,6 +188,21 @@ def test_put_toolset_config_device_without_approve_scope_is_403(
     assert r.status_code == 403
 
 
+def test_get_toolset_config_device_without_approve_scope_is_403(
+    loopback_client, monkeypatch
+):
+    _patch_toolset_helpers(monkeypatch)
+    monkeypatch.setattr(_api(), "_has_dashboard_api_auth", lambda _request: True)
+    monkeypatch.setattr(_api(), "_device_has_scope", lambda _request, _scope: False)
+
+    r = loopback_client.get(
+        f"{_PREFIX}/toolsets/web/config",
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 403
+
+
 # ===========================================================================
 # GET /toolsets/{name}/config
 # ===========================================================================
