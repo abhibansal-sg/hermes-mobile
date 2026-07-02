@@ -44,6 +44,13 @@ _SHARED_HEADER = {"X-Hermes-Session-Token": web_server._SESSION_TOKEN}
 _SHARED_BEARER = {"Authorization": f"Bearer {web_server._SESSION_TOKEN}"}
 
 
+def _restrict_device_scopes(home, device_id: str, scopes: list[str]) -> None:
+    registry_path = home / "device_tokens.json"
+    registry = json.loads(registry_path.read_text())
+    registry[device_id]["scopes"] = scopes
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+
 @pytest.fixture
 def home(monkeypatch, tmp_path):
     """Throwaway HERMES_HOME so device_tokens.json never touches ~/.hermes."""
@@ -109,10 +116,7 @@ def test_get_devices_device_token_without_approve_scope_is_403(
     client, home, wired_token_auth
 ):
     issued = device_tokens.issue(device_name="Chat Only")
-    registry_path = home / "device_tokens.json"
-    registry = json.loads(registry_path.read_text())
-    registry[issued["device_id"]]["scopes"] = ["chat"]
-    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    _restrict_device_scopes(home, issued["device_id"], ["chat"])
 
     r = client.get(
         f"{_PREFIX}/devices",
@@ -120,6 +124,55 @@ def test_get_devices_device_token_without_approve_scope_is_403(
     )
 
     assert r.status_code == 403
+    assert r.json() == {"detail": "Device token lacks approve scope"}
+
+
+def test_issue_device_token_without_approve_scope_is_403(
+    client, home, wired_token_auth
+):
+    issued = device_tokens.issue(device_name="Chat Only")
+    _restrict_device_scopes(home, issued["device_id"], ["chat"])
+
+    denied = client.post(
+        f"{_PREFIX}/devices/issue",
+        json={"device_name": "Nested"},
+        headers={"X-Hermes-Session-Token": issued["token"]},
+    )
+    allowed = client.post(
+        f"{_PREFIX}/devices/issue",
+        json={"device_name": "Shared Token"},
+        headers=_SHARED_HEADER,
+    )
+
+    assert denied.status_code == 403
+    assert denied.json() == {"detail": "Device token lacks approve scope"}
+    assert allowed.status_code == 200
+
+
+def test_revoke_device_token_without_approve_scope_is_403(
+    client, home, wired_token_auth
+):
+    issued = device_tokens.issue(device_name="Chat Only")
+    _restrict_device_scopes(home, issued["device_id"], ["chat"])
+
+    denied = client.delete(
+        f"{_PREFIX}/devices/{issued['device_id']}",
+        headers={"X-Hermes-Session-Token": issued["token"]},
+    )
+
+    assert denied.status_code == 403
+    assert denied.json() == {"detail": "Device token lacks approve scope"}
+    assert device_tokens.match(issued["token"]) is not None
+
+    approved = client.post(
+        f"{_PREFIX}/devices/issue", json={"device_name": "Approve"}, headers=_SHARED_HEADER
+    ).json()
+    allowed = client.delete(
+        f"{_PREFIX}/devices/{approved['device_id']}",
+        headers={"X-Hermes-Session-Token": approved["token"]},
+    )
+
+    assert allowed.status_code == 200
 
 
 # ===========================================================================

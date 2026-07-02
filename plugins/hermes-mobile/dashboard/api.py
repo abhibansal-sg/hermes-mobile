@@ -321,6 +321,8 @@ async def issue_device_token(request: Request, body: _DeviceIssueBody):
     to its Keychain immediately — it is never recoverable afterwards."""
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
     if _is_device_auth(request):
         raise HTTPException(status_code=403, detail="Device tokens cannot issue devices")
 
@@ -388,6 +390,8 @@ async def revoke_device_token(device_id: str, request: Request):
     """
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
 
     device_tokens = _plugin_module("device_tokens")
     device = _request_device(request)
