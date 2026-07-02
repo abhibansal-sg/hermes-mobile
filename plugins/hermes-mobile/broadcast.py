@@ -337,10 +337,9 @@ def on_owner_write(obj: dict, sid: str, owner: Any) -> None:
 
 def activate() -> None:
     """Wire the fan-out engine into the gateway's S1 seams."""
+    from . import _append_unique
     from tui_gateway import server as _server
     from tui_gateway import ws as _ws
 
-    if on_owner_write not in _server._EVENT_FANOUT_SUBSCRIBERS:
-        _server._EVENT_FANOUT_SUBSCRIBERS.append(on_owner_write)
-    if on_transport not in _ws.TRANSPORT_OBSERVERS:
-        _ws.TRANSPORT_OBSERVERS.append(on_transport)
+    _append_unique(_server, "_EVENT_FANOUT_SUBSCRIBERS", on_owner_write, "broadcast")
+    _append_unique(_ws, "TRANSPORT_OBSERVERS", on_transport, "broadcast")

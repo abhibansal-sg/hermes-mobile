@@ -1480,7 +1480,7 @@ def handle_gateway_event(event: str, sid: str, payload: dict | None = None) -> N
 
 def activate() -> None:
     """Wire the push engine into the gateway's S2 emit-observer seam."""
+    from . import _append_unique
     from tui_gateway import server as _server
 
-    if handle_gateway_event not in _server._EMIT_OBSERVERS:
-        _server._EMIT_OBSERVERS.append(handle_gateway_event)
+    _append_unique(_server, "_EMIT_OBSERVERS", handle_gateway_event, "push")
