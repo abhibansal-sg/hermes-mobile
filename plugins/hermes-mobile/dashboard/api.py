@@ -2098,10 +2098,18 @@ async def set_provider_key(
         base_url = os.environ.get(pconfig.base_url_env_var, "") or ""
     if not base_url:
         base_url = getattr(pconfig, "inference_base_url", "") or ""
+    api_mode = getattr(pconfig, "api_mode", None)
+    if not api_mode:
+        extra = getattr(pconfig, "extra", None)
+        if isinstance(extra, dict):
+            api_mode = extra.get("api_mode")
+    if not api_mode and getattr(pconfig, "id", "") == "anthropic":
+        api_mode = "anthropic_messages"
     validation = await asyncio.to_thread(
         _validate_provider_key,
         api_key=api_key,
         base_url=base_url,
+        api_mode=api_mode,
         timeout=_PROVIDER_KEY_VALIDATION_TIMEOUT_SECONDS,
     )
 

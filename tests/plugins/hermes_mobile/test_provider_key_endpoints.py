@@ -215,6 +215,15 @@ _NOUS_ROW = {
     "total_models": 0,
     "models": [],
 }
+_ANTHROPIC_ROW = {
+    "slug": "anthropic",
+    "name": "Anthropic",
+    "auth_type": "api_key",
+    "is_current": False,
+    "authenticated": False,
+    "total_models": 2,
+    "models": [{"id": "claude-sonnet-4-20250514"}],
+}
 
 
 # ===========================================================================
@@ -730,6 +739,64 @@ def test_provider_key_validation_runs_via_to_thread_for_mutators(
         "api_mode": "openai",
         "timeout": api._PROVIDER_KEY_VALIDATION_TIMEOUT_SECONDS,
     }
+
+
+def test_validate_provider_key_endpoint_uses_anthropic_headers_for_anthropic(
+    loopback_client, monkeypatch
+):
+    """ABH-259: registered Anthropic key validation must use x-api-key.
+
+    The Tier A endpoint must pass the provider's Anthropic Messages mode into
+    the real validation helper; otherwise the helper falls back to the OpenAI
+    Bearer header and Anthropic rejects the key.
+    """
+    import urllib.request
+
+    captured_headers = []
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def _accept(req, timeout):
+        captured_headers.append({k.lower(): v for k, v in req.header_items()})
+        return _Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", _accept)
+    _patch_inventory(monkeypatch, rows=[_ANTHROPIC_ROW])
+    calls = _patch_config(monkeypatch)
+
+    anthropic = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/anthropic/key",
+        json={"api_key": "anthropic-test-key"},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert anthropic.status_code == 200, anthropic.text
+    assert ("ANTHROPIC_API_KEY", "anthropic-test-key") in calls["save_env"]
+    anthropic_headers = captured_headers[-1]
+    assert anthropic_headers["x-api-key"] == "anthropic-test-key"
+    assert anthropic_headers["anthropic-version"] == "2023-06-01"
+    assert "authorization" not in anthropic_headers
+
+    _patch_inventory(monkeypatch, rows=[_DEEPSEEK_ROW])
+    deepseek = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/deepseek/key",
+        json={"api_key": "deepseek-test-key"},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert deepseek.status_code == 200, deepseek.text
+    deepseek_headers = captured_headers[-1]
+    assert deepseek_headers["authorization"] == "Bearer deepseek-test-key"
+    assert "x-api-key" not in deepseek_headers
+    assert "anthropic-version" not in deepseek_headers
 
 
 # ===========================================================================
