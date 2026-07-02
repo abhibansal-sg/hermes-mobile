@@ -6605,21 +6605,64 @@ def _(rid, params: dict) -> dict:
     return _respond(rid, params, "value")
 
 
+def _ws_device_identity() -> Optional[dict]:
+    transport = current_transport()
+    ws = getattr(transport, "_ws", None)
+    device = getattr(getattr(ws, "state", None), "device", None)
+    if isinstance(device, dict) and device.get("device_id"):
+        return device
+    return None
+
+
+def _ws_resolve_audit(session_id: str, session_key: str) -> dict:
+    device = _ws_device_identity()
+    if device is not None:
+        return {
+            "credential": "device",
+            "device_id": device.get("device_id"),
+            "device_name": device.get("device_name"),
+            "token_prefix": device.get("token_prefix"),
+            "session_id": session_id,
+            "session_key": session_key,
+        }
+    credential = (
+        "shared" if getattr(current_transport(), "_ws", None) is not None else "internal"
+    )
+    return {
+        "credential": credential,
+        "device_id": None,
+        "device_name": None,
+        "token_prefix": None,
+        "session_id": session_id,
+        "session_key": session_key,
+    }
+
+
 @method("approval.respond")
 def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    assert session is not None
     try:
         from tools.approval import resolve_gateway_approval
 
+        device = _ws_device_identity()
+        if device is not None and "approve" not in (device.get("scopes") or []):
+            return _err(rid, 4030, "device token lacks approve scope")
+        session_id = params.get("session_id") or ""
+        session_key = session["session_key"]
+        choice = params.get("choice", "deny")
+        if choice == "approve":
+            choice = "once"
         return _ok(
             rid,
             {
                 "resolved": resolve_gateway_approval(
-                    session["session_key"],
-                    params.get("choice", "deny"),
+                    session_key,
+                    choice,
                     resolve_all=params.get("all", False),
+                    audit=_ws_resolve_audit(session_id, session_key),
                 )
             },
         )
