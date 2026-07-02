@@ -272,6 +272,9 @@ enum HermesURLRouter {
 
         switch host {
         case "new-session":
+            if routeToRunningTurnIfNeeded(url, sessions: sessions, chat: chat, inbox: inbox) {
+                return
+            }
             PendingIntentRouter.apply(
                 .newSession, connection: connection, sessions: sessions, chat: chat
             )
@@ -343,6 +346,9 @@ enum HermesURLRouter {
             applyPair(payload, connection: connection)
 
         case "":
+            if routeToRunningTurnIfNeeded(url, sessions: sessions, chat: chat, inbox: inbox) {
+                return
+            }
             // Bare root (Live Activity / widget link): land on a USABLE
             // surface. `closeActive()` left compact width on a permanent
             // "Loading conversation…" spinner with a dead composer (R1 #96 —
@@ -354,6 +360,75 @@ enum HermesURLRouter {
         default:
             // Unknown host — ignore rather than guess.
             break
+        }
+    }
+
+    /// Preserve the running turn when a widget / Live Activity tap foregrounds
+    /// the app through a generic open/new-session route.
+    ///
+    /// The root and status-widget routes still create a draft when idle. But while
+    /// the app is already rendering a turn, treating that tap as "new session"
+    /// calls `SessionStore.startDraft()`, which resets `ChatStore`, cancels the
+    /// stream, and fires `onTurnDiscarded` (ending the activity the user tapped).
+    /// A tap on a live surface is navigation-to-self, not discard.
+    @discardableResult
+    private static func routeToRunningTurnIfNeeded(
+        _ url: URL,
+        sessions: SessionStore,
+        chat: ChatStore,
+        inbox: InboxStore
+    ) -> Bool {
+        guard chat.isStreaming else { return false }
+
+        let targetRuntimeId = liveActivitySessionId(from: url)
+            ?? LiveActivityManager.shared.currentSessionIdForRouting
+            ?? sessions.activeRuntimeId
+
+        guard let targetRuntimeId, !targetRuntimeId.isEmpty else {
+            // We know a turn is live, but not enough to translate it. The honest
+            // action is to leave the current transcript intact rather than wipe it.
+            return true
+        }
+        resumeRunningTurn(runtimeSessionId: targetRuntimeId, sessions: sessions, inbox: inbox)
+        return true
+    }
+
+    /// Parse an optional runtime id carried by a future/ActivityKit-specific URL.
+    /// Existing `hermesapp://` and `hermesapp://new-session` links omit it, so this
+    /// is strictly additive and falls back to the app-side LiveActivityManager id.
+    private static func liveActivitySessionId(from url: URL) -> String? {
+        let raw = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+            .first { $0.name == "session_id" || $0.name == "sessionId" }?
+            .value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let raw, !raw.isEmpty else { return nil }
+        return raw
+    }
+
+    /// Route to the stored session for a live runtime id without resetting the
+    /// already-open live transcript when the target is the current session.
+    private static func resumeRunningTurn(
+        runtimeSessionId: String,
+        sessions: SessionStore,
+        inbox: InboxStore
+    ) {
+        let storedId = inbox.storedSessionId(forRuntime: runtimeSessionId)
+            ?? (sessions.activeRuntimeId == runtimeSessionId ? sessions.activeStoredId : nil)
+            ?? (sessions.sessions.contains { $0.id == runtimeSessionId } ? runtimeSessionId : nil)
+
+        guard let storedId, !storedId.isEmpty else { return }
+        guard sessions.activeStoredId != storedId else { return }
+        if let summary = sessions.sessions.first(where: { $0.id == storedId }) {
+            sessions.open(summary)
+            return
+        }
+        Task {
+            await sessions.refresh()
+            if let summary = sessions.sessions.first(where: { $0.id == storedId }) {
+                sessions.open(summary)
+            } else {
+                inbox.requestPresentation()
+            }
         }
     }
 

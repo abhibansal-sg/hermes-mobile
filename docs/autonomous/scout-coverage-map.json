@@ -99,8 +99,8 @@
         "HermesWidget*",
         "capture routes"
       ],
-      "last_audited": "never",
-      "note": "ABH-267/271 hint at gaps; never had a dedicated pass"
+      "last_audited": "2026-07-03",
+      "note": "First dedicated pass (swarm fan-out, 3 flows: share-sheet, widget deep links, quick-capture). ABH-267 (stall/no-toast) and ABH-271 (dead capture route) verified still current, not re-filed. 3 NEW type:fix filed: ABH-310 (share-drain discards content on failed send but reports success via unchecked chat.send Bool return), ABH-311 (non-atomic batch drain -> duplicate session/send if app killed mid-drain), ABH-312 (widget/Live Activity tap during an active turn calls startDraft()->chat.reset()->cancelStreaming()->onTurnDiscarded->LiveActivityManager.end(), destroying the local view of the very turn the user tapped to check on -- root cause: HermesTurnAttributes carries no session id to route on). 4 polish bullets appended to ABH-290 digest (dead RecordingControls.compact param, stale VoiceRecorder/DrawerView quick-capture doc comments, unbounded share-inbox queue size, generic non-specific 'review' approval landing). Quick-capture confirmed fully dead everywhere (Intents/Shortcuts/Siri/widgets/Control Center/URL routing/share ext) beyond ABH-271's known dead capture() factory."
     },
     "reconnect-offline": {
       "flows": [

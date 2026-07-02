@@ -186,7 +186,8 @@ final class LiveActivityManager {
         registrationGeneration += 1
 
         let attributes = HermesTurnAttributes(
-            sessionTitle: sessionTitle.isEmpty ? "Hermes" : sessionTitle
+            sessionTitle: sessionTitle.isEmpty ? "Hermes" : sessionTitle,
+            sessionId: sessionId
         )
         let state = HermesTurnAttributes.ContentState(
             phase: "Thinking",
@@ -221,6 +222,16 @@ final class LiveActivityManager {
             startedAt = nil
             self.sessionId = nil
         }
+        #endif
+    }
+
+    /// Runtime session id for the currently-live turn, used by URL routing when a
+    /// Live Activity/widget tap foregrounds the app through the generic root route.
+    var currentSessionIdForRouting: String? {
+        #if canImport(ActivityKit)
+        return sessionId
+        #else
+        return nil
         #endif
     }
 

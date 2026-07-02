@@ -58,10 +58,17 @@ struct HermesTurnAttributes: ActivityAttributes, Sendable {
         }
     }
 
-    /// The session this turn belongs to — fixed for the activity's lifetime.
+    /// The runtime session this turn belongs to — fixed for the activity's lifetime.
+    ///
+    /// This lets a Live Activity tap route back to the in-flight turn it represents
+    /// instead of falling through to the generic "new draft" root route.
+    public var sessionId: String?
+
+    /// The human-facing session title — fixed for the activity's lifetime.
     public var sessionTitle: String
 
-    public init(sessionTitle: String) {
+    public init(sessionTitle: String, sessionId: String? = nil) {
+        self.sessionId = sessionId
         self.sessionTitle = sessionTitle
     }
 }

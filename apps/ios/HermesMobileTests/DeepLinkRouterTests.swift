@@ -140,6 +140,30 @@ final class DeepLinkRouterTests: XCTestCase {
         XCTAssertNil(s.sessions.activeRuntimeId)
     }
 
+    func testNewSessionDeepLinkPreservesRunningTurnInsteadOfDraftReset() {
+        let s = makeStores()
+        s.sessions.sessions = [summary(id: "stored-live")]
+        s.sessions.activeStoredId = "stored-live"
+        s.sessions.activeRuntimeId = "runtime-live"
+        s.chat.isStreaming = true
+        var discarded = false
+        s.chat.onTurnDiscarded = { discarded = true }
+
+        HermesURLRouter.route(
+            URL(string: "hermesapp://new-session")!,
+            connection: s.connection,
+            sessions: s.sessions,
+            chat: s.chat,
+            inbox: s.inbox
+        )
+
+        XCTAssertFalse(s.sessions.isDraft, "A widget tap during a live turn must not start a blank draft.")
+        XCTAssertEqual(s.sessions.activeStoredId, "stored-live")
+        XCTAssertEqual(s.sessions.activeRuntimeId, "runtime-live")
+        XCTAssertTrue(s.chat.isStreaming)
+        XCTAssertFalse(discarded, "Preserving the live turn must not fire the discard/Live Activity end seam.")
+    }
+
     // MARK: - capture route removed
 
     func testCaptureRouteIsInertNoOp() {
@@ -340,6 +364,30 @@ final class DeepLinkRouterTests: XCTestCase {
             inbox: s.inbox
         )
         XCTAssertTrue(s.sessions.isDraft)
+    }
+
+    func testBareRootWithLiveActivitySessionIdPreservesRunningTurn() {
+        let s = makeStores()
+        s.sessions.sessions = [summary(id: "stored-live")]
+        s.sessions.activeStoredId = "stored-live"
+        s.sessions.activeRuntimeId = "runtime-live"
+        s.chat.isStreaming = true
+        var discarded = false
+        s.chat.onTurnDiscarded = { discarded = true }
+
+        HermesURLRouter.route(
+            URL(string: "hermesapp://?session_id=runtime-live")!,
+            connection: s.connection,
+            sessions: s.sessions,
+            chat: s.chat,
+            inbox: s.inbox
+        )
+
+        XCTAssertFalse(s.sessions.isDraft)
+        XCTAssertEqual(s.sessions.activeStoredId, "stored-live")
+        XCTAssertEqual(s.sessions.activeRuntimeId, "runtime-live")
+        XCTAssertTrue(s.chat.isStreaming)
+        XCTAssertFalse(discarded)
     }
 
     func testUnknownHostIsIgnored() {
