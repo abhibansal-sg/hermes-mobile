@@ -21,6 +21,7 @@ struct RelaySettingsView: View {
             urlSection
             tokenSection
             pairSection
+            testPushSection
             saveSection
         }
         .listStyle(.insetGrouped)
@@ -177,13 +178,46 @@ struct RelaySettingsView: View {
                     }
                 }
             }
-            .disabled(!store.enabled || store.isLoading || store.isSaving || store.isPairing)
+            .disabled(!store.enabled || store.isLoading || store.isSaving || store.isPairing || store.isTestingPush)
             .listRowBackground(theme.card)
             .accessibilityIdentifier("relayPairDevice")
         } header: {
             Text("Device Pairing")
         } footer: {
             Text("Uses the saved relay URL to mint a fresh pairing token for this phone. Save relay setting changes before pairing.")
+        }
+    }
+
+    @ViewBuilder
+    private var testPushSection: some View {
+        Section {
+            if let testPushMessage = store.testPushMessage {
+                Text(testPushMessage)
+                    .foregroundStyle(testPushMessage.hasPrefix("✅") ? theme.midground : .red)
+                    .textSelection(.enabled)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("relayTestPushResult")
+            }
+
+            Button {
+                Task { await store.sendTestPush() }
+            } label: {
+                HStack {
+                    Label("Send test push", systemImage: "paperplane")
+                    Spacer(minLength: 8)
+                    if store.isTestingPush {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+            }
+            .disabled(!store.enabled || store.isLoading || store.isSaving || store.isPairing || store.isTestingPush)
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("relaySendTestPush")
+        } header: {
+            Text("Delivery Test")
+        } footer: {
+            Text("Sends a real relay push through the saved relay URL and reports the delivered result or actual error.")
         }
     }
 
@@ -209,7 +243,7 @@ struct RelaySettingsView: View {
                     }
                 }
             }
-            .disabled(store.isLoading || store.isSaving)
+            .disabled(store.isLoading || store.isSaving || store.isTestingPush)
             .listRowBackground(theme.card)
             .accessibilityIdentifier("relayPushSave")
         }

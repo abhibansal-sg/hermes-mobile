@@ -24,9 +24,11 @@ final class RelayStore {
     var isLoading = false
     var isSaving = false
     var isPairing = false
+    var isTestingPush = false
     var errorMessage: String?
     var savedMessage: String?
     var pairingMessage: String?
+    var testPushMessage: String?
     var relayPairing: RelayPairingPayload?
 
     init(rest: RestClient) {
@@ -63,6 +65,7 @@ final class RelayStore {
         errorMessage = nil
         savedMessage = nil
         pairingMessage = nil
+        testPushMessage = nil
         defer { isLoading = false }
         do {
             apply(try await fetchConfig())
@@ -77,6 +80,7 @@ final class RelayStore {
         errorMessage = nil
         savedMessage = nil
         pairingMessage = nil
+        testPushMessage = nil
 
         let trimmedURL = relayURLDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         if enabled && trimmedURL.isEmpty {
@@ -113,6 +117,7 @@ final class RelayStore {
         errorMessage = nil
         savedMessage = nil
         pairingMessage = nil
+        testPushMessage = nil
         isPairing = true
         defer { isPairing = false }
         do {
@@ -122,6 +127,26 @@ final class RelayStore {
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
+        }
+    }
+
+    func sendTestPush() async {
+        guard !isTestingPush else { return }
+        errorMessage = nil
+        savedMessage = nil
+        pairingMessage = nil
+        testPushMessage = nil
+        isTestingPush = true
+        defer { isTestingPush = false }
+        do {
+            let result = try await postTestPush()
+            testPushMessage = result.ok
+                ? "✅ \(result.detail)"
+                : "❌ \(result.detail)"
+        } catch {
+            let detail = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            testPushMessage = "❌ \(detail)"
         }
     }
 
@@ -172,6 +197,21 @@ final class RelayStore {
         let data = try await rest.perform(request)
         let root = try rest.decodeJSONValue(from: data, context: "relay.pair")
         return RelayPairingPayload(json: root)
+    }
+
+    private func postTestPush() async throws -> (ok: Bool, detail: String) {
+        let request = rest.makeRequest(
+            path: "\(rest.mobileAPIPrefix)/relay/test-push",
+            method: "POST"
+        )
+        let data = try await rest.perform(request)
+        let root = try rest.decodeJSONValue(from: data, context: "relay.testPush")
+        guard let ok = root["ok"]?.boolValue else {
+            throw RestError.decoding("relay.testPush: missing ok")
+        }
+        let detail = root["detail"]?.stringValue
+            ?? (ok ? "Test push delivered" : "Unknown relay failure")
+        return (ok: ok, detail: detail)
     }
 }
 

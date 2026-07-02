@@ -968,6 +968,48 @@ async def pair_relay_device(request: Request) -> Any:
     }
 
 
+def _relay_test_push_error_detail(exc: Exception) -> str:
+    """Return a user-visible relay delivery error with the real failure class."""
+    message = str(exc).strip()
+    if message:
+        return f"{type(exc).__name__}: {message}"
+    return type(exc).__name__
+
+
+@router.post("/relay/test-push")
+async def test_relay_push(request: Request) -> Any:
+    """Synchronously send a relay test push and report the truthful result."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
+
+    relay = _plugin_module("relay_client")
+    if not relay.relay_url_configured():
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "detail": "relay URL is not configured"},
+        )
+
+    try:
+        await relay.relay_client().send_event(
+            kind="attention",
+            session_id=None,
+            title="Hermes test push",
+            body="Relay push delivery test from Hermes Mobile settings.",
+            source="relay_test_push",
+        )
+    except relay.RelayConfigurationError:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "detail": "relay URL is not configured"},
+        )
+    except Exception as exc:
+        return {"ok": False, "detail": _relay_test_push_error_detail(exc)}
+
+    return {"ok": True, "detail": "Test push delivered"}
+
+
 @router.post("/push/register")
 async def register_push_token(body: PushRegisterBody, request: Request) -> Dict[str, Any]:
     """Register an iOS APNs device token for server push."""
