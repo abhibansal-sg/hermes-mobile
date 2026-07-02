@@ -10,6 +10,8 @@ struct HermesMobileApp: App {
     /// Carries a deferred `hermesapp://pair` payload from `onOpenURL` up to the
     /// confirmation UI in `RootView` (re-pairing while connected is destructive).
     @State private var deepLink = DeepLinkCoordinator()
+    @State private var sharedInboxToast: String?
+    @State private var sharedInboxToastDismissTask: Task<Void, Never>?
     @Environment(\.scenePhase) private var scenePhase
     /// APNs token callbacks only reach a `UIApplicationDelegate`; this adaptor
     /// forwards them to `PushRegistrar` (see ``AppDelegate``).
@@ -78,6 +80,16 @@ struct HermesMobileApp: App {
                 // because SwiftUI does not reliably inherit custom environment
                 // values across presentation boundaries.
                 .hermesThemed(environment.themeStore)
+                .overlay(alignment: .top) {
+                    if let sharedInboxToast {
+                        AppToastBanner(message: sharedInboxToast)
+                            .padding(.top, 16)
+                            .padding(.horizontal, 16)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                            .allowsHitTesting(false)
+                    }
+                }
+                .animation(.spring(response: 0.3, dampingFraction: 0.85), value: sharedInboxToast)
                 .task {
                     #if DEBUG
                     // DEBUG-only main-thread hitch logger (HERMES_PERF_LOG=1). Cheap,
@@ -180,7 +192,10 @@ struct HermesMobileApp: App {
                             connection: environment.connectionStore,
                             sessions: environment.sessionStore,
                             chat: environment.chatStore,
-                            attachments: environment.attachmentStore
+                            attachments: environment.attachmentStore,
+                            onDrained: { count in
+                                presentSharedInboxToast(processed: count)
+                            }
                         )
                         environment.refreshUsageSnapshot()
                     }
@@ -233,6 +248,35 @@ struct HermesMobileApp: App {
                     )
                 }
         }
+    }
+
+    @MainActor
+    private func presentSharedInboxToast(processed count: Int) {
+        guard count > 0 else { return }
+        sharedInboxToastDismissTask?.cancel()
+        sharedInboxToast = "Queued \(count) shared item(s)"
+        sharedInboxToastDismissTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled else { return }
+            sharedInboxToast = nil
+            sharedInboxToastDismissTask = nil
+        }
+    }
+}
+
+private struct AppToastBanner: View {
+    let message: String
+    @Environment(\.hermesTheme) private var theme
+
+    var body: some View {
+        Text(message)
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(theme.bg)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .background(theme.fg.opacity(0.9), in: Capsule())
+            .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
+            .accessibilityLabel(message)
     }
 }
 

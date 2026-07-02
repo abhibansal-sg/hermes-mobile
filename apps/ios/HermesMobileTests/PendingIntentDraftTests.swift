@@ -129,3 +129,71 @@ final class PendingIntentDraftTests: XCTestCase {
         XCTAssertFalse(s.sessions.isDraft)
     }
 }
+
+/// Share-extension inbox drain coverage. Kept beside the pending-intent foreground
+/// tests because both exercise app-scope foreground drainers without live network.
+@MainActor
+final class SharedInboxDrainerTests: XCTestCase {
+
+    private struct Stores {
+        let connection: ConnectionStore
+        let sessions: SessionStore
+        let chat: ChatStore
+        let attachments: AttachmentStore
+    }
+
+    private func makeStores() -> Stores {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let attachments = AttachmentStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        sessions.attach(connection: connection, chat: chat)
+        connection.phase = .connected
+        return Stores(connection: connection, sessions: sessions, chat: chat, attachments: attachments)
+    }
+
+    func testDrainInvokesOnDrainedWithProcessedCount() async {
+        let s = makeStores()
+        let items = [
+            SharedStore.SharedInboxItem(
+                id: UUID(), text: "first", url: nil, comment: nil,
+                imageFiles: [], createdAt: Date(timeIntervalSince1970: 2)
+            ),
+            SharedStore.SharedInboxItem(
+                id: UUID(), text: "second", url: nil, comment: nil,
+                imageFiles: [], createdAt: Date(timeIntervalSince1970: 1)
+            ),
+        ]
+        let drained = expectation(description: "onDrained called")
+        var observedCount: Int?
+        var processedOrder: [String] = []
+        var didClearInbox = false
+
+        SharedInboxDrainer.drain(
+            connection: s.connection,
+            sessions: s.sessions,
+            chat: s.chat,
+            attachments: s.attachments,
+            onDrained: { count in
+                observedCount = count
+                drained.fulfill()
+            },
+            readInbox: { items },
+            clearInbox: { didClearInbox = true },
+            processItem: { item in
+                processedOrder.append(item.text ?? "")
+                let storedId = "stored-\(item.text ?? "item")"
+                s.sessions.activeStoredId = storedId
+                s.sessions.activeRuntimeId = "runtime-\(item.text ?? "item")"
+                return (storedId: storedId, runtimeId: s.sessions.activeRuntimeId)
+            }
+        )
+
+        await fulfillment(of: [drained], timeout: 1)
+        XCTAssertEqual(observedCount, 2)
+        XCTAssertEqual(processedOrder, ["second", "first"], "shares drain oldest-first")
+        XCTAssertTrue(didClearInbox, "a processed batch clears the one-shot inbox")
+        XCTAssertEqual(s.sessions.activeStoredId, "stored-first", "the drainer lands on the newest share")
+    }
+}

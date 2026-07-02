@@ -31,6 +31,11 @@ import Foundation
 @MainActor
 enum SharedInboxDrainer {
 
+    typealias ProcessItemOverride = @MainActor (SharedStore.SharedInboxItem) async -> (
+        storedId: String,
+        runtimeId: String?
+    )?
+
     /// Whether a drain is currently running, so overlapping foregrounds coalesce.
     private static var isDraining = false
 
@@ -45,39 +50,50 @@ enum SharedInboxDrainer {
     ///   - attachments: normalises + uploads any shared images.
     ///   - onDrained: optional toast hook called with the number of items that
     ///     were processed (≥1). Not called when there was nothing to drain.
+    ///   - readInbox/clearInbox/processItem: injectable seams for unit tests;
+    ///     app calls use the shared app-group inbox + real session-send path.
     static func drain(
         connection: ConnectionStore,
         sessions: SessionStore,
         chat: ChatStore,
         attachments: AttachmentStore,
-        onDrained: ((Int) -> Void)? = nil
+        onDrained: ((Int) -> Void)? = nil,
+        readInbox: () -> [SharedStore.SharedInboxItem] = { SharedStore.readInbox() },
+        clearInbox: @escaping @MainActor () -> Void = { SharedStore.clearInbox() },
+        processItem: ProcessItemOverride? = nil
     ) {
         guard !isDraining else { return }
         // Need a live gateway to create sessions / upload — otherwise leave the
         // items queued and try again on the next foreground.
         guard case .connected = connection.phase else { return }
 
-        let items = SharedStore.readInbox()
+        let items = readInbox()
         guard !items.isEmpty else { return }
 
         isDraining = true
         // Oldest first so the newest share becomes the most recent session.
         let ordered = items.sorted { $0.createdAt < $1.createdAt }
 
-        Task {
+        Task { @MainActor in
             defer { isDraining = false }
             var processed = 0
             // Ids of the most recent session we successfully created+sent into, so
             // we can land the user there after the batch (newest share = last one).
             var lastLanded: (storedId: String, runtimeId: String?)?
             for item in ordered {
-                if let created = await process(
-                    item,
-                    connection: connection,
-                    sessions: sessions,
-                    chat: chat,
-                    attachments: attachments
-                ) {
+                let created: (storedId: String, runtimeId: String?)?
+                if let processItem {
+                    created = await processItem(item)
+                } else {
+                    created = await process(
+                        item,
+                        connection: connection,
+                        sessions: sessions,
+                        chat: chat,
+                        attachments: attachments
+                    )
+                }
+                if let created {
                     lastLanded = created
                 }
                 processed += 1
@@ -95,7 +111,7 @@ enum SharedInboxDrainer {
             // poisoned single item retrying forever is the lesser evil vs
             // silent data loss.
             if processed > 0 {
-                SharedStore.clearInbox()
+                clearInbox()
                 onDrained?(processed)
             }
         }
