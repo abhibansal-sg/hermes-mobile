@@ -1803,6 +1803,161 @@ def _provider_audit(request: Request, event: str, slug: str) -> None:
         _log.debug("provider-key audit append failed", exc_info=True)
 
 
+class ToolsetConfigBody(BaseModel):
+    key: Optional[str] = None
+    value: Optional[str] = None
+
+
+def _valid_toolset_config_names() -> set[str]:
+    from hermes_cli.tools_config import _get_effective_configurable_toolsets
+
+    return {ts_key for ts_key, _, _ in _get_effective_configurable_toolsets()}
+
+
+def _toolset_config_payload(name: str) -> Tuple[Dict[str, Any], set[str]]:
+    """Return the desktop-parity toolset config row and allowed env keys.
+
+    The payload mirrors ``hermes_cli.web_server.get_toolset_config`` but lives
+    in the mobile plugin so phone-only clients can inspect which provider keys
+    are present. It never includes credential values — only env-var names and
+    boolean ``is_set`` states.
+    """
+    from hermes_cli.config import get_env_value, load_config
+    from hermes_cli.tools_config import (
+        TOOL_CATEGORIES,
+        _is_provider_active,
+        _visible_providers,
+    )
+
+    config = load_config()
+    cat = TOOL_CATEGORIES.get(name)
+    providers: List[Dict[str, Any]] = []
+    active_provider: Optional[str] = None
+    allowed_env_keys: set[str] = set()
+    if cat:
+        for prov in _visible_providers(cat, config, force_fresh=True):
+            env_vars: List[Dict[str, Any]] = []
+            for env in prov.get("env_vars", []) or []:
+                key = str(env.get("key") or "").strip()
+                if not key:
+                    continue
+                allowed_env_keys.add(key)
+                env_vars.append(
+                    {
+                        "key": key,
+                        "prompt": env.get("prompt", key),
+                        "url": env.get("url"),
+                        "default": env.get("default"),
+                        "is_set": bool(get_env_value(key)),
+                    }
+                )
+            is_active = _is_provider_active(prov, config, force_fresh=True)
+            if is_active and active_provider is None:
+                active_provider = prov["name"]
+            providers.append(
+                {
+                    "name": prov["name"],
+                    "badge": prov.get("badge", ""),
+                    "tag": prov.get("tag", ""),
+                    "env_vars": env_vars,
+                    "post_setup": prov.get("post_setup"),
+                    "requires_nous_auth": bool(prov.get("requires_nous_auth")),
+                    "is_active": is_active,
+                }
+            )
+
+    return (
+        {
+            "name": name,
+            "has_category": cat is not None,
+            "providers": providers,
+            "active_provider": active_provider,
+        },
+        allowed_env_keys,
+    )
+
+
+def _toolset_config_unknown_response(name: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"error": f"unknown toolset: {name}", "code": 4002},
+    )
+
+
+@router.get("/toolsets/{name}/config")
+async def get_toolset_config(name: str, request: Request) -> Any:
+    """Return provider matrix + env-var key status for a toolset config panel."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    name = (name or "").strip()
+    if name not in _valid_toolset_config_names():
+        return _toolset_config_unknown_response(name)
+
+    payload, _allowed = _toolset_config_payload(name)
+    return payload
+
+
+@router.put("/toolsets/{name}/config")
+async def set_toolset_config(
+    name: str, body: ToolsetConfigBody, request: Request
+) -> Any:
+    """Set or clear an env-var credential for a toolset provider."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(
+            status_code=403, detail="Device token lacks approve scope"
+        )
+
+    from hermes_cli.config import is_managed, remove_env_value, save_env_value
+
+    name = (name or "").strip()
+    if name not in _valid_toolset_config_names():
+        return _toolset_config_unknown_response(name)
+
+    key = (body.key or "").strip()
+    if not key:
+        return JSONResponse(
+            status_code=400, content={"error": "key required", "code": 4001}
+        )
+
+    if is_managed():
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "managed install — credentials are read-only",
+                "code": 4006,
+            },
+        )
+
+    _payload, allowed_env_keys = _toolset_config_payload(name)
+    if key not in allowed_env_keys:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"unknown key for {name}: {key}", "code": 4001},
+        )
+
+    value = body.value
+    value_text = str(value).strip() if value is not None else ""
+    try:
+        if not value_text:
+            remove_env_value(key)
+            os.environ.pop(key, None)
+        else:
+            save_env_value(key, value_text)
+            # Mirror into the live process so the refreshed provider matrix sees
+            # the key immediately (parity with set_provider_key below).
+            os.environ[key] = value_text
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400, content={"error": str(exc), "code": 4001}
+        )
+
+    refreshed, _allowed = _toolset_config_payload(name)
+    return refreshed
+
+
 @router.get("/providers")
 async def list_providers(request: Request) -> Dict[str, Any]:
     """List the provider universe + per-provider authenticated? flag.
