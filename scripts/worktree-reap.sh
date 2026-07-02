@@ -27,7 +27,7 @@ BASE="${REAP_BASE:-origin/environment-and-workflows-overview}"
 WTDIR="$REPO/.worktrees"
 MODE="${1:-full}"
 DRY=false; [ "$MODE" = "--dry-run" ] && { DRY=true; MODE=full; }
-[ "$1" = "--dd-only" ] 2>/dev/null && MODE=dd-only
+[ "${1:-}" = "--dd-only" ] && MODE=dd-only
 
 say(){ printf '[reap] %s\n' "$*"; }
 cd "$REPO" 2>/dev/null || { say "repo missing: $REPO"; exit 0; }
