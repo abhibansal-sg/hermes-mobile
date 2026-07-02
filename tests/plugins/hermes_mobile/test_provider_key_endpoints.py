@@ -27,6 +27,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from hermes_cli.auth import PROVIDER_REGISTRY
 from hermes_cli import web_server
 
 pytestmark = pytest.mark.xdist_group("dashboard_auth_app_state")
@@ -491,18 +492,19 @@ def test_set_key_rejects_oauth_provider_4003(loopback_client, monkeypatch):
     # Every non-api_key provider in PROVIDER_REGISTRY: OAuth device-code,
     # external OAuth, external process, minimax OAuth, and AWS SDK. None of
     # these can be provisioned from a raw key on mobile — the route must
-    # reject them all with the 4003 "set up on desktop" class. (The spec
-    # names gemini/minimax, which ALSO carry api_key variants — those api_key
-    # variants are Tier A; the OAuth variants below are the reject set.)
-    ["nous", "openai-codex", "xai-oauth", "qwen-oauth",
-     "google-gemini-cli", "copilot-acp", "minimax-oauth"],
+    # reject them all with the 4003 "set up on desktop" class. Derive the
+    # cases from the live registry so the test stays an auth-contract invariant
+    # instead of a stale provider-catalog snapshot.
+    sorted(
+        slug
+        for slug, pconfig in PROVIDER_REGISTRY.items()
+        if pconfig.auth_type != "api_key"
+    ),
 )
 def test_set_key_rejects_all_oauth_only_providers(
     loopback_client, monkeypatch, oauth_slug
 ):
     """Every OAuth/external-only provider is rejected (4003)."""
-    from hermes_cli.auth import PROVIDER_REGISTRY
-
     pconfig = PROVIDER_REGISTRY.get(oauth_slug)
     assert pconfig is not None, f"{oauth_slug} not in registry"
     assert pconfig.auth_type != "api_key", (

@@ -28,6 +28,32 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PLUGIN_DIR = REPO_ROOT / "plugins" / "hermes-mobile"
 _PLUGIN_PKG = "hermes_plugins.hermes_mobile"
+_API_MODULE_NAME = "hermes_dashboard_plugin_hermes-mobile"
+
+
+@pytest.fixture(autouse=True)
+def mounted_mobile_dashboard_api(_hermetic_environment):
+    """Ensure the dashboard loader has mounted the mobile API module.
+
+    ``web_server`` may have been imported during test collection, before the
+    per-test HERMES_HOME fixture ran.  If that import saw a disabled plugin in
+    the real profile, the module is absent and endpoint tests later fail with a
+    KeyError.  Re-run the mount after the hermetic env is active, but only when
+    the module is missing so we do not duplicate routes in the shared FastAPI
+    app.
+    """
+    if _API_MODULE_NAME not in sys.modules:
+        from hermes_cli import web_server
+
+        # Importing web_server normally performs the mount. Only re-run the
+        # mount if that import still did not register the module (the stale
+        # real-config/disabled-plugin case). Avoiding an unconditional second
+        # mount is important because FastAPI keeps the first route handler in
+        # dispatch order, while sys.modules would point at the second module.
+        if _API_MODULE_NAME not in sys.modules:
+            web_server._get_dashboard_plugins(force_rescan=True)
+            web_server._mount_plugin_api_routes()
+    assert _API_MODULE_NAME in sys.modules
 
 
 def load_plugin_module(name: str):

@@ -22,6 +22,7 @@ test runner at ``scripts/run_tests.sh``.
 import asyncio
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,16 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# Some modules under test are imported at pytest collection time, before the
+# autouse _hermetic_environment fixture can redirect HERMES_HOME.  Keep those
+# import-time side effects (config reads, dashboard plugin mounting, module-level
+# state paths) away from the developer's real profile too; the fixture below
+# still replaces this with a per-test tempdir for actual test execution.
+_COLLECTION_HERMES_HOME = Path(tempfile.mkdtemp(prefix="hermes_tests_collection_"))
+for _child in ("sessions", "cron", "memories", "skills"):
+    (_COLLECTION_HERMES_HOME / _child).mkdir(parents=True, exist_ok=True)
+os.environ["HERMES_HOME"] = str(_COLLECTION_HERMES_HOME)
 
 
 # ── Per-file process isolation ──────────────────────────────────────────────
