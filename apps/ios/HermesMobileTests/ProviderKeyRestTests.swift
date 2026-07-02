@@ -164,10 +164,10 @@ final class ProviderKeyRestTests: XCTestCase {
         {"provider":{"slug":"deepseek","name":"DeepSeek","auth_type":"api_key","is_current":false,"authenticated":true,"total_models":2,"models":[{"id":"deepseek-chat"},{"id":"deepseek-reasoner"}]}}
         """#.utf8)
         let client = makeClient(style: .plugin, script: [(body, 200)])
-        let row = try await client.setProviderKey(slug: "deepseek", apiKey: "sk-123")
-        XCTAssertEqual(row.slug, "deepseek")
-        XCTAssertTrue(row.authenticated)
-        XCTAssertEqual(row.models, ["deepseek-chat", "deepseek-reasoner"])
+        let result = try await client.setProviderKey(slug: "deepseek", apiKey: "sk-123")
+        XCTAssertEqual(result.row.slug, "deepseek")
+        XCTAssertTrue(result.row.authenticated)
+        XCTAssertEqual(result.row.models, ["deepseek-chat", "deepseek-reasoner"])
     }
 
     func testRemoveProviderKeyDecodesDisconnectResult() async throws {

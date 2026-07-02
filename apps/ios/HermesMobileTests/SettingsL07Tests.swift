@@ -145,3 +145,110 @@ final class SettingsL07Tests: XCTestCase {
         )
     }
 }
+
+/// ABH-237 — view-only Nous credits / billing RPC coverage.
+final class CreditsBillingRPCTests: XCTestCase {
+
+    private final class ScriptedTransport: GatewayWebSocketTask, @unchecked Sendable {
+        private var inbox: [URLSessionWebSocketTask.Message] = []
+        private var waiter: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+        private let lock = NSLock()
+
+        private(set) var methods: [String] = []
+        private(set) var params: [String: [String: Any]] = [:]
+
+        init() {
+            enqueue(.string(
+                #"{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready"}}"#
+            ))
+        }
+
+        func resume() {}
+        func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {}
+
+        func receive() async throws -> URLSessionWebSocketTask.Message {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                if !inbox.isEmpty {
+                    let next = inbox.removeFirst()
+                    lock.unlock()
+                    continuation.resume(returning: next)
+                } else {
+                    waiter = continuation
+                    lock.unlock()
+                }
+            }
+        }
+
+        func send(_ message: URLSessionWebSocketTask.Message) async throws {
+            guard case let .string(text) = message,
+                  let data = text.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let id = object["id"] as? String,
+                  let method = object["method"] as? String
+            else { return }
+
+            record(method: method, params: object["params"] as? [String: Any] ?? [:])
+            enqueue(.string(Self.responseFrame(id: id, method: method)))
+            await Task.yield()
+        }
+
+        private func record(method: String, params: [String: Any]) {
+            lock.lock()
+            methods.append(method)
+            self.params[method] = params
+            lock.unlock()
+        }
+
+        private func enqueue(_ message: URLSessionWebSocketTask.Message) {
+            lock.lock()
+            if let waiter {
+                self.waiter = nil
+                lock.unlock()
+                waiter.resume(returning: message)
+            } else {
+                inbox.append(message)
+                lock.unlock()
+            }
+        }
+
+        private static func responseFrame(id: String, method: String) -> String {
+            let result: String
+            switch method {
+            case "credits.view":
+                result = #"{"balance_lines":["Balance: $12.34","Monthly cap: $50"],"identity_line":"Nous Portal — abhi@example.com","topup_url":"https://portal.nousresearch.com/credits","depleted":true}"#
+            case "billing.state":
+                result = #"{"auto_reload":false,"billing_state":"active"}"#
+            case "billing.auto_reload":
+                result = #"{"auto_reload":true,"billing_state":"active"}"#
+            default:
+                result = #"{}"#
+            }
+            return #"{"jsonrpc":"2.0","id":"\#(id)","result":\#(result)}"#
+        }
+    }
+
+    func testCreditsViewDecodeAndAutoReloadToggleRPCPath() async throws {
+        let transport = ScriptedTransport()
+        let client = HermesGatewayClient { _ in transport }
+        try await client.connect(baseURL: URL(string: "ws://127.0.0.1:9999")!, token: "t")
+
+        let credits = try await client.viewCredits()
+        XCTAssertEqual(credits.balanceLines, ["Balance: $12.34", "Monthly cap: $50"])
+        XCTAssertEqual(credits.identityLine, "Nous Portal — abhi@example.com")
+        XCTAssertEqual(credits.topupURL?.absoluteString, "https://portal.nousresearch.com/credits")
+        XCTAssertTrue(credits.depleted)
+
+        let state = try await client.billingState()
+        XCTAssertFalse(state.autoReloadEnabled)
+        XCTAssertEqual(state.billingState, "active")
+
+        let updated = try await client.setBillingAutoReload(true)
+        XCTAssertTrue(updated.autoReloadEnabled)
+        XCTAssertEqual(updated.billingState, "active")
+
+        XCTAssertEqual(transport.methods, ["credits.view", "billing.state", "billing.auto_reload"])
+        XCTAssertEqual(transport.params["billing.auto_reload"]?["enabled"] as? Bool, true)
+        await client.disconnect()
+    }
+}

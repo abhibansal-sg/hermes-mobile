@@ -464,3 +464,67 @@ actor HermesGatewayClient {
         state = newState
     }
 }
+
+// MARK: - Nous credits / billing JSON-RPC surface (ABH-237)
+
+/// View-only credits payload from `credits.view`.
+///
+/// The server owns all money-moving behavior; mobile only renders these display
+/// lines and opens `topupURL` in the browser when present.
+struct NousCreditsView: Sendable, Equatable {
+    let balanceLines: [String]
+    let identityLine: String?
+    let topupURL: URL?
+    let depleted: Bool
+
+    init(json: JSONValue) {
+        self.balanceLines = json["balance_lines"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        self.identityLine = json["identity_line"]?.stringValue
+        if let rawURL = json["topup_url"]?.stringValue, !rawURL.isEmpty {
+            self.topupURL = URL(string: rawURL)
+        } else {
+            self.topupURL = nil
+        }
+        self.depleted = json["depleted"]?.boolValue ?? false
+    }
+}
+
+/// Auto-reload status from `billing.state` / `billing.auto_reload`.
+struct BillingState: Sendable, Equatable {
+    let autoReloadEnabled: Bool
+    let billingState: String?
+
+    init(json: JSONValue) {
+        self.autoReloadEnabled = json["auto_reload"]?.boolValue
+            ?? json["auto_reload_enabled"]?.boolValue
+            ?? json["enabled"]?.boolValue
+            ?? false
+        self.billingState = json["billing_state"]?.stringValue
+            ?? json["state"]?.stringValue
+    }
+}
+
+extension HermesGatewayClient {
+    /// `credits.view` → display-only Nous credits snapshot.
+    func viewCredits() async throws -> NousCreditsView {
+        let result = try await requestRaw("credits.view", timeout: .seconds(30))
+        return NousCreditsView(json: result)
+    }
+
+    /// `billing.state` → current auto-reload state.
+    func billingState() async throws -> BillingState {
+        let result = try await requestRaw("billing.state", timeout: .seconds(30))
+        return BillingState(json: result)
+    }
+
+    /// `billing.auto_reload {enabled}` → updated auto-reload state.
+    @discardableResult
+    func setBillingAutoReload(_ enabled: Bool) async throws -> BillingState {
+        let result = try await requestRaw(
+            "billing.auto_reload",
+            params: .object(["enabled": .bool(enabled)]),
+            timeout: .seconds(30)
+        )
+        return BillingState(json: result)
+    }
+}

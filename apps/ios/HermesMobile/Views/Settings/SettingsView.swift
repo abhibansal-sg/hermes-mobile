@@ -155,6 +155,7 @@ struct SettingsView: View {
                 approvalBypassSection
                 devicesSection
                 modelProviderSection
+                creditsBillingSection
                 debugShareSection
                 connectionSection
                 aboutSection
@@ -561,6 +562,30 @@ struct SettingsView: View {
                 .accessibilityIdentifier("settingsModelProvider")
             } footer: {
                 Text("Add or remove API keys for model providers. New chats use the provider you pick in Model.")
+            }
+        }
+    }
+
+    // MARK: - Nous Credits / Billing (ABH-237 — view-only credits + auto-reload)
+
+    /// The ABH-237 credits/billing section — a single push to
+    /// ``CreditsBillingView``. Credits are display-only; top-up opens the portal
+    /// URL in the browser, and the only in-app mutation is the existing
+    /// auto-reload setting.
+    @ViewBuilder
+    private var creditsBillingSection: some View {
+        if connectionStore.control != nil {
+            Section {
+                NavigationLink {
+                    CreditsBillingView(client: connectionStore.client)
+                        .background(theme.bg)
+                } label: {
+                    SettingsRow(icon: "creditcard", title: "Nous Credits", value: nil)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsNousCredits")
+            } footer: {
+                Text("View your Nous balance and manage auto-reload. Top-ups open in the browser.")
             }
         }
     }
@@ -1076,4 +1101,161 @@ private struct AboutPanel: View {
             // Graceful degradation: leave the "—" placeholders.
         }
     }
+}
+
+// MARK: - Credits / Billing panel
+
+private struct CreditsBillingView: View {
+    let client: HermesGatewayClient
+
+    @Environment(\.hermesTheme) private var theme
+    @Environment(\.openURL) private var openURL
+
+    @State private var phase: PanelPhase<CreditsBillingPayload> = .loading
+    @State private var autoReloadPending = false
+    @State private var actionError: String?
+
+    var body: some View {
+        PanelContent(phase: phase, label: "Loading credits…", retry: { Task { await load() } }) { payload in
+            List {
+                creditsSection(payload.credits)
+                autoReloadSection(payload.billing)
+            }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(theme.bg)
+            .refreshable { await load() }
+        }
+        .navigationTitle("Nous Credits")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await load() }
+        .alert("Couldn’t update auto-reload", isPresented: errorBinding) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(actionError ?? "")
+        }
+    }
+
+    @ViewBuilder
+    private func creditsSection(_ credits: NousCreditsView) -> some View {
+        Section {
+            if let identityLine = credits.identityLine, !identityLine.isEmpty {
+                LabeledContent("Account") {
+                    Text(identityLine)
+                        .foregroundStyle(theme.mutedFg)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.trailing)
+                        .textSelection(.enabled)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("creditsIdentityLine")
+            }
+
+            if credits.depleted {
+                Label("Credits depleted", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(theme.destructive)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("creditsDepletedWarning")
+            }
+
+            if credits.balanceLines.isEmpty {
+                Text("No Nous credit balance is available from this gateway yet.")
+                    .foregroundStyle(theme.mutedFg)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("creditsEmpty")
+            } else {
+                ForEach(Array(credits.balanceLines.enumerated()), id: \.offset) { index, line in
+                    Text(line)
+                        .foregroundStyle(theme.fg)
+                        .textSelection(.enabled)
+                        .listRowBackground(theme.card)
+                        .accessibilityIdentifier("creditsBalanceLine\(index)")
+                }
+            }
+
+            if let topupURL = credits.topupURL {
+                Button {
+                    openURL(topupURL)
+                } label: {
+                    Label("Top up in browser", systemImage: "safari")
+                        .foregroundStyle(theme.midground)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("creditsTopUpLink")
+            }
+        } header: {
+            Text("Credits")
+        } footer: {
+            Text("Top-ups open in your browser. The app does not start a payment flow.")
+        }
+    }
+
+    @ViewBuilder
+    private func autoReloadSection(_ billing: BillingState) -> some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { billing.autoReloadEnabled },
+                set: { newValue in Task { await setAutoReload(newValue) } }
+            )) {
+                Label {
+                    Text("Auto-reload")
+                        .foregroundStyle(theme.fg)
+                } icon: {
+                    Image(systemName: "arrow.clockwise.circle")
+                        .foregroundStyle(theme.fg)
+                }
+            }
+            .disabled(autoReloadPending)
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("billingAutoReloadToggle")
+
+            if let state = billing.billingState, !state.isEmpty {
+                LabeledContent("Billing state") {
+                    Text(state)
+                        .foregroundStyle(theme.mutedFg)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("billingStateLine")
+            }
+        } footer: {
+            Text("Auto-reload uses the gateway’s existing billing setting. Turn it off here any time.")
+        }
+    }
+
+    private var errorBinding: Binding<Bool> {
+        Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })
+    }
+
+    private func load() async {
+        if phase.value == nil { phase = .loading }
+        do {
+            async let credits = client.viewCredits()
+            async let billing = client.billingState()
+            phase = .loaded(CreditsBillingPayload(
+                credits: try await credits,
+                billing: try await billing
+            ))
+        } catch {
+            phase = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
+    }
+
+    private func setAutoReload(_ enabled: Bool) async {
+        guard !autoReloadPending else { return }
+        autoReloadPending = true
+        defer { autoReloadPending = false }
+        do {
+            let updated = try await client.setBillingAutoReload(enabled)
+            if let current = phase.value {
+                phase = .loaded(CreditsBillingPayload(credits: current.credits, billing: updated))
+            }
+        } catch {
+            actionError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+}
+
+private struct CreditsBillingPayload: Sendable, Equatable {
+    let credits: NousCreditsView
+    let billing: BillingState
 }
