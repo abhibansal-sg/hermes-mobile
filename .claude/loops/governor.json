@@ -2,12 +2,12 @@
   "version": 1,
   "_comment": "Machine-readable governor config for the Hermes autonomous loop system. GOVERNOR.md is the human/loop runbook; this file is the single source of truth for the numbers. Every loop skill MUST read this at the start of every cycle and obey it. Local-only working file (commit to origin; NEVER upstream).",
   "enabled": true,
-  "_enabled": "MASTER KILL SWITCH. While false, NO loop does any work — it logs 'governor disabled' and exits. Set true only after the governor is built + proven. Flip to false to pause everything instantly.",
+  "_enabled": "MASTER KILL SWITCH. While false, NO loop does any work \u2014 it logs 'governor disabled' and exits. Set true only after the governor is built + proven. Flip to false to pause everything instantly.",
   "shadow_mode": false,
   "_shadow_mode": "ACT MODE (2026-06-24, user: 'start the loop'). Action-taking loops may commit + transition, still gated by preflight + the evidence gate + the guard hook. Flip back to true to return to propose-only; kill switch (enabled:false) pauses everything.",
   "caps": {
     "retries_per_stage": 1,
-    "_retries_per_stage": "After the first failed attempt at a stage, at most ONE retry — and only with a genuinely DIFFERENT approach. A 2nd failure -> blocked:needs-human + escalate.",
+    "_retries_per_stage": "After the first failed attempt at a stage, at most ONE retry \u2014 and only with a genuinely DIFFERENT approach. A 2nd failure -> blocked:needs-human + escalate.",
     "max_build_verify_bounces": 1,
     "_max_build_verify_bounces": "An issue may round-trip Verify->Build at most this many times, then freeze + escalate.",
     "max_iterations_per_cycle": 3,
@@ -15,12 +15,12 @@
     "max_output_tokens_per_cycle": 100000,
     "min_cc_usage_headroom_pct": 30,
     "_min_cc_usage_headroom_pct": "Do NOT start a cycle if `cc-usage` headroom is below this. Read via ~/bin/cc-usage.",
-    "max_concurrent_action_loops": 1,
-    "_max_concurrent_action_loops": "Read-only watchers (asc-poll, CI, digest) do NOT count toward this."
+    "max_concurrent_action_loops": 3,
+    "_max_concurrent_action_loops": "Raised to 3 (Abhi 2026-07-01, RE-APPLIED 2026-07-02 after the original commit ebeb2c745 was stranded off-base during sync-branch churn). Never let the pipeline serialize to 1 chain \u2014 'at no point should active-agent count be zero.' Read-only watchers don't count."
   },
   "spin_detector": {
     "stop_on_repeat_failure_signature": true,
-    "_rule": "If two consecutive iterations share a failure signature (same failing test / same error class / same diff), STOP immediately and escalate — do not even consume the retry. 'Never retry the same approach twice.'"
+    "_rule": "If two consecutive iterations share a failure signature (same failing test / same error class / same diff), STOP immediately and escalate \u2014 do not even consume the retry. 'Never retry the same approach twice.'"
   },
   "evidence_gate": {
     "required": true,
@@ -61,7 +61,7 @@
   "linear": {
     "team": "Abhinav Bansal",
     "team_key": "ABH",
-    "project": "Hermes Mobile — Engineering",
+    "project": "Hermes Mobile \u2014 Engineering",
     "status_pipeline": [
       "Backlog",
       "Todo",
@@ -136,8 +136,8 @@
     "base_branch": "environment-and-workflows-overview",
     "merge_command": "gh pr merge <n> --squash --delete-branch --repo ab0991-oss/hermes-mobile",
     "never_autonomous_even_now": [
-      "EXTERNAL TestFlight beta submission / App Store release (Apple Beta App Review, reaches real users) — internal-only ship IS now autonomous per ship_policy",
-      "any edit to stock NousResearch core (forbidden_paths) — file to Abhi, continue",
+      "EXTERNAL TestFlight beta submission / App Store release (Apple Beta App Review, reaches real users) \u2014 internal-only ship IS now autonomous per ship_policy",
+      "any edit to stock NousResearch core (forbidden_paths) \u2014 file to Abhi, continue",
       "git push to upstream NousResearch (structurally disabled)",
       "spending money / provisioning paid infra",
       "destructive rm -rf / force-push / history rewrite"
@@ -145,24 +145,24 @@
     "_never_autonomous_even_now": "Full autonomy = through PR + merge-to-fork-base. The IRREVERSIBLE 5% above still files-to-Abhi-and-continues (escalation.never_block_the_chain), it does NOT execute autonomously. Autonomous merge to a revertible fork branch is fine (veto-by-revert); shipping to real users / editing stock core / spending money are not."
   },
   "upstream_policy": {
-    "_comment": "ARMED 2026-07-02 (Abhi: 'always be at the latest Hermes, all commits, daily'). The loop-upstream-watch beat (daily 06:00 SGT, profile scout-upstream=sonnet-5) fetches upstream NousResearch/hermes-agent main and keeps our FORK base (environment-and-workflows-overview) continuously synced. GOAL = stay current with ALL upstream commits so we never go stale. Clean merges auto-merge after the verifier proves the fork still builds+passes; conflicts get an engineer-resolve card then the same gate; unresolvable conflicts file to Abhi + continue. An upstream SYNC updating stock-core files is EXPECTED and allowed (importing NousResearch's own vetted commits, NOT a worker inventing core edits) — the real gate is build+tests green. NEVER push to upstream (hard-disabled). Everything is in the fork; the live gateway (~/.hermes/hermes-agent) is a separate checkout, never touched.",
+    "_comment": "ARMED 2026-07-02 (Abhi: 'always be at the latest Hermes, all commits, daily'). The loop-upstream-watch beat (daily 06:00 SGT, profile scout-upstream=sonnet-5) fetches upstream NousResearch/hermes-agent main and keeps our FORK base (environment-and-workflows-overview) continuously synced. GOAL = stay current with ALL upstream commits so we never go stale. Clean merges auto-merge after the verifier proves the fork still builds+passes; conflicts get an engineer-resolve card then the same gate; unresolvable conflicts file to Abhi + continue. An upstream SYNC updating stock-core files is EXPECTED and allowed (importing NousResearch's own vetted commits, NOT a worker inventing core edits) \u2014 the real gate is build+tests green. NEVER push to upstream (hard-disabled). Everything is in the fork; the live gateway (~/.hermes/hermes-agent) is a separate checkout, never touched.",
     "autonomous_sync_active": true,
     "source": "upstream/main (NousResearch/hermes-agent)",
     "target": "environment-and-workflows-overview (fork base)",
     "cadence": "daily 06:00 SGT",
     "sync_gate": "verifier proves fork builds+passes on the synced branch; then merge_policy 4 conditions; a sync that breaks build/tests does NOT merge (file + continue)",
-    "conflict_handling": "engineer-resolve card (scope=conflicting files) → verify → review → merge; unresolvable → file to Abhi (loop:blocked-human) + continue",
+    "conflict_handling": "engineer-resolve card (scope=conflicting files) \u2192 verify \u2192 review \u2192 merge; unresolvable \u2192 file to Abhi (loop:blocked-human) + continue",
     "never": "push to upstream; that remote's push is structurally DISABLED"
   },
   "ship_policy": {
-    "_comment": "ARMED 2026-07-02 (Abhi: 'even TestFlight auto'). When a build WAVE is fully merged to base, the orchestrator runs scripts/ship-testflight.sh <N> to archive+upload the completed wave to INTERNAL TestFlight (Abhi's own device group). INTERNAL ONLY — no external beta testers, no App Store release; those need Apple Beta App Review and stay Abhi's gate. Internal ship is reversible-in-effect (only Abhi's phone receives it) so it fits the veto-by-revert model; external ship puts code in front of OTHER humans and is NOT autonomous.",
+    "_comment": "ARMED 2026-07-02 (Abhi: 'even TestFlight auto'). When a build WAVE is fully merged to base, the orchestrator runs scripts/ship-testflight.sh <N> to archive+upload the completed wave to INTERNAL TestFlight (Abhi's own device group). INTERNAL ONLY \u2014 no external beta testers, no App Store release; those need Apple Beta App Review and stay Abhi's gate. Internal ship is reversible-in-effect (only Abhi's phone receives it) so it fits the veto-by-revert model; external ship puts code in front of OTHER humans and is NOT autonomous.",
     "autonomous_ship_active": true,
     "track": "internal",
     "trigger": "a wave is fully merged: zero issues tagged wave:build-N remain in a non-completed state",
     "ship_command": "scripts/ship-testflight.sh <N>",
-    "build_number_rule": "the ship script bumps CURRENT_PROJECT_VERSION (project.yml) — the ONLY place the build number changes — then archives via scripts/ios-build.sh (wedge-safe, never raw xcodebuild, never kill -9), runs the CFBundleVersion app+extensions gate, exports+uploads via ExportOptions-TestFlight.plist, polls ASC (app 6777140135) until VALID.",
-    "external_ship_is_abhi": "Submitting a build to EXTERNAL TestFlight beta testers (or App Store release) requires Apple Beta App Review and reaches real users — file to Abhi + continue, never autonomous.",
-    "wip_cap": "respect pipeline.wip_caps.shipped_unverified_builds — at the cap the ship stage throttles (stops shipping new builds) but build/plan keep running; a device-verify drains it."
+    "build_number_rule": "the ship script bumps CURRENT_PROJECT_VERSION (project.yml) \u2014 the ONLY place the build number changes \u2014 then archives via scripts/ios-build.sh (wedge-safe, never raw xcodebuild, never kill -9), runs the CFBundleVersion app+extensions gate, exports+uploads via ExportOptions-TestFlight.plist, polls ASC (app 6777140135) until VALID.",
+    "external_ship_is_abhi": "Submitting a build to EXTERNAL TestFlight beta testers (or App Store release) requires Apple Beta App Review and reaches real users \u2014 file to Abhi + continue, never autonomous.",
+    "wip_cap": "respect pipeline.wip_caps.shipped_unverified_builds \u2014 at the cap the ship stage throttles (stops shipping new builds) but build/plan keep running; a device-verify drains it."
   },
   "forbidden_paths": {
     "_comment": "HARD scope fence (added 2026-07-01 after Slice B run: an engineer worker drifted from a plugin task into editing tui_gateway/server.py, a stock-core file. The edit was caught at review + contained in a throwaway worktree, but the worker should never have written it. These globs are a PRE-WRITE block: a worker MUST NOT create/modify any path matching these unless the card body explicitly names the path AND carries Abhi's approval. The verifier MUST reject any diff touching these paths that the card did not authorize.",
@@ -179,9 +179,9 @@
       "docs/autonomous/PROJECT.yaml"
     ],
     "enforcement": {
-      "worker_prompt": "Every dispatched card body MUST embed the SCOPE FENCE block (see card template). The worker treats block_globs as read-only: it may READ them for context but MUST NOT edit them. If the task appears to require such an edit, the worker STOPS and blocks with `needs-human`, naming the file — it does NOT edit and does NOT chase unrelated failing tests into fenced files.",
+      "worker_prompt": "Every dispatched card body MUST embed the SCOPE FENCE block (see card template). The worker treats block_globs as read-only: it may READ them for context but MUST NOT edit them. If the task appears to require such an edit, the worker STOPS and blocks with `needs-human`, naming the file \u2014 it does NOT edit and does NOT chase unrelated failing tests into fenced files.",
       "verifier_gate": "The verifier runs `git diff --name-only` against the card's declared scope. ANY changed path matching block_globs that the card did not explicitly authorize = automatic REJECT, regardless of test results.",
-      "rationale": "Descriptive `autonomous_edits: blocked` in PROJECT.yaml was not enough — it was prose the worker never enforced. This is the machine-checkable fence."
+      "rationale": "Descriptive `autonomous_edits: blocked` in PROJECT.yaml was not enough \u2014 it was prose the worker never enforced. This is the machine-checkable fence."
     }
   },
   "concurrency_state": {
@@ -191,20 +191,20 @@
   "pipeline": {
     "_comment": "Buffered-basket pipeline rules (locked 2026-07-01). Full contract: docs/autonomous/wave-pipeline.md. These make the chain unbreakable: nothing Abhi owns can freeze the machine.",
     "ship_advances_pointer": true,
-    "_ship_advances_pointer": "RULE 1. The active_execution_wave pointer (PROJECT.yaml) advances to N+1 the MOMENT wave N uploads to TestFlight — NOT when Abhi device-verifies it. Verify is a separate async consumer reading the parking-lot buffer. A shipped-but-unverified wave never blocks the next wave's build.",
+    "_ship_advances_pointer": "RULE 1. The active_execution_wave pointer (PROJECT.yaml) advances to N+1 the MOMENT wave N uploads to TestFlight \u2014 NOT when Abhi device-verifies it. Verify is a separate async consumer reading the parking-lot buffer. A shipped-but-unverified wave never blocks the next wave's build.",
     "bump_blocked_slices": true,
-    "_bump_blocked_slices": "RULE 2. A slice that hits loop:blocked-human does NOT hold its wave hostage. Eject it into the next wave's candidate pool; close the current wave with its unblocked slices. The blocked task falls out of the moving basket into a side basket — the basket keeps rolling.",
+    "_bump_blocked_slices": "RULE 2. A slice that hits loop:blocked-human does NOT hold its wave hostage. Eject it into the next wave's candidate pool; close the current wave with its unblocked slices. The blocked task falls out of the moving basket into a side basket \u2014 the basket keeps rolling.",
     "pending_abhi_is_async": true,
-    "_pending_abhi_is_async": "RULE 3. Every human gate (merge approval, device-verify, direction fork) writes to the pending-abhi parking lot he drains whenever. The orchestrator NEVER idles waiting on it — it returns to basket 0 and pulls the next thing.",
+    "_pending_abhi_is_async": "RULE 3. Every human gate (merge approval, device-verify, direction fork) writes to the pending-abhi parking lot he drains whenever. The orchestrator NEVER idles waiting on it \u2014 it returns to basket 0 and pulls the next thing.",
     "wip_caps": {
       "shipped_unverified_builds": 2,
       "_shipped_unverified_builds": "BACKPRESSURE. At this many builds shipped-but-not-device-verified, the SHIP stage THROTTLES (stops uploading new builds) but BUILD and PLAN keep running into their buffers. Draining a verify un-throttles ship automatically. Soft slowdown at one stage, never a chain break.",
-      "building_waves": 1,
+      "building_waves": 2,
       "_building_waves": "At most this many waves in the 'building' stage at once while on the trust ladder (max_concurrent_action_loops still governs profiles within a wave)."
     }
   },
   "roster": {
-    "_comment": "Locked 2026-07-01 (Abhi). ONE model per profile, NO per-task branching — route to a different profile if a harder brain is needed. A profile is a full agent that JUDGES worker output (runs tests itself, accept/reject/retry, escalates), not a button-pusher.",
+    "_comment": "Locked 2026-07-01 (Abhi). ONE model per profile, NO per-task branching \u2014 route to a different profile if a harder brain is needed. A profile is a full agent that JUDGES worker output (runs tests itself, accept/reject/retry, escalates), not a button-pusher.",
     "profiles": {
       "scout": "sonnet-5",
       "architect": "opus-4.8",
@@ -214,9 +214,21 @@
       "orchestrator": "opus-4.8"
     },
     "worker_lanes": {
-      "claude_code": { "model": "opus-4.8", "effort": "ultracode", "launch": "claude --settings '{\"ultracode\": true}'" },
-      "opencode": { "model": "glm-5.2", "effort": "max", "launch": "env -u SSL_CERT_FILE opencode run -m zai-coding-plan/glm-5.2" },
-      "codex": { "model": "gpt-5.5", "effort": "high", "launch": "codex exec --full-auto" }
+      "claude_code": {
+        "model": "opus-4.8",
+        "effort": "ultracode",
+        "launch": "claude --settings '{\"ultracode\": true}'"
+      },
+      "opencode": {
+        "model": "glm-5.2",
+        "effort": "max",
+        "launch": "env -u SSL_CERT_FILE opencode run -m zai-coding-plan/glm-5.2"
+      },
+      "codex": {
+        "model": "gpt-5.5",
+        "effort": "high",
+        "launch": "codex exec --full-auto"
+      }
     },
     "cross_provider_review": {
       "opus_built": "gpt-5.5",
