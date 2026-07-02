@@ -206,4 +206,59 @@ extension RestClient {
             strategy: .useDefaultKeys
         ).entries
     }
+
+    /// `POST <plugin>/debug-share` — server-side redacted debug bundle upload.
+    ///
+    /// Served by the hermes-mobile plugin mount only. The server imports and calls
+    /// the same `build_debug_share` core as desktop `/api/ops/debug-share`, with
+    /// redaction forced on. The response is shareable paste URLs for support.
+    func debugShareReport() async throws -> DebugShareReport {
+        var request = makeRequest(path: "\(mobileAPIPrefix)/debug-share", method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let data = try await perform(request)
+        return try decode(
+            DebugShareReport.self,
+            from: data,
+            context: "debug.share",
+            strategy: .useDefaultKeys
+        )
+    }
+}
+
+/// Server-generated debug-share bundle returned by the hermes-mobile plugin.
+///
+/// The backend forces redaction on before upload; this model carries only the
+/// returned paste URLs + upload diagnostics for the Settings share sheet.
+struct DebugShareReport: Decodable, Identifiable, Sendable, Equatable {
+    let id = UUID()
+    let ok: Bool
+    let urls: [String: String]
+    let failures: [String]
+    let redacted: Bool
+    let autoDeleteSeconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case urls
+        case failures
+        case redacted
+        case autoDeleteSeconds = "auto_delete_seconds"
+    }
+
+    var sortedURLLabels: [String] {
+        urls.keys.sorted { lhs, rhs in
+            if lhs == "Report" { return true }
+            if rhs == "Report" { return false }
+            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+        }
+    }
+
+    var shareText: String {
+        sortedURLLabels
+            .compactMap { label in
+                guard let url = urls[label], !url.isEmpty else { return nil }
+                return "\(label): \(url)"
+            }
+            .joined(separator: "\n")
+    }
 }

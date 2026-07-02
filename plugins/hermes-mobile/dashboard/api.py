@@ -48,6 +48,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Annotated
 
+from hermes_cli.debug import build_debug_share
+
 _log = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -296,6 +298,45 @@ def _build_resolve_audit(
         "token_prefix": None,
         "session_id": session_id,
         "session_key": session_key,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Debug share — iOS mirror of desktop POST /api/ops/debug-share.
+# ---------------------------------------------------------------------------
+
+@router.post("/debug-share")
+async def debug_share_report(request: Request):
+    """Upload a redacted debug report + logs and return paste URLs.
+
+    Auth mirrors the sensitive control routes (``/approvals/respond`` and
+    ``/providers``): standard dashboard/device token PLUS the ``approve`` device
+    scope. Redaction is deliberately forced on; mobile does not expose the
+    desktop/operator no-redact override.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
+
+    try:
+        result = await asyncio.to_thread(
+            build_debug_share,
+            log_lines=200,
+            redact=True,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=f"Upload failed: {exc}")
+    except Exception as exc:
+        _log.exception("mobile debug share failed")
+        raise HTTPException(status_code=500, detail=f"Failed: {exc}")
+
+    return {
+        "ok": True,
+        "urls": result.urls,
+        "failures": result.failures,
+        "redacted": result.redacted,
+        "auto_delete_seconds": result.auto_delete_seconds,
     }
 
 

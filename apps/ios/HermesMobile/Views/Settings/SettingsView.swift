@@ -139,6 +139,12 @@ struct SettingsView: View {
     @State private var globalYoloPending = false
     /// User-visible error if the global escalation RPC fails.
     @State private var globalYoloError: String?
+    /// True while the server-side redacted debug bundle is being generated.
+    @State private var debugSharePending = false
+    /// Fetched debug-share result; drives the share/copy sheet.
+    @State private var debugShareResult: DebugShareReport?
+    /// User-visible error if debug-share generation fails.
+    @State private var debugShareError: String?
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -149,6 +155,7 @@ struct SettingsView: View {
                 approvalBypassSection
                 devicesSection
                 modelProviderSection
+                debugShareSection
                 connectionSection
                 aboutSection
             }
@@ -193,6 +200,18 @@ struct SettingsView: View {
                 Button("OK", role: .cancel) {}
             } message: {
                 Text(globalYoloError ?? "")
+            }
+            .alert("Debug Report Failed", isPresented: Binding(
+                get: { debugShareError != nil },
+                set: { if !$0 { debugShareError = nil } }
+            )) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(debugShareError ?? "")
+            }
+            .sheet(item: $debugShareResult) { report in
+                DebugShareSheet(report: report)
+                    .hermesThemed(themeStore)
             }
         }
     }
@@ -546,6 +565,34 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Debug share (ABH-223 — plugin-mount only)
+
+    @ViewBuilder
+    private var debugShareSection: some View {
+        if connectionStore.capabilities.pluginMount == .available,
+           connectionStore.rest != nil {
+            Section {
+                Button {
+                    generateDebugShare()
+                } label: {
+                    HStack(spacing: 12) {
+                        SettingsRowLabel(icon: "ladybug", title: "Share debug report")
+                        Spacer(minLength: 8)
+                        if debugSharePending {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+                }
+                .disabled(debugSharePending)
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsShareDebugReport")
+            } footer: {
+                Text("Generates a redacted support bundle on the server and opens a share/copy sheet.")
+            }
+        }
+    }
+
     // MARK: - Connection (server value + destructive disconnect)
 
     @ViewBuilder
@@ -784,6 +831,25 @@ struct SettingsView: View {
             }
         }
     }
+
+    /// Generate the server-side redacted debug bundle and present the share sheet.
+    private func generateDebugShare() {
+        guard !debugSharePending else { return }
+        guard let rest = connectionStore.rest else {
+            debugShareError = "Reconnect to a server before generating a debug report."
+            return
+        }
+        debugSharePending = true
+        Task {
+            defer { debugSharePending = false }
+            do {
+                let report = try await rest.debugShareReport()
+                debugShareResult = report
+            } catch {
+                debugShareError = "Couldn't generate debug report: \(error.localizedDescription)"
+            }
+        }
+    }
 }
 
 // MARK: - Native row primitives
@@ -843,6 +909,90 @@ private struct SettingsRow: View {
                     .truncationMode(.tail)
             }
         }
+    }
+}
+
+// MARK: - Debug-share sheet
+
+/// Result sheet for Settings → Share debug report.
+///
+/// Presents the redacted paste URLs returned by the server, a system ShareLink,
+/// and a copy fallback for users who need to paste the bundle into support chat.
+private struct DebugShareSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.hermesTheme) private var theme
+
+    let report: DebugShareReport
+    @State private var copied = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(report.sortedURLLabels, id: \.self) { label in
+                        if let url = report.urls[label], !url.isEmpty {
+                            LabeledContent(label) {
+                                Text(url)
+                                    .font(.footnote.monospaced())
+                                    .foregroundStyle(theme.mutedFg)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .textSelection(.enabled)
+                            }
+                            .listRowBackground(theme.card)
+                        }
+                    }
+                } header: {
+                    Text(report.redacted ? "Redacted debug report" : "Debug report")
+                } footer: {
+                    Text("Links auto-delete in \(Self.expiryText(report.autoDeleteSeconds)).")
+                }
+
+                if !report.failures.isEmpty {
+                    Section("Partial failures") {
+                        ForEach(report.failures, id: \.self) { failure in
+                            Text(failure)
+                                .foregroundStyle(theme.mutedFg)
+                                .listRowBackground(theme.card)
+                        }
+                    }
+                }
+
+                Section {
+                    ShareLink(item: report.shareText) {
+                        Label("Share links", systemImage: "square.and.arrow.up")
+                    }
+                    .disabled(report.shareText.isEmpty)
+                    .listRowBackground(theme.card)
+
+                    Button {
+                        UIPasteboard.general.string = report.shareText
+                        copied = true
+                    } label: {
+                        Label(copied ? "Copied" : "Copy links", systemImage: copied ? "checkmark" : "doc.on.doc")
+                    }
+                    .disabled(report.shareText.isEmpty)
+                    .listRowBackground(theme.card)
+                }
+            }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(theme.bg)
+            .navigationTitle("Debug Report")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private static func expiryText(_ seconds: Int) -> String {
+        let hours = seconds / 3600
+        if hours > 0 { return "\(hours)h" }
+        let minutes = max(1, seconds / 60)
+        return "\(minutes)m"
     }
 }
 

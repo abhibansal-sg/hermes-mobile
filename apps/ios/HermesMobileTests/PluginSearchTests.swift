@@ -291,6 +291,61 @@ final class PluginSearchTests: XCTestCase {
         XCTAssertEqual(results[1].id, "sess-2")
     }
 
+    func testDebugShareUsesPluginPathAndPost() async throws {
+        let json = #"{"ok":true,"urls":{"Report":"https://paste.example/r","agent.log":"https://paste.example/a"},"failures":["gateway.log: missing"],"redacted":true,"auto_delete_seconds":21600}"#
+        DebugShareStubProtocol.responses = [(Data(json.utf8), 200)]
+        DebugShareStubProtocol.capturedRequests = []
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [DebugShareStubProtocol.self]
+        let client = RestClient(
+            baseURL: baseURL,
+            token: token,
+            session: URLSession(configuration: config),
+            pathStyle: .plugin
+        )
+
+        let result = try await client.debugShareReport()
+
+        XCTAssertEqual(result.urls["Report"], "https://paste.example/r")
+        XCTAssertEqual(result.failures, ["gateway.log: missing"])
+        XCTAssertTrue(result.redacted)
+        XCTAssertEqual(result.autoDeleteSeconds, 21600)
+        XCTAssertEqual(result.shareText, "Report: https://paste.example/r\nagent.log: https://paste.example/a")
+
+        let request = try XCTUnwrap(DebugShareStubProtocol.capturedRequests.first)
+        XCTAssertEqual(request.httpMethod, "POST")
+        XCTAssertEqual(request.url?.path, "/api/plugins/hermes-mobile/debug-share")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Hermes-Session-Token"), token)
+    }
+
+}
+
+// MARK: - DebugShareStubProtocol
+
+final class DebugShareStubProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var responses: [(Data, Int)] = []
+    nonisolated(unsafe) static var capturedRequests: [URLRequest] = []
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        DebugShareStubProtocol.capturedRequests.append(request)
+        let (body, status) = DebugShareStubProtocol.responses.isEmpty
+            ? (Data(), 404)
+            : DebugShareStubProtocol.responses.removeFirst()
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: status,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 // MARK: - SearchStubProtocol
