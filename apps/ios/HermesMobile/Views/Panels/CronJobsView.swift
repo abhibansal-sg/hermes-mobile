@@ -80,6 +80,7 @@ struct CronJobsView: View {
                                     showDeleteConfirm = true
                                 } label: {
                                     Label("Delete", systemImage: "trash")
+                                        .foregroundStyle(theme.destructive)
                                 }
                             }
                             .swipeActions(edge: .leading) {

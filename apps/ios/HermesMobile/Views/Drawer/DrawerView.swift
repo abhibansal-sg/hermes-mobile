@@ -1204,6 +1204,7 @@ struct DrawerView: View {
             sessionPendingDelete = summary
         } label: {
             Label("Delete", systemImage: "trash")
+                .foregroundStyle(theme.destructive)
         }
     }
 

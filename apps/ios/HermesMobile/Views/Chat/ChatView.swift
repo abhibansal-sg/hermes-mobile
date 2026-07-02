@@ -1528,6 +1528,7 @@ struct ChatView: View {
                 Task { await sessionStore.delete(summary) }
             } label: {
                 Label("Delete", systemImage: "trash")
+                    .foregroundStyle(theme.destructive)
             }
         } else {
             Button {
