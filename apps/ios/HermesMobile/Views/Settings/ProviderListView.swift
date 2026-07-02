@@ -381,8 +381,9 @@ struct ProviderListView: View {
 /// `SecureField` + Save. The entered key is held in `@State` only until Save,
 /// which writes it to the Keychain transiently, POSTs it once via
 /// ``RestClient/setProviderKey(slug:apiKey:)``, then deletes the Keychain copy
-/// (the gateway is the source of truth). On 200 the callback fires with the
-/// refreshed provider row (authenticated, models populated) and the view pops.
+/// (the gateway is the source of truth). On 200 with a definitive provider
+/// validation reject, the sheet stays open and shows the provider's detail;
+/// otherwise the callback fires with the refreshed provider row and the view pops.
 ///
 /// Reached ONLY from a provisionable provider row (an `api_key` provider).
 /// OAuth-only providers never reach this view (they show a read-only
@@ -493,8 +494,12 @@ struct EnterProviderKeyView: View {
                 isSaving = false
             }
             do {
-                let updated = try await rest.setProviderKey(slug: slug, apiKey: trimmed)
-                onSaved(updated)
+                let result = try await rest.setProviderKey(slug: slug, apiKey: trimmed)
+                if result.validated == false {
+                    errorText = result.validationDetail ?? "Provider rejected this key"
+                    return
+                }
+                onSaved(result.row)
                 dismiss()
             } catch {
                 errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -509,8 +514,9 @@ struct EnterProviderKeyView: View {
 /// base_url, api_mode picker, and a key. The entered key is held in `@State`
 /// only until Save, which writes it to the Keychain transiently, POSTs it once
 /// via ``RestClient/addCustomProvider(name:baseURL:apiMode:apiKey:)``, then
-/// deletes the Keychain copy. On 200 the callback fires with the new provider
-/// row (authenticated, models populated) and the view dismisses.
+/// deletes the Keychain copy. On 200 with a definitive provider validation
+/// reject, the sheet stays open and shows the provider's detail; otherwise the
+/// callback fires with the new provider row and the view dismisses.
 ///
 /// Presented as a sheet (it's a create form, not a list push) — mirrors the
 /// ManualTokenPromptView sheet presentation. Cancel simply dismisses (no state
@@ -653,13 +659,17 @@ struct CustomProviderView: View {
                 isSaving = false
             }
             do {
-                let added = try await rest.addCustomProvider(
+                let result = try await rest.addCustomProvider(
                     name: trimmedName,
                     baseURL: trimmedBase,
                     apiMode: apiMode,
                     apiKey: trimmedKey
                 )
-                onAdded(added)
+                if result.validated == false {
+                    errorText = result.validationDetail ?? "Provider rejected this key"
+                    return
+                }
+                onAdded(result.row)
                 dismiss()
             } catch {
                 errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

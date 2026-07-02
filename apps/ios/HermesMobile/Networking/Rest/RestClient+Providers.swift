@@ -125,6 +125,26 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
     }
 }
 
+/// `POST <prefix>/providers/{slug}/key` and `POST <prefix>/providers/custom`
+/// response. The refreshed provider row is nested under `provider`; validation
+/// result fields are siblings at the response root. A definitive
+/// `validated == false` means the key was persisted but rejected by the upstream
+/// provider, so callers should keep entry UI open and show `validationDetail`.
+struct ProviderKeyResult: Sendable, Equatable {
+    let row: ProviderRow
+    let validated: Bool?
+    let validationDetail: String?
+    let persisted: Bool?
+
+    init(root: JSONValue) {
+        let providerJSON = root["provider"] ?? root
+        self.row = ProviderRow(json: providerJSON)
+        self.validated = root["validated"]?.boolValue
+        self.validationDetail = root["validation_detail"]?.stringValue
+        self.persisted = root["persisted"]?.boolValue
+    }
+}
+
 /// `DELETE <prefix>/providers/{slug}/key` result — the slug + name + a
 /// `disconnected` flag.
 struct ProviderDisconnectResult: Sendable, Equatable {
@@ -222,14 +242,16 @@ extension RestClient {
     /// 4003-class "set up on desktop" reject for OAuth-only providers), honours
     /// `is_managed()` (4006 read-only for managed installs), and persists via the
     /// stock `save_env_value`. Returns the refreshed provider row with models
-    /// populated and `authenticated == true`. NEVER echoes the key.
+    /// populated and `authenticated == true`, plus root-level validation status.
+    /// NEVER echoes the key.
     ///
     /// `apiKey` is held transiently in the Keychain by the caller
     /// (``KeychainService/saveProviderKey``) for this POST, then deleted — the
     /// gateway is the source of truth. Throws ``RestError`` (`badStatus`) on a
-    /// 4003/4006/validation reject.
+    /// 4003/4006 structural reject; an upstream key reject can arrive as a
+    /// successful response with `validated == false` and `validation_detail`.
     @discardableResult
-    func setProviderKey(slug: String, apiKey: String) async throws -> ProviderRow {
+    func setProviderKey(slug: String, apiKey: String) async throws -> ProviderKeyResult {
         let encodedSlug = slug.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? slug
@@ -241,9 +263,8 @@ extension RestClient {
         request.httpBody = try encodeBody(body, context: "providers.setKey")
         let data = try await perform(request)
         let root = try decodeJSONValue(from: data, context: "providers.setKey")
-        // The response is `{"provider": {…}}`; tolerate a bare provider object.
-        let providerJSON = root["provider"] ?? root
-        return ProviderRow(json: providerJSON)
+        // The response is `{"provider": {…}, "validated": …}`; tolerate a bare provider object.
+        return ProviderKeyResult(root: root)
     }
 
     // MARK: - Tier B — register a custom OpenAI/Anthropic-compatible provider
@@ -255,17 +276,20 @@ extension RestClient {
     /// the name is a safe dotted-key segment, the base_url is an http(s) URL, the
     /// api_mode is in the allowed set, and the api_key is non-empty. Honours
     /// `is_managed()` (4006). Returns the refreshed provider row with
-    /// `authenticated == true`. NEVER echoes the key.
+    /// `authenticated == true`, plus root-level validation status. NEVER echoes
+    /// the key.
     ///
     /// `apiKey` is held transiently in the Keychain by the caller, then deleted.
-    /// Throws ``RestError`` (`badStatus`) on a validation/managed reject.
+    /// Throws ``RestError`` (`badStatus`) on a structural validation/managed
+    /// reject; an upstream key reject can arrive as a successful response with
+    /// `validated == false` and `validation_detail`.
     @discardableResult
     func addCustomProvider(
         name: String,
         baseURL: String,
         apiMode: ProviderAPIMode,
         apiKey: String
-    ) async throws -> ProviderRow {
+    ) async throws -> ProviderKeyResult {
         var request = makeRequest(
             path: "\(mobileAPIPrefix)/providers/custom", method: "POST"
         )
@@ -279,8 +303,7 @@ extension RestClient {
         request.httpBody = try encodeBody(body, context: "providers.custom")
         let data = try await perform(request)
         let root = try decodeJSONValue(from: data, context: "providers.custom")
-        let providerJSON = root["provider"] ?? root
-        return ProviderRow(json: providerJSON)
+        return ProviderKeyResult(root: root)
     }
 
     // MARK: - Remove credentials (parity model.disconnect)
