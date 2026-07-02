@@ -168,9 +168,13 @@ final class RelayStore {
         defer { isTestingPush = false }
         do {
             let result = try await postTestPush()
-            testPushMessage = result.ok
-                ? "✅ \(result.detail)"
-                : "❌ \(result.detail)"
+            if result.ok {
+                testPushMessage = "✅ \(result.detail)"
+            } else if result.transport == "none" {
+                testPushMessage = "⚠️ \(result.detail)"
+            } else {
+                testPushMessage = "❌ \(result.detail)"
+            }
             await refreshStatus()
         } catch {
             let detail = (error as? LocalizedError)?.errorDescription
@@ -252,7 +256,7 @@ final class RelayStore {
         return RelayStatus(json: root)
     }
 
-    private func postTestPush() async throws -> (ok: Bool, detail: String) {
+    private func postTestPush() async throws -> (ok: Bool, detail: String, transport: String?) {
         let request = rest.makeRequest(
             path: "\(rest.mobileAPIPrefix)/relay/test-push",
             method: "POST"
@@ -262,9 +266,10 @@ final class RelayStore {
         guard let ok = root["ok"]?.boolValue else {
             throw RestError.decoding("relay.testPush: missing ok")
         }
+        let transport = root["transport"]?.stringValue
         let detail = root["detail"]?.stringValue
-            ?? (ok ? "Test push delivered" : "Unknown relay failure")
-        return (ok: ok, detail: detail)
+            ?? (ok ? "sent via \(transport ?? "push")" : "Unknown push failure")
+        return (ok: ok, detail: detail, transport: transport)
     }
 }
 

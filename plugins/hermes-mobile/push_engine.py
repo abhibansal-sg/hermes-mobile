@@ -818,7 +818,24 @@ def _send_one(
     return resp.status_code, (resp.text or "")
 
 
-def notify(
+def direct_apns_test_push_available() -> bool:
+    """True when direct APNs is armed and at least one alert token exists."""
+    return APNsConfig.from_env().is_armed() and any(
+        registered_tokens_by_env().values()
+    )
+
+
+def send_direct_apns_test_push() -> int:
+    """Send a direct-APNs settings test push via the normal APNs path."""
+    return _notify_direct_apns(
+        "test_push",
+        "Hermes test push",
+        "Direct APNs push delivery test from Hermes Mobile settings.",
+        {"source": "direct_test_push"},
+    )
+
+
+def _notify_direct_apns(
     event_type: str,
     title: str,
     body: str,
@@ -826,43 +843,7 @@ def notify(
     *,
     category: Optional[str] = None,
 ) -> int:
-    """Send an alert push to every registered device token.
-
-    Silent no-op (returns 0) unless push is enabled AND the APNs key file
-    exists. Tokens that APNs rejects with ``410 Unregistered`` are pruned from
-    the registry. Returns the count of pushes accepted (HTTP 200). In relay
-    mode, returns 1 only when background relay delivery was kicked off; relay
-    delivery failures are surfaced via relay warnings/failure counters.
-
-    ``event_type`` is also used as the per-event preference key (one of
-    :data:`PUSH_EVENT_KINDS` — ``approval``/``clarify``/``turn_complete``):
-    only tokens that opted into this kind (or have no prefs) receive the push.
-    ``category`` (e.g. ``HERMES_APPROVAL``) becomes ``aps.category`` for the
-    iOS action set.
-
-    Never raises: transport / credential errors are logged and swallowed so a
-    push failure can never break the calling gateway hook.
-    """
-    if os.environ.get("HERMES_MOBILE_RELAY_URL"):
-        try:
-            from . import relay_client
-        except Exception:
-            _log.debug("relay push notify failed", exc_info=True)
-            return 0
-        try:
-            relay_payload = payload if isinstance(payload, dict) else {}
-            relay_client.send_event_background(
-                kind=relay_client.map_push_kind(event_type),
-                session_id=relay_payload.get("session_id"),
-                title=title,
-                body=body,
-                source=relay_payload.get("source"),
-            )
-            return 1
-        except Exception:
-            _log.debug("relay push notify failed", exc_info=True)
-            return 0
-
+    """Send an alert push through direct APNs to registered tokens."""
     config = APNsConfig.from_env()
     if not config.is_armed():
         _log.debug("push notify: not armed (enabled=%s) — no-op", config.enabled)
@@ -934,6 +915,53 @@ def notify(
         _log.info("push notify: pruned %d unregistered token(s)", len(stale))
 
     return accepted
+
+
+def notify(
+    event_type: str,
+    title: str,
+    body: str,
+    payload: Optional[Dict[str, Any]] = None,
+    *,
+    category: Optional[str] = None,
+) -> int:
+    """Send an alert push to every registered device token.
+
+    Silent no-op (returns 0) unless push is enabled AND the APNs key file
+    exists. Tokens that APNs rejects with ``410 Unregistered`` are pruned from
+    the registry. Returns the count of pushes accepted (HTTP 200). In relay
+    mode, returns 1 only when background relay delivery was kicked off; relay
+    delivery failures are surfaced via relay warnings/failure counters.
+
+    ``event_type`` is also used as the per-event preference key (one of
+    :data:`PUSH_EVENT_KINDS` — ``approval``/``clarify``/``turn_complete``):
+    only tokens that opted into this kind (or have no prefs) receive the push.
+    ``category`` (e.g. ``HERMES_APPROVAL``) becomes ``aps.category`` for the
+    iOS action set.
+
+    Never raises: transport / credential errors are logged and swallowed so a
+    push failure can never break the calling gateway hook.
+    """
+    if os.environ.get("HERMES_MOBILE_RELAY_URL"):
+        try:
+            from . import relay_client
+        except Exception:
+            _log.debug("relay push notify failed", exc_info=True)
+            return 0
+        try:
+            relay_payload = payload if isinstance(payload, dict) else {}
+            relay_client.send_event_background(
+                kind=relay_client.map_push_kind(event_type),
+                session_id=relay_payload.get("session_id"),
+                title=title,
+                body=body,
+                source=relay_payload.get("source"),
+            )
+            return 1
+        except Exception:
+            _log.debug("relay push notify failed", exc_info=True)
+            return 0
+    return _notify_direct_apns(event_type, title, body, payload, category=category)
 
 
 def notify_live_activity(

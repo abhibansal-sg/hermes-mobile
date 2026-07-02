@@ -29,7 +29,7 @@ TestFlight + Abhi catch taste (layer 5).
 | CUJ-03 | Reconnect mid-turn without losing the reply | WS flap + reconcile (ABH-276/278/288/289) | Malacca |
 | CUJ-04 | Approve/deny a pending approval from the phone | `/api/approvals/respond` contract (ABH-258 ownership) | core |
 | CUJ-05 | Sessions list, search, resume | Recents default excludes cron/subagent + empty sessions; `/api/sessions/search` + resume + messages readback | core |
-| CUJ-06 | Enable relay push + pair + truthful test-push | `/relay/config` → `/relay/pair` → `/relay/test-push` → `/relay/status` truthfulness (ABH-282/283/284/285, ABH-213) | wave-68 |
+| CUJ-06 | Enable relay push + pair + truthful test-push | `/relay/config` → `/relay/pair` → `/relay/test-push` → `/relay/status` truthfulness, including direct-APNs vs relay vs no-push-configured outcomes (ABH-282/283/284/285, ABH-213, ABH-314) | wave-68 |
 | CUJ-07 | Device tokens: pair → APNs token registers, honest Settings state, list, revoke (scope-gated) | iOS pair/foreground registers `/push/register`; Settings shows not-authorized / not-registered / registered truthfully; `/api/devices`, DELETE + approve-scope 403 (ABH-315, ABH-275, ABH-270) | push lineage |
 | CUJ-08 | Provider list + key entry (no key leak in response) | `/api/providers` + `/providers/{slug}/key` write→readback redacted | provider mgmt |
 | CUJ-09 | Cron jobs: list + delivery-failure surfaced | cron surface + lastError contract (#85) | cron |

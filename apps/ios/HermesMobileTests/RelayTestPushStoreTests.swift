@@ -4,18 +4,38 @@ import XCTest
 
 @MainActor
 final class RelayTestPushStoreTests: XCTestCase {
-    func testSendTestPushShowsDeliveredMessage() async {
-        let store = RelayStore(rest: stubClient(returning: #"{"ok":true,"detail":"Test push delivered"}"#))
+    func testSendTestPushShowsDirectAPNsTransport() async {
+        let store = RelayStore(rest: stubClient(returning: #"{"ok":true,"transport":"direct_apns","detail":"sent via direct APNs"}"#))
 
         await store.sendTestPush()
 
-        XCTAssertEqual(store.testPushMessage, "✅ Test push delivered")
+        XCTAssertEqual(store.testPushMessage, "✅ sent via direct APNs")
+        XCTAssertFalse(store.isTestingPush)
+        XCTAssertNil(store.errorMessage)
+    }
+
+    func testSendTestPushShowsRelayTransport() async {
+        let store = RelayStore(rest: stubClient(returning: #"{"ok":true,"transport":"relay","detail":"sent via relay"}"#))
+
+        await store.sendTestPush()
+
+        XCTAssertEqual(store.testPushMessage, "✅ sent via relay")
+        XCTAssertFalse(store.isTestingPush)
+        XCTAssertNil(store.errorMessage)
+    }
+
+    func testSendTestPushShowsNoPushConfiguredAsWarning() async {
+        let store = RelayStore(rest: stubClient(returning: #"{"ok":false,"transport":"none","detail":"no push configured"}"#))
+
+        await store.sendTestPush()
+
+        XCTAssertEqual(store.testPushMessage, "⚠️ no push configured")
         XCTAssertFalse(store.isTestingPush)
         XCTAssertNil(store.errorMessage)
     }
 
     func testSendTestPushShowsServerFailureDetailInline() async {
-        let store = RelayStore(rest: stubClient(returning: #"{"ok":false,"detail":"TimeoutError: relay timed out"}"#))
+        let store = RelayStore(rest: stubClient(returning: #"{"ok":false,"transport":"relay","detail":"TimeoutError: relay timed out"}"#))
 
         await store.sendTestPush()
 

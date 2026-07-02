@@ -258,7 +258,7 @@ struct RelaySettingsView: View {
         Section {
             if let testPushMessage = store.testPushMessage {
                 Text(testPushMessage)
-                    .foregroundStyle(testPushMessage.hasPrefix("✅") ? theme.midground : .red)
+                    .foregroundStyle(testPushMessage.hasPrefix("✅") ? theme.midground : (testPushMessage.hasPrefix("⚠️") ? .orange : .red))
                     .textSelection(.enabled)
                     .listRowBackground(theme.card)
                     .accessibilityIdentifier("relayTestPushResult")
@@ -276,13 +276,13 @@ struct RelaySettingsView: View {
                     }
                 }
             }
-            .disabled(!store.enabled || store.isLoading || store.isSaving || store.isPairing || store.isTestingPush)
+            .disabled(store.isLoading || store.isSaving || store.isPairing || store.isTestingPush)
             .listRowBackground(theme.card)
             .accessibilityIdentifier("relaySendTestPush")
         } header: {
             Text("Delivery Test")
         } footer: {
-            Text("Sends a real relay push through the saved relay URL and reports the delivered result or actual error.")
+            Text("Sends a real push through whichever transport the gateway actually uses: direct APNs, relay, or an honest no-push-configured result.")
         }
     }
 

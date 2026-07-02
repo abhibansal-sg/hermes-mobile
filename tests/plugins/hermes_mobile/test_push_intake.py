@@ -16,6 +16,7 @@ Tests that stash sessions in ``server._sessions`` keep doing exactly that —
 the engine reads the gateway session table live via ``_gw_sessions()``.
 """
 
+import sys
 import threading
 import time
 import types
@@ -41,6 +42,113 @@ def _session(agent=None, **extra):
         "tool_progress_mode": "all",
         **extra,
     }
+
+
+class _FakeRelayClient:
+    class RelayConfigurationError(RuntimeError):
+        pass
+
+    def __init__(self, *, configured: bool) -> None:
+        self.configured = configured
+        self.events = []
+
+    def relay_url_configured(self) -> bool:
+        return self.configured
+
+    def relay_client(self):
+        return self
+
+    async def send_event(self, **kwargs):
+        self.events.append(kwargs)
+
+
+class _FakePushEngine:
+    def __init__(self, *, direct_available: bool, accepted: int = 1) -> None:
+        self.direct_available = direct_available
+        self.accepted = accepted
+        self.direct_calls = 0
+
+    def direct_apns_test_push_available(self) -> bool:
+        return self.direct_available
+
+    def send_direct_apns_test_push(self) -> int:
+        self.direct_calls += 1
+        return self.accepted
+
+
+def _push_test_client(monkeypatch, push_engine, relay_client):
+    fastapi = pytest.importorskip("fastapi")
+    testclient = pytest.importorskip("fastapi.testclient")
+
+    api = sys.modules["hermes_dashboard_plugin_hermes-mobile"]
+    monkeypatch.setattr(api, "_has_dashboard_api_auth", lambda request: True)
+    monkeypatch.setattr(api, "_device_has_scope", lambda request, scope: True)
+
+    def _fake_plugin_module(name: str):
+        if name == "push_engine":
+            return push_engine
+        if name == "relay_client":
+            return relay_client
+        raise AssertionError(f"unexpected plugin module: {name}")
+
+    monkeypatch.setattr(api, "_plugin_module", _fake_plugin_module)
+    app = fastapi.FastAPI()
+    app.include_router(api.router)
+    return testclient.TestClient(app)
+
+
+def test_relay_test_push_uses_direct_apns_when_configured(monkeypatch):
+    push = _FakePushEngine(direct_available=True, accepted=1)
+    relay = _FakeRelayClient(configured=False)
+    client = _push_test_client(monkeypatch, push, relay)
+
+    resp = client.post("/relay/test-push")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "ok": True,
+        "transport": "direct_apns",
+        "detail": "sent via direct APNs",
+    }
+    assert push.direct_calls == 1
+    assert relay.events == []
+
+
+def test_relay_test_push_reports_no_push_configured_without_transport(monkeypatch):
+    push = _FakePushEngine(direct_available=False)
+    relay = _FakeRelayClient(configured=False)
+    client = _push_test_client(monkeypatch, push, relay)
+
+    resp = client.post("/relay/test-push")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {
+        "ok": False,
+        "transport": "none",
+        "detail": "no push configured",
+    }
+    assert "relay URL is not configured" not in body["detail"]
+    assert push.direct_calls == 0
+    assert relay.events == []
+
+
+def test_relay_test_push_keeps_relay_path_when_relay_configured(monkeypatch):
+    push = _FakePushEngine(direct_available=False)
+    relay = _FakeRelayClient(configured=True)
+    client = _push_test_client(monkeypatch, push, relay)
+
+    resp = client.post("/relay/test-push")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "ok": True,
+        "transport": "relay",
+        "detail": "sent via relay",
+    }
+    assert push.direct_calls == 0
+    assert len(relay.events) == 1
+    assert relay.events[0]["source"] == "relay_test_push"
 
 
 # ===========================================================================

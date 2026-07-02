@@ -1075,18 +1075,30 @@ def _relay_test_push_error_detail(exc: Exception) -> str:
 
 @router.post("/relay/test-push")
 async def test_relay_push(request: Request) -> Any:
-    """Synchronously send a relay test push and report the truthful result."""
+    """Synchronously test the configured push transport and report truthfully."""
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     if not _device_has_scope(request, "approve"):
         raise HTTPException(status_code=403, detail="Device token lacks approve scope")
 
+    engine = _plugin_module("push_engine")
+    if engine.direct_apns_test_push_available():
+        accepted = engine.send_direct_apns_test_push()
+        if accepted > 0:
+            return {
+                "ok": True,
+                "transport": "direct_apns",
+                "detail": "sent via direct APNs",
+            }
+        return {
+            "ok": False,
+            "transport": "direct_apns",
+            "detail": "direct APNs test push was not accepted",
+        }
+
     relay = _plugin_module("relay_client")
     if not relay.relay_url_configured():
-        return JSONResponse(
-            status_code=400,
-            content={"ok": False, "detail": "relay URL is not configured"},
-        )
+        return {"ok": False, "transport": "none", "detail": "no push configured"}
 
     try:
         await relay.relay_client().send_event(
@@ -1097,14 +1109,15 @@ async def test_relay_push(request: Request) -> Any:
             source="relay_test_push",
         )
     except relay.RelayConfigurationError:
-        return JSONResponse(
-            status_code=400,
-            content={"ok": False, "detail": "relay URL is not configured"},
-        )
+        return {"ok": False, "transport": "none", "detail": "no push configured"}
     except Exception as exc:
-        return {"ok": False, "detail": _relay_test_push_error_detail(exc)}
+        return {
+            "ok": False,
+            "transport": "relay",
+            "detail": _relay_test_push_error_detail(exc),
+        }
 
-    return {"ok": True, "detail": "Test push delivered"}
+    return {"ok": True, "transport": "relay", "detail": "sent via relay"}
 
 
 @router.post("/push/register")
