@@ -425,6 +425,12 @@ extension ChatMessage {
         }
     }
 
+    /// Remove any inline warning parts while leaving text/tool/reasoning/usage
+    /// content untouched.
+    mutating func clearWarningPart() {
+        parts.removeAll(where: { $0.isWarning })
+    }
+
     /// Write/replace the single trailing `.usage` part. (The former dual-write to
     /// a legacy `usage` field is gone — the field is now derived from this part.)
     mutating func setUsagePart(_ usageStats: UsageStats?) {

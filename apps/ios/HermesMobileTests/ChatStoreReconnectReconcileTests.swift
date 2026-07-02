@@ -56,6 +56,13 @@ final class ChatStoreReconnectReconcileTests: XCTestCase {
         return chat.messages.last(where: { $0.role == .assistant })!
     }
 
+    private func warningTexts(in message: ChatMessage?) -> [String] {
+        message?.parts.compactMap { part in
+            if case .warning(_, let text) = part { return text }
+            return nil
+        } ?? []
+    }
+
     func testBackfillBeforeResumedPersistencePreservesConnectionLostRow() async {
         let (chat, _) = makeStore { _ in
             // The server has not persisted the resumed/final assistant row yet.
@@ -114,5 +121,49 @@ final class ChatStoreReconnectReconcileTests: XCTestCase {
                        "the final resumed reply keeps the interrupted row's identity")
         XCTAssertTrue(assistantRows.first?.text.contains("final reply after reconnect") == true)
         XCTAssertFalse(assistantRows.first?.isStreaming ?? true)
+    }
+
+    func testCleanResumedCompletionClearsConnectionLostWarningPart() async {
+        let (chat, _) = makeStore()
+
+        let interrupted = beginLocalPartialTurn(chat)
+        chat.handleConnectionDrop()
+        XCTAssertEqual(warningTexts(in: chat.messages.first(where: { $0.id == interrupted.id })), ["Connection lost"])
+
+        chat.handle(event: localFrame(type: "message.start", payload: ["role": "assistant"]))
+        chat.handle(event: localFrame(type: "message.complete", payload: [
+            "text": "fully recovered reply",
+            "status": "completed",
+        ]))
+
+        let assistantRows = chat.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(assistantRows.count, 1)
+        XCTAssertEqual(assistantRows.first?.id, interrupted.id)
+        XCTAssertEqual(assistantRows.first?.text, "fully recovered reply")
+        XCTAssertEqual(warningTexts(in: assistantRows.first), [],
+                       "a clean completion for the reconciled resumed row must remove the stale connection-loss warning part")
+    }
+
+    func testFailedResumedCompletionKeepsWarningPart() async {
+        let (chat, _) = makeStore()
+
+        let interrupted = beginLocalPartialTurn(chat)
+        chat.handleConnectionDrop()
+        XCTAssertEqual(warningTexts(in: chat.messages.first(where: { $0.id == interrupted.id })), ["Connection lost"])
+
+        chat.handle(event: localFrame(type: "message.start", payload: ["role": "assistant"]))
+        chat.handle(event: localFrame(type: "message.complete", payload: [
+            "text": "failed after reconnect",
+            "status": "failed",
+            "warning": "Agent failed after reconnect",
+        ]))
+
+        let assistantRows = chat.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(assistantRows.count, 1)
+        XCTAssertEqual(assistantRows.first?.id, interrupted.id)
+        XCTAssertEqual(assistantRows.first?.text, "failed after reconnect")
+        XCTAssertFalse(assistantRows.first?.isStreaming ?? true)
+        XCTAssertEqual(warningTexts(in: assistantRows.first), ["Agent failed after reconnect"],
+                       "a failed/warning-bearing resumed completion must keep its warning part instead of clearing it as stale")
     }
 }

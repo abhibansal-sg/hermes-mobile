@@ -876,6 +876,14 @@ final class ChatStore {
         flushBuffersImmediately()
         let completion = payload.decoded(as: MessageCompletePayload.self)
         let id = ensureStreamingMessage()
+        let failedStatuses = ["error", "failed", "interrupted", "cancelled", "canceled"]
+        let completionStatus = completion?.status?.lowercased()
+        let completionFailed = completionStatus.map { failedStatuses.contains($0) } ?? false
+        let shouldClearReconnectWarning = completion != nil
+            && pendingReconnectReconcileID == id
+            && completion?.warning == nil
+            && !completionFailed
+            && (completionStatus == nil || completionStatus == "completed")
         // Wall-clock the turn took, used to label a collapsed tool cluster.
         let elapsed = turnStartedAt.map { Date().timeIntervalSince($0) }
         // A2 (scarf): suppress the implicit animation on the streaming→final flip.
@@ -904,9 +912,12 @@ final class ChatStore {
             // error-like becomes the warning strip (without clobbering an
             // explicit warning the server already sent).
             if let status = completion?.status,
-               ["error", "failed", "interrupted", "cancelled", "canceled"].contains(status),
+               failedStatuses.contains(status.lowercased()),
                message.warning == nil {
                 message.setWarningPart("Turn \(status)")
+            }
+            if shouldClearReconnectWarning {
+                message.clearWarningPart()
             }
             message.setUsagePart(completion?.usage)
             message.isStreaming = false
@@ -923,6 +934,7 @@ final class ChatStore {
         }
         }  // withTransaction(animation: nil) — A2
         if streamingMessageID == id { streamingMessageID = nil }
+        if pendingReconnectReconcileID == id { pendingReconnectReconcileID = nil }
         // The local turn finalized. This path is only ever reached for a LOCAL
         // frame — a foreign `message.complete` is intercepted in
         // `handleForeignFrame` and returns before here — so releasing the
