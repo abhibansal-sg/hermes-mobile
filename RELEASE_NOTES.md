@@ -1,3 +1,24 @@
+Build 57 — "Malacca" — 2026-07-03
+RELIABILITY
+
+WHAT'S NEW
+- Relay recovery status (ABH-285)
+- Relay test push confirmation (ABH-284)
+- Relay PAIR — on-device pairing flow + kind=relay parse (ABH-283)
+- Relay push mode ENABLE — config route + iOS settings toggle (ABH-282)
+
+FIXED
+- Clear stale reconnect 'Connection lost' warning on clean resume (wave build-69) (ABH-289)
+- Reconnect on request timeout
+- Enforce approval session ownership
+
+WORTH TRYING
+- Try: Relay recovery status (ABH-285)
+- Try: Relay test push confirmation (ABH-284)
+- Try: Relay PAIR — on-device pairing flow + kind=relay parse (ABH-283)
+
+---
+
 Build 56 — "Malacca" — 2026-07-02
 RELIABILITY
 
