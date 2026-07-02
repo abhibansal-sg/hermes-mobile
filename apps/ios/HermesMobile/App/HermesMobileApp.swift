@@ -169,8 +169,11 @@ struct HermesMobileApp: App {
                         )
                     }
                     #endif
-                    // Push is opt-in; this no-ops unless the user enabled it.
-                    PushRegistrar.shared.enableIfAllowed()
+                    // Direct-APNs reconciliation: once a saved/dev-env gateway is
+                    // verified, make sure a fresh install actually asks iOS for
+                    // notification permission and an APNs token. If the user has
+                    // explicitly disabled Notifications, this remains a no-op.
+                    PushRegistrar.shared.ensureRegisteredForPairedGateway()
                     // First-launch usage figures for the widgets, once connected.
                     environment.refreshUsageSnapshot()
                 }
@@ -197,7 +200,20 @@ struct HermesMobileApp: App {
                                 presentSharedInboxToast(processed: count)
                             }
                         )
+                        PushRegistrar.shared.ensureRegisteredForPairedGateway()
                         environment.refreshUsageSnapshot()
+                    }
+                }
+                .onChange(of: environment.connectionStore.phase) { _, newPhase in
+                    switch newPhase {
+                    case .hydrating, .connected:
+                        // Pairing succeeds while the app is already active, so it
+                        // does not necessarily trigger a scene-phase foreground
+                        // transition. Treat the verified connection transition as
+                        // the pair-completed hook and reconcile APNs immediately.
+                        PushRegistrar.shared.ensureRegisteredForPairedGateway()
+                    case .needsSetup, .connecting, .reconnecting, .offline:
+                        break
                     }
                 }
                 .onOpenURL { url in

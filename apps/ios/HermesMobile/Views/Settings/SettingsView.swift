@@ -414,6 +414,24 @@ struct SettingsView: View {
             .disabled(pushUnsupported || !notifAuthProbed)
             .listRowBackground(theme.card)
 
+            if PushRegistrar.shared.isEnabled && !pushUnsupported {
+                LabeledContent("Notifications") {
+                    Text(Self.notificationPermissionLabel(for: notifAuthStatus))
+                        .foregroundStyle(notifAuthStatus == .denied ? theme.destructive : theme.mutedFg)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("notificationPermissionState")
+
+                LabeledContent("Push token") {
+                    Text(Self.pushTokenRegistrationLabel(
+                        token: UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken)
+                    ))
+                    .foregroundStyle(theme.mutedFg)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("pushTokenRegistrationState")
+            }
+
             // Per-event push prefs (A4): three native Toggles, shown only when
             // push is on (they have no effect otherwise). Each change re-POSTs
             // /api/push/register with the new events list. Pure system Toggles —
@@ -825,6 +843,30 @@ struct SettingsView: View {
     /// (stock server, E1). Only `.unavailable` disables the toggle.
     private var pushUnsupported: Bool {
         connectionStore.capabilities.pushRegistry == .unavailable
+    }
+
+    /// Human-readable notification permission state for the honest push-status
+    /// rows. Internal/static so the regression test can prove denied permission
+    /// surfaces as "Not authorized" without rendering the full Settings sheet.
+    static func notificationPermissionLabel(for status: UNAuthorizationStatus) -> String {
+        switch status {
+        case .authorized, .provisional, .ephemeral:
+            return "Authorized"
+        case .denied:
+            return "Not authorized"
+        case .notDetermined:
+            return "Not requested"
+        @unknown default:
+            return "Unknown"
+        }
+    }
+
+    /// Human-readable gateway-token state for the honest push-status rows.
+    static func pushTokenRegistrationLabel(token: String?) -> String {
+        if let token, !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Registered"
+        }
+        return "Not registered"
     }
 
     /// "1.0 (1)" from the bundle's short version + build number.

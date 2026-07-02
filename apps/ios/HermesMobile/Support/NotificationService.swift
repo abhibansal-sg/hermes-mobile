@@ -362,19 +362,41 @@ enum NotificationService {
     /// `.denied`, the OS returns the denial without a prompt and Settings surfaces
     /// its "Open Settings" path.
     static func requestAuthorizationIfNeeded(force: Bool = false) {
+        Task { @MainActor in
+            _ = await requestAuthorizationStatusIfNeeded(force: force)
+        }
+    }
+
+    /// Async variant for remote-push registration: returns the settled system
+    /// authorization state so callers can avoid asking APNs for a token when iOS
+    /// has already denied alert delivery (the Settings UI must then show a real
+    /// "not authorized" state, not a fake OK).
+    static func requestAuthorizationStatusIfNeeded(force: Bool = false) async -> UNAuthorizationStatus {
         installDelegateIfNeeded()
         registerCategories()
         let defaults = UserDefaults.standard
-        if !force {
-            guard !defaults.bool(forKey: DefaultsKeys.notificationsDidRequestAuthorization) else { return }
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        guard settings.authorizationStatus == .notDetermined else {
+            return settings.authorizationStatus
         }
-        UNUserNotificationCenter.current().requestAuthorization(
-            options: [.alert, .sound, .badge]
-        ) { _, _ in
-            // Latch "asked once" only AFTER the dialog resolves (release
-            // audit): setting it before meant an app kill mid-dialog consumed
-            // the one-shot without an answer — the prompt never re-showed.
-            defaults.set(true, forKey: DefaultsKeys.notificationsDidRequestAuthorization)
+        if !force {
+            guard !defaults.bool(forKey: DefaultsKeys.notificationsDidRequestAuthorization) else {
+                return settings.authorizationStatus
+            }
+        }
+
+        return await withCheckedContinuation { continuation in
+            UNUserNotificationCenter.current().requestAuthorization(
+                options: [.alert, .sound, .badge]
+            ) { _, _ in
+                // Latch "asked once" only AFTER the dialog resolves (release
+                // audit): setting it before meant an app kill mid-dialog consumed
+                // the one-shot without an answer — the prompt never re-showed.
+                defaults.set(true, forKey: DefaultsKeys.notificationsDidRequestAuthorization)
+                UNUserNotificationCenter.current().getNotificationSettings { updated in
+                    continuation.resume(returning: updated.authorizationStatus)
+                }
+            }
         }
     }
 

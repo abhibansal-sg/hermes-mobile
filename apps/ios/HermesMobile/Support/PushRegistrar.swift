@@ -2,12 +2,16 @@ import Foundation
 #if canImport(UIKit)
 import UIKit
 #endif
+import UserNotifications
 
 /// Coordinates APNs registration and ships the device token to the gateway.
 ///
-/// Remote push is opt-in behind `UserDefaults` key `hermes.pushEnabled` (default
-/// off). When enabled, ``enableIfAllowed()`` asks for notification authorization
-/// (reusing the local-notification grant) and calls
+/// Remote push is user-controllable behind `UserDefaults` key
+/// `hermes.pushEnabled`. A fresh install has no explicit value; successful
+/// pairing defaults that unset state to enabled so direct APNs can work, while an
+/// explicit Settings opt-out (`false`) is preserved. When enabled,
+/// ``enableIfAllowed()`` asks for notification authorization (reusing the local
+/// notification grant) and calls
 /// `UIApplication.registerForRemoteNotifications()`. iOS then calls the app
 /// delegate's
 /// `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)`, which
@@ -31,6 +35,17 @@ final class PushRegistrar {
 
     @ObservationIgnored
     private weak var connection: ConnectionStore?
+
+    /// Test seams for the OS/APNs boundaries. Production uses
+    /// ``NotificationService`` + ``UIApplication`` + ``PushTokenPoster``; tests
+    /// replace only these edges so the registrar's idempotency logic is exercised
+    /// without a real device token, permission dialog, or gateway.
+    @ObservationIgnored
+    var authorizationRequester: (@MainActor (Bool) async -> UNAuthorizationStatus)?
+    @ObservationIgnored
+    var remoteNotificationsRegistrar: (@MainActor () -> Void)?
+    @ObservationIgnored
+    var tokenRegisterOverride: (@MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome)?
 
     init() {
         isEnabled = UserDefaults.standard.bool(forKey: DefaultsKeys.pushEnabled)
@@ -91,15 +106,53 @@ final class PushRegistrar {
         }
     }
 
+    /// Pair/foreground reconciliation for direct-APNs gateways. A fresh install
+    /// has no explicit push preference yet; when the phone successfully pairs,
+    /// default that unset state to enabled so the system permission prompt + APNs
+    /// token request actually happen. If the user later turns Notifications off,
+    /// the key is explicitly `false` and this will not silently re-enable it.
+    func ensureRegisteredForPairedGateway() {
+        if UserDefaults.standard.object(forKey: DefaultsKeys.pushEnabled) == nil {
+            isEnabled = true
+            UserDefaults.standard.set(true, forKey: DefaultsKeys.pushEnabled)
+        }
+        enableIfAllowed()
+    }
+
     /// If push is enabled, request authorization and kick off APNs registration.
-    /// Safe to call every launch — APNs registration is cheap and idempotent, and
-    /// the system re-delivers the current token to the delegate each time.
+    /// Safe to call every launch/foreground — APNs registration is cheap and
+    /// idempotent, and the system re-delivers the current token to the delegate
+    /// each time. Denied notification access is an honest terminal state: do not
+    /// ask APNs for a token the UI would then present as healthy.
     func enableIfAllowed(forcePrompt: Bool = false) {
         guard isEnabled else { return }
         #if canImport(UIKit)
-        NotificationService.requestAuthorizationIfNeeded(force: forcePrompt)
-        UIApplication.shared.registerForRemoteNotifications()
+        Task { @MainActor in
+            let status: UNAuthorizationStatus
+            if let authorizationRequester {
+                status = await authorizationRequester(forcePrompt)
+            } else {
+                status = await NotificationService.requestAuthorizationStatusIfNeeded(force: forcePrompt)
+            }
+            guard Self.authorizationAllowsRemoteRegistration(status) else { return }
+            if let remoteNotificationsRegistrar {
+                remoteNotificationsRegistrar()
+            } else {
+                UIApplication.shared.registerForRemoteNotifications()
+            }
+        }
         #endif
+    }
+
+    static func authorizationAllowsRemoteRegistration(_ status: UNAuthorizationStatus) -> Bool {
+        switch status {
+        case .authorized, .provisional, .ephemeral:
+            return true
+        case .denied, .notDetermined:
+            return false
+        @unknown default:
+            return false
+        }
     }
 
     // MARK: - APNs delegate callbacks
@@ -123,28 +176,45 @@ final class PushRegistrar {
             return
         }
 
-        guard let poster = makePoster() else { return }  // not configured yet
-        Task { @MainActor in
-            let outcome = await poster.register(token: hex, events: events)
-            switch outcome {
-            case .success, .softFail, .validationRejected:
-                // Feed the push-registry capability gate (E1): a 404 soft-fail
-                // proves the endpoint is missing (stock gateway); a 2xx success
-                // or a 4xx validation rejection proves it exists.
-                connection?.capabilities.notePushRegistry(available: outcome.provesEndpointPresent)
-                // Remember the token + the events it was registered with only on a
-                // real success; soft-fail (404) and a validation rejection both
-                // persisted nothing, so we retry next launch.
-                if case .success = outcome {
-                    UserDefaults.standard.set(hex, forKey: DefaultsKeys.pushLastDeviceToken)
-                    lastRegisteredEvents = events
-                    lastRegisteredEnv = env
-                }
-            case .hardFail:
-                // Transport error: inconclusive for the capability gate, nothing
-                // remembered. The next enableIfAllowed() retries.
-                break
+        let registerToken: @MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome
+        if let tokenRegisterOverride {
+            registerToken = tokenRegisterOverride
+        } else {
+            guard let poster = makePoster() else { return }  // not configured yet
+            registerToken = { token, events in
+                await poster.register(token: token, events: events)
             }
+        }
+        Task { @MainActor in
+            let outcome = await registerToken(hex, events)
+            handleRegisterOutcome(outcome, token: hex, events: events, env: env)
+        }
+    }
+
+    private func handleRegisterOutcome(
+        _ outcome: PushTokenPoster.Outcome,
+        token hex: String,
+        events: [String],
+        env: String
+    ) {
+        switch outcome {
+        case .success, .softFail, .validationRejected:
+            // Feed the push-registry capability gate (E1): a 404 soft-fail
+            // proves the endpoint is missing (stock gateway); a 2xx success
+            // or a 4xx validation rejection proves it exists.
+            connection?.capabilities.notePushRegistry(available: outcome.provesEndpointPresent)
+            // Remember the token + the events it was registered with only on a
+            // real success; soft-fail (404) and a validation rejection both
+            // persisted nothing, so we retry next launch.
+            if case .success = outcome {
+                UserDefaults.standard.set(hex, forKey: DefaultsKeys.pushLastDeviceToken)
+                lastRegisteredEvents = events
+                lastRegisteredEnv = env
+            }
+        case .hardFail:
+            // Transport error: inconclusive for the capability gate, nothing
+            // remembered. The next enableIfAllowed() retries.
+            break
         }
     }
 
@@ -162,9 +232,17 @@ final class PushRegistrar {
             enableIfAllowed()
             return
         }
-        guard let poster = makePoster() else { return }
+        let registerToken: @MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome
+        if let tokenRegisterOverride {
+            registerToken = tokenRegisterOverride
+        } else {
+            guard let poster = makePoster() else { return }
+            registerToken = { token, events in
+                await poster.register(token: token, events: events)
+            }
+        }
         Task { @MainActor in
-            let outcome = await poster.register(token: hex, events: events)
+            let outcome = await registerToken(hex, events)
             if case .success = outcome {
                 lastRegisteredEvents = events
             }
