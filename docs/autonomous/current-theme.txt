@@ -1,0 +1,3 @@
+cycle=1
+name=Malacca
+focus=RELIABILITY — connection trust: reconnect races, silent failures, push truthfulness. The app should feel unshakeable when the network isn't.

@@ -36,7 +36,19 @@ for s in log:
     elif low.startswith('feat'): new.append(line)
     else: improved.append(line)
 today = datetime.date.today().isoformat()
-print(f"Build {build} — {today}")
+# theme header (Straits naming, Abhi 2026-07-02): read current-theme.txt if present
+theme_name, theme_focus = '', ''
+try:
+    for ln in open('docs/autonomous/current-theme.txt'):
+        if ln.startswith('name='): theme_name = ln.split('=',1)[1].strip()
+        if ln.startswith('focus='): theme_focus = ln.split('=',1)[1].strip()
+except FileNotFoundError:
+    pass
+if theme_name:
+    print(f"Build {build} — \"{theme_name}\" — {today}")
+    print(theme_focus.split(' — ')[0] if ' — ' in theme_focus else theme_focus)
+else:
+    print(f"Build {build} — {today}")
 if new:
     print("\nWHAT'S NEW"); [print(x) for x in new]
 if fixed:
