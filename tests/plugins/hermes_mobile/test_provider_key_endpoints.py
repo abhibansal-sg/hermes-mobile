@@ -673,6 +673,65 @@ def test_set_key_validation_is_additive_to_existing_success_shape(
     assert "sk-good" not in r.text
 
 
+def test_provider_key_validation_runs_via_to_thread_for_mutators(
+    loopback_client, monkeypatch
+):
+    """ABH-245: slow provider validation must not run on the request loop."""
+    import types
+
+    api = _api()
+    to_thread_calls = []
+    validation_calls = []
+
+    def _validation(**kwargs):
+        validation_calls.append(kwargs)
+        return {
+            "validated": True,
+            "validation_detail": "provider accepted the API key",
+            "persisted": True,
+        }
+
+    async def _to_thread(func, *args, **kwargs):
+        to_thread_calls.append({"func": func, "args": args, "kwargs": kwargs})
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(
+        api, "asyncio", types.SimpleNamespace(to_thread=_to_thread), raising=False
+    )
+    monkeypatch.setattr(api, "_validate_provider_key", _validation, raising=False)
+    _patch_inventory(monkeypatch, rows=[_DEEPSEEK_ROW])
+    _patch_config(monkeypatch)
+
+    registered = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/deepseek/key",
+        json={"api_key": "registered-threaded-key"},
+        headers=_TOKEN_HEADER,
+    )
+    custom = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/custom",
+        json={
+            "name": "threadedcustom",
+            "base_url": "https://api.threaded.example/v1",
+            "api_mode": "openai",
+            "api_key": "custom-threaded-key",
+        },
+        headers=_TOKEN_HEADER,
+    )
+
+    assert registered.status_code == 200, registered.text
+    assert custom.status_code == 200, custom.text
+    assert len(validation_calls) == 2
+    assert len(to_thread_calls) == 2
+    assert [call["func"] for call in to_thread_calls] == [_validation, _validation]
+    assert to_thread_calls[0]["kwargs"]["api_key"] == "registered-threaded-key"
+    assert to_thread_calls[1]["kwargs"] == {
+        "api_key": "custom-threaded-key",
+        "base_url": "https://api.threaded.example/v1",
+        "api_mode": "openai",
+        "timeout": api._PROVIDER_KEY_VALIDATION_TIMEOUT_SECONDS,
+    }
+
+
 # ===========================================================================
 # Tier B — POST /providers/custom
 # ===========================================================================

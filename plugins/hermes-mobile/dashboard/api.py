@@ -26,6 +26,7 @@ the W2 auth-provider conversion).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import importlib.util
@@ -2091,7 +2092,8 @@ async def set_provider_key(
         base_url = os.environ.get(pconfig.base_url_env_var, "") or ""
     if not base_url:
         base_url = getattr(pconfig, "inference_base_url", "") or ""
-    validation = _validate_provider_key(
+    validation = await asyncio.to_thread(
+        _validate_provider_key,
         api_key=api_key,
         base_url=base_url,
         timeout=_PROVIDER_KEY_VALIDATION_TIMEOUT_SECONDS,
@@ -2206,7 +2208,8 @@ async def add_custom_provider(
         )
 
     os.environ[env_var] = api_key
-    validation = _validate_provider_key(
+    validation = await asyncio.to_thread(
+        _validate_provider_key,
         api_key=api_key,
         base_url=base_url,
         api_mode=api_mode,
