@@ -36,6 +36,25 @@ print("  ship armed: internal TestFlight")
 PY
 [ $? -ne 0 ] && exit 0
 
+# --- STEP 0: SYNC LOCAL TO MERGED ORIGIN BASE (before archiving anything) -----
+# The ship archives the local working tree. If local HEAD lags origin/$BASE (e.g.
+# the orchestrator just merged PRs to origin but this checkout is behind), we'd
+# archive a STALE tree — shipping code that isn't the merged base. Fast-forward
+# first so we always build the just-merged tree. (Root cause of a 2026-07-02
+# mis-ship: archived stale HEAD behind the merge.)
+git fetch origin "$BASE" -q 2>/dev/null
+LOCAL_HEAD=$(git rev-parse HEAD 2>/dev/null)
+ORIGIN_HEAD=$(git rev-parse "origin/$BASE" 2>/dev/null)
+if [ -n "$ORIGIN_HEAD" ] && [ "$LOCAL_HEAD" != "$ORIGIN_HEAD" ]; then
+  if git merge-base --is-ancestor "$LOCAL_HEAD" "$ORIGIN_HEAD" 2>/dev/null; then
+    echo "  syncing local HEAD $(git rev-parse --short HEAD) -> origin/$BASE $(git rev-parse --short origin/$BASE) before archive"
+    git checkout "$BASE" -q 2>/dev/null && git merge --ff-only "origin/$BASE" -q 2>/dev/null \
+      || { echo "  FF sync failed (dirty tree?) — refusing to ship a stale/ambiguous tree"; exit 1; }
+  else
+    echo "  local HEAD has commits not on origin/$BASE — refusing to ship an unmerged tree"; exit 1
+  fi
+fi
+
 # --- GATE 1: wave fully merged? (no open/approved issues left in the wave) ----
 git fetch origin "$BASE" -q 2>/dev/null
 if [ -n "$WAVE" ]; then
