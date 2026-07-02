@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// The tool-activity area of an assistant turn — ONE consecutive-run `.tools`
 /// cluster (a non-tool part closes the run, so each `ToolClusterView` is exactly
@@ -59,7 +60,9 @@ struct ToolClusterView: View {
                 // only as a fallback for seeded/legacy activities that predate
                 // the structured field. Falls back to the standard row when
                 // neither yields a list (e.g. mid-run).
-                if tool.name == TodoList.toolName,
+                if let generatedImage = Self.generatedImageResult(for: tool) {
+                    GeneratedImageToolCard(result: generatedImage, state: tool.state)
+                } else if tool.name == TodoList.toolName,
                    let todos = tool.todos.flatMap({ TodoList(todosArray: $0) })
                     ?? TodoList(resultJSON: tool.resultPreview) {
                     TodoCardView(todos: todos, state: tool.state)
@@ -133,6 +136,14 @@ struct ToolClusterView: View {
             return String(format: "%d %@ · %.0fs", toolCount, noun, seconds)
         }
         return "\(toolCount) \(noun)"
+    }
+
+    /// Returns a parsed generated-image result only for the image-generation tool.
+    /// Kept static so tests can prove the native image branch is selected without
+    /// needing to instantiate SwiftUI's environment-backed view tree.
+    nonisolated static func generatedImageResult(for tool: ToolActivity) -> GeneratedImageToolResult? {
+        guard tool.name == GeneratedImageToolResult.toolName else { return nil }
+        return GeneratedImageToolResult(resultJSON: tool.resultPreview)
     }
 
     private var summaryText: String {
@@ -296,6 +307,314 @@ struct ToolActivityRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Parsed result for the `image_generate` tool.
+///
+/// The gateway/tool result can expose the generated image under a few historical
+/// keys. The first non-empty locator wins, matching the task contract, and can be
+/// either a remote URL, a data URL, or a server-local path.
+struct GeneratedImageToolResult: Sendable, Equatable {
+    static let toolName = "image_generate"
+    private static let locatorKeys = ["host_image", "image", "agent_visible_image"]
+
+    let reference: String
+
+    init?(resultJSON text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if trimmed.hasPrefix("{"),
+           let data = trimmed.data(using: .utf8),
+           let json = try? JSONDecoder().decode(JSONValue.self, from: data) {
+            if let reference = Self.reference(in: json) {
+                self.reference = reference
+                return
+            }
+            return nil
+        }
+
+        // Defensive fallback for older/local emitters that surface the locator as
+        // the preview itself instead of a JSON object. This branch is still gated
+        // by `tool.name == image_generate`, so it cannot steal generic tool rows.
+        self.reference = trimmed
+    }
+
+    var remoteURL: URL? {
+        guard reference.hasPrefix("http://") || reference.hasPrefix("https://") else { return nil }
+        return URL(string: reference)
+    }
+
+    var isDataURL: Bool { reference.hasPrefix("data:") }
+    var isServerLocalPath: Bool { remoteURL == nil && !isDataURL }
+
+    var displayName: String {
+        guard !isDataURL else { return "inline image" }
+        let last = reference.components(separatedBy: "/").last ?? reference
+        return last.isEmpty ? reference : last
+    }
+
+    private static func reference(in json: JSONValue) -> String? {
+        if let object = json.objectValue {
+            for key in locatorKeys {
+                guard let raw = object[key]?.stringValue else { continue }
+                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            }
+        } else if let raw = json.stringValue {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return nil
+    }
+}
+
+/// Native image card for an assistant-generated image tool result.
+///
+/// Remote URLs use `AsyncImage`. Server-local paths reuse the existing file-read
+/// REST surface (`fsReadAsDataURL`) and blob cache, instead of adding a bespoke
+/// route. All failure paths provide a retry plus a raw-locator reveal affordance.
+struct GeneratedImageToolCard: View {
+    let result: GeneratedImageToolResult
+    let state: ToolActivity.State
+
+    @Environment(ConnectionStore.self) private var connection
+    @Environment(SessionStore.self) private var sessions
+    @Environment(\.hermesTheme) private var theme
+
+    @State private var localPhase: LocalImagePhase = .idle
+    @State private var remoteRetryID = UUID()
+    @State private var showRawReference = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            header
+            content
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(theme.muted, in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityIdentifier("generatedImageToolCard")
+    }
+
+    private var header: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "photo")
+                .font(.caption2)
+                .foregroundStyle(theme.mutedFg)
+            Text("Generated image")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(theme.mutedFg)
+            Spacer(minLength: 0)
+            if state == .running {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Generated image loading")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if state == .failed {
+            failurePanel(message: "Image generation failed.")
+        } else if let remoteURL = result.remoteURL {
+            remoteImage(url: remoteURL)
+        } else if result.isDataURL {
+            dataURLImage
+        } else {
+            localImage
+        }
+    }
+
+    private func remoteImage(url: URL) -> some View {
+        AsyncImage(url: url, transaction: Transaction(animation: .snappy(duration: 0.2))) { phase in
+            switch phase {
+            case .empty:
+                loadingPlaceholder
+            case .success(let image):
+                renderedImage(image)
+            case .failure:
+                failurePanel(message: "Couldn't load the generated image.")
+            @unknown default:
+                failurePanel(message: "Couldn't load the generated image.")
+            }
+        }
+        .id(remoteRetryID)
+    }
+
+    @ViewBuilder
+    private var dataURLImage: some View {
+        if let decoded = Self.decodeDataURL(result.reference) {
+            renderedImage(Image(uiImage: decoded.image))
+        } else {
+            failurePanel(message: "Couldn't decode the generated image.")
+        }
+    }
+
+    @ViewBuilder
+    private var localImage: some View {
+        Group {
+            switch localPhase {
+            case .idle, .loading:
+                loadingPlaceholder
+            case .loaded(let image):
+                renderedImage(Image(uiImage: image))
+            case .failed(let message):
+                failurePanel(message: message)
+            }
+        }
+        .task(id: result.reference) {
+            await loadLocalImage(force: false)
+        }
+    }
+
+    private var loadingPlaceholder: some View {
+        RoundedRectangle(cornerRadius: 10)
+            .fill(theme.bg.opacity(0.5))
+            .overlay {
+                VStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading image…")
+                        .font(.caption2)
+                        .foregroundStyle(theme.mutedFg)
+                }
+            }
+            .frame(maxWidth: 360, minHeight: 180)
+            .accessibilityLabel("Loading generated image")
+    }
+
+    private func renderedImage(_ image: Image) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.snappy(duration: 0.2)) { showRawReference.toggle() }
+            } label: {
+                image
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: 360, maxHeight: 420, alignment: .leading)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(theme.mutedFg.opacity(0.18), lineWidth: 1)
+                    }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Generated image")
+            .accessibilityHint("Double-tap to \(showRawReference ? "hide" : "show") the image path")
+            .accessibilityIdentifier("generatedImageToolImage")
+
+            if showRawReference {
+                Text(result.reference)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(theme.fg)
+                    .lineLimit(4)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+
+    private func failurePanel(message: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(theme.statusError)
+            HStack(spacing: 10) {
+                Button("Retry") {
+                    if result.remoteURL != nil {
+                        remoteRetryID = UUID()
+                    } else if result.isServerLocalPath {
+                        Task { await loadLocalImage(force: true) }
+                    }
+                }
+                .font(.caption.weight(.medium))
+                .buttonStyle(.plain)
+                .foregroundStyle(theme.midground)
+
+                Button(showRawReference ? "Hide path" : "Show path") {
+                    withAnimation(.snappy(duration: 0.2)) { showRawReference.toggle() }
+                }
+                .font(.caption.weight(.medium))
+                .buttonStyle(.plain)
+                .foregroundStyle(theme.midground)
+            }
+            if showRawReference {
+                Text(result.reference)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(theme.fg)
+                    .lineLimit(4)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .frame(maxWidth: 360, alignment: .leading)
+    }
+
+    @MainActor
+    private func loadLocalImage(force: Bool) async {
+        guard result.isServerLocalPath, state != .failed else { return }
+        if !force {
+            if case .loaded = localPhase { return }
+            if case .loading = localPhase { return }
+        }
+        guard let rest = connection.rest else {
+            localPhase = .failed("Connect to the gateway to load this generated image.")
+            return
+        }
+        guard let sessionId = sessions.activeRuntimeId, !sessionId.isEmpty else {
+            localPhase = .failed("Open the source session to load this generated image.")
+            return
+        }
+
+        localPhase = .loading
+        do {
+            let imageResult = try await rest.fsReadAsDataURL(sessionId: sessionId, path: result.reference)
+            guard let dataURL = imageResult.dataURL,
+                  let decoded = Self.decodeDataURL(dataURL) else {
+                localPhase = .failed("Image preview requires an updated gateway.")
+                return
+            }
+            localPhase = .loaded(decoded.image)
+            cacheBlob(decoded.data, rest: rest, sessionId: sessionId, size: imageResult.size)
+        } catch let error as FSReadError {
+            localPhase = .failed(error.errorDescription ?? "Couldn't load image")
+        } catch {
+            localPhase = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
+    }
+
+    private func cacheBlob(_ data: Data, rest: RestClient, sessionId: String, size: Int) {
+        let key = AttachmentBlobCache.Key(
+            serverId: rest.baseURL.absoluteString,
+            profileId: sessions.activeProfile,
+            sessionId: sessionId,
+            path: result.reference,
+            size: size
+        )
+        AttachmentBlobCache.shared.store(data, for: key)
+    }
+
+    private static func decodeDataURL(_ dataURL: String) -> (image: UIImage, data: Data)? {
+        guard dataURL.hasPrefix("data:"),
+              let commaIndex = dataURL.firstIndex(of: ",") else { return nil }
+        let header = dataURL[dataURL.startIndex..<commaIndex]
+        guard header.contains(";base64") else { return nil }
+        let payload = String(dataURL[dataURL.index(after: commaIndex)...])
+        guard let data = Data(base64Encoded: payload, options: [.ignoreUnknownCharacters]),
+              let image = UIImage(data: data) else { return nil }
+        return (image, data)
+    }
+
+    private enum LocalImagePhase {
+        case idle
+        case loading
+        case loaded(UIImage)
+        case failed(String)
     }
 }
 

@@ -266,4 +266,60 @@ final class RenderingTests: XCTestCase {
         let attributed = AnsiText.stripOrRender(raw)
         XCTAssertEqual(String(attributed.characters), "on blue")
     }
+
+    // MARK: - image_generate native tool card
+
+    func testGeneratedImageToolResultPrefersHostImage() {
+        let result = GeneratedImageToolResult(resultJSON: """
+        {"host_image":" https://cdn.example.com/generated.png ","image":"https://fallback.example.com/other.png","agent_visible_image":"/tmp/agent.png"}
+        """)
+
+        XCTAssertEqual(result?.reference, "https://cdn.example.com/generated.png")
+        XCTAssertEqual(result?.remoteURL?.absoluteString, "https://cdn.example.com/generated.png")
+        XCTAssertFalse(result?.isServerLocalPath ?? true)
+    }
+
+    func testGeneratedImageToolResultFallsThroughToFirstNonEmptyLocator() {
+        let result = GeneratedImageToolResult(resultJSON: """
+        {"host_image":"   ","image":"","agent_visible_image":"/tmp/hermes-generated.png"}
+        """)
+
+        XCTAssertEqual(result?.reference, "/tmp/hermes-generated.png")
+        XCTAssertNil(result?.remoteURL)
+        XCTAssertTrue(result?.isServerLocalPath ?? false)
+    }
+
+    func testGeneratedImageToolResultNilForEmptyOrMissingLocator() {
+        XCTAssertNil(GeneratedImageToolResult(resultJSON: ""))
+        XCTAssertNil(GeneratedImageToolResult(resultJSON: "{\"ok\":true}"))
+    }
+
+    func testToolClusterGeneratedImageBranchOnlyForImageGenerate() {
+        let preview = "{\"image\":\"https://cdn.example.com/generated.png\"}"
+        let imageTool = ToolActivity(
+            id: "tool-1",
+            name: GeneratedImageToolResult.toolName,
+            argsSummary: "{}",
+            progressText: "",
+            resultPreview: preview,
+            state: .done,
+            durationMs: 1200,
+            todos: nil
+        )
+        let nonImageTool = ToolActivity(
+            id: "tool-2",
+            name: "web_search",
+            argsSummary: "{}",
+            progressText: "",
+            resultPreview: preview,
+            state: .done,
+            durationMs: nil,
+            todos: nil
+        )
+
+        XCTAssertEqual(ToolClusterView.generatedImageResult(for: imageTool)?.reference,
+                       "https://cdn.example.com/generated.png")
+        XCTAssertNil(ToolClusterView.generatedImageResult(for: nonImageTool),
+                     "Only image_generate should take the native image-card branch")
+    }
 }
