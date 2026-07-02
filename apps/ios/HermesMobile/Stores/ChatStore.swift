@@ -759,9 +759,22 @@ final class ChatStore {
                "a foreign message.start must have set streamingIsForeign before beginning the stream")
         // A tool event may already have created the streaming message; reuse it.
         if streamingMessageID == nil {
-            let message = ChatMessage(role: .assistant, isStreaming: true)
-            streamingMessageID = message.id
-            messages.append(message)
+            if !foreign,
+               let reconnectID = pendingReconnectReconcileID,
+               let index = messages.firstIndex(where: { $0.id == reconnectID && $0.role == .assistant }) {
+                // ABH-276: after a transport drop, the half-streamed local reply is
+                // left visible with a "Connection lost" warning. If the gateway
+                // resumes that same server turn before the reconnect backfill
+                // settles, stream back INTO that interrupted row. Appending a
+                // fresh assistant here creates the duplicate-bubble race: warning
+                // row + resumed row for one logical reply.
+                streamingMessageID = reconnectID
+                messages[index].isStreaming = true
+            } else {
+                let message = ChatMessage(role: .assistant, isStreaming: true)
+                streamingMessageID = message.id
+                messages.append(message)
+            }
         } else {
             mutateStreaming { $0.isStreaming = true }
         }
@@ -1523,6 +1536,7 @@ final class ChatStore {
         // now driving this stored session locally, so a stray foreign
         // `message.complete` can never tear our turn down. ownership/display:
         // LOCAL.
+        pendingReconnectReconcileID = nil
         beginLocalTurn()
 
         // Upload + attach any queued images first; abort the send on failure so
@@ -1666,6 +1680,7 @@ final class ChatStore {
 
         // Edit/retry is a genuinely-local turn: `cancelStreaming()` above cleared
         // the prior token, so claim a fresh one. ownership=LOCAL.
+        pendingReconnectReconcileID = nil
         beginLocalTurn()
         setStreaming(true, reason: "submitTruncating.localTurn")
         lastError = nil
@@ -2057,6 +2072,19 @@ final class ChatStore {
     /// row count are preserved (no blink, no restack). Cleared once consumed.
     private var pendingForeignReconcileID: UUID?
 
+    /// The id of a genuinely-local assistant row that was cut off by a transport
+    /// drop and left visible with a "Connection lost" warning (ABH-276/278).
+    ///
+    /// During reconnect, REST backfill and resumed WS frames race each other:
+    ///  - if REST returns first, the server may not have persisted the resumed
+    ///    assistant row yet, so a normal reconcile would evict the warning row;
+    ///  - if WS returns first, `message.start` would normally append a fresh
+    ///    streaming assistant row, duplicating the interrupted bubble for one turn.
+    /// This marker lets both paths treat the interrupted row as the reconnect
+    /// placeholder until the resumed turn settles or a fresh user action starts a
+    /// new local turn.
+    private var pendingReconnectReconcileID: UUID?
+
     /// Merge `incoming` (a freshly-built seed) onto `messages` IN PLACE, preserving
     /// SwiftUI identity wherever it can so a reseed/reconcile does not remount rows
     /// (contract Batch E §3.7 / D9):
@@ -2083,6 +2111,7 @@ final class ChatStore {
     private func reconcileMessages(with incoming: [ChatMessage]) {
         let placeholderID = pendingForeignReconcileID
         pendingForeignReconcileID = nil
+        let reconnectID = pendingReconnectReconcileID
 
         // Fast path: nothing to preserve identity against.
         guard !messages.isEmpty else {
@@ -2097,6 +2126,11 @@ final class ChatStore {
         // unmatched trailing assistant), so track whether it has been consumed.
         var placeholderConsumed = false
         let placeholderRow: ChatMessage? = placeholderID.flatMap { existingByID[$0] }
+        var reconnectConsumed = false
+        let reconnectRow: ChatMessage? = reconnectID.flatMap { existingByID[$0] }
+        let reconnectAdoptTargetID: UUID? = reconnectRow == nil
+            ? nil
+            : incoming.last(where: { $0.role == .assistant })?.id
 
         var rebuilt: [ChatMessage] = []
         rebuilt.reserveCapacity(incoming.count)
@@ -2127,10 +2161,45 @@ final class ChatStore {
                     presentation: newMessage.presentation
                 )
                 rebuilt.append(adopted)
+            } else if !reconnectConsumed,
+                      let reconnect = reconnectRow,
+                      let reconnectAdoptTargetID,
+                      newMessage.id == reconnectAdoptTargetID,
+                      newMessage.role == .assistant,
+                      reconnect.role == .assistant {
+                // ABH-278: the persisted final assistant row belongs to the local
+                // reply whose socket died. Adopt the interrupted warning row's
+                // identity for the TRAILING assistant in the authoritative seed so
+                // reconnect updates in place instead of replacing the bubble. If
+                // REST is temporarily behind and has no assistant yet, the row is
+                // preserved below and the marker stays armed.
+                reconnectConsumed = true
+                pendingReconnectReconcileID = nil
+                let adopted = ChatMessage(
+                    id: reconnect.id,
+                    role: newMessage.role,
+                    parts: newMessage.parts,
+                    isStreaming: newMessage.isStreaming,
+                    timestamp: newMessage.timestamp,
+                    presentation: newMessage.presentation
+                )
+                rebuilt.append(adopted)
             } else {
                 // Genuinely-new row.
                 rebuilt.append(newMessage)
             }
+        }
+        if !reconnectConsumed,
+           let reconnect = reconnectRow,
+           !rebuilt.contains(where: { $0.id == reconnect.id }) {
+            // ABH-278: REST can be a moment behind the resumed turn. Preserve the
+            // interrupted local row instead of evicting the in-flight reply /
+            // warning just because the backfill snapshot does not include it yet.
+            // Keep `pendingReconnectReconcileID` armed so a later seed containing
+            // the final assistant row can still adopt this identity.
+            rebuilt.append(reconnect)
+        } else if reconnectID != nil, reconnectRow == nil {
+            pendingReconnectReconcileID = nil
         }
         messages = rebuilt
     }
@@ -2798,6 +2867,7 @@ final class ChatStore {
         // A pending foreign-reconcile adoption belongs to the session being torn
         // down (§3.7); never let it bleed into the next session's first seed.
         pendingForeignReconcileID = nil
+        pendingReconnectReconcileID = nil
         transcriptGeneration = 0
     }
 
@@ -2957,6 +3027,7 @@ final class ChatStore {
             // list consistent with every other warning path (review fix #1).
             if message.warning == nil { message.setWarningPart("Connection lost") }
         }
+        pendingReconnectReconcileID = streamingMessageID
         if activeToolName != nil { onToolChange?(nil) }
         cancelStreaming()
         // Every prompt card rode the transport that just died. The secure

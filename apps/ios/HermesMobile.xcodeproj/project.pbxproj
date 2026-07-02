@@ -12,6 +12,7 @@
 		0339EF695F11A46D749622BA /* WorkspaceGroupingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE3210EFAC9C7C6C4AEEAA87 /* WorkspaceGroupingTests.swift */; };
 		03DEF22D7E9FC1413B99811E /* WSLivenessTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED6761AF4D3C165A3D28513A /* WSLivenessTests.swift */; };
 		06147AA99077BD3C371688C3 /* ConnectionPhaseTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F204B0D2DECE61198DC0214 /* ConnectionPhaseTests.swift */; };
+		6D7F62CDB43ADF24FB22DC67 /* ChatStoreReconnectReconcileTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A96C5C4FD17F26F67C699B0 /* ChatStoreReconnectReconcileTests.swift */; };
 		0651DE03B76616FE3685FF31 /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = F4626C6249AB0179602E1A85 /* GRDB */; };
 		066637F6B204895D00467030 /* ShareSheetView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3154F94BA54D788E73210763 /* ShareSheetView.swift */; };
 		0B3F2A34BD64AFF0701D3591 /* HermesGatewayClient+LearningJourney.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BA2233D8338EF62C33A469B /* HermesGatewayClient+LearningJourney.swift */; };
@@ -370,6 +371,7 @@
 		7EC4407253571CD5205DA35C /* ThemeStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemeStore.swift; sourceTree = "<group>"; };
 		7EE5F3863A3EA975DE8F9296 /* AttachmentStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentStore.swift; sourceTree = "<group>"; };
 		7F204B0D2DECE61198DC0214 /* ConnectionPhaseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionPhaseTests.swift; sourceTree = "<group>"; };
+		4A96C5C4FD17F26F67C699B0 /* ChatStoreReconnectReconcileTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStoreReconnectReconcileTests.swift; sourceTree = "<group>"; };
 		8040C48AF470178E56982EAA /* GatewayStatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayStatusView.swift; sourceTree = "<group>"; };
 		80BD0B5587C73D216BD204A8 /* KeychainService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainService.swift; sourceTree = "<group>"; };
 		81DC25B8CA2D9C02AD703712 /* QRScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScannerView.swift; sourceTree = "<group>"; };
@@ -825,6 +827,7 @@
 				B4BB9FEA0A68AA2D6AB23F3B /* ChatStoreForeignMirrorTests.swift */,
 				FDE99B5373A56D4136876F8A /* ChatStoreSeedParityTests.swift */,
 				7F204B0D2DECE61198DC0214 /* ConnectionPhaseTests.swift */,
+				4A96C5C4FD17F26F67C699B0 /* ChatStoreReconnectReconcileTests.swift */,
 				24872443B57B418F80C270E9 /* ConnectionStoreReconnectTests.swift */,
 				185C959B33CC2105062209B4 /* ContextMeterTests.swift */,
 				E11A41924097383D37603684 /* DeepLinkRouterTests.swift */,
@@ -1174,6 +1177,7 @@
 				3232D7ACF32443BBD3CF8DC2 /* ChatStoreForeignMirrorTests.swift in Sources */,
 				D240AECBED85AA6D2B161A83 /* ChatStoreSeedParityTests.swift in Sources */,
 				06147AA99077BD3C371688C3 /* ConnectionPhaseTests.swift in Sources */,
+				6D7F62CDB43ADF24FB22DC67 /* ChatStoreReconnectReconcileTests.swift in Sources */,
 				BCB59825F9154396928FE6D9 /* ConnectionStoreReconnectTests.swift in Sources */,
 				903A90AEE635376F613D0A73 /* ContextMeterTests.swift in Sources */,
 				C8FDBABB61DF3EEAC609590C /* DeepLinkRouterTests.swift in Sources */,
