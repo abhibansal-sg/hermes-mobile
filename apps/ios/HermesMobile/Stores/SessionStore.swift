@@ -151,12 +151,13 @@ final class SessionStore {
     /// Last human-readable error from a session operation, for the UI to surface.
     var lastError: String?
 
-    /// Set when a session mutation (delete/archive/rename) fails, for the drawer
-    /// to surface as a transient toast/alert. nil when there is nothing to show.
+    /// Set when a session action (open/resume/delete/archive/rename) fails, for
+    /// the drawer to surface as a transient toast/alert. nil when there is
+    /// nothing to show.
     ///
-    /// This is the dedicated, observed surface for mutation failures (ABH-73):
+    /// This is the dedicated, observed surface for session failures (ABH-73):
     /// ``lastError`` is a catch-all that nothing in the drawer watches, so a
-    /// failed delete used to vanish silently. The drawer binds a system `.alert`
+    /// failed delete/open used to vanish silently. The drawer binds a system `.alert`
     /// to this value (`DrawerView`); ``lastError`` is still written too for the
     /// other call sites that read it. `nil` = nothing to show / silent success.
     #if DEBUG
@@ -542,8 +543,8 @@ final class SessionStore {
     private static let maxEnsureRuntimeAttempts = 3
 
     /// Injectable `session.resume` RPC (tests). Defaults to the live gateway
-    /// request; a test stages a `SessionOpenResult` so the supersession guard in
-    /// ``resumeActiveAfterReconnect()`` is exercisable without a network.
+    /// request; tests stage a `SessionOpenResult` or failure so `open()` and
+    /// ``resumeActiveAfterReconnect()`` are exercisable without a network.
     var resumeRPC: ((_ storedId: String, _ params: [String: JSONValue]) async throws -> SessionOpenResult)?
 
     /// Supersede any in-flight on-demand re-resume (``ensureActiveRuntime()``) so a
@@ -1816,18 +1817,25 @@ final class SessionStore {
         // Slow path: gateway resume — spins up the agent server-side; only
         // prompt submission depends on it.
         Task { [weak self] in
-            guard let self, let client = self.client else { return }
+            guard let self, self.client != nil || self.resumeRPC != nil else { return }
             do {
                 // Thread the active profile scope so a profile-scoped resume lands
                 // in the right per-profile home. Omitted for the default/all scope
                 // (and every dormant case) — byte-for-byte the shipped resume.
                 var resumeParams: [String: JSONValue] = ["session_id": .string(summary.id)]
                 self.applyProfileScope(to: &resumeParams)
-                let result: SessionOpenResult = try await client.request(
-                    "session.resume",
-                    params: .object(resumeParams),
-                    timeout: .seconds(120)
-                )
+                let result: SessionOpenResult
+                if let resumeRPC = self.resumeRPC {
+                    result = try await resumeRPC(summary.id, resumeParams)
+                } else if let client = self.client {
+                    result = try await client.request(
+                        "session.resume",
+                        params: .object(resumeParams),
+                        timeout: .seconds(120)
+                    )
+                } else {
+                    return
+                }
                 guard self.openToken == token else { return }  // superseded
                 self.activeRuntimeId = result.sessionId
                 // Confirm/seed the active-profile pref from the server's echo: the
@@ -1855,6 +1863,7 @@ final class SessionStore {
                     Task { [weak self] in await self?.refresh() }
                 }
                 self.lastError = nil
+                self.sessionActionError = nil
                 // Runtime bound: clear the self-heal budget and flush anything the
                 // composer queued during this resume window (an idle desktop-driven
                 // session emits no turn-completion to trigger a drain otherwise).
@@ -1869,8 +1878,9 @@ final class SessionStore {
                 await self.chat?.seedContextUsageFromStatus(runtimeId: result.sessionId)
             } catch {
                 guard self.openToken == token else { return }
-                self.lastError = (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
+                let message = self.errorMessage(from: error)
+                self.lastError = message
+                self.sessionActionError = SessionActionError(action: "Open Session", message: message)
             }
         }
     }
@@ -2184,9 +2194,13 @@ final class SessionStore {
             confirmActiveProfile(from: result.info)
             // Keep the composer pill session-true on this resume path too.
             if let info = result.info { connection?.applyRuntimeInfo(info) }
+            lastError = nil
+            sessionActionError = nil
             return result.sessionId
         } catch {
-            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            let message = errorMessage(from: error)
+            lastError = message
+            sessionActionError = SessionActionError(action: "Resume Session", message: message)
             return nil
         }
     }
@@ -3071,7 +3085,7 @@ final class SessionStore {
     }
 }
 
-/// A surfaced failure from a session-list mutation (delete/archive/rename).
+/// A surfaced failure from a session action (open/resume/delete/archive/rename).
 ///
 /// Owned by ``SessionStore`` and published via ``SessionStore/sessionActionError``
 /// for the drawer to present as a system alert (ABH-73 — failures used to be
@@ -3080,7 +3094,7 @@ final class SessionStore {
 /// tracking and tests.
 struct SessionActionError: Identifiable, Equatable {
     let id = UUID()
-    /// The verb shown in the alert title ("Delete", "Archive", "Rename").
+    /// The verb shown in the alert title ("Open Session", "Delete", "Archive").
     let action: String
     /// Human-readable detail — the gateway error message where available.
     let message: String

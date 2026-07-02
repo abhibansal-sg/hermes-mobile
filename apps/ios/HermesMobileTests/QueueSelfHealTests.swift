@@ -40,6 +40,10 @@ final class QueueSelfHealTests: XCTestCase {
         return (chat, sessions)
     }
 
+    private struct ResumeFailure: LocalizedError {
+        var errorDescription: String? { "resume exploded" }
+    }
+
     // MARK: - A3: restamp migrates queued prompts parent → continuation
 
     func testRestampMigratesMatchingPromptsAndPreservesOrder() {
@@ -168,5 +172,20 @@ final class QueueSelfHealTests: XCTestCase {
         XCTAssertEqual(rid, "rt-A", "an un-superseded resume binds the runtime")
         XCTAssertEqual(sessions.activeRuntimeId, "rt-A")
         XCTAssertEqual(sessions.activeStoredId, "A")
+    }
+
+    func testResumeFailureSurfacesObservedSessionActionError() async {
+        let (_, sessions) = makeStores()
+        sessions.activeStoredId = "A"
+        sessions.activeRuntimeId = nil
+        sessions.resumeRPC = { _, _ in throw ResumeFailure() }
+
+        let rid = await sessions.resumeActiveAfterReconnect()
+
+        XCTAssertNil(rid, "a failed reconnect resume leaves the runtime unbound")
+        XCTAssertEqual(sessions.lastError, "resume exploded")
+        XCTAssertEqual(sessions.sessionActionError?.action, "Resume Session")
+        XCTAssertEqual(sessions.sessionActionError?.message, "resume exploded",
+                       "resume failures must route to the drawer-observed alert channel, not only lastError")
     }
 }
