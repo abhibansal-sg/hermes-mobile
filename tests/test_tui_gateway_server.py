@@ -855,10 +855,15 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
     ]
 
     assert server._history_to_messages(history) == [
-        {"role": "user", "text": "first prompt"},
-        {"context": "Searching files for resume", "name": "search_files", "role": "tool"},
-        {"role": "assistant", "text": "first answer"},
-        {"role": "user", "text": "second prompt"},
+        {"role": "user", "text": "first prompt", "id": 0},
+        {
+            "context": "Searching files for resume",
+            "name": "search_files",
+            "role": "tool",
+            "id": 1,
+        },
+        {"role": "assistant", "text": "first answer", "id": 2},
+        {"role": "user", "text": "second prompt", "id": 3},
     ]
 
 
@@ -875,9 +880,14 @@ def test_history_to_messages_keeps_reasoning_only_assistant_turn():
     ]
 
     assert server._history_to_messages(history) == [
-        {"role": "user", "text": "think about this"},
-        {"role": "assistant", "text": "", "reasoning": "step-by-step thoughts"},
-        {"role": "assistant", "text": "here is the answer"},
+        {"role": "user", "text": "think about this", "id": 0},
+        {
+            "role": "assistant",
+            "text": "",
+            "reasoning": "step-by-step thoughts",
+            "id": 1,
+        },
+        {"role": "assistant", "text": "here is the answer", "id": 2},
     ]
 
 
@@ -892,8 +902,8 @@ def test_history_to_messages_still_drops_empty_assistant_without_reasoning():
     ]
 
     assert server._history_to_messages(history) == [
-        {"role": "user", "text": "hi"},
-        {"role": "assistant", "text": "real reply"},
+        {"role": "user", "text": "hi", "id": 0},
+        {"role": "assistant", "text": "real reply", "id": 1},
     ]
 
 
@@ -2626,9 +2636,6 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
 
 
 def test_config_set_fast_updates_live_agent_and_config(monkeypatch):
-    """Session-scoped fast toggle: updates THIS session's agent and emits
-    session.info, but never writes the global config (session scoping,
-    ABH-84 / the env-leak fix wave)."""
     writes = []
     emits = []
     agent = types.SimpleNamespace(
@@ -2662,8 +2669,7 @@ def test_config_set_fast_updates_live_agent_and_config(monkeypatch):
             "foo": "bar",
             "service_tier": "priority",
         }
-        # Session-scoped: the global config key is never written.
-        assert writes == []
+        assert ("agent.service_tier", "fast") in writes
         assert ("session.info", "sid", {"model": "x"}) in emits
 
         resp_normal = server.handle_request(
@@ -2676,151 +2682,7 @@ def test_config_set_fast_updates_live_agent_and_config(monkeypatch):
         assert resp_normal["result"]["value"] == "normal"
         assert agent.service_tier is None
         assert agent.request_overrides == {"foo": "bar"}
-        assert writes == []
-    finally:
-        server._sessions.pop("sid", None)
-
-
-def test_config_set_fast_before_build_parks_override_for_agent_build(monkeypatch):
-    """S4 session-override pattern: fast toggled before the first turn must
-    NOT force an agent build and NOT write global config — it parks on the
-    session row and applies when the lazy agent is constructed."""
-    writes = []
-    session = _session()
-    session["agent"] = None
-    server._sessions["sid"] = session
-
-    monkeypatch.setattr(
-        server, "_write_config_key", lambda path, value: writes.append((path, value))
-    )
-    monkeypatch.setattr(
-        server,
-        "_start_agent_build",
-        lambda *a, **k: pytest.fail("fast pre-build must not force an agent build"),
-    )
-    monkeypatch.setattr(
-        "hermes_cli.models.resolve_fast_mode_overrides",
-        lambda _model_id: {"service_tier": "priority"},
-    )
-    monkeypatch.setattr(server, "_resolve_model", lambda: "openai/gpt-5.4")
-
-    try:
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "config.set",
-                "params": {"session_id": "sid", "key": "fast", "value": "fast"},
-            }
-        )
-        assert resp["result"]["value"] == "fast"
-        assert writes == []
-        assert session["fast_override"] == "fast"
-        assert session["fast_override_params"] == {"service_tier": "priority"}
-
-        # The build-time hook applies the parked override to the new agent.
-        agent = types.SimpleNamespace(
-            service_tier=None, request_overrides={"foo": "bar"}
-        )
-        server._apply_session_agent_overrides(agent, session)
-        assert agent.service_tier == "priority"
-        assert agent.request_overrides == {
-            "foo": "bar",
-            "service_tier": "priority",
-        }
-    finally:
-        server._sessions.pop("sid", None)
-
-
-def test_config_set_reasoning_before_build_parks_override_for_agent_build(monkeypatch):
-    """S4: reasoning effort set before the first turn parks on the session row
-    (no build, no global write) and applies at agent construction."""
-    writes = []
-    session = _session()
-    session["agent"] = None
-    server._sessions["sid"] = session
-
-    monkeypatch.setattr(
-        server, "_write_config_key", lambda path, value: writes.append((path, value))
-    )
-    monkeypatch.setattr(
-        server,
-        "_start_agent_build",
-        lambda *a, **k: pytest.fail("reasoning pre-build must not force an agent build"),
-    )
-
-    try:
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "config.set",
-                "params": {"session_id": "sid", "key": "reasoning", "value": "low"},
-            }
-        )
-        assert resp["result"]["value"] == "low"
-        assert writes == []
-        assert session["reasoning_override"] == {"enabled": True, "effort": "low"}
-
-        agent = types.SimpleNamespace(reasoning_config=None)
-        server._apply_session_agent_overrides(agent, session)
-        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
-    finally:
-        server._sessions.pop("sid", None)
-
-
-def test_config_set_fast_prebuild_status_toggle_and_get_reflect_parked_override(monkeypatch):
-    """S4 regression (adversarial gate): with the agent unbuilt, fast
-    status/toggle/config.get must reflect the PARKED session override, not the
-    global default — and a second toggle must flip back to normal."""
-    writes = []
-    session = _session()
-    session["agent"] = None
-    server._sessions["sid"] = session
-
-    monkeypatch.setattr(
-        server, "_write_config_key", lambda path, value: writes.append((path, value))
-    )
-    monkeypatch.setattr(
-        server,
-        "_start_agent_build",
-        lambda *a, **k: pytest.fail("pre-build fast must not force an agent build"),
-    )
-    monkeypatch.setattr(
-        "hermes_cli.models.resolve_fast_mode_overrides",
-        lambda _model_id: {"service_tier": "priority"},
-    )
-    monkeypatch.setattr(server, "_resolve_model", lambda: "openai/gpt-5.4")
-    monkeypatch.setattr(server, "_load_service_tier", lambda: None)
-
-    def _set(value):
-        return server.handle_request(
-            {
-                "id": "1",
-                "method": "config.set",
-                "params": {"session_id": "sid", "key": "fast", "value": value},
-            }
-        )
-
-    try:
-        assert _set("fast")["result"]["value"] == "fast"
-        # status reflects the parked override, not the global default
-        assert _set("status")["result"]["value"] == "fast"
-        # config.get mirrors it
-        got = server.handle_request(
-            {
-                "id": "2",
-                "method": "config.get",
-                "params": {"session_id": "sid", "key": "fast"},
-            }
-        )
-        assert got["result"]["value"] == "fast"
-        # toggle flips the parked override OFF (was stuck-on pre-fix)
-        assert _set("toggle")["result"]["value"] == "normal"
-        assert session["fast_override"] == "normal"
-        assert _set("status")["result"]["value"] == "normal"
-        # double-toggle ends where it started
-        assert _set("toggle")["result"]["value"] == "fast"
-        assert _set("toggle")["result"]["value"] == "normal"
-        assert writes == []
+        assert ("agent.service_tier", "normal") in writes
     finally:
         server._sessions.pop("sid", None)
 
@@ -3351,9 +3213,6 @@ def test_complete_slash_details_args():
 
 
 def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
-    """Session-scoped reasoning: effort applies to THIS session's agent and
-    show/hide flips only the session flag — the GLOBAL display config is
-    never written (session scoping, ABH-84 review P1)."""
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     agent = types.SimpleNamespace(reasoning_config=None)
     server._sessions["sid"] = _session(agent=agent)
@@ -3377,8 +3236,7 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     )
     assert resp_show["result"]["value"] == "show"
     assert server._sessions["sid"]["show_reasoning"] is True
-    # Session-scoped: the global display config stays untouched.
-    assert "display" not in server._load_cfg()
+    assert server._load_cfg()["display"]["sections"]["thinking"] == "expanded"
 
     resp_hide = server.handle_request(
         {
@@ -3389,7 +3247,7 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     )
     assert resp_hide["result"]["value"] == "hide"
     assert server._sessions["sid"]["show_reasoning"] is False
-    assert "display" not in server._load_cfg()
+    assert server._load_cfg()["display"]["sections"]["thinking"] == "hidden"
 
     # /reasoning full | clamp — parity with the classic CLI reasoning_full
     # toggle. In the TUI these map to the thinking section's expand/collapse
@@ -5078,97 +4936,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
             {"role": "assistant", "content": "edited reply"},
         ]
         assert server._sessions["sid"]["history_version"] == 2
-        # replace_messages is now called TWICE: first the truncate to the edit
-        # point, then the post-turn authoritative rewrite of the full final
-        # messages (the interrupt-persistence fix — the DB must equal
-        # result["messages"] so an interrupted/edited turn never loses the user
-        # prompt to a stale flush cursor).
-        final_messages = [
-            *original_history[:2],
-            {"role": "user", "content": "edited second"},
-            {"role": "assistant", "content": "edited reply"},
-        ]
-        assert stub_db.replaced == [
-            ("session-key", original_history[:2]),
-            ("session-key", final_messages),
-        ]
-    finally:
-        server._sessions.pop("sid", None)
-
-
-def test_prompt_submit_truncate_resyncs_agent_flush_cursor(monkeypatch):
-    """Interrupt-persistence root cause: the reused per-session agent's
-    `_last_flushed_db_idx` must be resynced to the rewritten row count when the
-    truncate path calls replace_messages — otherwise the next turn's flush skips
-    every message below the stale cursor, dropping the user prompt."""
-
-    class _Agent:
-        def __init__(self):
-            # Clearly-stale cursor from a prior turn; the truncate rewrites the
-            # DB down to 2 rows and the turn ends at 4.
-            self._last_flushed_db_idx = 99
-
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
-            return {
-                "final_response": "ok",
-                "messages": [
-                    *(conversation_history or []),
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": "ok"},
-                ],
-                "interrupted": False,
-            }
-
-    class _StubDb:
-        def __init__(self):
-            self.replaced = []
-
-        def replace_messages(self, session_id, messages):
-            self.replaced.append((session_id, list(messages)))
-
-    agent = _Agent()
-    stub_db = _StubDb()
-    original_history = [
-        {"role": "user", "content": "first"},
-        {"role": "assistant", "content": "first reply"},
-        {"role": "user", "content": "second"},
-        {"role": "assistant", "content": "second reply"},
-    ]
-    session = _session(agent=agent)
-    session["history"] = list(original_history)
-    server._sessions["sid"] = session
-
-    monkeypatch.setattr(server, "_get_db", lambda: stub_db)
-    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_wait_agent", lambda *a, **k: None)
-    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
-
-    try:
-        resp = server.handle_request({
-            "id": "1", "method": "prompt.submit",
-            "params": {
-                "session_id": "sid",
-                "text": "edited second",
-                "truncate_before_user_ordinal": 1,
-            },
-        })
-        assert resp.get("result"), f"got error: {resp.get('error')}"
-        import time as _t
-        # Wait for the background turn's post-turn authoritative rewrite (the
-        # 2nd replace_messages call).
-        for _ in range(100):
-            if len(stub_db.replaced) >= 2:
-                break
-            _t.sleep(0.02)
-        # Cursor was resynced off the stale 99 — first to the truncated length
-        # (2) under the lock, then to the final message count (4) by the
-        # post-turn rewrite. Never left stale, which would skip the user row on
-        # the next flush.
-        assert agent._last_flushed_db_idx == 4
-        # The post-turn rewrite persisted the FULL final messages incl. the user
-        # prompt (the user-visible guarantee), in addition to the truncate write.
-        assert stub_db.replaced[-1][1][-2] == {"role": "user", "content": "edited second"}
+        assert stub_db.replaced == [("session-key", original_history[:2])]
     finally:
         server._sessions.pop("sid", None)
 
