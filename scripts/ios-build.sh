@@ -141,7 +141,11 @@ acquire_lock
 log "lock acquired. building: xcodebuild ${args[*]}"
 log "derivedData=${DEFAULT_DD} (unless overridden) | timeout=${TIMEOUT}s | log=$LOG"
 
-xcodebuild "${args[@]}" >"$LOG" 2>&1 &
+# HERMES_IOS_WRAPPER_ACTIVE=1 tells the ~/.hermes/bin/xcodebuild PATH shim that this
+# invocation is wrapper-owned (mutex held) — the shim passes it straight to the real
+# binary instead of re-routing (which would recurse). Raw calls WITHOUT this env get
+# intercepted by the shim and routed here, so no un-serialized xcodebuild can run.
+HERMES_IOS_WRAPPER_ACTIVE=1 /usr/bin/xcodebuild "${args[@]}" >"$LOG" 2>&1 &
 BUILD_PID=$!
 
 # Watchdog: three triggers, all SIGTERM-only (NEVER -9).
