@@ -8,6 +8,8 @@ import SwiftUI
 /// - System / tool: small, centered, secondary captions.
 struct MessageBubble: View {
     @Environment(\.hermesTheme) private var theme
+    @Environment(ConnectionStore.self) private var connectionStore
+    @Environment(SessionStore.self) private var sessionStore
 
     /// The message to render.
     let message: ChatMessage
@@ -229,16 +231,32 @@ struct MessageBubble: View {
     @State private var userBubbleExpanded = false
 
     private var userBubble: some View {
-        HStack {
+        let attachmentInput = Self.sentImageAttachments(in: message.text)
+        let displayText = attachmentInput.displayText
+        return HStack {
             Spacer(minLength: 0)
             VStack(alignment: .trailing, spacing: 0) {
-                Text(message.text)
-                    .foregroundStyle(theme.userBubble.contrastingForeground)
-                    .lineLimit(userBubbleExpanded ? nil : Self.userBubbleCollapsedLines)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
-                    .textSelection(.enabled)
-                if shouldShowReadMore {
+                ForEach(attachmentInput.attachments) { attachment in
+                    SentImageThumbnailView(
+                        attachment: attachment,
+                        rest: connectionStore.rest,
+                        serverId: connectionStore.serverURLString,
+                        profileId: sessionStore.activeProfile,
+                        sessionId: sessionStore.activeRuntimeId ?? ""
+                    )
+                    .padding(.horizontal, 8)
+                    .padding(.top, 8)
+                    .padding(.bottom, displayText.isEmpty ? 8 : 0)
+                }
+                if !displayText.isEmpty {
+                    Text(displayText)
+                        .foregroundStyle(theme.userBubble.contrastingForeground)
+                        .lineLimit(userBubbleExpanded ? nil : Self.userBubbleCollapsedLines)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                        .textSelection(.enabled)
+                }
+                if shouldShowReadMore(for: displayText) {
                     Button {
                         userBubbleExpanded.toggle()
                     } label: {
@@ -262,7 +280,7 @@ struct MessageBubble: View {
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(MessageBubble.bubbleAccessibilityLabel(
                         role: message.role,
-                        text: message.text
+                        text: displayText
                     ))
             }
             .modifier(PerfUserBubbleChrome())
@@ -274,7 +292,11 @@ struct MessageBubble: View {
     /// Long enough means above the collapse threshold (approximately 8 lines of
     /// prose). We estimate using character count to avoid a layout pass.
     var shouldShowReadMore: Bool {
-        Self.isLongUserMessage(message.text)
+        Self.isLongUserMessage(Self.sentImageAttachments(in: message.text).displayText)
+    }
+
+    private func shouldShowReadMore(for text: String) -> Bool {
+        Self.isLongUserMessage(text)
     }
 
     /// Returns true when the message text is long enough to warrant the collapse
@@ -703,6 +725,82 @@ struct MessageBubble: View {
         return (usage.input ?? 0) + (usage.output ?? 0)
     }
 
+    // MARK: - Sent-image attachment hints
+
+    struct SentImageAttachment: Identifiable, Sendable, Equatable {
+        let name: String
+        let filename: String
+
+        var id: String { name }
+    }
+
+    struct SentImageAttachmentInput: Sendable, Equatable {
+        let displayText: String
+        let attachments: [SentImageAttachment]
+    }
+
+    /// Parse the gateway's image-attachment hint lines out of a user message.
+    ///
+    /// ``image.attach`` / native image routing stores text like
+    /// `[Image attached at: ~/.hermes/uploads/<opaque>.jpg]` in the persisted user
+    /// row. The human bubble should render the actual image thumbnail and keep the
+    /// prose caption, not show that machine hint as chat text. If a hint is present
+    /// but unsafe/unsupported, return the original text unchanged so the user still
+    /// gets an honest filename fallback.
+    nonisolated static func sentImageAttachments(in text: String) -> SentImageAttachmentInput {
+        let lines = text.components(separatedBy: .newlines)
+        var displayLines: [String] = []
+        var attachments: [SentImageAttachment] = []
+
+        for line in lines {
+            guard let target = attachmentTarget(from: line) else {
+                displayLines.append(line)
+                continue
+            }
+            guard let attachment = sentImageAttachment(from: target) else {
+                return SentImageAttachmentInput(displayText: text, attachments: [])
+            }
+            attachments.append(attachment)
+        }
+
+        guard !attachments.isEmpty else {
+            return SentImageAttachmentInput(displayText: text, attachments: [])
+        }
+        let cleaned = displayLines
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return SentImageAttachmentInput(displayText: cleaned, attachments: attachments)
+    }
+
+    private nonisolated static func attachmentTarget(from line: String) -> String? {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        for prefix in ["[Image attached at: ", "[User attached image: "] {
+            guard trimmed.hasPrefix(prefix), trimmed.hasSuffix("]") else { continue }
+            let start = trimmed.index(trimmed.startIndex, offsetBy: prefix.count)
+            let end = trimmed.index(before: trimmed.endIndex)
+            return String(trimmed[start..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
+    }
+
+    private nonisolated static func sentImageAttachment(from target: String) -> SentImageAttachment? {
+        guard !target.isEmpty,
+              !target.contains(".."),
+              !target.contains("\\")
+        else { return nil }
+        let name = target.split(separator: "/").last.map(String.init) ?? target
+        guard name == name.trimmingCharacters(in: .whitespacesAndNewlines),
+              name.range(of: #"^[A-Za-z0-9._-]+$"#, options: .regularExpression) != nil,
+              !name.contains(".."),
+              sentImageExtensions.contains(URL(fileURLWithPath: name).pathExtension.lowercased())
+        else { return nil }
+        return SentImageAttachment(name: name, filename: name)
+    }
+
+    private nonisolated static let sentImageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif"
+    ]
+
     // MARK: - A11y: combined element label construction
 
     /// Returns the VoiceOver label for a settled bubble's combined accessibility
@@ -736,6 +834,126 @@ private extension Array where Element == ChatMessagePart {
             if case .text(let id, _) = part { return id }
         }
         return nil
+    }
+}
+
+private struct SentImageThumbnailView: View {
+    enum Phase: Equatable {
+        case idle
+        case loading
+        case loaded(UIImage)
+        case failed(String)
+    }
+
+    @Environment(\.hermesTheme) private var theme
+
+    let attachment: MessageBubble.SentImageAttachment
+    let rest: RestClient?
+    let serverId: String
+    let profileId: String
+    let sessionId: String
+
+    @State private var phase: Phase = .idle
+
+    var body: some View {
+        Group {
+            switch phase {
+            case .idle, .loading:
+                loadingView
+            case .loaded(let image):
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: thumbnailSize.width, height: thumbnailSize.height)
+                    .clipped()
+                    .accessibilityLabel("Attached image \(attachment.filename)")
+            case .failed:
+                failedView
+            }
+        }
+        .frame(width: thumbnailSize.width, height: thumbnailSize.height)
+        .background(theme.userBubble.contrastingForeground.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(theme.userBubble.contrastingForeground.opacity(0.16), lineWidth: 1)
+        )
+        .task(id: attachment.name) { await load() }
+    }
+
+    private var thumbnailSize: CGSize {
+        let width = min(UIScreen.main.bounds.width * 0.58, 220)
+        return CGSize(width: width, height: min(width * 0.72, 160))
+    }
+
+    private var loadingView: some View {
+        VStack(spacing: 8) {
+            ProgressView()
+                .tint(theme.userBubble.contrastingForeground.opacity(0.75))
+            Text("Loading image…")
+                .font(.caption2)
+                .foregroundStyle(theme.userBubble.contrastingForeground.opacity(0.70))
+        }
+    }
+
+    private var failedView: some View {
+        VStack(spacing: 7) {
+            Image(systemName: "photo.badge.exclamationmark")
+                .font(.title3)
+            Text("Image unavailable")
+                .font(.caption.weight(.semibold))
+            Text(attachment.filename)
+                .font(.caption2)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Button("Retry") {
+                Task { await load(force: true) }
+            }
+            .font(.caption2.weight(.semibold))
+        }
+        .foregroundStyle(theme.userBubble.contrastingForeground.opacity(0.78))
+        .padding(10)
+    }
+
+    private func load(force: Bool = false) async {
+        if case .loaded = phase, !force { return }
+        guard let rest else {
+            phase = .failed("Not connected")
+            return
+        }
+
+        let key = cacheKey
+        if !force, let key, let image = AttachmentBlobCache.shared.image(for: key) {
+            phase = .loaded(image)
+            return
+        }
+
+        phase = .loading
+        do {
+            let data = try await rest.attachmentData(name: attachment.name)
+            guard let image = UIImage(data: data) else {
+                phase = .failed("Attachment is not a decodable image")
+                return
+            }
+            if let key {
+                AttachmentBlobCache.shared.store(data, for: key)
+            }
+            phase = .loaded(image)
+        } catch {
+            phase = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
+    }
+
+    private var cacheKey: AttachmentBlobCache.Key? {
+        let server = serverId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !server.isEmpty else { return nil }
+        return AttachmentBlobCache.Key(
+            serverId: server,
+            profileId: profileId,
+            sessionId: sessionId,
+            path: "uploads/\(attachment.name)",
+            size: 0
+        )
     }
 }
 

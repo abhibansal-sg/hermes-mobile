@@ -160,6 +160,18 @@ struct ArtifactPage: Decodable, Sendable {
 // MARK: - Endpoint
 
 extension RestClient {
+    /// `GET /api/plugins/hermes-mobile/attachments/{name}` — fetch bytes for a
+    /// previously uploaded image attachment. ``name`` is the opaque basename from
+    /// the `/upload` returned path; older/non-plugin gateways 404 and callers
+    /// degrade to filename text.
+    func attachmentData(name: String) async throws -> Data {
+        guard pathStyle == .plugin else {
+            throw RestError.badStatus(404, body: "plugin path style not active")
+        }
+        let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+        return try await get(path: "\(mobileAPIPrefix)/attachments/\(encodedName)")
+    }
+
     /// `GET /api/plugins/hermes-mobile/artifacts?type=&limit=&offset=&q=` —
     /// cross-session artifact gallery (images, files, links).
     ///

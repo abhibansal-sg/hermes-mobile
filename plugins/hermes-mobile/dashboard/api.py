@@ -5,6 +5,7 @@ Mounted at ``/api/plugins/hermes-mobile/`` by the dashboard plugin system
 verbatim from ``hermes_cli/web_server.py`` in the ABH-88 de-patch (W1):
 
 * ``POST /upload``                — attachment upload bridge (was /api/upload)
+* ``GET  /attachments/{name}``    — authenticated upload byte fetch for mobile thumbnails
 * ``POST /approvals/respond``     — REST approval resolve (was /api/approvals/respond)
 * ``GET  /approvals/audit``       — approval audit read   (was /api/approvals/audit)
 * ``POST /devices/issue``         — mint per-device token (was /api/devices/issue)
@@ -32,6 +33,7 @@ import importlib
 import importlib.util
 import json as _json
 import logging
+import mimetypes
 import os
 import re as _re
 import secrets
@@ -45,7 +47,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Annotated
 
@@ -183,6 +185,30 @@ _UPLOAD_MAX_FILES = 200
 _UPLOAD_MAX_AGE_SECONDS = 7 * 24 * 3600
 
 
+def _resolve_uploaded_attachment(name: str) -> Path:
+    """Resolve an opaque upload filename under ``_UPLOAD_DIR``.
+
+    The upload endpoint writes unguessable ``<token>.<ext>`` files directly under
+    ``_UPLOAD_DIR``. Fetch accepts only that basename form: no slashes, no ``..``
+    substrings, a small bounded character set, and an extension the upload bridge
+    itself can create. This keeps the endpoint a byte-serve for uploaded images,
+    not a filesystem browser.
+    """
+    clean = (name or "").strip()
+    if (
+        not clean
+        or len(clean) > 160
+        or clean != Path(clean).name
+        or "/" in clean
+        or "\\" in clean
+        or ".." in clean
+        or not _re.fullmatch(r"[A-Za-z0-9._-]+", clean)
+        or Path(clean).suffix.lower() not in _UPLOAD_ALLOWED_EXTENSIONS
+    ):
+        raise HTTPException(status_code=400, detail="Invalid attachment name")
+    return _UPLOAD_DIR / clean
+
+
 def _prune_uploads() -> None:
     """Best-effort cleanup so the uploads dir can't grow unbounded."""
     try:
@@ -255,6 +281,26 @@ async def upload_attachment(request: Request):
 
     _prune_uploads()
     return {"path": str(dest), "size": len(data)}
+
+
+@router.get("/attachments/{name}")
+async def fetch_uploaded_attachment(name: str, request: Request):
+    """Return previously uploaded image bytes by opaque filename.
+
+    Auth mirrors ``/upload``: the dashboard/session-token middleware gates plugin
+    API routes, and the handler keeps the explicit in-route check. The route never
+    accepts paths — only the basename returned inside the ``/upload`` path — so a
+    mobile transcript can render a thumbnail without exposing arbitrary files.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    path = _resolve_uploaded_attachment(name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return FileResponse(path, media_type=media_type, filename=path.name)
 
 
 # ---------------------------------------------------------------------------

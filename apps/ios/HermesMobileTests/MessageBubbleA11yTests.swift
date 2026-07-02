@@ -57,6 +57,35 @@ final class MessageBubbleA11yTests: XCTestCase {
                        "empty text must produce a valid (empty-body) label without crashing")
     }
 
+    // MARK: - Sent-image attachment rendering inputs
+
+    func testSentImageAttachmentsExtractsOpaqueUploadNameAndCleansText() {
+        let raw = """
+        Please look at this.
+
+        [Image attached at: /Users/abhi/.hermes/uploads/abcdef0123456789abcdef0123456789.jpg]
+        """
+
+        let result = MessageBubble.sentImageAttachments(in: raw)
+
+        XCTAssertEqual(result.displayText, "Please look at this.")
+        XCTAssertEqual(result.attachments.map(\.name), ["abcdef0123456789abcdef0123456789.jpg"])
+        XCTAssertEqual(result.attachments.first?.filename, "abcdef0123456789abcdef0123456789.jpg")
+    }
+
+    func testSentImageAttachmentsIgnoresUnsafeOrUnsupportedReferences() {
+        let raw = """
+        Caption survives.
+        [Image attached at: ../secret.png]
+        [Image attached at: /tmp/not-image.txt]
+        """
+
+        let result = MessageBubble.sentImageAttachments(in: raw)
+
+        XCTAssertEqual(result.displayText, raw)
+        XCTAssertTrue(result.attachments.isEmpty)
+    }
+
     // MARK: - 2. Equatable short-circuit integrity
 
     /// A settled bubble compared with itself must return `true` — SwiftUI skips
