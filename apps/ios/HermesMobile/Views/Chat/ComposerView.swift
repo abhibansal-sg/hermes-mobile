@@ -80,6 +80,8 @@ struct ComposerView: View {
     /// Whether the model-picker sheet (tapped from the Row-2 model chip) is up.
     /// The chip + this sheet are the F3 relocation of the old nav-header chip.
     @State private var showModelPicker = false
+    /// True while the composer YOLO / flow-state toggle RPC is in flight.
+    @State private var yoloTogglePending = false
 
     /// True once a hold-to-talk long-press has fired and a capture is live. Drives
     /// the press visuals and tells the drag handler whether a slide-away should
@@ -426,10 +428,12 @@ struct ComposerView: View {
         HStack(spacing: 10) {
             attachButton
             modelChip
+            yoloButton
             Spacer(minLength: 0)
             trailingAction
                 .animation(.snappy(duration: 0.18), value: showSend)
                 .animation(.snappy(duration: 0.18), value: isQueueMode)
+                .animation(.snappy(duration: 0.18), value: connection.sessionYolo)
         }
     }
 
@@ -655,6 +659,40 @@ struct ComposerView: View {
         }
         .frame(height: 2)
         .allowsHitTesting(false)
+    }
+
+    /// Session-scoped approval-bypass toggle (YOLO / flow-state). This calls the
+    /// same `config.set key="yolo" session_id=...` gateway path as desktop/TUI,
+    /// and the on-state is intentionally loud: a filled bolt capsule in warn tint.
+    private var yoloButton: some View {
+        Button {
+            toggleSessionYolo()
+        } label: {
+            Image(systemName: connection.sessionYolo ? "bolt.fill" : "bolt")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(connection.sessionYolo ? theme.statusWarn.contrastingForeground : theme.mutedFg)
+                .frame(width: 28, height: 24)
+                .background {
+                    if connection.sessionYolo {
+                        Capsule().fill(theme.statusWarn)
+                    } else {
+                        Capsule().strokeBorder(theme.border, lineWidth: 1)
+                    }
+                }
+                .opacity(yoloTogglePending ? 0.55 : 1)
+                .contentTransition(.symbolEffect(.replace))
+        }
+        .buttonStyle(.plain)
+        .disabled(!canToggleSessionYolo)
+        .accessibilityIdentifier("composerYoloToggle")
+        .accessibilityLabel(connection.sessionYolo ? "Turn off flow-state approvals bypass" : "Turn on flow-state approvals bypass")
+        .accessibilityValue(connection.sessionYolo ? "On" : "Off")
+    }
+
+    private var canToggleSessionYolo: Bool {
+        guard isConnected, !yoloTogglePending else { return false }
+        guard let sid = sessions.activeRuntimeId, !sid.isEmpty else { return false }
+        return true
     }
 
     /// The single docked action glyph. SF Symbol `.replace` morphs between mic and
@@ -893,6 +931,20 @@ struct ComposerView: View {
         Task {
             try? await Task.sleep(for: .seconds(2))
             if steerNote == note { steerNote = nil }
+        }
+    }
+
+    private func toggleSessionYolo() {
+        guard let sid = sessions.activeRuntimeId, !sid.isEmpty else { return }
+        let next = !connection.sessionYolo
+        yoloTogglePending = true
+        Task {
+            defer { yoloTogglePending = false }
+            do {
+                try await connection.sessionSetYolo(next, sessionId: sid)
+            } catch {
+                showSteerNote("Couldn't toggle flow-state")
+            }
         }
     }
 

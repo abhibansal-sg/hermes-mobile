@@ -135,6 +135,10 @@ struct SettingsView: View {
     @State private var notifAuthProbed = false
     /// Whether to show the "notifications denied — open Settings" alert.
     @State private var showNotifDeniedAlert = false
+    /// True while the global YOLO / flow-state config.set RPC is in flight.
+    @State private var globalYoloPending = false
+    /// User-visible error if the global escalation RPC fails.
+    @State private var globalYoloError: String?
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -142,6 +146,7 @@ struct SettingsView: View {
                 accountSection
                 appearanceAndPanelsSection
                 notificationsAndSecuritySection
+                approvalBypassSection
                 devicesSection
                 modelProviderSection
                 connectionSection
@@ -180,6 +185,14 @@ struct SettingsView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("Notification access is blocked. Allow it in Settings to receive agent alerts on this device.")
+            }
+            .alert("Flow-state Toggle Failed", isPresented: Binding(
+                get: { globalYoloError != nil },
+                set: { if !$0 { globalYoloError = nil } }
+            )) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(globalYoloError ?? "")
             }
         }
     }
@@ -446,6 +459,27 @@ struct SettingsView: View {
             } else if PushRegistrar.shared.isEnabled {
                 Text("Choose which agent events notify you on this device.")
             }
+        }
+    }
+
+    // MARK: - Approval bypass (global escalation)
+
+    @ViewBuilder
+    private var approvalBypassSection: some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { connectionStore.sessionYolo },
+                set: { newValue in
+                    setGlobalYolo(newValue)
+                }
+            )) {
+                SettingsRowLabel(icon: "bolt.fill", title: "Global flow-state")
+            }
+            .disabled(globalYoloPending)
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsGlobalYoloToggle")
+        } footer: {
+            Text("Escalates approval bypass globally across sessions. Use the composer bolt for this chat only.")
         }
     }
 
@@ -732,6 +766,22 @@ struct SettingsView: View {
                 urlString: connectionStore.serverURLString,
                 token: token
             )
+        }
+    }
+
+    /// Settings escalation path for approval bypass. Unlike the composer bolt,
+    /// this deliberately sends `scope="global"`, so it persists in the gateway
+    /// config and affects every session until turned off.
+    private func setGlobalYolo(_ enabled: Bool) {
+        guard !globalYoloPending else { return }
+        globalYoloPending = true
+        Task {
+            defer { globalYoloPending = false }
+            do {
+                try await connectionStore.globalSetYolo(enabled)
+            } catch {
+                globalYoloError = "Couldn't update global flow-state: \(error.localizedDescription)"
+            }
         }
     }
 }

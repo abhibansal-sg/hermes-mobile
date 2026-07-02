@@ -136,6 +136,11 @@ final class ConnectionStore {
     /// True when the live session is in fast mode (service_tier == "priority").
     var sessionFast: Bool?
 
+    /// Effective approval-bypass (YOLO / flow-state) state for the live session.
+    /// Sourced from `session.info["yolo"]`, which already folds together the
+    /// session flag and the global `approvals.mode=off` bypass.
+    var sessionYolo = false
+
     // MARK: Draft-mode model pick (ABH-84 follow-up)
 
     /// The model pick is allowed at ANY point — including a DRAFT chat that has
@@ -216,6 +221,9 @@ final class ConnectionStore {
         if let fast = payload["fast"]?.boolValue {
             sessionFast = fast
         }
+        if let yolo = payload["yolo"]?.boolValue {
+            sessionYolo = yolo
+        }
     }
 
     /// Reset active session hot-swap state when a session is torn down or
@@ -226,6 +234,7 @@ final class ConnectionStore {
         sessionProvider = nil
         sessionReasoningEffort = nil
         sessionFast = nil
+        sessionYolo = false
         draftSelection = nil
     }
 
@@ -286,6 +295,25 @@ final class ConnectionStore {
         )
     }
 
+    /// Send `config.set` with `key="yolo"` scoped to the live session.
+    /// This mirrors the desktop zap / TUI Shift+Tab: session-only approval
+    /// bypass, never a persistent global config write.
+    @discardableResult
+    func sessionSetYolo(_ enabled: Bool, sessionId: String) async throws -> Bool {
+        let result = try await client.requestRaw(
+            "config.set",
+            params: .object([
+                "key": .string("yolo"),
+                "value": .string(enabled ? "1" : "0"),
+                "session_id": .string(sessionId),
+            ]),
+            timeout: .seconds(30)
+        )
+        let active = result["value"]?.stringValue == "1"
+        sessionYolo = active
+        return active
+    }
+
     /// Send `config.set` for the GLOBAL default reasoning effort (no session_id).
     func globalSetReasoning(_ effort: String) async throws {
         _ = try await client.requestRaw(
@@ -308,6 +336,25 @@ final class ConnectionStore {
             ]),
             timeout: .seconds(30)
         )
+    }
+
+    /// Send `config.set` with `key="yolo"` and `scope="global"`.
+    /// This intentionally flips the persistent approval-bypass mode for every
+    /// session, matching the desktop zap's escalation gesture.
+    @discardableResult
+    func globalSetYolo(_ enabled: Bool) async throws -> Bool {
+        let result = try await client.requestRaw(
+            "config.set",
+            params: .object([
+                "key": .string("yolo"),
+                "scope": .string("global"),
+                "value": .string(enabled ? "1" : "0"),
+            ]),
+            timeout: .seconds(30)
+        )
+        let active = result["value"]?.stringValue == "1"
+        sessionYolo = active
+        return active
     }
 
     /// Number of consecutive auth-rejection probes seen by the reconnect loop.
