@@ -894,6 +894,34 @@ def _relay_config_payload() -> Dict[str, Any]:
     }
 
 
+async def _relay_status_payload(relay: Any) -> Dict[str, Any]:
+    """Return a truthful coarse relay health payload from real local signals."""
+    failure_count = relay.relay_delivery_failure_count()
+    try:
+        tunnel_status = await relay.relay_client().tunnel_status()
+    except Exception as exc:
+        tunnel_status = {"ok": False, "reason": type(exc).__name__}
+        detail = str(exc).strip()
+        if detail:
+            tunnel_status["detail"] = detail
+
+    if failure_count > 0:
+        health = "failing"
+    elif tunnel_status.get("reason") == "tunnel_status_unimplemented":
+        health = "unknown"
+    elif bool(tunnel_status.get("ok") or tunnel_status.get("agent_online")):
+        health = "ok"
+    else:
+        health = "failing"
+
+    return {
+        "configured": True,
+        "health": health,
+        "delivery_failure_count": failure_count,
+        "tunnel_status": tunnel_status,
+    }
+
+
 def _validate_relay_url(raw_url: Optional[str]) -> str | None:
     value = (raw_url or "").strip().rstrip("/")
     if not value:
@@ -914,6 +942,29 @@ async def get_relay_config(request: Request) -> Dict[str, Any]:
     if not _device_has_scope(request, "approve"):
         raise HTTPException(status_code=403, detail="Device token lacks approve scope")
     return _relay_config_payload()
+
+
+@router.get("/relay/status")
+async def get_relay_status(request: Request) -> Any:
+    """Return the relay's truthful coarse health without probing fake signals."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
+
+    relay = _plugin_module("relay_client")
+    if not relay.relay_url_configured():
+        return JSONResponse(
+            status_code=400,
+            content={
+                "configured": False,
+                "health": "unconfigured",
+                "delivery_failure_count": relay.relay_delivery_failure_count(),
+                "detail": "relay URL is not configured",
+            },
+        )
+
+    return await _relay_status_payload(relay)
 
 
 @router.put("/relay/config")

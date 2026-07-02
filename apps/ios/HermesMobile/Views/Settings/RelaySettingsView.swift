@@ -72,6 +72,71 @@ struct RelaySettingsView: View {
             .listRowBackground(theme.card)
             .accessibilityIdentifier("relayPushState")
 
+            LabeledContent("Health") {
+                Text(store.statusSummary)
+                    .foregroundStyle(statusColor)
+                    .multilineTextAlignment(.trailing)
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("relayPushHealth")
+
+            if let statusMessage = store.statusMessage {
+                Label(statusMessage, systemImage: "checkmark.circle")
+                    .foregroundStyle(theme.midground)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("relayPushStatusMessage")
+            }
+
+            Button {
+                Task { await store.refreshStatus() }
+            } label: {
+                HStack {
+                    Label("Refresh relay status", systemImage: "arrow.clockwise")
+                    Spacer(minLength: 8)
+                    if store.isRefreshingStatus {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+            }
+            .disabled(!store.enabled || isRelayBusy)
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("relayRefreshStatus")
+
+            if store.shouldShowRepairActions {
+                Button {
+                    Task { await store.pair() }
+                } label: {
+                    HStack {
+                        Label("Re-pair", systemImage: "link.badge.plus")
+                        Spacer(minLength: 8)
+                        if store.isPairing {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+                }
+                .disabled(!store.enabled || isRelayBusy)
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("relayRepairRePair")
+
+                Button {
+                    Task { await store.sendTestPush() }
+                } label: {
+                    HStack {
+                        Label("Re-validate", systemImage: "paperplane")
+                        Spacer(minLength: 8)
+                        if store.isTestingPush {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+                }
+                .disabled(!store.enabled || isRelayBusy)
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("relayRepairRevalidate")
+            }
+
             LabeledContent("Push kinds") {
                 Text(store.pushKindsSummary)
                     .foregroundStyle(theme.mutedFg)
@@ -254,5 +319,17 @@ struct RelaySettingsView: View {
             get: { store.errorMessage != nil },
             set: { if !$0 { store.errorMessage = nil } }
         )
+    }
+
+    private var isRelayBusy: Bool {
+        store.isLoading || store.isSaving || store.isPairing || store.isTestingPush || store.isRefreshingStatus
+    }
+
+    private var statusColor: Color {
+        switch store.relayStatus?.health {
+        case "ok": theme.midground
+        case "failing", "unconfigured": .red
+        default: theme.mutedFg
+        }
     }
 }

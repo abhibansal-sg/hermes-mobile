@@ -25,11 +25,14 @@ final class RelayStore {
     var isSaving = false
     var isPairing = false
     var isTestingPush = false
+    var isRefreshingStatus = false
     var errorMessage: String?
     var savedMessage: String?
     var pairingMessage: String?
     var testPushMessage: String?
+    var statusMessage: String?
     var relayPairing: RelayPairingPayload?
+    var relayStatus: RelayStatus?
 
     init(rest: RestClient) {
         self.rest = rest
@@ -60,6 +63,23 @@ final class RelayStore {
         return "Relay \(relayPairing.relayURL), agent \(relayPairing.agentID), pairing prefix \(relayPairing.pairingPrefix)…"
     }
 
+    var statusSummary: String {
+        guard let relayStatus else {
+            return enabled ? "Relay health: not checked." : "Relay health: unconfigured."
+        }
+        let failures = relayStatus.deliveryFailureCount
+        if failures > 0 {
+            let noun = failures == 1 ? "delivery failure" : "delivery failures"
+            return "Relay health: \(relayStatus.health) (\(failures) \(noun))."
+        }
+        return "Relay health: \(relayStatus.health)."
+    }
+
+    var shouldShowRepairActions: Bool {
+        guard let relayStatus else { return false }
+        return relayStatus.health == "failing" || relayStatus.health == "unconfigured"
+    }
+
     func load() async {
         isLoading = true
         errorMessage = nil
@@ -68,7 +88,11 @@ final class RelayStore {
         testPushMessage = nil
         defer { isLoading = false }
         do {
-            apply(try await fetchConfig())
+            let config = try await fetchConfig()
+            apply(config)
+            if !(config.relayURL ?? "").isEmpty {
+                await refreshStatus()
+            }
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
@@ -105,6 +129,9 @@ final class RelayStore {
                 registrationToken: tokenToWrite
             )
             apply(config)
+            if enabled {
+                await refreshStatus()
+            }
             savedMessage = "Relay settings saved."
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription
@@ -124,6 +151,7 @@ final class RelayStore {
             let payload = try await fetchPairing()
             relayPairing = payload
             pairingMessage = "Relay pairing ready for this device."
+            await refreshStatus()
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
@@ -143,10 +171,28 @@ final class RelayStore {
             testPushMessage = result.ok
                 ? "✅ \(result.detail)"
                 : "❌ \(result.detail)"
+            await refreshStatus()
         } catch {
             let detail = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
             testPushMessage = "❌ \(detail)"
+            await refreshStatus()
+        }
+    }
+
+    func refreshStatus() async {
+        guard !isRefreshingStatus else { return }
+        errorMessage = nil
+        statusMessage = nil
+        isRefreshingStatus = true
+        defer { isRefreshingStatus = false }
+        do {
+            relayStatus = try await fetchStatus()
+            statusMessage = "Relay status refreshed."
+        } catch {
+            relayStatus = nil
+            errorMessage = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
         }
     }
 
@@ -159,6 +205,7 @@ final class RelayStore {
         registrationTokenPrefix = config.registrationTokenPrefix
         pushKinds = config.pushKinds
         relayPairing = nil
+        relayStatus = nil
     }
 
     private func fetchConfig() async throws -> RelayConfig {
@@ -199,6 +246,12 @@ final class RelayStore {
         return RelayPairingPayload(json: root)
     }
 
+    private func fetchStatus() async throws -> RelayStatus {
+        let data = try await rest.get(path: "\(rest.mobileAPIPrefix)/relay/status")
+        let root = try rest.decodeJSONValue(from: data, context: "relay.status")
+        return RelayStatus(json: root)
+    }
+
     private func postTestPush() async throws -> (ok: Bool, detail: String) {
         let request = rest.makeRequest(
             path: "\(rest.mobileAPIPrefix)/relay/test-push",
@@ -227,6 +280,22 @@ struct RelayConfig: Sendable, Equatable {
         self.registrationTokenSet = json["registration_token_set"]?.boolValue ?? false
         self.registrationTokenPrefix = json["registration_token_prefix"]?.stringValue
         self.pushKinds = json["push_kinds"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    }
+}
+
+struct RelayStatus: Sendable, Equatable {
+    let configured: Bool
+    let health: String
+    let deliveryFailureCount: Int
+    let detail: String?
+    let tunnelStatus: [String: JSONValue]
+
+    init(json: JSONValue) {
+        self.configured = json["configured"]?.boolValue ?? false
+        self.health = json["health"]?.stringValue ?? "unknown"
+        self.deliveryFailureCount = json["delivery_failure_count"]?.intValue ?? 0
+        self.detail = json["detail"]?.stringValue
+        self.tunnelStatus = json["tunnel_status"]?.objectValue ?? [:]
     }
 }
 
