@@ -152,6 +152,7 @@ struct SettingsView: View {
                 accountSection
                 appearanceAndPanelsSection
                 notificationsAndSecuritySection
+                relayPushSection
                 approvalBypassSection
                 devicesSection
                 modelProviderSection
@@ -500,6 +501,30 @@ struct SettingsView: View {
             .accessibilityIdentifier("settingsGlobalYoloToggle")
         } footer: {
             Text("Escalates approval bypass globally across sessions. Use the composer bolt for this chat only.")
+        }
+    }
+
+    // MARK: - Relay Push (ABH-282 — plugin-mount only)
+
+    /// The relay-push ENABLE section — a single push to ``RelaySettingsView``.
+    /// Rendered only once the hermes-mobile plugin mount is available, because
+    /// the config route lives at `/api/plugins/hermes-mobile/relay/config`.
+    @ViewBuilder
+    private var relayPushSection: some View {
+        if connectionStore.capabilities.pluginMount == .available,
+           let rest = connectionStore.rest {
+            Section {
+                NavigationLink {
+                    RelaySettingsView(rest: rest)
+                        .background(theme.bg)
+                } label: {
+                    SettingsRow(icon: "antenna.radiowaves.left.and.right", title: "Relay Push", value: nil)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsRelayPush")
+            } footer: {
+                Text("Configure the optional relay URL and registration token used for relay push mode.")
+            }
         }
     }
 

@@ -30,6 +30,8 @@ log = logging.getLogger("hermes_mobile.relay")
 
 # No hosted default: relay transport is self-hosted / explicitly configured.
 DEFAULT_RELAY_URL: str | None = None
+RELAY_URL_ENV = "HERMES_MOBILE_RELAY_URL"
+RELAY_REGISTRATION_TOKEN_ENV = "HERMES_MOBILE_RELAY_REGISTRATION_TOKEN"
 
 _DEDUPE_WINDOW_S = 10.0
 RELAY_PUSH_KINDS = ("replies", "attention", "proactive")
@@ -105,6 +107,46 @@ def _config_value(
     return file_val if file_val else default
 
 
+def _write_config_value(
+    name: str, value: str | None, *, hermes_home: Path | None = None
+) -> None:
+    """Write or clear a relay env-backed config value."""
+    value_text = (value or "").strip()
+    if hermes_home is None:
+        from hermes_cli.config import remove_env_value, save_env_value
+
+        if value_text:
+            save_env_value(name, value_text)
+        else:
+            remove_env_value(name)
+        return
+
+    home = _hermes_home(hermes_home)
+    env_path = home / ".env"
+    home.mkdir(parents=True, exist_ok=True)
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        lines = []
+    lines = [line for line in lines if not line.strip().startswith(f"{name}=")]
+    if value_text:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        safe_value = value_text.replace("\n", "").replace("\r", "")
+        lines.append(f"{name}={safe_value}\n")
+    tmp_path = env_path.with_name(f".env.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp_path.write_text("".join(lines), encoding="utf-8")
+    try:
+        os.chmod(tmp_path, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp_path, env_path)
+    if value_text:
+        os.environ[name] = value_text
+    else:
+        os.environ.pop(name, None)
+
+
 class NeedsAttestation(Exception):
     """Relay requires an App Attest attestation to enroll this agent."""
 
@@ -132,11 +174,34 @@ def map_push_kind(kind: str) -> str:
 
 def relay_url(hermes_home: Path | None = None) -> str | None:
     configured = _config_value(
-        "HERMES_MOBILE_RELAY_URL", DEFAULT_RELAY_URL, hermes_home=hermes_home
+        RELAY_URL_ENV, DEFAULT_RELAY_URL, hermes_home=hermes_home
     )
     if configured:
         return configured.rstrip("/")
     return None
+
+
+def relay_registration_token(hermes_home: Path | None = None) -> str | None:
+    return _config_value(RELAY_REGISTRATION_TOKEN_ENV, hermes_home=hermes_home)
+
+
+def set_relay_config(
+    *,
+    relay_url: str | None,
+    registration_token: str | None = None,
+    hermes_home: Path | None = None,
+) -> None:
+    """Persist relay push configuration in the env-backed relay storage."""
+    home = _hermes_home(hermes_home)
+    _write_config_value(RELAY_URL_ENV, relay_url, hermes_home=hermes_home)
+    if registration_token is not None:
+        _write_config_value(
+            RELAY_REGISTRATION_TOKEN_ENV,
+            registration_token,
+            hermes_home=hermes_home,
+        )
+    with _client_lock:
+        _client_singletons.pop(home, None)
 
 
 def relay_url_configured(*, hermes_home: Path | None = None) -> bool:
@@ -397,9 +462,7 @@ def relay_client(*, hermes_home: Path | None = None) -> RelayClient:
         if not configured_url:
             raise RelayConfigurationError("HERMES_MOBILE_RELAY_URL is not configured")
         if client is None or client.relay_url != configured_url:
-            token = _config_value(
-                "HERMES_MOBILE_RELAY_REGISTRATION_TOKEN", hermes_home=home
-            )
+            token = relay_registration_token(home)
             client = RelayClient(
                 relay_url=configured_url,
                 credentials_path=home / "push" / "relay.json",

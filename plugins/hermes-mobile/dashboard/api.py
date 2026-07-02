@@ -39,6 +39,7 @@ import stat
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -875,6 +876,68 @@ class LiveActivityBody(BaseModel):
     token: str
     session_id: str
     env: str = ""  # "sandbox" | "production"; empty → server default
+
+
+class RelayConfigBody(BaseModel):
+    relay_url: Optional[str] = None
+    registration_token: Optional[str] = None
+
+
+def _relay_config_payload() -> Dict[str, Any]:
+    relay = _plugin_module("relay_client")
+    token = relay.relay_registration_token()
+    return {
+        "relay_url": relay.relay_url(),
+        "registration_token_set": bool(token),
+        "registration_token_prefix": token[:8] if token else None,
+        "push_kinds": list(relay.RELAY_PUSH_KINDS),
+    }
+
+
+def _validate_relay_url(raw_url: Optional[str]) -> str | None:
+    value = (raw_url or "").strip().rstrip("/")
+    if not value:
+        return None
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme != "https":
+        raise ValueError("relay_url must use https")
+    if not parsed.netloc:
+        raise ValueError("relay_url must include a host")
+    return value
+
+
+@router.get("/relay/config")
+async def get_relay_config(request: Request) -> Dict[str, Any]:
+    """Return relay push configuration without revealing the registration token."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
+    return _relay_config_payload()
+
+
+@router.put("/relay/config")
+async def set_relay_config(body: RelayConfigBody, request: Request) -> Any:
+    """Set or clear relay push configuration via relay_client's env storage."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
+
+    try:
+        relay_url = _validate_relay_url(body.relay_url)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc), "code": 4001})
+
+    relay = _plugin_module("relay_client")
+    try:
+        relay.set_relay_config(
+            relay_url=relay_url,
+            registration_token=body.registration_token,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc), "code": 4001})
+    return _relay_config_payload()
 
 
 @router.post("/push/register")
