@@ -135,3 +135,13 @@ git commit -q -m "ship: TestFlight build $NEXT (wave ${WAVE:-adhoc}, internal, a
 git push origin HEAD:"$BASE" 2>&1 | tail -2
 
 echo "✅ SHIPPED build $NEXT to internal TestFlight (wave ${WAVE:-adhoc}) with release notes."
+
+# --- STEP 7: REAP (2026-07-03) — a ship means a wave's worktrees are merged.
+# Reclaim their per-worktree .derivedData (~1.9G each) + remove merged worktrees.
+# This is the systemic fix for the 48G .worktrees leak: cleanup rides the ship,
+# so disk never silts. Loss-free (derivedData regenerates; only base-merged
+# worktrees are removed). Never blocks the ship — best-effort tail step.
+if [ -x "$REPO/scripts/worktree-reap.sh" ]; then
+  echo "  reaping merged worktrees + derivedData…"
+  bash "$REPO/scripts/worktree-reap.sh" 2>&1 | tail -3 || echo "  (reap best-effort; non-fatal)"
+fi
