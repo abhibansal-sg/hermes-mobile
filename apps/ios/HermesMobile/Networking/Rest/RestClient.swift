@@ -145,9 +145,10 @@ struct RestClient: Sendable {
     /// than walking with a fixed-limit+offset. The `offset` parameter is kept for the
     /// production-path default (offset=0) so older call sites compile unchanged.
     /// `excludeSource` / `source` filter by session origin (ABH drawer
-    /// bifurcation): the human-chat Recents passes `excludeSource: ["cron"]` so
-    /// automation runs never enter the list (or its cache); the automation-runs
-    /// feed passes `source: "cron"`. The server splits `exclude_sources` on commas.
+    /// bifurcation): the human-chat Recents passes `excludeSource: ["cron", "subagent"]`
+    /// so automation/agent-internal rows never enter the list (or its cache); the
+    /// automation-runs feed passes `source: "cron"`. The server splits
+    /// `exclude_sources` on commas.
     func sessionsWithTotal(
         limit: Int = 100,
         offset: Int = 0,
@@ -165,12 +166,12 @@ struct RestClient: Sendable {
         if !excludeSource.isEmpty {
             // Gateway FastAPI param is `exclude_sources` (PLURAL) — see
             // web_server.py /api/sessions. iOS historically sent the singular
-            // `exclude_source`, which FastAPI silently dropped, so cron runs were
-            // never server-filtered and dominated the first page (only the
+            // `exclude_source`, which FastAPI silently dropped, so autonomous rows
+            // were never server-filtered and dominated the first page (only the
             // client-side `visibleSessions` filter hid them — wasting the loaded
-            // window on cron and making a freshly-active desktop session far less
-            // likely to be in it). Backward-safe: a stock gateway ignores an
-            // unknown param, and the client-side filter remains the guarantee.
+            // window and making a freshly-active desktop session far less likely to
+            // be in it). Backward-safe: a stock gateway ignores an unknown param,
+            // and the client-side filter remains the guarantee.
             parts.append("exclude_sources=\(excludeSource.joined(separator: ","))")
         }
         if let source, !source.isEmpty {

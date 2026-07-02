@@ -28,7 +28,7 @@ TestFlight + Abhi catch taste (layer 5).
 | CUJ-02 | Send a prompt, receive a completed reply | REST session create → prompt → completion | core |
 | CUJ-03 | Reconnect mid-turn without losing the reply | WS flap + reconcile (ABH-276/278/288/289) | Malacca |
 | CUJ-04 | Approve/deny a pending approval from the phone | `/api/approvals/respond` contract (ABH-258 ownership) | core |
-| CUJ-05 | Sessions list, search, resume | `/api/sessions/search` + resume + messages readback | core |
+| CUJ-05 | Sessions list, search, resume | Recents default excludes cron/subagent + empty sessions; `/api/sessions/search` + resume + messages readback | core |
 | CUJ-06 | Enable relay push + pair + truthful test-push | `/relay/config` → `/relay/pair` → `/relay/test-push` → `/relay/status` truthfulness (ABH-282/283/284/285, ABH-213) | wave-68 |
 | CUJ-07 | Device tokens: register, list, revoke (scope-gated) | `/push/register`, `/api/devices`, DELETE + approve-scope 403 (ABH-275, ABH-270) | push lineage |
 | CUJ-08 | Provider list + key entry (no key leak in response) | `/api/providers` + `/providers/{slug}/key` write→readback redacted | provider mgmt |

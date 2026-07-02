@@ -44,7 +44,7 @@ final class SessionStore {
     private(set) var isLoadingMore: Bool = false
 
     /// Number of sessions currently visible after all client-side filters
-    /// (`hideCron`, profile scope). The drawer uses this together with
+    /// (human-recents source/count gate, profile scope). The drawer uses this together with
     /// `loadedCount` / `totalSessions` to produce the filter-honest header copy.
     var filteredCount: Int { visibleSessions.count }
 
@@ -64,11 +64,11 @@ final class SessionStore {
     /// `SIDEBAR_SESSIONS_PAGE_SIZE = 50` from `store/layout.ts:20`).
     private static let pageSize: Int = 50
 
-    /// Minimum number of non-cron, non-filtered sessions to show after a cold
+    /// Minimum number of human-facing, non-empty sessions to show after a cold
     /// launch. After the first-page merge, `refresh()` keeps fetching with
     /// growing limits (reusing `loadMore()`-exact semantics) until either this
     /// many visible sessions are present OR the server is exhausted. The loop
-    /// respects `hideCron`/profile filters because `visibleSessions` already
+    /// respects Recents/profile filters because `visibleSessions` already
     /// applies them, so the target is always "30 the user can actually see".
     static let initialVisibleTarget: Int = 30
 
@@ -82,11 +82,12 @@ final class SessionStore {
     static let loadMorePageVisibleTarget: Int = 30
 
     /// Sources excluded from the human-chat Recents list (drawer bifurcation).
-    /// Automation RUNS (`source == "cron"`) live in their own Automation-runs feed,
-    /// not the chat list — so the server filters them via `exclude_sources` and the
-    /// client never fetches OR caches them (no more cron-dense windows / cache
+    /// Automation RUNS (`source == "cron"`) and agent-internal child sessions
+    /// (`source == "subagent"`) do not belong in the human chat picker — so the
+    /// server filters them via `exclude_sources` and the client never fetches OR
+    /// caches them on fresh pages (no more autonomous-loop-dense windows / cache
     /// bloat). The automation-runs surface fetches `source: "cron"` separately.
-    static let recentsExcludeSources = ["cron"]
+    static let recentsExcludeSources = ["cron", "subagent"]
 
     /// Latches `true` ONLY when the initial fill has *successfully completed* —
     /// the target was met OR the server was proven exhausted. An aborted /
@@ -286,11 +287,14 @@ final class SessionStore {
     /// late reconcile so a genuinely-present target is never wrongly dropped.
     static let pendingMessageJumpMaxAttempts = 3
 
-    // MARK: - Pins / archive / cron filter (persisted)
+    // MARK: - Pins / archive / Recents filters (persisted)
 
     /// Pinned `stored_session_id`s; pinned rows float to a section on top.
     private(set) var pinnedIds: Set<String> = []
-    /// When `true`, sessions whose `source == "cron"` are hidden from the list.
+    /// Historical preference for hiding cron rows. Recents is now human-chat-only
+    /// by construction regardless of this vestigial toggle, but fresh installs keep
+    /// the persisted value `true` so older empty-state / migration paths do not
+    /// expose automation firehose rows.
     var hideCron: Bool {
         didSet {
             guard hideCron != oldValue else { return }
@@ -299,9 +303,9 @@ final class SessionStore {
     }
 
     /// When `true`, the drawer's Recents list is grouped by workspace (`cwd`)
-    /// instead of shown flat (UI Batch H2). Default `false`. The cron filter
-    /// (``hideCron``) still applies *inside* groups because grouping reads from
-    /// ``unpinnedSessions``, which is already cron-filtered. Persisted.
+    /// instead of shown flat (UI Batch H2). Default `false`. The human-Recents
+    /// filter still applies *inside* groups because grouping reads from
+    /// ``unpinnedSessions``, which is already source/count-filtered. Persisted.
     var groupByWorkspace: Bool {
         didSet {
             guard groupByWorkspace != oldValue else { return }
@@ -641,7 +645,7 @@ final class SessionStore {
         if let stored = defaults.array(forKey: DefaultsKeys.pinnedSessions) as? [String] {
             pinnedIds = Set(stored)
         }
-        hideCron = defaults.bool(forKey: DefaultsKeys.hideCron)
+        hideCron = (defaults.object(forKey: DefaultsKeys.hideCron) as? Bool) ?? true
         groupByWorkspace = defaults.bool(forKey: DefaultsKeys.groupByWorkspace)
         if let collapsed = defaults.array(forKey: DefaultsKeys.collapsedWorkspaces) as? [String] {
             collapsedWorkspaces = Set(collapsed)
@@ -721,7 +725,7 @@ final class SessionStore {
 
     // MARK: - Derived list slices
 
-    /// Sessions after the cron filter AND the multi-profile scope filter, sorted
+    /// Sessions after the human-Recents filter AND the multi-profile scope filter, sorted
     /// by `(lastActive ?? startedAt) DESC` (desktop parity: ABH-86 item 2).
     /// The view renders pinned and unpinned sections from these — it is the single
     /// funnel pinned/unpinned/grouped read through.
@@ -732,19 +736,24 @@ final class SessionStore {
     /// active session's `lastActive` may have advanced in the response and should
     /// float to the top immediately without waiting for the *next* pull.
     ///
-    /// The profile filter is DORMANT unless multi-profile is available (no stale
+    /// The source/count filter rejects cron, subagent, and true-empty rows. The
+    /// source gate is duplicated server-side on fresh REST pages via
+    /// ``recentsExcludeSources`` and `min_messages=1`, but remains client-side for
+    /// old gateways, WS fallback rows, and stale cached rows. The profile filter is
+    /// DORMANT unless multi-profile is available (no stale
     /// `activeProfile` can hide rows on a stock gateway). When available and a
     /// SPECIFIC profile scope is active, only rows whose `profile` matches survive;
-    /// the aggregate ("all") scope keeps every row. The cron filter still applies
-    /// in every case.
+    /// the aggregate ("all") scope keeps every row. The human-Recents filter still
+    /// applies in every case.
     var visibleSessions: [SessionSummary] {
         var rows = sessions
         // Recents is human-chat-only BY CONSTRUCTION (drawer bifurcation):
-        // automation runs (source == "cron") live in the Automation Runs feed,
-        // never the chat list. The server also filters them via `exclude_sources`
-        // for efficiency (no cron fetched/cached); this client-side filter
-        // guarantees the invariant even against a gateway that predates that param.
-        rows = rows.filter { ($0.source ?? "").lowercased() != "cron" }
+        // automation runs (cron), agent-internal subagent sessions, and true-empty
+        // scaffolds never become tappable chat history. Fresh REST pages also ask
+        // the server for `exclude_sources=cron,subagent&min_messages=1`; this
+        // client-side gate guarantees the invariant for old gateways, WS fallback,
+        // and stale cache rows.
+        rows = rows.filter(Self.isHumanRecentsSession)
         rows = Self.filterByProfile(rows, scope: activeProfile, multiAvailable: isMultiProfileAvailable)
         // Client-side re-sort by lastActive DESC, falling back to startedAt.
         // Nil timestamps sink to the bottom. The sort is stable so rows with
@@ -755,6 +764,15 @@ final class SessionStore {
             return l > r
         }
         return rows
+    }
+
+    /// Pure Recents eligibility gate. `messageCount == 0` is a known-empty
+    /// scaffold and not pickable; `nil` is kept because older gateway/RPC payloads
+    /// may omit the count even for real conversations.
+    static func isHumanRecentsSession(_ row: SessionSummary) -> Bool {
+        if let count = row.messageCount, count == 0 { return false }
+        let source = (row.source ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !recentsExcludeSources.contains(source)
     }
 
     /// Pure profile-scope filter applied by ``visibleSessions``. DORMANT unless
@@ -913,13 +931,13 @@ final class SessionStore {
 
     // MARK: - Transcript prefetch (WhatsApp bar — coverage)
 
-    /// How many most-recent non-cron sessions the post-hydration sweep warms.
+    /// How many most-recent human Recents sessions the post-hydration sweep warms.
     private static let prefetchSessionCount = 30
     /// Concurrency ceiling for the prefetch sweep — gentle pacing so it never
     /// contends with a live turn or the user's own open. 3 in flight at a time.
     private static let prefetchConcurrency = 3
 
-    /// Background-prefetch transcripts for the top ~30 most-recent non-cron
+    /// Background-prefetch transcripts for the top ~30 most-recent human Recents
     /// sessions so nearly every drawer tap is a DISK hit (cache-first open paints
     /// instantly). Called after connect + hydration settles and after a reconnect.
     ///
@@ -938,9 +956,9 @@ final class SessionStore {
     func prefetchRecentTranscripts() {
         guard let cacheStore, let fetch = resolvedPrefetchFetch else { return }
 
-        // Snapshot the prefetch targets on the main actor (newest-first, non-cron,
-        // excluding the open session). `visibleSessions` already excludes cron and
-        // sorts by recency, so it is the right source. Map to a Sendable tuple so
+        // Snapshot the prefetch targets on the main actor (newest-first human
+        // Recents, excluding the open session). `visibleSessions` already applies
+        // source/count filters and sorts by recency, so it is the right source. Map to a Sendable tuple so
         // the detached sweep captures plain values, not SessionSummary state.
         let openId = activeStoredId
         let targets: [(id: String, lastActive: Double?)] = visibleSessions
@@ -1108,7 +1126,7 @@ final class SessionStore {
         // and every stock-gateway case skip this entirely → the existing fetch.
         if usesAggregateRail, let rest = connection?.rest {
             do {
-                // fill30: the aggregate rail is just as cron-dense as the single
+                // fill30: the aggregate rail is just as autonomous-loop-dense as the single
                 // rail, so it needs the SAME fill-to-target treatment. Floor the
                 // first-page window at what the fill reached (so a post-fill
                 // heartbeat / drawer-open can't collapse it back to 100) and kick
@@ -1116,7 +1134,7 @@ final class SessionStore {
                 // `profileSessions` (routed inside `resolvedInitialFillFetch`).
                 // Previously this branch fetched a HARDCODED limit=100 and `return`ed
                 // BEFORE the fill, so on a multi-profile gateway the drawer was stuck
-                // at ~6 non-cron regardless of the single-rail fix.
+                // at ~6 human Recents regardless of the single-rail fix.
                 let fetchLimit = max(100, loadedFloor, loadedCount)
                 let result = try await rest.profileSessions(
                     profile: DefaultsKeys.allProfilesScope, limit: fetchLimit,
@@ -1354,13 +1372,13 @@ final class SessionStore {
     ///   request is `limit = loadedCount + PAGE_SIZE, offset=0, min_messages=1`.
     ///   The server window expands; we deduplicate the overlap by id so rows
     ///   already in the list are not duplicated.
-    /// - A patched gateway server-filters cron via `exclude_sources` (plural — the
-    ///   real FastAPI param, see `RestClient.sessionsWithTotal`), so the window is
-    ///   already cron-free and this loop converges fast. The client-side `hideCron`
-    ///   filter remains the hard invariant guarantee against a STOCK/older gateway
-    ///   that ignores the param and returns a dense cron-heavy window: `loadMore`
+    /// - A patched gateway server-filters cron/subagent via `exclude_sources`
+    ///   (plural — the real FastAPI param, see `RestClient.sessionsWithTotal`), so
+    ///   the window is already automation-free and this loop converges fast. The
+    ///   client-side Recents filter remains the hard invariant guarantee against a
+    ///   STOCK/older gateway that ignores the param and returns a dense firehose window: `loadMore`
     ///   keeps fetching in a loop until `visibleSessions` grows OR there are no more
-    ///   server rows — so the user is never stranded at a wall of hidden cron rows.
+    ///   server rows — so the user is never stranded at a wall of hidden automation rows.
     /// - A fetch is a no-op when already at the server total, already loading, or
     ///   when a first-page refresh is in flight (`isLoading`).
     /// - The same `refreshToken` / stale-response guard from `refresh()` protects
@@ -1386,7 +1404,7 @@ final class SessionStore {
         // started, OR the server is exhausted. Measuring the delta from the
         // call's starting visible count (not the prior iteration) is what
         // guarantees a full ~30-row batch per auto-load even when a dense
-        // cron-heavy window + `hideCron` filters most of each fetched page out.
+        // autonomous firehose window filters most of each fetched page out.
         //
         // The page is fetched via `resolvedInitialFillFetch` — the SAME resolver
         // the cold-launch fill uses — so loadMore pages the identical rail the
@@ -1427,7 +1445,7 @@ final class SessionStore {
 
     /// Kick the cold-launch initial fill: page (grow-limit) until at least
     /// ``initialVisibleTarget`` sessions are VISIBLE after the user's current
-    /// filters (`hideCron` / profile — `visibleSessions` already applies them) OR
+    /// filters (human-Recents / profile — `visibleSessions` already applies them) OR
     /// the server is exhausted. Idempotent and concurrency-safe; the safe entry
     /// point every `refresh()` calls.
     ///
@@ -1438,7 +1456,7 @@ final class SessionStore {
     /// token. When a sibling bumped the token mid-fill, the in-flight loop's
     /// `guard refreshToken == myToken` aborted it after the first ~100-row page —
     /// and because `initialFillDone` was latched at the *start*, the later refresh()
-    /// never retried it. Net: the drawer stuck at ~6 visible with `hideCron`.
+    /// never retried it. Net: the drawer stuck at ~6 visible through dense automation rows.
     ///
     /// This entry point decouples the fill from the per-request token:
     /// - **No two fills ever run concurrently** — `isFillingInitial` gates a second
@@ -1452,7 +1470,7 @@ final class SessionStore {
     ///   exhausted. An aborted / errored / cancelled attempt leaves it `false`, so
     ///   the next `refresh()` re-kicks the fill.
     /// - **Terminates cleanly** — stops the instant `loadedCount >= totalSessions`
-    ///   (a gateway with < 30 non-cron rows never spins) and bounds itself with a
+    ///   (a gateway with < 30 human Recents rows never spins) and bounds itself with a
     ///   no-progress guard so a server that returns the same window forever can't
     ///   loop.
     func ensureInitialFill() {
@@ -1498,7 +1516,7 @@ final class SessionStore {
             // bail WITHOUT latching done so a re-connect re-fills the new server.
             guard generation == fillGeneration, !Task.isCancelled else { return }
             // Server exhausted before the target: clean terminal outcome — latch
-            // done so a <30-non-cron gateway never spins on every refresh().
+            // done so a <30-human-Recents gateway never spins on every refresh().
             // An UNKNOWN total is NOT exhaustion (release audit): a payload
             // that omits `total` must keep paging — the no-progress guard
             // below is the reliable exhaustion signal in that case.
