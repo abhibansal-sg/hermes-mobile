@@ -23,6 +23,45 @@ final class DevicesTests: XCTestCase {
         try JSONDecoder().decode(T.self, from: Data(json.utf8))
     }
 
+    /// Minimal URLProtocol stub for `issueDevice` status/error tests.
+    final class IssueDeviceProtocol: URLProtocol, @unchecked Sendable {
+        nonisolated(unsafe) static var response: (Data, Int) = (Data(), 200)
+
+        static func reset(body: Data, status: Int) {
+            response = (body, status)
+        }
+
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+        override func startLoading() {
+            let (body, status) = Self.response
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: status,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: body)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+
+        override func stopLoading() {}
+    }
+
+    private func makeIssueClient(body: Data, status: Int) -> RestClient {
+        IssueDeviceProtocol.reset(body: body, status: status)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [IssueDeviceProtocol.self]
+        return RestClient(
+            baseURL: URL(string: "https://gw.example:9119")!,
+            token: "tok",
+            session: URLSession(configuration: config),
+            pathStyle: .plugin
+        )
+    }
+
     override func setUp() {
         super.setUp()
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.deviceIdsByServer)
@@ -170,6 +209,73 @@ final class DevicesTests: XCTestCase {
         XCTAssertEqual(issued.deviceId, "dev_new001")
         XCTAssertEqual(issued.token, "tok_secret_value_xyz")
         XCTAssertEqual(issued.deviceName, "iPhone")
+    }
+
+    func testIssueDevice409ThrowsTypedLimitReachedWithMaxDevices() async {
+        let body = Data(#"{"error":"device limit reached","max_devices":64}"#.utf8)
+        let client = makeIssueClient(body: body, status: 409)
+
+        do {
+            _ = try await client.issueDevice(name: "iPhone")
+            XCTFail("expected DeviceIssueError.limitReached")
+        } catch DeviceIssueError.limitReached(let maxDevices) {
+            XCTAssertEqual(maxDevices, 64)
+        } catch {
+            XCTFail("expected DeviceIssueError.limitReached, got \(error)")
+        }
+    }
+
+    func testIssueDeviceNon409StillSurfacesRestError() async {
+        let body = Data(#"{"error":"registry persist failed"}"#.utf8)
+        let client = makeIssueClient(body: body, status: 500)
+
+        do {
+            _ = try await client.issueDevice(name: "iPhone")
+            XCTFail("expected RestError.badStatus")
+        } catch RestError.badStatus(let code, let errorBody) {
+            XCTAssertEqual(code, 500)
+            XCTAssertTrue(errorBody.contains("registry persist failed"))
+        } catch {
+            XCTFail("expected RestError.badStatus, got \(error)")
+        }
+    }
+
+    func testDeviceLimitReachedMessageIsActionable() {
+        let message = ConnectionStore.deviceLimitReachedMessage(maxDevices: 64)
+        XCTAssertTrue(message.contains("64"))
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("revoke"))
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("retry"))
+    }
+
+    func testDeviceLimitReachedKeepsConnectedSessionLiveAndDismissible() {
+        let sessions = SessionStore()
+        let chat = ChatStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let server = "https://gw.example:9119"
+
+        connection.phase = .connected
+        connection._handleDeviceLimitReachedForTesting(serverURL: server, maxDevices: 64)
+
+        XCTAssertEqual(connection.phase, .connected)
+        XCTAssertEqual(connection.deviceLimitAdvisory, ConnectionStore.deviceLimitReachedMessage(maxDevices: 64))
+        XCTAssertTrue(connection._isDeviceIssueLimitReachedSuppressedForTesting(serverURL: server))
+
+        connection.dismissDeviceLimitAdvisory()
+
+        XCTAssertNil(connection.deviceLimitAdvisory)
+        XCTAssertEqual(connection.phase, .connected)
+    }
+
+    func testDeviceLimitReachedDuringHydrationDoesNotForceOffline() {
+        let sessions = SessionStore()
+        let chat = ChatStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+
+        connection.phase = .hydrating
+        connection._handleDeviceLimitReachedForTesting(serverURL: "https://gw.example:9119", maxDevices: nil)
+
+        XCTAssertEqual(connection.phase, .hydrating)
+        XCTAssertNotNil(connection.deviceLimitAdvisory)
     }
 
     func testRevokeResultDecodes() throws {

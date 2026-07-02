@@ -1183,6 +1183,10 @@ struct ChatView: View {
                 ClarifyBanner(clarification: clarification, chatStore: chatStore)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
+            if let deviceLimitAdvisory = connectionStore.deviceLimitAdvisory {
+                deviceLimitAdvisoryBanner(deviceLimitAdvisory)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
             if let toastError {
                 errorToast(toastError)
                     .transition(.move(edge: .top).combined(with: .opacity))
@@ -1201,6 +1205,7 @@ struct ChatView: View {
         // smooth across that cycle and across item-to-item swaps.
         .animation(.spring(response: 0.35, dampingFraction: 0.85),
                    value: crossSessionItems.isEmpty)
+        .animation(.easeInOut(duration: 0.25), value: connectionStore.deviceLimitAdvisory)
         .animation(.easeInOut(duration: 0.25), value: toastError)
         .animation(.easeInOut(duration: 0.25), value: compressionToast)
     }
@@ -1264,6 +1269,33 @@ struct ChatView: View {
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(theme.popover, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func deviceLimitAdvisoryBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "iphone.badge.exclamationmark")
+                .foregroundStyle(theme.statusWarn)
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(theme.fg)
+                .lineLimit(3)
+            Spacer(minLength: 0)
+            Button {
+                connectionStore.dismissDeviceLimitAdvisory()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(theme.midground)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss device limit advisory")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.popover, in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Device limit advisory: \(message)")
     }
 
     private func compressionToastBanner(_ message: String) -> some View {

@@ -95,6 +95,19 @@ final class ConnectionStore {
     /// `configure` and on `disconnect`. (D3 RE-PAIR FLOW.)
     var reauthRequired = false
 
+    /// Non-blocking advisory for a device-token auto-upgrade that hit the server's
+    /// device registry cap. Unlike `.offline`, this DOES NOT describe transport
+    /// health and must never gate the composer: the shared token remains live, so
+    /// the chat stays usable while the user revokes an unused device and retries.
+    #if DEBUG
+    @Snapshotable
+    #endif
+    var deviceLimitAdvisory: String?
+
+    func dismissDeviceLimitAdvisory() {
+        deviceLimitAdvisory = nil
+    }
+
     /// Short display name of the gateway's currently-configured main model
     /// (F0 / Amendment B). Sourced from `GET /api/model/info` on connect and
     /// re-fetched after a model switch. `nil` until the first successful probe
@@ -420,6 +433,13 @@ final class ConnectionStore {
     /// The token for the active connection (kept in memory; also in Keychain).
     private var currentToken: String?
 
+    /// Servers where `POST /devices/issue` hit the device registry cap during
+    /// this app run. A 409 is permanent until a device is revoked, so automatic
+    /// reconnect/recover probes should not hammer it repeatedly in silence. The
+    /// existing banner retry path calls `configure()` again, which clears the
+    /// marker for an explicit user re-attempt after cleanup.
+    private var deviceIssueLimitReachedServers = Set<String>()
+
     /// Injectable connect implementation (tests). When non-nil the reconnect
     /// loop calls this closure instead of `client.connect(...)` — the same
     /// pattern as `SessionStore.resumeRPC`. Defaults to `nil`; the live path
@@ -668,6 +688,8 @@ final class ConnectionStore {
         // Cancel any reconnect loop tied to a previous configuration.
         reconnectTask?.cancel()
         reconnectTask = nil
+        deviceIssueLimitReachedServers.remove(trimmedURL)
+        deviceLimitAdvisory = nil
 
         // Reset the initial-fill guard so the next refresh() after this
         // configure re-runs the fill-to-30 loop for the new server.
@@ -1275,6 +1297,21 @@ final class ConnectionStore {
     static let reauthMessage =
         "This device's pairing was revoked. Scan a new pairing code to reconnect."
 
+    /// User-visible, actionable copy for the non-retryable device registry cap.
+    /// Shown as a non-blocking advisory because the shared token remains live; the
+    /// user can keep chatting while they revoke an unused device and retry.
+    static func deviceLimitReachedMessage(maxDevices: Int?) -> String {
+        if let maxDevices {
+            return "Device limit reached (\(maxDevices) devices). Revoke an unused device in Settings → Devices, then retry."
+        }
+        return "Device limit reached. Revoke an unused device in Settings → Devices, then retry."
+    }
+
+    private func handleDeviceLimitReached(serverURL: String, maxDevices: Int?) {
+        deviceIssueLimitReachedServers.insert(serverURL)
+        deviceLimitAdvisory = Self.deviceLimitReachedMessage(maxDevices: maxDevices)
+    }
+
     // MARK: - Device-token auto-upgrade (W3A-A — silent rotation)
 
     /// Transparently swap a legacy SHARED token for a per-device token when the
@@ -1298,10 +1335,13 @@ final class ConnectionStore {
     ///     v2 QR handed us a device token — don't re-issue);
     ///   - we are still configured against `serverURL` with a live token.
     ///
-    /// FAILURE IS SILENT (binding): if `issueDevice` throws (500 persist failure,
-    /// 401, transport), the app KEEPS the shared token (no regression) and the
-    /// next connect retries (this method is re-invoked from `recoverActiveSession`
-    /// after a reconnect). The shared token never stops working.
+    /// FAILURE IS SILENT (binding) for transient/status failures: if `issueDevice`
+    /// throws (500 persist failure, 401, transport), the app KEEPS the shared
+    /// token (no regression) and the next connect retries (this method is
+    /// re-invoked from `recoverActiveSession` after a reconnect). A device-limit
+    /// 409 is the exception: it is user-visible and suppresses further automatic
+    /// re-issues for this server until the user explicitly retries. The shared
+    /// token never stops working.
     ///
     /// SECRETS HYGIENE (binding): the issued token goes straight to the Keychain
     /// + `currentToken` (in-memory, non-observable) and is NEVER logged,
@@ -1314,12 +1354,20 @@ final class ConnectionStore {
         // Already holding a device token for this server (prior upgrade or a v2
         // QR) → nothing to do.
         guard DefaultsKeys.deviceId(server: serverURL) == nil else { return }
+        // A prior 409 is not transient; retrying it on every reconnect produces
+        // the silent-forever loop ABH-254 is fixing. The existing offline banner's
+        // Retry action re-enters `configure()`, which clears this suppression so a
+        // user can re-attempt after revoking an unused device.
+        guard !deviceIssueLimitReachedServers.contains(serverURL) else { return }
         // Must still be the active configuration with a live token + REST client.
         guard serverURLString == serverURL, let rest else { return }
 
         let issued: IssuedDevice
         do {
             issued = try await rest.issueDevice(name: Self.deviceNameHint)
+        } catch DeviceIssueError.limitReached(let maxDevices) {
+            handleDeviceLimitReached(serverURL: serverURL, maxDevices: maxDevices)
+            return
         } catch {
             // Keep the shared token silently (no regression). A later connect
             // retries. Never log the error path with a token — `issueDevice`
@@ -1378,6 +1426,14 @@ final class ConnectionStore {
         currentToken = token
         hasConnected = true
         startReconnectLoop()
+    }
+
+    func _handleDeviceLimitReachedForTesting(serverURL: String, maxDevices: Int?) {
+        handleDeviceLimitReached(serverURL: serverURL, maxDevices: maxDevices)
+    }
+
+    func _isDeviceIssueLimitReachedSuppressedForTesting(serverURL: String) -> Bool {
+        deviceIssueLimitReachedServers.contains(serverURL)
     }
     #endif
 

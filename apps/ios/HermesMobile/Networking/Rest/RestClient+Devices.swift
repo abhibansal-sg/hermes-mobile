@@ -1,5 +1,23 @@
 import Foundation
 
+/// Typed errors specific to `POST /api/devices/issue`.
+enum DeviceIssueError: Error, LocalizedError, Equatable, Sendable {
+    /// The gateway refused to mint another device token because the registry is
+    /// at its configured cap. This is permanent until a device is revoked, so
+    /// callers must NOT treat it like a transient transport/status failure.
+    case limitReached(maxDevices: Int?)
+
+    var errorDescription: String? {
+        switch self {
+        case .limitReached(let maxDevices):
+            if let maxDevices {
+                return "Device limit reached (\(maxDevices) devices). Revoke an unused device in Settings → Devices, then retry."
+            }
+            return "Device limit reached. Revoke an unused device in Settings → Devices, then retry."
+        }
+    }
+}
+
 // MARK: - W3A-A per-device-token REST surface (feature-detected)
 //
 // The four NEW per-device-token endpoints (`GET /api/devices`, `POST
@@ -90,7 +108,9 @@ extension RestClient {
     /// registry-write failure the server returns `500`
     /// `{"error":"registry persist failed"}` (the token is NOT returned) which
     /// surfaces here as ``RestError/badStatus``; the auto-upgrade path catches
-    /// that and KEEPS the shared token (no regression). `401` on a bad/absent
+    /// that and KEEPS the shared token (no regression). `409` on a full device
+    /// registry throws ``DeviceIssueError/limitReached(maxDevices:)`` so callers
+    /// can surface an actionable, non-retryable condition. `401` on a bad/absent
     /// credential.
     ///
     /// `platform` defaults to `"ios"`. `deviceName` is sanitized server-side
@@ -104,13 +124,33 @@ extension RestClient {
             "platform": .string(platform),
         ])
         request.httpBody = try encodeBody(body, context: "devices.issue")
-        let data = try await perform(request)
+        let data: Data
+        do {
+            data = try await perform(request)
+        } catch RestError.badStatus(409, let body) {
+            throw DeviceIssueError.limitReached(
+                maxDevices: Self.issueDeviceLimitMaxDevices(from: body)
+            )
+        }
         return try decode(
             IssuedDevice.self,
             from: data,
             context: "devices.issue",
             strategy: .useDefaultKeys
         )
+    }
+
+    /// Extract `max_devices` from the gateway's device-limit body. Kept tolerant
+    /// (number or numeric string) so the typed 409 survives minor server encoder
+    /// changes while non-409 behavior remains the shared ``RestError`` path.
+    private static func issueDeviceLimitMaxDevices(from body: String) -> Int? {
+        guard let data = body.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let raw = object["max_devices"] else { return nil }
+        if let value = raw as? Int { return value }
+        if let value = raw as? NSNumber { return value.intValue }
+        if let value = raw as? String { return Int(value) }
+        return nil
     }
 
     // MARK: - Revoke a device (the panel's destructive action)
