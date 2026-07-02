@@ -89,6 +89,19 @@ def pending_session():
         approval._gateway_queues.pop(skey, None)
 
 
+class _Transport:
+    def __init__(self, ws: object) -> None:
+        self._ws = ws
+
+
+def _own_existing_session(session_id: str, device_id: str) -> None:
+    ws = object()
+    transport = _Transport(ws)
+    device_tokens.register_ws_socket(device_id, ws)
+    gateway._sessions[session_id]["transport"] = transport
+    device_tokens.record_session_transport(session_id, transport)
+
+
 # ===========================================================================
 # REST respond path → audit attribution: shared vs device
 # ===========================================================================
@@ -122,6 +135,7 @@ def test_rest_respond_device_token_writes_device_attribution(
         f"{_PREFIX}/devices/issue", json={"device_name": "Audit Phone"},
         headers=_SHARED_HEADER,
     ).json()
+    _own_existing_session(sid, issued["device_id"])
     r = client.post(
         f"{_PREFIX}/approvals/respond",
         json={"session_id": sid, "choice": "approve"},
@@ -165,6 +179,7 @@ def test_audit_file_never_contains_a_full_token(
     issued = client.post(
         f"{_PREFIX}/devices/issue", json={"device_name": "x"}, headers=_SHARED_HEADER
     ).json()
+    _own_existing_session(sid, issued["device_id"])
     client.post(
         f"{_PREFIX}/approvals/respond",
         json={"session_id": sid, "choice": "approve"},
@@ -198,6 +213,7 @@ def test_round_trip_pending_approval_to_unblock_to_audit_record(
             f"{_PREFIX}/devices/issue", json={"device_name": "RT Phone"},
             headers=_SHARED_HEADER,
         ).json()
+        _own_existing_session(sid, issued["device_id"])
 
         r = client.post(
             f"{_PREFIX}/approvals/respond",

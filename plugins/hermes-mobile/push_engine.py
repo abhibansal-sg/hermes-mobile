@@ -675,7 +675,10 @@ def prune_live_activity_tokens(
 
 
 def register_live_activity_token(
-    session_id: str, token: str, env: str = ""
+    session_id: str,
+    token: str,
+    env: str = "",
+    device_id: Optional[str] = None,
 ) -> bool:
     """Upsert a Live Activity push token for ``session_id``.
 
@@ -691,11 +694,14 @@ def register_live_activity_token(
     environment = env if env in ("sandbox", "production") else _default_env()
     with _la_registry_lock:
         entries = _load_la_registry()
-        entries[session_id] = {
+        entry = {
             "token": normalized,
             "env": environment,
             "registered_at": time.time(),
         }
+        if isinstance(device_id, str) and device_id.strip():
+            entry["device_id"] = device_id.strip()
+        entries[session_id] = entry
         _save_la_registry(entries)
     return True
 
@@ -726,6 +732,18 @@ def live_activity_token_for(session_id: str) -> Optional[Tuple[str, str]]:
     if env not in ("sandbox", "production"):
         env = _default_env()
     return token, env
+
+
+def live_activity_device_for(session_id: str) -> Optional[str]:
+    """Return the device id that registered ``session_id``'s LA token, if any."""
+    prune_live_activity_tokens()
+    entry = _load_la_registry().get(session_id)
+    if not isinstance(entry, dict):
+        return None
+    device_id = entry.get("device_id")
+    if isinstance(device_id, str) and device_id.strip():
+        return device_id.strip()
+    return None
 
 
 def _drop_la_token(session_id: str) -> None:

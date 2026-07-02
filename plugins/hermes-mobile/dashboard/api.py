@@ -112,6 +112,54 @@ def _request_device(request: Request) -> Optional[dict]:
     return _web()._request_device(request)
 
 
+def _request_device_id(request: Request) -> Optional[str]:
+    device = _request_device(request)
+    if isinstance(device, dict) and isinstance(device.get("device_id"), str):
+        device_id = device["device_id"].strip()
+        return device_id or None
+    return None
+
+
+def _device_owns_session(request: Request, session_id: str) -> bool:
+    """Return whether this request may act on ``session_id``.
+
+    Shared-token requests are host-trusted and keep their legacy behaviour.
+    Device-token requests must match the plugin-owned runtime session→device
+    correlation; missing or ambiguous ownership fails closed.
+    """
+    device_id = _request_device_id(request)
+    if device_id is None:
+        return True
+    try:
+        device_tokens = _plugin_module("device_tokens")
+        owner = device_tokens.device_identity_for_session(session_id)
+    except Exception:
+        return False
+    return isinstance(owner, dict) and owner.get("device_id") == device_id
+
+
+def _device_owns_live_activity_session(
+    request: Request, session_id: str, engine: Any
+) -> bool:
+    """Return whether this request may mutate a session's Live Activity token."""
+    device_id = _request_device_id(request)
+    if device_id is None:
+        return True
+    try:
+        device_tokens = _plugin_module("device_tokens")
+        owner = device_tokens.device_identity_for_session(session_id)
+    except Exception:
+        owner = None
+    if isinstance(owner, dict) and owner.get("device_id"):
+        return owner.get("device_id") == device_id
+    existing_owner = getattr(engine, "live_activity_device_for", lambda _sid: None)(
+        session_id
+    )
+    if isinstance(existing_owner, str) and existing_owner:
+        return existing_owner == device_id
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Attachment upload — bridge for remote clients (mobile/desktop-remote).
 #
@@ -251,6 +299,8 @@ async def respond_to_approval(body: ApprovalRespondBody, request: Request):
     session_key = session.get("session_key")
     if not session_key:
         raise HTTPException(status_code=404, detail="Unknown session")
+    if not _device_owns_session(request, body.session_id):
+        raise HTTPException(status_code=403, detail="Device token does not own session")
 
     # W3a: build the audit context from the resolver's auth identity. A device
     # token sets request.state.device (in _has_valid_session_token); otherwise
@@ -856,8 +906,13 @@ async def register_live_activity(body: LiveActivityBody, request: Request) -> Di
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     engine = _plugin_module("push_engine")
+    if not _device_owns_live_activity_session(request, body.session_id, engine):
+        raise HTTPException(status_code=403, detail="Device token does not own session")
     if not engine.register_live_activity_token(
-        body.session_id, body.token, env=body.env
+        body.session_id,
+        body.token,
+        env=body.env,
+        device_id=_request_device_id(request),
     ):
         raise HTTPException(
             status_code=400, detail="Invalid Live Activity token or session_id"
@@ -871,6 +926,8 @@ async def unregister_live_activity(body: LiveActivityBody, request: Request) -> 
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     engine = _plugin_module("push_engine")
+    if not _device_owns_live_activity_session(request, body.session_id, engine):
+        raise HTTPException(status_code=403, detail="Device token does not own session")
     removed = engine.unregister_live_activity_token(body.session_id)
     return {"ok": True, "removed": removed}
 
