@@ -27,6 +27,7 @@ struct DevicesView: View {
     /// app passes a live ``LAContextAuthenticator``; tests inject a stub.
     let authenticator: BiometricAuthenticating
 
+    @Environment(ConnectionStore.self) private var connection
     @Environment(\.hermesTheme) private var theme
 
     @State private var devices: [PairedDevice] = []
@@ -236,13 +237,11 @@ struct DevicesView: View {
 
         let wasCurrent = isCurrentDevice(device)
         devices.removeAll { $0.deviceId == device.deviceId }
-        if wasCurrent {
-            // This device just revoked itself. Clear the recorded id so the next
-            // request 401s into the existing re-pair flow (and a re-scan
-            // auto-upgrades to a FRESH device token). The Keychain still holds the
-            // now-invalid device token; the 401 path handles re-pair.
-            DefaultsKeys.setDeviceId(nil, server: serverURL)
-        }
+        Self.applySuccessfulRevokeSideEffects(
+            wasCurrent: wasCurrent,
+            serverURL: serverURL,
+            connection: connection
+        )
     }
 
     // MARK: - Current-device resolution
@@ -305,6 +304,23 @@ struct DevicesView: View {
     /// The biometric prompt reason for a revoke.
     static func biometricReason(device: PairedDevice) -> String {
         "Confirm to revoke “\(device.deviceName)”."
+    }
+
+    /// Apply side effects after a clean revoke. For a self-revoke, `wasCurrent`
+    /// is synchronous ground truth: route to re-pair immediately instead of
+    /// waiting for the external-revocation reconnect debounce.
+    static func applySuccessfulRevokeSideEffects(
+        wasCurrent: Bool,
+        serverURL: String,
+        connection: ConnectionStore
+    ) {
+        guard wasCurrent else { return }
+        // This device just revoked itself. Clear the recorded id so a re-scan
+        // auto-upgrades to a FRESH device token. The Keychain still holds the
+        // now-invalid device token; bootstrap/configure auth handling covers
+        // relaunches, while the live UI routes to re-pair synchronously here.
+        DefaultsKeys.setDeviceId(nil, server: serverURL)
+        connection.requireRepairAfterCurrentDeviceRevoked()
     }
 
     /// Relative date for an epoch-seconds timestamp. Clamped to the past: the

@@ -1297,6 +1297,21 @@ final class ConnectionStore {
     static let reauthMessage =
         "This device's pairing was revoked. Scan a new pairing code to reconnect."
 
+    /// Synchronously route a deliberate self-revoke to the re-pair state.
+    ///
+    /// External revocations still go through the reconnect-loop debounce; this
+    /// path is only for the Settings → Devices branch where the UI already knows
+    /// from `wasCurrent` that the current install revoked its own token.
+    func requireRepairAfterCurrentDeviceRevoked() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        hydrationTask?.cancel()
+        hydrationTask = nil
+        reauthRequired = true
+        consecutiveReconnectFailures = 0
+        phase = .needsSetup
+    }
+
     /// User-visible, actionable copy for the non-retryable device registry cap.
     /// Shown as a non-blocking advisory because the shared token remains live; the
     /// user can keep chatting while they revoke an unused device and retry.

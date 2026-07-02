@@ -286,6 +286,44 @@ final class DevicesTests: XCTestCase {
         XCTAssertEqual(result.socketsClosed, 2)
     }
 
+    func testRevokePersistFailureThrowsTypedErrorWithDistinctMessage() async {
+        let body = Data(#"{"error":"revocation persist failed","revoked":true,"device_id":"dev_abc123","sockets_closed":2}"#.utf8)
+        let client = makeIssueClient(body: body, status: 500)
+
+        do {
+            _ = try await client.revokeDevice(id: "dev_abc123")
+            XCTFail("expected DeviceRevokeError.persistFailed")
+        } catch DeviceRevokeError.persistFailed(let result) {
+            XCTAssertTrue(result.revoked)
+            XCTAssertEqual(result.deviceId, "dev_abc123")
+            XCTAssertEqual(result.socketsClosed, 2)
+
+            let persistFailureMessage = DeviceRevokeError.persistFailed(result).errorDescription ?? ""
+            let genericFailureMessage = RestError.badStatus(500, body: #"{"error":"boom"}"#).errorDescription ?? ""
+            XCTAssertTrue(persistFailureMessage.localizedCaseInsensitiveContains("not durably revoked"), persistFailureMessage)
+            XCTAssertNotEqual(persistFailureMessage, genericFailureMessage)
+        } catch {
+            XCTFail("expected DeviceRevokeError.persistFailed, got \(error)")
+        }
+    }
+
+    func testRevokeGeneric500StillSurfacesRestError() async {
+        let body = Data(#"{"error":"boom"}"#.utf8)
+        let client = makeIssueClient(body: body, status: 500)
+
+        do {
+            _ = try await client.revokeDevice(id: "dev_abc123")
+            XCTFail("expected RestError.badStatus")
+        } catch DeviceRevokeError.persistFailed {
+            XCTFail("generic 500 must not be mapped to persist-failure")
+        } catch RestError.badStatus(let code, let errorBody) {
+            XCTAssertEqual(code, 500)
+            XCTAssertTrue(errorBody.contains("boom"))
+        } catch {
+            XCTFail("expected RestError.badStatus, got \(error)")
+        }
+    }
+
     // MARK: - ApprovalAuditEntry decode (two identities)
 
     func testAuditDecodesSharedAndDeviceRecords() throws {
@@ -516,6 +554,44 @@ final class DevicesTests: XCTestCase {
         XCTAssertNil(DefaultsKeys.deviceId(server: server))
         // Now the device is eligible to auto-upgrade again on the next pairing.
         XCTAssertTrue(shouldAutoUpgrade(capability: .available, hasRecordedId: false))
+    }
+
+    func testSuccessfulSelfRevokeDrivesRepairStateSynchronouslyFromWasCurrent() {
+        let sessions = SessionStore()
+        let chat = ChatStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let server = "https://self-revoke:9119"
+        DefaultsKeys.setDeviceId("dev_current", server: server)
+        connection.phase = .connected
+
+        DevicesView.applySuccessfulRevokeSideEffects(
+            wasCurrent: true,
+            serverURL: server,
+            connection: connection
+        )
+
+        XCTAssertNil(DefaultsKeys.deviceId(server: server))
+        XCTAssertTrue(connection.reauthRequired)
+        XCTAssertEqual(connection.phase, .needsSetup)
+    }
+
+    func testSuccessfulOtherDeviceRevokeDoesNotDriveRepairState() {
+        let sessions = SessionStore()
+        let chat = ChatStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let server = "https://other-revoke:9119"
+        DefaultsKeys.setDeviceId("dev_current", server: server)
+        connection.phase = .connected
+
+        DevicesView.applySuccessfulRevokeSideEffects(
+            wasCurrent: false,
+            serverURL: server,
+            connection: connection
+        )
+
+        XCTAssertEqual(DefaultsKeys.deviceId(server: server), "dev_current")
+        XCTAssertFalse(connection.reauthRequired)
+        XCTAssertEqual(connection.phase, .connected)
     }
 
     func testDeviceRowDetailLineUsesPrefixNeverToken() {

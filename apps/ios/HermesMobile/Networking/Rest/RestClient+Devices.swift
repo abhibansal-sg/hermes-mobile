@@ -18,6 +18,21 @@ enum DeviceIssueError: Error, LocalizedError, Equatable, Sendable {
     }
 }
 
+/// Typed errors specific to `DELETE /api/devices/{id}`.
+enum DeviceRevokeError: Error, LocalizedError, Equatable, Sendable {
+    /// The gateway cut the token/socket in the live process, but failed to write
+    /// the registry file. The revocation is therefore not durable across restart.
+    case persistFailed(RevokeDeviceResult)
+
+    var errorDescription: String? {
+        switch self {
+        case .persistFailed(let result):
+            let socketCopy = result.socketsClosed == 1 ? "1 live socket" : "\(result.socketsClosed) live sockets"
+            return "Device was not durably revoked. The server closed \(socketCopy), but failed to save the registry change; it may return after a gateway restart. Try again."
+        }
+    }
+}
+
 // MARK: - W3A-A per-device-token REST surface (feature-detected)
 //
 // The four NEW per-device-token endpoints (`GET /api/devices`, `POST
@@ -162,21 +177,55 @@ extension RestClient {
     /// ``RestError/badStatus`` for the caller to surface inline. A persist
     /// failure returns `500` `{"error":"revocation persist failed","revoked":true,
     /// …}` (the token is already dead in the server process; the on-disk file is
-    /// stale) — also a ``RestError/badStatus``. Revoking a device NEVER affects
-    /// the shared token.
+    /// stale) — mapped to ``DeviceRevokeError/persistFailed`` so callers do not
+    /// present it like a clean revoke. Revoking a device NEVER affects the shared
+    /// token.
     @discardableResult
     func revokeDevice(id deviceId: String) async throws -> RevokeDeviceResult {
         let encodedId = deviceId.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? deviceId
         let request = makeRequest(path: "\(mobileAPIPrefix)/devices/\(encodedId)", method: "DELETE")
-        let data = try await perform(request)
+        let data: Data
+        do {
+            data = try await perform(request)
+        } catch RestError.badStatus(500, let body) {
+            if let result = Self.revokePersistFailureResult(from: body) {
+                throw DeviceRevokeError.persistFailed(result)
+            }
+            throw RestError.badStatus(500, body: body)
+        }
         return try decode(
             RevokeDeviceResult.self,
             from: data,
             context: "devices.revoke",
             strategy: .useDefaultKeys
         )
+    }
+
+    /// Extract the special revoke-persist-failure shape from a 500 body. This is
+    /// NOT a clean revoke: the token is dead in the current server process, but
+    /// the registry write failed, so the revocation is not durable.
+    private static func revokePersistFailureResult(from body: String) -> RevokeDeviceResult? {
+        guard let data = body.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let error = object["error"] as? String,
+              error == "revocation persist failed",
+              let revoked = object["revoked"] as? Bool,
+              revoked else { return nil }
+
+        let deviceId = object["device_id"] as? String ?? ""
+        let socketsClosed: Int
+        if let value = object["sockets_closed"] as? Int {
+            socketsClosed = value
+        } else if let value = object["sockets_closed"] as? NSNumber {
+            socketsClosed = value.intValue
+        } else if let value = object["sockets_closed"] as? String, let parsed = Int(value) {
+            socketsClosed = parsed
+        } else {
+            socketsClosed = 0
+        }
+        return RevokeDeviceResult(revoked: true, deviceId: deviceId, socketsClosed: socketsClosed)
     }
 
     // MARK: - Approval audit log (read-only)
