@@ -37,6 +37,7 @@ import re
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -61,10 +62,12 @@ _ws_device_sockets: Dict[str, Set[Any]] = {}
 # first indexed in ``_ws_device_sockets`` by the auth seam. Separately, the TUI
 # gateway session table tells us which transport serves runtime session S. This
 # plugin-owned map composes the two signals without relying on core-owned
-# ``ws.state.device``: {runtime_session_id: (device_id, ws)}. If either side is
-# missing or ambiguous, lookups fail closed.
+# ``ws.state.device``: {runtime_session_id: (device_id, ws, monotonic_seen_at)}.
+# If either side is missing or ambiguous, lookups fail closed. The index is
+# deliberately bounded + TTL-pruned because core session close/delete/idle-reap
+# lifecycle events are not plugin-owned signals.
 _session_index_lock = threading.Lock()
-_session_device_sockets: Dict[str, tuple[str, Any]] = {}
+_session_device_sockets: "OrderedDict[str, tuple[str, Any, float]]" = OrderedDict()
 
 # In-process deny-set of REVOKED ``token_hash`` values. A revocation is recorded
 # here BEFORE (and independent of) the on-disk write, so a revoked token stops
@@ -89,6 +92,8 @@ _DEFAULT_DEVICE_NAME = "iPhone"
 _TOKEN_PREFIX_LEN = 8
 _DEFAULT_SCOPES = ["chat", "approve"]
 _MAX_DEVICES = 64
+_MAX_SESSION_DEVICE_INDEX = 256
+_SESSION_DEVICE_INDEX_TTL_SECONDS = 30 * 60
 
 # Strip ASCII + Unicode control chars from a device name before storing it.
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -432,6 +437,35 @@ def _normalize_session_id(session_id: Any) -> str:
     return session_id.strip() if isinstance(session_id, str) else ""
 
 
+def _session_index_now() -> float:
+    return time.monotonic()
+
+
+def _prune_expired_session_mappings(now: Optional[float] = None) -> None:
+    """Drop stale runtime-session correlations while holding session lock."""
+    if not _session_device_sockets:
+        return
+    ttl = _SESSION_DEVICE_INDEX_TTL_SECONDS
+    if ttl <= 0:
+        _session_device_sockets.clear()
+        return
+    cutoff = (now if now is not None else _session_index_now()) - ttl
+    stale = [
+        session_id
+        for session_id, (_device_id, _ws, seen_at) in _session_device_sockets.items()
+        if seen_at < cutoff
+    ]
+    for session_id in stale:
+        _session_device_sockets.pop(session_id, None)
+
+
+def _enforce_session_index_bound() -> None:
+    """Evict oldest runtime-session correlations over the hard cap."""
+    max_entries = max(1, int(_MAX_SESSION_DEVICE_INDEX or 1))
+    while len(_session_device_sockets) > max_entries:
+        _session_device_sockets.popitem(last=False)
+
+
 def _device_ids_for_ws_socket(ws: Any) -> List[str]:
     if ws is None:
         return []
@@ -457,7 +491,7 @@ def _clear_session_mappings_for_ws(ws: Any) -> None:
     with _session_index_lock:
         stale = [
             session_id
-            for session_id, (_device_id, mapped_ws) in _session_device_sockets.items()
+            for session_id, (_device_id, mapped_ws, _seen_at) in _session_device_sockets.items()
             if mapped_ws is ws
         ]
         for session_id in stale:
@@ -468,7 +502,7 @@ def _clear_session_mappings_for_device(device_id: str) -> None:
     with _session_index_lock:
         stale = [
             session_id
-            for session_id, (mapped_device_id, _ws) in _session_device_sockets.items()
+            for session_id, (mapped_device_id, _ws, _seen_at) in _session_device_sockets.items()
             if mapped_device_id == device_id
         ]
         for session_id in stale:
@@ -490,11 +524,15 @@ def record_session_transport(session_id: Any, transport: Any) -> Optional[Dict[s
         return None
     ws = getattr(transport, "_ws", None)
     device_id = _single_active_device_for_ws_socket(ws)
+    now = _session_index_now()
     with _session_index_lock:
+        _prune_expired_session_mappings(now)
         if device_id is None:
             _session_device_sockets.pop(sid, None)
             return None
-        _session_device_sockets[sid] = (device_id, ws)
+        _session_device_sockets[sid] = (device_id, ws, now)
+        _session_device_sockets.move_to_end(sid)
+        _enforce_session_index_bound()
     return {"device_id": device_id}
 
 
@@ -512,7 +550,7 @@ def clear_session_transport(session_id: Any = "", transport: Any = None) -> None
             return
         stale = [
             mapped_session_id
-            for mapped_session_id, (_device_id, mapped_ws) in _session_device_sockets.items()
+            for mapped_session_id, (_device_id, mapped_ws, _seen_at) in _session_device_sockets.items()
             if mapped_ws is ws
         ]
         for mapped_session_id in stale:
@@ -525,10 +563,13 @@ def device_identity_for_session(session_id: Any) -> Optional[Dict[str, Any]]:
     if not sid:
         return None
     with _session_index_lock:
+        _prune_expired_session_mappings()
         mapped = _session_device_sockets.get(sid)
+        if mapped is not None:
+            _session_device_sockets.move_to_end(sid)
     if mapped is None:
         return None
-    device_id, ws = mapped
+    device_id, ws, _seen_at = mapped
     device_ids = _device_ids_for_ws_socket(ws)
     if len(device_ids) != 1 or device_ids[0] != device_id:
         clear_session_transport(sid)

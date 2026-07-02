@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from types import SimpleNamespace
 
 import pytest
 
@@ -190,3 +191,55 @@ def test_deny_set_is_cleared_by_reset_for_tests(home):
     # a hypothetical hash collision across tests can't leak.
     device_tokens._reset_for_tests()
     assert device_tokens._revoked_hashes == set()
+
+
+# ---------------------------------------------------------------------------
+# ABH-252: runtime-session → device correlation must not leak forever.
+# ---------------------------------------------------------------------------
+
+
+def test_session_device_index_is_bounded_across_many_closed_sessions(home, monkeypatch):
+    """Core session close/delete has no plugin lifecycle callback, so 500 closed
+    runtime session ids on one still-live phone socket must not leave 500 stale
+    correlation rows behind."""
+    monkeypatch.setattr(device_tokens, "_MAX_SESSION_DEVICE_INDEX", 64)
+    issued = device_tokens.issue(device_name="Abhi's iPhone")
+    ws = object()
+    transport = SimpleNamespace(_ws=ws)
+    device_tokens.register_ws_socket(issued["device_id"], ws)
+
+    for idx in range(500):
+        result = device_tokens.record_session_transport(f"closed-session-{idx}", transport)
+        assert result == {"device_id": issued["device_id"]}
+        # Simulated close: the core runtime session is gone, but the plugin gets
+        # no per-session close signal. The bound must hold without an explicit
+        # ``clear_session_transport`` call.
+
+    assert len(device_tokens._session_device_sockets) <= 64
+    assert len(device_tokens._session_device_sockets) != 500
+    assert device_tokens.device_identity_for_session("closed-session-0") is None
+    assert device_tokens.device_identity_for_session("closed-session-499") == {
+        "device_id": issued["device_id"]
+    }
+
+
+def test_session_device_index_prunes_expired_entries(home, monkeypatch):
+    """Idle runtime-session correlations self-clean before reuse/lookup."""
+    now = [100.0]
+    monkeypatch.setattr(device_tokens, "_session_index_now", lambda: now[0])
+    monkeypatch.setattr(device_tokens, "_SESSION_DEVICE_INDEX_TTL_SECONDS", 10)
+    issued = device_tokens.issue(device_name="Abhi's iPhone")
+    ws = object()
+    transport = SimpleNamespace(_ws=ws)
+    device_tokens.register_ws_socket(issued["device_id"], ws)
+
+    assert device_tokens.record_session_transport("runtime-sid", transport) == {
+        "device_id": issued["device_id"]
+    }
+    assert device_tokens.device_identity_for_session("runtime-sid") == {
+        "device_id": issued["device_id"]
+    }
+
+    now[0] = 111.0
+    assert device_tokens.device_identity_for_session("runtime-sid") is None
+    assert "runtime-sid" not in device_tokens._session_device_sockets
