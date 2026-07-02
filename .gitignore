@@ -145,6 +145,8 @@ apps/ios/.derivedData/
 
 # In-tree developer-gateway data home (runtime state; scripts/dev-gateway.sh)
 .hermes-dev/
+# In-tree staging-gateway data home (runtime state; scripts/staging-gateway.sh)
+.hermes-staging/
 .linear-backups/
 
 # Desktop demo-run scratch output (hermes writes demo/*.txt during recorded

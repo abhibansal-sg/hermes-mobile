@@ -58,7 +58,20 @@ if [ "$LOCAL" != "$REMOTE" ]; then
     || fail "staging checkout has local commits not on origin/staging — refusing (fix by hand)"
   [ -z "$(git -C "$STG_REPO" status --porcelain --untracked-files=no)" ] \
     || fail "staging checkout has uncommitted tracked changes — refusing"
-  git -C "$STG_REPO" merge --ff-only origin/staging --quiet || fail "ff merge failed"
+  # Clear BYTE-IDENTICAL untracked blockers (ABH-298): a file hand-placed
+  # untracked in the checkout that is identical to the version arriving in the
+  # incoming commit deadlocks git's ff (it refuses to overwrite untracked files
+  # even when the content matches). Removing an identical file is a safe no-op —
+  # the ff re-materializes it tracked. A DIFFERING untracked file is NOT cleared:
+  # that is real unsaved work → let the ff fail loudly below.
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    if git -C "$STG_REPO" cat-file -e "origin/staging:$u" 2>/dev/null \
+       && diff -q <(git -C "$STG_REPO" show "origin/staging:$u") "$STG_REPO/$u" >/dev/null 2>&1; then
+      rm -f "$STG_REPO/$u" && say "cleared byte-identical untracked blocker: $u"
+    fi
+  done < <(git -C "$STG_REPO" ls-files --others --exclude-standard)
+  git -C "$STG_REPO" merge --ff-only origin/staging --quiet || fail "ff merge failed (untracked blocker differs — human needed)"
   say "checkout fast-forwarded ${LOCAL:0:9} -> ${REMOTE:0:9}"
 else
   say "checkout already at ${LOCAL:0:9}"
