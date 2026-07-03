@@ -17,15 +17,6 @@ enum HermesWidgetLink {
 
     /// Opens the app directly to the pending approvals inbox.
     static var review: URL { URL(string: "\(scheme)://review")! }
-
-    /// Quick-capture entry point (text optional).
-    static func capture(text: String? = nil) -> URL {
-        guard let text, !text.isEmpty,
-              let encoded = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
-            return URL(string: "\(scheme)://capture")!
-        }
-        return URL(string: "\(scheme)://capture?text=\(encoded)")!
-    }
 }
 
 // MARK: - Timeline entry
