@@ -38,6 +38,8 @@ struct ArtifactsGalleryView: View {
     @State private var filter: ArtifactFilter = .all
     /// Observable model that owns all gallery state and fetch logic.
     @State private var model = ArtifactsGalleryModel()
+    /// The image artifact currently presented in the full-screen zoom viewer.
+    @State private var selectedImageArtifact: Artifact?
 
     // MARK: - Body
 
@@ -53,6 +55,16 @@ struct ArtifactsGalleryView: View {
         .navigationBarTitleDisplayMode(.inline)
         .task { await model.load(type: filter.rawValue, api: control) }
         .onChange(of: filter) { Task { await model.load(type: filter.rawValue, api: control) } }
+        .fullScreenCover(item: $selectedImageArtifact) { artifact in
+            ZoomableImageView(
+                title: artifact.displayName,
+                image: cachedBlobImage(for: artifact),
+                remoteURL: artifact.remoteURL,
+                dataURL: artifact.isDataURL ? artifact.urlOrPath : nil,
+                unavailableMessage: "This image artifact is not available on this device. Close the viewer or try again after opening the source session."
+            )
+            .accessibilityIdentifier("artifactZoomableImageViewer")
+        }
     }
 
     // MARK: - Content phases
@@ -163,7 +175,7 @@ struct ArtifactsGalleryView: View {
                     profileId: profileId
                 )
                 .contentShape(Rectangle())
-                .onTapGesture { openSourceSession(for: artifact) }
+                .onTapGesture { openArtifact(artifact) }
                 .accessibilityLabel(artifact.displayName)
                 .accessibilityAddTraits(.isButton)
                 .onAppear {
@@ -178,6 +190,24 @@ struct ArtifactsGalleryView: View {
         }
         .padding(.horizontal, 6)
         .padding(.bottom, 16)
+    }
+
+    // MARK: - Open image / source session
+
+    /// Image artifacts open in a full-screen zoom/pan viewer. Other artifacts
+    /// preserve the existing behavior: jump back to the source transcript.
+    private func openArtifact(_ artifact: Artifact) {
+        if artifact.kind == "image" {
+            selectedImageArtifact = artifact
+        } else {
+            openSourceSession(for: artifact)
+        }
+    }
+
+    private func cachedBlobImage(for artifact: Artifact) -> UIImage? {
+        guard let key = artifact.blobCacheKey(serverId: serverId, profileId: profileId)
+        else { return nil }
+        return AttachmentBlobCache.shared.image(for: key)
     }
 
     // MARK: - Open source session

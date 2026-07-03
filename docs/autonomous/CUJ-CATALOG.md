@@ -44,6 +44,7 @@ TestFlight + Abhi catch taste (layer 5).
 | CUJ-18 | Debug share bundle from settings | `/api/debug-share` produces a bundle (#90) | support |
 | CUJ-19 | Recover the gateway from the phone (restart + update) with honest reconnecting state | POST /api/gateway/restart → poll /api/actions/gateway-restart/status until running:false; badge reads reconnecting while in-flight | Malacca |
 | CUJ-20 | iPad keyboard user sends a message and navigates with Cmd shortcuts | `smoke: ios-sim` RootKeyboardShortcutActionsTests verifies shortcut action symbols fire / are wired | ABH-308 |
+| CUJ-21 | iOS artifact-gallery image opens full-screen, zooms, and closes | `smoke: ios-sim` ZoomableImageViewTests verifies fit math, zoom/pan clamp invariants, double-tap min→zoom/reset toggle, and swipe-down dismiss gate; UI smoke must open an image artifact into `artifactZoomableImageViewer`, exercise pinch/double-tap zoom behavior, then close via `zoomableImageCloseButton`/swipe dismiss | ABH-242 |
 
 `smoke: ios-sim` (covered by iOS test suite, skipped by gateway smoke): stale
 'Connection lost' warning clears on clean resume (ABH-289 tests), per-event
