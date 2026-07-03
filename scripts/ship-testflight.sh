@@ -129,7 +129,7 @@ if [ -n "$CLOUD_WF" ]; then
   git add apps/ios/project.yml apps/ios/*.xcodeproj 2>/dev/null
   git commit -q -m "ship: bump to build $NEXT (cloud ship pre-commit)" 2>/dev/null
   git push origin HEAD:"$BASE" 2>&1 | tail -1
-  RUN_ID=$(node apps/ios/ci_scripts/asc-cloud.mjs trigger "$CLOUD_WF" "$BASE" 2>&1 | grep -oE '[0-9a-f-]{36}' | head -1)
+  RUN_ID=$(node apps/ios/ci_scripts/asc-cloud.mjs trigger "$CLOUD_WF" "$BASE" 2>&1 | awk '/^  ID:/{print $2}' | head -1)
   if [ -n "$RUN_ID" ]; then
     echo "  cloud build run: $RUN_ID — waiting (ceiling 45m)…"
     if node apps/ios/ci_scripts/asc-cloud.mjs wait "$RUN_ID" 2>&1 | tail -3 | grep -q "SUCCEEDED"; then

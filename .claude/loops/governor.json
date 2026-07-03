@@ -165,12 +165,12 @@
     "wip_cap": "respect pipeline.wip_caps.shipped_unverified_builds \u2014 at the cap the ship stage throttles (stops shipping new builds) but build/plan keep running; a device-verify drains it.",
     "xcode_cloud": {
       "_comment": "Option-1 (Abhi 2026-07-03): SHIP archives build on Apple's machines (Xcode Cloud) so the Mac never wedges on the 40-min archive; verifier builds stay local behind the wedge-shim. Inactive until Abhi does the one-time portal connect (Xcode -> Integrate -> connect repo) and the workflow_id is filled in from `node apps/ios/ci_scripts/asc-cloud.mjs list-workflows`. While inactive or on any cloud failure, ship-testflight.sh falls back to the proven local archive path automatically.",
-      "active": true,
+      "active": false,
       "workflow_id": "1979B5F8-32DA-491C-BA92-289EC875D83C",
       "workflow_name": "HermesMobile Ship",
       "cost_note": "25 free compute h/mo; ~0.4h/ship at 4-5 ships/day -> expect ~$25-50/mo overage at $49.99/100h",
       "trigger": "manual-only (ship script triggers via asc-cloud.mjs; no auto branch trigger so non-ship project.yml commits never burn compute)",
-      "_validation": "ARMED 2026-07-03 but first cloud ship NOT yet validated end-to-end; local fallback engages automatically on any cloud failure. After first SUCCEEDED run + ASC VALID, note it here."
+      "_validation": "DISARMED 2026-07-03 19:2x after live test: cloud ARCHIVE works (proven \u2014 zero local xcodebuild during build, artifacts produced on Apple VMs), but the TestFlight upload step fails with ASC auth error (Session Proxy Provider / cloud-managed signing not provisioned). 3/3 runs failed identically at upload. Re-arm ONLY after the signing/auth blocker (ABH-347) is cleared and one manual cloud run reaches TestFlight. Local wedge-safe path is the active ship mechanism meanwhile."
     }
   },
   "forbidden_paths": {
