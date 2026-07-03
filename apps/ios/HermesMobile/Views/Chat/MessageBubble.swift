@@ -462,22 +462,14 @@ struct MessageBubble: View {
                     // never code (`CodeBlockView`, mono) nor the streaming cursor
                     // (its own `Text` keeps the system face).
                     //
-                    // CC-01 / round-2 ROOT D: the streaming cursor is NO LONGER an
-                    // animated `.opacity` on this prose `Text`. Previously the
-                    // riding-cursor case wrapped the (large, growing) prose block in
-                    // `.opacity(0.65 + cursorPulseOpacity*0.35)` driven by a 0.6s
-                    // `.repeatForever` animation — forcing SwiftUI to re-composite
-                    // the entire prose Text on every pulse frame AND on every flush.
-                    // The pulse is now lifted onto a SEPARATE standalone cursor
-                    // sibling (`cursorView`, appended after the segment stack
-                    // below), so this prose `Text` is static: it renders at full
-                    // opacity, carries no animation, and its `RenderCache`-memoized
-                    // AttributedString is composited once per text value.
-                    (Text(RenderCache.prose(body)).font(Self.proseFont))
-                        .foregroundStyle(theme.fg)
-                        .lineSpacing(Self.proseLineSpacing)
-                        .perfTextSelection()
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    // ABH-360 extends the prose renderer with a cached GFM block
+                    // pass. Regular paragraphs still flow through the existing
+                    // RenderCache.prose → AttributedString markdown path, while
+                    // tables/task lists/blockquotes/lists become native SwiftUI
+                    // blocks so GFM does not collapse into raw dashes and pipes.
+                    ForEach(Array(RenderCache.markdownBlocks(body).enumerated()), id: \.offset) { _, block in
+                        markdownBlock(block)
+                    }
                 case .code(let language, let body):
                     CodeBlockView(language: language, code: body)
                 }
@@ -505,6 +497,313 @@ struct MessageBubble: View {
     /// reference: "Assistant text is full-width serif"). Code + cursor keep the
     /// system face.
     private static let proseFont: Font = .system(.body, design: .serif)
+
+    @ViewBuilder
+    private func markdownBlock(_ block: MarkdownBlock) -> some View {
+        switch block {
+        case .paragraph(let text):
+            paragraphText(text)
+        case .table(let table):
+            MarkdownTableBlockView(table: table)
+        case .blockquote(let text):
+            MarkdownBlockquoteView(text: text)
+        case .taskItems(let items):
+            MarkdownTaskListView(items: items)
+        case .listItems(let items):
+            MarkdownListBlockView(items: items)
+        }
+    }
+
+    private func paragraphText(_ text: String) -> some View {
+        (Text(RenderCache.prose(text)).font(Self.proseFont))
+            .foregroundStyle(theme.fg)
+            .lineSpacing(Self.proseLineSpacing)
+            .perfTextSelection()
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: - ABH-360 GFM block parsing
+
+    struct MarkdownTable: Equatable, Sendable {
+        enum Alignment: Equatable, Sendable { case leading, center, trailing }
+
+        let headers: [String]
+        let alignments: [Alignment]
+        let rows: [[String]]
+    }
+
+    struct MarkdownTaskItem: Equatable, Sendable {
+        let checked: Bool
+        let text: String
+        let level: Int
+    }
+
+    struct MarkdownListItem: Equatable, Sendable {
+        let marker: String
+        let text: String
+        let level: Int
+    }
+
+    enum MarkdownBlock: Equatable, Sendable {
+        case paragraph(String)
+        case table(MarkdownTable)
+        case blockquote(String)
+        case taskItems([MarkdownTaskItem])
+        case listItems([MarkdownListItem])
+    }
+
+    /// Parse GFM block constructs that `AttributedString(markdown:)` cannot lay
+    /// out as native chat UI. The parser is intentionally conservative: if a run
+    /// is not a clear GFM table / task-list / blockquote / list, it falls back to
+    /// the existing inline markdown path unchanged.
+    static func markdownBlocks(_ text: String) -> [MarkdownBlock] {
+        let lines = text.components(separatedBy: "\n")
+        guard !lines.isEmpty else { return [] }
+
+        var blocks: [MarkdownBlock] = []
+        var paragraph: [String] = []
+        var index = 0
+
+        func flushParagraph() {
+            guard !paragraph.isEmpty else { return }
+            let body = paragraph.joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !body.isEmpty { blocks.append(.paragraph(body)) }
+            paragraph.removeAll(keepingCapacity: true)
+        }
+
+        while index < lines.count {
+            let line = lines[index]
+
+            if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                flushParagraph()
+                index += 1
+                continue
+            }
+
+            if let table = markdownTable(startingAt: index, lines: lines) {
+                flushParagraph()
+                blocks.append(.table(table.table))
+                index = table.nextIndex
+                continue
+            }
+
+            if let quote = blockquoteRun(startingAt: index, lines: lines) {
+                flushParagraph()
+                blocks.append(.blockquote(quote.text))
+                index = quote.nextIndex
+                continue
+            }
+
+            if let tasks = taskListRun(startingAt: index, lines: lines) {
+                flushParagraph()
+                blocks.append(.taskItems(tasks.items))
+                index = tasks.nextIndex
+                continue
+            }
+
+            if let list = listRun(startingAt: index, lines: lines) {
+                flushParagraph()
+                blocks.append(.listItems(list.items))
+                index = list.nextIndex
+                continue
+            }
+
+            paragraph.append(line)
+            index += 1
+        }
+
+        flushParagraph()
+        return blocks
+    }
+
+    private static func markdownTable(
+        startingAt index: Int,
+        lines: [String]
+    ) -> (table: MarkdownTable, nextIndex: Int)? {
+        guard index + 1 < lines.count,
+              lines[index].contains("|"),
+              lines[index + 1].contains("|")
+        else { return nil }
+
+        let headers = pipeCells(lines[index])
+        let delimiters = pipeCells(lines[index + 1])
+        guard !headers.isEmpty,
+              headers.count == delimiters.count,
+              delimiters.allSatisfy(isTableDelimiterCell)
+        else { return nil }
+
+        var rows: [[String]] = []
+        var cursor = index + 2
+        while cursor < lines.count, lines[cursor].contains("|") {
+            let trimmed = lines[cursor].trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { break }
+            rows.append(normalizedTableRow(pipeCells(lines[cursor]), count: headers.count))
+            cursor += 1
+        }
+
+        return (
+            MarkdownTable(
+                headers: headers,
+                alignments: delimiters.map(tableAlignment),
+                rows: rows
+            ),
+            cursor
+        )
+    }
+
+    private static func pipeCells(_ line: String) -> [String] {
+        var body = line.trimmingCharacters(in: .whitespaces)
+        if body.first == "|" { body.removeFirst() }
+        if body.last == "|" { body.removeLast() }
+
+        var cells: [String] = []
+        var current = ""
+        var escaped = false
+        for char in body {
+            if escaped {
+                current.append(char)
+                escaped = false
+            } else if char == "\\" {
+                escaped = true
+            } else if char == "|" {
+                cells.append(current.trimmingCharacters(in: .whitespaces))
+                current.removeAll(keepingCapacity: true)
+            } else {
+                current.append(char)
+            }
+        }
+        cells.append(current.trimmingCharacters(in: .whitespaces))
+        return cells
+    }
+
+    private static func isTableDelimiterCell(_ cell: String) -> Bool {
+        let trimmed = cell.trimmingCharacters(in: .whitespaces)
+        guard trimmed.count >= 3 else { return false }
+        let body = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+        return !body.isEmpty && body.allSatisfy { $0 == "-" }
+    }
+
+    private static func tableAlignment(_ delimiter: String) -> MarkdownTable.Alignment {
+        let trimmed = delimiter.trimmingCharacters(in: .whitespaces)
+        let leading = trimmed.hasPrefix(":")
+        let trailing = trimmed.hasSuffix(":")
+        if leading && trailing { return .center }
+        if trailing { return .trailing }
+        return .leading
+    }
+
+    private static func normalizedTableRow(_ row: [String], count: Int) -> [String] {
+        if row.count == count { return row }
+        if row.count > count { return Array(row.prefix(count)) }
+        return row + Array(repeating: "", count: count - row.count)
+    }
+
+    private static func blockquoteRun(
+        startingAt index: Int,
+        lines: [String]
+    ) -> (text: String, nextIndex: Int)? {
+        guard let first = blockquoteText(lines[index]) else { return nil }
+        var quoted = [first]
+        var cursor = index + 1
+        while cursor < lines.count, let text = blockquoteText(lines[cursor]) {
+            quoted.append(text)
+            cursor += 1
+        }
+        return (quoted.joined(separator: "\n"), cursor)
+    }
+
+    private static func blockquoteText(_ line: String) -> String? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.hasPrefix(">") else { return nil }
+        var text = String(trimmed.dropFirst())
+        if text.first == " " { text.removeFirst() }
+        return text
+    }
+
+    private static func taskListRun(
+        startingAt index: Int,
+        lines: [String]
+    ) -> (items: [MarkdownTaskItem], nextIndex: Int)? {
+        guard let first = taskItem(lines[index]) else { return nil }
+        var items = [first]
+        var cursor = index + 1
+        while cursor < lines.count, let item = taskItem(lines[cursor]) {
+            items.append(item)
+            cursor += 1
+        }
+        return (items, cursor)
+    }
+
+    private static func taskItem(_ line: String) -> MarkdownTaskItem? {
+        let (leading, rest) = splitLeadingSpaces(line)
+        guard rest.hasPrefix("- [") || rest.hasPrefix("* [") || rest.hasPrefix("+ [") else { return nil }
+        let chars = Array(rest)
+        guard chars.count >= 6,
+              chars[1] == " ",
+              chars[2] == "[",
+              chars[4] == "]",
+              chars[5] == " ",
+              chars[3] == " " || chars[3].lowercased() == "x"
+        else { return nil }
+        return MarkdownTaskItem(
+            checked: chars[3].lowercased() == "x",
+            text: String(chars.dropFirst(6)),
+            level: nestingLevel(forLeadingSpaces: leading)
+        )
+    }
+
+    private static func listRun(
+        startingAt index: Int,
+        lines: [String]
+    ) -> (items: [MarkdownListItem], nextIndex: Int)? {
+        guard let first = listItem(lines[index]) else { return nil }
+        var items = [first]
+        var cursor = index + 1
+        while cursor < lines.count, let item = listItem(lines[cursor]) {
+            items.append(item)
+            cursor += 1
+        }
+        return (items, cursor)
+    }
+
+    private static func listItem(_ line: String) -> MarkdownListItem? {
+        let (leading, rest) = splitLeadingSpaces(line)
+        guard !rest.isEmpty else { return nil }
+        let level = nestingLevel(forLeadingSpaces: leading)
+        if rest.hasPrefix("- ") || rest.hasPrefix("* ") || rest.hasPrefix("+ ") {
+            return MarkdownListItem(marker: "•", text: String(rest.dropFirst(2)), level: level)
+        }
+        var digits = ""
+        var cursor = rest.startIndex
+        while cursor < rest.endIndex, rest[cursor].isNumber {
+            digits.append(rest[cursor])
+            cursor = rest.index(after: cursor)
+        }
+        guard !digits.isEmpty,
+              cursor < rest.endIndex,
+              rest[cursor] == "." || rest[cursor] == ")"
+        else { return nil }
+        let delimiter = rest[cursor]
+        let afterDelimiter = rest.index(after: cursor)
+        guard afterDelimiter < rest.endIndex, rest[afterDelimiter] == " " else { return nil }
+        let textStart = rest.index(after: afterDelimiter)
+        return MarkdownListItem(marker: "\(digits)\(delimiter)", text: String(rest[textStart...]), level: level)
+    }
+
+    private static func splitLeadingSpaces(_ line: String) -> (Int, Substring) {
+        var count = 0
+        var index = line.startIndex
+        while index < line.endIndex, line[index] == " " {
+            count += 1
+            index = line.index(after: index)
+        }
+        return (count, line[index...])
+    }
+
+    private static func nestingLevel(forLeadingSpaces spaces: Int) -> Int {
+        min(spaces / 2, 4)
+    }
 
     // MARK: - CC-01: Streaming cursor
 
@@ -834,6 +1133,185 @@ private extension Array where Element == ChatMessagePart {
             if case .text(let id, _) = part { return id }
         }
         return nil
+    }
+}
+
+private struct MarkdownTableBlockView: View {
+    @Environment(\.hermesTheme) private var theme
+
+    let table: MessageBubble.MarkdownTable
+
+    private static let minCellWidth: CGFloat = 116
+    private static let maxCellWidth: CGFloat = 240
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: true) {
+            VStack(alignment: .leading, spacing: 0) {
+                row(table.headers, isHeader: true, rowIndex: 0)
+                if table.rows.isEmpty {
+                    emptyRow
+                } else {
+                    ForEach(Array(table.rows.enumerated()), id: \.offset) { rowIndex, cells in
+                        row(cells, isHeader: false, rowIndex: rowIndex)
+                    }
+                }
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            .background(theme.codeBg, in: RoundedRectangle(cornerRadius: 12, style: .circular))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .circular)
+                    .strokeBorder(theme.border, lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .circular))
+        }
+        .perfScrollIndicators()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Markdown table with \(table.headers.count) columns and \(table.rows.count) rows")
+    }
+
+    private func row(_ cells: [String], isHeader: Bool, rowIndex: Int) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            ForEach(Array(cells.enumerated()), id: \.offset) { columnIndex, cell in
+                cellView(
+                    text: cell,
+                    columnIndex: columnIndex,
+                    isHeader: isHeader,
+                    rowIndex: rowIndex
+                )
+            }
+        }
+    }
+
+    private var emptyRow: some View {
+        Text("No rows")
+            .font(.caption.weight(.medium))
+            .foregroundStyle(theme.mutedFg)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(minWidth: CGFloat(max(table.headers.count, 1)) * Self.minCellWidth, alignment: .leading)
+            .background(theme.muted.opacity(0.22))
+            .overlay(Rectangle().stroke(theme.border.opacity(0.7), lineWidth: 0.5))
+    }
+
+    private func cellView(
+        text: String,
+        columnIndex: Int,
+        isHeader: Bool,
+        rowIndex: Int
+    ) -> some View {
+        let alignment = table.alignments.indices.contains(columnIndex)
+            ? table.alignments[columnIndex]
+            : .leading
+        let background = isHeader
+            ? theme.muted.opacity(0.42)
+            : (rowIndex.isMultiple(of: 2) ? theme.card.opacity(0.22) : Color.clear)
+        let displayedText = text.isEmpty ? "—" : text
+
+        return Text(RenderCache.prose(displayedText))
+            .font(.system(isHeader ? .subheadline : .body, design: .serif).weight(isHeader ? .semibold : .regular))
+            .foregroundStyle(isHeader ? theme.fg : (text.isEmpty ? theme.mutedFg : theme.fg))
+            .lineLimit(nil)
+            .multilineTextAlignment(textAlignment(for: alignment))
+            .padding(.horizontal, 12)
+            .padding(.vertical, isHeader ? 9 : 10)
+            .frame(minWidth: Self.minCellWidth, maxWidth: Self.maxCellWidth, alignment: frameAlignment(for: alignment))
+            .background(background)
+            .overlay(Rectangle().stroke(theme.border.opacity(0.72), lineWidth: 0.5))
+            .perfTextSelection()
+    }
+
+    private func frameAlignment(for alignment: MessageBubble.MarkdownTable.Alignment) -> Alignment {
+        switch alignment {
+        case .leading: return .leading
+        case .center: return .center
+        case .trailing: return .trailing
+        }
+    }
+
+    private func textAlignment(for alignment: MessageBubble.MarkdownTable.Alignment) -> TextAlignment {
+        switch alignment {
+        case .leading: return .leading
+        case .center: return .center
+        case .trailing: return .trailing
+        }
+    }
+}
+
+private struct MarkdownBlockquoteView: View {
+    @Environment(\.hermesTheme) private var theme
+
+    let text: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            RoundedRectangle(cornerRadius: 2, style: .circular)
+                .fill(theme.midground.opacity(0.72))
+                .frame(width: 3)
+            Text(RenderCache.prose(text))
+                .font(.system(.body, design: .serif))
+                .foregroundStyle(theme.mutedFg)
+                .lineSpacing(3.5)
+                .perfTextSelection()
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 8)
+        .padding(.horizontal, 10)
+        .background(theme.muted.opacity(0.18), in: RoundedRectangle(cornerRadius: 10, style: .circular))
+        .accessibilityLabel("Quote: \(text)")
+    }
+}
+
+private struct MarkdownTaskListView: View {
+    @Environment(\.hermesTheme) private var theme
+
+    let items: [MessageBubble.MarkdownTaskItem]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: item.checked ? "checkmark.square.fill" : "square")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(item.checked ? theme.statusOK : theme.mutedFg)
+                        .accessibilityHidden(true)
+                    Text(RenderCache.prose(item.text))
+                        .font(.system(.body, design: .serif))
+                        .foregroundStyle(theme.fg)
+                        .strikethrough(item.checked, color: theme.mutedFg)
+                        .perfTextSelection()
+                }
+                .padding(.leading, CGFloat(item.level) * 18)
+                .accessibilityLabel("\(item.checked ? "Completed" : "Incomplete") task: \(item.text)")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct MarkdownListBlockView: View {
+    @Environment(\.hermesTheme) private var theme
+
+    let items: [MessageBubble.MarkdownListItem]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(item.marker)
+                        .font(.system(.body, design: .serif).monospacedDigit().weight(.semibold))
+                        .foregroundStyle(theme.mutedFg)
+                        .frame(width: item.marker == "•" ? 14 : 28, alignment: .trailing)
+                    Text(RenderCache.prose(item.text))
+                        .font(.system(.body, design: .serif))
+                        .foregroundStyle(theme.fg)
+                        .lineSpacing(3.5)
+                        .perfTextSelection()
+                }
+                .padding(.leading, CGFloat(item.level) * 18)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

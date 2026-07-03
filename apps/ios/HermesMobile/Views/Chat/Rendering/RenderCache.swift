@@ -18,6 +18,8 @@ import SwiftUI
 /// the scroll hitching (round-2 forensics ROOT D). These caches make a render of
 /// unchanged text O(1) (a dictionary lookup), so realized rows never re-parse on
 /// scroll and a streaming flush only pays for the genuinely-new tail text.
+/// A fourth cache covers the ABH-360 GFM block pass (tables/task lists/
+/// blockquotes/lists) before paragraph text falls through to inline markdown.
 ///
 /// **Invalidation by construction.** Every cache is keyed on the *input value*
 /// (the exact text / code+language+colour). Identical input always maps to
@@ -86,6 +88,30 @@ enum RenderCache {
         #endif
         let value = MessageBubble.prose(text)
         store(text, value, in: &proseCache, order: &proseOrder, limit: proseLimit)
+        return value
+    }
+
+    // MARK: - GFM blocks
+
+    private static var markdownBlockCache: [String: [MessageBubble.MarkdownBlock]] = [:]
+    private static var markdownBlockOrder: [String] = []
+    private static let markdownBlockLimit = 512
+
+    /// Memoized GFM block parse. This is the cheap structural pass that detects
+    /// tables/task lists/blockquotes/lists inside prose segments before the view
+    /// falls back to the existing inline markdown renderer for paragraph text.
+    static func markdownBlocks(_ text: String) -> [MessageBubble.MarkdownBlock] {
+        if let hit = markdownBlockCache[text] {
+            #if DEBUG
+            hits += 1
+            #endif
+            return hit
+        }
+        #if DEBUG
+        misses += 1
+        #endif
+        let value = MessageBubble.markdownBlocks(text)
+        store(text, value, in: &markdownBlockCache, order: &markdownBlockOrder, limit: markdownBlockLimit)
         return value
     }
 
@@ -192,6 +218,7 @@ enum RenderCache {
     static func resetForTesting() {
         segmentCache.removeAll(); segmentOrder.removeAll()
         proseCache.removeAll(); proseOrder.removeAll()
+        markdownBlockCache.removeAll(); markdownBlockOrder.removeAll()
         highlightCache.removeAll(); highlightOrder.removeAll()
     }
     #endif

@@ -86,6 +86,62 @@ final class MessageBubbleA11yTests: XCTestCase {
         XCTAssertTrue(result.attachments.isEmpty)
     }
 
+    // MARK: - ABH-360 GFM block parsing
+
+    func testMarkdownBlocksParsesGFMTableWithAlignmentAndRows() {
+        let blocks = MessageBubble.markdownBlocks("""
+        Before
+
+        | Name | Qty | Notes |
+        |:-----|----:|:-----:|
+        | Apples | 12 | fresh |
+        | Pears | | ready |
+        """)
+
+        XCTAssertEqual(blocks.count, 2)
+        guard case .table(let table) = blocks[1] else {
+            return XCTFail("second block should be a native markdown table")
+        }
+        XCTAssertEqual(table.headers, ["Name", "Qty", "Notes"])
+        XCTAssertEqual(table.alignments, [.leading, .trailing, .center])
+        XCTAssertEqual(table.rows, [["Apples", "12", "fresh"], ["Pears", "", "ready"]])
+    }
+
+    func testMarkdownBlocksParsesTaskListBlockquoteAndNestedList() {
+        let blocks = MessageBubble.markdownBlocks("""
+        - [x] Done
+          - [ ] Nested
+
+        > quoted **markdown**
+        > continues
+
+        1. Parent
+          - Child
+        """)
+
+        XCTAssertEqual(blocks.count, 3)
+        guard case .taskItems(let tasks) = blocks[0] else {
+            return XCTFail("first block should be a task list")
+        }
+        XCTAssertEqual(tasks, [
+            MessageBubble.MarkdownTaskItem(checked: true, text: "Done", level: 0),
+            MessageBubble.MarkdownTaskItem(checked: false, text: "Nested", level: 1),
+        ])
+
+        guard case .blockquote(let quote) = blocks[1] else {
+            return XCTFail("second block should be a blockquote")
+        }
+        XCTAssertEqual(quote, "quoted **markdown**\ncontinues")
+
+        guard case .listItems(let items) = blocks[2] else {
+            return XCTFail("third block should be a nested list")
+        }
+        XCTAssertEqual(items, [
+            MessageBubble.MarkdownListItem(marker: "1.", text: "Parent", level: 0),
+            MessageBubble.MarkdownListItem(marker: "•", text: "Child", level: 1),
+        ])
+    }
+
     // MARK: - 2. Equatable short-circuit integrity
 
     /// A settled bubble compared with itself must return `true` — SwiftUI skips
