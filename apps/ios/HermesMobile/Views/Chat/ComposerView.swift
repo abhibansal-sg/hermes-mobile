@@ -117,6 +117,13 @@ struct ComposerView: View {
         chatStore.isStreaming || (!isConnected && canQueue)
     }
 
+    /// "Steer now" is a live-turn injection and only works while a stream exists.
+    /// Offline queue mode still uses the queue glyph, but must not expose the steer
+    /// affordance because tapping it is guaranteed to hit "No active session".
+    private var shouldShowSteerQueueMenu: Bool {
+        chatStore.isStreaming && canQueue
+    }
+
     /// Send is allowed with text, OR with at least one pending attachment (an
     /// image with no caption is sent with a default prompt — see `ChatStore.send`).
     private var canSend: Bool {
@@ -804,13 +811,14 @@ struct ComposerView: View {
 
     /// While the agent is streaming the docked button either interrupts the turn
     /// (empty field — "stop replaces both") or queues the typed prompt for after
-    /// the turn (preserves the queue affordance).
+    /// the turn (preserves the queue affordance). Offline queue mode keeps only
+    /// the working queue path — "Steer now" is live-streaming only.
     ///
     /// CC-11 — ActionCircleButtonStyle applied here as on sendAction so the
     /// stop and queue circles have the same spring press depth.
     @ViewBuilder
     private var streamingAction: some View {
-        if canQueue {
+        if shouldShowSteerQueueMenu {
             // While the agent is streaming AND the user has typed text, present
             // BOTH paths: "Steer now" (inject into the live turn) and "Queue
             // for after" (enqueue for drain on completion). A `Menu` on the
@@ -833,6 +841,14 @@ struct ComposerView: View {
             .menuStyle(.button)
             .buttonStyle(ActionCircleButtonStyle())
             .accessibilityLabel("Queue or steer message")
+        } else if canQueue {
+            Button {
+                enqueue()
+            } label: {
+                actionGlyph("text.badge.plus", filled: true, tint: theme.fg, enabled: true)
+            }
+            .buttonStyle(ActionCircleButtonStyle())
+            .accessibilityLabel("Queue message")
         } else {
             Button {
                 Task { await chatStore.interrupt() }
