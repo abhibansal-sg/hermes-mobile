@@ -1,3 +1,22 @@
+Build 70 — "Malacca" — 2026-07-03
+RELIABILITY
+
+FIXED
+- Serialize PushRegistrar registrations so toggle changes are never clobbered (ABH-339) (ABH-339)
+- Serialize PushRegistrar registrations so toggle changes are never clobbered (ABH-339) (ABH-339)
+- Recents excludes cli-source loop machinery by human-vs-machinery axis (ABH-343) (ABH-343)
+- Recents excludes cli-source loop machinery by human-vs-machinery axis (ABH-343) (ABH-343)
+- Inline dashboard auth helpers
+
+WORTH TRYING
+- Try: Serialize PushRegistrar registrations so toggle changes are never clobbered (ABH-339) (ABH-339)
+- Try: Serialize PushRegistrar registrations so toggle changes are never clobbered (ABH-339) (ABH-339)
+- Try: Recents excludes cli-source loop machinery by human-vs-machinery axis (ABH-343) (ABH-343)
+
+(+3 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 64 — "Malacca" — 2026-07-03
 RELIABILITY
 
