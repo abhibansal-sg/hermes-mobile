@@ -313,3 +313,25 @@ waiting — those need no build and pre-clear the branch for a fast post-unwedge
 cascade. GOTCHA: a bogus ios-build.sh verb (e.g. `preflight`) returns rc=64
 usage-error, which is NOT a wedge-clear signal — only a real `build` reaching
 swift-frontend progress proves the wedge lifted.
+
+**Base-moved-mid-tick → false fenced-path FAIL (bit twice on 2026-07-03).** The
+fork base (`environment-and-workflows-overview`) can advance WHILE a chain is
+in flight (an upstream-sync or soak beat merges a commit mid-tick). If you then
+compute a branch's scope with `git diff --name-only origin/<base>..HEAD`, git
+shows *base's own new commits* as if the branch deleted/added them — e.g. a soak
+beat that landed `.claude/loops/governor.json` + `scripts/promote-to-live.sh` on
+base made a clean 1-file widget branch LOOK like it edited two fenced paths. This
+produced a false verifier FAIL + a bogus "remove those files" retry card, and
+separately fooled the orchestrator's own eyeball read. THE FIX (mandatory for any
+scope/fenced-path check): diff against the **merge-base**, never the moving tip:
+  `MB=$(git merge-base HEAD origin/<base>); git diff --name-only $MB..HEAD`
+Cross-check with `git show <branch_tip> --stat` (a squash-style single commit
+shows its true file set). When a branch's committed-diff-vs-tip disagrees with
+its merge-base-diff, the base MOVED — REBASE the branch onto the new tip
+(`git rebase origin/<base>`, resolve only genuine overlaps — usually just the
+Xcode `project.pbxproj` additive conflict; take BOTH sides' new entries but drop
+any the base already added, then `plutil -lint` the pbxproj), force-push with
+lease, and re-chain the downstream stage on the rebased tip. Every verifier/
+reviewer card body MUST instruct the merge-base diff so the artifact can't
+recur. This is why downstream cards should always carry the explicit
+`git merge-base` recipe, not a bare `diff origin/<base>..HEAD`.
