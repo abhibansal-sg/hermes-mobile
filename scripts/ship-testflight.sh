@@ -83,6 +83,22 @@ if [ -n "$LAST_SHIP_SHA" ]; then
   fi
 fi
 
+# --- GATE 2b: CADENCE (2026-07-03, continuous-flow mode) ----------------------
+# With no wave argument, ships run on a time+merge cadence instead of wave
+# completion: ship iff >=1 merge since last ship AND (>=4h since last ship OR
+# >=6 merges accumulated). Prevents both build-number churn (a ship per merge)
+# and starvation (merges piling up 13h waiting for a "wave" that never closes).
+# A wave argument (legacy) or FORCE_SHIP=1 bypasses the cadence gate.
+if [ -z "$WAVE" ] && [ "${FORCE_SHIP:-0}" != "1" ] && [ -n "$LAST_SHIP_SHA" ]; then
+  LAST_SHIP_TS=$(git log -1 --format="%ct" "$LAST_SHIP_SHA" 2>/dev/null || echo 0)
+  NOW_TS=$(date +%s)
+  HOURS_SINCE=$(( (NOW_TS - LAST_SHIP_TS) / 3600 ))
+  if [ "$HOURS_SINCE" -lt 4 ] && [ "$COMMITS_SINCE_LAST_SHIP" -lt 6 ]; then
+    echo "  SHIP SKIPPED (cadence): ${COMMITS_SINCE_LAST_SHIP} merges, ${HOURS_SINCE}h since last ship (need >=4h or >=6 merges)"; exit 0
+  fi
+  echo "  cadence gate passed: ${COMMITS_SINCE_LAST_SHIP} merges, ${HOURS_SINCE}h since last ship"
+fi
+
 # --- STEP 1: bump build number (ONLY place it changes) -----------------------
 NEXT=$((CUR + 1))
 echo "  bumping build $CUR -> $NEXT"
