@@ -748,15 +748,14 @@ final class ChatStore {
     /// round-1 culprit, where a foreign start ran this with `foreign:false` and
     /// claimed local ownership.
     private func beginStreamingMessage(foreign: Bool = false) {
-        // Ownership is declared by the caller, not inferred. `handleForeignFrame`
-        // sets `streamingIsForeign = true` *before* calling us for an adopted
-        // foreign turn; we never flip it here. A local start leaves it false (the
-        // local-turn token, set by `send`/`submitTruncating`, is the source of
-        // truth for local ownership). This `assert` pins the contract that a
-        // foreign frame can only ever begin a foreign-owned stream — the exact
-        // invariant the round-1 culprit violated.
-        assert(!foreign || streamingIsForeign,
-               "a foreign message.start must have set streamingIsForeign before beginning the stream")
+        // Never crash the client on an out-of-order ownership marker. The router
+        // should set `streamingIsForeign` before this path, but a gateway restart
+        // / buffered-frame edge must degrade to a conservative foreign stream, not
+        // trip a debug assertion while the reconnect recovery is trying to run.
+        if foreign, !streamingIsForeign {
+            chatLog.warning("foreign message.start reached beginStreamingMessage without streamingIsForeign; coercing foreign ownership")
+            streamingIsForeign = true
+        }
         // A tool event may already have created the streaming message; reuse it.
         if streamingMessageID == nil {
             if !foreign,
@@ -1420,6 +1419,36 @@ final class ChatStore {
     }
 
     #if DEBUG
+    /// DEBUG-only crash-guard probe for ABH-355.
+    ///
+    /// Drives the exact out-of-order ownership-marker condition that used to be a
+    /// DEBUG assertion: `beginStreamingMessage(foreign: true)` reached while the
+    /// caller had not yet marked `streamingIsForeign`. The production fix must
+    /// degrade to a conservative foreign stream instead of crashing.
+    func simulateOutOfOrderForeignOwnershipMarkerForTesting() {
+        beginStreamingMessage(foreign: true)
+    }
+
+    /// DEBUG-only crash-guard probe for ABH-355.
+    ///
+    /// Synthesizes the inconsistent edge that used to assert in
+    /// `teardownForeignStream`: a foreign teardown arrives while a local turn token
+    /// is still held. The guarded behavior is to preserve local ownership, clear
+    /// the stale foreign marker, and let the normal connection-drop path finalize
+    /// the local turn.
+    func simulateForeignTeardownWithLocalTurnTokenForTesting() {
+        beginLocalTurn()
+        streamingIsForeign = true
+        if streamingMessageID == nil {
+            let message = ChatMessage(role: .assistant, isStreaming: true)
+            streamingMessageID = message.id
+            messages.append(message)
+            markTurnStartedIfNeeded()
+        }
+        setStreaming(true, reason: "simulateForeignTeardownWithLocalTurnTokenForTesting")
+        teardownForeignStream()
+    }
+
     /// DEBUG-only deterministic drain hook for unit tests.
     ///
     /// Cancels the pending 40ms coalescing Task and calls the SAME `flushBuffers()`
@@ -3113,12 +3142,11 @@ final class ChatStore {
         foreignMirrorWatchdog = nil
         mirroringRuntimeId = nil
         guard streamingIsForeign else { return }
-        // A foreign-owned stream can never be a local turn. This pins the
-        // invariant: tearing down a foreign stream must never coincide with the
-        // user holding the local-turn token. ownership=FOREIGN (display state torn
-        // down); the local token is deliberately untouched.
-        assert(localTurnToken == nil,
-               "a foreign stream must not be torn down while a local turn token is held")
+        if localTurnToken != nil {
+            chatLog.warning("foreign stream teardown saw a local turn token; preserving local ownership and clearing foreign marker")
+            streamingIsForeign = false
+            return
+        }
         flushTask?.cancel()
         flushTask = nil
         if let id = streamingMessageID {

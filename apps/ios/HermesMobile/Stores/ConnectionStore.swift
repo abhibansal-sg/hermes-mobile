@@ -1443,6 +1443,24 @@ final class ConnectionStore {
         startReconnectLoop()
     }
 
+    /// DEBUG-only test seam: seed the app as already paired and connected without
+    /// starting a reconnect loop. Used by ABH-355 regression coverage to exercise
+    /// the real state-observer drop path from a connected, mid-stream shell.
+    func _seedConnectedForTesting(serverURL: String, token: String) {
+        serverURLString = serverURL
+        currentToken = token
+        hasConnected = true
+        reauthRequired = false
+        phase = .connected
+    }
+
+    /// DEBUG-only test seam for a gateway-client state transition. This keeps the
+    /// ABH-355 mid-turn disconnect test on the production handler (`handle(state:)`)
+    /// instead of duplicating reconnect/drop logic in the test.
+    func _handleGatewayStateForTesting(_ state: GatewayConnectionState) {
+        handle(state: state)
+    }
+
     func _handleDeviceLimitReachedForTesting(serverURL: String, maxDevices: Int?) {
         handleDeviceLimitReached(serverURL: serverURL, maxDevices: maxDevices)
     }

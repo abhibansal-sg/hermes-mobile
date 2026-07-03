@@ -26,7 +26,7 @@ TestFlight + Abhi catch taste (layer 5).
 |----|---------|-------|----------|
 | CUJ-01 | Pair a device and get an authed session | `POST /api/devices/issue` + authed `/api/status` | core |
 | CUJ-02 | Send a prompt, receive a completed reply | REST session create → prompt → completion | core |
-| CUJ-03 | Reconnect mid-turn without losing the reply | WS flap + reconcile (ABH-276/278/288/289) | Malacca |
+| CUJ-03 | Gateway dies mid-turn → iOS survives, shows reconnecting, auto-recovers, re-attaches to the open session, and refreshes the transcript | WS flap + reconcile; `smoke: ios-sim` ConnectionStoreReconnectTests mid-turn drop path (ABH-276/278/288/289/355) | Malacca/ABH-355 |
 | CUJ-04 | Approve/deny a pending approval from the phone; reply to a clarification from lock screen | `/api/approvals/respond` contract (ABH-258 ownership) + `/api/approvals/reply` clarify-only contract (ABH-296) | core |
 | CUJ-05 | Sessions list, source-grouped drawer, search, resume | Recents default excludes cron/subagent + empty sessions; `smoke: ios-sim` drawer opens with reachable Chats + Telegram source groups only, honest counts/empty/error states, and no cron/subagent drawer bucket; `/api/sessions/search` + resume + messages readback | core/ABH-345 |
 | CUJ-06 | Enable relay push + pair + truthful test-push | `/relay/config` → `/relay/pair` → `/relay/test-push` → `/relay/status` truthfulness, including direct-APNs vs relay vs no-push-configured outcomes (ABH-282/283/284/285, ABH-213, ABH-314) | wave-68 |

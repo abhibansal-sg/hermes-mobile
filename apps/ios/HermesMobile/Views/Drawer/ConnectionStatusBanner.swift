@@ -17,11 +17,13 @@ struct ConnectionStatusBanner: View {
         switch connection.phase {
         case .reconnecting(let attempt):
             banner(
-                text: attempt == 0 ? "Reconnecting…" : "Reconnecting… (\(attempt))",
+                text: attempt == 0
+                    ? "Connection lost — reconnecting now"
+                    : "Still reconnecting — retry \(attempt)",
                 systemImage: "arrow.triangle.2.circlepath",
                 background: theme.statusWarn,
                 showRetry: false,
-                reason: nil
+                reason: "We'll re-attach this chat when the gateway returns."
             )
             .transition(.move(edge: .top).combined(with: .opacity))
         case .offline(let reason):

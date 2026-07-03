@@ -55,6 +55,121 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(600))
     }
 
+    private func frame(
+        type: String,
+        runtime: String,
+        payload: JSONValue = .null
+    ) -> GatewayEvent {
+        GatewayEvent(params: .object([
+            "type": .string(type),
+            "session_id": .string(runtime),
+            "payload": payload,
+        ]))!
+    }
+
+    private func storedMessage(role: String, text: String) -> StoredMessage {
+        StoredMessage(json: .object([
+            "role": .string(role),
+            "content": .string(text),
+        ]))!
+    }
+
+    private func stagedResumeResult(sessionId: String, resumed: String) -> SessionOpenResult {
+        JSONValue.object([
+            "session_id": .string(sessionId),
+            "resumed": .string(resumed),
+        ]).decoded(as: SessionOpenResult.self)!
+    }
+
+    // MARK: - ABH-355: mid-turn gateway death survives + re-attaches
+
+    #if DEBUG
+    func testOutOfOrderForeignOwnershipMarkerDegradesWithoutCrashing() async {
+        let (_, sessions, chat) = makeStore()
+        sessions.activeStoredId = "stored-foreign-guard"
+        sessions.activeRuntimeId = "rt-local"
+
+        chat.simulateOutOfOrderForeignOwnershipMarkerForTesting()
+
+        XCTAssertTrue(chat.isStreaming, "the out-of-order foreign marker should still render as a conservative stream")
+        XCTAssertFalse(chat.localTurnInFlight, "coercing a foreign marker must not claim local ownership")
+
+        chat.handleConnectionDrop()
+
+        XCTAssertFalse(chat.isStreaming, "the coerced foreign stream must be tear-downable after a transport drop")
+        XCTAssertFalse(chat.localTurnInFlight, "the foreign guard path must not leak a local ownership token")
+    }
+
+    func testForeignTeardownWithLocalTokenDegradesThenConnectionDropFinalizesLocalTurn() async {
+        let (_, sessions, chat) = makeStore()
+        sessions.activeStoredId = "stored-foreign-teardown"
+        sessions.activeRuntimeId = "rt-local"
+
+        chat.simulateForeignTeardownWithLocalTurnTokenForTesting()
+
+        XCTAssertTrue(chat.isStreaming, "the local turn must survive the refused foreign teardown")
+        XCTAssertTrue(chat.localTurnInFlight, "foreign teardown must preserve local ownership instead of crashing")
+
+        chat.handleConnectionDrop()
+
+        XCTAssertFalse(chat.isStreaming, "a later real transport drop should finalize the still-local turn")
+        XCTAssertFalse(chat.localTurnInFlight, "the transport-drop finalizer releases local ownership")
+        XCTAssertEqual(chat.messages.last?.warning, "Connection lost")
+    }
+    #endif
+
+    func testGatewayDiesMidTurnFinalizesReconnectingThenReattachesAndBackfills() async {
+        let (connection, sessions, chat) = makeStore()
+        let storedId = "stored-midturn"
+        let oldRuntime = "rt-before-drop"
+        let resumedRuntime = "rt-after-reconnect"
+        var connectCount = 0
+        var resumeCount = 0
+        var backfillCount = 0
+
+        connection.connectRPC = { _, _, _ in connectCount += 1 }
+        sessions.resumeRPC = { stored, _ in
+            resumeCount += 1
+            XCTAssertEqual(stored, storedId)
+            return self.stagedResumeResult(sessionId: resumedRuntime, resumed: storedId)
+        }
+        chat.backfillFetch = { stored in
+            backfillCount += 1
+            XCTAssertEqual(stored, storedId)
+            return [
+                self.storedMessage(role: "user", text: "prompt before gateway died"),
+                self.storedMessage(role: "assistant", text: "authoritative recovered reply"),
+            ]
+        }
+
+        connection._seedConnectedForTesting(serverURL: "http://localhost:9123", token: "test-stable-token")
+        sessions.activeStoredId = storedId
+        sessions.activeRuntimeId = oldRuntime
+        chat.handle(event: frame(type: "message.start", runtime: oldRuntime))
+        chat.handle(event: frame(
+            type: "message.delta",
+            runtime: oldRuntime,
+            payload: .object(["text": .string("half a reply…")])
+        ))
+        chat.drainFlushForTesting()
+        XCTAssertTrue(chat.isStreaming, "precondition: the gateway dies during an active stream")
+
+        connection._handleGatewayStateForTesting(.failed("gateway process exited"))
+
+        await connection.waitForReconnectForTesting()
+
+        XCTAssertEqual(connection.phase, .connected)
+        XCTAssertEqual(connectCount, 1, "the reconnect loop should reconnect once")
+        XCTAssertEqual(resumeCount, 1, "the active stored session must be re-attached")
+        XCTAssertEqual(backfillCount, 1, "the transcript must be refreshed after re-attach")
+        XCTAssertEqual(sessions.activeRuntimeId, resumedRuntime)
+        XCTAssertEqual(chat.messages.map(\.text), ["prompt before gateway died", "authoritative recovered reply"])
+        XCTAssertFalse(chat.isStreaming, "the interrupted stream must not survive as a fake spinner")
+        XCTAssertFalse(chat.localTurnInFlight, "local turn ownership must be released on transport loss")
+        XCTAssertFalse(connection.reauthRequired, "a gateway restart must not be treated as token revocation")
+        XCTAssertTrue(connection.hasConnected, "the shell must stay in the paired state while reconnecting")
+    }
+
     // MARK: - Success criteria §1 + §2 + §3 — the core restart-survival proof
 
     /// Gateway restart at stable address+token: loop recovers to `.connected`
