@@ -1344,10 +1344,11 @@ async def search_sessions(
         if not db._fts_enabled and db._fts_table_exists("messages_fts"):
             db._fts_enabled = True
 
-        # Exclude sub-agent "tool" source sessions — same rationale as session.list.
+        # Hide autonomous machinery (cron runs, subagent children) AND tool/child
+        # sessions, matching the native session_search hidden-sources set.
         matches = db.search_messages(
             query=q.strip(),
-            exclude_sources=["tool"],
+            exclude_sources=["cron", "subagent", "tool"],
             role_filter=role_filter,
             limit=limit,
             offset=offset,
