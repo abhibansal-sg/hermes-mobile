@@ -1,8 +1,45 @@
 # Xcode Cloud — Operator Guide for HermesMobile
 
-> **Status:** Scaffolding authored; portal connection is a user-only step.
-> Everything in `apps/ios/ci_scripts/` is committed; the Xcode Cloud build
-> has NOT been run end-to-end (that requires portal connection per steps below).
+> **OPTION-1 SHIP MODE (2026-07-03, active plan):** Xcode Cloud's job here is the
+> SHIP archive+upload (the 40-min build that wedges the Mac). Verifier builds stay
+> local. Create the **"HermesMobile Ship"** workflow below FIRST — the CI/test
+> workflow from the original guide is optional and can wait.
+
+## The 5-minute connect (Abhi's one-time step)
+
+1. Open Xcode → **Integrate** menu → **Get Started** (or ⌘9 → Cloud tab → +).
+2. Sign in with your Apple ID (a.b.0991@gmail.com) when prompted.
+3. Select the **HermesMobile** app target.
+4. **Grant Access on GitHub** → authorize for **abhibansal-sg** → confirm
+   `abhibansal-sg/hermes-mobile` is listed (repo moved from ab0991-oss).
+5. Xcode Cloud drafts a workflow — replace it with "HermesMobile Ship" below.
+
+## The Ship workflow (the one that matters)
+
+App Store Connect → Xcode Cloud → Manage Workflows → **+**:
+
+| Setting | Value |
+|---|---|
+| Name | `HermesMobile Ship` |
+| Start condition | **Branch Changes** → branch `environment-and-workflows-overview`, **Files touched: apps/ios/project.yml** (the ship script's build-number bump commit is what triggers it) |
+| Environment | Latest Xcode, latest macOS |
+| Action | **Archive** — platform iOS, scheme `HermesMobile`, deployment prep: **TestFlight (Internal Only)** |
+| Post-action | **TestFlight Internal Testing** → group: Abhi's internal group |
+| Signing | Cloud-managed (accept the default) |
+
+`ci_post_clone.sh` (already in this directory) regenerates the xcodeproj from
+project.yml on the Cloud VM — no generated project needs committing.
+
+## After the connect: hand the workflow id to the loop
+
+```sh
+node apps/ios/ci_scripts/asc-cloud.mjs list-workflows   # grab the Ship workflow UUID
+```
+Then in `.claude/loops/governor.json` → `ship_policy.xcode_cloud`: set
+`workflow_id` and `active: true`. From the next cadence ship onward,
+`ship-testflight.sh` pushes the build bump, triggers the cloud run, and waits —
+the Mac never archives. Any cloud failure automatically falls back to the local
+wedge-safe path, so shipping never stalls on Apple's queue.
 
 ---
 
@@ -10,7 +47,7 @@
 
 | Thing | Detail |
 |---|---|
-| Repo | `ab0991-oss/hermes-mobile` on GitHub |
+| Repo | `abhibansal-sg/hermes-mobile` on GitHub |
 | Scheme | `HermesMobile` (defined in `apps/ios/project.yml`) |
 | Xcode project path | `apps/ios/HermesMobile.xcodeproj` |
 | Free compute | **25 compute hours/month** on the Apple Developer account |
@@ -29,9 +66,9 @@
 4. Select the **HermesMobile** app target in the project selector.
 5. Xcode Cloud will ask you to **grant access to your source code provider**:
    - Click **Grant Access on GitHub**.
-   - GitHub opens in your browser. Click **Install & Authorize** for the `ab0991-oss` organization (or personal account).
-   - GitHub redirects back to App Store Connect. Confirm you see `ab0991-oss/hermes-mobile` listed.
-6. Back in Xcode, the repo picker now shows `ab0991-oss/hermes-mobile`. Select it.
+   - GitHub opens in your browser. Click **Install & Authorize** for the `abhibansal-sg` account.
+   - GitHub redirects back to App Store Connect. Confirm you see `abhibansal-sg/hermes-mobile` listed.
+6. Back in Xcode, the repo picker now shows `abhibansal-sg/hermes-mobile`. Select it.
 7. Xcode Cloud generates a first draft workflow. **Do not use it** — you will replace it with the configuration in Step 2.
 
 ---

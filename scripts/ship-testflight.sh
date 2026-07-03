@@ -111,7 +111,40 @@ open(p,'w').write(s)
 PY
 ( cd apps/ios && xcodegen generate >/dev/null 2>&1 ) || { echo "  FAIL: xcodegen"; exit 1; }
 
-# --- STEP 2: archive (wedge-safe wrapper) ------------------------------------
+# --- STEP 2-4: BUILD + UPLOAD — cloud path (preferred) or local (fallback) ----
+# CLOUD PATH (2026-07-03, Abhi option-1: ships build on Apple's machines so the
+# Mac never wedges on the 40-min archive). Active iff governor ship_policy
+# carries xcode_cloud.active=true + a workflow_id (set after the one-time portal
+# connect). The build-number bump must be ON THE REMOTE before triggering —
+# Xcode Cloud builds from the pushed ref, not the local tree.
+CLOUD_WF=$(python3 -c "
+import json
+g=json.load(open('.claude/loops/governor.json'))
+xc=g.get('ship_policy',{}).get('xcode_cloud',{})
+print(xc.get('workflow_id','') if xc.get('active') else '')" 2>/dev/null)
+
+CLOUD_OK=0
+if [ -n "$CLOUD_WF" ]; then
+  echo "  CLOUD SHIP: pushing build bump, then triggering Xcode Cloud workflow $CLOUD_WF"
+  git add apps/ios/project.yml apps/ios/*.xcodeproj 2>/dev/null
+  git commit -q -m "ship: bump to build $NEXT (cloud ship pre-commit)" 2>/dev/null
+  git push origin HEAD:"$BASE" 2>&1 | tail -1
+  RUN_ID=$(node apps/ios/ci_scripts/asc-cloud.mjs trigger "$CLOUD_WF" "$BASE" 2>&1 | grep -oE '[0-9a-f-]{36}' | head -1)
+  if [ -n "$RUN_ID" ]; then
+    echo "  cloud build run: $RUN_ID — waiting (ceiling 45m)…"
+    if node apps/ios/ci_scripts/asc-cloud.mjs wait "$RUN_ID" 2>&1 | tail -3 | grep -q "SUCCEEDED"; then
+      CLOUD_OK=1
+      echo "  cloud build SUCCEEDED — archive+upload happened on Apple's machines"
+    else
+      echo "  cloud build did not succeed — falling back to LOCAL archive path"
+    fi
+  else
+    echo "  cloud trigger failed (no run id) — falling back to LOCAL archive path"
+  fi
+fi
+
+if [ "$CLOUD_OK" != "1" ]; then
+# --- LOCAL PATH: archive (wedge-safe wrapper) ---------------------------------
 rm -rf /tmp/hermes-tf; mkdir -p /tmp/hermes-tf
 echo "  archiving (timeout 2400s, wedge-safe)…"
 HERMES_BUILD_TIMEOUT=2400 scripts/ios-build.sh archive \
@@ -121,7 +154,7 @@ HERMES_BUILD_TIMEOUT=2400 scripts/ios-build.sh archive \
   -authenticationKeyIssuerID "$ASC_ISSUER" -allowProvisioningUpdates 2>&1 | tail -5
 [ -d "$ARCH" ] || { echo "  FAIL: archive did not produce $ARCH"; exit 1; }
 
-# --- STEP 3: CFBundleVersion gate (app + both extensions must match) ----------
+# --- CFBundleVersion gate (app + both extensions must match) ------------------
 A="$ARCH/Products/Applications/HermesMobile.app"
 V1=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$A/Info.plist" 2>/dev/null)
 V2=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$A/PlugIns/HermesWidgets.appex/Info.plist" 2>/dev/null)
@@ -129,7 +162,7 @@ V3=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$A/PlugIns/HermesShare.
 echo "  CFBundleVersion: app=$V1 widgets=$V2 share=$V3"
 if [ "$V1" != "$V2" ] || [ "$V1" != "$V3" ]; then echo "  FAIL: CFBundleVersion mismatch — aborting before upload"; exit 1; fi
 
-# --- STEP 4: export + upload to ASC (ExportOptions destination=upload) --------
+# --- export + upload to ASC (ExportOptions destination=upload) ----------------
 echo "  exporting + uploading to App Store Connect…"
 xcodebuild -exportArchive -archivePath "$ARCH" \
   -exportOptionsPlist apps/ios/ExportOptions-TestFlight.plist \
@@ -137,6 +170,7 @@ xcodebuild -exportArchive -archivePath "$ARCH" \
   -authenticationKeyPath "$ASC_KEY" -authenticationKeyID "$ASC_KEYID" \
   -authenticationKeyIssuerID "$ASC_ISSUER" -allowProvisioningUpdates 2>&1 | tail -6 \
   | grep -qE "EXPORT SUCCEEDED|Uploaded HermesMobile" || { echo "  FAIL: export/upload did not report success"; exit 1; }
+fi
 
 # --- STEP 5: poll ASC until build shows VALID (~5-15 min) ---------------------
 echo "  polling ASC for build $NEXT to reach VALID…"

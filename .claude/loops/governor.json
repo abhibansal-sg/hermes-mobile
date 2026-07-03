@@ -162,7 +162,14 @@
     "ship_command": "scripts/ship-testflight.sh <N>",
     "build_number_rule": "the ship script bumps CURRENT_PROJECT_VERSION (project.yml) \u2014 the ONLY place the build number changes \u2014 then archives via scripts/ios-build.sh (wedge-safe, never raw xcodebuild, never kill -9), runs the CFBundleVersion app+extensions gate, exports+uploads via ExportOptions-TestFlight.plist, polls ASC (app 6777140135) until VALID.",
     "external_ship_is_abhi": "Submitting a build to EXTERNAL TestFlight beta testers (or App Store release) requires Apple Beta App Review and reaches real users \u2014 file to Abhi + continue, never autonomous.",
-    "wip_cap": "respect pipeline.wip_caps.shipped_unverified_builds \u2014 at the cap the ship stage throttles (stops shipping new builds) but build/plan keep running; a device-verify drains it."
+    "wip_cap": "respect pipeline.wip_caps.shipped_unverified_builds \u2014 at the cap the ship stage throttles (stops shipping new builds) but build/plan keep running; a device-verify drains it.",
+    "xcode_cloud": {
+      "_comment": "Option-1 (Abhi 2026-07-03): SHIP archives build on Apple's machines (Xcode Cloud) so the Mac never wedges on the 40-min archive; verifier builds stay local behind the wedge-shim. Inactive until Abhi does the one-time portal connect (Xcode -> Integrate -> connect repo) and the workflow_id is filled in from `node apps/ios/ci_scripts/asc-cloud.mjs list-workflows`. While inactive or on any cloud failure, ship-testflight.sh falls back to the proven local archive path automatically.",
+      "active": false,
+      "workflow_id": "",
+      "workflow_name": "HermesMobile Ship",
+      "cost_note": "25 free compute h/mo; ~0.4h/ship at 4-5 ships/day -> expect ~$25-50/mo overage at $49.99/100h"
+    }
   },
   "forbidden_paths": {
     "_comment": "HARD scope fence (added 2026-07-01 after Slice B run: an engineer worker drifted from a plugin task into editing tui_gateway/server.py, a stock-core file. The edit was caught at review + contained in a throwaway worktree, but the worker should never have written it. These globs are a PRE-WRITE block: a worker MUST NOT create/modify any path matching these unless the card body explicitly names the path AND carries Abhi's approval. The verifier MUST reject any diff touching these paths that the card did not authorize.",
