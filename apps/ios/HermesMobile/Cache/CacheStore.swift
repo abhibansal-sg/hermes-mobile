@@ -197,18 +197,21 @@ actor CacheStore {
     /// Persist a full transcript page for a session, replacing any existing rows.
     /// Extracts wireId from the optional `wireIds` parallel array (same count and
     /// order as `messages`). Sets transcriptCachedAt and maxMessageId on the
-    /// session row. No-ops for sessions whose source is "cron".
+    /// session row. No-ops for sessions that are not human-Recents-eligible.
     func saveTranscript(
         sessionId: String,
         messages: [StoredMessage],
         wireIds: [Int?]? = nil
     ) throws {
         try db.write { db in
-            // Guard: cron sessions are never transcript-cached
+            // Guard: sessions excluded from human Recents are never transcript-cached.
             guard let sessionRecord = try SessionCacheRecord.fetchOne(db, key: sessionId) else {
                 return
             }
-            guard sessionRecord.source != "cron" else { return }
+            guard SessionStore.isHumanRecentsSession(
+                source: sessionRecord.source,
+                messageCount: sessionRecord.messageCount
+            ) else { return }
 
             // Delete existing rows for this session
             try MessageRowRecord

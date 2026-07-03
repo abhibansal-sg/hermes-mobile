@@ -87,7 +87,7 @@ final class SessionStore {
     /// server filters them via `exclude_sources` and the client never fetches OR
     /// caches them on fresh pages (no more autonomous-loop-dense windows / cache
     /// bloat). The automation-runs surface fetches `source: "cron"` separately.
-    static let recentsExcludeSources = ["cron", "subagent"]
+    nonisolated static let recentsExcludeSources = ["cron", "subagent"]
 
     /// Latches `true` ONLY when the initial fill has *successfully completed* —
     /// the target was met OR the server was proven exhausted. An aborted /
@@ -769,9 +769,17 @@ final class SessionStore {
     /// Pure Recents eligibility gate. `messageCount == 0` is a known-empty
     /// scaffold and not pickable; `nil` is kept because older gateway/RPC payloads
     /// may omit the count even for real conversations.
-    static func isHumanRecentsSession(_ row: SessionSummary) -> Bool {
-        if let count = row.messageCount, count == 0 { return false }
-        let source = (row.source ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    nonisolated static func isHumanRecentsSession(_ row: SessionSummary) -> Bool {
+        isHumanRecentsSession(source: row.source, messageCount: row.messageCount)
+    }
+
+    /// Source/count overload for cache rows that have not decoded the full
+    /// ``SessionSummary``. Kept beside the Recents predicate so Spotlight,
+    /// transcript cache, and the drawer cannot drift on autonomous-source or
+    /// empty-session eligibility.
+    nonisolated static func isHumanRecentsSession(source: String?, messageCount: Int?) -> Bool {
+        if let count = messageCount, count == 0 { return false }
+        let source = (source ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !recentsExcludeSources.contains(source)
     }
 

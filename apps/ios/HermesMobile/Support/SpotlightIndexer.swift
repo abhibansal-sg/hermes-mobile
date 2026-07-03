@@ -47,13 +47,14 @@ enum SpotlightIndexer {
     /// indexes the current rows (title + preview). Best-effort — indexing
     /// failures are swallowed so they never block a list refresh.
     ///
-    /// Cron/automation sessions are skipped: they are machine-generated and
-    /// would flood the user's Spotlight results.
+    /// Human-Recents-ineligible sessions are skipped: automation runs,
+    /// agent-internal subagent sessions, and true-empty scaffolds do not belong
+    /// in the user's Spotlight results.
     static func index(sessions: [SessionSummary]) {
         // Capture only the Sendable `[SessionSummary]` across the actor hop and
         // build the (non-Sendable) `CSSearchableItem`s inside the detached task,
         // so nothing un-Sendable crosses the boundary under strict concurrency.
-        let rows = sessions.filter { ($0.source ?? "").lowercased() != "cron" }
+        let rows = sessions.filter(SessionStore.isHumanRecentsSession)
         let domain = domainIdentifier
 
         Task.detached(priority: .utility) {
