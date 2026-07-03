@@ -85,7 +85,8 @@ B="$HOME/hermes-backups/pre-live-$TS"
 mkdir -p "$B"
 rsync -a --exclude hermes-agent --exclude node --exclude cache \
   --exclude bootstrap-cache --exclude audio_cache --exclude image_cache \
-  --exclude logs --exclude '*.log' "$HOME/.hermes/" "$B/dot-hermes/" \
+  --exclude logs --exclude '*.log' --exclude '*.db-shm' --exclude '*.db-wal' \
+  "$HOME/.hermes/" "$B/dot-hermes/" \
   || { log "backup FAILED — refusing to touch live"; exit 1; }
 cp "$SERVICE_WRAPPER" "$B/hermes-dashboard-service.orig"
 echo "$CURRENT" > "$B/pre-promote-sha"
