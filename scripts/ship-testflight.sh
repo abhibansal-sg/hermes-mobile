@@ -140,7 +140,54 @@ if [ -z "$WAVE" ] && [ "${FORCE_SHIP:-0}" != "1" ] && [ -n "$LAST_SHIP_SHA" ]; t
   echo "  cadence gate passed: ${COMMITS_SINCE_LAST_SHIP} merges, ${HOURS_SINCE}h since last ship"
 fi
 
-# --- STEP 1: bump build number (ONLY place it changes) -----------------------
+# --- STEP 1+2-4: BUILD NUMBER + BUILD + UPLOAD ---------------------------------
+# TWO PATHS, ONE BUILD-NUMBER AUTHORITY EACH (2026-07-03, after the cloud/local
+# counter collision — "bundle version must be higher than previously uploaded"):
+#   CLOUD: Xcode Cloud's own counter stamps CFBundleVersion (set >= 70 in the
+#          workflow UI by Abhi). We do NOT bump project.yml; we read the real
+#          number back from the run and use it for polling/notes/record.
+#   LOCAL: we bump project.yml as before (the only place it changes).
+CLOUD_WF=$(python3 -c "
+import json
+g=json.load(open('.claude/loops/governor.json'))
+xc=g.get('ship_policy',{}).get('xcode_cloud',{})
+print(xc.get('workflow_id','') if xc.get('active') else '')" 2>/dev/null)
+
+CLOUD_OK=0
+if [ -n "$CLOUD_WF" ]; then
+  echo "  CLOUD SHIP: triggering Xcode Cloud workflow $CLOUD_WF (cloud owns the build number)"
+  # Push any unpushed state so the cloud builds current base (no bump commit).
+  git push origin HEAD:"$BASE" -q 2>/dev/null || true
+  TRIGGER_OUT=$(node apps/ios/ci_scripts/asc-cloud.mjs trigger "$CLOUD_WF" "$BASE" 2>&1)
+  RUN_ID=$(echo "$TRIGGER_OUT" | awk '/^  ID:/{print $2}' | head -1)
+  CLOUD_BUILD=$(echo "$TRIGGER_OUT" | awk '/^  Build #:/{print $3}' | head -1)
+  if [ -n "$RUN_ID" ]; then
+    echo "  cloud build run: $RUN_ID (cloud build number: ${CLOUD_BUILD:-unknown}) — waiting (ceiling 45m)…"
+    if node apps/ios/ci_scripts/asc-cloud.mjs wait "$RUN_ID" 2>&1 | tail -3 | grep -q "SUCCEEDED"; then
+      CLOUD_OK=1
+      # Cloud's run number IS the shipped CFBundleVersion.
+      if [ -n "$CLOUD_BUILD" ] && [ "$CLOUD_BUILD" != "—" ]; then NEXT="$CLOUD_BUILD"; fi
+      echo "  cloud build SUCCEEDED — build $NEXT archived+uploaded on Apple's machines"
+      # Record the cloud number in project.yml so local and cloud counters never
+      # cross again (next local fallback bump starts above it).
+      python3 - "$NEXT" <<'PY'
+import re,sys
+n=sys.argv[1]
+p='apps/ios/project.yml'; s=open(p).read()
+s=re.sub(r'(CURRENT_PROJECT_VERSION:\s*)\d+', r'\g<1>'+n, s, count=1)
+open(p,'w').write(s)
+PY
+      ( cd apps/ios && xcodegen generate >/dev/null 2>&1 ) || true
+    else
+      echo "  cloud build did not succeed — falling back to LOCAL archive path"
+    fi
+  else
+    echo "  cloud trigger failed (no run id) — falling back to LOCAL archive path"
+  fi
+fi
+
+if [ "$CLOUD_OK" != "1" ]; then
+# --- LOCAL PATH: bump build number (the ONLY local place it changes) -----------
 NEXT=$((CUR + 1))
 echo "  bumping build $CUR -> $NEXT"
 python3 - "$NEXT" <<'PY'
@@ -152,40 +199,7 @@ open(p,'w').write(s)
 PY
 ( cd apps/ios && xcodegen generate >/dev/null 2>&1 ) || { echo "  FAIL: xcodegen"; exit 1; }
 
-# --- STEP 2-4: BUILD + UPLOAD — cloud path (preferred) or local (fallback) ----
-# CLOUD PATH (2026-07-03, Abhi option-1: ships build on Apple's machines so the
-# Mac never wedges on the 40-min archive). Active iff governor ship_policy
-# carries xcode_cloud.active=true + a workflow_id (set after the one-time portal
-# connect). The build-number bump must be ON THE REMOTE before triggering —
-# Xcode Cloud builds from the pushed ref, not the local tree.
-CLOUD_WF=$(python3 -c "
-import json
-g=json.load(open('.claude/loops/governor.json'))
-xc=g.get('ship_policy',{}).get('xcode_cloud',{})
-print(xc.get('workflow_id','') if xc.get('active') else '')" 2>/dev/null)
-
-CLOUD_OK=0
-if [ -n "$CLOUD_WF" ]; then
-  echo "  CLOUD SHIP: pushing build bump, then triggering Xcode Cloud workflow $CLOUD_WF"
-  git add apps/ios/project.yml apps/ios/*.xcodeproj 2>/dev/null
-  git commit -q -m "ship: bump to build $NEXT (cloud ship pre-commit)" 2>/dev/null
-  git push origin HEAD:"$BASE" 2>&1 | tail -1
-  RUN_ID=$(node apps/ios/ci_scripts/asc-cloud.mjs trigger "$CLOUD_WF" "$BASE" 2>&1 | awk '/^  ID:/{print $2}' | head -1)
-  if [ -n "$RUN_ID" ]; then
-    echo "  cloud build run: $RUN_ID — waiting (ceiling 45m)…"
-    if node apps/ios/ci_scripts/asc-cloud.mjs wait "$RUN_ID" 2>&1 | tail -3 | grep -q "SUCCEEDED"; then
-      CLOUD_OK=1
-      echo "  cloud build SUCCEEDED — archive+upload happened on Apple's machines"
-    else
-      echo "  cloud build did not succeed — falling back to LOCAL archive path"
-    fi
-  else
-    echo "  cloud trigger failed (no run id) — falling back to LOCAL archive path"
-  fi
-fi
-
-if [ "$CLOUD_OK" != "1" ]; then
-# --- LOCAL PATH: archive (wedge-safe wrapper) ---------------------------------
+# --- archive (wedge-safe wrapper) ----------------------------------------------
 rm -rf /tmp/hermes-tf; mkdir -p /tmp/hermes-tf
 echo "  archiving (timeout 2400s, wedge-safe)…"
 HERMES_BUILD_TIMEOUT=2400 scripts/ios-build.sh archive \
