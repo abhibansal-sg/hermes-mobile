@@ -281,3 +281,35 @@ profile sees the actual code:
   `git worktree add "$(pwd)/.worktrees/<slug>" <builder_branch>` → point the card at
   that absolute path. One-stage-at-a-time is safest (each stage recreates before it
   runs); don't assume the path a prior stage used still exists.
+
+---
+
+## 11. Two failure modes that bit a real tick (2026-07-03)
+
+**Kanban DB index corruption (`wrong # of entries in index idx_*`).** The
+`hermes kanban` tool refuses to open a DB failing `PRAGMA integrity_check` and
+auto-renames it to `kanban.db.corrupt.<hash>.bak` on each open until it passes.
+This corruption class is **index-only** — the table rows are intact — so it is
+**losslessly recoverable**: back up the file, then
+`sqlite3 ~/.hermes/kanban/boards/<board>/kanban.db "REINDEX;"` and re-check
+`PRAGMA integrity_check;` (expect `ok`). WATCH-OUT: a `kanban create` that races
+the corrupt window **silently rolls back** — the card returns an id but never
+persists (verify with `sqlite3 ... "SELECT id FROM tasks WHERE id='t_...';"` and
+recreate if empty). Its worktree also won't materialize.
+
+**SWBBuildService wedge is a lane-wide gate, and you must not chain into it.**
+When `scripts/ios-build.sh` exits 75 (watchdog reaps at ~240s: 0 swift-frontend,
+xcodebuild parked at CreateBuildDescription), the Xcode-26 per-user build daemon
+is wedged and the ONLY fix is Abhi logout/login (the 5%; file p1 blocked-human).
+It gates the **entire iOS build-evidence lane** — every verify and every ship.
+Engineers can still write Swift + tests and `git commit` into the buffer (only
+the final build-verify step wedges), so the buffered-basket keeps rolling. But
+do **NOT** chain a verifier onto a committed-but-unbuilt branch while wedged: the
+verifier hits the identical exit-75 and burns the `retries_per_stage: 1` budget
+for nothing. Hold the branch in the buffer; the verify→review→merge cascade
+resumes automatically once the wedge clears. Do the mechanical scope-check
+(`git diff --name-only` vs SCOPE, zero fenced paths) and CUJ-entry check while
+waiting — those need no build and pre-clear the branch for a fast post-unwedge
+cascade. GOTCHA: a bogus ios-build.sh verb (e.g. `preflight`) returns rc=64
+usage-error, which is NOT a wedge-clear signal — only a real `build` reaching
+swift-frontend progress proves the wedge lifted.
