@@ -412,44 +412,44 @@ private struct SplitLayout: View {
             if RootKeyboardShortcutActions.isEnabledForHardwareShortcuts(horizontalSizeClass: horizontalSizeClass) {
                 Button {
                     newChat()
-                } label: { EmptyView() }
+                } label: { Text("New Chat") }
                 .keyboardShortcut("n", modifiers: .command)
 
                 Button {
                     searchFocusRequested = true
-                } label: { EmptyView() }
+                } label: { Text("Search") }
                 .keyboardShortcut("f", modifiers: .command)
 
                 Button {
                     interrupt()
-                } label: { EmptyView() }
+                } label: { Text("Interrupt") }
                 .keyboardShortcut(".", modifiers: .command)
                 .disabled(!chat.isStreaming)
 
                 Button {
                     sendCurrentComposerDraft()
-                } label: { EmptyView() }
+                } label: { Text("Send") }
                 .keyboardShortcut(.return, modifiers: .command)
                 .disabled(!RootKeyboardShortcutActions.hasSendableComposerText(sessions: sessions))
 
                 Button {
                     openSettings()
-                } label: { EmptyView() }
+                } label: { Text("Settings") }
                 .keyboardShortcut(",", modifiers: .command)
 
                 Button {
                     navigateBack()
-                } label: { EmptyView() }
+                } label: { Text("Back") }
                 .keyboardShortcut("[", modifiers: .command)
 
                 Button {
                     navigateForward()
-                } label: { EmptyView() }
+                } label: { Text("Forward") }
                 .keyboardShortcut("]", modifiers: .command)
 
                 Button {
                     toggleAppearanceDarkMode()
-                } label: { EmptyView() }
+                } label: { Text("Toggle Dark Mode") }
                 .keyboardShortcut("d", modifiers: .command)
             }
         }
