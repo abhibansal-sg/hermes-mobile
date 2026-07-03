@@ -1,3 +1,25 @@
+Build 71 — "Malacca" — 2026-07-03
+RELIABILITY
+
+WHAT'S NEW
+- GET /api/plugins/hermes-mobile/projects overview route (ABH-350) (ABH-350)
+
+FIXED
+- Serialize PushRegistrar registrations so toggle changes are never clobbered (ABH-339) (ABH-339)
+- Serialize PushRegistrar registrations so toggle changes are never clobbered (ABH-339) (ABH-339)
+- Recents excludes cli-source loop machinery by human-vs-machinery axis (ABH-343) (ABH-343)
+- Recents excludes cli-source loop machinery by human-vs-machinery axis (ABH-343) (ABH-343)
+- Inline dashboard auth helpers
+
+WORTH TRYING
+- Try: GET /api/plugins/hermes-mobile/projects overview route (ABH-350) (ABH-350)
+- Try: Serialize PushRegistrar registrations so toggle changes are never clobbered (ABH-339) (ABH-339)
+- Try: Serialize PushRegistrar registrations so toggle changes are never clobbered (ABH-339) (ABH-339)
+
+(+5 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 70 — "Malacca" — 2026-07-03
 RELIABILITY
 
