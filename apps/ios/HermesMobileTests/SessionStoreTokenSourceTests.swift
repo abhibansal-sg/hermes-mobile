@@ -194,3 +194,69 @@ final class ComposerDraftLifecycleTests: XCTestCase {
         XCTAssertEqual(sessions.composerDraft(for: "session-b"), "B edited draft")
     }
 }
+
+/// ABH-380/381 — compact drawer gesture arbitration must yield to text editing
+/// and become exclusive with transcript vertical scrolling once horizontal intent
+/// wins. These are pure seams so a false-green mutation in the latch/gate fails
+/// without needing a UI harness to drag UIKit selection handles.
+final class DrawerGestureArbitrationTests: XCTestCase {
+    func testOpenSwipeYieldsWhenTouchStartsInsideFirstResponderTextInput() {
+        let textInput = DrawerTextInputSnapshot(
+            frameInScreen: CGRect(x: 0, y: 620, width: 390, height: 54),
+            hasActiveSelection: false
+        )
+
+        let latch = DrawerGestureArbitration.resolveHorizontalDominance(
+            current: nil,
+            isDrawerOpen: false,
+            translation: CGSize(width: 48, height: 2),
+            startLocation: CGPoint(x: 18, y: 640),
+            openZone: 390,
+            dominanceRatio: 1.2,
+            textInput: textInput
+        )
+
+        XCTAssertEqual(latch, false,
+            "ABH-380: a leading-edge rightward drag that begins in the focused composer text container must NOT latch the drawer")
+    }
+
+    func testOpenSwipeYieldsDuringActiveTextSelectionEvenIfHandleBeginsOutsideFrame() {
+        let textInput = DrawerTextInputSnapshot(
+            frameInScreen: CGRect(x: 80, y: 620, width: 286, height: 54),
+            hasActiveSelection: true
+        )
+
+        let latch = DrawerGestureArbitration.resolveHorizontalDominance(
+            current: nil,
+            isDrawerOpen: false,
+            translation: CGSize(width: 48, height: 1),
+            startLocation: CGPoint(x: 8, y: 640),
+            openZone: 390,
+            dominanceRatio: 1.2,
+            textInput: textInput
+        )
+
+        XCTAssertEqual(latch, false,
+            "ABH-380: an active text-selection handle drag must yield even when the handle hotspot starts just outside the field frame")
+    }
+
+    func testHorizontalDrawerDominanceLocksTranscriptScrollUntilReset() {
+        let latch = DrawerGestureArbitration.resolveHorizontalDominance(
+            current: nil,
+            isDrawerOpen: false,
+            translation: CGSize(width: 52, height: 3),
+            startLocation: CGPoint(x: 40, y: 220),
+            openZone: 390,
+            dominanceRatio: 1.2,
+            textInput: nil
+        )
+
+        XCTAssertEqual(latch, true, "setup: the drawer should latch for a clean leading-edge horizontal swipe")
+        XCTAssertTrue(DrawerGestureArbitration.shouldLockTranscriptScroll(horizontalDominant: latch),
+            "ABH-381: transcript vertical scroll must be disabled once drawer horizontal dominance latches")
+        XCTAssertFalse(DrawerGestureArbitration.shouldLockTranscriptScroll(horizontalDominant: nil),
+            "ABH-381: scroll lock must clear at the end of the touch sequence")
+        XCTAssertFalse(DrawerGestureArbitration.shouldLockTranscriptScroll(horizontalDominant: false),
+            "ABH-381: non-drawer drags must leave transcript scrolling enabled")
+    }
+}

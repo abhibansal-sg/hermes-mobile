@@ -566,6 +566,105 @@ extension EnvironmentValues {
     }
 }
 
+// MARK: - Drawer gesture arbitration seams (ABH-380/381)
+
+/// UIKit text-input state visible to the compact drawer pan. SwiftUI's root
+/// `DragGesture` cannot participate in `UITextView`'s selection-handle gesture
+/// delegate chain, so the drawer samples the live first-responder text input
+/// before it latches horizontal dominance.
+struct DrawerTextInputSnapshot: Equatable {
+    /// The first responder's text-container frame in screen/global coordinates.
+    let frameInScreen: CGRect
+    /// `true` while UIKit has a non-collapsed selected range, which is exactly
+    /// the state where left/right selection handles may begin just outside the
+    /// text view's bounds.
+    let hasActiveSelection: Bool
+}
+
+/// Pure decision logic for compact drawer pan arbitration. Kept testable so the
+/// two table-stakes invariants (text-selection yield and scroll exclusivity) are
+/// pinned without a fragile drag UI test harness.
+enum DrawerGestureArbitration {
+    /// UIKit selection handles can start a little outside the text rect. Treat
+    /// that as owned by text editing rather than the drawer.
+    static let selectionHandleHitSlop: CGFloat = 28
+
+    static func shouldYieldToTextInteraction(
+        startLocation: CGPoint,
+        textInput: DrawerTextInputSnapshot?
+    ) -> Bool {
+        guard let textInput else { return false }
+        if textInput.hasActiveSelection { return true }
+        guard !textInput.frameInScreen.isNull, !textInput.frameInScreen.isEmpty else { return false }
+        return textInput.frameInScreen
+            .insetBy(dx: -selectionHandleHitSlop, dy: -selectionHandleHitSlop)
+            .contains(startLocation)
+    }
+
+    static func resolveHorizontalDominance(
+        current: Bool?,
+        isDrawerOpen: Bool,
+        translation: CGSize,
+        startLocation: CGPoint,
+        openZone: CGFloat,
+        dominanceRatio: CGFloat,
+        textInput: DrawerTextInputSnapshot?
+    ) -> Bool? {
+        if current != nil { return current }
+
+        let dx = translation.width
+        let dy = translation.height
+        // Only classify once the drag has enough magnitude and a clear horizontal
+        // lead. Until then, let the transcript/code scrollers continue normally.
+        guard abs(dx) > abs(dy) * dominanceRatio, abs(dx) > 1 else { return nil }
+
+        if shouldYieldToTextInteraction(startLocation: startLocation, textInput: textInput) {
+            return false
+        }
+
+        if isDrawerOpen { return true }
+        if startLocation.x <= openZone && dx > 0 { return true }
+        return false
+    }
+
+    static func shouldLockTranscriptScroll(horizontalDominant: Bool?) -> Bool {
+        horizontalDominant == true
+    }
+}
+
+@MainActor
+private enum DrawerTextInputLocator {
+    static func currentSnapshot() -> DrawerTextInputSnapshot? {
+        let windows = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .filter { !$0.isHidden && $0.alpha > 0 }
+
+        for window in windows {
+            guard let responder = window.hermesFirstResponderDescendant() else { continue }
+            guard let input = responder as? (UIView & UITextInput) else { continue }
+
+            let frame = responder.convert(responder.bounds, to: nil)
+            let selectedRange = input.selectedTextRange
+            return DrawerTextInputSnapshot(
+                frameInScreen: frame,
+                hasActiveSelection: selectedRange.map { !$0.isEmpty } ?? false
+            )
+        }
+        return nil
+    }
+}
+
+private extension UIView {
+    func hermesFirstResponderDescendant() -> UIView? {
+        if isFirstResponder { return self }
+        for subview in subviews {
+            if let match = subview.hermesFirstResponderDescendant() { return match }
+        }
+        return nil
+    }
+}
+
 // MARK: - Compact width (push-card drawer)
 
 /// iPhone layout (Claude-iOS push-card, F1 / Amendment D): ``DrawerView`` sits
@@ -615,6 +714,12 @@ private struct CompactLayout: View {
     /// layout container, not by ``DrawerView``, so a cold drawer first-commit cannot
     /// reset/drop the presentation write before SwiftUI anchors the sheet.
     @State private var showingSettings = false
+
+    /// `true` for the remainder of a touch sequence after the drawer pan has
+    /// latched horizontal dominance. Bound into the chat subtree via
+    /// `.scrollDisabled` so the transcript's vertical `ScrollView` stops tracking
+    /// the same finger until the drawer gesture ends.
+    @State private var drawerScrollLocked = false
 
     /// SMOOTHNESS R40 (Defect: "card snaps to the right on open"). The finger
     /// position (cumulative `translation.width`) at the instant this gesture
@@ -857,6 +962,7 @@ private struct CompactLayout: View {
                     compactStandaloneChrome: true,
                     compactTopInset: safeTop
                 )
+                .scrollDisabled(drawerScrollLocked)
                 // STRIKE P0: NO external `.safeAreaInset(.top)` here. A top
                 // safe-area inset re-establishes a top safe-area region on
                 // ChatView that DEFEATS the transcript's
@@ -952,9 +1058,10 @@ private struct CompactLayout: View {
 
     /// One drag gesture handling both directions, gated on horizontal dominance
     /// (BUG 2 / locked design):
-    /// - When closed, a rightward drag STARTING within the leading 50% of the
-    ///   screen opens it — but only once the drag is horizontally dominant
-    ///   (`abs(dx) > abs(dy) * dominanceRatio` AND `dx > 0`). Before dominance is
+    /// - When closed, a rightward drag STARTING within the leading open zone
+    ///   (currently the full chat width) opens it — but only once the drag is
+    ///   horizontally dominant (`abs(dx) > abs(dy) * dominanceRatio` AND `dx > 0`)
+    ///   and UIKit text editing has not claimed the touch. Before dominance is
     ///   established the drawer does NOT move, so vertical scrolls and horizontal
     ///   sub-scrollers (code blocks, attachment strip) win naturally (this gesture
     ///   is installed via `simultaneousGesture`).
@@ -967,26 +1074,24 @@ private struct CompactLayout: View {
         return DragGesture(minimumDistance: 12, coordinateSpace: .global)
             .onChanged { value in
                 let dx = value.translation.width
-                let dy = value.translation.height
 
                 // Resolve (and latch) horizontal dominance once per gesture.
                 if horizontalDominant == nil {
-                    // Only latch once the drag has enough magnitude to classify;
-                    // wait for a clear horizontal lead before driving the drawer.
-                    guard abs(dx) > abs(dy) * dominanceRatio, abs(dx) > 1 else { return }
-                    // For an OPEN swipe also require the start to be in the leading
-                    // zone and the motion to be rightward; otherwise this drag is
-                    // not ours (let scrollers keep it).
-                    if drawer.isOpen {
-                        horizontalDominant = true
-                    } else if value.startLocation.x <= openZone && dx > 0 {
-                        horizontalDominant = true
-                    } else {
-                        // Not a drawer drag — mark as non-dominant so we ignore the
-                        // rest of this gesture without re-evaluating each frame.
-                        horizontalDominant = false
-                        return
-                    }
+                    let resolved = DrawerGestureArbitration.resolveHorizontalDominance(
+                        current: horizontalDominant,
+                        isDrawerOpen: drawer.isOpen,
+                        translation: value.translation,
+                        startLocation: value.startLocation,
+                        openZone: openZone,
+                        dominanceRatio: dominanceRatio,
+                        textInput: DrawerTextInputLocator.currentSnapshot()
+                    )
+                    guard let resolved else { return }
+                    horizontalDominant = resolved
+                    drawerScrollLocked = DrawerGestureArbitration.shouldLockTranscriptScroll(
+                        horizontalDominant: resolved)
+                    guard resolved else { return }
+
                     // Just latched: anchor here so the card tracks from the finger's
                     // CURRENT position (offset 0 this frame), not from touch-down —
                     // kills the pre-latch dead-zone step ("snaps to the right").
@@ -1015,6 +1120,7 @@ private struct CompactLayout: View {
                 // transaction, on each real path below.
                 defer {
                     horizontalDominant = nil
+                    drawerScrollLocked = false
                     dragAnchor = 0
                 }
                 // A drag this gesture never drove still animates its (zero) drag
