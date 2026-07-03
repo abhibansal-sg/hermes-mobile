@@ -1,3 +1,26 @@
+Build 76 — "Malacca" — 2026-07-04
+RELIABILITY
+
+WHAT'S NEW
+- IOS system log viewer with file/level/substring filters (ABH-368)
+
+FIXED
+- Arbitrate drawer pan against text and scroll
+- Preserve provider auth type for key rotation
+- — kill 'Show technical detail' toggle, expanded tool row shows detail directly (ABH-358)
+
+IMPROVED
+- Show iOS compaction status (ABH-363)
+
+WORTH TRYING
+- Try: IOS system log viewer with file/level/substring filters (ABH-368)
+- Try: Arbitrate drawer pan against text and scroll
+- Try: Preserve provider auth type for key rotation
+
+(+5 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 72 — "Malacca" — 2026-07-04
 RELIABILITY
 
