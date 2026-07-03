@@ -146,6 +146,13 @@ struct ChatView: View {
     /// file endpoints) AND an active runtime session.
     @State private var showingWorkingDirPicker = false
 
+    /// ABH-362: the current absolute session cwd, fetched when the working-dir
+    /// picker opens (and updated on successful change). Drives (a) the overflow
+    /// menu label so the user sees the current dir without opening the picker,
+    /// (b) the explainer banner inside the picker, and (c) the in-transcript
+    /// confirmation message posted on change.
+    @State private var currentSessionCwd: String = ""
+
     /// A fetched markdown export awaiting the share sheet (R1 #66 — the store's
     /// `exportMarkdown` was fully implemented + tested with no UI entry point).
     /// `Identifiable` so `.sheet(item:)` presents exactly when a fetch lands.
@@ -466,6 +473,8 @@ struct ChatView: View {
                 // `onPick` joins it to the absolute cwd and drives
                 // `session.cwd.set` (4009/4016/4017 mapped to native errors), then
                 // re-lists so the browser/composer @-file cwd reflect the new root.
+                // ABH-362: fetches the current cwd on open to show in the explainer
+                // banner; on successful change posts an in-transcript system notice.
                 .sheet(isPresented: $showingWorkingDirPicker) {
                     if let control = connectionStore.control,
                        let sessionId = sessionStore.activeRuntimeId, !sessionId.isEmpty {
@@ -474,9 +483,21 @@ struct ChatView: View {
                             sessionId: sessionId,
                             onPick: { relativePath in
                                 handleWorkingDirPick(relativePath, rest: control, sessionId: sessionId)
-                            }
+                            },
+                            currentCwd: currentSessionCwd
                         )
                         .hermesThemed(themeStore)
+                        .task {
+                            // Fetch the current cwd so the explainer banner + the
+                            // confirmation message know the starting point.
+                            do {
+                                currentSessionCwd = try await control.fsList(
+                                    sessionId: sessionId, path: nil
+                                ).root
+                            } catch {
+                                currentSessionCwd = ""
+                            }
+                        }
                     } else {
                         ContentUnavailableView(
                             "No Active Session",
@@ -497,6 +518,10 @@ struct ChatView: View {
     /// cwd by `session_id` on every call, so the next listing/completion reflects
     /// the new root automatically (no client-side cache to invalidate). Errors land
     /// in `chatStore.lastError` (rendered as the chat toast).
+    ///
+    /// ABH-362: On success, posts a visible in-transcript system confirmation
+    /// ("Working directory set to ~/x/y") so the effect is immediately observable,
+    /// and updates `currentSessionCwd` so the menu label + explainer reflect it.
     private func handleWorkingDirPick(_ relativePath: String, rest: RestClient, sessionId: String) {
         Task {
             // Resolve the absolute cwd root the browser was showing. fsList with no
@@ -508,7 +533,43 @@ struct ChatView: View {
                 chatStore.lastError = WorkingDirectory.mapSetError(error).message
                 return
             }
-            await chatStore.setWorkingDirectory(root: root, relativePath: relativePath)
+            let success = await chatStore.setWorkingDirectory(root: root, relativePath: relativePath)
+            guard success else { return }
+            // E2E adoption probe (ABH-362 bounce-1): the gateway accepted the RPC,
+            // but Abhi's complaint was "I pressed it and couldn't tell if it works."
+            // So we RE-READ the session cwd via fsList (the authoritative post-change
+            // root — the gateway's `_set_session_cwd` sets `session["cwd"]` and the
+            // next `fsList` resolves its root from exactly that). If the session did
+            // NOT adopt the cwd we sent, resolveCwdPlumbing returns nil and we refuse
+            // to post a confirmation — surfacing the failure honestly instead of a
+            // false green.
+            let adoptedCwd: String?
+            do {
+                adoptedCwd = try await rest.fsList(sessionId: sessionId, path: nil).root
+            } catch {
+                // The fsList probe failed (transient). Don't block the confirmation
+                // on a transport hiccup — but DO surface the error so the user can
+                // retry the verification. Pass nil to skip the adoption gate.
+                adoptedCwd = nil
+            }
+            guard let plumbing = WorkingDirectory.resolveCwdPlumbing(
+                root: root,
+                relativePath: relativePath,
+                gatewayAdoptedCwd: adoptedCwd
+            ) else {
+                // The session adopted a DIFFERENT cwd than we sent — a real plumbing
+                // break. Surface it rather than posting a false-green confirmation.
+                let sent = WorkingDirectory.absolutePath(root: root, relative: relativePath)
+                chatStore.lastError = "Working directory did not update (sent \(WorkingDirectory.displayPath(sent)), session is at \(WorkingDirectory.displayPath(adoptedCwd ?? "?")))."
+                currentSessionCwd = adoptedCwd ?? ""
+                return
+            }
+            currentSessionCwd = plumbing.wireCwd
+            // ABH-362 (c): post a desktop-style system confirmation in the
+            // transcript so the user can SEE that the change took effect — now
+            // backed by the E2E adoption probe above.
+            chatStore.messages.append(ChatMessage(role: .system, text: plumbing.confirmation))
+            showingWorkingDirPicker = false
         }
     }
 
@@ -1571,7 +1632,19 @@ struct ChatView: View {
             Button {
                 showingWorkingDirPicker = true
             } label: {
-                Label("Working Directory", systemImage: "folder.badge.gearshape")
+                if currentSessionCwd.isEmpty {
+                    Label("Working Directory", systemImage: "folder.badge.gearshape")
+                } else {
+                    // ABH-362 (a): show the current cwd truncated so the user
+                    // sees WHERE they are without opening the picker.
+                    Label {
+                        Text("Working Directory: \(WorkingDirectory.displayPath(currentSessionCwd))")
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    } icon: {
+                        Image(systemName: "folder.badge.gearshape")
+                    }
+                }
             }
             .accessibilityIdentifier("workingDirMenuItem")
             Divider()
