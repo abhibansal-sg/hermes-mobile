@@ -240,7 +240,7 @@ private struct SplitLayout: View {
 
     var body: some View {
         NavigationSplitView {
-            DrawerView()
+            DrawerView(onOpenSettings: openSettings)
                 .environment(\.rootSearchFocusRequested, searchFocusRequested)
                 .onChange(of: searchFocusRequested) { _, requested in
                     if requested {
@@ -596,6 +596,7 @@ private struct CompactLayout: View {
     @Environment(SpeechPlayer.self) private var speechPlayer
     @Environment(ConnectionStore.self) private var connection
     @Environment(SessionStore.self) private var sessions
+    @Environment(AppLock.self) private var appLock
     @Environment(ThemeStore.self) private var themeStore
     @Environment(DrawerState.self) private var drawer
 
@@ -609,6 +610,11 @@ private struct CompactLayout: View {
     /// a drag that started horizontal keeps driving even if it later curves.
     /// Reset to `nil` on `onEnded`.
     @State private var horizontalDominant: Bool?
+
+    /// Presents Settings from the compact drawer avatar. Owned by this stable
+    /// layout container, not by ``DrawerView``, so a cold drawer first-commit cannot
+    /// reset/drop the presentation write before SwiftUI anchors the sheet.
+    @State private var showingSettings = false
 
     /// SMOOTHNESS R40 (Defect: "card snaps to the right on open"). The finger
     /// position (cumulative `translation.width`) at the instant this gesture
@@ -667,7 +673,7 @@ private struct CompactLayout: View {
                 // The drawer sits on the canvas beneath the chat card. It owns
                 // the status-bar area when the card is pushed aside (it fills the
                 // whole surface; the card simply rides above it).
-                DrawerView(onNavigate: close)
+                DrawerView(onNavigate: close, onOpenSettings: openSettings)
                     .frame(width: drawerWidth, alignment: .leading)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                     .background(themeStore.current.listBg.ignoresSafeArea())
@@ -774,6 +780,7 @@ private struct CompactLayout: View {
         }
         // Re-install the resolved palette + brand tint at this root. PRESERVED.
         .hermesThemed(themeStore)
+        .sheet(isPresented: $showingSettings) { settingsSheet }
         // Dismiss the composer keyboard whenever the drawer OPENS, from ANY
         // trigger — edge-swipe completion, the toolbar drawer button, ⌘F, or the
         // empty-state "Sessions" button — since they all funnel through
@@ -789,6 +796,23 @@ private struct CompactLayout: View {
                 #selector(UIResponder.resignFirstResponder),
                 to: nil, from: nil, for: nil)
         }
+    }
+
+    private func openSettings() {
+        showingSettings = true
+    }
+
+    /// Presents the Settings surface from the compact layout root. `SettingsView`
+    /// still owns its internal `NavigationStack` and dismisses via its toolbar; the
+    /// compact shell supplies only the stable presentation state and palette bridge.
+    private var settingsSheet: some View {
+        SettingsView(
+            connectionStore: connection,
+            sessionStore: sessions,
+            appLock: appLock
+        )
+        .presentationDragIndicator(.hidden)
+        .hermesThemed(themeStore)
     }
 
     // MARK: Chat stack

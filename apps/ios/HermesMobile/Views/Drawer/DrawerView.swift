@@ -77,6 +77,13 @@ struct DrawerView: View {
     /// compact layouts, a no-op on iPad where the drawer is permanent.
     var onNavigate: () -> Void = {}
 
+    /// Invoked when the header avatar/gear should present Settings. Presentation
+    /// ownership is deliberately hoisted to ``RootView``'s stable layout containers
+    /// rather than local drawer `@State`: on a cold compact drawer open, SwiftUI can
+    /// recreate/commit this view while the first tap is being handled, and a local
+    /// sheet boolean can be reset before presentation anchors.
+    var onOpenSettings: () -> Void = {}
+
     /// Drives navigation into ArchivedSessionsView (pull-to-reveal row in the
     /// drawer list — see `archivedRevealRow`).
     @State private var showingArchivedChats = false
@@ -91,9 +98,10 @@ struct DrawerView: View {
     @State private var renamingSession: SessionSummary?
     /// Working text for the rename alert's field.
     @State private var renameText = ""
-    /// Drives presentation of the Settings sheet (F2), opened from the header
-    /// gear button. The gear is the Settings entry point (ABH-80 item 3).
-    @State private var showingSettings = false
+    /// Haptic trigger for the Settings gear tap. Sheet presentation itself is owned
+    /// by the stable parent layout (`onOpenSettings`) so it survives cold drawer
+    /// first-commit state resets.
+    @State private var settingsFeedbackTrigger = UUID()
     /// Whether the sessions list has ever completed its first data load. Latches
     /// `true` on first non-empty sessions array so the skeleton/spinner guards
     /// the "No conversations yet" flash (DC-02).
@@ -180,7 +188,6 @@ struct DrawerView: View {
         // SwiftUI does not reliably inherit custom environment values across
         // presentation/column boundaries.
         .hermesThemed(themeStore)
-        .sheet(isPresented: $showingSettings) { settingsSheet }
         // Archived Chats sheet (pull-to-reveal entry point).
         .sheet(isPresented: $showingArchivedChats) {
             NavigationStack {
@@ -601,26 +608,21 @@ struct DrawerView: View {
     /// reads more clearly as a settings entry). The `settingsAvatar` accessibility
     /// identifier is preserved verbatim — UI tests key on it and must not break.
     ///
-    /// SETTINGS-GLITCH FIX: the sheet previously auto-closed on first open. Root
-    /// cause: the gear tap set `showingSettings = true` during the same synchronous
-    /// render pass that first committed the `DrawerView` into the hierarchy (on
-    /// cold drawer open). SwiftUI can reset `@State` when a view completes its
-    /// first layout pass, so a state write that races with first-commit could be
-    /// dropped before the sheet had time to anchor. The fix: schedule the state
-    /// write on the NEXT main-actor task so it lands AFTER the view's initial
-    /// layout is fully committed, guaranteeing `showingSettings = true` is stable.
+    /// ABH-375: the sheet boolean is no longer local drawer state and is no longer
+    /// flipped from a deferred `Task`. The prior ABH-266 deferral could still lose
+    /// the write on a cold drawer open because the task might run after SwiftUI's
+    /// first layout commit recreated/reset this drawer value. The tap now calls the
+    /// parent-owned `onOpenSettings` synchronously; `RootView`'s stable compact/split
+    /// layout state drives the sheet.
     ///
-    /// Additionally, the drawer is NOT closed (no `onNavigate()` call) so the
+    /// The drawer is NOT closed (no `onNavigate()` call) so the
     /// settings sheet presents reliably over the open drawer — a cleaner UX and
     /// removes any potential state conflict from a simultaneous drawer-close
     /// animation racing the sheet presentation.
     private var avatarButton: some View {
         Button {
-            // SETTINGS-GLITCH FIX: defer to next main-actor task so this state
-            // write is guaranteed to land after the view's first layout pass.
-            Task { @MainActor in
-                showingSettings = true
-            }
+            settingsFeedbackTrigger = UUID()
+            onOpenSettings()
         } label: {
             Image(systemName: "gearshape")
                 .font(.system(size: gearGlyphSize, weight: .regular))
@@ -630,30 +632,10 @@ struct DrawerView: View {
         }
         .buttonStyle(.plain)
         // DC-01: light haptic on gear tap
-        .sensoryFeedback(.impact(flexibility: .soft), trigger: showingSettings)
+        .sensoryFeedback(.impact(flexibility: .soft), trigger: settingsFeedbackTrigger)
         .accessibilityIdentifier("settingsAvatar")
         .accessibilityLabel("Settings")
         .accessibilityHint("Open settings")
-    }
-
-    // MARK: - Settings sheet (F2 seam)
-
-    /// Presents the Settings surface as a sheet from the header avatar — the
-    /// canonical call site documented by F2's ``SettingsView`` presentation
-    /// contract. F2's view owns its OWN `NavigationStack` + chrome (X close pill,
-    /// centered title, info pill) and dismisses itself via `@Environment(\.dismiss)`,
-    /// so F1 supplies only the `Bool`-binding sheet, the hidden drag indicator,
-    /// and re-installs the palette across the sheet boundary. This same path
-    /// drives the iPad sidebar avatar too (DrawerView is the split-view sidebar),
-    /// satisfying Amendment E ("avatar→Settings sheet works from the iPad sidebar").
-    private var settingsSheet: some View {
-        SettingsView(
-            connectionStore: connection,
-            sessionStore: sessions,
-            appLock: appLock
-        )
-        .presentationDragIndicator(.hidden)
-        .hermesThemed(themeStore)
     }
 
     // MARK: - Search

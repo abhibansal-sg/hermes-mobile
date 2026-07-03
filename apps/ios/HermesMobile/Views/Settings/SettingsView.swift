@@ -31,10 +31,12 @@ import UserNotifications
 /// toolbar with an `X` close item (leading, `settingsClose`), a centered
 /// "Settings" principal title, and an info item (trailing, `settingsInfo`).
 ///
-/// F1 presents it as a `Bool`-binding sheet. The canonical call site is:
+/// F1 presents it as a `Bool`-binding sheet from the stable shell/layout owner
+/// (ABH-375: not local drawer state, which can be reset on cold first-commit).
+/// The canonical call site is:
 ///
 /// ```swift
-/// // In DrawerView (and the iPad sidebar), owned by F1:
+/// // In RootView's compact/split layout owner, opened by DrawerView's avatar:
 /// @State private var showingSettings = false
 /// // … avatar button sets `showingSettings = true` …
 /// .sheet(isPresented: $showingSettings) {

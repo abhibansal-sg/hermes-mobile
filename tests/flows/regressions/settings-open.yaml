@@ -1,0 +1,29 @@
+# ABH-375 — Settings gear opens the Settings sheet from a cold drawer
+# Regresses the cold-open @State presentation race in DrawerView's header avatar.
+# Run: scripts/ui-test.sh regressions/settings-open.yaml
+appId: ai.hermes.app
+---
+- launchApp
+- extendedWaitUntil:
+    visible: "Message Hermes…"
+    timeout: 15000
+- tapOn: "Open menu"
+- extendedWaitUntil:
+    visible: "Sessions"
+    timeout: 15000
+- assertVisible: "Projects"
+- tapOn:
+    id: "settingsAvatar"
+- assertVisible:
+    id: "settingsClose"
+- assertVisible: "Gateway Status"
+- tapOn:
+    id: "settingsClose"
+- assertNotVisible:
+    id: "settingsClose"
+- tapOn:
+    id: "settingsAvatar"
+- assertVisible:
+    id: "settingsClose"
+- assertVisible: "Gateway Status"
+- takeScreenshot: settings-open-green
