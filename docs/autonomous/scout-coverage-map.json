@@ -58,8 +58,8 @@
         "iOS chat views + WS client",
         "session routes"
       ],
-      "last_audited": "2026-07-01",
-      "note": "ABH-239 (dropped steer) found here - likely more in this family"
+      "last_audited": "2026-07-03",
+      "note": "Re-audited 2026-07-03 (manual; swarm CLI produced empty output again -- see push-relay note, same failure mode). All 5 flows walked through source, both iPhone (CompactLayout) and iPad (SplitLayout/NavigationSplitView) code paths. 2 NEW type:fix filed: ABH-320 (P3, biggest find: ComposerView.text is plain view-local @State with no persistence; ChatView's transcript+composer subtree carries .id(chatStore.activeStoredSessionId) which remounts on every session switch AND RootView swaps SplitLayout<->CompactLayout structs on iPad size-class change mid-draft -- both paths silently wipe unsent composer text, no warning, no queue entry; pending attachments survive since AttachmentStore is a separate injected store, only free text is lost -- filed with the iPad rotation trigger as a comment, same root cause), ABH-321 (P4, minor: isQueueMode conflates streaming and offline+queueable-text, so the composer's 'Steer now' menu option is offered and attempted while offline, where it always fails with 'No active session' -- text is preserved, Queue for after still works, but the option is a dead/confusing menu entry with a spurious haptic). Flows verified CLEAN: queue prompt/drain (FIFO, re-entrancy, session-affinity all correct), session list/resume/rename incl. iPad split-view sidebar+detail sync (both panes read the same @Observable SessionStore, no desync), interrupt-then-continue (interruptTarget correctly routes to mirroringRuntimeId, retry/edit gate on localTurnInFlight correctly), long-turn progress display incl. iPad rotation/backgrounding (isStreaming/activeToolName/turnStartedAt all live on the ChatStore singleton, not view-local state, so they survive the same remounts that break composer text -- TurnActivityBar unaffected)."
     },
     "cron-surface": {
       "flows": [

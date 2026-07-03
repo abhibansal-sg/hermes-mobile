@@ -552,7 +552,8 @@ struct ChatView: View {
             ComposerView(
                 chatStore: chatStore,
                 attachmentStore: attachmentStore,
-                isConnected: isConnected
+                isConnected: isConnected,
+                draftKey: sessionStore.activeComposerDraftKey
             )
             // Measure the composer card height so the transcript's bottom clearance
             // tracks the MEASURED composer (desktop `--composer-measured-height`)

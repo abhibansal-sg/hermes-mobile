@@ -25,6 +25,11 @@ struct ComposerView: View {
     let attachmentStore: AttachmentStore
     /// Whether the gateway connection is live. When false, send is disabled.
     let isConnected: Bool
+    /// Session-scoped draft identity for the active chat. ChatView re-inits this
+    /// value when `activeStoredId` changes; because the composer is an overlay
+    /// sibling outside the transcript `.id(...)`, `body` observes `draftKey`
+    /// explicitly to save the outgoing text and load the incoming draft.
+    let draftKey: String
 
     /// Voice dictation engine (mic → transcript).
     @Environment(VoiceRecorder.self) private var recorder
@@ -94,6 +99,21 @@ struct ComposerView: View {
 
     private var trimmed: String {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Apply a stored-session switch to the visible composer draft: persist the
+    /// text that belonged to the outgoing key, then replace the field with the
+    /// incoming key's saved text. Kept as a static seam so the `.onChange(of:
+    /// draftKey)` lifecycle invariant can be unit-tested without ViewInspector.
+    @MainActor
+    static func applyDraftKeyChange(
+        text: inout String,
+        sessions: SessionStore,
+        oldKey: String,
+        newKey: String
+    ) {
+        sessions.setComposerDraft(text, for: oldKey)
+        text = sessions.composerDraft(for: newKey)
     }
 
     /// True while the recorder is capturing or transcribing — the input row is
@@ -344,6 +364,7 @@ struct ComposerView: View {
             Text(photoLoadError ?? "")
         }
         .onAppear {
+            text = sessions.composerDraft(for: draftKey)
             // Deliver watchdog (B3) / interruption (B4) SALVAGE transcripts into
             // the field — the recorder ends those captures itself (no explicit
             // stop call site to receive the text), so register the same append
@@ -353,6 +374,17 @@ struct ComposerView: View {
                 appendTranscript(transcript)
             }
             refreshSlashCommands()
+        }
+        .onChange(of: draftKey) { oldKey, newKey in
+            Self.applyDraftKeyChange(
+                text: &text,
+                sessions: sessions,
+                oldKey: oldKey,
+                newKey: newKey
+            )
+        }
+        .onDisappear {
+            sessions.setComposerDraft(text, for: draftKey)
         }
     }
 
@@ -589,7 +621,10 @@ struct ComposerView: View {
             .padding(.horizontal, 2)
             .padding(.top, 2)
             .submitLabel(.return)
-            .onChange(of: text) { _, _ in refreshSlashCommands() }
+            .onChange(of: text) { _, newValue in
+                sessions.setComposerDraft(newValue, for: draftKey)
+                refreshSlashCommands()
+            }
             .onChange(of: isFocused) { _, focused in
                 if focused {
                     refreshSlashCommands()

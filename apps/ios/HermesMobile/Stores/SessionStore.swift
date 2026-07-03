@@ -137,12 +137,47 @@ final class SessionStore {
     @Snapshotable
     #endif
     var activeStoredId: String?
+    /// Key used for the local, not-yet-materialized chat draft. This intentionally
+    /// matches ChatView's transcript `.id` fallback so the stable overlay composer
+    /// and transcript agree on the draft-chat identity.
+    static let composerDraftFallbackKey = "hermes.chat.draft"
+    /// Per-session unsent composer text. Kept in the long-lived session store so
+    /// ComposerView can explicitly swap visible text on `draftKey` changes instead
+    /// of relying on a remount. Empty / whitespace-only drafts are removed instead
+    /// of persisted as noise.
+    private var composerDrafts: [String: String] = [:]
     /// The summary for the active session, if it's present in the loaded list.
     /// Used by app-side glue (e.g. the Live Activity title); `nil` for a session
     /// not yet in `sessions` (a brand-new create the list hasn't refreshed onto).
     var activeSummary: SessionSummary? {
         guard let id = activeStoredId else { return nil }
         return sessions.first { $0.id == id }
+    }
+
+    /// Draft identity for a stored session id, using the exact fallback ChatView
+    /// uses for the brand-new local chat.
+    static func composerDraftKey(storedSessionId: String?) -> String {
+        let trimmed = storedSessionId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? composerDraftFallbackKey : trimmed
+    }
+
+    /// The draft key for the currently active chat context.
+    var activeComposerDraftKey: String {
+        Self.composerDraftKey(storedSessionId: activeStoredId)
+    }
+
+    /// Restore the unsent composer text for a session-scoped draft key.
+    func composerDraft(for key: String) -> String {
+        composerDrafts[key] ?? ""
+    }
+
+    /// Persist or clear the unsent composer text for a session-scoped draft key.
+    func setComposerDraft(_ draft: String, for key: String) {
+        if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            composerDrafts.removeValue(forKey: key)
+        } else {
+            composerDrafts[key] = draft
+        }
     }
     /// True while a list/open/create RPC is in flight.
     #if DEBUG

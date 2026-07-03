@@ -151,3 +151,46 @@ final class SessionStoreTokenSourceTests: XCTestCase {
             "unarchive with no live token must surface 'Not connected.' message")
     }
 }
+
+/// ABH-320 — the composer is structurally outside ChatView's per-session
+/// transcript `.id(...)`, so switching stored sessions must explicitly swap the
+/// visible draft instead of relying on `onAppear` / `onDisappear` remounts.
+@MainActor
+final class ComposerDraftLifecycleTests: XCTestCase {
+    func testDraftKeyChangeSavesOutgoingTextAndLoadsIncomingDraft() {
+        let sessions = SessionStore()
+        sessions.setComposerDraft("B saved draft", for: "session-b")
+        var visibleText = "A edited draft"
+
+        ComposerView.applyDraftKeyChange(
+            text: &visibleText,
+            sessions: sessions,
+            oldKey: "session-a",
+            newKey: "session-b"
+        )
+
+        XCTAssertEqual(visibleText, "B saved draft",
+            "switching A→B must replace the visible composer text with B's stored draft")
+        XCTAssertEqual(sessions.composerDraft(for: "session-a"), "A edited draft",
+            "the outgoing visible text must be saved under A before B's draft is loaded")
+    }
+
+    func testIncomingSessionEditsDoNotClobberOutgoingDraft() {
+        let sessions = SessionStore()
+        sessions.setComposerDraft("B saved draft", for: "session-b")
+        var visibleText = "A edited draft"
+
+        ComposerView.applyDraftKeyChange(
+            text: &visibleText,
+            sessions: sessions,
+            oldKey: "session-a",
+            newKey: "session-b"
+        )
+        visibleText = "B edited draft"
+        sessions.setComposerDraft(visibleText, for: "session-b")
+
+        XCTAssertEqual(sessions.composerDraft(for: "session-a"), "A edited draft",
+            "typing in B after the switch must not overwrite A's draft slot")
+        XCTAssertEqual(sessions.composerDraft(for: "session-b"), "B edited draft")
+    }
+}
