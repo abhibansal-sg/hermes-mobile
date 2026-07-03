@@ -2037,6 +2037,84 @@ async def artifacts_gallery(
 
 
 # ---------------------------------------------------------------------------
+# Projects overview (ABH-350) — read-only list mirroring the desktop's projects
+# tab. The desktop derives projects by merging filesystem-scanned git repo roots
+# with session-derived repo roots (tui_gateway.server._discover_repos_payload).
+# Rather than recompute that scan here, we PROXY the gateway's payload and
+# reshape it to the {id, label, root, session_count} contract the iOS Projects
+# tab consumes. The gateway already junk-filters (hermes home + bare home); we
+# re-apply the same filter defensively so a future change upstream cannot leak
+# junk through this surface.
+# ---------------------------------------------------------------------------
+
+def _is_project_junk(root: str) -> bool:
+    """True for roots we never surface as a project.
+
+    Mirrors ``tui_gateway.server._is_repo_junk``: the bare home dir and the
+    hermes-home subtree are config/sessions/skills stores, not workspaces.
+    """
+    if not root:
+        return True
+    from hermes_constants import get_hermes_home
+
+    real = os.path.realpath(root)
+    home = os.path.realpath(os.path.expanduser("~"))
+    hermes_home = os.path.realpath(str(get_hermes_home()))
+    return real == home or real == hermes_home or real.startswith(
+        hermes_home + os.sep
+    )
+
+
+@router.get("/projects")
+async def projects_overview(request: Request) -> List[Dict[str, Any]]:
+    """Read-only projects overview for the iOS Projects tab.
+
+    Proxies ``tui_gateway.server._discover_repos_payload`` (the same merge of
+    filesystem-scanned + session-derived git repo roots the desktop uses) and
+    reshapes each entry to ``{id, label, root, session_count}``.
+
+    ``id`` is the repo root path (stable identity, matching how desktop keys
+    project entries). ``session_count`` is the number of sessions whose cwd
+    resolved to that repo root. Junk-filtered (no ~/.hermes, no bare home).
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Proxy the gateway's payload — reuse, do not recompute the scan.
+    repos: List[Dict[str, Any]] = []
+    try:
+        from tui_gateway.server import _discover_repos_payload
+        from hermes_state import SessionDB
+
+        db = SessionDB(read_only=True)
+        repos = _discover_repos_payload(db, backfill=False)
+    except Exception as exc:
+        _log.debug("projects overview: gateway payload unavailable: %s", exc)
+        return []
+
+    out: List[Dict[str, Any]] = []
+    seen_roots: set[str] = set()
+    for entry in repos or []:
+        root = str(entry.get("root") or "")
+        if not root or _is_project_junk(root):
+            continue
+        real = os.path.realpath(root)
+        if real in seen_roots:
+            continue
+        seen_roots.add(real)
+        label = str(entry.get("label") or os.path.basename(root.rstrip("/\\")) or root)
+        out.append(
+            {
+                "id": root,
+                "label": label,
+                "root": root,
+                "session_count": int(entry.get("sessions") or 0),
+            }
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Provider / API-key entry (ABH-183) — mobile-side key onboarding for the iOS
 # app's provider setup screen. Additive plugin routes only; ZERO stock-core
 # edits. Reuses the SAME stock mutators the desktop ``model.save_key`` /
