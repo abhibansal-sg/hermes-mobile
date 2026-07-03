@@ -803,6 +803,7 @@ struct ChatView: View {
                         onRestoreCheckpoint: restoreCheckpointHandler,
                         onBranch: branchHandler,
                         menuActionsEnabled: menuActionsEnabled,
+                        assistantTurnActionsEnabled: !chatStore.isStreaming,
                         appearance: BubbleAppearance(themeID: theme.id, colorScheme: colorScheme, typeSize: dynamicTypeSize)
                     )
                     // A1 (scarf): settled bubbles short-circuit their body — only the

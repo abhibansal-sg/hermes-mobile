@@ -1105,6 +1105,48 @@ final class ChatStore {
         applyContextUsage(from: usage)
     }
 
+    /// Reconcile a freshly-resumed session against the live runtime state.
+    ///
+    /// Opening a stored session can resume into a runtime that is already running
+    /// (for example, the user re-enters a chat whose turn was started elsewhere or
+    /// before navigating away). The REST transcript only contains persisted rows;
+    /// it does NOT prove the current runtime is idle. After the open seed has
+    /// landed, ask the gateway for `session.status` and, if it reports `running`,
+    /// re-create the local in-flight UI state: a streaming assistant placeholder,
+    /// the global `isStreaming` flag, the local-turn ownership token (so mutable
+    /// actions are disabled), and the Stop target (`activeSessionId`).
+    ///
+    /// This is deliberately idempotent: a live websocket `message.start` that wins
+    /// the race simply means the streaming row already exists, and a superseded
+    /// open drops out via the runtime-id guard.
+    func reconcileLiveTurnStatus(runtimeId: String) async {
+        guard let fetch = resolvedLiveTurnStatusFetch else { return }
+        let status = try? await fetch(runtimeId)
+        guard runtimeId == activeSessionId else { return }
+        if let usage = status?.usage, !isStreaming {
+            applyContextUsage(from: usage)
+        }
+        guard status?.running == true else { return }
+        beginLocalTurn()
+        beginStreamingMessage()
+    }
+
+    /// Injectable seam for `reconcileLiveTurnStatus` tests. The live path uses the
+    /// gateway `session.status` RPC; tests can answer synchronously without a socket.
+    var liveTurnStatusFetch: ((String) async throws -> SessionStatusResult)?
+
+    private var resolvedLiveTurnStatusFetch: ((String) async throws -> SessionStatusResult)? {
+        if let liveTurnStatusFetch { return liveTurnStatusFetch }
+        guard let client else { return nil }
+        return { runtimeId in
+            try await client.request(
+                "session.status",
+                params: .object(["session_id": .string(runtimeId)]),
+                timeout: .seconds(30)
+            )
+        }
+    }
+
     private func handleApprovalRequest(_ event: GatewayEvent) {
         let request = ApprovalRequestPayload(payload: event.payload)
         let sessionId = event.sessionId ?? activeSessionId ?? ""

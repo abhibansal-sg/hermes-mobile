@@ -1932,14 +1932,20 @@ final class SessionStore {
     /// Never compiled into Release.
     private(set) var lastOpenSeedTask: Task<Void, Never>?
 
+    /// DEBUG-only handle to the most recent open-resume Task. Stored so live
+    /// re-entry tests can await the resume → status reconciliation path without a
+    /// wall-clock settle.
+    private(set) var lastOpenResumeTask: Task<Void, Never>?
+
     /// DEBUG-only: await the most recently spawned open-seed Task, then yield
     /// once so any main-actor mutations it enqueued have a chance to propagate.
     /// Call this in tests INSTEAD OF (or after) `settle()` to deterministically
     /// wait for the seed to land without a wall-clock timeout.
     func waitForPendingOpenForTesting() async {
         await lastOpenSeedTask?.value
+        await lastOpenResumeTask?.value
         // One additional cooperative yield so `@Observable` write propagations
-        // that happen synchronously inside the seed Task's final await have
+        // that happen synchronously inside the open Tasks' final awaits have
         // settled before the test asserts.
         await Task.yield()
     }
@@ -2045,7 +2051,7 @@ final class SessionStore {
 
         // Slow path: gateway resume — spins up the agent server-side; only
         // prompt submission depends on it.
-        Task { [weak self] in
+        let resumeTask = Task { [weak self] in
             guard let self, self.client != nil || self.resumeRPC != nil else { return }
             do {
                 // Thread the active profile scope so a profile-scoped resume lands
@@ -2097,8 +2103,23 @@ final class SessionStore {
                 // composer queued during this resume window (an idle desktop-driven
                 // session emits no turn-completion to trigger a drain otherwise).
                 // The drain no-ops while a foreign turn streams and is re-entrancy
-                // guarded, so this is safe to fire unconditionally on a bind.
                 self.ensureRuntimeAttempts = 0
+                // ABH-371 live re-entry: the transcript seed is persisted history,
+                // not proof the just-resumed runtime is idle. Wait for the open seed
+                // so a stale REST/cache snapshot cannot erase the placeholder, then
+                // reconcile against live `session.status`. If the runtime reports a
+                // turn in flight, ChatStore restores the streaming placeholder + Stop
+                // state immediately instead of showing a completed-turn action row.
+                // Run this BEFORE the runtime-bound queue drain; otherwise an idle
+                // queued prompt could slip into an already-running server turn during
+                // the resume/status gap.
+                await seedTask.value
+                guard self.openToken == token,
+                      self.activeRuntimeId == result.sessionId else { return }
+                await self.chat?.reconcileLiveTurnStatus(runtimeId: result.sessionId)
+                // Runtime bound: flush anything the composer queued during this
+                // resume window. If live re-entry just restored a running turn, the
+                // queue's busy guards now see that state and leave prompts queued.
                 self.onActiveRuntimeBound?()
                 // Seed the context-window meter from session.status so a resumed
                 // session shows occupancy before its first new turn (H1). Runs
@@ -2112,6 +2133,9 @@ final class SessionStore {
                 self.sessionActionError = SessionActionError(action: "Open Session", message: message)
             }
         }
+        #if DEBUG
+        lastOpenResumeTask = resumeTask
+        #endif
     }
 
     /// Enter a fresh **draft** chat: drop the active session pointers, mark the

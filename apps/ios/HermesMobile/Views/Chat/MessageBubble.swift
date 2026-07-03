@@ -53,6 +53,14 @@ struct MessageBubble: View {
     /// but disabled. Read by `==` (a Sendable `let`), so a change re-renders.
     let menuActionsEnabled: Bool
 
+    /// Whether the inline completed-turn assistant action row (copy/share/speak/
+    /// retry) may be shown. Unlike context-menu actions, this row represents the
+    /// *current turn is settled* affordance; while any local live turn is active
+    /// (ABH-371 live re-entry), ChatView passes `false` so a reopened running
+    /// session shows the working cursor/Stop state without a dangling end-of-turn
+    /// row under older assistant prose.
+    let assistantTurnActionsEnabled: Bool
+
     /// Appearance identity (theme + Dynamic Type), folded into `Equatable` (A1) so
     /// a theme/type-size switch re-renders the bubble even though `.equatable()`
     /// short-circuits content-equal updates. The bubble reads the theme via
@@ -73,6 +81,7 @@ struct MessageBubble: View {
         onRestoreCheckpoint: ((ChatMessage) -> Void)? = nil,
         onBranch: ((ChatMessage) -> Void)? = nil,
         menuActionsEnabled: Bool = true,
+        assistantTurnActionsEnabled: Bool = true,
         appearance: BubbleAppearance = BubbleAppearance()
     ) {
         self.message = message
@@ -82,6 +91,7 @@ struct MessageBubble: View {
         self.onRestoreCheckpoint = onRestoreCheckpoint
         self.onBranch = onBranch
         self.menuActionsEnabled = menuActionsEnabled
+        self.assistantTurnActionsEnabled = assistantTurnActionsEnabled
         self.appearance = appearance
     }
 
@@ -382,7 +392,11 @@ struct MessageBubble: View {
             // the same `.text` parts, Batch A) the copied string is exactly the
             // displayed prose; on a parts-only turn the row is therefore present
             // and correct by construction.
-            if !message.isStreaming && hasRenderedText {
+            if Self.shouldShowAssistantActionRow(
+                messageIsStreaming: message.isStreaming,
+                hasRenderedText: hasRenderedText,
+                assistantTurnActionsEnabled: assistantTurnActionsEnabled
+            ) {
                 assistantActionRow
             }
         }
@@ -400,6 +414,18 @@ struct MessageBubble: View {
             if case .text(_, let t) = part { return !t.isEmpty }
             return false
         }
+    }
+
+    /// Pure action-row visibility contract for tests: a completed assistant row
+    /// needs rendered prose AND the chat-level turn must be settled. The extra
+    /// chat-level gate prevents live re-entry from showing an end-of-turn row while
+    /// the runtime is still working.
+    nonisolated static func shouldShowAssistantActionRow(
+        messageIsStreaming: Bool,
+        hasRenderedText: Bool,
+        assistantTurnActionsEnabled: Bool
+    ) -> Bool {
+        !messageIsStreaming && hasRenderedText && assistantTurnActionsEnabled
     }
 
     @ViewBuilder
@@ -1487,6 +1513,7 @@ extension MessageBubble: Equatable {
     nonisolated static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
         lhs.message == rhs.message
             && lhs.menuActionsEnabled == rhs.menuActionsEnabled
+            && lhs.assistantTurnActionsEnabled == rhs.assistantTurnActionsEnabled
             && lhs.appearance == rhs.appearance
     }
 }
