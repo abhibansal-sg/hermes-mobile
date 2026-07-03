@@ -224,6 +224,85 @@ final class ChatStoreBatchBTests: XCTestCase {
         XCTAssertEqual(chat.messages.map(\.text), ["reconciled"])
     }
 
+    // MARK: - ABH-363: auto-compaction status indicator
+
+    func testStatusUpdateCompactingSetsActiveSessionIndicator() async {
+        let (chat, _) = makeStore()
+
+        chat.handle(event: frame(
+            type: "status.update", runtime: activeRuntime,
+            payload: .object(["kind": .string("compacting")])
+        ))
+
+        XCTAssertTrue(chat.isActiveSessionCompacting)
+    }
+
+    func testStatusUpdateForDifferentSessionDoesNotShowOnActiveSession() async {
+        let (chat, _) = makeStore()
+
+        chat.handle(event: frame(
+            type: "status.update", runtime: "rt-background",
+            payload: .object(["kind": .string("compacting")])
+        ))
+
+        XCTAssertFalse(chat.isActiveSessionCompacting)
+    }
+
+    func testCompactionIndicatorClearsOnKindChangeAndMessageComplete() async {
+        let (chat, _) = makeStore()
+
+        chat.handle(event: frame(
+            type: "status.update", runtime: activeRuntime,
+            payload: .object(["kind": .string("compacting")])
+        ))
+        XCTAssertTrue(chat.isActiveSessionCompacting)
+
+        chat.handle(event: frame(
+            type: "status.update", runtime: activeRuntime,
+            payload: .object(["kind": .string("running")])
+        ))
+        XCTAssertFalse(chat.isActiveSessionCompacting)
+
+        chat.handle(event: frame(
+            type: "status.update", runtime: activeRuntime,
+            payload: .object(["kind": .string("compacting")])
+        ))
+        XCTAssertTrue(chat.isActiveSessionCompacting)
+
+        chat.handle(event: frame(
+            type: "message.complete", runtime: activeRuntime,
+            payload: .object(["text": .string("done"), "status": .string("completed")])
+        ))
+        XCTAssertFalse(chat.isActiveSessionCompacting)
+    }
+
+    func testDismissingCompactionIndicatorIsPerSessionAndResetsOnNewCompaction() async {
+        let (chat, _) = makeStore()
+
+        chat.handle(event: frame(
+            type: "status.update", runtime: activeRuntime,
+            payload: .object(["kind": .string("compacting")])
+        ))
+        chat.dismissActiveCompactionIndicator()
+        XCTAssertFalse(chat.isActiveSessionCompacting)
+
+        chat.handle(event: frame(
+            type: "status.update", runtime: activeRuntime,
+            payload: .object(["kind": .string("compacting")])
+        ))
+        XCTAssertFalse(chat.isActiveSessionCompacting, "duplicate compacting frames must not resurrect a dismissed marker")
+
+        chat.handle(event: frame(
+            type: "status.update", runtime: activeRuntime,
+            payload: .object(["kind": .string("running")])
+        ))
+        chat.handle(event: frame(
+            type: "status.update", runtime: activeRuntime,
+            payload: .object(["kind": .string("compacting")])
+        ))
+        XCTAssertTrue(chat.isActiveSessionCompacting)
+    }
+
     // MARK: - #52: local message.complete expires prompt cards
 
     func testMessageCompleteExpiresPromptCards() async {

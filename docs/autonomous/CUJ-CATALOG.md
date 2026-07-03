@@ -38,7 +38,7 @@ TestFlight + Abhi catch taste (layer 5).
 | CUJ-12 | Slash-command launcher lists real commands | slash-commands route (#104, ABH-228) | build 58 |
 | CUJ-13 | Learning Journey read surface loads | learning.frames/detail (ABH-246) | build 56 |
 | CUJ-14 | Credits/billing view loads (view-only) | credits surface (ABH-237) | build 56 |
-| CUJ-15 | Manual context compress action | compress route (ABH-222) | build 55 |
+| CUJ-15 | Manual context compress action and auto-compaction truth marker | compress route (ABH-222); `smoke: ios-sim` status.update kind=compacting shows an inline "Compressing older context…" marker only for the active session, not for a background session, and message.complete/kind-change clears it (ABH-363) | build 55 / ABH-363 |
 | CUJ-16 | YOLO/flow-state approval-bypass toggle honored | toggle write + approval behavior contract (ABH-227) | build 55 |
 | CUJ-17 | Device-limit 409 surfaced without composer lock | `/api/devices/issue` at limit → 409 contract (ABH-254) | fix lineage |
 | CUJ-18 | Debug share bundle from settings | `/api/debug-share` produces a bundle (#90) | support |

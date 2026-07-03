@@ -331,6 +331,62 @@ final class ChatStore {
     /// drain them only into that session (R1 #17, Batch C).
     var activeStoredSessionId: String? { sessions?.activeStoredId }
 
+    /// Runtime sessions whose gateway status currently reports a mid-turn
+    /// context compaction. Keyed by runtime `session_id` (desktop parity): a
+    /// background session can compact without lighting up the foreground
+    /// transcript, and the active transcript derives its marker from the active
+    /// runtime id only.
+    private var compactingSessionIds: Set<String> = []
+
+    /// Per-session local dismissals for the inline marker. Dismissal hides the
+    /// current compacting episode only; the next non-compacting status clear then
+    /// a later compacting status shows it again.
+    private var dismissedCompactionSessionIds: Set<String> = []
+
+    /// Whether the foreground transcript should show the auto-compaction marker.
+    /// This is intentionally separate from manual `isCompressingContext` in
+    /// `ChatView`: it reflects only the gateway's real `status.update` compaction
+    /// signal and never fakes a marker for user-triggered manual compression.
+    var isActiveSessionCompacting: Bool {
+        visibleCompactingSessionId != nil
+    }
+
+    /// User dismissed the inline marker for the active compaction episode.
+    func dismissActiveCompactionIndicator() {
+        guard let sessionId = visibleCompactingSessionId else { return }
+        dismissedCompactionSessionIds.insert(sessionId)
+    }
+
+    private var visibleCompactingSessionId: String? {
+        [activeSessionId, mirroringRuntimeId].compactMap { $0 }.first { sessionId in
+            compactingSessionIds.contains(sessionId)
+                && !dismissedCompactionSessionIds.contains(sessionId)
+        }
+    }
+
+    private func setSessionCompacting(_ sessionId: String?, _ compacting: Bool) {
+        guard let sessionId = sessionId ?? activeSessionId, !sessionId.isEmpty else { return }
+        if compacting {
+            let wasAlreadyCompacting = compactingSessionIds.contains(sessionId)
+            compactingSessionIds.insert(sessionId)
+            if !wasAlreadyCompacting {
+                dismissedCompactionSessionIds.remove(sessionId)
+            }
+        } else {
+            compactingSessionIds.remove(sessionId)
+            dismissedCompactionSessionIds.remove(sessionId)
+        }
+    }
+
+    private func handleStatusUpdate(_ event: GatewayEvent) {
+        setSessionCompacting(event.sessionId, event.payload["kind"]?.stringValue == "compacting")
+    }
+
+    private func clearAllCompactionIndicators() {
+        compactingSessionIds = []
+        dismissedCompactionSessionIds = []
+    }
+
     /// Begin a genuinely-local turn: stamp the explicit ownership token and drop
     /// any foreign-mirror ownership we were holding (the user is now driving this
     /// stored session locally, so a stray foreign `message.complete` must never
@@ -534,6 +590,7 @@ final class ChatStore {
         case .toolComplete:
             handleToolComplete(ToolCompletePayload(payload: event.payload))
         case .messageComplete:
+            setSessionCompacting(event.sessionId, false)
             handleMessageComplete(event.payload)
         case .approvalRequest:
             handleApprovalRequest(event)
@@ -548,7 +605,9 @@ final class ChatStore {
             handleSecretRequest(event)
         case .error:
             handleGatewayError(event.payload)
-        case .gatewayReady, .statusUpdate, .unknown,
+        case .statusUpdate:
+            handleStatusUpdate(event)
+        case .gatewayReady, .unknown,
              // ABH-84: session.info is handled by ConnectionStore, not ChatStore.
              .sessionInfo:
             break
@@ -563,6 +622,7 @@ final class ChatStore {
     /// local-turn ownership, and surface the message via `lastError` (the
     /// existing toast seam).
     private func handleGatewayError(_ payload: JSONValue) {
+        setSessionCompacting(activeSessionId, false)
         flushBuffersImmediately()
         let message = payload["message"]?.stringValue ?? "The agent hit an error"
         if streamingMessageID != nil {
@@ -608,6 +668,10 @@ final class ChatStore {
     /// frame; `sid` falls back to the empty string only for a malformed frame, which
     /// the stored-id correlation in `ownership(of:)` already vetted.
     private func handleForeignFrame(_ event: GatewayEvent) {
+        if event.type == .statusUpdate {
+            handleStatusUpdate(event)
+            return
+        }
         let sid = event.sessionId ?? ""
         let isPrompt = event.type == .approvalRequest || event.type == .clarifyRequest
         if let current = mirroringRuntimeId {
@@ -643,6 +707,7 @@ final class ChatStore {
         }
         #endif
         if event.type == .messageComplete || event.type == .error {
+            setSessionCompacting(event.sessionId, false)
             #if DEBUG
             foreignMirrorTelemetry.foreignCompletesReconciled += 1
             #endif
@@ -3050,6 +3115,7 @@ final class ChatStore {
         // down (§3.7); never let it bleed into the next session's first seed.
         pendingForeignReconcileID = nil
         pendingReconnectReconcileID = nil
+        clearAllCompactionIndicators()
         transcriptGeneration = 0
     }
 
@@ -3185,6 +3251,7 @@ final class ChatStore {
     /// (`ConnectionStore.handle(state:)`, `disconnect()`, the dead-socket
     /// scene-phase probe). Idempotent — a no-op when nothing is streaming.
     func handleConnectionDrop() {
+        clearAllCompactionIndicators()
         // An adopted foreign mirror dies with its transport: clear the mirror
         // bookkeeping (and its placeholder row) so the reconnect backfill can
         // reconcile from server history (#42). No-op for a local turn.

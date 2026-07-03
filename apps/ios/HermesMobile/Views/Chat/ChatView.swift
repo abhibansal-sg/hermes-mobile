@@ -814,14 +814,31 @@ struct ChatView: View {
                     .padding(.top, Self.topGap(above: message, after: previous))
                     .id(message.id)
                 }
-                // ABH-83 / ABH-359: Inline tail affordances are rendered as
-                // ADDITIVE transcript content after the last message: first a
-                // pending approval card (the turn is waiting on the user), then the
-                // working/timer indicator when the turn is actually still running.
+                // ABH-83 / ABH-359 / ABH-363: Inline tail affordances are rendered as
+                // ADDITIVE transcript content after the last message: first the
+                // auto-compaction indicator (context is being compressed mid-turn),
+                // then a pending approval card (the turn is waiting on the user), then
+                // the working/timer indicator when the turn is actually still running.
                 // These are real rows inside the scroll content — never a floating
                 // strip — so transcript prose cannot slide underneath them. The
                 // existing bottom-anchor re-pin naturally keeps whichever tail row is
                 // current visible, exactly like a new message row.
+                if chatStore.isActiveSessionCompacting {
+                    autoCompactionIndicator
+                        .padding(.top, Self.intraTurnGap)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .bottom).combined(with: .opacity),
+                            removal: .opacity
+                        ))
+                        .id("hermes.chat.auto-compaction-indicator")
+                }
+                // ABH-83: Inline approval card — rendered as ADDITIVE transcript
+                // content after the last message when there is a pending approval
+                // for the current session. This is pure additive content: it does
+                // not touch any scroll/anchor/keyboard machinery. The existing
+                // re-pin-on-settle (BottomEdgeScroll / pendingLandOnNewest /
+                // scrollToBottomIfNeeded) naturally keeps this card visible when
+                // it appears at the tail, exactly like a new message row.
                 // The card disappears when pendingApproval is cleared (respondApproval
                 // sets it nil, expireTurnScopedPrompts sets it nil on turn end /
                 // session switch) — no manual lifecycle needed.
@@ -870,6 +887,7 @@ struct ChatView: View {
                     .id(bottomAnchor)
             }
             .padding(.horizontal, 16)
+            .animation(.easeInOut(duration: 0.2), value: chatStore.isActiveSessionCompacting)
             // TOP CLEARANCE (FIX 2): the first element must REST below the floating
             // header (not jammed under it) while still sliding UNDER the header when
             // scrolled (the EdgeFadeMask top band handles the under-header look).
@@ -1005,6 +1023,48 @@ struct ChatView: View {
                 content  // iOS 17: atBottom stays default true; pill always available.
             }
         }
+    }
+
+    private var autoCompactionIndicator: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "rectangle.compress.vertical")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(theme.midground)
+                .frame(width: 20, height: 20)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Compressing older context…")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(theme.fg)
+                Text("The conversation is being compacted, not reset.")
+                    .font(.caption)
+                    .foregroundStyle(theme.midground)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Button {
+                chatStore.dismissActiveCompactionIndicator()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(theme.midground.opacity(0.85))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss context compression indicator")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: isCompact ? .infinity : 560, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(theme.popover.opacity(0.92))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(theme.midground.opacity(0.16), lineWidth: 1)
+                }
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Compressing older context. The conversation is being compacted, not reset.")
     }
 
     /// Search jump-to-match: when the session was opened from a search result
