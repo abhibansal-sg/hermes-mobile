@@ -78,6 +78,16 @@ struct UsageWidgetView: View {
         return Self.costFormatter.string(from: NSNumber(value: cost)) ?? String(format: "$%.2f", cost)
     }
 
+    private var tokensAccessibilityValue: String {
+        guard snapshot?.tokensToday != nil else { return "Unavailable" }
+        return "\(tokensText) tokens today"
+    }
+
+    private var costAccessibilityValue: String {
+        guard snapshot?.costTodayUSD != nil else { return "Unavailable" }
+        return "\(costText) estimated cost today"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
@@ -100,6 +110,9 @@ struct UsageWidgetView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Token usage today")
+            .accessibilityValue(tokensAccessibilityValue)
 
             HStack(spacing: 4) {
                 Text(costText)
@@ -110,6 +123,9 @@ struct UsageWidgetView: View {
                     .foregroundStyle(.tertiary)
                 Spacer(minLength: 0)
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Estimated cost today")
+            .accessibilityValue(costAccessibilityValue)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .widgetURL(HermesWidgetLink.open)

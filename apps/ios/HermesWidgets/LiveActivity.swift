@@ -22,6 +22,23 @@ private func elapsedString(_ seconds: Int) -> String {
     return String(format: "%d:%02d", m, r)
 }
 
+private func elapsedAccessibilityString(_ seconds: Int) -> String {
+    let s = max(0, seconds)
+    let minutes = s / 60
+    let seconds = s % 60
+
+    switch (minutes, seconds) {
+    case (0, 1): return "1 second elapsed"
+    case (0, let seconds): return "\(seconds) seconds elapsed"
+    case (1, 0): return "1 minute elapsed"
+    case (1, 1): return "1 minute 1 second elapsed"
+    case (1, let seconds): return "1 minute \(seconds) seconds elapsed"
+    case (let minutes, 0): return "\(minutes) minutes elapsed"
+    case (let minutes, 1): return "\(minutes) minutes 1 second elapsed"
+    default: return "\(minutes) minutes \(seconds) seconds elapsed"
+    }
+}
+
 /// Elapsed-time display for a Live Activity state.
 ///
 /// While the turn is running and the start instant is known, render a
@@ -70,6 +87,16 @@ private extension HermesTurnAttributes.ContentState {
     }
 
     var tintColor: Color { needsApproval ? .orange : .accentColor }
+
+    var elapsedAccessibilityValue: String {
+        let currentElapsedSeconds: Int
+        if let startedAt, phase.lowercased() != "done" {
+            currentElapsedSeconds = max(elapsedSeconds, Int(Date().timeIntervalSince(startedAt)))
+        } else {
+            currentElapsedSeconds = elapsedSeconds
+        }
+        return elapsedAccessibilityString(currentElapsedSeconds)
+    }
 }
 
 // MARK: - Live Activity
@@ -94,6 +121,8 @@ struct HermesTurnLiveActivity: Widget {
                         .font(.title2)
                         .foregroundStyle(context.state.tintColor)
                         .padding(.leading, 4)
+                        .accessibilityLabel("Turn status")
+                        .accessibilityValue(context.state.statusLabel)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
                     elapsedView(context.state)
@@ -101,6 +130,8 @@ struct HermesTurnLiveActivity: Widget {
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.trailing)
                         .padding(.trailing, 4)
+                        .accessibilityLabel("Elapsed time")
+                        .accessibilityValue(context.state.elapsedAccessibilityValue)
                 }
                 DynamicIslandExpandedRegion(.center) {
                     VStack(spacing: 2) {
@@ -112,6 +143,8 @@ struct HermesTurnLiveActivity: Widget {
                             .foregroundStyle(context.state.needsApproval ? .orange : .secondary)
                             .lineLimit(1)
                     }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(context.attributes.sessionTitle), \(context.state.statusLabel)")
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     if context.state.needsApproval {
@@ -119,6 +152,7 @@ struct HermesTurnLiveActivity: Widget {
                             Label("Review approval", systemImage: "arrow.up.forward.app.fill")
                                 .font(.caption.weight(.semibold))
                                 .frame(maxWidth: .infinity)
+                                .accessibilityLabel("Review approval required")
                         }
                         .tint(.orange)
                     }
@@ -126,13 +160,19 @@ struct HermesTurnLiveActivity: Widget {
             } compactLeading: {
                 Image(systemName: context.state.needsApproval ? "exclamationmark.triangle.fill" : "bolt.horizontal.fill")
                     .foregroundStyle(context.state.tintColor)
+                    .accessibilityLabel("Turn status")
+                    .accessibilityValue(context.state.statusLabel)
             } compactTrailing: {
                 elapsedView(context.state)
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
+                    .accessibilityLabel("Elapsed time")
+                    .accessibilityValue(context.state.elapsedAccessibilityValue)
             } minimal: {
                 Image(systemName: context.state.needsApproval ? "exclamationmark.triangle.fill" : "bolt.horizontal.fill")
                     .foregroundStyle(context.state.tintColor)
+                    .accessibilityLabel("Turn status")
+                    .accessibilityValue(context.state.statusLabel)
             }
             .widgetURL(context.state.needsApproval ? HermesWidgetLink.review : HermesWidgetLink.open)
             .keylineTint(context.state.tintColor)
@@ -153,6 +193,8 @@ struct HermesTurnLockScreenView: View {
                 .font(.title2)
                 .foregroundStyle(state.tintColor)
                 .frame(width: 36)
+                .accessibilityLabel("Turn status")
+                .accessibilityValue(state.statusLabel)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
@@ -163,6 +205,8 @@ struct HermesTurnLockScreenView: View {
                     .foregroundStyle(state.needsApproval ? .orange : .secondary)
                     .lineLimit(1)
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(title), \(state.statusLabel)")
 
             Spacer(minLength: 8)
 
@@ -170,10 +214,13 @@ struct HermesTurnLockScreenView: View {
                 elapsedView(state)
                     .font(.system(.title3, design: .rounded).monospacedDigit())
                     .multilineTextAlignment(.trailing)
+                    .accessibilityLabel("Elapsed time")
+                    .accessibilityValue(state.elapsedAccessibilityValue)
                 if state.needsApproval {
                     Text("tap to review")
                         .font(.caption2)
                         .foregroundStyle(.orange)
+                        .accessibilityLabel("Tap to review approval")
                 }
             }
         }

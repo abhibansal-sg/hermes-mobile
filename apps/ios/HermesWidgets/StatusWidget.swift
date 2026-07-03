@@ -115,7 +115,11 @@ struct StatusWidgetView: View {
         VStack(alignment: .leading, spacing: 8) {
             header
             Spacer(minLength: 0)
-            metric(value: "\(activeSessions)", label: activeSessions == 1 ? "session" : "sessions")
+            metric(
+                value: "\(activeSessions)",
+                label: activeSessions == 1 ? "session" : "sessions",
+                accessibilityLabel: activeSessionsAccessibilityLabel
+            )
             if pendingApprovals > 0 {
                 approvalLine
             } else {
@@ -135,8 +139,11 @@ struct StatusWidgetView: View {
             }
             Spacer(minLength: 0)
             VStack(alignment: .trailing, spacing: 12) {
-                metric(value: "\(activeSessions)",
-                       label: activeSessions == 1 ? "active session" : "active sessions")
+                metric(
+                    value: "\(activeSessions)",
+                    label: activeSessions == 1 ? "active session" : "active sessions",
+                    accessibilityLabel: activeSessionsAccessibilityLabel
+                )
                 Link(destination: pendingApprovals > 0 ? HermesWidgetLink.review : HermesWidgetLink.open) {
                     if pendingApprovals > 0 {
                         approvalLine
@@ -166,7 +173,12 @@ struct StatusWidgetView: View {
         }
     }
 
-    private func metric(value: String, label: String) -> some View {
+    private var activeSessionsAccessibilityLabel: String {
+        guard snapshot != nil else { return "Active sessions unavailable" }
+        return activeSessions == 1 ? "1 active session" : "\(activeSessions) active sessions"
+    }
+
+    private func metric(value: String, label: String, accessibilityLabel: String) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(value)
                 .font(.system(.title, design: .rounded).weight(.semibold))
@@ -175,6 +187,8 @@ struct StatusWidgetView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
     }
 
     private var approvalLine: some View {
@@ -182,6 +196,9 @@ struct StatusWidgetView: View {
             .font(.caption.weight(.semibold))
             .foregroundStyle(.orange)
             .lineLimit(1)
+            .accessibilityLabel(
+                pendingApprovals == 1 ? "1 pending approval" : "\(pendingApprovals) pending approvals"
+            )
     }
 
     private var staleLine: some View {
