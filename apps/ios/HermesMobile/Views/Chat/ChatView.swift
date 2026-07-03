@@ -176,6 +176,16 @@ struct ChatView: View {
     /// through; themed-opaque on regular/iPad) and the scroll-to-bottom pill.
     private var isCompact: Bool { horizontalSizeClass == .compact }
 
+    /// The inline working row is honest busy-state chrome: it appears only while a
+    /// turn is actively running, not while the turn is paused on a human approval,
+    /// clarification, sudo, or secret prompt (those have their own user-action UI).
+    private var shouldShowInlineTurnActivity: Bool {
+        chatStore.isStreaming
+            && chatStore.pendingApproval == nil
+            && chatStore.pendingClarification == nil
+            && chatStore.pendingSecurePrompt == nil
+    }
+
     /// Approximate height reserved at the bottom of the transcript so the last
     /// message is never hidden under the floating composer. The composer card is
     /// ~100-130pt tall; an extra ~20pt breathing room reads well. This is a
@@ -325,6 +335,33 @@ struct ChatView: View {
     static func isScaffolding(_ message: ChatMessage) -> Bool {
         if case .collapsed = message.presentation { return true }
         return message.role == .system
+    }
+
+    /// Whether the in-flight assistant row has already produced visible prose.
+    /// Mirrors desktop's split between the pre-first-token loading indicator and
+    /// the tail "still thinking" indicator once output has begun.
+    static func hasVisibleAssistantOutput(_ message: ChatMessage?) -> Bool {
+        guard let message, message.role == .assistant else { return false }
+        return !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Status label for the inline turn row. Active tools win because they are the
+    /// most truthful current activity; otherwise a turn with visible assistant text
+    /// reads as "Still thinking" (desktop tail indicator) and a pre-token turn reads
+    /// as "Working".
+    static func turnActivityLabel(activeToolName: String?, hasAssistantOutput: Bool) -> String {
+        if let activeToolName, !activeToolName.isEmpty { return activeToolName }
+        return hasAssistantOutput ? "Still thinking" : "Working"
+    }
+
+    /// Desktop ActivityTimerText-compatible elapsed format: `Xs` under a minute,
+    /// `M:SS` after that. Kept pure so tests can pin the visible lifecycle without
+    /// mounting a live SwiftUI timer.
+    static func turnActivityElapsedText(startedAt: Date?, now: Date) -> String {
+        guard let startedAt else { return "0s" }
+        let seconds = max(0, Int(now.timeIntervalSince(startedAt)))
+        if seconds < 60 { return "\(seconds)s" }
+        return TimeInterval(seconds).mmss
     }
 
     var body: some View {
@@ -592,8 +629,10 @@ struct ChatView: View {
 
     /// The floating bottom stack (ABH-79 Task 3): now an `.overlay(alignment:.bottom)`
     /// on the transcript. The stack holds banners (above the readability fade),
-    /// the optional scroll-to-bottom pill, the optional streaming activity bar, and
-    /// the floating glass composer. The opaque toolbarBg strip is removed from
+    /// the optional scroll-to-bottom pill, and the floating glass composer. The
+    /// turn activity indicator is intentionally NOT here: ABH-359 makes it an
+    /// inline transcript row so messages never slide underneath a status strip.
+    /// The opaque toolbarBg strip is removed from
     /// ComposerView's outer container (see `ComposerView.body`); only the glass
     /// card surface (`ComposerCardSurface`) reads. A `theme.bg` readability
     /// backing is painted BEHIND the composer on ALL OS versions so the composer
@@ -605,10 +644,6 @@ struct ChatView: View {
             banners
             if isCompact && !atBottom {
                 scrollToBottomPill(proxy: proxy)
-            }
-            if chatStore.isStreaming {
-                TurnActivityBar(chatStore: chatStore)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
             ComposerView(
                 chatStore: chatStore,
@@ -779,13 +814,14 @@ struct ChatView: View {
                     .padding(.top, Self.topGap(above: message, after: previous))
                     .id(message.id)
                 }
-                // ABH-83: Inline approval card — rendered as ADDITIVE transcript
-                // content after the last message when there is a pending approval
-                // for the current session. This is pure additive content: it does
-                // not touch any scroll/anchor/keyboard machinery. The existing
-                // re-pin-on-settle (BottomEdgeScroll / pendingLandOnNewest /
-                // scrollToBottomIfNeeded) naturally keeps this card visible when
-                // it appears at the tail, exactly like a new message row.
+                // ABH-83 / ABH-359: Inline tail affordances are rendered as
+                // ADDITIVE transcript content after the last message: first a
+                // pending approval card (the turn is waiting on the user), then the
+                // working/timer indicator when the turn is actually still running.
+                // These are real rows inside the scroll content — never a floating
+                // strip — so transcript prose cannot slide underneath them. The
+                // existing bottom-anchor re-pin naturally keeps whichever tail row is
+                // current visible, exactly like a new message row.
                 // The card disappears when pendingApproval is cleared (respondApproval
                 // sets it nil, expireTurnScopedPrompts sets it nil on turn end /
                 // session switch) — no manual lifecycle needed.
@@ -794,6 +830,12 @@ struct ChatView: View {
                         .padding(.top, Self.intraTurnGap)
                         .transition(.opacity.combined(with: .move(edge: .bottom)))
                         .id("inline-approval-\(approval.id)")
+                }
+                if shouldShowInlineTurnActivity {
+                    TurnActivityBar(chatStore: chatStore)
+                        .padding(.top, Self.intraTurnGap)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                        .id("inline-working-indicator")
                 }
                 // SCROLL P0 #2 (contract Batch E §3.6) — composer-clearance spacer.
                 //
@@ -2196,18 +2238,18 @@ private extension View {
     }
 }
 
-// MARK: - Turn activity bar
+// MARK: - Inline turn activity row
 
-/// A thin status strip shown above the composer while a turn streams: a spinner,
-/// the currently-running tool's name (if any), and the elapsed time since
-/// `turnStartedAt`.
+/// A compact status row rendered inside the transcript while a turn streams: a
+/// spinner, the currently-running tool (if any) or the working/still-thinking
+/// label, and the elapsed time since `turnStartedAt`.
 ///
 /// The stop (interrupt) affordance lives ONLY on the composer's morph button now
 /// (H4 / single-stop-affordance principle): while streaming, the composer's
 /// docked action becomes the "Interrupt" glyph, so a duplicate stop button on
-/// this bar would be a second, competing affordance. The bar is therefore a
-/// pure read-only status strip with no interactive controls — which is also why
-/// `ChatFlowUITests` asserts no "Stop turn" button is ever present.
+/// this row would be a second, competing affordance. The row is therefore pure
+/// read-only status chrome with no interactive controls — and, per ABH-359, it
+/// lives in the transcript layout rather than as a floating overlay strip.
 private struct TurnActivityBar: View {
     let chatStore: ChatStore
 
@@ -2222,37 +2264,38 @@ private struct TurnActivityBar: View {
         HStack(spacing: 8) {
             ProgressView()
                 .controlSize(.mini)
-            Text(statusText)
-                .font(.caption)
+                .tint(theme.navBarTint)
+            Text(labelText)
+                .font(.caption.weight(.medium))
                 .foregroundStyle(theme.mutedFg)
                 .lineLimit(1)
                 .truncationMode(.middle)
-            Spacer(minLength: 0)
+            Text(elapsedText)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(theme.mutedFg.opacity(0.72))
+                .lineLimit(1)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 7)
-        .frame(maxWidth: .infinity)
-        .background(theme.card, in: Capsule())
         .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(theme.card.opacity(0.92), in: Capsule())
+        .overlay {
+            Capsule().stroke(theme.mutedFg.opacity(0.14), lineWidth: 1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(labelText), \(elapsedText)")
+        .accessibilityIdentifier("inlineWorkingIndicator")
         .onReceive(tick) { now = $0 }
     }
 
-    private var statusText: String {
-        var parts: [String] = []
-        if let name = chatStore.activeToolName, !name.isEmpty {
-            parts.append(name)
-        } else {
-            parts.append("Working")
-        }
-        parts.append(elapsedText)
-        return parts.joined(separator: " · ")
+    private var labelText: String {
+        ChatView.turnActivityLabel(
+            activeToolName: chatStore.activeToolName,
+            hasAssistantOutput: ChatView.hasVisibleAssistantOutput(chatStore.messages.last)
+        )
     }
 
     private var elapsedText: String {
-        guard let started = chatStore.turnStartedAt else { return "0s" }
-        let elapsed = now.timeIntervalSince(started)
-        let seconds = max(0, Int(elapsed))
-        if seconds < 60 { return "\(seconds)s" }
-        return elapsed.mmss
+        ChatView.turnActivityElapsedText(startedAt: chatStore.turnStartedAt, now: now)
     }
 }
