@@ -46,6 +46,17 @@ final class PushRegistrar {
     var remoteNotificationsRegistrar: (@MainActor () -> Void)?
     @ObservationIgnored
     var tokenRegisterOverride: (@MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome)?
+    @ObservationIgnored
+    private var registrationInFlight = false
+    @ObservationIgnored
+    private var pendingRegistrationRequest: RegistrationRequest?
+
+    private struct RegistrationRequest {
+        let token: String
+        let events: [String]
+        let env: String
+        let registerToken: @MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome
+    }
 
     init() {
         isEnabled = UserDefaults.standard.bool(forKey: DefaultsKeys.pushEnabled)
@@ -185,9 +196,29 @@ final class PushRegistrar {
                 await poster.register(token: token, events: events)
             }
         }
+        enqueueRegistration(
+            RegistrationRequest(token: hex, events: events, env: env, registerToken: registerToken)
+        )
+    }
+
+    /// Serialize all alert-token registration POSTs through one main-actor drain.
+    /// If a newer intent arrives while an older request is in flight, keep only
+    /// that newest pending intent. This preserves launch/foreground registration
+    /// while ensuring a Settings toggle cannot be clobbered by an older network
+    /// completion: server writes happen in intent order and the final successful
+    /// local state mirrors the final successful server write.
+    private func enqueueRegistration(_ request: RegistrationRequest) {
+        pendingRegistrationRequest = request
+        guard !registrationInFlight else { return }
+        registrationInFlight = true
+
         Task { @MainActor in
-            let outcome = await registerToken(hex, events)
-            handleRegisterOutcome(outcome, token: hex, events: events, env: env)
+            while let next = pendingRegistrationRequest {
+                pendingRegistrationRequest = nil
+                let outcome = await next.registerToken(next.token, next.events)
+                handleRegisterOutcome(outcome, token: next.token, events: next.events, env: next.env)
+            }
+            registrationInFlight = false
         }
     }
 
@@ -241,12 +272,14 @@ final class PushRegistrar {
                 await poster.register(token: token, events: events)
             }
         }
-        Task { @MainActor in
-            let outcome = await registerToken(hex, events)
-            if case .success = outcome {
-                lastRegisteredEvents = events
-            }
-        }
+        enqueueRegistration(
+            RegistrationRequest(
+                token: hex,
+                events: events,
+                env: PushTokenPoster.apnsEnvironment,
+                registerToken: registerToken
+            )
+        )
     }
 
     /// The event subset last successfully registered, persisted so a prefs change

@@ -84,6 +84,64 @@ final class PushRegistrarPairFlowTests: XCTestCase {
         XCTAssertEqual(SettingsView.pushTokenRegistrationLabel(token: nil), "Not registered")
     }
 
+    func testNotificationToggleReregisterWaitsBehindForegroundRegisterAndWins() async {
+        let token = "deadbeef"
+        let currentEnv = PushRegistrar.apnsEnvironment
+        var invocations: [(token: String, events: [String]?)] = []
+        var completions: [(token: String, events: [String]?)] = []
+        var firstContinuation: CheckedContinuation<PushTokenPoster.Outcome, Never>?
+
+        UserDefaults.standard.set(true, forKey: DefaultsKeys.pushEnabled)
+        UserDefaults.standard.set(token, forKey: DefaultsKeys.pushLastDeviceToken)
+        UserDefaults.standard.set(["approval"], forKey: DefaultsKeys.pushLastEvents)
+        UserDefaults.standard.set(currentEnv, forKey: DefaultsKeys.pushLastEnv)
+
+        registrar.authorizationRequester = { _ in .denied }
+        registrar.setEnabled(true)
+        registrar.tokenRegisterOverride = { token, events in
+            invocations.append((token: token, events: events))
+            if invocations.count == 1 {
+                let outcome: PushTokenPoster.Outcome = await withCheckedContinuation { continuation in
+                    firstContinuation = continuation
+                }
+                completions.append((token: token, events: events))
+                return outcome
+            }
+            completions.append((token: token, events: events))
+            return .success
+        }
+
+        // Foreground APNs re-delivery captures the old event intent (A) and then
+        // pauses mid-flight, simulating a slow network response.
+        registrar.didRegister(deviceToken: Data([0xde, 0xad, 0xbe, 0xef]))
+        await waitUntil(invocations.count == 1, "foreground register should start")
+        XCTAssertEqual(invocations[0].events, ["approval", "clarify", "turn_complete"])
+
+        // The user flips a Settings toggle while A is in flight. This is the new
+        // latest intent (B), and it must not race A as an independent POST.
+        UserDefaults.standard.set(false, forKey: DefaultsKeys.pushEventClarify)
+        registrar.reRegisterEvents()
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(
+            invocations.count,
+            1,
+            "toggle re-register should wait behind the in-flight foreground register"
+        )
+
+        firstContinuation?.resume(returning: .success)
+        await waitUntil(completions.count == 2, "foreground and toggle registrations should settle")
+
+        let latestEvents = ["approval", "turn_complete"]
+        XCTAssertEqual(invocations.map(\.events), [
+            ["approval", "clarify", "turn_complete"],
+            latestEvents,
+        ])
+        XCTAssertEqual(completions.last?.events, latestEvents)
+        XCTAssertEqual(UserDefaults.standard.stringArray(forKey: DefaultsKeys.pushLastEvents), latestEvents)
+        XCTAssertEqual(UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken), token)
+        XCTAssertEqual(UserDefaults.standard.string(forKey: DefaultsKeys.pushLastEnv), currentEnv)
+    }
+
     private func resetRegistrarState() {
         registrar.authorizationRequester = nil
         registrar.remoteNotificationsRegistrar = nil
