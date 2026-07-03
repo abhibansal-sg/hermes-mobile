@@ -32,7 +32,7 @@ TestFlight + Abhi catch taste (layer 5).
 | CUJ-06 | Enable relay push + pair + truthful test-push | `/relay/config` → `/relay/pair` → `/relay/test-push` → `/relay/status` truthfulness, including direct-APNs vs relay vs no-push-configured outcomes (ABH-282/283/284/285, ABH-213, ABH-314) | wave-68 |
 | CUJ-07 | Device tokens: pair → APNs token registers, honest Settings state, list, revoke (scope-gated) | iOS pair/foreground registers `/push/register`; with relay configured, POST `/push/register` exercises relay `register_device` enrollment without delaying the REST 200; Settings shows not-authorized / not-registered / registered truthfully; `/api/devices`, DELETE + approve-scope 403 (ABH-329, ABH-315, ABH-275, ABH-270) | push lineage |
 | CUJ-08 | Provider list + key entry (no key leak in response) | `/api/providers` + `/providers/{slug}/key` write→readback redacted | provider mgmt |
-| CUJ-09 | Cron jobs: list + delivery-failure surfaced | cron surface + lastError contract (#85) | cron |
+| CUJ-09 | Cron jobs: list, delivery-failure surfaced, and live "Deliver to" target selection | `/api/cron/jobs` + `/api/cron/delivery-targets`; `smoke: ios-sim` opens cron editor, sees only connected targets, shows the home-channel hint for unconfigured-home targets, saves the chosen `deliver`, and keeps a CLI-created exotic `deliver` value selected instead of blank | cron/ABH-265 |
 | CUJ-10 | File attach/upload → agent sees it | `/api/upload` + fs/read contract | share/capture |
 | CUJ-11 | Kanban/agents visibility (active agents view) | `/api/agents` shape sanity | ops surface |
 | CUJ-12 | Slash-command launcher lists real commands | slash-commands route (#104, ABH-228) | build 58 |
@@ -49,7 +49,8 @@ TestFlight + Abhi catch taste (layer 5).
 `smoke: ios-sim` (covered by iOS test suite, skipped by gateway smoke): stale
 'Connection lost' warning clears on clean resume (ABH-289 tests), per-event
 push toggles gate local notifications (ABH-269), share-extension inbox drain
-toast (ABH-277).
+toast (ABH-277), cron delivery target picker truthfulness/legacy-selection
+(ABH-265).
 
 ## Maintenance
 

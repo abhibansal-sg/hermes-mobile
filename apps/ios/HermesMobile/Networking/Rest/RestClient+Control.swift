@@ -378,6 +378,8 @@ struct CronJob: Identifiable, Sendable, Equatable {
     let name: String
     let prompt: String?
     let scheduleDisplay: String?
+    /// Delivery target requested for this job ("local", "telegram", etc.).
+    let deliver: String?
     /// "scheduled" or "paused".
     let state: String?
     let enabled: Bool
@@ -396,6 +398,7 @@ struct CronJob: Identifiable, Sendable, Equatable {
         self.prompt = json["prompt"]?.stringValue
         self.scheduleDisplay = json["schedule_display"]?.stringValue
             ?? json["schedule"]?["display"]?.stringValue
+        self.deliver = json["deliver"]?.stringValue
         self.state = json["state"]?.stringValue
         self.enabled = json["enabled"]?.boolValue ?? true
         self.nextRunAt = json["next_run_at"]?.stringValue
@@ -409,6 +412,39 @@ struct CronJob: Identifiable, Sendable, Equatable {
 
     /// True when the job is paused or disabled (vs. actively scheduled).
     var isPaused: Bool { state == "paused" || !enabled }
+}
+
+/// One target from `GET /api/cron/delivery-targets` → `targets[]`.
+/// Includes connected cron-capable gateway platforms plus the implicit local
+/// save-only target. `homeTargetSet == false` means the platform is configured
+/// for interactive use but cannot receive unattended cron deliveries yet.
+struct CronDeliveryTarget: Identifiable, Sendable, Equatable {
+    let id: String
+    let name: String
+    let homeTargetSet: Bool
+    let homeEnvVar: String?
+
+    init(id: String, name: String, homeTargetSet: Bool, homeEnvVar: String?) {
+        self.id = id
+        self.name = name
+        self.homeTargetSet = homeTargetSet
+        self.homeEnvVar = homeEnvVar
+    }
+
+    init(json: JSONValue) {
+        let id = json["id"]?.stringValue ?? ""
+        self.id = id
+        self.name = json["name"]?.stringValue ?? id
+        self.homeTargetSet = json["home_target_set"]?.boolValue ?? false
+        self.homeEnvVar = json["home_env_var"]?.stringValue
+    }
+
+    static let local = CronDeliveryTarget(
+        id: "local",
+        name: "Local (save only)",
+        homeTargetSet: true,
+        homeEnvVar: nil
+    )
 }
 
 // MARK: Skills
@@ -540,6 +576,14 @@ extension RestClient {
     func cronJobs() async throws -> [CronJob] {
         let json = try await getJSON(path: "/api/cron/jobs")
         return (json.arrayValue ?? []).map(CronJob.init(json:))
+    }
+
+    /// `GET /api/cron/delivery-targets` — connected cron-capable delivery
+    /// targets, including `local`. Falls back at the call site on failure so the
+    /// editor can still save local-only jobs if the dynamic endpoint breaks.
+    func cronDeliveryTargets() async throws -> [CronDeliveryTarget] {
+        let json = try await getJSON(path: "/api/cron/delivery-targets")
+        return (json["targets"]?.arrayValue ?? []).map(CronDeliveryTarget.init(json:))
     }
 
     /// `POST /api/cron/jobs/{id}/trigger` — run now; returns the updated job.

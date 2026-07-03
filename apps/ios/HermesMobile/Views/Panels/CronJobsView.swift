@@ -419,6 +419,9 @@ private struct CronEditorSheet: View {
     @State private var schedulePreset = SchedulePreset.daily
     @State private var customExpr = ""
     @State private var deliver = "local"
+    @State private var deliveryTargets: [CronDeliveryTarget] = [.local]
+    @State private var deliveryTargetsLoading = true
+    @State private var deliveryTargetsError: String?
     @State private var saving = false
     @State private var saveError: String?
 
@@ -475,12 +478,17 @@ private struct CronEditorSheet: View {
                     }
                 }
 
-                Section("Delivery") {
+                Section {
                     Picker("Deliver to", selection: $deliver) {
-                        ForEach(["local", "telegram", "discord", "slack", "email"], id: \.self) { ch in
-                            Text(ch.capitalized).tag(ch)
+                        ForEach(deliveryRows) { target in
+                            Text(deliveryLabel(for: target)).tag(target.id)
                         }
                     }
+                    .accessibilityIdentifier("cronDeliverPicker")
+
+                    deliveryStateNote
+                } header: {
+                    Text("Delivery")
                 }
 
                 if let err = saveError {
@@ -512,12 +520,88 @@ private struct CronEditorSheet: View {
                     }
                 }
             }
-            .onAppear { prefill() }
+            .onAppear {
+                prefill()
+                Task { await loadDeliveryTargets() }
+            }
         }
     }
 
     private var effectiveExpr: String {
         schedulePreset == .custom ? customExpr : (schedulePreset.expr ?? customExpr)
+    }
+
+    private var deliveryRows: [CronDeliveryTarget] {
+        var rows = deliveryTargets.isEmpty ? [CronDeliveryTarget.local] : deliveryTargets
+        if !rows.contains(where: { $0.id == CronDeliveryTarget.local.id }) {
+            rows.insert(.local, at: 0)
+        }
+        if !deliver.isEmpty, !rows.contains(where: { $0.id == deliver }) {
+            rows.append(
+                CronDeliveryTarget(
+                    id: deliver,
+                    name: deliver,
+                    homeTargetSet: false,
+                    homeEnvVar: nil
+                )
+            )
+        }
+        return rows
+    }
+
+    private var hasOnlyLocalDeliveryTarget: Bool {
+        deliveryRows.filter { $0.id != CronDeliveryTarget.local.id }.isEmpty
+    }
+
+    @ViewBuilder
+    private var deliveryStateNote: some View {
+        if deliveryTargetsLoading {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Loading live delivery targets\u{2026}")
+            }
+            .font(.caption)
+            .foregroundStyle(theme.mutedFg)
+        } else if let deliveryTargetsError {
+            Label(
+                "Couldn\u{2019}t refresh delivery targets; saving local-only unless this job already had a selected target. \(deliveryTargetsError)",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(theme.statusWarn)
+        } else if deliveryTargets.isEmpty {
+            Label("No delivery targets reported; local save only.", systemImage: "tray")
+                .font(.caption)
+                .foregroundStyle(theme.mutedFg)
+        } else if hasOnlyLocalDeliveryTarget {
+            Text("No messaging platforms are connected for cron delivery. Set a home channel before delivering reports to chat.")
+                .font(.caption)
+                .foregroundStyle(theme.mutedFg)
+        }
+    }
+
+    private func deliveryLabel(for target: CronDeliveryTarget) -> String {
+        if target.id == CronDeliveryTarget.local.id { return target.name }
+        let fetchedTargetIds = Set(deliveryTargets.map(\.id))
+        if !fetchedTargetIds.contains(target.id) {
+            return "\(target.name) \u{2014} unavailable on this gateway"
+        }
+        if !target.homeTargetSet {
+            return "\(target.name) \u{2014} set a home channel first"
+        }
+        return target.name
+    }
+
+    private func loadDeliveryTargets() async {
+        deliveryTargetsLoading = true
+        deliveryTargetsError = nil
+        do {
+            deliveryTargets = try await control.cronDeliveryTargets()
+        } catch {
+            deliveryTargets = [.local]
+            deliveryTargetsError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+        deliveryTargetsLoading = false
     }
 
     private func prefill() {
@@ -528,7 +612,7 @@ private struct CronEditorSheet: View {
         let preset = SchedulePreset.preset(for: rawExpr)
         schedulePreset = preset
         customExpr = rawExpr
-        deliver = job.source ?? "local"
+        deliver = job.deliver ?? job.source ?? "local"
     }
 
     private func save() async {

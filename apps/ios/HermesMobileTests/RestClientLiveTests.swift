@@ -70,6 +70,37 @@ final class RestClientLiveTests: XCTestCase {
         )
     }
 
+    /// `GET /api/cron/delivery-targets` keeps snake_case target metadata intact
+    /// and exposes both configured and needs-home-channel states to the cron
+    /// editor. This is stubbed (not live) so CI pins the decoder without a
+    /// configured gateway channel.
+    func testCronDeliveryTargetsDecodeHomeTargetState() async throws {
+        CronDeliveryTargetsStubProtocol.nextResponse = (
+            data: #"{"targets":[{"id":"local","name":"Local (save only)","home_target_set":true,"home_env_var":null},{"id":"telegram","name":"Telegram","home_target_set":true,"home_env_var":"TELEGRAM_HOME_CHAT_ID"},{"id":"discord","name":"Discord","home_target_set":false,"home_env_var":"DISCORD_HOME_CHANNEL_ID"}]}"#.data(using: .utf8)!,
+            status: 200
+        )
+        CronDeliveryTargetsStubProtocol.requestedPath = nil
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [CronDeliveryTargetsStubProtocol.self]
+        let client = RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "test-token",
+            session: URLSession(configuration: config)
+        )
+
+        let targets = try await client.cronDeliveryTargets()
+
+        XCTAssertEqual(CronDeliveryTargetsStubProtocol.requestedPath, "/api/cron/delivery-targets")
+        XCTAssertEqual(targets.map(\.id), ["local", "telegram", "discord"])
+        XCTAssertEqual(targets[0].name, "Local (save only)")
+        XCTAssertTrue(targets[0].homeTargetSet)
+        XCTAssertNil(targets[0].homeEnvVar)
+        XCTAssertTrue(targets[1].homeTargetSet)
+        XCTAssertEqual(targets[1].homeEnvVar, "TELEGRAM_HOME_CHAT_ID")
+        XCTAssertFalse(targets[2].homeTargetSet)
+        XCTAssertEqual(targets[2].homeEnvVar, "DISCORD_HOME_CHANNEL_ID")
+    }
+
     // MARK: - Test fixtures
 
     /// A minimal, valid 1x1 opaque-red PNG, built in-code so the test carries no
@@ -96,4 +127,31 @@ final class RestClientLiveTests: XCTestCase {
         ]
         return Data(bytes)
     }
+}
+
+private final class CronDeliveryTargetsStubProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var nextResponse: (data: Data, status: Int)?
+    nonisolated(unsafe) static var requestedPath: String?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.requestedPath = request.url?.path
+        guard let (data, status) = Self.nextResponse else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: status,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
