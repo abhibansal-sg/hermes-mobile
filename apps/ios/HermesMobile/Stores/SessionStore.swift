@@ -39,6 +39,18 @@ final class SessionStore {
     /// when working-set survivors inflate the array. Resets on every first-page fetch.
     private(set) var loadedCount: Int = 0
 
+    /// ABH-373: Every server row id consumed across all pages — INCLUDING machinery
+    /// that was filtered out at ingress and never entered `sessions`. Grow-limit
+    /// pagination re-fetches the full expanded window each iteration (limit grows by
+    /// `pageSize`), so deduping the `loadedCount` cursor advance against `sessions`
+    /// (which excludes filtered machinery) would re-count those rows every iteration
+    /// and inflate the cursor past `totalSessions` — halting `loadMore` before later
+    /// human sessions. Tracking all-seen ids makes the ingress filter cursor-neutral:
+    /// a row consumed from the server is counted exactly once regardless of whether it
+    /// passes the machinery predicate. Reset alongside `sessions`/`loadedCount` on
+    /// every list clear and rebuilt from the raw page on every first-page replace.
+    private var seenServerSessionIds: Set<String> = []
+
     /// True while a `loadMore()` page fetch is in flight (distinct from `isLoading`
     /// which gates the first-page spinner). Drives the sentinel loading row.
     private(set) var isLoadingMore: Bool = false
@@ -818,6 +830,11 @@ final class SessionStore {
         // guarantees the stronger ABH-343 human-vs-machinery invariant for old
         // gateways, WS fallback, cli-source loop rows, and stale cache rows.
         rows = rows.filter(Self.isHumanRecentsSession)
+        // ABH-373: this read-time filter is now BELT-AND-SUSPENDERS. The
+        // invariant is established at ingress (mergeSessionPage +
+        // paintFromCache), so machinery never enters `sessions`. This filter
+        // remains as a defensive guarantee for any path that bypasses those
+        // two gates (a future ingress point, or direct mutation during testing).
         rows = Self.filterByProfile(rows, scope: activeProfile, multiAvailable: isMultiProfileAvailable)
         // Client-side re-sort by lastActive DESC, falling back to startedAt.
         // Nil timestamps sink to the bottom. The sort is stable so rows with
@@ -1125,9 +1142,18 @@ final class SessionStore {
                 // refresh may have populated the list while we were reading
                 // disk — never overwrite fresher server data with the cache.
                 if sessions.isEmpty {
-                    sessions = cached
+                    // ABH-373: gate machinery at the cache-restore ingress too.
+                    // A stale cache may contain rows that were eligible when
+                    // cached but are now machinery (or were always machinery
+                    // and slipped through an older build). The predicate is the
+                    // single source of truth.
+                    sessions = cached.filter(Self.isHumanRecentsSession)
                     // The cold cache paint is a real first page for the
                     // pagination cursors and the initial-fill fast-path.
+                    // ABH-373: seed all-seen ids from the RAW cached page
+                    // (before the machinery filter) so the cursor math on
+                    // subsequent grow-limit appends is accurate.
+                    seenServerSessionIds = Set(cached.map(\.id))
                     loadedCount = cached.count
                     loadedOffset = cached.count
                 }
@@ -1300,6 +1326,7 @@ final class SessionStore {
             sessions = []
             loadedCount = 0
             loadedOffset = 0
+            seenServerSessionIds = []  // ABH-373
             didColdReadCache = false
         }
 
@@ -1447,26 +1474,62 @@ final class SessionStore {
     /// `sessions` array rather than replacing it. Deduplication is by `id`.
     /// Working-set survivor logic is skipped on appended pages (the first-page
     /// already carries those survivors). `loadedCount` is advanced accordingly.
-    private func mergeSessionPage(_ incoming: [SessionSummary], total: Int?, isAppend: Bool = false) {
+    private func mergeSessionPage(_ page: [SessionSummary], total: Int?, isAppend: Bool = false) {
+        // ABH-373: Gate machinery at INGRESS. Every path that writes into
+        // `sessions` — fetch, WS-triggered refresh, background refresh, load-more
+        // append, initial-fill append — funnels through this merge. Filtering
+        // here means machinery (cron / subagent / agent / cli-loop) can NEVER
+        // enter the drawer's backing array, so there is no flicker where a row
+        // flashes in then disappears on the next `visibleSessions` read. The
+        // predicate is the single source of truth (`isHumanRecentsSession`);
+        // `visibleSessions` retains it as belt-and-suspenders, but the invariant
+        // is established at write time, not read time.
+        //
+        // ABH-373 (two dedupe concerns — do NOT conflate them):
+        //
+        // 1. ROW-INCLUSION dedupe (which rows enter `sessions`): against the
+        //    RENDERED set `sessions.map(\.id)`. This is the only set that
+        //    contains working-set survivors (pinned/active/live rows carried
+        //    forward from a prior first-page replace). Deduping row inclusion
+        //    against any other set risks appending a survivor twice → a duplicate
+        //    Identifiable id → SwiftUI ForEach undefined behavior.
+        //
+        // 2. CURSOR-ADVANCE dedupe (how far `loadedCount` has consumed the
+        //    server list): against `seenServerSessionIds` (ALL server rows ever
+        //    consumed, INCLUDING machinery filtered out at ingress). Grow-limit
+        //    pagination re-fetches the full expanded window each iteration, so
+        //    overlap rows reappear — they must NOT advance the cursor again.
+        //    This set intentionally EXCLUDES working-set survivors (they are
+        //    local-only, never delivered by the server), which is exactly why it
+        //    must never be used for row inclusion.
+        let rawCount = page.count
+        let pageIds = page.map(\.id)
+        let incoming = page.filter(Self.isHumanRecentsSession)
         // Update the total count when the server provides it.
         if let total { totalSessions = total }
 
         if isAppend {
-            // Append path: dedupe by id, preserve recency order of prior list.
+            // ABH-373 REWORK: row-inclusion dedupe MUST be against the actual
+            // rendered set (`sessions`), NOT against `seenServerSessionIds`. The
+            // all-seen-id set intentionally EXCLUDES working-set survivors
+            // (pinned/active/live rows carried forward from a prior first-page
+            // replace that were absent from that server page). A survivor that
+            // reappears in a grown-limit append window would pass a
+            // `seenServerSessionIds` filter and be appended a SECOND time → a
+            // duplicate Identifiable id in `sessions` → SwiftUI ForEach undefined
+            // behavior. Dedupe against the rendered set guarantees each id is
+            // present exactly once.
             let existingIds = Set(sessions.map(\.id))
             let newRows = incoming.filter { !existingIds.contains($0.id) }
+            // ABH-373: the CURSOR advance dedupe stays against `seenServerSessionIds`
+            // (all server rows ever consumed, including filtered machinery). A
+            // grow-limit page returns the full expanded window, so rows from earlier
+            // pages reappear — they are NOT new and must not advance `loadedCount`
+            // again. This set is cursor-only; never use it for row inclusion.
+            let newlySeenRawIds = pageIds.filter { !seenServerSessionIds.contains($0) }
+            seenServerSessionIds.formUnion(pageIds)
             sessions.append(contentsOf: newRows)
-            // Advance `loadedCount` by the number of GENUINELY NEW rows, not the
-            // full incoming window. With grow-limit pagination the live REST call
-            // returns the ENTIRE expanded window each time (e.g. limit=150 returns
-            // 150 rows, ~50 of them new); blindly adding `incoming.count` made
-            // `loadedCount` race ~2x ahead of the real `sessions.count`. That
-            // over-count then poisoned the heartbeat's `max(100, loadedCount)`
-            // first-page window and the header's "N loaded" copy. Counting new rows
-            // keeps `loadedCount == sessions.count` (minus working-set survivors),
-            // which is the honest, stable invariant. (Test seams return delta-only
-            // pages, so `newRows.count == incoming.count` there — unchanged.)
-            loadedCount += newRows.count
+            loadedCount += newlySeenRawIds.count
             return
         }
 
@@ -1526,8 +1589,16 @@ final class SessionStore {
         sessions = survivors + reconciled
 
         // Reset pagination cursors on a first-page refresh.
-        loadedCount = incoming.count
-        loadedOffset = incoming.count
+        // ABH-373: a first-page replace is a fresh server window — rebuild the
+        // all-seen-id set from the RAW page (before the machinery filter) so the
+        // cursor math on subsequent grow-limit appends is accurate. Only the RAW
+        // page ids count as "seen"; survivors (working-set rows absent from the
+        // page) are local-only and must not be seeded (they may be machinery a
+        // prior build failed to filter, and a future append should still skip them
+        // honestly). `loadedCount` / `loadedOffset` track the RAW page position.
+        seenServerSessionIds = Set(pageIds)
+        loadedCount = rawCount
+        loadedOffset = rawCount
     }
 
     /// ABH-86: optimistically bump a session's activity to NOW so a live frame
@@ -1913,6 +1984,7 @@ final class SessionStore {
         loadedOffset = 0
         loadedFloor = 0  // ABH review P2: don't carry the prior profile's high-water
                          // window into the new profile's first-page fetch (over-fetch).
+        seenServerSessionIds = []  // ABH-373
         didColdReadCache = false
         Task { [weak self] in await self?.refresh() }
     }

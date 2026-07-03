@@ -318,6 +318,247 @@ final class UX1DrawerFeedTests: XCTestCase {
             "The separate Automations route still finds cron rows by source == cron")
     }
 
+    /// ABH-373: Machinery sessions must NEVER enter the drawer's backing
+    /// `sessions` array — not just get filtered out at read time. Before ABH-373
+    /// the predicate was applied only in `visibleSessions`, so a live-update path
+    /// (WS message-complete → debounced refresh → mergeSessionPage) would insert
+    /// machinery rows into `sessions` where they lingered until the next
+    /// `visibleSessions` read. This test proves the stronger invariant: machinery
+    /// is rejected at INGRESS (mergeSessionPage), so `sessions` itself is clean.
+    ///
+    /// The test simulates the LIVE path: a first refresh populates human sessions,
+    /// then a second refresh (the kind a WS session-created event triggers)
+    /// delivers a page containing BOTH human and machinery sessions. The
+    /// machinery rows must never appear in `sessions`.
+    func testMachineryRejectedAtIngressOnLiveRefreshPath() async {
+        let store = makeStore()
+
+        let human1 = makeSummary(id: "human1", lastActive: 500, source: "app",
+                                 title: "Lunch plan", messageCount: 3)
+        let human2 = makeSummary(id: "human2", lastActive: 400, source: "app",
+                                 title: "Code review notes", messageCount: 5)
+
+        // Initial refresh: clean human sessions only.
+        store.sessionsFetch = { ([human1, human2], 2) }
+        await store.refresh()
+        XCTAssertEqual(Set(store.sessions.map(\.id)), Set(["human1", "human2"]),
+            "Baseline: human sessions populate the backing array")
+
+        // Simulate a LIVE update: a WS message-complete triggers a debounced
+        // refresh. The server page now includes a flood of machinery sessions
+        // alongside the human sessions (the exact scenario ABH-373 fixes).
+        let cronMachinery = makeSummary(id: "cronRun", lastActive: 600, source: "cron",
+                                        title: "Nightly briefing", messageCount: 8)
+        let subagentMachinery = makeSummary(id: "subagent1", lastActive: 590, source: "subagent",
+                                            title: "Research subtask", messageCount: 4)
+        let agentMachinery = makeSummary(id: "agent1", lastActive: 580, source: "agent",
+                                         title: "Scout sweep", messageCount: 2)
+        let cliLoopMachinery = makeSummary(id: "loopPlan", lastActive: 570, source: "cli",
+                                           title: "Loop Plan #42", messageCount: 6)
+        let cliReviewMachinery = makeSummary(id: "reviewApproval", lastActive: 560, source: "cli",
+                                             title: "review approval: merge PR", messageCount: 4)
+        let worktreeMachinery = makeSummary(id: "worktreeRun", lastActive: 550, source: "cli",
+            title: "Build task",
+            cwd: "/Users/abhi/Developer/products/hermes-mobile/.worktrees/abh373-fix",
+            messageCount: 10)
+        let kanbanMachinery = makeSummary(id: "kanbanTask", lastActive: 540, source: "cli",
+            title: "kanban task t_abc123",
+            cwd: "/Users/abhi/.hermes/kanban/boards/hermes-mobile/workspaces/t_abc123",
+            messageCount: 12)
+
+        let livePage = [
+            cronMachinery, subagentMachinery, agentMachinery,
+            cliLoopMachinery, cliReviewMachinery, worktreeMachinery,
+            kanbanMachinery, human1, human2,
+        ]
+        store.sessionsFetch = { (livePage, livePage.count) }
+
+        // This is the refresh that a WS session-created / message-complete
+        // event triggers via scheduleSessionRefresh().
+        await store.refresh()
+
+        // CORE INVARIANT (ABH-373): machinery never enters `sessions`.
+        // The backing array must contain ONLY human sessions — not just
+        // visibleSessions, but the raw backing store.
+        let sessionIds = Set(store.sessions.map(\.id))
+        let machineryIds: Set<String> = [
+            "cronRun", "subagent1", "agent1",
+            "loopPlan", "reviewApproval", "worktreeRun", "kanbanTask",
+        ]
+        XCTAssertEqual(sessionIds, Set(["human1", "human2"]),
+            "ABH-373: machinery sessions must never enter the backing `sessions` array via the live refresh path. " +
+            "Found machinery in sessions: \(sessionIds.intersection(machineryIds).sorted())")
+
+        // visibleSessions is a weaker downstream check but must also hold.
+        XCTAssertEqual(store.visibleSessions.map(\.id).sorted(), ["human1", "human2"].sorted(),
+            "visibleSessions must show only human sessions")
+    }
+
+    /// ABH-373: The load-more (append) path also rejects machinery at ingress.
+    /// When `mergeSessionPage(isAppend: true)` receives a page with mixed human
+    /// and machinery rows, only the human rows are appended to `sessions`.
+    func testMachineryRejectedAtIngressOnLoadMoreAppend() async {
+        let store = makeStore()
+
+        let human1 = makeSummary(id: "human1", source: "app", title: "Chat 1", messageCount: 3)
+        let human2 = makeSummary(id: "human2", source: "app", title: "Chat 2", messageCount: 5)
+
+        // First page: two human sessions.
+        store.sessionsFetch = { ([human1, human2], 10) }
+        await store.refresh()
+
+        // Load-more uses the `initialFillFetch` seam (same as real loadMore).
+        // The page contains a mix of human and machinery rows.
+        let human3 = makeSummary(id: "human3", source: "app", title: "Chat 3", messageCount: 2)
+        let cronRow = makeSummary(id: "cronLoadMore", source: "cron", title: "Scheduled run",
+                                  messageCount: 6)
+        let loopRow = makeSummary(id: "loopLoadMore", source: "cli", title: "Loop Plan #99",
+                                  messageCount: 4)
+
+        store.initialFillFetch = { _ in
+            ([human1, human2, human3, cronRow, loopRow], 10)
+        }
+        await store.loadMore()
+
+        let sessionIds = Set(store.sessions.map(\.id))
+        XCTAssertFalse(sessionIds.contains("cronLoadMore"),
+            "ABH-373: cron machinery must not enter sessions via load-more append")
+        XCTAssertFalse(sessionIds.contains("loopLoadMore"),
+            "ABH-373: cli-loop machinery must not enter sessions via load-more append")
+        XCTAssertTrue(sessionIds.contains("human3"),
+            "Human sessions on the load-more page must still be appended")
+    }
+
+    /// ABH-373 (verifier rework): the central pagination regression. When early
+    /// pages are heavy with machinery, `loadMore()` must NOT halt before reaching
+    /// the human sessions that live on LATER pages. Grow-limit pagination
+    /// re-fetches the full expanded window each iteration, so a row consumed once
+    /// must be counted exactly ONCE — even if the ingress machinery filter drops
+    /// it from `sessions` (and thus from the dedupe set the cursor advance used).
+    /// Before the fix, filtered machinery was re-counted on every grow-limit
+    /// iteration, inflating `loadedCount` past `totalSessions`, tripping the
+    /// exhaustion guard, and stranding later human sessions.
+    ///
+    /// This test builds a server where the first 2/3 are machinery and only the
+    /// LAST third are human sessions. `loadMore()` must page through the machinery
+    /// wall and surface those human sessions. The page fetch simulates the REAL
+    /// grow-limit REST contract: each call returns the full window `[0, limit)`.
+    func testLoadMoreReachesHumanSessionsPastMachineryWall() async {
+        let store = makeStore()
+
+        // 150-row server: rows 0-99 are machinery (cron), rows 100-149 are human.
+        // Human sessions are ONLY on the last third — a loadMore that halts at the
+        // machinery wall would never surface them.
+        let total = 150
+        func row(_ i: Int) -> SessionSummary {
+            if i < 100 {
+                return makeSummary(id: "mach_\(i)", lastActive: Double(total - i), source: "cron")
+            } else {
+                return makeSummary(id: "human_\(i)", lastActive: Double(total - i), source: "app")
+            }
+        }
+        let fullServer = (0..<total).map(row)
+
+        // First page: the server's default window (first 50 rows — all machinery).
+        // They are all filtered at ingress, so `sessions` starts empty but the
+        // cursor honestly reflects 50 consumed server rows.
+        store.sessionsFetch = { (Array(fullServer.prefix(50)), total) }
+        await store.refresh()
+        XCTAssertEqual(store.sessions.count, 0,
+            "first page is all machinery — sessions must be empty after ingress filter")
+        XCTAssertEqual(store.loadedCount, 50,
+            "loadedCount must honestly track 50 consumed server rows (machinery counted)")
+
+        // loadMore pages the same rail via the fill resolver — grow-limit contract:
+        // each call returns the full window [0, limit), exactly like the live REST path.
+        store.initialFillFetch = { limit in
+            (Array(fullServer.prefix(min(limit, total))), total)
+        }
+        await store.loadMore()
+
+        // CORE REGRESSION: the human sessions (rows 100-149) MUST be in `sessions`.
+        // A loadMore that over-counted machinery and tripped the exhaustion guard
+        // would halt inside the machinery wall and never reach them.
+        let sessionIds = Set(store.sessions.map(\.id))
+        let expectedHuman = Set((100..<total).map { "human_\($0)" })
+        XCTAssertFalse(sessionIds.isDisjoint(with: expectedHuman),
+            "ABH-373 regression: loadMore must page through the machinery wall and " +
+            "surface human sessions on later pages. Got sessions: \(sessionIds.sorted())")
+
+        // Sanity: no machinery leaked into sessions.
+        XCTAssertFalse(sessionIds.contains { $0.hasPrefix("mach_") },
+            "machinery must never enter sessions even when loadMore pages through it")
+
+        // The cursor must NOT have over-counted past the server total.
+        XCTAssertLessThanOrEqual(store.loadedCount, total,
+            "loadedCount (\(store.loadedCount)) must never exceed the server total (\(total)) — " +
+            "over-counting filtered machinery was the bug")
+    }
+
+    /// ABH-373 REWORK (survivor dedupe): a working-set SURVIVOR (pinned/active/
+    /// live row carried forward from a first-page replace because it was absent
+    /// from that server page) that later REAPPEARS in a grown-limit loadMore
+    /// append window must be present in `sessions` EXACTLY ONCE — never appended
+    /// a second time.
+    ///
+    /// The prior fix's `newRows` filter deduped row inclusion against
+    /// `seenServerSessionIds`, a set that by design EXCLUDES working-set
+    /// survivors (they are local-only, never delivered by the server). So a
+    /// survivor reappearing in an append page passed that filter and was
+    /// appended again → a duplicate Identifiable id → SwiftUI ForEach undefined
+    /// behavior.
+    ///
+    /// This test goes RED against the old `seenServerSessionIds`-based filter
+    /// (the survivor appears twice) and GREEN with the `existingIds`
+    /// (rendered-set) fix (exactly once).
+    func testSurvivorReappearingInLoadMoreNotDuplicated() async {
+        let store = makeStore()
+
+        // A pinned session that will be absent from the first server page → it
+        // survives the first-page replace as a working-set row.
+        let pinned = makeSummary(id: "pinned_survivor", lastActive: 9001,
+                                 source: "app", title: "Pinned Chat", messageCount: 4)
+        store.sessions = [pinned]
+        if !store.isPinned(pinned) { store.togglePin(pinned) }
+
+        // First page: does NOT contain the pinned survivor. The survivor is
+        // carried forward by the working-set merge. Two other human rows are
+        // present on the page.
+        let humanA = makeSummary(id: "humanA", source: "app", title: "A", messageCount: 2)
+        let humanB = makeSummary(id: "humanB", source: "app", title: "B", messageCount: 1)
+        store.sessionsFetch = { ([humanA, humanB], 50) }
+        await store.refresh()
+
+        // After the first-page replace, the pinned survivor must have survived.
+        XCTAssertTrue(store.sessions.map(\.id).contains("pinned_survivor"),
+            "pinned survivor must be carried forward by the first-page replace")
+
+        // loadMore via the fill seam — the grown-limit page now INCLUDES the
+        // pinned survivor (the server caught up and delivered it). This is the
+        // regression trigger: the survivor is in `sessions` (carried forward)
+        // AND in the append page.
+        store.initialFillFetch = { _ in
+            ([pinned, humanA, humanB], 50)
+        }
+        await store.loadMore()
+
+        // CORE ASSERTION: no duplicate ids in `sessions`. The survivor must be
+        // present EXACTLY ONCE.
+        let ids = store.sessions.map(\.id)
+        let idCounts = ids.reduce(into: [String: Int]()) { $0[$1, default: 0] += 1 }
+        let duplicates = idCounts.filter { $0.value > 1 }
+        XCTAssertTrue(duplicates.isEmpty,
+            "ABH-373 REWORK: survivor must not be duplicated in sessions. "
+            + "Duplicate ids: \(duplicates). All ids: \(ids)")
+
+        // Specifically: the survivor appears exactly once.
+        XCTAssertEqual(idCounts["pinned_survivor"], 1,
+            "pinned_survivor must appear exactly once in sessions, got \(idCounts["pinned_survivor"] ?? 0)")
+
+        // Cleanup so UserDefaults does not pollute later test runs.
+        if store.isPinned(pinned) { store.togglePin(pinned) }
+    }
+
     /// `filteredCount` is always `<= loadedCount` (filters can only reduce, not expand).
     func testFilteredCountNeverExceedsLoadedCount() async {
         let store = makeStore()
