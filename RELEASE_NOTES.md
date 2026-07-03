@@ -1,3 +1,31 @@
+Build 60 — "Malacca" — 2026-07-03
+RELIABILITY
+
+WHAT'S NEW
+- Add iPad keyboard shortcut parity slice
+
+FIXED
+- Add widget voiceover labels
+- Enroll device tokens with the relay so relay push actually delivers (ABH-329) (ABH-329)
+- Session search excludes cron/subagent/tool — preserve native tool hide (ABH-327) (ABH-327)
+- Add widget voiceover labels
+- Persist unsent composer draft across session switch (ABH-320) (ABH-320)
+- Gate steer action to live streaming
+- Exclude agent sessions from spotlight cache
+- Reply to clarify from notification
+- Make test push transport-aware
+- Fix ios APNs registration after pairing
+- Hide autonomous sessions from recents
+
+WORTH TRYING
+- Try: Add iPad keyboard shortcut parity slice
+- Try: Add widget voiceover labels
+- Try: Enroll device tokens with the relay so relay push actually delivers (ABH-329) (ABH-329)
+
+(+2 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 59 — "Malacca" — 2026-07-03
 RELIABILITY
 
