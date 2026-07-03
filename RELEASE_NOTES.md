@@ -1,3 +1,19 @@
+Build 72 — "Malacca" — 2026-07-04
+RELIABILITY
+
+WHAT'S NEW
+- Projects drawer — Sessions/Projects toggle, project detail, new-session-in-project (ABH-351)
+
+IMPROVED
+- IOS graceful degradation on gateway disconnect — no crash + auto-recover (ABH-355)
+
+WORTH TRYING
+- Try: Projects drawer — Sessions/Projects toggle, project detail, new-session-in-project (ABH-351)
+
+(+4 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 71 — "Malacca" — 2026-07-03
 RELIABILITY
 
