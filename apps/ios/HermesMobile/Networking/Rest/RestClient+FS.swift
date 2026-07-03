@@ -190,3 +190,137 @@ extension RestClient {
         return nil
     }
 }
+
+// MARK: - ABH-368 system log viewer
+
+/// Errors surfaced by ``RestClient/systemLogs``. The gateway's `GET /api/logs`
+/// returns `400 {"detail":"Unknown log file: foo"}` for an unrecognized `file`
+/// param — that is mapped to ``unknownFile`` so the viewer shows "Unknown log
+/// file" rather than a generic HTTP error.
+enum SystemLogError: Error, LocalizedError, Sendable {
+    /// `400` — the `file` key is not in the server's `LOG_FILES`.
+    case unknownFile(detail: String)
+    /// Any other failure (network, decoding, unexpected status).
+    case other(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unknownFile(let detail):
+            return detail.isEmpty ? "Unknown log file." : detail
+        case .other(let message):
+            return message
+        }
+    }
+}
+
+extension RestClient {
+
+    // MARK: - System logs tail
+
+    /// `GET /api/logs?file=…&level=…&search=…` — fetch a filtered tail of a
+    /// system log file. The server reads up to N lines from the end of the file
+    /// (100 by default, capped at 500; 2000 when a search term narrows the
+    /// window), applies the `level` (minimum-level) and `search` (case-
+    /// insensitive substring) filters server-side, and returns
+    /// `{file, lines:[…]}`.
+    ///
+    /// An unknown `file` key yields a `400` → ``SystemLogError/unknownFile``.
+    /// A file that exists but has no content (e.g. `desktop.log` on a headless
+    /// server) yields a successful `200` with an empty `lines` array — the
+    /// viewer treats that as an honest "no lines" state, NOT an error.
+    ///
+    /// - Parameters:
+    ///   - file: The log file key (e.g. "agent", "errors", "gateway"). The
+    ///     valid set comes from the server's `LOG_FILES` — the viewer reads it
+    ///     defensively and never hardcodes a list the gateway might not have.
+    ///   - level: An optional minimum severity (DEBUG/INFO/WARNING/ERROR).
+    ///     `.all` omits the param entirely (the server treats absent as no
+    ///     filter).
+    ///   - search: An optional case-insensitive substring. Omitted when empty.
+    ///   - lineCount: The max lines to return (server caps at 500; 2000 with
+    ///     search). Defaults to 200 — enough for a phone tail without flooding.
+    /// - Returns: The decoded `{file, lines}` payload.
+    func systemLogs(
+        file: String,
+        level: SystemLogLevel = .all,
+        search: String = "",
+        lineCount: Int = 200
+    ) async throws -> SystemLogResult {
+        let query = Self.logsQuery(
+            file: file,
+            level: level,
+            search: search,
+            lineCount: lineCount
+        )
+        // /api/logs is a STOCK gateway route (not a plugin-mount route), so it
+        // hangs off /api directly regardless of pathStyle. The existing
+        // makeRequest joins the path under baseURL, and the Host override +
+        // bearer auth headers are applied uniformly.
+        let request = makeRequest(path: "/api/logs?\(query)", method: "GET")
+        do {
+            let data = try await perform(request)
+            return try decode(
+                SystemLogResult.self,
+                from: data,
+                context: "systemLogs",
+                strategy: .useDefaultKeys
+            )
+        } catch let error as RestError {
+            throw Self.mapLogsError(error)
+        }
+    }
+
+    // MARK: - Helpers
+
+    /// Build the `file`/`level`/`search`/`lines` query string, percent-encoding
+    /// each value so a search term with spaces or special chars survives. `level`
+    /// is omitted entirely for `.all` (the server treats absent/`ALL`/empty as no
+    /// filter); `search` is omitted when blank.
+    static func logsQuery(
+        file: String,
+        level: SystemLogLevel,
+        search: String,
+        lineCount: Int
+    ) -> String {
+        var items = [
+            URLQueryItem(name: "file", value: file),
+            URLQueryItem(name: "lines", value: String(lineCount)),
+        ]
+        if level.isLevel {
+            items.append(URLQueryItem(name: "level", value: level.rawValue))
+        }
+        let trimmedSearch = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedSearch.isEmpty {
+            items.append(URLQueryItem(name: "search", value: trimmedSearch))
+        }
+        var components = URLComponents()
+        components.queryItems = items
+        return components.percentEncodedQuery ?? ""
+    }
+
+    /// Map a thrown ``RestError/badStatus`` into ``SystemLogError``: a `400`
+    /// from `/api/logs` means an unknown file key (surfaced as a clear
+    /// "Unknown log file" message); anything else is `.other`.
+    static func mapLogsError(_ error: RestError) -> SystemLogError {
+        switch error {
+        case .badStatus(let code, let body):
+            if code == 400 {
+                // The server body is FastAPI's {"detail": "Unknown log file: foo"}
+                let detail = Self.parseDetailField(from: body) ?? body
+                return .unknownFile(detail: detail)
+            }
+            return .other(error.errorDescription ?? "HTTP \(code)")
+        case .network, .decoding:
+            return .other(error.errorDescription ?? "Request failed")
+        }
+    }
+
+    /// Pull the `"detail"` string out of a FastAPI error body
+    /// (`{"detail":"Unknown log file: foo"}`); tolerant of absence.
+    private static func parseDetailField(from body: String) -> String? {
+        guard let data = body.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return object["detail"] as? String
+    }
+}

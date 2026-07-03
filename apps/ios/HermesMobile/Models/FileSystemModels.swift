@@ -220,3 +220,111 @@ struct PathCompletionItem: Decodable, Equatable, Sendable, Identifiable {
         return meta.contains("dir") || meta.contains("folder") || text.hasSuffix("/")
     }
 }
+
+// MARK: - /api/logs (ABH-368 system log viewer)
+
+/// The `GET /api/logs` `200` body: the echoed `file` key and the tail `lines`.
+///
+/// The server returns `{"file": "agent", "lines": ["..."]}` on success, and a
+/// `400 {"detail": "Unknown log file: foo"}` when the `file` param does not
+/// resolve to a known `LOG_FILES` entry. When the log file does not exist on
+/// disk (e.g. `desktop.log` on a server with no desktop), the server returns a
+/// successful `200` with an empty `lines` array — NOT an error. The viewer
+/// treats that honestly as "no lines".
+///
+/// Decoded with explicit `CodingKeys` (no snake_case conversion needed — both
+/// keys are single words — but declared for clarity and to match the sibling
+/// FS models' convention).
+struct SystemLogResult: Decodable, Equatable, Sendable {
+    /// The log file key echoed by the server (e.g. "agent").
+    let file: String
+    /// The tail lines (newest-last; the server reads N lines from the end of
+    /// the file, applying level/component/substring filters server-side).
+    let lines: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case file
+        case lines
+    }
+
+    init(file: String, lines: [String]) {
+        self.file = file
+        self.lines = lines
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        file = try c.decodeIfPresent(String.self, forKey: .file) ?? ""
+        lines = try c.decodeIfPresent([String].self, forKey: .lines) ?? []
+    }
+}
+
+/// A minimum-level filter for the system log viewer. Maps directly to the
+/// server's `level` query param (DEBUG/INFO/WARNING/ERROR) plus an explicit
+/// "all levels" case (sent as no `level` param — the server treats `ALL` /
+/// empty / absent as no filter). The viewer's picker binds to this so the
+/// filter state is a value type, not a loose String.
+enum SystemLogLevel: String, CaseIterable, Identifiable, Sendable {
+    case all
+    case debug = "DEBUG"
+    case info = "INFO"
+    case warning = "WARNING"
+    case error = "ERROR"
+
+    var id: String { rawValue }
+
+    /// The display label in the picker.
+    var label: String {
+        switch self {
+        case .all: return "All Levels"
+        case .debug: return "Debug"
+        case .info: return "Info"
+        case .warning: return "Warning"
+        case .error: return "Error"
+        }
+    }
+
+    /// The SF Symbol for the level (used in the line-row leading icon and the
+    /// picker). `all` has no icon (it is not a level).
+    var systemImage: String? {
+        switch self {
+        case .all: return nil
+        case .debug: return "ant"
+        case .info: return "info.circle"
+        case .warning: return "exclamationmark.triangle"
+        case .error: return "xmark.octagon"
+        }
+    }
+
+    /// True if this is a real level (not `.all`) — used to decide whether to
+    /// include the `level` query param.
+    var isLevel: Bool { self != .all }
+}
+
+/// Extracts the severity level from a raw log line (matches the server's own
+/// `_LEVEL_RE`: a level token surrounded by whitespace). Returns `nil` for
+/// lines without a recognizable level (the viewer renders those as neutral).
+///
+/// Pure function — testable without a server. The viewer uses it to color-code
+/// each line (ERROR reads as error).
+private let _logLevelRegex: NSRegularExpression? = {
+    let pattern = "\\s(DEBUG|INFO|WARNING|ERROR|CRITICAL)\\s"
+    return try? NSRegularExpression(pattern: pattern)
+}()
+
+func extractLogLevel(_ line: String) -> SystemLogLevel? {
+    guard let regex = _logLevelRegex else { return nil }
+    let range = NSRange(line.startIndex..., in: line)
+    guard let match = regex.firstMatch(in: line, range: range),
+          match.numberOfRanges >= 2,
+          let levelRange = Range(match.range(at: 1), in: line)
+    else { return nil }
+    let level = String(line[levelRange])
+    switch level {
+    case "DEBUG": return .debug
+    case "INFO": return .info
+    case "WARNING": return .warning
+    case "ERROR", "CRITICAL": return .error
+    default: return nil
+    }
+}

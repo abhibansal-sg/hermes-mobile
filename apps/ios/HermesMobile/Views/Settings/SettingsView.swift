@@ -726,13 +726,13 @@ struct SettingsView: View {
     /// live control surface; `about` is the local version page (no control
     /// client needed) and is excluded from ``pushable``.
     private enum ControlPanel: String, Identifiable, Hashable {
-        case appearance, model, personality, usage, cron, skills, learning, gateway, artifacts, about
+        case appearance, model, personality, usage, cron, skills, learning, gateway, artifacts, logs, about
         var id: String { rawValue }
 
         /// The panels that need a live control client (`appearance` + `about` do
         /// NOT — they are local pages, excluded from ``pushable``).
         static var pushable: [ControlPanel] {
-            [.model, .personality, .usage, .cron, .skills, .learning, .gateway, .artifacts]
+            [.model, .personality, .usage, .cron, .skills, .learning, .gateway, .artifacts, .logs]
         }
 
         var title: String {
@@ -746,6 +746,7 @@ struct SettingsView: View {
             case .learning: return "Learning Journey"
             case .gateway: return "Gateway Status"
             case .artifacts: return "Artifacts"
+            case .logs: return "System Logs"
             case .about: return "About"
             }
         }
@@ -761,6 +762,7 @@ struct SettingsView: View {
             case .learning: return "sparkles"
             case .gateway: return "network"
             case .artifacts: return "photo.on.rectangle.angled"
+            case .logs: return "doc.text.magnifyingglass"
             case .about: return "info.circle"
             }
         }
@@ -826,6 +828,20 @@ struct SettingsView: View {
                         profileId: sessionStore.activeProfile,
                         sessions: sessionStore
                     )
+                case .logs:
+                    // ABH-368: System log viewer. Uses the REST client (not the
+                    // WS control client) — /api/logs is a stock GET route. Falls
+                    // back to ContentUnavailableView when there is no REST client
+                    // (same posture as the outer guard for `control`).
+                    if let rest = connectionStore.rest {
+                        SystemLogsView(rest: rest)
+                    } else {
+                        ContentUnavailableView(
+                            "Not connected",
+                            systemImage: "wifi.slash",
+                            description: Text("Reconnect to view logs.")
+                        )
+                    }
                 case .appearance, .about:
                     EmptyView() // handled by the outer switch
                 }
@@ -1331,4 +1347,326 @@ private struct CreditsBillingView: View {
 private struct CreditsBillingPayload: Sendable, Equatable {
     let credits: NousCreditsView
     let billing: BillingState
+}
+
+// MARK: - ABH-368 System Logs Viewer
+
+/// The known log-file keys the server's `LOG_FILES` maps. This is a SUPPLEMENT
+/// to the runtime probe — the viewer lists these as the file picker options but
+/// labels any server-returned 400 ("Unknown log file") honestly. The keys are
+/// stable (they are the hermes_cli.logs.LOG_FILES dict keys: agent, errors,
+/// gateway, gui, desktop). New server-side keys are harmless: the viewer still
+/// works, the new key just is not pre-listed until this array is updated.
+private let knownLogFileKeys: [String] = ["agent", "errors", "gateway", "desktop"]
+
+/// A human label for a log file key. Falls back to the raw key for unknown
+/// values (defensive — never assume the gateway has only the documented set).
+private func logFileLabel(_ key: String) -> String {
+    switch key {
+    case "agent": return "Agent"
+    case "errors": return "Errors"
+    case "gateway": return "Gateway"
+    case "gui": return "GUI"
+    case "desktop": return "Desktop"
+    default: return key.capitalized
+    }
+}
+
+/// The system log viewer (ABH-368). Presents a filtered tail of a chosen log
+/// file with a file picker, a minimum-level filter, and a substring search
+/// field. Refreshes on every filter change. Every filter combination resolves
+/// to a real, honest state:
+///
+/// - **Loading**: spinner with the file name.
+/// - **Empty file** (`200` with `lines: []`): honest "No log lines" — NOT a
+///   fake error or a blank list.
+/// - **Fetch failure** (network / decode): honest error message with a Retry.
+/// - **Unknown file** (`400`): honest "Unknown log file" — the picker is
+///   defensive; if the server does not know a key, the viewer says so.
+///
+/// Design language: native grouped list, SF Symbols, monospaced log text,
+/// color-per-level semantics (ERROR reads as error via `theme.statusError`,
+/// WARNING via `theme.statusWarn`, etc.). Size-class sane on iPhone and iPad.
+private struct SystemLogsView: View {
+    @Environment(\.hermesTheme) private var theme
+
+    @State private var store: SystemLogsStore
+
+    init(rest: RestClient) {
+        _store = State(initialValue: SystemLogsStore(rest: rest))
+    }
+
+    var body: some View {
+        List {
+            // MARK: Filters section
+            Section {
+                filePickerRow
+                levelPickerRow
+                searchFieldRow
+            } header: {
+                Text("Filters")
+            } footer: {
+                if store.selectedLevel.isLevel || !store.searchText.isEmpty {
+                    Text("\(store.displayedCount) matching \(store.displayedCount == 1 ? "line" : "lines")")
+                        .font(.footnote)
+                }
+            }
+            .listRowBackground(theme.card)
+
+            // MARK: Log tail
+            logTailSection
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .background(theme.bg)
+        .navigationTitle("System Logs")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    store.refresh()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(store.phase.isLoading || store.phase.isError)
+                .accessibilityLabel("Refresh logs")
+                .accessibilityIdentifier("logsRefreshButton")
+            }
+        }
+        .task {
+            await store.loadIfNeeded()
+        }
+        // Refresh on filter change (file / level) and on submit of the search
+        // field. The search field is a plain TextField (not .searchable), so we
+        // use bare .onSubmit which fires on the keyboard Search / Return key.
+        .onChange(of: store.selectedFile) { _, _ in store.refresh() }
+        .onChange(of: store.selectedLevel) { _, _ in store.refresh() }
+        .onSubmit { store.refresh() }
+    }
+
+    // MARK: - Filter rows
+
+    private var filePickerRow: some View {
+        Picker(selection: $store.selectedFile) {
+            ForEach(knownLogFileKeys, id: \.self) { key in
+                Text(logFileLabel(key)).tag(key)
+            }
+        } label: {
+            SettingsRowLabel(icon: "doc.text", title: "Log File")
+        }
+        .accessibilityIdentifier("logsFilePicker")
+    }
+
+    private var levelPickerRow: some View {
+        Picker(selection: $store.selectedLevel) {
+            ForEach(SystemLogLevel.allCases) { level in
+                Text(level.label).tag(level)
+            }
+        } label: {
+            SettingsRowLabel(icon: "line.3.horizontal.decrease.circle", title: "Level")
+        }
+        .accessibilityIdentifier("logsLevelPicker")
+    }
+
+    private var searchFieldRow: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(theme.mutedFg)
+            TextField("Search log lines", text: $store.searchText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.search)
+                .accessibilityIdentifier("logsSearchField")
+            if !store.searchText.isEmpty {
+                Button {
+                    store.searchText = ""
+                    store.refresh()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(theme.mutedFg)
+                }
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .listRowBackground(theme.card)
+    }
+
+    // MARK: - Tail section (the actual log lines)
+
+    @ViewBuilder
+    private var logTailSection: some View {
+        switch store.phase {
+        case .idle:
+            EmptyView()
+
+        case .loading:
+            Section {
+                HStack(spacing: 12) {
+                    ProgressView()
+                    Text("Loading \(logFileLabel(store.selectedFile))…")
+                        .foregroundStyle(theme.mutedFg)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .listRowBackground(theme.card)
+            }
+
+        case .loaded(let result):
+            if result.lines.isEmpty {
+                Section {
+                    HStack(spacing: 12) {
+                        Image(systemName: "tray")
+                            .foregroundStyle(theme.mutedFg)
+                        Text(emptyMessage)
+                            .foregroundStyle(theme.mutedFg)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .listRowBackground(theme.card)
+                }
+            } else {
+                Section {
+                    ForEach(Array(result.lines.enumerated()), id: \.offset) { _, line in
+                        SystemLogLineRow(line: line, theme: theme)
+                    }
+                } header: {
+                    Text(logFileLabel(store.selectedFile))
+                }
+            }
+
+        case .error(let message):
+            Section {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 12) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .foregroundStyle(theme.statusError)
+                        Text(message)
+                            .foregroundStyle(theme.fg)
+                    }
+                    Button {
+                        store.refresh()
+                    } label: {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                            .font(.system(size: 15, weight: .medium))
+                    }
+                    .accessibilityIdentifier("logsRetryButton")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .listRowBackground(theme.card)
+            } footer: {
+                Text("The server may be unreachable or the log file may not exist on this gateway.")
+                    .font(.footnote)
+            }
+        }
+    }
+
+    /// Honest empty message: tailored to the filter state so the user
+    /// understands WHY there are no lines (not just a blank list).
+    private var emptyMessage: String {
+        if store.selectedLevel.isLevel || !store.searchText.isEmpty {
+            return "No lines match the current filters."
+        }
+        return "This log file is empty."
+    }
+}
+
+/// One monospaced, color-coded log line. Color-per-level semantics:
+/// ERROR/CRITICAL → `statusError`, WARNING → `statusWarn`, INFO → `accent` or
+/// `fg`, DEBUG → `mutedFg`, unknown → `fg`. Long lines wrap so nothing is cut.
+private struct SystemLogLineRow: View {
+    let line: String
+    let theme: HermesTheme
+
+    /// The level extracted from the line (nil if unrecognizable).
+    private var level: SystemLogLevel? { extractLogLevel(line) }
+
+    private var lineColor: Color {
+        switch level {
+        case .error: return theme.statusError
+        case .warning: return theme.statusWarn
+        case .info: return theme.fg
+        case .debug: return theme.mutedFg
+        case .all, nil: return theme.fg
+        }
+    }
+
+    var body: some View {
+        Text(line)
+            .font(.system(size: 12, weight: .regular, design: .monospaced))
+            .foregroundStyle(lineColor)
+            .textSelection(.enabled)
+            .lineLimit(nil)
+            .fixedSize(horizontal: false, vertical: true)
+            .listRowSeparatorTint(theme.border)
+    }
+}
+
+/// The view-model for ``SystemLogsView``. Owns the filter state and the fetch
+/// phase, and drives the REST call through ``RestClient/systemLogs``.
+@MainActor
+private final class SystemLogsStore: ObservableObject {
+
+    /// The fetch outcome — a value type so the view can switch exhaustively.
+    enum Phase: Equatable {
+        case idle
+        case loading
+        case loaded(SystemLogResult)
+        case error(String)
+
+        var isLoading: Bool {
+            if case .loading = self { return true }
+            return false
+        }
+
+        var isError: Bool {
+            if case .error = self { return true }
+            return false
+        }
+    }
+
+    @Published var selectedFile: String = "agent"
+    @Published var selectedLevel: SystemLogLevel = .all
+    @Published var searchText: String = ""
+    @Published private(set) var phase: Phase = .idle
+
+    /// The count shown in the filter footer when filters narrow the result.
+    var displayedCount: Int {
+        if case .loaded(let result) = phase { return result.lines.count }
+        return 0
+    }
+
+    private let rest: RestClient
+
+    init(rest: RestClient) {
+        self.rest = rest
+    }
+
+    /// Load on first appearance only (idle → loading). Subsequent updates go
+    /// through ``refresh()``.
+    func loadIfNeeded() async {
+        guard case .idle = phase else { return }
+        await fetch()
+    }
+
+    /// Re-fetch with the current filter state. Called on filter change and on
+    /// the explicit Refresh / Retry buttons.
+    func refresh() {
+        Task { await fetch() }
+    }
+
+    private func fetch() async {
+        phase = .loading
+        do {
+            let result = try await rest.systemLogs(
+                file: selectedFile,
+                level: selectedLevel,
+                search: searchText
+            )
+            phase = .loaded(result)
+        } catch let error as SystemLogError {
+            phase = .error(error.errorDescription ?? "Failed to load logs.")
+        } catch {
+            phase = .error(
+                (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            )
+        }
+    }
 }

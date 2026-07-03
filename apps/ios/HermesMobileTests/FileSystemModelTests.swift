@@ -248,4 +248,154 @@ final class FileSystemModelTests: XCTestCase {
         XCTAssertTrue(q.contains("a%20dir") || q.contains("a%2520dir"))
         XCTAssertFalse(q.contains("a dir"))
     }
+
+    // MARK: - /api/logs model + query building (ABH-368)
+
+    func testLogResultDecodesFileAndLines() throws {
+        let json = #"{"file":"agent","lines":["2026-07-04 01:00:00 INFO agent: started","line2"]}"#
+        let result = try decode(SystemLogResult.self, json)
+        XCTAssertEqual(result.file, "agent")
+        XCTAssertEqual(result.lines.count, 2)
+        XCTAssertEqual(result.lines[0], "2026-07-04 01:00:00 INFO agent: started")
+    }
+
+    func testLogResultEmptyLinesArray() throws {
+        // A file that exists but has no content → 200 with lines: [] (NOT an error)
+        let json = #"{"file":"desktop","lines":[]}"#
+        let result = try decode(SystemLogResult.self, json)
+        XCTAssertEqual(result.file, "desktop")
+        XCTAssertTrue(result.lines.isEmpty)
+    }
+
+    func testLogResultTolerantOfMissingKeys() throws {
+        // Defensive: if the server omits a key, decode should not throw.
+        let result = try decode(SystemLogResult.self, "{}")
+        XCTAssertEqual(result.file, "")
+        XCTAssertTrue(result.lines.isEmpty)
+    }
+
+    // MARK: - Query building (logsQuery)
+
+    func testLogsQueryIncludesFileAndLines() {
+        let q = RestClient.logsQuery(
+            file: "agent", level: .all, search: "", lineCount: 200
+        )
+        XCTAssertTrue(q.contains("file=agent"))
+        XCTAssertTrue(q.contains("lines=200"))
+        // Level=all should NOT include a level param (server treats absent as no filter)
+        XCTAssertFalse(q.contains("level="))
+        // Empty search should NOT include a search param
+        XCTAssertFalse(q.contains("search="))
+    }
+
+    func testLogsQueryIncludesLevelWhenNotAll() {
+        let q = RestClient.logsQuery(
+            file: "errors", level: .warning, search: "", lineCount: 100
+        )
+        XCTAssertTrue(q.contains("file=errors"))
+        XCTAssertTrue(q.contains("level=WARNING"))
+        XCTAssertFalse(q.contains("search="))
+    }
+
+    func testLogsQueryIncludesSearchWhenNonEmpty() {
+        let q = RestClient.logsQuery(
+            file: "agent", level: .all, search: "timeout", lineCount: 200
+        )
+        XCTAssertTrue(q.contains("search=timeout"))
+    }
+
+    func testLogsQueryPercentEncodesSearch() {
+        let q = RestClient.logsQuery(
+            file: "agent", level: .all, search: "connection refused", lineCount: 200
+        )
+        // Spaces must be encoded so the query string is valid
+        XCTAssertTrue(q.contains("search=connection") && q.contains("refused"))
+        XCTAssertFalse(q.contains("connection refused"))
+    }
+
+    // MARK: - Error mapping (mapLogsError)
+
+    func testMapLogsError400IsUnknownFile() {
+        let body = #"{"detail":"Unknown log file: foo"}"#
+        let error = RestClient.mapLogsError(.badStatus(400, body: body))
+        if case .unknownFile(let detail) = error {
+            XCTAssertEqual(detail, "Unknown log file: foo")
+        } else {
+            XCTFail("expected .unknownFile, got: \(error)")
+        }
+    }
+
+    func testMapLogsError400TolerantOfMalformedBody() {
+        let error = RestClient.mapLogsError(.badStatus(400, body: "garbage"))
+        if case .unknownFile(let detail) = error {
+            // Falls back to the raw body when detail can't be parsed
+            XCTAssertEqual(detail, "garbage")
+        } else {
+            XCTFail("expected .unknownFile, got: \(error)")
+        }
+    }
+
+    func testMapLogsError500IsOther() {
+        let error = RestClient.mapLogsError(.badStatus(500, body: "oops"))
+        if case .other = error {
+            // pass
+        } else {
+            XCTFail("expected .other, got: \(error)")
+        }
+    }
+
+    func testMapLogsErrorNetworkIsOther() {
+        let error = RestClient.mapLogsError(.network("timeout"))
+        if case .other(let msg) = error {
+            XCTAssertTrue(msg.contains("timeout") || msg.contains("Network"))
+        } else {
+            XCTFail("expected .other, got: \(error)")
+        }
+    }
+
+    // MARK: - Level extraction (extractLogLevel)
+
+    func testExtractLogLevelDebug() {
+        XCTAssertEqual(extractLogLevel("2026-01-01 00:00:00 DEBUG module: msg"), .debug)
+    }
+
+    func testExtractLogLevelInfo() {
+        XCTAssertEqual(extractLogLevel("2026-01-01 00:00:00 INFO module: msg"), .info)
+    }
+
+    func testExtractLogLevelWarning() {
+        XCTAssertEqual(extractLogLevel("2026-01-01 00:00:00 WARNING module: msg"), .warning)
+    }
+
+    func testExtractLogLevelError() {
+        XCTAssertEqual(extractLogLevel("2026-01-01 00:00:00 ERROR module: msg"), .error)
+    }
+
+    func testExtractLogLevelCritical() {
+        XCTAssertEqual(extractLogLevel("2026-01-01 00:00:00 CRITICAL module: msg"), .error)
+    }
+
+    func testExtractLogLevelNilForUnrecognizable() {
+        XCTAssertNil(extractLogLevel("a line with no level token"))
+    }
+
+    // MARK: - SystemLogLevel enum
+
+    func testLevelAllIsNotLevel() {
+        XCTAssertFalse(SystemLogLevel.all.isLevel)
+    }
+
+    func testLevelRealAreLevels() {
+        XCTAssertTrue(SystemLogLevel.debug.isLevel)
+        XCTAssertTrue(SystemLogLevel.info.isLevel)
+        XCTAssertTrue(SystemLogLevel.warning.isLevel)
+        XCTAssertTrue(SystemLogLevel.error.isLevel)
+    }
+
+    func testLevelRawValues() {
+        XCTAssertEqual(SystemLogLevel.debug.rawValue, "DEBUG")
+        XCTAssertEqual(SystemLogLevel.info.rawValue, "INFO")
+        XCTAssertEqual(SystemLogLevel.warning.rawValue, "WARNING")
+        XCTAssertEqual(SystemLogLevel.error.rawValue, "ERROR")
+    }
 }
