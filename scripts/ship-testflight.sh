@@ -25,6 +25,47 @@ ARCH=/tmp/hermes-tf/HermesMobile.xcarchive
 
 echo "🚀 SHIP TestFlight (internal) — wave=${WAVE:-<unspecified>} — $(date '+%a %H:%M %Z')"
 
+# --- MUTEX: only one ship at a time (mirrors scripts/ios-build.sh mkdir-lock) --
+# Without this, two concurrent ship invocations (orchestrator cadence + soak/live-
+# beat) each bump the build and trigger a separate Xcode Cloud run — double-firing
+# compute and stranding builds as bumps with no completion (ABH-348, 2026-07-03).
+# macOS has no flock(1); mkdir is atomic so we use it for the try-lock. Non-blocking:
+# a concurrent ship prints "SHIP SKIPPED" and exits 0 (a skipped ship is not a failure).
+SHIP_LOCK_DIR="$HOME/.hermes/ship-testflight.lock"
+release_ship_lock(){
+  [ -f "$SHIP_LOCK_DIR/pid" ] && [ "$(cat "$SHIP_LOCK_DIR/pid" 2>/dev/null)" = "$$" ] \
+    && rm -rf "$SHIP_LOCK_DIR"
+}
+if mkdir "$SHIP_LOCK_DIR" 2>/dev/null; then
+  : # lock acquired
+else
+  _holder=$(cat "$SHIP_LOCK_DIR/pid" 2>/dev/null || echo "")
+  if [ -n "$_holder" ] && ! kill -0 "$_holder" 2>/dev/null; then
+    # stale lock from a crashed/killed ship — reclaim and proceed
+    rm -rf "$SHIP_LOCK_DIR"
+    mkdir "$SHIP_LOCK_DIR" 2>/dev/null || { echo "SHIP SKIPPED: another ship in progress"; exit 0; }
+  else
+    echo "SHIP SKIPPED: another ship in progress (pid ${_holder:-?})"
+    exit 0
+  fi
+fi
+echo "$$" > "$SHIP_LOCK_DIR/pid"
+echo "$(date '+%Y-%m-%d %H:%M:%S') wave=${WAVE:-<adhoc>}" > "$SHIP_LOCK_DIR/info"
+trap release_ship_lock EXIT INT TERM
+
+# --- SELFTEST GUARD (test-only — inert in normal runs; ABH-348) ---------------
+# When SHIP_SELFTEST=1 is set, exit immediately AFTER the mutex decision but
+# BEFORE any side effect (gates, git ops, build bump, archive, upload, cloud
+# trigger). This is the hard safety boundary that makes test-ship-mutex.sh
+# hermetic: the test exercises the mutex contention path, and even if the
+# mutex is removed (false-green proof), SHIP_SELFTEST stops the script here
+# before it can reach GATE 0 or anything downstream. Inert by default —
+# SHIP_SELFTEST is never set in normal ship runs.
+if [ "${SHIP_SELFTEST:-0}" = "1" ]; then
+  echo "SHIP SELFTEST: mutex acquired, stopping before any side effect"
+  exit 0
+fi
+
 # --- GATE 0: kill switch + is ship even armed? -------------------------------
 python3 - <<'PY' || exit 0
 import json,sys
