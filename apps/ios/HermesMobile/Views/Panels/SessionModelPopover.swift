@@ -70,6 +70,11 @@ struct SessionModelPickerContent: View {
     @State private var visibleKeys: Set<String>? = ModelVisibility.load()
     @State private var showEditModels = false
 
+    // ABH-383: per-model reasoning-effort + fast-mode presets. Remembered
+    // keyed by `provider::model` and re-applied on model switch so changing
+    // models no longer resets to defaults.
+    private let presetStore = ModelPresetStore()
+
     private var errorBinding: Binding<Bool> {
         Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })
     }
@@ -441,16 +446,27 @@ struct SessionModelPickerContent: View {
         guard pendingKey == nil else { return }
         // Draft mode: no session to hot-swap — pend the pick. It applies the
         // moment the draft materializes (before the first prompt goes out).
+        // ABH-383: seed the draft's effort/fast from the per-model preset so
+        // the remembered preference rides along into the materialized session.
         if isDraftMode {
             withAnimation(.snappy(duration: 0.25)) {   // accordion expand
                 localModel = model
                 localProvider = provider
             }
+            let preset = presetStore.preset(forProvider: provider, model: model)
             var draft = connection.draftSelection
                 ?? DraftModelSelection(model: model, provider: provider, reasoningEffort: nil, fast: nil)
             draft.model = model
             draft.provider = provider
+            // Only carry the preset dimensions the user has explicitly set for
+            // this model — `nil` leaves the gateway default alone.
+            draft.reasoningEffort = preset.effort
+            draft.fast = preset.fast
             connection.draftSelection = draft
+            // Reflect the applied preset in the local UI state so the picker
+            // shows what will be applied.
+            localReasoningEffort = preset.effort ?? ""
+            localFast = preset.fast ?? false
             return
         }
         guard let sessionId else { return }
@@ -458,6 +474,8 @@ struct SessionModelPickerContent: View {
         defer { pendingKey = nil }
         let prev = localModel
         let prevProvider = localProvider
+        let prevEffort = localReasoningEffort
+        let prevFast = localFast
         withAnimation(.snappy(duration: 0.25)) {   // accordion expand
             localModel = model        // Optimistic update —
             localProvider = provider  // (provider, model) move together.
@@ -470,11 +488,28 @@ struct SessionModelPickerContent: View {
             // joined "provider/model" only works on aggregator providers, so it
             // is NOT safe here.
             try await connection.sessionSetModel("\(model) --provider \(provider)", sessionId: sessionId)
+            // ABH-383: apply the remembered per-model preset for the newly-
+            // selected model. Unset dimensions are skipped (the gateway keeps
+            // the session's current value for those). Best-effort: a failure
+            // does NOT roll back the model switch (the model is already live).
+            let preset = presetStore.preset(forProvider: provider, model: model)
+            if let effort = preset.effort, !effort.isEmpty {
+                localReasoningEffort = effort
+                try? await connection.sessionSetReasoning(
+                    effort.isEmpty ? "none" : effort, sessionId: sessionId
+                )
+            }
+            if let fast = preset.fast {
+                localFast = fast
+                try? await connection.sessionSetFast(fast, sessionId: sessionId)
+            }
             // session.info event will confirm; local state is already updated.
         } catch {
             withAnimation(.snappy(duration: 0.25)) {
                 localModel = prev            // Roll back —
                 localProvider = prevProvider // (provider, model) move together.
+                localReasoningEffort = prevEffort
+                localFast = prevFast
             }
             actionError = (error as? GatewayError)?.errorDescription ?? error.localizedDescription
         }
@@ -497,12 +532,17 @@ struct SessionModelPickerContent: View {
                 ?? DraftModelSelection(model: "", provider: "", reasoningEffort: nil, fast: nil)
             draft.reasoningEffort = effort
             connection.draftSelection = draft
+            // ABH-383: persist the effort preference for the current model.
+            persistEffort(effort)
             return
         }
         guard let sessionId else { return }
         let prev = connection.sessionReasoningEffort ?? ""
         do {
             try await connection.sessionSetReasoning(effort.isEmpty ? "none" : effort, sessionId: sessionId)
+            // ABH-383: persist the effort preference for the current model
+            // after a successful session-scoped write.
+            persistEffort(effort)
         } catch {
             localReasoningEffort = prev   // Roll back.
             actionError = (error as? GatewayError)?.errorDescription ?? error.localizedDescription
@@ -522,15 +562,56 @@ struct SessionModelPickerContent: View {
                 ?? DraftModelSelection(model: "", provider: "", reasoningEffort: nil, fast: nil)
             draft.fast = enabled
             connection.draftSelection = draft
+            // ABH-383: persist the fast preference for the current model.
+            persistFast(enabled)
             return
         }
         guard let sessionId else { return }
         let prev = connection.sessionFast ?? false
         do {
             try await connection.sessionSetFast(enabled, sessionId: sessionId)
+            // ABH-383: persist the fast preference for the current model
+            // after a successful session-scoped write.
+            persistFast(enabled)
         } catch {
             localFast = prev   // Roll back.
             actionError = (error as? GatewayError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    // MARK: - Per-model preset persistence (ABH-383)
+
+    /// Resolve the current (provider, model) identity to key the preset under.
+    /// Prefers the live draft pick (most recent selection) when drafting.
+    private var presetIdentity: (provider: String, model: String)? {
+        if isDraftMode, let draft = connection.draftSelection, !draft.model.isEmpty {
+            return (draft.provider, draft.model)
+        }
+        let model = localModel.isEmpty
+            ? (connection.sessionModelRaw ?? "")
+            : localModel
+        guard !model.isEmpty else { return nil }
+        let provider = localProvider.isEmpty
+            ? (connection.sessionProvider ?? "")
+            : localProvider
+        return (provider, model)
+    }
+
+    /// Persist the reasoning effort for the current model (non-empty only).
+    private func persistEffort(_ effort: String) {
+        guard let id = presetIdentity else { return }
+        presetStore.merge(
+            provider: id.provider, model: id.model,
+            patch: ModelPreset(effort: effort.isEmpty ? nil : effort, fast: nil)
+        )
+    }
+
+    /// Persist the fast-mode preference for the current model.
+    private func persistFast(_ enabled: Bool) {
+        guard let id = presetIdentity else { return }
+        presetStore.merge(
+            provider: id.provider, model: id.model,
+            patch: ModelPreset(effort: nil, fast: enabled)
+        )
     }
 }
