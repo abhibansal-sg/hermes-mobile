@@ -162,7 +162,8 @@ struct ToolClusterView: View {
 ///
 /// Collapsed: leading state icon + tool name + a one-line summary, inside a
 /// `theme.muted` container. Tapping expands an inline panel showing the call
-/// arguments and a preview of the result.
+/// arguments and the result directly (ABH-358: no second 'Show technical
+/// detail' toggle — expanding IS the intent to see detail).
 struct ToolActivityRow: View {
     /// The tool call to render. Updates in place as progress/result arrive.
     let activity: ToolActivity
@@ -170,11 +171,6 @@ struct ToolActivityRow: View {
     @Environment(\.hermesTheme) private var theme
 
     @State private var isExpanded = false
-
-    /// Product (summary) vs technical (raw args + result) verbosity for the
-    /// expanded panel (F4A-A2). Persisted in DefaultsKeys (default = product);
-    /// `@AppStorage` keeps every expanded row in sync and survives relaunch.
-    @AppStorage(DefaultsKeys.toolTechnicalDetail) private var technicalDetail = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -254,55 +250,65 @@ struct ToolActivityRow: View {
     @ViewBuilder
     private var expandedDetail: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // The product/technical toggle (F4A-A2): a native `Toggle` bound to the
-            // persisted DefaultsKey, so flipping it here changes verbosity for
-            // every expanded row and survives a relaunch.
-            Toggle("Show technical detail", isOn: $technicalDetail)
-                .font(.caption2)
-                .tint(theme.midground)
-                .foregroundStyle(theme.mutedFg)
-
-            if technicalDetail {
-                // TECHNICAL: raw call arguments + result preview.
-                if !activity.argsSummary.isEmpty {
-                    detailBlock(title: "Arguments", body: activity.argsSummary)
-                }
-                if !activity.resultPreview.isEmpty {
-                    // Result output may carry shell ANSI colour codes — render them.
-                    detailBlock(title: "Result", attributed: AnsiText.stripOrRender(activity.resultPreview))
-                }
-            } else {
-                // PRODUCT: the human one-liner only (the calm default).
-                detailBlock(title: "Summary", body: AnsiText.strip(activity.summaryLine))
+            // ABH-358: expanding a tool row shows the technical detail
+            // (arguments + result) DIRECTLY — no second 'Show technical
+            // detail' toggle. The collapsed row is already the summary;
+            // expanding = intent to see the detail.
+            if !activity.argsSummary.isEmpty {
+                detailBlock(title: "Arguments", body: activity.argsSummary)
             }
+
+            resultBlock
         }
         .padding(.top, 2)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// Result block: monospace, scroll-in-card (bounded height so huge outputs
+    /// don't flood the transcript), honest error tinting for failed tools.
+    /// Mirrors desktop's `max-h-* overflow-auto` pre block pattern.
+    @ViewBuilder
+    private var resultBlock: some View {
+        // Running with no result yet → honest placeholder, not a fake "ok".
+        if activity.state == .running && activity.resultPreview.isEmpty {
+            detailBlock(title: "Result", body: "Running…")
+        } else if !activity.resultPreview.isEmpty {
+            let isError = activity.state == .failed
+            detailBlock(
+                title: "Result",
+                titleTint: isError ? theme.statusError : nil,
+            ) {
+                ScrollView(.vertical, showsIndicators: true) {
+                    // ANSI-aware: terminal color codes render as styled runs.
+                    Text(AnsiText.stripOrRender(activity.resultPreview))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(isError ? theme.statusError : theme.fg)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 240)
+            }
+        }
+    }
+
     private func detailBlock(title: String, body: String) -> some View {
-        detailBlock(title: title) {
+        detailBlock(title: title, titleTint: nil) {
             Text(body)
                 .font(.caption2.monospaced())
                 .foregroundStyle(theme.fg)
         }
     }
 
-    /// Result variant: the body is a pre-styled `AttributedString` (ANSI-rendered).
-    private func detailBlock(title: String, attributed: AttributedString) -> some View {
-        detailBlock(title: title) {
-            Text(attributed)
-                .font(.caption2.monospaced())
-        }
-    }
-
-    private func detailBlock(title: String, @ViewBuilder content: () -> some View) -> some View {
+    private func detailBlock(
+        title: String,
+        titleTint: Color? = nil,
+        @ViewBuilder content: () -> some View
+    ) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title)
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(theme.mutedFg)
+                .foregroundStyle(titleTint ?? theme.mutedFg)
             content()
-                .lineLimit(8)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
