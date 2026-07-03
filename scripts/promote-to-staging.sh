@@ -89,6 +89,16 @@ if ! git -C "$STG_REPO" diff --quiet "$LOCAL" "$REMOTE" -- pyproject.toml uv.loc
   (cd "$STG_REPO" && uv sync --quiet) || fail "uv sync failed"
 fi
 
+# 3b. plugin/core symbol-contract gate (2026-07-03 outage guard).
+# After any upstream catch-up, a core auth refactor can silently remove a
+# web_server symbol the hermes-mobile plugin still delegates to (_web()._<sym>),
+# which 500s EVERY authenticated dashboard + mobile call. Fail the promote here,
+# never in production. Runs in the freshly-synced staging checkout so it checks
+# the exact code about to serve.
+say "symbol-contract: plugin vs core web_server"
+(cd "$STG_REPO" && "$STG_REPO/.venv/bin/python" scripts/check_plugin_core_symbols.py) \
+  || fail "plugin references a core web_server symbol that no longer exists — see output above; inline the helper in the plugin before promoting"
+
 # 4. restart the staging gateway (never touches dev :9200 or live).
 PID=$(lsof -nP -iTCP:$STG_PORT -sTCP:LISTEN -t 2>/dev/null | head -1)
 if [ -n "${PID:-}" ]; then

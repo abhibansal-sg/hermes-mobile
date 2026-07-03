@@ -100,19 +100,44 @@ def _web():
 
 
 def _has_dashboard_api_auth(request: Request) -> bool:
-    return _web()._has_dashboard_api_auth(request)
+    """Inlined after upstream removed ``web_server._has_dashboard_api_auth``.
+
+    Reproduces the old core logic against the new auth seam:
+    - Gated/OAuth mode (``app.state.auth_required``): the middleware is
+      authoritative — accept when it attached a browser ``request.state.session``,
+      a mobile ``request.state.device``, or a bearer ``token_authenticated`` flag.
+    - Loopback/insecure mode: fall back to the injected session-token check.
+
+    Owning these helpers in the plugin (rather than delegating to core
+    ``_web()._<sym>``) keeps the dashboard/mobile auth path resilient to the
+    core auth refactor that moved these symbols into
+    ``hermes_cli/dashboard_auth/*``. Only ``_has_valid_session_token`` — a
+    stable public-ish seam — is still borrowed from core.
+    """
+    web = _web()
+    if getattr(request.app.state, "auth_required", False):
+        return (
+            getattr(request.state, "session", None) is not None
+            or getattr(request.state, "device", None) is not None
+            or getattr(request.state, "token_authenticated", False)
+        )
+    return web._has_valid_session_token(request)
 
 
 def _device_has_scope(request: Request, scope: str) -> bool:
-    return _web()._device_has_scope(request, scope)
+    device = _request_device(request)
+    if device is None:
+        return True
+    return scope in (device.get("scopes") or [])
 
 
 def _is_device_auth(request: Request) -> bool:
-    return _web()._is_device_auth(request)
+    return _request_device(request) is not None
 
 
 def _request_device(request: Request) -> Optional[dict]:
-    return _web()._request_device(request)
+    device = getattr(request.state, "device", None)
+    return device if isinstance(device, dict) else None
 
 
 def _request_device_id(request: Request) -> Optional[str]:
