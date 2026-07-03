@@ -2335,6 +2335,20 @@ def _provider_provider_rows() -> List[Dict[str, Any]]:
         ctx, picker_hints=True, include_unconfigured=True, max_models=50
     )
     rows = payload.get("providers", []) or []
+    for row in rows:
+        slug = str(row.get("slug") or "")
+        if not slug or row.get("auth_type") or not bool(row.get("authenticated")):
+            continue
+        pconfig = PROVIDER_REGISTRY.get(slug)
+        if pconfig:
+            row["auth_type"] = pconfig.auth_type
+            if not row.get("key_env") and pconfig.api_key_env_vars:
+                row["key_env"] = pconfig.api_key_env_vars[0]
+        elif row.get("key_env") or row.get("api_key_env_vars"):
+            # Non-registry authenticated rows with key material are key-based;
+            # rows without a credential hint (e.g. virtual/desktop-only sources)
+            # stay blank so mobile does not invent a provisioning flow.
+            row["auth_type"] = "api_key"
     return [
         row for row in rows
         if bool(row.get("authenticated"))
