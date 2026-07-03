@@ -140,3 +140,55 @@ final class MentionCompletionTests: XCTestCase {
         )
     }
 }
+
+/// ABH-382: iOS composer @-context trigger parity with the gateway's
+/// complete.path response. Pure logic coverage so the picker can stay a thin
+/// SwiftUI surface over the RPC result.
+final class MentionContextTriggerTests: XCTestCase {
+
+    func testBareAtContextHintsParseFromCompletePathResponse() {
+        let raw: JSONValue = [
+            "items": [
+                ["text": "@diff", "display": "@diff", "meta": "git diff"],
+                ["text": "@staged", "display": "@staged", "meta": "staged diff"],
+                ["text": "@file:", "display": "@file:", "meta": "attach file"],
+                ["text": "@folder:", "display": "@folder:", "meta": "attach folder"],
+                ["text": "@url:", "display": "@url:", "meta": "fetch url"],
+                ["text": "@git:", "display": "@git:", "meta": "git log"]
+            ]
+        ]
+
+        let items = MentionPicker.parse(raw)
+
+        XCTAssertEqual(items.map(\.text), ["@diff", "@staged", "@file:", "@folder:", "@url:", "@git:"])
+        XCTAssertEqual(items.map(\.label), ["@diff", "@staged", "@file:", "@folder:", "@url:", "@git:"])
+    }
+
+    func testSelectingSimpleContextHintsInsertsBareToken() {
+        XCTAssertEqual(replacingBareAt(with: "@diff"), "inspect @diff ")
+        XCTAssertEqual(replacingBareAt(with: "@staged"), "inspect @staged ")
+    }
+
+    func testSelectingArgumentContextHintsLeavesCursorAfterPrefix() {
+        XCTAssertEqual(replacingBareAt(with: "@file:"), "inspect @file:")
+        XCTAssertEqual(replacingBareAt(with: "@folder:"), "inspect @folder:")
+        XCTAssertEqual(replacingBareAt(with: "@url:"), "inspect @url:")
+        XCTAssertEqual(replacingBareAt(with: "@git:"), "inspect @git:")
+    }
+
+    func testSelectingTypedContextValuePreservesKindPrefix() {
+        XCTAssertEqual(replacingBareAt(with: "@folder:Sources/"), "inspect @folder:Sources/ ")
+        XCTAssertEqual(replacingBareAt(with: "@file:Sources/App.swift"), "inspect @file:Sources/App.swift ")
+        XCTAssertEqual(replacingBareAt(with: "@git:HEAD~1..HEAD"), "inspect @git:HEAD~1..HEAD ")
+    }
+
+    func testLegacyBarePathStillInsertsFileTokenByteIdentically() {
+        XCTAssertEqual(replacingBareAt(with: "Sources/App.swift"), "inspect @file:Sources/App.swift ")
+    }
+
+    private func replacingBareAt(with completionText: String) -> String {
+        let text = "inspect @"
+        let mention = MentionCompletion.activeMention(in: text)!
+        return MentionCompletion.insert(path: completionText, replacing: mention, in: text)
+    }
+}

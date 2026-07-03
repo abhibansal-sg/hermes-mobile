@@ -78,22 +78,42 @@ enum MentionCompletion {
         "@" + query
     }
 
-    /// Replace the active mention's range with the chosen file token. The token
-    /// is `@file:<path>` followed by a trailing space so the user keeps typing
-    /// after it. Returns the new full buffer text.
+    /// Replace the active mention's range with the selected context token.
     ///
-    /// `path` is the `text` field of the chosen ``PathCompletionItem`` — the
-    /// server already strips any `@file:` prefix internally, but we defensively
-    /// strip a leading `@file:`/`@folder:`/`@` so a double prefix can't occur.
+    /// Legacy bare path completions still insert byte-identical `@file:<path> `
+    /// tokens. Context-trigger completions from `complete.path` preserve their
+    /// kind: simple refs (`@diff`, `@staged`) insert as bare tokens with a trailing
+    /// space, while argument starters (`@file:`, `@folder:`, `@url:`, `@git:`)
+    /// insert without a trailing space so the cursor remains after the colon.
     static func insert(
         path: String,
         replacing mention: ActiveMention,
         in text: String
     ) -> String {
-        let token = "@file:" + normalizedPath(path) + " "
+        let token = insertionToken(for: path)
         var result = text
         result.replaceSubrange(mention.range, with: token)
         return result
+    }
+
+    private static let bareContextTokens: Set<String> = ["@diff", "@staged"]
+    private static let argumentContextPrefixes = ["@file:", "@folder:", "@url:", "@git:"]
+
+    /// The exact composer text that should replace an active mention for a
+    /// completion row's `text` field.
+    static func insertionToken(for raw: String) -> String {
+        if bareContextTokens.contains(raw) {
+            return raw + " "
+        }
+
+        for prefix in argumentContextPrefixes where raw.hasPrefix(prefix) {
+            if raw == prefix {
+                return prefix
+            }
+            return prefix + String(raw.dropFirst(prefix.count)) + " "
+        }
+
+        return "@file:" + normalizedPath(raw) + " "
     }
 
     /// Append a `@file:<path>` token to the end of the composer buffer — used by

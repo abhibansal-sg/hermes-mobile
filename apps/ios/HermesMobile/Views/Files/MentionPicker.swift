@@ -133,23 +133,71 @@ struct MentionPicker: View {
     }
 
     private func row(_ item: PathCompletionItem) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: item.isDirectory ? "folder.fill" : "doc")
-                .foregroundStyle(item.isDirectory ? theme.midground : theme.mutedFg)
+        let contextKind = contextHintKind(item)
+        return HStack(spacing: 10) {
+            Image(systemName: iconName(for: item, contextKind: contextKind))
+                .foregroundStyle(contextKind == nil ? (item.isDirectory ? theme.midground : theme.mutedFg) : theme.midground)
                 .frame(width: 18)
                 .accessibilityHidden(true)
-            Text(item.label)
-                .font(.body)
-                .foregroundStyle(theme.fg)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.label)
+                    .font(.body)
+                    .foregroundStyle(theme.fg)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if contextKind != nil, let meta = item.meta, !meta.isEmpty {
+                    Text(meta)
+                        .font(.caption2)
+                        .foregroundStyle(theme.mutedFg)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
             Spacer(minLength: 0)
         }
         .contentShape(Rectangle())
         .padding(.horizontal, 14)
-        .padding(.vertical, 11)
+        .padding(.vertical, contextKind == nil ? 11 : 9)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel((item.isDirectory ? "Folder: " : "File: ") + item.label)
+        .accessibilityLabel(accessibilityLabel(for: item, contextKind: contextKind))
+    }
+
+    private static let contextHintTexts: Set<String> = [
+        "@diff", "@staged", "@file:", "@folder:", "@url:", "@git:"
+    ]
+
+    private func contextHintKind(_ item: PathCompletionItem) -> String? {
+        guard query.isEmpty, Self.contextHintTexts.contains(item.text) else { return nil }
+        switch item.text {
+        case "@diff": return "Diff"
+        case "@staged": return "Staged diff"
+        case "@file:": return "File reference"
+        case "@folder:": return "Folder reference"
+        case "@url:": return "URL reference"
+        case "@git:": return "Git reference"
+        default: return nil
+        }
+    }
+
+    private func iconName(for item: PathCompletionItem, contextKind: String?) -> String {
+        guard contextKind != nil else {
+            return item.isDirectory ? "folder.fill" : "doc"
+        }
+        switch item.text {
+        case "@diff", "@staged": return "arrow.triangle.branch"
+        case "@file:": return "doc.text"
+        case "@folder:": return "folder.fill"
+        case "@url:": return "link"
+        case "@git:": return "point.3.connected.trianglepath.dotted"
+        default: return "at"
+        }
+    }
+
+    private func accessibilityLabel(for item: PathCompletionItem, contextKind: String?) -> String {
+        if let contextKind {
+            return "\(contextKind): \(item.label)"
+        }
+        return (item.isDirectory ? "Folder: " : "File: ") + item.label
     }
 
     // MARK: - Fetch
