@@ -136,18 +136,21 @@ final class AttachmentStore {
 
     // MARK: - Upload + attach
 
-    /// Upload every pending attachment and bind it to the session.
+    /// Upload every pending attachment, bind it to the session, and return the
+    /// server-local upload paths that were attached in send order.
     ///
     /// For each pending image: `rest.upload` → `image.attach {session_id, path}`.
     /// A successfully attached image is removed from `pending` as it completes,
     /// so a retry after a mid-batch failure only re-sends what's left. Throws
     /// with a readable message on the first failure (the offending attachment is
     /// marked `.failed` and kept).
-    func uploadAndAttach(sessionId: String, connection: ConnectionStore) async throws {
+    @discardableResult
+    func uploadAndAttach(sessionId: String, connection: ConnectionStore) async throws -> [String] {
         guard let rest = connection.rest else {
             throw AttachmentError.notConfigured
         }
         let client = connection.client
+        var attachedPaths: [String] = []
 
         // Snapshot ids up front; `pending` mutates as items succeed.
         let ids = pending.map(\.id)
@@ -170,6 +173,7 @@ final class AttachmentStore {
                     ]),
                     timeout: .seconds(30)
                 )
+                attachedPaths.append(upload.path)
                 // Success: drop it so a partial-batch retry doesn't double-attach.
                 pending.removeAll { $0.id == id }
             } catch {
@@ -181,6 +185,7 @@ final class AttachmentStore {
                 throw AttachmentError.failed(message)
             }
         }
+        return attachedPaths
     }
 
     // MARK: - Image normalisation

@@ -1382,6 +1382,7 @@ private struct SentImageThumbnailView: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(theme.userBubble.contrastingForeground.opacity(0.16), lineWidth: 1)
         )
+        .accessibilityIdentifier("sentImageThumbnail")
         .task(id: attachment.name) { await load() }
     }
 

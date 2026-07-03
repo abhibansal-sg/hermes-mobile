@@ -86,6 +86,25 @@ final class MessageBubbleA11yTests: XCTestCase {
         XCTAssertTrue(result.attachments.isEmpty)
     }
 
+    func testLocalSentImageEchoCarriesUploadMarkersForImmediateThumbnail() {
+        let paths = [
+            "/Users/abhi/.hermes/uploads/11111111111111111111111111111111.jpg",
+            "/Users/abhi/.hermes/uploads/22222222222222222222222222222222.png",
+        ]
+
+        let echoed = ChatStore.localSentImageDisplayText(
+            outgoing: "Please compare these.",
+            uploadedImagePaths: paths
+        )
+        let result = MessageBubble.sentImageAttachments(in: echoed)
+
+        XCTAssertEqual(result.displayText, "Please compare these.")
+        XCTAssertEqual(result.attachments.map(\.name), [
+            "11111111111111111111111111111111.jpg",
+            "22222222222222222222222222222222.png",
+        ])
+    }
+
     // MARK: - ABH-360 GFM block parsing
 
     func testMarkdownBlocksParsesGFMTableWithAlignmentAndRows() {

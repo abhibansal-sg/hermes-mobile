@@ -1830,11 +1830,12 @@ final class ChatStore {
 
         // Upload + attach any queued images first; abort the send on failure so
         // the user keeps their text and can retry without a half-attached turn.
+        var uploadedImagePaths: [String] = []
         if hasAttachments, let attachments {
             setStreaming(true, reason: "send.uploadAttachments")  // display-only; ownership=LOCAL via token
             lastError = nil
             do {
-                try await attachments.uploadAndAttach(sessionId: sessionId, connection: connection)
+                uploadedImagePaths = try await attachments.uploadAndAttach(sessionId: sessionId, connection: connection)
             } catch {
                 endLocalTurn()
                 setStreaming(false, reason: "send.uploadFailed")
@@ -1845,7 +1846,11 @@ final class ChatStore {
 
         // Images-with-no-caption: prompt.submit needs text, so supply a default.
         let outgoing = trimmed.isEmpty ? "Please look at the attached image." : trimmed
-        let userMessage = ChatMessage(role: .user, text: outgoing)
+        let localDisplay = Self.localSentImageDisplayText(
+            outgoing: outgoing,
+            uploadedImagePaths: uploadedImagePaths
+        )
+        let userMessage = ChatMessage(role: .user, text: localDisplay)
         userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
         messages.append(userMessage)
         setStreaming(true, reason: "send.localTurn")  // ownership=LOCAL (token already held)
@@ -1870,6 +1875,26 @@ final class ChatStore {
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             return false
         }
+    }
+
+    /// Build the local echo text for a just-sent user row after mobile has already
+    /// uploaded + `image.attach`'d its queued images. The gateway's persisted row
+    /// later carries the same `[Image attached at: …]` hints through native image
+    /// routing, but the app-native immediate echo is created before that persisted
+    /// row is re-fetched. Mirroring the hint lines here lets `MessageBubble` render
+    /// the thumbnail immediately and keeps cross-surface/backfill parsing on the
+    /// same single marker contract.
+    nonisolated static func localSentImageDisplayText(
+        outgoing: String,
+        uploadedImagePaths: [String]
+    ) -> String {
+        let trimmed = outgoing.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !uploadedImagePaths.isEmpty else { return outgoing }
+        let markers = uploadedImagePaths
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .map { "[Image attached at: \($0)]" }
+        guard !markers.isEmpty else { return outgoing }
+        return ([trimmed].filter { !$0.isEmpty } + markers).joined(separator: "\n\n")
     }
 
     // MARK: - Edit & retry

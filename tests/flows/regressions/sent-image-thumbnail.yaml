@@ -1,0 +1,26 @@
+# ABH-385 — sent image thumbnail renders in the user's own bubble
+# Regresses the app-native immediate echo path that used to append only caption text
+# after upload+image.attach, leaving MessageBubble with no attachment marker to parse.
+# Run: scripts/ui-test.sh regressions/sent-image-thumbnail.yaml
+appId: ai.hermes.app
+---
+- addMedia:
+    - gateway/assets/telegram-botfather-threads-settings.jpg
+- launchApp
+- extendedWaitUntil:
+    visible: "Message Hermes…"
+    timeout: 15000
+- tapOn:
+    id: "composerAttachButton"
+- tapOn: "Photo Library"
+- tapOn: "sent-thumbnail-smoke"
+- extendedWaitUntil:
+    visible: "Remove attachment"
+    timeout: 15000
+- tapOn: "Message Hermes…"
+- inputText: "thumbnail regression"
+- tapOn: "Send"
+- extendedWaitUntil:
+    id: "sentImageThumbnail"
+    timeout: 20000
+- takeScreenshot: sent-image-thumbnail-green
