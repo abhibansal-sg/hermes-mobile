@@ -55,6 +55,81 @@ final class SessionListSourceFilterTests: XCTestCase {
             "Fresh drawer pages must ask the server to omit both autonomous sources")
     }
 
+    func testDrawerSourceGroupsSplitReachableChatsAndTelegramInStaticOrder() {
+        UserDefaults.standard.removeObject(forKey: hideCronKey)
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.pinnedSessions)
+        let store = SessionStore()
+        store.sessions = [
+            summary(id: "telegram", source: "telegram", messageCount: 3, lastActive: 400),
+            summary(id: "human", source: "app", messageCount: 2, lastActive: 300),
+            summary(id: "cliMachinery", source: "cli", title: "Loop Plan #51", messageCount: 5, lastActive: 200),
+            summary(id: "emptyTelegram", source: "telegram", messageCount: 0, lastActive: 100),
+        ]
+
+        let groups = store.drawerSourceGroups()
+
+        XCTAssertEqual(groups.map(\.kind), [.chats, .telegram],
+            "Drawer sections must keep the desktop static source order, not global recency order")
+        XCTAssertEqual(groups[0].sessions.map(\.id), ["human"],
+            "Chats must reuse the human Recents predicate and exclude generated CLI machinery")
+        XCTAssertEqual(groups[1].sessions.map(\.id), ["telegram"],
+            "Telegram-source sessions belong in their own section, not mixed into Chats")
+    }
+
+    func testDrawerPinnedSessionsStayAboveAndOutOfEverySourceGroup() {
+        UserDefaults.standard.removeObject(forKey: hideCronKey)
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.pinnedSessions)
+        let store = SessionStore()
+        let pinnedTelegram = summary(id: "pinnedTelegram", source: "telegram", messageCount: 4, lastActive: 500)
+        let chat = summary(id: "chat", source: "app", messageCount: 4, lastActive: 300)
+        store.sessions = [pinnedTelegram, chat]
+        store.togglePin(pinnedTelegram)
+
+        XCTAssertEqual(store.drawerPinnedSessions.map(\.id), ["pinnedTelegram"],
+            "Pinned Telegram rows must stay on top across source groups")
+        XCTAssertEqual(store.drawerSourceGroups().flatMap { $0.sessions.map(\.id) }, ["chat"],
+            "A pinned session must be removed from its source group so it appears exactly once")
+
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.pinnedSessions)
+    }
+
+    func testDrawerSourceGroupsKeepDesignedEmptyTelegramState() {
+        UserDefaults.standard.removeObject(forKey: hideCronKey)
+        let store = SessionStore()
+        store.sessions = [summary(id: "chat", source: "app", messageCount: 4, lastActive: 500)]
+
+        let groups = store.drawerSourceGroups()
+
+        XCTAssertEqual(groups.map(\.kind), [.chats, .telegram],
+            "The drawer must always reserve only reachable source sections")
+        XCTAssertEqual(groups.map(\.count), [1, 0],
+            "Empty Telegram gets an honest zero-count empty state without inventing unreachable buckets")
+        XCTAssertEqual(groups[1].emptyTitle, "No Telegram chats yet")
+    }
+
+    func testDrawerWorkspaceGroupsUseChatsOnlyAndPreservePinnedWorkspaceOrdering() throws {
+        UserDefaults.standard.removeObject(forKey: hideCronKey)
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.pinnedSessions)
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.pinnedWorkspaces)
+        let store = SessionStore()
+        store.sessions = [
+            summary(id: "telegram", source: "telegram", messageCount: 3, lastActive: 600, cwd: "/repo/chat"),
+            summary(id: "chatA", source: "app", messageCount: 3, lastActive: 400, cwd: "/repo/a"),
+            summary(id: "chatB", source: "app", messageCount: 3, lastActive: 300, cwd: "/repo/b"),
+        ]
+        store.togglePinnedWorkspace("/repo/b")
+
+        let chats = try XCTUnwrap(store.drawerSourceGroups().first { $0.kind == .chats })
+        let workspaceGroups = store.drawerWorkspaceGroups(for: chats)
+
+        XCTAssertEqual(workspaceGroups.map(\.id), ["/repo/b", "/repo/a"],
+            "Workspace grouping must apply within the Chats source group only, with pinned workspace ordering preserved")
+        XCTAssertEqual(workspaceGroups.flatMap { $0.sessions.map(\.id) }, ["chatB", "chatA"],
+            "Telegram rows must stay in their own source section, not leak into Chats workspace groups")
+
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.pinnedWorkspaces)
+    }
+
     func testRecentsRestQueryExcludesCronSubagentAndEmptySessions() async throws {
         SessionListSourceFilterStubProtocol.nextResponse = (
             data: #"{"sessions":[],"total":0}"#.data(using: .utf8)!,
@@ -88,18 +163,20 @@ final class SessionListSourceFilterTests: XCTestCase {
     private func summary(
         id: String,
         source: String?,
+        title: String? = nil,
         messageCount: Int?,
-        lastActive: Double
+        lastActive: Double,
+        cwd: String? = nil
     ) -> SessionSummary {
         SessionSummary(
             id: id,
-            title: id,
+            title: title ?? id,
             preview: nil,
             startedAt: nil,
             messageCount: messageCount,
             source: source,
             lastActive: lastActive,
-            cwd: nil
+            cwd: cwd
         )
     }
 }

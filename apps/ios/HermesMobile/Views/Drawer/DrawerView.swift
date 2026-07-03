@@ -724,9 +724,9 @@ struct DrawerView: View {
 
     @ViewBuilder
     private var pinnedSection: some View {
-        if !sessions.pinnedSessions.isEmpty {
+        if !sessions.drawerPinnedSessions.isEmpty {
             Section {
-                ForEach(sessions.pinnedSessions) { summary in
+                ForEach(sessions.drawerPinnedSessions) { summary in
                     sessionRow(summary, pinned: true)
                 }
             } header: {
@@ -735,53 +735,47 @@ struct DrawerView: View {
         }
     }
 
-    // MARK: Recents section
+    // MARK: Source-grouped session sections
 
-    /// The Recents section. Its header carries a trailing filter "…" menu whose
-    /// "Group by workspace" checkmark item toggles `groupByWorkspace` (H2). When
-    /// grouping is off the unpinned sessions render flat (as before); when on,
-    /// per-workspace subheaders replace the flat list. The cron filter still
-    /// applies in both modes (grouping reads from the already-filtered
-    /// `unpinnedSessions`).
-    ///
-    /// UX1: a sentinel row at the bottom of the unpinned list (and inside each
-    /// workspace group) triggers `loadMore()` via `.onAppear` when it scrolls into
-    /// view. A `loadMoreRow` progress row replaces the sentinel while the fetch is
-    /// in flight.
+    /// ABH-345 drawer session list: static reachable source sections (Chats /
+    /// Telegram) rather than one global recency-mixed firehose. The store owns
+    /// the source split so the iPhone drawer and iPad `NavigationSplitView`
+    /// sidebar render the same model. Pinned sessions are rendered once above all
+    /// source sections; every source section keeps its own designed empty/loading
+    /// state. Automation runs stay in the dedicated automation-runs nav surface,
+    /// not in this session list, because the session fetch excludes cron/subagent.
     @ViewBuilder
     private var recentSection: some View {
-        Section {
-            // DC-02: guard the empty-state flash during cold first-load.
-            // Show skeleton rows while the first fetch is in flight AND no
-            // sessions have loaded yet AND the first load hasn't completed.
-            // Once sessions are present (or the load completes), the normal
-            // empty/list paths take over. This mirrors the desktop's
-            // `showSessionSkeletons = sessionsLoading && sortedSessions.length === 0`.
-            if sessions.isLoading && !didCompleteFirstLoad && sessions.unpinnedSessions.isEmpty {
-                sessionSkeletonRows
-            } else if sessions.unpinnedSessions.isEmpty {
-                emptyRecent
-            } else if sessions.groupByWorkspace {
-                groupedRecents
-            } else {
-                ForEach(sessions.unpinnedSessions) { summary in
-                    sessionRow(summary, pinned: false)
-                        .onAppear { maybePrefetchMore(rowId: summary.id) }
+        Group {
+            let groups = sessions.drawerSourceGroups()
+            let hasSourceRows = groups.contains { !$0.sessions.isEmpty }
+            if sessions.isLoading && !didCompleteFirstLoad && sessions.drawerPinnedSessions.isEmpty && !hasSourceRows {
+                ForEach(groups) { group in
+                    Section {
+                        sourceGroupLoadingRow
+                    } header: {
+                        sourceGroupHeader(group)
+                    }
                 }
-                // Infinite scroll sentinel / loading row (UX1).
+            } else {
+                ForEach(groups) { group in
+                    Section {
+                        sourceGroupRows(group)
+                    } header: {
+                        sourceGroupHeader(group)
+                    }
+                }
+                // Infinite scroll sentinel / loading row (UX1), after all static
+                // source groups so every group's rows remain reachable.
                 loadMoreSentinel
-            }
-        } header: {
-            DrawerSectionHeader(title: recentsHeaderTitle) {
-                recentsFilterMenu
             }
         }
         // DC-02: latch didCompleteFirstLoad once sessions arrive so the skeleton
         // is replaced exactly once and never re-shown during a heartbeat refresh.
-        // Latched off VISIBLE sessions (release audit): the backing array can be
-        // momentarily all-cron (filtered out of Recents), and latching on it
-        // flashed "No conversations yet" while the fill was still paging.
-        .onChange(of: sessions.visibleSessions.isEmpty) { _, isEmpty in
+        // Latched off the backing array rather than human Recents so old cached
+        // non-drawer rows still prove the fetch completed and do not leave the
+        // drawer stuck in skeleton state.
+        .onChange(of: sessions.sessions.isEmpty) { _, isEmpty in
             if !isEmpty {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     didCompleteFirstLoad = true
@@ -798,6 +792,126 @@ struct DrawerView: View {
                     didCompleteFirstLoad = true
                 }
             }
+        }
+    }
+
+    private func sourceGroupHeader(_ group: SessionStore.DrawerSourceGroup) -> some View {
+        DrawerSourceGroupHeader(
+            group: group,
+            action: group.kind == .chats ? AnyView(recentsFilterMenu) : nil
+        )
+    }
+
+    @ViewBuilder
+    private func sourceGroupRows(_ group: SessionStore.DrawerSourceGroup) -> some View {
+        if let error = sessions.lastError, group.kind == .chats, group.sessions.isEmpty {
+            sourceGroupErrorRow(error)
+        } else if group.sessions.isEmpty {
+            sourceGroupEmptyRow(group)
+        } else if group.kind == .chats && sessions.groupByWorkspace {
+            groupedSourceRows(group)
+        } else {
+            ForEach(group.sessions) { summary in
+                sessionRow(summary, pinned: false)
+                    .onAppear { maybePrefetchMore(rowId: summary.id) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func groupedSourceRows(_ group: SessionStore.DrawerSourceGroup) -> some View {
+        ForEach(sessions.drawerWorkspaceGroups(for: group)) { workspace in
+            let isCollapsed = sessions.collapsedWorkspaces.contains(workspace.id)
+            let isPinned = sessions.pinnedWorkspaceKeys.contains(workspace.id)
+            plainRow {
+                DrawerWorkspaceHeader(
+                    label: workspace.label,
+                    isCollapsed: isCollapsed,
+                    isPinned: isPinned
+                ) {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        sessions.toggleCollapsed(workspaceKey: workspace.id)
+                    }
+                } onPin: {
+                    sessions.togglePinnedWorkspace(workspace.id)
+                }
+            }
+            if !isCollapsed {
+                ForEach(workspace.sessions) { summary in
+                    sessionRow(summary, pinned: false)
+                        .onAppear { maybePrefetchMore(rowId: summary.id) }
+                }
+            }
+        }
+    }
+
+    private var sourceGroupLoadingRow: some View {
+        plainRow {
+            HStack(spacing: 10) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Loading conversations…")
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 12)
+        }
+    }
+
+    private func sourceGroupEmptyRow(_ group: SessionStore.DrawerSourceGroup) -> some View {
+        plainRow {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: group.systemImage)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg.opacity(0.75))
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(group.emptyTitle)
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(theme.mutedFg)
+                    Text(emptyDescription(for: group.kind))
+                        .font(.caption2)
+                        .foregroundStyle(theme.mutedFg.opacity(0.82))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 10)
+        }
+    }
+
+    private func sourceGroupErrorRow(_ message: String) -> some View {
+        plainRow {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(theme.destructive)
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Couldn’t load chats")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(theme.fg)
+                    Text(message)
+                        .font(.caption2)
+                        .foregroundStyle(theme.mutedFg)
+                        .lineLimit(2)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 10)
+        }
+    }
+
+    private func emptyDescription(for kind: SessionStore.DrawerSourceKind) -> String {
+        switch kind {
+        case .chats:
+            return "Start a new chat or connect another Hermes client."
+        case .telegram:
+            return "Telegram conversations will appear here separately from local chats."
         }
     }
 
@@ -830,7 +944,7 @@ struct DrawerView: View {
     private func maybePrefetchMore(rowId: SessionSummary.ID) {
         guard !sessions.isLoadingMore else { return }
         if let total = sessions.totalSessions, sessions.loadedOffset >= total { return }
-        let list = sessions.unpinnedSessions
+        let list = sessions.drawerSourceGroups().flatMap(\.sessions)
         guard let index = list.firstIndex(where: { $0.id == rowId }) else { return }
         guard index >= list.count - Self.loadMorePrefetchDistance else { return }
         Task { await sessions.loadMore() }
@@ -1396,6 +1510,50 @@ private struct DrawerNavRow: View {
         .accessibilityLabel(badge > 0 ? "\(title), \(badge) pending" : title)
         .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : .isButton)
         .accessibilityIdentifier(identifier ?? "")
+    }
+}
+
+// MARK: - Source group header
+
+/// Top-level drawer source section header: SF Symbol + label + honest count.
+private struct DrawerSourceGroupHeader: View {
+    @Environment(\.hermesTheme) private var theme
+
+    let group: SessionStore.DrawerSourceGroup
+    var action: AnyView? = nil
+
+    var body: some View {
+        HStack(spacing: 6) {
+            labelBody
+            Spacer(minLength: 0)
+            action
+        }
+        .padding(.horizontal, 10)
+        .padding(.top, 8)
+        .padding(.bottom, 4)
+        .textCase(nil)
+        .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+        .accessibilityLabel("\(group.label), \(group.count) items")
+    }
+
+    private var labelBody: some View {
+        HStack(spacing: 6) {
+            Image(systemName: group.systemImage)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(theme.mutedFg)
+                .frame(width: 14)
+            Text(group.label.uppercased())
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(theme.mutedFg)
+            Text("\(group.count)")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(theme.mutedFg.opacity(0.82))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(theme.muted.opacity(0.7), in: Capsule())
+        }
     }
 }
 

@@ -900,6 +900,103 @@ final class SessionStore {
 
     func isPinned(_ summary: SessionSummary) -> Bool { pinnedIds.contains(summary.id) }
 
+    // MARK: - Drawer source grouping (ABH-345)
+
+    /// Static source-section identities for the drawer. Matches the reachable
+    /// desktop-parity source grouping order for the human chat feed: human chats,
+    /// then messaging-platform chats. Automation runs are intentionally absent
+    /// here because the session fetch path excludes cron/subagent rows; they live
+    /// in the dedicated automation-runs surface instead.
+    enum DrawerSourceKind: String, CaseIterable, Sendable {
+        case chats
+        case telegram
+
+        var label: String {
+            switch self {
+            case .chats: return "Chats"
+            case .telegram: return "Telegram"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .chats: return "bubble.left.and.bubble.right"
+            case .telegram: return "paperplane"
+            }
+        }
+
+        var emptyTitle: String {
+            switch self {
+            case .chats: return "No chats yet"
+            case .telegram: return "No Telegram chats yet"
+            }
+        }
+    }
+
+    /// One source-grouped drawer section. `sessions` carries the full unpinned
+    /// contents so the header count stays honest even when the group is empty.
+    struct DrawerSourceGroup: Identifiable, Equatable, Sendable {
+        let kind: DrawerSourceKind
+        let sessions: [SessionSummary]
+
+        var id: String { kind.rawValue }
+        var count: Int { sessions.count }
+        var label: String { kind.label }
+        var systemImage: String { kind.systemImage }
+        var emptyTitle: String { kind.emptyTitle }
+    }
+
+    /// Pinned drawer rows across all reachable drawer source groups. Pinning is a
+    /// global affordance, so pinned Telegram rows float to the top instead of
+    /// remaining inside the Telegram source section.
+    var drawerPinnedSessions: [SessionSummary] {
+        drawerSourceCandidateSessions.filter { pinnedIds.contains($0.id) }
+    }
+
+    /// Source-grouped unpinned sessions for the drawer. Groups are always returned
+    /// in the static desktop order even when empty, giving the view a stable place
+    /// to render designed per-group empty states.
+    func drawerSourceGroups() -> [DrawerSourceGroup] {
+        let unpinned = drawerSourceCandidateSessions.filter { !pinnedIds.contains($0.id) }
+        return DrawerSourceKind.allCases.map { kind in
+            DrawerSourceGroup(
+                kind: kind,
+                sessions: unpinned.filter { Self.drawerSourceKind(for: $0) == kind }
+            )
+        }
+    }
+
+    /// Rows eligible for the ABH-345 drawer source groups, after profile scope and
+    /// newest-first ordering. This deliberately mirrors the live fetch path's
+    /// human-facing session cache: cron/subagent automation rows are excluded by
+    /// ``recentsExcludeSources`` before they ever populate `sessions`, so the
+    /// drawer only advertises source groups it can actually fill.
+    private var drawerSourceCandidateSessions: [SessionSummary] {
+        let scoped = Self.filterByProfile(sessions, scope: activeProfile, multiAvailable: isMultiProfileAvailable)
+            .filter { Self.drawerSourceKind(for: $0) != nil }
+        return Self.sortedByActivity(scoped)
+    }
+
+    private static func drawerSourceKind(for row: SessionSummary) -> DrawerSourceKind? {
+        if isTelegramSource(row.source), isHumanRecentsSession(row) { return .telegram }
+        if isHumanRecentsSession(row) { return .chats }
+        return nil
+    }
+
+    private static func isTelegramSource(_ source: String?) -> Bool {
+        (source ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "telegram"
+    }
+
+    private static func sortedByActivity(_ rows: [SessionSummary]) -> [SessionSummary] {
+        var sorted = rows
+        sorted.sort { lhs, rhs in
+            let l = lhs.lastActive ?? lhs.startedAt ?? -.greatestFiniteMagnitude
+            let r = rhs.lastActive ?? rhs.startedAt ?? -.greatestFiniteMagnitude
+            return l > r
+        }
+        return sorted
+    }
+
     // MARK: - Workspace grouping (H2)
 
     /// One workspace section for the grouped Recents list: a stable group `id`
@@ -911,30 +1008,39 @@ final class SessionStore {
         let sessions: [SessionSummary]
     }
 
-    /// Group ``unpinnedSessions`` by workspace (`cwd`), replicating the desktop
-    /// sidebar's `workspaceGroupsFor` (apps/desktop/src/app/chat/sidebar/index.tsx).
+    /// Group ``unpinnedSessions`` by workspace, replicating the desktop sidebar's
+    /// `workspaceGroupsFor` ordering for the legacy Recents grouped view.
+    /// ``drawerWorkspaceGroups(for:)`` runs the same grouping algorithm over one
+    /// source-group's rows so ABH-345 keeps workspaces scoped inside Chats.
     ///
     /// Ordering semantics:
     /// - **Pinned groups first.** Groups whose workspace key is in
     ///   ``pinnedWorkspaceKeys`` float to the top tier, preserving recency order
     ///   among themselves. Unpinned groups follow in the same recency order.
     /// - **Group order = recency.** Within each tier (pinned / unpinned), groups
-    ///   appear in *first-seen* order of the recency-sorted input
-    ///   (``unpinnedSessions`` is already in REST `order=recent` order), so a
-    ///   workspace with fresh activity floats to the top of its tier.
+    ///   appear in *first-seen* order of the recency-sorted input.
     /// - **Rows within a group = `startedAt` DESC, stably.** Newest-created on
     ///   top, but a stable sort means rows don't reshuffle when a message lands
     ///   (preserving muscle memory). A `nil` `startedAt` sorts to the bottom.
     ///
     /// Pinned sessions are intentionally absent: they live in the drawer's
-    /// Pinned section regardless of grouping. The cron filter already applies
-    /// because the input is ``unpinnedSessions`` (derived from
-    /// ``visibleSessions``).
+    /// Pinned section regardless of grouping.
+    /// Workspace groups for a single drawer source group. Used by the ABH-345
+    /// source-grouped drawer so workspace folding stays inside Chats instead of
+    /// mixing Telegram rows back into the human chat section.
+    func drawerWorkspaceGroups(for group: DrawerSourceGroup) -> [WorkspaceGroup] {
+        workspaceGroups(from: group.sessions)
+    }
+
     func workspaceGroups() -> [WorkspaceGroup] {
+        workspaceGroups(from: unpinnedSessions)
+    }
+
+    private func workspaceGroups(from rows: [SessionSummary]) -> [WorkspaceGroup] {
         var order: [String] = []
         var buckets: [String: [SessionSummary]] = [:]
 
-        for session in unpinnedSessions {
+        for session in rows {
             let key = session.workspaceKey
             if buckets[key] == nil {
                 buckets[key] = []
