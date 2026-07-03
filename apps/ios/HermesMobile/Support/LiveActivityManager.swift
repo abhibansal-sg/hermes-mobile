@@ -43,6 +43,11 @@ final class LiveActivityManager {
     private var currentNeedsApproval = false
     /// The deferred-end task, cancellable if a new turn starts within the grace.
     private var endTask: Task<Void, Never>?
+    /// Local stale-date watchdog: if neither local updates nor remote pushes
+    /// refresh the activity before `staleDate`, deliver the same visual END as a
+    /// terminal event so the lock-screen timer cannot keep looking alive.
+    private var staleEndTask: Task<Void, Never>?
+    private var staleGeneration = 0
 
     /// Runtime session id the live activity belongs to — the key the gateway's
     /// `/api/push/live-activity` registry upserts/prunes by (A3). `nil` when the
@@ -184,6 +189,11 @@ final class LiveActivityManager {
         // New lifecycle: invalidate any straggling registration round-trip
         // from a previous activity (R1 #32/#97).
         registrationGeneration += 1
+        // New lifecycle also resets the stale watchdog. The new activity below
+        // arms a fresh one whose deadline matches its ActivityContent.staleDate.
+        staleEndTask?.cancel()
+        staleEndTask = nil
+        staleGeneration += 1
 
         let attributes = HermesTurnAttributes(
             sessionTitle: sessionTitle.isEmpty ? "Hermes" : sessionTitle,
@@ -216,6 +226,7 @@ final class LiveActivityManager {
             // Observe the push token (and its rotations) and register each with
             // the gateway. Only meaningful when we have a session id to key by.
             observePushToken(for: started)
+            scheduleStaleEnd()
         } catch {
             // Disabled, over budget, or unsupported — silently skip.
             activity = nil
@@ -275,6 +286,11 @@ final class LiveActivityManager {
     func end() {
         #if canImport(ActivityKit)
         guard let activity else { return }
+        // Once end() is requested, stale expiry has already become a terminal
+        // visual state. Cancel the watchdog so it cannot re-enter end().
+        staleEndTask?.cancel()
+        staleEndTask = nil
+        staleGeneration += 1
         // Stop observing token rotations and drop the gateway registration up
         // front — the activity is on its way out, so no further remote LA pushes
         // should be routed to it.
@@ -323,16 +339,42 @@ final class LiveActivityManager {
     /// Recompute and push the current content state to the live activity.
     private func update(phaseOverride: String? = nil) {
         guard let activity else { return }
+        let staleDate = Date().addingTimeInterval(Self.staleAfter)
         let content = ActivityContent(
             state: makeState(phaseOverride: phaseOverride),
             // Every live frame refreshes the self-stale horizon (R1 #26).
-            staleDate: Date().addingTimeInterval(Self.staleAfter)
+            staleDate: staleDate
         )
         enqueueDelivery(content, to: ActivityBox(activity: activity))
+        scheduleStaleEnd()
     }
 
     /// Push using the derived phase (no override).
     private func pushState() { update(phaseOverride: nil) }
+
+    /// Arm a local terminal-frame watchdog for the current stale horizon.
+    ///
+    /// ActivityKit marks a frame stale at `staleDate`, but stale UI can still
+    /// render the previous running content state. This watchdog makes the stale
+    /// deadline visually terminal: the timer stops, phase becomes Done, and the
+    /// normal end grace/dismiss path runs. Every live update re-arms it for the
+    /// new rolling staleDate.
+    private func scheduleStaleEnd() {
+        staleEndTask?.cancel()
+        let generation = staleGeneration
+        let staleNanoseconds = max(0, Self.staleAfter) * 1_000_000_000
+        let nanoseconds = UInt64(staleNanoseconds.rounded())
+        staleEndTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard
+                !Task.isCancelled,
+                let self,
+                self.staleGeneration == generation,
+                self.activity != nil
+            else { return }
+            self.end()
+        }
+    }
 
     /// Append a content push to the FIFO delivery chain (R1 #3). Each delivery
     /// awaits its predecessor, so ActivityKit applies frames in enqueue order —

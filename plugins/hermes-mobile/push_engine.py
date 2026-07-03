@@ -1256,6 +1256,99 @@ def _live_activity_status_phase(data: dict) -> tuple[str, bool]:
     return "thinking", False
 
 
+def _live_activity_end_content_state(elapsed_seconds: int = 0) -> dict:
+    """Terminal Live Activity content-state shared by every turn-death path."""
+    return {
+        "phase": "done",
+        "toolName": None,
+        "elapsedSeconds": max(0, int(elapsed_seconds or 0)),
+        "needsApproval": False,
+    }
+
+
+def _unique_live_activity_session_ids(*session_ids: object) -> list[str]:
+    ids: list[str] = []
+    for raw in session_ids:
+        sid = str(raw or "").strip()
+        if sid and sid not in ids:
+            ids.append(sid)
+    return ids
+
+
+def _send_live_activity_end_frame(session_id: str, *, elapsed_seconds: int = 0) -> bool:
+    """Best-effort terminal frame for one registered Live Activity token."""
+    if live_activity_token_for(session_id) is None:
+        return False
+    return notify_live_activity(
+        session_id,
+        _live_activity_end_content_state(elapsed_seconds),
+        end=True,
+    )
+
+
+def end_live_activity_sessions(*session_ids: object, elapsed_seconds: int = 0) -> int:
+    """Send terminal frames, then drop registry rows, for ended sessions.
+
+    Used by non-happy-path teardown/reconciliation paths where there may never
+    be a ``message.complete`` event.  Registry cleanup is retained even if the
+    APNs send is a no-op/failure, matching the previous finalize/delete cleanup
+    behavior: once the server knows the turn/session is dead, the token must not
+    keep receiving live updates.
+    """
+    ended = 0
+    for sid in _unique_live_activity_session_ids(*session_ids):
+        had_token = live_activity_token_for(sid) is not None
+        if had_token:
+            _send_live_activity_end_frame(sid, elapsed_seconds=elapsed_seconds)
+            ended += 1
+        try:
+            unregister_live_activity_token(sid)
+        except Exception:
+            _log.debug(
+                "failed to unregister Live Activity token for %s",
+                sid,
+                exc_info=True,
+            )
+    return ended
+
+
+def _active_live_activity_session_ids() -> set[str]:
+    """Session ids that currently map to a live gateway session."""
+    active: set[str] = set()
+    for sid, session in _gw_sessions().items():
+        for value in (
+            sid,
+            (session or {}).get("_runtime_sid") if isinstance(session, dict) else None,
+            (session or {}).get("session_id") if isinstance(session, dict) else None,
+            (session or {}).get("session_key") if isinstance(session, dict) else None,
+            getattr((session or {}).get("agent"), "session_id", None)
+            if isinstance(session, dict)
+            else None,
+        ):
+            text = str(value or "").strip()
+            if text:
+                active.add(text)
+    return active
+
+
+def sweep_dead_live_activity_tokens(active_session_ids: set[str] | None = None) -> int:
+    """End and prune LA tokens whose sessions are not live after startup.
+
+    A gateway restart can strand the JSON registry with ActivityKit tokens from
+    turns that died with the old process.  On the next plugin activation, compare
+    the registry against the current live session table and send an end frame for
+    anything that no longer has a live owner.
+    """
+    prune_live_activity_tokens()
+    active = (
+        _active_live_activity_session_ids()
+        if active_session_ids is None
+        else active_session_ids
+    )
+    dead = [sid for sid in _load_la_registry().keys() if sid not in active]
+    return end_live_activity_sessions(*dead)
+
+
 def _live_activity_hook(
     event: str,
     sid: str,
@@ -1328,12 +1421,16 @@ def _live_activity_hook(
         else:
             return
 
-        content_state = {
-            "phase": phase,
-            "toolName": tool_name,
-            "elapsedSeconds": elapsed,
-            "needsApproval": needs_approval,
-        }
+        content_state = (
+            _live_activity_end_content_state(elapsed)
+            if is_end
+            else {
+                "phase": phase,
+                "toolName": tool_name,
+                "elapsedSeconds": elapsed,
+                "needsApproval": needs_approval,
+            }
+        )
 
         # Throttle non-final updates to >=3s/session; the end frame always goes.
         if not is_end and session is not None:
@@ -1468,24 +1565,11 @@ def unregister_live_activity_tokens(*session_ids: object) -> None:
     """Best-effort Live Activity registry cleanup for ended sessions.
 
     Moved verbatim from ``tui_gateway/server.py`` (the lazy push_notify import
-    became a direct local call after the move).
+    became a direct local call after the move).  ABH-361 extends the cleanup to
+    send a terminal ActivityKit frame before pruning, so teardown paths that
+    never emit ``message.complete`` do not leave a zombie lock-screen timer.
     """
-    ids: list[str] = []
-    for raw in session_ids:
-        sid = str(raw or "").strip()
-        if sid and sid not in ids:
-            ids.append(sid)
-    if not ids:
-        return
-    for sid in ids:
-        try:
-            unregister_live_activity_token(sid)
-        except Exception:
-            _log.debug(
-                "failed to unregister Live Activity token for %s",
-                sid,
-                exc_info=True,
-            )
+    end_live_activity_sessions(*session_ids)
 
 
 def handle_gateway_event(event: str, sid: str, payload: dict | None = None) -> None:
@@ -1507,7 +1591,7 @@ def handle_gateway_event(event: str, sid: str, payload: dict | None = None) -> N
         )
         return
     if event == "session.deleted":
-        unregister_live_activity_tokens(sid)
+        end_live_activity_sessions(sid)
         return
     _push_hook(event, sid, payload)
 
@@ -1517,4 +1601,6 @@ def activate() -> None:
     from . import _append_unique
     from tui_gateway import server as _server
 
-    _append_unique(_server, "_EMIT_OBSERVERS", handle_gateway_event, "push")
+    wired = _append_unique(_server, "_EMIT_OBSERVERS", handle_gateway_event, "push")
+    if wired:
+        sweep_dead_live_activity_tokens()

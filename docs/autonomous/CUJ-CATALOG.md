@@ -46,6 +46,7 @@ TestFlight + Abhi catch taste (layer 5).
 | CUJ-20 | iPad keyboard user sends a message and navigates with Cmd shortcuts | `smoke: ios-sim` RootKeyboardShortcutActionsTests verifies shortcut action symbols fire / are wired | ABH-308 |
 | CUJ-21 | iOS artifact-gallery image opens full-screen, zooms, and closes | `smoke: ios-sim` ZoomableImageViewTests verifies fit math, zoom/pan clamp invariants, double-tap min→zoom/reset toggle, and swipe-down dismiss gate; UI smoke must open an image artifact into `artifactZoomableImageViewer`, exercise pinch/double-tap zoom behavior, then close via `zoomableImageCloseButton`/swipe dismiss | ABH-242 |
 | CUJ-22 | Projects tab loads real projects with session counts | `GET /api/plugins/hermes-mobile/projects` returns a JSON array of `{id,label,root,session_count}`; 401 without token; junk-filtered (no ~/.hermes, no bare home); empty → `[]` | ABH-350 |
+| CUJ-23 | Turn ends by any path → Live Activity shows ended, never a zombie timer | `smoke: ios-sim` verifies staleDate expiry is visual END; plugin pytest proves non-happy teardown/startup sweep emit ActivityKit end frames | ABH-361 |
 
 `smoke: ios-sim` (covered by iOS test suite, skipped by gateway smoke): stale
 'Connection lost' warning clears on clean resume (ABH-289 tests), per-event
