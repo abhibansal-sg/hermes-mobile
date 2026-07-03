@@ -509,6 +509,43 @@ def send_event_background(
     ).start()
 
 
+def register_device_background(
+    *,
+    token: str,
+    platform: str,
+    environment: str,
+    bundle_id: str,
+    preferences: dict,
+    hermes_home: Path | None = None,
+) -> None:
+    """Fire-and-forget relay device enrollment. Never blocks the caller."""
+    threading.Thread(
+        target=_register_device_sync,
+        kwargs={
+            "token": token,
+            "platform": platform,
+            "environment": environment,
+            "bundle_id": bundle_id,
+            "preferences": preferences,
+            "hermes_home": hermes_home,
+        },
+        daemon=True,
+        name="hermes-mobile-relay-register",
+    ).start()
+
+
+def unregister_device_background(
+    *, token: str, hermes_home: Path | None = None
+) -> None:
+    """Fire-and-forget relay device unenrollment. Never blocks the caller."""
+    threading.Thread(
+        target=_unregister_device_sync,
+        kwargs={"token": token, "hermes_home": hermes_home},
+        daemon=True,
+        name="hermes-mobile-relay-unregister",
+    ).start()
+
+
 def send_live_activity_background(
     *,
     session_id: str,
@@ -582,3 +619,65 @@ def _send_sync(
     except Exception as exc:
         _record_delivery_failure()
         log.warning("Hermes relay push event delivery failed: %s", exc, exc_info=True)
+
+
+def _register_device_sync(
+    *,
+    token: str,
+    platform: str,
+    environment: str,
+    bundle_id: str,
+    preferences: dict,
+    hermes_home: Path | None,
+) -> None:
+    try:
+        asyncio.run(
+            relay_client(hermes_home=hermes_home).register_device(
+                token=token,
+                platform=platform,
+                environment=environment,
+                bundle_id=bundle_id,
+                preferences=preferences,
+            )
+        )
+    except RelayConfigurationError as exc:
+        _record_delivery_failure()
+        log.error(
+            "Hermes relay device enrollment is misconfigured: "
+            "HERMES_MOBILE_RELAY_URL unreachable or invalid: %s",
+            exc,
+            exc_info=True,
+        )
+    except NeedsAttestation as exc:
+        _record_delivery_failure()
+        log.warning(
+            "Hermes relay requires device re-enrollment via App Attest: %s",
+            exc,
+            exc_info=True,
+        )
+    except Exception as exc:
+        _record_delivery_failure()
+        log.warning("Hermes relay device enrollment failed: %s", exc, exc_info=True)
+
+
+def _unregister_device_sync(*, token: str, hermes_home: Path | None) -> None:
+    try:
+        asyncio.run(relay_client(hermes_home=hermes_home).unregister_device(token=token))
+    except RelayConfigurationError as exc:
+        _record_delivery_failure()
+        log.error(
+            "Hermes relay device unenrollment is misconfigured: "
+            "HERMES_MOBILE_RELAY_URL unreachable or invalid: %s",
+            exc,
+            exc_info=True,
+        )
+    except NeedsAttestation as exc:
+        _record_delivery_failure()
+        log.warning(
+            "Hermes relay requires device re-enrollment via App Attest: %s",
+            exc,
+            exc_info=True,
+        )
+    except Exception as exc:
+        _record_delivery_failure()
+        log.warning("Hermes relay device unenrollment failed: %s", exc, exc_info=True)

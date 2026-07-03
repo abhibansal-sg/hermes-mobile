@@ -1133,6 +1133,65 @@ def _relay_test_push_error_detail(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def _relay_device_environment(push_engine: Any, requested_env: str) -> str:
+    """Resolve the APNs environment for relay device enrollment."""
+    if requested_env in ("sandbox", "production"):
+        return requested_env
+    config = push_engine.APNsConfig.from_env()
+    return "sandbox" if config.use_sandbox else "production"
+
+
+def _relay_device_bundle_id(push_engine: Any) -> str:
+    """Resolve the APNs bundle id/topic used by direct APNs sends."""
+    return str(push_engine.APNsConfig.from_env().topic)
+
+
+def _relay_device_preferences(relay: Any, events: Optional[List[str]]) -> Dict[str, bool]:
+    """Translate direct-APNs event opt-ins into relay push-kind preferences."""
+    if events is None:
+        return {kind: True for kind in relay.RELAY_PUSH_KINDS}
+    wanted = {relay.map_push_kind(event) for event in events if isinstance(event, str)}
+    return {kind: kind in wanted for kind in relay.RELAY_PUSH_KINDS}
+
+
+def _record_relay_enrollment_failure(relay: Any) -> None:
+    record = getattr(relay, "_record_delivery_failure", None)
+    if callable(record):
+        record()
+
+
+def _register_relay_device_if_configured(body: PushRegisterBody, push_engine: Any) -> None:
+    relay = None
+    try:
+        relay = _plugin_module("relay_client")
+        if not relay.relay_url_configured():
+            return
+        relay.register_device_background(
+            token=body.token,
+            platform=body.platform,
+            environment=_relay_device_environment(push_engine, body.env),
+            bundle_id=_relay_device_bundle_id(push_engine),
+            preferences=_relay_device_preferences(relay, body.events),
+        )
+    except Exception as exc:
+        if relay is not None:
+            _record_relay_enrollment_failure(relay)
+        _log.warning("Hermes relay device enrollment failed: %s", exc, exc_info=True)
+
+
+def _unregister_relay_device_if_configured(body: PushUnregisterBody) -> None:
+    relay = None
+    try:
+        relay = _plugin_module("relay_client")
+        if not relay.relay_url_configured():
+            return
+        relay.unregister_device_background(token=body.token)
+    except Exception as exc:
+        if relay is not None:
+            _record_relay_enrollment_failure(relay)
+        _log.warning("Hermes relay device unenrollment failed: %s", exc, exc_info=True)
+
+
 @router.post("/relay/test-push")
 async def test_relay_push(request: Request) -> Any:
     """Synchronously test the configured push transport and report truthfully."""
@@ -1190,6 +1249,7 @@ async def register_push_token(body: PushRegisterBody, request: Request) -> Dict[
         body.token, platform=body.platform, env=body.env, events=body.events
     ):
         raise HTTPException(status_code=400, detail="Invalid device token")
+    _register_relay_device_if_configured(body, engine)
     return {"ok": True}
 
 
@@ -1200,6 +1260,7 @@ async def unregister_push_token(body: PushUnregisterBody, request: Request) -> D
         raise HTTPException(status_code=401, detail="Unauthorized")
     engine = _plugin_module("push_engine")
     removed = engine.unregister_token(body.token)
+    _unregister_relay_device_if_configured(body)
     return {"ok": True, "removed": removed}
 
 
