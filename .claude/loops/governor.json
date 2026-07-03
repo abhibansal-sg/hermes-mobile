@@ -240,5 +240,25 @@
       "verifier": "opus-4.8",
       "reviewer": "opus-4.8"
     }
+  },
+  "live_policy": {
+    "_comment": "ARMED 2026-07-03 (Abhi: 'dev to staging and staging to live should also be autonomous... real time'). scripts/promote-to-live.sh advances the FROZEN checkout at ~/Developer/products/hermes-mobile-live to the latest soak-SHIP sha and restarts the :9119 dashboard. Gates: soak verdict SHIP + zero open loop:staging-blocker + sha on origin base. Safety: full ~/.hermes backup before every promotion + AUTOMATIC rollback (checkout+plugin+wrapper) on failed health gate + p1 filed. The parachute replaces the human tap. Flip autonomous_live_active:false to restore human-gated promotion instantly.",
+    "autonomous_live_active": true,
+    "mechanism": "scripts/promote-to-live.sh (soak beat runs it after a SHIP verdict)",
+    "requires": [
+      "soak_verdict_SHIP",
+      "zero_open_staging_blockers",
+      "sha_on_origin_base"
+    ],
+    "safety": [
+      "pre_promotion_backup_mandatory",
+      "auto_rollback_on_failed_health_gate",
+      "p1_filed_on_rollback"
+    ],
+    "never_autonomous": [
+      "config_yaml_semantic_changes",
+      "HERMES_HOME_migration_prompts",
+      "anything_touching_memory_or_model_config"
+    ]
   }
 }
