@@ -70,6 +70,7 @@ struct DrawerView: View {
     @Environment(AppLock.self) private var appLock
     @Environment(ThemeStore.self) private var themeStore
     @Environment(\.hermesTheme) private var theme
+    @Environment(ProjectsStore.self) private var projectsStore
 
     /// Invoked after a navigation action that should dismiss the drawer (row
     /// open, New chat). Injected by ``RootView``: closes the push-card in
@@ -107,6 +108,11 @@ struct DrawerView: View {
     /// `NavigationStack` (Amendment D: not re-parented) is unchanged.
     @State private var path = NavigationPath()
 
+    /// ABH-351 — the active drawer tab (Sessions / Projects). The segmented
+    /// control below the header drives this; the list body switches between
+    /// the sessions list (the existing drawer) and the read-only projects list.
+    @State private var selectedTab: DrawerTab = .sessions
+
     /// The current display name (Settings field, F2) used for the avatar
     /// initials. `nil`/blank → a neutral person glyph.
     @AppStorage(DefaultsKeys.displayName) private var displayName = ""
@@ -126,8 +132,13 @@ struct DrawerView: View {
         NavigationStack(path: $path) {
             VStack(spacing: 0) {
                 header
-                searchField
-                listBody
+                tabSegmentedControl
+                if selectedTab == .sessions {
+                    searchField
+                    listBody
+                } else {
+                    projectsListBody
+                }
                 slimFooter
             }
             .background(theme.listBg)
@@ -135,25 +146,29 @@ struct DrawerView: View {
             // (observed reference). theme.fg fill / theme.bg text — the per-theme
             // "black-on-cream" equivalent. Floats ABOVE the list's bottom scroll-
             // edge fade (BUG 3: hugs the bottom safe area).
+            // ABH-351: only shown on the Sessions tab — the Projects tab has no
+            // global "new chat" (each project row owns its own new-session action).
             .overlay(alignment: .bottomTrailing) {
-                // Baseline parity with the chat composer (user spec): ignore the
-                // CONTAINER bottom inset so `controlBottomBaseline` measures from
-                // the absolute screen edge — identical to ChatView's bottomStack.
-                // Without this the capsule sat home-indicator-height above the
-                // composer's baseline.
-                // DC-07: capsule fades + scales in from bottom-right on first
-                // appear so it doesn't pop in abruptly while the drawer animates
-                // open. `.spring(response: 0.35)` matches the drawer open spring.
-                newChatCapsule
-                    .ignoresSafeArea(.container, edges: .bottom)
-                    .transition(
-                        .asymmetric(
-                            insertion: .scale(scale: 0.8, anchor: .bottomTrailing)
-                                .combined(with: .opacity),
-                            removal: .scale(scale: 0.8, anchor: .bottomTrailing)
-                                .combined(with: .opacity)
+                if selectedTab == .sessions {
+                    // Baseline parity with the chat composer (user spec): ignore the
+                    // CONTAINER bottom inset so `controlBottomBaseline` measures from
+                    // the absolute screen edge — identical to ChatView's bottomStack.
+                    // Without this the capsule sat home-indicator-height above the
+                    // composer's baseline.
+                    // DC-07: capsule fades + scales in from bottom-right on first
+                    // appear so it doesn't pop in abruptly while the drawer animates
+                    // open. `.spring(response: 0.35)` matches the drawer open spring.
+                    newChatCapsule
+                        .ignoresSafeArea(.container, edges: .bottom)
+                        .transition(
+                            .asymmetric(
+                                insertion: .scale(scale: 0.8, anchor: .bottomTrailing)
+                                    .combined(with: .opacity),
+                                removal: .scale(scale: 0.8, anchor: .bottomTrailing)
+                                    .combined(with: .opacity)
+                            )
                         )
-                    )
+                }
             }
             // The drawer hosts no pushed destinations in F1 (Settings is a sheet
             // now); the root drawer surface has no large title (chat-as-home owns
@@ -306,6 +321,210 @@ struct DrawerView: View {
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 10)
+    }
+
+    // MARK: - Sessions/Projects segmented toggle (ABH-351)
+
+    /// A system `Picker(.segmented)` that switches the drawer body between the
+    /// Sessions list (the existing drawer) and the read-only Projects list.
+    /// Sits between the header and the search/list body. When Projects is
+    /// selected the search field is hidden (projects have their own list) and
+    /// the floating "New chat" capsule is replaced by per-project new-session
+    /// actions in the detail view.
+    ///
+    /// FULL NATIVE: system `Picker` with `.pickerStyle(.segmented)` tinted by
+    /// `theme.midground` so the selected segment carries the brand identity.
+    /// The `accessibilityIdentifier` lets UI tests assert the toggle exists
+    /// and switches the body.
+    @ViewBuilder
+    private var tabSegmentedControl: some View {
+        Picker("Drawer Section", selection: $selectedTab) {
+            ForEach(DrawerTab.allCases, id: \.self) { tab in
+                Text(tab.title).tag(tab)
+            }
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 6)
+        .accessibilityIdentifier("drawerTabToggle")
+        .onChange(of: selectedTab) { _, newTab in
+            // Refresh the projects list when the Projects tab is first selected
+            // so the data is fresh without waiting for the next drawer-open.
+            if newTab == .projects {
+                Task { await projectsStore.refresh() }
+            }
+        }
+    }
+
+    // MARK: - Projects list body (ABH-351)
+
+    /// The drawer body for the Projects tab: a read-only list of projects from
+    /// the slice-1 REST route. Each project row shows its label, root path, and
+    /// session count; tapping pushes ``ProjectDetailView`` (the project's
+    /// sessions + a "new session in this project" action).
+    ///
+    /// Designed states (CRAFT BAR — honest, never blank):
+    /// - **Loading** — the fetch is in flight (spinner + "Loading projects…").
+    /// - **Empty** — no projects discovered (helpful message, not a blank list).
+    /// - **Error** — the fetch failed (honest error + retry affordance).
+    /// - **Populated** — project rows, each tappable.
+    @ViewBuilder
+    private var projectsListBody: some View {
+        List {
+            if projectsStore.isLoading && projectsStore.projects == nil {
+                projectsLoadingRow
+            } else if let error = projectsStore.loadError,
+                      projectsStore.projects == nil {
+                projectsErrorRow(error)
+            } else if let projects = projectsStore.projects, projects.isEmpty {
+                projectsEmptyRow
+            } else if let projects = projectsStore.projects {
+                Section {
+                    ForEach(projects) { project in
+                        projectRow(project)
+                    }
+                } header: {
+                    DrawerSectionHeader(title: "Projects")
+                }
+            }
+        }
+        .listStyle(.plain)
+        .environment(\.defaultMinListRowHeight, 0)
+        .scrollContentBackground(.hidden)
+        .background(theme.listBg)
+        .modifier(DrawerBottomFade())
+        .navigationDestination(for: Project.self) { project in
+            ProjectDetailView(project: project, onNavigate: onNavigate)
+                .environment(sessions)
+                .environment(projectsStore)
+                .environment(themeStore)
+        }
+        .onAppear {
+            // First time the Projects tab renders, kick a refresh if we haven't
+            // loaded yet (the toggle's onChange also covers the switch-in path,
+            // but onAppear catches the cold first-render too).
+            if projectsStore.projects == nil && !projectsStore.isLoading {
+                Task { await projectsStore.refresh() }
+            }
+        }
+    }
+
+    private var projectsLoadingRow: some View {
+        plainRow {
+            HStack(spacing: 10) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Loading projects…")
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 12)
+        }
+    }
+
+    private var projectsEmptyRow: some View {
+        plainRow {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "folder.badge.plus")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg.opacity(0.75))
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("No projects found")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(theme.mutedFg)
+                    Text("Projects are discovered from your git repositories and active sessions. Open a repo on your Mac to see it here.")
+                        .font(.caption2)
+                        .foregroundStyle(theme.mutedFg.opacity(0.82))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 10)
+        }
+    }
+
+    private func projectsErrorRow(_ message: String) -> some View {
+        plainRow {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(theme.destructive)
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Couldn't load projects")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(theme.fg)
+                    Text(message)
+                        .font(.caption2)
+                        .foregroundStyle(theme.mutedFg)
+                        .lineLimit(3)
+                    Button("Retry") {
+                        Task { await projectsStore.refresh() }
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(theme.midground)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 10)
+        }
+    }
+
+    /// One project row: folder glyph, label, root path, session count.
+    /// Tapping pushes ``ProjectDetailView`` via the `NavigationStack` path
+    /// (navigationDestination(for: Project.self)).
+    @ViewBuilder
+    private func projectRow(_ project: Project) -> some View {
+        plainRow {
+            Button {
+                path.append(project)
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "folder")
+                        .font(.body)
+                        .foregroundStyle(theme.midground)
+                        .frame(width: 22)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(project.label)
+                            .font(.body.weight(.medium))
+                            .foregroundStyle(theme.fg)
+                            .lineLimit(1)
+                        Text(project.root)
+                            .font(.caption2)
+                            .foregroundStyle(theme.mutedFg)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 0)
+                    if project.sessionCount > 0 {
+                        Text("\(project.sessionCount)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(theme.mutedFg.opacity(0.82))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(theme.muted.opacity(0.6), in: Capsule())
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(theme.mutedFg)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("projectRow")
+            .accessibilityLabel("Project: \(project.label)")
+            .accessibilityValue("\(project.sessionCount) sessions")
+            .accessibilityHint("View project sessions")
+        }
     }
 
     // MARK: - Profile switcher (F4b, FULL NATIVE)
@@ -1795,5 +2014,232 @@ private struct DrawerBottomFade: ViewModifier {
                 }
             }
         }
+    }
+}
+
+// MARK: - Drawer tab enum (ABH-351)
+
+/// The two drawer body sections switchable via the segmented control.
+enum DrawerTab: String, CaseIterable, Identifiable {
+    case sessions
+    case projects
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .sessions: return "Sessions"
+        case .projects: return "Projects"
+        }
+    }
+}
+
+// MARK: - Project detail view (ABH-351 SLICE 2)
+
+/// ABH-351 (SLICE 2) — the project detail view pushed when the user taps a
+/// project row in the drawer's Projects tab.
+///
+/// Shows the project's sessions (those whose `cwd` matches the project's
+/// `root`, derived live from ``SessionStore``) and a prominent "New session
+/// in this project" action that starts a draft session seeded with the
+/// project's root as its cwd (``SessionStore/startDraft(cwd:)``).
+///
+/// Designed states:
+/// - **Loading** — the session list hasn't arrived yet (skeleton rows).
+/// - **Empty (no sessions yet)** — the project has zero sessions; a helpful
+///   message + the new-session action guide the user forward (no dead-end).
+/// - **Error** — the projects fetch itself failed before reaching detail (the
+///   project was tapped from stale cache); surfaced honestly.
+/// - **Populated** — session rows, each tappable (opens the session).
+///
+/// Every state leads somewhere: the new-session action is always present and
+/// gives immediate feedback (haptic + navigation to the chat surface). The
+/// session rows reuse the drawer's ``DrawerSessionRow`` for visual parity.
+struct ProjectDetailView: View {
+    @Environment(\.hermesTheme) private var theme
+    @Environment(ThemeStore.self) private var themeStore
+    @Environment(SessionStore.self) private var sessions
+    @Environment(ProjectsStore.self) private var projectsStore
+
+    let project: Project
+
+    /// Invoked after a navigation action that should dismiss the drawer (row
+    /// open, new session). Injected by the drawer — closes the push-card in
+    /// compact layouts, a no-op on iPad.
+    var onNavigate: () -> Void = {}
+
+    /// Haptic trigger for the new-session action — bumped on each tap.
+    @State private var newSessionFeedbackTrigger = UUID()
+
+    /// Haptic trigger for session row taps.
+    @State private var rowTapFeedbackTrigger = UUID()
+
+    var body: some View {
+        List {
+            newSessionSection
+            sessionsSection
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(theme.listBg)
+        .navigationTitle(project.label)
+        .navigationBarTitleDisplayMode(.inline)
+        .hermesThemed(themeStore)
+    }
+
+    // MARK: - New session in this project
+
+    /// The primary action: a full-width button that starts a draft session
+    /// rooted at the project's repo. The draft materializes on first prompt
+    /// (``SessionStore/startDraft(cwd:)`` → ``createDraftSession()`` passes
+    /// the cwd to `session.create`). Immediate feedback: haptic + drawer
+    /// dismiss (the chat surface is revealed with a clean composer).
+    private var newSessionSection: some View {
+        Section {
+            Button {
+                newSessionFeedbackTrigger = UUID()
+                startNewSessionInProject()
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.title3)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("New Session")
+                            .font(.body.weight(.semibold))
+                        Text(project.root)
+                            .font(.caption2)
+                            .foregroundStyle(theme.mutedFg)
+                            .lineLimit(2)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .sensoryFeedback(.impact(weight: .medium), trigger: newSessionFeedbackTrigger)
+            .accessibilityIdentifier("projectDetailNewSession")
+            .accessibilityLabel("New session in \(project.label)")
+            .accessibilityHint("Start a new chat rooted at this project")
+        } header: {
+            Text("PROJECT")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(theme.mutedFg)
+                .textCase(nil)
+        }
+    }
+
+    // MARK: - Sessions
+
+    @ViewBuilder
+    private var sessionsSection: some View {
+        let projectSessions = projectsStore.sessions(for: project, in: sessions)
+
+        Section {
+            if sessions.isLoading && projectSessions.isEmpty {
+                // Loading state: the session list hasn't arrived yet. Skeleton
+                // rows match the drawer's cold-load pattern.
+                ForEach(0..<3, id: \.self) { _ in
+                    sessionSkeletonRow
+                }
+            } else if projectSessions.isEmpty {
+                // Designed empty state: no sessions yet. Helpful, not blank.
+                emptyStateRow
+            } else {
+                ForEach(projectSessions) { summary in
+                    sessionRow(summary)
+                }
+            }
+        } header: {
+            HStack(spacing: 6) {
+                Text("SESSIONS")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg)
+                Text("\(projectSessions.count)")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg.opacity(0.82))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(theme.muted.opacity(0.7), in: Capsule())
+                Spacer(minLength: 0)
+            }
+            .textCase(nil)
+        }
+    }
+
+    // MARK: - Session row
+
+    private func sessionRow(_ summary: SessionSummary) -> some View {
+        Button {
+            rowTapFeedbackTrigger = UUID()
+            sessions.open(summary) { onNavigate() }
+        } label: {
+            DrawerSessionRow(
+                summary: summary,
+                isSelected: summary.id == sessions.activeStoredId,
+                isLive: sessions.isLive(summary)
+            )
+        }
+        .buttonStyle(.plain)
+        .sensoryFeedback(.selection, trigger: rowTapFeedbackTrigger)
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+    }
+
+    // MARK: - Skeleton + empty states
+
+    private var sessionSkeletonRow: some View {
+        HStack(spacing: 10) {
+            Color.clear.frame(width: 8, height: 8)
+            VStack(alignment: .leading, spacing: 5) {
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(theme.mutedFg.opacity(0.18))
+                    .frame(width: 130, height: 10)
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(theme.mutedFg.opacity(0.11))
+                    .frame(width: 80, height: 8)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 7)
+        .padding(.horizontal, 10)
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+        .accessibilityHidden(true)
+    }
+
+    private var emptyStateRow: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "bubble.left")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(theme.mutedFg.opacity(0.75))
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("No sessions yet")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(theme.mutedFg)
+                Text("Start a new session above to begin working in this project.")
+                    .font(.caption2)
+                    .foregroundStyle(theme.mutedFg.opacity(0.82))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+    }
+
+    // MARK: - Actions
+
+    /// Start a new draft session rooted at the project's repo, then dismiss
+    /// the drawer so the chat surface is revealed with a clean composer.
+    private func startNewSessionInProject() {
+        sessions.startDraft(cwd: project.root)
+        onNavigate()
     }
 }

@@ -424,3 +424,155 @@ final class TurnInProgressCarryForwardTests: XCTestCase {
         )
     }
 }
+
+// MARK: - ABH-351 ProjectsStore tests (folded from ProjectsStoreTests.swift)
+
+import Testing
+
+/// ABH-351 — Projects model decoding + store state + session-filter tests.
+///
+/// These tests exercise the three things slice-2 owns:
+/// 1. The `Project` model decodes the slice-1 route's JSON contract
+///    (`{id, label, root, session_count}`) — including the snake_case key.
+/// 2. `ProjectsStore.normalizedPath` matches a session's cwd to a project's
+///    root (case-insensitive, trailing-slash-insensitive).
+/// 3. `ProjectsStore.sessions(for:in:)` correctly filters a session list to
+///    the ones whose cwd resolves to the project root.
+@MainActor
+struct ProjectsStoreTests {
+
+    // MARK: - Project model decoding
+
+    @Test("Project decodes the full route contract with snake_case session_count")
+    func decode_fullContract() throws {
+        let json = #"""
+        {
+            "id": "/Users/abbhinnav/Developer/products/hermes-mobile",
+            "label": "hermes-mobile",
+            "root": "/Users/abbhinnav/Developer/products/hermes-mobile",
+            "session_count": 5
+        }
+        """# .data(using: .utf8)!
+
+        let project = try JSONDecoder().decode(Project.self, from: json)
+        #expect(project.id == "/Users/abbhinnav/Developer/products/hermes-mobile")
+        #expect(project.label == "hermes-mobile")
+        #expect(project.root == "/Users/abbhinnav/Developer/products/hermes-mobile")
+        #expect(project.sessionCount == 5)
+    }
+
+    @Test("Project decodes a bare JSON array (route response shape)")
+    func decode_array() throws {
+        let json = #"""
+        [
+            {
+                "id": "/repo/a",
+                "label": "a",
+                "root": "/repo/a",
+                "session_count": 3
+            },
+            {
+                "id": "/repo/b",
+                "label": "b",
+                "root": "/repo/b",
+                "session_count": 0
+            }
+        ]
+        """# .data(using: .utf8)!
+
+        let projects = try JSONDecoder().decode([Project].self, from: json)
+        #expect(projects.count == 2)
+        #expect(projects[0].label == "a")
+        #expect(projects[1].sessionCount == 0)
+    }
+
+    // MARK: - normalizedPath
+
+    @Test("normalizedPath is case-insensitive and trailing-slash-insensitive")
+    func normalizedPath_matching() {
+        #expect(ProjectsStore.normalizedPath("/Users/foo/Repo") == "/users/foo/repo")
+        #expect(ProjectsStore.normalizedPath("/Users/foo/Repo/") == "/users/foo/repo")
+        #expect(ProjectsStore.normalizedPath("/Users/foo/Repo//") == "/users/foo/repo")
+        // whitespace trimmed
+        #expect(ProjectsStore.normalizedPath("  /Users/foo/Repo  ") == "/users/foo/repo")
+    }
+
+    @Test("normalizedPath returns empty for whitespace-only input")
+    func normalizedPath_empty() {
+        #expect(ProjectsStore.normalizedPath("") == "")
+        #expect(ProjectsStore.normalizedPath("   ") == "")
+        #expect(ProjectsStore.normalizedPath("\n") == "")
+    }
+
+    // MARK: - sessions(for:in:)
+
+    @Test("sessions(for:in:) filters sessions whose cwd matches project root")
+    func sessionFilter_matches() {
+        let store = ProjectsStore()
+        let project = Project(
+            id: "/repo/a",
+            label: "a",
+            root: "/Repo/A",
+            sessionCount: 2
+        )
+
+        let sessions = SessionStore()
+        sessions.sessions = [
+            SessionSummary.stub(id: "1", cwd: "/repo/a"),
+            SessionSummary.stub(id: "2", cwd: "/repo/a/"),
+            SessionSummary.stub(id: "3", cwd: "/repo/b"),
+            SessionSummary.stub(id: "4", cwd: nil),
+        ]
+
+        let result = store.sessions(for: project, in: sessions)
+        #expect(result.count == 2)
+        #expect(result.contains { $0.id == "1" })
+        #expect(result.contains { $0.id == "2" })
+    }
+
+    @Test("sessions(for:in:) returns empty when no cwds match")
+    func sessionFilter_noMatch() {
+        let store = ProjectsStore()
+        let project = Project(
+            id: "/repo/x",
+            label: "x",
+            root: "/repo/x",
+            sessionCount: 0
+        )
+
+        let sessions = SessionStore()
+        sessions.sessions = [
+            SessionSummary.stub(id: "1", cwd: "/repo/a"),
+            SessionSummary.stub(id: "2", cwd: nil),
+        ]
+
+        let result = store.sessions(for: project, in: sessions)
+        #expect(result.isEmpty)
+    }
+
+    // MARK: - Store initial state
+
+    @Test("ProjectsStore starts with nil projects, not loading, no error")
+    func initialStoreState() {
+        let store = ProjectsStore()
+        #expect(store.projects == nil)
+        #expect(store.isLoading == false)
+        #expect(store.loadError == nil)
+    }
+}
+
+/// Minimal stub for ProjectsStoreTests: id + optional cwd, everything else nil.
+extension SessionSummary {
+    static func stub(id: String, cwd: String?) -> SessionSummary {
+        SessionSummary(
+            id: id,
+            title: nil,
+            preview: nil,
+            startedAt: nil,
+            messageCount: nil,
+            source: nil,
+            lastActive: nil,
+            cwd: cwd
+        )
+    }
+}

@@ -13,6 +13,7 @@ final class AppEnvironment {
     let inboxStore: InboxStore
     let appLock: AppLock
     let themeStore: ThemeStore
+    let projectsStore: ProjectsStore
 
     init() {
         let sessionStore = SessionStore()
@@ -24,6 +25,7 @@ final class AppEnvironment {
         let inboxStore = InboxStore()
         let appLock = AppLock()
         let themeStore = ThemeStore()
+        let projectsStore = ProjectsStore()
         let connectionStore = ConnectionStore(
             sessionStore: sessionStore,
             chatStore: chatStore
@@ -31,6 +33,9 @@ final class AppEnvironment {
         // Stores need back-references for RPC access and cross-store flows.
         sessionStore.attach(connection: connectionStore, chat: chatStore)
         chatStore.attach(connection: connectionStore, sessions: sessionStore, attachments: attachmentStore)
+        // ABH-351: ProjectsStore needs REST access (the /projects route) —
+        // injected after ConnectionStore is built, same pattern as the others.
+        projectsStore.attach(connection: connectionStore)
         // Offline-first cache (P3): build the ONE CacheStore actor and inject it
         // behind the session/chat stores. Construction can throw (App Support
         // unavailable, migration failure); on failure we leave the cache `nil`,
@@ -112,6 +117,7 @@ final class AppEnvironment {
         self.appLock = appLock
         self.themeStore = themeStore
         self.connectionStore = connectionStore
+        self.projectsStore = projectsStore
 
         // Publish an initial widget snapshot from the current (pre-bootstrap)
         // state so the widgets render real data immediately rather than the

@@ -228,6 +228,15 @@ final class SessionStore {
     /// "New chat" without littering the session list with empty sessions.
     private(set) var isDraft: Bool = false
 
+    /// ABH-351 — the cwd a draft session should start in. Set by
+    /// ``startDraft(cwd:)`` (new-session-in-project) before the draft
+    /// materializes; consumed by ``createDraftSession()`` which passes it as
+    /// the `cwd` param to `session.create` (the gateway's session.create
+    /// accepts an optional `cwd` — see server.py:4987). `nil` = no explicit
+    /// cwd (the session lands in the gateway's default / launch directory,
+    /// exactly as before). Cleared on every ``startDraft()`` entry.
+    private(set) var draftCwd: String?
+
     // MARK: - Search
 
     /// Current search query bound to the list's `.searchable`. Empty when not
@@ -2110,7 +2119,7 @@ final class SessionStore {
     /// session is created lazily on the first prompt (see ``createDraftSession()``
     /// / `ChatStore.send`). This is what "New chat" and launch land on, so an
     /// abandoned draft never litters the session list with an empty session.
-    func startDraft() {
+    func startDraft(cwd: String? = nil) {
         // Supersede any in-flight `open()` so its resume can't reactivate, and any
         // on-demand re-resume so its result can't bind into this fresh draft.
         openToken = UUID()
@@ -2123,6 +2132,11 @@ final class SessionStore {
         // A draft has NO session: drop the previous session's hot-swap state
         // (else the pill shows the LAST chat's model) and any stale draft pick.
         connection?.clearSessionState()
+        // ABH-351: capture the cwd for the new-session-in-project flow. An
+        // explicit non-empty path seeds the draft so the materializing
+        // session.create carries it; nil/empty = the gateway default.
+        let trimmed = cwd?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        draftCwd = trimmed.isEmpty ? nil : trimmed
         lastError = nil
     }
 
@@ -2146,6 +2160,14 @@ final class SessionStore {
             // every dormant case) — byte-for-byte the shipped create.
             var createParams: [String: JSONValue] = ["cols": .number(96)]
             applyProfileScope(to: &createParams)
+            // ABH-351: new-session-in-project — pass the captured draft cwd so
+            // the session starts rooted at the project's repo (the gateway's
+            // session.create honors an optional `cwd` that, when it resolves to
+            // an existing directory, becomes the session's explicit workspace).
+            // See startDraft(cwd:) and server.py:4987.
+            if let cwd = draftCwd, !cwd.isEmpty {
+                createParams["cwd"] = .string(cwd)
+            }
             let result: SessionOpenResult = try await client.request(
                 "session.create",
                 params: .object(createParams),
@@ -3318,4 +3340,157 @@ struct SessionActionError: Identifiable, Equatable {
     let action: String
     /// Human-readable detail — the gateway error message where available.
     let message: String
+}
+
+// MARK: - Projects overview (ABH-351 SLICE 2)
+
+/// ABH-351 (SLICE 2) — read-only Projects browsing for the drawer's Projects tab.
+///
+/// Fetches the projects overview from the slice-1 REST route
+/// (`GET /api/plugins/hermes-mobile/projects`) — the merged user-created +
+/// auto-discovered git-repo-roots + session-cwds list, junk-filtered, reshaped
+/// to `{id, label, root, session_count}`. The store exposes the fetched list
+/// plus designed loading / empty / error states, and derives per-project
+/// sessions from ``SessionStore`` (a project's sessions are the ones whose
+/// `cwd` matches the project's `root`).
+///
+/// This slice is READ-ONLY browsing + session-start ONLY. Create-project /
+/// attach-folders / set-idea is a FAST-FOLLOW and lives outside this store.
+///
+/// The store is `@Observable` + `@MainActor`, mirroring the app's other store
+/// shape (``SessionStore``, ``ConnectionStore``). It owns NO back-references at
+/// construction time — ``attach(connection:)`` is called by ``AppEnvironment``
+/// after the store graph is built, exactly as the other stores are wired.
+@MainActor
+@Observable
+final class ProjectsStore {
+
+    // MARK: - Published state
+
+    /// The fetched projects overview (slice-1 route payload), or `nil` before
+    /// the first successful load completes. An empty array IS a valid loaded
+    /// state (no projects discovered) and renders a designed empty state, NOT
+    /// this `nil` placeholder.
+    private(set) var projects: [Project]?
+
+    /// `true` while a fetch is in flight. Drives the loading state.
+    private(set) var isLoading = false
+
+    /// A human-readable error message from the last failed fetch, or `nil`.
+    /// Renders a designed error state (never fakes 'ok'). Cleared on the next
+    /// successful fetch.
+    private(set) var loadError: String?
+
+    // MARK: - Back-reference (injected by AppEnvironment)
+
+    /// The connection store, for REST access. `nil` until
+    /// ``attach(connection:)`` is called by the composition root.
+    private var connection: ConnectionStore?
+
+    init() {}
+
+    /// Inject the connection store (REST access). Called once by
+    /// ``AppEnvironment`` after the store graph is built — mirrors the
+    /// attach-pattern the other stores use (``SessionStore/attach`` etc.).
+    func attach(connection: ConnectionStore) {
+        self.connection = connection
+    }
+
+    // MARK: - Fetch
+
+    /// Fetch the projects overview from the slice-1 REST route and update
+    /// ``projects`` / ``isLoading`` / ``loadError``.
+    ///
+    /// Safe to call repeatedly (drawer-open refresh, pull-to-refresh). A fetch
+    /// supersedes the prior error state. Never throws — failures land in
+    /// ``loadError`` and leave the last successful ``projects`` intact so the
+    /// UI doesn't flicker on a transient network blip.
+    func refresh() async {
+        guard let rest = connection?.rest else {
+            loadError = "Not connected"
+            return
+        }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            let data = try await rest.get(
+                path: "\(rest.mobileAPIPrefix)/projects"
+            )
+            // The route returns a bare JSON array (see test_projects_route.py);
+            // decode with default keys (no snake_case conversion needed — the
+            // keys are already lowercase with underscores).
+            let decoded = try JSONDecoder().decode(
+                [Project].self, from: data
+            )
+            projects = decoded
+            loadError = nil
+        } catch {
+            // Preserve the last successful list so the UI doesn't blank out
+            // on a transient failure — only surface the error when there is no
+            // cached data to show.
+            if projects == nil {
+                loadError = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+            }
+        }
+    }
+
+    // MARK: - Derived queries
+
+    /// The sessions belonging to a project: those whose `cwd` resolves to the
+    /// project's `root` (exact match on the trimmed path, case-insensitive,
+    /// trailing-slash-insensitive). Read from ``SessionStore/sessions`` so the
+    /// project detail list stays live as sessions arrive / refresh.
+    ///
+    /// Returns `[]` when the session list hasn't loaded yet (a designed
+    /// loading/empty state in the detail view, not a silent zero).
+    func sessions(for project: Project, in sessionStore: SessionStore) -> [SessionSummary] {
+        let root = Self.normalizedPath(project.root)
+        guard !root.isEmpty else { return [] }
+        return sessionStore.sessions.filter {
+            Self.normalizedPath($0.cwd ?? "") == root
+        }
+    }
+
+    /// Normalize a filesystem path for cwd matching: trimmed, trailing slashes
+    /// stripped, case-folded. Empty / whitespace-only → "" (never matches).
+    static func normalizedPath(_ path: String) -> String {
+        var value = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        while value.count > 1 && value.hasSuffix("/") { value.removeLast() }
+        return value.lowercased()
+    }
+}
+
+/// One entry in the projects overview (the slice-1 route's `{id, label, root,
+/// session_count}` contract).
+///
+/// `id` and `root` are both the repo root path (stable identity, matching how
+/// the desktop keys project entries). `session_count` is the number of sessions
+/// whose cwd resolved to that repo root (server-side count; the iOS client
+/// re-derives the live list from ``SessionStore`` for the detail view).
+struct Project: Decodable, Identifiable, Sendable, Equatable, Hashable {
+    let id: String
+    let label: String
+    let root: String
+    let sessionCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id, label, root
+        case sessionCount = "session_count"
+    }
+
+    init(id: String, label: String, root: String, sessionCount: Int) {
+        self.id = id
+        self.label = label
+        self.root = root
+        self.sessionCount = sessionCount
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.label = try c.decode(String.self, forKey: .label)
+        self.root = try c.decode(String.self, forKey: .root)
+        self.sessionCount = try c.decode(Int.self, forKey: .sessionCount)
+    }
 }

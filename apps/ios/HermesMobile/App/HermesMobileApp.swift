@@ -69,6 +69,7 @@ struct HermesMobileApp: App {
                 .environment(environment.inboxStore)
                 .environment(environment.appLock)
                 .environment(environment.themeStore)
+                .environment(environment.projectsStore)
                 // The deep-link pair-confirmation coordinator (L11). Owned at the
                 // app root, observed by RootView to present the destructive-repair
                 // confirmation. Not part of AppEnvironment — it is a view-layer
