@@ -1925,6 +1925,34 @@ final class SessionStore {
     /// superseded open (the user tapped another session) checks it and bails.
     private var openToken = UUID()
 
+    /// ABH-372 warm-switch cache: the already-normalized transcript snapshots
+    /// from sessions opened in this app process. The disk cache avoids a network
+    /// fetch, but a warm switch still paid SQLite decode + full `toChatMessages`
+    /// normalization before the first frame. Keeping the normalized rows lets a
+    /// re-open paint immediately, then reconcile with the authoritative delta/full
+    /// fetch in the background. Bounded by recent session id to avoid unbounded
+    /// transcript retention during long mobile sessions.
+    private var warmOpenSnapshots: [String: [ChatMessage]] = [:]
+    private var warmOpenSnapshotOrder: [String] = []
+    private static let warmOpenSnapshotLimit = 6
+
+    private func cachedWarmOpenSnapshot(for storedId: String) -> [ChatMessage]? {
+        warmOpenSnapshots[storedId]
+    }
+
+    private func rememberWarmOpenSnapshot(_ normalized: [ChatMessage], for storedId: String) {
+        warmOpenSnapshots[storedId] = normalized
+        warmOpenSnapshotOrder.removeAll { $0 == storedId }
+        warmOpenSnapshotOrder.append(storedId)
+        if warmOpenSnapshotOrder.count > Self.warmOpenSnapshotLimit {
+            let overflow = warmOpenSnapshotOrder.count - Self.warmOpenSnapshotLimit
+            for evicted in warmOpenSnapshotOrder.prefix(overflow) {
+                warmOpenSnapshots.removeValue(forKey: evicted)
+            }
+            warmOpenSnapshotOrder.removeFirst(overflow)
+        }
+    }
+
     #if DEBUG
     /// DEBUG-only handle to the most recent open-seed Task. Stored so tests can
     /// `await` it without depending on wall-clock `settle()`. Set by `open()`
@@ -3133,12 +3161,26 @@ final class SessionStore {
         let openClock = ContinuousClock.now
         #endif
 
-        // Phase 1 — cache paint (or reset on miss). The cron-only sessions are
-        // never transcript-cached (CacheStore guards the write), so this misses
-        // for them and the network fetch is the sole seed. No cache (tests/
-        // previews) ⇒ treated as a miss (reset), network-only path preserved.
+        // Phase 1 — warm memory paint, then disk cache paint (or reset on miss).
+        // ABH-372: if this process already opened the session, the normalized
+        // rows are the cheapest safe first frame. This bypasses both REST and
+        // the SQLite decode/normalize path; the authoritative fetch below still
+        // reconciles any tail/delta afterward.
         var paintedFromCache = false
-        if let cacheStore {
+        var paintedFromDisk = false
+        if openToken == token, let cached = cachedWarmOpenSnapshot(for: storedId) {
+            chat.seed(normalized: cached)
+            paintedFromCache = true
+            #if DEBUG
+            Self.logOpenLatency(
+                phase: "memory-paint(HIT)", storedId: storedId, since: openClock)
+            #endif
+        }
+        // The cron-only sessions are never transcript-cached (CacheStore guards
+        // the write), so this misses for them and the network fetch is the sole
+        // seed. No cache (tests/previews) ⇒ treated as a miss (reset),
+        // network-only path preserved.
+        if !paintedFromCache, let cacheStore {
             // `touchSession` bumps `lastAccessedAt` so an actively-opened session
             // never ages out of the eviction horizon.
             try? await cacheStore.touchSession(storedId)
@@ -3151,8 +3193,10 @@ final class SessionStore {
                 // only for the in-place reconcile (the FIRST painted frame).
                 let normalized = await Self.normalizeOffMain(cached)
                 guard openToken == token else { return }
+                rememberWarmOpenSnapshot(normalized, for: storedId)
                 chat.seed(normalized: normalized)  // in-place reconcile — FIRST frame
                 paintedFromCache = true
+                paintedFromDisk = true
             }
         }
         if !paintedFromCache, openToken == token {
@@ -3174,15 +3218,14 @@ final class SessionStore {
         // Phase 2 — authoritative network seed, reconciled in place.
         guard let fetch = resolvedTranscriptFetch else { return }
         do {
-            // ARCH37 STEP 3 — skip the redundant network seed when the cache copy
-            // is FRESH. A fresh cache paint is the ONLY seed on open; the existing
-            // reconnect/foreground `backfill()` reconciles any later drift. This
-            // halves the open-time normalize cost AND removes the second async
-            // @Observable write the scroll machinery used to race against (the
-            // double-seed mid-conversation-landing window). Staleness is proven
-            // against the session's `lastActive`; a nil `lastActive` is treated as
-            // STALE (Step 3 / CacheStore change), so "fresh" is never over-broad.
-            if paintedFromCache, let cacheStore,
+            // ARCH37 STEP 3 — skip the redundant network seed only when the SAME
+            // DISK copy we just painted is FRESH. A memory snapshot is an instant
+            // first frame only; disk can advance independently via backfill/prefetch,
+            // so memory paints must still run the authoritative fetch and reconcile.
+            // Staleness is proven against the session's `lastActive`; a nil
+            // `lastActive` is treated as STALE (Step 3 / CacheStore change), so
+            // "fresh" is never over-broad.
+            if paintedFromDisk, let cacheStore,
                let lastActive = sessions.first(where: { $0.id == storedId })?.lastActive,
                (try? await cacheStore.transcriptIsFresh(storedId, lastActive: lastActive)) == true {
                 guard openToken == token else { return }
@@ -3199,6 +3242,7 @@ final class SessionStore {
             // a fresh openToken re-check (a superseded open's normalize is dropped).
             let normalized = await Self.normalizeOffMain(stored)
             guard openToken == token else { return }  // superseded during normalize
+            rememberWarmOpenSnapshot(normalized, for: storedId)
             chat.seed(normalized: normalized)
             #if DEBUG
             Self.logOpenLatency(
@@ -3253,6 +3297,7 @@ final class SessionStore {
                openToken == token {
                 let normalized = await Self.normalizeOffMain(cached)
                 guard openToken == token else { return }
+                rememberWarmOpenSnapshot(normalized, for: storedId)
                 chat.seed(normalized: normalized)
             }
         }
@@ -3262,6 +3307,7 @@ final class SessionStore {
             guard openToken == token else { return }  // superseded (R1 #28/#43)
             let normalized = await Self.normalizeOffMain(stored)
             guard openToken == token else { return }  // superseded during normalize
+            rememberWarmOpenSnapshot(normalized, for: storedId)
             chat.seed(normalized: normalized)
             if let cacheStore {
                 Task { try? await cacheStore.saveTranscript(sessionId: storedId, messages: stored) }

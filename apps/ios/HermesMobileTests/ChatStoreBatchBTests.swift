@@ -1,4 +1,5 @@
 import XCTest
+import GRDB
 @testable import HermesMobile
 
 /// ABH-47 (R1 Batch B) — ChatStore streaming-ownership and backfill races.
@@ -22,6 +23,7 @@ final class ChatStoreBatchBTests: XCTestCase {
     /// Build a wired ChatStore whose active session points at `activeRuntime` /
     /// `storedId`, with an injectable backfill fetch.
     private func makeStore(
+        cache: CacheStore? = nil,
         backfill: @escaping (String) async throws -> [StoredMessage] = { _ in [] }
     ) -> (ChatStore, SessionStore) {
         let chat = ChatStore()
@@ -30,10 +32,23 @@ final class ChatStoreBatchBTests: XCTestCase {
         let attachments = AttachmentStore()
         chat.attach(connection: connection, sessions: sessions, attachments: attachments)
         sessions.attach(connection: connection, chat: chat)
+        if let cache {
+            chat.attachCache(cache)
+            sessions.attachCache(cache)
+        }
         sessions.activeRuntimeId = activeRuntime
         sessions.activeStoredId = storedId
         chat.backfillFetch = backfill
         return (chat, sessions)
+    }
+
+    private func makeInMemoryCache() throws -> CacheStore {
+        var config = Configuration()
+        config.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+        }
+        let queue = try DatabaseQueue(configuration: config)
+        return try CacheStore(testDB: queue)
     }
 
     private func frame(
@@ -58,10 +73,38 @@ final class ChatStoreBatchBTests: XCTestCase {
         ]))!
     }
 
-    private func summary(_ id: String) -> SessionSummary {
+    private func liveSizedTranscript(count: Int = 900) -> [StoredMessage] {
+        (0..<count).map { index in
+            let role = index.isMultiple(of: 2) ? "user" : "assistant"
+            let body = role == "assistant"
+                ? String(repeating: "Assistant row \(index) with **markdown**, `code`, and enough prose to model a live transcript. ", count: 8)
+                : "User row \(index): switch latency measurement prompt."
+            return storedMessage(role: role, text: body)
+        }
+    }
+
+    private func elapsedMs(_ operation: () async -> Void) async -> Double {
+        let start = ContinuousClock.now
+        await operation()
+        let duration = ContinuousClock.now - start
+        let components = duration.components
+        return Double(components.seconds) * 1000
+            + Double(components.attoseconds) / 1_000_000_000_000_000
+    }
+
+    private func elapsedMsSync(_ operation: () -> Void) -> Double {
+        let start = ContinuousClock.now
+        operation()
+        let duration = ContinuousClock.now - start
+        let components = duration.components
+        return Double(components.seconds) * 1000
+            + Double(components.attoseconds) / 1_000_000_000_000_000
+    }
+
+    private func summary(_ id: String, lastActive: Double? = nil) -> SessionSummary {
         SessionSummary(
             id: id, title: nil, preview: nil, startedAt: nil,
-            messageCount: nil, source: nil, lastActive: nil, cwd: nil
+            messageCount: nil, source: nil, lastActive: lastActive, cwd: nil
         )
     }
 
@@ -458,7 +501,117 @@ final class ChatStoreBatchBTests: XCTestCase {
                        "A's stale fetch must not seed over B's transcript")
     }
 
+    /// ABH-372: a session that was already opened once in this app process must
+    /// repaint from the in-memory normalized snapshot immediately on a warm
+    /// switch, before the authoritative delta/full fetch returns. The previous
+    /// path had only the SQLite/REST seed: a warm re-open with a slow fetch reset
+    /// to an empty transcript until the fetch completed, which made switching feel
+    /// laggy even though the exact rendered transcript had just been on screen.
+    func testWarmReopenPaintsCachedSnapshotBeforeSlowFetchReturns() async throws {
+        let cache = try makeInMemoryCache()
+        let (chat, sessions) = makeStore(cache: cache)
+        let sessionB = summary("stored-B", lastActive: 1)
+        let sessionA = summary("stored-A", lastActive: 1)
+        sessions.sessions = [sessionB, sessionA]
+        try await cache.saveSessionList(
+            [sessionB, sessionA],
+            scope: CacheScope(serverId: "unit-test-gateway", profileId: DefaultsKeys.allProfilesScope)
+        )
+
+        // First open B: the network seed lands and should become the warm-open
+        // snapshot for this process.
+        sessions.transcriptFetch = { sid in
+            [self.storedMessage(role: "assistant", text: "SNAPSHOT \(sid.suffix(1))")]
+        }
+        sessions.open(summary("stored-B"))
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
+        await settle()
+        #endif
+        XCTAssertEqual(chat.messages.map(\.text), ["SNAPSHOT B"])
+
+        // Simulate the real stale-snapshot hole: a background reconcile/prefetch
+        // advances the disk cache after the in-memory normalized snapshot was
+        // captured. The warm re-open below must paint the memory snapshot instantly
+        // but MUST NOT use this fresh disk proof to skip the authoritative fetch.
+        await settle()
+        try await cache.saveTranscript(
+            sessionId: "stored-B",
+            messages: [storedMessage(role: "assistant", text: "DISK ADVANCED B")]
+        )
+
+        // Switch away so the next B tap is a real session switch, not a no-op.
+        sessions.open(summary("stored-A"))
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
+        await settle()
+        #endif
+        XCTAssertEqual(chat.messages.map(\.text), ["SNAPSHOT A"])
+
+        let fetchStarted = expectation(description: "warm-open fetch started")
+        let gate = Gate()
+        sessions.transcriptFetch = { sid in
+            if sid == "stored-B" {
+                fetchStarted.fulfill()
+                await gate.wait()
+                return [self.storedMessage(role: "assistant", text: "NETWORK B")]
+            }
+            return [self.storedMessage(role: "assistant", text: "NETWORK \(sid.suffix(1))")]
+        }
+
+        sessions.open(summary("stored-B"))
+        await fulfillment(of: [fetchStarted], timeout: 1.0)
+
+        XCTAssertEqual(
+            chat.messages.map(\.text), ["SNAPSHOT B"],
+            "warm switch must paint the last normalized snapshot before waiting on REST/delta")
+
+        gate.release()
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
+        await settle()
+        #endif
+        XCTAssertEqual(chat.messages.map(\.text), ["NETWORK B"])
+    }
+
+    /// Diagnostic benchmark for ABH-372. It measures the old warm-open dominant
+    /// term (normalize a live-sized cached transcript, then seed) against the new
+    /// in-memory snapshot paint (seed an already-normalized transcript). The exact
+    /// thresholds are intentionally loose; the printed ABH372_METRIC lines are the
+    /// evidence artifact, while the assertion protects the invariant that the
+    /// snapshot path stays materially cheaper than the old first-render gate.
+    func testWarmSwitchSnapshotBenchmarkBeatsNormalizePath() async {
+        let stored = liveSizedTranscript(count: 900)
+        let (chat, _) = makeStore()
+
+        var normalized: [ChatMessage] = []
+        let normalizeMs = await elapsedMs {
+            normalized = await SessionStore.normalizeOffMain(stored)
+        }
+        let oldSeedMs = elapsedMsSync {
+            chat.seed(normalized: normalized)
+        }
+        let oldPathMs = normalizeMs + oldSeedMs
+        let snapshotSeedMs = elapsedMsSync {
+            chat.seed(normalized: normalized)
+        }
+
+        print(String(format: "ABH372_METRIC client_old_normalize_ms=%.2f", normalizeMs))
+        print(String(format: "ABH372_METRIC client_old_seed_ms=%.2f", oldSeedMs))
+        print(String(format: "ABH372_METRIC client_old_total_ms=%.2f", oldPathMs))
+        print(String(format: "ABH372_METRIC client_after_snapshot_seed_ms=%.2f", snapshotSeedMs))
+
+        XCTAssertLessThan(
+            snapshotSeedMs,
+            oldPathMs * 0.50,
+            "warm snapshot paint must avoid the live-sized normalize gate on first render")
+    }
+
     // MARK: - #79: failed open()-path seed surfaces a recoverable error
+
 
     func testSeedTranscriptFailureSurfacesRecoverableError() async {
         let (chat, sessions) = makeStore()
