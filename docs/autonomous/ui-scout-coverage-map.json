@@ -1,0 +1,13 @@
+{
+  "_contract": "ui-scout picks the lens+area with the oldest last_audited. Lenses: functionality, stress, permutations (design activates after taste calibration — Abhi reviews first week of filings). Update last_audited + note after each run, commit.",
+  "areas": [
+    {"area": "drawer-session-list", "lens_last": {"functionality": null, "stress": null, "permutations": null}, "note": "highest-churn surface; ABH-343/345/346 in flight — expect movement"},
+    {"area": "chat-transcript", "lens_last": {"functionality": null, "stress": null, "permutations": null}, "note": "ABH-357/358/359/360 overhaul in flight"},
+    {"area": "composer-input", "lens_last": {"functionality": null, "stress": null, "permutations": null}, "note": "typing, dictation button, model picker, send/steer"},
+    {"area": "settings-gateway", "lens_last": {"functionality": null, "stress": null, "permutations": null}, "note": "connection modes, push settings (relay=parked infra: re-spec toward direct APNs), devices"},
+    {"area": "projects-tab", "lens_last": {"functionality": "2026-07-03", "stress": null, "permutations": null}, "note": "GATE-0 smoke found the 404 (ABH-350 in flight) — re-audit after it ships"},
+    {"area": "inbox-approvals", "lens_last": {"functionality": null, "stress": null, "permutations": null}, "note": "approval cards, clarify banners"},
+    {"area": "widgets-live-activity", "lens_last": {"functionality": null, "stress": null, "permutations": null}, "note": "ABH-361 zombie-LA fix in flight; LA needs on-device checks — sim coverage partial"},
+    {"area": "onboarding-pairing", "lens_last": {"functionality": null, "stress": null, "permutations": null}, "note": "fresh-install path; use --fresh-state"}
+  ]
+}

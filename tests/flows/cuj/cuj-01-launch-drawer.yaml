@@ -1,0 +1,15 @@
+# cuj-01 — Cold launch reaches the chat surface and the drawer opens
+# CUJ-CATALOG: the most basic journey — app launches, composer renders,
+# the drawer opens and shows the session list. If this fails, nothing else matters.
+# Run: scripts/ui-test.sh cuj/cuj-01-launch-drawer.yaml
+# NOTE: asserts use display text until the accessibility-id pass lands (ABH: ui-ids).
+appId: ai.hermes.app
+---
+- launchApp
+- assertVisible: "Message Hermes…"
+- takeScreenshot: launch-home
+- tapOn: "Open menu"
+- assertVisible: "Sessions"
+- assertVisible: "Projects"
+- assertVisible: "Inbox"
+- takeScreenshot: drawer-open
