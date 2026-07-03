@@ -81,13 +81,32 @@ final class SessionStore {
     /// limit until it has added this many visible rows OR the server is exhausted.
     static let loadMorePageVisibleTarget: Int = 30
 
-    /// Sources excluded from the human-chat Recents list (drawer bifurcation).
-    /// Automation RUNS (`source == "cron"`) and agent-internal child sessions
-    /// (`source == "subagent"`) do not belong in the human chat picker — so the
-    /// server filters them via `exclude_sources` and the client never fetches OR
-    /// caches them on fresh pages (no more autonomous-loop-dense windows / cache
-    /// bloat). The automation-runs surface fetches `source: "cron"` separately.
+    /// Sources excluded server-side from the human-chat Recents list (drawer
+    /// bifurcation). Automation RUNS (`source == "cron"`) and agent-internal
+    /// child sessions (`source == "subagent"`) do not belong in the human chat
+    /// picker — so fresh REST pages ask the gateway to omit them via
+    /// `exclude_sources` before the client caches them. The automation-runs
+    /// surface fetches `source: "cron"` separately.
     nonisolated static let recentsExcludeSources = ["cron", "subagent"]
+
+    /// Client-side machinery-source gate for Recents. Kept separate from
+    /// ``recentsExcludeSources`` so the server query stays the stable
+    /// channel-filter surface while the local ABH-343 predicate can reject newer
+    /// future-tagged machinery rows (`agent`) even on old gateways.
+    nonisolated private static let recentsMachinerySources = ["cron", "subagent", "agent"]
+
+    /// Conservative title fragments that identify loop/review/kanban machinery,
+    /// not user-authored human chats. These are intentionally narrow: ABH-343 is
+    /// about keeping generated loop sessions out of Recents without hiding a real
+    /// CLI conversation just because it came from the CLI channel.
+    nonisolated private static let recentsMachineryTitleFragments = [
+        "review approval",
+        "kanban task",
+        "loop:",
+        "scout-",
+        "verify:",
+        "review:",
+    ]
 
     /// Latches `true` ONLY when the initial fill has *successfully completed* —
     /// the target was met OR the server was proven exhausted. An aborted /
@@ -783,11 +802,12 @@ final class SessionStore {
     var visibleSessions: [SessionSummary] {
         var rows = sessions
         // Recents is human-chat-only BY CONSTRUCTION (drawer bifurcation):
-        // automation runs (cron), agent-internal subagent sessions, and true-empty
-        // scaffolds never become tappable chat history. Fresh REST pages also ask
-        // the server for `exclude_sources=cron,subagent&min_messages=1`; this
-        // client-side gate guarantees the invariant for old gateways, WS fallback,
-        // and stale cache rows.
+        // automation runs (cron), agent-internal subagent/agent sessions,
+        // generated loop/review/kanban machinery, and true-empty scaffolds never
+        // become tappable chat history. Fresh REST pages also ask the server for
+        // `exclude_sources=cron,subagent&min_messages=1`; this client-side gate
+        // guarantees the stronger ABH-343 human-vs-machinery invariant for old
+        // gateways, WS fallback, cli-source loop rows, and stale cache rows.
         rows = rows.filter(Self.isHumanRecentsSession)
         rows = Self.filterByProfile(rows, scope: activeProfile, multiAvailable: isMultiProfileAvailable)
         // Client-side re-sort by lastActive DESC, falling back to startedAt.
@@ -801,11 +821,19 @@ final class SessionStore {
         return rows
     }
 
-    /// Pure Recents eligibility gate. `messageCount == 0` is a known-empty
-    /// scaffold and not pickable; `nil` is kept because older gateway/RPC payloads
-    /// may omit the count even for real conversations.
+    /// Pure Recents eligibility gate (ABH-343). The drawer is a human-chat
+    /// picker, not a channel picker: generated loop/kanban/review machinery may
+    /// arrive as `source == "cli"`, so source-only filtering was insufficient.
+    /// `messageCount == 0` is a known-empty scaffold and not pickable; `nil` is
+    /// kept because older gateway/RPC payloads may omit the count even for real
+    /// conversations.
     nonisolated static func isHumanRecentsSession(_ row: SessionSummary) -> Bool {
-        isHumanRecentsSession(source: row.source, messageCount: row.messageCount)
+        isHumanRecentsSession(
+            source: row.source,
+            title: row.title,
+            cwd: row.cwd,
+            messageCount: row.messageCount
+        )
     }
 
     /// Source/count overload for cache rows that have not decoded the full
@@ -813,9 +841,34 @@ final class SessionStore {
     /// transcript cache, and the drawer cannot drift on autonomous-source or
     /// empty-session eligibility.
     nonisolated static func isHumanRecentsSession(source: String?, messageCount: Int?) -> Bool {
+        isHumanRecentsSession(source: source, title: nil, cwd: nil, messageCount: messageCount)
+    }
+
+    /// Full Recents predicate for REST/RPC rows with title + workspace metadata.
+    /// The title/cwd checks are deliberately conservative and only catch
+    /// unambiguous loop machinery; ordinary CLI conversations remain eligible.
+    nonisolated static func isHumanRecentsSession(
+        source: String?,
+        title: String?,
+        cwd: String?,
+        messageCount: Int?
+    ) -> Bool {
         if let count = messageCount, count == 0 { return false }
         let source = (source ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return !recentsExcludeSources.contains(source)
+        if recentsMachinerySources.contains(source) { return false }
+
+        let title = (title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if title.hasPrefix("loop plan") { return false }
+        if recentsMachineryTitleFragments.contains(where: { title.contains($0) }) {
+            return false
+        }
+
+        let cwd = (cwd ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if cwd.contains("/.worktrees/") || cwd.contains("/kanban/boards/") {
+            return false
+        }
+
+        return true
     }
 
     /// Pure profile-scope filter applied by ``visibleSessions``. DORMANT unless

@@ -25,17 +25,20 @@ final class UX1DrawerFeedTests: XCTestCase {
         id: String,
         lastActive: Double? = nil,
         startedAt: Double? = nil,
-        source: String? = nil
+        source: String? = nil,
+        title: String? = nil,
+        cwd: String? = nil,
+        messageCount: Int? = nil
     ) -> SessionSummary {
         SessionSummary(
             id: id,
-            title: id,
+            title: title ?? id,
             preview: nil,
             startedAt: startedAt,
-            messageCount: nil,
+            messageCount: messageCount,
             source: source,
             lastActive: lastActive,
-            cwd: nil
+            cwd: cwd
         )
     }
 
@@ -255,6 +258,64 @@ final class UX1DrawerFeedTests: XCTestCase {
         XCTAssertEqual(store.filteredCount, 2)
         XCTAssertEqual(store.filteredCount, store.visibleSessions.count)
         store.hideCron = false
+    }
+
+    /// ABH-343: cli-source loop/kanban/review machinery is not human Recents,
+    /// even though the transport source is `cli`. Cron remains absent from
+    /// Recents but still belongs to the separate Automation Runs route, which
+    /// selects `source == "cron"` independently of this drawer predicate.
+    func testHumanRecentsExcludeCliSourceLoopMachinery() async {
+        let store = makeStore()
+
+        let loopPlan = makeSummary(
+            id: "loopPlan",
+            lastActive: 500,
+            source: "cli",
+            title: "Loop Plan #39",
+            messageCount: 6
+        )
+        let reviewApproval = makeSummary(
+            id: "reviewApproval",
+            lastActive: 400,
+            source: "cli",
+            title: "Dead code removal review approval",
+            messageCount: 6
+        )
+        let worktreeRow = makeSummary(
+            id: "worktree",
+            lastActive: 300,
+            source: "cli",
+            title: "ordinary-looking machinery title",
+            cwd: "/Users/abhi/Developer/products/hermes-mobile/.worktrees/abh343-drawer-machinery",
+            messageCount: 6
+        )
+        let humanChat = makeSummary(
+            id: "human",
+            lastActive: 200,
+            source: "app",
+            title: "What should I focus on today?",
+            messageCount: 6
+        )
+        let cronRun = makeSummary(
+            id: "cronRun",
+            lastActive: 100,
+            source: "cron",
+            title: "Nightly briefing",
+            messageCount: 6
+        )
+        let rows = [loopPlan, reviewApproval, worktreeRow, humanChat, cronRun]
+        store.sessionsFetch = { (rows, rows.count) }
+
+        await store.refresh()
+
+        XCTAssertEqual(store.visibleSessions.map(\.id), ["human"],
+            "Recents must keep only real human chats: cli loop plans, review approvals, loop worktrees, and cron runs are machinery")
+        XCTAssertFalse(SessionStore.isHumanRecentsSession(source: "agent", messageCount: 6),
+            "future-tagged agent machinery must also be excluded from human Recents")
+
+        let automationRuns = rows.filter { ($0.source ?? "").lowercased() == "cron" }
+        XCTAssertEqual(automationRuns.map(\.id), ["cronRun"],
+            "The separate Automations route still finds cron rows by source == cron")
     }
 
     /// `filteredCount` is always `<= loadedCount` (filters can only reduce, not expand).
