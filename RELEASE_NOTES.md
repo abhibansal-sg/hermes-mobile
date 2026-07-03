@@ -1,3 +1,24 @@
+Build 64 — "Malacca" — 2026-07-03
+RELIABILITY
+
+FIXED
+- Load cron delivery targets from gateway
+- Remove dead HermesWidgetLink.capture factory (ABH-271) (ABH-271)
+- Tint settings destructive swipe labels
+- Label iPad keyboard shortcut HUD actions
+
+IMPROVED
+- Pinch-to-zoom + full-screen image viewer on iOS (ABH-242)
+
+WORTH TRYING
+- Try: Load cron delivery targets from gateway
+- Try: Remove dead HermesWidgetLink.capture factory (ABH-271) (ABH-271)
+- Try: Tint settings destructive swipe labels
+
+(+4 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 60 — "Malacca" — 2026-07-03
 RELIABILITY
 
