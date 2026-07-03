@@ -224,6 +224,7 @@ struct ProviderListView: View {
                     pendingDisconnect = provider
                 } label: {
                     Label("Disconnect", systemImage: "trash")
+                        .foregroundStyle(theme.destructive)
                 }
                 .disabled(disconnectingSlug != nil)
                 .accessibilityIdentifier("providerDisconnect-\(provider.slug)")

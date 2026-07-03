@@ -192,6 +192,7 @@ struct DevicesView: View {
                     current ? "Revoke (this device)" : "Revoke",
                     systemImage: "trash"
                 )
+                .foregroundStyle(theme.destructive)
             }
             .disabled(revokingId != nil)
             .accessibilityIdentifier("devicesRevoke-\(device.deviceId)")
