@@ -209,11 +209,18 @@ private struct SplitLayout: View {
     @Environment(SpeechPlayer.self) private var speechPlayer
     @Environment(ConnectionStore.self) private var connection
     @Environment(InboxStore.self) private var inbox
+    @Environment(AppLock.self) private var appLock
     @Environment(ThemeStore.self) private var themeStore
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     /// Drives the optional inspector column (the approval inbox). Starts hidden;
     /// toggled from the detail toolbar.
     @State private var showingInspector = false
+
+    /// Presents Settings from the iPad hardware-keyboard layer (⌘,). The sidebar
+    /// avatar still owns the visible Settings affordance; this is the keyboard-only
+    /// parity entry point at the split-view root.
+    @State private var showingSettings = false
 
     /// Which inspector tab is shown (F4A-A2): the approval inbox or the subagent
     /// delegation tree. The tab picker only appears when subagent activity exists.
@@ -253,6 +260,15 @@ private struct SplitLayout: View {
         // SwiftUI does not reliably inherit custom environment values across
         // presentation/column boundaries. PRESERVED.
         .hermesThemed(themeStore)
+        .sheet(isPresented: $showingSettings) {
+            SettingsView(
+                connectionStore: connection,
+                sessionStore: sessions,
+                appLock: appLock
+            )
+            .presentationDragIndicator(.hidden)
+            .hermesThemed(themeStore)
+        }
     }
 
     // MARK: Detail column
@@ -393,21 +409,49 @@ private struct SplitLayout: View {
     /// available regardless of which column currently holds visible focus.
     private var keyboardShortcutLayer: some View {
         ZStack {
-            Button {
-                newChat()
-            } label: { EmptyView() }
-            .keyboardShortcut("n", modifiers: .command)
+            if RootKeyboardShortcutActions.isEnabledForHardwareShortcuts(horizontalSizeClass: horizontalSizeClass) {
+                Button {
+                    newChat()
+                } label: { EmptyView() }
+                .keyboardShortcut("n", modifiers: .command)
 
-            Button {
-                searchFocusRequested = true
-            } label: { EmptyView() }
-            .keyboardShortcut("f", modifiers: .command)
+                Button {
+                    searchFocusRequested = true
+                } label: { EmptyView() }
+                .keyboardShortcut("f", modifiers: .command)
 
-            Button {
-                interrupt()
-            } label: { EmptyView() }
-            .keyboardShortcut(".", modifiers: .command)
-            .disabled(!chat.isStreaming)
+                Button {
+                    interrupt()
+                } label: { EmptyView() }
+                .keyboardShortcut(".", modifiers: .command)
+                .disabled(!chat.isStreaming)
+
+                Button {
+                    sendCurrentComposerDraft()
+                } label: { EmptyView() }
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(!RootKeyboardShortcutActions.hasSendableComposerText(sessions: sessions))
+
+                Button {
+                    openSettings()
+                } label: { EmptyView() }
+                .keyboardShortcut(",", modifiers: .command)
+
+                Button {
+                    navigateBack()
+                } label: { EmptyView() }
+                .keyboardShortcut("[", modifiers: .command)
+
+                Button {
+                    navigateForward()
+                } label: { EmptyView() }
+                .keyboardShortcut("]", modifiers: .command)
+
+                Button {
+                    toggleAppearanceDarkMode()
+                } label: { EmptyView() }
+                .keyboardShortcut("d", modifiers: .command)
+            }
         }
         .frame(width: 0, height: 0)
         .accessibilityHidden(true)
@@ -417,9 +461,89 @@ private struct SplitLayout: View {
         sessions.startDraft()
     }
 
+    private func sendCurrentComposerDraft() {
+        RootKeyboardShortcutActions.sendCurrentComposerDraft(from: sessions) { text in
+            Task { await chat.send(text: text, includeAttachments: false) }
+        }
+    }
+
+    private func openSettings() {
+        RootKeyboardShortcutActions.openSettings(isPresented: $showingSettings)
+    }
+
+    private func navigateBack() {
+        RootKeyboardShortcutActions.navigateBack()
+    }
+
+    private func navigateForward() {
+        RootKeyboardShortcutActions.navigateForward()
+    }
+
+    private func toggleAppearanceDarkMode() {
+        RootKeyboardShortcutActions.toggleAppearanceDarkMode(themeStore: themeStore)
+    }
+
     private func interrupt() {
         guard chat.isStreaming else { return }
         Task { await chat.interrupt() }
+    }
+}
+
+// MARK: - iPad hardware-keyboard action seams
+
+/// Testable action seams for ``SplitLayout``'s hidden hardware-keyboard buttons.
+/// The actions are intentionally tiny and safe: shortcuts are regular-width only,
+/// absent navigation targets no-op, and sending refuses empty/whitespace drafts.
+@MainActor
+enum RootKeyboardShortcutActions {
+    static func isEnabledForHardwareShortcuts(horizontalSizeClass: UserInterfaceSizeClass?) -> Bool {
+        horizontalSizeClass == .regular
+    }
+
+    static func hasSendableComposerText(sessions: SessionStore) -> Bool {
+        !sessions.composerDraft(for: sessions.activeComposerDraftKey)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+    }
+
+    @discardableResult
+    static func sendCurrentComposerDraft(
+        from sessions: SessionStore,
+        send: @escaping @MainActor (String) -> Void
+    ) -> Bool {
+        let key = sessions.activeComposerDraftKey
+        let text = sessions.composerDraft(for: key)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return false }
+
+        sessions.setComposerDraft("", for: key)
+        send(text)
+        return true
+    }
+
+    static func openSettings(isPresented: Binding<Bool>) {
+        isPresented.wrappedValue = true
+    }
+
+    @discardableResult
+    static func navigateBack() -> Bool {
+        // The split-view detail currently owns no root-level NavigationPath. Keep
+        // ⌘[ wired as a safe no-op until a detail navigation target is introduced.
+        false
+    }
+
+    @discardableResult
+    static func navigateForward() -> Bool {
+        // Symmetric safe no-op for ⌘] while there is no forward stack to traverse.
+        false
+    }
+
+    static func toggleAppearanceDarkMode(themeStore: ThemeStore) {
+        if themeStore.forcedColorScheme == .dark {
+            themeStore.select(HermesThemePresets.defaultName)
+        } else {
+            themeStore.select("midnight")
+        }
     }
 }
 
