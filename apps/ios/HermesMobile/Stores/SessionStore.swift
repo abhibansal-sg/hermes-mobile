@@ -1253,7 +1253,16 @@ final class SessionStore {
     private var resolvedPrefetchFetch: (@Sendable (String) async throws -> [StoredMessage])? {
         if let prefetchFetch { return prefetchFetch }
         guard let rest = connection?.rest else { return nil }
-        return { sessionId in try await rest.messages(sessionId: sessionId) }
+        return { sessionId in
+            if let page = await fetchTranscriptPage(
+                rest: rest,
+                sessionId: sessionId,
+                limit: ChatStore.transcriptOpenWindowLimit
+            ) {
+                return page.messages
+            }
+            return try await rest.messages(sessionId: sessionId)
+        }
     }
 
     /// Cancel any in-flight prefetch sweep (WhatsApp bar). Called on disconnect /
@@ -3241,7 +3250,7 @@ final class SessionStore {
         var paintedFromCache = false
         var paintedFromDisk = false
         if openToken == token, let cached = cachedWarmOpenSnapshot(for: storedId) {
-            chat.seed(normalized: cached)
+            chat.seed(normalized: Array(cached.suffix(ChatStore.transcriptOpenWindowLimit)))
             paintedFromCache = true
             #if DEBUG
             Self.logOpenLatency(
@@ -3263,10 +3272,12 @@ final class SessionStore {
                openToken == token {          // re-check after every await
                 // ARCH37 STEP 2 — normalize the cached rows OFF main, hop to main
                 // only for the in-place reconcile (the FIRST painted frame).
-                let normalized = await Self.normalizeOffMain(cached)
+                let cachedWindow = Array(cached.suffix(ChatStore.transcriptOpenWindowLimit))
+                let normalized = await Self.normalizeOffMain(cachedWindow)
                 guard openToken == token else { return }
                 rememberWarmOpenSnapshot(normalized, for: storedId)
                 chat.seed(normalized: normalized)  // in-place reconcile — FIRST frame
+                chat.noteTranscriptSeedWindow(cachedWindow)
                 paintedFromCache = true
                 paintedFromDisk = true
             }
@@ -3316,6 +3327,7 @@ final class SessionStore {
             guard openToken == token else { return }  // superseded during normalize
             rememberWarmOpenSnapshot(normalized, for: storedId)
             chat.seed(normalized: normalized)
+            chat.noteTranscriptSeedWindow(stored)
             #if DEBUG
             Self.logOpenLatency(
                 phase: "network-painted", storedId: storedId, since: openClock)
@@ -3367,10 +3379,12 @@ final class SessionStore {
                openToken == token,
                let cached = try? await cacheStore.loadTranscript(storedId),
                openToken == token {
-                let normalized = await Self.normalizeOffMain(cached)
+                let cachedWindow = Array(cached.suffix(ChatStore.transcriptOpenWindowLimit))
+                let normalized = await Self.normalizeOffMain(cachedWindow)
                 guard openToken == token else { return }
                 rememberWarmOpenSnapshot(normalized, for: storedId)
                 chat.seed(normalized: normalized)
+                chat.noteTranscriptSeedWindow(cachedWindow)
             }
         }
 
@@ -3381,6 +3395,7 @@ final class SessionStore {
             guard openToken == token else { return }  // superseded during normalize
             rememberWarmOpenSnapshot(normalized, for: storedId)
             chat.seed(normalized: normalized)
+            chat.noteTranscriptSeedWindow(stored)
             if let cacheStore {
                 Task { try? await cacheStore.saveTranscript(sessionId: storedId, messages: stored) }
             }
@@ -3431,11 +3446,17 @@ final class SessionStore {
     private var resolvedTranscriptFetch: ((String) async throws -> [StoredMessage])? {
         if let transcriptFetch { return transcriptFetch }
         guard let rest = connection?.rest else { return nil }
-        // Phase 3: fetch only the tail beyond the cache cursor when the plugin
-        // mount serves the delta route; falls back to the full fetch otherwise.
-        // Returns the full StoredMessage list either way (delta invisible downstream).
+        // ABH-400: plugin gateways fetch only the recent tail window on open;
+        // legacy/older plugin builds keep the existing delta-aware full fallback.
         return { [cacheStore] sessionId in
-            try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId)
+            if let page = await fetchTranscriptPage(
+                rest: rest,
+                sessionId: sessionId,
+                limit: ChatStore.transcriptOpenWindowLimit
+            ) {
+                return page.messages
+            }
+            return try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId)
         }
     }
 

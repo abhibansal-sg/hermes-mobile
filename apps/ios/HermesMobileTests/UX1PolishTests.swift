@@ -301,5 +301,43 @@ final class UX1PolishTests: XCTestCase {
         XCTAssertLessThanOrEqual(ChatView.transcriptWindow, 500,
             "the eager window must stay bounded so eager row construction (even with "
             + "RenderCache memoization) does not regress hitch counts on a huge session")
+        XCTAssertEqual(ChatView.transcriptWindow, ChatStore.transcriptOpenWindowLimit,
+            "the render window and cold-open fetch window must stay locked together")
+        XCTAssertEqual(ChatView.transcriptWindow, 50,
+            "ABH-400 deliberately fetches/renders only the newest 50 messages on open")
+    }
+
+    func testWindowedCacheNormalizeKeepsFiveHundredMessageOpenUnderBudget() async {
+        let longTranscript = (1...500).map { id in
+            StoredMessage(
+                role: id % 2 == 0 ? "assistant" : "user",
+                content: .string(String(repeating: "message \(id) with markdown **bold** and `code`\n", count: 4)),
+                timestamp: Double(id),
+                wireId: id
+            )
+        }
+
+        let fullStart = ContinuousClock.now
+        let full = await SessionStore.normalizeOffMain(longTranscript)
+        let fullMs = Self.elapsedMilliseconds(since: fullStart)
+
+        let window = Array(longTranscript.suffix(ChatStore.transcriptOpenWindowLimit))
+        let windowStart = ContinuousClock.now
+        let normalizedWindow = await SessionStore.normalizeOffMain(window)
+        let windowMs = Self.elapsedMilliseconds(since: windowStart)
+
+        let line = "ABH400 measurement cache-normalize 500-full=\(String(format: "%.2f", fullMs))ms 50-window=\(String(format: "%.2f", windowMs))ms"
+        print(line)
+        try? line.write(toFile: "/tmp/abh400-transcript-window-measurement.txt", atomically: true, encoding: .utf8)
+        XCTAssertEqual(full.count, 500)
+        XCTAssertEqual(normalizedWindow.count, ChatStore.transcriptOpenWindowLimit)
+        XCTAssertLessThan(windowMs, 300)
+    }
+
+    private static func elapsedMilliseconds(since start: ContinuousClock.Instant) -> Double {
+        let duration = ContinuousClock.now - start
+        let components = duration.components
+        return Double(components.seconds) * 1000
+            + Double(components.attoseconds) / 1_000_000_000_000_000
     }
 }

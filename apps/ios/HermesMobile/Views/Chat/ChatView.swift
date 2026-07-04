@@ -246,7 +246,7 @@ struct ChatView: View {
     /// majority of real sessions in a single window while keeping eager construction
     /// cheap (RenderCache memoizes segmentation + prose, so an off-screen tail row
     /// costs little). Pinned by `UX1PolishTests` so the value is a deliberate choice.
-    static let transcriptWindow = 150
+    static let transcriptWindow = ChatStore.transcriptOpenWindowLimit
 
     // MARK: - Header-clearance top inset (FIX 2)
 
@@ -758,9 +758,9 @@ struct ChatView: View {
             // (the user's "scroll-up-then-snap"). A plain `VStack` over a BOUNDED
             // tail window removes estimation from the window entirely: every rendered
             // row is fully laid out, so the bottom anchor resolves against EXACT
-            // geometry and the open lands precisely on newest. Older messages stay in
-            // `ChatStore` (full memory); only VIEW construction is windowed, and
-            // `RenderCache` keeps eager construction cheap.
+            // geometry and the open lands precisely on newest. ABH-400 keeps both
+            // fetched rows and eager VIEW construction bounded to this same tail;
+            // older rows are fetched/prepended only when the reader asks for them.
             VStack(alignment: .leading, spacing: 0) {
                 // ARCH37 STEP 1 — capture the enumerated snapshot ONCE so the
                 // previous-row lookup indexes the SAME array the `ForEach` iterates,
@@ -785,9 +785,14 @@ struct ChatView: View {
                 // another `transcriptWindow`. The grow is anchored to the previously
                 // first-visible row id via `ScrollViewReader` so the content above
                 // appears WITHOUT yanking the reader's current position.
-                if windowStart > 0, let firstId = rows.first?.element.id {
-                    loadEarlierChip(anchorTo: firstId, proxy: proxy)
-                        .id("hermes.chat.loadEarlier")
+                if let firstId = rows.first?.element.id {
+                    if windowStart > 0 {
+                        loadEarlierChip(anchorTo: firstId, proxy: proxy, fetchesServerPage: false)
+                            .id("hermes.chat.loadEarlier")
+                    } else if chatStore.transcriptHasMoreBefore {
+                        loadEarlierChip(anchorTo: firstId, proxy: proxy, fetchesServerPage: true)
+                            .id("hermes.chat.loadEarlier")
+                    }
                 }
                 ForEach(rows, id: \.element.id) { index, message in
                     // `index` here is the ABSOLUTE index into the full transcript
@@ -1233,6 +1238,29 @@ struct ChatView: View {
 
     // MARK: - Load-earlier chip (R39 / Defect 2)
 
+    /// ABH-400: the render-window start index for a transcript of `messageCount`
+    /// rows when the eager tail window covers the last `windowSize`. Rows at
+    /// indices `[0..<windowStart)` are sliced out and never constructed (the
+    /// VStack is NOT lazy). This is the exact slice math used by the render
+    /// path (`allRows[windowStart...]`) lifted into a pure, testable function.
+    nonisolated static func renderWindowStart(messageCount: Int, windowSize: Int) -> Int {
+        max(0, messageCount - windowSize)
+    }
+
+    /// ABH-400: after a server-page backward load prepends `prependedRowCount`
+    /// older rows onto the transcript, the render window MUST grow by exactly
+    /// that delta so ``renderWindowStart`` stays at 0 and the fetched rows are
+    /// revealed instead of being sliced out by the unchanged tail window.
+    /// A non-positive delta (nothing prepended / fetch failed) is a no-op —
+    /// the window stays put so we never claim a reveal that did not happen.
+    nonisolated static func windowSizeAfterServerPageReveal(
+        currentWindowSize: Int,
+        prependedRowCount: Int
+    ) -> Int {
+        guard prependedRowCount > 0 else { return currentWindowSize }
+        return currentWindowSize + prependedRowCount
+    }
+
     /// "Load earlier messages" affordance shown above the eager tail window when the
     /// window does not cover the whole transcript. Tapping grows the window by one
     /// `transcriptWindow` step. The grow is anchored to the previously-first windowed
@@ -1240,19 +1268,53 @@ struct ChatView: View {
     /// above, the view re-pins that same row to `.top` so the reader's position is
     /// preserved (no visible jump). Wrapped in `withAnimation(nil)` so the grow is an
     /// instant content swap, not an animated reflow fighting the anchor.
-    private func loadEarlierChip(anchorTo firstId: ChatMessage.ID, proxy: ScrollViewProxy) -> some View {
+    private func loadEarlierChip(
+        anchorTo firstId: ChatMessage.ID,
+        proxy: ScrollViewProxy,
+        fetchesServerPage: Bool
+    ) -> some View {
         Button {
-            withAnimation(nil) {
-                windowSize += Self.transcriptWindow
-            }
-            // Re-pin the previously-first row to the top after the older rows lay
-            // out above it, so the reader stays put. A runloop hop lets the grown
-            // window construct before the scroll resolves.
-            DispatchQueue.main.async {
-                proxy.scrollTo(firstId, anchor: .top)
+            if fetchesServerPage {
+                // ABH-400: measure how many rows the backward page actually
+                // prepended, then grow the render window by that delta so
+                // windowStart stays at 0 and the fetched older rows render
+                // (instead of being silently sliced out by the unchanged tail
+                // window — the false-done no-op defect). We do NOT assume the
+                // page size: a short final page prepends fewer rows, and a
+                // fetch that added nothing leaves the window untouched.
+                Task {
+                    let before = chatStore.messages.count
+                    await chatStore.loadEarlierTranscript()
+                    let added = chatStore.messages.count - before
+                    if added > 0 {
+                        withAnimation(nil) {
+                            windowSize = Self.windowSizeAfterServerPageReveal(
+                                currentWindowSize: windowSize,
+                                prependedRowCount: added
+                            )
+                        }
+                    }
+                    // Re-pin the previously-first row to the top after the
+                    // older rows lay out above it, preserving the reader's
+                    // position. A runloop hop lets the grown window construct
+                    // before the scroll resolves the anchor.
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(firstId, anchor: .top)
+                    }
+                }
+            } else {
+                withAnimation(nil) {
+                    windowSize += Self.transcriptWindow
+                }
+                // Re-pin the previously-first row to the top after the older rows lay
+                // out above it, so the reader stays put. A runloop hop lets the grown
+                // window construct before the scroll resolves.
+                DispatchQueue.main.async {
+                    proxy.scrollTo(firstId, anchor: .top)
+                }
             }
         } label: {
-            Text("Load earlier messages")
+            Text(chatStore.isLoadingEarlierTranscript ? "Loading earlier…" : "Load earlier messages")
                 .font(.footnote.weight(.medium))
                 .foregroundStyle(theme.mutedFg)
                 .padding(.horizontal, 14)
@@ -1260,6 +1322,7 @@ struct ChatView: View {
                 .chromePill(theme, in: Capsule())
         }
         .buttonStyle(.plain)
+        .disabled(fetchesServerPage && chatStore.isLoadingEarlierTranscript)
         .frame(maxWidth: .infinity)
         .padding(.vertical, 6)
         .accessibilityLabel("Load earlier messages")

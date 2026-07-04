@@ -5,6 +5,45 @@ import os
 import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-G)
 #endif
 
+struct TranscriptPageFetch: Sendable {
+    let messages: [StoredMessage]
+    let oldestId: Int?
+    let hasMoreBefore: Bool
+}
+
+/// Plugin-only backward-paged transcript fetch. Kept outside RestClient.swift for
+/// ABH-400's narrow scope fence; it reuses RestClient's internal request/JSON
+/// helpers without changing the existing no-param delta handshake method.
+func fetchTranscriptPage(
+    rest: RestClient,
+    sessionId: String,
+    limit: Int,
+    before: Int? = nil
+) async -> TranscriptPageFetch? {
+    guard rest.pathStyle == .plugin else { return nil }
+    let encodedId = sessionId.addingPercentEncoding(
+        withAllowedCharacters: .urlPathAllowed
+    ) ?? sessionId
+    var path = "\(rest.pathStyle.mobileAPIPrefix)/sessions/\(encodedId)/messages"
+        + "?limit=\(max(1, limit))"
+    if let before, before > 0 {
+        path += "&before=\(before)"
+    }
+    do {
+        let data = try await rest.get(path: path)
+        let root = try rest.decodeJSONValue(from: data, context: "messagesPage")
+        guard let array = root["messages"]?.arrayValue else { return nil }
+        let page = root["page"]
+        return TranscriptPageFetch(
+            messages: array.compactMap(StoredMessage.init(json:)),
+            oldestId: page?["oldest_id"]?.intValue,
+            hasMoreBefore: page?["has_more_before"]?.boolValue ?? false
+        )
+    } catch {
+        return nil
+    }
+}
+
 /// Subsystem logger for transcript reconciliation. Backfill failures used to be
 /// swallowed by a bare `catch`; they now surface here (and, in DEBUG, on the
 /// bridge-readable counters) so a future REST-error mirror drop is not invisible.
@@ -330,6 +369,13 @@ final class ChatStore {
     /// the queue can stamp prompts with the session they were composed for and
     /// drain them only into that session (R1 #17, Batch C).
     var activeStoredSessionId: String? { sessions?.activeStoredId }
+
+    /// ABH-400: cold opens fetch/render only a recent tail window, then page
+    /// older transcript rows backward on demand.
+    nonisolated static let transcriptOpenWindowLimit = 50
+    private(set) var transcriptHasMoreBefore = false
+    private(set) var isLoadingEarlierTranscript = false
+    private var oldestLoadedTranscriptWireId: Int?
 
     /// Runtime sessions whose gateway status currently reports a mid-turn
     /// context compaction. Keyed by runtime `session_id` (desktop parity): a
@@ -2378,6 +2424,48 @@ final class ChatStore {
         transcriptGeneration += 1
     }
 
+    /// Update the backward-paging cursor carried by the latest authoritative
+    /// transcript seed. ``stored`` may be only the recent tail window; the server
+    /// page metadata tells us whether older rows exist beyond the first loaded id.
+    func noteTranscriptPaging(oldestId: Int?, hasMoreBefore: Bool) {
+        oldestLoadedTranscriptWireId = oldestId
+        transcriptHasMoreBefore = hasMoreBefore
+    }
+
+    /// Convenience for callers that only have the fetched rows (cache / legacy
+    /// fallback). A full 50-row tail may have older rows; clicking once verifies
+    /// against the server and clears the affordance if not.
+    func noteTranscriptSeedWindow(_ stored: [StoredMessage]) {
+        noteTranscriptPaging(
+            oldestId: stored.first?.wireId,
+            hasMoreBefore: stored.count >= Self.transcriptOpenWindowLimit
+        )
+    }
+
+    /// Fetch and prepend one older server page. Used by ChatView's top affordance
+    /// once the locally-loaded rows no longer have hidden in-memory rows above.
+    func loadEarlierTranscript() async {
+        guard !isStreaming,
+              !isLoadingEarlierTranscript,
+              transcriptHasMoreBefore,
+              let storedId = sessions?.activeStoredId,
+              let before = oldestLoadedTranscriptWireId,
+              let rest = connection?.rest else { return }
+        isLoadingEarlierTranscript = true
+        defer { isLoadingEarlierTranscript = false }
+        guard let page = await fetchTranscriptPage(
+            rest: rest,
+            sessionId: storedId,
+            limit: Self.transcriptOpenWindowLimit,
+            before: before
+        ) else { return }
+        if !page.messages.isEmpty {
+            let older = Self.toChatMessages(page.messages)
+            seed(normalized: older + messages)
+        }
+        noteTranscriptPaging(oldestId: page.oldestId, hasMoreBefore: page.hasMoreBefore)
+    }
+
     /// The id of a foreign-mirror placeholder assistant row that
     /// `teardownForeignStream` left in place (contract Batch E §3.7) for the
     /// recovery `backfill()`/`seed()` to reconcile ONTO — rather than removing it
@@ -3051,6 +3139,7 @@ final class ChatStore {
             // post-await guard in `seedContextUsageFromStatus`.
             guard !isStreaming, storedId == sessions?.activeStoredId else { return }
             seed(from: stored)
+            noteTranscriptSeedWindow(stored)
             // P3 write-through: the foreground/reconnect reconcile re-fetched the
             // authoritative transcript — persist it so the next open paints from
             // disk. Fire-and-forget, OFF the UI path; CacheStore no-ops for cron
@@ -3097,10 +3186,17 @@ final class ChatStore {
     private var resolvedBackfillFetch: ((String) async throws -> [StoredMessage])? {
         if let backfillFetch { return backfillFetch }
         guard let rest = connection?.rest else { return nil }
-        // Phase 3: delta-aware reconnect/foreground reconcile (tail-only when the
-        // plugin mount serves it; full fetch otherwise). Full list returned either way.
+        // ABH-400: plugin gateways serve only the recent tail window on
+        // foreground/reconnect; legacy gateways keep the existing full/delta path.
         return { [cacheStore] sessionId in
-            try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId)
+            if let page = await fetchTranscriptPage(
+                rest: rest,
+                sessionId: sessionId,
+                limit: ChatStore.transcriptOpenWindowLimit
+            ) {
+                return page.messages
+            }
+            return try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId)
         }
     }
 
@@ -3178,6 +3274,9 @@ final class ChatStore {
         // a stale error must not render in the next session's empty-transcript
         // state (see ChatView's loading/error split, R1 #79).
         lastBackfillError = nil
+        transcriptHasMoreBefore = false
+        isLoadingEarlierTranscript = false
+        oldestLoadedTranscriptWireId = nil
         // A pending foreign-reconcile adoption belongs to the session being torn
         // down (§3.7); never let it bleed into the next session's first seed.
         pendingForeignReconcileID = nil

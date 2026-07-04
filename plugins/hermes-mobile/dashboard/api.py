@@ -1511,6 +1511,8 @@ async def session_messages_delta(
     after_id: int = 0,
     prefix_count: int = -1,
     shape: str = "full",
+    limit: int | None = None,
+    before: int | None = None,
 ):
     """Incremental transcript fetch. ``after_id`` + ``prefix_count`` are the
     client's cursor; omit them (cold fetch) to get the full transcript. The
@@ -1545,10 +1547,15 @@ async def session_messages_delta(
     is_delta, messages, total, max_id = transcript_sync.decide_delta(
         full, after_id, prefix_count
     )
-    # Phase 4: tier the payload (skeleton/light) for a faster cold-open. Rows are
-    # never dropped, so prefix_count/max_id (the cursor) are unaffected by shaping.
+    page = None
+    if limit is not None:
+        page = transcript_sync.page_messages(messages, limit=limit, before=before)
+        messages = page.messages
+    # Phase 4: tier the payload (skeleton/light) for a faster cold-open. Paging
+    # (when requested) drops rows only AFTER the delta cursor has been computed,
+    # so prefix_count/max_id remain the full server cursor.
     messages = transcript_sync.shape_messages(messages, shape)
-    return {
+    result = {
         "session_id": session_id,
         "is_delta": is_delta,
         "prefix_count": total,
@@ -1556,6 +1563,12 @@ async def session_messages_delta(
         "shape": shape if shape in ("skeleton", "light") else "full",
         "messages": messages,
     }
+    if page is not None:
+        result["page"] = {
+            "oldest_id": page.oldest_id,
+            "has_more_before": page.has_more_before,
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------

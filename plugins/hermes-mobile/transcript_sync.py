@@ -33,7 +33,53 @@ no gateway hooks.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+
+@dataclass(frozen=True)
+class MessagePage:
+    """A backward-page slice of an ascending transcript.
+
+    ``messages`` preserves ascending order. ``oldest_id`` is the cursor the
+    client sends back as ``before`` to fetch the next older page.
+    """
+
+    messages: List[Dict[str, Any]]
+    oldest_id: Optional[int]
+    has_more_before: bool
+
+
+def page_messages(
+    messages: List[Dict[str, Any]],
+    limit: Optional[int],
+    before: Optional[int] = None,
+) -> MessagePage:
+    """Return the newest ``limit`` rows, optionally before a message id cursor.
+
+    The input is the active transcript in ascending DB-id order. ``before`` means
+    "strictly older than this id"; the returned page is still ascending so it can
+    be prepended on the client without re-sorting.
+    """
+    if limit is None:
+        page = list(messages)
+    else:
+        safe_limit = max(1, min(int(limit), 500))
+        candidates = messages
+        if before is not None and before > 0:
+            candidates = [m for m in messages if m.get("id", 0) < before]
+        page = list(candidates[-safe_limit:])
+
+    oldest_id = page[0].get("id") if page else None
+    has_more_before = (
+        oldest_id is not None
+        and any(m.get("id", 0) < oldest_id for m in messages)
+    )
+    return MessagePage(
+        messages=page,
+        oldest_id=oldest_id,
+        has_more_before=has_more_before,
+    )
 
 
 def decide_delta(
