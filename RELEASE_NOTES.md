@@ -1,3 +1,22 @@
+Build 80 — "Malacca" — 2026-07-04
+RELIABILITY
+
+FIXED
+- Use delta-aware transcript fetch for prefetch
+- Cross-profile session open+delete scoping (ABH-408)
+
+IMPROVED
+- Digest blocked-human section — team-wide, correct label (was stale blocked:needs-human + project-scoped = blind), age-ranked with >48h red flag + fence:approved status
+- Fence:approved lane — loop-scope-check.sh accepts Abhi-authorized stock-core globs as arg 3 (per-file override, unnamed forbidden files still hard-fail)
+
+WORTH TRYING
+- Try: Use delta-aware transcript fetch for prefetch
+- Try: Cross-profile session open+delete scoping (ABH-408)
+
+(+2 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 79 — "Malacca" — 2026-07-04
 RELIABILITY
 
