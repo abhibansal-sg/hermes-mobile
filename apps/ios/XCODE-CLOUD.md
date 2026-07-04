@@ -35,7 +35,7 @@ project.yml on the Cloud VM — no generated project needs committing.
 ```sh
 node apps/ios/ci_scripts/asc-cloud.mjs list-workflows   # grab the Ship workflow UUID
 ```
-Then in `.claude/loops/governor.json` → `ship_policy.xcode_cloud`: set
+Then in `contracts/governor.json` (hermes-loop repo) → `ship_policy.xcode_cloud`: set
 `workflow_id` and `active: true`. From the next cadence ship onward,
 `ship-testflight.sh` pushes the build bump, triggers the cloud run, and waits —
 the Mac never archives. Any cloud failure automatically falls back to the local

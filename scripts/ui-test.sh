@@ -1,6 +1,6 @@
 #!/bin/bash
 # ui-test.sh — single entrypoint for agent-driven UI testing (L-regress lane).
-# Contract: docs/autonomous/UI-TESTING.md. WEDGE INVARIANT: this script never
+# Contract: hermes-loop docs/UI-TESTING.md. WEDGE INVARIANT: this script never
 # invokes raw xcodebuild; artifact refresh goes through scripts/ios-build.sh
 # (the machine-global mutex) and only when the .app is stale.
 #
