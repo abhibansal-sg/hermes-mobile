@@ -1,3 +1,25 @@
+Build 77 — "Malacca" — 2026-07-04
+RELIABILITY
+
+WHAT'S NEW
+- Per-model presets (reasoning effort + fast mode remembered per provider::model) (ABH-383)
+
+FIXED
+- — toolset credential panels, fix web_search->web key mismatch (ABH-262)
+- Stop prompt promising card-JSON structured UI the iOS renderer never built (ABH-244)
+- — remove false card-JSON prompt promise from mobile output context (ABH-244)
+- Surface and retry shared inbox drains
+- Survivor dedupe against rendered set (drawer machinery reappearance) (ABH-373)
+
+WORTH TRYING
+- Try: Per-model presets (reasoning effort + fast mode remembered per provider::model) (ABH-383)
+- Try: — toolset credential panels, fix web_search->web key mismatch (ABH-262)
+- Try: Stop prompt promising card-JSON structured UI the iOS renderer never built (ABH-244)
+
+(+2 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 76 — "Malacca" — 2026-07-04
 RELIABILITY
 
