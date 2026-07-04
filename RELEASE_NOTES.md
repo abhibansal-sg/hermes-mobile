@@ -1,3 +1,18 @@
+Build 79 — "Malacca" — 2026-07-04
+RELIABILITY
+
+FIXED
+- Windowed transcript loading — bounded cold-open + backward paging (ABH-400)
+- — drawer edge-swipe yields to horizontal table scroll (ABH-399)
+
+WORTH TRYING
+- Try: Windowed transcript loading — bounded cold-open + backward paging (ABH-400)
+- Try: — drawer edge-swipe yields to horizontal table scroll (ABH-399)
+
+(+2 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 77 — "Malacca" — 2026-07-04
 RELIABILITY
 
