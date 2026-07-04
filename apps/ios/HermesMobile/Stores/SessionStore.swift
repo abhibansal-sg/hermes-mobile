@@ -1263,14 +1263,45 @@ final class SessionStore {
     /// (default) resolves the live REST client below.
     var prefetchFetch: (@Sendable (String) async throws -> [StoredMessage])?
 
+    #if DEBUG
+    /// DEBUG-only RestClient seam for exercising the live prefetch fetch resolver
+    /// with a stubbed URLSession. The production path still resolves through the
+    /// live ``ConnectionStore/rest`` client; tests use this only when they need to
+    /// assert which REST endpoint the default prefetch sweep chose.
+    var prefetchRestClientForTesting: RestClient?
+    #endif
+
     /// The injected ``prefetchFetch``, or a `@Sendable` closure built from the live
     /// `RestClient` (a Sendable value struct — safe to capture across the task-group
     /// boundary). `nil` when unconfigured/offline, which makes the whole sweep a
     /// no-op (purely additive coverage, never a correctness dependency).
     private var resolvedPrefetchFetch: (@Sendable (String) async throws -> [StoredMessage])? {
         if let prefetchFetch { return prefetchFetch }
-        guard let rest = connection?.rest else { return nil }
-        return { sessionId in
+        #if DEBUG
+        let resolvedRest = prefetchRestClientForTesting ?? connection?.rest
+        #else
+        let resolvedRest = connection?.rest
+        #endif
+        guard let rest = resolvedRest else { return nil }
+        return { [cacheStore] sessionId in
+            // Cursor-bearing cached transcripts take the delta-aware path first so
+            // an unchanged background sweep pays only the cheap cursor check. Rows
+            // without a cursor keep the ABH-400 page-window prefetch behavior.
+            if let cacheStore {
+                do {
+                    if let cursor = try await cacheStore.deltaCursor(for: sessionId),
+                       cursor.afterId > 0 {
+                        return try await fetchTranscriptDeltaAware(
+                            rest: rest,
+                            cacheStore: cacheStore,
+                            sessionId: sessionId
+                        )
+                    }
+                } catch {
+                    // Treat a cursor read failure like "no cursor"; the fetch path
+                    // below preserves the previous best-effort prefetch semantics.
+                }
+            }
             if let page = await fetchTranscriptPage(
                 rest: rest,
                 sessionId: sessionId,
@@ -1278,7 +1309,11 @@ final class SessionStore {
             ) {
                 return page.messages
             }
-            return try await rest.messages(sessionId: sessionId)
+            return try await fetchTranscriptDeltaAware(
+                rest: rest,
+                cacheStore: cacheStore,
+                sessionId: sessionId
+            )
         }
     }
 
