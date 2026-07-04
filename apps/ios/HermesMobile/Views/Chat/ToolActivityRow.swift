@@ -23,6 +23,10 @@ import UIKit
 /// Both modes share the `theme.muted` container + 12pt leading indent so the
 /// tool cluster reads as one quiet block inside the assistant gutter.
 struct ToolClusterView: View {
+    private static let liveToolWindowThreshold = 3
+    private static let liveToolWindowHeight: CGFloat = 172
+    private static let liveToolWindowBottomID = "live-tool-window-bottom"
+
     /// This cluster's tools, in start order.
     let tools: [ToolActivity]
     /// True once this finalized cluster (which has ≥2 tools) collapsed into a
@@ -37,6 +41,11 @@ struct ToolClusterView: View {
     /// Whether the collapsed summary is currently expanded into the full
     /// timeline. Ignored when `collapsed` is false.
     @State private var isExpanded = false
+    /// Tracks row disclosures owned by this cluster so opening any tool can
+    /// immediately break the live bounded window back out to the readable flat
+    /// timeline without losing the row's expanded state during that layout swap.
+    @State private var expandedToolIDs: Set<String> = []
+    @State private var liveScrollTarget: String? = Self.liveToolWindowBottomID
 
     var body: some View {
         if collapsed && tools.count >= 2 {
@@ -50,28 +59,113 @@ struct ToolClusterView: View {
 
     /// Every tool as its own row, 6pt apart, each in its muted container.
     private var liveCluster: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(tools) { tool in
-                // A `todo` tool result renders as a native checklist card rather
-                // than a generic tool row (F4A-A2). Parsed from the STRUCTURED
-                // `tool.todos` retained verbatim off the wire (ABH-46 item 10)
-                // — never from `resultPreview`, whose 300-char truncation breaks
-                // the JSON re-parse for any real list. The preview-parse remains
-                // only as a fallback for seeded/legacy activities that predate
-                // the structured field. Falls back to the standard row when
-                // neither yields a list (e.g. mid-run).
-                if let generatedImage = Self.generatedImageResult(for: tool) {
-                    GeneratedImageToolCard(result: generatedImage, state: tool.state)
-                } else if tool.name == TodoList.toolName,
-                   let todos = tool.todos.flatMap({ TodoList(todosArray: $0) })
-                    ?? TodoList(resultJSON: tool.resultPreview) {
-                    TodoCardView(todos: todos, state: tool.state)
-                } else {
-                    ToolActivityRow(activity: tool)
-                }
+        Group {
+            if usesBoundedLiveToolWindow {
+                boundedLiveToolWindow
+            } else {
+                flatToolRows
             }
         }
+        .onChange(of: tools.map(\.id)) { _, ids in
+            expandedToolIDs = expandedToolIDs.intersection(Set(ids))
+            liveScrollTarget = Self.liveToolWindowBottomID
+        }
+    }
+
+    private var usesBoundedLiveToolWindow: Bool {
+        !collapsed
+            && tools.count >= Self.liveToolWindowThreshold
+            && expandedToolIDs.isEmpty
+    }
+
+    private var flatToolRows: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            toolRows
+        }
         .padding(.leading, 12)
+    }
+
+    private var boundedLiveToolWindow: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 6) {
+                    toolRows
+
+                    Color.clear
+                        .frame(height: 1)
+                        .id(Self.liveToolWindowBottomID)
+                }
+                .padding(.leading, 12)
+                .scrollTargetLayout()
+            }
+            .scrollPosition(id: $liveScrollTarget, anchor: .bottom)
+            .frame(height: Self.liveToolWindowHeight)
+            .mask(alignment: .top) {
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0),
+                        .init(color: .black, location: 0.16),
+                        .init(color: .black, location: 1),
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+            .accessibilityIdentifier("boundedLiveToolWindow")
+            .onAppear {
+                liveScrollTarget = Self.liveToolWindowBottomID
+                proxy.scrollTo(Self.liveToolWindowBottomID, anchor: .bottom)
+            }
+            .onChange(of: tools.map(\.id)) { _, _ in
+                liveScrollTarget = Self.liveToolWindowBottomID
+                proxy.scrollTo(Self.liveToolWindowBottomID, anchor: .bottom)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var toolRows: some View {
+        // `ToolActivity.id` is the gateway `tool_call_id`; keeping this exact
+        // ForEach id stable across the 2→3 live-window threshold preserves row
+        // identity while only the surrounding scroll container changes.
+        ForEach(tools, id: \.id) { tool in
+            toolCard(for: tool)
+        }
+    }
+
+    @ViewBuilder
+    private func toolCard(for tool: ToolActivity) -> some View {
+        // A `todo` tool result renders as a native checklist card rather
+        // than a generic tool row (F4A-A2). Parsed from the STRUCTURED
+        // `tool.todos` retained verbatim off the wire (ABH-46 item 10)
+        // — never from `resultPreview`, whose 300-char truncation breaks
+        // the JSON re-parse for any real list. The preview-parse remains
+        // only as a fallback for seeded/legacy activities that predate
+        // the structured field. Falls back to the standard row when
+        // neither yields a list (e.g. mid-run).
+        if let generatedImage = Self.generatedImageResult(for: tool) {
+            GeneratedImageToolCard(result: generatedImage, state: tool.state)
+        } else if tool.name == TodoList.toolName,
+                  let todos = tool.todos.flatMap({ TodoList(todosArray: $0) })
+            ?? TodoList(resultJSON: tool.resultPreview) {
+            TodoCardView(todos: todos, state: tool.state)
+        } else {
+            ToolActivityRow(activity: tool, isExpanded: expansionBinding(for: tool))
+        }
+    }
+
+    private func expansionBinding(for tool: ToolActivity) -> Binding<Bool> {
+        Binding {
+            expandedToolIDs.contains(tool.id)
+        } set: { isExpanded in
+            var next = expandedToolIDs
+            if isExpanded {
+                next.insert(tool.id)
+            } else {
+                next.remove(tool.id)
+            }
+            expandedToolIDs = next
+        }
     }
 
     // MARK: - Collapsed summary capsule
@@ -170,12 +264,26 @@ struct ToolActivityRow: View {
 
     @Environment(\.hermesTheme) private var theme
 
-    @State private var isExpanded = false
+    private let externalExpansion: Binding<Bool>?
+    @State private var localIsExpanded = false
+
+    init(activity: ToolActivity, isExpanded: Binding<Bool>? = nil) {
+        self.activity = activity
+        self.externalExpansion = isExpanded
+    }
+
+    private var expansion: Binding<Bool> {
+        externalExpansion ?? $localIsExpanded
+    }
+
+    private var isExpanded: Bool {
+        expansion.wrappedValue
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                withAnimation(.snappy(duration: 0.2)) { isExpanded.toggle() }
+                withAnimation(.snappy(duration: 0.2)) { expansion.wrappedValue.toggle() }
             } label: {
                 HStack(spacing: 8) {
                     stateIcon
