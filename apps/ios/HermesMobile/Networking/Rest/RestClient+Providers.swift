@@ -53,8 +53,10 @@ enum ProviderAuthType: String, Sendable, Equatable {
     case custom = "custom"
 
     /// Whether this auth type can be provisioned from a raw key on mobile
-    /// (Tier A). OAuth/external types must be set up on the desktop.
-    var provisionableFromKey: Bool { self == .apiKey }
+    /// (Tier A / Tier B). OAuth/external types must be set up on the desktop.
+    /// ABH-257: `.custom` is provisionable — tapping an authenticated custom
+    /// provider row opens a pre-filled edit/rotate form (same upsert endpoint).
+    var provisionableFromKey: Bool { self == .apiKey || self == .custom }
 }
 
 /// One provider row from `GET <prefix>/providers`. The plugin's list projects
@@ -77,14 +79,21 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
     /// The curated model ids (present on the POST key/custom responses; the GET
     /// list omits this). `nil` = unknown / not provided by this response.
     let models: [String]?
+    /// ABH-257: base_url for a custom provider (present only on custom rows).
+    /// Used to pre-fill the edit/rotate form. `nil` for registered providers.
+    let baseURL: String?
+    /// ABH-257: api_mode for a custom provider (present only on custom rows).
+    /// Used to pre-fill the edit/rotate form. `nil` for registered providers.
+    let apiMode: ProviderAPIMode?
 
     var id: String { slug }
 
     /// Whether this provider can be provisioned from a raw API key on mobile
-    /// (Tier A). Delegates to the auth type: only `api_key` providers qualify;
-    /// OAuth/external types must be set up on the desktop (the plugin rejects
-    /// them with a 4003-class error), and a row whose `auth_type` we could not
-    /// classify is conservatively NOT provisionable from mobile.
+    /// (Tier A / Tier B). Delegates to the auth type: `api_key` and `custom`
+    /// providers qualify; OAuth/external types must be set up on the desktop
+    /// (the plugin rejects them with a 4003-class error), and a row whose
+    /// `auth_type` we could not classify is conservatively NOT provisionable
+    /// from mobile.
     var provisionableFromKey: Bool { authType?.provisionableFromKey ?? false }
 
     /// Memberwise init (so the list view can flip a row locally after a
@@ -96,7 +105,9 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
         isCurrent: Bool,
         authenticated: Bool,
         totalModels: Int,
-        models: [String]?
+        models: [String]?,
+        baseURL: String? = nil,
+        apiMode: ProviderAPIMode? = nil
     ) {
         self.slug = slug
         self.name = name
@@ -105,6 +116,8 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
         self.authenticated = authenticated
         self.totalModels = totalModels
         self.models = models
+        self.baseURL = baseURL
+        self.apiMode = apiMode
     }
 
     init(json: JSONValue) {
@@ -122,6 +135,10 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
         } else {
             self.models = nil
         }
+        // ABH-257: custom-provider transport metadata for the edit/rotate form.
+        self.baseURL = json["base_url"]?.stringValue
+        let rawMode = json["api_mode"]?.stringValue ?? ""
+        self.apiMode = rawMode.isEmpty ? nil : ProviderAPIMode(rawValue: rawMode)
     }
 }
 

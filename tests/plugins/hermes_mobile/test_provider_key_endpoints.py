@@ -1707,3 +1707,194 @@ def test_delete_registered_provider_with_tuning_only_entry_uses_registered_path(
         f"BUG5: phantom custom env var {phantom_env!r} was incorrectly removed; "
         f"remove_env calls: {calls['remove_env']}"
     )
+
+
+# ===========================================================================
+# ABH-257 — GET /providers custom-provider enrichment (edit/rotate path)
+#
+# The GET response must carry ``base_url`` + ``api_mode`` for custom-slug rows
+# (those with a ``providers.<slug>`` config entry carrying key_env/api_key
+# marker — the POST /providers/custom fingerprint). It must NEVER carry the
+# api_key value, the key_env NAME, or any credential material. Registered
+# providers must NOT gain these fields (they are custom-transport metadata).
+# ===========================================================================
+
+
+def test_list_providers_custom_row_has_base_url_and_api_mode(
+    loopback_client, monkeypatch
+):
+    """ABH-257: a custom provider's GET /providers row carries base_url +
+    api_mode (non-secret transport metadata for the edit/rotate form) and is
+    tagged auth_type="custom"."""
+    _patch_stock_inventory(
+        monkeypatch,
+        rows=[
+            {
+                "slug": "my-proxy",
+                "name": "my-proxy",
+                "auth_type": "",
+                "is_current": False,
+                "authenticated": True,
+                "total_models": 1,
+            },
+        ],
+    )
+    _patch_config(
+        monkeypatch,
+        providers_in_config={
+            "my-proxy": {
+                "name": "my-proxy",
+                "base_url": "https://api.proxy.example.com/v1",
+                "api_mode": "openai",
+                "key_env": "MYPROXY_ABC123_API_KEY",
+            },
+        },
+    )
+
+    r = loopback_client.get(
+        "/api/plugins/hermes-mobile/providers", headers=_TOKEN_HEADER
+    )
+    assert r.status_code == 200, r.text
+    providers = r.json()["providers"]
+    assert len(providers) == 1
+    row = providers[0]
+    assert row["slug"] == "my-proxy"
+    assert row["auth_type"] == "custom"
+    assert row["base_url"] == "https://api.proxy.example.com/v1"
+    assert row["api_mode"] == "openai"
+    assert row["authenticated"] is True
+
+
+def test_list_providers_custom_row_never_leaks_api_key(
+    loopback_client, monkeypatch
+):
+    """ABH-257: the GET /providers response NEVER includes the raw api_key,
+    the key_env NAME, or any credential value — even for a custom row that
+    carries base_url + api_mode."""
+    _patch_stock_inventory(
+        monkeypatch,
+        rows=[
+            {
+                "slug": "my-proxy",
+                "name": "my-proxy",
+                "auth_type": "",
+                "is_current": False,
+                "authenticated": True,
+                "total_models": 0,
+            },
+        ],
+    )
+    _patch_config(
+        monkeypatch,
+        providers_in_config={
+            "my-proxy": {
+                "name": "my-proxy",
+                "base_url": "https://api.proxy.example.com/v1",
+                "api_mode": "anthropic_messages",
+                "key_env": "MYPROXY_ABC123_API_KEY",
+                # Simulate a legacy/buggy entry that also has a raw api_key
+                # field in config (the POST handler writes key_env, not
+                # api_key, but a desktop `hermes set` could write it). The GET
+                # response must STILL not leak it.
+                "api_key": "sk-super-secret-12345",
+            },
+        },
+    )
+
+    r = loopback_client.get(
+        "/api/plugins/hermes-mobile/providers", headers=_TOKEN_HEADER
+    )
+    assert r.status_code == 200, r.text
+    dumped = r.text.lower()
+    # The raw key value must NEVER appear.
+    assert "sk-super-secret-12345" not in dumped
+    # The key_env NAME must not appear (it's an env-var name, not transport metadata).
+    assert "myproxy_abc123_api_key" not in dumped
+    # The field name "key_env" must not appear in any row.
+    assert "key_env" not in dumped
+    # base_url + api_mode ARE present (non-secret).
+    assert "https://api.proxy.example.com/v1" in r.text
+    assert "anthropic_messages" in r.text
+
+
+def test_list_providers_registered_row_has_no_base_url_or_api_mode(
+    loopback_client, monkeypatch
+):
+    """ABH-257: a registered api_key provider's GET /providers row does NOT
+    carry base_url or api_mode — those fields are custom-transport metadata
+    only. Registered providers keep their existing safe shape."""
+    _patch_stock_inventory(
+        monkeypatch,
+        rows=[
+            {
+                "slug": "deepseek",
+                "name": "DeepSeek",
+                "auth_type": "api_key",
+                "is_current": False,
+                "authenticated": True,
+                "total_models": 3,
+            },
+        ],
+    )
+    # A config entry for deepseek that is tuning-only (base_url override) but
+    # has NO credential markers → must NOT trigger custom enrichment.
+    _patch_config(
+        monkeypatch,
+        providers_in_config={
+            "deepseek": {
+                "base_url": "https://override.deepseek.com/v1",
+            },
+        },
+    )
+
+    r = loopback_client.get(
+        "/api/plugins/hermes-mobile/providers", headers=_TOKEN_HEADER
+    )
+    assert r.status_code == 200, r.text
+    providers = r.json()["providers"]
+    assert len(providers) == 1
+    row = providers[0]
+    assert row["slug"] == "deepseek"
+    assert row["auth_type"] == "api_key"
+    assert "base_url" not in row
+    assert "api_mode" not in row
+
+
+def test_list_providers_custom_row_anthropic_mode(
+    loopback_client, monkeypatch
+):
+    """ABH-257: a custom provider with api_mode='anthropic_messages' surfaces
+    the mode correctly (the edit form's picker has two cases)."""
+    _patch_stock_inventory(
+        monkeypatch,
+        rows=[
+            {
+                "slug": "anthropic-proxy",
+                "name": "anthropic-proxy",
+                "auth_type": "",
+                "is_current": False,
+                "authenticated": True,
+                "total_models": 2,
+            },
+        ],
+    )
+    _patch_config(
+        monkeypatch,
+        providers_in_config={
+            "anthropic-proxy": {
+                "name": "anthropic-proxy",
+                "base_url": "https://claude-proxy.example.com",
+                "api_mode": "anthropic_messages",
+                "key_env": "ANTHROPICPROXY_DEF456_API_KEY",
+            },
+        },
+    )
+
+    r = loopback_client.get(
+        "/api/plugins/hermes-mobile/providers", headers=_TOKEN_HEADER
+    )
+    assert r.status_code == 200, r.text
+    row = r.json()["providers"][0]
+    assert row["auth_type"] == "custom"
+    assert row["api_mode"] == "anthropic_messages"
+    assert row["base_url"] == "https://claude-proxy.example.com"

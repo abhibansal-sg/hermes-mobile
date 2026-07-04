@@ -2319,6 +2319,35 @@ def _remove_custom_provider_credentials_from_config(slug: str) -> bool:
     return True
 
 
+def _custom_provider_entries() -> Dict[str, Dict[str, Any]]:
+    """Read all custom-provider config entries from config.yaml (ABH-257).
+
+    Returns ``{slug: entry}`` for every ``providers.<slug>`` entry that has
+    credential markers (``key_env`` or ``api_key`` — the markers POST
+    /providers/custom writes). This is the same marker logic the DELETE
+    handler's ``has_custom_entry`` check uses (BUG5 fix). NEVER returns the raw
+    key value: ``key_env`` holds the env-var NAME only; the raw key lives in
+    the secure .env, not config.yaml. Used to enrich GET /providers rows with
+    ``auth_type="custom"`` + ``base_url`` + ``api_mode`` so the mobile
+    edit/rotate path can pre-fill the form. Best-effort: returns ``{}`` if
+    config is unavailable (tests / cold-boot race).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        return {}
+    providers = config.get("providers") or {}
+    if not isinstance(providers, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for slug, entry in providers.items():
+        if isinstance(entry, dict) and ("key_env" in entry or "api_key" in entry):
+            out[str(slug)] = entry
+    return out
+
+
 def _provider_provider_rows() -> List[Dict[str, Any]]:
     """Build the provider universe rows via the stock inventory builder.
 
@@ -2326,6 +2355,14 @@ def _provider_provider_rows() -> List[Dict[str, Any]]:
     ``authenticated`` boolean the mobile list surface keys off (same flag the
     TUI frontend + the stock model.save_key refresh use). Imported lazily so
     the module stays importable without the host inventory loaded (tests).
+
+    ABH-257: after the registry/auth_type pass, rows whose slug has a custom
+    ``providers.<slug>`` config entry (key_env/api_key marker — the POST
+    /providers/custom fingerprint) are re-tagged ``auth_type="custom"`` and
+    enriched with ``base_url`` + ``api_mode`` from config. This lets the mobile
+    list distinguish a custom provider from a registered api_key provider and
+    pre-fill the edit/rotate form. NEVER adds the api_key or key_env value —
+    only non-secret transport metadata.
     """
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.inventory import build_models_payload, load_picker_context
@@ -2349,6 +2386,25 @@ def _provider_provider_rows() -> List[Dict[str, Any]]:
             # rows without a credential hint (e.g. virtual/desktop-only sources)
             # stay blank so mobile does not invent a provisioning flow.
             row["auth_type"] = "api_key"
+
+    # ABH-257: custom-provider enrichment. A row whose slug matches a custom
+    # config entry (providers.<slug> with key_env/api_key marker) is re-tagged
+    # "custom" and carries base_url + api_mode so the mobile edit/rotate form
+    # can pre-fill. Registered providers with a tuning-only providers.<slug>
+    # entry (no credential markers) are NOT affected — parity with the BUG5
+    # fix in the DELETE handler.
+    custom_entries = _custom_provider_entries()
+    if custom_entries:
+        for row in rows:
+            cslug = str(row.get("slug") or "")
+            if cslug and cslug in custom_entries:
+                entry = custom_entries[cslug]
+                row["auth_type"] = "custom"
+                if entry.get("base_url"):
+                    row["base_url"] = entry["base_url"]
+                if entry.get("api_mode"):
+                    row["api_mode"] = entry["api_mode"]
+
     return [
         row for row in rows
         if bool(row.get("authenticated"))
@@ -2574,21 +2630,28 @@ async def list_providers(request: Request) -> Dict[str, Any]:
 
     # Project to the mobile-safe shape: NEVER forward api_key / key_env values
     # or any credential material. ``authenticated`` is the only auth signal.
+    # ABH-257: custom-provider rows carry ``base_url`` + ``api_mode`` (non-secret
+    # transport metadata) so the edit/rotate form can pre-fill. Registered
+    # providers never carry these fields in the GET response.
     safe: List[Dict[str, Any]] = []
     for row in rows:
         slug = row.get("slug") or ""
         if not slug:
             continue
-        safe.append(
-            {
-                "slug": slug,
-                "name": row.get("name") or slug,
-                "auth_type": row.get("auth_type") or "",
-                "is_current": bool(row.get("is_current")),
-                "authenticated": bool(row.get("authenticated")),
-                "total_models": int(row.get("total_models") or 0),
-            }
-        )
+        entry: Dict[str, Any] = {
+            "slug": slug,
+            "name": row.get("name") or slug,
+            "auth_type": row.get("auth_type") or "",
+            "is_current": bool(row.get("is_current")),
+            "authenticated": bool(row.get("authenticated")),
+            "total_models": int(row.get("total_models") or 0),
+        }
+        if row.get("auth_type") == "custom":
+            if row.get("base_url"):
+                entry["base_url"] = row["base_url"]
+            if row.get("api_mode"):
+                entry["api_mode"] = row["api_mode"]
+        safe.append(entry)
     return {"providers": safe}
 
 
@@ -3037,7 +3100,7 @@ def _refresh_provider_row(slug: str, *, fallback_name: str = "") -> Dict[str, An
         if row.get("slug") == slug:
             if not row.get("authenticated"):
                 continue
-            return {
+            out_row: Dict[str, Any] = {
                 "slug": row.get("slug") or slug,
                 "name": row.get("name") or fallback_name or slug,
                 "auth_type": row.get("auth_type") or "",
@@ -3046,6 +3109,13 @@ def _refresh_provider_row(slug: str, *, fallback_name: str = "") -> Dict[str, An
                 "total_models": int(row.get("total_models") or 0),
                 "models": row.get("models") or [],
             }
+            # ABH-257: carry base_url + api_mode for custom-provider rows.
+            if out_row.get("auth_type") == "custom":
+                if row.get("base_url"):
+                    out_row["base_url"] = row["base_url"]
+                if row.get("api_mode"):
+                    out_row["api_mode"] = row["api_mode"]
+            return out_row
     return {
         "slug": slug,
         "name": fallback_name or slug,

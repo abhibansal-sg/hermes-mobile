@@ -53,7 +53,11 @@ struct ProviderListView: View {
     /// The provider whose EnterProviderKeyView is presented (Tier A push).
     @State private var pendingKeyProvider: ProviderRow?
 
-    /// Whether the CustomProviderView is presented (Tier B push).
+    /// ABH-257: the authenticated custom provider whose edit/rotate sheet is
+    /// presented (Tier B edit path). Set on tap of an authenticated `.custom` row.
+    @State private var pendingEditCustom: ProviderRow?
+
+    /// Whether the CustomProviderView is presented (Tier B — Add New).
     @State private var showingCustom = false
 
     /// The provider awaiting a disconnect confirmation.
@@ -102,6 +106,17 @@ struct ProviderListView: View {
                 }
             }
             // \.hermesTheme does not inherit across a sheet presentation; re-inject.
+            .environment(\.hermesTheme, theme)
+        }
+        // ABH-257: edit/rotate sheet for an authenticated custom provider. Same
+        // sheet shape as Add New, but pre-filled from the existing row.
+        .sheet(item: $pendingEditCustom) { provider in
+            NavigationStack {
+                CustomProviderView(rest: rest, existing: provider) { updated in
+                    upsertRow(updated)
+                    onProvidersChanged?()
+                }
+            }
             .environment(\.hermesTheme, theme)
         }
         .confirmationDialog(
@@ -206,15 +221,21 @@ struct ProviderListView: View {
             }
             .padding(.vertical, 2)
             .opacity(disconnectingSlug == provider.slug ? 0.4 : 1)
-            // Tapping an authenticated api_key provider re-opens the key form
-            // (replace key). OAuth-only providers that somehow report authenticated
-            // are read-only (no tap affordance). The `canProvision` gate keeps the
+            // Tapping an authenticated provider re-opens its provisioning form:
+            //   • .apiKey → EnterProviderKeyView (replace key)
+            //   • .custom → CustomProviderView in edit/rotate mode (ABH-257)
+            // OAuth-only providers that somehow report authenticated are
+            // read-only (no tap affordance). The `canProvision` gate keeps the
             // tap a no-op for them while still letting the swipe Disconnect fire.
             .contentShape(Rectangle())
             .onTapGesture {
                 guard canProvision else { return }
                 actionError = nil
-                pendingKeyProvider = provider
+                if provider.authType == .custom {
+                    pendingEditCustom = provider
+                } else {
+                    pendingKeyProvider = provider
+                }
             }
             // A re-provision (replace key) is available for provisionable providers
             // even when already authenticated; OAuth-only providers are read-only.
@@ -231,9 +252,19 @@ struct ProviderListView: View {
             }
         } else if canProvision {
             // Provisionable, not yet authenticated → tap to enter a key.
+            // ABH-257: a `.custom` provider routes to the create form (it needs
+            // base_url + api_mode, not just a key); an `.apiKey` provider routes
+            // to the Tier A key-entry form.
             Button {
                 actionError = nil
-                pendingKeyProvider = provider
+                if provider.authType == .custom {
+                    // An unauthenticated custom row is rare (disconnect clears
+                    // the config entry entirely), but route it to the create
+                    // form pre-filled rather than the Tier A key form.
+                    pendingEditCustom = provider
+                } else {
+                    pendingKeyProvider = provider
+                }
             } label: {
                 HStack(spacing: 12) {
                     VStack(alignment: .leading, spacing: 4) {
@@ -524,8 +555,14 @@ struct EnterProviderKeyView: View {
 /// is written until Save).
 struct CustomProviderView: View {
     let rest: RestClient
-    /// Invoked with the newly-added provider row on a successful save.
+    /// Invoked with the newly-added (or updated) provider row on a successful save.
     let onAdded: (ProviderRow) -> Void
+    /// ABH-257: when non-nil, the form opens in EDIT/ROTATE mode — name is LOCKED
+    /// (read-only), base_url + api_mode are pre-filled from the existing row, and
+    /// the api_key field is blank (the user re-enters it to rotate). When nil,
+    /// the form is a bare create (the original flow). Save POSTs to the same
+    /// `/providers/custom` upsert endpoint either way (the server upserts by name).
+    let existing: ProviderRow?
 
     @Environment(\.hermesTheme) private var theme
     @Environment(\.dismiss) private var dismiss
@@ -538,6 +575,9 @@ struct CustomProviderView: View {
     @State private var isSaving = false
     @FocusState private var nameFieldFocused: Bool
 
+    /// True when opening in edit/rotate mode (an existing row was passed in).
+    private var isEditing: Bool { existing != nil }
+
     private var canSave: Bool {
         !name.trimmingCharacters(in: .whitespaces).isEmpty
             && !baseURL.trimmingCharacters(in: .whitespaces).isEmpty
@@ -549,10 +589,12 @@ struct CustomProviderView: View {
         Form {
             Section {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Custom Provider")
+                    Text(isEditing ? "Edit Custom Provider" : "Custom Provider")
                         .font(.title2.bold())
                         .foregroundStyle(theme.fg)
-                    Text("Add any OpenAI- or Anthropic-compatible endpoint — a proxy, a self-host, or a third-party provider with a base URL.")
+                    Text(isEditing
+                        ? "Update the base URL, API mode, or rotate the key for this provider. The name is locked (used as the upsert key)."
+                        : "Add any OpenAI- or Anthropic-compatible endpoint — a proxy, a self-host, or a third-party provider with a base URL.")
                         .font(.subheadline)
                         .foregroundStyle(theme.mutedFg)
                         .fixedSize(horizontal: false, vertical: true)
@@ -563,12 +605,27 @@ struct CustomProviderView: View {
             }
 
             Section {
-                TextField("Name", text: $name, prompt: Text("e.g. my-proxy"))
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .submitLabel(.next)
-                    .focused($nameFieldFocused)
-                    .accessibilityIdentifier("customProviderNameField")
+                if isEditing {
+                    // ABH-257: name is LOCKED in edit mode (the server upserts by
+                    // name — changing it would create a new provider). Show it
+                    // read-only with a lock affordance.
+                    HStack {
+                        Text(name)
+                            .foregroundStyle(theme.fg)
+                        Spacer()
+                        Image(systemName: "lock.fill")
+                            .foregroundStyle(theme.mutedFg)
+                            .font(.caption)
+                    }
+                    .accessibilityIdentifier("customProviderNameLocked")
+                } else {
+                    TextField("Name", text: $name, prompt: Text("e.g. my-proxy"))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.next)
+                        .focused($nameFieldFocused)
+                        .accessibilityIdentifier("customProviderNameField")
+                }
 
                 TextField("Base URL", text: $baseURL, prompt: Text("https://api.example.com"))
                     .textInputAutocapitalization(.never)
@@ -585,7 +642,7 @@ struct CustomProviderView: View {
                 .pickerStyle(.menu)
                 .accessibilityIdentifier("customProviderAPIModePicker")
 
-                SecureField("API key", text: $apiKey, prompt: Text("Paste API key"))
+                SecureField(isEditing ? "New API key" : "API key", text: $apiKey, prompt: Text(isEditing ? "Paste new API key" : "Paste API key"))
                     .textContentType(.password)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -597,7 +654,9 @@ struct CustomProviderView: View {
                     Text(errorText)
                         .foregroundStyle(theme.destructive)
                 } else {
-                    Text("The name must be letters, numbers, dashes, or underscores. The base URL must start with http:// or https://.")
+                    Text(isEditing
+                        ? "Enter a new API key to rotate. The base URL and API mode can also be corrected. The key is sent once and stored securely on your gateway."
+                        : "The name must be letters, numbers, dashes, or underscores. The base URL must start with http:// or https://.")
                 }
             }
 
@@ -609,7 +668,7 @@ struct CustomProviderView: View {
                             ProgressView()
                                 .tint(theme.midground.contrastingForeground)
                         } else {
-                            Text("Add Provider")
+                            Text(isEditing ? "Update Provider" : "Add Provider")
                                 .fontWeight(.semibold)
                         }
                         Spacer()
@@ -621,13 +680,13 @@ struct CustomProviderView: View {
                 .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                 .listRowBackground(Color.clear)
                 .disabled(!canSave)
-                .accessibilityLabel(isSaving ? "Adding" : "Add Provider")
+                .accessibilityLabel(isSaving ? "Saving" : (isEditing ? "Update Provider" : "Add Provider"))
                 .accessibilityIdentifier("customProviderSaveButton")
             }
         }
         .scrollContentBackground(.hidden)
         .background(theme.bg)
-        .navigationTitle("Custom Provider")
+        .navigationTitle(isEditing ? "Edit Provider" : "Custom Provider")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
@@ -635,7 +694,16 @@ struct CustomProviderView: View {
                     .accessibilityIdentifier("customProviderCancelButton")
             }
         }
-        .onAppear { nameFieldFocused = true }
+        .onAppear {
+            // ABH-257: pre-fill from the existing row when editing; focus the key
+            // field area (name is locked so no auto-focus on it in edit mode).
+            if let existing {
+                name = existing.name
+                baseURL = existing.baseURL ?? "https://"
+                if let mode = existing.apiMode { apiMode = mode }
+            }
+            if !isEditing { nameFieldFocused = true }
+        }
     }
 
     private func save() {
@@ -646,7 +714,7 @@ struct CustomProviderView: View {
         let trimmedName = name.trimmingCharacters(in: .whitespaces)
         let trimmedBase = baseURL.trimmingCharacters(in: .whitespaces)
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespaces)
-        // Transient Keychain hold for the POST duration (slug = the new name).
+        // Transient Keychain hold for the POST duration (slug = the name).
         do {
             try KeychainService.saveProviderKey(trimmedKey, slug: trimmedName)
         } catch {
@@ -676,5 +744,19 @@ struct CustomProviderView: View {
                 errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
         }
+    }
+
+    /// Convenience create-only init (preserves the original call site shape).
+    init(rest: RestClient, onAdded: @escaping (ProviderRow) -> Void) {
+        self.rest = rest
+        self.onAdded = onAdded
+        self.existing = nil
+    }
+
+    /// ABH-257: edit/rotate init — pre-fills from an existing provider row.
+    init(rest: RestClient, existing: ProviderRow, onAdded: @escaping (ProviderRow) -> Void) {
+        self.rest = rest
+        self.onAdded = onAdded
+        self.existing = existing
     }
 }
