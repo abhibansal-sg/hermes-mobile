@@ -17,6 +17,7 @@ Key design decisions:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -30,6 +31,29 @@ from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
+
+_SESSION_ORIGIN_ENV = "HERMES_SESSION_ORIGIN"
+_DEFAULT_SESSION_SOURCE_VALUES = {"", "cli", "unknown"}
+
+
+def _resolve_create_session_source(source: Optional[str]) -> str:
+    """Return the durable source for a newly-created session row.
+
+    Machinery launchers mark the child process with HERMES_SESSION_ORIGIN so
+    session rows can be classified by an explicit create-time marker rather
+    than leaky title/cwd heuristics. Human/messaging callers that pass a real
+    source (telegram, discord, api_server, etc.) remain authoritative.
+
+    Legacy CLI/agent creation paths often pass fallback values ("cli" or
+    "unknown") even when the caller did not intentionally choose a source; the
+    origin marker is allowed to replace those defaults.
+    """
+    normalized = str(source or "").strip()
+    origin = str(os.environ.get(_SESSION_ORIGIN_ENV, "") or "").strip()
+    if origin and normalized.lower() in _DEFAULT_SESSION_SOURCE_VALUES:
+        return origin
+    return normalized or "unknown"
+
 
 def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
@@ -1567,7 +1591,7 @@ class SessionDB:
     def _insert_session_row(
         self,
         session_id: str,
-        source: str,
+        source: Optional[str] = None,
         model: str = None,
         model_config: Dict[str, Any] = None,
         system_prompt: str = None,
@@ -1597,6 +1621,8 @@ class SessionDB:
         switching to it (IDOR scoping — without them the ``sessions`` table has
         no chat/thread to compare).
         """
+        source = _resolve_create_session_source(source)
+
         def _do(conn):
             conn.execute(
                 """INSERT INTO sessions (
@@ -1632,7 +1658,7 @@ class SessionDB:
             )
         self._execute_write(_do)
 
-    def create_session(self, session_id: str, source: str, **kwargs) -> str:
+    def create_session(self, session_id: str, source: Optional[str] = None, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id

@@ -62,7 +62,7 @@ class _RecordingSearchDB:
         return []
 
 
-def test_session_search_excludes_cron_subagent_and_tool_sources(client, monkeypatch, tmp_path):
+def test_session_search_excludes_machinery_cron_subagent_and_tool_sources(client, monkeypatch, tmp_path):
     state_db = tmp_path / "state.db"
     state_db.touch()
     _RecordingSearchDB.instances = []
@@ -77,7 +77,8 @@ def test_session_search_excludes_cron_subagent_and_tool_sources(client, monkeypa
     db = _RecordingSearchDB.instances[-1]
     assert db.read_only is True
     assert db.captured_kwargs is not None
-    assert db.captured_kwargs["exclude_sources"] == ["cron", "subagent", "tool"]
+    assert db.captured_kwargs["exclude_sources"] == ["machinery", "cron", "subagent", "tool"]
+    assert "machinery" in db.captured_kwargs["exclude_sources"]
     assert "cron" in db.captured_kwargs["exclude_sources"]
     assert "subagent" in db.captured_kwargs["exclude_sources"]
     assert "tool" in db.captured_kwargs["exclude_sources"]

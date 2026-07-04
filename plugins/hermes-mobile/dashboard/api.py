@@ -1460,7 +1460,7 @@ async def search_sessions(
         # sessions, matching the native session_search hidden-sources set.
         matches = db.search_messages(
             query=q.strip(),
-            exclude_sources=["cron", "subagent", "tool"],
+            exclude_sources=["machinery", "cron", "subagent", "tool"],
             role_filter=role_filter,
             limit=limit,
             offset=offset,

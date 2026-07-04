@@ -93,6 +93,21 @@ class TestSessionLifecycle:
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
 
+    def test_create_session_uses_env_origin_when_source_omitted(self, db, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_ORIGIN", "machinery")
+
+        sid = db.create_session(session_id="s-origin")
+
+        assert sid == "s-origin"
+        assert db.get_session("s-origin")["source"] == "machinery"
+
+    def test_create_session_env_origin_does_not_override_explicit_source(self, db, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_ORIGIN", "machinery")
+
+        db.create_session(session_id="s-telegram", source="telegram")
+
+        assert db.get_session("s-telegram")["source"] == "telegram"
+
 
     def test_get_nonexistent_session(self, db):
         assert db.get_session("nonexistent") is None

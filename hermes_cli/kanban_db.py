@@ -7709,6 +7709,10 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    # Durable create-time marker for session rows: the worker's SessionDB
+    # creation path records this as sessions.source so mobile can hide
+    # machinery without guessing from titles or cwd.
+    env["HERMES_SESSION_ORIGIN"] = "machinery"
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the

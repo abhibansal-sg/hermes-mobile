@@ -1709,6 +1709,46 @@ def test_has_spawnable_ready_false_on_empty_queue(kanban_home):
         assert kb.has_spawnable_ready(conn) is False
 
 
+def test_default_spawn_marks_worker_session_origin_as_machinery(kanban_home, monkeypatch, tmp_path):
+    captured = {}
+
+    class FakePopen:
+        pid = 1234
+
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_resolve_worker_cli_toolsets", lambda hermes_home: None)
+    workspace = tmp_path / "worker"
+    workspace.mkdir()
+    task = kb.Task(
+        id="t_spawn",
+        title="spawn",
+        body=None,
+        assignee="engineer",
+        status="running",
+        priority=0,
+        created_by="test",
+        created_at=1,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="scratch",
+        workspace_path=str(workspace),
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+    )
+
+    assert kb._default_spawn(task, str(workspace)) == 1234
+
+    env = captured["kwargs"]["env"]
+    assert env["HERMES_KANBAN_TASK"] == "t_spawn"
+    assert env["HERMES_SESSION_ORIGIN"] == "machinery"
+
+
 def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable):
     spawns = []
 
