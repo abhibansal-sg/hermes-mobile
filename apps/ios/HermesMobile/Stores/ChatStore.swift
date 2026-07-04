@@ -1550,8 +1550,9 @@ final class ChatStore {
     }
 
     /// Restore files from the checkpoint currently displayed in the confirmation
-    /// sheet. This is the ONLY production call path to `rollback.restore`, making
-    /// the confirm-before-restore invariant explicit and testable.
+    /// sheet. The turn has already been removed by `session.undo`, so each restore
+    /// is file-scoped; a full `rollback.restore` would pop another user+assistant
+    /// turn from server history.
     func confirmPendingRollbackRestore() async {
         guard !localTurnInFlight else {
             lastError = "Agent is busy"
@@ -1568,15 +1569,21 @@ final class ChatStore {
         undoRollbackPhase = .restoring
         lastError = nil
         do {
-            let restored = RollbackRestoreResult(json: try await undoRollbackRequest(
-                "rollback.restore",
-                params: .object([
-                    "session_id": .string(sessionId),
-                    "hash": .string(pending.checkpoint.hash),
-                ])
-            ))
-            guard restored.success else {
-                throw GatewayError.rpc(code: 5021, message: "rollback.restore did not report success")
+            guard !pending.diff.filePaths.isEmpty else {
+                throw GatewayError.rpc(code: 5021, message: "rollback.diff did not report restorable file paths")
+            }
+            for filePath in pending.diff.filePaths {
+                let restored = RollbackRestoreResult(json: try await undoRollbackRequest(
+                    "rollback.restore",
+                    params: .object([
+                        "session_id": .string(sessionId),
+                        "hash": .string(pending.checkpoint.hash),
+                        "file_path": .string(filePath),
+                    ])
+                ))
+                guard restored.success else {
+                    throw GatewayError.rpc(code: 5021, message: "rollback.restore did not report success for \(filePath)")
+                }
             }
             pendingRollbackRestore = nil
             undoRollbackPhase = .restored

@@ -705,11 +705,14 @@ struct RollbackDiffResult: Sendable, Equatable {
     let stat: String
     let diff: String
     let rendered: String?
+    let filePaths: [String]
 
     init(json: JSONValue) {
         self.stat = json["stat"]?.stringValue ?? ""
-        self.diff = json["diff"]?.stringValue ?? ""
+        let diff = json["diff"]?.stringValue ?? ""
+        self.diff = diff
         self.rendered = json["rendered"]?.stringValue
+        self.filePaths = Self.changedFilePaths(in: diff)
     }
 
     var displayText: String {
@@ -717,6 +720,38 @@ struct RollbackDiffResult: Sendable, Equatable {
         if let body, !body.isEmpty { return body }
         let raw = diff.trimmingCharacters(in: .whitespacesAndNewlines)
         return raw.isEmpty ? "No file diff reported for this checkpoint." : raw
+    }
+
+    private static func changedFilePaths(in diff: String) -> [String] {
+        var paths: [String] = []
+        var previousOldPath: String?
+
+        func appendPath(_ raw: String) {
+            let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !path.isEmpty, path != "/dev/null", !paths.contains(path) else { return }
+            paths.append(path)
+        }
+
+        for rawLine in diff.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(rawLine)
+            if line.hasPrefix("diff --git a/") {
+                let rest = String(line.dropFirst("diff --git a/".count))
+                if let separator = rest.range(of: " b/") {
+                    appendPath(String(rest[separator.upperBound...]))
+                }
+                previousOldPath = nil
+            } else if line.hasPrefix("--- a/") {
+                previousOldPath = String(line.dropFirst("--- a/".count))
+            } else if line.hasPrefix("+++ b/") {
+                appendPath(String(line.dropFirst("+++ b/".count)))
+                previousOldPath = nil
+            } else if line == "+++ /dev/null", let oldPath = previousOldPath {
+                appendPath(oldPath)
+                previousOldPath = nil
+            }
+        }
+
+        return paths
     }
 }
 
