@@ -249,3 +249,226 @@ final class ProviderKeyRestTests: XCTestCase {
         }
     }
 }
+
+/// ABH-262 — non-model toolset credential REST client tests.
+///
+/// Pins the mobile toolset-key surface to the plugin contract: GET/PUT paths stay
+/// under the shared RestClient path family, PUT carries the key/value in the JSON
+/// body (including the empty-string clear path), and redacted responses decode
+/// only `is_set` booleans — never stored secret values.
+final class ToolsetCredentialRestTests: XCTestCase {
+
+    final class RecordingProtocol: URLProtocol, @unchecked Sendable {
+        nonisolated(unsafe) static var requests: [URLRequest] = []
+        nonisolated(unsafe) static var script: [(Data, Int)] = [(Data(), 200)]
+        nonisolated(unsafe) static var served = 0
+
+        static func reset(script: [(Data, Int)]) {
+            requests = []
+            self.script = script
+            served = 0
+        }
+
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+        override func startLoading() {
+            Self.requests.append(request)
+            let index = min(Self.served, Self.script.count - 1)
+            Self.served += 1
+            let (body, status) = Self.script[index]
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: status,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: body)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+
+        override func stopLoading() {}
+    }
+
+    private func makeClient(style: APIPathStyle, script: [(Data, Int)]) -> RestClient {
+        RecordingProtocol.reset(script: script)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecordingProtocol.self]
+        return RestClient(
+            baseURL: URL(string: "https://gw.example:9119")!,
+            token: "tok",
+            session: URLSession(configuration: config),
+            pathStyle: style
+        )
+    }
+
+    private var recordedPaths: [String] {
+        RecordingProtocol.requests.compactMap { $0.url?.path }
+    }
+
+    private var recordedMethods: [String] {
+        RecordingProtocol.requests.compactMap { $0.httpMethod }
+    }
+
+    func testGetToolsetConfigUsesPathFamilyAndDecodesRedactedStatusOnly() async throws {
+        let body = Data(#"""
+        {
+          "name":"web",
+          "has_category":true,
+          "active_provider":"tavily",
+          "providers":[{
+            "name":"Tavily",
+            "badge":"recommended",
+            "tag":"tavily",
+            "requires_nous_auth":false,
+            "is_active":true,
+            "post_setup":"Restart the gateway after saving.",
+            "env_vars":[{
+              "key":"TAVILY_API_KEY",
+              "prompt":"Tavily API Key",
+              "url":"https://app.tavily.com",
+              "default":"",
+              "is_set":true,
+              "value":"redacted-payload-sentinel"
+            }]
+          }]
+        }
+        """#.utf8)
+
+        for style in [APIPathStyle.legacy, .plugin] {
+            let prefix = style.mobileAPIPrefix
+            let client = makeClient(style: style, script: [(body, 200)])
+
+            let config = try await client.getToolsetConfig(name: "web")
+
+            XCTAssertEqual(recordedPaths, ["\(prefix)/toolsets/web/config"])
+            XCTAssertEqual(recordedMethods, ["GET"])
+            XCTAssertEqual(config.name, "web")
+            XCTAssertEqual(config.displayName, "Web Search")
+            XCTAssertTrue(config.hasCategory)
+            XCTAssertEqual(config.activeProvider, "tavily")
+            XCTAssertEqual(config.providers.count, 1)
+            XCTAssertTrue(config.providers[0].isActive)
+            XCTAssertEqual(config.providers[0].postSetup, "Restart the gateway after saving.")
+
+            let envVar = try XCTUnwrap(config.providers.first?.envVars.first)
+            XCTAssertEqual(envVar.key, "TAVILY_API_KEY")
+            XCTAssertEqual(envVar.prompt, "Tavily API Key")
+            XCTAssertEqual(envVar.url, "https://app.tavily.com")
+            XCTAssertTrue(envVar.isSet, "redacted responses must drive status from is_set")
+            let decodedFieldLabels = Set(Mirror(reflecting: envVar).children.compactMap(\.label))
+            XCTAssertFalse(decodedFieldLabels.contains("value"), "ToolsetEnvVar must not retain a secret value field")
+        }
+    }
+
+    func testSetToolsetCredentialPutsKeyAndTrimmedValueInBody() async throws {
+        let response = Data(#"{"name":"web","providers":[]}"#.utf8)
+
+        for style in [APIPathStyle.legacy, .plugin] {
+            let prefix = style.mobileAPIPrefix
+            let client = makeClient(style: style, script: [(response, 200)])
+
+            _ = try await client.setToolsetCredential(
+                name: "web",
+                key: "TAVILY_API_KEY",
+                value: "  tvly-test-token  "
+            )
+
+            XCTAssertEqual(recordedPaths, ["\(prefix)/toolsets/web/config"])
+            XCTAssertEqual(recordedMethods, ["PUT"])
+            let request = try XCTUnwrap(RecordingProtocol.requests.first)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+            XCTAssertFalse(request.url?.absoluteString.contains("tvly-test-token") ?? true, "credential must not leak into URL")
+            let object = try XCTUnwrap(jsonBody(for: request))
+            XCTAssertEqual(object["key"] as? String, "TAVILY_API_KEY")
+            XCTAssertEqual(object["value"] as? String, "tvly-test-token")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "X-Hermes-Session-Token"), "tok")
+        }
+    }
+
+    func testClearToolsetCredentialSendsEmptyValue() async throws {
+        let response = Data(#"""
+        {"name":"image_gen","providers":[{"name":"FAL","env_vars":[{"key":"FAL_KEY","prompt":"FAL Key","is_set":false}]}]}
+        """#.utf8)
+        let client = makeClient(style: .plugin, script: [(response, 200)])
+
+        let config = try await client.setToolsetCredential(
+            name: "image_gen",
+            key: "FAL_KEY",
+            value: nil
+        )
+
+        XCTAssertEqual(recordedPaths, ["/api/plugins/hermes-mobile/toolsets/image_gen/config"])
+        XCTAssertEqual(recordedMethods, ["PUT"])
+        let request = try XCTUnwrap(RecordingProtocol.requests.first)
+        let object = try XCTUnwrap(jsonBody(for: request))
+        XCTAssertEqual(object["key"] as? String, "FAL_KEY")
+        XCTAssertEqual(object["value"] as? String, "", "nil clear must be sent as an empty value")
+        XCTAssertFalse(try XCTUnwrap(config.providers.first?.envVars.first).isSet)
+    }
+
+    func testToolsetCatalogKeepsSettingsReachabilitySurfaceFocused() {
+        // CONTRACT (not a frozen literal): every configurable name the iOS
+        // client requests MUST be a key the gateway's
+        // CONFIGURABLE_TOOLSETS (hermes_cli/tools_config.py) recognises —
+        // otherwise _valid_toolset_config_names() silently drops the panel.
+        // The known valid set today is {web, image_gen}. If a new panel is
+        // added, extend this set, but never let the client drift off it.
+        let gatewayValidToolsetKeys: Set<String> = ["web", "image_gen"]
+        XCTAssertTrue(
+            Set(ToolsetConfigCatalog.configurableNames).isSubset(of: gatewayValidToolsetKeys),
+            "iOS configurableNames \(ToolsetConfigCatalog.configurableNames) must be a subset of " +
+            "the gateway's valid toolset keys \(gatewayValidToolsetKeys)"
+        )
+        XCTAssertEqual(ToolsetConfig.displayName(for: "web"), "Web Search")
+        XCTAssertEqual(ToolsetConfig.displayName(for: "image_gen"), "Image Generation")
+    }
+
+    func testCredentialEntryViewIsConstructedFromRedactedTargetOnly() {
+        let target = ToolsetCredentialTarget(
+            toolsetName: "web",
+            toolsetDisplayName: "Web Search",
+            providerName: "Tavily",
+            envVar: ToolsetEnvVar(
+                key: "TAVILY_API_KEY",
+                prompt: "Tavily API Key",
+                url: nil,
+                defaultValue: nil,
+                isSet: true
+            )
+        )
+        let client = makeClient(style: .plugin, script: [(Data(#"{"name":"web","providers":[]}"#.utf8), 200)])
+        let view = ToolsetCredentialEntryView(rest: client, target: target) { _ in }
+
+        XCTAssertTrue(target.envVar.isSet, "configured status is carried as is_set only")
+        XCTAssertFalse(
+            Set(Mirror(reflecting: target.envVar).children.compactMap(\.label)).contains("value"),
+            "entry targets must not carry a stored secret for SecureField prefill"
+        )
+        XCTAssertTrue(
+            Mirror(reflecting: view).children.contains { $0.label == "target" },
+            "entry view should be reachable from the redacted target model"
+        )
+    }
+
+    private func jsonBody(for request: URLRequest) throws -> [String: Any]? {
+        let data = try bodyData(for: request)
+        return try JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    private func bodyData(for request: URLRequest) throws -> Data {
+        if let body = request.httpBody, !body.isEmpty { return body }
+        guard let stream = request.httpBodyStream else { return Data() }
+        stream.open()
+        defer { stream.close() }
+        var drained = Data()
+        let bufferSize = 1_024
+        while stream.hasBytesAvailable {
+            var buffer = [UInt8](repeating: 0, count: bufferSize)
+            let read = stream.read(&buffer, maxLength: bufferSize)
+            if read > 0 { drained.append(buffer, count: read) } else { break }
+        }
+        return drained
+    }
+}

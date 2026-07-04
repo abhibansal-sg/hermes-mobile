@@ -344,3 +344,197 @@ extension RestClient {
         return ProviderDisconnectResult(json: root)
     }
 }
+
+
+// MARK: - ABH-262 toolset credential REST surface (plugin-mount)
+//
+// The mobile plugin exposes desktop-parity toolset credential config at:
+//
+//   GET <prefix>/toolsets/{name}/config
+//   PUT <prefix>/toolsets/{name}/config {"key":"ENV_VAR", "value":"..."}
+//
+// The GET response is explicitly redacted: env vars carry `is_set` only, never
+// the stored value. PUT with an empty value clears the env var. This extension
+// keeps the iOS app on the same RestClient plumbing as the provider-key surface
+// (Host override, X-Hermes-Session-Token auth header, timeout, JSON helpers).
+
+// MARK: Toolset config domain types
+
+struct ToolsetConfig: Identifiable, Sendable, Equatable {
+    let name: String
+    let hasCategory: Bool
+    let providers: [ToolsetConfigProvider]
+    let activeProvider: String?
+
+    var id: String { name }
+
+    var displayName: String { Self.displayName(for: name) }
+
+    var configuredCredentialCount: Int {
+        providers.reduce(0) { total, provider in
+            total + provider.envVars.filter(\.isSet).count
+        }
+    }
+
+    var credentialCount: Int {
+        providers.reduce(0) { $0 + $1.envVars.count }
+    }
+
+    var hasConfiguredCredential: Bool { configuredCredentialCount > 0 }
+
+    init(
+        name: String,
+        hasCategory: Bool,
+        providers: [ToolsetConfigProvider],
+        activeProvider: String?
+    ) {
+        self.name = name
+        self.hasCategory = hasCategory
+        self.providers = providers
+        self.activeProvider = activeProvider
+    }
+
+    init(json: JSONValue) {
+        let name = json["name"]?.stringValue ?? ""
+        self.name = name
+        self.hasCategory = json["has_category"]?.boolValue ?? false
+        self.activeProvider = json["active_provider"]?.stringValue
+        self.providers = (json["providers"]?.arrayValue ?? []).map {
+            ToolsetConfigProvider(json: $0, toolsetName: name)
+        }
+    }
+
+    static func displayName(for name: String) -> String {
+        switch name {
+        case "web": return "Web Search"
+        case "image_gen": return "Image Generation"
+        default:
+            return name
+                .split(separator: "_")
+                .map { part in
+                    String(part.prefix(1)).uppercased() + String(part.dropFirst())
+                }
+                .joined(separator: " ")
+        }
+    }
+}
+
+struct ToolsetConfigProvider: Identifiable, Sendable, Equatable {
+    let toolsetName: String
+    let name: String
+    let badge: String
+    let tag: String
+    let envVars: [ToolsetEnvVar]
+    let postSetup: String?
+    let requiresNousAuth: Bool
+    let isActive: Bool
+
+    var id: String { "\(toolsetName)::\(name)::\(tag)::\(badge)" }
+
+    init(
+        toolsetName: String,
+        name: String,
+        badge: String,
+        tag: String,
+        envVars: [ToolsetEnvVar],
+        postSetup: String?,
+        requiresNousAuth: Bool,
+        isActive: Bool
+    ) {
+        self.toolsetName = toolsetName
+        self.name = name
+        self.badge = badge
+        self.tag = tag
+        self.envVars = envVars
+        self.postSetup = postSetup
+        self.requiresNousAuth = requiresNousAuth
+        self.isActive = isActive
+    }
+
+    init(json: JSONValue, toolsetName: String) {
+        self.toolsetName = toolsetName
+        self.name = json["name"]?.stringValue ?? ""
+        self.badge = json["badge"]?.stringValue ?? ""
+        self.tag = json["tag"]?.stringValue ?? ""
+        self.envVars = (json["env_vars"]?.arrayValue ?? []).map(ToolsetEnvVar.init(json:))
+        self.postSetup = json["post_setup"]?.stringValue
+        self.requiresNousAuth = json["requires_nous_auth"]?.boolValue ?? false
+        self.isActive = json["is_active"]?.boolValue ?? false
+    }
+}
+
+struct ToolsetEnvVar: Identifiable, Sendable, Equatable, Hashable {
+    let key: String
+    let prompt: String
+    let url: String?
+    let defaultValue: String?
+    let isSet: Bool
+
+    var id: String { key }
+
+    init(key: String, prompt: String, url: String?, defaultValue: String?, isSet: Bool) {
+        self.key = key
+        self.prompt = prompt
+        self.url = url
+        self.defaultValue = defaultValue
+        self.isSet = isSet
+    }
+
+    init(json: JSONValue) {
+        self.key = json["key"]?.stringValue ?? ""
+        self.prompt = json["prompt"]?.stringValue ?? json["key"]?.stringValue ?? ""
+        self.url = json["url"]?.stringValue
+        self.defaultValue = json["default"]?.stringValue
+        self.isSet = json["is_set"]?.boolValue ?? false
+    }
+}
+
+enum ToolsetConfigCatalog {
+    /// The server currently exposes toolset config one toolset at a time rather
+    /// than a list endpoint. Keep this starter set aligned with the shipped top
+    /// non-model credential panels ABH-262 asked to surface on iOS.
+    /// "web" (Web Search) and "image_gen" (Image Generation) are the gateway's
+    /// canonical configurable toolset keys (CONFIGURABLE_TOOLSETS in
+    /// hermes_cli/tools_config.py). The individual TOOLS web_search / web_extract
+    /// live INSIDE the "web" toolset — the config path segment is "web", not
+    /// "web_search".
+    static let configurableNames = ["web", "image_gen"]
+}
+
+// MARK: - Toolset credential endpoints
+
+extension RestClient {
+
+    /// `GET <prefix>/toolsets/{name}/config` — returns provider/env-var status
+    /// for one toolset. The response never includes a stored secret value.
+    func getToolsetConfig(name: String) async throws -> ToolsetConfig {
+        let encodedName = name.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? name
+        let data = try await get(path: "\(mobileAPIPrefix)/toolsets/\(encodedName)/config")
+        let root = try decodeJSONValue(from: data, context: "toolsets.config")
+        return ToolsetConfig(json: root)
+    }
+
+    /// `PUT <prefix>/toolsets/{name}/config` — set or clear an env-var credential.
+    /// Passing `nil` or an empty string clears the key. The refreshed config is
+    /// returned and remains redacted (`is_set` booleans only).
+    @discardableResult
+    func setToolsetCredential(name: String, key: String, value: String?) async throws -> ToolsetConfig {
+        let encodedName = name.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? name
+        var request = makeRequest(
+            path: "\(mobileAPIPrefix)/toolsets/\(encodedName)/config", method: "PUT"
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: JSONValue = .object([
+            "key": .string(key),
+            "value": .string(value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""),
+        ])
+        request.httpBody = try encodeBody(body, context: "toolsets.setConfig")
+        let data = try await perform(request)
+        let root = try decodeJSONValue(from: data, context: "toolsets.setConfig")
+        return ToolsetConfig(json: root)
+    }
+}

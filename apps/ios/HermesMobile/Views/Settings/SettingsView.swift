@@ -158,6 +158,7 @@ struct SettingsView: View {
                 approvalBypassSection
                 devicesSection
                 modelProviderSection
+                toolsetKeysSection
                 creditsBillingSection
                 debugShareSection
                 connectionSection
@@ -607,6 +608,33 @@ struct SettingsView: View {
                 .accessibilityIdentifier("settingsModelProvider")
             } footer: {
                 Text("Add or remove API keys for model providers. New chats use the provider you pick in Model.")
+            }
+        }
+    }
+
+    // MARK: - Toolset Keys (ABH-262 — feature-detected; plugin-mount only)
+
+    /// The ABH-262 Toolset Keys section — a single push to
+    /// ``ToolsetConfigView`` (web + image_gen credential state, set, and
+    /// clear). Rendered ONLY when the connected gateway advertises the plugin
+    /// mount because the routes live at
+    /// `/api/plugins/hermes-mobile/toolsets/{name}/config`. Stored key values are
+    /// never returned by the gateway; the pushed form always starts blank.
+    @ViewBuilder
+    private var toolsetKeysSection: some View {
+        if connectionStore.capabilities.pluginMount == .available,
+           let rest = connectionStore.rest {
+            Section {
+                NavigationLink {
+                    ToolsetConfigView(rest: rest)
+                        .background(theme.bg)
+                } label: {
+                    SettingsRow(icon: "key.viewfinder", title: "Toolset Keys", value: nil)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsToolsetKeys")
+            } footer: {
+                Text("Add or clear keys for web search and image generation toolsets. Stored key values are never shown on the phone.")
             }
         }
     }
@@ -1668,5 +1696,517 @@ private final class SystemLogsStore: ObservableObject {
                 (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             )
         }
+    }
+}
+
+
+// MARK: - ABH-262 toolset credential settings UI
+//
+// A plugin-mount Settings panel for non-model tool credentials (web and
+// image_gen to start). The server is the source of truth and deliberately returns
+// only redacted `is_set` booleans, never secret values. This view preserves that
+// contract: configured credentials render as status chips only, and the edit form
+// always starts with an empty SecureField.
+
+struct ToolsetConfigView: View {
+    let rest: RestClient
+
+    @Environment(\.hermesTheme) private var theme
+
+    @State private var phase: PanelPhase<[ToolsetConfig]> = .loading
+    @State private var actionError: String?
+    @State private var successText: String?
+    @State private var editTarget: ToolsetCredentialTarget?
+    @State private var clearTarget: ToolsetCredentialTarget?
+    @State private var mutatingTargetID: String?
+
+    var body: some View {
+        PanelContent(phase: phase, label: "Loading toolset keys\u{2026}", retry: { Task { await load() } }) { configs in
+            List {
+                statusSection
+
+                if configs.isEmpty {
+                    emptySection
+                } else {
+                    ForEach(configs) { config in
+                        toolsetSection(config)
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(theme.bg)
+            .refreshable { await load() }
+        }
+        .navigationTitle("Toolset Keys")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await load() }
+        .alert("Couldn\u{2019}t update key", isPresented: errorBinding) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(actionError ?? "")
+        }
+        .sheet(item: $editTarget) { target in
+            NavigationStack {
+                ToolsetCredentialEntryView(rest: rest, target: target) { refreshed in
+                    replaceConfig(refreshed)
+                    successText = "Saved \(target.envVar.prompt)."
+                }
+            }
+            .environment(\.hermesTheme, theme)
+        }
+        .confirmationDialog(
+            "Clear this key?",
+            isPresented: clearDialogBinding,
+            titleVisibility: .visible,
+            presenting: clearTarget
+        ) { target in
+            Button("Clear Key", role: .destructive) {
+                Task { await clear(target) }
+            }
+            Button("Cancel", role: .cancel) { clearTarget = nil }
+        } message: { target in
+            Text("\(target.envVar.prompt) for \(target.providerName) will be removed from your gateway. You can set it again later.")
+        }
+    }
+
+    // MARK: - Sections
+
+    @ViewBuilder
+    private var statusSection: some View {
+        if let successText {
+            Section {
+                Label(successText, systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(theme.midground)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("toolsetKeySuccess")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var emptySection: some View {
+        Section {
+            ContentUnavailableView {
+                Label("No toolset keys", systemImage: "key.slash")
+            } description: {
+                Text("This server does not expose configurable web or image_gen credentials yet.")
+            }
+            .listRowBackground(theme.card)
+        }
+    }
+
+    @ViewBuilder
+    private func toolsetSection(_ config: ToolsetConfig) -> some View {
+        Section {
+            if config.providers.isEmpty {
+                Label("No providers available.", systemImage: "tray")
+                    .foregroundStyle(theme.mutedFg)
+                    .listRowBackground(theme.card)
+            } else {
+                ForEach(config.providers) { provider in
+                    providerBlock(provider, in: config)
+                }
+            }
+        } header: {
+            Text(config.displayName)
+        } footer: {
+            Text(toolsetFooter(config))
+        }
+    }
+
+    @ViewBuilder
+    private func providerBlock(_ provider: ToolsetConfigProvider, in config: ToolsetConfig) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(provider.name.isEmpty ? config.displayName : provider.name)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(theme.fg)
+                    .lineLimit(1)
+                if provider.isActive {
+                    Text("ACTIVE")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(theme.midground)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .overlay(Capsule().strokeBorder(theme.midground.opacity(0.4), lineWidth: 1))
+                }
+                if !provider.badge.isEmpty {
+                    Text(provider.badge)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(theme.mutedFg)
+                }
+                Spacer(minLength: 8)
+            }
+
+            if provider.requiresNousAuth {
+                Text("Requires Nous account authentication on the gateway.")
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+            }
+
+            if provider.envVars.isEmpty {
+                Text("No key entry is required for this provider.")
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+            } else {
+                ForEach(provider.envVars) { envVar in
+                    credentialRow(
+                        ToolsetCredentialTarget(
+                            toolsetName: config.name,
+                            toolsetDisplayName: config.displayName,
+                            providerName: provider.name.isEmpty ? config.displayName : provider.name,
+                            envVar: envVar
+                        )
+                    )
+                }
+            }
+
+            if let postSetup = provider.postSetup, !postSetup.isEmpty {
+                Text(postSetup)
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.vertical, 4)
+        .listRowBackground(theme.card)
+        .accessibilityIdentifier("toolsetProvider-\(config.name)-\(provider.name)")
+    }
+
+    @ViewBuilder
+    private func credentialRow(_ target: ToolsetCredentialTarget) -> some View {
+        let isMutating = mutatingTargetID == target.id
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(target.envVar.prompt)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(theme.fg)
+                    Text(target.envVar.key)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(theme.mutedFg)
+                }
+                Spacer(minLength: 8)
+                statusChip(isSet: target.envVar.isSet)
+            }
+
+            HStack(spacing: 12) {
+                Button(target.envVar.isSet ? "Replace" : "Set") {
+                    actionError = nil
+                    successText = nil
+                    editTarget = target
+                }
+                .buttonStyle(.bordered)
+                .tint(theme.midground)
+                .accessibilityIdentifier("toolsetSet-\(target.envVar.key)")
+
+                if target.envVar.isSet {
+                    Button(role: .destructive) {
+                        actionError = nil
+                        successText = nil
+                        clearTarget = target
+                    } label: {
+                        if isMutating {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text("Clear")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isMutating)
+                    .accessibilityIdentifier("toolsetClear-\(target.envVar.key)")
+                }
+
+                if let url = target.envVar.url, let destination = URL(string: url) {
+                    Link("Get key", destination: destination)
+                        .font(.subheadline)
+                        .accessibilityIdentifier("toolsetKeyURL-\(target.envVar.key)")
+                }
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    @ViewBuilder
+    private func statusChip(isSet: Bool) -> some View {
+        if isSet {
+            Label("Configured", systemImage: "checkmark.seal.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(theme.midground.contrastingForeground)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(theme.midground, in: Capsule())
+                .accessibilityLabel("Configured")
+        } else {
+            Text("Not set")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(theme.mutedFg)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .overlay(Capsule().strokeBorder(theme.mutedFg.opacity(0.35), lineWidth: 1))
+                .accessibilityLabel("Not set")
+        }
+    }
+
+    // MARK: - Load + mutate
+
+    private func load() async {
+        if phase.value == nil { phase = .loading }
+        actionError = nil
+        do {
+            var configs: [ToolsetConfig] = []
+            for name in ToolsetConfigCatalog.configurableNames {
+                do {
+                    let config = try await rest.getToolsetConfig(name: name)
+                    // A valid category may legitimately have zero providers; keep it
+                    // so the empty provider state is visible. Unknown toolsets are
+                    // handled by the 4002 path below.
+                    configs.append(config)
+                } catch {
+                    if ToolsetConfigErrorMessage.isUnknownToolset(error) {
+                        continue
+                    }
+                    throw error
+                }
+            }
+            phase = .loaded(configs)
+        } catch {
+            phase = .failed(ToolsetConfigErrorMessage.message(for: error))
+        }
+    }
+
+    private func clear(_ target: ToolsetCredentialTarget) async {
+        clearTarget = nil
+        mutatingTargetID = target.id
+        defer { mutatingTargetID = nil }
+        do {
+            let refreshed = try await rest.setToolsetCredential(
+                name: target.toolsetName,
+                key: target.envVar.key,
+                value: nil
+            )
+            replaceConfig(refreshed)
+            successText = "Cleared \(target.envVar.prompt)."
+        } catch {
+            actionError = ToolsetConfigErrorMessage.message(for: error)
+        }
+    }
+
+    private func replaceConfig(_ refreshed: ToolsetConfig) {
+        guard var configs = phase.value else {
+            phase = .loaded([refreshed])
+            return
+        }
+        if let index = configs.firstIndex(where: { $0.name == refreshed.name }) {
+            configs[index] = refreshed
+        } else {
+            configs.append(refreshed)
+        }
+        phase = .loaded(configs)
+    }
+
+    // MARK: - Derived
+
+    private var errorBinding: Binding<Bool> {
+        Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })
+    }
+
+    private var clearDialogBinding: Binding<Bool> {
+        Binding(get: { clearTarget != nil }, set: { if !$0 { clearTarget = nil } })
+    }
+
+    private func toolsetFooter(_ config: ToolsetConfig) -> String {
+        if config.credentialCount == 0 {
+            return "No credentials are required for this toolset on this server."
+        }
+        let configured = config.configuredCredentialCount
+        let total = config.credentialCount
+        if configured == 0 {
+            return "No stored secrets are shown here. Enter a key to save it on the gateway."
+        }
+        return "\(configured) of \(total) key\(total == 1 ? "" : "s") configured. Stored values are never returned to the phone."
+    }
+}
+
+// MARK: - Entry form
+
+struct ToolsetCredentialEntryView: View {
+    let rest: RestClient
+    let target: ToolsetCredentialTarget
+    let onSaved: (ToolsetConfig) -> Void
+
+    @Environment(\.hermesTheme) private var theme
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var value = ""
+    @State private var errorText: String?
+    @State private var isSaving = false
+    @FocusState private var fieldFocused: Bool
+
+    private var canSave: Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isSaving
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(target.providerName)
+                        .font(.title2.bold())
+                        .foregroundStyle(theme.fg)
+                    Text("Enter the key for \(target.toolsetDisplayName). The current stored value is never sent back to the phone; replacing it starts from a blank secure field.")
+                        .font(.subheadline)
+                        .foregroundStyle(theme.mutedFg)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 4, trailing: 16))
+                .listRowBackground(Color.clear)
+            }
+
+            Section {
+                SecureField(target.envVar.prompt, text: $value, prompt: Text("Paste key"))
+                    .textContentType(.password)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.go)
+                    .focused($fieldFocused)
+                    .onSubmit { if canSave { save() } }
+                    .accessibilityIdentifier("toolsetCredentialField")
+            } footer: {
+                if let errorText {
+                    Text(errorText)
+                        .foregroundStyle(theme.destructive)
+                } else {
+                    Text("Saved to \(target.envVar.key) on your gateway. The app clears this field after the save completes.")
+                }
+            }
+
+            Section {
+                Button(action: save) {
+                    HStack {
+                        Spacer()
+                        if isSaving {
+                            ProgressView()
+                                .tint(theme.midground.contrastingForeground)
+                        } else {
+                            Text("Save Key")
+                                .fontWeight(.semibold)
+                        }
+                        Spacer()
+                    }
+                    .frame(minHeight: 22)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(theme.midground)
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                .listRowBackground(Color.clear)
+                .disabled(!canSave)
+                .accessibilityIdentifier("toolsetCredentialSaveButton")
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .background(theme.bg)
+        .navigationTitle(target.envVar.prompt)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel") { dismiss() }
+                    .accessibilityIdentifier("toolsetCredentialCancelButton")
+            }
+        }
+        .onAppear { fieldFocused = true }
+    }
+
+    private func save() {
+        guard canSave else { return }
+        fieldFocused = false
+        errorText = nil
+        isSaving = true
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            defer { isSaving = false }
+            do {
+                let refreshed = try await rest.setToolsetCredential(
+                    name: target.toolsetName,
+                    key: target.envVar.key,
+                    value: trimmed
+                )
+                value = ""
+                onSaved(refreshed)
+                dismiss()
+            } catch {
+                errorText = ToolsetConfigErrorMessage.message(for: error)
+            }
+        }
+    }
+}
+
+struct ToolsetCredentialTarget: Identifiable, Sendable, Hashable {
+    let toolsetName: String
+    let toolsetDisplayName: String
+    let providerName: String
+    let envVar: ToolsetEnvVar
+
+    var id: String { "\(toolsetName)::\(envVar.key)::\(providerName)" }
+}
+
+enum ToolsetConfigErrorMessage {
+    static func message(for error: Error) -> String {
+        if let restError = error as? RestError {
+            switch restError {
+            case .badStatus(401, _):
+                return "This connection is not authorized. Reconnect to the gateway, then try again."
+            case .badStatus(403, _):
+                return "This device token lacks approve scope, so it cannot manage tool keys. Re-pair with an approving device token."
+            case .badStatus(_, let body):
+                if let parsed = parseServerMessage(body) { return parsed }
+            case .network, .decoding:
+                break
+            }
+        }
+        return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    }
+
+    static func isUnknownToolset(_ error: Error) -> Bool {
+        guard let restError = error as? RestError else { return false }
+        if case .badStatus(_, let body) = restError {
+            return serverCode(body) == 4002 || body.localizedCaseInsensitiveContains("unknown toolset")
+        }
+        return false
+    }
+
+    private static func parseServerMessage(_ body: String) -> String? {
+        switch serverCode(body) {
+        case 4001:
+            return serverText(body) ?? "The gateway rejected this key request."
+        case 4002:
+            return serverText(body) ?? "This gateway does not recognize that toolset."
+        case 4006:
+            return "This Hermes install is managed, so credentials are read-only here. Change the key on the desktop or server."
+        default:
+            return serverText(body)
+        }
+    }
+
+    private static func serverCode(_ body: String) -> Int? {
+        serverObject(body)?["code"] as? Int
+    }
+
+    private static func serverText(_ body: String) -> String? {
+        guard let object = serverObject(body) else { return nil }
+        if let error = object["error"] as? String { return error }
+        if let detail = object["detail"] as? String { return detail }
+        return nil
+    }
+
+    private static func serverObject(_ body: String) -> [String: Any]? {
+        guard let data = body.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return object
     }
 }
