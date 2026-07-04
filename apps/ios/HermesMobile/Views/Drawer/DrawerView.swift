@@ -120,6 +120,10 @@ struct DrawerView: View {
     /// control below the header drives this; the list body switches between
     /// the sessions list (the existing drawer) and the read-only projects list.
     @State private var selectedTab: DrawerTab = .sessions
+    /// Share-extension items currently parked in the app-group inbox. This is a
+    /// visibility badge only; ``SharedInboxDrainer`` still uses the app-group
+    /// inbox as the single source of truth for delivery/idempotency.
+    @State private var sharedInboxPendingCount = SharedStore.pendingInboxCount()
 
     /// The current display name (Settings field, F2) used for the avatar
     /// initials. `nil`/blank → a neutral person glyph.
@@ -188,6 +192,10 @@ struct DrawerView: View {
         // SwiftUI does not reliably inherit custom environment values across
         // presentation/column boundaries.
         .hermesThemed(themeStore)
+        .onAppear { refreshSharedInboxPendingCount() }
+        .onReceive(NotificationCenter.default.publisher(for: SharedStore.inboxDidChangeNotification)) { _ in
+            refreshSharedInboxPendingCount()
+        }
         // Archived Chats sheet (pull-to-reveal entry point).
         .sheet(isPresented: $showingArchivedChats) {
             NavigationStack {
@@ -629,13 +637,42 @@ struct DrawerView: View {
                 .foregroundStyle(theme.fg)
                 .frame(width: 34, height: 34)
                 .contentShape(Rectangle())
+                .overlay(alignment: .topTrailing) {
+                    if sharedInboxPendingCount > 0 {
+                        sharedInboxPendingBadge
+                    }
+                }
         }
         .buttonStyle(.plain)
         // DC-01: light haptic on gear tap
         .sensoryFeedback(.impact(flexibility: .soft), trigger: settingsFeedbackTrigger)
         .accessibilityIdentifier("settingsAvatar")
         .accessibilityLabel("Settings")
+        .accessibilityValue(sharedInboxPendingAccessibilityValue)
         .accessibilityHint("Open settings")
+    }
+
+    private var sharedInboxPendingBadge: some View {
+        Text(sharedInboxPendingCount > 99 ? "99+" : "\(sharedInboxPendingCount)")
+            .font(.caption2.weight(.bold))
+            .monospacedDigit()
+            .foregroundStyle(theme.bg)
+            .padding(.horizontal, sharedInboxPendingCount > 9 ? 5 : 4)
+            .padding(.vertical, 2)
+            .background(theme.destructive, in: Capsule())
+            .overlay(Capsule().stroke(theme.listBg, lineWidth: 1.5))
+            .offset(x: 5, y: -5)
+            .accessibilityHidden(true)
+    }
+
+    private var sharedInboxPendingAccessibilityValue: String {
+        sharedInboxPendingCount > 0
+            ? "\(sharedInboxPendingCount) shared item(s) pending"
+            : "No shared items pending"
+    }
+
+    private func refreshSharedInboxPendingCount() {
+        sharedInboxPendingCount = SharedStore.pendingInboxCount()
     }
 
     // MARK: - Search

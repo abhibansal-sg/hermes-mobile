@@ -184,38 +184,29 @@ struct HermesMobileApp: App {
                     // UX1: start/stop the 30-second foreground heartbeat so the
                     // session list refreshes without user interaction in the foreground.
                     environment.sessionStore.handleScenePhaseActive(newPhase == .active)
-                    // On foreground: apply parked App Intents, drain the share
-                    // inbox, and refresh the widgets' usage figures.
+                    // On foreground: apply parked App Intents, surface/drain the
+                    // share inbox, and refresh the widgets' usage figures.
                     if newPhase == .active {
                         PendingIntentRouter.drain(
                             connection: environment.connectionStore,
                             sessions: environment.sessionStore,
                             chat: environment.chatStore
                         )
-                        SharedInboxDrainer.drain(
-                            connection: environment.connectionStore,
-                            sessions: environment.sessionStore,
-                            chat: environment.chatStore,
-                            attachments: environment.attachmentStore,
-                            onDrained: { count in
-                                presentSharedInboxToast(processed: count)
-                            }
-                        )
+                        SharedStore.notifyInboxDidChange()
+                        attemptSharedInboxDrain()
                         PushRegistrar.shared.ensureRegisteredForPairedGateway()
                         environment.refreshUsageSnapshot()
                     }
                 }
                 .onChange(of: environment.connectionStore.phase) { _, newPhase in
-                    switch newPhase {
-                    case .hydrating, .connected:
-                        // Pairing succeeds while the app is already active, so it
-                        // does not necessarily trigger a scene-phase foreground
-                        // transition. Treat the verified connection transition as
-                        // the pair-completed hook and reconcile APNs immediately.
-                        PushRegistrar.shared.ensureRegisteredForPairedGateway()
-                    case .needsSetup, .connecting, .reconnecting, .offline:
-                        break
-                    }
+                    SharedInboxDrainConnectionTrigger.handle(
+                        newPhase,
+                        ensureRegisteredForPairedGateway: {
+                            PushRegistrar.shared.ensureRegisteredForPairedGateway()
+                        },
+                        notifyInboxDidChange: { SharedStore.notifyInboxDidChange() },
+                        drain: { attemptSharedInboxDrain() }
+                    )
                 }
                 .onOpenURL { url in
                     HermesURLRouter.route(
@@ -268,6 +259,19 @@ struct HermesMobileApp: App {
     }
 
     @MainActor
+    private func attemptSharedInboxDrain() {
+        SharedInboxDrainer.drain(
+            connection: environment.connectionStore,
+            sessions: environment.sessionStore,
+            chat: environment.chatStore,
+            attachments: environment.attachmentStore,
+            onDrained: { count in
+                presentSharedInboxToast(processed: count)
+            }
+        )
+    }
+
+    @MainActor
     private func presentSharedInboxToast(processed count: Int) {
         guard count > 0 else { return }
         sharedInboxToastDismissTask?.cancel()
@@ -277,6 +281,35 @@ struct HermesMobileApp: App {
             guard !Task.isCancelled else { return }
             sharedInboxToast = nil
             sharedInboxToastDismissTask = nil
+        }
+    }
+}
+
+@MainActor
+enum SharedInboxDrainConnectionTrigger {
+    static func handle(
+        _ newPhase: ConnectionStore.Phase,
+        ensureRegisteredForPairedGateway: () -> Void,
+        notifyInboxDidChange: () -> Void,
+        drain: () -> Void
+    ) {
+        switch newPhase {
+        case .hydrating:
+            // Pairing succeeds while the app is already active, so it does not
+            // necessarily trigger a scene-phase foreground transition. Treat the
+            // verified connection transition as the pair-completed hook and
+            // reconcile APNs immediately.
+            ensureRegisteredForPairedGateway()
+        case .connected:
+            // A user can foreground the app before the gateway finishes
+            // reconnecting. Try the share inbox again on the verified connection
+            // edge; the drainer is idempotent and the app-group inbox remains the
+            // single source of truth.
+            ensureRegisteredForPairedGateway()
+            notifyInboxDidChange()
+            drain()
+        case .needsSetup, .connecting, .reconnecting, .offline:
+            break
         }
     }
 }

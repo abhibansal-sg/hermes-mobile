@@ -5,6 +5,7 @@ import Foundation
 /// inbox. Extensions and app compile this same file into their targets.
 enum SharedStore {
     static let appGroupID = "group.ai.hermes.app"
+    static let inboxDidChangeNotification = Notification.Name("SharedStore.inboxDidChange")
 
     static var defaults: UserDefaults? {
         UserDefaults(suiteName: appGroupID)
@@ -67,11 +68,18 @@ enum SharedStore {
         return (try? JSONDecoder().decode([SharedInboxItem].self, from: data)) ?? []
     }
 
+    static func pendingInboxCount(
+        readInbox: () -> [SharedInboxItem] = { SharedStore.readInbox() }
+    ) -> Int {
+        readInbox().count
+    }
+
     static func appendInboxItem(_ item: SharedInboxItem) {
         var items = readInbox()
         items.append(item)
         if let data = try? JSONEncoder().encode(items) {
             defaults?.set(data, forKey: inboxKey)
+            notifyInboxDidChange()
         }
     }
 
@@ -89,6 +97,7 @@ enum SharedStore {
         }
 
         removeSharedImages(named: removed.imageFiles)
+        notifyInboxDidChange()
     }
 
     private static func removeSharedImages(named imageFiles: [String]) {
@@ -103,5 +112,10 @@ enum SharedStore {
         if let dir = sharedImagesDirectory {
             try? FileManager.default.removeItem(at: dir)
         }
+        notifyInboxDidChange()
+    }
+
+    static func notifyInboxDidChange() {
+        NotificationCenter.default.post(name: inboxDidChangeNotification, object: nil)
     }
 }
