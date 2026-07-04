@@ -339,6 +339,101 @@ final class ProfilesTests: XCTestCase {
         XCTAssertNil(buildCreateParams(scope: "work", multiAvailable: false)["profile"])
     }
 
+    func testAllProfilesOpenThreadsRowProfileIntoTranscriptFetch() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let attachments = AttachmentStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        sessions.attach(connection: connection, chat: chat)
+        sessions.activeProfile = DefaultsKeys.allProfilesScope
+        sessions.profileThreadingAvailableForTesting = true
+
+        var captured: (sessionId: String, profile: String?)?
+        sessions.transcriptFetchWithProfile = { sessionId, profile in
+            captured = (sessionId, profile)
+            return []
+        }
+
+        sessions.open(row("work-session", profile: "work"))
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(captured?.sessionId, "work-session")
+        XCTAssertEqual(captured?.profile, "work",
+                       "All-profiles row opens must load transcript through the row's profile scope")
+        sessions.profileThreadingAvailableForTesting = nil
+    }
+
+    func testAllProfilesDeleteThreadsRowProfileIntoProfileScopedDelete() async {
+        let sessions = SessionStore()
+        sessions.activeProfile = DefaultsKeys.allProfilesScope
+        sessions.profileThreadingAvailableForTesting = true
+        let target = row("work-session", profile: "work")
+        sessions.sessions = [target]
+
+        var captured: (sessionId: String, profile: String?)?
+        sessions.deleteSessionRequest = { sessionId, profile in
+            captured = (sessionId, profile)
+        }
+
+        await sessions.delete(target)
+
+        XCTAssertEqual(captured?.sessionId, "work-session")
+        XCTAssertEqual(captured?.profile, "work",
+                       "All-profiles row deletes must target the row's profile store")
+        XCTAssertFalse(sessions.sessions.contains(where: { $0.id == "work-session" }))
+        sessions.profileThreadingAvailableForTesting = nil
+    }
+
+    func testAllProfilesCompressedOpenThreadsRowProfileToResumeAndChainTipFetch() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let attachments = AttachmentStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        sessions.attach(connection: connection, chat: chat)
+        sessions.activeProfile = DefaultsKeys.allProfilesScope
+        sessions.profileThreadingAvailableForTesting = true
+
+        var resumeProfile: String?
+        sessions.resumeRPC = { requested, params in
+            XCTAssertEqual(requested, "parent-session")
+            if case let .string(profile)? = params["profile"] {
+                resumeProfile = profile
+            }
+            return JSONValue.object([
+                "session_id": .string("runtime-child"),
+                "resumed": .string("child-session"),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+
+        var transcriptCalls: [(sessionId: String, profile: String?)] = []
+        sessions.transcriptFetchWithProfile = { sessionId, profile in
+            transcriptCalls.append((sessionId, profile))
+            return []
+        }
+
+        sessions.open(row("parent-session", profile: "work"))
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(resumeProfile, "work")
+        XCTAssertTrue(transcriptCalls.contains { $0.sessionId == "parent-session" && $0.profile == "work" })
+        XCTAssertTrue(transcriptCalls.contains { $0.sessionId == "child-session" && $0.profile == "work" },
+                      "Compression-chain continuation seed must keep the parent row's profile scope")
+        sessions.profileThreadingAvailableForTesting = nil
+    }
+
+    func testDefaultProfileRowsKeepProfilelessPerSessionActions() {
+        let defaultRow = row("default-session", profile: "default")
+        XCTAssertNil(SessionStore.profileParam(for: defaultRow,
+                                               activeScope: DefaultsKeys.allProfilesScope,
+                                               multiAvailable: true))
+        XCTAssertNil(SessionStore.profileParam(for: defaultRow,
+                                               activeScope: "work",
+                                               multiAvailable: true),
+                     "An explicit default row must not be retargeted to the active non-default scope")
+    }
+
     // MARK: - REST per-session threading error surfacing
 
     func testStrictUnknownProfileErrorsSurfaceReadableMessages() {
