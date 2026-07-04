@@ -19,6 +19,10 @@ struct ModelPickerView: View {
     /// reasoning/fast controls are hidden — backwards-compatible with call sites
     /// that only need the model-selection surface.
     var gatewayClient: HermesGatewayClient?
+    /// Settings-owned connection store; preferred global config writer because
+    /// it uses the same `ConnectionStore.globalSet*` RPC helpers as the root
+    /// Settings toggles.
+    var connectionStore: ConnectionStore?
 
     /// Invoked after a successful model switch so the owner can re-resolve the
     /// running model (F0 / Amendment B — `ConnectionStore.refreshActiveModel`).
@@ -57,11 +61,13 @@ struct ModelPickerView: View {
     init(
         control: RestClient,
         gatewayClient: HermesGatewayClient? = nil,
+        connectionStore: ConnectionStore? = nil,
         contextUsage: (used: Int, max: Int, percent: Int, compressions: Int)? = nil,
         onModelChanged: (() -> Void)? = nil
     ) {
         self.control = control
         self.gatewayClient = gatewayClient
+        self.connectionStore = connectionStore
         self.contextUsage = contextUsage
         self.onModelChanged = onModelChanged
     }
@@ -75,8 +81,8 @@ struct ModelPickerView: View {
                 headerSection(options)
 
                 // ABH-84: Global default fast/reasoning controls (Settings surface).
-                // Only shown when a gateway WS client was supplied.
-                if gatewayClient != nil {
+                // Shown when a global config writer was supplied.
+                if gatewayClient != nil || connectionStore != nil {
                     globalDefaultsSection(options)
                 }
 
@@ -415,7 +421,7 @@ struct ModelPickerView: View {
 
     /// Load current global reasoning effort + fast mode from the gateway config.
     private func loadGlobalConfig() async {
-        guard gatewayClient != nil else { return }
+        guard gatewayClient != nil || connectionStore != nil else { return }
         // Read from `GET /api/config` — the same endpoint the desktop uses.
         guard let agentSection = try? await control.agentConfig() else { return }
         let effort = agentSection["reasoning_effort"]?.stringValue ?? ""
@@ -425,19 +431,23 @@ struct ModelPickerView: View {
     }
 
     private func applyGlobalReasoning(_ effort: String) async {
-        guard let gatewayClient else { return }
+        guard gatewayClient != nil || connectionStore != nil else { return }
         pendingGlobalConfig = true
         defer { pendingGlobalConfig = false }
         let prev = globalReasoningEffort
         do {
-            _ = try await gatewayClient.requestRaw(
-                "config.set",
-                params: .object([
-                    "key": .string("reasoning"),
-                    "value": .string(effort.isEmpty ? "none" : effort),
-                ]),
-                timeout: .seconds(30)
-            )
+            if let connectionStore {
+                try await connectionStore.globalSetReasoning(effort.isEmpty ? "none" : effort)
+            } else if let gatewayClient {
+                _ = try await gatewayClient.requestRaw(
+                    "config.set",
+                    params: .object([
+                        "key": .string("reasoning"),
+                        "value": .string(effort.isEmpty ? "none" : effort),
+                    ]),
+                    timeout: .seconds(30)
+                )
+            }
         } catch {
             globalReasoningEffort = prev
             actionError = (error as? GatewayError)?.errorDescription ?? error.localizedDescription
@@ -445,19 +455,23 @@ struct ModelPickerView: View {
     }
 
     private func applyGlobalFast(_ enabled: Bool) async {
-        guard let gatewayClient else { return }
+        guard gatewayClient != nil || connectionStore != nil else { return }
         pendingGlobalConfig = true
         defer { pendingGlobalConfig = false }
         let prev = globalFast
         do {
-            _ = try await gatewayClient.requestRaw(
-                "config.set",
-                params: .object([
-                    "key": .string("fast"),
-                    "value": .string(enabled ? "fast" : "normal"),
-                ]),
-                timeout: .seconds(30)
-            )
+            if let connectionStore {
+                try await connectionStore.globalSetFast(enabled)
+            } else if let gatewayClient {
+                _ = try await gatewayClient.requestRaw(
+                    "config.set",
+                    params: .object([
+                        "key": .string("fast"),
+                        "value": .string(enabled ? "fast" : "normal"),
+                    ]),
+                    timeout: .seconds(30)
+                )
+            }
         } catch {
             globalFast = prev
             actionError = (error as? GatewayError)?.errorDescription ?? error.localizedDescription

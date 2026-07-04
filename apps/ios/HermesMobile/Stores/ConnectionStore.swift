@@ -1,4 +1,5 @@
 import SwiftUI
+import OSLog
 #if canImport(UIKit)
 import UIKit  // UIDevice.current.name — the auto-upgrade device-name hint (W3A-A)
 #endif
@@ -27,6 +28,8 @@ struct DraftModelSelection: Equatable, Sendable {
 @MainActor
 @Observable
 final class ConnectionStore {
+    private static let log = Logger(subsystem: "HermesMobile", category: "ConnectionStore")
+
     /// UI-facing connection lifecycle.
     enum Phase: Equatable {
         case needsSetup
@@ -1171,6 +1174,10 @@ final class ConnectionStore {
         // ABH-178: clear any stuck turn flags on explicit disconnect so a later
         // re-pair starts with a clean carry-forward slate.
         sessionStore.clearAllTurnsInProgress()
+        // ABH-410: privacy cleanup for unpair/sign-out. Indexed session titles
+        // live outside the app sandbox until explicitly removed from Spotlight.
+        Self.log.notice("Disconnect clearing Hermes Spotlight session index")
+        SpotlightIndexer.clearAll()
         await client.disconnect()
         phase = .needsSetup
     }

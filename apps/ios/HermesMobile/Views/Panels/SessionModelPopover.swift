@@ -257,6 +257,31 @@ struct SessionModelPickerContent: View {
         if supportsFast {
             fastToggle(disabled: pendingKey != nil)
         }
+        resetModelPresetButton(provider: provider, family: family, disabled: pendingKey != nil)
+    }
+
+    @ViewBuilder
+    private func resetModelPresetButton(provider: ModelProvider, family: ModelFamily, disabled: Bool) -> some View {
+        Button {
+            resetModelPreset(provider: provider.slug, model: family.id)
+        } label: {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Reset saved defaults")
+                        .font(.body)
+                        .foregroundStyle(theme.fg)
+                    Text("Use the gateway default the next time this model is selected")
+                        .font(.caption)
+                        .foregroundStyle(theme.mutedFg)
+                }
+            } icon: {
+                Image(systemName: "arrow.counterclockwise")
+                    .foregroundStyle(theme.midground)
+            }
+        }
+        .disabled(disabled)
+        .listRowBackground(theme.card)
+        .accessibilityIdentifier("sessionModelResetPreset")
     }
 
     /// A provider's family rows after visibility curation + search.
@@ -613,5 +638,21 @@ struct SessionModelPickerContent: View {
             provider: id.provider, model: id.model,
             patch: ModelPreset(effort: nil, fast: enabled)
         )
+    }
+
+    /// Clear the remembered per-model preset so this model falls back to the
+    /// gateway default on the next selection/materialization.
+    private func resetModelPreset(provider: String, model: String) {
+        presetStore.clear(provider: provider, model: model)
+        if isDraftMode,
+           connection.draftSelection?.provider == provider,
+           connection.draftSelection?.model == model {
+            var draft = connection.draftSelection
+            draft?.reasoningEffort = nil
+            draft?.fast = nil
+            connection.draftSelection = draft
+            localReasoningEffort = ""
+            localFast = false
+        }
     }
 }
