@@ -341,3 +341,80 @@ final class ChatStoreBatchETests: XCTestCase {
                        "cache(no ids)->network(ids) reconciles to correct content, no duplication")
     }
 }
+
+@MainActor
+final class UndoRollbackTests: XCTestCase {
+    func testUndoLastTurnListsAndDiffsRollbackButDoesNotRestoreUntilConfirmed() async throws {
+        let sessions = SessionStore()
+        let chat = ChatStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.activeRuntimeId = "runtime-1"
+        chat.backfillFetch = { _ in [] }
+
+        var calls: [(method: String, params: JSONValue)] = []
+        chat.undoRollbackRPC = { method, params, _ in
+            calls.append((method, params))
+            switch method {
+            case "session.undo":
+                return .object(["removed": .number(2)])
+            case "rollback.list":
+                return .object([
+                    "enabled": .bool(true),
+                    "checkpoints": .array([
+                        .object([
+                            "hash": .string("abc123"),
+                            "timestamp": .string("2026-07-04T10:00:00Z"),
+                            "message": .string("before tool write"),
+                        ]),
+                    ]),
+                ])
+            case "rollback.diff":
+                XCTAssertEqual(params["hash"]?.stringValue, "abc123")
+                return .object([
+                    "stat": .string("1 file changed"),
+                    "diff": .string("--- a/file\n+++ b/file"),
+                    "rendered": .string("file | 1 +"),
+                ])
+            case "rollback.restore":
+                return .object(["success": .bool(true), "history_removed": .number(2)])
+            default:
+                XCTFail("unexpected RPC method \(method)")
+                return .null
+            }
+        }
+
+        await chat.undoLastTurn()
+
+        XCTAssertEqual(calls.map(\.method), ["session.undo", "rollback.list", "rollback.diff"])
+        XCTAssertEqual(chat.pendingRollbackRestore?.checkpoint.hash, "abc123")
+        XCTAssertEqual(chat.pendingRollbackRestore?.diff.stat, "1 file changed")
+        XCTAssertEqual(chat.undoRollbackPhase, .awaitingConfirmation)
+
+        await chat.confirmPendingRollbackRestore()
+
+        XCTAssertEqual(calls.map(\.method), ["session.undo", "rollback.list", "rollback.diff", "rollback.restore"])
+        XCTAssertNil(chat.pendingRollbackRestore)
+        XCTAssertEqual(chat.undoRollbackPhase, .restored)
+    }
+
+    func testUndoLastTurnEmptyStateDoesNotListRollback() async throws {
+        let sessions = SessionStore()
+        let chat = ChatStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.activeRuntimeId = "runtime-1"
+
+        var calls: [String] = []
+        chat.undoRollbackRPC = { method, _, _ in
+            calls.append(method)
+            return .object(["removed": .number(0)])
+        }
+
+        await chat.undoLastTurn()
+
+        XCTAssertEqual(calls, ["session.undo"])
+        XCTAssertNil(chat.pendingRollbackRestore)
+        XCTAssertEqual(chat.undoRollbackPhase, .empty)
+    }
+}
