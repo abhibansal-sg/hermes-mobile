@@ -77,15 +77,38 @@ async function board() {
     }
   }`);
   if (!data) return null;
+  // Blocked-human queue: TEAM-WIDE (no project filter — fenced filings land outside
+  // the project too) and on the CORRECT label. The old query used the stale label
+  // name 'blocked:needs-human' + project scope, which made this section blind while
+  // 8 items silted (found 2026-07-04 power session).
+  const bh = await linear(`{
+    issues(first: 50, filter: {
+      team: { key: { eq: "${TEAM_KEY}" } },
+      labels: { name: { eq: "loop:blocked-human" } },
+      state: { type: { nin: ["completed", "canceled"] } }
+    }) {
+      nodes {
+        identifier title createdAt priority
+        labels { nodes { name } }
+      }
+    }
+  }`);
+  const now = Date.now();
+  const blocked = (bh?.issues?.nodes ?? []).map(n => {
+    const ageDays = (now - new Date(n.createdAt).getTime()) / 86400000;
+    const labels = (n.labels?.nodes ?? []).map(l => l.name);
+    return {
+      id: n.identifier, title: n.title, ageDays,
+      priority: n.priority ?? 9,
+      approved: labels.includes('fence:approved'),
+    };
+  }).sort((a, b) => (a.priority - b.priority) || (b.ageDays - a.ageDays));
   const nodes = data.issues.nodes;
   const byType = {};
-  const blocked = [];
   const recentDone = [];
   for (const n of nodes) {
     const t = n.state.type; // backlog|unstarted|started|completed|canceled
     byType[t] = (byType[t] || 0) + 1;
-    const labels = (n.labels?.nodes ?? []).map(l => l.name);
-    if (labels.includes('blocked:needs-human')) blocked.push(`${n.identifier} ${n.title}`);
     if (t === 'completed') recentDone.push({ id: n.identifier, title: n.title, at: n.updatedAt });
   }
   recentDone.sort((a, b) => (a.at < b.at ? 1 : -1));
@@ -135,8 +158,17 @@ function line(s = '') { process.stdout.write(s + '\n'); }
     const c = b.counts;
     line(` Board (${PROJECT_NAME}):`);
     line(`   open: ${c.backlog} backlog · ${c.todo} todo · ${c.in_progress} in-progress    | done: ${c.done_total}`);
-    if (b.blocked.length) { line(` ⚠ BLOCKED (needs human): ${b.blocked.length}`); b.blocked.forEach(x => line(`     • ${x}`)); }
-    else line(' ✓ nothing blocked:needs-human');
+    if (b.blocked.length) {
+      line(` ⚠ AWAITING ABHI (loop:blocked-human): ${b.blocked.length}`);
+      b.blocked.forEach(x => {
+        const age = x.ageDays >= 2 ? `🔴 ${x.ageDays.toFixed(0)}d` : `${x.ageDays.toFixed(1)}d`;
+        const st = x.approved ? 'approved→in-pipeline' : 'NEEDS VERDICT';
+        line(`     • ${x.id} p${x.priority} [${age}] (${st}) ${x.title.slice(0, 55)}`);
+      });
+      const needing = b.blocked.filter(x => !x.approved);
+      if (needing.length) line(`   → ${needing.length} awaiting your verdict: say "approve <id>" / "park <id>" to Hermes on any surface.`);
+    }
+    else line(' ✓ nothing awaiting Abhi (loop:blocked-human empty)');
     if (b.open.length) {
       line(' Open issues:');
       b.open.slice(0, 12).forEach(o => line(`     ${o.id}  [${o.state}]  ${o.title.slice(0, 60)}`));
