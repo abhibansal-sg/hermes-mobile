@@ -9,11 +9,19 @@
 # correctly but also edited tui_gateway/server.py (stock core). That edit would
 # have been auto-rejected here.
 #
-#   scripts/loop-scope-check.sh <worktree_dir> "<allowed glob> <allowed glob> ..."
+#   scripts/loop-scope-check.sh <worktree_dir> "<allowed glob> <allowed glob> ..." ["<fence-approved glob> ..."]
 #
 # Example:
 #   scripts/loop-scope-check.sh .worktrees/t_abc123 \
 #     "plugins/hermes-mobile/relay_client.py plugins/hermes-mobile/push_engine.py tests/plugins/hermes_mobile/**"
+#
+# FENCE EXCEPTION (arg 3, Abhi-authorized only — 2026-07-04):
+#   When a Linear issue carries the `fence:approved` label, Abhi has authorized a
+#   SCOPED stock-core edit. The orchestrator passes the approved files (verbatim
+#   from the issue's FENCE APPROVED comment) as the third argument. A changed file
+#   matching BOTH a forbidden path AND a fence-approved glob passes the hard block.
+#   Files in forbidden paths NOT named in the exception still hard-fail (exit 4).
+#   Never pass arg 3 for an issue without the fence:approved label.
 #
 # Exit codes:
 #   0 = clean: every changed file is inside an allowed glob AND none hit forbidden_paths
@@ -24,8 +32,9 @@ set -euo pipefail
 
 WORKTREE="${1:-}"
 ALLOWED="${2:-}"
+FENCE_OK="${3:-}"
 if [ -z "$WORKTREE" ] || [ -z "$ALLOWED" ]; then
-  echo "usage: $0 <worktree_dir> \"<allowed glob> ...\"" >&2
+  echo "usage: $0 <worktree_dir> \"<allowed glob> ...\" [\"<fence-approved glob> ...\"]" >&2
   exit 2
 fi
 cd "$WORKTREE" 2>/dev/null || { echo "not a dir: $WORKTREE" >&2; exit 2; }
@@ -49,12 +58,31 @@ if [ "${#CHANGED[@]}" -eq 0 ]; then
   echo "scope-check: no changes."; exit 0
 fi
 
-# 1) forbidden-paths hard block
+# helper: does file match any glob in a space-separated list (same semantics as in_scope)
+matches_list() {
+  local file="$1" list="$2" g pat
+  for g in $list; do
+    pat="${g%/**}"; pat="${pat%/*}"
+    case "$file" in
+      $g) return 0 ;;
+      "${g%\*\*}"*) return 0 ;;
+      "$pat"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# 1) forbidden-paths hard block (fence:approved globs in arg 3 are exempt, per-file)
 forbidden_hit=0
 for f in "${CHANGED[@]}"; do
   for fp in "${FORBIDDEN[@]}"; do
     case "$f" in
-      "$fp"*) echo "❌ FORBIDDEN PATH: $f (matches governor block '$fp')"; forbidden_hit=1 ;;
+      "$fp"*)
+        if [ -n "$FENCE_OK" ] && matches_list "$f" "$FENCE_OK"; then
+          echo "  🔓 fence-approved: $f (forbidden '$fp' overridden by Abhi authorization)"
+        else
+          echo "❌ FORBIDDEN PATH: $f (matches governor block '$fp')"; forbidden_hit=1
+        fi ;;
     esac
   done
 done
