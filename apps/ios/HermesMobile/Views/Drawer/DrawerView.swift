@@ -1,4 +1,14 @@
 import SwiftUI
+import UIKit
+
+/// A prepared Markdown export file waiting for native share-sheet presentation.
+/// The `sessionId` lets each drawer row host the share presenter from its own
+/// view hierarchy, so iPad popovers can anchor to the row that initiated export.
+private struct DrawerExportedTranscript: Identifiable, Equatable {
+    let id = UUID()
+    let sessionId: String
+    let fileURL: URL
+}
 
 /// The Claude-iOS navigation drawer (F1): a serif wordmark + avatar header, thin
 /// line-icon nav rows (Inbox, Automations), a muted "Recents" label, plain
@@ -110,6 +120,9 @@ struct DrawerView: View {
     /// the user taps Delete in the context menu; the confirmation dialog fires
     /// before the actual `SessionStore.delete` call.
     @State private var sessionPendingDelete: SessionSummary?
+    /// Prepared export file awaiting native share-sheet presentation. Hosted by
+    /// the initiating row so iPad uses that row as the popover anchor.
+    @State private var exportedTranscript: DrawerExportedTranscript?
     /// The drawer's own NavigationStack path. Empty in F1 — the only former
     /// destination (Settings) became a sheet — but kept so search/inbox/row
     /// pushes the integrator may add later have a home, and so the structural
@@ -1508,6 +1521,12 @@ struct DrawerView: View {
             .contextMenu {
                 rowContextMenu(for: summary, pinned: pinned)
             }
+            .background {
+                DrawerExportSharePresenter(
+                    export: $exportedTranscript,
+                    sessionId: summary.id
+                )
+            }
             // ABH-85 REVERTED (user decision): NO `.swipeActions` on drawer rows.
             // A per-row trailing swipe is horizontally-dominant, and while the
             // drawer is open the CompactLayout card-drag latches ANY horizontal
@@ -1545,6 +1564,12 @@ struct DrawerView: View {
         } label: {
             Label("Archive", systemImage: "archivebox")
         }
+        Button {
+            exportSession(summary)
+        } label: {
+            Label("Export", systemImage: "square.and.arrow.up")
+        }
+        .accessibilityIdentifier("sessionExportMenuItem")
         Divider()
         // ABH-80: stage for confirmation; the .confirmationDialog on the
         // NavigationStack root presents the destructive confirmation before the
@@ -1690,6 +1715,120 @@ struct DrawerView: View {
     private func startDraft() {
         sessions.startDraft()
         onNavigate()
+    }
+
+    /// Fetch a full Markdown transcript and stage a temporary `.md` file for the
+    /// native iOS share sheet. Empty/failed fetches are surfaced by SessionStore's
+    /// existing session-action alert, so this never presents a blank activity UI.
+    private func exportSession(_ summary: SessionSummary) {
+        Task {
+            guard let markdown = await sessions.exportMarkdown(summary) else { return }
+            do {
+                let url = try Self.writeMarkdownExport(markdown, summary: summary)
+                exportedTranscript = DrawerExportedTranscript(
+                    sessionId: summary.id,
+                    fileURL: url
+                )
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                sessions.lastError = message
+                sessions.sessionActionError = SessionActionError(action: "Export", message: message)
+            }
+        }
+    }
+
+    private static func writeMarkdownExport(
+        _ markdown: String,
+        summary: SessionSummary
+    ) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("HermesExports", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let filename = exportFilename(for: summary)
+        let url = directory.appendingPathComponent(filename, isDirectory: false)
+        try markdown.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    private static func exportFilename(for summary: SessionSummary) -> String {
+        let raw = summary.displayTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = "Hermes Session"
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: " -_"))
+        let sanitizedScalars = (raw.isEmpty ? fallback : raw).unicodeScalars.map { scalar in
+            allowed.contains(scalar) ? Character(scalar) : "-"
+        }
+        let collapsed = String(sanitizedScalars)
+            .split(separator: " ")
+            .joined(separator: " ")
+            .trimmingCharacters(in: CharacterSet(charactersIn: " .-_"))
+        let base = String((collapsed.isEmpty ? fallback : collapsed).prefix(80))
+        let idSuffix = String(summary.id.prefix(8))
+        return "\(base)-\(idSuffix).md"
+    }
+}
+
+/// Invisible per-row presenter for the export share sheet. Presenting from the
+/// row's backing `UIView` gives `UIActivityViewController` a concrete popover
+/// anchor on iPad instead of falling back to an unanchored centered sheet.
+private struct DrawerExportSharePresenter: UIViewRepresentable {
+    @Binding var export: DrawerExportedTranscript?
+    let sessionId: String
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView(frame: .zero)
+        view.backgroundColor = .clear
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        guard let active = export, active.sessionId == sessionId else { return }
+        guard context.coordinator.presentedID != active.id else { return }
+        context.coordinator.presentedID = active.id
+
+        DispatchQueue.main.async {
+            guard self.export?.id == active.id,
+                  let presenter = uiView.nearestViewController,
+                  presenter.presentedViewController == nil else {
+                context.coordinator.presentedID = nil
+                return
+            }
+
+            let controller = UIActivityViewController(
+                activityItems: [active.fileURL],
+                applicationActivities: nil
+            )
+            controller.completionWithItemsHandler = { _, _, _, _ in
+                DispatchQueue.main.async {
+                    if self.export?.id == active.id {
+                        self.export = nil
+                    }
+                    context.coordinator.presentedID = nil
+                }
+            }
+            if let popover = controller.popoverPresentationController {
+                popover.sourceView = uiView
+                popover.sourceRect = uiView.bounds
+                popover.permittedArrowDirections = [.up, .down]
+            }
+            presenter.present(controller, animated: true)
+        }
+    }
+
+    final class Coordinator {
+        var presentedID: UUID?
+    }
+}
+
+private extension UIView {
+    var nearestViewController: UIViewController? {
+        sequence(first: self as UIResponder, next: { $0.next })
+            .first { $0 is UIViewController } as? UIViewController
     }
 }
 

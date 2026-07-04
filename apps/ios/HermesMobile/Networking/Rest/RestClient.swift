@@ -193,10 +193,7 @@ struct RestClient: Sendable {
     /// both shapes are handled. Entries that fail ``StoredMessage`` parsing
     /// are dropped.
     func messages(sessionId: String) async throws -> [StoredMessage] {
-        let encodedId = sessionId.addingPercentEncoding(
-            withAllowedCharacters: .urlPathAllowed
-        ) ?? sessionId
-        let data = try await get(path: "/api/sessions/\(encodedId)/messages")
+        let data = try await get(path: "/api/sessions/\(sessionId)/messages")
 
         let root = try decodeJSONValue(from: data, context: "messages")
 
