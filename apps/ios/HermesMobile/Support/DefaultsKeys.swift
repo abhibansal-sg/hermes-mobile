@@ -106,9 +106,10 @@ enum DefaultsKeys {
 
     // MARK: Per-event push preferences (F2-A / A4)
     //
-    // Three independent toggles for which push event kinds the gateway should
+    // Five independent toggles for which push event kinds the gateway should
     // deliver. Each maps to one wire `events` token: `"approval"`, `"clarify"`,
-    // `"turn_complete"`. ALL DEFAULT ON — the keys read as `false` when absent,
+    // `"turn_complete"`, `"turn_error"`, or `"background_done"`.
+    // ALL DEFAULT ON — the keys read as `false` when absent,
     // so the accessors below invert through `object(forKey:) == nil ? true : …`
     // to make "unset" mean "on" (legacy installs / first launch get everything).
     // Owned by ``SettingsView`` (writer) + ``PushRegistrar`` (reads the list to
@@ -120,6 +121,10 @@ enum DefaultsKeys {
     static let pushEventClarify = "hermes.push.event.clarify"
     /// `Bool` — deliver long-turn-complete pushes. Default ON.
     static let pushEventTurnComplete = "hermes.push.event.turnComplete"
+    /// `Bool` — deliver errored-turn pushes. Default ON.
+    static let pushEventTurnError = "hermes.push.event.turnError"
+    /// `Bool` — deliver background-job-complete pushes. Default ON.
+    static let pushEventBackgroundDone = "hermes.push.event.backgroundDone"
 
     /// Read a default-ON push-event toggle: a *missing* key reads as `true`
     /// (everything on by default); a present key is honored verbatim.
@@ -127,14 +132,17 @@ enum DefaultsKeys {
         defaults.object(forKey: key) == nil ? true : defaults.bool(forKey: key)
     }
 
-    /// The wire `events` list for `/api/push/register`, built from the three
-    /// toggles. Order is stable (`approval`, `clarify`, `turn_complete`) so the
-    /// body is deterministic for tests and access-log assertions.
+    /// The wire `events` list for `/api/push/register`, built from the five
+    /// toggles. Order is stable (`approval`, `clarify`, `turn_complete`,
+    /// `turn_error`, `background_done`) so the body is deterministic for tests
+    /// and access-log assertions.
     static func pushEventList(_ defaults: UserDefaults = .standard) -> [String] {
         var events: [String] = []
         if pushEventEnabled(pushEventApproval, defaults) { events.append("approval") }
         if pushEventEnabled(pushEventClarify, defaults) { events.append("clarify") }
         if pushEventEnabled(pushEventTurnComplete, defaults) { events.append("turn_complete") }
+        if pushEventEnabled(pushEventTurnError, defaults) { events.append("turn_error") }
+        if pushEventEnabled(pushEventBackgroundDone, defaults) { events.append("background_done") }
         return events
     }
 

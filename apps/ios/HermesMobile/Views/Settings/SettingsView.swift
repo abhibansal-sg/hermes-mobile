@@ -105,13 +105,15 @@ struct SettingsView: View {
 
     // MARK: Per-event push prefs (F2-A / A4)
 
-    /// The three per-event push toggles. All default ON. A change re-POSTs
+    /// The per-event push toggles. All default ON. A change re-POSTs
     /// `/api/push/register` with the new `events` list via
     /// ``PushRegistrar/reRegisterEvents()``. The `@AppStorage` default of `true`
     /// matches ``DefaultsKeys/pushEventEnabled(_:_:)``'s "absent ⇒ on" semantics.
     @AppStorage(DefaultsKeys.pushEventApproval) private var notifyApproval = true
     @AppStorage(DefaultsKeys.pushEventClarify) private var notifyClarify = true
     @AppStorage(DefaultsKeys.pushEventTurnComplete) private var notifyTurnComplete = true
+    @AppStorage(DefaultsKeys.pushEventTurnError) private var notifyTurnError = true
+    @AppStorage(DefaultsKeys.pushEventBackgroundDone) private var notifyBackgroundDone = true
 
     // MARK: Notifications permission bridge (P0)
     //
@@ -435,7 +437,7 @@ struct SettingsView: View {
                 .accessibilityIdentifier("pushTokenRegistrationState")
             }
 
-            // Per-event push prefs (A4): three native Toggles, shown only when
+            // Per-event push prefs (A4): native Toggles, shown only when
             // push is on (they have no effect otherwise). Each change re-POSTs
             // /api/push/register with the new events list. Pure system Toggles —
             // chrome via the system, identity via the .tint applied app-wide.
@@ -464,6 +466,24 @@ struct SettingsView: View {
                 .listRowBackground(theme.card)
                 .accessibilityIdentifier("notifyLongTurnsToggle")
                 .onChange(of: notifyTurnComplete) { _, _ in
+                    PushRegistrar.shared.reRegisterEvents()
+                }
+
+                Toggle(isOn: $notifyTurnError) {
+                    SettingsRowLabel(icon: "exclamationmark.triangle", title: "Turn errors")
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("notifyTurnErrorToggle")
+                .onChange(of: notifyTurnError) { _, _ in
+                    PushRegistrar.shared.reRegisterEvents()
+                }
+
+                Toggle(isOn: $notifyBackgroundDone) {
+                    SettingsRowLabel(icon: "checkmark.circle", title: "Background job done")
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("notifyBackgroundDoneToggle")
+                .onChange(of: notifyBackgroundDone) { _, _ in
                     PushRegistrar.shared.reRegisterEvents()
                 }
             }

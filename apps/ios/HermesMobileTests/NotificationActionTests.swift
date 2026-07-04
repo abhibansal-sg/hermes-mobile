@@ -165,7 +165,7 @@ final class NotificationActionTests: XCTestCase {
 
 // MARK: - Per-event push prefs round-trip (A4)
 
-/// Round-trips the three notification toggles through `DefaultsKeys`, asserting
+/// Round-trips the notification toggles through `DefaultsKeys`, asserting
 /// the default-ON semantics and the deterministic wire `events` list.
 final class PushEventPrefsTests: XCTestCase {
 
@@ -189,9 +189,11 @@ final class PushEventPrefsTests: XCTestCase {
         XCTAssertTrue(DefaultsKeys.pushEventEnabled(DefaultsKeys.pushEventApproval, defaults))
         XCTAssertTrue(DefaultsKeys.pushEventEnabled(DefaultsKeys.pushEventClarify, defaults))
         XCTAssertTrue(DefaultsKeys.pushEventEnabled(DefaultsKeys.pushEventTurnComplete, defaults))
+        XCTAssertTrue(DefaultsKeys.pushEventEnabled(DefaultsKeys.pushEventTurnError, defaults))
+        XCTAssertTrue(DefaultsKeys.pushEventEnabled(DefaultsKeys.pushEventBackgroundDone, defaults))
         XCTAssertEqual(
             DefaultsKeys.pushEventList(defaults),
-            ["approval", "clarify", "turn_complete"]
+            ["approval", "clarify", "turn_complete", "turn_error", "background_done"]
         )
     }
 
@@ -200,8 +202,20 @@ final class PushEventPrefsTests: XCTestCase {
         XCTAssertFalse(DefaultsKeys.pushEventEnabled(DefaultsKeys.pushEventApproval, defaults))
         XCTAssertEqual(
             DefaultsKeys.pushEventList(defaults),
-            ["clarify", "turn_complete"],
+            ["clarify", "turn_complete", "turn_error", "background_done"],
             "approval must drop out of the events list when toggled off"
+        )
+    }
+
+    func testTogglingTurnErrorAndBackgroundDoneOffExcludesThemFromList() {
+        defaults.set(false, forKey: DefaultsKeys.pushEventTurnError)
+        defaults.set(false, forKey: DefaultsKeys.pushEventBackgroundDone)
+        XCTAssertFalse(DefaultsKeys.pushEventEnabled(DefaultsKeys.pushEventTurnError, defaults))
+        XCTAssertFalse(DefaultsKeys.pushEventEnabled(DefaultsKeys.pushEventBackgroundDone, defaults))
+        XCTAssertEqual(
+            DefaultsKeys.pushEventList(defaults),
+            ["approval", "clarify", "turn_complete"],
+            "new push kinds must drop out of the events list when toggled off"
         )
     }
 
@@ -209,28 +223,35 @@ final class PushEventPrefsTests: XCTestCase {
         defaults.set(false, forKey: DefaultsKeys.pushEventApproval)
         defaults.set(false, forKey: DefaultsKeys.pushEventClarify)
         defaults.set(false, forKey: DefaultsKeys.pushEventTurnComplete)
+        defaults.set(false, forKey: DefaultsKeys.pushEventTurnError)
+        defaults.set(false, forKey: DefaultsKeys.pushEventBackgroundDone)
         XCTAssertEqual(DefaultsKeys.pushEventList(defaults), [])
     }
 
     func testRoundTripPersistsExplicitTrue() {
         // An explicit ON (the user toggled off then on again) is honored verbatim.
         defaults.set(false, forKey: DefaultsKeys.pushEventClarify)
-        XCTAssertEqual(DefaultsKeys.pushEventList(defaults), ["approval", "turn_complete"])
+        XCTAssertEqual(
+            DefaultsKeys.pushEventList(defaults),
+            ["approval", "turn_complete", "turn_error", "background_done"]
+        )
         defaults.set(true, forKey: DefaultsKeys.pushEventClarify)
         XCTAssertEqual(
             DefaultsKeys.pushEventList(defaults),
-            ["approval", "clarify", "turn_complete"]
+            ["approval", "clarify", "turn_complete", "turn_error", "background_done"]
         )
     }
 
     func testListOrderIsStable() {
         // Order is part of the contract for deterministic access-log assertions.
         defaults.set(true, forKey: DefaultsKeys.pushEventTurnComplete)
+        defaults.set(true, forKey: DefaultsKeys.pushEventBackgroundDone)
         defaults.set(true, forKey: DefaultsKeys.pushEventApproval)
+        defaults.set(true, forKey: DefaultsKeys.pushEventTurnError)
         defaults.set(true, forKey: DefaultsKeys.pushEventClarify)
         XCTAssertEqual(
             DefaultsKeys.pushEventList(defaults),
-            ["approval", "clarify", "turn_complete"]
+            ["approval", "clarify", "turn_complete", "turn_error", "background_done"]
         )
     }
 }

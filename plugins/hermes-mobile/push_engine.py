@@ -411,7 +411,13 @@ def _default_env() -> str:
 # The per-event preference vocabulary. A registry entry may opt into a subset;
 # ``None``/absent means "all events" so legacy entries (registered before prefs
 # existed) keep receiving every push.
-PUSH_EVENT_KINDS = ("approval", "clarify", "turn_complete")
+PUSH_EVENT_KINDS = (
+    "approval",
+    "clarify",
+    "turn_complete",
+    "turn_error",
+    "background_done",
+)
 
 
 def _normalize_events(events: Optional[List[str]]) -> Optional[List[str]]:
@@ -1086,7 +1092,13 @@ def _gw_sessions() -> dict:
 _LIVE_ACTIVITY_THROTTLE_S = 3.0
 _PUSH_QUEUE_MAX = 512
 _PUSH_ALERT_EVENTS = frozenset(
-    {"approval.request", "clarify.request", "message.complete"}
+    {
+        "approval.request",
+        "clarify.request",
+        "message.complete",
+        "error",
+        "background.complete",
+    }
 )
 _LIVE_ACTIVITY_EVENTS = frozenset(
     {
@@ -1528,6 +1540,38 @@ def _process_push_event(
                 _push_safe_text(data.get("question"), "Input needed"),
                 clarify_payload,
                 category="HERMES_CLARIFY",
+            )
+        elif event == "error":
+            if _is_kanban_worker():
+                return
+            message = str(data.get("message") or "")
+            preview = (
+                _push_safe_text(message.strip().splitlines()[0], "Turn errored")
+                if message.strip()
+                else "Turn errored"
+            )
+            notify(
+                "turn_error",
+                "Hermes hit an error",
+                preview,
+                {"session_id": sid},
+                category="HERMES_ERROR",
+            )
+        elif event == "background.complete":
+            if _is_kanban_worker():
+                return
+            text = str(data.get("text") or "")
+            preview = (
+                _push_safe_text(text.strip().splitlines()[0], "Job finished")
+                if text.strip()
+                else "Job finished"
+            )
+            notify(
+                "background_done",
+                "Background job finished",
+                preview,
+                {"session_id": sid, "task_id": data.get("task_id")},
+                category="HERMES_TURN",
             )
         else:  # message.complete — only for long turns
             session = _gw_sessions().get(sid)
