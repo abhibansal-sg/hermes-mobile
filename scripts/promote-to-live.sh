@@ -83,14 +83,25 @@ log "promoting live: $(git rev-parse --short "$CURRENT") -> $(git rev-parse --sh
 # --- S1: BACKUP (before any mutation) ----------------------------------------------
 B="$HOME/hermes-backups/pre-live-$TS"
 mkdir -p "$B"
+# Excludes: reinstallables + transient/regenerable churn. kanban workspaces hold
+# per-task checkouts + derivedData (GBs, regenerable, files vanish mid-copy);
+# *.lock dirs are transient. rsync exit 24 (files vanished during transfer) is
+# ACCEPTABLE for this backup — everything durable was copied.
 rsync -a --exclude hermes-agent --exclude node --exclude cache \
   --exclude bootstrap-cache --exclude audio_cache --exclude image_cache \
-  --exclude logs --exclude '*.log' --exclude '*.db-shm' --exclude '*.db-wal' \
-  "$HOME/.hermes/" "$B/dot-hermes/" \
-  || { log "backup FAILED — refusing to touch live"; exit 1; }
+  --exclude logs --exclude '*.log' \
+  --exclude 'kanban/boards/*/workspaces' --exclude '*.lock' \
+  --exclude '*.db-wal' --exclude '*.db-shm' --exclude '.state.db.*' \
+  "$HOME/.hermes/" "$B/dot-hermes/"
+RSYNC_RC=$?
+if [ "$RSYNC_RC" != "0" ] && [ "$RSYNC_RC" != "24" ]; then
+  log "backup FAILED (rsync rc=$RSYNC_RC) — refusing to touch live"; exit 1
+fi
 cp "$SERVICE_WRAPPER" "$B/hermes-dashboard-service.orig"
 echo "$CURRENT" > "$B/pre-promote-sha"
-log "backup at $B"
+# Keep only the 2 newest pre-live backups (each ~19G; 3+ filled the disk on 07-04).
+ls -dt "$HOME"/hermes-backups/pre-live-* 2>/dev/null | tail -n +3 | xargs rm -rf 2>/dev/null
+log "backup at $B (rsync rc=$RSYNC_RC)"
 
 # --- ADVANCE the frozen checkout ----------------------------------------------------
 git checkout -q live 2>/dev/null || true
