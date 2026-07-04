@@ -1,5 +1,8 @@
 {
   "_contract": "ui-scout picks the lens+area with the oldest last_audited. Lenses: functionality, stress, permutations (design activates after taste calibration — Abhi reviews first week of filings). Update last_audited + note after each run, commit.",
+  "_infra_blocks": [
+    {"date": "2026-07-04", "branch": "environment-and-workflows-overview", "issue": "ABH-417", "note": "build-for-testing fails (dangling ProjectSessionCwdPrefixTests.swift ref in project.pbxproj, orphaned from ABH-407 branch, introduced by ship-79 commit 7ff26a124). NO area could be audited this run — infra gate tripped before any surface was picked, per HARD RULE 4. Re-run once ABH-417 lands."}
+  ],
   "areas": [
     {"area": "drawer-session-list", "lens_last": {"functionality": null, "stress": null, "permutations": null}, "note": "highest-churn surface; ABH-343/345/346 in flight — expect movement"},
     {"area": "chat-transcript", "lens_last": {"functionality": null, "stress": null, "permutations": null}, "note": "ABH-357/358/359/360 overhaul in flight"},
