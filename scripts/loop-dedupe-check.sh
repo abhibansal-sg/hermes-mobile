@@ -11,7 +11,7 @@
 # reviewer cycles — "widget voiceover labels" merged as BOTH #123 and #126, iPad
 # keyboard HUD labels landed twice. 30 seconds of checking beats a wasted chain.
 set -uo pipefail
-REPO=/Users/abbhinnav/Developer/products/hermes-mobile
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASE=environment-and-workflows-overview
 GH_REPO=ab0991-oss/hermes-mobile
 

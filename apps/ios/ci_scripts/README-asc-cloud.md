@@ -13,10 +13,10 @@ App Store Connect REST API. No GUI, no Xcode needed — pure API calls.
 The script reads the private key **only at runtime**, in this order:
 
 1. `$ASC_KEY_PATH` (env override — absolute path to any `.p8`)
-2. `~/.appstoreconnect/private_keys/AuthKey_3DHXXG4GHQ.p8`
-3. `~/.appstoreconnect/private/AuthKey_3DHXXG4GHQ.p8`
+2. `~/.appstoreconnect/private_keys/AuthKey_<ASC_KEY_ID>.p8`
+3. `~/.appstoreconnect/private/AuthKey_<ASC_KEY_ID>.p8`
 
-The key ID (`3DHXXG4GHQ`), issuer ID, and app ID are hardcoded as defaults
+The key ID (`<ASC_KEY_ID>`), issuer ID, and app ID are hardcoded as defaults
 but all three can be overridden via env vars (`ASC_KEY_ID`, `ASC_ISSUER_ID`,
 `ASC_APP_ID`).
 

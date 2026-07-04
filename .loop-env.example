@@ -1,0 +1,15 @@
+# Loop identity — operator-specific values the autonomous-loop scripts read.
+# Copy to .loop-env (gitignored) and fill in. Scripts fall back to env vars.
+# None of these are secrets (the .p8 key itself lives outside the repo),
+# but they are operator-specific and do not belong in tracked files.
+
+# Linear user UUID that escalations are assigned to (your Linear account)
+LOOP_HUMAN_ASSIGNEE_ID=
+
+# App Store Connect API identity (key file path lives outside the repo)
+ASC_KEY_ID=
+ASC_ISSUER_ID=
+ASC_KEY_FILE=
+
+# Simulator UDID used by the UI-test lane (xcrun simctl list devices)
+UI_TEST_SIM_UDID=

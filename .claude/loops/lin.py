@@ -8,12 +8,13 @@ appear as the beat actor (NOT Abhi). Usage:
 Prints JSON to stdout.
 """
 import json
+import os
 import subprocess
 import sys
 import urllib.request
 
 TOKEN = subprocess.check_output(
-    ["/Users/abbhinnav/.hermes/scripts/linear-app-token.sh"], text=True
+    [os.path.expanduser("~/.hermes/scripts/linear-app-token.sh")], text=True
 ).strip()
 
 

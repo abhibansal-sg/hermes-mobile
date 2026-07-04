@@ -4,8 +4,8 @@
 
 project:
   name: hermes-mobile
-  permanent_root: /Users/abbhinnav/Developer/products/hermes-mobile
-  worktree_root: /Users/abbhinnav/Developer/worktrees
+  permanent_root: $REPO_ROOT
+  worktree_root: $WORKTREE_ROOT
   base_branch: environment-and-workflows-overview
   github_remote: origin
   github_repo: ab0991-oss/hermes-mobile
@@ -196,8 +196,8 @@ planning:
       inspect the generated graph, then assign execution cards deliberately.
 
 runtime:
-  production_hermes: /Users/abbhinnav/.hermes
-  dev_gateway_home: /Users/abbhinnav/Developer/products/hermes-mobile/.hermes-dev
+  production_hermes: ~/.hermes
+  dev_gateway_home: $REPO_ROOT/.hermes-dev
   dev_gateway_port: 9200
   dev_gateway_launchd_label: ai.hermes.dev-gateway
   note: >-
@@ -280,7 +280,7 @@ verification:
     - dev gateway health when connectivity-related
   dev_gateway_health:
     port: 9200
-    expected_home: /Users/abbhinnav/Developer/products/hermes-mobile/.hermes-dev
+    expected_home: $REPO_ROOT/.hermes-dev
 
 external_coding_lanes:
   glm_opencode:

@@ -8,7 +8,7 @@
 set -uo pipefail
 BUILD="${1:?build number required}"
 OUT="${2:-/tmp/notes-$BUILD.txt}"
-REPO=/Users/abbhinnav/Developer/products/hermes-mobile
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 LAST_SHIP_SHA=$(git log -1 --grep="ship: TestFlight build" --format="%H" 2>/dev/null)

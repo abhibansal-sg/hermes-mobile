@@ -11,13 +11,16 @@
 # ios-build.sh (never raw xcodebuild, never kill -9). CFBundleVersion gate before
 # upload. Idempotent-ish: refuses to ship if HEAD already shipped (same build no).
 set -uo pipefail
-REPO=/Users/abbhinnav/Developer/products/hermes-mobile
+
+# Operator identity (ASC ids, sim UDID) — see .loop-env.example
+if [ -f "$(dirname "${BASH_SOURCE[0]}")/../.loop-env" ]; then set -a; . "$(dirname "${BASH_SOURCE[0]}")/../.loop-env"; set +a; fi
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO" || { echo "ship: repo missing"; exit 1; }
 
 WAVE="${1:-}"
-ASC_KEY=/Users/abbhinnav/.appstoreconnect/private_keys/AuthKey_3DHXXG4GHQ.p8
-ASC_ISSUER=d7deff8e-5489-4d18-995d-c8a10f854118
-ASC_KEYID=3DHXXG4GHQ
+ASC_KEY="${ASC_KEY_FILE:-$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID:-}.p8}"
+ASC_ISSUER="${ASC_ISSUER_ID:-}"
+ASC_KEYID="${ASC_KEY_ID:-}"
 APP_ID=6777140135
 TOKEN="$("$HOME/.hermes/scripts/linear-app-token.sh" 2>/dev/null || true)"
 BASE=environment-and-workflows-overview

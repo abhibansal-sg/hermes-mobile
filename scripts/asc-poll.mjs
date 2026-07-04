@@ -22,8 +22,8 @@
  * Env (same contract as apps/ios/ci_scripts/asc-cloud.mjs — shared credential scoping):
  *   ASC_KEY_PATH   path to .p8   (default: ~/.appstoreconnect/private_keys/AuthKey_<kid>.p8
  *                                          then ~/.appstoreconnect/private/AuthKey_<kid>.p8)
- *   ASC_KEY_ID     key id        (default 3DHXXG4GHQ)
- *   ASC_ISSUER_ID  issuer uuid   (default d7deff8e-5489-4d18-995d-c8a10f854118)
+ *   ASC_KEY_ID     key id        (no default — set env)
+ *   ASC_ISSUER_ID  issuer uuid   (no default — set env)
  *   ASC_APP_ID     numeric appId (default 6777140135)
  *   ASC_POLL_INTERVAL_S  seconds between polls (default 60)
  *   ASC_POLL_MAX_MIN     minutes ceiling       (default 30)
@@ -37,8 +37,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const DEFAULT_KEY_ID    = '3DHXXG4GHQ';
-const DEFAULT_ISSUER_ID = 'd7deff8e-5489-4d18-995d-c8a10f854118';
+const DEFAULT_KEY_ID    = '';
+const DEFAULT_ISSUER_ID = '';
 const DEFAULT_APP_ID    = '6777140135';
 const ASC_BASE          = 'https://api.appstoreconnect.apple.com/v1';
 

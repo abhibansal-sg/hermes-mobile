@@ -76,7 +76,7 @@ backfill semantics, queue drain hooks, spotlight hook.
 
 ## B4 pairing — owns Views/Onboarding/* (new), Support/QRScanner.swift (new),
 App/HermesURLRouter.swift (pair route), AND server file
-/Users/abbhinnav/.hermes/hermes-agent/hermes_cli/mobile_pair.py (new) +
+~/.hermes/hermes-agent/hermes_cli/mobile_pair.py (new) +
 registering the subcommand (read hermes_cli/main.py argparse wiring; add
 "mobile-pair" minimally where other subcommands register).
 - WelcomeView: brand moment (app icon asset, "Hermes" title, one-liner),

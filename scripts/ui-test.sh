@@ -11,9 +11,12 @@
 # Output: human log + final line "UI-TEST VERDICT: PASS|FAIL passed=N failed=N"
 # Exit: 0 all green, 1 any failure, 2 infra error (couldn't even run).
 set -uo pipefail
-REPO=/Users/abbhinnav/Developer/products/hermes-mobile
+
+# Operator identity (ASC ids, sim UDID) — see .loop-env.example
+if [ -f "$(dirname "${BASH_SOURCE[0]}")/../.loop-env" ]; then set -a; . "$(dirname "${BASH_SOURCE[0]}")/../.loop-env"; set +a; fi
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUNDLE_ID=ai.hermes.app
-DEFAULT_UDID=BC5EB32A-C67E-45BF-8BA9-7EBC0FE40C0B   # iPhone 17 Pro
+DEFAULT_UDID="${UI_TEST_SIM_UDID:-}"  # set in .loop-env or env
 DERIVED="$REPO/apps/ios/.derivedData/Build/Products"
 export JAVA_HOME=${JAVA_HOME:-/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home}
 # PATH NOTE (GATE-1 pitfall, cost an hour): ~/.hermes/bin holds the xcodebuild

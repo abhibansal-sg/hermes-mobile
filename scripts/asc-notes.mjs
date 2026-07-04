@@ -22,8 +22,8 @@ const BUILD = arg('--build');
 const NOTES = arg('--notes') ?? (arg('--notes-file') ? readFileSync(arg('--notes-file'), 'utf8') : null);
 if (!BUILD || !NOTES) { console.error('usage: asc-notes.mjs --build N (--notes "..." | --notes-file F)'); process.exit(2); }
 
-const KEY_ID = process.env.ASC_KEY_ID || '3DHXXG4GHQ';
-const ISSUER = process.env.ASC_ISSUER_ID || 'd7deff8e-5489-4d18-995d-c8a10f854118';
+const KEY_ID = process.env.ASC_KEY_ID || '';
+const ISSUER = process.env.ASC_ISSUER_ID || '';
 const APP_ID = process.env.ASC_APP_ID || '6777140135';
 const keyPath = process.env.ASC_KEY_PATH
   || [`${homedir()}/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8`,

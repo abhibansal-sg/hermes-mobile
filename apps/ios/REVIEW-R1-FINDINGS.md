@@ -297,4 +297,4 @@ Fix actions:
 
 ---
 
-*Ledger generated for the R1 fix loop. Counts: P0=1, P1=26, P2=47, P3=23 (total 97). Fix batches: A–H (8). All file paths absolute under `/Users/abbhinnav/.hermes/hermes-agent/`.*
+*Ledger generated for the R1 fix loop. Counts: P0=1, P1=26, P2=47, P3=23 (total 97). Fix batches: A–H (8). All file paths absolute under `~/.hermes/hermes-agent/`.*

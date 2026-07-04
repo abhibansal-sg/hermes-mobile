@@ -55,14 +55,14 @@ drawer footer entry + a SettingsView row
 
 ## E3 verification — integrator stage (no module owns files)
 Stand up a STOCK dashboard and prove degradation:
-1. Find upstream baseline: cd /Users/abbhinnav/.hermes/hermes-agent &&
+1. Find upstream baseline: cd ~/.hermes/hermes-agent &&
    git merge-base hermes-mobile origin/main (or main). git worktree add
    /tmp/hermes-stock <merge-base>. Run its dashboard:
    HERMES_DASHBOARD_SESSION_TOKEN=stock-test <worktree>/venv? — the worktree
    shares no venv; run via the EXISTING venv but with PYTHONPATH/cwd at the
    worktree so the stock code executes:
    cd /tmp/hermes-stock && HERMES_DASHBOARD_SESSION_TOKEN=stock-test
-   /Users/abbhinnav/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main
+   ~/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main
    dashboard --no-open --tui --host 127.0.0.1 --port 9125
    (HERMES_HOME stays default — it will share ~/.hermes state; acceptable:
    create/close only test sessions; do NOT bulk-delete; alternatively set

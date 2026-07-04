@@ -125,7 +125,7 @@ so it won't be caught by a green build.
 Things that break on rebase/update, each with a one-line mitigation:
 
 1. **`hermes dashboard --tui` flag removed (commit `cae6b5486`) → launchd service fails
-   to start.** Our wrapper `/Users/abbhinnav/.hermes/bin/hermes-dashboard-service:45`
+   to start.** Our wrapper `~/.hermes/bin/hermes-dashboard-service:45`
    runs `hermes dashboard --no-open --tui --host 127.0.0.1 --port 9119`; the commit
    removes `--tui` from the dashboard subparser and its own body warns argparse "would
    now error with 'unrecognized arguments: --tui'".
@@ -247,7 +247,7 @@ today** — our single-profile 9119 service makes `_profile_home` return `None` 
 
 1. **No code action required today.** Nothing breaks until we pull. F3 ships as-is.
 2. **Pre-stage the launchd fix.** Note that the rebase commit past `cae6b5486` MUST edit
-   `/Users/abbhinnav/.hermes/bin/hermes-dashboard-service:45` to drop `--tui` in the same
+   `~/.hermes/bin/hermes-dashboard-service:45` to drop `--tui` in the same
    commit (it's a hard argparse error otherwise). Write the new command down now:
    `hermes dashboard --no-open --host 127.0.0.1 --port 9119`.
 3. **Decide the multi-client model (Option A vs B) on paper** so the resume-handler

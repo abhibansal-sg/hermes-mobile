@@ -61,12 +61,12 @@ Shared plumbing (provided by parent before modules run):
   needed (UIApplicationDelegateAdaptor) for token callbacks.
 
 ## X4 server-push (dormant) — owns gateway-side files ONLY:
-`/Users/abbhinnav/.hermes/hermes-agent/hermes_cli/push_notify.py` (new) +
+`~/.hermes/hermes-agent/hermes_cli/push_notify.py` (new) +
 documented small hooks (do NOT apply hooks; the parent integrates them):
 - push_notify.py: APNs HTTP/2 sender using a .p8 token key (path from env
   HERMES_APNS_KEY_FILE, key id HERMES_APNS_KEY_ID, team id HERMES_APNS_TEAM_ID,
   topic HERMES_APNS_TOPIC default "ai.hermes.app"), JWT ES256 via PyJWT +
-  cryptography (check venv availability: /Users/abbhinnav/.hermes/hermes-agent/venv/bin/python -c "import jwt, cryptography").
+  cryptography (check venv availability: ~/.hermes/hermes-agent/venv/bin/python -c "import jwt, cryptography").
   Device token registry: JSON file ~/.hermes/push_tokens.json (registered via
   a new REST endpoint — provide the FastAPI route code in your file as a
   ready-to-mount APIRouter: POST /api/push/register, DELETE /api/push/register).

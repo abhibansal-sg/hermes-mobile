@@ -447,17 +447,17 @@ struct ProjectsStoreTests {
     func decode_fullContract() throws {
         let json = #"""
         {
-            "id": "/Users/abbhinnav/Developer/products/hermes-mobile",
+            "id": "/path/to/hermes-mobile",
             "label": "hermes-mobile",
-            "root": "/Users/abbhinnav/Developer/products/hermes-mobile",
+            "root": "/path/to/hermes-mobile",
             "session_count": 5
         }
         """# .data(using: .utf8)!
 
         let project = try JSONDecoder().decode(Project.self, from: json)
-        #expect(project.id == "/Users/abbhinnav/Developer/products/hermes-mobile")
+        #expect(project.id == "/path/to/hermes-mobile")
         #expect(project.label == "hermes-mobile")
-        #expect(project.root == "/Users/abbhinnav/Developer/products/hermes-mobile")
+        #expect(project.root == "/path/to/hermes-mobile")
         #expect(project.sessionCount == 5)
     }
 
