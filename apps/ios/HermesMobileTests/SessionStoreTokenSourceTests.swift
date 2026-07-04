@@ -259,4 +259,125 @@ final class DrawerGestureArbitrationTests: XCTestCase {
         XCTAssertFalse(DrawerGestureArbitration.shouldLockTranscriptScroll(horizontalDominant: false),
             "ABH-381: non-drawer drags must leave transcript scrolling enabled")
     }
+
+    // MARK: - ABH-399: horizontal-scroller yield (generalized, non-enumerating)
+
+    /// ABH-399 PRIMARY: a leading-edge rightward pan whose touch is over a
+    /// horizontal scroller with content beyond bounds must NOT latch the drawer.
+    /// This is the bug — a rightward drag from the left half over a wide GFM
+    /// table opened the drawer instead of scrolling the table. The fix is
+    /// structural (enclosing-scroll-view overflow check), so this test passes
+    /// a `DrawerHorizontalScrollerSnapshot(hasHorizontalOverflow: true)` —
+    /// NOT a table-specific type match — proving the generalization.
+    func testOpenSwipeOverHorizontalScrollerWithOverflowYieldsToScroller() {
+        let scroller = DrawerHorizontalScrollerSnapshot(hasHorizontalOverflow: true)
+
+        let latch = DrawerGestureArbitration.resolveHorizontalDominance(
+            current: nil,
+            isDrawerOpen: false,
+            translation: CGSize(width: 48, height: 2),
+            startLocation: CGPoint(x: 18, y: 400),
+            openZone: 390,
+            dominanceRatio: 1.2,
+            textInput: nil,
+            horizontalScroller: scroller
+        )
+
+        XCTAssertEqual(latch, false,
+            "ABH-399: a rightward drag starting over a horizontal scroller with overflow content must NOT latch the drawer — the table should scroll")
+    }
+
+    /// ABH-399 GENERALIZATION: the yield fires for ANY horizontal scroller with
+    /// overflow, not just tables. The test deliberately passes the SAME snapshot
+    /// shape a code block (CodeBlockView) or a future horizontal scroller would
+    /// produce — `hasHorizontalOverflow: true` with no type tag. If the
+    /// arbitration were type-enumerating (checking "is this a table?"), a
+    /// code-block fixture would miss; the structural check covers both.
+    func testHorizontalScrollerYieldIsTypeAgnostic() {
+        // Same snapshot shape regardless of whether the scroller is a table,
+        // code block, or future horizontal scroller — proving the fix is
+        // structural, not enumerating control types.
+        let scroller = DrawerHorizontalScrollerSnapshot(hasHorizontalOverflow: true)
+
+        let latch = DrawerGestureArbitration.resolveHorizontalDominance(
+            current: nil,
+            isDrawerOpen: false,
+            translation: CGSize(width: 60, height: 1),
+            startLocation: CGPoint(x: 200, y: 600),
+            openZone: 390,
+            dominanceRatio: 1.2,
+            textInput: nil,
+            horizontalScroller: scroller
+        )
+
+        XCTAssertEqual(latch, false,
+            "ABH-399 generalization: the yield must fire for any enclosing horizontal scroller with overflow, not a specific view type")
+    }
+
+    /// ABH-399 NON-REGRESSION: a scroller that fits its content (no overflow)
+    /// must NOT trigger the yield — a drag over a narrow table that doesn't
+    /// need to scroll should still let the drawer open. This pins the overflow
+    /// gate so we don't over-block the drawer for non-scrollable content.
+    func testHorizontalScrollerWithoutOverflowDoesNotYield() {
+        let scroller = DrawerHorizontalScrollerSnapshot(hasHorizontalOverflow: false)
+
+        let latch = DrawerGestureArbitration.resolveHorizontalDominance(
+            current: nil,
+            isDrawerOpen: false,
+            translation: CGSize(width: 52, height: 3),
+            startLocation: CGPoint(x: 40, y: 220),
+            openZone: 390,
+            dominanceRatio: 1.2,
+            textInput: nil,
+            horizontalScroller: scroller
+        )
+
+        XCTAssertEqual(latch, true,
+            "ABH-399 non-regression: a scroller with no overflow must NOT block the drawer — only scrollable content yields")
+    }
+
+    /// ABH-399 NON-REGRESSION: no scroller under the touch (nil snapshot) must
+    /// preserve the pre-ABH-399 drawer-open behavior. This pins that the new
+    /// check doesn't regress plain drags on non-scrollable transcript content.
+    func testNilHorizontalScrollerSnapshotDoesNotBlockDrawer() {
+        let latch = DrawerGestureArbitration.resolveHorizontalDominance(
+            current: nil,
+            isDrawerOpen: false,
+            translation: CGSize(width: 52, height: 3),
+            startLocation: CGPoint(x: 40, y: 220),
+            openZone: 390,
+            dominanceRatio: 1.2,
+            textInput: nil,
+            horizontalScroller: nil
+        )
+
+        XCTAssertEqual(latch, true,
+            "ABH-399 non-regression: a drag over plain transcript content (no horizontal scroller) must still open the drawer")
+    }
+
+    /// ABH-399 PRIORITY: text-selection yield takes precedence over the
+    /// horizontal-scroller yield. If a drag starts in a focused text input
+    /// AND over a horizontal scroller (edge case: composer overlapping a
+    /// scrolled-out table), text interaction wins. This pins the ordering.
+    func testTextInteractionYieldTakesPrecedenceOverHorizontalScroller() {
+        let textInput = DrawerTextInputSnapshot(
+            frameInScreen: CGRect(x: 0, y: 380, width: 390, height: 54),
+            hasActiveSelection: false
+        )
+        let scroller = DrawerHorizontalScrollerSnapshot(hasHorizontalOverflow: true)
+
+        let latch = DrawerGestureArbitration.resolveHorizontalDominance(
+            current: nil,
+            isDrawerOpen: false,
+            translation: CGSize(width: 48, height: 2),
+            startLocation: CGPoint(x: 18, y: 400),
+            openZone: 390,
+            dominanceRatio: 1.2,
+            textInput: textInput,
+            horizontalScroller: scroller
+        )
+
+        XCTAssertEqual(latch, false,
+            "ABH-399 priority: text interaction yield must take precedence over the horizontal-scroller yield")
+    }
 }

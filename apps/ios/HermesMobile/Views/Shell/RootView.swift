@@ -566,7 +566,7 @@ extension EnvironmentValues {
     }
 }
 
-// MARK: - Drawer gesture arbitration seams (ABH-380/381)
+// MARK: - Drawer gesture arbitration seams (ABH-380/381, ABH-399)
 
 /// UIKit text-input state visible to the compact drawer pan. SwiftUI's root
 /// `DragGesture` cannot participate in `UITextView`'s selection-handle gesture
@@ -581,9 +581,25 @@ struct DrawerTextInputSnapshot: Equatable {
     let hasActiveSelection: Bool
 }
 
+/// Snapshot of the nearest enclosing horizontal scroll container under the
+/// touch point. ABH-399: the drawer's leading-edge pan must yield to ANY
+/// horizontally-scrollable content whose content extends beyond its bounds —
+/// tables, code blocks, future horizontal scrollers — discovered structurally
+/// (walk the UIKit view hierarchy for an enclosing `UIScrollView` with a
+/// horizontal content axis and overflow), NOT by enumerating control types.
+/// Enumerate-and-miss is the bug class that caused ABH-399 in the first place
+/// (ABH-380/381 enumerated text inputs; the GFM table ScrollView was missed).
+struct DrawerHorizontalScrollerSnapshot: Equatable {
+    /// `true` when the enclosing horizontal scroll view has content that
+    /// extends beyond its visible bounds on the horizontal axis — i.e. there
+    /// is somewhere to scroll, so a horizontal drag should feed the scroller,
+    /// not the drawer.
+    let hasHorizontalOverflow: Bool
+}
+
 /// Pure decision logic for compact drawer pan arbitration. Kept testable so the
-/// two table-stakes invariants (text-selection yield and scroll exclusivity) are
-/// pinned without a fragile drag UI test harness.
+/// table-stakes invariants (text-selection yield, scroll exclusivity, and
+/// horizontal-scroller yield) are pinned without a fragile drag UI test harness.
 enum DrawerGestureArbitration {
     /// UIKit selection handles can start a little outside the text rect. Treat
     /// that as owned by text editing rather than the drawer.
@@ -601,6 +617,20 @@ enum DrawerGestureArbitration {
             .contains(startLocation)
     }
 
+    /// ABH-399: the drawer must yield to a horizontal drag that begins over a
+    /// horizontal scroller with content beyond its bounds. This is the
+    /// generalization that covers tables (MessageBubble), code blocks
+    /// (CodeBlockView), and any future horizontal scroller in one stroke —
+    /// the discovery is structural (an enclosing scroll view with overflow),
+    /// never an enumeration of specific view types.
+    static func shouldYieldToHorizontalScroller(
+        startLocation: CGPoint,
+        scroller: DrawerHorizontalScrollerSnapshot?
+    ) -> Bool {
+        guard let scroller else { return false }
+        return scroller.hasHorizontalOverflow
+    }
+
     static func resolveHorizontalDominance(
         current: Bool?,
         isDrawerOpen: Bool,
@@ -608,7 +638,8 @@ enum DrawerGestureArbitration {
         startLocation: CGPoint,
         openZone: CGFloat,
         dominanceRatio: CGFloat,
-        textInput: DrawerTextInputSnapshot?
+        textInput: DrawerTextInputSnapshot?,
+        horizontalScroller: DrawerHorizontalScrollerSnapshot? = nil
     ) -> Bool? {
         if current != nil { return current }
 
@@ -619,6 +650,15 @@ enum DrawerGestureArbitration {
         guard abs(dx) > abs(dy) * dominanceRatio, abs(dx) > 1 else { return nil }
 
         if shouldYieldToTextInteraction(startLocation: startLocation, textInput: textInput) {
+            return false
+        }
+
+        // ABH-399: a horizontal drag starting over a horizontal scroller with
+        // overflow content yields to the scroller — the drawer does not latch.
+        // Checked AFTER text interaction (selection handles take priority) but
+        // BEFORE the drawer-open zone classification, so a rightward drag from
+        // the leading edge over a wide table scrolls the table, not the drawer.
+        if shouldYieldToHorizontalScroller(startLocation: startLocation, scroller: horizontalScroller) {
             return false
         }
 
@@ -662,6 +702,61 @@ private extension UIView {
             if let match = subview.hermesFirstResponderDescendant() { return match }
         }
         return nil
+    }
+}
+
+// MARK: - ABH-399 horizontal-scroller discovery (generalized, non-enumerating)
+
+/// Walks the UIKit view hierarchy at a touch point and reports whether the
+/// nearest enclosing `UIScrollView` is a horizontal scroller with content that
+/// extends beyond its visible bounds. ABH-399: this is the STRUCTURAL discovery
+/// that replaces the old enumerate-control-types-and-miss pattern. It covers
+/// GFM tables (MessageBubble), code blocks (CodeBlockView), and any future
+/// horizontal scroller — because it never asks "is this a table?", it asks
+/// "is there an enclosing scroll view here that can scroll horizontally?".
+@MainActor
+private enum DrawerHorizontalScrollerLocator {
+    static func snapshot(at point: CGPoint) -> DrawerHorizontalScrollerSnapshot? {
+        // Find the deepest view under the touch, then walk UP its ancestor
+        // chain looking for a UIScrollView that scrolls horizontally and has
+        // overflow content. This is exactly how UIKit itself resolves scroll
+        // touch delivery — we're mirroring the hit-test ancestor walk.
+        guard let root = keyWindow() else { return nil }
+        let target = root.hitTest(point, with: nil)
+        guard let target else { return nil }
+
+        var view: UIView? = target
+        while let candidate = view {
+            // Only consider scroll views whose primary scroll axis could be
+            // horizontal. UIScrollView's contentLayoutGuide would give us the
+            // content size on iOS 13+, but checking frame vs contentSize is the
+            // robust, version-stable way to detect horizontal overflow.
+            if let scroll = candidate as? UIScrollView {
+                let contentWidth = scroll.contentSize.width
+                let visibleWidth = scroll.bounds.width
+                // A contentSize of .zero usually means the scroll view hasn't
+                // laid out yet (e.g. SwiftUI-hosted NSScroller-backed views
+                // before first layout pass) — treat that as "no overflow" so we
+                // never block the drawer on an unloaded view. Once laid out,
+                // contentWidth > visibleWidth means there IS content to scroll.
+                if contentWidth > 0 && contentWidth > visibleWidth + 0.5 {
+                    return DrawerHorizontalScrollerSnapshot(hasHorizontalOverflow: true)
+                }
+            }
+            view = candidate.superview
+        }
+        return DrawerHorizontalScrollerSnapshot(hasHorizontalOverflow: false)
+    }
+
+    private static func keyWindow() -> UIWindow? {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first { !$0.isHidden && $0.alpha > 0 && $0.isKeyWindow }
+            ?? UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .flatMap(\.windows)
+                .first { !$0.isHidden && $0.alpha > 0 }
     }
 }
 
@@ -740,9 +835,12 @@ private struct CompactLayout: View {
     /// (the full chat surface) so a swipe anywhere opens the drawer — the prior 50%
     /// zone was the BUG-2 fix; horizontal-dominance gating is what keeps vertical
     /// scrolls and horizontal sub-scrollers (code blocks) safe regardless of where
-    /// the drag begins. The horizontal sub-scroller exception is enforced by the
-    /// `simultaneousGesture` path: a `ScrollView(.horizontal)` wins if it first
-    /// establishes its own recognizer before this gesture classifies as dominant.
+    /// the drag begins. The horizontal sub-scroller exception is enforced by BOTH
+    /// the `simultaneousGesture` path (a `ScrollView(.horizontal)` wins if it first
+    /// establishes its own recognizer) AND, as of ABH-399, by a structural
+    /// enclosing-horizontal-scroller overflow probe in `resolveHorizontalDominance`
+    /// — so a rightward drag over a wide GFM table scrolls the TABLE, not the
+    /// drawer, even when the drawer gesture classifies as dominant first.
     private let openZoneFraction: CGFloat = 1.0
     /// Horizontal-dominance ratio: a drag only begins driving the drawer once
     /// `abs(dx) > abs(dy) * dominanceRatio` (and, for opening, `dx > 0`). Below
@@ -1084,7 +1182,8 @@ private struct CompactLayout: View {
                         startLocation: value.startLocation,
                         openZone: openZone,
                         dominanceRatio: dominanceRatio,
-                        textInput: DrawerTextInputLocator.currentSnapshot()
+                        textInput: DrawerTextInputLocator.currentSnapshot(),
+                        horizontalScroller: DrawerHorizontalScrollerLocator.snapshot(at: value.startLocation)
                     )
                     guard let resolved else { return }
                     horizontalDominant = resolved
