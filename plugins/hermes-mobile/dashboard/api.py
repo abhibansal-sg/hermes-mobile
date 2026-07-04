@@ -426,10 +426,13 @@ async def reply_to_clarify_approval(body: ApprovalReplyBody, request: Request):
         raise HTTPException(status_code=503, detail=f"Gateway unavailable: {exc}")
 
     session = _sessions.get(body.session_id)
-    if session is None or not session.get("session_key"):
+    session_key = (session or {}).get("session_key")
+    if session is None or not session_key:
         raise HTTPException(status_code=404, detail="Unknown session")
     if not _device_owns_session(request, body.session_id):
         raise HTTPException(status_code=403, detail="Device token does not own session")
+
+    audit = _build_resolve_audit(request, body.session_id, session_key)
 
     answer = str(body.answer or "").strip()
     if not answer:
@@ -446,11 +449,34 @@ async def reply_to_clarify_approval(body: ApprovalReplyBody, request: Request):
         owner_sid, ev = pending
         if owner_sid != body.session_id:
             return {"resolved": False}
-        event, _payload = _pending_prompt_payloads.get(rid, ("", {}))
+        event, payload = _pending_prompt_payloads.get(rid, ("", {}))
         if event != "clarify.request":
             return {"resolved": False}
         _answers[rid] = answer
         ev.set()
+
+    try:
+        audit_log = _plugin_module("audit_log")
+        preview = ""
+        if isinstance(payload, dict):
+            preview = audit_log._build_command_preview(
+                {"description": payload.get("question")}
+            )
+        audit_log.append(
+            session_id=audit.get("session_id", body.session_id),
+            session_key=audit.get("session_key", session_key),
+            choice="once",
+            resolve_all=False,
+            credential=audit.get("credential", "shared"),
+            device_id=audit.get("device_id"),
+            device_name=audit.get("device_name"),
+            token_prefix=audit.get("token_prefix"),
+            command_preview=preview,
+        )
+    except Exception:
+        # The text reply already resolved the clarify waiter. Audit emission is
+        # best-effort and must never turn a valid reply into a 500.
+        _log.debug("approval reply audit failed", exc_info=True)
     return {"resolved": True}
 
 
