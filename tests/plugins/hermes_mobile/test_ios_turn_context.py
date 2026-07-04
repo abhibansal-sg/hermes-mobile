@@ -52,9 +52,10 @@ def test_ios_platform_injects_short_mobile_formatting_context():
     assert result is not None
     context = result["context"]
     assert "mobile (iOS)" in context
-    assert "Markdown" in context
-    assert "fenced card JSON" in context
-    assert "ASCII" in context
+    assert "concise Markdown" in context
+    assert "card JSON" not in context
+    assert "structured UI" not in context
+    assert "Avoid ASCII" in context
     assert "Mermaid" in context
     assert "HTML" in context
     assert len(context) < 500

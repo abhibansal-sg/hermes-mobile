@@ -5,10 +5,9 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 MOBILE_OUTPUT_CONTEXT = (
-    "This is a mobile (iOS) session: keep output phone-native. Prefer concise Markdown "
-    "and fenced card JSON blocks when structured UI helps. Avoid ASCII "
-    "tables/charts, Mermaid, raw SVG, and HTML artifacts that do not render "
-    "well in the app."
+    "This is a mobile (iOS) session: keep output phone-native. Prefer concise Markdown. "
+    "Avoid ASCII tables/charts, Mermaid, raw SVG, and HTML artifacts that do "
+    "not render well in the app."
 )
 
 _MOBILE_PLATFORMS = frozenset({"ios", "mobile", "hermes-mobile"})
