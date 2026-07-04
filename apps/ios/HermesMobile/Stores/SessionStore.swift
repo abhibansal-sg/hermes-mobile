@@ -3110,20 +3110,24 @@ final class SessionStore {
 
     // MARK: - Export
 
-    /// Fetch `/api/sessions/{id}/export` and render it to a Markdown transcript
-    /// for `ShareLink` / share sheet. Returns `nil` (and sets `lastError`) on
-    /// failure so the caller can skip presenting the share UI.
+    /// Fetch the full `/api/sessions/{id}/messages` transcript and render it to a
+    /// Markdown export. Returns `nil` and surfaces a session-action alert on
+    /// failure/empty transcript so the caller never presents an empty share sheet.
     func exportMarkdown(_ summary: SessionSummary) async -> String? {
         guard let api = restAPI else {
             lastError = "Not connected."
+            sessionActionError = SessionActionError(action: "Export", message: "Not connected.")
             return nil
         }
         do {
-            let markdown = try await api.exportSessionMarkdown(id: summary.id)
+            let markdown = try await api.exportSessionMarkdown(summary: summary)
             lastError = nil
+            sessionActionError = nil
             return markdown
         } catch {
-            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            let message = errorMessage(from: error)
+            lastError = message
+            sessionActionError = SessionActionError(action: "Export", message: message)
             return nil
         }
     }

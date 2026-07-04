@@ -459,19 +459,18 @@ extension RestClient {
         _ = try await patchSession(id: id, body: body)
     }
 
-    /// `GET /api/sessions/{id}/export` → JSON `{ ...session, messages: [...] }`,
-    /// rendered to a Markdown transcript suitable for `ShareLink`.
+    /// `GET /api/sessions/{id}/messages` → full stored transcript, rendered to
+    /// Markdown for a native share/export flow.
     ///
-    /// The server returns structured JSON (not Markdown), so the transcript is
-    /// assembled client-side here — reusing ``StoredMessage`` for the same
-    /// string/blocks content flattening the chat view uses.
-    func exportSessionMarkdown(id: String) async throws -> String {
-        let encodedId = id.addingPercentEncoding(
-            withAllowedCharacters: .urlPathAllowed
-        ) ?? id
-        let data = try await get(path: "/api/sessions/\(encodedId)/export")
-        let root = try decodeJSONValue(from: data, context: "export")
-        return Self.renderExportMarkdown(from: root)
+    /// The desktop has a separate `/export` helper, but iOS deliberately uses the
+    /// existing full-history messages route so the export round-trips the complete
+    /// transcript without adding server surface.
+    func exportSessionMarkdown(summary: SessionSummary) async throws -> String {
+        let messages = try await messages(sessionId: summary.id)
+        guard !messages.isEmpty else {
+            throw RestError.decoding("No messages to export.")
+        }
+        return Self.renderExportMarkdown(summary: summary, messages: messages)
     }
 
     /// `PATCH /api/sessions/{id}` with a JSON body — shared by rename/archive.
@@ -487,23 +486,23 @@ extension RestClient {
 
     // MARK: - Markdown rendering
 
-    /// Format an export payload into a human-readable Markdown transcript.
-    static func renderExportMarkdown(from root: JSONValue) -> String {
+    /// Format a full transcript into a human-readable Markdown export.
+    static func renderExportMarkdown(
+        summary: SessionSummary,
+        messages: [StoredMessage]
+    ) -> String {
         var lines: [String] = []
 
-        let title = root["title"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
-        lines.append("# \(title.flatMap { $0.isEmpty ? nil : $0 } ?? "Hermes session")")
+        let title = summary.displayTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        lines.append("# \(title.isEmpty ? "Hermes session" : title)")
         lines.append("")
 
         var meta: [String] = []
-        if let source = root["source"]?.stringValue, !source.isEmpty {
+        if let source = summary.source, !source.isEmpty {
             meta.append("Source: \(source)")
         }
-        if let model = root["model"]?.stringValue, !model.isEmpty {
-            meta.append("Model: \(model)")
-        }
-        if let started = (root["started_at"] ?? root["session_started"])?.doubleValue {
-            let date = Date(timeIntervalSince1970: started)
+        if let started = summary.startedDate {
+            let date = started
             meta.append("Started: \(Self.exportDateFormatter.string(from: date))")
         }
         if !meta.isEmpty {
@@ -511,11 +510,10 @@ extension RestClient {
             lines.append("")
         }
 
-        let parsed = (root["messages"]?.arrayValue ?? []).compactMap(StoredMessage.init(json:))
-        if parsed.isEmpty {
+        if messages.isEmpty {
             lines.append("_No messages._")
         } else {
-            for message in parsed {
+            for message in messages {
                 lines.append("## \(Self.roleHeading(message.role))")
                 let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 lines.append(text.isEmpty ? "_(empty)_" : text)

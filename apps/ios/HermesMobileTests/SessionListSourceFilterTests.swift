@@ -160,6 +160,67 @@ final class SessionListSourceFilterTests: XCTestCase {
         XCTAssertNil(queryItems["exclude_source"], "The singular param is ignored by the gateway and must not regress")
     }
 
+    func testSessionExportFetchesFullMessagesRouteAndRendersMarkdown() async throws {
+        SessionListSourceFilterStubProtocol.nextResponse = (
+            data: #"{"messages":[{"id":1,"role":"user","content":"Hello"},{"id":2,"role":"assistant","content":"Hi there"}]}"#.data(using: .utf8)!,
+            status: 200
+        )
+        SessionListSourceFilterStubProtocol.requestedURL = nil
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SessionListSourceFilterStubProtocol.self]
+        let rest = RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "test-token",
+            session: URLSession(configuration: config)
+        )
+
+        let markdown = try await rest.exportSessionMarkdown(summary: summary(
+            id: "session 1",
+            source: "cli",
+            title: "Export me",
+            messageCount: 2,
+            lastActive: 123
+        ))
+
+        let components = try XCTUnwrap(URLComponents(url: try XCTUnwrap(SessionListSourceFilterStubProtocol.requestedURL), resolvingAgainstBaseURL: false))
+        XCTAssertEqual(components.percentEncodedPath, "/api/sessions/session%201/messages")
+        XCTAssertFalse(components.path.contains("/export"), "iOS export must use the full transcript messages route, not the desktop-only export route")
+        XCTAssertTrue(markdown.contains("# Export me"))
+        let userHeading = try XCTUnwrap(markdown.range(of: "## User")?.lowerBound)
+        let assistantHeading = try XCTUnwrap(markdown.range(of: "## Assistant")?.lowerBound)
+        XCTAssertLessThan(userHeading, assistantHeading)
+        XCTAssertTrue(markdown.contains("Hello"))
+        XCTAssertTrue(markdown.contains("Hi there"))
+    }
+
+    func testSessionExportRejectsEmptyTranscript() async throws {
+        SessionListSourceFilterStubProtocol.nextResponse = (
+            data: #"{"messages":[]}"#.data(using: .utf8)!,
+            status: 200
+        )
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SessionListSourceFilterStubProtocol.self]
+        let rest = RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "test-token",
+            session: URLSession(configuration: config)
+        )
+
+        do {
+            _ = try await rest.exportSessionMarkdown(summary: summary(
+                id: "empty",
+                source: "cli",
+                messageCount: 0,
+                lastActive: 123
+            ))
+            XCTFail("empty exports should fail instead of presenting a half-file")
+        } catch let error as RestError {
+            XCTAssertTrue(error.localizedDescription.contains("No messages"))
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     private func summary(
         id: String,
         source: String?,
