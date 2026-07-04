@@ -453,6 +453,13 @@ final class SessionStore {
         }
     }
 
+    #if DEBUG
+    /// DEBUG-only override so unit tests can exercise profile-threaded open/delete
+    /// call sites without standing up the full capability-probe + profile-list
+    /// graph. `nil` in production/test-defaults means use the real switcher gate.
+    var profileThreadingAvailableForTesting: Bool?
+    #endif
+
     /// The fetched profile list backing the switcher (F4b). Populated by
     /// ``loadProfiles()`` ONLY when `profiles == .available`; empty otherwise, so
     /// the switcher visibility gate (`profiles == .available && count > 1`) is
@@ -522,6 +529,16 @@ final class SessionStore {
         guard isMultiProfileAvailable else { return false }
         let trimmed = activeProfile.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed != Self.defaultProfileName
+    }
+
+    /// Gate for per-row profile threading on open/delete. In production this is
+    /// the same dormancy gate as the switcher; tests may override it to assert the
+    /// call-site wiring without a live profile-capable gateway.
+    private var profileThreadingAvailable: Bool {
+        #if DEBUG
+        if let override = profileThreadingAvailableForTesting { return override }
+        #endif
+        return isMultiProfileAvailable
     }
 
     // MARK: - Live-activity registry
@@ -1246,14 +1263,45 @@ final class SessionStore {
     /// (default) resolves the live REST client below.
     var prefetchFetch: (@Sendable (String) async throws -> [StoredMessage])?
 
+    #if DEBUG
+    /// DEBUG-only RestClient seam for exercising the live prefetch fetch resolver
+    /// with a stubbed URLSession. The production path still resolves through the
+    /// live ``ConnectionStore/rest`` client; tests use this only when they need to
+    /// assert which REST endpoint the default prefetch sweep chose.
+    var prefetchRestClientForTesting: RestClient?
+    #endif
+
     /// The injected ``prefetchFetch``, or a `@Sendable` closure built from the live
     /// `RestClient` (a Sendable value struct — safe to capture across the task-group
     /// boundary). `nil` when unconfigured/offline, which makes the whole sweep a
     /// no-op (purely additive coverage, never a correctness dependency).
     private var resolvedPrefetchFetch: (@Sendable (String) async throws -> [StoredMessage])? {
         if let prefetchFetch { return prefetchFetch }
-        guard let rest = connection?.rest else { return nil }
-        return { sessionId in
+        #if DEBUG
+        let resolvedRest = prefetchRestClientForTesting ?? connection?.rest
+        #else
+        let resolvedRest = connection?.rest
+        #endif
+        guard let rest = resolvedRest else { return nil }
+        return { [cacheStore] sessionId in
+            // Cursor-bearing cached transcripts take the delta-aware path first so
+            // an unchanged background sweep pays only the cheap cursor check. Rows
+            // without a cursor keep the ABH-400 page-window prefetch behavior.
+            if let cacheStore {
+                do {
+                    if let cursor = try await cacheStore.deltaCursor(for: sessionId),
+                       cursor.afterId > 0 {
+                        return try await fetchTranscriptDeltaAware(
+                            rest: rest,
+                            cacheStore: cacheStore,
+                            sessionId: sessionId
+                        )
+                    }
+                } catch {
+                    // Treat a cursor read failure like "no cursor"; the fetch path
+                    // below preserves the previous best-effort prefetch semantics.
+                }
+            }
             if let page = await fetchTranscriptPage(
                 rest: rest,
                 sessionId: sessionId,
@@ -1261,7 +1309,11 @@ final class SessionStore {
             ) {
                 return page.messages
             }
-            return try await rest.messages(sessionId: sessionId)
+            return try await fetchTranscriptDeltaAware(
+                rest: rest,
+                cacheStore: cacheStore,
+                sessionId: sessionId
+            )
         }
     }
 
@@ -2118,6 +2170,7 @@ final class SessionStore {
         openToken = token
         activeRuntimeId = nil          // gates the composer until resume lands
         activeStoredId = summary.id
+        let rowProfile = profileParam(for: summary)
         // Fresh user intent to use this session: supersede any in-flight on-demand
         // re-resume (it was for the PREVIOUS session — its result must not bind
         // here) and reset the budget so a session that exhausted its retries
@@ -2152,7 +2205,11 @@ final class SessionStore {
         let seedTask = Task { [weak self] in
             guard let self, self.openToken == token else { return }
             await self.seedTranscriptCacheFirst(
-                storedId: summary.id, token: token, onFirstPaint: revealOnFirstPaint)
+                storedId: summary.id,
+                profile: rowProfile,
+                token: token,
+                onFirstPaint: revealOnFirstPaint
+            )
         }
         #if DEBUG
         lastOpenSeedTask = seedTask
@@ -2163,11 +2220,13 @@ final class SessionStore {
         let resumeTask = Task { [weak self] in
             guard let self, self.client != nil || self.resumeRPC != nil else { return }
             do {
-                // Thread the active profile scope so a profile-scoped resume lands
-                // in the right per-profile home. Omitted for the default/all scope
-                // (and every dormant case) — byte-for-byte the shipped resume.
+                // Thread the row's profile scope so an All-profiles tap resumes in
+                // the row's owning profile home. Omitted for default/all/dormant
+                // cases — byte-for-byte the shipped resume.
                 var resumeParams: [String: JSONValue] = ["session_id": .string(summary.id)]
-                self.applyProfileScope(to: &resumeParams)
+                if let rowProfile {
+                    resumeParams["profile"] = .string(rowProfile)
+                }
                 let result: SessionOpenResult
                 if let resumeRPC = self.resumeRPC {
                     result = try await resumeRPC(summary.id, resumeParams)
@@ -2201,7 +2260,7 @@ final class SessionStore {
                     self.activeStoredId = chainTip
                     // Same token: the chain-tip seed's REST await is just as
                     // outrunnable by a newer open() as the fast path (R1 #43).
-                    await self.seedTranscript(storedId: chainTip, token: token)
+                    await self.seedTranscript(storedId: chainTip, profile: rowProfile, token: token)
                     // Surface the chain-tip row in the drawer NOW rather than
                     // on the next 30s heartbeat (release audit P2).
                     Task { [weak self] in await self?.refresh() }
@@ -2471,7 +2530,7 @@ final class SessionStore {
     /// 3. The `session.delete` payload keys on the STORED id (`summary.id`); the
     ///    `session.close` payload keys on the RUNTIME id (`activeRuntimeId`).
     func delete(_ summary: SessionSummary) async {
-        guard let send = resolvedRPCSend else { return }
+        let profile = profileParam(for: summary)
 
         // (1) For the session this app holds open, interrupt the in-flight turn
         //     then evict it server-side so the delete doesn't trip the live
@@ -2479,6 +2538,7 @@ final class SessionStore {
         //     skipped, so neither blocks the delete attempt.
         let isActive = summary.id == activeStoredId || summary.id == activeRuntimeId
         if isActive {
+            guard let send = resolvedRPCSend else { return }
             // RIDER: stop the actively-streaming runtime before tearing it down.
             await resolvedInterruptActive()
             if let runtimeId = activeRuntimeId, !runtimeId.isEmpty {
@@ -2498,12 +2558,22 @@ final class SessionStore {
             clearActive()
         }
 
-        // (2) Delete keys on the STORED id.
+        // (2) Delete keys on the STORED id. Non-default profile rows from the
+        //     aggregate rail must use REST's profile-scoped delete path; default /
+        //     dormant rows keep the shipped WS `session.delete` payload.
         do {
-            _ = try await send(
-                "session.delete",
-                .object(["session_id": .string(summary.id)])
-            )
+            if let profile {
+                guard let delete = resolvedDeleteSessionRequest else {
+                    throw RestError.network("Not connected.")
+                }
+                try await delete(summary.id, profile)
+            } else {
+                guard let send = resolvedRPCSend else { return }
+                _ = try await send(
+                    "session.delete",
+                    .object(["session_id": .string(summary.id)])
+                )
+            }
             sessions.removeAll { $0.id == summary.id }
             if pinnedIds.remove(summary.id) != nil { persistPins() }
             // `clearActive()` already ran above for the active case; this covers
@@ -3154,6 +3224,32 @@ final class SessionStore {
         return trimmed
     }
 
+    /// Profile param for an action on a concrete session row. A row tag from the
+    /// aggregate rail is authoritative: non-default rows thread that profile;
+    /// explicit default rows stay profile-less and must never be retargeted to the
+    /// active switcher scope. Rows without a tag fall back to the active specific
+    /// scope, preserving the existing named-profile path.
+    static func profileParam(
+        for summary: SessionSummary,
+        activeScope: String,
+        multiAvailable: Bool
+    ) -> String? {
+        guard multiAvailable else { return nil }
+        if let rowProfile = summary.profile?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rowProfile.isEmpty {
+            return rowProfile == defaultProfileName ? nil : rowProfile
+        }
+        return profileParam(scope: activeScope, multiAvailable: multiAvailable)
+    }
+
+    private func profileParam(for summary: SessionSummary) -> String? {
+        Self.profileParam(
+            for: summary,
+            activeScope: activeProfile,
+            multiAvailable: profileThreadingAvailable
+        )
+    }
+
     /// Confirm/seed the active-profile pref from a create/resume `info` echo. The
     /// WS path silently falls back to the launch profile on an unknown name
     /// (`_profile_home` swallows resolver failures), so the server's echoed
@@ -3200,10 +3296,20 @@ final class SessionStore {
     /// the requested `limit` so tests can assert on grow-limit semantics.
     var initialFillFetch: ((Int) async throws -> (sessions: [SessionSummary], total: Int?))?
 
-    /// REST fetch backing ``seedTranscript(storedId:token:)``, injected for
+    /// REST fetch backing ``seedTranscript(storedId:profile:token:)``, injected for
     /// tests (mirrors `ChatStore.backfillFetch`). In the app it resolves the
-    /// live `connection?.rest` lazily on each call.
+    /// live `connection?.rest` lazily on each call. The legacy one-argument seam
+    /// is kept so existing tests/default-scope callers remain byte-for-byte.
     var transcriptFetch: ((String) async throws -> [StoredMessage])?
+
+    /// Profile-aware transcript seam for ABH-408: All-profiles row opens must
+    /// invoke the stored-transcript fetch with the row's owning profile.
+    var transcriptFetchWithProfile: ((String, String?) async throws -> [StoredMessage])?
+
+    /// Profile-aware delete seam for ABH-408. The live path resolves to
+    /// `RestClient.deleteSession(id:profile:)`; tests inject this to assert that
+    /// All-profiles row deletes target the row's owning profile store.
+    var deleteSessionRequest: ((String, String?) async throws -> Void)?
 
     /// CACHE-FIRST session open (WhatsApp bar — kills the white void).
     ///
@@ -3222,7 +3328,10 @@ final class SessionStore {
     /// ``openToken`` re-checked after every await so a newer open/draft supersedes
     /// a stale seed (R1 #28/#43).
     private func seedTranscriptCacheFirst(
-        storedId: String, token: UUID, onFirstPaint: (@MainActor () -> Void)? = nil
+        storedId: String,
+        profile: String?,
+        token: UUID,
+        onFirstPaint: (@MainActor () -> Void)? = nil
     ) async {
         // R40 reveal-on-paint: fire the caller's reveal (drawer close) exactly
         // once, after phase 1 lands the first frame — even on the early-out paths
@@ -3318,7 +3427,7 @@ final class SessionStore {
                 #endif
                 return
             }
-            let stored = try await fetch(storedId)
+            let stored = try await fetch(storedId, profile)
             guard openToken == token else { return }  // superseded (R1 #28/#43)
             // ARCH37 STEP 2 — normalize OFF the main actor (the pure `toChatMessages`
             // transform), hop to main only for the in-place reconcile assignment with
@@ -3362,7 +3471,7 @@ final class SessionStore {
     /// `token` is the ``openToken`` re-checked AFTER the REST await (R1 #28/#43):
     /// a newer `open()`/`startDraft()` may have activated a different session while
     /// the fetch was in flight, and the stale result must be dropped.
-    private func seedTranscript(storedId: String?, token: UUID) async {
+    private func seedTranscript(storedId: String?, profile: String?, token: UUID) async {
         guard let chat else { return }
         guard let storedId, let fetch = resolvedTranscriptFetch else {
             chat.reset()
@@ -3389,7 +3498,7 @@ final class SessionStore {
         }
 
         do {
-            let stored = try await fetch(storedId)
+            let stored = try await fetch(storedId, profile)
             guard openToken == token else { return }  // superseded (R1 #28/#43)
             let normalized = await Self.normalizeOffMain(stored)
             guard openToken == token else { return }  // superseded during normalize
@@ -3441,14 +3550,24 @@ final class SessionStore {
         }.value
     }
 
-    /// The injected `transcriptFetch`, or the default that resolves the live
+    /// The injected transcript seams, or the default that resolves the live
     /// REST client (mirrors `ChatStore.resolvedBackfillFetch`).
-    private var resolvedTranscriptFetch: ((String) async throws -> [StoredMessage])? {
-        if let transcriptFetch { return transcriptFetch }
+    private var resolvedTranscriptFetch: ((String, String?) async throws -> [StoredMessage])? {
+        if let transcriptFetchWithProfile { return transcriptFetchWithProfile }
+        if let transcriptFetch { return { sessionId, _ in try await transcriptFetch(sessionId) } }
         guard let rest = connection?.rest else { return nil }
-        // ABH-400: plugin gateways fetch only the recent tail window on open;
-        // legacy/older plugin builds keep the existing delta-aware full fallback.
-        return { [cacheStore] sessionId in
+        // ABH-408: a non-default row opened from the All-profiles rail must use
+        // RestClient+Profiles.messages(sessionId:profile:) so the backend reads
+        // that profile's store. The plugin transcript-page route currently has no
+        // profile-scoped/latest-descendant equivalent, so scoped opens deliberately
+        // bypass the ABH-400 page/delta fast path until plugins/hermes-mobile adds
+        // a profile-aware latest-descendant/messages route.
+        return { [cacheStore] sessionId, profile in
+            if let profile, !profile.isEmpty {
+                return try await rest.messages(sessionId: sessionId, profile: profile)
+            }
+            // ABH-400: plugin gateways fetch only the recent tail window on open;
+            // legacy/older plugin builds keep the existing delta-aware full fallback.
             if let page = await fetchTranscriptPage(
                 rest: rest,
                 sessionId: sessionId,
@@ -3467,6 +3586,17 @@ final class SessionStore {
         if let rpcSend { return rpcSend }
         guard let client else { return nil }
         return { method, params in try await client.requestRaw(method, params: params) }
+    }
+
+    /// The injected profile-aware delete seam, or the live REST profile-scoped
+    /// delete. Used only for non-default profile rows; default/dormant deletes
+    /// keep using the existing WS `session.delete` path.
+    private var resolvedDeleteSessionRequest: ((String, String?) async throws -> Void)? {
+        if let deleteSessionRequest { return deleteSessionRequest }
+        guard let api = restAPI else { return nil }
+        return { sessionId, profile in
+            try await api.deleteSession(id: sessionId, profile: profile)
+        }
     }
 
     /// The injected ``interruptActive``, or the default that forwards to the

@@ -208,6 +208,83 @@ final class CacheFirstLaunchTests: XCTestCase {
                        "skips the open session, the fresh-cached one, and cron")
     }
 
+    func testPrefetchDefaultFetchUsesDeltaCursorForCachedStaleSession() async throws {
+        let (_, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
+        // Nil freshness means "stale/unknown" so prefetch must reconcile, but the
+        // cached transcript has a durable cursor and an unchanged server tail.
+        let rows = [makeSummary(id: "unchanged", lastActive: nil)]
+        try await cache.saveSessionList(rows, scope: scope)
+        try await cache.saveTranscript(
+            sessionId: "unchanged",
+            messages: [stubStored("cached-1", wireId: 101), stubStored("cached-2", wireId: 102)],
+            wireIds: [101, 102]
+        )
+        sessions.sessions = rows
+
+        PrefetchDeltaStubProtocol.reset()
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [PrefetchDeltaStubProtocol.self]
+        sessions.prefetchRestClientForTesting = RestClient(
+            baseURL: URL(string: serverURL)!,
+            token: "test-token",
+            session: URLSession(configuration: config),
+            pathStyle: .plugin
+        )
+
+        sessions.prefetchRecentTranscripts()
+        try await Self.poll {
+            PrefetchDeltaStubProtocol.sawDelta || PrefetchDeltaStubProtocol.sawFullMessages
+        }
+
+        XCTAssertTrue(PrefetchDeltaStubProtocol.sawDelta,
+                      "unchanged cached prefetch should pay only the delta cursor check")
+        XCTAssertFalse(PrefetchDeltaStubProtocol.sawFullMessages,
+                       "unchanged cached prefetch must not re-download the full transcript")
+        let cached = try await cache.loadTranscript("unchanged") ?? []
+        XCTAssertEqual(cached.map(\.text), ["cached-1", "cached-2"],
+                       "empty delta leaves the cached transcript hydrated")
+    }
+
+    func testPrefetchDefaultFetchMergesChangedSessionDelta() async throws {
+        let (_, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
+        let rows = [makeSummary(id: "changed", lastActive: nil)]
+        try await cache.saveSessionList(rows, scope: scope)
+        try await cache.saveTranscript(
+            sessionId: "changed",
+            messages: [stubStored("cached-1", wireId: 201), stubStored("cached-2", wireId: 202)],
+            wireIds: [201, 202]
+        )
+        sessions.sessions = rows
+
+        PrefetchDeltaStubProtocol.reset()
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [PrefetchDeltaStubProtocol.self]
+        sessions.prefetchRestClientForTesting = RestClient(
+            baseURL: URL(string: serverURL)!,
+            token: "test-token",
+            session: URLSession(configuration: config),
+            pathStyle: .plugin
+        )
+
+        sessions.prefetchRecentTranscripts()
+        try await Self.poll { PrefetchDeltaStubProtocol.sawDelta }
+
+        let cached = try await cache.loadTranscript("changed") ?? []
+        XCTAssertEqual(cached.map(\.text), ["cached-1", "cached-2", "tail-3"],
+                       "changed prefetch hydrates by appending the delta tail")
+        let cursor = try await cache.maxMessageId(for: "changed")
+        XCTAssertEqual(cursor, 203,
+                       "merged changed prefetch advances the durable cursor")
+        XCTAssertFalse(PrefetchDeltaStubProtocol.sawFullMessages,
+                       "changed cursor prefetch should not fall back to the full transcript")
+    }
+
     func testCancelPrefetchStopsTheSweep() async throws {
         let (_, sessions, _) = makeGraph()
         let cache = try makeInMemoryCache()
@@ -263,8 +340,8 @@ final class CacheFirstLaunchTests: XCTestCase {
 
 /// Free `@Sendable` StoredMessage factory for the prefetch seams (a MainActor
 /// XCTestCase method can't be called from inside a `@Sendable` closure).
-private func stubStored(_ text: String) -> StoredMessage {
-    StoredMessage(role: "assistant", content: .string(text), timestamp: 1)
+private func stubStored(_ text: String, wireId: Int? = nil) -> StoredMessage {
+    StoredMessage(role: "assistant", content: .string(text), timestamp: 1, wireId: wireId)
 }
 
 /// A tiny Sendable box so the `@Sendable` prefetch seams can record their calls
@@ -281,4 +358,60 @@ private extension TestActorBox where T == Set<String> {
 
 private extension TestActorBox where T == Int {
     func increment() { value += 1 }
+}
+
+private final class PrefetchDeltaStubProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var sawDelta = false
+    nonisolated(unsafe) static var sawFullMessages = false
+    nonisolated(unsafe) static var requestedPaths: [String] = []
+
+    static func reset() {
+        sawDelta = false
+        sawFullMessages = false
+        requestedPaths = []
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let path = request.url?.path ?? ""
+        let query = request.url?.query ?? ""
+        Self.requestedPaths.append(query.isEmpty ? path : "\(path)?\(query)")
+
+        let body: String
+        let status: Int
+        if path == "/api/plugins/hermes-mobile/sessions/unchanged/messages",
+           query.contains("after_id=102"),
+           query.contains("prefix_count=2") {
+            Self.sawDelta = true
+            status = 200
+            body = #"{"is_delta":true,"prefix_count":2,"max_id":102,"messages":[]}"#
+        } else if path == "/api/plugins/hermes-mobile/sessions/changed/messages",
+                  query.contains("after_id=202"),
+                  query.contains("prefix_count=2") {
+            Self.sawDelta = true
+            status = 200
+            body = #"{"is_delta":true,"prefix_count":3,"max_id":203,"messages":[{"role":"assistant","content":"tail-3","timestamp":1,"id":203}]}"#
+        } else if path == "/api/sessions/unchanged/messages" || path == "/api/sessions/changed/messages" {
+            Self.sawFullMessages = true
+            status = 500
+            body = #"{"error":"full transcript should not be fetched"}"#
+        } else {
+            status = 404
+            body = #"{"error":"unexpected prefetch request"}"#
+        }
+
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: status,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
