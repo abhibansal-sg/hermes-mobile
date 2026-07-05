@@ -85,11 +85,11 @@ def test_relay_test_push_requires_approve_scope(client, relay_env, wired_token_a
     assert response.status_code == 403
 
 
-def test_relay_test_push_400_when_relay_not_configured(client):
+def test_relay_test_push_reports_no_push_configured_when_relay_not_configured(client):
     response = client.post(f"{_PREFIX}/relay/test-push", headers=_TOKEN_HEADER)
 
-    assert response.status_code == 400
-    assert response.json() == {"ok": False, "detail": "relay URL is not configured"}
+    assert response.status_code == 200
+    assert response.json() == {"ok": False, "transport": "none", "detail": "no push configured"}
 
 
 def test_relay_test_push_sends_real_event_and_returns_delivered(client, relay_env, monkeypatch):
@@ -100,7 +100,7 @@ def test_relay_test_push_sends_real_event_and_returns_delivered(client, relay_en
     response = client.post(f"{_PREFIX}/relay/test-push", headers=_TOKEN_HEADER)
 
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "detail": "Test push delivered"}
+    assert response.json() == {"ok": True, "transport": "relay", "detail": "sent via relay"}
     assert fake.calls == [
         {
             "kind": "attention",
