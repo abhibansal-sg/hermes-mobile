@@ -154,7 +154,9 @@ struct RestClient: Sendable {
     /// given path (Project detail). Built via `URLQueryItem`/`URLComponents` so the
     /// raw path (spaces, slashes, etc.) is correctly percent-encoded — unlike the
     /// other params above, a project root is arbitrary user-filesystem text, not a
-    /// fixed enum value.
+    /// fixed enum value. `+` is additionally escaped to `%2B` below, since
+    /// `URLComponents` otherwise leaves it literal and FastAPI/Starlette decode a
+    /// literal `+` as a space.
     func sessionsWithTotal(
         limit: Int = 100,
         offset: Int = 0,
@@ -189,7 +191,13 @@ struct RestClient: Sendable {
         }
         var components = URLComponents()
         components.queryItems = queryItems
-        let path = "/api/sessions?" + (components.percentEncodedQuery ?? "")
+        // URLComponents leaves "+" unescaped in a query (RFC 3986 allows it there
+        // unencoded), but FastAPI/Starlette's query parsing follows the
+        // application/x-www-form-urlencoded convention and decodes a literal "+"
+        // as a space. Escape it explicitly so a value containing "+" (e.g. a
+        // cwd_prefix project root) round-trips exactly instead of becoming a space.
+        let rawQuery = (components.percentEncodedQuery ?? "").replacingOccurrences(of: "+", with: "%2B")
+        let path = "/api/sessions?" + rawQuery
         let data = try await get(path: path)
         struct Wrapper: Decodable {
             let sessions: [SessionSummary]

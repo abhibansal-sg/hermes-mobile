@@ -175,7 +175,11 @@ final class SessionListSourceFilterTests: XCTestCase {
             session: URLSession(configuration: config)
         )
 
-        let projectRoot = "/Users/abbhinnav/My Projects/hermes mobile"
+        // Exercises space, slash, "+", "&", and "=" in one root: FastAPI/Starlette
+        // decode a literal "+" as a space (application/x-www-form-urlencoded
+        // convention), so a root containing "+" must wire as "%2B" or it silently
+        // corrupts to a space server-side (STR-58 regression).
+        let projectRoot = "/Users/abbhinnav/My Projects/hermes+mobile&a=b"
         _ = try await rest.sessionsWithTotal(cwdPrefix: projectRoot)
 
         let requestedURL = try XCTUnwrap(SessionListSourceFilterStubProtocol.requestedURL)
@@ -185,17 +189,35 @@ final class SessionListSourceFilterTests: XCTestCase {
         })
         XCTAssertEqual(components.path, "/api/sessions")
         XCTAssertEqual(queryItems["cwd_prefix"], projectRoot,
-            "cwd_prefix must round-trip the exact project root, including its spaces and slashes")
+            "cwd_prefix must round-trip the exact project root, including its spaces, slashes, +, &, and =")
         XCTAssertEqual(queryItems["order"], "recent",
             "Project detail must not regress the order=recent (compression-chain-aware) semantics")
         XCTAssertEqual(queryItems["archived"], "exclude",
             "Project detail must not regress the archived=exclude semantics")
         XCTAssertEqual(queryItems["min_messages"], "1",
             "Project detail must not regress the min_messages=1 scaffold/empty-session filter")
-        XCTAssertFalse(
-            (components.percentEncodedQuery ?? "").contains(" "),
-            "the raw wire query must percent-encode the space in the project root, not send it literally"
+
+        let rawQuery = components.percentEncodedQuery ?? ""
+        XCTAssertFalse(rawQuery.contains(" "),
+            "the raw wire query must percent-encode the space in the project root, not send it literally")
+
+        // Foundation's decoded queryItems (checked above) can't tell "%2B" apart
+        // from a literal "+" — both decode back to "+". Only the raw wire string
+        // proves which one was actually sent, so assert on it directly.
+        let cwdPrefixSegment = try XCTUnwrap(
+            rawQuery.components(separatedBy: "&").first { $0.hasPrefix("cwd_prefix=") },
+            "cwd_prefix must appear as its own delimited query segment"
         )
+        XCTAssertTrue(cwdPrefixSegment.contains("%2B"),
+            "'+' in the project root must be escaped to %2B on the wire, not left as a literal '+' " +
+            "(FastAPI/Starlette decode a literal '+' as a space)")
+        XCTAssertFalse(cwdPrefixSegment.contains("+"),
+            "the raw wire segment for cwd_prefix must not contain a literal '+'")
+        let cwdPrefixValue = String(cwdPrefixSegment.dropFirst("cwd_prefix=".count))
+        XCTAssertFalse(cwdPrefixValue.contains("&"),
+            "'&' inside the cwd_prefix value must be escaped, not left literal (would split the query wrong)")
+        XCTAssertFalse(cwdPrefixValue.contains("="),
+            "'=' inside the cwd_prefix value must be escaped, not left literal (would corrupt the key=value pairing)")
     }
 
     func testSessionExportFetchesFullMessagesRouteAndRendersMarkdown() async throws {
