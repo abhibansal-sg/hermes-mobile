@@ -5,10 +5,14 @@ import XCTest
 /// RPC path wired to the Stop button on the subagent tree (STR-145 / ABH-413,
 /// Slice B of ABH-409).
 ///
-/// Two load-bearing invariants under test:
+/// Three load-bearing invariants under test:
 /// 1. The RPC always targets the stable `subagent_id` from the event stream —
 ///    never a row index, `task_index`, depth, or synthesized display key.
-/// 2. Idempotent race handling: a late tap after the branch already completed
+/// 2. The RPC also carries the owning runtime `session_id` — captured on the
+///    node from the `GatewayEvent` that created its branch (`SubagentNode.
+///    sessionId`), so a MIRRORED (foreign) delegation tree is interrupted on
+///    the runtime that actually owns it, never the phone's own local runtime.
+/// 3. Idempotent race handling: a late tap after the branch already completed
 ///    (locally or server-side via `found:false`) is a silent no-op — never a
 ///    fake "cancelled" success and never a `lastError`/`.failed` surface. Only
 ///    a genuine transport/RPC error sets `.failed` + `lastError`, matching the
@@ -20,6 +24,7 @@ import XCTest
 final class SubagentInterruptTests: XCTestCase {
 
     private let localRuntime = "rt-local"
+    private let foreignRuntime = "rt-foreign"
     private let storedId = "stored-session-1"
 
     /// Build a wired store graph with an active local session (same shape as
@@ -57,6 +62,30 @@ final class SubagentInterruptTests: XCTestCase {
         ]))!)
     }
 
+    /// Inject a broadcast `subagent.*` frame from a FOREIGN runtime, tagged
+    /// with the stored id the app has open (so it passes the correlation gate
+    /// in `ChatStore.ownership(of:)` — same pattern as
+    /// `ChatStoreForeignMirrorTests.foreignFrame`). Requires a prior foreign
+    /// `message.start` on the same runtime so the mirror is adopted first.
+    private func sendForeign(_ type: String, subagentId: String?, parentId: String? = nil,
+                              taskIndex: Int? = nil, depth: Int? = nil, goal: String? = nil,
+                              status: String? = nil, to chat: ChatStore) {
+        var payload: [String: JSONValue] = [:]
+        if let subagentId { payload["subagent_id"] = .string(subagentId) }
+        if let parentId { payload["parent_id"] = .string(parentId) }
+        if let taskIndex { payload["task_index"] = .number(Double(taskIndex)) }
+        if let depth { payload["depth"] = .number(Double(depth)) }
+        if let goal { payload["goal"] = .string(goal) }
+        if let status { payload["status"] = .string(status) }
+
+        chat.handle(event: GatewayEvent(params: .object([
+            "type": .string(type),
+            "session_id": .string(foreignRuntime),
+            "stored_session_id": .string(storedId),
+            "payload": .object(payload),
+        ]))!)
+    }
+
     // MARK: - Race: late tap after local completion is a no-op
 
     /// REQUIRED: `subagent.start` -> `subagent.complete` -> delayed
@@ -68,7 +97,7 @@ final class SubagentInterruptTests: XCTestCase {
         send("subagent.complete", subagentId: "sub-1", status: "completed", to: chat)
 
         var rpcCalled = false
-        chat.interruptSubagentRPC = { _ in
+        chat.interruptSubagentRPC = { _, _ in
             rpcCalled = true
             return ChatStore.SubagentInterruptResponse(found: true, subagentId: "sub-1")
         }
@@ -87,6 +116,8 @@ final class SubagentInterruptTests: XCTestCase {
     /// its `task_index`, `depth`, or a synthesized `parent|index` key. Uses a
     /// nested child whose `task_index`/`depth` numerically collide with other
     /// values in the tree, so any accidental substitution would be caught.
+    /// Also asserts the owning `session_id` is the local active runtime — the
+    /// RPC's other required param (STR-145 review).
     func testInterruptTargetsStableSubagentIdNotTaskIndexOrDepth() async {
         let chat = makeStore()
         // Parent: task_index 0, depth 0.
@@ -97,7 +128,9 @@ final class SubagentInterruptTests: XCTestCase {
              taskIndex: 3, depth: 2, goal: "Child", to: chat)
 
         var capturedId: String?
-        chat.interruptSubagentRPC = { subagentId in
+        var capturedSessionId: String?
+        chat.interruptSubagentRPC = { sessionId, subagentId in
+            capturedSessionId = sessionId
             capturedId = subagentId
             return ChatStore.SubagentInterruptResponse(found: true, subagentId: subagentId)
         }
@@ -108,6 +141,44 @@ final class SubagentInterruptTests: XCTestCase {
                        "RPC must target the stable subagent_id, not task_index/depth/row order")
         XCTAssertNotEqual(capturedId, "3", "must not have substituted task_index for the id")
         XCTAssertNotEqual(capturedId, "2", "must not have substituted depth for the id")
+        XCTAssertEqual(capturedSessionId, localRuntime,
+                       "RPC must carry the owning runtime session_id alongside subagent_id")
+    }
+
+    // MARK: - Mirrored (foreign) subagent targets the FOREIGN runtime's session_id
+
+    /// REQUIRED (STR-145 review): a subagent branch delegated by an ADOPTED
+    /// foreign mirror must be interrupted on the foreign runtime that actually
+    /// owns it — never the phone's own local `activeRuntimeId`, which never
+    /// started this turn at all. Node identity captures `session_id` from the
+    /// `GatewayEvent` at branch-creation time (`SubagentNode.sessionId`), not
+    /// from `activeSessionId`/`mirroringRuntimeId` re-derived at tap time.
+    func testInterruptOnMirroredForeignSubagentTargetsForeignSessionId() async {
+        let chat = makeStore()
+        // Adopt the foreign mirror first (no local turn in flight).
+        chat.handle(event: GatewayEvent(params: .object([
+            "type": .string("message.start"),
+            "session_id": .string(foreignRuntime),
+            "stored_session_id": .string(storedId),
+            "payload": .object(["role": .string("assistant")]),
+        ]))!)
+        sendForeign("subagent.start", subagentId: "sub-foreign", goal: "Mirrored delegation", to: chat)
+
+        var capturedSessionId: String?
+        var capturedId: String?
+        chat.interruptSubagentRPC = { sessionId, subagentId in
+            capturedSessionId = sessionId
+            capturedId = subagentId
+            return ChatStore.SubagentInterruptResponse(found: true, subagentId: subagentId)
+        }
+
+        await chat.interruptSubagent(nodeId: "sub-foreign")
+
+        XCTAssertEqual(capturedId, "sub-foreign")
+        XCTAssertEqual(capturedSessionId, foreignRuntime,
+                       "a mirrored subagent must be interrupted on the FOREIGN runtime, not local")
+        XCTAssertNotEqual(capturedSessionId, localRuntime,
+                          "must never substitute the phone's own local runtime for a mirrored branch")
     }
 
     // MARK: - found:false is a silent no-op, not an error
@@ -119,7 +190,7 @@ final class SubagentInterruptTests: XCTestCase {
         let chat = makeStore()
         send("subagent.start", subagentId: "sub-2", goal: "Still going", to: chat)
 
-        chat.interruptSubagentRPC = { subagentId in
+        chat.interruptSubagentRPC = { _, subagentId in
             ChatStore.SubagentInterruptResponse(found: false, subagentId: subagentId)
         }
 
@@ -138,7 +209,7 @@ final class SubagentInterruptTests: XCTestCase {
         let chat = makeStore()
         send("subagent.start", subagentId: "sub-3", goal: "Flaky", to: chat)
 
-        chat.interruptSubagentRPC = { _ in
+        chat.interruptSubagentRPC = { _, _ in
             throw GatewayError.rpc(code: 4009, message: "gateway unreachable")
         }
 
@@ -183,14 +254,14 @@ final class SubagentInterruptTests: XCTestCase {
         let chat = makeStore()
         send("subagent.start", subagentId: "sub-4", goal: "Once", to: chat)
 
-        chat.interruptSubagentRPC = { subagentId in
+        chat.interruptSubagentRPC = { _, subagentId in
             ChatStore.SubagentInterruptResponse(found: true, subagentId: subagentId)
         }
         await chat.interruptSubagent(nodeId: "sub-4")
         XCTAssertEqual(chat.subagentInterruptStates["sub-4"], .stopped)
 
         var secondCallFired = false
-        chat.interruptSubagentRPC = { subagentId in
+        chat.interruptSubagentRPC = { _, subagentId in
             secondCallFired = true
             return ChatStore.SubagentInterruptResponse(found: true, subagentId: subagentId)
         }
@@ -208,7 +279,7 @@ final class SubagentInterruptTests: XCTestCase {
     func testNewTurnClearsInterruptStates() async {
         let chat = makeStore()
         send("subagent.start", subagentId: "sub-5", goal: "Old turn", to: chat)
-        chat.interruptSubagentRPC = { subagentId in
+        chat.interruptSubagentRPC = { _, subagentId in
             ChatStore.SubagentInterruptResponse(found: true, subagentId: subagentId)
         }
         await chat.interruptSubagent(nodeId: "sub-5")

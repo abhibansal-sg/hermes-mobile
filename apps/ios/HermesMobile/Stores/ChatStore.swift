@@ -657,7 +657,8 @@ final class ChatStore {
             handleClarifyRequest(event)
         case .subagentStart, .subagentThinking, .subagentTool,
              .subagentProgress, .subagentComplete:
-            handleSubagentEvent(type: event.type, payload: event.payload)
+            handleSubagentEvent(type: event.type, payload: event.payload,
+                                 sessionId: event.sessionId ?? activeSessionId ?? "")
         case .sudoRequest:
             handleSudoRequest(event)
         case .secretRequest:
@@ -847,8 +848,12 @@ final class ChatStore {
         case .subagentStart, .subagentThinking, .subagentTool,
              .subagentProgress, .subagentComplete:
             // A mirrored (foreign) turn that delegates renders its subagent tree
-            // too, so the desktop's delegation is visible on the phone.
-            handleSubagentEvent(type: event.type, payload: event.payload)
+            // too, so the desktop's delegation is visible on the phone. The
+            // owning runtime is the ADOPTED foreign session (`sid` /
+            // `mirroringRuntimeId`), never our own `activeSessionId` — the
+            // `subagent.interrupt` RPC (STR-145) must target the runtime that
+            // actually owns the branch, not whichever one is locally active.
+            handleSubagentEvent(type: event.type, payload: event.payload, sessionId: sid)
         case .messageComplete, .gatewayReady, .statusUpdate, .unknown,
              // Secure prompts are session-local and never broadcast-mirrored
              // (the gateway emits them only to the requesting runtime), so a
@@ -1270,7 +1275,7 @@ final class ChatStore {
     /// `parent|taskIndex` key so a flat tree still renders one row per branch.
     /// The same node is updated in place across start → thinking/tool/progress →
     /// complete, so the tree mutates rather than appending duplicate rows.
-    private func handleSubagentEvent(type: GatewayEventType, payload rawPayload: JSONValue) {
+    private func handleSubagentEvent(type: GatewayEventType, payload rawPayload: JSONValue, sessionId ownerSessionId: String) {
         let payload = SubagentEventPayload(payload: rawPayload)
         let nodeId = subagentNodeId(for: payload)
         let parentId = payload.parentId
@@ -1278,6 +1283,7 @@ final class ChatStore {
 
         var node = subagentNodes[nodeId] ?? SubagentNode(
             id: nodeId,
+            sessionId: ownerSessionId,
             parentId: parentId,
             depth: payload.depth ?? 0,
             taskIndex: payload.taskIndex ?? 0,
@@ -1301,6 +1307,7 @@ final class ChatStore {
 
         // Stable identity/structure fields fill in as later frames carry them
         // (an early thinking frame may precede the start that has the goal).
+        if !ownerSessionId.isEmpty { node.sessionId = ownerSessionId }
         if let parentId { node.parentId = parentId }
         if let depth = payload.depth { node.depth = depth }
         if let taskIndex = payload.taskIndex { node.taskIndex = taskIndex }
@@ -1445,7 +1452,7 @@ final class ChatStore {
     #if DEBUG
     /// Injectable hook for tests — replaces the live `subagent.interrupt` RPC.
     /// Pattern mirrors `steerRPC`. `nil` in production (inert).
-    var interruptSubagentRPC: ((_ subagentId: String) async throws -> SubagentInterruptResponse)?
+    var interruptSubagentRPC: ((_ sessionId: String, _ subagentId: String) async throws -> SubagentInterruptResponse)?
     #endif
 
     /// Whether `nodeId` can currently be targeted by the Stop button: running,
@@ -1457,10 +1464,11 @@ final class ChatStore {
         return subagentInterruptStates[nodeId] != .stopped
     }
 
-    /// Send `subagent.interrupt` for `nodeId`, targeting the stable
-    /// `subagent_id` from the event stream — never a row index, `task_index`,
-    /// depth, or other synthesized display-order value (server.py only reads
-    /// `subagent_id`; there is no `session_id` in the RPC's params contract).
+    /// Send `subagent.interrupt` for `nodeId`, targeting the owning runtime
+    /// `session_id` (captured on the node when its branch was created — see
+    /// `SubagentNode.sessionId`) plus the stable `subagent_id` from the event
+    /// stream — never a row index, `task_index`, depth, or other synthesized
+    /// display-order value.
     ///
     /// Late-tap / race handling: if the node already left `.running` (the
     /// `subagent.complete` frame beat the tap locally), this is a silent
@@ -1476,7 +1484,7 @@ final class ChatStore {
               subagentInterruptStates[nodeId] != .stopping,
               subagentInterruptStates[nodeId] != .stopped else { return }
 
-        guard node.hasServerSubagentId, let client else {
+        guard node.hasServerSubagentId, !node.sessionId.isEmpty, let client else {
             subagentInterruptStates[nodeId] = .failed(message: "This subagent can't be interrupted.")
             return
         }
@@ -1487,17 +1495,23 @@ final class ChatStore {
             let response: SubagentInterruptResponse
             #if DEBUG
             if let hook = interruptSubagentRPC {
-                response = try await hook(nodeId)
+                response = try await hook(node.sessionId, nodeId)
             } else {
                 response = try await client.request(
                     "subagent.interrupt",
-                    params: .object(["subagent_id": .string(nodeId)])
+                    params: .object([
+                        "session_id": .string(node.sessionId),
+                        "subagent_id": .string(nodeId),
+                    ])
                 )
             }
             #else
             response = try await client.request(
                 "subagent.interrupt",
-                params: .object(["subagent_id": .string(nodeId)])
+                params: .object([
+                    "session_id": .string(node.sessionId),
+                    "subagent_id": .string(nodeId),
+                ])
             )
             #endif
 
