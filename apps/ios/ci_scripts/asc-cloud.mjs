@@ -163,6 +163,41 @@ async function cmdListWorkflows() {
   console.log(`\n${workflows.length} workflow(s) total.`);
 }
 
+// STR-173: idempotency lookup. Before triggering a NEW cloud build, callers
+// should check whether an in-flight (or very recent) run already exists for
+// the current commit SHA on this workflow, and adopt it instead of firing a
+// duplicate. This is what let 6 cloud runs fire for one SHA (#81-#86,
+// 12:28-12:36Z, ~90s apart): the driving ship-testflight.sh invocation was
+// killed mid-`wait` (cron's 3-minute hard interrupt vs. the up-to-45-minute
+// cloud wait ceiling) and re-invoked from scratch with no memory of the run
+// it had already started; the mutex only guards true concurrency, not a
+// killed-then-restarted serial retry once the dead pid is reclaimed.
+async function cmdFindRun(workflowId, sha, sinceMinutesArg) {
+  if (!workflowId || !sha) {
+    die('Usage: asc-cloud.mjs find-run <workflowId> <sha> [sinceMinutes=180]');
+  }
+  const sinceMinutes = Number(sinceMinutesArg) > 0 ? Number(sinceMinutesArg) : 180;
+  const cutoff = Date.now() - sinceMinutes * 60_000;
+  const shaShort = sha.slice(0, 7);
+
+  const runs = await ascFetchAll(`/ciWorkflows/${workflowId}/buildRuns?limit=20&sort=-createdDate`);
+  const match = runs.find((r) => {
+    const commitSha = r.attributes?.sourceCommit?.commitSha ?? '';
+    const createdMs = r.attributes?.createdDate ? Date.parse(r.attributes.createdDate) : 0;
+    return commitSha.startsWith(shaShort) && createdMs >= cutoff;
+  });
+
+  if (!match) {
+    console.log('NO_MATCH');
+    return;
+  }
+  console.log('MATCH');
+  console.log(`  ID: ${match.id}`);
+  console.log(`  Build #: ${match.attributes?.number ?? '—'}`);
+  console.log(`  Progress: ${match.attributes?.executionProgress ?? 'UNKNOWN'}`);
+  console.log(`  Completion: ${match.attributes?.completionStatus ?? 'IN_PROGRESS'}`);
+}
+
 async function cmdTrigger(workflowId, gitRef) {
   if (!workflowId || !gitRef) {
     die('Usage: asc-cloud.mjs trigger <workflowId> <gitRef>\n  e.g. trigger abc123 refs/heads/phase2-upstream-rebase');
@@ -369,6 +404,7 @@ Xcode Cloud driver — App Store Connect API
 
 Usage:
   node asc-cloud.mjs list-workflows
+  node asc-cloud.mjs find-run <workflowId> <sha> [sinceMinutes=180]
   node asc-cloud.mjs trigger <workflowId> <gitRef>
   node asc-cloud.mjs status  <buildRunId>
   node asc-cloud.mjs wait    <buildRunId>
@@ -385,6 +421,7 @@ const [,, cmd, ...args] = process.argv;
 
 switch (cmd) {
   case 'list-workflows': await cmdListWorkflows(); break;
+  case 'find-run':       await cmdFindRun(args[0], args[1], args[2]); break;
   case 'trigger':        await cmdTrigger(args[0], args[1]); break;
   case 'status':         await cmdStatus(args[0]); break;
   case 'wait':           await cmdWait(args[0]); break;
