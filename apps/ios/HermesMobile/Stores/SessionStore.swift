@@ -3678,6 +3678,27 @@ final class ProjectsStore {
     /// successful fetch.
     private(set) var loadError: String?
 
+    // MARK: - Per-project sessions (ABH-407)
+
+    /// Server-scoped session lists for Project detail, keyed by ``Project/id``.
+    /// Populated by ``refreshSessions(for:)`` via `GET /api/sessions?cwd_prefix=…`
+    /// — independent of ``SessionStore/sessions`` (the global drawer Recents list)
+    /// so a project fetch can never corrupt Recents or the active session state.
+    private(set) var projectSessionsById: [String: [SessionSummary]] = [:]
+
+    /// Project ids with a fetch currently in flight (drives the detail loading state).
+    private(set) var projectSessionsLoadingIds: Set<String> = []
+
+    /// A human-readable error per project id from its last failed fetch, or absent.
+    /// Cleared on the next successful fetch for that project.
+    private(set) var projectSessionsErrorById: [String: String] = [:]
+
+    /// Testing seam: when set, ``refreshSessions(for:)`` calls this instead of
+    /// hitting the network via `connection?.rest` — mirrors
+    /// ``SessionStore/sessionsFetch``. Lets tests prove the store renders
+    /// exactly the (stubbed) server-scoped response without a live gateway.
+    var sessionsFetch: ((Project) async throws -> (sessions: [SessionSummary], total: Int?))?
+
     // MARK: - Back-reference (injected by AppEnvironment)
 
     /// The connection store, for REST access. `nil` until
@@ -3732,12 +3753,68 @@ final class ProjectsStore {
         }
     }
 
+    /// Fetch a project's sessions from the server with `cwd_prefix=project.root`
+    /// (ABH-407) and update ``projectSessionsById`` / ``projectSessionsLoadingIds``
+    /// / ``projectSessionsErrorById`` for that project's id. This is the primary
+    /// Project detail data source — it does NOT touch ``SessionStore/sessions``
+    /// (the global drawer Recents list) or the active session state.
+    ///
+    /// Safe to call repeatedly (detail-view appear, pull-to-refresh). Never
+    /// throws — failures land in ``projectSessionsErrorById`` and leave the last
+    /// successful list for this project intact so the UI doesn't flicker on a
+    /// transient network blip.
+    func refreshSessions(for project: Project) async {
+        let fetch: () async throws -> (sessions: [SessionSummary], total: Int?)
+        if let sessionsFetch {
+            fetch = { try await sessionsFetch(project) }
+        } else {
+            guard let rest = connection?.rest else {
+                projectSessionsErrorById[project.id] = "Not connected"
+                return
+            }
+            fetch = { try await rest.sessionsWithTotal(cwdPrefix: project.root) }
+        }
+        projectSessionsLoadingIds.insert(project.id)
+        defer { projectSessionsLoadingIds.remove(project.id) }
+        do {
+            let result = try await fetch()
+            projectSessionsById[project.id] = result.sessions
+            projectSessionsErrorById[project.id] = nil
+        } catch {
+            if projectSessionsById[project.id] == nil {
+                projectSessionsErrorById[project.id] = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+            }
+        }
+    }
+
+    /// The server-scoped session list for `project`, or `[]` if it hasn't
+    /// loaded yet (a designed loading/empty state in the detail view, not a
+    /// silent zero). Populated by ``refreshSessions(for:)``.
+    func sessions(for project: Project) -> [SessionSummary] {
+        projectSessionsById[project.id] ?? []
+    }
+
+    /// `true` while a ``refreshSessions(for:)`` fetch is in flight for `project`.
+    func isLoadingSessions(for project: Project) -> Bool {
+        projectSessionsLoadingIds.contains(project.id)
+    }
+
+    /// The last fetch error for `project`, or `nil`. Cleared on the next
+    /// successful ``refreshSessions(for:)`` call.
+    func sessionsError(for project: Project) -> String? {
+        projectSessionsErrorById[project.id]
+    }
+
     // MARK: - Derived queries
 
-    /// The sessions belonging to a project: those whose `cwd` resolves to the
+    /// Client-side fallback/test utility: the sessions belonging to a project
+    /// filtered from an already-loaded ``SessionStore`` by matching `cwd` to the
     /// project's `root` (exact match on the trimmed path, case-insensitive,
-    /// trailing-slash-insensitive). Read from ``SessionStore/sessions`` so the
-    /// project detail list stays live as sessions arrive / refresh.
+    /// trailing-slash-insensitive). ABH-407 moved Project detail's primary data
+    /// source to the server-side ``sessions(for:)`` / ``refreshSessions(for:)``
+    /// pair above (`cwd_prefix` query) — this method is kept for tests and as a
+    /// fallback utility, not as the detail view's data source.
     ///
     /// Returns `[]` when the session list hasn't loaded yet (a designed
     /// loading/empty state in the detail view, not a silent zero).
