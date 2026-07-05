@@ -763,6 +763,11 @@ struct SubagentNode: Sendable, Equatable, Identifiable {
     var taskCount: Int
     var goal: String
     var model: String?
+    /// Whether the gateway sent a real `subagent_id` for this node (vs. the
+    /// synthesized `parent|taskIndex` fallback key for an id-less emitter).
+    /// `subagent.interrupt` matches on the server's `subagent_id`, so a
+    /// synthesized key can never be targeted.
+    var hasServerSubagentId: Bool
     /// The latest activity line (running thought / tool preview).
     var activity: String
     var status: Status

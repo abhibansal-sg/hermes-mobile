@@ -1284,6 +1284,7 @@ final class ChatStore {
             taskCount: payload.taskCount ?? 1,
             goal: payload.goal ?? "Subagent",
             model: payload.model,
+            hasServerSubagentId: (payload.subagentId?.isEmpty == false),
             activity: "",
             status: .running,
             summary: nil,
@@ -1401,6 +1402,117 @@ final class ChatStore {
         subagentRootIds = []
         pendingSubagentChildren = [:]
         subagentNodeCount = 0
+        subagentInterruptStates = [:]
+    }
+
+    // MARK: - Subagent interrupt (STR-145 / ABH-413)
+
+    /// Per-node interrupt state for the Stop button on the subagent tree.
+    /// Tracks the in-flight `subagent.interrupt` RPC so the UI shows honest
+    /// stopping → stopped / failed transitions instead of a fake "ok".
+    enum SubagentInterruptState: Sendable, Equatable {
+        /// No interrupt requested (default). The Stop button is tappable.
+        case idle
+        /// Interrupt RPC in-flight. The Stop button is disabled with a spinner.
+        case stopping
+        /// The gateway confirmed it found and signalled the subagent. The node
+        /// itself transitions to `.error` (status "interrupted") only when the
+        /// `subagent.complete` frame arrives — until then the UI shows
+        /// "Stopping…". Not a terminal state on its own.
+        case stopped
+        /// The interrupt RPC failed with a real transport/RPC error (NOT the
+        /// benign `found:false` already-finished case — see
+        /// `interruptSubagent(nodeId:)`). `message` is user-facing and the
+        /// button remains retryable.
+        case failed(message: String)
+    }
+
+    /// Gateway response shape for `subagent.interrupt` (server.py `_ok(rid,
+    /// {"found": ok, "subagent_id": subagent_id})`).
+    struct SubagentInterruptResponse: Decodable, Sendable {
+        /// Whether the gateway found a live subagent matching `subagent_id`.
+        /// `false` means it already finished (or the id was stale) — NOT an
+        /// error; the caller must treat it as an idempotent no-op.
+        let found: Bool
+        let subagentId: String?
+    }
+
+    /// Interrupt state per subagent node id. Absent == `.idle`. Read by
+    /// `SubagentTreeView` to drive the Stop button. Cleared on
+    /// `resetSubagentTree`.
+    private(set) var subagentInterruptStates: [String: SubagentInterruptState] = [:]
+
+    #if DEBUG
+    /// Injectable hook for tests — replaces the live `subagent.interrupt` RPC.
+    /// Pattern mirrors `steerRPC`. `nil` in production (inert).
+    var interruptSubagentRPC: ((_ subagentId: String) async throws -> SubagentInterruptResponse)?
+    #endif
+
+    /// Whether `nodeId` can currently be targeted by the Stop button: running,
+    /// carries a real (non-synthesized) `subagent_id`, and hasn't already been
+    /// signalled.
+    func isSubagentInterruptible(_ nodeId: String) -> Bool {
+        guard let node = subagentNodes[nodeId], node.status == .running,
+              node.hasServerSubagentId else { return false }
+        return subagentInterruptStates[nodeId] != .stopped
+    }
+
+    /// Send `subagent.interrupt` for `nodeId`, targeting the stable
+    /// `subagent_id` from the event stream — never a row index, `task_index`,
+    /// depth, or other synthesized display-order value (server.py only reads
+    /// `subagent_id`; there is no `session_id` in the RPC's params contract).
+    ///
+    /// Late-tap / race handling: if the node already left `.running` (the
+    /// `subagent.complete` frame beat the tap locally), this is a silent
+    /// no-op — no RPC is sent. If the RPC itself resolves `found:false` (the
+    /// subagent finished server-side before the tap landed there), this is
+    /// ALSO treated as a no-op: the state quietly returns to `.idle` with no
+    /// "cancelled" success signal and no error — the eventual/already-arrived
+    /// `subagent.complete` frame is what updates the row. Only a genuine
+    /// transport/RPC failure sets `.failed` (and `lastError`, matching
+    /// `interrupt()` / `steer()`).
+    func interruptSubagent(nodeId: String) async {
+        guard let node = subagentNodes[nodeId], node.status == .running,
+              subagentInterruptStates[nodeId] != .stopping,
+              subagentInterruptStates[nodeId] != .stopped else { return }
+
+        guard node.hasServerSubagentId, let client else {
+            subagentInterruptStates[nodeId] = .failed(message: "This subagent can't be interrupted.")
+            return
+        }
+
+        subagentInterruptStates[nodeId] = .stopping
+
+        do {
+            let response: SubagentInterruptResponse
+            #if DEBUG
+            if let hook = interruptSubagentRPC {
+                response = try await hook(nodeId)
+            } else {
+                response = try await client.request(
+                    "subagent.interrupt",
+                    params: .object(["subagent_id": .string(nodeId)])
+                )
+            }
+            #else
+            response = try await client.request(
+                "subagent.interrupt",
+                params: .object(["subagent_id": .string(nodeId)])
+            )
+            #endif
+
+            if response.found {
+                subagentInterruptStates[nodeId] = .stopped
+            } else {
+                // Already finished / stale id server-side — quiet no-op, NOT a
+                // failure: don't fake a cancelled toast, don't show an error.
+                subagentInterruptStates[nodeId] = .idle
+            }
+        } catch {
+            let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            subagentInterruptStates[nodeId] = .failed(message: msg)
+            lastError = msg
+        }
     }
 
     // MARK: - Secure prompts: sudo / secret (F4A-A2)
