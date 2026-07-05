@@ -160,6 +160,44 @@ final class SessionListSourceFilterTests: XCTestCase {
         XCTAssertNil(queryItems["exclude_source"], "The singular param is ignored by the gateway and must not regress")
     }
 
+    // ABH-407 — Project detail's `cwd_prefix` REST query shape.
+    func testProjectDetailRestQueryIncludesPercentEncodedCwdPrefixAndPreservesOtherParams() async throws {
+        SessionListSourceFilterStubProtocol.nextResponse = (
+            data: #"{"sessions":[],"total":0}"#.data(using: .utf8)!,
+            status: 200
+        )
+        SessionListSourceFilterStubProtocol.requestedURL = nil
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SessionListSourceFilterStubProtocol.self]
+        let rest = RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "test-token",
+            session: URLSession(configuration: config)
+        )
+
+        let projectRoot = "/Users/abbhinnav/My Projects/hermes mobile"
+        _ = try await rest.sessionsWithTotal(cwdPrefix: projectRoot)
+
+        let requestedURL = try XCTUnwrap(SessionListSourceFilterStubProtocol.requestedURL)
+        let components = try XCTUnwrap(URLComponents(url: requestedURL, resolvingAgainstBaseURL: false))
+        let queryItems = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).compactMap { item in
+            item.value.map { (item.name, $0) }
+        })
+        XCTAssertEqual(components.path, "/api/sessions")
+        XCTAssertEqual(queryItems["cwd_prefix"], projectRoot,
+            "cwd_prefix must round-trip the exact project root, including its spaces and slashes")
+        XCTAssertEqual(queryItems["order"], "recent",
+            "Project detail must not regress the order=recent (compression-chain-aware) semantics")
+        XCTAssertEqual(queryItems["archived"], "exclude",
+            "Project detail must not regress the archived=exclude semantics")
+        XCTAssertEqual(queryItems["min_messages"], "1",
+            "Project detail must not regress the min_messages=1 scaffold/empty-session filter")
+        XCTAssertFalse(
+            (components.percentEncodedQuery ?? "").contains(" "),
+            "the raw wire query must percent-encode the space in the project root, not send it literally"
+        )
+    }
+
     func testSessionExportFetchesFullMessagesRouteAndRendersMarkdown() async throws {
         SessionListSourceFilterStubProtocol.nextResponse = (
             data: #"{"messages":[{"id":1,"role":"user","content":"Hello"},{"id":2,"role":"assistant","content":"Hi there"}]}"#.data(using: .utf8)!,

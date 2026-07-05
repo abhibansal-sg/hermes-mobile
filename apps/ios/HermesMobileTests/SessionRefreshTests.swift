@@ -559,6 +559,78 @@ struct ProjectsStoreTests {
         #expect(store.isLoading == false)
         #expect(store.loadError == nil)
     }
+
+    // MARK: - refreshSessions(for:) / sessions(for:) server-scoped fetch (ABH-407)
+
+    @Test("refreshSessions(for:) fetches scoped to the project's root and sessions(for:) returns exactly the server rows")
+    func refreshSessions_usesProjectRootAndRendersServerRows() async {
+        let store = ProjectsStore()
+        let project = Project(id: "/repo/a", label: "a", root: "/Repo/A", sessionCount: 2)
+        let serverRows = [
+            SessionSummary.stub(id: "server-1", cwd: "/Repo/A"),
+            SessionSummary.stub(id: "server-2", cwd: "/Repo/A/sub"),
+        ]
+        var requestedRoot: String?
+        store.sessionsFetch = { requestedProject in
+            requestedRoot = requestedProject.root
+            return (serverRows, serverRows.count)
+        }
+
+        await store.refreshSessions(for: project)
+
+        #expect(requestedRoot == "/Repo/A",
+            "refreshSessions must fetch scoped to the project's own root (the cwd_prefix value)")
+        #expect(store.sessions(for: project).map(\.id) == ["server-1", "server-2"])
+        #expect(store.isLoadingSessions(for: project) == false)
+        #expect(store.sessionsError(for: project) == nil)
+    }
+
+    @Test("sessions(for:) trusts only the server-scoped response — a matching-cwd row in the global SessionStore must not leak in")
+    func refreshSessions_falseGreenGuard_globalSessionStoreCwdMatchIsIgnored() async {
+        let store = ProjectsStore()
+        let project = Project(id: "/repo/a", label: "a", root: "/Repo/A", sessionCount: 2)
+
+        // The global SessionStore (drawer Recents) happens to hold rows whose cwd
+        // matches the project root. Pre-ABH-407, Project detail derived its list by
+        // scanning exactly this list — a test that only checked "does the detail
+        // list contain the matching rows" would go green even if the server-scoped
+        // fetch were never wired up. Prove the opposite: the server's cwd_prefix
+        // response — here, empty — is authoritative, so these rows must NOT appear.
+        let sessionStore = SessionStore()
+        sessionStore.sessions = [
+            SessionSummary.stub(id: "stale-1", cwd: "/repo/a"),
+            SessionSummary.stub(id: "stale-2", cwd: "/repo/a"),
+        ]
+        store.sessionsFetch = { _ in ([], 0) }
+
+        await store.refreshSessions(for: project)
+
+        #expect(store.sessions(for: project).isEmpty,
+            "Project detail must render the server's cwd_prefix response, not a client-side scan of SessionStore.sessions")
+        // Sanity: the old client-side helper WOULD have matched these rows —
+        // confirming the false-green guard actually exercises a real divergence.
+        #expect(!store.sessions(for: project, in: sessionStore).isEmpty)
+    }
+
+    @Test("refreshSessions(for:) surfaces a fetch failure without corrupting the global SessionStore")
+    func refreshSessions_failurePreservesGlobalSessionStore() async {
+        let store = ProjectsStore()
+        let project = Project(id: "/repo/a", label: "a", root: "/Repo/A", sessionCount: 0)
+        struct StubError: Error, LocalizedError {
+            var errorDescription: String? { "boom" }
+        }
+        store.sessionsFetch = { _ in throw StubError() }
+
+        let sessionStore = SessionStore()
+        sessionStore.sessions = [SessionSummary.stub(id: "untouched", cwd: "/repo/a")]
+
+        await store.refreshSessions(for: project)
+
+        #expect(store.sessions(for: project).isEmpty)
+        #expect(store.sessionsError(for: project) == "boom")
+        #expect(sessionStore.sessions.map(\.id) == ["untouched"],
+            "a failed project-scoped fetch must never mutate the global drawer Recents list")
+    }
 }
 
 /// Minimal stub for ProjectsStoreTests: id + optional cwd, everything else nil.

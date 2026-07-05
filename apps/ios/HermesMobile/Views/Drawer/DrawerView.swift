@@ -2243,6 +2243,13 @@ struct ProjectDetailView: View {
         .navigationTitle(project.label)
         .navigationBarTitleDisplayMode(.inline)
         .hermesThemed(themeStore)
+        .task(id: project.id) {
+            // ABH-407: server-scoped fetch (`cwd_prefix=project.root`), not a
+            // client-side scan of the global Recents list. `.task(id:)` re-fires
+            // if the pushed project changes identity within the same navigation
+            // stack slot.
+            await projectsStore.refreshSessions(for: project)
+        }
     }
 
     // MARK: - New session in this project
@@ -2291,10 +2298,14 @@ struct ProjectDetailView: View {
 
     @ViewBuilder
     private var sessionsSection: some View {
-        let projectSessions = projectsStore.sessions(for: project, in: sessions)
+        // ABH-407: server-scoped list (`cwd_prefix=project.root`), fetched by
+        // the `.task(id:)` in `body`. Not derived from the global `sessions`
+        // (SessionStore) Recents list.
+        let projectSessions = projectsStore.sessions(for: project)
+        let isLoadingSessions = projectsStore.isLoadingSessions(for: project)
 
         Section {
-            if sessions.isLoading && projectSessions.isEmpty {
+            if isLoadingSessions && projectSessions.isEmpty {
                 // Loading state: the session list hasn't arrived yet. Skeleton
                 // rows match the drawer's cold-load pattern.
                 ForEach(0..<3, id: \.self) { _ in
