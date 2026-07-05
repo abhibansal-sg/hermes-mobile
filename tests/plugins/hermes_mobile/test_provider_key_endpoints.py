@@ -24,6 +24,8 @@ no ``HERMES_URL``/``HERMES_TOKEN`` is required (skip-guard friendly).
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -537,6 +539,44 @@ def test_set_key_rejects_managed_4006(loopback_client, monkeypatch):
     assert calls["save_env"] == []
 
 
+def test_set_key_managed_env_var_is_4006_and_does_not_overwrite_or_validate(
+    loopback_client, monkeypatch
+):
+    """STR-172 — a per-key managed_scope-pinned env var (distinct from the
+    coarse is_managed() install lock above) must reject the SET before ever
+    calling save_env_value, must not be mirrored into os.environ, must not
+    proceed to key validation, and must surface a managed/read-only error
+    rather than a false success."""
+    import hermes_cli.managed_scope as managed_scope
+
+    _patch_inventory(monkeypatch, rows=[_DEEPSEEK_ROW])
+    calls = _patch_config(monkeypatch)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "admin-pinned-value")
+    monkeypatch.setattr(
+        managed_scope, "is_env_managed", lambda key: key == "DEEPSEEK_API_KEY"
+    )
+
+    validated = {"called": False}
+    monkeypatch.setattr(
+        _api(),
+        "_validate_provider_key",
+        lambda **_kw: validated.update(called=True) or {"validated": True},
+        raising=False,
+    )
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/deepseek/key",
+        json={"api_key": "attacker-submitted-value"},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 400, r.text
+    assert r.json()["code"] == 4006
+    assert calls["save_env"] == []
+    assert os.environ.get("DEEPSEEK_API_KEY") == "admin-pinned-value"
+    assert validated["called"] is False
+
+
 def test_set_key_rejects_unknown_slug_4002(loopback_client, monkeypatch):
     _patch_config(monkeypatch)
     r = loopback_client.post(
@@ -902,6 +942,42 @@ def test_custom_rejects_managed_4006(loopback_client, monkeypatch):
     )
     assert r.status_code == 400
     assert r.json()["code"] == 4006
+    assert calls["set_config"] == []
+
+
+def test_custom_managed_env_var_is_4006_and_does_not_overwrite_or_set_config(
+    loopback_client, monkeypatch
+):
+    """STR-172 — a per-key managed_scope-pinned env var for the derived
+    custom-provider var must reject before any save/config write, must not
+    be mirrored into os.environ, and must surface 4006 (same contract as the
+    registered-provider Tier A route)."""
+    import hashlib as _hashlib
+    import hermes_cli.managed_scope as managed_scope
+
+    expected_env_var = "MYCO_" + _hashlib.sha1(b"myco").hexdigest()[:6] + "_API_KEY"
+    _patch_inventory(monkeypatch, rows=[])
+    calls = _patch_config(monkeypatch)
+    monkeypatch.setenv(expected_env_var, "admin-pinned-value")
+    monkeypatch.setattr(
+        managed_scope, "is_env_managed", lambda key: key == expected_env_var
+    )
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/custom",
+        json={
+            "name": "myco",
+            "base_url": "https://api.my.co/v1",
+            "api_mode": "openai",
+            "api_key": "attacker-submitted-value",
+        },
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 400, r.text
+    assert r.json()["code"] == 4006
+    assert calls["save_env"] == []
+    assert os.environ.get(expected_env_var) == "admin-pinned-value"
     assert calls["set_config"] == []
 
 

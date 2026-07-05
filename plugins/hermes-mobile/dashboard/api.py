@@ -2626,11 +2626,35 @@ async def set_toolset_config(
 
     value = body.value
     value_text = str(value).strip() if value is not None else ""
+    # A managed env key must never be popped from / overwritten in the live
+    # process — save_env_value()/remove_env_value()'s own False return is
+    # ambiguous (managed vs. already-absent), so check the managed scope
+    # directly on both branches rather than infer it from a bool. Clearing an
+    # already-absent, unmanaged key stays a benign no-op below.
+    from hermes_cli import managed_scope
+
     try:
         if not value_text:
+            if managed_scope.is_env_managed(key):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "managed install — credentials are read-only",
+                        "code": 4006,
+                    },
+                )
+            # remove_env_value() already pops os.environ on its own — no
+            # route-level mirror needed (and none that could run unconditionally).
             remove_env_value(key)
-            os.environ.pop(key, None)
         else:
+            if managed_scope.is_env_managed(key):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "managed install — credentials are read-only",
+                        "code": 4006,
+                    },
+                )
             save_env_value(key, value_text)
             # Mirror into the live process so the refreshed provider matrix sees
             # the key immediately (parity with set_provider_key below).
@@ -2769,6 +2793,21 @@ async def set_provider_key(
         )
 
     env_var = pconfig.api_key_env_vars[0]
+
+    # save_env_value() has no way to signal "managed no-op" back to the
+    # caller, so check the per-key managed scope directly, before the call —
+    # this must not be mirrored into os.environ or proceed to validation.
+    from hermes_cli import managed_scope
+
+    if managed_scope.is_env_managed(env_var):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "managed install — credentials are read-only",
+                "code": 4006,
+            },
+        )
+
     try:
         save_env_value(env_var, api_key)
     except ValueError as exc:
@@ -2896,6 +2935,21 @@ async def add_custom_provider(
     # raw secret ever touching config.yaml or a log line. This mirrors the
     # hygiene of the desktop's key_env-backed custom providers.
     env_var = _custom_provider_env_var(name)
+
+    # save_env_value() has no way to signal "managed no-op" back to the
+    # caller, so check the per-key managed scope directly, before the call —
+    # this must not be mirrored into os.environ or proceed to config writes.
+    from hermes_cli import managed_scope
+
+    if managed_scope.is_env_managed(env_var):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "managed install — credentials are read-only",
+                "code": 4006,
+            },
+        )
+
     try:
         save_env_value(env_var, api_key)
         set_config_value(f"providers.{name}.name", name)

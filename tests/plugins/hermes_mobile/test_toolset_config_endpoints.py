@@ -369,3 +369,84 @@ def test_put_toolset_config_clears_env_and_returns_refreshed_safe_row(
     body = r.json()
     assert body["providers"][0]["env_vars"][0]["is_set"] is False
     assert "sk-old-secret" not in r.text
+
+
+# ===========================================================================
+# STR-172 — managed-scope credential mutations must not overwrite the live
+# admin-pinned os.environ value, even when the .env persist is a rejected
+# no-op (per-key managed_scope.is_env_managed(), distinct from is_managed()).
+# ===========================================================================
+
+
+def test_put_toolset_config_managed_key_set_is_4006_and_preserves_live_env(
+    loopback_client, monkeypatch
+):
+    """A per-key managed_scope-pinned env var must reject the SET before ever
+    calling save_env_value, must not be mirrored into os.environ, and must
+    surface as a read-only error, not a false success."""
+    calls = _patch_toolset_helpers(monkeypatch)
+    monkeypatch.setenv("KAGI_API_KEY", "admin-pinned-value")
+
+    import hermes_cli.managed_scope as managed_scope
+
+    monkeypatch.setattr(
+        managed_scope, "is_env_managed", lambda key: key == "KAGI_API_KEY"
+    )
+
+    r = loopback_client.put(
+        f"{_PREFIX}/toolsets/web/config",
+        json={"key": "KAGI_API_KEY", "value": "attacker-submitted-value"},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 400, r.text
+    assert r.json()["code"] == 4006
+    assert calls["save_env"] == []
+    assert os.environ.get("KAGI_API_KEY") == "admin-pinned-value"
+
+
+def test_put_toolset_config_managed_key_clear_is_4006_and_preserves_live_env(
+    loopback_client, monkeypatch
+):
+    """A managed key must not be popped from os.environ by a clear request,
+    and remove_env_value() must never even be dispatched for it."""
+    calls = _patch_toolset_helpers(monkeypatch)
+    monkeypatch.setenv("KAGI_API_KEY", "admin-pinned-value")
+
+    import hermes_cli.managed_scope as managed_scope
+
+    monkeypatch.setattr(
+        managed_scope, "is_env_managed", lambda key: key == "KAGI_API_KEY"
+    )
+
+    r = loopback_client.put(
+        f"{_PREFIX}/toolsets/web/config",
+        json={"key": "KAGI_API_KEY", "value": ""},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 400, r.text
+    assert r.json()["code"] == 4006
+    assert calls["remove_env"] == []
+    assert os.environ.get("KAGI_API_KEY") == "admin-pinned-value"
+
+
+def test_put_toolset_config_clear_of_absent_unmanaged_key_stays_benign(
+    loopback_client, monkeypatch
+):
+    """Clearing a key that isn't managed and isn't currently set stays a
+    benign no-op success (managed_scope check must not turn this into 4006)."""
+    calls = _patch_toolset_helpers(monkeypatch)
+
+    import hermes_cli.managed_scope as managed_scope
+
+    monkeypatch.setattr(managed_scope, "is_env_managed", lambda key: False)
+
+    r = loopback_client.put(
+        f"{_PREFIX}/toolsets/web/config",
+        json={"key": "KAGI_API_KEY", "value": ""},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    assert calls["remove_env"] == ["KAGI_API_KEY"]
