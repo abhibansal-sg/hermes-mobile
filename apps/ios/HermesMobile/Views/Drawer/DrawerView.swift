@@ -2303,6 +2303,7 @@ struct ProjectDetailView: View {
         // (SessionStore) Recents list.
         let projectSessions = projectsStore.sessions(for: project)
         let isLoadingSessions = projectsStore.isLoadingSessions(for: project)
+        let sessionsError = projectsStore.sessionsError(for: project)
 
         Section {
             if isLoadingSessions && projectSessions.isEmpty {
@@ -2311,6 +2312,8 @@ struct ProjectDetailView: View {
                 ForEach(0..<3, id: \.self) { _ in
                     sessionSkeletonRow
                 }
+            } else if let sessionsError, projectSessions.isEmpty {
+                projectSessionsErrorRow(sessionsError)
             } else if projectSessions.isEmpty {
                 // Designed empty state: no sessions yet. Helpful, not blank.
                 emptyStateRow
@@ -2356,7 +2359,7 @@ struct ProjectDetailView: View {
         .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
     }
 
-    // MARK: - Skeleton + empty states
+    // MARK: - Skeleton + empty + error states
 
     private var sessionSkeletonRow: some View {
         HStack(spacing: 10) {
@@ -2401,6 +2404,39 @@ struct ProjectDetailView: View {
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
         .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+    }
+
+    private func projectSessionsErrorRow(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(theme.destructive)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Couldn’t load sessions")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(theme.fg)
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(theme.mutedFg)
+                    .lineLimit(3)
+                Button("Retry") {
+                    Task { await projectsStore.refreshSessions(for: project) }
+                }
+                .buttonStyle(.plain)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(theme.midground)
+                .accessibilityIdentifier("projectSessionsRetryButton")
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("projectSessionsErrorRow")
     }
 
     // MARK: - Actions
