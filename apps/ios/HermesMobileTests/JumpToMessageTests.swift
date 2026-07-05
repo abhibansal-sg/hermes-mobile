@@ -117,6 +117,32 @@ final class JumpToMessageCacheFirstTests: XCTestCase {
         ]))!
     }
 
+    private func storesForAroundLoad() -> (ChatStore, SessionStore) {
+        let chatStore = ChatStore()
+        let sessionStore = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessionStore, chatStore: chatStore)
+        let attachments = AttachmentStore()
+        chatStore.attach(connection: connection, sessions: sessionStore, attachments: attachments)
+        sessionStore.attach(connection: connection, chat: chatStore)
+        sessionStore.activeStoredId = "session-around"
+        return (chatStore, sessionStore)
+    }
+
+    @discardableResult
+    private func consumeResolvedJump(
+        chatStore: ChatStore, sessionStore: SessionStore
+    ) -> Bool {
+        guard let messageId = sessionStore.pendingMessageJump else { return false }
+        let candidates = Set(ChatStore.messageJumpCandidateIDs(for: messageId))
+        guard chatStore.messages.contains(where: { candidates.contains($0.id) }) else {
+            return false
+        }
+        sessionStore.pendingMessageJump = nil
+        sessionStore.pendingMessageJumpAttempts = 0
+        sessionStore.pendingMessageJumpSnippet = nil
+        return true
+    }
+
     /// The exact decision rule `jumpToMessageIfNeeded` applies, factored out so
     /// the test can drive it across the two seed phases WITHOUT a SwiftUI
     /// render tree. Mirrors the resolver: resolve candidate ids against the
@@ -301,6 +327,135 @@ final class JumpToMessageCacheFirstTests: XCTestCase {
                      "with a messageId, the query-text scroll must NOT be armed")
         XCTAssertEqual(sessionStore.activeStoredId, "session-new",
                        "open(searchResult:) must switch to the result's session")
+    }
+
+    func testDrawerSearchJumpLoadsOlderTargetBeyondCurrentWindow() async {
+        let (chatStore, sessionStore) = storesForAroundLoad()
+        chatStore.seed(normalized: ChatStore.toChatMessages([
+            stored(role: "user", text: "newer tail", wireId: 90),
+            stored(role: "assistant", text: "newest tail", wireId: 91),
+        ]))
+        chatStore.transcriptAroundFetchForTesting = { sessionId, messageId, radius in
+            XCTAssertEqual(sessionId, "session-around")
+            XCTAssertEqual(messageId, 40)
+            XCTAssertEqual(radius, ChatStore.transcriptOpenWindowLimit)
+            XCTAssertTrue(chatStore.isLoadingEarlierTranscript)
+            return TranscriptPageFetch(
+                messages: [
+                    self.stored(role: "assistant", text: "older context", wireId: 39),
+                    self.stored(role: "user", text: "drawer target", wireId: 40),
+                    self.stored(role: "assistant", text: "after target", wireId: 41),
+                ],
+                oldestId: 39,
+                hasMoreBefore: true,
+                hasMoreAfter: true,
+                targetFound: true
+            )
+        }
+
+        sessionStore.sessions = [SessionSummary(
+            id: "session-around", title: "Around", preview: nil,
+            startedAt: nil, messageCount: nil, source: nil, lastActive: nil, cwd: nil
+        )]
+        sessionStore.searchQuery = "drawer target"
+        sessionStore.open(searchResult: SessionSearchResult(
+            id: "session-around", snippet: "drawer target", role: "user",
+            source: nil, model: nil, sessionStarted: nil, messageId: 40
+        ))
+
+        XCTAssertEqual(sessionStore.pendingMessageJump, 40)
+        XCTAssertTrue(await chatStore.loadTranscriptAroundMessage(40))
+        XCTAssertEqual(sessionStore.pendingMessageJumpAttempts, 0)
+        XCTAssertTrue(consumeResolvedJump(chatStore: chatStore, sessionStore: sessionStore))
+        XCTAssertNil(sessionStore.pendingMessageJump)
+    }
+
+    func testDeepLinkJumpLoadsOlderTargetBeyondCurrentWindow() async {
+        let (chatStore, sessionStore) = storesForAroundLoad()
+        chatStore.seed(normalized: ChatStore.toChatMessages([
+            stored(role: "assistant", text: "newest tail", wireId: 100),
+        ]))
+        chatStore.transcriptAroundFetchForTesting = { _, messageId, _ in
+            XCTAssertEqual(messageId, 12)
+            return TranscriptPageFetch(
+                messages: [self.stored(role: "assistant", text: "deep link target", wireId: 12)],
+                oldestId: 12,
+                hasMoreBefore: false,
+                hasMoreAfter: true,
+                targetFound: true
+            )
+        }
+
+        sessionStore.pendingMessageJump = 12
+        sessionStore.pendingMessageJumpAttempts = 0
+
+        XCTAssertTrue(await chatStore.loadTranscriptAroundMessage(12))
+        XCTAssertEqual(sessionStore.pendingMessageJumpAttempts, 0)
+        XCTAssertTrue(consumeResolvedJump(chatStore: chatStore, sessionStore: sessionStore))
+        XCTAssertNil(sessionStore.pendingMessageJump)
+    }
+
+    func testArtifactGalleryJumpLoadsOlderTargetBeyondCurrentWindow() async {
+        let (chatStore, sessionStore) = storesForAroundLoad()
+        chatStore.seed(normalized: ChatStore.toChatMessages([
+            stored(role: "user", text: "newer tail", wireId: 88),
+        ]))
+        chatStore.transcriptAroundFetchForTesting = { _, messageId, _ in
+            XCTAssertEqual(messageId, 33)
+            return TranscriptPageFetch(
+                messages: [self.stored(role: "assistant", text: "wrote report.md", wireId: 33)],
+                oldestId: 33,
+                hasMoreBefore: true,
+                hasMoreAfter: true,
+                targetFound: true
+            )
+        }
+
+        let artifactResult = SessionSearchResult(
+            id: "session-around", snippet: "wrote report.md", role: nil,
+            source: nil, model: nil, sessionStarted: nil, messageId: 33
+        )
+        sessionStore.sessions = [artifactResult.asSessionSummary]
+        sessionStore.open(searchResult: artifactResult)
+
+        XCTAssertEqual(sessionStore.pendingMessageJump, 33)
+        XCTAssertTrue(await chatStore.loadTranscriptAroundMessage(33))
+        XCTAssertEqual(sessionStore.pendingMessageJumpAttempts, 0)
+        XCTAssertTrue(consumeResolvedJump(chatStore: chatStore, sessionStore: sessionStore))
+        XCTAssertNil(sessionStore.pendingMessageJump)
+    }
+
+    func testAroundLoadNotFoundClearsToSnippetFallback() async {
+        let (chatStore, sessionStore) = storesForAroundLoad()
+        chatStore.seed(normalized: ChatStore.toChatMessages([
+            stored(role: "user", text: "fallback snippet", wireId: 10),
+        ]))
+        chatStore.transcriptAroundFetchForTesting = { _, _, _ in
+            TranscriptPageFetch(
+                messages: [],
+                oldestId: nil,
+                hasMoreBefore: false,
+                hasMoreAfter: false,
+                targetFound: false
+            )
+        }
+
+        sessionStore.pendingMessageJump = 404
+        sessionStore.pendingMessageJumpSnippet = "fallback snippet"
+
+        XCTAssertFalse(await chatStore.loadTranscriptAroundMessage(404))
+        let snippet = sessionStore.pendingMessageJumpSnippet
+        sessionStore.pendingMessageJump = nil
+        sessionStore.pendingMessageJumpAttempts = 0
+        sessionStore.pendingMessageJumpSnippet = nil
+        if let snippet, !snippet.isEmpty {
+            sessionStore.pendingSearchScroll = snippet
+            sessionStore.pendingSearchScrollIsSnippet = true
+        }
+
+        XCTAssertNil(sessionStore.pendingMessageJump)
+        XCTAssertEqual(sessionStore.pendingSearchScroll, "fallback snippet")
+        XCTAssertTrue(sessionStore.pendingSearchScrollIsSnippet)
     }
 
     // MARK: - ABH-192 regression: coalesced-turn artifact miss → snippet fallback

@@ -111,6 +111,7 @@ struct ChatView: View {
     /// row heights and never parks against a bad estimate. Reset to the base window
     /// on every per-session remount (the `.id` swap re-inits `@State`).
     @State private var windowSize: Int = ChatView.transcriptWindow
+    @State private var attemptedAroundLoadsByMessageId: Set<Int> = []
     /// The error currently shown in the toast, if any.
     @State private var toastError: String?
     /// Cancels the in-flight toast auto-dismiss when a new error arrives.
@@ -996,6 +997,7 @@ struct ChatView: View {
             sessionStore.pendingMessageJump = nil
             sessionStore.pendingMessageJumpAttempts = 0
             sessionStore.pendingMessageJumpSnippet = nil
+            attemptedAroundLoadsByMessageId.removeAll()
         }
         // PER-SESSION SCROLLVIEW IDENTITY: each session open mounts a fresh ScrollView.
         // `.defaultScrollAnchor(.bottom)` resolves at first layout → native open-on-newest.
@@ -1140,11 +1142,10 @@ struct ChatView: View {
     /// the seed key and a tap may not carry it (the artifacts gallery has none),
     /// we resolve the id against the LOADED transcript rather than assuming one.
     ///
-    /// Load-until-visible: the VStack only constructs the last `windowSize` rows.
-    /// If the target sits outside that tail window, grow the window in one shot
-    /// to cover the target (plus one `transcriptWindow` of context below it,
-    /// capped at the full transcript), then scroll. The grow reuses the same
-    /// `windowSize` knob "Load earlier" uses — no new loading path.
+    /// Load-until-visible: if the target is older than the cold-open server tail,
+    /// fetch a bounded plugin window around that wire id, merge it, and retry on
+    /// the resulting transcript-generation bump. Once the row is loaded, grow the
+    /// render window enough for `scrollTo` to resolve the anchor.
     ///
     /// M1 (Opus review): when the target row is NOT in the loaded transcript,
     /// the jump is NOT consumed on the first miss. The open path is cache-first
@@ -1155,8 +1156,8 @@ struct ChatView: View {
     /// bumps and is bounded by an attempt cap + a session-switch reset (see the
     /// miss branch below and `.onChange(of: chatStore.activeStoredSessionId)`).
     /// On a gateway that did NOT emit stable wire ids (`wireId == nil`,
-    /// stock/old), no seeded row matches the candidate id; after the attempt cap
-    /// the jump falls back to the snippet scroll (S2) or is consumed as a no-op.
+    /// stock/old), the plugin around load is unavailable/not-found; the jump
+    /// falls back to the snippet scroll (S2) or is consumed as a no-op.
     private func jumpToMessageIfNeeded(_ proxy: ScrollViewProxy) {
         guard let messageId = sessionStore.pendingMessageJump,
               !chatStore.messages.isEmpty else { return }
@@ -1167,41 +1168,32 @@ struct ChatView: View {
         let target = chatStore.messages.first { candidates.contains($0.id) }?.id
 
         guard let target else {
-            // M1 (Opus review): the target row is NOT in the currently-loaded
-            // transcript. The open path is CACHE-FIRST then NETWORK
-            // (`SessionStore.seedTranscriptCacheFirst`): the FIRST
-            // `transcriptGeneration` bump is often a STALE on-disk-cache partial
-            // seed that does not contain the matched row, while the SECOND bump
-            // (the authoritative network reconcile) usually does. Clearing the
-            // jump here would drop it on the stale cache bump and the scroll
-            // would silently never happen in the common stale-cache case.
-            //
-            // So: leave `pendingMessageJump` set and return — the next bump
-            // (after the network seed) re-runs this resolver. Bounded three ways
-            // so it can't live forever / loop:
-            //   (1) a successful scroll clears it (below),
-            //   (2) a session switch clears it (`.onChange(of: chatStore
-            //       .activeStoredSessionId)` + `SessionStore.open` switch clear),
-            //   (3) a small attempt cap (`pendingMessageJumpMaxAttempts`) —
-            //       after the cache + network + a late-reconcile hop a target
-            //       that is still absent is genuinely missing (coalesced turn /
-            //       stock gateway / compressed-out row). On the cap, fall back to
-            //       a snippet scroll (S2) then consume.
-            sessionStore.pendingMessageJumpAttempts += 1
-            if sessionStore.pendingMessageJumpAttempts
-                >= SessionStore.pendingMessageJumpMaxAttempts {
-                // S2: exact-id miss fallback — scroll to the search snippet's
-                // first occurrence so the user lands inside the right turn
-                // instead of a silent no-op at the bottom. Reuses the existing
-                // query-text scroll path (no new scroll machinery).
+            guard !chatStore.isLoadingEarlierTranscript else { return }
+            guard !attemptedAroundLoadsByMessageId.contains(messageId) else {
                 let snippet = sessionStore.pendingMessageJumpSnippet
                 sessionStore.pendingMessageJump = nil
                 sessionStore.pendingMessageJumpAttempts = 0
                 sessionStore.pendingMessageJumpSnippet = nil
+                attemptedAroundLoadsByMessageId.remove(messageId)
                 if let snippet, !snippet.isEmpty {
-                    // BUG6 fix: this is a snippet-derived needle (prose slice from
-                    // pendingMessageJumpSnippet), not a literal user query — mark it
-                    // so jumpToSearchMatchIfNeeded collapses whitespace on both sides.
+                    sessionStore.pendingSearchScroll = snippet
+                    sessionStore.pendingSearchScrollIsSnippet = true
+                    jumpToSearchMatchIfNeeded(proxy)
+                }
+                return
+            }
+            attemptedAroundLoadsByMessageId.insert(messageId)
+            let requestedMessageId = messageId
+            Task { @MainActor in
+                let loaded = await chatStore.loadTranscriptAroundMessage(requestedMessageId)
+                guard !loaded,
+                      sessionStore.pendingMessageJump == requestedMessageId else { return }
+                let snippet = sessionStore.pendingMessageJumpSnippet
+                sessionStore.pendingMessageJump = nil
+                sessionStore.pendingMessageJumpAttempts = 0
+                sessionStore.pendingMessageJumpSnippet = nil
+                attemptedAroundLoadsByMessageId.remove(requestedMessageId)
+                if let snippet, !snippet.isEmpty {
                     sessionStore.pendingSearchScroll = snippet
                     sessionStore.pendingSearchScrollIsSnippet = true
                     jumpToSearchMatchIfNeeded(proxy)
@@ -1229,6 +1221,7 @@ struct ChatView: View {
         sessionStore.pendingMessageJump = nil
         sessionStore.pendingMessageJumpAttempts = 0
         sessionStore.pendingMessageJumpSnippet = nil
+        attemptedAroundLoadsByMessageId.remove(messageId)
         DispatchQueue.main.async {
             withAnimation(.easeInOut(duration: 0.25)) {
                 proxy.scrollTo(target, anchor: .center)

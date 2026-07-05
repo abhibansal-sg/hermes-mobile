@@ -1597,6 +1597,60 @@ async def session_messages_delta(
     return result
 
 
+@router.get("/sessions/{session_id}/messages/around")
+async def session_messages_around(
+    session_id: str,
+    request: Request,
+    around: int | None = None,
+    radius: int = 50,
+    shape: str = "full",
+):
+    """Fetch a bounded active transcript window centered on one wire row id."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if around is None or around <= 0:
+        raise HTTPException(status_code=400, detail="around must be a positive message id")
+
+    from hermes_state import SessionDB, DEFAULT_DB_PATH
+
+    if not DEFAULT_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="state.db unavailable")
+
+    db = None
+    try:
+        db = SessionDB(read_only=True)
+        if db.get_session(session_id) is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        full = db.get_messages(session_id)
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning("session_messages_around read failed for %s: %s", session_id, exc)
+        raise HTTPException(status_code=503, detail="transcript read failed")
+    finally:
+        try:
+            if db is not None and getattr(db, "_conn", None) is not None:
+                db._conn.close()
+        except Exception:
+            pass
+
+    transcript_sync = _plugin_module("transcript_sync")
+    page = transcript_sync.page_messages_around(full, around=around, radius=radius)
+    messages = transcript_sync.shape_messages(page.messages, shape)
+    return {
+        "session_id": session_id,
+        "messages": messages,
+        "shape": shape if shape in ("skeleton", "light") else "full",
+        "page": {
+            "oldest_id": page.oldest_id,
+            "has_more_before": page.has_more_before,
+            "has_more_after": page.has_more_after,
+            "target_found": page.target_found,
+            "radius": page.radius,
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Artifacts gallery — GET /artifacts
 #

@@ -41,6 +41,40 @@ final class RestClientLiveTests: XCTestCase {
         XCTAssertNil(TranscriptPageStubProtocol.requestedPath)
     }
 
+    func testTranscriptAroundFetchUsesPluginAroundRouteAndDecodesPage() async {
+        TranscriptPageStubProtocol.nextResponse = (
+            #"{"messages":[{"id":40,"role":"user","content":"target"}],"page":{"oldest_id":40,"has_more_before":true,"has_more_after":true,"target_found":true,"radius":50}}"#.data(using: .utf8)!,
+            200
+        )
+        TranscriptPageStubProtocol.requestedPath = nil
+        TranscriptPageStubProtocol.requestedQuery = nil
+        let rest = transcriptPageStubClient(pathStyle: .plugin)
+
+        let page = await fetchTranscriptAroundMessage(
+            rest: rest, sessionId: "s 1", around: 40, radius: 50
+        )
+
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/plugins/hermes-mobile/sessions/s%201/messages/around")
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedQuery, "around=40&radius=50")
+        XCTAssertEqual(page?.messages.map(\.wireId), [40])
+        XCTAssertEqual(page?.oldestId, 40)
+        XCTAssertEqual(page?.hasMoreBefore, true)
+        XCTAssertEqual(page?.hasMoreAfter, true)
+        XCTAssertEqual(page?.targetFound, true)
+    }
+
+    func testTranscriptAroundFetchIsPluginOnly() async {
+        TranscriptPageStubProtocol.requestedPath = nil
+        let rest = transcriptPageStubClient(pathStyle: .legacy)
+
+        let page = await fetchTranscriptAroundMessage(
+            rest: rest, sessionId: "s1", around: 40, radius: 50
+        )
+
+        XCTAssertNil(page)
+        XCTAssertNil(TranscriptPageStubProtocol.requestedPath)
+    }
+
     /// `GET /api/sessions?order=recent` must round-trip with its query string
     /// intact (regression: appendingPathComponent percent-encoded the "?" and
     /// the server 404'd, silently degrading the app to creation-ordered

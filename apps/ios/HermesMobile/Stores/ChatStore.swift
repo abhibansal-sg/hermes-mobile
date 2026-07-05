@@ -9,6 +9,8 @@ struct TranscriptPageFetch: Sendable {
     let messages: [StoredMessage]
     let oldestId: Int?
     let hasMoreBefore: Bool
+    let hasMoreAfter: Bool
+    let targetFound: Bool?
 }
 
 /// Plugin-only backward-paged transcript fetch. Kept outside RestClient.swift for
@@ -37,7 +39,41 @@ func fetchTranscriptPage(
         return TranscriptPageFetch(
             messages: array.compactMap(StoredMessage.init(json:)),
             oldestId: page?["oldest_id"]?.intValue,
-            hasMoreBefore: page?["has_more_before"]?.boolValue ?? false
+            hasMoreBefore: page?["has_more_before"]?.boolValue ?? false,
+            hasMoreAfter: page?["has_more_after"]?.boolValue ?? false,
+            targetFound: page?["target_found"]?.boolValue
+        )
+    } catch {
+        return nil
+    }
+}
+
+/// Plugin-only targeted transcript fetch for jump/search rows outside the
+/// cold-open tail window.
+func fetchTranscriptAroundMessage(
+    rest: RestClient,
+    sessionId: String,
+    around messageId: Int,
+    radius: Int
+) async -> TranscriptPageFetch? {
+    guard rest.pathStyle == .plugin, messageId > 0 else { return nil }
+    let encodedId = sessionId.addingPercentEncoding(
+        withAllowedCharacters: .urlPathAllowed
+    ) ?? sessionId
+    let safeRadius = max(1, radius)
+    let path = "\(rest.pathStyle.mobileAPIPrefix)/sessions/\(encodedId)/messages/around"
+        + "?around=\(messageId)&radius=\(safeRadius)"
+    do {
+        let data = try await rest.get(path: path)
+        let root = try rest.decodeJSONValue(from: data, context: "messagesAround")
+        guard let array = root["messages"]?.arrayValue else { return nil }
+        let page = root["page"]
+        return TranscriptPageFetch(
+            messages: array.compactMap(StoredMessage.init(json:)),
+            oldestId: page?["oldest_id"]?.intValue,
+            hasMoreBefore: page?["has_more_before"]?.boolValue ?? false,
+            hasMoreAfter: page?["has_more_after"]?.boolValue ?? false,
+            targetFound: page?["target_found"]?.boolValue
         )
     } catch {
         return nil
@@ -376,6 +412,10 @@ final class ChatStore {
     private(set) var transcriptHasMoreBefore = false
     private(set) var isLoadingEarlierTranscript = false
     private var oldestLoadedTranscriptWireId: Int?
+
+    #if DEBUG
+    var transcriptAroundFetchForTesting: (@MainActor (String, Int, Int) async -> TranscriptPageFetch?)?
+    #endif
 
     /// Runtime sessions whose gateway status currently reports a mid-turn
     /// context compaction. Keyed by runtime `session_id` (desktop parity): a
@@ -2464,6 +2504,47 @@ final class ChatStore {
             seed(normalized: older + messages)
         }
         noteTranscriptPaging(oldestId: page.oldestId, hasMoreBefore: page.hasMoreBefore)
+    }
+
+    /// Load a bounded server window around an exact wire id that is not present
+    /// in the current cold-open tail. Returns true only when the target row was
+    /// found and merged into the transcript.
+    @discardableResult
+    func loadTranscriptAroundMessage(_ messageId: Int) async -> Bool {
+        guard !isStreaming,
+              !isLoadingEarlierTranscript,
+              let storedId = sessions?.activeStoredId else { return false }
+        isLoadingEarlierTranscript = true
+        defer { isLoadingEarlierTranscript = false }
+
+        let radius = Self.transcriptOpenWindowLimit
+        let page: TranscriptPageFetch?
+        #if DEBUG
+        if let seam = transcriptAroundFetchForTesting {
+            page = await seam(storedId, messageId, radius)
+        } else if let rest = connection?.rest {
+            page = await fetchTranscriptAroundMessage(
+                rest: rest, sessionId: storedId, around: messageId, radius: radius
+            )
+        } else {
+            page = nil
+        }
+        #else
+        guard let rest = connection?.rest else { return false }
+        page = await fetchTranscriptAroundMessage(
+            rest: rest, sessionId: storedId, around: messageId, radius: radius
+        )
+        #endif
+
+        guard let page, page.targetFound == true, !page.messages.isEmpty else {
+            return false
+        }
+
+        let loaded = Self.toChatMessages(page.messages)
+        let loadedIds = Set(loaded.map(\.id))
+        seed(normalized: loaded + messages.filter { !loadedIds.contains($0.id) })
+        noteTranscriptPaging(oldestId: page.oldestId, hasMoreBefore: page.hasMoreBefore)
+        return true
     }
 
     /// The id of a foreign-mirror placeholder assistant row that

@@ -50,6 +50,18 @@ class MessagePage:
     has_more_before: bool
 
 
+@dataclass(frozen=True)
+class AroundMessagePage:
+    """A bounded transcript slice centered on one wire message id."""
+
+    messages: List[Dict[str, Any]]
+    oldest_id: Optional[int]
+    has_more_before: bool
+    has_more_after: bool
+    target_found: bool
+    radius: int
+
+
 def page_messages(
     messages: List[Dict[str, Any]],
     limit: Optional[int],
@@ -79,6 +91,47 @@ def page_messages(
         messages=page,
         oldest_id=oldest_id,
         has_more_before=has_more_before,
+    )
+
+
+def page_messages_around(
+    messages: List[Dict[str, Any]],
+    around: int,
+    radius: int,
+    *,
+    max_radius: int = 100,
+) -> AroundMessagePage:
+    """Return up to ``radius`` rows before/after ``around`` from active rows.
+
+    ``messages`` must be in ascending DB-id order. The result preserves that
+    order and reports whether older/newer rows exist outside the returned slice.
+    """
+    safe_radius = max(1, min(int(radius), int(max_radius)))
+    target_index = next(
+        (idx for idx, msg in enumerate(messages) if msg.get("id") == around),
+        None,
+    )
+    if target_index is None:
+        return AroundMessagePage(
+            messages=[],
+            oldest_id=None,
+            has_more_before=False,
+            has_more_after=False,
+            target_found=False,
+            radius=safe_radius,
+        )
+
+    start = max(0, target_index - safe_radius)
+    end = min(len(messages), target_index + safe_radius + 1)
+    page = list(messages[start:end])
+    oldest_id = page[0].get("id") if page else None
+    return AroundMessagePage(
+        messages=page,
+        oldest_id=oldest_id,
+        has_more_before=start > 0,
+        has_more_after=end < len(messages),
+        target_found=True,
+        radius=safe_radius,
     )
 
 
