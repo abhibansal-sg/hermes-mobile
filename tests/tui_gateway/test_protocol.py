@@ -332,9 +332,9 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
     assert "error" not in resp
     assert resp["result"]["message_count"] == 3
     assert resp["result"]["messages"] == [
-        {"role": "user", "text": "hello"},
-        {"role": "assistant", "text": "yo", "reasoning": "thoughts"},
-        {"role": "tool", "name": "tool", "context": ""},
+        {"role": "user", "text": "hello", "id": 0},
+        {"role": "assistant", "text": "yo", "reasoning": "thoughts", "id": 1},
+        {"role": "tool", "name": "tool", "context": "", "id": 2},
     ]
 
 
@@ -395,8 +395,8 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
     assert result["session_key"] == target
     assert result["message_count"] == 2
     assert result["messages"] == [
-        {"role": "user", "text": "hello"},
-        {"role": "assistant", "text": "yo"},
+        {"role": "user", "text": "hello", "id": 0},
+        {"role": "assistant", "text": "yo", "id": 1},
     ]
     # Lazy info contract (same shape session.create returns), with the session's
     # persisted model/provider restored rather than the global default.
@@ -532,8 +532,9 @@ def test_session_resume_handles_multimodal_list_content(server, monkeypatch):
         {
             "role": "user",
             "text": "describe this\ndata:image/png;base64,AAAA",
+            "id": 0,
         },
-        {"role": "assistant", "text": "ok"},
+        {"role": "assistant", "text": "ok", "id": 1},
     ]
 
 
@@ -580,7 +581,7 @@ def test_session_resume_lazy_registers_watch_session_without_agent(server, monke
     assert result["session_key"] == target
     assert result["info"]["lazy"] is True
     assert result["info"]["desktop_contract"] == server.DESKTOP_BACKEND_CONTRACT
-    assert result["messages"] == [{"role": "user", "text": "delegated goal"}]
+    assert result["messages"] == [{"role": "user", "text": "delegated goal", "id": 0}]
 
     sid = result["session_id"]
     session = server._sessions[sid]
@@ -1042,9 +1043,9 @@ def test_session_resume_live_payload_uses_current_history_with_ancestors(server,
         assert "error" not in first
         sid = first["result"]["session_id"]
         assert first["result"]["messages"] == [
-            {"role": "user", "text": "ancestor"},
-            {"role": "user", "text": "current"},
-            {"role": "assistant", "text": "current reply"},
+            {"role": "user", "text": "ancestor", "id": 0},
+            {"role": "user", "text": "current", "id": 1},
+            {"role": "assistant", "text": "current reply", "id": 2},
         ]
 
         with server._sessions[sid]["history_lock"]:
@@ -1064,11 +1065,11 @@ def test_session_resume_live_payload_uses_current_history_with_ancestors(server,
     assert "error" not in second
     assert second["result"]["session_id"] == sid
     assert second["result"]["messages"] == [
-        {"role": "user", "text": "ancestor"},
-        {"role": "user", "text": "current"},
-        {"role": "assistant", "text": "current reply"},
-        {"role": "user", "text": "new live turn"},
-        {"role": "assistant", "text": "new live reply"},
+        {"role": "user", "text": "ancestor", "id": 0},
+        {"role": "user", "text": "current", "id": 1},
+        {"role": "assistant", "text": "current reply", "id": 2},
+        {"role": "user", "text": "new live turn", "id": 3},
+        {"role": "assistant", "text": "new live reply", "id": 4},
     ]
 
 
