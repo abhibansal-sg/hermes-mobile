@@ -2087,10 +2087,14 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     billing_provider = str(
         model_config.get("billing_provider") or row.get("billing_provider") or ""
     ).strip()
+    base_url = str(model_config.get("base_url") or "").strip()
     provider = explicit_provider
     if not provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
         provider = billing_provider
-    base_url = str(model_config.get("base_url") or "").strip()
+    elif not provider and billing_provider.lower() == "custom" and base_url:
+        # Bare "custom" billing bucket WITH a real base_url names a routable
+        # direct-alias endpoint, not the unresolvable bare class dropped above.
+        provider = billing_provider
     api_mode = str(model_config.get("api_mode") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
