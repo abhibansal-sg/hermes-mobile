@@ -1,3 +1,15 @@
+Build 86 — 2026-07-05
+
+WHAT'S NEW
+- Session export on iOS (ABH-384)
+
+WORTH TRYING
+- Try: Session export on iOS (ABH-384)
+
+(+3 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 80 — "Malacca" — 2026-07-04
 RELIABILITY
 
