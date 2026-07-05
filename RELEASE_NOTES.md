@@ -1,3 +1,9 @@
+Build 87 — 2026-07-06
+
+(+2 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 86 — 2026-07-05
 
 WHAT'S NEW
