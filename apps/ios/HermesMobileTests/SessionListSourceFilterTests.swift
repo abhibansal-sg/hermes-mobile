@@ -304,6 +304,98 @@ final class SessionListSourceFilterTests: XCTestCase {
         XCTAssertEqual(store.sessions.map(\.id), ["human"])
     }
 
+    func testAutomationRunsUseAggregateProfileRailWhenMultiProfileAvailable() async throws {
+        SessionListSourceFilterStubProtocol.nextResponse = (
+            data: """
+            {
+              "sessions":[
+                {"id":"work-cron","title":"Nightly","source":"cron","profile":"work","last_active":200.0}
+              ],
+              "total":1,
+              "profile_totals":{"work":1},
+              "limit":100,
+              "offset":0,
+              "errors":[]
+            }
+            """.data(using: .utf8)!,
+            status: 200
+        )
+        SessionListSourceFilterStubProtocol.requestedURL = nil
+        let rest = makeStubbedRestClient()
+
+        let runs = try await AutomationRunsLoader.fetch(
+            rest: rest,
+            multiProfileAvailable: true
+        )
+
+        let components = try XCTUnwrap(URLComponents(
+            url: try XCTUnwrap(SessionListSourceFilterStubProtocol.requestedURL),
+            resolvingAgainstBaseURL: false
+        ))
+        let queryItems = Self.queryItems(from: components)
+        XCTAssertEqual(components.path, "/api/profiles/sessions")
+        XCTAssertEqual(queryItems["profile"], DefaultsKeys.allProfilesScope)
+        XCTAssertEqual(queryItems["source"], "cron")
+        XCTAssertEqual(queryItems["order"], "recent")
+        XCTAssertEqual(runs.map(\.id), ["work-cron"])
+        XCTAssertEqual(runs.first?.profile, "work")
+    }
+
+    func testAutomationRunsUseSingleProfileSessionsRailWhenMultiProfileUnavailable() async throws {
+        SessionListSourceFilterStubProtocol.nextResponse = (
+            data: #"{"sessions":[{"id":"default-cron","source":"cron"}],"total":1}"#.data(using: .utf8)!,
+            status: 200
+        )
+        SessionListSourceFilterStubProtocol.requestedURL = nil
+        let rest = makeStubbedRestClient()
+
+        let runs = try await AutomationRunsLoader.fetch(
+            rest: rest,
+            multiProfileAvailable: false
+        )
+
+        let components = try XCTUnwrap(URLComponents(
+            url: try XCTUnwrap(SessionListSourceFilterStubProtocol.requestedURL),
+            resolvingAgainstBaseURL: false
+        ))
+        let queryItems = Self.queryItems(from: components)
+        XCTAssertEqual(components.path, "/api/sessions")
+        XCTAssertNotEqual(components.path, "/api/profiles/sessions")
+        XCTAssertEqual(queryItems["source"], "cron")
+        XCTAssertEqual(queryItems["order"], "recent")
+        XCTAssertEqual(runs.map(\.id), ["default-cron"])
+        XCTAssertNil(runs.first?.profile)
+    }
+
+    func testAutomationRunsFilterOutNonCronRowsFromStaleServerResponse() async throws {
+        SessionListSourceFilterStubProtocol.nextResponse = (
+            data: """
+            {
+              "sessions":[
+                {"id":"keep","title":"Cron","source":"CrOn","profile":"work"},
+                {"id":"drop","title":"Chat","source":"cli","profile":"work"}
+              ],
+              "total":2,
+              "profile_totals":{"work":2},
+              "limit":100,
+              "offset":0,
+              "errors":[]
+            }
+            """.data(using: .utf8)!,
+            status: 200
+        )
+        SessionListSourceFilterStubProtocol.requestedURL = nil
+        let rest = makeStubbedRestClient()
+
+        let runs = try await AutomationRunsLoader.fetch(
+            rest: rest,
+            multiProfileAvailable: true
+        )
+
+        XCTAssertEqual(runs.map(\.id), ["keep"])
+        XCTAssertEqual(runs.first?.profile, "work")
+    }
+
     func testSessionExportFetchesFullMessagesRouteAndRendersMarkdown() async throws {
         SessionListSourceFilterStubProtocol.nextResponse = (
             data: #"{"messages":[{"id":1,"role":"user","content":"Hello"},{"id":2,"role":"assistant","content":"Hi there"}]}"#.data(using: .utf8)!,
@@ -383,6 +475,22 @@ final class SessionListSourceFilterTests: XCTestCase {
             lastActive: lastActive,
             cwd: cwd
         )
+    }
+
+    private func makeStubbedRestClient() -> RestClient {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SessionListSourceFilterStubProtocol.self]
+        return RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "test-token",
+            session: URLSession(configuration: config)
+        )
+    }
+
+    private static func queryItems(from components: URLComponents) -> [String: String] {
+        Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).compactMap { item in
+            item.value.map { (item.name, $0) }
+        })
     }
 }
 

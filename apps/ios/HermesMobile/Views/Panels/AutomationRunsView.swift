@@ -1,16 +1,18 @@
 import SwiftUI
 
 /// Flat recency feed of cron (automation) sessions, fetched via
-/// `GET /api/sessions?source=cron&order=recent`. Reachable from
+/// `GET /api/sessions?source=cron&order=recent` on a single-profile gateway,
+/// or the cross-profile aggregate rail when multi-profile is available.
+/// Reachable from
 /// ``CronJobsView`` via a toolbar button and a "Recent runs" row at the top
 /// of the jobs list. Part of the drawer bifurcation (ABH): automation runs
 /// no longer appear in the human-chat Recents — they live here instead.
 ///
 /// ## Fetch strategy
-/// Fetch-on-view: a single `sessionsWithTotal(source: "cron")` per appear,
-/// with pull-to-refresh. No separate cache — cron sessions are excluded from
-/// `SessionStore.sessions` by the bifurcation (`excludeSource: ["cron"]`),
-/// so there is nothing to alias here.
+/// Fetch-on-view: a single cron-scoped request per appear, with pull-to-refresh.
+/// No separate cache — cron sessions are excluded from `SessionStore.sessions`
+/// by the bifurcation (`excludeSource: ["cron"]`), so there is nothing to alias
+/// here.
 ///
 /// ## Open-a-run approach: `sessionStore.open(_:)` + `dismiss()`
 /// Tapping a row calls `sessionStore.open(summary)` then
@@ -78,11 +80,10 @@ struct AutomationRunsView: View {
     private func load() async {
         if phase.value == nil { phase = .loading }
         do {
-            let (sessions, _) = try await rest.sessionsWithTotal(source: "cron")
-            // Defense-in-depth: keep only cron rows even against a gateway that
-            // predates the `source` param (which would return all sources).
-            let runs = sessions.filter { ($0.source ?? "").lowercased() == "cron" }
-            phase = .loaded(runs)
+            phase = .loaded(try await AutomationRunsLoader.fetch(
+                rest: rest,
+                multiProfileAvailable: sessionStore.isMultiProfileAvailable
+            ))
         } catch {
             phase = .failed(
                 (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -98,6 +99,29 @@ struct AutomationRunsView: View {
     private func openRun(_ summary: SessionSummary) {
         sessionStore.open(summary)
         dismiss()
+    }
+}
+
+// MARK: - Loader
+
+enum AutomationRunsLoader {
+    static func fetch(
+        rest: RestClient,
+        multiProfileAvailable: Bool
+    ) async throws -> [SessionSummary] {
+        let sessions: [SessionSummary]
+        if multiProfileAvailable {
+            let result = try await rest.profileSessions(
+                profile: DefaultsKeys.allProfilesScope,
+                source: "cron"
+            )
+            sessions = result.sessions
+        } else {
+            sessions = try await rest.sessionsWithTotal(source: "cron").sessions
+        }
+        // Defense-in-depth: keep only cron rows even against a gateway that
+        // predates or ignores the `source` param and returns all sources.
+        return sessions.filter { ($0.source ?? "").lowercased() == "cron" }
     }
 }
 
