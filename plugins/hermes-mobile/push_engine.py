@@ -945,6 +945,11 @@ def notify(
     ``category`` (e.g. ``HERMES_APPROVAL``) becomes ``aps.category`` for the
     iOS action set.
 
+    In relay mode, ``event_type``/``category``/``payload`` are forwarded to the
+    relay so it can rebuild the same ``aps.category`` + ``hermes`` envelope the
+    direct APNs path emits (STR-10A) instead of only a flat, non-actionable
+    alert.
+
     Never raises: transport / credential errors are logged and swallowed so a
     push failure can never break the calling gateway hook.
     """
@@ -970,6 +975,9 @@ def notify(
                 title=title,
                 body=body,
                 source=relay_payload.get("source"),
+                event_type=event_type,
+                category=category,
+                payload=relay_payload or None,
             )
             return 1
         except Exception:

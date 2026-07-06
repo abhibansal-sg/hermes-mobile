@@ -974,6 +974,9 @@ def test_notify_relay_on_routes_to_relay_client(monkeypatch, isolated_home):
         "title": "Approval needed",
         "body": "Review in Hermes",
         "source": "telegram",
+        "event_type": "approval",
+        "category": "HERMES_APPROVAL",
+        "payload": {"session_id": "sess-1", "source": "telegram"},
     }]
 
 
