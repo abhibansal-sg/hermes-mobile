@@ -28,7 +28,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 logger = logging.getLogger(__name__)
 
@@ -3023,7 +3023,7 @@ class SessionDB:
 
     def list_sessions_rich(
         self,
-        source: str = None,
+        source: Union[str, List[str]] = None,
         exclude_sources: List[str] = None,
         cwd_prefix: str = None,
         limit: int = 20,
@@ -3099,8 +3099,15 @@ class SessionDB:
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
 
         if source:
-            where_clauses.append("s.source = ?")
-            params.append(source)
+            if isinstance(source, (list, tuple, set)):
+                sources = [s for s in source if s]
+                if sources:
+                    placeholders = ",".join("?" for _ in sources)
+                    where_clauses.append(f"s.source IN ({placeholders})")
+                    params.extend(sources)
+            else:
+                where_clauses.append("s.source = ?")
+                params.append(source)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
@@ -4945,7 +4952,7 @@ class SessionDB:
 
     def session_count(
         self,
-        source: str = None,
+        source: Union[str, List[str]] = None,
         cwd_prefix: str = None,
         min_message_count: int = 0,
         include_archived: bool = False,
@@ -4977,8 +4984,15 @@ class SessionDB:
             where_clauses.append(_LISTABLE_CHILD_SQL)
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
         if source:
-            where_clauses.append("s.source = ?")
-            params.append(source)
+            if isinstance(source, (list, tuple, set)):
+                sources = [s for s in source if s]
+                if sources:
+                    placeholders = ",".join("?" for _ in sources)
+                    where_clauses.append(f"s.source IN ({placeholders})")
+                    params.extend(sources)
+            else:
+                where_clauses.append("s.source = ?")
+                params.append(source)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
