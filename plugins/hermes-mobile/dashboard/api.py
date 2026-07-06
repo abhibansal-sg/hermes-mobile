@@ -3641,6 +3641,33 @@ class _MemoryApprovalBody(BaseModel):
     enabled: bool
 
 
+# Staged pending ids are emitted by ``write_approval.stage_write`` as
+# ``uuid.uuid4().hex[:8]`` (exactly 8 lowercase hex). This allowlist is the
+# REST boundary defense: ``write_approval.get_pending``/``discard_pending``
+# build a filesystem path from the id, so a caller-supplied value like
+# ``../skills/<id>`` would traverse out of ``pending/memory`` into a sibling
+# subsystem. We reject anything that is not ``all`` or this exact shape
+# before the id is ever passed down.
+_MEMORY_TARGET_RE = _re.compile(r"^[0-9a-f]{8}$")
+
+
+def _validate_memory_target(raw: str) -> Optional[str]:
+    """Normalize and validate a memory review target id.
+
+    Returns the validated target (``"all"`` or an 8-lowercase-hex id), or
+    ``None`` when the value is malformed — in which case the caller must
+    respond 400 without forwarding the id to ``write_approval``.
+    """
+    target = (raw or "").strip()
+    if not target:
+        return None
+    if target.lower() == "all":
+        return "all"
+    if _MEMORY_TARGET_RE.fullmatch(target):
+        return target
+    return None
+
+
 def _memory_pending_item(rec: Dict[str, Any]) -> Dict[str, Any]:
     """Project a staged memory pending record into the mobile review shape.
 
@@ -3702,8 +3729,10 @@ async def approve_memory_write(body: _MemoryIdBody, request: Request) -> Dict[st
     Body ``{id:"<pending-id>"|"all"}``. Loads a fresh on-disk MemoryStore via
     ``load_on_disk_store()``, replays each staged record via
     ``apply_memory_pending``, and discards ONLY the successful records.
-    Returns ``{approved, failed, pending_count}``. Missing/empty id -> 400;
-    unknown single id -> 404; ``all`` never 404s.
+    Returns ``{approved, failed, pending_count}``. The id is validated at the
+    REST boundary — only ``all`` or an 8-hex staged memory id is accepted;
+    anything else (missing/empty/path separator/``..``) -> 400 before any
+    filesystem access. Unknown single id -> 404; ``all`` never 404s.
     """
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -3713,12 +3742,15 @@ async def approve_memory_write(body: _MemoryIdBody, request: Request) -> Dict[st
     from tools import write_approval as wa
     from tools.memory_tool import apply_memory_pending, load_on_disk_store
 
-    target = (body.id or "").strip()
-    if not target:
-        return JSONResponse(status_code=400, content={"error": "id required"})
+    target = _validate_memory_target(body.id or "")
+    if target is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "id must be 'all' or a pending memory id"},
+        )
 
     records = wa.list_pending(wa.MEMORY)
-    if target.lower() == "all":
+    if target == "all":
         targets = list(records)
     else:
         rec = wa.get_pending(wa.MEMORY, target)
@@ -3762,7 +3794,10 @@ async def reject_memory_write(body: _MemoryIdBody, request: Request) -> Dict[str
     """Discard one (or all) staged memory writes without applying.
 
     Body ``{id:"<pending-id>"|"all"}``. Returns ``{rejected, pending_count}``.
-    Missing/empty id -> 400; unknown single id -> 404; ``all`` never 404s.
+    The id is validated at the REST boundary — only ``all`` or an 8-hex staged
+    memory id is accepted; anything else (missing/empty/path separator/``..``)
+    -> 400 before any filesystem access. Unknown single id -> 404;
+    ``all`` never 404s.
     """
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -3771,11 +3806,14 @@ async def reject_memory_write(body: _MemoryIdBody, request: Request) -> Dict[str
 
     from tools import write_approval as wa
 
-    target = (body.id or "").strip()
-    if not target:
-        return JSONResponse(status_code=400, content={"error": "id required"})
+    target = _validate_memory_target(body.id or "")
+    if target is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "id must be 'all' or a pending memory id"},
+        )
 
-    if target.lower() == "all":
+    if target == "all":
         rejected = 0
         for rec in wa.list_pending(wa.MEMORY):
             if wa.discard_pending(wa.MEMORY, rec["id"]):

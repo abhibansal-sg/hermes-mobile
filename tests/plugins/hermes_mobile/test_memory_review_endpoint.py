@@ -13,9 +13,10 @@ Covered:
   shape, missing-dir empty-not-500, skill writes never surfaced.
 * ``POST .../memory/approve``  — single apply to MEMORY.md + USER.md,
   pending removal on success, ``all`` apply, unknown id -> 404, missing
-  id -> 400.
+  id -> 400, path-traversal/``..`` id -> 400 (never reaches write_approval).
 * ``POST .../memory/reject``   — single discard without applying, ``all``
-  discard, unknown id -> 404, missing id -> 400.
+  discard, unknown id -> 404, missing id -> 400, path-traversal/``..`` id
+  -> 400 and a staged SKILL pending record is never deleted through it.
 * ``PUT  .../memory/approval`` — toggle persists ``memory.write_approval``
   and is reflected by ``write_approval_enabled`` + the pending response.
 
@@ -304,6 +305,98 @@ def test_reject_missing_id_400(client, home):
     assert client.post(
         f"{_MEM_PREFIX}/reject", json={"id": ""}, headers=_SHARED_HEADER
     ).status_code == 400
+
+
+# ===========================================================================
+# Path-traversal hardening — ids are validated at the REST boundary.
+# Regression for the STR-538 review finding: ``write_approval`` builds a
+# pending file path from the caller-supplied id, so a value like
+# ``../skills/<id>`` would traverse out of ``pending/memory`` into a sibling
+# subsystem. The boundary must 400 before any filesystem access and never
+# touch a staged SKILL pending record.
+# ===========================================================================
+
+
+def test_reject_skill_traversal_id_is_400_and_keeps_skill_pending(client, home):
+    mem = _stage_memory(content="a real memory entry")
+    skill = wa.stage_write(
+        wa.SKILLS,
+        {"action": "create", "name": "s", "content": "skill body"},
+        summary="create skill s",
+        origin="foreground",
+    )
+    traversal = f"../skills/{skill['id']}"
+
+    r = client.post(
+        f"{_MEM_PREFIX}/reject", json={"id": traversal}, headers=_SHARED_HEADER
+    )
+    assert r.status_code == 400
+    # The traversal never reached write_approval: both records are intact.
+    assert wa.get_pending(wa.SKILLS, skill["id"]) is not None
+    assert wa.get_pending(wa.MEMORY, mem["id"]) is not None
+    assert wa.pending_count(wa.SKILLS) == 1
+    assert wa.pending_count(wa.MEMORY) == 1
+
+
+def test_approve_skill_traversal_id_is_400_and_keeps_skill_pending(client, home):
+    mem = _stage_memory(content="a real memory entry")
+    skill = wa.stage_write(
+        wa.SKILLS,
+        {"action": "create", "name": "s", "content": "skill body"},
+        summary="create skill s",
+        origin="foreground",
+    )
+    traversal = f"../skills/{skill['id']}"
+
+    r = client.post(
+        f"{_MEM_PREFIX}/approve", json={"id": traversal}, headers=_SHARED_HEADER
+    )
+    assert r.status_code == 400
+    assert wa.get_pending(wa.SKILLS, skill["id"]) is not None
+    assert wa.get_pending(wa.MEMORY, mem["id"]) is not None
+    assert wa.pending_count(wa.SKILLS) == 1
+    assert wa.pending_count(wa.MEMORY) == 1
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "../skills/abc12345",  # subsystem traversal (the reported vector)
+        "abc/def",             # path separator
+        "abc\\def",            # backslash path separator
+        "..",                  # parent reference
+        "deadbeef0",           # 9 chars — wrong length
+        "deadbee",             # 7 chars — wrong length
+        "/etc/passwd",         # absolute-ish path
+    ],
+)
+def test_memory_id_boundary_rejects_malformed(client, home, bad_id):
+    # Malformed ids never reach write_approval — 400 on both surfaces.
+    assert client.post(
+        f"{_MEM_PREFIX}/reject", json={"id": bad_id}, headers=_SHARED_HEADER
+    ).status_code == 400
+    assert client.post(
+        f"{_MEM_PREFIX}/approve", json={"id": bad_id}, headers=_SHARED_HEADER
+    ).status_code == 400
+
+
+def test_memory_id_boundary_allows_real_staged_id_after_traversal_attempt(
+    client, home
+):
+    # A real staged memory id is still accepted right after a rejected
+    # traversal attempt — the allowlist does not lock out legitimate use.
+    rec = _stage_memory(content="legitimate memory entry")
+    bad = client.post(
+        f"{_MEM_PREFIX}/reject",
+        json={"id": "../skills/abc12345"},
+        headers=_SHARED_HEADER,
+    )
+    assert bad.status_code == 400
+    good = client.post(
+        f"{_MEM_PREFIX}/reject", json={"id": rec["id"]}, headers=_SHARED_HEADER
+    )
+    assert good.status_code == 200
+    assert good.json()["rejected"] == 1
 
 
 # ===========================================================================
