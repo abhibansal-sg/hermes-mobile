@@ -1072,6 +1072,54 @@ class TestWebServerEndpoints:
         assert captured["count"]["source"] == ["cron", "subagent"]
         assert captured["count"]["exclude_children"] is False
 
+    def test_get_sessions_multi_source_include_children_returns_cron_and_subagent(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="cron-root", source="cron")
+            db.create_session(
+                session_id="subagent-child",
+                source="subagent",
+                parent_session_id="cron-root",
+            )
+            db.create_session(session_id="cli-noise", source="cli")
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/sessions?limit=20&offset=0&source=cron,subagent&include_children=true"
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        ids = {session["id"] for session in data["sessions"]}
+        assert ids == {"cron-root", "subagent-child"}
+        assert data["total"] == 2
+        assert data["total"] == len(data["sessions"])
+
+    def test_get_sessions_source_cron_default_excludes_children(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="cron-root", source="cron")
+            db.create_session(
+                session_id="cron-child",
+                source="cron",
+                parent_session_id="cron-root",
+            )
+            db.create_session(session_id="subagent-child", source="subagent")
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions?limit=20&offset=0&source=cron")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert [session["id"] for session in data["sessions"]] == ["cron-root"]
+        assert data["total"] == 1
+
     def test_rename_session_updates_title(self):
         """PATCH /api/sessions/{id} renames a session (regression: the route
         was missing entirely, so the desktop rename dialog got a 405)."""
