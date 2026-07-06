@@ -126,6 +126,57 @@ def transcript_db(tmp_path, monkeypatch):
     return db_path
 
 
+@pytest.fixture
+def transcript_db_deep_page(tmp_path, monkeypatch):
+    """One owned session with a single (oldest) matching message, plus five
+    unowned 'noise' sessions whose matching messages are all newer.
+
+    Under ``sort=newest`` every noise session ranks ahead of the owner's
+    single match. This proves pagination scopes to the OWNED subset rather
+    than filtering an already-paginated global page: with ``limit=1`` the
+    top-of-page match across ALL sessions is a noise session, so a naive
+    "fetch page, then filter by ownership" approach hands the owner an empty
+    page even though it has a real, owned match further back in the ranking.
+    """
+    db_path = tmp_path / "state.db"
+    rw = SessionDB(db_path=db_path)
+    now = time.time()
+
+    rw._conn.execute(
+        "INSERT INTO sessions (id, source, started_at, title) VALUES (?, ?, ?, ?)",
+        ("owned-session", "tui", now - 1000, "Owned Session"),
+    )
+    rw._conn.execute(
+        "INSERT INTO messages (session_id, role, content, timestamp, active)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("owned-session", "user", "the secret plan is quick", now - 1000, 1),
+    )
+
+    for i in range(5):
+        sid = f"noise-session-{i}"
+        ts = now - 500 + i
+        rw._conn.execute(
+            "INSERT INTO sessions (id, source, started_at, title) VALUES (?, ?, ?, ?)",
+            (sid, "tui", ts, f"Noise Session {i}"),
+        )
+        rw._conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, active)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (sid, "user", "another quick topic", ts, 1),
+        )
+    rw._conn.commit()
+
+    cur = rw._conn.cursor()
+    SessionDB._rebuild_fts_indexes(cur)
+    rw._conn.commit()
+    rw._conn.close()
+
+    import hermes_state as hs
+
+    monkeypatch.setattr(hs, "DEFAULT_DB_PATH", db_path, raising=False)
+    return db_path
+
+
 # ---------------------------------------------------------------------------
 # GET /sessions/{session_id}/messages
 # ---------------------------------------------------------------------------
@@ -235,3 +286,65 @@ class TestSearchOwnership:
         body = r.json()
         session_ids = {row["session_id"] for row in body["results"]}
         assert session_ids == {"owned-session", "other-session"}
+
+    def test_owning_device_finds_owned_match_ranked_behind_noise(
+        self, client, devices, transcript_db_deep_page
+    ):
+        """Regression: pagination must scope to the OWNED subset, not filter
+        an already-paginated global page. All 5 noise sessions' matches are
+        newer than (and rank ahead of, under sort=newest) the owner's single
+        matching row, so a "fetch top-1 page, then filter by ownership"
+        approach returns an empty page here even though the owner has a real
+        match — that bug is exactly what this test guards against."""
+        owner, _intruder = devices
+        _own_session("owned-session", owner["device_id"])
+
+        r = client.get(
+            f"{_PREFIX}/sessions/search",
+            params={"q": "quick", "limit": 1, "sort": "newest"},
+            headers={"X-Hermes-Session-Token": owner["token"]},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["results"]) == 1, (
+            "owner must see its owned match even though it ranks behind 5 "
+            f"non-owned noise sessions; got {body['results']!r}"
+        )
+        assert body["results"][0]["session_id"] == "owned-session"
+        assert body["count"] == 1
+
+    def test_owning_device_offset_past_owned_matches_returns_empty(
+        self, client, devices, transcript_db_deep_page
+    ):
+        """Offset beyond the number of OWNED matches must return an empty
+        page, not wrap around into non-owned noise results."""
+        owner, _intruder = devices
+        _own_session("owned-session", owner["device_id"])
+
+        r = client.get(
+            f"{_PREFIX}/sessions/search",
+            params={"q": "quick", "limit": 1, "offset": 1, "sort": "newest"},
+            headers={"X-Hermes-Session-Token": owner["token"]},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["results"] == []
+        assert body["count"] == 0
+
+    def test_non_owner_device_sees_no_leak_in_deep_page(
+        self, client, devices, transcript_db_deep_page
+    ):
+        """An intruder device (owning nothing) must still see zero results
+        even when the owned-only scan has to page deep through noise."""
+        owner, intruder = devices
+        _own_session("owned-session", owner["device_id"])
+
+        r = client.get(
+            f"{_PREFIX}/sessions/search",
+            params={"q": "quick", "limit": 1, "sort": "newest"},
+            headers={"X-Hermes-Session-Token": intruder["token"]},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["results"] == []
+        assert body["count"] == 0
