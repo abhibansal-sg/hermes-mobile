@@ -440,12 +440,24 @@ final class ConnectionStore {
     /// marker for an explicit user re-attempt after cleanup.
     private var deviceIssueLimitReachedServers = Set<String>()
 
+    /// Per-server single-flight guard for silent shared-token → device-token
+    /// upgrades. Multiple reconnect/configure paths can overlap for the same
+    /// active server; only one `/devices/issue` request may be in flight for a
+    /// server at a time, and joiners await that same operation.
+    private var autoUpgradeIssueTasks: [String: Task<IssuedDevice, Error>] = [:]
+
     /// Injectable connect implementation (tests). When non-nil the reconnect
     /// loop calls this closure instead of `client.connect(...)` — the same
     /// pattern as `SessionStore.resumeRPC`. Defaults to `nil`; the live path
     /// is taken in production (the nil-check is free). Set by unit tests to
     /// make the loop deterministic without a live socket.
     var connectRPC: ((_ url: URL, _ token: String, _ mode: ConnectionMode) async throws -> Void)?
+
+    #if DEBUG
+    /// DEBUG-only test seam for deterministic auto-upgrade tests. Production
+    /// builds always call `RestClient.issueDevice(name:)` directly.
+    var issueDeviceRPC: (@Sendable (_ rest: RestClient, _ name: String) async throws -> IssuedDevice)?
+    #endif
 
     #if DEBUG
     /// Injectable configure status probe (tests). When non-nil, replaces the live
@@ -1404,9 +1416,29 @@ final class ConnectionStore {
         // Must still be the active configuration with a live token + REST client.
         guard serverURLString == serverURL, let rest else { return }
 
+        let issueTask: Task<IssuedDevice, Error>
+        if let inFlight = autoUpgradeIssueTasks[serverURL] {
+            issueTask = inFlight
+        } else {
+            #if DEBUG
+            let issueDeviceRPC = issueDeviceRPC
+            #endif
+            issueTask = Task { [rest] in
+                #if DEBUG
+                if let issueDeviceRPC {
+                    return try await issueDeviceRPC(rest, Self.deviceNameHint)
+                }
+                #endif
+                return try await rest.issueDevice(name: Self.deviceNameHint)
+            }
+            autoUpgradeIssueTasks[serverURL] = issueTask
+        }
+
+        defer { autoUpgradeIssueTasks[serverURL] = nil }
+
         let issued: IssuedDevice
         do {
-            issued = try await rest.issueDevice(name: Self.deviceNameHint)
+            issued = try await issueTask.value
         } catch DeviceIssueError.limitReached(let maxDevices) {
             handleDeviceLimitReached(serverURL: serverURL, maxDevices: maxDevices)
             return
@@ -1494,6 +1526,10 @@ final class ConnectionStore {
 
     func _isDeviceIssueLimitReachedSuppressedForTesting(serverURL: String) -> Bool {
         deviceIssueLimitReachedServers.contains(serverURL)
+    }
+
+    func _setDevicesCapabilityForTesting(_ state: ServerCapabilities.State) {
+        capabilities._setDevicesForTesting(state)
     }
     #endif
 

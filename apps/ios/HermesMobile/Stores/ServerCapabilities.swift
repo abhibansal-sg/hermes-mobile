@@ -211,6 +211,14 @@ final class ServerCapabilities {
         probedAppVersion = nil
     }
 
+    #if DEBUG
+    /// DEBUG-only test seam for stores that need to exercise capability-gated
+    /// behavior without performing live gateway probes.
+    func _setDevicesForTesting(_ state: State) {
+        devices = state
+    }
+    #endif
+
     // MARK: - Passive / derived signals
 
     /// Record the outcome of a real push-register call (from ``PushRegistrar``).

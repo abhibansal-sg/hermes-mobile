@@ -23,6 +23,13 @@ final class DevicesTests: XCTestCase {
         try JSONDecoder().decode(T.self, from: Data(json.utf8))
     }
 
+    private func issuedDeviceFixture(deviceId: String, token: String, deviceName: String = "iPhone") throws -> IssuedDevice {
+        try decodeKeyed(
+            IssuedDevice.self,
+            #"{"device_id":"\#(deviceId)","token":"\#(token)","device_name":"\#(deviceName)"}"#
+        )
+    }
+
     /// Minimal URLProtocol stub for `issueDevice` status/error tests.
     final class IssueDeviceProtocol: URLProtocol, @unchecked Sendable {
         nonisolated(unsafe) static var response: (Data, Int) = (Data(), 200)
@@ -48,6 +55,58 @@ final class DevicesTests: XCTestCase {
         }
 
         override func stopLoading() {}
+    }
+
+    actor IssueDeviceStub {
+        enum Response: Sendable {
+            case success(IssuedDevice)
+            case failure(RestError)
+        }
+
+        private var responses: [Response]
+        private let suspendFirstCall: Bool
+        private var continuations: [CheckedContinuation<Void, Never>] = []
+        private var calls = 0
+
+        init(responses: [Response], suspendFirstCall: Bool = false) {
+            self.responses = responses
+            self.suspendFirstCall = suspendFirstCall
+        }
+
+        func issue() async throws -> IssuedDevice {
+            calls += 1
+            if suspendFirstCall, calls == 1 {
+                await withCheckedContinuation { continuation in
+                    continuations.append(continuation)
+                }
+            }
+            switch responses.removeFirst() {
+            case .success(let issued):
+                return issued
+            case .failure(let error):
+                throw error
+            }
+        }
+
+        func releaseSuspended() {
+            let pending = continuations
+            continuations.removeAll()
+            for continuation in pending {
+                continuation.resume()
+            }
+        }
+
+        func callCount() -> Int {
+            calls
+        }
+
+        func waitForCallCount(_ expected: Int) async -> Bool {
+            for _ in 0..<100 {
+                if calls >= expected { return true }
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            return calls >= expected
+        }
     }
 
     private func makeIssueClient(body: Data, status: Int) -> RestClient {
@@ -516,6 +575,74 @@ final class DevicesTests: XCTestCase {
         // The auto-upgrade device-name hint is always a non-empty label (generic
         // model name acceptable per the contract's open question).
         XCTAssertFalse(ConnectionStore.deviceNameHint.isEmpty)
+    }
+
+    func testAutoUpgradeSingleFlightsOverlappingIssueForSameServer() async throws {
+        let server = "https://singleflight:9119"
+        KeychainService.deleteToken(server: server)
+        defer {
+            KeychainService.deleteToken(server: server)
+            DefaultsKeys.setDeviceId(nil, server: server)
+        }
+        let issued = try issuedDeviceFixture(deviceId: "dev_singleflight", token: "device-token-singleflight")
+        let issuer = IssueDeviceStub(responses: [.success(issued)], suspendFirstCall: true)
+        let connection = ConnectionStore(sessionStore: SessionStore(), chatStore: ChatStore())
+        connection._seedConnectedForTesting(serverURL: server, token: "shared-token")
+        connection._setDevicesCapabilityForTesting(.available)
+        connection.issueDeviceRPC = { _, _ in
+            try await issuer.issue()
+        }
+
+        async let first: Void = connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
+        let didStartIssuing = await issuer.waitForCallCount(1)
+        XCTAssertTrue(didStartIssuing)
+        async let second: Void = connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
+        try? await Task.sleep(nanoseconds: 20_000_000)
+
+        let callCountWhileSuspended = await issuer.callCount()
+        XCTAssertEqual(callCountWhileSuspended, 1)
+        await issuer.releaseSuspended()
+        _ = await (first, second)
+
+        let finalCallCount = await issuer.callCount()
+        XCTAssertEqual(finalCallCount, 1)
+        XCTAssertEqual(DefaultsKeys.deviceId(server: server), "dev_singleflight")
+        XCTAssertEqual(KeychainService.loadToken(server: server), "device-token-singleflight")
+        XCTAssertEqual(connection.rest?.token, "device-token-singleflight")
+    }
+
+    func testAutoUpgradeRetriesAfterGenericIssueFailure() async throws {
+        let server = "https://retry-after-failure:9119"
+        KeychainService.deleteToken(server: server)
+        defer {
+            KeychainService.deleteToken(server: server)
+            DefaultsKeys.setDeviceId(nil, server: server)
+        }
+        let issued = try issuedDeviceFixture(deviceId: "dev_retry", token: "device-token-retry")
+        let issuer = IssueDeviceStub(responses: [
+            .failure(.badStatus(500, body: "registry persist failed")),
+            .success(issued)
+        ])
+        let connection = ConnectionStore(sessionStore: SessionStore(), chatStore: ChatStore())
+        connection._seedConnectedForTesting(serverURL: server, token: "shared-token")
+        connection._setDevicesCapabilityForTesting(.available)
+        connection.issueDeviceRPC = { _, _ in
+            try await issuer.issue()
+        }
+
+        await connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
+        let failedCallCount = await issuer.callCount()
+        XCTAssertEqual(failedCallCount, 1)
+        XCTAssertNil(DefaultsKeys.deviceId(server: server))
+        XCTAssertNil(KeychainService.loadToken(server: server))
+        XCTAssertEqual(connection.rest?.token, "shared-token")
+
+        await connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
+        let retriedCallCount = await issuer.callCount()
+        XCTAssertEqual(retriedCallCount, 2)
+        XCTAssertEqual(DefaultsKeys.deviceId(server: server), "dev_retry")
+        XCTAssertEqual(KeychainService.loadToken(server: server), "device-token-retry")
+        XCTAssertEqual(connection.rest?.token, "device-token-retry")
     }
 
     // MARK: - Current-device marking + revoke confirmation flow logic
