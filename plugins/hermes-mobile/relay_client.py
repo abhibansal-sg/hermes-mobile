@@ -56,6 +56,12 @@ def _record_delivery_failure() -> None:
         _delivery_failure_count += 1
 
 
+def _reset_delivery_failures() -> None:
+    global _delivery_failure_count
+    with _delivery_failure_lock:
+        _delivery_failure_count = 0
+
+
 def _hermes_home(hermes_home: Path | None = None) -> Path:
     if hermes_home is not None:
         return Path(hermes_home).expanduser()
@@ -622,6 +628,7 @@ def _send_sync(
                 payload=payload,
             )
         )
+        _reset_delivery_failures()
     except RelayConfigurationError as exc:
         _record_delivery_failure()
         log.error(

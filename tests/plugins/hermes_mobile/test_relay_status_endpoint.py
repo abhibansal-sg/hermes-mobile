@@ -134,3 +134,25 @@ def test_relay_status_reports_failing_when_delivery_failures_exist(
     assert body["health"] == "failing"
     assert body["health"] != "ok"
     assert body["tunnel_status"] == {"ok": True, "agent_online": True}
+
+
+def test_relay_status_recovers_after_successful_delivery(
+    client, relay_env, monkeypatch
+):
+    relay.set_relay_config(relay_url="https://relay.example.test", hermes_home=relay_env)
+    relay._record_delivery_failure()
+    assert relay.relay_delivery_failure_count() == 1
+
+    relay._reset_delivery_failures()
+    assert relay.relay_delivery_failure_count() == 0
+
+    fake = _FakeRelayClient({"ok": True, "agent_online": True})
+    monkeypatch.setattr(relay, "relay_client", lambda: fake)
+
+    response = client.get(f"{_PREFIX}/relay/status", headers=_TOKEN_HEADER)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["configured"] is True
+    assert body["delivery_failure_count"] == 0
+    assert body["health"] != "failing"
