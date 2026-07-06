@@ -1361,7 +1361,10 @@ final class ConnectionStore {
         reconnectTask = nil
         hydrationTask?.cancel()
         hydrationTask = nil
+        chatStore.handleConnectionDrop()
+        sessionStore.clearAllTurnsInProgress()
         reauthRequired = true
+        hasConnected = false
         consecutiveReconnectFailures = 0
         phase = .needsSetup
     }
