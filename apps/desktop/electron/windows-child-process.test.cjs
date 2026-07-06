@@ -77,12 +77,14 @@ test('desktop backend launches console python so child consoles are inherited, n
 test('desktop backend teardown tree-kills Windows backend descendants', () => {
   const source = readElectronFile('main.cjs')
 
-  const helperIndex = source.indexOf('function stopBackendChild(child)')
+  assert.match(source, /require\('\.\/backend-lifecycle\.cjs'\)/)
+
+  const helperIndex = source.indexOf('async function stopBackendChildAndWait(child')
   assert.notEqual(helperIndex, -1, 'missing backend teardown helper')
-  const helperSnippet = source.slice(helperIndex, helperIndex + 500)
-  assert.match(helperSnippet, /IS_WINDOWS && Number\.isInteger\(child\.pid\)/)
-  assert.match(helperSnippet, /forceKillProcessTree\(child\.pid\)/)
-  assert.match(helperSnippet, /child\.kill\('SIGTERM'\)/)
+  const helperSnippet = source.slice(helperIndex, helperIndex + 700)
+  assert.match(helperSnippet, /terminateBackendChild\(child/)
+  assert.match(helperSnippet, /isWindows: IS_WINDOWS/)
+  assert.match(helperSnippet, /forceKillProcessTree/)
 
   const resetIndex = source.indexOf('function resetHermesConnection()')
   assert.notEqual(resetIndex, -1, 'missing resetHermesConnection')
@@ -92,9 +94,34 @@ test('desktop backend teardown tree-kills Windows backend descendants', () => {
 
   const quitIndex = source.indexOf("app.on('before-quit'")
   assert.notEqual(quitIndex, -1, 'missing before-quit handler')
-  const quitSnippet = source.slice(quitIndex, quitIndex + 900)
-  assert.match(quitSnippet, /stopBackendChild\(hermesProcess\)/)
+  const quitSnippet = source.slice(quitIndex, quitIndex + 1100)
+  assert.match(quitSnippet, /finishQuitAfterManagedBackendShutdown\(event\)/)
   assert.doesNotMatch(quitSnippet, /hermesProcess\.kill\('SIGTERM'\)/)
+
+  const willQuitIndex = source.indexOf("app.on('will-quit'")
+  assert.notEqual(willQuitIndex, -1, 'missing will-quit handler')
+  const willQuitSnippet = source.slice(willQuitIndex, willQuitIndex + 250)
+  assert.match(willQuitSnippet, /finishQuitAfterManagedBackendShutdown\(event\)/)
+
+  const finishIndex = source.indexOf('function finishQuitAfterManagedBackendShutdown(event)')
+  assert.notEqual(finishIndex, -1, 'missing shared quit lifecycle helper')
+  const finishSnippet = source.slice(finishIndex, finishIndex + 800)
+  assert.match(finishSnippet, /event\.preventDefault\(\)/)
+  assert.match(finishSnippet, /shutdownManagedBackends\(\)/)
+  assert.doesNotMatch(finishSnippet, /hermesProcess\.kill\('SIGTERM'\)/)
+})
+
+test('desktop termination signals use lifecycle shutdown path', () => {
+  const source = readElectronFile('main.cjs')
+
+  const handlerIndex = source.indexOf('function registerBackendTerminationSignalHandlers()')
+  assert.notEqual(handlerIndex, -1, 'missing backend termination signal handler registration')
+  const handlerSnippet = source.slice(handlerIndex, handlerIndex + 900)
+  assert.match(handlerSnippet, /process\.once\(signal/)
+  assert.match(handlerSnippet, /shutdownManagedBackends\(\)/)
+  assert.match(handlerSnippet, /process\.exit\(0\)/)
+  assert.doesNotMatch(handlerSnippet, /hermesProcess\.kill\('SIGTERM'\)/)
+  assert.match(source, /registerBackendTerminationSignalHandlers\(\)/)
 })
 
 test('intentional or interactive desktop child processes stay documented', () => {

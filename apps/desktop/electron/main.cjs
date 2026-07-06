@@ -45,6 +45,12 @@ const { probeGatewayWebSocket } = require('./gateway-ws-probe.cjs')
 const { adoptServedDashboardToken } = require('./dashboard-token.cjs')
 const { waitForDashboardPortAnnouncement } = require('./backend-ready.cjs')
 const { dashboardFallbackArgs, sourceDeclaresServe } = require('./backend-command.cjs')
+const {
+  reapPersistedBackendChildren,
+  removeBackendLifecycleRecord,
+  terminateBackendChild,
+  upsertBackendLifecycleRecord
+} = require('./backend-lifecycle.cjs')
 const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
 const { fetchMarketplaceThemes, searchMarketplaceThemes } = require('./vscode-marketplace.cjs')
 const { buildDesktopBackendEnv, normalizeHermesHomeRoot } = require('./backend-env.cjs')
@@ -368,6 +374,7 @@ const BOOTSTRAP_MARKER_SCHEMA_VERSION = 1
 const DESKTOP_CONNECTION_CONFIG_PATH = path.join(app.getPath('userData'), 'connection.json')
 const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.json')
 const DESKTOP_WINDOW_STATE_PATH = path.join(app.getPath('userData'), 'window-state.json')
+const DESKTOP_BACKEND_LIFECYCLE_PATH = path.join(app.getPath('userData'), 'backend-lifecycle.json')
 // active-profile.json records which Hermes profile the desktop launches its
 // local backend as. When set, startHermes() passes `hermes --profile <name>
 // dashboard …`, which deterministically pins HERMES_HOME (see
@@ -820,6 +827,8 @@ let desktopLogBuffer = ''
 let desktopLogFlushTimer = null
 let desktopLogFlushPromise = Promise.resolve()
 let nativeThemeListenerInstalled = false
+let backendShutdownPromise = null
+let startupBackendReapPromise = null
 let bootProgressState = {
   error: null,
   fakeMode: BOOT_FAKE_MODE,
@@ -5147,17 +5156,67 @@ function resetBootProgressForReconnect() {
   )
 }
 
-function stopBackendChild(child) {
-  if (!child || child.killed) return
+function trackBackendChild(child, metadata) {
+  if (!child || !Number.isInteger(child.pid)) return
   try {
-    if (IS_WINDOWS && Number.isInteger(child.pid)) {
-      forceKillProcessTree(child.pid)
-    } else {
-      child.kill('SIGTERM')
-    }
-  } catch {
-    // Already gone.
+    upsertBackendLifecycleRecord(DESKTOP_BACKEND_LIFECYCLE_PATH, {
+      pid: child.pid,
+      startedAt: new Date().toISOString(),
+      ...metadata
+    })
+  } catch (error) {
+    rememberLog(`Failed to persist backend lifecycle state: ${error.message}`)
   }
+}
+
+function updateTrackedBackendChild(child, metadata) {
+  if (!child || !Number.isInteger(child.pid)) return
+  try {
+    upsertBackendLifecycleRecord(DESKTOP_BACKEND_LIFECYCLE_PATH, {
+      pid: child.pid,
+      startedAt: new Date().toISOString(),
+      ...metadata
+    })
+  } catch (error) {
+    rememberLog(`Failed to update backend lifecycle state: ${error.message}`)
+  }
+}
+
+function forgetBackendChild(childOrPid) {
+  const pid = typeof childOrPid === 'number' ? childOrPid : childOrPid?.pid
+  if (!Number.isInteger(pid)) return
+  try {
+    removeBackendLifecycleRecord(DESKTOP_BACKEND_LIFECYCLE_PATH, pid)
+  } catch {
+    void 0
+  }
+}
+
+async function reapStartupBackendChildren() {
+  if (!startupBackendReapPromise) {
+    startupBackendReapPromise = reapPersistedBackendChildren(DESKTOP_BACKEND_LIFECYCLE_PATH, {
+      isWindows: IS_WINDOWS,
+      forceKillProcessTree,
+      logger: rememberLog
+    }).catch(error => {
+      rememberLog(`Failed to reap prior desktop backend state: ${error.message}`)
+    })
+  }
+  await startupBackendReapPromise
+}
+
+function stopBackendChild(child) {
+  void stopBackendChildAndWait(child)
+}
+
+async function stopBackendChildAndWait(child, timeoutMs = 5000) {
+  if (!child) return
+  await terminateBackendChild(child, {
+    graceMs: timeoutMs,
+    isWindows: IS_WINDOWS,
+    forceKillProcessTree
+  })
+  forgetBackendChild(child)
 }
 
 function resetHermesConnection() {
@@ -5183,31 +5242,7 @@ async function teardownPrimaryBackendAndWait() {
 }
 
 async function waitForBackendExit(child, timeoutMs = 5000) {
-  if (!child) {
-    return
-  }
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return
-  }
-
-  await new Promise(resolve => {
-    const timer = setTimeout(() => {
-      try {
-        if (IS_WINDOWS && Number.isInteger(child.pid)) {
-          forceKillProcessTree(child.pid)
-        } else {
-          child.kill('SIGKILL')
-        }
-      } catch {
-        // Already gone.
-      }
-      resolve()
-    }, timeoutMs)
-    child.once('exit', () => {
-      clearTimeout(timer)
-      resolve()
-    })
-  })
+  await stopBackendChildAndWait(child, timeoutMs)
 }
 
 // The profile the primary (window) backend runs as. readActiveDesktopProfile()
@@ -5354,6 +5389,13 @@ async function spawnPoolBackend(profile, entry) {
   )
   entry.process = child
   entry.token = token
+  const lifecycleMetadata = {
+    role: 'pool',
+    profile,
+    command: backend.command,
+    args: backend.args
+  }
+  trackBackendChild(child, lifecycleMetadata)
 
   child.stdout.on('data', rememberLog)
   child.stderr.on('data', rememberLog)
@@ -5366,11 +5408,13 @@ async function spawnPoolBackend(profile, entry) {
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
     backendPool.delete(profile)
+    forgetBackendChild(child)
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
     backendPool.delete(profile)
+    forgetBackendChild(child)
     if (!ready) {
       rejectStart?.(
         new Error(`Hermes backend for profile "${profile}" exited before it became ready (${signal || code}).`)
@@ -5386,6 +5430,7 @@ async function spawnPoolBackend(profile, entry) {
   entry.port = port
 
   const baseUrl = `http://127.0.0.1:${port}`
+  updateTrackedBackendChild(child, { ...lifecycleMetadata, baseUrl, port })
   await Promise.race([waitForHermes(baseUrl, token), startFailed])
   ready = true
   const authToken = await adoptServedDashboardToken(baseUrl, token, {
@@ -5429,6 +5474,31 @@ function stopAllPoolBackends() {
   for (const profile of [...backendPool.keys()]) {
     stopPoolBackend(profile)
   }
+}
+
+async function stopAllPoolBackendsAndWait(timeoutMs = 5000) {
+  const entries = [...backendPool.entries()]
+  backendPool.clear()
+  await Promise.all(entries.map(([, entry]) => stopBackendChildAndWait(entry.process, timeoutMs)))
+  if (poolIdleReaper) {
+    clearInterval(poolIdleReaper)
+    poolIdleReaper = null
+  }
+}
+
+async function shutdownManagedBackends(timeoutMs = 5000) {
+  if (!backendShutdownPromise) {
+    const primary = hermesProcess
+    hermesProcess = null
+    connectionPromise = null
+    backendShutdownPromise = Promise.all([
+      stopBackendChildAndWait(primary, timeoutMs),
+      stopAllPoolBackendsAndWait(timeoutMs)
+    ]).catch(error => {
+      rememberLog(`Backend shutdown failed: ${error.message}`)
+    })
+  }
+  await backendShutdownPromise
 }
 
 function profileNameFromDeleteRequest(request) {
@@ -5495,6 +5565,7 @@ async function startHermes() {
 
   connectionPromise = (async () => {
     await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
+    await reapStartupBackendChildren()
     // Resolve for the desktop's primary profile so a per-profile remote
     // override on the active profile is honored (falls back to env / global).
     const remote = await resolveRemoteBackend(primaryProfileKey())
@@ -5580,6 +5651,14 @@ async function startHermes() {
         stdio: ['ignore', 'pipe', 'pipe']
       })
     )
+    const lifecycleMetadata = {
+      role: 'primary',
+      profile: activeProfile || null,
+      command: backend.command,
+      args: backend.args
+    }
+    trackBackendChild(hermesProcess, lifecycleMetadata)
+    const primaryChild = hermesProcess
 
     hermesProcess.stdout.on('data', rememberLog)
     hermesProcess.stderr.on('data', rememberLog)
@@ -5599,6 +5678,7 @@ async function startHermes() {
         },
         { allowDecrease: true }
       )
+      forgetBackendChild(primaryChild)
       hermesProcess = null
       connectionPromise = null
       sendBackendExit({ code: null, signal: null, error: error.message })
@@ -5606,6 +5686,7 @@ async function startHermes() {
     })
     hermesProcess.once('exit', (code, signal) => {
       rememberLog(`Hermes backend exited (${signal || code})`)
+      forgetBackendChild(primaryChild)
       hermesProcess = null
       connectionPromise = null
       sendBackendExit({ code, signal })
@@ -5639,6 +5720,7 @@ async function startHermes() {
     }
 
     const baseUrl = `http://127.0.0.1:${port}`
+    updateTrackedBackendChild(hermesProcess, { ...lifecycleMetadata, baseUrl, port })
     await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
     await Promise.race([waitForHermes(baseUrl, token), backendStartFailed])
     backendReady = true
@@ -7621,7 +7703,9 @@ function configureSpellChecker() {
   }
 }
 
-app.on('before-quit', () => {
+let backendQuitCleanupComplete = false
+
+function runSynchronousQuitCleanup() {
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
@@ -7647,10 +7731,52 @@ app.on('before-quit', () => {
   for (const id of [...terminalSessions.keys()]) {
     disposeTerminalSession(id)
   }
+}
 
-  stopBackendChild(hermesProcess)
-  stopAllPoolBackends()
+function finishQuitAfterManagedBackendShutdown(event) {
+  if (backendQuitCleanupComplete) return
+  event.preventDefault()
+  runSynchronousQuitCleanup()
+
+  shutdownManagedBackends()
+    .catch(error => {
+      rememberLog(`Backend quit cleanup failed: ${error.message}`)
+    })
+    .finally(() => {
+      backendQuitCleanupComplete = true
+      app.quit()
+    })
+}
+
+app.on('before-quit', event => {
+  finishQuitAfterManagedBackendShutdown(event)
 })
+
+app.on('will-quit', event => {
+  finishQuitAfterManagedBackendShutdown(event)
+})
+
+function registerBackendTerminationSignalHandlers() {
+  const signals = process.platform === 'win32' ? ['SIGTERM', 'SIGINT'] : ['SIGTERM', 'SIGINT', 'SIGHUP']
+  for (const signal of signals) {
+    try {
+      process.once(signal, () => {
+        runSynchronousQuitCleanup()
+        shutdownManagedBackends()
+          .catch(error => {
+            rememberLog(`Backend ${signal} cleanup failed: ${error.message}`)
+          })
+          .finally(() => {
+            process.exit(0)
+          })
+      })
+    } catch {
+      void 0
+    }
+  }
+}
+
+registerBackendTerminationSignalHandlers()
 
 app.on('window-all-closed', () => {
   // macOS convention: keep the process alive in the Dock when the user closes
