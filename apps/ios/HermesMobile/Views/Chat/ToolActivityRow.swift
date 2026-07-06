@@ -53,10 +53,23 @@ struct ToolClusterView: View {
     @State private var liveScrollTarget: String? = Self.liveToolWindowBottomID
 
     var body: some View {
-        if collapsed && tools.count >= 2 {
-            collapsedCluster
-        } else {
-            liveCluster
+        Group {
+            if collapsed && tools.count >= 2 {
+                collapsedCluster
+            } else {
+                liveCluster
+            }
+        }
+        // Dismissed-id pruning MUST attach at the body level (not inside
+        // `liveCluster`) so it fires on every tool-id change regardless of
+        // whether the cluster renders collapsed, expanded, or live. A collapsed
+        // cluster never mounts `liveCluster`, so a `.onChange` living only there
+        // would let stale dismissed ids survive a tool-id change in the
+        // collapsed/summary path — which the STR-518 review flagged. The
+        // `expandedToolIDs` + scroll reset below remain live-cluster-specific.
+        .onChange(of: tools.map(\.id)) { _, ids in
+            let idSet = Set(ids)
+            dismissedToolIDs = Self.prunedDismissedIDs(dismissedToolIDs, toolIDs: idSet)
         }
     }
 
@@ -74,9 +87,8 @@ struct ToolClusterView: View {
         .onChange(of: tools.map(\.id)) { _, ids in
             let idSet = Set(ids)
             expandedToolIDs = expandedToolIDs.intersection(idSet)
-            // Prune dismissed ids that no longer exist in this cluster so a
-            // tool list change drops hides that don't apply anymore (STR-518).
-            dismissedToolIDs = Self.prunedDismissedIDs(dismissedToolIDs, toolIDs: idSet)
+            // dismissed-id pruning is handled at the body level so it also runs
+            // for collapsed/summary clusters (STR-518 review fix).
             liveScrollTarget = Self.liveToolWindowBottomID
         }
     }
@@ -488,16 +500,23 @@ struct ToolActivityRow: View {
     }
 
     /// Deterministic clipboard payload for a tool row (STR-518 parity with
-    /// desktop's `toolCopyPayload`). Prefers a substantial (>16 char, matching
-    /// desktop's `hasSubstantialOutput` threshold) ANSI-stripped result preview;
-    /// falls back to non-empty arguments; finally to the tool name. `nonisolated
-    /// static` so unit tests can verify the payload without a SwiftUI view.
+    /// desktop's `toolCopyPayload`). Precedence:
+    /// 1. substantial (>16 char, matching desktop's `hasSubstantialOutput`
+    ///    threshold) ANSI-stripped result preview;
+    /// 2. non-empty arguments;
+    /// 3. any non-empty (possibly short) ANSI-stripped result preview — desktop
+    ///    (fallback-model/index.ts:1216-1218) falls back to `detail` before the
+    ///    `title`, so a short result like "no hits" must be copied as the result,
+    ///    NOT the tool name;
+    /// 4. the tool name (last resort).
+    /// `nonisolated static` so unit tests can verify the payload without a view.
     nonisolated static func copyPayload(for activity: ToolActivity) -> String {
         let result = AnsiText.strip(activity.resultPreview)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if result.count > 16 { return result }
         let args = activity.argsSummary.trimmingCharacters(in: .whitespacesAndNewlines)
         if !args.isEmpty { return args }
+        if !result.isEmpty { return result }
         return activity.name
     }
 

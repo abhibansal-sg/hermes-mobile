@@ -434,6 +434,20 @@ final class RenderingTests: XCTestCase {
         XCTAssertEqual(ToolActivityRow.copyPayload(for: activity), "rust async runtime")
     }
 
+    func testCopyPayloadFallsBackToShortResultWhenNoArgs() {
+        // Short non-empty result + no args must copy the RESULT, not the tool
+        // name — desktop (fallback-model/index.ts:1216-1218) prefers any
+        // non-empty detail over the title. Regression for STR-518 review fix.
+        let activity = ToolActivity(
+            id: "tool-1", name: "web_search",
+            argsSummary: "", progressText: "",
+            resultPreview: "no hits",
+            state: .done, durationMs: nil, todos: nil
+        )
+        XCTAssertEqual(ToolActivityRow.copyPayload(for: activity), "no hits",
+                       "A short result with no args must copy the result, not the tool name")
+    }
+
     func testCopyPayloadFallsBackToNameWhenNoDetail() {
         let activity = ToolActivity(
             id: "tool-1", name: "mystery_tool", argsSummary: "   ",
