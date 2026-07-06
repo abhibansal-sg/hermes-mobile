@@ -45,6 +45,11 @@ struct ToolClusterView: View {
     /// immediately break the live bounded window back out to the readable flat
     /// timeline without losing the row's expanded state during that layout swap.
     @State private var expandedToolIDs: Set<String> = []
+    /// View-only/session-local hidden rows (STR-518, parity with desktop's
+    /// `tool-dismiss.ts`). Keyed by stable `ToolActivity.id`; never mutates
+    /// `ChatStore` or stored messages. Pruned to the current tool ids when the
+    /// cluster's tool list changes so stale hides don't survive a remount.
+    @State private var dismissedToolIDs: Set<String> = []
     @State private var liveScrollTarget: String? = Self.liveToolWindowBottomID
 
     var body: some View {
@@ -67,7 +72,11 @@ struct ToolClusterView: View {
             }
         }
         .onChange(of: tools.map(\.id)) { _, ids in
-            expandedToolIDs = expandedToolIDs.intersection(Set(ids))
+            let idSet = Set(ids)
+            expandedToolIDs = expandedToolIDs.intersection(idSet)
+            // Prune dismissed ids that no longer exist in this cluster so a
+            // tool list change drops hides that don't apply anymore (STR-518).
+            dismissedToolIDs = Self.prunedDismissedIDs(dismissedToolIDs, toolIDs: idSet)
             liveScrollTarget = Self.liveToolWindowBottomID
         }
     }
@@ -128,9 +137,17 @@ struct ToolClusterView: View {
         // `ToolActivity.id` is the gateway `tool_call_id`; keeping this exact
         // ForEach id stable across the 2→3 live-window threshold preserves row
         // identity while only the surrounding scroll container changes.
-        ForEach(tools, id: \.id) { tool in
+        // Dismissed rows are filtered out here so only that row disappears;
+        // siblings keep their identity (STR-518, parity with desktop).
+        ForEach(visibleTools, id: \.id) { tool in
             toolCard(for: tool)
         }
+    }
+
+    /// `tools` minus the session-locally dismissed rows. Filtering (rather than
+    /// rendering an empty placeholder) makes a dismissed row truly disappear.
+    private var visibleTools: [ToolActivity] {
+        dismissedToolIDs.isEmpty ? tools : tools.filter { !dismissedToolIDs.contains($0.id) }
     }
 
     @ViewBuilder
@@ -150,7 +167,20 @@ struct ToolClusterView: View {
             ?? TodoList(resultJSON: tool.resultPreview) {
             TodoCardView(todos: todos, state: tool.state)
         } else {
-            ToolActivityRow(activity: tool, isExpanded: expansionBinding(for: tool))
+            // Dismiss is offered only for completed/failed rows; running rows
+            // are never dismissible (STR-518). The closure mutates this view's
+            // session-local `dismissedToolIDs` only — no history mutation.
+            ToolActivityRow(
+                activity: tool,
+                isExpanded: expansionBinding(for: tool),
+                onDismiss: Self.canDismiss(state: tool.state) ? { dismiss(tool.id) } : nil
+            )
+        }
+    }
+
+    private func dismiss(_ toolID: String) {
+        withAnimation(.snappy(duration: 0.2)) {
+            dismissedToolIDs.insert(toolID)
         }
     }
 
@@ -240,6 +270,20 @@ struct ToolClusterView: View {
         return GeneratedImageToolResult(resultJSON: tool.resultPreview)
     }
 
+    /// A row is dismissible only once it has reached a terminal state
+    /// (`.done` / `.failed`). Running rows must stay visible (STR-518).
+    /// Kept static + nonisolated so tests can assert the gate directly.
+    nonisolated static func canDismiss(state: ToolActivity.State) -> Bool {
+        state == .done || state == .failed
+    }
+
+    /// Drops dismissed ids that no longer appear in the current tool list so a
+    /// cluster remount / tool-id change sheds stale hides. Matches desktop's
+    /// session-memory semantics (view-only, pruned on tool-id change).
+    nonisolated static func prunedDismissedIDs(_ dismissed: Set<String>, toolIDs: Set<String>) -> Set<String> {
+        dismissed.intersection(toolIDs)
+    }
+
     private var summaryText: String {
         Self.summaryLabel(toolCount: tools.count, elapsedSeconds: elapsedSeconds)
     }
@@ -265,11 +309,17 @@ struct ToolActivityRow: View {
     @Environment(\.hermesTheme) private var theme
 
     private let externalExpansion: Binding<Bool>?
+    /// Dismiss handler; non-`nil` only for dismissible (`.done`/`.failed`) rows.
+    /// Mutates the owning `ToolClusterView`'s session-local hide set only.
+    private let onDismiss: (() -> Void)?
     @State private var localIsExpanded = false
+    /// Transient "Copied" confirmation, mirroring `CodeBlockView`'s feedback.
+    @State private var didCopy = false
 
-    init(activity: ToolActivity, isExpanded: Binding<Bool>? = nil) {
+    init(activity: ToolActivity, isExpanded: Binding<Bool>? = nil, onDismiss: (() -> Void)? = nil) {
         self.activity = activity
         self.externalExpansion = isExpanded
+        self.onDismiss = onDismiss
     }
 
     private var expansion: Binding<Bool> {
@@ -362,6 +412,10 @@ struct ToolActivityRow: View {
             // (arguments + result) DIRECTLY — no second 'Show technical
             // detail' toggle. The collapsed row is already the summary;
             // expanding = intent to see the detail.
+            if hasCopyableDetail || onDismiss != nil {
+                detailActions
+            }
+
             if !activity.argsSummary.isEmpty {
                 detailBlock(title: "Arguments", body: activity.argsSummary)
             }
@@ -370,6 +424,81 @@ struct ToolActivityRow: View {
         }
         .padding(.top, 2)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Copy + Dismiss controls live in the EXPANDED body (not the header) so
+    /// they never compete with the disclosure caret's hit target — the same
+    /// lesson desktop applied when it moved copy out of the trailing slot
+    /// (STR-518 parity). Both are muted, plain-styled, trailing-aligned.
+    @ViewBuilder
+    private var detailActions: some View {
+        HStack(spacing: 14) {
+            Spacer(minLength: 0)
+
+            if hasCopyableDetail {
+                Button {
+                    copyResult()
+                } label: {
+                    Label(didCopy ? "Copied" : "Copy", systemImage: didCopy ? "checkmark" : "doc.on.doc")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(theme.mutedFg)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Copy tool result")
+                .accessibilityIdentifier("toolResultCopyButton")
+            }
+
+            if let onDismiss {
+                Button {
+                    onDismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(theme.mutedFg)
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss tool row")
+                .accessibilityIdentifier("toolResultDismissButton")
+            }
+        }
+    }
+
+    /// True when there's something worth copying beyond the bare tool name —
+    /// non-empty arguments or a non-empty (ANSI-stripped) result preview.
+    private var hasCopyableDetail: Bool {
+        let args = activity.argsSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !args.isEmpty { return true }
+        let result = AnsiText.strip(activity.resultPreview).trimmingCharacters(in: .whitespacesAndNewlines)
+        return !result.isEmpty
+    }
+
+    private func copyResult() {
+        // Copy the full uncapped payload (ANSI stripped), not just the visible
+        // fragment — mirrors desktop's `toolCopyPayload` precedence (STR-518).
+        UIPasteboard.general.string = Self.copyPayload(for: activity)
+        // Light haptic + transient checkmark mirrors `CodeBlockView`'s feedback.
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        withAnimation(.snappy) { didCopy = true }
+        Task {
+            try? await Task.sleep(for: .seconds(1.6))
+            withAnimation(.snappy) { didCopy = false }
+        }
+    }
+
+    /// Deterministic clipboard payload for a tool row (STR-518 parity with
+    /// desktop's `toolCopyPayload`). Prefers a substantial (>16 char, matching
+    /// desktop's `hasSubstantialOutput` threshold) ANSI-stripped result preview;
+    /// falls back to non-empty arguments; finally to the tool name. `nonisolated
+    /// static` so unit tests can verify the payload without a SwiftUI view.
+    nonisolated static func copyPayload(for activity: ToolActivity) -> String {
+        let result = AnsiText.strip(activity.resultPreview)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if result.count > 16 { return result }
+        let args = activity.argsSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !args.isEmpty { return args }
+        return activity.name
     }
 
     /// Result block: monospace, scroll-in-card (bounded height so huge outputs
