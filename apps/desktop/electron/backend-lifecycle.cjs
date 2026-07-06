@@ -160,6 +160,8 @@ async function terminateRecordedPid(pid, options = {}) {
     isWindows = process.platform === 'win32',
     forceKillProcessTree = () => {},
     killPid = (targetPid, signal) => process.kill(targetPid, signal),
+    pidExists = defaultPidExists,
+    getProcessCommandLine = targetPid => defaultProcessCommandLine(targetPid, isWindows),
     sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
   } = options
 
@@ -170,6 +172,15 @@ async function terminateRecordedPid(pid, options = {}) {
   }
 
   await sleep(graceMs)
+
+  if (!pidExists(pid)) {
+    return { signaled: true, escalated: false, cleared: 'dead' }
+  }
+
+  const liveCommandLine = getProcessCommandLine(pid)
+  if (!liveCommandLine || !looksLikeHermesBackend('', [], liveCommandLine)) {
+    return { signaled: true, escalated: false, cleared: 'reused' }
+  }
 
   try {
     if (isWindows) {
@@ -208,7 +219,8 @@ async function reapPersistedBackendChildren(statePath, options = {}) {
 
     logger(`Reaping prior desktop-managed Hermes backend pid ${record.pid} (${record.role})`)
     const terminated = await terminateRecordedPid(record.pid, options)
-    results.push({ pid: record.pid, action: 'reaped', ...terminated })
+    const action = terminated.cleared ? `cleared-${terminated.cleared}` : 'reaped'
+    results.push({ pid: record.pid, action, ...terminated })
   }
 
   try {

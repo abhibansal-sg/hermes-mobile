@@ -135,6 +135,36 @@ test('PID reuse with a non-Hermes command is not killed', async t => {
   assert.equal(fs.existsSync(statePath), false)
 })
 
+test('PID reuse after SIGTERM is not escalated', async t => {
+  const statePath = tmpStatePath(t)
+  upsertBackendLifecycleRecord(statePath, {
+    pid: 334,
+    role: 'primary',
+    command: 'hermes',
+    args: ['serve']
+  })
+
+  const kills = []
+  let commandLine = '/usr/local/bin/hermes serve --host 127.0.0.1 --port 49321'
+  const results = await reapPersistedBackendChildren(statePath, {
+    pidExists: () => true,
+    getProcessCommandLine: () => commandLine,
+    killPid: (pid, signal) => {
+      kills.push([pid, signal])
+      if (signal === 'SIGTERM') {
+        commandLine = '/usr/bin/python -m unrelated_server'
+      }
+    },
+    sleep: async () => {}
+  })
+
+  assert.deepEqual(kills, [[334, 'SIGTERM']])
+  assert.deepEqual(results, [
+    { pid: 334, action: 'cleared-reused', signaled: true, escalated: false, cleared: 'reused' }
+  ])
+  assert.equal(fs.existsSync(statePath), false)
+})
+
 test('remote mode with no local lifecycle state does not signal processes', async t => {
   const statePath = tmpStatePath(t)
   const kills = []
