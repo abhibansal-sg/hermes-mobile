@@ -22,6 +22,7 @@ final class PanelL6T12Tests: XCTestCase {
     /// ``StubProtocol``, which replies with the JSON string you supply.
     private func stubClient(returning json: String, status: Int = 200) -> RestClient {
         StubProtocol.nextResponse = (json.data(using: .utf8) ?? Data(), status)
+        StubProtocol.lastRequest = nil
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [StubProtocol.self]
         return RestClient(
@@ -114,6 +115,61 @@ final class PanelL6T12Tests: XCTestCase {
         """)
         let job = try await client.resumeCronJob(id: "job-5")
         XCTAssertFalse(job.isPaused, "Resumed job should have isPaused == false")
+    }
+
+    func testCronJobOutputsEndpointPathQueryAndMarkdownDecode() async throws {
+        let client = stubClient(returning: """
+        {
+          "job_id": "job-1",
+          "profile": "work",
+          "outputs": [
+            {
+              "id": "out-1",
+              "filename": "2026-07-06.md",
+              "run_at": "2026-07-06T09:00:00Z",
+              "created_at": "2026-07-06T09:00:03Z",
+              "size": 42,
+              "preview": "# Daily brief"
+            }
+          ],
+          "latest": {
+            "id": "out-1",
+            "filename": "2026-07-06.md",
+            "run_at": "2026-07-06T09:00:00Z",
+            "created_at": "2026-07-06T09:00:03Z",
+            "size": 42,
+            "preview": "# Daily brief",
+            "body": "# Daily brief\\n\\n- shipped **cron output**"
+          },
+          "limit": 20
+        }
+        """)
+
+        let response = try await client.cronJobOutputs(
+            jobId: "job-1",
+            profile: "work",
+            limit: 20,
+            includeLatestBody: true
+        )
+
+        let request = try XCTUnwrap(StubProtocol.lastRequest)
+        XCTAssertEqual(request.url?.path, "/api/cron/jobs/job-1/outputs")
+        let queryItems = Dictionary(
+            uniqueKeysWithValues: URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?
+                .queryItems?
+                .compactMap { item -> (String, String)? in
+                    guard let value = item.value else { return nil }
+                    return (item.name, value)
+                } ?? []
+        )
+        XCTAssertEqual(queryItems["profile"], "work")
+        XCTAssertEqual(queryItems["limit"], "20")
+        XCTAssertEqual(queryItems["include_latest_body"], "true")
+        XCTAssertEqual(response.jobId, "job-1")
+        XCTAssertEqual(response.profile, "work")
+        XCTAssertEqual(response.outputs.first?.filename, "2026-07-06.md")
+        XCTAssertEqual(response.outputs.first?.preview, "# Daily brief")
+        XCTAssertEqual(response.latest?.body, "# Daily brief\n\n- shipped **cron output**")
     }
 
     // MARK: - Skill toggle
@@ -228,11 +284,13 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {
     /// Nonisolated mutable state is acceptable in tests (single-threaded XCTest
     /// execution, no concurrent access across test cases).
     nonisolated(unsafe) static var nextResponse: (Data, Int) = (Data(), 200)
+    nonisolated(unsafe) static var lastRequest: URLRequest?
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        Self.lastRequest = request
         let (body, status) = Self.nextResponse
         let response = HTTPURLResponse(
             url: request.url!,
@@ -247,4 +305,3 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {
 
     override func stopLoading() {}
 }
-

@@ -25,6 +25,7 @@ struct CronJobsView: View {
     /// Delete confirmation.
     @State private var pendingDelete: CronJob?
     @State private var showDeleteConfirm = false
+    @State private var outputJob: CronJob?
 
     init(control: RestClient) {
         self.control = control
@@ -69,7 +70,10 @@ struct CronJobsView: View {
                                 } } },
                                 onResume: { Task { await act(job.id, toast: "Job resumed") {
                                     try await control.resumeCronJob(id: job.id)
-                                } } }
+                                } } },
+                                onViewOutput: {
+                                    outputJob = job
+                                }
                             )
                             // PSF-03: cron job rows use theme.card so the list
                             // doesn't fall through to system gray on dark palettes.
@@ -142,6 +146,9 @@ struct CronJobsView: View {
                     showToast(editorJob == nil ? "Job created" : "Job updated")
                 }
             )
+        }
+        .sheet(item: $outputJob) { job in
+            CronOutputSheet(control: control, job: job)
         }
         .confirmationDialog(
             "Delete \u{201C}\(pendingDelete?.name ?? "job")\u{201D}?",
@@ -253,6 +260,7 @@ private struct CronJobRow: View {
     let onTrigger: () -> Void
     let onPause: () -> Void
     let onResume: () -> Void
+    let onViewOutput: () -> Void
 
     @Environment(\.hermesTheme) private var theme
 
@@ -337,6 +345,10 @@ private struct CronJobRow: View {
                             }
                             .accessibilityIdentifier("cronPause_\(job.name)")
                         }
+                        Button(action: onViewOutput) {
+                            Label("Latest output", systemImage: "doc.text.magnifyingglass")
+                        }
+                        .accessibilityIdentifier("cronLatestOutput_\(job.name)")
                     }
                 }
                 .font(.caption)
@@ -418,6 +430,103 @@ private struct CronJobRow: View {
         }
         .font(.caption2)
         .foregroundStyle(deliveryFailed ? theme.statusWarn : theme.mutedFg)
+    }
+}
+
+// MARK: - Output sheet
+
+private struct CronOutputSheet: View {
+    let control: RestClient
+    let job: CronJob
+
+    @Environment(\.hermesTheme) private var theme
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var phase: PanelPhase<CronJobOutputsResponse> = .loading
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                switch phase {
+                case .loading:
+                    ProgressView("Loading output\u{2026}")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .failed(let message):
+                    ContentUnavailableView {
+                        Label("Output unavailable", systemImage: "exclamationmark.triangle")
+                    } description: {
+                        Text(message)
+                    } actions: {
+                        Button("Retry") { Task { await load() } }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .loaded(let response):
+                    if let latest = response.latest, !latest.body.isEmpty {
+                        outputBody(latest)
+                    } else {
+                        ContentUnavailableView {
+                            Label("No saved output yet", systemImage: "doc.text")
+                        } description: {
+                            Text("This job has not produced a saved local output.")
+                        } actions: {
+                            Button("Retry") { Task { await load() } }
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+            }
+            .background(theme.bg)
+            .navigationTitle("Latest Output")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .task { await load() }
+        }
+    }
+
+    private func outputBody(_ output: CronJobOutput) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(job.name)
+                        .font(.headline)
+                        .foregroundStyle(theme.fg)
+                    if let timestamp = output.runAt ?? output.createdAt,
+                       let relative = PanelFormat.relative(fromISO: timestamp) {
+                        Text("Saved \(relative)")
+                            .font(.caption)
+                            .foregroundStyle(theme.mutedFg)
+                    }
+                    if let filename = output.filename, !filename.isEmpty {
+                        Text(filename)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(theme.mutedFg)
+                    }
+                }
+
+                Divider()
+
+                Text(.init(output.body))
+                    .font(.body)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding()
+        }
+        .background(theme.bg)
+    }
+
+    private func load() async {
+        phase = .loading
+        do {
+            let response = try await control.cronJobOutputs(jobId: job.id, profile: job.profile)
+            phase = .loaded(response)
+        } catch {
+            phase = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
     }
 }
 
