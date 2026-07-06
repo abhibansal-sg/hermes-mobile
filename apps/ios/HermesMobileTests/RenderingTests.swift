@@ -126,6 +126,74 @@ final class RenderingTests: XCTestCase {
         }
     }
 
+    func testInlineDollarMathBecomesMathSegment() {
+        let segments = MessageSegmenter.segments("Use $x^2$ here")
+        XCTAssertEqual(segments.count, 3)
+        XCTAssertProse(segments[0], "Use ")
+        XCTAssertMath(segments[1], latex: "x^2", display: false)
+        XCTAssertProse(segments[2], " here")
+    }
+
+    func testDisplayDollarMathBecomesDisplayMathSegment() {
+        let segments = MessageSegmenter.segments("Before\n$$x^2 + y^2 = z^2$$\nAfter")
+        XCTAssertEqual(segments.count, 3)
+        XCTAssertProse(segments[0], "Before\n")
+        XCTAssertMath(segments[1], latex: "x^2 + y^2 = z^2", display: true)
+        XCTAssertProse(segments[2], "\nAfter")
+    }
+
+    func testBracketDisplayMathBecomesDisplayMathSegment() {
+        let segments = MessageSegmenter.segments("Before \\[x^2 + y^2 = z^2\\] after")
+        XCTAssertEqual(segments.count, 3)
+        XCTAssertProse(segments[0], "Before ")
+        XCTAssertMath(segments[1], latex: "x^2 + y^2 = z^2", display: true)
+        XCTAssertProse(segments[2], " after")
+    }
+
+    func testParenMathBecomesInlineMathSegment() {
+        let segments = MessageSegmenter.segments("Use \\(x^2\\) here")
+        XCTAssertEqual(segments.count, 3)
+        XCTAssertProse(segments[0], "Use ")
+        XCTAssertMath(segments[1], latex: "x^2", display: false)
+        XCTAssertProse(segments[2], " here")
+    }
+
+    func testEscapedDollarRemainsProse() {
+        let segments = MessageSegmenter.segments("Cost is \\$5, not math")
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertProse(segments[0], "Cost is \\$5, not math")
+    }
+
+    func testCurrencyDollarRunsRemainProse() {
+        let text = "Costs are $5 and $10 today"
+        let segments = MessageSegmenter.segments(text)
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertProse(segments[0], text)
+    }
+
+    func testMathInsideFencedCodeStaysCode() {
+        let text = """
+        ```text
+        $x^2$
+        \\[y\\]
+        ```
+        """
+        let segments = MessageSegmenter.segments(text)
+        XCTAssertEqual(segments.count, 1)
+        guard case .code(let language, let body) = segments[0] else {
+            return XCTFail("expected code, got \(segments[0])")
+        }
+        XCTAssertEqual(language, "text")
+        XCTAssertEqual(body, "$x^2$\n\\[y\\]")
+    }
+
+    func testUnclosedMathDelimiterRemainsProseWhileStreaming() {
+        let text = "Streaming $x^2"
+        let segments = MessageSegmenter.segments(text)
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertProse(segments[0], text)
+    }
+
     // MARK: - SyntaxHighlighter
 
     func testHighlighterReturnsSameCharactersAsInput() {
@@ -321,5 +389,31 @@ final class RenderingTests: XCTestCase {
                        "https://cdn.example.com/generated.png")
         XCTAssertNil(ToolClusterView.generatedImageResult(for: nonImageTool),
                      "Only image_generate should take the native image-card branch")
+    }
+
+    private func XCTAssertProse(
+        _ segment: MessageSegmenter.Segment,
+        _ expected: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case .prose(let body) = segment else {
+            return XCTFail("expected prose, got \(segment)", file: file, line: line)
+        }
+        XCTAssertEqual(body, expected, file: file, line: line)
+    }
+
+    private func XCTAssertMath(
+        _ segment: MessageSegmenter.Segment,
+        latex: String,
+        display: Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case .math(let actualLatex, let actualDisplay) = segment else {
+            return XCTFail("expected math, got \(segment)", file: file, line: line)
+        }
+        XCTAssertEqual(actualLatex, latex, file: file, line: line)
+        XCTAssertEqual(actualDisplay, display, file: file, line: line)
     }
 }
