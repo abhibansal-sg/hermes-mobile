@@ -685,7 +685,7 @@ def test_set_key_timeout_reports_validation_skipped_without_500(
     assert body["persisted"] is True
     assert body["validated"] == "skipped"
     assert "saved" in body["validation_detail"].lower()
-    assert body["provider"]["authenticated"] is True
+    assert body["provider"]["authenticated"] is False
 
 
 def test_set_key_validation_is_additive_to_existing_success_shape(
@@ -882,6 +882,44 @@ def test_custom_dispatches_set_config(loopback_client, monkeypatch):
     raw_key_in_config = any(v == "sk-custom-1" for _, v in calls["set_config"])
     assert not raw_key_in_config
     assert "sk-custom-1" not in r.text
+
+
+def test_custom_timeout_reports_validation_skipped_without_authentication(
+    loopback_client, monkeypatch
+):
+    """Skipped validation persists the custom key but must not green-light auth."""
+    api = _api()
+    monkeypatch.setattr(
+        api,
+        "_validate_provider_key",
+        lambda **_kw: {
+            "validated": "skipped",
+            "validation_detail": "validation timed out; key saved but not confirmed",
+            "persisted": True,
+        },
+        raising=False,
+    )
+    _patch_inventory(monkeypatch, rows=[])
+    _patch_config(monkeypatch)
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/custom",
+        json={
+            "name": "myco",
+            "base_url": "https://api.my.co/v1",
+            "api_mode": "openai",
+            "api_key": "sk-custom-timeout",
+        },
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["persisted"] is True
+    assert body["validated"] == "skipped"
+    assert "saved" in body["validation_detail"].lower()
+    assert body["provider"]["authenticated"] is False
+    assert "sk-custom-timeout" not in r.text
 
 
 def test_custom_rejects_bad_base_url(loopback_client, monkeypatch):
