@@ -213,6 +213,13 @@ private struct SplitLayout: View {
     @Environment(ThemeStore.self) private var themeStore
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
+    /// Live-reactive read of the persisted subagents section preference (STR-2 /
+    /// ABH-421 / STR-241): gates the iPad subagent inspector toggle + tab the same
+    /// way `ChatView.showSubagentAffordance` gates the iPhone toolbar affordance.
+    /// `@AppStorage` (not a one-shot `DefaultsKeys` read) so a Settings change
+    /// applies immediately without reconnect.
+    @AppStorage(DefaultsKeys.transcriptSectionSubagentsEnabled) private var transcriptSubagentsEnabled = true
+
     /// Drives the optional inspector column (the approval inbox). Starts hidden;
     /// toggled from the detail toolbar.
     @State private var showingInspector = false
@@ -340,9 +347,14 @@ private struct SplitLayout: View {
     }
 
     /// Whether the iPad subagent inspector toggle should appear (F4A-A2): the
-    /// gateway emitted subagent frames AND there is delegation activity.
+    /// subagents section is enabled (STR-2 / ABH-421 / STR-241 client-only pref)
+    /// AND the gateway emitted subagent frames AND there is delegation activity.
     private var showSubagentInspector: Bool {
-        connection.capabilities.subagentEvents == .available && chat.hasSubagentActivity
+        RootInspectorPolicy.showSubagentInspector(
+            sectionEnabled: transcriptSubagentsEnabled,
+            subagentEventsAvailable: connection.capabilities.subagentEvents == .available,
+            hasSubagentActivity: chat.hasSubagentActivity
+        )
     }
 
     private var subagentInspectorToggleButton: some View {
@@ -395,6 +407,17 @@ private struct SplitLayout: View {
             // way back (R1 #55). Snap it home when the tree empties.
             .onChange(of: chat.hasSubagentActivity) { _, hasActivity in
                 if !hasActivity && inspectorTab == .subagents {
+                    inspectorTab = .inbox
+                }
+            }
+            // STR-2 / ABH-421 / STR-241: the same stuck-tab hazard (R1 #55)
+            // applies when the user disables the Subagents section from
+            // Settings while the inspector is open on that tab — snap back to
+            // Inbox so the segmented picker/toggle disappearing (both gated on
+            // `showSubagentInspector`) never strands a tab with nothing to
+            // pick it back from.
+            .onChange(of: transcriptSubagentsEnabled) { _, enabled in
+                if !enabled && inspectorTab == .subagents {
                     inspectorTab = .inbox
                 }
             }
@@ -486,6 +509,24 @@ private struct SplitLayout: View {
     private func interrupt() {
         guard chat.isStreaming else { return }
         Task { await chat.interrupt() }
+    }
+}
+
+// MARK: - iPad subagent inspector gating seam (STR-2 / ABH-421 / STR-241)
+
+/// Pure gating logic for ``SplitLayout``'s subagent inspector toggle/tab, kept
+/// free of `ConnectionStore`/`ChatStore`/`@AppStorage` so the AND-of-three-
+/// conditions is unit-testable without a live environment. Mirrors
+/// `ChatView.showSubagentAffordance`'s iPhone-side gating exactly: the
+/// persisted client-only section preference must be on, on top of the
+/// existing gateway-capability + activity gates.
+enum RootInspectorPolicy {
+    static func showSubagentInspector(
+        sectionEnabled: Bool,
+        subagentEventsAvailable: Bool,
+        hasSubagentActivity: Bool
+    ) -> Bool {
+        sectionEnabled && subagentEventsAvailable && hasSubagentActivity
     }
 }
 
