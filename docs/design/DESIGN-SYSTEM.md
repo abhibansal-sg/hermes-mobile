@@ -212,11 +212,11 @@ Telegram empty ("No Telegram chats yet") are the references.
 
 ## 6. Density & rhythm
 
-- **Screen margin = 16pt (`base`).** One left rail; icons, labels, rows align to
+- **Screen margin = 16pt (`lg`).** One left rail; icons, labels, rows align to
   it. This is the single most-cited alignment rule at the gate.
 - **Vertical rhythm** steps on the spacing scale: `md` inside a component,
-  `base` between rows/sections within a group, `lg` between distinct sections,
-  `xl`/`xxl` for hero breaks. No off-grid gaps.
+  `lg` between rows/sections within a group, `xl` between distinct sections,
+  `xxl` for hero breaks. No off-grid gaps.
 - **Information density** is judged per size class against this spec (PERCEPTION-
   QA §3b/c). iPhone tolerates less density than iPad; a screen that's airy on
   iPad may be sparse-to-empty on iPhone (the drawer's large bottom void with one

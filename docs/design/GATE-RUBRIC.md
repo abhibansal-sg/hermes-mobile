@@ -78,10 +78,11 @@ Each dimension: what to check, the citable rule, and the instant-BLOCK line.
   content surface wrapped in glass.
 
 ### R5 — Spacing & alignment (grid)
-- Spacing snaps to the 8-derived scale (`hair/xs/sm/md/base/lg/xl/xxl`). No
-  off-grid literals (`5/7/9/20`).
-- One 16pt (`base`) screen-margin rail; icons, labels, rows align to it.
-- Radii snap to `sm/md/lg/xl/capsule`; no `10/14`. Nested corners concentric.
+- Spacing snaps to the 4-pt ramp (`xs/sm/md/lg/xl/xxl`). No off-grid literals
+  (`5/7/9/20`).
+- One 16pt (`lg`) screen-margin rail; icons, labels, rows align to it.
+- Radii snap to `sm/md/lg/xl/pill`; no off-grid radii (`10/20`). `14` is the
+  sanctioned `lg` radius, not off-grid. Nested corners concentric.
 - Cite: `DESIGN §Layout`, `DESIGN §Shapes`, `DS §6`.
 - **BLOCK:** off-grid spacing/radius introduced by the PR; rows anchoring to
   different left rails (the drawer session-row-vs-nav-row defect).
