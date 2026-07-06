@@ -1,8 +1,8 @@
 import Foundation
 
-/// Splits assistant markdown into an ordered list of prose / code segments so
-/// the bubble can render prose as inline markdown and code in a syntax-aware
-/// card.
+/// Splits assistant markdown into an ordered list of prose / code / math
+/// segments so the bubble can render prose as inline markdown, fenced code in a
+/// syntax-aware card, and LaTeX math with a native math view.
 ///
 /// The split is driven by triple-backtick fences (```). An opening fence may
 /// carry an info string (the language hint, e.g. ```` ```swift ````); the
@@ -14,10 +14,11 @@ import Foundation
 /// matches how terminals and other chat clients render streaming code.
 enum MessageSegmenter {
 
-    /// A contiguous run of either prose or fenced code.
+    /// A contiguous run of prose, fenced code, or LaTeX math.
     enum Segment: Identifiable, Equatable, Sendable {
         case prose(String)
         case code(language: String?, body: String)
+        case math(latex: String, display: Bool)
 
         /// Stable-enough identity for `ForEach`. The index prefix keeps
         /// otherwise-identical adjacent segments distinct.
@@ -27,6 +28,8 @@ enum MessageSegmenter {
                 return "p:\(text.hashValue)"
             case .code(let language, let body):
                 return "c:\(language ?? "")|\(body.hashValue)"
+            case .math(let latex, let display):
+                return "m:\(display ? "d" : "i")|\(latex.hashValue)"
             }
         }
     }
@@ -62,7 +65,7 @@ enum MessageSegmenter {
             // Drop a run that is purely empty lines between two code blocks so
             // we don't emit blank prose bubbles; keep meaningful whitespace.
             if !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                result.append(.prose(body))
+                result.append(contentsOf: proseAndMathSegments(body))
             }
             proseLines.removeAll(keepingCapacity: true)
         }
@@ -133,5 +136,220 @@ enum MessageSegmenter {
             index = line.index(after: index)
         }
         return line[index...]
+    }
+
+    // MARK: - Math recognition
+
+    private struct MathMatch {
+        let start: String.Index
+        let contentStart: String.Index
+        let contentEnd: String.Index
+        let end: String.Index
+        let display: Bool
+    }
+
+    /// Split a prose run further around clear LaTeX math delimiters. This pass is
+    /// intentionally conservative for single-dollar math so normal currency prose
+    /// remains untouched and streaming tails with unclosed delimiters stay prose.
+    private static func proseAndMathSegments(_ text: String) -> [Segment] {
+        var segments: [Segment] = []
+        var cursor = text.startIndex
+        var proseStart = cursor
+
+        while cursor < text.endIndex {
+            guard let match = mathMatch(in: text, from: cursor) else {
+                cursor = text.index(after: cursor)
+                continue
+            }
+
+            if proseStart < match.start {
+                segments.append(.prose(String(text[proseStart..<match.start])))
+            }
+
+            let latex = String(text[match.contentStart..<match.contentEnd])
+            segments.append(.math(latex: latex, display: match.display))
+            cursor = match.end
+            proseStart = cursor
+        }
+
+        if proseStart < text.endIndex {
+            segments.append(.prose(String(text[proseStart..<text.endIndex])))
+        }
+
+        return segments
+    }
+
+    private static func mathMatch(in text: String, from start: String.Index) -> MathMatch? {
+        guard !isEscaped(start, in: text) else { return nil }
+
+        if text[start] == "\\" {
+            let next = text.index(after: start)
+            guard next < text.endIndex else { return nil }
+            if text[next] == "(" {
+                return pairedDelimiterMatch(in: text, start: start, openingLength: 2, closing: "\\)", display: false)
+            }
+            if text[next] == "[" {
+                return pairedDelimiterMatch(in: text, start: start, openingLength: 2, closing: "\\]", display: true)
+            }
+            return nil
+        }
+
+        guard text[start] == "$" else { return nil }
+        let afterDollar = text.index(after: start)
+
+        if afterDollar < text.endIndex, text[afterDollar] == "$" {
+            return dollarDisplayMatch(in: text, start: start)
+        }
+
+        return dollarInlineMatch(in: text, start: start)
+    }
+
+    private static func pairedDelimiterMatch(
+        in text: String,
+        start: String.Index,
+        openingLength: Int,
+        closing: String,
+        display: Bool
+    ) -> MathMatch? {
+        let contentStart = text.index(start, offsetBy: openingLength)
+        guard let closeStart = findUnescaped(closing, in: text, from: contentStart) else {
+            return nil
+        }
+        let content = text[contentStart..<closeStart]
+        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return MathMatch(
+            start: start,
+            contentStart: contentStart,
+            contentEnd: closeStart,
+            end: text.index(closeStart, offsetBy: closing.count),
+            display: display
+        )
+    }
+
+    private static func dollarDisplayMatch(in text: String, start: String.Index) -> MathMatch? {
+        let contentStart = text.index(start, offsetBy: 2)
+        guard contentStart < text.endIndex,
+              let closeStart = findUnescaped("$$", in: text, from: contentStart)
+        else { return nil }
+
+        let content = text[contentStart..<closeStart]
+        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !containsUnescapedDollar(content)
+        else { return nil }
+
+        return MathMatch(
+            start: start,
+            contentStart: contentStart,
+            contentEnd: closeStart,
+            end: text.index(closeStart, offsetBy: 2),
+            display: true
+        )
+    }
+
+    private static func dollarInlineMatch(in text: String, start: String.Index) -> MathMatch? {
+        let contentStart = text.index(after: start)
+        guard contentStart < text.endIndex,
+              !text[contentStart].isWhitespace,
+              !text[contentStart].isNumber
+        else { return nil }
+
+        var cursor = contentStart
+        while cursor < text.endIndex {
+            if text[cursor] == "$", !isEscaped(cursor, in: text) {
+                let content = text[contentStart..<cursor]
+                guard isValidInlineDollarContent(content, in: text, closingAt: cursor) else {
+                    return nil
+                }
+                return MathMatch(
+                    start: start,
+                    contentStart: contentStart,
+                    contentEnd: cursor,
+                    end: text.index(after: cursor),
+                    display: false
+                )
+            }
+            cursor = text.index(after: cursor)
+        }
+
+        return nil
+    }
+
+    private static func isValidInlineDollarContent(
+        _ content: Substring,
+        in text: String,
+        closingAt close: String.Index
+    ) -> Bool {
+        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !content.contains(where: { $0.isNewline }),
+              content.last?.isWhitespace != true,
+              !containsUnescapedDollar(content)
+        else { return false }
+
+        let afterClose = text.index(after: close)
+        if afterClose < text.endIndex, text[afterClose].isNumber {
+            return false
+        }
+
+        return true
+    }
+
+    private static func findUnescaped(
+        _ needle: String,
+        in text: String,
+        from start: String.Index
+    ) -> String.Index? {
+        var cursor = start
+        while cursor < text.endIndex {
+            if text[cursor...].hasPrefix(needle), !isEscaped(cursor, in: text) {
+                return cursor
+            }
+            cursor = text.index(after: cursor)
+        }
+        return nil
+    }
+
+    private static func containsUnescapedDollar(_ content: Substring) -> Bool {
+        var cursor = content.startIndex
+        while cursor < content.endIndex {
+            if content[cursor] == "$", !isEscaped(cursor, in: content) {
+                return true
+            }
+            cursor = content.index(after: cursor)
+        }
+        return false
+    }
+
+    private static func isEscaped(_ index: String.Index, in text: String) -> Bool {
+        guard index > text.startIndex else { return false }
+        var slashCount = 0
+        var cursor = text.index(before: index)
+        while true {
+            if text[cursor] == "\\" {
+                slashCount += 1
+            } else {
+                break
+            }
+            if cursor == text.startIndex { break }
+            cursor = text.index(before: cursor)
+        }
+        return slashCount % 2 == 1
+    }
+
+    private static func isEscaped(_ index: Substring.Index, in text: Substring) -> Bool {
+        guard index > text.startIndex else { return false }
+        var slashCount = 0
+        var cursor = text.index(before: index)
+        while true {
+            if text[cursor] == "\\" {
+                slashCount += 1
+            } else {
+                break
+            }
+            if cursor == text.startIndex { break }
+            cursor = text.index(before: cursor)
+        }
+        return slashCount % 2 == 1
     }
 }

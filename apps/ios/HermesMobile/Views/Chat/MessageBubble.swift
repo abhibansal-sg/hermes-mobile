@@ -462,11 +462,10 @@ struct MessageBubble: View {
         }
     }
 
-    /// Render the assistant text as ordered prose / code segments (E3 segmenter):
-    /// prose runs become inline-markdown `Text`, fenced code becomes a
-    /// `CodeBlockView`. The streaming cursor rides the last prose segment — or
-    /// stands alone when the streaming tail is a code block, so the code card
-    /// never gets a stray glyph.
+    /// Render the assistant text as ordered prose / code / math segments (E3
+    /// segmenter): prose runs become inline-markdown `Text`, fenced code becomes
+    /// a `CodeBlockView`, and LaTeX math becomes `MathSegmentView`. The streaming
+    /// cursor is a standalone sibling so code/math cards never get a stray glyph.
     private func assistantText(_ text: String, showsCursor: Bool) -> some View {
         // Memoized segmentation (RenderCache): a flick-scroll re-realizes this
         // row without changing `text`, so the segment scan is an O(1) cache hit
@@ -498,6 +497,8 @@ struct MessageBubble: View {
                     }
                 case .code(let language, let body):
                     CodeBlockView(language: language, code: body)
+                case .math(let latex, let display):
+                    MathSegmentView(latex: latex, display: display)
                 }
             }
             // CC-01 / round-2: the breathing streaming cursor is a single
