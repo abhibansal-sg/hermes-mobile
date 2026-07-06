@@ -3044,10 +3044,18 @@ async def set_provider_key(
     Validates ``slug`` is a known PROVIDER_REGISTRY entry with
     ``auth_type == "api_key"`` (else 4003 "set up on desktop" for OAuth-only
     providers — they cannot be provisioned from a key alone). Honours
-    is_managed() (4006 read-only for managed installs). Persists via the stock
-    ``save_env_value`` + mirrors into os.environ so the refreshed inventory
-    sees it immediately (parity with stock model.save_key). Returns the
-    refreshed provider row with models populated. NEVER echoes the key.
+    is_managed() (4006 read-only for managed installs).
+
+    STR-274 (STR-108 child): validates the submitted key BEFORE persisting
+    it. A definitive rejection (``validated: False``) is never written to
+    ``.env``/``os.environ`` — the response reports ``persisted: false`` and
+    any prior working credential in ``os.environ`` is left untouched, so a
+    later ``GET /providers`` reload can't green-heal off a bad key that was
+    never saved. ``validated: true`` and ``validated: "skipped"`` persist via
+    the stock ``save_env_value`` + mirror into ``os.environ`` (parity with
+    stock model.save_key) — ambiguous/unreachable validation must not lose
+    the user-entered key. Returns the refreshed provider row with models
+    populated. NEVER echoes the key.
     """
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -3121,16 +3129,6 @@ async def set_provider_key(
             },
         )
 
-    try:
-        save_env_value(env_var, api_key)
-    except ValueError as exc:
-        return JSONResponse(
-            status_code=400, content={"error": str(exc), "code": 4001}
-        )
-    # Mirror into the live process so the refreshed inventory row sees the key
-    # (parity with stock model.save_key).
-    os.environ[env_var] = api_key
-
     base_url = ""
     if getattr(pconfig, "base_url_env_var", ""):
         base_url = os.environ.get(pconfig.base_url_env_var, "") or ""
@@ -3143,6 +3141,13 @@ async def set_provider_key(
             api_mode = extra.get("api_mode")
     if not api_mode and getattr(pconfig, "id", "") == "anthropic":
         api_mode = "anthropic_messages"
+
+    # STR-274 (STR-108 child): validate BEFORE persisting. A definitive
+    # rejection (validated is False, 401/403-class) must not overwrite the
+    # previous env/.env/live-process credential state — otherwise a follow-up
+    # GET /providers would green-heal on mere env-var presence. Ambiguous /
+    # unreachable results (validated:"skipped") still persist, since a
+    # transient network issue must not lose the user-entered key.
     validation = await asyncio.to_thread(
         _validate_provider_key,
         api_key=api_key,
@@ -3150,6 +3155,22 @@ async def set_provider_key(
         api_mode=api_mode,
         timeout=_PROVIDER_KEY_VALIDATION_TIMEOUT_SECONDS,
     )
+
+    persisted = validation.get("validated") is not False
+    if persisted:
+        try:
+            save_env_value(env_var, api_key)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=400, content={"error": str(exc), "code": 4001}
+            )
+        # Mirror into the live process so the refreshed inventory row sees the
+        # key (parity with stock model.save_key).
+        os.environ[env_var] = api_key
+    else:
+        detail = validation.get("validation_detail") or "provider rejected the API key"
+        validation["validation_detail"] = f"{detail} — key was not saved"
+    validation["persisted"] = persisted
 
     _provider_audit(request, "key set", slug)
 
@@ -3201,6 +3222,15 @@ async def add_custom_provider(
     removed (mirrors the DELETE handler's backward-compat ``key_env``
     preference); any legacy inline ``api_key`` is stripped from config.yaml as
     part of the upsert. Non-credential tuning is preserved.
+
+    STR-274 (STR-108 child): validates the submitted key BEFORE any of the
+    above writes happen. A definitive rejection (``validated: False``) short-
+    circuits the whole persist block: for a brand-new provider nothing is
+    written to .env/config.yaml/os.environ; for an edit/rotate of an existing
+    custom provider the previous ``providers.<name>`` config and previous
+    env-var value are left untouched (no old-key removal, no credential
+    strip, no upsert). The response reports ``persisted: false``.
+    ``validated: true``/``"skipped"`` persist as before.
     """
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -3315,34 +3345,12 @@ async def add_custom_provider(
         else None
     )
 
-    try:
-        # Remove the OLD env var ONLY when it differs from the newly-derived
-        # one (an in-place edit that already uses the current scheme must not
-        # delete-then-recreate the var it's about to write).
-        if old_key_env and old_key_env != env_var:
-            try:
-                remove_env_value(old_key_env)
-            except ValueError:
-                pass
-        # Strip any legacy inline api_key / stale key_env from config so a raw
-        # secret never survives the upsert in config.yaml. Non-credential
-        # tuning (base_url/api_mode/name/etc.) on the existing entry is
-        # preserved — the set_config_value calls below then overwrite it with
-        # this request's values.
-        if existing_entry is not None:
-            _remove_custom_provider_credentials_from_config(name)
-
-        save_env_value(env_var, api_key)
-        set_config_value(f"providers.{name}.name", name)
-        set_config_value(f"providers.{name}.base_url", base_url)
-        set_config_value(f"providers.{name}.api_mode", api_mode)
-        set_config_value(f"providers.{name}.key_env", env_var)
-    except ValueError as exc:
-        return JSONResponse(
-            status_code=400, content={"error": str(exc), "code": 4001}
-        )
-
-    os.environ[env_var] = api_key
+    # STR-274 (STR-108 child): validate BEFORE persisting. A definitive
+    # rejection must not touch .env/config.yaml/os.environ at all — for a
+    # brand-new custom provider that means nothing is left behind; for an
+    # edit/rotate of an EXISTING custom provider it means the previous
+    # providers.<name> config and previous env-var value are left exactly as
+    # they were (no old-key removal, no credential strip, no upsert).
     if preserving_unknown_api_mode:
         validation = _provider_key_validation_payload(
             "skipped",
@@ -3357,6 +3365,40 @@ async def add_custom_provider(
             api_mode=api_mode,
             timeout=_PROVIDER_KEY_VALIDATION_TIMEOUT_SECONDS,
         )
+
+    persisted = validation.get("validated") is not False
+    if persisted:
+        try:
+            # Remove the OLD env var ONLY when it differs from the newly-derived
+            # one (an in-place edit that already uses the current scheme must not
+            # delete-then-recreate the var it's about to write).
+            if old_key_env and old_key_env != env_var:
+                try:
+                    remove_env_value(old_key_env)
+                except ValueError:
+                    pass
+            # Strip any legacy inline api_key / stale key_env from config so a raw
+            # secret never survives the upsert in config.yaml. Non-credential
+            # tuning (base_url/api_mode/name/etc.) on the existing entry is
+            # preserved — the set_config_value calls below then overwrite it with
+            # this request's values.
+            if existing_entry is not None:
+                _remove_custom_provider_credentials_from_config(name)
+
+            save_env_value(env_var, api_key)
+            set_config_value(f"providers.{name}.name", name)
+            set_config_value(f"providers.{name}.base_url", base_url)
+            set_config_value(f"providers.{name}.api_mode", api_mode)
+            set_config_value(f"providers.{name}.key_env", env_var)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=400, content={"error": str(exc), "code": 4001}
+            )
+        os.environ[env_var] = api_key
+    else:
+        detail = validation.get("validation_detail") or "provider rejected the API key"
+        validation["validation_detail"] = f"{detail} — key was not saved"
+    validation["persisted"] = persisted
 
     _provider_audit(request, "custom provider added", name)
 
