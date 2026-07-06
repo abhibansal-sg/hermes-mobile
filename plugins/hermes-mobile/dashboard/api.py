@@ -1384,6 +1384,11 @@ async def unregister_live_activity(body: LiveActivityBody, request: Request) -> 
 
 _SEARCH_LIMIT_MAX = 100
 _SEARCH_LIMIT_DEFAULT = 20
+# Hard cap on rows scanned from the underlying (unscoped) FTS query when a
+# device-token request needs to paginate within its OWNED-only subset — see
+# FIX #4 below. Bounds worst-case work for a device with few/no owned matches
+# in a large corpus.
+_SEARCH_OWNED_SCAN_MAX = 2000
 
 
 @router.get("/sessions/search")
@@ -1458,14 +1463,62 @@ async def search_sessions(
 
         # Hide autonomous machinery (cron runs, subagent children) AND tool/child
         # sessions, matching the native session_search hidden-sources set.
-        matches = db.search_messages(
-            query=q.strip(),
-            exclude_sources=["machinery", "cron", "subagent", "tool"],
-            role_filter=role_filter,
-            limit=limit,
-            offset=offset,
-            sort=sort_norm,
-        )
+        exclude_sources = ["machinery", "cron", "subagent", "tool"]
+
+        # FIX #3 — scope results to sessions this request owns.
+        # Shared-token/host-trusted requests keep the legacy whole-profile
+        # search (_device_owns_session returns True unconditionally for
+        # them). Device-token requests must not see, or leak titles/snippets
+        # for, sessions correlated to a different device; missing/ambiguous
+        # ownership fails closed via _device_owns_session.
+        owns_cache: Dict[str, bool] = {}
+
+        def _owns(sid: str) -> bool:
+            if sid not in owns_cache:
+                owns_cache[sid] = _device_owns_session(request, sid)
+            return owns_cache[sid]
+
+        if _request_device_id(request) is None:
+            # Shared-token/host-trusted: legacy single-page whole-profile
+            # query — _owns() is a no-op True for every row.
+            matches = db.search_messages(
+                query=q.strip(),
+                exclude_sources=exclude_sources,
+                role_filter=role_filter,
+                limit=limit,
+                offset=offset,
+                sort=sort_norm,
+            )
+        else:
+            # FIX #4 — device-token requests must paginate WITHIN the owned
+            # subset, not filter a global page post-hoc. Filtering the global
+            # page after the fact (the previous approach) can hand back a
+            # short or empty page even when the device owns matching content
+            # ranked further down, because non-owned rows occupy page slots
+            # before being discarded. Instead, re-run the (stock, unmodified)
+            # FTS query with a growing limit — starting at offset+limit and
+            # scaling up — until the owned subset covers this request's
+            # window or the underlying result set is exhausted, then slice
+            # the window ourselves. Capped at _SEARCH_OWNED_SCAN_MAX.
+            needed = offset + limit
+            scan_limit = min(needed, _SEARCH_OWNED_SCAN_MAX)
+            owned_matches: List[Dict[str, Any]] = []
+            while True:
+                batch = db.search_messages(
+                    query=q.strip(),
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                    limit=scan_limit,
+                    offset=0,
+                    sort=sort_norm,
+                )
+                owned_matches = [m for m in batch if _owns(m.get("session_id") or "")]
+                if len(owned_matches) >= needed or len(batch) < scan_limit:
+                    break
+                if scan_limit >= _SEARCH_OWNED_SCAN_MAX:
+                    break
+                scan_limit = min(scan_limit * 4, _SEARCH_OWNED_SCAN_MAX)
+            matches = owned_matches[offset:offset + limit]
 
         # FIX #2 — look up session titles separately.
         # search_messages SELECT does not return s.title (and we do not modify
@@ -1547,6 +1600,8 @@ async def session_messages_delta(
     """
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_owns_session(request, session_id):
+        raise HTTPException(status_code=403, detail="Device token does not own session")
 
     from hermes_state import SessionDB, DEFAULT_DB_PATH
 
