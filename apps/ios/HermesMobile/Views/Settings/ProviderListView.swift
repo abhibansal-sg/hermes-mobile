@@ -22,6 +22,20 @@ import SwiftUI
 // once, then deletes the Keychain copy (the gateway is the source of truth).
 // The key is never logged; `RestError` already truncates response bodies.
 
+enum AuthenticatedRowTapDestination: Equatable, Sendable {
+    case enterKey(ProviderRow)
+    case editCustom(ProviderRow)
+}
+
+func authenticatedRowTapDestination(
+    provider: ProviderRow,
+    canProvision: Bool,
+    disconnectingSlug: String?
+) -> AuthenticatedRowTapDestination? {
+    guard canProvision, disconnectingSlug == nil else { return nil }
+    return provider.authType == .custom ? .editCustom(provider) : .enterKey(provider)
+}
+
 /// The Model Provider picker — a FULL NATIVE `List` of every provider in the
 /// universe (`GET <prefix>/providers`) with its auth status: "authenticated"
 /// (green chip), "Add key" (a registered api_key provider the user can provision
@@ -71,6 +85,7 @@ struct ProviderListView: View {
     @State private var pendingDisconnect: ProviderRow?
     /// The slug currently being disconnected (disables its row while in flight).
     @State private var disconnectingSlug: String?
+    @State private var disconnectTask: Task<Void, Never>?
 
     init(rest: RestClient, onProvidersChanged: (() -> Void)? = nil) {
         self.rest = rest
@@ -113,6 +128,7 @@ struct ProviderListView: View {
         }
         .navigationTitle("Model Provider")
         .navigationBarTitleDisplayMode(.inline)
+        .onDisappear { disconnectTask?.cancel() }
         .task { await load() }
         .alert("Couldn\u{2019}t update provider", isPresented: errorBinding) {
             Button("OK", role: .cancel) {}
@@ -154,7 +170,7 @@ struct ProviderListView: View {
             presenting: pendingDisconnect
         ) { provider in
             Button("Disconnect", role: .destructive) {
-                Task { await disconnect(provider) }
+                disconnectTask = Task { await disconnect(provider) }
             }
             Button("Cancel", role: .cancel) { pendingDisconnect = nil }
         } message: { provider in
@@ -257,11 +273,16 @@ struct ProviderListView: View {
             // tap a no-op for them while still letting the swipe Disconnect fire.
             .contentShape(Rectangle())
             .onTapGesture {
-                guard canProvision else { return }
+                guard let destination = authenticatedRowTapDestination(
+                    provider: provider,
+                    canProvision: canProvision,
+                    disconnectingSlug: disconnectingSlug
+                ) else { return }
                 actionError = nil
-                if provider.authType == .custom {
+                switch destination {
+                case .editCustom(let provider):
                     pendingEditCustom = provider
-                } else {
+                case .enterKey(let provider):
                     pendingKeyProvider = provider
                 }
             }
@@ -357,6 +378,7 @@ struct ProviderListView: View {
         defer { disconnectingSlug = nil }
         do {
             _ = try await rest.removeProviderKey(slug: provider.slug)
+            guard !Task.isCancelled else { return }
             // Drop the transient client copy if one lingered.
             KeychainService.deleteProviderKey(slug: provider.slug)
             // Flip the row locally: same slug, now unauthenticated.
@@ -458,6 +480,7 @@ struct EnterProviderKeyView: View {
     @State private var apiKey = ""
     @State private var errorText: String?
     @State private var isSaving = false
+    @State private var saveTask: Task<Void, Never>?
     @FocusState private var keyFieldFocused: Bool
 
     private var canSave: Bool {
@@ -531,6 +554,7 @@ struct EnterProviderKeyView: View {
         .navigationTitle(provider.name)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { keyFieldFocused = true }
+        .onDisappear { saveTask?.cancel() }
     }
 
     private func save() {
@@ -549,13 +573,14 @@ struct EnterProviderKeyView: View {
             errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             return
         }
-        Task {
+        saveTask = Task {
             defer {
                 KeychainService.deleteProviderKey(slug: slug)
                 isSaving = false
             }
             do {
                 let result = try await rest.setProviderKey(slug: slug, apiKey: trimmed)
+                guard !Task.isCancelled else { return }
                 if result.validated == false {
                     errorText = result.validationDetail ?? "Provider rejected this key"
                     return
@@ -633,6 +658,7 @@ struct CustomProviderView: View {
     @State private var apiKey = ""
     @State private var errorText: String?
     @State private var isSaving = false
+    @State private var saveTask: Task<Void, Never>?
     @FocusState private var nameFieldFocused: Bool
 
     /// True when opening in edit/rotate mode (an existing row was passed in).
@@ -789,6 +815,7 @@ struct CustomProviderView: View {
             }
             if !isEditing { nameFieldFocused = true }
         }
+        .onDisappear { saveTask?.cancel() }
     }
 
     private func save() {
@@ -807,7 +834,7 @@ struct CustomProviderView: View {
             errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             return
         }
-        Task {
+        saveTask = Task {
             defer {
                 KeychainService.deleteProviderKey(slug: trimmedName)
                 isSaving = false
@@ -819,6 +846,7 @@ struct CustomProviderView: View {
                     rawAPIMode: selectedRawAPIMode,
                     apiKey: trimmedKey
                 )
+                guard !Task.isCancelled else { return }
                 if result.validated == false {
                     errorText = result.validationDetail ?? "Provider rejected this key"
                     return

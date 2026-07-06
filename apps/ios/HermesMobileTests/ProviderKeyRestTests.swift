@@ -768,3 +768,162 @@ final class ToolsetCredentialRestTests: XCTestCase {
         return drained
     }
 }
+
+// MARK: - STR-284 provider-row tap guard
+
+/// STR-284 — symmetric disconnect-in-flight guard on authenticated provider rows.
+///
+/// `ProviderListView` makes the swipe Disconnect button inert while any disconnect
+/// is in flight (`.disabled(disconnectingSlug != nil)`), but the authenticated
+/// row's `.onTapGesture` previously gated only on `canProvision`. A user could
+/// swipe Disconnect, then tap the dimmed authenticated row and route into
+/// rotate/edit (a POST) while the DELETE was still in flight.
+///
+/// The fix factors the tap decision into the pure `authenticatedRowTapDestination`
+/// helper (in `ProviderListView.swift`) so the guard is unit-testable without
+/// driving SwiftUI. These cases pin the regression: the tap is a no-op while
+/// `disconnectingSlug != nil` (mirroring the swipe), while preserving OAuth
+/// read-only behavior and the custom-vs-apiKey routing when no disconnect is in
+/// flight. Co-located in this provider-test file so the new tests register in
+/// the target without a project-file edit (the repo uses explicit file refs).
+final class ProviderRowTapGuardTests: XCTestCase {
+
+    // MARK: - Fixtures
+
+    /// An authenticated registered `api_key` provider (Tier A — replace key).
+    private func apiKeyRow(slug: String = "openai") -> ProviderRow {
+        ProviderRow(
+            slug: slug,
+            name: "OpenAI",
+            authType: .apiKey,
+            isCurrent: false,
+            authenticated: true,
+            totalModels: 3,
+            models: nil
+        )
+    }
+
+    /// An authenticated `custom` provider (Tier B — edit/rotate form).
+    private func customRow(slug: String = "my-proxy") -> ProviderRow {
+        ProviderRow(
+            slug: slug,
+            name: "my-proxy",
+            authType: .custom,
+            isCurrent: false,
+            authenticated: true,
+            totalModels: 1,
+            models: nil,
+            baseURL: "https://api.example.com",
+            apiMode: .openai
+        )
+    }
+
+    /// An authenticated OAuth-only provider (read-only — no mobile provisioning).
+    private func oauthRow(slug: String = "google") -> ProviderRow {
+        ProviderRow(
+            slug: slug,
+            name: "Google",
+            authType: .oauthExternal,
+            isCurrent: false,
+            authenticated: true,
+            totalModels: 0,
+            models: nil
+        )
+    }
+
+    /// Mirrors how `ProviderListView` derives `canProvision` for a row.
+    private func canProvision(_ provider: ProviderRow) -> Bool {
+        provider.authType?.provisionableFromKey ?? false
+    }
+
+    // MARK: - STR-284: tap is a no-op while a disconnect is in flight
+
+    /// The regression: tapping the SAME row whose disconnect is in flight must be
+    /// a no-op (previously only `canProvision` gated this, so the tap routed into
+    /// rotate/edit and a POST could race the in-flight DELETE).
+    func testAuthenticatedAPIKeyRowTapIsNoOpWhenOwnDisconnectInFlight() {
+        let provider = apiKeyRow()
+        let result = authenticatedRowTapDestination(
+            provider: provider,
+            canProvision: canProvision(provider),
+            disconnectingSlug: provider.slug
+        )
+        XCTAssertNil(result, "Tapping the row being disconnected must be a no-op.")
+    }
+
+    /// The guard mirrors the swipe semantics globally: while ANY disconnect is in
+    /// flight (a different slug), every authenticated-row tap is a no-op — the
+    /// swipe is `.disabled(disconnectingSlug != nil)` (not per-row).
+    func testAuthenticatedAPIKeyRowTapIsNoOpWhenOtherDisconnectInFlight() {
+        let provider = apiKeyRow()
+        let result = authenticatedRowTapDestination(
+            provider: provider,
+            canProvision: canProvision(provider),
+            disconnectingSlug: "some-other-slug"
+        )
+        XCTAssertNil(result, "Tap must be a no-op while any disconnect is in flight (symmetric with swipe).")
+    }
+
+    /// Same symmetric guard applies to a custom (Tier B edit/rotate) row.
+    func testAuthenticatedCustomRowTapIsNoOpWhenDisconnectInFlight() {
+        let provider = customRow()
+        let result = authenticatedRowTapDestination(
+            provider: provider,
+            canProvision: canProvision(provider),
+            disconnectingSlug: "unrelated-slug"
+        )
+        XCTAssertNil(result, "Custom-row tap must be a no-op while a disconnect is in flight.")
+    }
+
+    // MARK: - Routing preserved when no disconnect is in flight
+
+    /// No disconnect in flight: an `api_key` row routes to the Tier A key-entry
+    /// form (unchanged behavior).
+    func testAPIKeyRowRoutesToEnterKeyWhenIdle() {
+        let provider = apiKeyRow()
+        let result = authenticatedRowTapDestination(
+            provider: provider,
+            canProvision: canProvision(provider),
+            disconnectingSlug: nil
+        )
+        XCTAssertEqual(result, .enterKey(provider))
+    }
+
+    /// No disconnect in flight: a `.custom` row routes to the edit/rotate form
+    /// (unchanged ABH-257 behavior).
+    func testCustomRowRoutesToEditCustomWhenIdle() {
+        let provider = customRow()
+        let result = authenticatedRowTapDestination(
+            provider: provider,
+            canProvision: canProvision(provider),
+            disconnectingSlug: nil
+        )
+        XCTAssertEqual(result, .editCustom(provider))
+    }
+
+    // MARK: - OAuth read-only behavior preserved
+
+    /// An OAuth-only authenticated row is read-only: tap is a no-op even with no
+    /// disconnect in flight (the `canProvision` gate still holds).
+    func testOAuthRowTapIsNoOpWhenIdle() {
+        let provider = oauthRow()
+        let result = authenticatedRowTapDestination(
+            provider: provider,
+            canProvision: canProvision(provider),
+            disconnectingSlug: nil
+        )
+        XCTAssertNil(result, "OAuth-only rows stay read-only (no tap affordance).")
+    }
+
+    /// Both guards compose: an OAuth row is still a no-op when a disconnect is
+    /// also in flight.
+    func testOAuthRowTapIsNoOpWhenDisconnectInFlight() {
+        let provider = oauthRow()
+        let result = authenticatedRowTapDestination(
+            provider: provider,
+            canProvision: canProvision(provider),
+            disconnectingSlug: "some-slug"
+        )
+        XCTAssertNil(result, "OAuth-only rows must remain no-op under the disconnect guard too.")
+    }
+}
