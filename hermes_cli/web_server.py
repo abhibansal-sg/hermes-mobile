@@ -14591,6 +14591,21 @@ async def _close_if_ws_device_revoked(ws: "WebSocket") -> bool:
     return True
 
 
+@contextmanager
+def _ws_live_socket_index(ws: "WebSocket"):
+    """Register a token-authenticated live WS until its handler exits."""
+    from hermes_cli.dashboard_auth.token_auth import notify_socket
+
+    identity = _ws_active_identity(ws)
+    if identity:
+        notify_socket("register", identity, ws)
+    try:
+        yield identity
+    finally:
+        if identity:
+            notify_socket("deregister", identity, ws)
+
+
 def _ws_auth_ok(ws: "WebSocket") -> bool:
     """True when the WS-upgrade credential is accepted. See _ws_auth_reason."""
     return _ws_auth_reason(ws)[0] is None
@@ -15211,6 +15226,9 @@ async def console_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
+    live_socket_index = _ws_live_socket_index(ws)
+    live_socket_index.__enter__()
+
     _log.info(
         "console accepted peer=%s mode=%s cred=%s context=%s profile=%s",
         peer,
@@ -15487,6 +15505,7 @@ async def console_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        live_socket_index.__exit__(None, None, None)
         if active_task and not active_task.done():
             active_task.cancel()
             try:
@@ -15745,8 +15764,9 @@ async def pub_ws(ws: WebSocket) -> None:
     await ws.accept()
 
     try:
-        while True:
-            await _broadcast_event(ws.app, channel, await ws.receive_text())
+        with _ws_live_socket_index(ws):
+            while True:
+                await _broadcast_event(ws.app, channel, await ws.receive_text())
     except WebSocketDisconnect:
         pass
 
@@ -15780,11 +15800,12 @@ async def events_ws(ws: WebSocket) -> None:
         event_channels.setdefault(channel, set()).add(ws)
 
     try:
-        while True:
-            # Subscribers don't speak — the receive() just blocks until
-            # disconnect so the connection stays open as long as the
-            # browser holds it.
-            await ws.receive_text()
+        with _ws_live_socket_index(ws):
+            while True:
+                # Subscribers don't speak — the receive() just blocks until
+                # disconnect so the connection stays open as long as the
+                # browser holds it.
+                await ws.receive_text()
     except WebSocketDisconnect:
         pass
     finally:
