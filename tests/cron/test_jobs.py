@@ -281,6 +281,29 @@ class TestJobCRUD:
         assert remove_job(job["id"]) is True
         assert get_job(job["id"]) is None
 
+    def test_remove_job_purges_cron_sessions_for_canonical_id(self, tmp_cron_dir, monkeypatch):
+        job = create_job(prompt="Temp job", schedule="30m", name="daily digest")
+        calls = []
+        monkeypatch.setattr(
+            "cron.jobs._best_effort_prune_cron_sessions",
+            lambda job_id, *, keep_latest: calls.append((job_id, keep_latest)),
+        )
+
+        assert remove_job("daily digest") is True
+
+        assert calls == [(job["id"], 0)]
+
+    def test_remove_job_real_retention_wrapper_is_best_effort(self, tmp_cron_dir, monkeypatch):
+        job = create_job(prompt="Temp job", schedule="30m")
+
+        def fail_purge(*args, **kwargs):
+            raise RuntimeError("state db locked")
+
+        monkeypatch.setattr("cron.session_retention.purge_cron_job_sessions", fail_purge)
+
+        assert remove_job(job["id"]) is True
+        assert get_job(job["id"]) is None
+
     def test_remove_job_rejects_unsafe_legacy_id_before_output_cleanup(self, tmp_cron_dir):
         """Legacy unsafe IDs left over from before the create-time guard
         must fail closed without half-applying the removal."""
@@ -493,11 +516,35 @@ class TestMarkJobRun:
         assert updated["repeat"]["completed"] == 1
         assert updated["last_status"] == "ok"
 
+    def test_mark_job_run_retains_newest_twenty_for_active_job(self, tmp_cron_dir, monkeypatch):
+        job = create_job(prompt="Test", schedule="every 1h")
+        calls = []
+        monkeypatch.setattr(
+            "cron.jobs._best_effort_prune_cron_sessions",
+            lambda job_id, *, keep_latest: calls.append((job_id, keep_latest)),
+        )
+
+        mark_job_run(job["id"], success=True)
+
+        assert calls == [(job["id"], 20)]
+
     def test_repeat_limit_removes_job(self, tmp_cron_dir):
         job = create_job(prompt="Once", schedule="30m", repeat=1)
         mark_job_run(job["id"], success=True)
         # Job should be removed after hitting repeat limit
         assert get_job(job["id"]) is None
+
+    def test_repeat_limit_purges_all_cron_sessions(self, tmp_cron_dir, monkeypatch):
+        job = create_job(prompt="Once", schedule="30m", repeat=1)
+        calls = []
+        monkeypatch.setattr(
+            "cron.jobs._best_effort_prune_cron_sessions",
+            lambda job_id, *, keep_latest: calls.append((job_id, keep_latest)),
+        )
+
+        mark_job_run(job["id"], success=True)
+
+        assert calls == [(job["id"], 0)]
 
     def test_repeat_negative_one_is_infinite(self, tmp_cron_dir):
         # LLMs often pass repeat=-1 to mean "infinite/forever".
