@@ -85,6 +85,7 @@
 		4B59F41B5D4C1D2FA6C9F08A /* MathSegmentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B59F41A5D4C1D2FA6C9F08A /* MathSegmentView.swift */; };
 		4B86CBC596079FD4498C0F2E /* WorkingDirPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94D65E57EDBF086BDC8091D2 /* WorkingDirPicker.swift */; };
 		4CFA344B94A514B796964B75 /* KeychainService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80BD0B5587C73D216BD204A8 /* KeychainService.swift */; };
+		4D072A9EE70D4BC2834CA489 /* SwiftMath in Frameworks */ = {isa = PBXBuildFile; productRef = 4D072A9DE70D4BC2834CA489 /* SwiftMath */; };
 		4D2CBA12A6341763016E1118 /* RestClient+FS.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91E1D4732F9F236C93E2D001 /* RestClient+FS.swift */; };
 		4DB2C9ACA1FF08CA0521ABDF /* ZoomableImageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B774266C71DEAC18236EF4D9 /* ZoomableImageView.swift */; };
 		4FFED9BD7DE0E571743F1771 /* HermesTurnAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 389E9BFD5D355E9F4ECDDD8A /* HermesTurnAttributes.swift */; };
@@ -543,6 +544,7 @@
 			files = (
 				A0580A5DDE956E58669DAE6E /* DebugBridgeUI in Frameworks */,
 				0651DE03B76616FE3685FF31 /* GRDB in Frameworks */,
+				4D072A9EE70D4BC2834CA489 /* SwiftMath in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1103,6 +1105,7 @@
 			packageProductDependencies = (
 				D7B7C98D6D9744C4C63FD11A /* DebugBridgeUI */,
 				F4626C6249AB0179602E1A85 /* GRDB */,
+				4D072A9DE70D4BC2834CA489 /* SwiftMath */,
 			);
 			productName = HermesMobile;
 			productReference = E11909D98B0F5781E0DA91D1 /* HermesMobile.app */;
@@ -1169,6 +1172,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				3FC55DA6D1D42868A31C9F9F /* XCRemoteSwiftPackageReference "GRDB.swift" */,
+				4D072A9CE70D4BC2834CA489 /* XCRemoteSwiftPackageReference "SwiftMath" */,
 				D77632FDF43B9ACC38ACFBF1 /* XCLocalSwiftPackageReference "DebugBridge" */,
 			);
 			preferredProjectObjectVersion = 77;
@@ -1866,6 +1870,14 @@
 				minimumVersion = 7.0.0;
 			};
 		};
+		4D072A9CE70D4BC2834CA489 /* XCRemoteSwiftPackageReference "SwiftMath" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/mgriebling/SwiftMath";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.7.3;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -1877,6 +1889,11 @@
 		D7B7C98D6D9744C4C63FD11A /* DebugBridgeUI */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = DebugBridgeUI;
+		};
+		4D072A9DE70D4BC2834CA489 /* SwiftMath */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4D072A9CE70D4BC2834CA489 /* XCRemoteSwiftPackageReference "SwiftMath" */;
+			productName = SwiftMath;
 		};
 		F4626C6249AB0179602E1A85 /* GRDB */ = {
 			isa = XCSwiftPackageProductDependency;
