@@ -1467,6 +1467,21 @@ async def search_sessions(
             sort=sort_norm,
         )
 
+        # FIX #3 — scope results to sessions this request owns.
+        # Shared-token/host-trusted requests keep the legacy whole-profile
+        # search (_device_owns_session returns True unconditionally for
+        # them). Device-token requests must not see, or leak titles/snippets
+        # for, sessions correlated to a different device; missing/ambiguous
+        # ownership fails closed via _device_owns_session.
+        owns_cache: Dict[str, bool] = {}
+
+        def _owns(sid: str) -> bool:
+            if sid not in owns_cache:
+                owns_cache[sid] = _device_owns_session(request, sid)
+            return owns_cache[sid]
+
+        matches = [m for m in matches if _owns(m.get("session_id") or "")]
+
         # FIX #2 — look up session titles separately.
         # search_messages SELECT does not return s.title (and we do not modify
         # that query — it is stock + shared).  Collect the distinct session_ids
@@ -1547,6 +1562,8 @@ async def session_messages_delta(
     """
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_owns_session(request, session_id):
+        raise HTTPException(status_code=403, detail="Device token does not own session")
 
     from hermes_state import SessionDB, DEFAULT_DB_PATH
 
