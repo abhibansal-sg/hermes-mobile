@@ -540,6 +540,44 @@ final class ChatStoreSeedParityTests: XCTestCase {
         XCTAssertTrue(allToolIDs.contains("dup"), "the first occurrence keeps its id")
     }
 
+    // MARK: - STR-460 retry: stored role:tool rows carry `content` as a raw
+    // string (often itself JSON-encoded), unlike the live `tool.complete`
+    // payload's structured `result` object. `fullDiff` extraction must survive
+    // that shape for seeded/historical transcripts.
+
+    func testStoredToolRowExtractsFullDiffFromStringifiedJSONContent() {
+        let rows = [
+            StoredMessage(role: "user", content: .string("fix the bug"), timestamp: 1),
+            StoredMessage(role: "assistant", content: .string(""), timestamp: 2,
+                          toolCalls: [WireToolCall(callId: "c1", name: "patch")], finishReason: "tool_calls"),
+            StoredMessage(
+                role: "tool",
+                content: .string(#"{"inline_diff": "+added line\n-removed line", "message": "applied"}"#),
+                timestamp: 3, toolCallId: "c1", toolName: "patch"
+            ),
+            StoredMessage(role: "assistant", content: .string("done"), timestamp: 4, finishReason: "stop"),
+        ]
+        let seeded = ChatStore.toChatMessages(rows)
+        let tool = seeded.flatMap(\.tools).first { $0.id == "c1" }
+        XCTAssertEqual(tool?.fullDiff, "+added line\n-removed line")
+    }
+
+    /// Unmatched role:tool rows (no correlating assistant tool_calls entry)
+    /// take the synthesized-activity path (`ChatStore.toChatMessages`'s
+    /// "unmatched" branch) — must extract the same way.
+    func testUnmatchedStoredToolRowExtractsFullDiffFromStringifiedJSONContent() {
+        let rows = [
+            StoredMessage(
+                role: "tool",
+                content: .string(#"{"diff": "+new\n-old"}"#),
+                timestamp: 1, toolCallId: nil, toolName: "write_file"
+            ),
+        ]
+        let seeded = ChatStore.toChatMessages(rows)
+        let tool = seeded.flatMap(\.tools).first { $0.name == "write_file" }
+        XCTAssertEqual(tool?.fullDiff, "+new\n-old")
+    }
+
     // MARK: - helpers
 
     private func assertParity(_ turns: [Turn], file: StaticString = #filePath, line: UInt = #line) async {

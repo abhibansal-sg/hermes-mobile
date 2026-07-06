@@ -954,11 +954,18 @@ final class ChatStore {
         // (tui_gateway/server.py:2077 _on_tool_complete) and also mirrors it to
         // a top-level `payload.todos`; read either.
         let todos = payload.result["todos"]?.arrayValue ?? payload.todos
+        // File-edit tools (patch/write_file/edit_file) carry a full unified diff
+        // in the result that the 300-char `resultPreview` would truncate mid-hunk.
+        // Retain it untruncated, mirroring desktop's `inlineDiffFromResult`.
+        let fullDiff = InlineFileDiff.isFileEditTool(payload.name)
+            ? InlineFileDiff.extract(from: payload.result)
+            : nil
         mutateTool(id: id) { tool in
             tool.state = failed ? .failed : .done
             tool.resultPreview = preview
             tool.durationMs = payload.durationMs
             tool.todos = todos
+            tool.fullDiff = fullDiff
         }
         // Clear the activity-bar tool label only when the tool that finished is
         // the one currently advertised, so a later tool's label survives.
@@ -2736,6 +2743,7 @@ final class ChatStore {
             let name = row.toolName ?? "tool"
             let preview = String(row.text.prefix(300))
             let failed = row.text.isEmpty ? false : Self.seedIndicatesFailure(name: name, content: row.content)
+            let fullDiff = InlineFileDiff.isFileEditTool(name) ? InlineFileDiff.extract(from: row.content) : nil
             func matches(_ activity: ToolActivity) -> Bool {
                 if let callId { return activity.id == callId }
                 return activity.name == name
@@ -2745,13 +2753,15 @@ final class ChatStore {
                 pendingTools[i].resultPreview = preview
                 pendingTools[i].state = failed ? .failed : .done
                 pendingTools[i].todos = row.content["todos"]?.arrayValue
+                pendingTools[i].fullDiff = fullDiff
                 return true
             }
             // Emitted assistant messages, newest first.
             for mi in result.indices.reversed() where result[mi].role == .assistant {
                 if result[mi].mergeSeedToolResult(
                     matching: callId, name: name, preview: preview, failed: failed,
-                    todos: row.content["todos"]?.arrayValue
+                    todos: row.content["todos"]?.arrayValue,
+                    fullDiff: fullDiff
                 ) {
                     return true
                 }
@@ -2766,9 +2776,10 @@ final class ChatStore {
             if role == .tool {
                 if mergeToolResult(row) { continue }
                 // Unmatched: synthesize an activity buffered for the next flush.
-                let activity = ToolActivity(
+                let unmatchedName = row.toolName ?? "tool"
+                var activity = ToolActivity(
                     id: row.toolCallId ?? "stored-tool-\(index)",
-                    name: row.toolName ?? "tool",
+                    name: unmatchedName,
                     argsSummary: "",
                     progressText: "",
                     resultPreview: String(row.text.prefix(300)),
@@ -2776,6 +2787,9 @@ final class ChatStore {
                     durationMs: nil,
                     todos: row.content["todos"]?.arrayValue
                 )
+                if InlineFileDiff.isFileEditTool(unmatchedName) {
+                    activity.fullDiff = InlineFileDiff.extract(from: row.content)
+                }
                 pendingTools.append(activity)
                 pendingToolsTimestamp = pendingToolsTimestamp ?? row.timestamp
                 continue

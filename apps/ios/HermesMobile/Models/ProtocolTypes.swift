@@ -497,6 +497,61 @@ struct ToolCompletePayload: Sendable {
     }
 }
 
+/// File-edit tool inline diff extraction — mirrors the desktop reference
+/// contract (`apps/desktop/src/components/assistant-ui/tool/fallback-model/index.ts`:
+/// `FILE_EDIT_TOOL_NAMES`, `inlineDiffFromResult`, `stripInlineDiffChrome`) so
+/// `patch`/`write_file`/`edit_file` tool rows render the same diff mobile-side.
+enum InlineFileDiff {
+    static let fileEditToolNames: Set<String> = ["patch", "write_file", "edit_file"]
+
+    static func isFileEditTool(_ name: String?) -> Bool {
+        guard let name else { return false }
+        return fileEditToolNames.contains(name)
+    }
+
+    /// First non-blank string from `result.inline_diff` (preferred) or
+    /// `result.diff`, with ANSI + chrome stripped. `nil` if neither key holds
+    /// non-blank text.
+    static func extract(from result: JSONValue) -> String? {
+        let object = objectCandidate(for: result)
+        for key in ["inline_diff", "diff"] {
+            guard let raw = object[key]?.stringValue,
+                  !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            return stripChrome(raw)
+        }
+        return nil
+    }
+
+    /// Stored `role: tool` rows carry their result as a raw string
+    /// (`StoredMessage.content` is `.string` for role:tool — the seed/history
+    /// path, unlike the live `tool.complete` payload's structured `result`).
+    /// That string is itself often JSON-encoded, holding the same
+    /// `inline_diff`/`diff` keys. Parse it so seeded/historical file-edit rows
+    /// extract a diff exactly like the live path does; falls back to the
+    /// input unchanged (and thus no match) when it isn't a JSON object.
+    private static func objectCandidate(for result: JSONValue) -> JSONValue {
+        guard let raw = result.stringValue,
+              let data = raw.data(using: .utf8),
+              let parsed = try? JSONDecoder().decode(JSONValue.self, from: data),
+              parsed.objectValue != nil else {
+            return result
+        }
+        return parsed
+    }
+
+    /// Strips ANSI escapes and a leading `┊ review diff` chrome line, then trims.
+    static func stripChrome(_ value: String) -> String {
+        var text = AnsiText.strip(value)
+        if let range = text.range(
+            of: #"^\s*┊\s*review diff\s*\n"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) {
+            text.removeSubrange(range)
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 // MARK: - Approvals / clarifications
 
 /// Payload of `approval.request`.

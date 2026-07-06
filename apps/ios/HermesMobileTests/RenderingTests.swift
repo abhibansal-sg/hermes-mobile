@@ -399,6 +399,123 @@ final class RenderingTests: XCTestCase {
                      "Only image_generate should take the native image-card branch")
     }
 
+    // MARK: - DiffRendering (STR-460 inline diff rendering for file-edit tools)
+
+    func testDiffLineClassifiesAddAndRemove() {
+        XCTAssertEqual(DiffRendering.classify("+foo"), .add)
+        XCTAssertEqual(DiffRendering.classify("-foo"), .remove)
+        XCTAssertEqual(DiffRendering.classify(" unchanged"), .context)
+        XCTAssertEqual(DiffRendering.classify("@@ -1,3 +1,4 @@"), .context)
+    }
+
+    func testDiffLineFileHeadersDoNotCountAsAddOrRemove() {
+        XCTAssertEqual(DiffRendering.classify("+++ b/file.swift"), .context)
+        XCTAssertEqual(DiffRendering.classify("--- a/file.swift"), .context)
+    }
+
+    func testDiffStatsExcludeFileHeaders() {
+        let diff = """
+        diff --git a/file.swift b/file.swift
+        index abc123..def456 100644
+        --- a/file.swift
+        +++ b/file.swift
+        @@ -1,3 +1,4 @@
+         unchanged line
+        -removed line
+        +added line one
+        +added line two
+        """
+        let stats = DiffRendering.stats(for: diff)
+        XCTAssertEqual(stats.added, 2)
+        XCTAssertEqual(stats.removed, 1)
+    }
+
+    func testDiffLinesPreserveOrderAndKind() {
+        let diff = "+add\n-remove\n context"
+        let lines = DiffRendering.lines(in: diff)
+        XCTAssertEqual(lines.map(\.kind), [.add, .remove, .context])
+        XCTAssertEqual(lines.map(\.text), ["+add", "-remove", " context"])
+    }
+
+    func testToolActivityRowDefaultExpandedForFileEditDiff() {
+        let diffTool = ToolActivity(
+            id: "t1", name: "patch", argsSummary: "{}", progressText: "",
+            resultPreview: "applied", state: .done, durationMs: 100, todos: nil,
+            fullDiff: "+line"
+        )
+        XCTAssertTrue(ToolActivityRow.defaultExpanded(for: diffTool),
+                      "a file-edit tool row carrying a diff must start expanded")
+    }
+
+    func testToolActivityRowDefaultExpandedForFailedFileEditTool() {
+        let failedTool = ToolActivity(
+            id: "t2", name: "write_file", argsSummary: "{}", progressText: "",
+            resultPreview: "error: disk full", state: .failed, durationMs: nil, todos: nil
+        )
+        XCTAssertTrue(ToolActivityRow.defaultExpanded(for: failedTool),
+                      "a failed file-edit tool must stay legible without an extra tap")
+    }
+
+    func testToolActivityRowNotDefaultExpandedForNonFileEditOrNoDiff() {
+        let noDiffPatch = ToolActivity(
+            id: "t3", name: "patch", argsSummary: "{}", progressText: "",
+            resultPreview: "no changes", state: .done, durationMs: 50, todos: nil
+        )
+        let nonFileEdit = ToolActivity(
+            id: "t4", name: "web_search", argsSummary: "{}",
+            progressText: "", resultPreview: "results", state: .done,
+            durationMs: nil, todos: nil
+        )
+        XCTAssertFalse(ToolActivityRow.defaultExpanded(for: noDiffPatch))
+        XCTAssertFalse(ToolActivityRow.defaultExpanded(for: nonFileEdit))
+    }
+
+    // MARK: - STR-460 retry: multi-tool cluster must not hide a diff row
+
+    /// A common `read_file -> patch` run: the cluster collapses (>=2 tools),
+    /// but the `patch` row carries a diff, so the outer summary capsule must
+    /// start expanded rather than hiding the diff behind a tap.
+    func testToolClusterDefaultExpandedWhenAnyToolHasDiff() {
+        let readTool = ToolActivity(
+            id: "t1", name: "read_file", argsSummary: "{}", progressText: "",
+            resultPreview: "file contents", state: .done, durationMs: 20, todos: nil
+        )
+        let patchTool = ToolActivity(
+            id: "t2", name: "patch", argsSummary: "{}", progressText: "",
+            resultPreview: "applied", state: .done, durationMs: 100, todos: nil,
+            fullDiff: "+added line"
+        )
+        XCTAssertTrue(ToolClusterView.defaultExpanded(for: [readTool, patchTool]),
+                      "a cluster containing a diff row must not start collapsed")
+    }
+
+    /// A `patch -> test` run where the patch failed: the failure carve-out
+    /// (error must stay legible) must also keep the outer cluster expanded.
+    func testToolClusterDefaultExpandedWhenAnyToolIsFailedFileEdit() {
+        let failedPatch = ToolActivity(
+            id: "t1", name: "patch", argsSummary: "{}", progressText: "",
+            resultPreview: "error: conflict", state: .failed, durationMs: nil, todos: nil
+        )
+        let testTool = ToolActivity(
+            id: "t2", name: "run_tests", argsSummary: "{}", progressText: "",
+            resultPreview: "1 failed", state: .done, durationMs: 500, todos: nil
+        )
+        XCTAssertTrue(ToolClusterView.defaultExpanded(for: [failedPatch, testTool]))
+    }
+
+    func testToolClusterNotDefaultExpandedWithoutAnyDiffOrFailure() {
+        let readTool = ToolActivity(
+            id: "t1", name: "read_file", argsSummary: "{}", progressText: "",
+            resultPreview: "file contents", state: .done, durationMs: 20, todos: nil
+        )
+        let searchTool = ToolActivity(
+            id: "t2", name: "web_search", argsSummary: "{}",
+            progressText: "", resultPreview: "results", state: .done,
+            durationMs: 30, todos: nil
+        )
+        XCTAssertFalse(ToolClusterView.defaultExpanded(for: [readTool, searchTool]))
+    }
+
     private func XCTAssertProse(
         _ segment: MessageSegmenter.Segment,
         _ expected: String,

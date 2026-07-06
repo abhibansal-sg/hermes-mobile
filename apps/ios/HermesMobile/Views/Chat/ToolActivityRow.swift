@@ -39,13 +39,39 @@ struct ToolClusterView: View {
     @Environment(\.hermesTheme) private var theme
 
     /// Whether the collapsed summary is currently expanded into the full
-    /// timeline. Ignored when `collapsed` is false.
-    @State private var isExpanded = false
+    /// timeline. Ignored when `collapsed` is false. Seeded `true` when any tool
+    /// in the cluster defaults to expanded (STR-460 retry): a summary capsule
+    /// must not hide a file-edit diff (or a failed file-edit's error) behind an
+    /// extra tap.
+    @State private var isExpanded: Bool
     /// Tracks row disclosures owned by this cluster so opening any tool can
     /// immediately break the live bounded window back out to the readable flat
     /// timeline without losing the row's expanded state during that layout swap.
-    @State private var expandedToolIDs: Set<String> = []
+    @State private var expandedToolIDs: Set<String>
     @State private var liveScrollTarget: String? = Self.liveToolWindowBottomID
+
+    init(tools: [ToolActivity], collapsed: Bool, turnElapsed: TimeInterval?) {
+        self.tools = tools
+        self.collapsed = collapsed
+        self.turnElapsed = turnElapsed
+        // File-edit diff rows must be visible without an extra tap (STR-460):
+        // seed the disclosure set with any tool whose default state is expanded
+        // (a diff, or a failed file-edit tool whose error must stay legible).
+        _expandedToolIDs = State(initialValue: Set(
+            tools.filter(ToolActivityRow.defaultExpanded(for:)).map(\.id)
+        ))
+        _isExpanded = State(initialValue: Self.defaultExpanded(for: tools))
+    }
+
+    /// A cluster whose summary capsule would otherwise start collapsed must
+    /// start expanded when any tool inside it defaults to expanded (STR-460
+    /// retry) — otherwise a common `read_file -> patch` or `patch -> test` run
+    /// hides the diff (or a failed file-edit's error) behind the "N tool
+    /// calls" capsule until the user taps it. Static so tests can pin the rule
+    /// without constructing a view.
+    nonisolated static func defaultExpanded(for tools: [ToolActivity]) -> Bool {
+        tools.contains(where: ToolActivityRow.defaultExpanded(for:))
+    }
 
     var body: some View {
         if collapsed && tools.count >= 2 {
@@ -270,10 +296,21 @@ struct ToolActivityRow: View {
     init(activity: ToolActivity, isExpanded: Binding<Bool>? = nil) {
         self.activity = activity
         self.externalExpansion = isExpanded
+        _localIsExpanded = State(initialValue: Self.defaultExpanded(for: activity))
     }
 
     private var expansion: Binding<Bool> {
         externalExpansion ?? $localIsExpanded
+    }
+
+    /// A file-edit tool row with a diff (or a failed file-edit tool, whose
+    /// error text must stay legible) starts expanded — the diff/error must be
+    /// visible without an extra tap (STR-460). Static so tests can pin the
+    /// rule without constructing a view.
+    nonisolated static func defaultExpanded(for activity: ToolActivity) -> Bool {
+        guard InlineFileDiff.isFileEditTool(activity.name) else { return false }
+        if let diff = activity.fullDiff, !diff.isEmpty { return true }
+        return activity.state == .failed
     }
 
     private var isExpanded: Bool {
@@ -366,10 +403,68 @@ struct ToolActivityRow: View {
                 detailBlock(title: "Arguments", body: activity.argsSummary)
             }
 
-            resultBlock
+            if let diff = activity.fullDiff, !diff.isEmpty {
+                diffBlock(diff)
+                // Failure carve-out (STR-460): a failed file-edit tool must
+                // keep its error/result text legible — the diff view never
+                // replaces it.
+                if activity.state == .failed {
+                    resultBlock
+                }
+            } else {
+                resultBlock
+            }
         }
         .padding(.top, 2)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Native diff rendering for file-edit tool rows: a compact `+N / -M` stat
+    /// header, then every line color-tinted by `DiffRendering.classify` (added
+    /// green, removed red, context/header muted) — mirrors desktop's
+    /// `diff-lines.tsx` tinting.
+    @ViewBuilder
+    private func diffBlock(_ diff: String) -> some View {
+        let stats = DiffRendering.stats(for: diff)
+        let lines = DiffRendering.lines(in: diff)
+        detailBlock(title: "Diff") {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("+\(stats.added) / -\(stats.removed)")
+                    .font(.caption2.monospaced().weight(.semibold))
+                    .foregroundStyle(theme.mutedFg)
+
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(lines) { line in
+                            Text(line.text.isEmpty ? " " : line.text)
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(diffLineForeground(line.kind))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 4)
+                                .background(diffLineBackground(line.kind))
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 280)
+            }
+        }
+    }
+
+    private func diffLineForeground(_ kind: DiffLineKind) -> Color {
+        switch kind {
+        case .add: return theme.statusOK
+        case .remove: return theme.statusError
+        case .context: return theme.mutedFg
+        }
+    }
+
+    private func diffLineBackground(_ kind: DiffLineKind) -> Color {
+        switch kind {
+        case .add: return theme.statusOK.opacity(0.12)
+        case .remove: return theme.statusError.opacity(0.12)
+        case .context: return .clear
+        }
     }
 
     /// Result block: monospace, scroll-in-card (bounded height so huge outputs
@@ -421,6 +516,55 @@ struct ToolActivityRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Classification of one unified-diff line, mirroring desktop's `diffKind`
+/// (`apps/desktop/src/components/chat/diff-lines.tsx`): `+++`/`---` file-header
+/// markers are NOT additions/removals — they classify as context so they don't
+/// pollute the `+N / -M` stat and render in the muted/default style like any
+/// other header or hunk line.
+enum DiffLineKind: Sendable, Equatable {
+    case add
+    case remove
+    case context
+}
+
+/// One displayable line of a parsed diff.
+struct DiffLine: Sendable, Equatable, Identifiable {
+    let id: Int
+    let kind: DiffLineKind
+    let text: String
+}
+
+/// Parses/classifies a unified diff for native rendering. Pure and
+/// `nonisolated` so tests can verify classification and stats without SwiftUI.
+enum DiffRendering {
+    static func classify(_ line: String) -> DiffLineKind {
+        if line.hasPrefix("+"), !line.hasPrefix("+++") { return .add }
+        if line.hasPrefix("-"), !line.hasPrefix("---") { return .remove }
+        return .context
+    }
+
+    static func lines(in diff: String) -> [DiffLine] {
+        diff.split(separator: "\n", omittingEmptySubsequences: false).enumerated().map { index, substring in
+            let text = String(substring)
+            return DiffLine(id: index, kind: classify(text), text: text)
+        }
+    }
+
+    /// `(added, removed)` counts, excluding `+++`/`---` file-header markers.
+    static func stats(for diff: String) -> (added: Int, removed: Int) {
+        var added = 0
+        var removed = 0
+        for line in diff.split(separator: "\n", omittingEmptySubsequences: false) {
+            switch classify(String(line)) {
+            case .add: added += 1
+            case .remove: removed += 1
+            case .context: break
+            }
+        }
+        return (added, removed)
     }
 }
 
