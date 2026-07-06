@@ -142,6 +142,14 @@ final class RenderingTests: XCTestCase {
         XCTAssertProse(segments[2], "\nAfter")
     }
 
+    func testDisplayDollarMathAllowsCommonMultilineBlock() {
+        let segments = MessageSegmenter.segments("Before\n$$\nx^2 + y^2 = z^2\n$$\nAfter")
+        XCTAssertEqual(segments.count, 3)
+        XCTAssertProse(segments[0], "Before\n")
+        XCTAssertMath(segments[1], latex: "\nx^2 + y^2 = z^2\n", display: true)
+        XCTAssertProse(segments[2], "\nAfter")
+    }
+
     func testBracketDisplayMathBecomesDisplayMathSegment() {
         let segments = MessageSegmenter.segments("Before \\[x^2 + y^2 = z^2\\] after")
         XCTAssertEqual(segments.count, 3)

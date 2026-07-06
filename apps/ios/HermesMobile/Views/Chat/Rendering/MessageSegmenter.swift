@@ -231,7 +231,6 @@ enum MessageSegmenter {
     private static func dollarDisplayMatch(in text: String, start: String.Index) -> MathMatch? {
         let contentStart = text.index(start, offsetBy: 2)
         guard contentStart < text.endIndex,
-              !text[contentStart].isWhitespace,
               let closeStart = findUnescaped("$$", in: text, from: contentStart)
         else { return nil }
 
