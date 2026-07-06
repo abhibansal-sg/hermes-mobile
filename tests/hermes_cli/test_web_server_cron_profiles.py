@@ -1,7 +1,8 @@
 """Regression tests for dashboard cron job profile routing."""
 
-from queue import Empty, SimpleQueue
+import os
 import threading
+from queue import Empty, SimpleQueue
 
 import pytest
 from fastapi import HTTPException
@@ -116,6 +117,51 @@ async def test_list_cron_jobs_specific_profile_filters_results(isolated_profiles
 
     assert [job["id"] for job in jobs] == [worker_job["id"]]
     assert jobs[0]["profile"] == "worker_alpha"
+
+
+@pytest.mark.asyncio
+async def test_cron_delivery_targets_use_selected_profile_config_and_env(
+    isolated_profiles, monkeypatch
+):
+    from hermes_cli import web_server
+
+    default_home = isolated_profiles["default"]
+    worker_home = isolated_profiles["worker_alpha"]
+    (default_home / "config.yaml").write_text(
+        "platforms:\n"
+        "  telegram:\n"
+        "    enabled: true\n"
+        "    token: default-token\n",
+        encoding="utf-8",
+    )
+    (default_home / ".env").write_text(
+        "TELEGRAM_HOME_CHANNEL=-100default\n",
+        encoding="utf-8",
+    )
+    (worker_home / "config.yaml").write_text(
+        "platforms:\n"
+        "  matrix:\n"
+        "    enabled: true\n"
+        "    token: worker-token\n",
+        encoding="utf-8",
+    )
+    (worker_home / ".env").write_text(
+        "MATRIX_HOME_ROOM=!worker:matrix.org\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-100process")
+    monkeypatch.delenv("MATRIX_HOME_ROOM", raising=False)
+
+    response = await web_server.get_cron_delivery_targets(profile="worker_alpha")
+    targets = {target["id"]: target for target in response["targets"]}
+
+    assert "local" in targets
+    assert "matrix" in targets
+    assert targets["matrix"]["home_target_set"] is True
+    assert targets["matrix"]["home_env_var"] == "MATRIX_HOME_ROOM"
+    assert "telegram" not in targets
+    assert os.environ["TELEGRAM_HOME_CHANNEL"] == "-100process"
+    assert "MATRIX_HOME_ROOM" not in os.environ
 
 
 @pytest.mark.asyncio

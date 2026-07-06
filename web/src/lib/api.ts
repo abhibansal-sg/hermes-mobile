@@ -552,8 +552,10 @@ export const api = {
   // Cron jobs
   getCronJobs: (profile = "all") =>
     fetchJSON<CronJob[]>(`/api/cron/jobs?profile=${encodeURIComponent(profile)}`),
-  getCronDeliveryTargets: () =>
-    fetchJSON<{ targets: CronDeliveryTarget[] }>("/api/cron/delivery-targets"),
+  getCronDeliveryTargets: (profile = "default") =>
+    fetchJSON<{ targets: CronDeliveryTarget[] }>(
+      `/api/cron/delivery-targets?profile=${encodeURIComponent(profile)}`,
+    ),
   createCronJob: (job: CronJobMutation, profile = "default") =>
     fetchJSON<CronJob>(`/api/cron/jobs?profile=${encodeURIComponent(profile)}`, {
       method: "POST",

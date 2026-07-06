@@ -10208,6 +10208,30 @@ def _call_cron_for_profile(
     return result
 
 
+def _cron_delivery_targets_for_profile(
+    target_profile: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Read cron delivery targets using the selected profile's config/env."""
+    _profile_name, home = _cron_profile_home(target_profile)
+    with _CRON_PROFILE_LOCK:
+        from cron.scheduler import cron_delivery_targets
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        old_environ = os.environ.copy()
+        token = set_hermes_home_override(str(home))
+        try:
+            load_hermes_dotenv(hermes_home=home)
+            return cron_delivery_targets()
+        finally:
+            os.environ.clear()
+            os.environ.update(old_environ)
+            reset_hermes_home_override(token)
+
+
 def _find_cron_job_profile(job_id: str) -> Optional[str]:
     for profile in _cron_profile_dicts():
         name = str(profile.get("name") or "")
@@ -10361,7 +10385,7 @@ async def create_cron_job(body: CronJobCreate, profile: str = "default"):
 
 
 @app.get("/api/cron/delivery-targets")
-async def get_cron_delivery_targets():
+async def get_cron_delivery_targets(profile: str = "default"):
     """Delivery targets the cron dropdown should offer.
 
     Always includes the implicit ``local`` option. Beyond that, the list is
@@ -10380,9 +10404,9 @@ async def get_cron_delivery_targets():
         }
     ]
     try:
-        from cron.scheduler import cron_delivery_targets
-
-        targets.extend(cron_delivery_targets())
+        targets.extend(_cron_delivery_targets_for_profile(profile))
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("GET /api/cron/delivery-targets failed")
     return {"targets": targets}

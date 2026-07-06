@@ -592,18 +592,6 @@ export default function CronPage() {
   }, []);
 
   useEffect(() => {
-    api
-      .getCronDeliveryTargets()
-      .then((res) => setDeliveryTargets(res.targets))
-      .catch(() =>
-        // Fall back to local-only so the modal still works if the endpoint fails.
-        setDeliveryTargets([
-          { id: "local", name: "Local", home_target_set: true, home_env_var: null },
-        ]),
-      );
-  }, []);
-
-  useEffect(() => {
     loadJobs();
   }, [loadJobs]);
 
@@ -615,11 +603,17 @@ export default function CronPage() {
     Promise.all([
       api.getSkills(resourceProfile).catch(() => []),
       api.getToolsets(resourceProfile).catch(() => []),
+      api.getCronDeliveryTargets(resourceProfile).catch(() => ({
+        targets: [
+          { id: "local", name: "Local", home_target_set: true, home_env_var: null },
+        ],
+      })),
       api.getModelOptions(resourceProfile).catch(() => null),
-    ]).then(([skills, toolsets, options]) => {
+    ]).then(([skills, toolsets, targets, options]) => {
       if (cancelled) return;
       setAvailableSkills([...skills].sort((a, b) => a.name.localeCompare(b.name)));
       setAvailableToolsets([...toolsets].sort((a, b) => a.name.localeCompare(b.name)));
+      setDeliveryTargets(targets.targets);
       setModelOptions(options);
     });
     return () => {
@@ -913,6 +907,9 @@ export default function CronPage() {
               >
                 Edit job
               </h2>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Profile: {profileLabel(getJobProfile(editJob))}
+              </p>
             </header>
 
             <div className="min-h-0 overflow-y-auto p-5 grid gap-4">
