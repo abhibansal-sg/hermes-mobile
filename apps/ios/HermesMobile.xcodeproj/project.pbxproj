@@ -52,6 +52,7 @@
 		2CDBD606C806A0897D6C70F0 /* DevicesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7415F1022EC37DEE884D4629 /* DevicesView.swift */; };
 		2E4A1D17D38871699001F38B /* ModelPresetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD558422C711DA2EE477416E /* ModelPresetTests.swift */; };
 		2ECBBD89549D0E2916F1DBF2 /* BatchGTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48DF3123FEA22B7F3DA2A38C /* BatchGTests.swift */; };
+		2ED7BEED4BABE5355097F3B0 /* MathSegmentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EB3FD807B7D0204CCB7B5F7 /* MathSegmentView.swift */; };
 		30650FB05CAEAE76BFC4DA34 /* ChatSteerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 528F8F0B3E68D6D6F73189CB /* ChatSteerTests.swift */; };
 		31165D99B641B1D3DE678F62 /* MentionCompletion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01E6D69ED0E4210BAF05D00F /* MentionCompletion.swift */; };
 		312EC72DBA2AFCCE6FB17A08 /* ProviderListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C821A891E45D17FB58698283 /* ProviderListView.swift */; };
@@ -82,10 +83,8 @@
 		4A4E4B679BB380E73D89252A /* HermesAppIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = B54060142ACAE96B34BD2AB4 /* HermesAppIntents.swift */; };
 		4A7ADDEE312999D20B8474F7 /* RemoteURLModeUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7AFB9A5A600035A10180D27 /* RemoteURLModeUITests.swift */; };
 		4AB9FD721AB87DADEE0CB1D4 /* MessageSegmenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6453C39B6601B43A4039649D /* MessageSegmenter.swift */; };
-		4B59F41B5D4C1D2FA6C9F08A /* MathSegmentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B59F41A5D4C1D2FA6C9F08A /* MathSegmentView.swift */; };
 		4B86CBC596079FD4498C0F2E /* WorkingDirPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94D65E57EDBF086BDC8091D2 /* WorkingDirPicker.swift */; };
 		4CFA344B94A514B796964B75 /* KeychainService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80BD0B5587C73D216BD204A8 /* KeychainService.swift */; };
-		4D072A9EE70D4BC2834CA489 /* SwiftMath in Frameworks */ = {isa = PBXBuildFile; productRef = 4D072A9DE70D4BC2834CA489 /* SwiftMath */; };
 		4D2CBA12A6341763016E1118 /* RestClient+FS.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91E1D4732F9F236C93E2D001 /* RestClient+FS.swift */; };
 		4DB2C9ACA1FF08CA0521ABDF /* ZoomableImageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B774266C71DEAC18236EF4D9 /* ZoomableImageView.swift */; };
 		4FFED9BD7DE0E571743F1771 /* HermesTurnAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 389E9BFD5D355E9F4ECDDD8A /* HermesTurnAttributes.swift */; };
@@ -305,6 +304,7 @@
 		0B493ECAAA09AFD2AA200978 /* SecurePromptView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecurePromptView.swift; sourceTree = "<group>"; };
 		0C028EAA9312823746769CE4 /* VoiceRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRecorder.swift; sourceTree = "<group>"; };
 		0CC10F89B2FA3A66A6A5977C /* ConnectionMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionMode.swift; sourceTree = "<group>"; };
+		0EB3FD807B7D0204CCB7B5F7 /* MathSegmentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MathSegmentView.swift; sourceTree = "<group>"; };
 		0FB2B9112BE331DC9936D694 /* WorkingDirectory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkingDirectory.swift; sourceTree = "<group>"; };
 		1157F2DBE43C1E8EDF3C3B58 /* FileSystemModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileSystemModels.swift; sourceTree = "<group>"; };
 		119BCB282CC9BB93ABB7210A /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
@@ -358,7 +358,6 @@
 		493CC7559EC337DC66FFB7C0 /* UX1DrawerFeedTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UX1DrawerFeedTests.swift; sourceTree = "<group>"; };
 		4987981420D718F41C87C1FF /* LiveActivityManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityManager.swift; sourceTree = "<group>"; };
 		4B5D21A55C5D483D6D317B89 /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
-		4B59F41A5D4C1D2FA6C9F08A /* MathSegmentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MathSegmentView.swift; sourceTree = "<group>"; };
 		4C2D6AE4B416C5D426C91E15 /* RenderingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderingTests.swift; sourceTree = "<group>"; };
 		4CC8A321EED3528AF81D9780 /* SpeechPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayer.swift; sourceTree = "<group>"; };
 		4E51EB46FF434B9F1AF6D0E3 /* SharedInboxWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedInboxWriter.swift; sourceTree = "<group>"; };
@@ -544,7 +543,6 @@
 			files = (
 				A0580A5DDE956E58669DAE6E /* DebugBridgeUI in Frameworks */,
 				0651DE03B76616FE3685FF31 /* GRDB in Frameworks */,
-				4D072A9EE70D4BC2834CA489 /* SwiftMath in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -949,7 +947,7 @@
 			children = (
 				BE595B3D5BD7CE915E2E2112 /* AnsiText.swift */,
 				6A60E8ABAAC1CD00A2F23FBF /* CodeBlockView.swift */,
-				4B59F41A5D4C1D2FA6C9F08A /* MathSegmentView.swift */,
+				0EB3FD807B7D0204CCB7B5F7 /* MathSegmentView.swift */,
 				6453C39B6601B43A4039649D /* MessageSegmenter.swift */,
 				EEA27F5DA2514ED03A75B7B7 /* RenderCache.swift */,
 				EB04EDFCBE7CEDA7E07B7FE7 /* SyntaxHighlighter.swift */,
@@ -1105,7 +1103,6 @@
 			packageProductDependencies = (
 				D7B7C98D6D9744C4C63FD11A /* DebugBridgeUI */,
 				F4626C6249AB0179602E1A85 /* GRDB */,
-				4D072A9DE70D4BC2834CA489 /* SwiftMath */,
 			);
 			productName = HermesMobile;
 			productReference = E11909D98B0F5781E0DA91D1 /* HermesMobile.app */;
@@ -1172,7 +1169,6 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				3FC55DA6D1D42868A31C9F9F /* XCRemoteSwiftPackageReference "GRDB.swift" */,
-				4D072A9CE70D4BC2834CA489 /* XCRemoteSwiftPackageReference "SwiftMath" */,
 				D77632FDF43B9ACC38ACFBF1 /* XCLocalSwiftPackageReference "DebugBridge" */,
 			);
 			preferredProjectObjectVersion = 77;
@@ -1381,11 +1377,11 @@
 				CCCE8EE15573B5CF51306C5C /* LearningJourneyView.swift in Sources */,
 				7332D05F32989F9EC7F742DB /* LiveActivityManager.swift in Sources */,
 				46C4C919CBA39FA3F0F46210 /* ManualTokenPromptView.swift in Sources */,
+				2ED7BEED4BABE5355097F3B0 /* MathSegmentView.swift in Sources */,
 				31165D99B641B1D3DE678F62 /* MentionCompletion.swift in Sources */,
 				EE76C51F4FC88C03BEC15EE4 /* MentionPicker.swift in Sources */,
 				DD6F60035E0B003BA3F00BB1 /* MessageBubble.swift in Sources */,
 				856C0011EAFF4E2B0CBA42C1 /* MessageRowRecord.swift in Sources */,
-				4B59F41B5D4C1D2FA6C9F08A /* MathSegmentView.swift in Sources */,
 				4AB9FD721AB87DADEE0CB1D4 /* MessageSegmenter.swift in Sources */,
 				E66EBD2A959B283EF207E7AF /* ModelPickerView.swift in Sources */,
 				EB682F32E00C0AF44D2CA44B /* ModelPresetStore.swift in Sources */,
@@ -1545,7 +1541,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 88;
+				CURRENT_PROJECT_VERSION = 90;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = 6J4Y9NKRQ2;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -1623,7 +1619,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 88;
+				CURRENT_PROJECT_VERSION = 90;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = 6J4Y9NKRQ2;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -1870,14 +1866,6 @@
 				minimumVersion = 7.0.0;
 			};
 		};
-		4D072A9CE70D4BC2834CA489 /* XCRemoteSwiftPackageReference "SwiftMath" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/mgriebling/SwiftMath";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 1.7.3;
-			};
-		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -1889,11 +1877,6 @@
 		D7B7C98D6D9744C4C63FD11A /* DebugBridgeUI */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = DebugBridgeUI;
-		};
-		4D072A9DE70D4BC2834CA489 /* SwiftMath */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 4D072A9CE70D4BC2834CA489 /* XCRemoteSwiftPackageReference "SwiftMath" */;
-			productName = SwiftMath;
 		};
 		F4626C6249AB0179602E1A85 /* GRDB */ = {
 			isa = XCSwiftPackageProductDependency;

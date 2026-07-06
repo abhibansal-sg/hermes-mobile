@@ -1,3 +1,13 @@
+Build 90 — 2026-07-06
+
+FIXED
+- Render transcript LaTeX math
+
+WORTH TRYING
+- Try: Render transcript LaTeX math
+
+---
+
 Build 88 — 2026-07-06
 
 FIXED
