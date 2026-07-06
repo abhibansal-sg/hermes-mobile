@@ -170,6 +170,52 @@ final class ProviderKeyRestTests: XCTestCase {
         XCTAssertEqual(result.row.models, ["deepseek-chat", "deepseek-reasoner"])
     }
 
+    func testSkippedValidationDecodesAsUnverifiedSaveDecision() async throws {
+        let body = Data(#"""
+        {
+          "provider":{"slug":"deepseek","name":"DeepSeek","auth_type":"api_key","is_current":false,"authenticated":false,"total_models":2,"models":[{"id":"deepseek-chat"}]},
+          "validated":"skipped",
+          "validation_detail":"validation timed out; key saved but not confirmed",
+          "persisted":true
+        }
+        """#.utf8)
+        let client = makeClient(style: .plugin, script: [(body, 200)])
+
+        let result = try await client.setProviderKey(slug: "deepseek", apiKey: "sk-timeout")
+
+        XCTAssertEqual(result.validationStatus, .skipped)
+        XCTAssertEqual(result.persisted, true)
+        XCTAssertFalse(result.row.authenticated)
+        XCTAssertEqual(
+            ProviderKeySaveDecision(result),
+            .savedUnverified("validation timed out; key saved but not confirmed")
+        )
+    }
+
+    func testSaveDecisionDistinguishesConfirmedRejectedAndUnverified() {
+        let accepted = ProviderKeyResult(root: .object([
+            "provider": .object(["slug": .string("deepseek"), "name": .string("DeepSeek")]),
+            "validated": .bool(true),
+        ]))
+        let rejected = ProviderKeyResult(root: .object([
+            "provider": .object(["slug": .string("deepseek"), "name": .string("DeepSeek")]),
+            "validated": .bool(false),
+            "validation_detail": .string("provider rejected the API key"),
+        ]))
+        let skipped = ProviderKeyResult(root: .object([
+            "provider": .object(["slug": .string("deepseek"), "name": .string("DeepSeek")]),
+            "validated": .string("skipped"),
+            "validation_detail": .string("key saved; no validation endpoint is configured"),
+        ]))
+
+        XCTAssertEqual(ProviderKeySaveDecision(accepted), .confirmed)
+        XCTAssertEqual(ProviderKeySaveDecision(rejected), .rejected("provider rejected the API key"))
+        XCTAssertEqual(
+            ProviderKeySaveDecision(skipped),
+            .savedUnverified("key saved; no validation endpoint is configured")
+        )
+    }
+
     func testRemoveProviderKeyDecodesDisconnectResult() async throws {
         let body = Data(#"{"slug":"deepseek","name":"DeepSeek","disconnected":true}"#.utf8)
         let client = makeClient(style: .plugin, script: [(body, 200)])
