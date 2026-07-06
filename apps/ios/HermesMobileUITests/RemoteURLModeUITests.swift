@@ -88,18 +88,32 @@ final class RemoteURLModeUITests: XCTestCase {
 
     // MARK: - Test 3: HERMES_UITEST_PANEL=gateway cold-launches into Gateway Status
 
-    /// STR-459/STR-462: proves the DEBUG-only navigation seed lands a cold
-    /// launch directly on the Settings sheet's Gateway Status panel — no
+    /// STR-459/STR-462/STR-485: proves the DEBUG-only navigation seed lands a
+    /// cold launch directly on the Settings sheet's Gateway Status panel — no
     /// drawer tap, no Settings tap, no row tap — via
     /// `HERMES_UITEST_PANEL=gateway`. Uses the same live remote-URL gateway
     /// rig as the tests above.
     ///
-    /// NOTE: this workspace's base predates PR #26 (the drain/cancel
-    /// recovery controls), so `GatewayStatusView` here exposes no
-    /// `gatewayDrain`/`gatewayCancel`-style affordances to assert — only the
-    /// panel's own "Gateway" navigation title (`GatewayStatusView.swift:62`).
-    /// If a future rebase lands PR #26 on top of this branch, extend this
-    /// test to also assert the drain/cancel controls' visibility.
+    /// Asserts TWO independent proofs the real `GatewayStatusView` rendered
+    /// (not the `SettingsView.panelView` "Not connected" placeholder a
+    /// premature seed would land on — see `RootView.seedGatewayPanelIfReady()`):
+    /// the panel's own navigation title, AND its "Restart Gateway"
+    /// gateway-recovery button (`GatewayStatusView.actionButtons`,
+    /// `GatewayRecoveryAction.restartGateway.buttonTitle`) — the placeholder
+    /// has neither.
+    ///
+    /// DRAIN/CANCEL CONTROLS: per the STR-459 retry requirement, this test
+    /// must assert PR #26's drain/cancel recovery controls if this branch/base
+    /// contains them, or block with exact evidence if it doesn't rather than
+    /// weaken the test. Evidence they are absent here: `GatewayRecoveryAction`
+    /// (`GatewayStatusView.swift:332-334`) declares exactly two cases —
+    /// `.restartGateway` and `.updateHermes` — with no drain/cancel case, and
+    /// `actionButtons` (`GatewayStatusView.swift:140-152`) renders unconditionally
+    /// from `GatewayRecoveryAction.allCases`, so there is no drain/cancel
+    /// affordance anywhere in this view to assert without an out-of-scope edit
+    /// to `GatewayStatusView.swift` (outside this issue's scope fence). This is
+    /// reported as a blocked sub-scope in the STR-485 hand-back rather than
+    /// synthesized here.
     func testUITestPanelGatewaySeedLandsOnGatewayStatus() throws {
         let env = ProcessInfo.processInfo.environment
         guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
@@ -126,6 +140,17 @@ final class RemoteURLModeUITests: XCTestCase {
         XCTAssertTrue(
             gatewayTitle.waitForExistence(timeout: 30),
             "HERMES_UITEST_PANEL=gateway did not cold-launch into the Gateway Status panel"
+        )
+
+        // Second, independent proof: the real panel's recovery controls are
+        // present — the "Not connected" placeholder SettingsView falls back to
+        // when `connectionStore.control` isn't ready has no such button, so
+        // this cannot pass on a race that lands on the placeholder.
+        XCTAssertTrue(
+            app.buttons["Restart Gateway"].waitForExistence(timeout: 15),
+            "Gateway Status panel's Restart Gateway recovery control did not appear — "
+            + "the seed may have landed on the \"Not connected\" placeholder "
+            + "instead of the real GatewayStatusView"
         )
     }
 }
