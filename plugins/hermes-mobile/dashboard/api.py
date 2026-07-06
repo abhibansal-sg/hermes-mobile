@@ -2879,6 +2879,15 @@ async def add_custom_provider(
     whose final statement prints ``Set providers.<name>.api_key = <RAW KEY>``
     to stdout — captured at rest by the launchd plists into the dashboard /
     dev-gateway logs. The key_env + save_env_value path below closes that leak.
+
+    SECURITY (STR-107/STR-238): editing/rotating an EXISTING custom provider
+    used to derive-and-write the new credential state without ever reading
+    what was already stored, orphaning the old raw key. Before writing, this
+    handler now reads the existing ``providers.<name>`` entry: if its stored
+    ``key_env`` differs from the newly-derived var, the OLD .env var is
+    removed (mirrors the DELETE handler's backward-compat ``key_env``
+    preference); any legacy inline ``api_key`` is stripped from config.yaml as
+    part of the upsert. Non-credential tuning is preserved.
     """
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -2887,7 +2896,13 @@ async def add_custom_provider(
             status_code=403, detail="Device token lacks approve scope"
         )
 
-    from hermes_cli.config import is_managed, save_env_value, set_config_value
+    from hermes_cli.config import (
+        is_managed,
+        load_config_readonly,
+        remove_env_value,
+        save_env_value,
+        set_config_value,
+    )
 
     name = (body.name or "").strip()
     base_url = (body.base_url or "").strip()
@@ -2950,7 +2965,44 @@ async def add_custom_provider(
             },
         )
 
+    # STR-238 (STR-107 child): before writing the new credential state, read
+    # whatever is already stored under providers.<name> — editing/rotating a
+    # pre-existing custom provider must not orphan its OLD raw key. Best-effort
+    # (no raw key logging/returning): a read failure just skips cleanup, same
+    # failure mode the DELETE handler already tolerates.
     try:
+        existing_config = load_config_readonly()
+    except Exception:
+        existing_config = {}
+    existing_providers = existing_config.get("providers")
+    existing_entry = (
+        existing_providers.get(name)
+        if isinstance(existing_providers, dict)
+        else None
+    )
+    old_key_env = (
+        existing_entry.get("key_env")
+        if isinstance(existing_entry, dict)
+        else None
+    )
+
+    try:
+        # Remove the OLD env var ONLY when it differs from the newly-derived
+        # one (an in-place edit that already uses the current scheme must not
+        # delete-then-recreate the var it's about to write).
+        if old_key_env and old_key_env != env_var:
+            try:
+                remove_env_value(old_key_env)
+            except ValueError:
+                pass
+        # Strip any legacy inline api_key / stale key_env from config so a raw
+        # secret never survives the upsert in config.yaml. Non-credential
+        # tuning (base_url/api_mode/name/etc.) on the existing entry is
+        # preserved — the set_config_value calls below then overwrite it with
+        # this request's values.
+        if existing_entry is not None:
+            _remove_custom_provider_credentials_from_config(name)
+
         save_env_value(env_var, api_key)
         set_config_value(f"providers.{name}.name", name)
         set_config_value(f"providers.{name}.base_url", base_url)
