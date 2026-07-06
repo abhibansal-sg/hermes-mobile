@@ -6,6 +6,7 @@
  *   list-workflows              List all ciWorkflows for the app (id + name)
  *   trigger <workflowId> <ref>  Start a cloud build on a branch ref
  *   status  <buildRunId>        Print current status + action summaries
+ *   run-sha <buildRunId>        Print the source commit SHA for a build run
  *   wait    <buildRunId>        Poll until complete; exit 0=SUCCEEDED non-zero otherwise
  *   issues  <buildRunId>        Print test failures + warning counts per action
  *
@@ -89,6 +90,9 @@ function mintJWT() {
 // ─── HTTP helpers ────────────────────────────────────────────────────────────
 
 async function ascFetch(method, urlOrPath, body, attempt = 1) {
+  const mocked = mockAscFetch(method, urlOrPath);
+  if (mocked !== undefined) return mocked;
+
   const url    = urlOrPath.startsWith('http') ? urlOrPath : `${ASC_BASE}${urlOrPath}`;
   const jwt    = mintJWT(); // re-mint on every request — safe for long polls
   const opts   = {
@@ -118,6 +122,28 @@ async function ascFetch(method, urlOrPath, body, attempt = 1) {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function mockAscFetch(method, urlOrPath) {
+  const raw = process.env.ASC_CLOUD_MOCK_BUILD_RUNS_JSON;
+  if (!raw) return undefined;
+  if (method !== 'GET') return undefined;
+
+  const match = /^\/ciBuildRuns\/([^/?]+)$/.exec(urlOrPath);
+  if (!match) return undefined;
+
+  let runs;
+  try {
+    runs = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`Invalid ASC_CLOUD_MOCK_BUILD_RUNS_JSON: ${err.message}`);
+  }
+
+  const buildRunId = decodeURIComponent(match[1]);
+  if (!Object.prototype.hasOwnProperty.call(runs, buildRunId)) {
+    throw new Error(`No mocked ciBuildRuns response for ${buildRunId}`);
+  }
+  return runs[buildRunId];
+}
 
 // Paginate through all pages of a LIST response
 async function ascFetchAll(path) {
@@ -305,6 +331,16 @@ async function cmdStatus(buildRunId) {
   }
 }
 
+async function cmdRunSha(buildRunId) {
+  if (!buildRunId) die('Usage: asc-cloud.mjs run-sha <buildRunId>');
+
+  const runData = await ascFetch('GET', `/ciBuildRuns/${buildRunId}`);
+  const sha = runData?.data?.attributes?.sourceCommit?.commitSha;
+  if (!sha) die(`No sourceCommit.commitSha found for build run ${buildRunId}`);
+
+  console.log(sha);
+}
+
 async function cmdWait(buildRunId) {
   if (!buildRunId) die('Usage: asc-cloud.mjs wait <buildRunId>');
 
@@ -414,6 +450,7 @@ Usage:
   node asc-cloud.mjs find-run <workflowId> <sha> [sinceMinutes=180]
   node asc-cloud.mjs trigger <workflowId> <gitRef>
   node asc-cloud.mjs status  <buildRunId>
+  node asc-cloud.mjs run-sha <buildRunId>
   node asc-cloud.mjs wait    <buildRunId>
   node asc-cloud.mjs issues  <buildRunId>
 
@@ -431,6 +468,7 @@ switch (cmd) {
   case 'find-run':       await cmdFindRun(args[0], args[1], args[2]); break;
   case 'trigger':        await cmdTrigger(args[0], args[1]); break;
   case 'status':         await cmdStatus(args[0]); break;
+  case 'run-sha':        await cmdRunSha(args[0]); break;
   case 'wait':           await cmdWait(args[0]); break;
   case 'issues':         await cmdIssues(args[0]); break;
   default:
