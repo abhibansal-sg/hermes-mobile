@@ -1657,6 +1657,18 @@ struct ChatView: View {
                 .lineLimit(3)
             Spacer(minLength: 0)
             Button {
+                let serverURL = connectionStore.serverURLString
+                Task {
+                    await connectionStore.retryDeviceUpgrade(serverURL: serverURL)
+                }
+            } label: {
+                Text("Retry")
+                    .font(.callout.weight(.semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(theme.accent)
+            .accessibilityLabel("Retry device token upgrade")
+            Button {
                 connectionStore.dismissDeviceLimitAdvisory()
             } label: {
                 Image(systemName: "xmark.circle.fill")
