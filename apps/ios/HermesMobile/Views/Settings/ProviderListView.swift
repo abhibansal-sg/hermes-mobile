@@ -22,6 +22,26 @@ import SwiftUI
 // once, then deletes the Keychain copy (the gateway is the source of truth).
 // The key is never logged; `RestError` already truncates response bodies.
 
+enum ProviderKeySaveDecision: Equatable {
+    case confirmed
+    case rejected(String)
+    case savedUnverified(String)
+
+    init(_ result: ProviderKeyResult) {
+        switch result.validationStatus {
+        case .verified:
+            self = .confirmed
+        case .rejected:
+            self = .rejected(result.validationDetail ?? "Provider rejected this key")
+        case .skipped, .unknown:
+            self = .savedUnverified(
+                result.validationDetail
+                    ?? "Key saved, but the provider could not be verified. Check the provider status before using it."
+            )
+        }
+    }
+}
+
 /// The Model Provider picker — a FULL NATIVE `List` of every provider in the
 /// universe (`GET <prefix>/providers`) with its auth status: "authenticated"
 /// (green chip), "Add key" (a registered api_key provider the user can provision
@@ -431,6 +451,7 @@ struct EnterProviderKeyView: View {
 
     @State private var apiKey = ""
     @State private var errorText: String?
+    @State private var noticeText: String?
     @State private var isSaving = false
     @FocusState private var keyFieldFocused: Bool
 
@@ -468,6 +489,9 @@ struct EnterProviderKeyView: View {
                 if let errorText {
                     Text(errorText)
                         .foregroundStyle(theme.destructive)
+                } else if let noticeText {
+                    Text(noticeText)
+                        .foregroundStyle(theme.mutedFg)
                 } else {
                     Text("The key is sent once over your existing connection and held only until the save completes. Your gateway is the source of truth.")
                 }
@@ -508,6 +532,7 @@ struct EnterProviderKeyView: View {
         guard canSave else { return }
         keyFieldFocused = false
         errorText = nil
+        noticeText = nil
         isSaving = true
         let trimmed = apiKey.trimmingCharacters(in: .whitespaces)
         let slug = provider.slug
@@ -527,12 +552,18 @@ struct EnterProviderKeyView: View {
             }
             do {
                 let result = try await rest.setProviderKey(slug: slug, apiKey: trimmed)
-                if result.validated == false {
-                    errorText = result.validationDetail ?? "Provider rejected this key"
+                switch ProviderKeySaveDecision(result) {
+                case .confirmed:
+                    onSaved(result.row)
+                    dismiss()
+                case .rejected(let message):
+                    errorText = message
+                    return
+                case .savedUnverified(let message):
+                    noticeText = message
+                    onSaved(result.row)
                     return
                 }
-                onSaved(result.row)
-                dismiss()
             } catch {
                 errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
@@ -572,6 +603,7 @@ struct CustomProviderView: View {
     @State private var apiMode: ProviderAPIMode = .openai
     @State private var apiKey = ""
     @State private var errorText: String?
+    @State private var noticeText: String?
     @State private var isSaving = false
     @FocusState private var nameFieldFocused: Bool
 
@@ -653,6 +685,9 @@ struct CustomProviderView: View {
                 if let errorText {
                     Text(errorText)
                         .foregroundStyle(theme.destructive)
+                } else if let noticeText {
+                    Text(noticeText)
+                        .foregroundStyle(theme.mutedFg)
                 } else {
                     Text(isEditing
                         ? "Enter a new API key to rotate. The base URL and API mode can also be corrected. The key is sent once and stored securely on your gateway."
@@ -710,6 +745,7 @@ struct CustomProviderView: View {
         guard canSave else { return }
         nameFieldFocused = false
         errorText = nil
+        noticeText = nil
         isSaving = true
         let trimmedName = name.trimmingCharacters(in: .whitespaces)
         let trimmedBase = baseURL.trimmingCharacters(in: .whitespaces)
@@ -734,12 +770,18 @@ struct CustomProviderView: View {
                     apiMode: apiMode,
                     apiKey: trimmedKey
                 )
-                if result.validated == false {
-                    errorText = result.validationDetail ?? "Provider rejected this key"
+                switch ProviderKeySaveDecision(result) {
+                case .confirmed:
+                    onAdded(result.row)
+                    dismiss()
+                case .rejected(let message):
+                    errorText = message
+                    return
+                case .savedUnverified(let message):
+                    noticeText = message
+                    onAdded(result.row)
                     return
                 }
-                onAdded(result.row)
-                dismiss()
             } catch {
                 errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
