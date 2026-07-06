@@ -61,7 +61,7 @@ struct CronJobsView: View {
                                     editorJob = job
                                     showEditor = true
                                 },
-                                onTrigger: { Task { await act(job.id, toast: "Job triggered") {
+                                onTrigger: { Task { await act(job.id, toast: "Job triggered", refreshAfterSuccess: true) {
                                     try await control.triggerCronJob(id: job.id)
                                 } } },
                                 onPause: { Task { await act(job.id, toast: "Job paused") {
@@ -179,16 +179,32 @@ struct CronJobsView: View {
         }
     }
 
-    /// Run a mutating action, then splice the returned (updated) job back into
-    /// the list so the row reflects the new state without a full reload.
-    private func act(_ id: String, toast toastMessage: String, _ operation: @escaping () async throws -> CronJob) async {
+    /// Run a mutating action, then update the list. Triggered jobs reload from
+    /// the source because execution metadata may change after the trigger route
+    /// returns its snapshot.
+    private func act(
+        _ id: String,
+        toast toastMessage: String,
+        refreshAfterSuccess: Bool = false,
+        _ operation: @escaping () async throws -> CronJob
+    ) async {
         guard !pending.contains(id) else { return }
         pending.insert(id)
         defer { pending.remove(id) }
         do {
             let updated = try await operation()
-            if case .loaded(var jobs) = phase,
-               let index = jobs.firstIndex(where: { $0.id == id }) {
+            if refreshAfterSuccess {
+                try await refreshJobs()
+                Task {
+                    do {
+                        try await Task.sleep(for: .seconds(1.5))
+                        try await refreshJobs()
+                    } catch {
+                        actionError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    }
+                }
+            } else if case .loaded(var jobs) = phase,
+                      let index = jobs.firstIndex(where: { $0.id == id }) {
                 jobs[index] = updated
                 phase = .loaded(jobs)
             }
@@ -196,6 +212,10 @@ struct CronJobsView: View {
         } catch {
             actionError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    private func refreshJobs() async throws {
+        phase = .loaded(try await control.cronJobs())
     }
 
     private func deleteJob(_ job: CronJob) async {
