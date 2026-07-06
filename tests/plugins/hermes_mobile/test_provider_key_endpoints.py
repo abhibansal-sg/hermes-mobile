@@ -1589,6 +1589,158 @@ def test_delete_legacy_custom_provider_removes_stored_key_env(
 
 
 # ===========================================================================
+# STR-107/STR-238 — POST /providers/custom (upsert) must clean up whatever
+# legacy credential state already sits under providers.<name>, mirroring the
+# DELETE handler's backward-compat pattern instead of blindly deriving-and-
+# writing the new state on top of it.
+# ===========================================================================
+
+
+def test_custom_post_legacy_key_env_and_inline_api_key_removes_old_env_and_strips_config(
+    loopback_client, monkeypatch
+):
+    """Regression (STR-107/STR-238): editing/rotating an existing custom
+    provider that carries a LEGACY ``key_env`` (pre collision-resistance fix)
+    AND a stray inline ``api_key`` must not orphan either credential. The POST
+    upsert now reads the existing ``providers.<name>`` entry first: it removes
+    the OLD ``.env`` var (the STORED ``key_env`` — not a re-derived one) and
+    strips the legacy inline ``api_key`` from config.yaml, while the new POST
+    body's base_url/api_mode still land via the normal ``set_config_value``
+    path.
+    """
+    import hashlib as _hashlib
+
+    legacy_env = "MY_CO_API_KEY"
+    new_env = "MY_CO_" + _hashlib.sha1(b"my-co").hexdigest()[:6] + "_API_KEY"
+    assert legacy_env != new_env, "test pre-condition: schemes must differ"
+
+    calls = _patch_config(
+        monkeypatch,
+        providers_in_config={
+            "my-co": {
+                "key_env": legacy_env,
+                "api_key": "legacy-inline",
+                "base_url": "https://api.my-co.example/v1",
+                "api_mode": "openai",
+            }
+        },
+    )
+    _patch_inventory(monkeypatch, rows=[])
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/custom",
+        json={
+            "name": "my-co",
+            "base_url": "https://api.my-co.new/v1",
+            "api_mode": "anthropic_messages",
+            "api_key": "sk-brand-new-key",
+        },
+        headers=_TOKEN_HEADER,
+    )
+    assert r.status_code == 200, r.text
+
+    # The new env var (from _custom_provider_env_var("my-co")) is saved with
+    # the new key.
+    assert (new_env, "sk-brand-new-key") in calls["save_env"], (
+        f"new key not saved under {new_env!r}; save_env calls: {calls['save_env']}"
+    )
+
+    # The OLD stored key_env is passed to remove_env_value — NOT the new var.
+    assert legacy_env in calls["remove_env"], (
+        f"POST did not remove the stale legacy env var {legacy_env!r}; "
+        f"remove_env calls: {calls['remove_env']}"
+    )
+    assert new_env not in calls["remove_env"], (
+        f"POST incorrectly removed the just-written {new_env!r}"
+    )
+
+    # Config save/set leaves no api_key under providers.my-co, via either the
+    # credential-strip save_config() call or the subsequent set_config_value
+    # calls.
+    for saved in calls["save_config"]:
+        assert "api_key" not in (saved.get("providers", {}).get("my-co") or {}), (
+            f"legacy inline api_key survived a save_config() write: {saved}"
+        )
+    assert not any(k == "providers.my-co.api_key" for k, _ in calls["set_config"]), (
+        f"api_key written via set_config_value: {calls['set_config']}"
+    )
+
+    # Final key_env is the NEW hashed var; base_url/api_mode reflect the POST body.
+    set_config_map = dict(calls["set_config"])
+    assert set_config_map["providers.my-co.key_env"] == new_env
+    assert set_config_map["providers.my-co.base_url"] == "https://api.my-co.new/v1"
+    assert set_config_map["providers.my-co.api_mode"] == "anthropic_messages"
+
+    # Response text never contains the old or new raw key values.
+    assert "legacy-inline" not in r.text
+    assert "sk-brand-new-key" not in r.text
+
+
+def test_custom_post_legacy_inline_api_key_no_key_env_strips_without_touching_new_env(
+    loopback_client, monkeypatch
+):
+    """Regression (STR-107/STR-238): a legacy custom-provider entry that has an
+    inline ``api_key`` but NO stored ``key_env`` (an even older shape) must
+    have that inline key stripped on the POST upsert — but the handler must
+    NOT attempt to remove a re-derived env var as though it were legacy: there
+    is no stored ``key_env`` to distrust the derivation of, and the
+    newly-derived var is about to be written to, not removed.
+    """
+    import hashlib as _hashlib
+
+    new_env = "MY_CO_" + _hashlib.sha1(b"my-co").hexdigest()[:6] + "_API_KEY"
+
+    calls = _patch_config(
+        monkeypatch,
+        providers_in_config={
+            "my-co": {
+                "api_key": "legacy-inline-no-key-env",
+                "base_url": "https://api.my-co.example/v1",
+                "api_mode": "openai",
+            }
+        },
+    )
+    _patch_inventory(monkeypatch, rows=[])
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/custom",
+        json={
+            "name": "my-co",
+            "base_url": "https://api.my-co.new/v1",
+            "api_mode": "openai",
+            "api_key": "sk-fresh-key",
+        },
+        headers=_TOKEN_HEADER,
+    )
+    assert r.status_code == 200, r.text
+
+    # No remove_env_value call at all — there was no stored key_env to clean
+    # up, and the newly-derived var must not be removed out from under itself.
+    assert calls["remove_env"] == [], (
+        f"POST attempted an env removal with no stored key_env to justify it: "
+        f"{calls['remove_env']}"
+    )
+
+    # New key lands under the derived var.
+    assert (new_env, "sk-fresh-key") in calls["save_env"]
+
+    # The legacy inline api_key never survives the upsert.
+    for saved in calls["save_config"]:
+        assert "api_key" not in (saved.get("providers", {}).get("my-co") or {}), (
+            f"legacy inline api_key survived a save_config() write: {saved}"
+        )
+    assert not any(k == "providers.my-co.api_key" for k, _ in calls["set_config"]), (
+        f"api_key written via set_config_value: {calls['set_config']}"
+    )
+
+    set_config_map = dict(calls["set_config"])
+    assert set_config_map["providers.my-co.key_env"] == new_env
+
+    assert "legacy-inline-no-key-env" not in r.text
+    assert "sk-fresh-key" not in r.text
+
+
+# ===========================================================================
 # ABH-183 BUG 3 + BUG 4 — DELETE /providers/{slug}/key correctness
 # ===========================================================================
 
