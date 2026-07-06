@@ -3601,6 +3601,16 @@ class TestListSessionsRich:
         assert len(sessions) == 1
         assert sessions[0]["id"] == "s1"
 
+    def test_rich_list_multi_source_filter_applies_before_limit(self, db):
+        db.create_session("old-cron", "cron")
+        db.create_session("new-cli", "cli")
+        db.create_session("new-subagent", "subagent")
+
+        sessions = db.list_sessions_rich(source=["cron", "subagent"], limit=1)
+
+        assert [session["id"] for session in sessions] == ["new-subagent"]
+        assert db.session_count(source=["cron", "subagent"]) == 2
+
     def test_rich_list_cwd_prefix_filter(self, db):
         db.create_session("s1", "cli", cwd="/repo")
         db.create_session("s2", "cli", cwd="/repo/subdir")
@@ -3750,6 +3760,18 @@ class TestListSessionsRich:
         ids = [s["id"] for s in sessions]
         assert "delegate" not in ids, "Delegate sub-agent should not appear in default list"
         assert "root" in ids
+
+    def test_include_children_surfaces_and_counts_subagent_children(self, db):
+        db.create_session("root", "cli")
+        db.create_session("delegate", "subagent", parent_session_id="root")
+
+        assert db.list_sessions_rich(source=["subagent"]) == []
+        assert db.session_count(source=["subagent"], exclude_children=True) == 0
+
+        sessions = db.list_sessions_rich(source=["subagent"], include_children=True)
+
+        assert [session["id"] for session in sessions] == ["delegate"]
+        assert db.session_count(source=["subagent"], exclude_children=False) == 1
 
     def test_compression_child_still_hidden(self, db):
         """Compression continuation sessions remain hidden (parent ended with 'compression')."""
