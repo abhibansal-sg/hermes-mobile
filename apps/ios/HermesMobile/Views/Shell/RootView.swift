@@ -260,7 +260,28 @@ private struct SplitLayout: View {
         // SwiftUI does not reliably inherit custom environment values across
         // presentation/column boundaries. PRESERVED.
         .hermesThemed(themeStore)
+        #if DEBUG
+        // STR-459/STR-462: DEBUG/UITest-only navigation seed. Cold-launches
+        // straight into the Settings sheet when HERMES_UITEST_PANEL=gateway is
+        // set, so a UI test can assert the Gateway Status panel with no manual
+        // taps. Byte-path absent from Release.
+        .onAppear {
+            if UITestSeed.requestedPanel == "gateway" {
+                showingSettings = true
+            }
+        }
+        #endif
         .sheet(isPresented: $showingSettings) {
+            #if DEBUG
+            SettingsView(
+                connectionStore: connection,
+                sessionStore: sessions,
+                appLock: appLock,
+                initialUITestPanel: UITestSeed.requestedPanel
+            )
+            .presentationDragIndicator(.hidden)
+            .hermesThemed(themeStore)
+            #else
             SettingsView(
                 connectionStore: connection,
                 sessionStore: sessions,
@@ -268,6 +289,7 @@ private struct SplitLayout: View {
             )
             .presentationDragIndicator(.hidden)
             .hermesThemed(themeStore)
+            #endif
         }
     }
 
@@ -983,6 +1005,17 @@ private struct CompactLayout: View {
         }
         // Re-install the resolved palette + brand tint at this root. PRESERVED.
         .hermesThemed(themeStore)
+        #if DEBUG
+        // STR-459/STR-462: DEBUG/UITest-only navigation seed. Cold-launches
+        // straight into the Settings sheet when HERMES_UITEST_PANEL=gateway is
+        // set, so a UI test can assert the Gateway Status panel with no manual
+        // taps. Byte-path absent from Release.
+        .onAppear {
+            if UITestSeed.requestedPanel == "gateway" {
+                showingSettings = true
+            }
+        }
+        #endif
         .sheet(isPresented: $showingSettings) { settingsSheet }
         // Dismiss the composer keyboard whenever the drawer OPENS, from ANY
         // trigger — edge-swipe completion, the toolbar drawer button, ⌘F, or the
@@ -1009,6 +1042,16 @@ private struct CompactLayout: View {
     /// still owns its internal `NavigationStack` and dismisses via its toolbar; the
     /// compact shell supplies only the stable presentation state and palette bridge.
     private var settingsSheet: some View {
+        #if DEBUG
+        SettingsView(
+            connectionStore: connection,
+            sessionStore: sessions,
+            appLock: appLock,
+            initialUITestPanel: UITestSeed.requestedPanel
+        )
+        .presentationDragIndicator(.hidden)
+        .hermesThemed(themeStore)
+        #else
         SettingsView(
             connectionStore: connection,
             sessionStore: sessions,
@@ -1016,6 +1059,7 @@ private struct CompactLayout: View {
         )
         .presentationDragIndicator(.hidden)
         .hermesThemed(themeStore)
+        #endif
     }
 
     // MARK: Chat stack

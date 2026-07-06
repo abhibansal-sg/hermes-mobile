@@ -85,4 +85,47 @@ final class RemoteURLModeUITests: XCTestCase {
             "No session row in drawer — REST hydration may have failed due to a Host mismatch"
         )
     }
+
+    // MARK: - Test 3: HERMES_UITEST_PANEL=gateway cold-launches into Gateway Status
+
+    /// STR-459/STR-462: proves the DEBUG-only navigation seed lands a cold
+    /// launch directly on the Settings sheet's Gateway Status panel — no
+    /// drawer tap, no Settings tap, no row tap — via
+    /// `HERMES_UITEST_PANEL=gateway`. Uses the same live remote-URL gateway
+    /// rig as the tests above.
+    ///
+    /// NOTE: this workspace's base predates PR #26 (the drain/cancel
+    /// recovery controls), so `GatewayStatusView` here exposes no
+    /// `gatewayDrain`/`gatewayCancel`-style affordances to assert — only the
+    /// panel's own "Gateway" navigation title (`GatewayStatusView.swift:62`).
+    /// If a future rebase lands PR #26 on top of this branch, extend this
+    /// test to also assert the drain/cancel controls' visibility.
+    func testUITestPanelGatewaySeedLandsOnGatewayStatus() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+              !url.isEmpty, !token.isEmpty else {
+            throw XCTSkip("HERMES_URL/HERMES_TOKEN not provided; skipping live gateway test")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_URL"] = url
+        app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchEnvironment["HERMES_UITEST_PANEL"] = "gateway"
+        app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
+        app.launch()
+
+        // The seed pushes Settings' sheet open, then appends the Gateway
+        // Status panel onto its NavigationPath — both before any user
+        // interaction. `GatewayStatusView.navigationTitle("Gateway")` is the
+        // canonical proof the push landed (the Settings row itself is
+        // titled "Gateway Status"; the pushed destination's own title is
+        // "Gateway" — assert either so this doesn't overfit one label).
+        let gatewayTitle = app.navigationBars.matching(
+            NSPredicate(format: "identifier == %@ OR identifier == %@", "Gateway", "Gateway Status")
+        ).firstMatch
+        XCTAssertTrue(
+            gatewayTitle.waitForExistence(timeout: 30),
+            "HERMES_UITEST_PANEL=gateway did not cold-launch into the Gateway Status panel"
+        )
+    }
 }
