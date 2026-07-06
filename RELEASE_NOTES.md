@@ -1,3 +1,15 @@
+Build 88 — 2026-07-06
+
+FIXED
+- STR-238 — clean legacy custom-provider credentials during POST upsert
+
+WORTH TRYING
+- Try: STR-238 — clean legacy custom-provider credentials during POST upsert
+
+(+1 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 87 — 2026-07-06
 
 (+2 server-side/infra changes active on the gateway, no app UI change)
