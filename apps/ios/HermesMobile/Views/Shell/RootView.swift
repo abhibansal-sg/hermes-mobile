@@ -493,7 +493,10 @@ private struct SplitLayout: View {
                     sendCurrentComposerDraft()
                 } label: { Text("Send") }
                 .keyboardShortcut(.return, modifiers: .command)
-                .disabled(!RootKeyboardShortcutActions.hasSendableComposerText(sessions: sessions))
+                .disabled(!RootKeyboardShortcutActions.canSendComposerDraft(
+                    sessions: sessions,
+                    isStreaming: chat.isStreaming
+                ))
 
                 Button {
                     recallPreviousComposerPrompt()
@@ -535,7 +538,10 @@ private struct SplitLayout: View {
     }
 
     private func sendCurrentComposerDraft() {
-        RootKeyboardShortcutActions.sendCurrentComposerDraft(from: sessions) { text in
+        RootKeyboardShortcutActions.sendCurrentComposerDraft(
+            from: sessions,
+            isStreaming: chat.isStreaming
+        ) { text in
             Task { await chat.send(text: text, includeAttachments: false) }
         }
     }
@@ -587,11 +593,17 @@ enum RootKeyboardShortcutActions {
             .isEmpty
     }
 
+    static func canSendComposerDraft(sessions: SessionStore, isStreaming: Bool) -> Bool {
+        !isStreaming && hasSendableComposerText(sessions: sessions)
+    }
+
     @discardableResult
     static func sendCurrentComposerDraft(
         from sessions: SessionStore,
+        isStreaming: Bool = false,
         send: @escaping @MainActor (String) -> Void
     ) -> Bool {
+        guard !isStreaming else { return false }
         let key = sessions.activeComposerDraftKey
         let text = sessions.composerDraft(for: key)
             .trimmingCharacters(in: .whitespacesAndNewlines)
