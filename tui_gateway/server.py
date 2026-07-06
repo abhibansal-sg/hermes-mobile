@@ -2078,29 +2078,22 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
 
     overrides: dict = {}
     model = str(row.get("model") or model_config.get("model") or "").strip()
-    # ``billing_provider`` is only the billing bucket — for a custom endpoint it is the
-    # bare class ``"custom"``, which agent_init treats as non-routable, so restoring it as
-    # the provider override makes ``session.resume`` fail with "No LLM provider configured".
-    # Only restore an explicit provider; otherwise leave it unset so resume falls back to
-    # the configured default, matching the working CLI path.
+    # ``billing_provider`` is only the billing bucket — for most bare buckets
+    # (``auto``/``openrouter``) that label is never a routable provider name,
+    # so only restore an explicit provider for those; otherwise leave it unset
+    # so resume falls back to the configured default, matching the working CLI
+    # path. ``custom`` is let through as a tentative value: the healing block
+    # below recovers its durable ``custom:<name>`` identity (or keeps/drops the
+    # bare label) using the base_url and config together, so both a real
+    # base_url and a config-only recovery path stay reconstructable.
     explicit_provider = str(model_config.get("provider") or "").strip()
     billing_provider = str(
         model_config.get("billing_provider") or row.get("billing_provider") or ""
     ).strip()
     provider = explicit_provider
-    if not provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
+    if not provider and billing_provider.lower() not in ("auto", "openrouter"):
         provider = billing_provider
     base_url = str(model_config.get("base_url") or "").strip()
-    # FIX (iOS resume "No LLM provider configured"): "custom" is a generic
-    # BILLING label the gateway assigns to non-standard providers (e.g. a local
-    # proxy), NOT a resolvable provider name. A session stored with
-    # billing_provider="custom" but NO base_url cannot reconstruct a working
-    # endpoint, so forcing provider="custom" into the override makes the agent
-    # rebuild fail on resume (a fresh session on the configured global provider
-    # builds fine). Drop the unresolvable provider so resume falls back to the
-    # configured global provider — the one the session actually ran on.
-    if provider == "custom" and not base_url:
-        provider = ""
     api_mode = str(model_config.get("api_mode") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
