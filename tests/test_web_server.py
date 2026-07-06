@@ -244,6 +244,9 @@ def test_stall_watchdog_trips_and_restarts_exactly_once():
         assert _wait_until(lambda: wd.tripped, timeout=2.0), (
             "watchdog never tripped on a stale heartbeat"
         )
+        assert _wait_until(lambda: restart_calls == [1], timeout=2.0), (
+            f"restart callback did not run after trip, got {restart_calls!r}"
+        )
         # Give it several more poll cycles worth of time to prove it
         # doesn't spin/re-trip/re-restart.
         time.sleep(wd._poll_interval * 5)
