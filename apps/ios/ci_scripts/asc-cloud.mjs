@@ -180,7 +180,14 @@ async function cmdFindRun(workflowId, sha, sinceMinutesArg) {
   const cutoff = Date.now() - sinceMinutes * 60_000;
   const shaShort = sha.slice(0, 7);
 
-  const runs = await ascFetchAll(`/ciWorkflows/${workflowId}/buildRuns?limit=20&sort=-createdDate`);
+  // NOTE (STR-493 fix, 2026-07-06): the ciBuildRuns endpoint only accepts
+  // sort=number|-number — createdDate is NOT a valid sort value (400
+  // PARAMETER_ERROR.INVALID). This silently broke find-run since STR-173
+  // shipped: every call threw, so the ship script's MATCH check never fired
+  // and ship-testflight.sh double-triggered a fresh Xcode Cloud run on every
+  // retry instead of adopting the in-flight one. -number sorts by build
+  // number descending, which is monotonic with recency for this workflow.
+  const runs = await ascFetchAll(`/ciWorkflows/${workflowId}/buildRuns?limit=20&sort=-number`);
   const match = runs.find((r) => {
     const commitSha = r.attributes?.sourceCommit?.commitSha ?? '';
     const createdMs = r.attributes?.createdDate ? Date.parse(r.attributes.createdDate) : 0;
