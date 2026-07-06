@@ -35,17 +35,36 @@ struct ToolClusterView: View {
     /// Wall-clock seconds the turn took, for the summary's "· Xs" tail. Falls
     /// back to the sum of per-tool durations when absent.
     let turnElapsed: TimeInterval?
+    /// The global transcript detail level (STR-241). `.verbose` seeds every row
+    /// in this cluster open by default; a user's own tap always wins over this
+    /// default (mirrors `ThinkingView`'s streaming/user-toggle precedence).
+    let detailsMode: TranscriptDetailsMode
 
     @Environment(\.hermesTheme) private var theme
 
     /// Whether the collapsed summary is currently expanded into the full
     /// timeline. Ignored when `collapsed` is false.
     @State private var isExpanded = false
-    /// Tracks row disclosures owned by this cluster so opening any tool can
-    /// immediately break the live bounded window back out to the readable flat
-    /// timeline without losing the row's expanded state during that layout swap.
-    @State private var expandedToolIDs: Set<String> = []
+    /// EXPLICIT per-tool user choices only — absent entries fall back to the
+    /// `detailsMode`-driven default (`isToolExpanded`), so first-toggle-wins
+    /// semantics hold exactly like `ThinkingView.userExpanded`. Also lets
+    /// opening any tool immediately break the live bounded window back out to
+    /// the readable flat timeline without losing the row's expanded state
+    /// during that layout swap.
+    @State private var explicitToolExpansion: [String: Bool] = [:]
     @State private var liveScrollTarget: String? = Self.liveToolWindowBottomID
+
+    init(
+        tools: [ToolActivity],
+        collapsed: Bool,
+        turnElapsed: TimeInterval?,
+        detailsMode: TranscriptDetailsMode = .normal
+    ) {
+        self.tools = tools
+        self.collapsed = collapsed
+        self.turnElapsed = turnElapsed
+        self.detailsMode = detailsMode
+    }
 
     var body: some View {
         if collapsed && tools.count >= 2 {
@@ -67,7 +86,8 @@ struct ToolClusterView: View {
             }
         }
         .onChange(of: tools.map(\.id)) { _, ids in
-            expandedToolIDs = expandedToolIDs.intersection(Set(ids))
+            let idSet = Set(ids)
+            explicitToolExpansion = explicitToolExpansion.filter { idSet.contains($0.key) }
             liveScrollTarget = Self.liveToolWindowBottomID
         }
     }
@@ -75,7 +95,7 @@ struct ToolClusterView: View {
     private var usesBoundedLiveToolWindow: Bool {
         !collapsed
             && tools.count >= Self.liveToolWindowThreshold
-            && expandedToolIDs.isEmpty
+            && !tools.contains { isToolExpanded($0) }
     }
 
     private var flatToolRows: some View {
@@ -154,17 +174,17 @@ struct ToolClusterView: View {
         }
     }
 
+    /// Whether `tool`'s row should currently show expanded: the user's own
+    /// choice when they've made one, else the `detailsMode`-driven default.
+    private func isToolExpanded(_ tool: ToolActivity) -> Bool {
+        explicitToolExpansion[tool.id] ?? TranscriptRenderPolicy.toolDefaultExpanded(mode: detailsMode)
+    }
+
     private func expansionBinding(for tool: ToolActivity) -> Binding<Bool> {
         Binding {
-            expandedToolIDs.contains(tool.id)
+            isToolExpanded(tool)
         } set: { isExpanded in
-            var next = expandedToolIDs
-            if isExpanded {
-                next.insert(tool.id)
-            } else {
-                next.remove(tool.id)
-            }
-            expandedToolIDs = next
+            explicitToolExpansion[tool.id] = isExpanded
         }
     }
 

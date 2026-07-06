@@ -308,4 +308,47 @@ enum DefaultsKeys {
         return ConnectionMode(rawValue: raw) ?? .remoteURL
     }
 
+    // MARK: Transcript details mode + section visibility (STR-2 / ABH-421 / STR-241)
+
+    /// `String` (raw value of `TranscriptDetailsMode`) — the global transcript
+    /// detail level. Absent/unrecognised values fall back to `.normal`, which
+    /// preserves today's collapsed-by-default behavior exactly. Owned by
+    /// ``SettingsView`` (writer) + ``ChatView`` (reader, threaded down to
+    /// `MessageBubble`).
+    static let transcriptDetailsMode = "hermes.transcriptDetailsMode"
+
+    /// Read + decode the persisted ``TranscriptDetailsMode``. Returns `.normal`
+    /// when unset (existing installs keep the existing behaviour unchanged).
+    static func transcriptDetailsModeValue(_ defaults: UserDefaults = .standard) -> TranscriptDetailsMode {
+        let raw = defaults.string(forKey: transcriptDetailsMode) ?? ""
+        return TranscriptDetailsMode(rawValue: raw) ?? .normal
+    }
+
+    /// `Bool` per section — whether that section's transcript UI renders at
+    /// all. **Default ON** for all four (missing key reads as `true`, so
+    /// existing installs see every section exactly as today). Disabling a
+    /// section is a purely client-side WHETHER-to-render gate: the underlying
+    /// `ChatMessage.parts` data is never touched.
+    static let transcriptSectionThinkingEnabled = "hermes.transcriptSection.thinkingEnabled"
+    static let transcriptSectionToolsEnabled = "hermes.transcriptSection.toolsEnabled"
+    static let transcriptSectionSubagentsEnabled = "hermes.transcriptSection.subagentsEnabled"
+    static let transcriptSectionActivityEnabled = "hermes.transcriptSection.activityEnabled"
+
+    /// The `UserDefaults` key backing a given ``TranscriptSection``'s visibility.
+    static func transcriptSectionKey(_ section: TranscriptSection) -> String {
+        switch section {
+        case .thinking: return transcriptSectionThinkingEnabled
+        case .tools: return transcriptSectionToolsEnabled
+        case .subagents: return transcriptSectionSubagentsEnabled
+        case .activity: return transcriptSectionActivityEnabled
+        }
+    }
+
+    /// Whether a given transcript section is enabled. A *missing* key reads as
+    /// `true` (on by default); a present key is honored verbatim.
+    static func transcriptSectionEnabled(_ section: TranscriptSection, _ defaults: UserDefaults = .standard) -> Bool {
+        let key = transcriptSectionKey(section)
+        return defaults.object(forKey: key) == nil ? true : defaults.bool(forKey: key)
+    }
+
 }

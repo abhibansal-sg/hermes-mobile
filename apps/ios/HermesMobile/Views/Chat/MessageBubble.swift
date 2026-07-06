@@ -69,6 +69,12 @@ struct MessageBubble: View {
     /// sites compiling unchanged.
     let appearance: BubbleAppearance
 
+    /// Transcript detail-mode + per-section visibility (STR-241), folded into
+    /// `Equatable` for the same reason as `appearance`: `ChatView` reads the
+    /// live `@AppStorage` values and rebuilds this struct every render, so a
+    /// Settings change re-renders the already-visible transcript immediately.
+    let transcriptPrefs: BubbleTranscriptPrefs
+
     /// Explicit memberwise init so every comparison input can be an immutable
     /// `Sendable` `let` (required for the `nonisolated ==` under Swift 6 strict
     /// concurrency — a `View` is main-actor-isolated, so `Equatable.==` may only
@@ -82,7 +88,8 @@ struct MessageBubble: View {
         onBranch: ((ChatMessage) -> Void)? = nil,
         menuActionsEnabled: Bool = true,
         assistantTurnActionsEnabled: Bool = true,
-        appearance: BubbleAppearance = BubbleAppearance()
+        appearance: BubbleAppearance = BubbleAppearance(),
+        transcriptPrefs: BubbleTranscriptPrefs = BubbleTranscriptPrefs()
     ) {
         self.message = message
         self.onEdit = onEdit
@@ -93,6 +100,7 @@ struct MessageBubble: View {
         self.menuActionsEnabled = menuActionsEnabled
         self.assistantTurnActionsEnabled = assistantTurnActionsEnabled
         self.appearance = appearance
+        self.transcriptPrefs = transcriptPrefs
     }
 
     var body: some View {
@@ -432,19 +440,31 @@ struct MessageBubble: View {
     private func assistantPart(_ part: ChatMessagePart, showsCursor: Bool) -> some View {
         switch part {
         case .reasoning(_, let text):
-            if !text.isEmpty {
+            // STR-241: disabling the "thinking" section hides this view but
+            // never touches `message.parts` — the reasoning text stays intact
+            // in the model, just not rendered.
+            if !text.isEmpty && transcriptPrefs.thinkingEnabled {
                 // Wire-position thinking (§3.3): the accordion renders exactly
                 // where this `.reasoning` part sits in `parts` (never hoisted to
                 // the top) and auto-opens while the turn streams, collapsing when
-                // it settles. `message.isStreaming` drives that default.
-                ThinkingView(thinking: text, streaming: message.isStreaming)
+                // it settles. `message.isStreaming` drives that default; STR-241
+                // additionally seeds the default open in verbose mode.
+                ThinkingView(
+                    thinking: text,
+                    streaming: message.isStreaming,
+                    detailsMode: transcriptPrefs.detailsMode
+                )
             }
         case .tools(_, let tools, let collapsed, let turnElapsed):
-            if !tools.isEmpty {
+            // STR-241: disabling the "tools" section hides this view but never
+            // touches `message.parts` — the tool timeline stays intact in the
+            // model, just not rendered.
+            if !tools.isEmpty && transcriptPrefs.toolsEnabled {
                 ToolClusterView(
                     tools: tools,
                     collapsed: collapsed,
-                    turnElapsed: turnElapsed
+                    turnElapsed: turnElapsed,
+                    detailsMode: transcriptPrefs.detailsMode
                 )
             }
         case .text(_, let text):
@@ -1498,6 +1518,18 @@ struct BubbleAppearance: Equatable, Sendable {
     var typeSize: DynamicTypeSize = .large
 }
 
+/// Transcript detail-mode + per-section visibility (STR-241), threaded into
+/// `MessageBubble` the same way `BubbleAppearance` threads theme/type-size:
+/// `ChatView` reads the live `DefaultsKeys`-backed values and builds a fresh
+/// value every render, so a Settings change applies to the visible transcript
+/// immediately (contract item 4) without needing an `@Observable` prefs store.
+/// Defaults match today's behavior exactly (`.normal`, every section on).
+struct BubbleTranscriptPrefs: Equatable, Sendable {
+    var detailsMode: TranscriptDetailsMode = .normal
+    var thinkingEnabled: Bool = true
+    var toolsEnabled: Bool = true
+}
+
 extension MessageBubble: Equatable {
     /// Two bubbles render identically iff their content (`message`), the menu-action
     /// gating, and the appearance token match. `nonisolated` is required under
@@ -1516,6 +1548,7 @@ extension MessageBubble: Equatable {
             && lhs.menuActionsEnabled == rhs.menuActionsEnabled
             && lhs.assistantTurnActionsEnabled == rhs.assistantTurnActionsEnabled
             && lhs.appearance == rhs.appearance
+            && lhs.transcriptPrefs == rhs.transcriptPrefs
     }
 }
 

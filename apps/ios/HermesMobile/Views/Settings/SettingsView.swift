@@ -103,6 +103,27 @@ struct SettingsView: View {
     /// same source of truth without re-presenting anything.
     @AppStorage(DefaultsKeys.displayName) private var displayName = ""
 
+    // MARK: Transcript detail mode + section visibility (STR-2 / ABH-421 / STR-241)
+
+    /// Raw `TranscriptDetailsMode` value; decoded via `transcriptDetailsMode`
+    /// below. `@AppStorage`'s own default implements "absent ⇒ normal" without
+    /// a manual inversion (mirrors the `notifyApproval`-style precedent).
+    @AppStorage(DefaultsKeys.transcriptDetailsMode) private var transcriptDetailsModeRaw = TranscriptDetailsMode.normal.rawValue
+    @AppStorage(DefaultsKeys.transcriptSectionThinkingEnabled) private var transcriptThinkingEnabled = true
+    @AppStorage(DefaultsKeys.transcriptSectionToolsEnabled) private var transcriptToolsEnabled = true
+    @AppStorage(DefaultsKeys.transcriptSectionSubagentsEnabled) private var transcriptSubagentsEnabled = true
+    @AppStorage(DefaultsKeys.transcriptSectionActivityEnabled) private var transcriptActivityEnabled = true
+
+    /// Binding the segmented Picker drives; decodes/encodes through the raw
+    /// `@AppStorage` string so an unrecognised persisted value still reads back
+    /// as `.normal` instead of crashing the Picker's selection.
+    private var transcriptDetailsMode: Binding<TranscriptDetailsMode> {
+        Binding(
+            get: { TranscriptDetailsMode(rawValue: transcriptDetailsModeRaw) ?? .normal },
+            set: { transcriptDetailsModeRaw = $0.rawValue }
+        )
+    }
+
     // MARK: Per-event push prefs (F2-A / A4)
 
     /// The per-event push toggles. All default ON. A change re-POSTs
@@ -155,6 +176,7 @@ struct SettingsView: View {
             List {
                 accountSection
                 appearanceAndPanelsSection
+                transcriptDetailSection
                 notificationsAndSecuritySection
                 relayPushSection
                 approvalBypassSection
@@ -374,6 +396,53 @@ struct SettingsView: View {
                 }
                 .listRowBackground(theme.card)
             }
+        }
+    }
+
+    // MARK: - Transcript detail (STR-2 / ABH-421 / STR-241)
+
+    /// Global detail level + per-section visibility for the chat transcript.
+    /// Client-only prefs (`@AppStorage`) — never a server mutation. Changes
+    /// apply to the visible transcript immediately (`ChatView` reads the same
+    /// keys live) and persist across relaunch.
+    @ViewBuilder
+    private var transcriptDetailSection: some View {
+        Section {
+            Picker("Detail level", selection: transcriptDetailsMode) {
+                Text("Minimal").tag(TranscriptDetailsMode.minimal)
+                Text("Normal").tag(TranscriptDetailsMode.normal)
+                Text("Verbose").tag(TranscriptDetailsMode.verbose)
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("transcriptDetailsModePicker")
+
+            Toggle(isOn: $transcriptThinkingEnabled) {
+                SettingsRowLabel(icon: "brain", title: "Thinking")
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("transcriptSectionThinkingToggle")
+
+            Toggle(isOn: $transcriptToolsEnabled) {
+                SettingsRowLabel(icon: "wrench.and.screwdriver", title: "Tools")
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("transcriptSectionToolsToggle")
+
+            Toggle(isOn: $transcriptSubagentsEnabled) {
+                SettingsRowLabel(icon: "point.3.connected.trianglepath.dotted", title: "Subagents")
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("transcriptSectionSubagentsToggle")
+
+            Toggle(isOn: $transcriptActivityEnabled) {
+                SettingsRowLabel(icon: "timer", title: "Activity")
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("transcriptSectionActivityToggle")
+        } header: {
+            Text("Transcript Detail")
+        } footer: {
+            Text("Minimal keeps answers clean; Verbose expands machine detail by default. Turning a section off hides it without deleting anything.")
         }
     }
 

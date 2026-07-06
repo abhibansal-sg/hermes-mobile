@@ -21,6 +21,12 @@ struct ThinkingView: View {
     /// sites / previews render the calm collapsed state unchanged.
     var streaming: Bool = false
 
+    /// The global transcript detail level (STR-241). `.verbose` defaults this
+    /// accordion open; `.minimal`/`.normal` preserve today's collapsed default.
+    /// Only a SEED for the initial/default state — the streaming auto-open and
+    /// the user's own toggle (`userExpanded`) both still take precedence.
+    var detailsMode: TranscriptDetailsMode = .normal
+
     @Environment(\.hermesTheme) private var theme
 
     /// The effective expansion state. `nil` means "no explicit user choice yet,
@@ -41,8 +47,12 @@ struct ThinkingView: View {
     /// animates (the watch-it-settle UX during an in-view turn).
     @State private var hasAppeared = false
 
-    /// Auto behavior: open while streaming, collapsed once settled.
-    private var autoExpanded: Bool { streaming }
+    /// Auto behavior: open while streaming, collapsed once settled — OR open by
+    /// default in verbose mode (STR-241). Either condition is overridden the
+    /// instant the user takes manual control (`userExpanded`, first-toggle-wins).
+    private var autoExpanded: Bool {
+        streaming || TranscriptRenderPolicy.thinkingDefaultExpanded(mode: detailsMode)
+    }
 
     /// The animation to apply to the settle transition — `nil` (no animation) until
     /// the view has appeared once, so the seed-path first paint lands final.

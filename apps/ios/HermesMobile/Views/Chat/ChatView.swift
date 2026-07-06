@@ -29,6 +29,35 @@ struct ChatView: View {
     /// adaptive theme's light↔dark flip, where the theme name is unchanged.
     @Environment(\.colorScheme) private var colorScheme
 
+    // MARK: - STR-241: transcript details mode + section visibility
+    //
+    // Live-reactive `@AppStorage` reads so a Settings change applies to the
+    // already-visible transcript immediately (contract item 4). Folded into
+    // each bubble's `BubbleTranscriptPrefs` (A1-style Equatable token, same
+    // reasoning as `appearance` above) and into the subagent/activity
+    // affordance gates below.
+    @AppStorage(DefaultsKeys.transcriptDetailsMode) private var transcriptDetailsModeRaw = ""
+    @AppStorage(DefaultsKeys.transcriptSectionThinkingEnabled) private var transcriptThinkingEnabled = true
+    @AppStorage(DefaultsKeys.transcriptSectionToolsEnabled) private var transcriptToolsEnabled = true
+    @AppStorage(DefaultsKeys.transcriptSectionSubagentsEnabled) private var transcriptSubagentsEnabled = true
+    @AppStorage(DefaultsKeys.transcriptSectionActivityEnabled) private var transcriptActivityEnabled = true
+
+    /// Decoded detail mode; falls back to `.normal` for an absent/unrecognised
+    /// raw value, matching `DefaultsKeys.transcriptDetailsModeValue`.
+    private var transcriptDetailsMode: TranscriptDetailsMode {
+        TranscriptDetailsMode(rawValue: transcriptDetailsModeRaw) ?? .normal
+    }
+
+    /// Built fresh every render from the live `@AppStorage` values above so
+    /// `.equatable()` on `MessageBubble` correctly detects a Settings change.
+    private var transcriptPrefs: BubbleTranscriptPrefs {
+        BubbleTranscriptPrefs(
+            detailsMode: transcriptDetailsMode,
+            thinkingEnabled: transcriptThinkingEnabled,
+            toolsEnabled: transcriptToolsEnabled
+        )
+    }
+
     /// Optional hook invoked when the user chooses "Speak" on an assistant
     /// message. Wiring to the speech player happens during integration; nil
     /// (default) hides the Speak action.
@@ -180,7 +209,8 @@ struct ChatView: View {
     /// turn is actively running, not while the turn is paused on a human approval,
     /// clarification, sudo, or secret prompt (those have their own user-action UI).
     private var shouldShowInlineTurnActivity: Bool {
-        chatStore.isStreaming
+        transcriptActivityEnabled
+            && chatStore.isStreaming
             && chatStore.pendingApproval == nil
             && chatStore.pendingClarification == nil
             && chatStore.pendingSecurePrompt == nil
@@ -809,7 +839,8 @@ struct ChatView: View {
                         onBranch: branchHandler,
                         menuActionsEnabled: menuActionsEnabled,
                         assistantTurnActionsEnabled: !chatStore.isStreaming,
-                        appearance: BubbleAppearance(themeID: theme.id, colorScheme: colorScheme, typeSize: dynamicTypeSize)
+                        appearance: BubbleAppearance(themeID: theme.id, colorScheme: colorScheme, typeSize: dynamicTypeSize),
+                        transcriptPrefs: transcriptPrefs
                     )
                     // A1 (scarf): settled bubbles short-circuit their body — only the
                     // streaming bubble (whose `message` changed) re-evaluates. Drops the
@@ -1762,7 +1793,8 @@ struct ChatView: View {
     /// least one `subagent.*` frame (passive capability) AND the active turn has
     /// recorded subagent activity. A stock gateway shows nothing.
     private var showSubagentAffordance: Bool {
-        connectionStore.capabilities.subagentEvents == .available
+        transcriptSubagentsEnabled
+            && connectionStore.capabilities.subagentEvents == .available
             && chatStore.hasSubagentActivity
     }
 
