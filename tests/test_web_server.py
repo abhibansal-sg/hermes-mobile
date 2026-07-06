@@ -6,6 +6,8 @@ Config + Server + asyncio.run to capture kwargs without starting an event loop.
 
 import asyncio
 import contextlib
+import threading
+import time
 
 import uvicorn
 
@@ -210,3 +212,105 @@ def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
     assert runner_called["hit"] is False, (
         "POSIX must not take the Windows loop-factory branch"
     )
+
+
+# ── Off-loop stall watchdog (STR-12 / ABH-370) ───────────────────────────
+
+
+def _wait_until(predicate, timeout=2.0, interval=0.01) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+def test_stall_watchdog_trips_and_restarts_exactly_once():
+    """A heartbeat that never advances past the threshold must trip the
+    watchdog and fire the injected restart callback -- exactly once, even
+    if the watchdog thread lives on for further poll cycles afterward."""
+    restart_calls = []
+    stale_beat = time.monotonic() - 1000.0  # already ancient, never updates
+
+    wd = web_server._LoopStallWatchdog(
+        get_last_beat=lambda: stale_beat,
+        restart_callback=lambda: restart_calls.append(1),
+        stall_threshold=0.05,
+        poll_interval=0.02,
+    )
+    wd.start()
+    try:
+        assert _wait_until(lambda: wd.tripped, timeout=2.0), (
+            "watchdog never tripped on a stale heartbeat"
+        )
+        # Give it several more poll cycles worth of time to prove it
+        # doesn't spin/re-trip/re-restart.
+        time.sleep(wd._poll_interval * 5)
+        assert restart_calls == [1], (
+            f"restart callback must fire exactly once, got {restart_calls!r}"
+        )
+        assert _wait_until(lambda: not wd._thread.is_alive(), timeout=2.0), (
+            "watchdog thread must exit after tripping, not keep polling"
+        )
+    finally:
+        wd.stop()
+
+
+def test_stall_watchdog_normal_stop_does_not_restart():
+    """Stopping the watchdog (the server.main_loop() returned normally path)
+    before the heartbeat ever goes stale must never invoke the restart
+    callback, and must leave no thread running behind."""
+    restart_calls = []
+    fresh_beat = time.monotonic()
+
+    wd = web_server._LoopStallWatchdog(
+        get_last_beat=lambda: fresh_beat,
+        restart_callback=lambda: restart_calls.append(1),
+        stall_threshold=10.0,
+        poll_interval=0.02,
+    )
+    assert wd._thread.daemon is True, "watchdog thread must not block interpreter exit"
+
+    wd.start()
+    time.sleep(wd._poll_interval * 5)  # let it poll harmlessly a few times
+    wd.stop()
+
+    assert restart_calls == [], "restart must not fire on a clean shutdown"
+    assert wd.tripped is False
+    assert not wd._thread.is_alive(), "stop() must leave no watchdog thread running"
+
+
+def test_format_stall_forensics_includes_loop_thread_and_stack_frame():
+    """The forensics dump must identify the (suspected-wedged) loop thread
+    by name and id, and include at least one real stack frame so the next
+    incident is diagnosable from the log alone."""
+    current = threading.current_thread()
+
+    report = web_server._format_stall_forensics(
+        age=123.4, threshold=75.0, loop_thread=current,
+    )
+
+    assert "123.4" in report
+    assert "75.0" in report
+    assert current.name in report
+    assert str(current.ident) in report
+    assert "[event loop]" in report
+    # traceback.format_stack of this thread's live frame must include this
+    # very test function somewhere in the call chain.
+    assert (
+        "test_format_stall_forensics_includes_loop_thread_and_stack_frame"
+        in report
+    )
+
+
+def test_dump_stall_forensics_logs_via_module_logger(caplog):
+    """_dump_stall_forensics (the production entry point _trip() calls)
+    must actually emit the report through the module logger, not just
+    build a string nobody sees."""
+    current = threading.current_thread()
+    with caplog.at_level("ERROR", logger="hermes_cli.web_server"):
+        web_server._dump_stall_forensics(42.0, 75.0, current)
+
+    assert "42.0" in caplog.text
+    assert current.name in caplog.text
