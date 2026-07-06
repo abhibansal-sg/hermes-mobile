@@ -24,6 +24,11 @@ packages:
   GRDB:
     url: https://github.com/groue/GRDB.swift
     from: "7.0.0"
+  # LaTeX math rendering for transcript math segments (STR-445).
+  # HermesMobile only; neither extension renders transcript content.
+  SwiftMath:
+    url: https://github.com/mgriebling/SwiftMath
+    from: "1.7.3"
 targets:
   HermesMobile:
     type: application
@@ -44,6 +49,9 @@ targets:
       # HermesMobile only; no extension target links this.
       - package: GRDB
         product: GRDB
+      # LaTeX math rendering (MathSegmentView / STR-445).
+      - package: SwiftMath
+        product: SwiftMath
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app
