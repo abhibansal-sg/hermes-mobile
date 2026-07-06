@@ -73,4 +73,39 @@ final class BatchHTests: XCTestCase {
         XCTAssertEqual(inbox.pendingItems.map(\.id), ["ap-live"],
                        "pending items survive the tidy-up")
     }
+
+    // MARK: - STR-291: already-resolved clarify must not resurrect a phantom card
+
+    func testIsAlreadyResolvedErrorRecognizesNoPendingClarify() {
+        let inbox = InboxStore()
+        // The gateway's `_respond` returns RPC 4009 "no pending clarify
+        // request" when the request id is already consumed (e.g. answered via
+        // the push-notification text-reply REST path). The app must treat that
+        // as moot and NOT re-arm the item.
+        let moot = GatewayError.rpc(code: 4009, message: "no pending clarify request")
+        XCTAssertTrue(inbox.isAlreadyResolvedError(moot),
+                      "4009 'no pending clarify request' is an already-resolved signal")
+    }
+
+    func testIsAlreadyResolvedErrorRejectsSessionBusy() {
+        let inbox = InboxStore()
+        // Code 4009 is shared with "session busy"; only the "no pending"
+        // message variant signals a consumed prompt. "session busy" is a
+        // transient failure and must still trigger rearm.
+        let busy = GatewayError.rpc(code: 4009, message: "session busy")
+        XCTAssertFalse(inbox.isAlreadyResolvedError(busy),
+                       "4009 'session busy' is transient, not already-resolved")
+    }
+
+    func testIsAlreadyResolvedErrorRejectsTransportFailures() {
+        let inbox = InboxStore()
+        // Genuine transport / timeout failures must rearm so the user can retry.
+        XCTAssertFalse(inbox.isAlreadyResolvedError(GatewayError.notConnected))
+        XCTAssertFalse(
+            inbox.isAlreadyResolvedError(GatewayError.timeout(method: "clarify.respond"))
+        )
+        XCTAssertFalse(
+            inbox.isAlreadyResolvedError(GatewayError.transport("socket dropped"))
+        )
+    }
 }
