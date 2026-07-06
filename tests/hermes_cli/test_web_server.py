@@ -1042,6 +1042,35 @@ class TestWebServerEndpoints:
         assert full.status_code == 200
         full_rows = [s for s in full.json()["sessions"] if s["id"] == "lean-profiles-row"]
         assert full_rows and full_rows[0]["system_prompt"].startswith("# SOUL.md")
+    def test_get_sessions_forwards_multi_source_and_include_children(self, monkeypatch):
+        captured = {}
+
+        class _FakeDB:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def list_sessions_rich(self, limit, offset, **kwargs):
+                captured["list"] = kwargs
+                return []
+
+            def session_count(self, **kwargs):
+                captured["count"] = kwargs
+                return 0
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("hermes_state.SessionDB", _FakeDB)
+
+        resp = self.client.get(
+            "/api/sessions?limit=5&offset=0&source=cron,subagent&include_children=true"
+        )
+
+        assert resp.status_code == 200
+        assert captured["list"]["source"] == ["cron", "subagent"]
+        assert captured["list"]["include_children"] is True
+        assert captured["count"]["source"] == ["cron", "subagent"]
+        assert captured["count"]["exclude_children"] is False
 
     def test_rename_session_updates_title(self):
         """PATCH /api/sessions/{id} renames a session (regression: the route

@@ -3888,6 +3888,7 @@ def get_sessions(
     order: str = "created",
     source: str = None,
     exclude_sources: str = None,
+    include_children: bool = False,
     cwd_prefix: str = None,
     full: bool = False,
     profile: Optional[str] = None,
@@ -3926,17 +3927,19 @@ def get_sessions(
             min_message_count = max(0, min_messages)
             archived_only = archived == "only"
             include_archived = archived == "include"
-            # Optional source scoping: ``source`` includes a single class,
+            # Optional source scoping: ``source`` includes one or more classes,
             # ``exclude_sources`` (comma-separated) drops classes. The desktop
             # uses these to split recents (exclude=cron) from the cron-jobs
             # section (source=cron) into two independent lists.
+            source_list = [s.strip() for s in (source or "").split(",") if s.strip()]
             exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
             sessions = db.list_sessions_rich(
-                source=source or None,
+                source=source_list or None,
                 exclude_sources=exclude_list or None,
                 cwd_prefix=(cwd_prefix or None),
                 limit=limit,
                 offset=offset,
+                include_children=include_children,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
@@ -3947,13 +3950,13 @@ def get_sessions(
                 compact_rows=not full,
             )
             total = db.session_count(
-                source=source or None,
+                source=source_list or None,
                 cwd_prefix=(cwd_prefix or None),
                 exclude_sources=exclude_list or None,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
-                exclude_children=True,
+                exclude_children=not include_children,
             )
             now = time.time()
             for s in sessions:
