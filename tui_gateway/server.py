@@ -9261,6 +9261,24 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 _clear_inflight_turn(session)
             _emit("message.complete", sid, payload)
 
+            # Leftover /steer: if a steer arrived after the final tool batch
+            # (no more tool messages to drain into), the agent returned it in
+            # result["pending_steer"]. Redeliver it as the next user turn via
+            # _enqueue_prompt so it isn't silently dropped (mobile/TUI parity
+            # with gateway/run). _enqueue_prompt preserves merge semantics
+            # (a mid-turn user prompt already queued is merged losslessly) and
+            # pins the current turn's transport. _drain_queued_prompt in the
+            # tail below dispatches it once session["running"] releases. The
+            # just-finished turn stays status `complete` — leftover steer is
+            # not an error.
+            _leftover_steer = (
+                result.get("pending_steer") if isinstance(result, dict) else None
+            )
+            if isinstance(_leftover_steer, str) and _leftover_steer.strip():
+                _enqueue_prompt(
+                    session, _leftover_steer.strip(), session.get("transport")
+                )
+
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
             # whether the goal is done and — if not and we're still under

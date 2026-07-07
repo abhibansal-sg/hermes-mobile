@@ -5125,6 +5125,81 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_prompt_submit_leftover_steer_redelivered_as_queued_prompt(monkeypatch):
+    """Fix for TUI silent-drop: a /steer that arrives after the final tool
+    batch is returned by the agent in result["pending_steer"]. The TUI
+    gateway must redeliver it as the next user turn via _enqueue_prompt so
+    it isn't silently dropped (mobile/TUI parity with gateway/run).
+
+    Asserts the leftover text + current-turn transport are stored in
+    queued_prompt (drained next by _drain_queued_prompt), and that the
+    just-finished assistant turn still completes with status `complete`."""
+    _steer = "please continue with my steer"
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "done",
+                "messages": [{"role": "assistant", "content": "done"}],
+                "pending_steer": _steer,
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    _transport = object()
+    server._sessions["sid"] = _session(agent=_Agent(), transport=_transport)
+    emits: list[tuple] = []
+    drained: list[bool] = []
+
+    def _fake_drain(*_a, **_kw):
+        drained.append(True)
+        return False  # do not recursively dispatch while proving queue state
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+        monkeypatch.setattr(server, "_drain_queued_prompt", _fake_drain)
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hi"},
+            }
+        )
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+
+        # Leftover steer is staged as the next user turn, with the
+        # current turn's transport pinned for redelivery.
+        queued = server._sessions["sid"].get("queued_prompt")
+        assert queued is not None, "leftover /steer was not queued for redelivery"
+        assert queued["text"] == _steer
+        assert queued["transport"] is _transport
+
+        # The tail drain path was reached (it would consume this queue next).
+        assert drained == [True]
+
+        # The just-finished assistant turn completed normally — leftover
+        # steer is not an error/interrupt.
+        complete_calls = [a for a in emits if a[0] == "message.complete"]
+        assert len(complete_calls) == 1
+        _, _, payload = complete_calls[0]
+        assert payload["status"] == "complete", (
+            "leftover steer must not turn the finished turn into an error/interrupt"
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
     """Desktop user-message edits should restart the turn from the edited user."""
 
