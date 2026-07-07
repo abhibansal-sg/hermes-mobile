@@ -400,6 +400,26 @@ struct ChatView: View {
         return "\(label) · \(path)"
     }
 
+    // MARK: - Reading measure (STR-1098)
+
+    /// The single regular-width (iPad) reading-measure cap shared by every
+    /// transcript-edge row — the inline status glow (``TurnActivityBar``),
+    /// the context line (``SessionContextLine``), and the user
+    /// ``MessageBubble`` column (``MessageBubble/userBubbleMaxWidth(screenWidth:horizontalSizeClass:)``).
+    /// Chosen to match the bubble's pre-existing regular-width footprint
+    /// (`1024 × 0.78 ≈ 799pt`) rather than the old `720` clamp, so
+    /// reconciling the tokens widens the status/context rows to meet the
+    /// bubble column instead of shrinking the bubble column to meet them.
+    static let transcriptReadingMeasure: CGFloat = 800
+
+    /// The max-width a transcript-edge row (status glow, context line) should
+    /// use for its `.frame(maxWidth:)`: unbounded in compact (iPhone), capped
+    /// to ``transcriptReadingMeasure`` in regular (iPad). Pure + static so the
+    /// compact/regular split is unit-testable without a live view.
+    static func transcriptRowMaxWidth(isCompact: Bool) -> CGFloat {
+        isCompact ? .infinity : transcriptReadingMeasure
+    }
+
     /// The status-glow breathe token values per TRANSCRIPT-CHROME-TOKENS.md §1.2.
     /// Pure + static so a test can pin the exact alphas/radii without a live
     /// animation, and compact mode (STR-1009) can reuse the same numbers.
@@ -2532,7 +2552,7 @@ struct TurnActivityBar: View {
         }
         .padding(.horizontal, isCompact ? 12 : 14)
         .padding(.vertical, isCompact ? 10 : 12)
-        .frame(maxWidth: isCompact ? .infinity : 720, alignment: .leading)
+        .frame(maxWidth: ChatView.transcriptRowMaxWidth(isCompact: isCompact), alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: ChatView.StatusGlowToken.cornerRadius,
                              style: .circular)
@@ -2599,7 +2619,7 @@ struct SessionContextLine: View {
                 .foregroundStyle(theme.mutedFg)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .frame(maxWidth: isCompact ? .infinity : 720, alignment: .leading)
+                .frame(maxWidth: ChatView.transcriptRowMaxWidth(isCompact: isCompact), alignment: .leading)
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("Session context: \(summary.workspaceLabel)")
                 .accessibilityIdentifier("sessionContextLine")
