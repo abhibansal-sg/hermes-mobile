@@ -33,6 +33,10 @@ struct ComposerView: View {
 
     /// Voice dictation engine (mic → transcript).
     @Environment(VoiceRecorder.self) private var recorder
+    /// Hands-free conversation-mode state machine (STR-344 / STR-533): start/
+    /// stop, mute, live status, and auto-submit — a distinct path from
+    /// tap/hold dictation above, which always stays review-only.
+    @Environment(VoiceConversationController.self) private var voice
     /// Persistent prompt queue / offline outbox.
     @Environment(QueueStore.self) private var queueStore
     /// REST client (transcription endpoint); nil when unconfigured.
@@ -233,6 +237,7 @@ struct ComposerView: View {
         .animation(.easeInOut(duration: 0.16), value: activeMention != nil)
         .animation(.easeInOut(duration: 0.16), value: showSlashCommandPicker)
         .animation(.easeInOut(duration: 0.18), value: isCapturing)
+        .animation(.easeInOut(duration: 0.18), value: voice.isEnabled)
         .animation(.easeInOut(duration: 0.18), value: queueStore.items.count)
         .animation(.easeInOut(duration: 0.18), value: steerNote)
         .animation(.snappy(duration: 0.16), value: holdActive)
@@ -382,9 +387,21 @@ struct ComposerView: View {
                 oldKey: oldKey,
                 newKey: newKey
             )
+            // Session switch / new draft (STR-533 contract item 5): conversation
+            // mode is scoped to the chat it was started on, so a switch must not
+            // leave it silently listening into the newly-loaded session.
+            voice.end()
         }
         .onDisappear {
             sessions.setComposerDraft(text, for: draftKey)
+        }
+        // Disconnect / REST unavailable (STR-533 contract item 5): both
+        // `startListening` and `speak` dependencies in AppEnvironment require
+        // `connectionStore.rest`, which is nil exactly when disconnected — so
+        // gating conversation mode on `isConnected` covers "REST STT/TTS
+        // unavailable" too; there is no separate capability flag for it.
+        .onChange(of: isConnected) { _, connected in
+            if !connected { voice.end() }
         }
     }
 
@@ -423,8 +440,8 @@ struct ComposerView: View {
         // a hold-release's `.onEnded` would stop firing again. The strip is laid
         // over the top and intercepts NEW touches; a hold gesture that has already
         // begun tracking keeps receiving `.onEnded` from its still-mounted host.
-        .opacity(isCapturing ? 0 : 1)
-        .accessibilityHidden(isCapturing)
+        .opacity((isCapturing || voice.isEnabled) ? 0 : 1)
+        .accessibilityHidden(isCapturing || voice.isEnabled)
         .overlay {
             if isCapturing {
                 RecordingStrip(
@@ -443,6 +460,16 @@ struct ComposerView: View {
                         resetHoldState()
                         stopAndTranscribe()
                     }
+                )
+            } else if voice.isEnabled {
+                // Same field+actionRow-stays-mounted pattern as isCapturing above:
+                // conversation mode's own controls are plain buttons (no in-flight
+                // gesture to preserve), so overlaying is purely a visual takeover.
+                ConversationModeStrip(
+                    controller: voice,
+                    onMute: { Task { await voice.toggleMute() } },
+                    onDoneTalking: { Task { await voice.stopTurn(forceTranscribe: true) } },
+                    onHardStop: { voice.end() }
                 )
             }
         }
@@ -479,6 +506,7 @@ struct ComposerView: View {
             attachButton
             modelChip
             yoloButton
+            conversationModeButton
             Spacer(minLength: 0)
             trailingAction
                 .animation(.snappy(duration: 0.18), value: showSend)
@@ -754,6 +782,40 @@ struct ComposerView: View {
         guard isConnected, !yoloTogglePending else { return false }
         guard let sid = sessions.activeRuntimeId, !sid.isEmpty else { return false }
         return true
+    }
+
+    /// Entry point for hands-free conversation mode (STR-344 / STR-533): starts
+    /// the listen→transcribe→think→speak→re-arm loop. Hidden behind the
+    /// ``ConversationModeStrip`` overlay once active, same as the mic glyph is
+    /// hidden behind ``RecordingStrip`` while tap/hold dictation is capturing.
+    private var conversationModeButton: some View {
+        Button {
+            startConversationMode()
+        } label: {
+            Image(systemName: "waveform")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(theme.mutedFg)
+                .frame(width: 28, height: 24)
+                .background {
+                    Capsule().strokeBorder(theme.border, lineWidth: 1)
+                }
+        }
+        .buttonStyle(.plain)
+        .disabled(!isConnected)
+        .accessibilityIdentifier("composerConversationModeButton")
+        .accessibilityLabel("Start conversation mode")
+    }
+
+    /// Starts conversation mode via the recorder's shared permission path — a
+    /// denial surfaces the SAME alert tap-to-record uses (`showMicDeniedAlert`),
+    /// since both paths ultimately drive the one `VoiceRecorder`.
+    private func startConversationMode() {
+        Task {
+            await voice.start()
+            if recorder.permission == .denied {
+                showMicDeniedAlert = true
+            }
+        }
     }
 
     /// The single docked action glyph. SF Symbol `.replace` morphs between mic and
@@ -1436,6 +1498,95 @@ private struct RecordingStrip: View {
     private var elapsedText: String {
         if case .recording(let value) = recorder.state { return value.mmss }
         return TimeInterval.zero.mmss
+    }
+}
+
+/// Replaces the composer card while hands-free conversation mode
+/// (``VoiceConversationController``) is active: mute/unmute, a live status
+/// label + level meter, a "done talking" finish button, and an
+/// ALWAYS-REACHABLE hard stop (STR-344 / STR-533 contract item 2). Mirrors
+/// ``RecordingStrip``'s glass idiom so the two capture modes read as one
+/// system, but conversation mode owns its own controls — mute isn't "cancel"
+/// and hard stop isn't "finish and transcribe", so this does not reuse
+/// ``RecordingControls`` verbatim.
+///
+/// v1 has no VAD / silence detection (`VoiceConversationController`'s own
+/// doc calls this out as a non-goal) — the controller's `stopTurn` is a
+/// no-op outside `.listening` and something has to call it to close the
+/// listening phase. `onDoneTalking` is that manual call site: a checkmark
+/// mirroring `RecordingControls`' "Finish and transcribe" button, enabled
+/// only while `.listening` so a stray tap during transcribing/thinking/
+/// speaking can't race `stopTurn`'s own status guard.
+private struct ConversationModeStrip: View {
+    let controller: VoiceConversationController
+    let onMute: () -> Void
+    let onDoneTalking: () -> Void
+    let onHardStop: () -> Void
+
+    @Environment(\.hermesTheme) private var theme
+
+    private let cornerRadius: CGFloat = 20
+
+    private var isListening: Bool {
+        controller.status == .listening
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button(action: onMute) {
+                Image(systemName: controller.muted ? "mic.slash.fill" : "mic.fill")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(controller.muted ? theme.destructive : theme.mutedFg)
+                    .frame(width: 32, height: 32)
+                    .background(theme.muted, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("conversationModeMuteButton")
+            .accessibilityLabel(controller.muted ? "Unmute" : "Mute")
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(controller.statusLabel)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(theme.fg)
+                LevelBars(level: controller.level)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(controller.accessibilityLabel)
+
+            Button(action: onDoneTalking) {
+                Image(systemName: "checkmark")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(isListening ? theme.midground.contrastingForeground : theme.mutedFg)
+                    .frame(width: 32, height: 32)
+                    .background(isListening ? theme.midground : theme.muted, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!isListening)
+            .opacity(isListening ? 1 : 0.4)
+            .accessibilityIdentifier("conversationModeDoneTalkingButton")
+            .accessibilityLabel("Done talking")
+
+            Button(action: onHardStop) {
+                Image(systemName: "stop.fill")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(theme.destructive.contrastingForeground)
+                    .frame(width: 36, height: 36)
+                    .background(theme.destructive, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("conversationModeStopButton")
+            .accessibilityLabel("End conversation mode")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity)
+        .modifier(ComposerCardSurface(theme: theme, cornerRadius: cornerRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: cornerRadius)
+                .strokeBorder(theme.border, lineWidth: 1)
+        )
+        .animation(.easeInOut(duration: 0.15), value: controller.status)
     }
 }
 
