@@ -7,12 +7,13 @@ import time
 import types
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
+from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
 
 
@@ -6834,7 +6835,8 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
         _stub_urlopen(monkeypatch, ok=False)
         with (
             patch(
-                "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False
+                "hermes_cli.browser_connect.launch_chrome_debug",
+                return_value=ChromeDebugLaunch(launched=False, attempts=[]),
             ),
             patch(
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
@@ -6891,7 +6893,8 @@ def test_browser_manage_connect_no_session_skips_progress_events(monkeypatch):
         _stub_urlopen(monkeypatch, ok=False)
         with (
             patch(
-                "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False
+                "hermes_cli.browser_connect.launch_chrome_debug",
+                return_value=ChromeDebugLaunch(launched=False, attempts=[]),
             ),
             patch(
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
@@ -6979,7 +6982,8 @@ def test_browser_manage_connect_default_local_retries_after_launch(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _opener)
     with patch.dict(sys.modules, {"tools.browser_tool": fake}):
         with patch(
-            "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=True
+            "hermes_cli.browser_connect.launch_chrome_debug",
+            return_value=ChromeDebugLaunch(launched=True, attempts=[]),
         ):
             resp = server.handle_request(
                 {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}
@@ -6992,6 +6996,64 @@ def test_browser_manage_connect_default_local_retries_after_launch(monkeypatch):
         "Chromium-family browser launched and listening on port 9222",
     ]
     assert os.environ["BROWSER_CDP_URL"] == "http://127.0.0.1:9222"
+
+
+def test_guard_chrome_debug_launch_binds_to_launch_chrome_debug(monkeypatch):
+    """Regression for the STR-860 patch-target drift.
+
+    ``_browser_connect`` calls ``hermes_cli.browser_connect.launch_chrome_debug``
+    at call time; the suite-wide autouse guard in ``tests/conftest.py`` must
+    mock that exact symbol, not the dead ``try_launch_chrome_debug`` wrapper
+    the three tests above used to patch (which no production code calls).
+
+    This test poisons every path a real launch could still take *except*
+    ``launch_chrome_debug`` itself, then asserts the real ``subprocess.Popen``
+    is never reached. If the conftest guard regressed to patching
+    ``try_launch_chrome_debug`` instead, the real ``launch_chrome_debug``
+    would run, see the fake non-empty candidate list set up below, and call
+    ``subprocess.Popen`` — which this test would then catch.
+    """
+    import hermes_cli.browser_connect as browser_connect
+
+    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+    monkeypatch.setattr(
+        browser_connect,
+        "get_chrome_debug_candidates",
+        lambda system: ["/nonexistent/not-a-real-chrome-binary"],
+    )
+
+    def _poisoned_try_launch(*_args, **_kwargs):
+        raise AssertionError(
+            "try_launch_chrome_debug was invoked — this dead legacy wrapper "
+            "is never called by production code; something is patching the "
+            "wrong symbol"
+        )
+
+    monkeypatch.setattr(browser_connect, "try_launch_chrome_debug", _poisoned_try_launch)
+
+    poisoned_popen = Mock(
+        side_effect=RuntimeError(
+            "real subprocess.Popen reached — the Chrome-launch guard did not bind"
+        )
+    )
+    monkeypatch.setattr(browser_connect.subprocess, "Popen", poisoned_popen)
+
+    fake = types.SimpleNamespace(
+        cleanup_all_browsers=lambda: None,
+        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
+    )
+    with patch.dict(sys.modules, {"tools.browser_tool": fake}):
+        _stub_urlopen(monkeypatch, ok=False)
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "browser.manage",
+                "params": {"action": "connect", "url": "http://localhost:9222"},
+            }
+        )
+
+    poisoned_popen.assert_not_called()
+    assert resp["result"]["connected"] is False
 
 
 def test_browser_manage_connect_rejects_unreachable_endpoint(monkeypatch):
