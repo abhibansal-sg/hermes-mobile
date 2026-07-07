@@ -2473,7 +2473,11 @@ private extension View {
 /// (H4 / single-stop-affordance principle). The row is pure read-only status
 /// chrome with no interactive controls, living in the transcript layout rather
 /// than as a floating overlay strip (ABH-359).
-private struct TurnActivityBar: View {
+///
+/// Internal (not private) so `TranscriptChromeGlowEvidenceTests` can render the
+/// production glow shell to PNG via `ImageRenderer` for STR-1029 visual evidence
+/// — same testability convention as `composerFloatInset` (line ~199).
+struct TurnActivityBar: View {
     let chatStore: ChatStore
 
     @Environment(\.hermesTheme) private var theme
@@ -2578,7 +2582,9 @@ private struct TurnActivityBar: View {
 /// The display text is computed by the pure helper
 /// ``ChatView/contextLineDisplayText(for:)`` so the visibility/formatting gate
 /// is unit-testable without a live view.
-private struct SessionContextLine: View {
+///
+/// Internal (not private) so evidence tests can render it to PNG (STR-1029).
+struct SessionContextLine: View {
     let summary: SessionSummary
 
     @Environment(\.hermesTheme) private var theme
