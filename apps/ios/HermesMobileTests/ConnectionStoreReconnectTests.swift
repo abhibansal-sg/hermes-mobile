@@ -132,6 +132,37 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         )
     }
 
+    func testConfigureClearsStaleDeviceIdWhenNilIssuedDeviceIdUsesDifferentToken() async {
+        let (connection, _, _) = makeStore()
+        let serverURL = "https://gw.example:9121"
+        let priorServerURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
+        KeychainService.deleteToken(server: serverURL)
+        defer {
+            KeychainService.deleteToken(server: serverURL)
+            DefaultsKeys.setDeviceId(nil, server: serverURL)
+            if let priorServerURL {
+                UserDefaults.standard.set(priorServerURL, forKey: DefaultsKeys.serverURL)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+            }
+        }
+        try? KeychainService.saveToken("stored-device-token", server: serverURL)
+        DefaultsKeys.setDeviceId("dev_stale", server: serverURL)
+
+        let failure = await configureWithoutGateway(
+            connection,
+            serverURL: serverURL,
+            token: "manual-shared-token"
+        )
+
+        XCTAssertNil(failure)
+        XCTAssertNil(
+            DefaultsKeys.deviceId(server: serverURL),
+            "nil-id configure with a different token must clear stale device_id so auto-upgrade can issue a fresh device token"
+        )
+        XCTAssertEqual(KeychainService.loadToken(server: serverURL), "manual-shared-token")
+    }
+
     func testConfigureRecordsNonNilIssuedDeviceId() async {
         let (connection, _, _) = makeStore()
         let serverURL = "https://gw.example:9120"
