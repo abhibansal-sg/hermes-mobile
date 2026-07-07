@@ -82,6 +82,17 @@ _JWT_REFRESH_SECONDS = 50 * 60
 _TRUTHY = frozenset({"1", "true", "yes", "on", "y", "t"})
 
 
+def _relay_client_if_configured():
+    try:
+        from . import relay_client
+    except Exception:
+        _log.debug("relay push config check failed", exc_info=True)
+        return None
+    if relay_client.relay_url_configured():
+        return relay_client
+    return None
+
+
 class PushDependencyError(RuntimeError):
     """Raised when PyJWT / cryptography are required but unavailable.
 
@@ -948,12 +959,8 @@ def notify(
     Never raises: transport / credential errors are logged and swallowed so a
     push failure can never break the calling gateway hook.
     """
-    if os.environ.get("HERMES_MOBILE_RELAY_URL"):
-        try:
-            from . import relay_client
-        except Exception:
-            _log.debug("relay push notify failed", exc_info=True)
-            return 0
+    relay_client = _relay_client_if_configured()
+    if relay_client is not None:
         try:
             relay_payload = payload if isinstance(payload, dict) else {}
             relay_client.send_event_background(
@@ -991,12 +998,8 @@ def notify_live_activity(
     Never raises: errors are logged and swallowed so a failed LA push can never
     break the calling gateway hook.
     """
-    if os.environ.get("HERMES_MOBILE_RELAY_URL"):
-        try:
-            from . import relay_client
-        except Exception:
-            _log.debug("relay live activity notify failed", exc_info=True)
-            return False
+    relay_client = _relay_client_if_configured()
+    if relay_client is not None:
         try:
             relay_client.send_live_activity_background(
                 session_id=session_id,

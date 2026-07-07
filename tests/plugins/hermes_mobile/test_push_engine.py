@@ -380,6 +380,84 @@ def test_notify_noop_when_disabled(monkeypatch, isolated_home):
     assert pn.notify("turn.complete", "Done", "Your turn finished", {}) == 0
 
 
+def test_notify_uses_persisted_relay_url_after_env_restart(monkeypatch, isolated_home):
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    relay = load_plugin_module("relay_client")
+    (isolated_home / ".env").write_text(
+        "HERMES_MOBILE_RELAY_URL=https://relay.example.test\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pn,
+        "_notify_direct_apns",
+        lambda *args, **kwargs: pytest.fail("direct APNs path should not run"),
+    )
+
+    sent = []
+    monkeypatch.setattr(
+        relay,
+        "send_event_background",
+        lambda **kwargs: sent.append(kwargs),
+    )
+
+    assert pn.notify(
+        "approval",
+        "Approval needed",
+        "Hermes needs approval",
+        {"session_id": "sid-1", "source": "gateway"},
+        category="HERMES_APPROVAL",
+    ) == 1
+
+    assert sent == [
+        {
+            "kind": "attention",
+            "session_id": "sid-1",
+            "title": "Approval needed",
+            "body": "Hermes needs approval",
+            "source": "gateway",
+        }
+    ]
+
+
+def test_live_activity_uses_persisted_relay_url_after_env_restart(
+    monkeypatch, isolated_home
+):
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    relay = load_plugin_module("relay_client")
+    (isolated_home / ".env").write_text(
+        "HERMES_MOBILE_RELAY_URL=https://relay.example.test\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pn.APNsConfig,
+        "from_env",
+        classmethod(lambda cls: pytest.fail("direct APNs path should not run")),
+    )
+
+    sent = []
+    monkeypatch.setattr(
+        relay,
+        "send_live_activity_background",
+        lambda **kwargs: sent.append(kwargs),
+    )
+
+    content_state = {
+        "phase": "tool",
+        "toolName": "shell",
+        "elapsedSeconds": 3,
+        "needsApproval": False,
+    }
+    assert pn.notify_live_activity("sid-1", content_state, end=True) is True
+
+    assert sent == [
+        {
+            "session_id": "sid-1",
+            "content_state": content_state,
+            "end": True,
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Plugin dashboard API routes (skips cleanly if FastAPI is unavailable).
 #
