@@ -3452,3 +3452,26 @@ final class ChatStore {
         expireTurnScopedPrompts(includeSecure: true)
     }
 }
+
+// MARK: - Latest completed assistant reply (STR-545)
+
+extension ChatStore {
+    /// The most recent assistant turn that has finished streaming and carries
+    /// non-empty text — ignores streaming/pending rows, non-assistant rows,
+    /// and blank assistant turns (a tool-only or thinking-only turn has no
+    /// `.text` part). This is the read-only seam the hands-free conversation
+    /// loop (STR-532) polls to find what to speak next; it does not mutate
+    /// any store state.
+    ///
+    /// - Parameter lastSeenId: the id of the reply already spoken/consumed.
+    ///   Passing the same id again returns `nil` so a poller doesn't re-speak
+    ///   an unchanged reply.
+    func latestCompletedAssistantReply(excluding lastSeenId: UUID? = nil) -> ChatMessage? {
+        guard let candidate = messages.last(where: { message in
+            message.role == .assistant
+                && !message.isStreaming
+                && !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else { return nil }
+        return candidate.id == lastSeenId ? nil : candidate
+    }
+}

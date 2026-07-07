@@ -66,6 +66,7 @@ struct HermesMobileApp: App {
                 .environment(environment.queueStore)
                 .environment(environment.voiceRecorder)
                 .environment(environment.speechPlayer)
+                .environment(environment.voiceConversationController)
                 .environment(environment.inboxStore)
                 .environment(environment.appLock)
                 .environment(environment.themeStore)
