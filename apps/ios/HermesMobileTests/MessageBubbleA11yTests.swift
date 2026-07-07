@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import HermesMobile
 
 /// A11y judgment PR — unit tests for `MessageBubble.bubbleAccessibilityLabel` and
@@ -161,6 +162,121 @@ final class MessageBubbleA11yTests: XCTestCase {
         ])
     }
 
+    func testMarkdownBlocksParsesAllGitHubAlertMarkers() {
+        let cases: [(marker: String, kind: MessageBubble.MarkdownAlertKind, label: String)] = [
+            ("NOTE", .note, "Note"),
+            ("TIP", .tip, "Tip"),
+            ("IMPORTANT", .important, "Important"),
+            ("WARNING", .warning, "Warning"),
+            ("CAUTION", .caution, "Caution"),
+        ]
+
+        for testCase in cases {
+            let blocks = MessageBubble.markdownBlocks("> [!\(testCase.marker)] Alert body")
+
+            XCTAssertEqual(blocks.count, 1, testCase.marker)
+            guard case .alert(let alert) = blocks[0] else {
+                XCTFail("\(testCase.marker) should parse as an alert")
+                continue
+            }
+            XCTAssertEqual(alert.kind, testCase.kind)
+            XCTAssertEqual(alert.kind.label, testCase.label)
+            XCTAssertEqual(alert.body, "Alert body")
+            XCTAssertFalse(alert.body.contains("[!\(testCase.marker)]"))
+        }
+    }
+
+    func testMarkdownBlocksParsesAlertMarkerCaseAndLeadingWhitespace() {
+        let blocks = MessageBubble.markdownBlocks(">     [!warning] Watch this")
+
+        guard case .alert(let alert) = blocks.first else {
+            return XCTFail("leading whitespace and lowercase marker should parse as an alert")
+        }
+        XCTAssertEqual(alert.kind, .warning)
+        XCTAssertEqual(alert.body, "Watch this")
+    }
+
+    func testMarkdownBlocksParsesAlertMultilineBodyAfterMarker() {
+        let blocks = MessageBubble.markdownBlocks("""
+        > [!TIP]
+        > Use **markdown** here.
+        > Keep the second line.
+        """)
+
+        guard case .alert(let alert) = blocks.first else {
+            return XCTFail("blockquote alert should parse as an alert")
+        }
+        XCTAssertEqual(alert.kind, .tip)
+        XCTAssertEqual(alert.body, "Use **markdown** here.\nKeep the second line.")
+    }
+
+    func testMarkdownBlocksLeavesUnknownAlertAndParagraphMarkersUnchanged() {
+        let blocks = MessageBubble.markdownBlocks("""
+        > [!INFO] Keep raw marker
+
+        [!WARNING] Paragraph marker
+        """)
+
+        XCTAssertEqual(blocks.count, 2)
+        guard case .blockquote(let quote) = blocks[0] else {
+            return XCTFail("unknown marker should remain a normal blockquote")
+        }
+        XCTAssertEqual(quote, "[!INFO] Keep raw marker")
+
+        guard case .paragraph(let paragraph) = blocks[1] else {
+            return XCTFail("paragraph marker should remain a paragraph")
+        }
+        XCTAssertEqual(paragraph, "[!WARNING] Paragraph marker")
+    }
+
+    func testAccessibilityTextForMarkdownStripsValidAlertMarker() {
+        let text = MessageBubble.accessibilityTextForMarkdown("""
+        > [!CAUTION] Do not expose the token.
+        """)
+
+        XCTAssertEqual(text, "Caution: Do not expose the token.")
+        XCTAssertFalse(text.contains("[!CAUTION]"))
+    }
+
+    func testGitHubAlertRenderingEvidenceSnapshots() throws {
+        let message = ChatMessage(
+            role: .assistant,
+            text: """
+            > [!WARNING] Rotate the token before sharing logs.
+            > The raw marker should not be visible in this card.
+            """,
+            isStreaming: false
+        )
+
+        let directory = URL(fileURLWithPath: "/tmp/str-693-evidence", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let environment = AppEnvironment()
+
+        try writeSnapshot(
+            MessageBubble(message: message)
+                .environment(\.hermesTheme, HermesThemePresets.nousLight)
+                .environment(environment.connectionStore)
+                .environment(environment.sessionStore)
+                .padding(20)
+                .background(HermesThemePresets.nousLight.bg),
+            size: CGSize(width: 393, height: 260),
+            url: directory.appendingPathComponent("github-alert-iphone.png")
+        )
+        try writeSnapshot(
+            MessageBubble(message: message)
+                .environment(\.hermesTheme, HermesThemePresets.nousLight)
+                .environment(environment.connectionStore)
+                .environment(environment.sessionStore)
+                .padding(28)
+                .background(HermesThemePresets.nousLight.bg),
+            size: CGSize(width: 768, height: 300),
+            url: directory.appendingPathComponent("github-alert-ipad.png")
+        )
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("github-alert-iphone.png").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("github-alert-ipad.png").path))
+    }
+
     // MARK: - 2. Equatable short-circuit integrity
 
     /// A settled bubble compared with itself must return `true` — SwiftUI skips
@@ -219,5 +335,21 @@ final class MessageBubbleA11yTests: XCTestCase {
         let disabled = MessageBubble(message: msg, menuActionsEnabled: false, appearance: appearance)
         XCTAssertNotEqual(enabled, disabled,
                           "menuActionsEnabled change must break equality")
+    }
+
+    private func writeSnapshot<V: View>(_ view: V, size: CGSize, url: URL) throws {
+        let controller = UIHostingController(rootView: view.frame(width: size.width, height: size.height, alignment: .topLeading))
+        controller.view.bounds = CGRect(origin: .zero, size: size)
+        controller.view.backgroundColor = .clear
+
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let image = renderer.image { _ in
+            controller.view.drawHierarchy(in: controller.view.bounds, afterScreenUpdates: true)
+        }
+
+        guard let data = image.pngData() else {
+            return XCTFail("snapshot PNG encoding failed")
+        }
+        try data.write(to: url, options: .atomic)
     }
 }
