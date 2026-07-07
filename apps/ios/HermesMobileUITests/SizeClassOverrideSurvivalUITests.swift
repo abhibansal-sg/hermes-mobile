@@ -43,14 +43,12 @@ final class SizeClassOverrideSurvivalUITests: XCTestCase {
     /// Launch-env seam: `HERMES_UITEST_SIZE_CLASS` deterministically picks the
     /// iPad's layout. Two INDEPENDENT launches of the same app on the same iPad
     /// sim, one per value, prove the seam — not the OS — is choosing the branch.
-    /// Each launch terminates the prior instance first so no cross-launch state
-    /// can mask the result.
+    /// Each launch uses a fresh launch environment so no cross-launch state can
+    /// mask the result.
+    @MainActor
     func testLaunchEnvSeamForcesBothLayoutsOnPad() throws {
         // compact -> CompactLayout (drawerToggle present, no SplitLayout inspector).
-        let compactApp = XCUIApplication()
-        compactApp.launchEnvironment["HERMES_UITEST_SEED"] = "demo"
-        compactApp.launchEnvironment["HERMES_UITEST_SIZE_CLASS"] = "compact"
-        compactApp.launch()
+        let compactApp = launch(sizeClass: "compact")
         XCTAssertTrue(
             compactApp.buttons["drawerToggle"].waitForExistence(timeout: 45),
             "Compact shell did not render under HERMES_UITEST_SIZE_CLASS=compact"
@@ -60,15 +58,12 @@ final class SizeClassOverrideSurvivalUITests: XCTestCase {
             "Compact override leaked SplitLayout's inspector toggle"
         )
         attach(compactApp, named: "launch-env-compact")
-        compactApp.terminate()
 
-        // regular -> SplitLayout (inspector toggle present). A fresh XCUIApplication
-        // gives an independent launch so the env override — not the prior instance —
-        // selects the branch.
-        let regularApp = XCUIApplication()
-        regularApp.launchEnvironment["HERMES_UITEST_SEED"] = "demo"
-        regularApp.launchEnvironment["HERMES_UITEST_SIZE_CLASS"] = "regular"
-        regularApp.launch()
+        // regular -> SplitLayout (inspector toggle present). Relaunching through
+        // XCUITest applies a fresh launch environment; avoiding an explicit
+        // terminate keeps the simulator test runner from treating the expected
+        // app stop as a crash on iOS 26.5.
+        let regularApp = launch(sizeClass: "regular")
         XCTAssertTrue(
             regularApp.buttons["Show inbox"].waitForExistence(timeout: 45),
             "Split shell did not render under HERMES_UITEST_SIZE_CLASS=regular (inspector toggle absent)"
@@ -82,6 +77,16 @@ final class SizeClassOverrideSurvivalUITests: XCTestCase {
 
     // MARK: - Helpers
 
+    @MainActor
+    private func launch(sizeClass: String) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_UITEST_SEED"] = "demo"
+        app.launchEnvironment["HERMES_UITEST_SIZE_CLASS"] = sizeClass
+        app.launch()
+        return app
+    }
+
+    @MainActor
     private func attach(_ app: XCUIApplication, named name: String) {
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = name
