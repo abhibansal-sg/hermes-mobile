@@ -1038,9 +1038,10 @@ private struct CompactLayout: View {
         // and no draft (delete of the open session, bare-root deep link,
         // archive-of-last), ChatView's empty-transcript state is a permanent
         // "Loading conversation…" spinner over a dead composer. Render a
-        // recoverable placeholder instead. The placeholder DOES still want a
-        // NavigationStack for its own title/chrome, so it keeps a minimal wrapper;
-        // the live chat path is the stack-free one that matters for the fix.
+        // recoverable placeholder instead. Like the live chat path, this
+        // placeholder is now stack-free (STR-54) — the empty-state CTAs sit
+        // directly in the `.geometryGroup()`'d card subtree so their
+        // hit-test geometry rides the card offset.
         Group {
             if sessions.activeStoredId != nil || sessions.isDraft {
                 ChatView(
