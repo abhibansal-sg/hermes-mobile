@@ -2544,6 +2544,13 @@ struct TurnActivityBar: View {
                 .stroke(theme.midground.opacity(ringAlpha),
                         lineWidth: ChatView.StatusGlowToken.ringWidth)
         }
+        // Flatten background+overlay into one rasterized layer before the
+        // breathing shadow is applied. Without this, SwiftUI re-renders the
+        // full HStack (both Text views, fill, stroke) on every frame of the
+        // repeatForever shadow-alpha/radius animation instead of compositing
+        // a cached layer — measured as a ~5-6x increase in >30ms frame
+        // hitches during the live glow vs. a static control (STR-1106).
+        .compositingGroup()
         .shadow(color: theme.midground.opacity(liftAlpha), radius: liftRadius, x: 0, y: 2)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(labelText), \(elapsedText)")
