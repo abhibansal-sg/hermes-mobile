@@ -266,6 +266,152 @@ final class RenderingTests: XCTestCase {
         XCTAssertProse(segments[0], text)
     }
 
+    // MARK: - MessageSegmenter rich URL embeds (STR-530)
+
+    func testBareYouTubeURLBecomesEmbedSegment() {
+        let segments = MessageSegmenter.segments("https://youtu.be/dQw4w9WgXcQ")
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertEmbed(segments[0], id: "youtube:dQw4w9WgXcQ")
+    }
+
+    func testYouTubeURLAfterProseSplitsIntoProseAndEmbed() {
+        let segments = MessageSegmenter.segments("Check this out https://youtu.be/dQw4w9WgXcQ")
+        XCTAssertEqual(segments.count, 2)
+        XCTAssertProse(segments[0], "Check this out ")
+        XCTAssertEmbed(segments[1], id: "youtube:dQw4w9WgXcQ")
+    }
+
+    func testYouTubeURLBeforeProseSplitsIntoEmbedAndProse() {
+        let segments = MessageSegmenter.segments("https://youtu.be/dQw4w9WgXcQ is worth watching")
+        XCTAssertEqual(segments.count, 2)
+        XCTAssertEmbed(segments[0], id: "youtube:dQw4w9WgXcQ")
+        XCTAssertProse(segments[1], " is worth watching")
+    }
+
+    func testYouTubeURLBetweenProse() {
+        let segments = MessageSegmenter.segments("before https://youtu.be/dQw4w9WgXcQ after")
+        XCTAssertEqual(segments.count, 3)
+        XCTAssertProse(segments[0], "before ")
+        XCTAssertEmbed(segments[1], id: "youtube:dQw4w9WgXcQ")
+        XCTAssertProse(segments[2], " after")
+    }
+
+    func testMultipleEmbedsSplitCorrectly() {
+        let segments = MessageSegmenter.segments(
+            "first https://youtu.be/dQw4w9WgXcQ then https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b last"
+        )
+        XCTAssertEqual(segments.count, 5)
+        XCTAssertProse(segments[0], "first ")
+        XCTAssertEmbed(segments[1], id: "youtube:dQw4w9WgXcQ")
+        XCTAssertProse(segments[2], " then ")
+        XCTAssertEmbed(segments[3], id: "spotify:track:0VjIjW4GlUZAMYd2vXMi3b")
+        XCTAssertProse(segments[4], " last")
+    }
+
+    func testUnsupportedURLRemainsProse() {
+        let segments = MessageSegmenter.segments("see https://example.com for details")
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertProse(segments[0], "see https://example.com for details")
+    }
+
+    func testURLInFencedCodeStaysCode() {
+        let text = """
+        ```text
+        https://youtu.be/dQw4w9WgXcQ
+        ```
+        """
+        let segments = MessageSegmenter.segments(text)
+        XCTAssertEqual(segments.count, 1)
+        guard case .code(let language, let body) = segments[0] else {
+            return XCTFail("expected code, got \(segments[0])")
+        }
+        XCTAssertEqual(language, "text")
+        XCTAssertEqual(body, "https://youtu.be/dQw4w9WgXcQ")
+    }
+
+    func testMarkdownLinkURLRemainsProse() {
+        let segments = MessageSegmenter.segments("[watch this](https://youtu.be/dQw4w9WgXcQ)")
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertProse(segments[0], "[watch this](https://youtu.be/dQw4w9WgXcQ)")
+    }
+
+    func testTrailingPunctuationTrimmedFromEmbed() {
+        let segments = MessageSegmenter.segments("Watch https://youtu.be/dQw4w9WgXcQ.")
+        XCTAssertEqual(segments.count, 3)
+        XCTAssertProse(segments[0], "Watch ")
+        XCTAssertEmbed(segments[1], id: "youtube:dQw4w9WgXcQ")
+        XCTAssertProse(segments[2], ".")
+    }
+
+    func testSpotifyURLBecomesEmbed() {
+        let segments = MessageSegmenter.segments("https://open.spotify.com/track/0VjIjW4GlUZAMYd2vXMi3b")
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertEmbed(segments[0], id: "spotify:track:0VjIjW4GlUZAMYd2vXMi3b")
+    }
+
+    func testEmbedAndMathCoexist() {
+        let segments = MessageSegmenter.segments("See $x^2$ and https://youtu.be/dQw4w9WgXcQ")
+        XCTAssertEqual(segments.count, 4)
+        XCTAssertProse(segments[0], "See ")
+        XCTAssertMath(segments[1], latex: "x^2", display: false)
+        XCTAssertProse(segments[2], " and ")
+        XCTAssertEmbed(segments[3], id: "youtube:dQw4w9WgXcQ")
+    }
+
+    func testGoogleMapsURLBecomesEmbed() {
+        let segments = MessageSegmenter.segments("https://maps.google.com?q=Berlin")
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertEmbed(segments[0], id: "googlemaps:Berlin")
+    }
+
+    // MARK: - MessageSegmenter rich URL embeds — scanner advance (STR-530 retry)
+
+    /// A markdown inline-link URL must remain prose but must not stop the
+    /// scanner from embedding a later bare supported URL in the same run.
+    func testMarkdownLinkURLDoesNotBlockLaterBareEmbed() {
+        let segments = MessageSegmenter.segments(
+            "[watch](https://youtu.be/dQw4w9WgXcQ) then https://youtu.be/9bZkp7q19f0"
+        )
+        XCTAssertEqual(segments.count, 2)
+        XCTAssertProse(segments[0], "[watch](https://youtu.be/dQw4w9WgXcQ) then ")
+        XCTAssertEmbed(segments[1], id: "youtube:9bZkp7q19f0")
+    }
+
+    /// An unsupported bare URL must remain prose but must not stop the scanner
+    /// from embedding a later bare supported URL in the same run.
+    func testUnsupportedURLDoesNotBlockLaterBareEmbed() {
+        let segments = MessageSegmenter.segments(
+            "unsupported https://example.com then https://youtu.be/9bZkp7q19f0"
+        )
+        XCTAssertEqual(segments.count, 2)
+        XCTAssertProse(segments[0], "unsupported https://example.com then ")
+        XCTAssertEmbed(segments[1], id: "youtube:9bZkp7q19f0")
+    }
+
+    /// A supported URL inside display math must stay part of the math segment;
+    /// no embed may be lifted out of a `$$ … $$` region.
+    func testURLInsideDisplayMathStaysMath() {
+        let segments = MessageSegmenter.segments(
+            "Before $$\nhttps://youtu.be/dQw4w9WgXcQ\n$$ after"
+        )
+        XCTAssertEqual(segments.count, 3)
+        XCTAssertProse(segments[0], "Before ")
+        XCTAssertMath(segments[1], latex: "\nhttps://youtu.be/dQw4w9WgXcQ\n", display: true)
+        XCTAssertProse(segments[2], " after")
+    }
+
+    /// A supported URL inside inline `$ … $` math must stay part of the math
+    /// segment; no embed may be lifted out of an inline math region.
+    func testURLInsideInlineMathStaysMath() {
+        let segments = MessageSegmenter.segments(
+            "See $https://youtu.be/dQw4w9WgXcQ$ tail"
+        )
+        XCTAssertEqual(segments.count, 3)
+        XCTAssertProse(segments[0], "See ")
+        XCTAssertMath(segments[1], latex: "https://youtu.be/dQw4w9WgXcQ", display: false)
+        XCTAssertProse(segments[2], " tail")
+    }
+
     // MARK: - SyntaxHighlighter
 
     func testHighlighterReturnsSameCharactersAsInput() {
@@ -869,5 +1015,17 @@ final class RenderingTests: XCTestCase {
         }
         XCTAssertEqual(actualLatex, latex, file: file, line: line)
         XCTAssertEqual(actualDisplay, display, file: file, line: line)
+    }
+
+    private func XCTAssertEmbed(
+        _ segment: MessageSegmenter.Segment,
+        id expectedID: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case .embed(let descriptor) = segment else {
+            return XCTFail("expected embed, got \(segment)", file: file, line: line)
+        }
+        XCTAssertEqual(descriptor.id, expectedID, file: file, line: line)
     }
 }
