@@ -54,6 +54,19 @@ struct RootView: View {
     /// ``showingInspector`` for the same reason.
     @State private var inspectorTab: InspectorTab = .inbox
 
+    /// STR-691/STR-687: the Settings sheet's presentation state is owned HERE,
+    /// ABOVE the ``mainUI`` size-class branch. Previously each concrete branch
+    /// (``SplitLayout`` / ``CompactLayout``) held its own `showingSettings`
+    /// `@State` and presented its own sheet, so a regular<->compact size-class
+    /// change tore the active branch down — dismissing Settings and destroying
+    /// the hosted NavigationStack/form `@State` (an unsaved provider key in
+    /// Settings > Model Providers). Hoisting the state above the branch keeps
+    /// the sheet (and the unsaved form text) alive across the transition. Both
+    /// branches now open Settings through ``openSettings`` rather than their own
+    /// state; the credential/form values are NEVER persisted here (only the
+    /// existing Save path writes them).
+    @State private var showingSettings = false
+
     #if DEBUG
     /// STR-716: in-process live size-class override set by the DEBUG deep link
     /// `hermesapp://debug/size-class/<compact|regular|auto>` (see
@@ -147,6 +160,16 @@ struct RootView: View {
                 )
                 .hermesThemed(themeStore)
             }
+            // STR-691: Settings is presented from THIS root (above the
+            // ``mainUI`` size-class branch) so its presentation identity — and
+            // the NavigationStack/form `@State` SettingsView hosts (e.g. an
+            // unsaved provider key) — survives a regular<->compact transition.
+            // Both layout branches funnel here via ``openSettings``. iPad ⌘,,
+            // the drawer/avatar affordance in both layouts, the drag indicator
+            // (.hidden), and theming are all preserved.
+            .sheet(isPresented: $showingSettings) {
+                settingsSheet
+            }
             #if DEBUG
             // STR-716: in-process size-class flip for automated iPad evidence
             // (`hermesapp://debug/size-class/<compact|regular|auto>`). SwiftUI
@@ -187,6 +210,40 @@ struct RootView: View {
                 if value == nil { deepLink.clearManualTokenPair() }
             }
         )
+    }
+
+    /// The single entry point every "open Settings" request routes through
+    /// (iPad ⌘, the sidebar/drawer avatar in either layout). Writes to the
+    /// root-owned ``showingSettings`` so the sheet stays presented across a
+    /// regular<->compact size-class swap (STR-691). Routes through the existing
+    /// testable ``RootKeyboardShortcutActions.openSettings(isPresented:)`` seam.
+    private func openSettings() {
+        RootKeyboardShortcutActions.openSettings(isPresented: $showingSettings)
+    }
+
+    /// Presents Settings from this root. `SettingsView` keeps owning its internal
+    /// `NavigationStack` and dismisses via its toolbar; this surface supplies the
+    /// stable presentation identity + palette bridge that previously lived
+    /// separately inside each layout branch.
+    private var settingsSheet: some View {
+        #if DEBUG
+        SettingsView(
+            connectionStore: connection,
+            sessionStore: sessions,
+            appLock: appLock,
+            initialUITestPanel: UITestSeed.requestedPanel
+        )
+        .presentationDragIndicator(.hidden)
+        .hermesThemed(themeStore)
+        #else
+        SettingsView(
+            connectionStore: connection,
+            sessionStore: sessions,
+            appLock: appLock
+        )
+        .presentationDragIndicator(.hidden)
+        .hermesThemed(themeStore)
+        #endif
     }
 
     @ViewBuilder
@@ -246,10 +303,11 @@ struct RootView: View {
         if effectiveHorizontalSizeClass == .regular {
             SplitLayout(
                 showingInspector: $showingInspector,
-                inspectorTab: $inspectorTab
+                inspectorTab: $inspectorTab,
+                onOpenSettings: openSettings
             )
         } else {
-            CompactLayout()
+            CompactLayout(onOpenSettings: openSettings)
         }
     }
 
@@ -456,7 +514,6 @@ private struct SplitLayout: View {
     @Environment(SpeechPlayer.self) private var speechPlayer
     @Environment(ConnectionStore.self) private var connection
     @Environment(InboxStore.self) private var inbox
-    @Environment(AppLock.self) private var appLock
     @Environment(ThemeStore.self) private var themeStore
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -470,10 +527,12 @@ private struct SplitLayout: View {
     /// activity exists.
     @Binding var inspectorTab: InspectorTab
 
-    /// Presents Settings from the iPad hardware-keyboard layer (⌘,). The sidebar
-    /// avatar still owns the visible Settings affordance; this is the keyboard-only
-    /// parity entry point at the split-view root.
-    @State private var showingSettings = false
+    /// STR-691: opens Settings by routing to the ROOT-owned presentation state
+    /// (``RootView.openSettings``), passed in from above the size-class branch.
+    /// Both the iPad ⌘, shortcut (``keyboardShortcutLayer``) and the sidebar
+    /// avatar (``DrawerView``) call this so Settings stays presented across a
+    /// regular<->compact size-class swap.
+    private let onOpenSettings: () -> Void
 
     #if DEBUG
     /// STR-485: one-shot latch for `seedGatewayPanelIfReady()` — guards against
@@ -488,9 +547,22 @@ private struct SplitLayout: View {
     /// edge and focus it. A no-op if the drawer hasn't adopted the hook.
     @State private var searchFocusRequested = false
 
+    /// Explicit (file-visible) initializer: the synthesized memberwise init for
+    /// a stored closure would be `private`-scoped to this struct and invisible
+    /// to ``RootView.mainUI`` in the same file, so declare it explicitly.
+    init(
+        showingInspector: Binding<Bool>,
+        inspectorTab: Binding<InspectorTab>,
+        onOpenSettings: @escaping () -> Void
+    ) {
+        self._showingInspector = showingInspector
+        self._inspectorTab = inspectorTab
+        self.onOpenSettings = onOpenSettings
+    }
+
     var body: some View {
         NavigationSplitView {
-            DrawerView(onOpenSettings: openSettings)
+            DrawerView(onOpenSettings: onOpenSettings)
                 .environment(\.rootSearchFocusRequested, searchFocusRequested)
                 .onChange(of: searchFocusRequested) { _, requested in
                     if requested {
@@ -533,26 +605,6 @@ private struct SplitLayout: View {
         .onAppear { seedGatewayPanelIfReady() }
         .onChange(of: connection.phase) { _, _ in seedGatewayPanelIfReady() }
         #endif
-        .sheet(isPresented: $showingSettings) {
-            #if DEBUG
-            SettingsView(
-                connectionStore: connection,
-                sessionStore: sessions,
-                appLock: appLock,
-                initialUITestPanel: UITestSeed.requestedPanel
-            )
-            .presentationDragIndicator(.hidden)
-            .hermesThemed(themeStore)
-            #else
-            SettingsView(
-                connectionStore: connection,
-                sessionStore: sessions,
-                appLock: appLock
-            )
-            .presentationDragIndicator(.hidden)
-            .hermesThemed(themeStore)
-            #endif
-        }
     }
 
     #if DEBUG
@@ -572,7 +624,7 @@ private struct SplitLayout: View {
               UITestSeed.requestedPanel == "gateway",
               connection.control != nil else { return }
         didSeedGatewayPanel = true
-        showingSettings = true
+        onOpenSettings()
     }
     #endif
 
@@ -744,7 +796,7 @@ private struct SplitLayout: View {
                 .keyboardShortcut(.downArrow, modifiers: .command)
 
                 Button {
-                    openSettings()
+                    onOpenSettings()
                 } label: { Text("Settings") }
                 .keyboardShortcut(",", modifiers: .command)
 
@@ -785,11 +837,6 @@ private struct SplitLayout: View {
     private func recallNextComposerPrompt() {
         RootKeyboardShortcutActions.recallNextComposerPrompt(sessions: sessions, chat: chat)
     }
-
-    private func openSettings() {
-        RootKeyboardShortcutActions.openSettings(isPresented: $showingSettings)
-    }
-
     private func navigateBack() {
         RootKeyboardShortcutActions.navigateBack()
     }
@@ -1120,7 +1167,6 @@ private struct CompactLayout: View {
     @Environment(SpeechPlayer.self) private var speechPlayer
     @Environment(ConnectionStore.self) private var connection
     @Environment(SessionStore.self) private var sessions
-    @Environment(AppLock.self) private var appLock
     @Environment(ThemeStore.self) private var themeStore
     @Environment(DrawerState.self) private var drawer
 
@@ -1135,10 +1181,12 @@ private struct CompactLayout: View {
     /// Reset to `nil` on `onEnded`.
     @State private var horizontalDominant: Bool?
 
-    /// Presents Settings from the compact drawer avatar. Owned by this stable
-    /// layout container, not by ``DrawerView``, so a cold drawer first-commit cannot
-    /// reset/drop the presentation write before SwiftUI anchors the sheet.
-    @State private var showingSettings = false
+    /// STR-691: opens Settings by routing to the ROOT-owned presentation state
+    /// (``RootView.openSettings``), passed in from above the size-class branch.
+    /// The compact drawer avatar calls this so Settings stays presented across a
+    /// regular<->compact size-class swap (the sheet and its unsaved provider
+    /// form `@State` are no longer owned by this layout container).
+    private let onOpenSettings: () -> Void
 
     #if DEBUG
     /// STR-485: one-shot latch for `seedGatewayPanelIfReady()` — see the
@@ -1192,6 +1240,13 @@ private struct CompactLayout: View {
     /// behavior). Cheap now that the drawer is geometry-grouped.
     private let parallaxFraction: CGFloat = 0.30
 
+    /// Explicit (file-visible) initializer: the synthesized memberwise init for
+    /// a stored closure would be `private`-scoped to this struct and invisible
+    /// to ``RootView.mainUI`` in the same file, so declare it explicitly.
+    init(onOpenSettings: @escaping () -> Void) {
+        self.onOpenSettings = onOpenSettings
+    }
+
     var body: some View {
         GeometryReader { proxy in
             // The chat card travels from x=0 (closed) to +drawerWidth (open).
@@ -1214,7 +1269,7 @@ private struct CompactLayout: View {
                 // The drawer sits on the canvas beneath the chat card. It owns
                 // the status-bar area when the card is pushed aside (it fills the
                 // whole surface; the card simply rides above it).
-                DrawerView(onNavigate: close, onOpenSettings: openSettings)
+                DrawerView(onNavigate: close, onOpenSettings: onOpenSettings)
                     .frame(width: drawerWidth, alignment: .leading)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                     .background(themeStore.current.listBg.ignoresSafeArea())
@@ -1328,7 +1383,6 @@ private struct CompactLayout: View {
         .onAppear { seedGatewayPanelIfReady() }
         .onChange(of: connection.phase) { _, _ in seedGatewayPanelIfReady() }
         #endif
-        .sheet(isPresented: $showingSettings) { settingsSheet }
         // Dismiss the composer keyboard whenever the drawer OPENS, from ANY
         // trigger — edge-swipe completion, the toolbar drawer button, ⌘F, or the
         // empty-state "Sessions" button — since they all funnel through
@@ -1346,10 +1400,6 @@ private struct CompactLayout: View {
         }
     }
 
-    private func openSettings() {
-        showingSettings = true
-    }
-
     #if DEBUG
     /// STR-485: see the `SplitLayout` counterpart's doc — same gate, same
     /// reason (`connection.control` is what `SettingsView.panelView(.gateway)`
@@ -1360,34 +1410,9 @@ private struct CompactLayout: View {
               UITestSeed.requestedPanel == "gateway",
               connection.control != nil else { return }
         didSeedGatewayPanel = true
-        showingSettings = true
+        onOpenSettings()
     }
     #endif
-
-    /// Presents the Settings surface from the compact layout root. `SettingsView`
-    /// still owns its internal `NavigationStack` and dismisses via its toolbar; the
-    /// compact shell supplies only the stable presentation state and palette bridge.
-    private var settingsSheet: some View {
-        #if DEBUG
-        SettingsView(
-            connectionStore: connection,
-            sessionStore: sessions,
-            appLock: appLock,
-            initialUITestPanel: UITestSeed.requestedPanel
-        )
-        .presentationDragIndicator(.hidden)
-        .hermesThemed(themeStore)
-        #else
-        SettingsView(
-            connectionStore: connection,
-            sessionStore: sessions,
-            appLock: appLock
-        )
-        .presentationDragIndicator(.hidden)
-        .hermesThemed(themeStore)
-        #endif
-    }
-
     // MARK: Chat stack
 
     /// ``ChatView`` hosted DIRECTLY in the card ZStack — NO NavigationStack
