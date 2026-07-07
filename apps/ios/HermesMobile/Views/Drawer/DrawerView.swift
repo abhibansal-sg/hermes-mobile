@@ -998,8 +998,10 @@ struct DrawerView: View {
     @ViewBuilder
     private var recentSection: some View {
         Group {
+            let profileGroups = sessions.drawerProfileGroups()
             let groups = sessions.drawerSourceGroups()
-            let hasSourceRows = groups.contains { !$0.sessions.isEmpty }
+            let hasSourceRows = profileGroups.contains { !$0.sessions.isEmpty }
+                || groups.contains { !$0.sessions.isEmpty }
             if sessions.isLoading && !didCompleteFirstLoad && sessions.drawerPinnedSessions.isEmpty && !hasSourceRows {
                 ForEach(groups) { group in
                     Section {
@@ -1009,11 +1011,21 @@ struct DrawerView: View {
                     }
                 }
             } else {
-                ForEach(groups) { group in
-                    Section {
-                        sourceGroupRows(group)
-                    } header: {
-                        sourceGroupHeader(group)
+                if !profileGroups.isEmpty {
+                    ForEach(profileGroups) { profileGroup in
+                        Section {
+                            profileGroupRows(profileGroup)
+                        } header: {
+                            profileGroupHeader(profileGroup)
+                        }
+                    }
+                } else {
+                    ForEach(groups) { group in
+                        Section {
+                            sourceGroupRows(group)
+                        } header: {
+                            sourceGroupHeader(group)
+                        }
                     }
                 }
                 // Infinite scroll sentinel / loading row (UX1), after all static
@@ -1051,6 +1063,39 @@ struct DrawerView: View {
             group: group,
             action: group.kind == .chats ? AnyView(recentsFilterMenu) : nil
         )
+    }
+
+    private func profileGroupHeader(_ group: SessionStore.DrawerProfileGroup) -> some View {
+        DrawerProfileGroupHeader(
+            group: group,
+            isCollapsed: sessions.collapsedProfiles.contains(group.profile),
+            action: group.profile == "default" ? AnyView(recentsFilterMenu) : nil
+        ) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                sessions.toggleCollapsed(profile: group.profile)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func profileGroupRows(_ group: SessionStore.DrawerProfileGroup) -> some View {
+        if !sessions.collapsedProfiles.contains(group.profile) {
+            ForEach(group.sourceGroups.filter { !$0.sessions.isEmpty }) { sourceGroup in
+                profileSourceGroupRows(sourceGroup)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func profileSourceGroupRows(_ group: SessionStore.DrawerSourceGroup) -> some View {
+        if group.kind == .chats && sessions.groupByWorkspace {
+            groupedSourceRows(group)
+        } else {
+            ForEach(group.sessions) { summary in
+                sessionRow(summary, pinned: false)
+                    .onAppear { maybePrefetchMore(rowId: summary.id) }
+            }
+        }
     }
 
     @ViewBuilder
@@ -1931,6 +1976,60 @@ private struct DrawerSourceGroupHeader: View {
                 .padding(.vertical, 1)
                 .background(theme.muted.opacity(0.7), in: Capsule())
         }
+    }
+}
+
+// MARK: - Profile group header
+
+/// Top-level All Profiles drawer section header. It owns the profile-first
+/// hierarchy; source/workspace grouping continues inside each expanded section.
+private struct DrawerProfileGroupHeader: View {
+    @Environment(\.hermesTheme) private var theme
+
+    let group: SessionStore.DrawerProfileGroup
+    let isCollapsed: Bool
+    var action: AnyView? = nil
+    var onToggle: () -> Void
+
+    var body: some View {
+        Button {
+            onToggle()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "person.crop.circle")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg)
+                    .frame(width: 14)
+                Text(group.label.uppercased())
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg)
+                    .lineLimit(1)
+                Text("\(group.count)")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg.opacity(0.82))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(theme.muted.opacity(0.7), in: Capsule())
+                Spacer(minLength: 0)
+                action
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg.opacity(0.55))
+                    .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                    .animation(.easeInOut(duration: 0.2), value: isCollapsed)
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 8)
+            .padding(.bottom, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .textCase(nil)
+        .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+        .accessibilityLabel("\(group.label), \(group.count) items\(isCollapsed ? ", collapsed" : "")")
+        .accessibilityHint(isCollapsed ? "Double-tap to expand" : "Double-tap to collapse")
     }
 }
 
