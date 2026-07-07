@@ -999,11 +999,11 @@ async def test_drain_timeout_uses_restart_reason_when_restarting():
 
 
 @pytest.mark.asyncio
-async def test_drain_timeout_skips_pending_sentinel_sessions():
+async def test_drain_timeout_no_entry_sentinel_is_rejected_by_store_guard():
     """Pending sentinels — sessions whose AIAgent construction hasn't
-    produced a real agent yet — are skipped by
-    ``_interrupt_running_agents()``.  The resume_pending marking must
-    mirror that: no agent started means no turn was interrupted.
+    produced a real agent yet — are attempted so durable sentinel sessions
+    can resume.  A bare sentinel with no durable entry is rejected by the
+    SessionStore guard, not by the runner's sentinel type.
     """
     from gateway.run import _AGENT_PENDING_SENTINEL
 
@@ -1018,6 +1018,46 @@ async def test_drain_timeout_skips_pending_sentinel_sessions():
         session_key_sentinel: _AGENT_PENDING_SENTINEL,
     }
 
+    marked = []
+
+    def mark_resume_pending(session_key, reason):
+        if session_key == session_key_sentinel:
+            return False
+        marked.append((session_key, reason))
+        return True
+
+    session_store = MagicMock()
+    session_store.mark_resume_pending = MagicMock(side_effect=mark_resume_pending)
+    runner.session_store = session_store
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        await runner.stop()
+
+    calls = session_store.mark_resume_pending.call_args_list
+    attempted = {args[0][0] for args in calls}
+    assert attempted == {session_key_real, session_key_sentinel}
+    assert {session_key for session_key, _reason in marked} == {session_key_real}
+    for _session_key, reason in marked:
+        assert reason == "shutdown_timeout"
+
+
+@pytest.mark.asyncio
+async def test_drain_timeout_marks_durable_pending_sentinel_sessions():
+    """A pending sentinel with an existing durable session entry is eligible for
+    resume_pending; the store, not runner type filtering, decides that."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner._restart_drain_timeout = 0.05
+
+    session_key_sentinel = "agent:main:telegram:dm:B"
+    runner._running_agents = {
+        session_key_sentinel: _AGENT_PENDING_SENTINEL,
+    }
+
     session_store = MagicMock()
     session_store.mark_resume_pending = MagicMock(return_value=True)
     runner.session_store = session_store
@@ -1028,8 +1068,10 @@ async def test_drain_timeout_skips_pending_sentinel_sessions():
         await runner.stop()
 
     calls = session_store.mark_resume_pending.call_args_list
-    marked = {args[0][0] for args in calls}
-    assert marked == {session_key_real}
+    assert calls, "expected sentinel session to be offered to SessionStore"
+    assert {args[0][0] for args in calls} == {session_key_sentinel}
+    for args in calls:
+        assert args[0][1] == "shutdown_timeout"
 
 
 # ---------------------------------------------------------------------------

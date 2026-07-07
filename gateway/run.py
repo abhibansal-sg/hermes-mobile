@@ -7978,6 +7978,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             timeout = self._restart_drain_timeout
 
+            def _adapter_active_turns_for_stop() -> "dict[str, object]":
+                adapter_active_turns = getattr(self, "_adapter_active_turns", None)
+                if callable(adapter_active_turns):
+                    return adapter_active_turns()
+                return {}
+
+            def _active_human_turn_keys_for_stop() -> "set[str]":
+                active_human_turn_keys = getattr(self, "_active_human_turn_keys", None)
+                if callable(active_human_turn_keys):
+                    return active_human_turn_keys()
+                return set((getattr(self, "_running_agents", {}) or {}).keys())
+
+            def _active_human_turn_count_for_stop() -> int:
+                active_human_turn_count = getattr(self, "_active_human_turn_count", None)
+                if callable(active_human_turn_count):
+                    return active_human_turn_count()
+                return len(_active_human_turn_keys_for_stop())
+
             # Pre-mark sessions as resume_pending BEFORE the drain wait.
             # If the process is killed by the service manager during the
             # drain, the durable marker is already written so the next
@@ -8004,7 +8022,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # ``mark_resume_pending`` is a no-op (returns False) when no session
             # entry/transcript exists, so this never creates a misleading resume
             # marker for a session with no durable state.
-            for _sk in self._adapter_active_turns():
+            for _sk in _adapter_active_turns_for_stop():
                 if _sk in self._running_agents:
                     continue
                 try:
@@ -8014,7 +8032,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
 
             _drain_started_at = time.monotonic()
-            _active_turns_at_start = self._active_human_turn_count()
+            _active_turns_at_start = _active_human_turn_count_for_stop()
             active_agents, timed_out = await self._drain_active_agents(timeout)
             logger.info(
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
@@ -8024,7 +8042,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 timed_out,
                 _active_turns_at_start,
                 len(active_agents),
-                self._active_human_turn_count(),
+                _active_human_turn_count_for_stop(),
             )
 
             if not timed_out:
@@ -8076,7 +8094,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _resume_reason = (
                     "restart_timeout" if self._restart_requested else "shutdown_timeout"
                 )
-                for _sk in self._active_human_turn_keys():
+                for _sk in _active_human_turn_keys_for_stop():
                     try:
                         self.session_store.mark_resume_pending(_sk, _resume_reason)
                     except Exception as _e:
