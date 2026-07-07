@@ -773,12 +773,6 @@ struct ComposerView: View {
         .accessibilityHint(yoloAccessibilityHint)
     }
 
-    private var canToggleSessionYolo: Bool {
-        guard isConnected, !yoloTogglePending else { return false }
-        guard let sid = sessions.activeRuntimeId, !sid.isEmpty else { return false }
-        return true
-    }
-
     private var yoloAccessibilityValue: String {
         if yoloTogglePending { return "Updating" }
         if Self.yoloUnavailableReason(isConnected: isConnected, activeRuntimeId: sessions.activeRuntimeId) != nil {
