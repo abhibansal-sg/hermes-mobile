@@ -21,10 +21,9 @@ import XCTest
 ///      relaunch). The host harness `scripts/ios-sizeclass-evidence.sh` drives
 ///      that in-process flip with `simctl openurl` and captures the screenshots.
 ///   2. Same-process STR-691 hoist survival (an unsaved Settings provider key
-///      surviving an in-process compact<->regular flip). See
-///      `testSameProcessSurvivalNotAutomatableHere` for the constraint and the
-///      open structural prerequisite (the STR-691 hoist must be present in the
-///      code under test).
+///      surviving an in-process compact<->regular flip). The required hoist is
+///      present in RootView; see `testSameProcessSurvivalNotAutomatableHere`
+///      for the remaining XCUITest constraint and host-capture requirement.
 ///
 /// Run on an iPad simulator:
 ///   scripts/ios-build.sh test -scheme HermesMobile \
@@ -98,18 +97,14 @@ final class SizeClassOverrideSurvivalUITests: XCTestCase {
     ///    Slide Over / Split View from XCUITest, so there is no non-seam way to
     ///    force the transition in a single process either.
     ///
-    /// Structural prerequisite (verified first-hand): the STR-691 hoist
-    /// (`showingSettings` + the Settings `.sheet` owned on `RootView`, ABOVE the
-    /// `mainUI` size-class branch — commit 1ede9bdb6) MUST be present in the code
-    /// under test for survival to hold. In PR #65's current head, SplitLayout and
-    /// CompactLayout each still own their own `showingSettings` @State, so a
-    /// size-class flip tears the active branch down and dismisses Settings. The
-    /// host-driven `simctl openurl` flip therefore CANNOT show survival until the
-    /// hoist is restored to the code under test (it was dropped in the PR #65
-    /// rebase; `str-722-sizeclass-seam` still has it). Once the hoist is in,
-    /// `scripts/ios-sizeclass-evidence.sh` captures the survival screenshots.
+    /// Structural prerequisite (verified by RootKeyboardShortcutActionsTests):
+    /// the STR-691 hoist (`showingSettings` + the Settings `.sheet` owned on
+    /// `RootView`, ABOVE the `mainUI` size-class branch) is present in the code
+    /// under test. That makes survival structurally possible, but the actual
+    /// same-process flip still has to be delivered by a host-side
+    /// `simctl openurl` capture because XCTest delivery relaunches the app.
     func testSameProcessSurvivalNotAutomatableHere() throws {
-        throw XCTSkip("Same-process STR-691 survival needs the hoist (1ede9bdb6) in the code under test + a host-driven simctl openurl capture — see doc comment")
+        throw XCTSkip("Same-process STR-691 survival needs a host-driven simctl openurl capture — see doc comment")
     }
 
     // MARK: - Helpers
