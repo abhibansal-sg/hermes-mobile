@@ -410,6 +410,73 @@ describe('resumeSession failure recovery', () => {
     expect($activeSessionId.get()).toBe('runtime-1')
     expect($messages.get().length).toBe(1)
   })
+
+  // STR-1061: model a real gateway restart. Before the restart, session-1 was
+  // active with runtime-stale and a visible transcript (non-empty cached
+  // messages). After the restart, runtime-stale is dead. resumeSession's warm
+  // cache fast-path takes the cached runtime (it was valid before the restart),
+  // probes session.usage on it, catches the 404, and falls through to a full
+  // session.resume that rebinds a FRESH runtime id. This proves the stale
+  // runtime id is not retained for session.usage or prompt submission after the
+  // reconnect-resume completes (contract clause 3).
+  it('purges a stale runtime id after a reconnect-resume and binds the fresh backend runtime', async () => {
+    const runtimeIdByStoredSessionIdRef = {
+      current: new Map([['stored-1', 'runtime-stale']])
+    } satisfies MutableRefObject<Map<string, string>>
+
+    const sessionStateByRuntimeIdRef = {
+      current: new Map([
+        [
+          'runtime-stale',
+          {
+            ...createClientSessionState('stored-1'),
+            messages: [{ id: 'm1', role: 'user', parts: [] }] as ClientSessionState['messages']
+          }
+        ]
+      ])
+    } satisfies MutableRefObject<Map<string, ClientSessionState>>
+
+    setSessions([storedSession({ id: 'stored-1', message_count: 1 })])
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.usage') {
+        throw new Error('session not found: runtime-stale')
+      }
+
+      if (method === 'session.resume') {
+        return { session_id: 'runtime-fresh', resumed: params?.session_id, messages: [], info: {} } as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(getSessionMessages).mockResolvedValue({
+      messages: [{ content: 'hello', role: 'user', timestamp: 1 }],
+      session_id: 'stored-1'
+    } as never)
+
+    await runResume(requestGateway, {
+      runtimeIdByStoredSessionIdRef,
+      sessionStateByRuntimeIdRef
+    })
+
+    // The stale runtime id was probed via session.usage (it was valid before
+    // the restart) — the 404 is what triggers the fallthrough to full resume.
+    const usageCalls = requestGateway.mock.calls.filter(([method]) => method === 'session.usage')
+
+    expect(usageCalls).toHaveLength(1)
+    expect(usageCalls[0][1]).toMatchObject({ session_id: 'runtime-stale' })
+
+    // The full resume ran and bound the FRESH runtime id — not the stale one.
+    const resumeCalls = requestGateway.mock.calls.filter(([method]) => method === 'session.resume')
+
+    expect(resumeCalls).toHaveLength(1)
+    expect($activeSessionId.get()).toBe('runtime-fresh')
+
+    // The stale mapping was purged so it can't mis-resolve on the next resume.
+    expect(runtimeIdByStoredSessionIdRef.current.has('stored-1')).toBe(false)
+    expect(sessionStateByRuntimeIdRef.current.has('runtime-stale')).toBe(false)
+  })
 })
 
 // ── Warm-cache mapping integrity (the "open chat A, chat B loads" bug) ─────────
