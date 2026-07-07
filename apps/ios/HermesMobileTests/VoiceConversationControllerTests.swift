@@ -113,6 +113,85 @@ final class VoiceConversationControllerTests: XCTestCase {
         XCTAssertEqual(fake.startListeningCount, 2)
     }
 
+    func testAutoSpeakHandoffSpeaksOnlyLatestNewCompletedAssistantReply() async {
+        let (controller, fake) = makeController()
+        let chat = ChatStore()
+        let coordinator = VoiceConversationAutoSpeakCoordinator()
+        let alreadySpokenId = UUID()
+        let userId = UUID()
+        let streamingId = UUID()
+        let blankId = UUID()
+        let firstReplyId = UUID()
+        chat.messages = [
+            ChatMessage(id: alreadySpokenId, role: .assistant, text: "old reply"),
+            ChatMessage(id: userId, role: .user, text: "latest user row"),
+            ChatMessage(id: streamingId, role: .assistant, text: "still streaming", isStreaming: true),
+            ChatMessage(id: blankId, role: .assistant, text: "   "),
+            ChatMessage(id: firstReplyId, role: .assistant, text: "  speak me  "),
+        ]
+        await reachThinking(controller: controller, fake: fake)
+
+        await coordinator.handleTurnComplete(chat: chat, controller: controller)
+
+        XCTAssertEqual(fake.spokenTexts, ["speak me"])
+        XCTAssertEqual(controller.status, .listening, "speech completion re-arms through the controller")
+
+        fake.nextTranscript = "second prompt"
+        await controller.stopTurn(forceTranscribe: false)
+        XCTAssertEqual(controller.status, .thinking)
+
+        await coordinator.handleTurnComplete(chat: chat, controller: controller)
+
+        XCTAssertEqual(
+            fake.spokenTexts,
+            ["speak me"],
+            "a duplicate onTurnComplete/backfill for the same assistant id must not re-speak"
+        )
+        XCTAssertEqual(controller.status, .listening, "duplicate handoff re-arms without speech")
+
+        let secondReplyId = UUID()
+        chat.messages.append(ChatMessage(id: secondReplyId, role: .assistant, text: "new reply"))
+        fake.nextTranscript = "third prompt"
+        await controller.stopTurn(forceTranscribe: false)
+        XCTAssertEqual(controller.status, .thinking)
+
+        await coordinator.handleTurnComplete(chat: chat, controller: controller)
+
+        XCTAssertEqual(fake.spokenTexts, ["speak me", "new reply"])
+    }
+
+    func testAutoSpeakHandoffRearmsWithoutSpeakingWhenNoCompletedAssistantReply() async {
+        let (controller, fake) = makeController()
+        let chat = ChatStore()
+        let coordinator = VoiceConversationAutoSpeakCoordinator()
+        chat.messages = [
+            ChatMessage(role: .user, text: "latest user row"),
+            ChatMessage(role: .assistant, text: "streaming reply", isStreaming: true),
+            ChatMessage(role: .assistant, text: "   "),
+        ]
+        await reachThinking(controller: controller, fake: fake)
+
+        await coordinator.handleTurnComplete(chat: chat, controller: controller)
+
+        XCTAssertTrue(fake.spokenTexts.isEmpty)
+        XCTAssertEqual(controller.status, .listening, "blank/streaming/user-only completions still re-arm")
+        XCTAssertEqual(fake.startListeningCount, 2)
+    }
+
+    func testTurnCompletionPipelineRunsQueueDrainAndVoiceHandoff() {
+        var queueDrainCount = 0
+        var voiceHandoffCount = 0
+        let pipeline = VoiceConversationTurnCompletionPipeline(
+            drainQueue: { queueDrainCount += 1 },
+            completeVoiceTurn: { voiceHandoffCount += 1 }
+        )
+
+        pipeline.run()
+
+        XCTAssertEqual(queueDrainCount, 1, "conversation-mode wiring must not clobber queue drain")
+        XCTAssertEqual(voiceHandoffCount, 1)
+    }
+
     func testEmptyReplyRearmsWithoutSpeaking() async {
         let (controller, fake) = makeController()
         await reachThinking(controller: controller, fake: fake)

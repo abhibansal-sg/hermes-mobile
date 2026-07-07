@@ -10,6 +10,7 @@ final class AppEnvironment {
     let queueStore: QueueStore
     let voiceRecorder: VoiceRecorder
     let speechPlayer: SpeechPlayer
+    let voiceConversationController: VoiceConversationController
     let inboxStore: InboxStore
     let appLock: AppLock
     let themeStore: ThemeStore
@@ -30,6 +31,35 @@ final class AppEnvironment {
             sessionStore: sessionStore,
             chatStore: chatStore
         )
+        let voiceConversationController = VoiceConversationController(
+            dependencies: .init(
+                startListening: { [weak voiceRecorder, weak connectionStore] in
+                    guard let rest = connectionStore?.rest else { return }
+                    await voiceRecorder?.start(rest: rest)
+                },
+                stopAndTranscribe: { [weak voiceRecorder, weak connectionStore] in
+                    guard let recorder = voiceRecorder, let rest = connectionStore?.rest else { return nil }
+                    return await recorder.stopAndTranscribe(rest: rest)
+                },
+                cancelListening: { [weak voiceRecorder] in
+                    voiceRecorder?.cancel()
+                },
+                submitTranscript: { [weak chatStore] transcript in
+                    _ = await chatStore?.send(text: transcript, includeAttachments: false)
+                },
+                speak: { [weak speechPlayer, weak connectionStore] text in
+                    guard let player = speechPlayer, let rest = connectionStore?.rest else { return }
+                    _ = await player.speak(text: text, rest: rest)
+                },
+                stopSpeaking: { [weak speechPlayer] in
+                    speechPlayer?.stop()
+                },
+                level: { [weak voiceRecorder] in
+                    voiceRecorder?.level ?? 0
+                }
+            )
+        )
+        let voiceAutoSpeak = VoiceConversationAutoSpeakCoordinator()
         // Stores need back-references for RPC access and cross-store flows.
         sessionStore.attach(connection: connectionStore, chat: chatStore)
         chatStore.attach(connection: connectionStore, sessions: sessionStore, attachments: attachmentStore)
@@ -55,10 +85,24 @@ final class AppEnvironment {
         // Turn completion drives the queue's "send next" — ChatStore holds no
         // QueueStore reference, so this closure is the seam (see ChatStore).
         // It ALSO ends the in-flight-turn Live Activity (after its own 2s grace).
-        chatStore.onTurnComplete = { [weak queueStore, weak chatStore] in
+        let turnCompletionPipeline = VoiceConversationTurnCompletionPipeline(
+            drainQueue: { [weak queueStore, weak chatStore] in
+                guard let queueStore, let chatStore else { return }
+                Task { await queueStore.drain(chat: chatStore) }
+            },
+            completeVoiceTurn: { [weak chatStore, weak voiceConversationController, voiceAutoSpeak] in
+                guard let chatStore, let voiceConversationController else { return }
+                Task {
+                    await voiceAutoSpeak.handleTurnComplete(
+                        chat: chatStore,
+                        controller: voiceConversationController
+                    )
+                }
+            }
+        )
+        chatStore.onTurnComplete = {
             LiveActivityManager.shared.end()
-            guard let queueStore, let chatStore else { return }
-            Task { await queueStore.drain(chat: chatStore) }
+            turnCompletionPipeline.run()
         }
         // Queue self-heal seams (the "No active session" / queues-forever trap on
         // desktop-driven sessions). A resume that BINDS a live runtime drains the
@@ -113,6 +157,7 @@ final class AppEnvironment {
         self.queueStore = queueStore
         self.voiceRecorder = voiceRecorder
         self.speechPlayer = speechPlayer
+        self.voiceConversationController = voiceConversationController
         self.inboxStore = inboxStore
         self.appLock = appLock
         self.themeStore = themeStore
@@ -181,5 +226,40 @@ final class AppEnvironment {
             let todayCost = usage.daily.last?.estimatedCost ?? usage.totals.totalEstimatedCost
             WidgetSnapshotWriter.update(tokensToday: todayTokens, costTodayUSD: todayCost)
         }
+    }
+}
+
+/// Coordinates the completed-turn reply hand-off for hands-free voice mode.
+///
+/// `ChatStore` remains the source of truth for transcript rows; this helper
+/// keeps only the stable assistant id that has already been handed to the voice
+/// loop so duplicate `onTurnComplete`/backfill paths do not re-speak it.
+@MainActor
+final class VoiceConversationAutoSpeakCoordinator {
+    private var lastSpokenAssistantReplyId: UUID?
+
+    func handleTurnComplete(
+        chat: ChatStore,
+        controller: VoiceConversationController
+    ) async {
+        let reply = chat.latestCompletedAssistantReply(excluding: lastSpokenAssistantReplyId)
+        if let reply {
+            lastSpokenAssistantReplyId = reply.id
+        }
+        await controller.handleTurnComplete(replyText: reply?.text)
+    }
+}
+
+/// Tiny composition seam for the app's turn-complete side effects. Keeping the
+/// queue drain and voice hand-off as peers makes it testable that installing
+/// conversation-mode plumbing does not clobber the existing queue callback.
+@MainActor
+struct VoiceConversationTurnCompletionPipeline {
+    var drainQueue: () -> Void
+    var completeVoiceTurn: () -> Void
+
+    func run() {
+        drainQueue()
+        completeVoiceTurn()
     }
 }
