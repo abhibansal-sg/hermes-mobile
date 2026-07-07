@@ -1195,3 +1195,141 @@ def test_notify_live_activity_relay_off_uses_existing_direct_apns_path(
     assert pn.notify_live_activity("sess-1", content_state) is True
     assert fake.calls[0]["path"] == f"/3/device/{_VALID_TOKEN}"
     assert fake.calls[0]["headers"]["apns-push-type"] == "liveactivity"
+
+
+# ===========================================================================
+# STR-975 — attention gate replaces the 30s duration gate (message.complete)
+#
+#   (a) backgrounded session (no live client WS) → banner lands even on a
+#       sub-30s turn (the failing Board scenario: quick turn, phone off).
+#   (b) foregrounded session (live WS)          → banner suppressed (watching).
+#   (c) kanban worker                           → never pushes, even backgrounded.
+#   (d) turn_complete carries apns-expiration=14400 (store-and-forward); other
+#       alert kinds keep apns-expiration=0 (deliver-once).
+# ===========================================================================
+
+
+class _LiveWS:
+    """Stand-in for a gateway session's client WebSocket transport."""
+
+    def __init__(self, closed: bool):
+        self._closed = closed
+
+
+def _drive_message_complete(monkeypatch, session, started):
+    """Run the message.complete branch with controlled session + notify spy.
+
+    Returns the list of captured notify() calls. ``notify`` is replaced with a
+    recorder so no APNs/relay work happens; the real attention gate and
+    kanban suppression still run.
+    """
+    monkeypatch.setattr(pn, "_gw_sessions", lambda: {"sess-attn": session})
+    monkeypatch.setattr(pn, "_is_kanban_worker", lambda: False)
+    calls = []
+    monkeypatch.setattr(pn, "notify", lambda *a, **kw: calls.append((a, kw)) or 1)
+    pn._process_push_event(
+        "message.complete", "sess-attn", {"text": "done"},
+        event_time=time.time(), turn_started=started,
+    )
+    return calls
+
+
+def test_message_complete_backgrounded_pushes_on_short_turn(monkeypatch):
+    # (a) Regression: a 5s turn was suppressed by the old 30s duration gate.
+    # The attention gate keys on transport presence, not elapsed time.
+    started = time.time() - 5.0
+    session = {"_push_turn_started": started}  # stamp matches → pop fires
+    calls = _drive_message_complete(monkeypatch, session, started)
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == "turn_complete"
+    assert kwargs["expiration"] == 14400
+    # Registry hygiene: the start stamp cleared even on a backgrounded short turn.
+    assert "_push_turn_started" not in session
+
+
+def test_message_complete_closed_transport_still_pushes(monkeypatch):
+    # (a, variant) a transport flagged _closed is treated as backgrounded.
+    started = time.time() - 5.0
+    session = {"transport": _LiveWS(closed=True), "_push_turn_started": started}
+    calls = _drive_message_complete(monkeypatch, session, started)
+
+    assert len(calls) == 1
+    assert calls[0][1]["expiration"] == 14400
+    assert "_push_turn_started" not in session
+
+
+def test_message_complete_foregrounded_suppresses_push(monkeypatch):
+    # (b) a live client WS means the user is watching → no banner, even for a
+    # long turn that the old 30s gate would have pushed.
+    started = time.time() - 120.0
+    session = {"transport": _LiveWS(closed=False), "_push_turn_started": started}
+    calls = _drive_message_complete(monkeypatch, session, started)
+
+    assert calls == []
+    # The pop runs before the gate, so the stamp still clears (registry hygiene).
+    assert "_push_turn_started" not in session
+
+
+def test_message_complete_kanban_worker_never_pushes(monkeypatch):
+    # (c) a dispatched kanban worker's internal turns stay silent even when the
+    # session is backgrounded (no transport).
+    started = time.time() - 5.0
+    session = {"_push_turn_started": started}
+    monkeypatch.setattr(pn, "_gw_sessions", lambda: {"sess-attn": session})
+    monkeypatch.setattr(pn, "_is_kanban_worker", lambda: True)
+    calls = []
+    monkeypatch.setattr(pn, "notify", lambda *a, **kw: calls.append((a, kw)) or 1)
+    pn._process_push_event(
+        "message.complete", "sess-attn", {"text": "done"},
+        event_time=time.time(), turn_started=started,
+    )
+
+    assert calls == []
+
+
+def test_turn_complete_alert_carries_4h_apns_expiration(monkeypatch, isolated_home):
+    # (d) End-to-end: message.complete → notify(expiration=14400) → direct APNs
+    # headers. APNs store-and-forwards so the banner lands on an offline device.
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    _arm_push(monkeypatch, isolated_home)
+    pn.register_token(_VALID_TOKEN, env="sandbox")
+    monkeypatch.setattr(pn, "_get_provider_jwt", lambda config: "JWT")
+    monkeypatch.setattr(pn, "_gw_sessions", lambda: {"sess-attn": {}})
+    monkeypatch.setattr(pn, "_is_kanban_worker", lambda: False)
+
+    fake = _FakeConn(status_code=200)
+    import httpx
+    monkeypatch.setattr(httpx, "Client", lambda **kw: fake)
+
+    pn._process_push_event(
+        "message.complete", "sess-attn", {"text": "done"},
+        event_time=time.time(), turn_started=time.time() - 5,
+    )
+
+    assert fake.calls, "expected one APNs alert POST"
+    headers = fake.calls[0]["headers"]
+    assert headers["apns-push-type"] == "alert"
+    assert headers["apns-expiration"] == "14400"
+
+
+def test_approval_alert_stays_deliver_once(monkeypatch, isolated_home):
+    # (d) Approval (and other time-sensitive) sends keep apns-expiration=0.
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    _arm_push(monkeypatch, isolated_home)
+    pn.register_token(_VALID_TOKEN, env="sandbox")
+    monkeypatch.setattr(pn, "_get_provider_jwt", lambda config: "JWT")
+
+    fake = _FakeConn(status_code=200)
+    import httpx
+    monkeypatch.setattr(httpx, "Client", lambda **kw: fake)
+
+    pn.notify(
+        "approval", "Approval required", "Review this in Hermes",
+        {"session_id": "sess-1"}, category="HERMES_APPROVAL",
+    )
+
+    assert fake.calls, "expected one APNs alert POST"
+    headers = fake.calls[0]["headers"]
+    assert headers["apns-expiration"] == "0"

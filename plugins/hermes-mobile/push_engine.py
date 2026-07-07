@@ -859,6 +859,7 @@ def _notify_direct_apns(
     payload: Optional[Dict[str, Any]] = None,
     *,
     category: Optional[str] = None,
+    expiration: int = 0,
 ) -> int:
     """Send an alert push through direct APNs to registered tokens."""
     config = APNsConfig.from_env()
@@ -886,7 +887,9 @@ def _notify_direct_apns(
         _log.warning("push notify: cannot read APNs key file: %s", exc)
         return 0
 
-    headers = build_push_headers(provider_jwt=provider_jwt, topic=config.topic)
+    headers = build_push_headers(
+        provider_jwt=provider_jwt, topic=config.topic, expiration=expiration
+    )
     body_bytes = json.dumps(
         build_alert_payload(
             title=title, body=body, event_type=event_type, payload=payload,
@@ -941,6 +944,7 @@ def notify(
     payload: Optional[Dict[str, Any]] = None,
     *,
     category: Optional[str] = None,
+    expiration: int = 0,
 ) -> int:
     """Send an alert push to every registered device token.
 
@@ -955,6 +959,13 @@ def notify(
     only tokens that opted into this kind (or have no prefs) receive the push.
     ``category`` (e.g. ``HERMES_APPROVAL``) becomes ``aps.category`` for the
     iOS action set.
+
+    ``expiration`` (seconds) becomes the APNs ``apns-expiration`` header: 0
+    means deliver-once (default, for time-sensitive alerts); a non-zero value
+    asks APNs to store-and-forward the push for that window so it lands even
+    when the device is off / out of coverage (used for ``turn_complete``).
+    The relay path does not currently carry expiration — direct APNs is the
+    store-and-forward guarantee there.
 
     Never raises: transport / credential errors are logged and swallowed so a
     push failure can never break the calling gateway hook.
@@ -974,7 +985,9 @@ def notify(
         except Exception:
             _log.debug("relay push notify failed", exc_info=True)
             return 0
-    return _notify_direct_apns(event_type, title, body, payload, category=category)
+    return _notify_direct_apns(
+        event_type, title, body, payload, category=category, expiration=expiration
+    )
 
 
 def notify_live_activity(
@@ -1087,6 +1100,20 @@ def _gw_sessions() -> dict:
         return _server._sessions
     except Exception:  # pragma: no cover - gateway absent (tests, CLI-only)
         return {}
+
+
+def _session_holds_foreground(session) -> bool:
+    """True iff a live client WebSocket still holds this session foregrounded.
+
+    STR-975 attention gate: a locked / off / killed / backgrounded phone drops
+    to a background URLSession with no WS attached (see dashboard/api.py
+    ``register_device_background``), so ``transport`` is absent (or its socket
+    is ``_closed``). In that state the user is NOT watching, so a
+    ``message.complete`` turn-complete alert should land on the lock screen.
+    A live WS means the user is in the foreground conversation — suppress.
+    """
+    t = (session or {}).get("transport")
+    return t is not None and not getattr(t, "_closed", False)
 
 
 # Minimum seconds between Live Activity remote updates for one session. The
@@ -1576,16 +1603,23 @@ def _process_push_event(
                 {"session_id": sid, "task_id": data.get("task_id")},
                 category="HERMES_TURN",
             )
-        else:  # message.complete — only for long turns
+        else:  # message.complete — attention gate (STR-975)
             session = _gw_sessions().get(sid)
             started = turn_started
             if started is None:
                 started = (session or {}).get("_push_turn_started")
-            now = event_time or time.time()
-            if started is None or (now - started) < 30:
-                return
+            # Registry hygiene: clear the start stamp BEFORE the attention gate
+            # so a foregrounded turn (which returns below) still clears its
+            # stamp instead of leaving it stale. Guard against clobbering a
+            # newer turn's stamp (started changed while this turn ran).
             if session is not None and session.get("_push_turn_started") == started:
                 session.pop("_push_turn_started", None)
+            # Attention gate: a live client WS still holds the session in the
+            # foreground → the user is watching → suppress the alert. A locked /
+            # off / backgrounded phone has no live WS → push the banner so the
+            # user sees the turn finished even on a sub-30s turn.
+            if _session_holds_foreground(session):
+                return
             # ABH-204: a dispatched kanban worker's internal turns must not
             # spam the phone with a turn-complete alert. Approval requests
             # still push (their own branch above); Live Activity is unaffected.
@@ -1597,12 +1631,17 @@ def _process_push_event(
                 if text.strip()
                 else "Turn finished"
             )
+            # apns-expiration 4h (14400s): APNs store-and-forwards the banner so
+            # it lands even if the phone is off / out of coverage when the turn
+            # completes. Other sends (approval/clarify/error/background) stay at
+            # 0 (deliver-once) — they are time-sensitive with no store benefit.
             notify(
                 "turn_complete",
                 "Hermes finished",
                 preview,
                 {"session_id": sid},
                 category="HERMES_TURN",
+                expiration=14400,
             )
     except Exception:
         _log.debug("push hook failed", exc_info=True)
