@@ -82,6 +82,7 @@ struct HermesMobileApp: App {
                 // because SwiftUI does not reliably inherit custom environment
                 // values across presentation boundaries.
                 .hermesThemed(environment.themeStore)
+                .modifier(UITestSizeClassOverride())
                 .overlay(alignment: .top) {
                     if let sharedInboxToast {
                         AppToastBanner(message: sharedInboxToast)
@@ -330,6 +331,30 @@ private struct AppToastBanner: View {
             .accessibilityLabel(message)
     }
 }
+
+#if DEBUG
+private struct UITestSizeClassOverride: ViewModifier {
+    private var requested: UserInterfaceSizeClass? {
+        switch ProcessInfo.processInfo.environment["HERMES_UITEST_SIZE_CLASS"] {
+        case "compact": return .compact
+        case "regular": return .regular
+        default: return nil
+        }
+    }
+
+    func body(content: Content) -> some View {
+        if let requested {
+            content.environment(\.horizontalSizeClass, requested)
+        } else {
+            content
+        }
+    }
+}
+#else
+private struct UITestSizeClassOverride: ViewModifier {
+    func body(content: Content) -> some View { content }
+}
+#endif
 
 #if canImport(UIKit)
 /// App delegate adaptor whose sole job is forwarding the APNs device-token
