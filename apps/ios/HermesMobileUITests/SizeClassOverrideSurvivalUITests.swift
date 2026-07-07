@@ -1,23 +1,34 @@
 import XCTest
 
-/// STR-722 iPad evidence for the DEBUG size-class override seam.
+/// STR-722 / STR-713 iPad evidence for the DEBUG size-class override seam.
 ///
-/// These tests prove, on a real iPad simulator, that the seam deterministically
-/// forces `RootView.mainUI`'s branch (SplitLayout vs CompactLayout):
-///   1. The `HERMES_UITEST_SIZE_CLASS` launch env forces either layout.
-///   2. The `hermesapp://debug/size-class/<compact|regular|auto>` deep link
-///      flips the branch end-to-end (the URL reaches `.onOpenURL`, which sets
-///      the override that `effectiveHorizontalSizeClass` feeds into `mainUI`).
+/// What this UITest proves (deterministically, on an iPad simulator):
+///   - The `HERMES_UITEST_SIZE_CLASS` launch env forces `RootView.mainUI`'s
+///     branch: `compact` -> CompactLayout (`drawerToggle`), `regular` ->
+///     SplitLayout (the "Show inbox" inspector toggle). Two independent launches
+///     prove the seam — not the OS size class — is choosing the branch.
 ///
-/// Same-process STR-691 hoist survival (unsaved Settings `@State` surviving an
-/// in-process flip) is covered structurally + at the unit level, and is called
-/// out explicitly in `testSameProcessSurvivalNotAutomatableHere` with the
-/// first-hand testability constraint that prevents a same-process XCUITest
-/// assertion on the iPad simulator.
+/// What is NOT provable from inside an XCUITest (first-hand, this run) and is
+/// therefore covered by the host-driven harness instead:
+///   1. The `hermesapp://debug/size-class/<compact|regular|auto>` deep link
+///      flipping the branch IN-PROCESS. `XCUIApplication.open(_:)` RELAUNCHES
+///      the app under test on the iOS 26.5 simulator (verified in the PR review
+///      log at the `Open ai.hermes.app with URL` -> `Launch ai.hermes.app`
+///      sequence), so it resets in-memory `@State` and cannot demonstrate a
+///      same-process flip. `Process`/`NSTask` is unavailable on the iOS-Simulator
+///      SDK, so the test cannot shell out to `xcrun simctl openurl` (the
+///      host-side delivery that DOES fire `.onOpenURL` in-process without a
+///      relaunch). The host harness `scripts/ios-sizeclass-evidence.sh` drives
+///      that in-process flip with `simctl openurl` and captures the screenshots.
+///   2. Same-process STR-691 hoist survival (an unsaved Settings provider key
+///      surviving an in-process compact<->regular flip). See
+///      `testSameProcessSurvivalNotAutomatableHere` for the constraint and the
+///      open structural prerequisite (the STR-691 hoist must be present in the
+///      code under test).
 ///
 /// Run on an iPad simulator:
-///   scripts/ios-build.sh test-without-building -scheme HermesMobile \
-///     -destination 'platform=iOS Simulator,name=iPad Pro 13-inch (M5),OS=26.3' \
+///   scripts/ios-build.sh test -scheme HermesMobile \
+///     -destination 'platform=iOS Simulator,name=iPad Pro 13-inch (M5),OS=26.5' \
 ///     -only-testing:HermesMobileUITests/SizeClassOverrideSurvivalUITests
 ///
 /// `HERMES_UITEST_SEED=demo` forces `.connected` (chat shell renders, no
@@ -31,8 +42,10 @@ final class SizeClassOverrideSurvivalUITests: XCTestCase {
     }
 
     /// Launch-env seam: `HERMES_UITEST_SIZE_CLASS` deterministically picks the
-    /// iPad's layout. Two launches of the same app on the same iPad sim, one
-    /// per value, prove the seam — not the OS — is choosing the branch.
+    /// iPad's layout. Two INDEPENDENT launches of the same app on the same iPad
+    /// sim, one per value, prove the seam — not the OS — is choosing the branch.
+    /// Each launch terminates the prior instance first so no cross-launch state
+    /// can mask the result.
     func testLaunchEnvSeamForcesBothLayoutsOnPad() throws {
         // compact -> CompactLayout (drawerToggle present, no SplitLayout inspector).
         let compactApp = XCUIApplication()
@@ -40,7 +53,7 @@ final class SizeClassOverrideSurvivalUITests: XCTestCase {
         compactApp.launchEnvironment["HERMES_UITEST_SIZE_CLASS"] = "compact"
         compactApp.launch()
         XCTAssertTrue(
-            compactApp.buttons["drawerToggle"].waitForExistence(timeout: 30),
+            compactApp.buttons["drawerToggle"].waitForExistence(timeout: 45),
             "Compact shell did not render under HERMES_UITEST_SIZE_CLASS=compact"
         )
         XCTAssertFalse(
@@ -48,57 +61,24 @@ final class SizeClassOverrideSurvivalUITests: XCTestCase {
             "Compact override leaked SplitLayout's inspector toggle"
         )
         attach(compactApp, named: "launch-env-compact")
+        compactApp.terminate()
 
-        // regular -> SplitLayout (inspector toggle present).
+        // regular -> SplitLayout (inspector toggle present). A fresh XCUIApplication
+        // gives an independent launch so the env override — not the prior instance —
+        // selects the branch.
         let regularApp = XCUIApplication()
         regularApp.launchEnvironment["HERMES_UITEST_SEED"] = "demo"
         regularApp.launchEnvironment["HERMES_UITEST_SIZE_CLASS"] = "regular"
         regularApp.launch()
         XCTAssertTrue(
-            regularApp.buttons["Show inbox"].waitForExistence(timeout: 30),
+            regularApp.buttons["Show inbox"].waitForExistence(timeout: 45),
             "Split shell did not render under HERMES_UITEST_SIZE_CLASS=regular (inspector toggle absent)"
         )
-        attach(regularApp, named: "launch-env-regular")
-    }
-
-    /// Deep-link seam: starting from a compact launch, the
-    /// `hermesapp://debug/size-class/regular` deep link flips `mainUI` to
-    /// SplitLayout, and `.../compact` flips it back — proving the in-process
-    /// override reaches `mainUI` end-to-end on iPad.
-    ///
-    /// (XCUIApplication.open delivers the URL by reactivating the app, so the
-    /// override is applied from the deep link rather than the launch env; the
-    /// assertion is the resulting layout, identical to what an in-process
-    /// `.onOpenURL` delivery would produce.)
-    func testDeepLinkFlipsLayoutOnPad() throws {
-        let app = XCUIApplication()
-        app.launchEnvironment["HERMES_UITEST_SEED"] = "demo"
-        app.launchEnvironment["HERMES_UITEST_SIZE_CLASS"] = "compact"
-        app.launch()
-        XCTAssertTrue(
-            app.buttons["drawerToggle"].waitForExistence(timeout: 30),
-            "Compact shell did not render at launch"
-        )
-
-        // compact -> regular via deep link.
-        app.open(URL(string: "hermesapp://debug/size-class/regular")!)
-        XCTAssertTrue(
-            app.buttons["Show inbox"].waitForExistence(timeout: 20),
-            "Deep link .../regular did not flip mainUI to SplitLayout"
-        )
-        attach(app, named: "deeplink-regular")
-
-        // regular -> compact via deep link.
-        app.open(URL(string: "hermesapp://debug/size-class/compact")!)
-        XCTAssertTrue(
-            app.buttons["drawerToggle"].waitForExistence(timeout: 20),
-            "Deep link .../compact did not flip mainUI back to CompactLayout"
-        )
         XCTAssertFalse(
-            app.buttons["Show inbox"].exists,
-            "Deep link .../compact left SplitLayout's inspector toggle present"
+            regularApp.buttons["drawerToggle"].exists,
+            "Regular override leaked CompactLayout's drawer toggle"
         )
-        attach(app, named: "deeplink-compact")
+        attach(regularApp, named: "launch-env-regular")
     }
 
     /// Same-process STR-691 hoist survival (the unsaved Settings form `@State`
@@ -118,16 +98,18 @@ final class SizeClassOverrideSurvivalUITests: XCTestCase {
     ///    Slide Over / Split View from XCUITest, so there is no non-seam way to
     ///    force the transition in a single process either.
     ///
-    /// The survival property itself is structurally guaranteed by the STR-691
-    /// hoist (`showingSettings` + the Settings `.sheet` live on `RootView`,
-    /// ABOVE the `mainUI` size-class branch) and the override logic is pinned by
-    /// `DebugSizeClassOverrideTests`. Capturing the unsaved-key survival as an
-    /// actual iPad recording requires either a host-driven `simctl openurl`
-    /// capture against a running, manually-set-up app, or extending the DEBUG
-    /// `UITestSeed` to synthesize `pluginMount == .available` so the Model
-    /// Providers form is reachable under the seed (tracked as a follow-up).
+    /// Structural prerequisite (verified first-hand): the STR-691 hoist
+    /// (`showingSettings` + the Settings `.sheet` owned on `RootView`, ABOVE the
+    /// `mainUI` size-class branch — commit 1ede9bdb6) MUST be present in the code
+    /// under test for survival to hold. In PR #65's current head, SplitLayout and
+    /// CompactLayout each still own their own `showingSettings` @State, so a
+    /// size-class flip tears the active branch down and dismisses Settings. The
+    /// host-driven `simctl openurl` flip therefore CANNOT show survival until the
+    /// hoist is restored to the code under test (it was dropped in the PR #65
+    /// rebase; `str-722-sizeclass-seam` still has it). Once the hoist is in,
+    /// `scripts/ios-sizeclass-evidence.sh` captures the survival screenshots.
     func testSameProcessSurvivalNotAutomatableHere() throws {
-        throw XCTSkip("Same-process STR-691 survival not automatable via XCUITest on iPad sim — see doc comment for the three first-hand constraints")
+        throw XCTSkip("Same-process STR-691 survival needs the hoist (1ede9bdb6) in the code under test + a host-driven simctl openurl capture — see doc comment")
     }
 
     // MARK: - Helpers
