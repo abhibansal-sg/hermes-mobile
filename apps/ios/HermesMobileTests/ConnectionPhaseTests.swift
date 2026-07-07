@@ -52,6 +52,26 @@ final class ConnectionPhaseTests: XCTestCase {
         connection.phase = .hydrating
         XCTAssertEqual(connection.phaseLabel, "hydrating")
     }
+
+    func testConnectedPhaseLabelIsPlainWhenNotInGrace() {
+        let (connection, _, _) = makeStore()
+        connection.phase = .connected
+        XCTAssertEqual(connection.phaseLabel, "connected")
+    }
+
+    func testConnectedPhaseLabelReflectsGrace() {
+        // STR-973A: the StateServer bridge must be able to distinguish a
+        // silent-grace `.connected` (transport actually down, reconnecting
+        // underneath) from a genuinely healthy one — both keep
+        // `phase == .connected`, so the label is the only observable.
+        let (connection, _, _) = makeStore()
+        connection.graceWindowOverride = .seconds(60)
+        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection._seedConnectedForTesting(serverURL: "http://localhost:9123", token: "test-stable-token")
+        connection._handleGatewayStateForTesting(.failed("gateway process exited"))
+        XCTAssertEqual(connection.phase, .connected)
+        XCTAssertEqual(connection.phaseLabel, "connected(grace)")
+    }
     #endif
 
     // MARK: - Hydration timeout fallback (the never-strand guarantee)
