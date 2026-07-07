@@ -186,6 +186,15 @@ struct RootView: View {
             CompactLayout()
         }
     }
+
+    /// `hermesapp://debug/open-settings` opens the same root-owned Settings
+    /// sheet as the iPad shortcut/avatar. This host-driven DEBUG seam avoids
+    /// `XCUIApplication.open(_:)`, which relaunches the app under test.
+    static func isOpenSettingsURL(_ url: URL) -> Bool {
+        url.scheme?.lowercased() == "hermesapp"
+            && url.host?.lowercased() == "debug"
+            && url.pathComponents.dropFirst().map { $0.lowercased() } == ["open-settings"]
+    }
 }
 
 // MARK: - Regular width (split view)
