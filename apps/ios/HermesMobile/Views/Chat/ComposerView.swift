@@ -801,12 +801,6 @@ struct ComposerView: View {
         .accessibilityHint(yoloAccessibilityHint)
     }
 
-    private var canToggleSessionYolo: Bool {
-        guard isConnected, !yoloTogglePending else { return false }
-        guard let sid = sessions.activeRuntimeId, !sid.isEmpty else { return false }
-        return true
-    }
-
     /// Entry point for hands-free conversation mode (STR-344 / STR-533): starts
     /// the listen→transcribe→think→speak→re-arm loop. Hidden behind the
     /// ``ConversationModeStrip`` overlay once active, same as the mic glyph is
@@ -840,7 +834,6 @@ struct ComposerView: View {
             }
         }
     }
-
     private var yoloAccessibilityValue: String {
         if yoloTogglePending { return "Updating" }
         if Self.yoloUnavailableReason(isConnected: isConnected, activeRuntimeId: sessions.activeRuntimeId) != nil {
