@@ -5,8 +5,12 @@ import UIKit
 /// `GET /api/fs/read` (Module F4A-A1). Handles all content outcomes:
 ///
 /// **Text** (`encoding == "utf-8"`, `content != nil`)
-///   - Mono font, selectable; `[Preview truncated]` appended + footer note when
-///     the server cut the file at the 1 MB cap.
+///   - Syntax-highlighted (language inferred from `path` extension via
+///     `SyntaxHighlighter`/`RenderCache`) with a muted read-only line-number
+///     gutter; selectable; long lines scroll horizontally without clipping the
+///     gutter. Unknown/no extension → plain monospaced (never crashes).
+///     `[Preview truncated]` appended + footer note when the server cut the
+///     file at the 1 MB cap.
 ///
 /// **Image** (path extension is a known image type)
 ///   - Requests the file with `&format=data_url`; renders the returned
@@ -146,14 +150,22 @@ struct FileViewerView: View {
 
     @ViewBuilder
     private func textContent(_ text: String, truncated: Bool) -> some View {
-        ScrollView([.vertical, .horizontal]) {
-            Text(text.isEmpty ? "(empty file)" : text)
-                .font(.system(.callout, design: .monospaced))
-                .foregroundStyle(theme.fg)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(16)
-                .accessibilityIdentifier("fileViewerText")
+        // Vertical scroll wraps both the empty placeholder and the source grid
+        // so the truncation footer applies uniformly. Horizontal scrolling is
+        // delegated to the code column's own ScrollView so the line-number
+        // gutter stays pinned as the left column (mirrors desktop SourceView).
+        ScrollView(.vertical) {
+            if text.isEmpty {
+                Text("(empty file)")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(theme.fg)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(16)
+                    .accessibilityIdentifier("fileViewerText")
+            } else {
+                sourceTextGrid(text)
+            }
         }
         .background(theme.bg)
         .safeAreaInset(edge: .bottom) {
@@ -161,6 +173,92 @@ struct FileViewerView: View {
                 truncationFooter
             }
         }
+    }
+
+    /// Highlighted source laid out as a read-only line-number gutter (left,
+    /// pinned during horizontal scroll) beside the horizontally-scrollable,
+    /// syntax-highlighted code column (right). Mirrors the desktop
+    /// `preview-file.tsx` `SourceView` two-column grid without porting its
+    /// virtualization / edit / diff / interactive line-selection.
+    ///
+    /// Both columns share `.system(.body, design: .monospaced)` so the gutter
+    /// stays line-for-line aligned with the code (identical line metrics).
+    @ViewBuilder
+    private func sourceTextGrid(_ text: String) -> some View {
+        let lineCount = Self.lineCount(for: text)
+        HStack(alignment: .top, spacing: 12) {
+            // Line-number gutter — read-only display only. Stays pinned as the
+            // left column while the code column scrolls horizontally; scrolls
+            // vertically in lockstep with the code (same font/line metrics).
+            // Hidden from accessibility: the code Text (fileViewerText) is the
+            // screen-reader surface; reading every number would be noise.
+            Text(Self.lineNumberString(lineCount: lineCount))
+                .font(.system(.body, design: .monospaced))
+                .foregroundStyle(theme.mutedFg)
+                .frame(width: Self.gutterWidth(forLineCount: lineCount), alignment: .trailing)
+                .accessibilityHidden(true)
+
+            // Code column — horizontally scrollable so long lines pan, never clip.
+            // The highlighter bakes `theme.fg` (and semantic colours) per-run into
+            // the AttributedString, so no `.foregroundStyle` is needed here —
+            // matches CodeBlockView's rendering of the same highlighter output.
+            ScrollView(.horizontal, showsIndicators: true) {
+                Text(highlightedSource(text))
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.trailing, 16)
+                    .accessibilityIdentifier("fileViewerText")
+            }
+        }
+        .padding(.top, 16)
+        .padding(.bottom, 16)
+        .padding(.leading, 16)
+    }
+
+    /// Theme-aware, memoized highlighted source for `text`, using the language
+    /// inferred from `path`. Unknown/no-extension files fall through to plain
+    /// monospaced (the highlighter's baseColor-only output) — never crashes.
+    private func highlightedSource(_ text: String) -> AttributedString {
+        RenderCache.highlight(text, language: Self.highlightLanguage(forPath: path), baseColor: theme.fg)
+    }
+
+    // MARK: - Source helpers (pure / testable)
+
+    /// Number of rendered lines for `text`: newline count + 1 (a trailing
+    /// newline yields a final empty line, matching how `Text` renders it).
+    /// Empty input is `0` so the gutter is skipped entirely for empty files.
+    static func lineCount(for text: String) -> Int {
+        guard !text.isEmpty else { return 0 }
+        return text.reduce(into: 1) { count, ch in if ch == "\n" { count += 1 } }
+    }
+
+    /// The gutter string `"1\n2\n…\nN"` for `lineCount` lines. Right-aligned in
+    /// the gutter frame so single- and multi-digit numbers share a right edge
+    /// (matches the desktop SourceView right-aligned gutter).
+    static func lineNumberString(lineCount: Int) -> String {
+        guard lineCount > 0 else { return "" }
+        return (1...lineCount).map(String.init).joined(separator: "\n")
+    }
+
+    /// Gutter width that fits the widest line number without clipping while
+    /// staying modest on small screens: ~8pt per monospaced body digit + a
+    /// trailing pad, clamped to [28, 80]. A 4-digit file (~9999 lines) ≈ 44pt.
+    static func gutterWidth(forLineCount lineCount: Int) -> CGFloat {
+        let digits = max(1, String(max(1, lineCount)).count)
+        return min(max(CGFloat(digits) * 8 + 12, 28), 80)
+    }
+
+    /// Infer a `SyntaxHighlighter` language alias from the file `path`'s
+    /// extension. Returns `nil` for no/unknown extensions so the highlighter
+    /// renders plain monospaced text. Covers every alias the highlighter knows
+    /// (swift, py/python, js/jsx/mjs/cjs, ts/tsx, sh/zsh/bash, json/jsonc/json5,
+    /// yaml/yml, go/golang, rs/rust, sql, html/htm/xml, css/scss) via the
+    /// extension (`.swift`, `.py`, `.ts`, `.sh`, `.json`, …).
+    static func highlightLanguage(forPath path: String) -> String? {
+        let ext = (path as NSString).pathExtension
+        guard !ext.isEmpty, SyntaxHighlighter.isSupported(ext) else { return nil }
+        return ext
     }
 
     private var truncationFooter: some View {

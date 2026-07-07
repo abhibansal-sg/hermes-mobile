@@ -454,6 +454,86 @@ final class RenderingTests: XCTestCase {
         XCTAssertNil(SVGSanitizer.sanitize(remoteStyle))
     }
 
+    // MARK: - FileViewerView source helpers
+
+    func testFileViewerLineCountHandlesNewlines() {
+        XCTAssertEqual(FileViewerView.lineCount(for: ""), 0)
+        XCTAssertEqual(FileViewerView.lineCount(for: "one line"), 1)
+        XCTAssertEqual(FileViewerView.lineCount(for: "a\nb"), 2)
+        XCTAssertEqual(FileViewerView.lineCount(for: "a\nb\n"), 3, "trailing newline yields a final empty line")
+        XCTAssertEqual(FileViewerView.lineCount(for: "\n\n\n"), 4)
+    }
+
+    func testFileViewerLineNumberString() {
+        XCTAssertEqual(FileViewerView.lineNumberString(lineCount: 0), "")
+        XCTAssertEqual(FileViewerView.lineNumberString(lineCount: 1), "1")
+        XCTAssertEqual(FileViewerView.lineNumberString(lineCount: 3), "1\n2\n3")
+    }
+
+    func testFileViewerGutterWidthScalesWithDigitsAndClamps() {
+        XCTAssertEqual(FileViewerView.gutterWidth(forLineCount: 0), 28)        // min clamp
+        XCTAssertEqual(FileViewerView.gutterWidth(forLineCount: 5), 28)        // 1 digit → min clamp
+        XCTAssertEqual(FileViewerView.gutterWidth(forLineCount: 50), 28)       // 2 digits → 2*8+12 = 28
+        XCTAssertEqual(FileViewerView.gutterWidth(forLineCount: 500), 36)      // 3 digits → 3*8+12
+        XCTAssertEqual(FileViewerView.gutterWidth(forLineCount: 5000), 44)     // 4 digits → 4*8+12
+        XCTAssertEqual(FileViewerView.gutterWidth(forLineCount: 999_999_999), 80) // 9 digits → clamp
+    }
+
+    func testFileViewerHighlightLanguageInfersFromExtension() {
+        // Every alias the highlighter supports resolves from its extension.
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "Sources/Foo.swift"), "swift")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "scripts/run.py"), "py")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "app.tsx"), "tsx")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "mod.mjs"), "mjs")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "deploy.sh"), "sh")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "boot.zsh"), "zsh")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "pkg.json"), "json")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "cfg.jsonc"), "jsonc")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "cfg.yml"), "yml")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "main.go"), "go")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "lib.rs"), "rs")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "schema.sql"), "sql")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "page.html"), "html")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "feed.xml"), "xml")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "style.scss"), "scss")
+    }
+
+    func testFileViewerHighlightLanguageIsCaseInsensitiveAndPathAware() {
+        // Extension case should not matter (highlighter lowercases aliases).
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "App.SWIFT"), "SWIFT")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "a/b/c/Note.MD"), nil, "md is unknown to the highlighter")
+        // Only the final extension is considered.
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "archive.tar.gz"), nil, "gz is unknown")
+        XCTAssertEqual(FileViewerView.highlightLanguage(forPath: "weird.swift.bak"), nil, "bak is the extension")
+    }
+
+    func testFileViewerHighlightLanguageUnknownOrMissingIsNil() {
+        XCTAssertNil(FileViewerView.highlightLanguage(forPath: "README.md"))
+        XCTAssertNil(FileViewerView.highlightLanguage(forPath: "notes.txt"))
+        XCTAssertNil(FileViewerView.highlightLanguage(forPath: "Makefile"))
+        XCTAssertNil(FileViewerView.highlightLanguage(forPath: "no_extension"))
+        XCTAssertNil(FileViewerView.highlightLanguage(forPath: ""))
+        XCTAssertNil(FileViewerView.highlightLanguage(forPath: "weird.xyz"))
+    }
+
+    func testFileViewerPathInferredHighlightPreservesCharacters() {
+        // End-to-end: path → language → highlight must not alter source text,
+        // and unknown extensions fall through to a plain (uncoloured) result
+        // that still round-trips the exact characters.
+        let samples: [(String, String)] = [
+            ("f.swift", "let n: Int = 42 // hi\nfunc f() {}\n"),
+            ("f.py", "def f():\n    return 'x'\n"),
+            ("f.ts", "const a: number = 1;\n"),
+            ("f.json", "{\"k\": true, \"n\": 1}\n"),
+            ("f.unknownext", "plain text\nline two\n")
+        ]
+        for (path, code) in samples {
+            let language = FileViewerView.highlightLanguage(forPath: path)
+            let highlighted = SyntaxHighlighter.highlight(code, language: language)
+            XCTAssertEqual(String(highlighted.characters), code, "\(path) highlight altered text")
+        }
+    }
+
     // MARK: - AnsiText
 
     func testStripOrRenderPlainTextUnchanged() {
