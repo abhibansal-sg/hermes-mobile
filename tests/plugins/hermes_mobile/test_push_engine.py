@@ -948,7 +948,7 @@ def _wait_for_relay_failure_log(
     )
 
 
-def test_notify_relay_on_routes_to_relay_client(monkeypatch):
+def test_notify_relay_on_routes_to_relay_client(monkeypatch, isolated_home):
     relay = load_plugin_module("relay_client")
     calls = []
 
@@ -957,6 +957,9 @@ def test_notify_relay_on_routes_to_relay_client(monkeypatch):
 
     monkeypatch.setenv("HERMES_MOBILE_RELAY_URL", "https://relay.example.test")
     monkeypatch.setattr(relay, "send_event_background", fake_send_event_background)
+    # Relay notify now gates known event types on the per-event registry,
+    # mirroring direct APNs; register a recipient that opts into "approval".
+    pn.register_token(_VALID_TOKEN, env="sandbox", events=["approval"])
 
     assert pn.notify(
         "approval",
@@ -989,7 +992,7 @@ def test_notify_relay_on_routes_to_relay_client(monkeypatch):
         ),
     ],
 )
-def test_notify_relay_logs_static_failures_distinctly(monkeypatch, caplog, exc, level, needle):
+def test_notify_relay_logs_static_failures_distinctly(monkeypatch, caplog, isolated_home, exc, level, needle):
     relay = load_plugin_module("relay_client")
     error = (
         relay.RelayConfigurationError("bad relay URL")
@@ -1004,6 +1007,9 @@ def test_notify_relay_logs_static_failures_distinctly(monkeypatch, caplog, exc, 
     monkeypatch.setenv("HERMES_MOBILE_RELAY_URL", "https://relay.example.test")
     monkeypatch.setattr(relay, "relay_client", lambda hermes_home=None: FailingClient())
     _reset_relay_async_observability(relay)
+    # Relay notify gates known event types on the per-event registry; register
+    # a recipient that opts into "approval" so delivery is actually attempted.
+    pn.register_token(_VALID_TOKEN, env="sandbox", events=["approval"])
 
     with caplog.at_level(logging.WARNING, logger="hermes_mobile.relay"):
         assert pn.notify(
