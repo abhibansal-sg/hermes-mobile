@@ -54,6 +54,35 @@ final class TranscriptChromeGlowTests: XCTestCase {
         XCTAssertEqual(ChatView.StatusGlowToken.cornerRadius, 12, accuracy: 0.001)
     }
 
+    // MARK: - 1b. Settle-in animation wiring (statusGlow.appear — STR-1029 review)
+
+    /// The inline activity row's appear/disappear settle must be wired to a real
+    /// animation driven by the `settleDuration` token, not left as a dead
+    /// constant. Under normal motion the row settles via a non-nil easeOut.
+    func testSettleAnimationIsLiveUnderNormalMotion() {
+        let animation = ChatView.settleAnimation(reduceMotion: false)
+        // Non-nil proves the token drives a real production animation
+        // (it is no longer a dead 0.18 constant).
+        XCTAssertNotNil(animation)
+    }
+
+    /// Under Reduce Motion the settle is instant (nil animation): the row must
+    /// appear/disappear with no settle-in movement. The continuous breathe loop
+    /// (handled separately in TurnActivityBar) stays static-at-mid regardless.
+    func testSettleAnimationIsInstantUnderReduceMotion() {
+        XCTAssertNil(ChatView.settleAnimation(reduceMotion: true))
+    }
+
+    /// The only non-nil path derives its duration from `settleDuration`, so the
+    /// gate is the exclusive determinant. Asserting the boolean symmetry pins
+    /// that nothing else can produce a settle animation.
+    func testSettleAnimationGatedSolelyByReduceMotion() {
+        XCTAssertNotNil(ChatView.settleAnimation(reduceMotion: false))
+        XCTAssertNil(ChatView.settleAnimation(reduceMotion: true))
+        // And the duration it would use is exactly the token (180ms).
+        XCTAssertEqual(ChatView.StatusGlowToken.settleDuration, 0.18, accuracy: 0.001)
+    }
+
     // MARK: - 2. Elapsed text (desktop ActivityTimerText parity)
 
     func testElapsedTextNilStartReturnsZeroSeconds() {

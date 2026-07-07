@@ -28,6 +28,10 @@ struct ChatView: View {
     /// Paired with the theme id in each bubble's `Equatable` value (A1): catches an
     /// adaptive theme's light↔dark flip, where the theme name is unchanged.
     @Environment(\.colorScheme) private var colorScheme
+    /// Gates the inline activity row's appear/disappear settle: under Reduce
+    /// Motion the row settles instantly (nil animation); the continuous breathe
+    /// loop is handled separately inside `TurnActivityBar` (static-at-mid).
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Optional hook invoked when the user chooses "Speak" on an assistant
     /// message. Wiring to the speech player happens during integration; nil
@@ -414,6 +418,19 @@ struct ChatView: View {
         static let settleDuration: Double = 0.18
         static let breatheDuration: Double = 1.8
         static let cornerRadius: CGFloat = 12
+    }
+
+    /// The inline activity row's appear/disappear settle-in animation
+    /// (TRANSCRIPT-CHROME-TOKENS.md §1.2 `statusGlow.appear` = 180ms `.easeOut`).
+    /// Wired to the row via `.animation(settleAnimation(reduceMotion:),
+    /// value: shouldShowInlineTurnActivity)` so the glow shell settles in and
+    /// out over 180ms rather than snapping. Returns `nil` under Reduce Motion →
+    /// the row appears/disappears instantly; the continuous breathe loop is
+    /// owned separately inside `TurnActivityBar` (static-at-mid under Reduce
+    /// Motion) and is unaffected. Pure + static so the wiring gate is
+    /// unit-testable and the `settleDuration` token is provably live.
+    static func settleAnimation(reduceMotion: Bool) -> Animation? {
+        reduceMotion ? nil : .easeOut(duration: StatusGlowToken.settleDuration)
     }
 
     var body: some View {
@@ -959,6 +976,13 @@ struct ChatView: View {
             }
             .padding(.horizontal, 16)
             .animation(.easeInOut(duration: 0.2), value: chatStore.isActiveSessionCompacting)
+            // Inline activity row settle-in/out (TRANSCRIPT-CHROME-TOKENS.md
+            // §1.2 `statusGlow.appear` = 180ms easeOut): drives the
+            // TurnActivityBar's .transition on appear/disappear. nil under
+            // Reduce Motion so the row settles instantly; the breathe loop
+            // stays static-at-mid (handled inside TurnActivityBar).
+            .animation(Self.settleAnimation(reduceMotion: reduceMotion),
+                       value: shouldShowInlineTurnActivity)
             // TOP CLEARANCE (FIX 2): the first element must REST below the floating
             // header (not jammed under it) while still sliding UNDER the header when
             // scrolled (the EdgeFadeMask top band handles the under-header look).
