@@ -1,3 +1,20 @@
+Build 95 — 2026-07-08
+
+FIXED
+- Stabilize size-class survival UI test
+- STR-272 repark refused ask prompt
+
+IMPROVED
+- Add STR-1021 provider key survival harness
+
+WORTH TRYING
+- Try: Stabilize size-class survival UI test
+- Try: STR-272 repark refused ask prompt
+
+(+6 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 94 — 2026-07-07
 
 FIXED
