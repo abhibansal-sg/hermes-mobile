@@ -1,3 +1,9 @@
+Build 92 — 2026-07-07
+
+(+3 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 90 — 2026-07-06
 
 FIXED
