@@ -1071,16 +1071,30 @@ private struct CompactLayout: View {
                 // overlay (under the pills), so the transcript scroll surface keeps
                 // a clean, uninsetted full-bleed top edge.
             } else {
-                NavigationStack {
-                    ContentUnavailableView {
-                        Label("No conversation", systemImage: "bubble.left.and.text.bubble.right")
-                    } description: {
-                        Text("Start a new chat or pick a session from the drawer.")
-                    } actions: {
-                        Button("New Chat") { sessions.startDraft() }
-                            .buttonStyle(.borderedProminent)
-                        Button("Sessions") { drawer.toggle() }
-                    }
+                // STR-54: NO NavigationStack wrapper here (mirrors the ChatView
+                // "STRIKE P0" removal above). This branch renders no title/toolbar
+                // chrome — the stack was pure inert scaffolding — but its
+                // UIKit-backed hosting controller mounts with whatever `.offset(x:)`
+                // the surrounding `.geometryGroup()`'d card happens to have at that
+                // instant. Reaching this branch by deleting the active session
+                // WHILE the drawer is open (offset == drawerWidth) baked that
+                // offset into the stack's accessibility/hit-test frame permanently:
+                // the card later animates back to its visually-correct offset 0,
+                // but the NavigationStack's own hit-test geometry never followed,
+                // leaving the "Sessions"/"New Chat" buttons rendered on-screen yet
+                // untappable there (repro'd via AXe: AX frame stuck at
+                // `x ≈ drawerWidth` while the screenshot showed them centered).
+                // Dropping the wrapper puts `ContentUnavailableView` directly in
+                // the `.geometryGroup()`'d subtree, so its hit-test geometry rides
+                // the offset rigidly like the rest of the card.
+                ContentUnavailableView {
+                    Label("No conversation", systemImage: "bubble.left.and.text.bubble.right")
+                } description: {
+                    Text("Start a new chat or pick a session from the drawer.")
+                } actions: {
+                    Button("New Chat") { sessions.startDraft() }
+                        .buttonStyle(.borderedProminent)
+                    Button("Sessions") { drawer.toggle() }
                 }
             }
         }
