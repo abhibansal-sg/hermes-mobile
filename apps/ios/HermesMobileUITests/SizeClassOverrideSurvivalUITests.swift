@@ -80,33 +80,6 @@ final class SizeClassOverrideSurvivalUITests: XCTestCase {
         attach(regularApp, named: "launch-env-regular")
     }
 
-    /// Same-process STR-691 hoist survival (the unsaved Settings form `@State`
-    /// surviving an in-process compact<->regular flip) is NOT automatable via
-    /// XCUITest on the iPad simulator. This records the first-hand constraints
-    /// so the gap is explicit rather than silent.
-    ///
-    /// Verified constraints (this heartbeat):
-    /// 1. `XCUIApplication.open(_:)` RE-LAUNCHES the app under test (observed in
-    ///    the test log: "Launch ai.hermes.app" immediately follows the openURL),
-    ///    which resets in-memory `@State` and dismisses the Settings sheet — so
-    ///    it cannot demonstrate same-process survival.
-    /// 2. `Process`/`NSTask` is unavailable on the iOS-Simulator SDK, so the
-    ///    test cannot shell out to `xcrun simctl openurl` (the host-side delivery
-    ///    that WOULD fire `.onOpenURL` in-process without relaunching).
-    /// 3. An iPad simulator cannot enter compact width via device rotation or
-    ///    Slide Over / Split View from XCUITest, so there is no non-seam way to
-    ///    force the transition in a single process either.
-    ///
-    /// Structural prerequisite (verified by RootKeyboardShortcutActionsTests):
-    /// the STR-691 hoist (`showingSettings` + the Settings `.sheet` owned on
-    /// `RootView`, ABOVE the `mainUI` size-class branch) is present in the code
-    /// under test. That makes survival structurally possible, but the actual
-    /// same-process flip still has to be delivered by a host-side
-    /// `simctl openurl` capture because XCTest delivery relaunches the app.
-    func testSameProcessSurvivalNotAutomatableHere() throws {
-        throw XCTSkip("Same-process STR-691 survival needs a host-driven simctl openurl capture — see doc comment")
-    }
-
     // MARK: - Helpers
 
     private func attach(_ app: XCUIApplication, named name: String) {

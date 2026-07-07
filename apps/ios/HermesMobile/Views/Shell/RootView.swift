@@ -182,7 +182,10 @@ struct RootView: View {
                 case .compact: debugSizeClassOverride = .compact
                 case .regular: debugSizeClassOverride = .regular
                 case .clearAuto: debugSizeClassOverride = nil
-                case .notHandled: break
+                case .notHandled:
+                    if Self.isOpenSettingsURL(url) {
+                        showingSettings = true
+                    }
                 }
             }
             #endif
@@ -480,6 +483,7 @@ enum DebugSizeClassOverride {
         default: return .notHandled
         }
     }
+
 }
 #endif
 
