@@ -335,7 +335,15 @@ enum HermesURLRouter {
             // silently. An unconfigured app (first run / pre-bootstrap repair)
             // pairs immediately — nothing to lose. `rest != nil` iff a server
             // URL + token are already in place (a live or restored connection).
-            if connection.rest != nil {
+            //
+            // STR-903: a self-revoke (Settings → Devices) or auth-rejection puts
+            // the app in `.needsSetup` + `reauthRequired` while the stale URL +
+            // token still make `rest != nil`. That is the repair/re-pair posture,
+            // not a live session to protect — a pair link there is the intended
+            // recovery and must apply immediately rather than prompt a false
+            // destructive-disconnect confirmation. `isAwaitingRePair` is the
+            // explicit discriminator; `rest != nil` alone is insufficient.
+            if connection.rest != nil && !connection.isAwaitingRePair {
                 if let requestPairConfirmation {
                     requestPairConfirmation(payload)
                 }

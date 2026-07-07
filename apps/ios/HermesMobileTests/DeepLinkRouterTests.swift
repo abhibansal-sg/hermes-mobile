@@ -11,9 +11,14 @@ import XCTest
 ///   configured defers to a confirmation request).
 /// - the App Intents `.newSession` LOCAL-DRAFT parity change (no orphan session).
 /// - the Spotlight / Handoff continuation receiver (`routeContinuedActivity`).
+/// - STR-903: a pair link after self-revoke (`.needsSetup` + `reauthRequired`
+///   repair state, stale `rest != nil`) applies immediately and must NOT raise
+///   the destructive-disconnect confirmation; a live `.connected` session still
+///   does.
 ///
-/// No live gateway is touched. Each store is built unconfigured (no `client`,
-/// `rest == nil`), mirroring the pure-state style of `ConnectionPhaseTests`.
+/// No live gateway is touched. Stores start unconfigured (no `client`,
+/// `rest == nil`) unless a test seeds a configured/connected state via the
+/// DEBUG `_seedConnectedForTesting` seam, mirroring `ConnectionPhaseTests`.
 @MainActor
 final class DeepLinkRouterTests: XCTestCase {
 
@@ -218,6 +223,91 @@ final class DeepLinkRouterTests: XCTestCase {
             requestPairConfirmation: { _ in confirmationRequested = true }
         )
         XCTAssertFalse(confirmationRequested)
+    }
+
+    // MARK: - repair-state pair link (STR-903)
+
+    /// A connected/configured app with a LIVE session must STILL request the
+    /// destructive-disconnect confirmation before re-pairing. Guards against the
+    /// STR-903 fix weakening the live-session protection: `rest != nil` plus a
+    /// non-repair phase must route to the confirmation seam.
+    func testPairOnConnectedConfiguredRequestsConfirmation() {
+        let s = makeStores()
+        // Seed a genuine connected state: URL + token present (rest != nil),
+        // phase .connected, reauthRequired false.
+        s.connection._seedConnectedForTesting(serverURL: "https://h:9119", token: "live-tok")
+        XCTAssertNotNil(s.connection.rest, "seeded store must look configured")
+        XCTAssertFalse(
+            s.connection.isAwaitingRePair,
+            "a live connected session is not in the repair/re-pair posture"
+        )
+
+        var confirmationRequested = false
+        HermesURLRouter.route(
+            URL(string: "hermesapp://pair?url=https%3A%2F%2Fh%3A9119&token=newtok")!,
+            connection: s.connection,
+            sessions: s.sessions,
+            chat: s.chat,
+            inbox: s.inbox,
+            requestPairConfirmation: { _ in confirmationRequested = true }
+        )
+
+        XCTAssertTrue(
+            confirmationRequested,
+            "A live connected session must request confirmation before re-pairing."
+        )
+    }
+
+    /// After the current device self-revokes, `requireRepairAfterCurrentDeviceRevoked()`
+    /// puts the app in `.needsSetup` + `reauthRequired` repair state while the stale
+    /// URL + token still make `rest != nil`. A standard pair link must then apply
+    /// immediately (re-pairing is the intended recovery) and must NOT trigger the
+    /// destructive-disconnect confirmation. (STR-903 regression.)
+    func testPairAfterSelfRevokeAppliesImmediatelyWithoutConfirmation() {
+        let s = makeStores()
+        s.connection._seedConnectedForTesting(serverURL: "https://h:9119", token: "dead-tok")
+        // Simulate the user revoking THIS device in Settings → Devices.
+        s.connection.requireRepairAfterCurrentDeviceRevoked()
+
+        // Repair-state invariants the fix relies on: still looks configured to a
+        // naive `rest != nil` check, but isAwaitingRePair is now true.
+        XCTAssertNotNil(
+            s.connection.rest,
+            "stale URL+token still yield a non-nil rest after self-revoke"
+        )
+        XCTAssertTrue(
+            s.connection.isAwaitingRePair,
+            "post-revoke must be in the repair/re-pair posture"
+        )
+        XCTAssertEqual(s.connection.phase, .needsSetup)
+        XCTAssertTrue(s.connection.reauthRequired)
+
+        var confirmationRequested = false
+        // Pin a deterministic non-.sharedDashboard start mode so the post-route
+        // flip to .sharedDashboard is a meaningful signal that applyPair ran
+        // (isolates the test from UserDefaults persisted in the test host).
+        s.connection.connectionMode = .remoteURL
+
+        HermesURLRouter.route(
+            URL(string: "hermesapp://pair?url=https%3A%2F%2Fh%3A9119&token=freshtok")!,
+            connection: s.connection,
+            sessions: s.sessions,
+            chat: s.chat,
+            inbox: s.inbox,
+            requestPairConfirmation: { _ in confirmationRequested = true }
+        )
+
+        XCTAssertFalse(
+            confirmationRequested,
+            "A pair link in the post-revoke repair state is recovery, not a destructive re-pair — must not prompt."
+        )
+        // `applyPair()` tags the mode `.sharedDashboard` synchronously before
+        // launching `configure()` asynchronously, so the mode flip is a
+        // deterministic, sleep-free signal that the immediate-apply path ran.
+        XCTAssertEqual(
+            s.connection.connectionMode, .sharedDashboard,
+            "The repair-state pair link must reach applyPair (mode flips to .sharedDashboard)."
+        )
     }
 
     func testDeepLinkCoordinatorStashAndClear() {
