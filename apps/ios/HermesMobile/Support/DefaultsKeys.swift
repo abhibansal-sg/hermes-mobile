@@ -50,6 +50,19 @@ enum DefaultsKeys {
     /// Owned by ``SessionStore``.
     static let pinnedWorkspaces = "hermes.pinnedWorkspaces"
 
+    /// `[String]` — profile names whose All Profiles drawer group the user has
+    /// EXPLICITLY collapsed, overriding the collapsed-by-default rule (STR-1022).
+    /// Pairs with ``expandedProfiles``: the effective state is derived from these
+    /// two sets plus the default rule (collapse every group except the default
+    /// profile), so no one-shot seeding is needed and newly-discovered profiles
+    /// auto-collapse without erasing prior choices. Default empty.
+    static let collapsedProfiles = "hermes.collapsedProfiles"
+
+    /// `[String]` — profile names the user has EXPLICITLY expanded beyond the
+    /// collapsed-by-default rule (STR-1022), so a non-default group they opened
+    /// stays open across restarts. Default empty.
+    static let expandedProfiles = "hermes.expandedProfiles"
+
     /// `String` — the active multi-profile SCOPE for the session rail (F4b). The
     /// sentinel ``allProfilesScope`` (`"all"`) or an empty/absent value = the
     /// aggregate "All profiles" view; any other value = that profile's name. Owned

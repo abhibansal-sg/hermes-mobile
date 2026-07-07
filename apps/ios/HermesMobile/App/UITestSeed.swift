@@ -301,6 +301,85 @@ enum UITestSeed {
             return
         }
 
+        // "multiprofile" — DEBUG seed for the All Profiles drawer (STR-1022):
+        // 3 profiles (default + work + personal), each with multiple sessions,
+        // so the collapsed-by-default + few-recent preview + expand flow is
+        // demonstrable without a live multi-profile gateway. Forces the
+        // capability + profile list through DEBUG seams, sets activeProfile to
+        // the aggregate "all" scope, and injects transcriptFetch so tapping a
+        // row opens a transcript without a network call.
+        if mode == "multiprofile" {
+            let profileList = [
+                ProfileSummary(name: "default", isDefault: true, description: nil),
+                ProfileSummary(name: "work", isDefault: false, description: nil),
+                ProfileSummary(name: "personal", isDefault: false, description: nil),
+            ]
+            environment.connectionStore.capabilities._seedProfilesCapabilityForTesting(.available)
+            environment.sessionStore._seedProfilesForTesting(profileList)
+            environment.sessionStore.activeProfile = DefaultsKeys.allProfilesScope
+
+            func summary(_ id: String, _ title: String, _ count: Int, _ ago: Double, _ profile: String) -> SessionSummary? {
+                JSONValue.object([
+                    "id": .string(id), "title": .string(title),
+                    "message_count": .number(Double(count)),
+                    "last_active": .number(1_700_000_000 - ago),
+                    "started_at": .number(1_700_000_000 - ago - 1000),
+                    "source": .string("user"),
+                    "profile": .string(profile),
+                ]).decoded(as: SessionSummary.self)
+            }
+
+            let list: [SessionSummary] = [
+                // default profile — 5 sessions (expanded by default)
+                summary("mp-d1", "Deploy health check", 4, 60, "default"),
+                summary("mp-d2", "Refactor the auth module", 22, 3600, "default"),
+                summary("mp-d3", "Tokyo trip — 5-day itinerary", 16, 7200, "default"),
+                summary("mp-d4", "Fix the flaky websocket test", 31, 14400, "default"),
+                summary("mp-d5", "Morning brief", 8, 86400, "default"),
+                // work profile — 4 sessions (collapsed by default)
+                summary("mp-w1", "Q3 roadmap planning", 14, 120, "work"),
+                summary("mp-w2", "API gateway migration", 28, 1800, "work"),
+                summary("mp-w3", "Customer onboarding flow", 9, 7200, "work"),
+                summary("mp-w4", "Security audit prep", 19, 21600, "work"),
+                // personal profile — 3 sessions (collapsed by default)
+                summary("mp-p1", "Weekend hiking routes", 6, 600, "personal"),
+                summary("mp-p2", "Recipe collection", 11, 5400, "personal"),
+                summary("mp-p3", "Book recommendations", 7, 36000, "personal"),
+            ].compactMap { $0 }
+
+            environment.sessionStore.sessions = list
+            environment.sessionStore.activeStoredId = "mp-d1"
+            environment.connectionStore.phase = .connected
+
+            // Inject transcriptFetch so tapping a session row opens a
+            // transcript without a gateway call.
+            environment.sessionStore.transcriptFetch = { id in
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                func stored(_ role: String, _ text: String, _ i: Int) -> StoredMessage? {
+                    StoredMessage(json: .object([
+                        "role": .string(role),
+                        "content": .string(text),
+                        "id": .number(Double(i)),
+                        "timestamp": .number(Double(1_700_000_000 + i)),
+                    ]))
+                }
+                return (0..<4).compactMap { i in
+                    stored(i.isMultiple(of: 2) ? "user" : "assistant",
+                           "Seed message #\(i + 1) for \(id)", i)
+                }
+            }
+
+            // Seed the active session's transcript so ChatView renders.
+            let convo: [ChatMessage] = [
+                ChatMessage(role: .user, text: "Is the staging deploy healthy?"),
+                ChatMessage(role: .assistant,
+                            text: "CI is green on main. Staging is returning 502s "
+                                + "from a wedged worker. A restart will clear it."),
+            ]
+            environment.chatStore.debugSeedTranscript(convo)
+            return
+        }
+
         environment.sessionStore.activeStoredId = "uitest-\(mode)"
         // Seed TIMING (scroll-race verification):
         //  • "long"/"short" — synchronous: content present at first layout.
