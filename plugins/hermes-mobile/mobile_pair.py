@@ -55,7 +55,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 # ---------------------------------------------------------------------------
 # Increment 4a — Address stability types
@@ -178,13 +178,21 @@ def mobile_pair_command(args) -> int:
     # broad shared dashboard token. ``--shared-token`` keeps the legacy v1 path
     # for stock gateways / old branches.
     if getattr(args, "device_token", True):
-        # Mint against the LOCAL listener: on some Macs the tailnet hostname
+        # Mint against the LOCAL listener for remote QR targets: on some Macs
+        # the tailnet hostname
         # resolves to public Funnel IPs (broken MagicDNS), so an HTTPS
         # round-trip to dashboard_url never reaches this machine's own
         # server (and its Host-check would reject the ts.net name anyway).
         # The QR still embeds dashboard_url for the phone; only the mint
-        # call goes local. An explicit --url override keeps minting remote.
-        mint_url = override_url or f"http://127.0.0.1:{DEFAULT_DASHBOARD_PORT}"
+        # call goes local. A discovered loopback URL must mint against that
+        # same origin because Desktop can own a non-default local port.
+        # An explicit --url override keeps minting against the operator's URL.
+        if override_url:
+            mint_url = override_url
+        elif _is_loopback_origin(dashboard_url):
+            mint_url = dashboard_url
+        else:
+            mint_url = f"http://127.0.0.1:{DEFAULT_DASHBOARD_PORT}"
         issued = _issue_device_token(mint_url, token)
         if issued is None:
             print(
@@ -700,6 +708,16 @@ def _print_no_url_instructions() -> None:
 # ---------------------------------------------------------------------------
 # Token
 # ---------------------------------------------------------------------------
+
+def _is_loopback_origin(url: str) -> bool:
+    """Return True when ``url`` targets a local loopback host."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
+
 
 def _read_dashboard_token() -> Optional[str]:
     """Resolve the dashboard session token: env override first, then the
