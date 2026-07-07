@@ -15229,24 +15229,31 @@ async def console_ws(ws: WebSocket) -> None:
     live_socket_index = _ws_live_socket_index(ws)
     live_socket_index.__enter__()
 
-    _log.info(
-        "console accepted peer=%s mode=%s cred=%s context=%s profile=%s",
-        peer,
-        mode,
-        cred,
-        context,
-        profile or "current",
-    )
-    await _console_send(
-        ws,
-        send_lock,
-        {
-            "type": "ready",
-            "context": context,
-            "profile": profile or "current",
-            "prompt": _CONSOLE_PROMPT,
-        },
-    )
+    try:
+        _log.info(
+            "console accepted peer=%s mode=%s cred=%s context=%s profile=%s",
+            peer,
+            mode,
+            cred,
+            context,
+            profile or "current",
+        )
+        await _console_send(
+            ws,
+            send_lock,
+            {
+                "type": "ready",
+                "context": context,
+                "profile": profile or "current",
+                "prompt": _CONSOLE_PROMPT,
+            },
+        )
+    except WebSocketDisconnect:
+        live_socket_index.__exit__(None, None, None)
+        return
+    except BaseException:
+        live_socket_index.__exit__(None, None, None)
+        raise
 
     active_task: asyncio.Task | None = None
     pending_confirmation: Optional[str] = None

@@ -21,7 +21,9 @@ directly.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import asyncio
+import sys
+from types import ModuleType, SimpleNamespace
 from urllib.parse import urlencode
 
 import pytest
@@ -241,6 +243,52 @@ def test_console_device_token_socket_is_live_cut_and_deregistered(
             conn.receive_json()
         assert exc.value.code == 4401
 
+    assert device_tokens.get_device_sockets(issued["device_id"]) == []
+
+
+def test_console_ready_send_disconnect_deregisters_device_socket(
+    dashboard_ws_enabled, home, wired_token_auth, monkeypatch
+):
+    issued = device_tokens.issue(device_name="console-ready-disconnect")
+
+    class _FakeConsoleWS:
+        def __init__(self) -> None:
+            self.query_params = _fake_ws(query={"token": issued["token"]}).query_params
+            self.headers = _WS_HEADERS
+            self.client = SimpleNamespace(host="127.0.0.1")
+            self.url = SimpleNamespace(path="/api/console")
+            self.state = SimpleNamespace()
+            self.accepted = False
+
+        async def accept(self) -> None:
+            self.accepted = True
+
+        async def close(self, code=1000, reason="") -> None:
+            self.closed = (code, reason)
+
+        async def receive(self):
+            raise AssertionError("ready-send failure should exit before receive")
+
+    fake_console_engine = ModuleType("hermes_cli.console_engine")
+
+    class HermesConsoleEngine:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    fake_console_engine.HermesConsoleEngine = HermesConsoleEngine
+    monkeypatch.setitem(sys.modules, "hermes_cli.console_engine", fake_console_engine)
+
+    async def fail_ready(ws, send_lock, payload):
+        assert payload["type"] == "ready"
+        assert len(device_tokens.get_device_sockets(issued["device_id"])) == 1
+        raise WebSocketDisconnect(code=1006)
+
+    monkeypatch.setattr(web_server, "_console_send", fail_ready)
+
+    ws = _FakeConsoleWS()
+    asyncio.run(web_server.console_ws(ws))
+
+    assert ws.accepted is True
     assert device_tokens.get_device_sockets(issued["device_id"]) == []
 
 
