@@ -425,19 +425,25 @@ final class TurnInProgressCarryForwardTests: XCTestCase {
     }
 }
 
-// MARK: - ABH-351 ProjectsStore tests (folded from ProjectsStoreTests.swift)
+// MARK: - ABH-351 / STR-992 WU2 ProjectsStore tests (folded from ProjectsStoreTests.swift)
 
 import Testing
 
-/// ABH-351 — Projects model decoding + store state + session-filter tests.
+/// ABH-351 / STR-992 WU2 — Projects model decoding + store state + server-backed
+/// session cache tests.
 ///
 /// These tests exercise the three things slice-2 owns:
 /// 1. The `Project` model decodes the slice-1 route's JSON contract
 ///    (`{id, label, root, session_count}`) — including the snake_case key.
-/// 2. `ProjectsStore.normalizedPath` matches a session's cwd to a project's
-///    root (case-insensitive, trailing-slash-insensitive).
-/// 3. `ProjectsStore.sessions(for:in:)` correctly filters a session list to
-///    the ones whose cwd resolves to the project root.
+/// 2. `ProjectsStore.normalizedPath` keys the server-backed session cache
+///    (case-insensitive, trailing-slash-insensitive) — it no longer matches a
+///    session's cwd, since project detail no longer derives membership from
+///    `SessionStore.sessions`.
+/// 3. `ProjectsStore.refreshSessions(for:)` / `.sessionsState(for:)` — the
+///    STR-992 WU2 server-backed session cache, injected via the `sessionsFetch`
+///    DEBUG seam. `ProjectsStore.sessions(for:in:)` (cwd-derived filtering of
+///    `SessionStore.sessions`) has been removed: a project's `sessionCount` is
+///    only a pre-fetch hint that may legitimately exceed what this cache holds.
 @MainActor
 struct ProjectsStoreTests {
 
@@ -504,50 +510,137 @@ struct ProjectsStoreTests {
         #expect(ProjectsStore.normalizedPath("\n") == "")
     }
 
-    // MARK: - sessions(for:in:)
+    // MARK: - Server-backed session cache (STR-992 WU2)
+    //
+    // Replaces the old `sessions(for:in:)` cwd-derivation tests. All tests here
+    // inject `sessionsFetch` (mirrors the `sessionsFetch`/`searchFetch` DEBUG
+    // seams elsewhere in this file) — no live gateway, and critically, no
+    // `SessionStore` instance is ever constructed: the server-backed cache is
+    // never allowed to fall back to `SessionStore.sessions` as a membership
+    // source.
 
-    @Test("sessions(for:in:) filters sessions whose cwd matches project root")
-    func sessionFilter_matches() {
+    @Test("sessionsState(for:) returns a fresh, not-loaded state before any refresh")
+    func sessionsState_beforeRefresh() {
         let store = ProjectsStore()
-        let project = Project(
-            id: "/repo/a",
-            label: "a",
-            root: "/Repo/A",
-            sessionCount: 2
-        )
+        let project = Project(id: "/repo/a", label: "a", root: "/repo/a", sessionCount: 5)
 
-        let sessions = SessionStore()
-        sessions.sessions = [
-            SessionSummary.stub(id: "1", cwd: "/repo/a"),
-            SessionSummary.stub(id: "2", cwd: "/repo/a/"),
-            SessionSummary.stub(id: "3", cwd: "/repo/b"),
-            SessionSummary.stub(id: "4", cwd: nil),
-        ]
-
-        let result = store.sessions(for: project, in: sessions)
-        #expect(result.count == 2)
-        #expect(result.contains { $0.id == "1" })
-        #expect(result.contains { $0.id == "2" })
+        let state = store.sessionsState(for: project)
+        #expect(state.sessions.isEmpty)
+        #expect(state.isLoading == false)
+        #expect(state.loadError == nil)
+        #expect(state.hasLoaded == false)
     }
 
-    @Test("sessions(for:in:) returns empty when no cwds match")
-    func sessionFilter_noMatch() {
+    @Test("refreshSessions(for:) populates the cache from the injected sessionsFetch seam")
+    func refreshSessions_populatesCache() async {
         let store = ProjectsStore()
-        let project = Project(
-            id: "/repo/x",
-            label: "x",
-            root: "/repo/x",
-            sessionCount: 0
-        )
+        let project = Project(id: "/repo/a", label: "a", root: "/repo/a", sessionCount: 2)
+        store.sessionsFetch = { _ in
+            RestClient.ProjectSessionsPage(sessions: [self.stub(id: "1"), self.stub(id: "2")], total: 2)
+        }
 
-        let sessions = SessionStore()
-        sessions.sessions = [
-            SessionSummary.stub(id: "1", cwd: "/repo/a"),
-            SessionSummary.stub(id: "2", cwd: nil),
-        ]
+        await store.refreshSessions(for: project)
 
-        let result = store.sessions(for: project, in: sessions)
-        #expect(result.isEmpty)
+        let state = store.sessionsState(for: project)
+        #expect(state.sessions.map(\.id) == ["1", "2"])
+        #expect(state.total == 2)
+        #expect(state.hasLoaded == true)
+        #expect(state.isLoading == false)
+        #expect(state.loadError == nil)
+    }
+
+    @Test("refreshSessions(for:) surfaces an error when the fetch fails before any load has succeeded")
+    func refreshSessions_surfacesErrorBeforeFirstLoad() async {
+        struct FetchError: Error, LocalizedError {
+            var errorDescription: String? { "boom" }
+        }
+        let store = ProjectsStore()
+        let project = Project(id: "/repo/a", label: "a", root: "/repo/a", sessionCount: 0)
+        store.sessionsFetch = { _ in throw FetchError() }
+
+        await store.refreshSessions(for: project)
+
+        let state = store.sessionsState(for: project)
+        #expect(state.hasLoaded == false)
+        #expect(state.loadError == "boom")
+        #expect(state.sessions.isEmpty)
+    }
+
+    @Test("a later failed refresh preserves the last successful list instead of surfacing an error")
+    func refreshSessions_preservesLastGoodListOnLaterFailure() async {
+        struct FetchError: Error {}
+        let store = ProjectsStore()
+        let project = Project(id: "/repo/a", label: "a", root: "/repo/a", sessionCount: 1)
+
+        store.sessionsFetch = { _ in RestClient.ProjectSessionsPage(sessions: [self.stub(id: "1")], total: 1) }
+        await store.refreshSessions(for: project)
+
+        store.sessionsFetch = { _ in throw FetchError() }
+        await store.refreshSessions(for: project)
+
+        let state = store.sessionsState(for: project)
+        #expect(state.hasLoaded == true)
+        #expect(state.sessions.map(\.id) == ["1"],
+                 "a transient failure must not blank out the last successful load")
+        #expect(state.loadError == nil,
+                 "no error banner once a load has already succeeded once for this project")
+    }
+
+    @Test("the cache is keyed by normalizedPath(root), so case/trailing-slash root variants share an entry")
+    func sessionsCache_keyedByNormalizedRoot() async {
+        let store = ProjectsStore()
+        let project = Project(id: "/Repo/A", label: "a", root: "/Repo/A", sessionCount: 1)
+        store.sessionsFetch = { _ in RestClient.ProjectSessionsPage(sessions: [self.stub(id: "1")], total: 1) }
+        await store.refreshSessions(for: project)
+
+        // Same repo, different id casing/trailing slash — must hit the same cache entry.
+        let sameRepoVariant = Project(id: "/repo/a/", label: "a", root: "/repo/a/", sessionCount: 1)
+        let state = store.sessionsState(for: sameRepoVariant)
+        #expect(state.hasLoaded == true)
+        #expect(state.sessions.map(\.id) == ["1"])
+    }
+
+    @Test("sessionCount may exceed the fetched session count — detail must never fall back to SessionStore.sessions")
+    func sessionCount_canExceedFetchedSessions() async {
+        let store = ProjectsStore()
+        // The overview hint says 50 sessions; the server-backed fetch (the only
+        // source project detail is allowed to read) returns just 2. A prior bug
+        // class conflated this hint with `SessionStore.sessions.filter(...)`,
+        // which could never exceed what the drawer's `SessionStore` had loaded.
+        let project = Project(id: "/repo/a", label: "a", root: "/repo/a", sessionCount: 50)
+        store.sessionsFetch = { _ in
+            RestClient.ProjectSessionsPage(sessions: [self.stub(id: "1"), self.stub(id: "2")], total: 2)
+        }
+
+        await store.refreshSessions(for: project)
+
+        let state = store.sessionsState(for: project)
+        #expect(state.hasLoaded == true)
+        #expect(state.sessions.count == 2, "the fetched count, not project.sessionCount, is authoritative once loaded")
+        #expect(project.sessionCount == 50, "the pre-fetch hint itself is untouched by the cache")
+        // No SessionStore is constructed anywhere in this test — unlike the old
+        // sessions(for:in:) derivation, the cache has no dependency on one.
+    }
+
+    @Test("state.total is the route's authoritative count, and can itself exceed sessions.count when session_limit truncates")
+    func total_canExceedFetchedSessionsWhenLimitTruncates() async {
+        let store = ProjectsStore()
+        // Mirrors STR-998's project_sessions route: `total` comes from the
+        // hydrated tree's `sessionCount`, while `sessions` is the flattened,
+        // `session_limit`-bounded list — the two can legitimately diverge.
+        // ProjectDetailView's header must read `state.total`, never
+        // `state.sessions.count`, once loaded.
+        let project = Project(id: "/repo/a", label: "a", root: "/repo/a", sessionCount: 0)
+        store.sessionsFetch = { _ in
+            RestClient.ProjectSessionsPage(sessions: [self.stub(id: "1"), self.stub(id: "2")], total: 9)
+        }
+
+        await store.refreshSessions(for: project)
+
+        let state = store.sessionsState(for: project)
+        #expect(state.hasLoaded == true)
+        #expect(state.sessions.count == 2)
+        #expect(state.total == 9, "total is server-authoritative and independent of how many rows session_limit returned")
     }
 
     // MARK: - Store initial state
@@ -559,11 +652,11 @@ struct ProjectsStoreTests {
         #expect(store.isLoading == false)
         #expect(store.loadError == nil)
     }
-}
 
-/// Minimal stub for ProjectsStoreTests: id + optional cwd, everything else nil.
-extension SessionSummary {
-    static func stub(id: String, cwd: String?) -> SessionSummary {
+    // MARK: - Helpers
+
+    /// Minimal `SessionSummary` builder for cache tests: only `id` varies.
+    private func stub(id: String) -> SessionSummary {
         SessionSummary(
             id: id,
             title: nil,
@@ -572,7 +665,122 @@ extension SessionSummary {
             messageCount: nil,
             source: nil,
             lastActive: nil,
-            cwd: cwd
+            cwd: nil
         )
+    }
+}
+
+// MARK: - RestClient.projectSessions(projectID:limit:) contract coverage (STR-992 WU2 / STR-998 WU1)
+
+/// Confirms `projectSessions(projectID:limit:)` matches the real STR-998/WU1
+/// route contract landed in `plugins/hermes-mobile/dashboard/api.py::project_sessions`
+/// (commit e0e67cd63): `GET {mobileAPIPrefix}/project-sessions` — mounted ONLY
+/// under the plugin router (`app.include_router(router, prefix="/api/plugins/hermes-mobile")`
+/// in `hermes_cli/web_server.py`; there is no legacy top-level alias for this
+/// new route), with `project_id` (not `root`) and `session_limit` as query
+/// params, and a `{"project_id", "sessions", "total"}` response body
+/// (`test_projects_route.py::test_project_sessions_flattens_hydrated_desktop_lanes`).
+///
+/// `projectID` is percent-encoded as a QUERY value (via
+/// `URLQueryItem`/`percentEncodedQuery`), not a path segment — a project id
+/// is a repo root and routinely contains `/`, spaces, and other characters a
+/// naive path segment would mis-encode or split on. Mirrors the
+/// `RecordingProtocol` stub-transport pattern from `PathStyleTests.swift`
+/// (no live gateway).
+@MainActor
+final class ProjectSessionsRestClientTests: XCTestCase {
+
+    /// Records every request URL and serves one scripted (Data, status) response.
+    final class RecordingProtocol: URLProtocol, @unchecked Sendable {
+        nonisolated(unsafe) static var requests: [URLRequest] = []
+        nonisolated(unsafe) static var response: (Data, Int) = (Data(), 200)
+
+        static func reset(response: (Data, Int)) {
+            requests = []
+            self.response = response
+        }
+
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+        override func startLoading() {
+            Self.requests.append(request)
+            let (body, status) = Self.response
+            let httpResponse = HTTPURLResponse(
+                url: request.url!,
+                statusCode: status,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            client?.urlProtocol(self, didReceive: httpResponse, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: body)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+
+        override func stopLoading() {}
+    }
+
+    private func makeClient(response: (Data, Int)) -> RestClient {
+        RecordingProtocol.reset(response: response)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecordingProtocol.self]
+        return RestClient(
+            baseURL: URL(string: "https://gw.example:9119")!,
+            token: "tok",
+            session: URLSession(configuration: config),
+            // STR-998's project-sessions route is mounted only under the
+            // plugin router — there is no `/api/project-sessions` legacy
+            // alias for this new endpoint, so `.plugin` is the only path
+            // style that resolves it. `.legacy` would 404 against a real
+            // gateway.
+            pathStyle: .plugin
+        )
+    }
+
+    func testProjectSessionsEncodesProjectIDAsQueryValue() async throws {
+        let json = #"{"project_id":"x","sessions":[],"total":0}"#.data(using: .utf8)!
+        let client = makeClient(response: (json, 200))
+
+        // Slashes, a space, and a reserved `&` — all illegal unescaped in a URL
+        // and, for `/`, would silently change path segmentation if this were
+        // (incorrectly) encoded as a path component instead of a query value.
+        _ = try await client.projectSessions(projectID: "/Users/foo/My Repo & Co")
+
+        let request = try #require(RecordingProtocol.requests.first)
+        let url = try #require(request.url)
+        #expect(url.path == "/api/plugins/hermes-mobile/project-sessions")
+
+        let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let projectIDValue = components.queryItems?.first { $0.name == "project_id" }?.value
+        #expect(projectIDValue == "/Users/foo/My Repo & Co",
+                 "decoded query value must round-trip exactly, proving the raw id was query-encoded, not path-mangled")
+        let sessionLimitValue = components.queryItems?.first { $0.name == "session_limit" }?.value
+        #expect(sessionLimitValue == "5000", "default limit must match the route's default session_limit")
+    }
+
+    func testProjectSessionsPassesExplicitLimit() async throws {
+        let json = #"{"project_id":"x","sessions":[],"total":0}"#.data(using: .utf8)!
+        let client = makeClient(response: (json, 200))
+
+        _ = try await client.projectSessions(projectID: "/repo/a", limit: 123)
+
+        let request = try #require(RecordingProtocol.requests.first)
+        let url = try #require(request.url)
+        let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        #expect(components.queryItems?.first { $0.name == "session_limit" }?.value == "123")
+    }
+
+    func testProjectSessionsDecodesSessionsAndTotal() async throws {
+        // Exact shape of `plugins/hermes-mobile/dashboard/api.py::project_sessions`'s
+        // response (STR-998, commit e0e67cd63) — `total` can exceed
+        // `sessions.count` when `session_limit` truncates the flattened list.
+        let json = #"""
+        {"project_id":"p_widget","sessions":[{"id":"s1","title":"t","preview":null,"started_at":null,"message_count":null,"source":null,"last_active":null,"cwd":null}],"total":9}
+        """#.data(using: .utf8)!
+        let client = makeClient(response: (json, 200))
+
+        let page = try await client.projectSessions(projectID: "p_widget")
+        #expect(page.sessions.map(\.id) == ["s1"])
+        #expect(page.total == 9)
     }
 }

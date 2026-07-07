@@ -3678,11 +3678,42 @@ final class ProjectsStore {
     /// successful fetch.
     private(set) var loadError: String?
 
+    /// One project's server-fetched session cache (STR-992 WU2). Distinct from
+    /// the overview's ``Project/sessionCount``, which is only a pre-fetch hint —
+    /// this is the authoritative list once ``hasLoaded`` flips true.
+    struct ProjectSessionsState: Equatable, Sendable {
+        var sessions: [SessionSummary] = []
+        /// Server-authoritative session count (`RestClient.ProjectSessionsPage.total`).
+        /// Distinct from `sessions.count`: the route's `session_limit` can
+        /// truncate the flattened list while `total` still reports the
+        /// project's real count — this is what a "N sessions" header should
+        /// read once ``hasLoaded`` is true, never `sessions.count` directly.
+        var total = 0
+        var isLoading = false
+        var loadError: String?
+        /// `true` once a fetch has completed successfully at least once. Lets
+        /// callers distinguish "never fetched yet" from "fetched, zero results" —
+        /// both have an empty `sessions` array.
+        var hasLoaded = false
+    }
+
+    /// Per-project session cache, keyed by ``normalizedPath(_:)`` of the
+    /// project's `id` (== `root`). Populated by ``refreshSessions(for:)``.
+    private(set) var projectSessionsByRoot: [String: ProjectSessionsState] = [:]
+
     // MARK: - Back-reference (injected by AppEnvironment)
 
     /// The connection store, for REST access. `nil` until
     /// ``attach(connection:)`` is called by the composition root.
     private var connection: ConnectionStore?
+
+    #if DEBUG
+    /// Injectable project-sessions fetch for unit tests — mirrors the
+    /// `sessionsFetch` / `searchFetch` seam pattern elsewhere in this file.
+    /// When set, replaces the live ``RestClient/projectSessions(projectID:limit:)``
+    /// call in ``refreshSessions(for:)``.
+    var sessionsFetch: ((Project) async throws -> RestClient.ProjectSessionsPage)?
+    #endif
 
     init() {}
 
@@ -3732,21 +3763,56 @@ final class ProjectsStore {
         }
     }
 
-    // MARK: - Derived queries
+    // MARK: - Project sessions (STR-992 WU2)
 
-    /// The sessions belonging to a project: those whose `cwd` resolves to the
-    /// project's `root` (exact match on the trimmed path, case-insensitive,
-    /// trailing-slash-insensitive). Read from ``SessionStore/sessions`` so the
-    /// project detail list stays live as sessions arrive / refresh.
-    ///
-    /// Returns `[]` when the session list hasn't loaded yet (a designed
-    /// loading/empty state in the detail view, not a silent zero).
-    func sessions(for project: Project, in sessionStore: SessionStore) -> [SessionSummary] {
-        let root = Self.normalizedPath(project.root)
-        guard !root.isEmpty else { return [] }
-        return sessionStore.sessions.filter {
-            Self.normalizedPath($0.cwd ?? "") == root
+    /// The cached server-fetched state for a project's sessions, or a fresh
+    /// (never-loaded) state if ``refreshSessions(for:)`` hasn't completed yet.
+    /// This — NOT ``SessionStore/sessions`` filtered by cwd, NOT
+    /// `project.sessionCount` — is the source of truth for project detail: a
+    /// project's `sessionCount` is a pre-fetch overview hint and can legitimately
+    /// exceed what's currently loaded in the drawer's `SessionStore`.
+    func sessionsState(for project: Project) -> ProjectSessionsState {
+        projectSessionsByRoot[Self.normalizedPath(project.id)] ?? ProjectSessionsState()
+    }
+
+    /// Fetch a project's sessions from the project-sessions route and update its
+    /// cached state. Safe to call repeatedly (detail-view appear, pull-to-refresh):
+    /// a fetch supersedes the prior error state and preserves the last successful
+    /// list on a transient failure, mirroring ``refresh()``.
+    func refreshSessions(for project: Project) async {
+        let key = Self.normalizedPath(project.id)
+        var state = projectSessionsByRoot[key] ?? ProjectSessionsState()
+        state.isLoading = true
+        projectSessionsByRoot[key] = state
+        defer {
+            state.isLoading = false
+            projectSessionsByRoot[key] = state
         }
+        do {
+            let page = try await fetchSessions(for: project)
+            state.sessions = page.sessions
+            state.total = page.total
+            state.loadError = nil
+            state.hasLoaded = true
+        } catch {
+            // Preserve the last successful list so the UI doesn't blank out on a
+            // transient failure — only surface the error before any load has
+            // ever succeeded for this project.
+            if !state.hasLoaded {
+                state.loadError = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+            }
+        }
+    }
+
+    private func fetchSessions(for project: Project) async throws -> RestClient.ProjectSessionsPage {
+        #if DEBUG
+        if let sessionsFetch { return try await sessionsFetch(project) }
+        #endif
+        guard let rest = connection?.rest else {
+            throw RestError.network("Not connected")
+        }
+        return try await rest.projectSessions(projectID: project.id)
     }
 
     /// Normalize a filesystem path for cwd matching: trimmed, trailing slashes

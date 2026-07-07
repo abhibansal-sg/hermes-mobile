@@ -473,6 +473,52 @@ extension RestClient {
         return Self.renderExportMarkdown(summary: summary, messages: messages)
     }
 
+    // MARK: - Project sessions (STR-992 WU2 / ABH-351 slice 2)
+
+    /// One page of a project's sessions from `GET {mobileAPIPrefix}/project-sessions`.
+    struct ProjectSessionsPage: Sendable, Equatable {
+        let sessions: [SessionSummary]
+        /// Server-authoritative session count for the project. Backed by the
+        /// hydrated project tree's `sessionCount`, which can exceed
+        /// `sessions.count` when the route's `session_limit` truncates the
+        /// flattened list — this, not `sessions.count`, is what a "N sessions"
+        /// header should read once loaded.
+        let total: Int
+    }
+
+    /// `GET {mobileAPIPrefix}/project-sessions?project_id=&session_limit=` — the
+    /// hydrated sessions belonging to one project (STR-998/WU1 contract:
+    /// `plugins/hermes-mobile/dashboard/api.py::project_sessions`, commit
+    /// e0e67cd63 — mirrors the desktop `projects.project_sessions` RPC, which
+    /// flattens the same `tui_gateway.server._build_project_tree(hydrate: true)`
+    /// lanes iOS already renders the overview from).
+    ///
+    /// `projectID` is `Project.id` — the same id key the sibling
+    /// `{mobileAPIPrefix}/projects` overview route emits and that
+    /// `project_tree.py`'s `_project_node(pid:)` assigns; it round-trips
+    /// through this route's `project_id` query param unchanged.
+    ///
+    /// `projectID` is percent-encoded as a QUERY value (not a path segment) via
+    /// `URLQueryItem`/`URLComponents.percentEncodedQuery`, matching
+    /// ``searchSessions(query:limit:offset:scope:)`` — project ids are repo
+    /// roots and routinely contain `/`, spaces, and other reserved characters
+    /// that a naive path segment would mis-encode or split on.
+    func projectSessions(projectID: String, limit: Int = 5000) async throws -> ProjectSessionsPage {
+        var components = URLComponents()
+        components.queryItems = [
+            URLQueryItem(name: "project_id", value: projectID),
+            URLQueryItem(name: "session_limit", value: String(limit)),
+        ]
+        let encodedQuery = components.percentEncodedQuery ?? ""
+        let base = "\(mobileAPIPrefix)/project-sessions"
+        let path = encodedQuery.isEmpty ? base : "\(base)?\(encodedQuery)"
+        let data = try await get(path: path)
+
+        struct Wrapper: Decodable { let sessions: [SessionSummary]; let total: Int }
+        let wrapper = try decode(Wrapper.self, from: data, context: "projectSessions")
+        return ProjectSessionsPage(sessions: wrapper.sessions, total: wrapper.total)
+    }
+
     /// `PATCH /api/sessions/{id}` with a JSON body — shared by rename/archive.
     private func patchSession(id: String, body: JSONValue) async throws -> Data {
         let encodedId = id.addingPercentEncoding(

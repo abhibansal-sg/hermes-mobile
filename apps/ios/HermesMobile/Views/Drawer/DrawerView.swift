@@ -2243,6 +2243,9 @@ struct ProjectDetailView: View {
         .navigationTitle(project.label)
         .navigationBarTitleDisplayMode(.inline)
         .hermesThemed(themeStore)
+        .task {
+            await projectsStore.refreshSessions(for: project)
+        }
     }
 
     // MARK: - New session in this project
@@ -2291,20 +2294,25 @@ struct ProjectDetailView: View {
 
     @ViewBuilder
     private var sessionsSection: some View {
-        let projectSessions = projectsStore.sessions(for: project, in: sessions)
+        let state = projectsStore.sessionsState(for: project)
 
         Section {
-            if sessions.isLoading && projectSessions.isEmpty {
-                // Loading state: the session list hasn't arrived yet. Skeleton
+            if !state.hasLoaded && state.isLoading {
+                // Loading state: the server fetch hasn't returned yet. Skeleton
                 // rows match the drawer's cold-load pattern.
                 ForEach(0..<3, id: \.self) { _ in
                     sessionSkeletonRow
                 }
-            } else if projectSessions.isEmpty {
-                // Designed empty state: no sessions yet. Helpful, not blank.
+            } else if !state.hasLoaded, let error = state.loadError {
+                // Error state: the project-sessions fetch failed and no prior
+                // successful load exists to fall back on. Surfaced honestly,
+                // with a retry affordance.
+                sessionsErrorRow(error)
+            } else if state.sessions.isEmpty {
+                // Designed empty state: fetched successfully, zero sessions.
                 emptyStateRow
             } else {
-                ForEach(projectSessions) { summary in
+                ForEach(state.sessions) { summary in
                     sessionRow(summary)
                 }
             }
@@ -2313,7 +2321,14 @@ struct ProjectDetailView: View {
                 Text("SESSIONS")
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(theme.mutedFg)
-                Text("\(projectSessions.count)")
+                // `project.sessionCount` is only a pre-fetch overview hint —
+                // once the server-backed fetch completes, the header reflects
+                // the route's authoritative `total` instead (which may be
+                // lower OR higher than the hint, and can itself exceed
+                // `state.sessions.count` when the route's session_limit
+                // truncates the flattened list). Never derived from
+                // `SessionStore.sessions`.
+                Text("\(state.hasLoaded ? state.total : project.sessionCount)")
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(theme.mutedFg.opacity(0.82))
                     .padding(.horizontal, 5)
@@ -2382,6 +2397,36 @@ struct ProjectDetailView: View {
                     .font(.caption2)
                     .foregroundStyle(theme.mutedFg.opacity(0.82))
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+    }
+
+    private func sessionsErrorRow(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(theme.destructive)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Couldn't load sessions")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(theme.fg)
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(theme.mutedFg)
+                    .lineLimit(3)
+                Button("Retry") {
+                    Task { await projectsStore.refreshSessions(for: project) }
+                }
+                .buttonStyle(.plain)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(theme.midground)
             }
             Spacer(minLength: 0)
         }
