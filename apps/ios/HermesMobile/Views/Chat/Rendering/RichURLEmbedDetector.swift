@@ -2,8 +2,13 @@ import Foundation
 
 enum RichURLEmbedProvider: String, Equatable, Sendable {
     case googleMaps = "googlemaps"
+    case instagram
     case openStreetMap = "openstreetmap"
+    case pinterest
     case spotify
+    case tiktok
+    case twitter
+    case vimeo
     case youtube
 }
 
@@ -29,7 +34,15 @@ enum RichURLEmbedDetector {
             return nil
         }
 
-        return youtube(url) ?? spotify(url) ?? googleMaps(url) ?? openStreetMap(url)
+        return youtube(url)
+            ?? vimeo(url)
+            ?? instagram(url)
+            ?? pinterest(url)
+            ?? tiktok(url)
+            ?? twitter(url)
+            ?? spotify(url)
+            ?? googleMaps(url)
+            ?? openStreetMap(url)
     }
 
     // MARK: - YouTube
@@ -128,6 +141,156 @@ enum RichURLEmbedDetector {
             aspectRatio: nil,
             fixedHeight: 152,
             id: "spotify:\(type):\(id)"
+        )
+    }
+
+    // MARK: - Vimeo
+
+    private static func vimeo(_ url: URL) -> RichURLEmbedDescriptor? {
+        let host = bareHost(url.host() ?? "")
+        guard host == "vimeo.com" || host == "player.vimeo.com" else { return nil }
+
+        // The clip id is the last all-digits segment, covering vimeo.com/123,
+        // /channels/x/123, /groups/x/videos/123, and player/video/123.
+        let id = pathSegments(url).reversed().first { segment in
+            segment.range(of: #"^\d+$"#, options: .regularExpression) != nil
+        }
+
+        guard let id, !id.isEmpty else { return nil }
+
+        return descriptor(
+            provider: .vimeo,
+            sourceURL: url,
+            embedURL: "https://player.vimeo.com/video/\(id)",
+            label: "Vimeo",
+            maxWidth: 640,
+            aspectRatio: 16 / 9,
+            fixedHeight: nil,
+            id: "vimeo:\(id)"
+        )
+    }
+
+    // MARK: - Instagram
+
+    private static func instagram(_ url: URL) -> RichURLEmbedDescriptor? {
+        guard bareHost(url.host() ?? "") == "instagram.com" else { return nil }
+
+        let segments = pathSegments(url)
+        guard segments.count >= 2 else { return nil }
+
+        let typeRaw = segments[0]
+        let code = segments[1]
+        // Desktop maps /reels/ to reel; p/reel/tv are the embeddable post types.
+        let type = typeRaw == "reels" ? "reel" : typeRaw
+
+        guard
+            ["p", "reel", "tv"].contains(type),
+            code.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil
+        else {
+            return nil
+        }
+
+        return descriptor(
+            provider: .instagram,
+            sourceURL: url,
+            embedURL: "https://www.instagram.com/\(type)/\(code)/embed",
+            label: "Instagram",
+            maxWidth: 400,
+            aspectRatio: nil,
+            fixedHeight: 450,
+            id: "instagram:\(code)"
+        )
+    }
+
+    // MARK: - Pinterest
+
+    private static func pinterest(_ url: URL) -> RichURLEmbedDescriptor? {
+        // Pinterest runs many locale TLDs (pinterest.co.uk, fr.pinterest.com, ...).
+        let host = bareHost(url.host() ?? "")
+        guard isPinterestHost(host) else { return nil }
+
+        let segments = pathSegments(url)
+        guard
+            segments.count >= 2,
+            segments[0] == "pin",
+            segments[1].range(of: #"^\d+$"#, options: .regularExpression) != nil
+        else {
+            return nil
+        }
+
+        let id = segments[1]
+
+        return descriptor(
+            provider: .pinterest,
+            sourceURL: url,
+            embedURL: "https://assets.pinterest.com/ext/embed.html?id=\(id)",
+            label: "Pinterest",
+            maxWidth: 236,
+            aspectRatio: nil,
+            fixedHeight: 380,
+            id: "pinterest:\(id)"
+        )
+    }
+
+    // MARK: - TikTok
+
+    private static func tiktok(_ url: URL) -> RichURLEmbedDescriptor? {
+        guard bareHost(url.host() ?? "") == "tiktok.com" else { return nil }
+
+        let segments = pathSegments(url)
+        guard
+            let videoIndex = segments.firstIndex(of: "video"),
+            videoIndex + 1 < segments.count
+        else {
+            return nil
+        }
+
+        let id = segments[videoIndex + 1]
+        guard id.range(of: #"^\d+$"#, options: .regularExpression) != nil else { return nil }
+
+        return descriptor(
+            provider: .tiktok,
+            sourceURL: url,
+            embedURL: "https://www.tiktok.com/player/v1/\(id)",
+            label: "TikTok",
+            maxWidth: 365,
+            aspectRatio: 9 / 16,
+            fixedHeight: nil,
+            id: "tiktok:\(id)"
+        )
+    }
+
+    // MARK: - Twitter / X
+
+    private static func twitter(_ url: URL) -> RichURLEmbedDescriptor? {
+        let host = bareHost(url.host() ?? "")
+        guard host == "twitter.com" || host == "x.com" else { return nil }
+
+        let segments = pathSegments(url)
+        guard
+            let statusIndex = segments.firstIndex(of: "status"),
+            statusIndex + 1 < segments.count
+        else {
+            return nil
+        }
+
+        let id = segments[statusIndex + 1]
+        guard id.range(of: #"^\d+$"#, options: .regularExpression) != nil else { return nil }
+
+        // Desktop renders Twitter via the widgets.js blockquote (renderer
+        // 'tweet', no embed URL). iOS has no JS widget runtime, so it loads the
+        // same iframe the widget injects as a top-level WKWebView document -
+        // the closest available parity. The card's load-failed fallback covers
+        // any transient render gap.
+        return descriptor(
+            provider: .twitter,
+            sourceURL: url,
+            embedURL: "https://platform.twitter.com/embed/Tweet.html?id=\(id)&dnt=true",
+            label: "X",
+            maxWidth: 480,
+            aspectRatio: nil,
+            fixedHeight: 400,
+            id: "twitter:\(id)"
         )
     }
 
@@ -253,6 +416,13 @@ enum RichURLEmbedDetector {
             return String(lowered.dropFirst(prefix.count))
         }
         return lowered
+    }
+
+    private static func isPinterestHost(_ host: String) -> Bool {
+        host == "pinterest.com"
+            || host.hasSuffix(".pinterest.com")
+            || host.hasPrefix("pinterest.")
+            || host.contains(".pinterest.")
     }
 
     private static func pathSegments(_ url: URL) -> [String] {

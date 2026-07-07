@@ -153,7 +153,8 @@ enum MessageSegmenter {
     }
 
     /// Split a prose run further around rich URL embeds and clear LaTeX math
-    /// delimiters. Bare supported URLs (YouTube / Spotify / Maps) are lifted
+    /// delimiters. Bare supported URLs (YouTube, Vimeo, Instagram, Pinterest,
+    /// TikTok, X/Twitter, Spotify, Maps) are lifted
     /// into standalone `.embed` segments; the prose around them is then
     /// math-split as before. This pass is intentionally conservative for
     /// single-dollar math so normal currency prose remains untouched and

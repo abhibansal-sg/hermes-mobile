@@ -44,9 +44,10 @@ private struct RichURLEmbedWidthPreferenceKey: PreferenceKey {
     }
 }
 
-/// A reusable rounded card that renders a rich URL embed (YouTube, Spotify,
-/// Google Maps, OpenStreetMap) inside a sandboxed `WKWebView`, driven entirely
-/// by the provider-agnostic ``RichURLEmbedDescriptor`` from
+/// A reusable rounded card that renders a rich URL embed (YouTube, Vimeo,
+/// Instagram, Pinterest, TikTok, X/Twitter, Spotify, Google Maps,
+/// OpenStreetMap) inside a sandboxed `WKWebView`, driven entirely by the
+/// provider-agnostic ``RichURLEmbedDescriptor`` from
 /// `RichURLEmbedDetector`. Not wired into message parsing by this view — the
 /// caller decides when a descriptor exists and hands it in.
 ///

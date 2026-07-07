@@ -92,10 +92,127 @@ final class RichURLEmbedDetectorTests: XCTestCase {
         XCTAssertEqual(embed.embedURL.absoluteString, "https://www.openstreetmap.org/export/embed.html?bbox=-122.46335%2C37.75293%2C-122.37545%2C37.79687&layer=mapnik&marker=37.7749%2C-122.4194")
     }
 
+    // MARK: - Vimeo (STR-373 parity)
+
+    func testVimeoClipURLBuildsPlayerEmbed() throws {
+        let embed = try XCTUnwrap(RichURLEmbedDetector.detect("https://vimeo.com/76979871"))
+
+        XCTAssertEqual(embed.provider, .vimeo)
+        XCTAssertEqual(embed.id, "vimeo:76979871")
+        XCTAssertEqual(embed.label, "Vimeo")
+        XCTAssertEqual(embed.maxWidth, 640)
+        XCTAssertEqual(embed.aspectRatio, 16 / 9)
+        XCTAssertNil(embed.fixedHeight)
+        XCTAssertEqual(embed.embedURL.absoluteString, "https://player.vimeo.com/video/76979871")
+    }
+
+    func testVimeoChannelsPathUsesLastDigitSegment() throws {
+        let embed = try XCTUnwrap(RichURLEmbedDetector.detect("https://vimeo.com/channels/staffpicks/76979871"))
+
+        XCTAssertEqual(embed.id, "vimeo:76979871")
+        XCTAssertEqual(embed.embedURL.absoluteString, "https://player.vimeo.com/video/76979871")
+    }
+
+    func testVimeoNonNumericSegmentIsUnsupported() {
+        XCTAssertNil(RichURLEmbedDetector.detect("https://vimeo.com/not-a-clip"))
+    }
+
+    // MARK: - Instagram (STR-373 parity)
+
+    func testInstagramPostURLBuildsEmbed() throws {
+        let embed = try XCTUnwrap(RichURLEmbedDetector.detect("https://www.instagram.com/p/CabcDEF123/"))
+
+        XCTAssertEqual(embed.provider, .instagram)
+        XCTAssertEqual(embed.id, "instagram:CabcDEF123")
+        XCTAssertEqual(embed.label, "Instagram")
+        XCTAssertEqual(embed.maxWidth, 400)
+        XCTAssertNil(embed.aspectRatio)
+        XCTAssertEqual(embed.fixedHeight, 450)
+        XCTAssertEqual(embed.embedURL.absoluteString, "https://www.instagram.com/p/CabcDEF123/embed")
+    }
+
+    func testInstagramReelAndReelsPathsMapToReelEmbed() throws {
+        let reel = try XCTUnwrap(RichURLEmbedDetector.detect("https://www.instagram.com/reel/CabcDEF123/"))
+        let reels = try XCTUnwrap(RichURLEmbedDetector.detect("https://www.instagram.com/reels/CabcDEF123/"))
+
+        XCTAssertEqual(reel.embedURL.absoluteString, "https://www.instagram.com/reel/CabcDEF123/embed")
+        XCTAssertEqual(reels.embedURL.absoluteString, "https://www.instagram.com/reel/CabcDEF123/embed")
+    }
+
+    func testInstagramUnsupportedPathIsIgnored() {
+        XCTAssertNil(RichURLEmbedDetector.detect("https://www.instagram.com/explore/top/"))
+    }
+
+    // MARK: - Pinterest (STR-373 parity)
+
+    func testPinterestPinURLBuildsAssetsEmbed() throws {
+        let embed = try XCTUnwrap(RichURLEmbedDetector.detect("https://www.pinterest.com/pin/1234567890/"))
+
+        XCTAssertEqual(embed.provider, .pinterest)
+        XCTAssertEqual(embed.id, "pinterest:1234567890")
+        XCTAssertEqual(embed.label, "Pinterest")
+        XCTAssertEqual(embed.maxWidth, 236)
+        XCTAssertNil(embed.aspectRatio)
+        XCTAssertEqual(embed.fixedHeight, 380)
+        XCTAssertEqual(embed.embedURL.absoluteString, "https://assets.pinterest.com/ext/embed.html?id=1234567890")
+    }
+
+    func testPinterestLocaleTLDsMatch() throws {
+        let embed = try XCTUnwrap(RichURLEmbedDetector.detect("https://fr.pinterest.com/pin/1234567890/"))
+
+        XCTAssertEqual(embed.provider, .pinterest)
+        XCTAssertEqual(embed.embedURL.absoluteString, "https://assets.pinterest.com/ext/embed.html?id=1234567890")
+    }
+
+    func testPinterestNonPinPathIsUnsupported() {
+        XCTAssertNil(RichURLEmbedDetector.detect("https://www.pinterest.com/board/abc/"))
+    }
+
+    // MARK: - TikTok (STR-373 parity)
+
+    func testTikTokVideoURLBuildsPlayerEmbed() throws {
+        let embed = try XCTUnwrap(RichURLEmbedDetector.detect("https://www.tiktok.com/@user/video/7212345678901234567"))
+
+        XCTAssertEqual(embed.provider, .tiktok)
+        XCTAssertEqual(embed.id, "tiktok:7212345678901234567")
+        XCTAssertEqual(embed.label, "TikTok")
+        XCTAssertEqual(embed.maxWidth, 365)
+        XCTAssertEqual(embed.aspectRatio, 9 / 16)
+        XCTAssertNil(embed.fixedHeight)
+        XCTAssertEqual(embed.embedURL.absoluteString, "https://www.tiktok.com/player/v1/7212345678901234567")
+    }
+
+    func testTikTokProfileWithoutVideoIsUnsupported() {
+        XCTAssertNil(RichURLEmbedDetector.detect("https://www.tiktok.com/@user"))
+    }
+
+    // MARK: - Twitter / X (STR-373 parity)
+
+    func testTwitterStatusURLResolvesToTweetEmbed() throws {
+        let embed = try XCTUnwrap(RichURLEmbedDetector.detect("https://twitter.com/jack/status/20"))
+
+        XCTAssertEqual(embed.provider, .twitter)
+        XCTAssertEqual(embed.id, "twitter:20")
+        XCTAssertEqual(embed.label, "X")
+        XCTAssertEqual(embed.maxWidth, 480)
+        XCTAssertEqual(embed.embedURL.absoluteString, "https://platform.twitter.com/embed/Tweet.html?id=20&dnt=true")
+    }
+
+    func testXDotComAliasResolvesSameAsTwitter() throws {
+        let embed = try XCTUnwrap(RichURLEmbedDetector.detect("https://x.com/jack/status/20"))
+
+        XCTAssertEqual(embed.id, "twitter:20")
+        XCTAssertEqual(embed.embedURL.absoluteString, "https://platform.twitter.com/embed/Tweet.html?id=20&dnt=true")
+    }
+
+    func testTwitterProfileWithoutStatusIsUnsupported() {
+        XCTAssertNil(RichURLEmbedDetector.detect("https://twitter.com/jack"))
+    }
+
     func testUnsupportedAndNonHTTPURLsReturnNil() {
         XCTAssertNil(RichURLEmbedDetector.detect("ftp://youtu.be/dQw4w9WgXcQ"))
         XCTAssertNil(RichURLEmbedDetector.detect("notaurl"))
-        XCTAssertNil(RichURLEmbedDetector.detect("https://vimeo.com/123456789"))
+        XCTAssertNil(RichURLEmbedDetector.detect("https://example.com/top"))
         XCTAssertNil(RichURLEmbedDetector.detect("https://example.com/maps?q=Empire+State+Building"))
     }
 }

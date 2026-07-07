@@ -364,6 +364,24 @@ final class RenderingTests: XCTestCase {
         XCTAssertEmbed(segments[0], id: "googlemaps:Berlin")
     }
 
+    func testNewRichURLProviderURLsBecomeEmbedSegments() {
+        let cases: [(String, String)] = [
+            ("https://vimeo.com/76979871", "vimeo:76979871"),
+            ("https://www.instagram.com/p/CabcDEF123/", "instagram:CabcDEF123"),
+            ("https://www.pinterest.com/pin/1234567890/", "pinterest:1234567890"),
+            ("https://www.tiktok.com/@user/video/7212345678901234567", "tiktok:7212345678901234567"),
+            ("https://x.com/jack/status/20", "twitter:20")
+        ]
+
+        for (url, id) in cases {
+            let segments = MessageSegmenter.segments("before \(url) after")
+            XCTAssertEqual(segments.count, 3, "url \(url)")
+            XCTAssertProse(segments[0], "before ")
+            XCTAssertEmbed(segments[1], id: id)
+            XCTAssertProse(segments[2], " after")
+        }
+    }
+
     // MARK: - MessageSegmenter rich URL embeds — scanner advance (STR-530 retry)
 
     /// A markdown inline-link URL must remain prose but must not stop the
