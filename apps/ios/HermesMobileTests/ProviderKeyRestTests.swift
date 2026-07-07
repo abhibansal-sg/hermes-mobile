@@ -179,6 +179,56 @@ final class ProviderKeyRestTests: XCTestCase {
         XCTAssertTrue(result.disconnected)
     }
 
+    // MARK: - STR-692: Custom provider metadata survives disconnect
+
+    func testCustomProviderRowDecodesTransportMetadata() async throws {
+        let body = Data(#"""
+        {"providers":[
+            {"slug":"my-proxy","name":"My Proxy","auth_type":"custom","is_current":false,"authenticated":true,"total_models":5,"base_url":"https://proxy.example.com","api_mode":"anthropic_messages","models":[{"id":"claude-3"}]}
+        ]}
+        """#.utf8)
+        let client = makeClient(style: .plugin, script: [(body, 200)])
+        let providers = try await client.listProviders()
+        XCTAssertEqual(providers.count, 1)
+        let row = providers[0]
+        XCTAssertEqual(row.authType, .custom)
+        XCTAssertEqual(row.baseURL, "https://proxy.example.com")
+        XCTAssertEqual(row.apiMode, .anthropicMessages)
+    }
+
+    func testProviderRowCopyPreservesCustomMetadataThroughDisconnect() {
+        let original = ProviderRow(
+            slug: "my-proxy",
+            name: "My Proxy",
+            authType: .custom,
+            isCurrent: true,
+            authenticated: true,
+            totalModels: 5,
+            models: ["claude-3"],
+            baseURL: "https://proxy.example.com",
+            apiMode: .anthropicMessages
+        )
+        let disconnected = original.copy(isCurrent: false, authenticated: false)
+        XCTAssertEqual(disconnected.slug, "my-proxy")
+        XCTAssertEqual(disconnected.authType, .custom)
+        XCTAssertFalse(disconnected.isCurrent)
+        XCTAssertFalse(disconnected.authenticated)
+        XCTAssertEqual(disconnected.totalModels, 5)
+        XCTAssertEqual(disconnected.models, ["claude-3"])
+        XCTAssertEqual(disconnected.baseURL, "https://proxy.example.com", "baseURL must survive disconnect")
+        XCTAssertEqual(disconnected.apiMode, .anthropicMessages, "apiMode must survive disconnect")
+    }
+
+    func testProviderRowCopyWithNilOverrides() {
+        let row = ProviderRow(
+            slug: "x", name: "X", authType: .apiKey, isCurrent: true,
+            authenticated: true, totalModels: 2, models: nil,
+            baseURL: "https://a.com", apiMode: .openai
+        )
+        let copy = row.copy()
+        XCTAssertEqual(copy, row, "no-arg copy must be identical")
+    }
+
     // MARK: - 4. The api_key rides the POST body, never the URL
 
     func testApiKeyRidesBodyNotURL() async throws {

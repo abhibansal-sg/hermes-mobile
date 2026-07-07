@@ -326,17 +326,14 @@ struct ProviderListView: View {
             // Drop the transient client copy if one lingered.
             KeychainService.deleteProviderKey(slug: provider.slug)
             // Flip the row locally: same slug, now unauthenticated.
+            // Preserve custom-provider transport metadata (baseURL, apiMode)
+            // so that re-tapping a disconnected custom row pre-fills the
+            // edit form instead of silently resetting to OpenAI defaults.
             if var rows = phase.value {
                 if let index = rows.firstIndex(where: { $0.slug == provider.slug }) {
-                    let existing = rows[index]
-                    rows[index] = ProviderRow(
-                        slug: existing.slug,
-                        name: existing.name,
-                        authType: existing.authType,
+                    rows[index] = rows[index].copy(
                         isCurrent: false,
-                        authenticated: false,
-                        totalModels: existing.totalModels,
-                        models: existing.models
+                        authenticated: false
                     )
                     phase = .loaded(rows)
                 }

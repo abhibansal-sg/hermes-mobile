@@ -120,6 +120,30 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
         self.apiMode = apiMode
     }
 
+    func copy(
+        slug: String? = nil,
+        name: String? = nil,
+        authType: ProviderAuthType? = nil,
+        isCurrent: Bool? = nil,
+        authenticated: Bool? = nil,
+        totalModels: Int? = nil,
+        models: [String]? = nil,
+        baseURL: String?? = nil,
+        apiMode: ProviderAPIMode?? = nil
+    ) -> ProviderRow {
+        ProviderRow(
+            slug: slug ?? self.slug,
+            name: name ?? self.name,
+            authType: authType ?? self.authType,
+            isCurrent: isCurrent ?? self.isCurrent,
+            authenticated: authenticated ?? self.authenticated,
+            totalModels: totalModels ?? self.totalModels,
+            models: models ?? self.models,
+            baseURL: baseURL ?? self.baseURL,
+            apiMode: apiMode ?? self.apiMode
+        )
+    }
+
     init(json: JSONValue) {
         self.slug = json["slug"]?.stringValue ?? ""
         self.name = json["name"]?.stringValue ?? json["slug"]?.stringValue ?? ""
