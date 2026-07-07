@@ -329,15 +329,7 @@ struct ProviderListView: View {
             if var rows = phase.value {
                 if let index = rows.firstIndex(where: { $0.slug == provider.slug }) {
                     let existing = rows[index]
-                    rows[index] = ProviderRow(
-                        slug: existing.slug,
-                        name: existing.name,
-                        authType: existing.authType,
-                        isCurrent: false,
-                        authenticated: false,
-                        totalModels: existing.totalModels,
-                        models: existing.models
-                    )
+                    rows[index] = existing.copy(isCurrent: false, authenticated: false)
                     phase = .loaded(rows)
                 }
             }
