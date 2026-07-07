@@ -2208,6 +2208,64 @@ async def projects_overview(request: Request) -> List[Dict[str, Any]]:
     return out
 
 
+def _flatten_project_sessions(project: Dict[str, Any]) -> List[Dict[str, Any]]:
+    sessions: List[Dict[str, Any]] = []
+    for repo in project.get("repos") or []:
+        for group in repo.get("groups") or []:
+            for session in group.get("sessions") or []:
+                if isinstance(session, dict):
+                    sessions.append(session)
+    return sessions
+
+
+@router.get("/project-sessions")
+async def project_sessions(
+    request: Request,
+    project_id: Annotated[str, Query(min_length=1)],
+    session_limit: Annotated[int, Query(ge=1, le=20000)] = 5000,
+) -> Dict[str, Any]:
+    """Hydrated sessions for one project using the desktop project tree path.
+
+    This intentionally delegates membership, counts, lane ordering, worktree
+    folding, child filtering, and cron exclusion to the same
+    ``tui_gateway.server._build_project_tree(... hydrate=True ...)`` machinery
+    used by the desktop ``projects.project_sessions`` RPC. The mobile-specific
+    work here is only flattening hydrated lanes into a compact REST shape.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        from hermes_state import SessionDB
+        from tui_gateway.server import _build_project_tree
+
+        db = SessionDB(read_only=True)
+        tree, _active = _build_project_tree(
+            db,
+            preview_limit=0,
+            hydrate=True,
+            session_limit=session_limit,
+            include_discovered=False,
+        )
+    except Exception as exc:
+        _log.debug("project sessions: gateway tree unavailable: %s", exc)
+        return {"project_id": project_id, "sessions": [], "total": 0}
+
+    project = next(
+        (p for p in tree.get("projects", []) if p.get("id") == project_id),
+        None,
+    )
+    if project is None:
+        return {"project_id": project_id, "sessions": [], "total": 0}
+
+    sessions = _flatten_project_sessions(project)
+    return {
+        "project_id": project_id,
+        "sessions": sessions,
+        "total": int(project.get("sessionCount") or len(sessions)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Provider / API-key entry (ABH-183) — mobile-side key onboarding for the iOS
 # app's provider setup screen. Additive plugin routes only; ZERO stock-core

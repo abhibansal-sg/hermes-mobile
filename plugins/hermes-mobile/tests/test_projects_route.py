@@ -64,6 +64,37 @@ def _patch_discover(monkeypatch, repos):
     )
 
 
+def _patch_project_tree(monkeypatch, projects):
+    """Make the project-session route consume a hydrated desktop tree."""
+    import tui_gateway.server as tgs
+
+    captured = {}
+
+    def _fake(
+        db,
+        *,
+        preview_limit,
+        hydrate,
+        session_limit,
+        include_discovered,
+    ):
+        captured.update(
+            {
+                "preview_limit": preview_limit,
+                "hydrate": hydrate,
+                "session_limit": session_limit,
+                "include_discovered": include_discovered,
+            }
+        )
+        return {"projects": projects, "scoped_session_ids": []}, None
+
+    monkeypatch.setattr(tgs, "_build_project_tree", _fake)
+    monkeypatch.setattr(
+        "hermes_state.SessionDB", lambda *a, **kw: object(), raising=False
+    )
+    return captured
+
+
 def test_projects_requires_auth(api_module, monkeypatch, tmp_path):
     """No session token → 401 (same belt-and-suspenders as other routes).
 
@@ -168,3 +199,110 @@ def test_projects_empty_state(client, monkeypatch):
     resp = client.get("/api/plugins/hermes-mobile/projects")
     assert resp.status_code == 200, resp.text
     assert resp.json() == []
+
+
+def test_project_sessions_requires_auth(api_module, monkeypatch):
+    """No session token -> 401 for the hydrated project sessions route."""
+    from starlette.testclient import TestClient
+
+    from hermes_cli.web_server import app
+
+    _patch_project_tree(monkeypatch, [])
+    resp = TestClient(app).get(
+        "/api/plugins/hermes-mobile/project-sessions?project_id=p_widget"
+    )
+    assert resp.status_code == 401
+
+
+def test_project_sessions_flattens_hydrated_desktop_lanes(client, monkeypatch):
+    """The REST route preserves desktop repo/lane/session order."""
+    captured = _patch_project_tree(
+        monkeypatch,
+        [
+            {
+                "id": "p_widget",
+                "sessionCount": 3,
+                "repos": [
+                    {
+                        "id": "/repo/widget",
+                        "groups": [
+                            {
+                                "id": "/repo/widget::branch::main",
+                                "sessions": [
+                                    {"id": "main-new", "title": "Main new"},
+                                    {"id": "main-old", "title": "Main old"},
+                                ],
+                            },
+                            {
+                                "id": "/repo/widget-wt-feature",
+                                "sessions": [
+                                    {"id": "feature", "title": "Feature"},
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "id": "/repo/widget-tools",
+                        "groups": [
+                            {
+                                "id": "/repo/widget-tools::branch::main",
+                                "sessions": [],
+                            }
+                        ],
+                    },
+                ],
+            }
+        ],
+    )
+
+    resp = client.get(
+        "/api/plugins/hermes-mobile/project-sessions",
+        params={"project_id": "p_widget", "session_limit": "123"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "project_id": "p_widget",
+        "sessions": [
+            {"id": "main-new", "title": "Main new"},
+            {"id": "main-old", "title": "Main old"},
+            {"id": "feature", "title": "Feature"},
+        ],
+        "total": 3,
+    }
+    assert captured == {
+        "preview_limit": 0,
+        "hydrate": True,
+        "session_limit": 123,
+        "include_discovered": False,
+    }
+
+
+def test_project_sessions_unknown_project_is_empty(client, monkeypatch):
+    """Unknown ids do not fall back to unrelated sessions from the tree."""
+    _patch_project_tree(
+        monkeypatch,
+        [
+            {
+                "id": "p_other",
+                "sessionCount": 1,
+                "repos": [
+                    {
+                        "id": "/repo/other",
+                        "groups": [
+                            {
+                                "id": "/repo/other::branch::main",
+                                "sessions": [{"id": "do-not-leak"}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+
+    resp = client.get(
+        "/api/plugins/hermes-mobile/project-sessions",
+        params={"project_id": "missing"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"project_id": "missing", "sessions": [], "total": 0}
