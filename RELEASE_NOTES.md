@@ -1,3 +1,15 @@
+Build 94 — 2026-07-07
+
+FIXED
+- STR-272 repark refused ask prompt
+
+WORTH TRYING
+- Try: STR-272 repark refused ask prompt
+
+(+5 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 93 — 2026-07-07
 
 (+1 server-side/infra changes active on the gateway, no app UI change)
