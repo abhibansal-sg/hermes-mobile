@@ -785,6 +785,127 @@ class TestWebServerEndpoints:
         resp = self.client.get("/api/profiles/sessions?archived=bogus")
         assert resp.status_code == 400
 
+    def test_profiles_sessions_specific_profile_paging(self):
+        """Regression: profile=<specific> on /api/profiles/sessions returns
+        only that profile's rows with correct totals and pagination echo."""
+        from hermes_state import SessionDB
+        from hermes_cli import profiles as profiles_mod
+
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True, exist_ok=True)
+
+        default_db = SessionDB()
+        try:
+            default_db.create_session(session_id="ps-default-1", source="cli")
+            default_db.append_message("ps-default-1", role="user", content="d1")
+            default_db.create_session(session_id="ps-default-2", source="cli")
+            default_db.append_message("ps-default-2", role="user", content="d2")
+        finally:
+            default_db.close()
+
+        worker_db = SessionDB(db_path=worker_home / "state.db")
+        try:
+            worker_db.create_session(session_id="ps-worker-1", source="cli")
+            worker_db.append_message("ps-worker-1", role="user", content="w1")
+            worker_db.create_session(session_id="ps-worker-2", source="cli")
+            worker_db.append_message("ps-worker-2", role="user", content="w2")
+            worker_db.create_session(session_id="ps-worker-3", source="cli")
+            worker_db.append_message("ps-worker-3", role="user", content="w3")
+        finally:
+            worker_db.close()
+
+        resp = self.client.get(
+            "/api/profiles/sessions?profile=worker&limit=2&offset=0&min_messages=0"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert set(data.keys()) == {"sessions", "total", "profile_totals", "limit", "offset", "errors"}
+
+        assert data["total"] == 3
+        assert data["profile_totals"] == {"worker": 3}
+        assert data["limit"] == 2
+        assert data["offset"] == 0
+        assert len(data["sessions"]) == 2
+
+        ids = {s["id"] for s in data["sessions"]}
+        assert ids.issubset({"ps-worker-1", "ps-worker-2", "ps-worker-3"})
+        assert "ps-default-1" not in ids
+        assert "ps-default-2" not in ids
+
+        for s in data["sessions"]:
+            assert s["profile"] == "worker"
+            assert s["is_default_profile"] is False
+
+    def test_profiles_sessions_specific_profile_offset(self):
+        """Offset pagination echoes correctly for a specific profile."""
+        from hermes_state import SessionDB
+        from hermes_cli import profiles as profiles_mod
+
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True, exist_ok=True)
+
+        default_db = SessionDB()
+        try:
+            default_db.create_session(session_id="pso-default", source="cli")
+            default_db.append_message("pso-default", role="user", content="d")
+        finally:
+            default_db.close()
+
+        worker_db = SessionDB(db_path=worker_home / "state.db")
+        try:
+            for i in range(4):
+                sid = f"pso-worker-{i}"
+                worker_db.create_session(session_id=sid, source="cli")
+                worker_db.append_message(sid, role="user", content=f"w{i}")
+        finally:
+            worker_db.close()
+
+        resp = self.client.get(
+            "/api/profiles/sessions?profile=worker&limit=2&offset=2&min_messages=0"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert data["total"] == 4
+        assert data["profile_totals"] == {"worker": 4}
+        assert data["limit"] == 2
+        assert data["offset"] == 2
+        assert len(data["sessions"]) == 2
+
+        for s in data["sessions"]:
+            assert s["profile"] == "worker"
+
+    def test_profiles_sessions_specific_profile_no_enumeration(self):
+        """Specific-profile path must not call profiles_mod.list_profiles."""
+        from unittest.mock import patch
+        from hermes_state import SessionDB
+        from hermes_cli import profiles as profiles_mod
+
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True, exist_ok=True)
+
+        worker_db = SessionDB(db_path=worker_home / "state.db")
+        try:
+            worker_db.create_session(session_id="pse-worker", source="cli")
+            worker_db.append_message("pse-worker", role="user", content="w")
+        finally:
+            worker_db.close()
+
+        def boom():
+            raise RuntimeError("list_profiles must not be called for specific profile")
+
+        with patch.object(profiles_mod, "list_profiles", side_effect=boom):
+            resp = self.client.get(
+                "/api/profiles/sessions?profile=worker&limit=20&min_messages=0"
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        ids = {s["id"] for s in data["sessions"]}
+        assert "pse-worker" in ids
+        assert data["profile_totals"] == {"worker": 1}
+        assert data["total"] == 1
+
     def test_sessions_endpoint_reads_requested_profile(self):
         """The machine dashboard's global profile switcher must retarget
         the Sessions page, not just config/skills/model pages."""
