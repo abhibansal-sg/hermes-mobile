@@ -120,23 +120,6 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
         self.apiMode = apiMode
     }
 
-    func copy(
-        isCurrent: Bool? = nil,
-        authenticated: Bool? = nil
-    ) -> ProviderRow {
-        ProviderRow(
-            slug: slug,
-            name: name,
-            authType: authType,
-            isCurrent: isCurrent ?? self.isCurrent,
-            authenticated: authenticated ?? self.authenticated,
-            totalModels: totalModels,
-            models: models,
-            baseURL: baseURL,
-            apiMode: apiMode
-        )
-    }
-
     init(json: JSONValue) {
         self.slug = json["slug"]?.stringValue ?? ""
         self.name = json["name"]?.stringValue ?? json["slug"]?.stringValue ?? ""
@@ -552,24 +535,6 @@ extension RestClient {
         request.httpBody = try encodeBody(body, context: "toolsets.setConfig")
         let data = try await perform(request)
         let root = try decodeJSONValue(from: data, context: "toolsets.setConfig")
-        return ToolsetConfig(json: root)
-    }
-
-    /// `PUT <prefix>/toolsets/{name}/provider` — activate a provider for a
-    /// toolset. Returns the refreshed (still-redacted) config.
-    @discardableResult
-    func selectToolsetProvider(name: String, provider: String) async throws -> ToolsetConfig {
-        let encodedName = name.addingPercentEncoding(
-            withAllowedCharacters: .urlPathAllowed
-        ) ?? name
-        var request = makeRequest(
-            path: "\(mobileAPIPrefix)/toolsets/\(encodedName)/provider", method: "PUT"
-        )
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body: JSONValue = .object(["provider": .string(provider)])
-        request.httpBody = try encodeBody(body, context: "toolsets.selectProvider")
-        let data = try await perform(request)
-        let root = try decodeJSONValue(from: data, context: "toolsets.selectProvider")
         return ToolsetConfig(json: root)
     }
 }
