@@ -165,6 +165,7 @@
 		A55F5D024D9A8C59D4FBEE2F /* FileBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 413D42BC8A1D067FA76BF90C /* FileBrowserView.swift */; };
 		A599031F3972D4366019AA1F /* ChatStoreBatchDTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7132A90C115AC8C23507209 /* ChatStoreBatchDTests.swift */; };
 		A5C7424FFF27F884C982CCB1 /* QueueSelfHealTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B48D8E6363EDE3BB94E0D2B /* QueueSelfHealTests.swift */; };
+		A6BF8F1EE7D7605DC4DD5C07 /* ComposerYoloGatewayUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB884A08C3A868007EC0FBF0 /* ComposerYoloGatewayUITests.swift */; };
 		A7D750D48A76745831A30416 /* FileViewerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDD02A71A20A460F3F659C3F /* FileViewerView.swift */; };
 		A7F2D1D43111EF5D7F2B6981 /* HermesTurnAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 389E9BFD5D355E9F4ECDDD8A /* HermesTurnAttributes.swift */; };
 		AB5DDBC15EB15FE1BBF332B3 /* WelcomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD46373BB6BCAF54435E77F3 /* WelcomeView.swift */; };
@@ -485,6 +486,7 @@
 		C857D8802D9AE3D720CE706A /* CacheStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheStore.swift; sourceTree = "<group>"; };
 		C97414BD0BE36C7EED1127F1 /* SpeechPlayerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayerTests.swift; sourceTree = "<group>"; };
 		C9C6A3451D3909FDD94C1468 /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
+		CB884A08C3A868007EC0FBF0 /* ComposerYoloGatewayUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposerYoloGatewayUITests.swift; sourceTree = "<group>"; };
 		CC94FDD251C876AFDBD6305E /* HermesMobileTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = HermesMobileTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		CD2AFC880F1727BFF35C8C35 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		CE288F4E38AF9892876CF46E /* TranscriptWindowRevealTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptWindowRevealTests.swift; sourceTree = "<group>"; };
@@ -737,6 +739,7 @@
 			children = (
 				D731F787AED1C5CD0B16B86C /* A11yMechanicalUITests.swift */,
 				8F6A943F0BC5448AEDCEE0AC /* ChatFlowUITests.swift */,
+				CB884A08C3A868007EC0FBF0 /* ComposerYoloGatewayUITests.swift */,
 				D029CC4EA55FAAB71D3AA4D3 /* ConnectionModePickerUITests.swift */,
 				3F08F8ACDEE165624EE32ADF /* CrossClientSyncUITests.swift */,
 				6A8705BA6768729726A7B366 /* LocalDesktopManualTokenUITests.swift */,
@@ -1232,6 +1235,7 @@
 			files = (
 				12C1260BED19F8CBFB3CC906 /* A11yMechanicalUITests.swift in Sources */,
 				E53597632C7D8EAFFA84A490 /* ChatFlowUITests.swift in Sources */,
+				A6BF8F1EE7D7605DC4DD5C07 /* ComposerYoloGatewayUITests.swift in Sources */,
 				2CA4860A835ADF0F01EAE69F /* ConnectionModePickerUITests.swift in Sources */,
 				B04D98152FE6C71B9341E8B4 /* CrossClientSyncUITests.swift in Sources */,
 				EDEB1B674368A7AD82195935 /* LocalDesktopManualTokenUITests.swift in Sources */,

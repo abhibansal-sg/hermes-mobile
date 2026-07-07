@@ -154,6 +154,13 @@ final class ConnectionStore {
     /// session flag and the global `approvals.mode=off` bypass.
     var sessionYolo = false
 
+    #if DEBUG
+    /// UITest-only read-back marker for the latest active-session `session.info`
+    /// yolo value. Unlike `sessionYolo`, this is never written by the direct
+    /// `config.set` response, so XCUITest can prove the gateway event landed.
+    var lastSessionInfoYolo: Bool?
+    #endif
+
     // MARK: Draft-mode model pick (ABH-84 follow-up)
 
     /// The model pick is allowed at ANY point — including a DRAFT chat that has
@@ -236,6 +243,9 @@ final class ConnectionStore {
         }
         if let yolo = payload["yolo"]?.boolValue {
             sessionYolo = yolo
+            #if DEBUG
+            lastSessionInfoYolo = yolo
+            #endif
         }
     }
 
@@ -248,6 +258,9 @@ final class ConnectionStore {
         sessionReasoningEffort = nil
         sessionFast = nil
         sessionYolo = false
+        #if DEBUG
+        lastSessionInfoYolo = nil
+        #endif
         draftSelection = nil
     }
 

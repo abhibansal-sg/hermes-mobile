@@ -479,6 +479,7 @@ struct ComposerView: View {
             attachButton
             modelChip
             yoloButton
+            yoloGatewayProbe
             Spacer(minLength: 0)
             trailingAction
                 .animation(.snappy(duration: 0.18), value: showSend)
@@ -750,10 +751,23 @@ struct ComposerView: View {
         .accessibilityValue(connection.sessionYolo ? "On" : "Off")
     }
 
+    @ViewBuilder
+    private var yoloGatewayProbe: some View {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["HERMES_UITEST_YOLO_GATEWAY_PROBE"] == "1" {
+            let value = connection.lastSessionInfoYolo.map { $0 ? "On" : "Off" } ?? "Unknown"
+            Text(value)
+                .frame(width: 1, height: 1)
+                .opacity(0.01)
+                .accessibilityIdentifier("composerYoloGatewayState")
+                .accessibilityLabel("Gateway flow-state approvals bypass")
+                .accessibilityValue(value)
+        }
+        #endif
+    }
+
     private var canToggleSessionYolo: Bool {
-        guard isConnected, !yoloTogglePending else { return false }
-        guard let sid = sessions.activeRuntimeId, !sid.isEmpty else { return false }
-        return true
+        !yoloTogglePending
     }
 
     /// The single docked action glyph. SF Symbol `.replace` morphs between mic and
@@ -1038,7 +1052,14 @@ struct ComposerView: View {
     }
 
     private func toggleSessionYolo() {
-        guard let sid = sessions.activeRuntimeId, !sid.isEmpty else { return }
+        guard isConnected else {
+            showSteerNote("Connect to a gateway to toggle flow-state")
+            return
+        }
+        guard let sid = sessions.activeRuntimeId, !sid.isEmpty else {
+            showSteerNote("Start a live session to toggle flow-state")
+            return
+        }
         let next = !connection.sessionYolo
         yoloTogglePending = true
         Task {
