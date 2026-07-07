@@ -13,6 +13,7 @@ import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { cn } from '@/lib/utils'
 import { setGlobalYolo, setSessionYolo } from '@/lib/yolo-session'
+import { $primaryGatewayReconnecting } from '@/store/gateway'
 import {
   $activeSessionId,
   $busy,
@@ -86,6 +87,7 @@ export function useStatusbarItems({
   const backendUpdateApply = useStore($backendUpdateApply)
   const desktopVersion = useStore($desktopVersion)
   const connection = useStore($connection)
+  const primaryGatewayReconnecting = useStore($primaryGatewayReconnecting)
 
   const contextUsage = useMemo(() => usageContextLabel(currentUsage), [currentUsage])
   const contextBar = useMemo(() => contextBarLabel(currentUsage), [currentUsage])
@@ -157,17 +159,19 @@ export function useStatusbarItems({
   const gatewayOpen = gatewayState === 'open'
   const gatewayConnecting = gatewayState === 'connecting'
   const inferenceReady = gatewayOpen && inferenceStatus?.ready === true
-  const gatewayDegraded = gatewayOpen || gatewayConnecting
+  const gatewayDegraded = gatewayOpen || gatewayConnecting || primaryGatewayReconnecting
 
-  const gatewayDetail = gatewayOpen
-    ? inferenceStatus?.ready
-      ? copy.gatewayReady
-      : inferenceStatus
-        ? copy.gatewayNeedsSetup
-        : copy.gatewayChecking
-    : gatewayConnecting
-      ? copy.gatewayConnecting
-      : copy.gatewayOffline
+  const gatewayDetail = primaryGatewayReconnecting
+    ? 'reconnecting…'
+    : gatewayOpen
+      ? inferenceStatus?.ready
+        ? copy.gatewayReady
+        : inferenceStatus
+          ? copy.gatewayNeedsSetup
+          : copy.gatewayChecking
+      : gatewayConnecting
+        ? copy.gatewayConnecting
+        : copy.gatewayOffline
 
   const gatewayClassName = inferenceReady
     ? undefined
@@ -344,6 +348,7 @@ export function useStatusbarItems({
       inferenceReady,
       inferenceStatus?.reason,
       openAgents,
+      primaryGatewayReconnecting,
       subagentsFailed,
       subagentsRunning,
       toggleCommandCenter

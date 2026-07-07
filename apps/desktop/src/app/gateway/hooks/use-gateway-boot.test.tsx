@@ -2,6 +2,7 @@ import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
+import { $primaryGatewayReconnecting } from '@/store/gateway'
 import { $gatewayState } from '@/store/session'
 
 import { useGatewayBoot } from './use-gateway-boot'
@@ -104,13 +105,16 @@ function fakeDesktop() {
   }
 }
 
+const refreshHermesConfig = vi.fn(async () => undefined)
+const refreshSessions = vi.fn(async () => undefined)
+
 function Harness() {
   useGatewayBoot({
     handleGatewayEvent: () => undefined,
     onConnectionReady: () => undefined,
     onGatewayReady: () => undefined,
-    refreshHermesConfig: async () => undefined,
-    refreshSessions: async () => undefined
+    refreshHermesConfig,
+    refreshSessions
   })
 
   return null
@@ -122,9 +126,12 @@ beforeEach(() => {
   vi.useFakeTimers()
   FakeWebSocket.mode = 'open'
   FakeWebSocket.instances = []
+  refreshHermesConfig.mockClear()
+  refreshSessions.mockClear()
   ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
   ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
   $gatewayState.set('idle')
+  $primaryGatewayReconnecting.set(false)
   $desktopBoot.set({
     error: null,
     fakeMode: false,
@@ -198,13 +205,14 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().error).toBeTruthy()
   })
 
-  it('a remote that drops post-boot keeps looping with NO boot.error (the dead-end CONNECTING combo)', async () => {
+  it('a remote that drops post-boot keeps retrying and marks the primary gateway reconnecting', async () => {
     render(<Harness />)
     await flushAsync()
 
     // Initial boot connected.
     expect($gatewayState.get()).toBe('open')
     expect($desktopBoot.get().error).toBeNull()
+    expect($primaryGatewayReconnecting.get()).toBe(false)
     expect(FakeWebSocket.instances).toHaveLength(1)
 
     // The remote VPS goes away: drop the live socket, and make every reopen
@@ -213,20 +221,20 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     act(() => FakeWebSocket.instances[0].drop())
     await flushAsync()
 
-    // Burn a couple backoff cycles BEFORE the escalation threshold (<6 attempts,
-    // ~the first ~15s). This is the window where stock and fixed behave the
-    // same: socket down, hook retrying, gatewayState non-open, boot.error still
-    // null → CONNECTING covers the screen with no recovery surface. (Past ~45s
-    // the fix raises boot.error; that's asserted in the next test.)
+    expect($primaryGatewayReconnecting.get()).toBe(true)
+
+    // Burn a couple backoff cycles: the app stays in the post-boot reconnect
+    // loop, not the initial boot overlay/recovery path.
     await advanceBackoff()
 
     expect($gatewayState.get()).not.toBe('open')
     expect($desktopBoot.get().error).toBeNull()
+    expect($primaryGatewayReconnecting.get()).toBe(true)
     // It is actively retrying, not idle — more sockets were minted.
     expect(FakeWebSocket.instances.length).toBeGreaterThan(1)
   })
 
-  it('FIX: after the prolonged drop the hook raises a recoverable boot error (the escape hatch)', async () => {
+  it('a prolonged post-boot drop keeps retrying past the old recovery threshold without raising boot error', async () => {
     render(<Harness />)
     await flushAsync()
     expect($desktopBoot.get().error).toBeNull()
@@ -235,35 +243,42 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     act(() => FakeWebSocket.instances[0].drop())
     await flushAsync()
 
-    // Walk the backoff past the >=6 attempt threshold (~45s of failures).
+    // Walk the backoff past the old >=6 attempt threshold (~45s of failures).
     for (let i = 0; i < 8; i += 1) {
       await advanceBackoff()
     }
 
-    // The hook surfaced the recoverable error → BootFailureOverlay (Use local
-    // gateway / Sign in / Retry) becomes reachable instead of CONNECTING.
-    expect($desktopBoot.get().error).toBeTruthy()
+    expect($gatewayState.get()).not.toBe('open')
+    expect($primaryGatewayReconnecting.get()).toBe(true)
+    expect($desktopBoot.get().error).toBeNull()
   })
 
-  it('FIX: a successful reconnect clears the recoverable error', async () => {
+  it('opens once, drops, fails several attempts, then reconnects and refreshes desktop state', async () => {
     render(<Harness />)
     await flushAsync()
+    const configRefreshesAfterBoot = refreshHermesConfig.mock.calls.length
+    const sessionRefreshesAfterBoot = refreshSessions.mock.calls.length
 
     FakeWebSocket.mode = 'fail'
     act(() => FakeWebSocket.instances[0].drop())
     await flushAsync()
 
-    for (let i = 0; i < 8; i += 1) {
+    for (let i = 0; i < 4; i += 1) {
       await advanceBackoff()
     }
 
-    expect($desktopBoot.get().error).toBeTruthy()
+    expect(FakeWebSocket.instances.length).toBeGreaterThanOrEqual(5)
+    expect($primaryGatewayReconnecting.get()).toBe(true)
+    expect($desktopBoot.get().error).toBeNull()
 
     // The remote comes back: next reconnect attempt opens.
     FakeWebSocket.mode = 'open'
     await advanceBackoff()
 
     expect($gatewayState.get()).toBe('open')
+    expect($primaryGatewayReconnecting.get()).toBe(false)
     expect($desktopBoot.get().error).toBeNull()
+    expect(refreshHermesConfig.mock.calls.length).toBeGreaterThan(configRefreshesAfterBoot)
+    expect(refreshSessions.mock.calls.length).toBeGreaterThan(sessionRefreshesAfterBoot)
   })
 })
