@@ -2236,23 +2236,95 @@ def _flatten_project_sessions(project: Dict[str, Any]) -> List[Dict[str, Any]]:
     return sessions
 
 
+def _project_sessions_server_fallback(
+    db: Any, project_id: str, session_limit: int
+) -> Dict[str, Any]:
+    """Server-owned sessions/count for a project root the desktop tree missed.
+
+    ``GET /projects`` surfaces repo roots from
+    ``tui_gateway.server._discover_repos_payload`` (session-derived ∪
+    filesystem-discovered). The ``_build_project_tree(... include_discovered=False
+    ...)`` drill-in path only carries projects whose id is either an explicit
+    ``projects_db`` id (Tier 1, which may own a repo root's sessions under a
+    *different* id) or a Tier-2 auto root with unowned sessions. A repo root
+    visible in ``/projects`` can therefore be absent from the tree — this
+    fallback answers it directly from ``SessionDB`` so every ``/projects`` id
+    has a server-owned detail query path.
+
+    Mirrors the desktop lane's filtering (``_project_tree_inputs``): exclude
+    cron, exclude non-listable children, require non-empty human sessions,
+    order by recent activity. ``total`` comes from
+    ``session_count(... exclude_children=True ...)`` so it is authoritative and
+    may exceed the returned rows when ``session_limit`` caps the page. Rows are
+    projected through ``_project_tree_row`` to match the hydrated desktop-lane
+    session shape exactly.
+    """
+    empty: Dict[str, Any] = {"project_id": project_id, "sessions": [], "total": 0}
+    if db is None:
+        return empty
+    try:
+        from tui_gateway.server import (
+            _PROJECT_TREE_EXCLUDED_SOURCES,
+            _project_tree_row,
+        )
+
+        rows = db.list_sessions_rich(
+            cwd_prefix=project_id,
+            limit=session_limit,
+            offset=0,
+            order_by_last_active=True,
+            min_message_count=1,
+            include_children=False,
+            exclude_sources=_PROJECT_TREE_EXCLUDED_SOURCES,
+            include_archived=False,
+        )
+        total = db.session_count(
+            cwd_prefix=project_id,
+            exclude_children=True,
+            exclude_sources=_PROJECT_TREE_EXCLUDED_SOURCES,
+            min_message_count=1,
+            include_archived=False,
+        )
+    except Exception as exc:
+        _log.debug("project sessions: server fallback unavailable: %s", exc)
+        return empty
+
+    sessions = [_project_tree_row(r) for r in rows or []]
+    return {
+        "project_id": project_id,
+        "sessions": sessions,
+        "total": int(total or 0),
+    }
+
+
 @router.get("/project-sessions")
 async def project_sessions(
     request: Request,
     project_id: Annotated[str, Query(min_length=1)],
     session_limit: Annotated[int, Query(ge=1, le=20000)] = 5000,
 ) -> Dict[str, Any]:
-    """Hydrated sessions for one project using the desktop project tree path.
+    """Hydrated sessions for one project, with server-owned parity for every
+    ``/projects``-visible root.
 
-    This intentionally delegates membership, counts, lane ordering, worktree
-    folding, child filtering, and cron exclusion to the same
+    Primary path: delegate membership, counts, lane ordering, worktree folding,
+    child filtering, and cron exclusion to the same
     ``tui_gateway.server._build_project_tree(... hydrate=True ...)`` machinery
-    used by the desktop ``projects.project_sessions`` RPC. The mobile-specific
-    work here is only flattening hydrated lanes into a compact REST shape.
+    used by the desktop ``projects.project_sessions`` RPC, then flatten the
+    hydrated lanes into a compact REST shape.
+
+    Parity fallback: ``GET /projects`` can surface a repo root whose sessions
+    the ``include_discovered=False`` tree does not carry under that id (e.g. a
+    root whose sessions are owned by an explicit ``projects_db`` project). When
+    the tree lookup misses, fall back to a direct ``SessionDB`` query scoped to
+    the root so the root is never returned empty/truncated just because it is
+    not an explicit project. ``total`` is the authoritative server count and
+    may exceed the returned rows.
     """
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    db = None
+    tree: Dict[str, Any] = {"projects": []}
     try:
         from hermes_state import SessionDB
         from tui_gateway.server import _build_project_tree
@@ -2267,21 +2339,20 @@ async def project_sessions(
         )
     except Exception as exc:
         _log.debug("project sessions: gateway tree unavailable: %s", exc)
-        return {"project_id": project_id, "sessions": [], "total": 0}
 
     project = next(
         (p for p in tree.get("projects", []) if p.get("id") == project_id),
         None,
     )
-    if project is None:
-        return {"project_id": project_id, "sessions": [], "total": 0}
+    if project is not None:
+        sessions = _flatten_project_sessions(project)
+        return {
+            "project_id": project_id,
+            "sessions": sessions,
+            "total": int(project.get("sessionCount") or len(sessions)),
+        }
 
-    sessions = _flatten_project_sessions(project)
-    return {
-        "project_id": project_id,
-        "sessions": sessions,
-        "total": int(project.get("sessionCount") or len(sessions)),
-    }
+    return _project_sessions_server_fallback(db, project_id, session_limit)
 
 
 # ---------------------------------------------------------------------------
