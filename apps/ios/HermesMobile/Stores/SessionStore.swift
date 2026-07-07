@@ -552,15 +552,91 @@ final class SessionStore {
     /// Profile names whose All Profiles drawer groups are collapsed. Kept
     /// separate from workspace collapse state so `work` as a profile name cannot
     /// collide with `/.../work` as a workspace key.
+    ///
+    /// STR-1022: this now holds ONLY the user's EXPLICIT collapse decisions. The
+    /// effective state is derived in ``isProfileGroupCollapsed(_:)`` by overlaying
+    /// this set (and ``expandedProfiles``) on the default rule "collapse every
+    /// group except the default/active profile" — so a fresh view opens with every
+    /// non-default group collapsed (desktop parity) WITHOUT a one-shot seed, a
+    /// profile discovered later still defaults to collapsed, and the user's
+    /// expand/collapse choices survive restarts (persisted).
     private(set) var collapsedProfiles: Set<String> = []
 
-    /// Toggle the collapsed state of a profile group.
+    /// Profile names the user has explicitly EXPANDED beyond the collapsed-by-
+    /// default rule, so a non-default group they opened does not snap back to
+    /// collapsed on the next render/restart. Persisted alongside
+    /// ``collapsedProfiles``. See ``isProfileGroupCollapsed(_:)``.
+    private(set) var expandedProfiles: Set<String> = []
+
+    /// How many most-recent rows a COLLAPSED All Profiles group previews before
+    /// its "show more" expand affordance (STR-1022 desktop parity: collapsed-by-
+    /// default + few-recent preview). The desktop web app has no equivalent — iOS
+    /// already went further in STR-996 by grouping at all — so this is the
+    /// mobile-chosen "few": compact enough that several collapsed groups fit the
+    /// drawer, enough to preview recent activity. Tunable.
+    static let drawerCollapsedProfilePreviewCount = 3
+
+    /// Effective collapsed state for an All Profiles group. Derives from the
+    /// default rule (collapse every group EXCEPT the default/active profile)
+    /// overlaid with the user's explicit decisions, so the view never needs to
+    /// know whether a profile was seeded vs toggled.
+    func isProfileGroupCollapsed(_ profile: String) -> Bool {
+        Self.isProfileGroupCollapsed(
+            profile,
+            collapsed: collapsedProfiles,
+            expanded: expandedProfiles,
+            profileMap: profileSummaryMap
+        )
+    }
+
+    /// Pure collapse-state derivation (testable without an instance). Default
+    /// rule: a group is collapsed unless it is the default profile. Explicit
+    /// decisions win over the default.
+    nonisolated static func isProfileGroupCollapsed(
+        _ profile: String,
+        collapsed: Set<String>,
+        expanded: Set<String>,
+        profileMap: [String: ProfileSummary]
+    ) -> Bool {
+        if expanded.contains(profile) { return false }
+        if collapsed.contains(profile) { return true }
+        return !isDefaultDrawerProfile(profile, profileMap: profileMap)
+    }
+
+    private var profileSummaryMap: [String: ProfileSummary] {
+        Dictionary(uniqueKeysWithValues: profiles.map { ($0.name, $0) })
+    }
+
+    /// Toggle the collapsed state of a profile group. Records the EXPLICIT
+    /// decision in ``collapsedProfiles`` / ``expandedProfiles`` so the default
+    /// rule cannot undo it: expanding a default-collapsed group writes an
+    /// explicit-expand, and collapsing the default group writes an explicit-
+    /// collapse. Idempotent and independent of ``resetInitialFill()`` (the
+    /// STR-991 teardown path never touches collapse state).
     func toggleCollapsed(profile: String) {
-        if collapsedProfiles.contains(profile) {
+        if isProfileGroupCollapsed(profile) {
             collapsedProfiles.remove(profile)
+            expandedProfiles.insert(profile)
         } else {
+            expandedProfiles.remove(profile)
             collapsedProfiles.insert(profile)
         }
+        persistCollapsedProfiles()
+        persistExpandedProfiles()
+    }
+
+    private func persistCollapsedProfiles() {
+        UserDefaults.standard.set(
+            Array(collapsedProfiles),
+            forKey: DefaultsKeys.collapsedProfiles
+        )
+    }
+
+    private func persistExpandedProfiles() {
+        UserDefaults.standard.set(
+            Array(expandedProfiles),
+            forKey: DefaultsKeys.expandedProfiles
+        )
     }
 
     // MARK: - Multi-profile scope (F4b — DORMANT unless capability available)
@@ -596,6 +672,16 @@ final class SessionStore {
     /// never satisfied on a stock gateway. Reset to empty when the capability is
     /// not available (a disconnect / stock reconnect).
     private(set) var profiles: [ProfileSummary] = []
+
+    #if DEBUG
+    /// DEBUG-only: set the profile list without a network `loadProfiles()`
+    /// call, so UITestSeed can populate the multi-profile drawer offline.
+    /// Pairs with `ServerCapabilities._seedProfilesCapabilityForTesting`.
+    /// Never compiled into Release.
+    func _seedProfilesForTesting(_ seeded: [ProfileSummary]) {
+        profiles = seeded
+    }
+    #endif
 
     /// Whether the multi-profile switcher should render: the server supports the
     /// endpoints AND there is more than one profile (the desktop's
@@ -879,6 +965,15 @@ final class SessionStore {
         // desktop's default "All profiles" view. Inert until the switcher is shown.
         activeProfile = defaults.string(forKey: DefaultsKeys.activeProfile)
             ?? DefaultsKeys.allProfilesScope
+        // STR-1022: profile-group collapse decisions are derived (see
+        // ``isProfileGroupCollapsed(_:)``); these two sets hold only the user's
+        // explicit overrides and are persisted so choices survive restarts.
+        if let collapsed = defaults.array(forKey: DefaultsKeys.collapsedProfiles) as? [String] {
+            collapsedProfiles = Set(collapsed)
+        }
+        if let expanded = defaults.array(forKey: DefaultsKeys.expandedProfiles) as? [String] {
+            expandedProfiles = Set(expanded)
+        }
     }
 
     /// Wire up the store graph. Called exactly once by `AppEnvironment`.

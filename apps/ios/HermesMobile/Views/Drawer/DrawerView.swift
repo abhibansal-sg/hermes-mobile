@@ -1068,7 +1068,7 @@ struct DrawerView: View {
     private func profileGroupHeader(_ group: SessionStore.DrawerProfileGroup) -> some View {
         DrawerProfileGroupHeader(
             group: group,
-            isCollapsed: sessions.collapsedProfiles.contains(group.profile),
+            isCollapsed: sessions.isProfileGroupCollapsed(group.profile),
             action: group.profile == "default" ? AnyView(recentsFilterMenu) : nil
         ) {
             withAnimation(.easeInOut(duration: 0.2)) {
@@ -1079,11 +1079,59 @@ struct DrawerView: View {
 
     @ViewBuilder
     private func profileGroupRows(_ group: SessionStore.DrawerProfileGroup) -> some View {
-        if !sessions.collapsedProfiles.contains(group.profile) {
+        let isCollapsed = sessions.isProfileGroupCollapsed(group.profile)
+        if isCollapsed {
+            // STR-1022 few-recent preview: the top N newest rows across the WHOLE
+            // profile group (flattened newest-first, NOT split per source sub-group
+            // or workspace fold), then an expand affordance. `group.sessions` is
+            // already newest-first (sortedByActivity in drawerProfileGroups).
+            let previewCount = SessionStore.drawerCollapsedProfilePreviewCount
+            ForEach(group.sessions.prefix(previewCount)) { summary in
+                sessionRow(summary, pinned: false)
+                    .onAppear { maybePrefetchMore(rowId: summary.id) }
+            }
+            if group.sessions.count > previewCount {
+                profileGroupExpandRow(group, hiddenCount: group.sessions.count - previewCount)
+            }
+        } else {
+            // Expanded: full source-group (chats/telegram) + optional workspace
+            // folding — unchanged from STR-996.
             ForEach(group.sourceGroups.filter { !$0.sessions.isEmpty }) { sourceGroup in
                 profileSourceGroupRows(sourceGroup)
             }
         }
+    }
+
+    /// STR-1022: the "show N more" affordance at the tail of a COLLAPSED profile
+    /// group's few-recent preview. Tapping expands the whole group (same toggle as
+    /// the group header). Hidden only when the preview already shows every row.
+    private func profileGroupExpandRow(
+        _ group: SessionStore.DrawerProfileGroup,
+        hiddenCount: Int
+    ) -> some View {
+        plainRow {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    sessions.toggleCollapsed(profile: group.profile)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(theme.mutedFg.opacity(0.7))
+                    Text("Show \(hiddenCount) more")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(theme.mutedFg)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .accessibilityLabel("Show \(hiddenCount) more in \(group.label)")
+        .accessibilityHint("Double-tap to expand")
     }
 
     @ViewBuilder

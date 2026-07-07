@@ -253,6 +253,16 @@ final class ServerCapabilities {
         persist()
     }
 
+    #if DEBUG
+    /// DEBUG-only: force the `profiles` capability state without a network
+    /// probe, so UITestSeed can populate the multi-profile drawer offline.
+    /// Mirrors the existing `profileThreadingAvailableForTesting` seam on
+    /// SessionStore. Never compiled into Release.
+    func _seedProfilesCapabilityForTesting(_ state: State) {
+        profiles = state
+    }
+    #endif
+
     // MARK: - Plugin-mount probe (ABH-88)
 
     /// `GET /api/plugins/hermes-mobile/devices` (absolute path — style-free).
