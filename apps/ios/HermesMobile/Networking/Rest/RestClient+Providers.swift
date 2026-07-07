@@ -537,4 +537,22 @@ extension RestClient {
         let root = try decodeJSONValue(from: data, context: "toolsets.setConfig")
         return ToolsetConfig(json: root)
     }
+
+    /// `PUT <prefix>/toolsets/{name}/provider` — activate a provider for a
+    /// toolset. Returns the refreshed (still-redacted) config.
+    @discardableResult
+    func selectToolsetProvider(name: String, provider: String) async throws -> ToolsetConfig {
+        let encodedName = name.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? name
+        var request = makeRequest(
+            path: "\(mobileAPIPrefix)/toolsets/\(encodedName)/provider", method: "PUT"
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: JSONValue = .object(["provider": .string(provider)])
+        request.httpBody = try encodeBody(body, context: "toolsets.selectProvider")
+        let data = try await perform(request)
+        let root = try decodeJSONValue(from: data, context: "toolsets.selectProvider")
+        return ToolsetConfig(json: root)
+    }
 }
