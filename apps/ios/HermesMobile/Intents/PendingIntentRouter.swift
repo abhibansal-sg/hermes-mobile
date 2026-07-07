@@ -73,17 +73,80 @@ enum PendingIntentRouter {
                     prompt,
                     defaults: defaults,
                     createSessionNow: { try await sessions.createSessionNow() },
-                    send: { await chat.send(text: $0) }
+                    currentSessionIdentity: {
+                        guard let storedId = sessions.activeStoredId,
+                              let runtimeId = sessions.activeRuntimeId else { return nil }
+                        return (storedId, runtimeId)
+                    },
+                    send: { prompt in
+                        let accepted = await chat.send(text: prompt)
+                        if accepted { return .accepted }
+                        // `chat.send` never got as far as `prompt.submit`: the
+                        // refusal is entirely local (no connection, no
+                        // resolvable runtime, attachment upload failure), so
+                        // the just-created session demonstrably never received
+                        // this prompt and is safe to clean up.
+                        guard chat.lastSendReachedServer else { return .refusedBeforeSubmit }
+                        // `prompt.submit` was dispatched but refused/failed —
+                        // this includes the ambiguous case where a transport
+                        // failure means the server may have silently accepted
+                        // it. Never guess-delete here.
+                        return .refusedAfterSubmitAttempt
+                    },
+                    cleanupSession: { storedId in
+                        // `SessionStore.delete` routes through `clearActive()`,
+                        // which resets `chat` (including `lastError`) as part
+                        // of tearing down the active transcript. That would
+                        // clobber the send-refusal reason `deliverAskPrompt`
+                        // just parked for the user — preserve/restore it so a
+                        // best-effort cleanup failure (or its own reset side
+                        // effect) never replaces the real failure the user
+                        // needs to see.
+                        let preservedError = chat.lastError
+                        await sessions.delete(
+                            SessionSummary(
+                                id: storedId,
+                                title: nil,
+                                preview: nil,
+                                startedAt: nil,
+                                messageCount: nil,
+                                source: nil,
+                                lastActive: nil,
+                                cwd: nil,
+                                profile: nil
+                            )
+                        )
+                        chat.lastError = preservedError
+                    }
                 )
             }
         }
+    }
+
+    /// Outcome of attempting to deliver `.ask`'s prompt into the session this
+    /// delivery just created via `createSessionNow()`.
+    enum AskSendOutcome {
+        /// `prompt.submit` was accepted by the server.
+        case accepted
+        /// Refused before `prompt.submit` ever reached the server (no
+        /// connection, no resolvable runtime, attachment-upload failure) —
+        /// demonstrably never delivered, so the just-created session is safe
+        /// to also clean up, not just re-park the prompt.
+        case refusedBeforeSubmit
+        /// `prompt.submit` was dispatched but its outcome could not be
+        /// observed (busy rejection, or a transport failure that may mean the
+        /// server actually accepted it). Re-park the prompt; never delete the
+        /// session — we cannot rule out the server having accepted it.
+        case refusedAfterSubmitAttempt
     }
 
     static func deliverAskPrompt(
         _ prompt: String,
         defaults: UserDefaults,
         createSessionNow: @escaping @MainActor () async throws -> Void,
-        send: @escaping @MainActor (String) async -> Bool
+        currentSessionIdentity: @escaping @MainActor () -> (storedId: String, runtimeId: String)?,
+        send: @escaping @MainActor (String) async -> AskSendOutcome,
+        cleanupSession: @escaping @MainActor (String) async -> Void
     ) async {
         let intent = PendingIntent.ask(prompt: prompt)
         do {
@@ -94,12 +157,35 @@ enum PendingIntentRouter {
             intent.park(in: defaults)
             return
         }
+        // Capture the identity of the session we just created for this
+        // delivery, so a refused send can be safely cleaned up ONLY when it's
+        // still the active session (see the drift check below).
+        let createdIdentity = currentSessionIdentity()
+
         // `createSessionNow()` sets `activeRuntimeId`; `send` can still refuse
         // the prompt (busy, transport failure, lost runtime). Preserve it for a
         // later foreground instead of silently dropping it.
-        let accepted = await send(prompt)
-        if !accepted {
+        let outcome = await send(prompt)
+        switch outcome {
+        case .accepted:
+            return
+        case .refusedAfterSubmitAttempt:
             intent.park(in: defaults)
+        case .refusedBeforeSubmit:
+            intent.park(in: defaults)
+            // Best-effort orphan cleanup: only when the active session still
+            // matches what THIS delivery created. If the user/app navigated
+            // elsewhere, opened another session, or a concurrent create/send
+            // raced in between capture and now, the active pointers will have
+            // drifted — skip cleanup rather than risk deleting a session this
+            // delivery didn't create. Re-parking the prompt above is already
+            // sufficient in that case.
+            if let createdIdentity,
+               let stillActive = currentSessionIdentity(),
+               stillActive.storedId == createdIdentity.storedId,
+               stillActive.runtimeId == createdIdentity.runtimeId {
+                await cleanupSession(createdIdentity.storedId)
+            }
         }
     }
 
