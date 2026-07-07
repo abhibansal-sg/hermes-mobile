@@ -16,7 +16,10 @@ afterEach(() => {
 
 describe('useStatusbarItems gateway status', () => {
   it('renders reconnecting detail while primary gateway retries after boot', () => {
-    const requestGateway = vi.fn(async <T,>() => undefined as T)
+    const requestGateway = async <T = unknown>(
+      _method: string,
+      _params?: Record<string, unknown>
+    ): Promise<T> => undefined as T
 
     const { result } = renderHook(() =>
       useStatusbarItems({
