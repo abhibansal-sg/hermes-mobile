@@ -772,6 +772,14 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         ),
         "options": ["stash", "discard"],
     },
+    "updates.refresh_cua_driver": {
+        "type": "bool",
+        "description": (
+            "Refresh an already-installed cua-driver during hermes update. "
+            "Disable this on non-admin macOS accounts where /Applications is "
+            "not writable."
+        ),
+    },
 }
 
 # Categories with fewer fields get merged into "general" to avoid tab sprawl.
@@ -9240,8 +9248,15 @@ async def auth_mcp_server(name: str, profile: Optional[str] = None):
                 # The default 30s connect timeout would kill the flow while the
                 # user is still on the consent screen — give the browser
                 # round-trip the full callback window (300s in mcp_oauth) plus
-                # headroom so the connect wrapper can't pre-empt it.
-                tools = _probe_single_server(name, cfg, connect_timeout=315)
+                # headroom so the connect wrapper can't pre-empt it. Honor a
+                # larger configured connect_timeout when the user set one.
+                try:
+                    _cfg_timeout = float(cfg.get("connect_timeout", 0))
+                except (TypeError, ValueError):
+                    _cfg_timeout = 0.0
+                tools = _probe_single_server(
+                    name, cfg, connect_timeout=max(_cfg_timeout, 315)
+                )
             except Exception:
                 storage.restore(backup)
                 raise
@@ -14026,13 +14041,21 @@ def mount_spa(application: FastAPI):
     and the SPA's runtime ``__HERMES_BASE_PATH__`` honour that prefix
     without rebuilding the bundle.
     """
-    if not WEB_DIST.exists():
+    # `hermes serve` is the headless backend: it must NEVER serve the browser
+    # SPA, even if a dist is lying around from a prior `dashboard`/build. Take
+    # the no-frontend path so only the JSON-RPC/WS/API surface is reachable.
+    _headless = os.environ.get("HERMES_SERVE_HEADLESS") == "1"
+    if _headless or not WEB_DIST.exists():
+        _msg = (
+            "Headless backend (hermes serve): web UI disabled — use "
+            "`hermes dashboard` for the browser UI."
+            if _headless
+            else "Frontend not built. Run: cd web && npm run build"
+        )
+
         @application.get("/{full_path:path}")
         async def no_frontend(full_path: str):
-            return JSONResponse(
-                {"error": "Frontend not built. Run: cd web && npm run build"},
-                status_code=404,
-            )
+            return JSONResponse({"error": _msg}, status_code=404)
         return
 
     _index_path = WEB_DIST / "index.html"
@@ -15272,6 +15295,7 @@ def start_server(
     open_browser: bool = True,
     allow_public: bool = False,
     initial_profile: str = "",
+    headless: bool = False,
 ):
     """Start the web UI server.
 
@@ -15279,6 +15303,10 @@ def start_server(
     URL as ``?profile=<name>`` so the SPA's profile switcher preselects it
     — used when a profile alias (``<profile> dashboard``) routes to the
     machine dashboard.
+
+    ``headless`` is the ``serve`` path: the JSON-RPC/WS backend with no UI
+    build and no SPA mount (mount_spa() honours ``HERMES_SERVE_HEADLESS``), so
+    the banner announces the bind rather than a browser URL.
     """
     import uvicorn
 
@@ -15435,8 +15463,17 @@ def start_server(
             app.state.bound_port = actual_port
 
             _write_dashboard_ready_file(actual_port)
-            print(f"HERMES_DASHBOARD_READY port={actual_port}", flush=True)
-            print(f"  Hermes Web UI → http://{host}:{actual_port}")
+            # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
+            # plain backend, not a dashboard, so it announces a neutral token;
+            # `dashboard` keeps the legacy one. The desktop matches either.
+            ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
+            print(f"{ready_token} port={actual_port}", flush=True)
+            if headless:
+                # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
+                # advertise a paste-and-connect URL, just announce the bind.
+                print(f"  Hermes backend listening on {host}:{actual_port}")
+            else:
+                print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
 
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop
