@@ -226,6 +226,91 @@ final class GatewayRequestRaceTests: XCTestCase {
         }
     }
 
+    /// A connect attempt that never sends `gateway.ready`; its `receive()` parks
+    /// until a later connect supersedes it.
+    private final class NeverReadyTransport: GatewayWebSocketTask, @unchecked Sendable {
+        private let lock = NSLock()
+        private var receiveWaiter: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+        private(set) var didCancel = false
+
+        func resume() {}
+        func send(_ message: URLSessionWebSocketTask.Message) async throws {}
+
+        func receive() async throws -> URLSessionWebSocketTask.Message {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                receiveWaiter = continuation
+                lock.unlock()
+            }
+        }
+
+        func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+            let waiter: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+            lock.lock()
+            didCancel = true
+            waiter = receiveWaiter
+            receiveWaiter = nil
+            lock.unlock()
+            waiter?.resume(throwing: URLError(.cancelled))
+        }
+    }
+
+    /// Opens after a short deterministic delay. The delay gives the superseded
+    /// first connect attempt a chance to run its catch path while this second
+    /// attempt is waiting for ready.
+    private final class DelayedReadyTransport: GatewayWebSocketTask, @unchecked Sendable {
+        private let readyDelay: Duration
+        private let lock = NSLock()
+        private var didSendReady = false
+        private var receiveWaiter: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+        private(set) var didCancel = false
+
+        init(readyDelay: Duration) {
+            self.readyDelay = readyDelay
+        }
+
+        func resume() {}
+        func send(_ message: URLSessionWebSocketTask.Message) async throws {}
+
+        func receive() async throws -> URLSessionWebSocketTask.Message {
+            try await withCheckedThrowingContinuation { continuation in
+                let shouldSendReady: Bool
+                lock.lock()
+                if didCancel {
+                    lock.unlock()
+                    continuation.resume(throwing: URLError(.cancelled))
+                    return
+                }
+                shouldSendReady = !didSendReady
+                if shouldSendReady {
+                    didSendReady = true
+                } else {
+                    receiveWaiter = continuation
+                }
+                lock.unlock()
+
+                if shouldSendReady {
+                    Task {
+                        try? await Task.sleep(for: readyDelay)
+                        continuation.resume(returning: .string(
+                            #"{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready"}}"#
+                        ))
+                    }
+                }
+            }
+        }
+
+        func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+            let waiter: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+            lock.lock()
+            didCancel = true
+            waiter = receiveWaiter
+            receiveWaiter = nil
+            lock.unlock()
+            waiter?.resume(throwing: URLError(.cancelled))
+        }
+    }
+
     private struct Echo: Decodable, Sendable {
         let value: String
     }
@@ -348,5 +433,71 @@ final class GatewayRequestRaceTests: XCTestCase {
         XCTAssertTrue(message.contains("dead.socket"), "failed state should preserve timeout context, got \(message)")
 
         await client.disconnect()
+    }
+
+    /// If an older connect attempt is failed by a newer `connect()` call, its
+    /// catch path must not tear down the newer socket. The old behavior cancelled
+    /// transport #2 and overwrote `.open`/`.connecting` with `.failed`.
+    func testStaleConnectFailureDoesNotTearDownNewerConnection() async throws {
+        let first = NeverReadyTransport()
+        let second = DelayedReadyTransport(readyDelay: .milliseconds(50))
+        let transportQueue = TransportQueue([first, second])
+        let client = HermesGatewayClient { _ in transportQueue.next() }
+        let baseURL = URL(string: "ws://127.0.0.1:9999")!
+
+        let staleConnect = Task {
+            do {
+                try await client.connect(baseURL: baseURL, token: "stale")
+                XCTFail("The first connect should be superseded before ready")
+            } catch {
+                // Expected: the second connect's initial teardown fails the old
+                // ready wait. The stale caller still observes its original error.
+            }
+        }
+
+        try await waitForState(.connecting, client: client)
+
+        try await client.connect(baseURL: baseURL, token: "fresh")
+        await staleConnect.value
+
+        XCTAssertTrue(first.didCancel, "fresh connect should cancel the superseded first transport")
+        XCTAssertFalse(second.didCancel, "stale first failure must not cancel the newer transport")
+        let state = await client.state
+        XCTAssertEqual(state, .open, "client should remain open on the newer connection")
+
+        await client.disconnect()
+    }
+
+    private final class TransportQueue: @unchecked Sendable {
+        private let transports: [GatewayWebSocketTask]
+        private let lock = NSLock()
+        private var index = 0
+
+        init(_ transports: [GatewayWebSocketTask]) {
+            self.transports = transports
+        }
+
+        func next() -> GatewayWebSocketTask {
+            lock.lock()
+            defer { lock.unlock() }
+            let transport = transports[index]
+            index += 1
+            return transport
+        }
+    }
+
+    private func waitForState(
+        _ expected: GatewayConnectionState,
+        client: HermesGatewayClient,
+        timeout: Duration = .seconds(1)
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline {
+            if await client.state == expected {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Timed out waiting for state \(expected); last state was \(await client.state)")
     }
 }
