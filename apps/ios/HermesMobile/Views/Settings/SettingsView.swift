@@ -1739,6 +1739,7 @@ struct ToolsetConfigView: View {
     @State private var editTarget: ToolsetCredentialTarget?
     @State private var clearTarget: ToolsetCredentialTarget?
     @State private var mutatingTargetID: String?
+    @State private var activatingProviderID: String?
 
     var body: some View {
         PanelContent(phase: phase, label: "Loading toolset keys\u{2026}", retry: { Task { await load() } }) { configs in
@@ -1770,7 +1771,9 @@ struct ToolsetConfigView: View {
             NavigationStack {
                 ToolsetCredentialEntryView(rest: rest, target: target) { refreshed in
                     replaceConfig(refreshed)
-                    successText = "Saved \(target.envVar.prompt)."
+                    successText = ToolsetConfigSaveCopy.savedMessage(
+                        target: target, refreshed: refreshed
+                    )
                 }
             }
             .environment(\.hermesTheme, theme)
@@ -1876,6 +1879,7 @@ struct ToolsetConfigView: View {
                             toolsetName: config.name,
                             toolsetDisplayName: config.displayName,
                             providerName: provider.name.isEmpty ? config.displayName : provider.name,
+                            providerTag: provider.tag,
                             envVar: envVar
                         )
                     )
@@ -1887,6 +1891,26 @@ struct ToolsetConfigView: View {
                     .font(.footnote)
                     .foregroundStyle(theme.mutedFg)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if !provider.isActive {
+                Button {
+                    Task { await activate(provider, in: config) }
+                } label: {
+                    HStack(spacing: 6) {
+                        if activatingProviderID == provider.id {
+                            ProgressView().controlSize(.small)
+                            Text("Activating\u{2026}")
+                        } else {
+                            Label("Make Active", systemImage: "bolt.fill")
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .tint(theme.midground)
+                .disabled(activatingProviderID != nil)
+                .accessibilityIdentifier("toolsetActivate-\(config.name)-\(provider.tag)")
             }
         }
         .padding(.vertical, 4)
@@ -2009,6 +2033,24 @@ struct ToolsetConfigView: View {
             )
             replaceConfig(refreshed)
             successText = "Cleared \(target.envVar.prompt)."
+        } catch {
+            actionError = ToolsetConfigErrorMessage.message(for: error)
+        }
+    }
+
+    private func activate(_ provider: ToolsetConfigProvider, in config: ToolsetConfig) async {
+        actionError = nil
+        successText = nil
+        activatingProviderID = provider.id
+        defer { activatingProviderID = nil }
+        do {
+            let refreshed = try await rest.selectToolsetProvider(
+                name: config.name,
+                provider: provider.tag
+            )
+            replaceConfig(refreshed)
+            let providerName = provider.name.isEmpty ? config.displayName : provider.name
+            successText = "Made \(providerName) the active \(config.displayName) provider."
         } catch {
             actionError = ToolsetConfigErrorMessage.message(for: error)
         }
@@ -2148,17 +2190,46 @@ struct ToolsetCredentialEntryView: View {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         Task {
             defer { isSaving = false }
+            // Phase 1 — persist the credential. A failure here means nothing
+            // was saved; surface it as the key-save error.
+            let savedConfig: ToolsetConfig
             do {
-                let refreshed = try await rest.setToolsetCredential(
+                savedConfig = try await rest.setToolsetCredential(
                     name: target.toolsetName,
                     key: target.envVar.key,
                     value: trimmed
                 )
-                value = ""
-                onSaved(refreshed)
-                dismiss()
             } catch {
                 errorText = ToolsetConfigErrorMessage.message(for: error)
+                return
+            }
+            value = ""
+
+            // No provider to activate — the key save is the whole operation.
+            guard let tag = target.providerTag else {
+                onSaved(savedConfig)
+                dismiss()
+                return
+            }
+
+            // Phase 2 — activate the provider. The key is already saved, so a
+            // failure here must NOT be reported as a generic key-save error,
+            // and must NOT discard the fact that the credential persisted.
+            do {
+                let activatedConfig = try await rest.selectToolsetProvider(
+                    name: target.toolsetName,
+                    provider: tag
+                )
+                onSaved(activatedConfig)
+                dismiss()
+            } catch {
+                // Reflect the saved credential into the parent (the provider is
+                // still NOT active in this config), then surface a distinct
+                // activation-failure message. Stay on the form so the user sees
+                // what happened instead of implying success.
+                onSaved(savedConfig)
+                let reason = ToolsetConfigErrorMessage.message(for: error)
+                errorText = "Key saved, but \(target.providerName) could not be made active: \(reason)"
             }
         }
     }
@@ -2168,9 +2239,32 @@ struct ToolsetCredentialTarget: Identifiable, Sendable, Hashable {
     let toolsetName: String
     let toolsetDisplayName: String
     let providerName: String
+    let providerTag: String?
     let envVar: ToolsetEnvVar
 
     var id: String { "\(toolsetName)::\(envVar.key)::\(providerName)" }
+}
+
+/// Success copy for the toolset credential save flow.
+///
+/// `save()` persists the key and then (when the target carries a provider tag)
+/// activates that provider. The single `onSaved(refreshed)` callback the parent
+/// receives cannot tell the two outcomes apart by itself, so this helper infers
+/// them from the refreshed config: if the target expected activation and the
+/// refreshed config reports that provider `isActive`, the key was saved AND the
+/// provider was made active — say so. Otherwise only confirm the key save
+/// (this also covers the activation-failure path, where the key was saved but
+/// the provider stayed inactive).
+enum ToolsetConfigSaveCopy {
+    static func savedMessage(target: ToolsetCredentialTarget, refreshed: ToolsetConfig) -> String {
+        let activated = target.providerTag.flatMap { tag in
+            refreshed.providers.first { $0.tag == tag }
+        }?.isActive ?? false
+        if target.providerTag != nil, activated {
+            return "Saved \(target.envVar.prompt) and made \(target.providerName) the active provider."
+        }
+        return "Saved \(target.envVar.prompt)."
+    }
 }
 
 enum ToolsetConfigErrorMessage {
