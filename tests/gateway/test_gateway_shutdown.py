@@ -705,3 +705,68 @@ async def test_drain_no_longer_early_returns_when_only_adapter_active_turn_in_fl
     # Let the blocked adapter task unwind so it does not leak past the test.
     await asyncio.sleep(0.05)
     await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_forced_timeout_resume_pending_covers_pending_sentinels():
+    """Regression (STR-1069 clause 4): forced-timeout shutdown must call
+    ``mark_resume_pending`` for pending-sentinel keys.  The runner must not
+    skip sentinels — the session-store no-entry guard is the safety net, not
+    the runner sentinel type.
+
+    Two scenarios:
+    1. Sentinel WITH a durable session entry → ``mark_resume_pending`` is
+       called and returns True (marker written).
+    2. Bare sentinel with NO session entry → ``mark_resume_pending`` is still
+       called (attempted) but returns False (no misleading marker created).
+    """
+    # --- Scenario 1: sentinel + existing session entry ---
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: gateway_run._AGENT_PENDING_SENTINEL}
+    runner._running_agents_ts = {session_key: 0.0}
+    runner._restart_drain_timeout = 0.0  # forced timeout
+
+    runner.session_store.mark_resume_pending = MagicMock(return_value=True)
+
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("agent.auxiliary_client.shutdown_cached_clients"),
+    ):
+        await runner.stop()
+
+    mark_calls = runner.session_store.mark_resume_pending.call_args_list
+    assert mark_calls, "mark_resume_pending must be called for sentinel keys"
+    marked_keys = {c.args[0] for c in mark_calls if c.args}
+    assert session_key in marked_keys
+    marked_reasons = {c.args[1] for c in mark_calls if len(c.args) > 1}
+    assert "shutdown_timeout" in marked_reasons
+
+    # --- Scenario 2: bare sentinel, no session entry ---
+    runner2, _adapter2 = make_restart_runner()
+    source2 = make_restart_source(chat_id="999", thread_id="77")
+    session_key2 = build_session_key(source2)
+    runner2._running_agents = {session_key2: gateway_run._AGENT_PENDING_SENTINEL}
+    runner2._running_agents_ts = {session_key2: 0.0}
+    runner2._restart_drain_timeout = 0.0
+
+    runner2.session_store.mark_resume_pending = MagicMock(return_value=False)
+
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("agent.auxiliary_client.shutdown_cached_clients"),
+    ):
+        await runner2.stop()
+
+    mark_calls2 = runner2.session_store.mark_resume_pending.call_args_list
+    assert mark_calls2, (
+        "mark_resume_pending must be attempted even for bare sentinels"
+    )
+    marked_keys2 = {c.args[0] for c in mark_calls2 if c.args}
+    assert session_key2 in marked_keys2
+    assert runner2.session_store.mark_resume_pending.return_value is False, (
+        "bare sentinel with no session entry must not create a resume marker"
+    )

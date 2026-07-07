@@ -7972,13 +7972,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # If the process is killed by the service manager during the
             # drain, the durable marker is already written so the next
             # gateway boot can recover in-flight sessions (#27856).
+            # Pending sentinels are included: a sentinel with an existing
+            # session entry must be marked so the next boot can resume it.
+            # ``mark_resume_pending`` returns False when no session entry
+            # exists, so bare sentinels with no durable state are skipped
+            # by the store guard, not by the runner sentinel type.
             _pre_drain_keys: list[str] = []
             _pre_drain_reason = (
                 "restart_timeout" if self._restart_requested else "shutdown_timeout"
             )
-            for _sk, _agent in list(self._running_agents.items()):
-                if _agent is _AGENT_PENDING_SENTINEL:
-                    continue
+            for _sk in list(self._running_agents.keys()):
                 try:
                     self.session_store.mark_resume_pending(_sk, _pre_drain_reason)
                     _pre_drain_keys.append(_sk)
@@ -8052,22 +8055,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # them a stray restart-interruption system note on their
                 # next turn even though their previous turn completed
                 # cleanly.  This broader set also covers adapter-active
-                # turns discovered through the active-turn accounting so a
-                # force-interrupted human turn at the adapter layer still
-                # gets a resume marker where a session entry exists.  Skip
-                # pending sentinels for the same reason
-                # _interrupt_running_agents() does: their agent hasn't
-                # started yet, there's nothing to interrupt, and the
-                # session shouldn't carry a misleading resume flag.
-                # ``mark_resume_pending`` returns False when no session
-                # entry/transcript exists, so no misleading resume markers
-                # are created for sessions with no durable state.
+                # turns and pending sentinels discovered through the
+                # active-turn accounting so a force-interrupted human
+                # turn still gets a resume marker where a session entry
+                # exists.  ``mark_resume_pending`` returns False when no
+                # session entry/transcript exists, so pending sentinels
+                # with no durable state do not create misleading resume
+                # markers — the session-store guard is the safety net,
+                # not the runner sentinel type.
                 _resume_reason = (
                     "restart_timeout" if self._restart_requested else "shutdown_timeout"
                 )
                 for _sk in self._active_human_turn_keys():
-                    if self._running_agents.get(_sk) is _AGENT_PENDING_SENTINEL:
-                        continue
                     try:
                         self.session_store.mark_resume_pending(_sk, _resume_reason)
                     except Exception as _e:
