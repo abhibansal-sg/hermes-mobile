@@ -8,8 +8,50 @@ import XCTest
 /// explicit snake_case `CodingKeys`).
 final class FileSystemModelTests: XCTestCase {
 
+    final class RecordingProtocol: URLProtocol, @unchecked Sendable {
+        nonisolated(unsafe) static var requests: [URLRequest] = []
+        nonisolated(unsafe) static var body = Data()
+        nonisolated(unsafe) static var status = 200
+
+        static func reset(body: Data, status: Int = 200) {
+            requests = []
+            self.body = body
+            self.status = status
+        }
+
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+        override func startLoading() {
+            Self.requests.append(request)
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: Self.status,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Self.body)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+
+        override func stopLoading() {}
+    }
+
     private func decode<T: Decodable>(_ type: T.Type, _ json: String) throws -> T {
         try JSONDecoder().decode(T.self, from: Data(json.utf8))
+    }
+
+    private func makeRecordingRest(body: Data, status: Int = 200) -> RestClient {
+        RecordingProtocol.reset(body: body, status: status)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecordingProtocol.self]
+        return RestClient(
+            baseURL: URL(string: "https://gw.example:9119")!,
+            token: "tok",
+            session: URLSession(configuration: config),
+            pathStyle: .plugin
+        )
     }
 
     // MARK: - /api/fs/list
@@ -93,6 +135,55 @@ final class FileSystemModelTests: XCTestCase {
         """
         let result = try decode(FSReadResult.self, json)
         XCTAssertNil(result.dataURL)
+    }
+
+    // MARK: - /api/fs/diff
+
+    func testDiffResultDecodesChangedDiff() throws {
+        let json = """
+        {"path":"Sources/App.swift","diff":"diff --git a/Sources/App.swift b/Sources/App.swift\\n+line\\n","has_changes":true}
+        """
+        let result = try decode(FSDiffResult.self, json)
+        XCTAssertEqual(result.path, "Sources/App.swift")
+        XCTAssertTrue(result.hasChanges)
+        XCTAssertTrue(result.diff.contains("+line"))
+    }
+
+    func testDiffResultTolerantEmptyDefaults() throws {
+        let result = try decode(FSDiffResult.self, "{}")
+        XCTAssertEqual(result, FSDiffResult(path: "", diff: "", hasChanges: false))
+    }
+
+    func testRestClientFSDiffUsesMobilePrefixAndDecodes() async throws {
+        let body = Data(#"{"path":"a dir/file.swift","diff":"+hello\n","has_changes":true}"#.utf8)
+        let rest = makeRecordingRest(body: body)
+
+        let result = try await rest.fsDiff(sessionId: "sess-1", path: "a dir/file.swift")
+
+        XCTAssertEqual(result.path, "a dir/file.swift")
+        XCTAssertEqual(result.diff, "+hello\n")
+        XCTAssertTrue(result.hasChanges)
+        XCTAssertEqual(RecordingProtocol.requests.count, 1)
+        let url = try XCTUnwrap(RecordingProtocol.requests.first?.url)
+        XCTAssertEqual(url.path, "/api/plugins/hermes-mobile/fs/diff")
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let items = components.queryItems ?? []
+        XCTAssertEqual(items.first(where: { $0.name == "session_id" })?.value, "sess-1")
+        XCTAssertEqual(items.first(where: { $0.name == "path" })?.value, "a dir/file.swift")
+    }
+
+    func testRestClientFSDiffMapsUnknownSession() async throws {
+        let body = Data(#"{"error":"unknown session"}"#.utf8)
+        let rest = makeRecordingRest(body: body, status: 404)
+
+        do {
+            _ = try await rest.fsDiff(sessionId: "ghost", path: "a.swift")
+            XCTFail("expected noActiveSession")
+        } catch let error as FSReadError {
+            guard case .noActiveSession = error else {
+                return XCTFail("expected .noActiveSession, got \(error)")
+            }
+        }
     }
 
     // MARK: - isImage detection

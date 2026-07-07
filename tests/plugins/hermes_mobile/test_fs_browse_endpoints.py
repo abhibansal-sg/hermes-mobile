@@ -18,6 +18,7 @@ api module now — monkeypatches/asserts target it via ``_api()`` below.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 
 import pytest
@@ -129,6 +130,12 @@ def test_read_requires_token(loopback_client, session_cwd):
     assert r.status_code == 401
 
 
+def test_diff_requires_token(loopback_client, session_cwd):
+    sid, _root, _outside = session_cwd
+    r = loopback_client.get(f"/api/plugins/hermes-mobile/fs/diff?session_id={sid}&path=alpha.txt")
+    assert r.status_code == 401
+
+
 # ---------------------------------------------------------------------------
 # /api/fs/list — required-param + happy paths
 # ---------------------------------------------------------------------------
@@ -235,6 +242,15 @@ def test_read_unknown_sid_404_unknown_session(loopback_client, _token_header):
     assert r.json() == {"error": "unknown session"}
 
 
+def test_diff_unknown_sid_404_unknown_session(loopback_client, _token_header):
+    r = loopback_client.get(
+        "/api/plugins/hermes-mobile/fs/diff?session_id=ghost&path=anything.txt",
+        headers=_token_header,
+    )
+    assert r.status_code == 404
+    assert r.json() == {"error": "unknown session"}
+
+
 # ---------------------------------------------------------------------------
 # Sandbox / traversal — 403 (the security-critical cases)
 # ---------------------------------------------------------------------------
@@ -285,6 +301,16 @@ def test_read_symlink_escape_403(loopback_client, session_cwd, _token_header):
         pytest.skip("symlinks unsupported on this platform")
     r = loopback_client.get(
         f"/api/plugins/hermes-mobile/fs/read?session_id={sid}&path=escape_link", headers=_token_header
+    )
+    assert r.status_code == 403
+    assert r.json() == {"error": "path escapes session root"}
+
+
+def test_diff_dotdot_escape_403(loopback_client, session_cwd, _token_header):
+    sid, _root, _outside = session_cwd
+    r = loopback_client.get(
+        f"/api/plugins/hermes-mobile/fs/diff?session_id={sid}&path=../outside/secret.txt",
+        headers=_token_header,
     )
     assert r.status_code == 403
     assert r.json() == {"error": "path escapes session root"}
@@ -460,6 +486,88 @@ def test_read_over_cap_text_split_multibyte_truncates(loopback_client, session_c
     assert body["truncated"] is True
     # Trailing partial 'é' dropped; clean prefix returned.
     assert body["content"] == "abcd"
+
+
+# ---------------------------------------------------------------------------
+# /api/fs/diff — working-tree-vs-HEAD diff under the session cwd
+# ---------------------------------------------------------------------------
+
+def _git_init_with_head(root):
+    subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, check=True)
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
+
+
+def test_diff_missing_session_id_400(loopback_client, _token_header):
+    r = loopback_client.get("/api/plugins/hermes-mobile/fs/diff?path=alpha.txt", headers=_token_header)
+    assert r.status_code == 400
+    assert r.json() == {"error": "session_id required"}
+
+
+def test_diff_missing_path_400(loopback_client, session_cwd, _token_header):
+    sid, _root, _outside = session_cwd
+    r = loopback_client.get(
+        f"/api/plugins/hermes-mobile/fs/diff?session_id={sid}", headers=_token_header
+    )
+    assert r.status_code == 400
+    assert r.json() == {"error": "path required"}
+
+
+def test_diff_clean_non_repo_empty_200(loopback_client, session_cwd, _token_header):
+    sid, _root, _outside = session_cwd
+    r = loopback_client.get(
+        f"/api/plugins/hermes-mobile/fs/diff?session_id={sid}&path=alpha.txt",
+        headers=_token_header,
+    )
+    assert r.status_code == 200
+    assert r.json() == {"path": "alpha.txt", "diff": "", "has_changes": False}
+
+
+def test_diff_clean_tracked_file_empty_200(loopback_client, session_cwd, _token_header):
+    sid, root, _outside = session_cwd
+    _git_init_with_head(root)
+    r = loopback_client.get(
+        f"/api/plugins/hermes-mobile/fs/diff?session_id={sid}&path=alpha.txt",
+        headers=_token_header,
+    )
+    assert r.status_code == 200
+    assert r.json() == {"path": "alpha.txt", "diff": "", "has_changes": False}
+
+
+def test_diff_tracked_modification_vs_head(loopback_client, session_cwd, _token_header):
+    sid, root, _outside = session_cwd
+    _git_init_with_head(root)
+    (root / "alpha.txt").write_text("hello alpha\nchanged\n", encoding="utf-8")
+    r = loopback_client.get(
+        f"/api/plugins/hermes-mobile/fs/diff?session_id={sid}&path=alpha.txt",
+        headers=_token_header,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["path"] == "alpha.txt"
+    assert body["has_changes"] is True
+    assert "diff --git a/alpha.txt b/alpha.txt" in body["diff"]
+    assert "+changed" in body["diff"]
+
+
+def test_diff_untracked_file_all_add(loopback_client, session_cwd, _token_header):
+    sid, root, _outside = session_cwd
+    _git_init_with_head(root)
+    (root / "new.txt").write_text("first\nsecond\n", encoding="utf-8")
+    r = loopback_client.get(
+        f"/api/plugins/hermes-mobile/fs/diff?session_id={sid}&path=new.txt",
+        headers=_token_header,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["path"] == "new.txt"
+    assert body["has_changes"] is True
+    assert "--- /dev/null" in body["diff"]
+    assert "+++ b/new.txt" in body["diff"]
+    assert "+first" in body["diff"]
+    assert "+second" in body["diff"]
 
 
 # ---------------------------------------------------------------------------

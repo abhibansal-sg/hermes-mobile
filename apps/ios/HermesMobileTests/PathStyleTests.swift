@@ -80,6 +80,7 @@ final class PathStyleTests: XCTestCase {
         let revoked = Data(#"{"revoked":true,"device_id":"d1","sockets_closed":0}"#.utf8)
         let fsList = Data(#"{"root":"/","path":"","entries":[]}"#.utf8)
         let fsRead = Data(#"{"path":"a","size":1,"encoding":"utf-8","content":"x","truncated":false}"#.utf8)
+        let fsDiff = Data(#"{"path":"a","diff":"","has_changes":false}"#.utf8)
 
         for style in [APIPathStyle.legacy, .plugin] {
             let prefix = style.mobileAPIPrefix
@@ -115,6 +116,10 @@ final class PathStyleTests: XCTestCase {
             client = makeClient(style: style, script: [(fsRead, 200)])
             _ = try await client.fsRead(sessionId: "s", path: "a")
             XCTAssertEqual(recordedPaths, ["\(prefix)/fs/read"])
+
+            client = makeClient(style: style, script: [(fsDiff, 200)])
+            _ = try await client.fsDiff(sessionId: "s", path: "a")
+            XCTAssertEqual(recordedPaths, ["\(prefix)/fs/diff"])
 
             client = makeClient(style: style, script: [(ok, 200)])
             _ = await client.registerLiveActivity(token: "t", sessionId: "s", env: "sandbox")
