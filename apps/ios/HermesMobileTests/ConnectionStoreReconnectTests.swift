@@ -81,9 +81,88 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         ]).decoded(as: SessionOpenResult.self)!
     }
 
+    #if DEBUG
+    private func configureWithoutGateway(
+        _ connection: ConnectionStore,
+        serverURL: String,
+        token: String,
+        issuedDeviceId: String? = nil
+    ) async -> String? {
+        connection.statusRPC = { _, _ in }
+        connection.connectRPC = { _, _, _ in }
+        return await connection.configure(
+            urlString: serverURL,
+            token: token,
+            issuedDeviceId: issuedDeviceId
+        )
+    }
+    #endif
+
     // MARK: - ABH-355: mid-turn gateway death survives + re-attaches
 
     #if DEBUG
+    func testSavedTokenConfigurePreservesRecordedDeviceIdWhenIssuedDeviceIdIsNil() async {
+        let (connection, _, _) = makeStore()
+        let serverURL = "https://gw.example:9119"
+        let priorServerURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
+        KeychainService.deleteToken(server: serverURL)
+        defer {
+            KeychainService.deleteToken(server: serverURL)
+            DefaultsKeys.setDeviceId(nil, server: serverURL)
+            if let priorServerURL {
+                UserDefaults.standard.set(priorServerURL, forKey: DefaultsKeys.serverURL)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+            }
+        }
+        try? KeychainService.saveToken("stored-device-token", server: serverURL)
+        DefaultsKeys.setDeviceId("dev_existing", server: serverURL)
+
+        let failure = await configureWithoutGateway(
+            connection,
+            serverURL: serverURL,
+            token: "stored-device-token"
+        )
+
+        XCTAssertNil(failure)
+        XCTAssertEqual(
+            DefaultsKeys.deviceId(server: serverURL),
+            "dev_existing",
+            "saved-token bootstrap/retry configure must not erase the recorded device_id"
+        )
+    }
+
+    func testConfigureRecordsNonNilIssuedDeviceId() async {
+        let (connection, _, _) = makeStore()
+        let serverURL = "https://gw.example:9120"
+        let priorServerURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
+        KeychainService.deleteToken(server: serverURL)
+        defer {
+            KeychainService.deleteToken(server: serverURL)
+            DefaultsKeys.setDeviceId(nil, server: serverURL)
+            if let priorServerURL {
+                UserDefaults.standard.set(priorServerURL, forKey: DefaultsKeys.serverURL)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+            }
+        }
+        DefaultsKeys.setDeviceId("dev_old", server: serverURL)
+
+        let failure = await configureWithoutGateway(
+            connection,
+            serverURL: serverURL,
+            token: "qr-v2-device-token",
+            issuedDeviceId: "dev_new"
+        )
+
+        XCTAssertNil(failure)
+        XCTAssertEqual(
+            DefaultsKeys.deviceId(server: serverURL),
+            "dev_new",
+            "QR v2/device-token configure must replace the recorded device_id"
+        )
+    }
+
     func testOutOfOrderForeignOwnershipMarkerDegradesWithoutCrashing() async {
         let (_, sessions, chat) = makeStore()
         sessions.activeStoredId = "stored-foreign-guard"

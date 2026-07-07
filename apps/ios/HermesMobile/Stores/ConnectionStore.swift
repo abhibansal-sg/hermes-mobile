@@ -448,6 +448,11 @@ final class ConnectionStore {
     var connectRPC: ((_ url: URL, _ token: String, _ mode: ConnectionMode) async throws -> Void)?
 
     #if DEBUG
+    /// Injectable configure status probe (tests). When non-nil, replaces the live
+    /// `RestClient.status()` call so unit tests can exercise verified configure
+    /// persistence without a gateway.
+    var statusRPC: ((_ url: URL, _ token: String) async throws -> Void)?
+
     /// Injectable auth-revoke probe (tests). When non-nil, replaces the live
     /// `probeIsAuthRevoked` REST call with this closure's return value so unit
     /// tests can drive the threshold → `reauthRequired` flip without a server.
@@ -698,9 +703,18 @@ final class ConnectionStore {
         phase = .connecting
 
         // Probe REST first to fail fast with a clear message before opening WS.
-        let probe = RestClient(baseURL: url, token: trimmedToken)
         do {
+            #if DEBUG
+            if let statusRPC {
+                try await statusRPC(url, trimmedToken)
+            } else {
+                let probe = RestClient(baseURL: url, token: trimmedToken)
+                _ = try await probe.status()
+            }
+            #else
+            let probe = RestClient(baseURL: url, token: trimmedToken)
             _ = try await probe.status()
+            #endif
         } catch {
             // An auth rejection on a probe means this token is no longer valid —
             // surface the re-pair affordance rather than a generic offline error
@@ -717,7 +731,11 @@ final class ConnectionStore {
         }
 
         do {
-            try await client.connect(baseURL: url, token: trimmedToken, mode: connectionMode)
+            if let connectRPC {
+                try await connectRPC(url, trimmedToken, connectionMode)
+            } else {
+                try await client.connect(baseURL: url, token: trimmedToken, mode: connectionMode)
+            }
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             phase = .offline(message)
@@ -733,11 +751,15 @@ final class ConnectionStore {
         // W3A-A QR v2: a `kind=device` pairing handed us a device token + its
         // server-minted `device_id`. Record the (non-secret) id so the panel can
         // mark "This device" and the auto-upgrade path sees this device already
-        // holds a device token (so it does NOT re-issue). The token is already in
-        // the Keychain above (it IS the stored credential). A v1/manual pairing
-        // passes `nil` here, so any stale id for this server is cleared and the
-        // post-connect auto-upgrade is free to issue a fresh device token.
-        DefaultsKeys.setDeviceId(issuedDeviceId, server: trimmedURL)
+        // holds a device token (so it does NOT re-issue). A nil id is ambiguous:
+        // saved-token bootstrap/retry paths also call configure without an
+        // issued id while reusing the already-stored device-token credential, so
+        // do not clear a recorded id here. Explicit self-revoke continues to clear
+        // via DevicesView, and manual shared-token pairing has no reliable signal
+        // in this call that the presented credential is not the stored one.
+        if let issuedDeviceId, !issuedDeviceId.isEmpty {
+            DefaultsKeys.setDeviceId(issuedDeviceId, server: trimmedURL)
+        }
 
         startLongLivedTasks()
         hasConnected = true
