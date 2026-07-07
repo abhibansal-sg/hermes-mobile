@@ -2197,8 +2197,9 @@ enum DrawerTab: String, CaseIterable, Identifiable {
 /// ABH-351 (SLICE 2) — the project detail view pushed when the user taps a
 /// project row in the drawer's Projects tab.
 ///
-/// Shows the project's sessions (those whose `cwd` matches the project's
-/// `root`, derived live from ``SessionStore``) and a prominent "New session
+/// Shows the project's sessions (fetched from the server-side project-sessions
+/// route via ``ProjectsStore``, keyed by the project's `id`/`root` — not
+/// derived from ``SessionStore``) and a prominent "New session
 /// in this project" action that starts a draft session seeded with the
 /// project's root as its cwd (``SessionStore/startDraft(cwd:)``).
 ///

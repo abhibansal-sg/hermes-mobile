@@ -3647,9 +3647,10 @@ struct SessionActionError: Identifiable, Equatable {
 /// (`GET /api/plugins/hermes-mobile/projects`) — the merged user-created +
 /// auto-discovered git-repo-roots + session-cwds list, junk-filtered, reshaped
 /// to `{id, label, root, session_count}`. The store exposes the fetched list
-/// plus designed loading / empty / error states, and derives per-project
-/// sessions from ``SessionStore`` (a project's sessions are the ones whose
-/// `cwd` matches the project's `root`).
+/// plus designed loading / empty / error states, and owns per-project session
+/// state fetched from the server-side project-sessions route (keyed by the
+/// project's normalized `id`/`root`) — it does not derive membership from
+/// ``SessionStore``.
 ///
 /// This slice is READ-ONLY browsing + session-start ONLY. Create-project /
 /// attach-folders / set-idea is a FAST-FOLLOW and lives outside this store.
@@ -3828,9 +3829,11 @@ final class ProjectsStore {
 /// session_count}` contract).
 ///
 /// `id` and `root` are both the repo root path (stable identity, matching how
-/// the desktop keys project entries). `session_count` is the number of sessions
-/// whose cwd resolved to that repo root (server-side count; the iOS client
-/// re-derives the live list from ``SessionStore`` for the detail view).
+/// the desktop keys project entries). `session_count` is a pre-fetch overview
+/// hint — the server-side count of sessions whose cwd resolved to that repo
+/// root at overview-fetch time. The detail view fetches its own
+/// server-authoritative session list and total via the project-sessions
+/// route, not this field.
 struct Project: Decodable, Identifiable, Sendable, Equatable, Hashable {
     let id: String
     let label: String
