@@ -1328,6 +1328,232 @@ def test_session_cwd_set_profile_session_updates_profile_db(monkeypatch, tmp_pat
     assert "launch_update" not in captured
 
 
+def test_load_cfg_reads_profile_override_path_and_isolates_cache(monkeypatch, tmp_path):
+    """_load_cfg must read profile_home/config.yaml when a Path hermes-home
+    override is active, not the launch profile's config — and the cache slot
+    must key on the resolved path so two profiles don't clobber each other
+    (STR-995/STR-991 profile-scoped config isolation)."""
+    launch_home = tmp_path / "launch"
+    profile_home = tmp_path / "profiles" / "worker"
+    launch_home.mkdir(parents=True)
+    profile_home.mkdir(parents=True)
+    (launch_home / "config.yaml").write_text(
+        "model:\n  default: launch-model\n", encoding="utf-8"
+    )
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: worker-model\n", encoding="utf-8"
+    )
+
+    monkeypatch.setattr(server, "_hermes_home", launch_home)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    token = None
+    try:
+        # Prime the cache with the LAUNCH config.
+        assert server._load_cfg()["model"]["default"] == "launch-model"
+
+        # Scope to the worker profile via a Path override and read again.
+        token = set_hermes_home_override(Path(profile_home))
+        worker_cfg = server._load_cfg()
+        assert worker_cfg["model"]["default"] == "worker-model", (
+            "profile override must read profile_home/config.yaml, not launch config"
+        )
+        # Cache isolation: the tracked path is the profile's config, proving the
+        # cache slot keys on the resolved path rather than a shared global.
+        assert server._cfg_path == Path(profile_home) / "config.yaml"
+
+        # Dropping the override returns to launch config (re-read, not stale).
+        reset_hermes_home_override(token)
+        token = None
+        assert server._load_cfg()["model"]["default"] == "launch-model"
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+
+
+def test_save_cfg_writes_profile_override_path_and_isolates_launch(monkeypatch, tmp_path):
+    """_save_cfg must write profile_home/config.yaml when a Path hermes-home
+    override is active, leaving the launch profile's config untouched — the
+    write-side counterpart of _load_cfg's override resolution
+    (STR-995/STR-991 profile-scoped config-write isolation)."""
+    launch_home = tmp_path / "launch"
+    profile_home = tmp_path / "profiles" / "worker"
+    launch_home.mkdir(parents=True)
+    profile_home.mkdir(parents=True)
+    (launch_home / "config.yaml").write_text(
+        "model:\n  default: launch-model\n", encoding="utf-8"
+    )
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: worker-model\n", encoding="utf-8"
+    )
+
+    monkeypatch.setattr(server, "_hermes_home", launch_home)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    token = None
+    try:
+        # Scope to the worker profile via a Path override and persist a change.
+        token = set_hermes_home_override(Path(profile_home))
+        server._save_cfg({"model": {"default": "worker-saved"}})
+
+        # The write landed in the profile's config, and the cache/path track it.
+        profile_written = (profile_home / "config.yaml").read_text(encoding="utf-8")
+        assert "worker-saved" in profile_written, (
+            "profile override must write profile_home/config.yaml, not launch config"
+        )
+        assert server._cfg_path == Path(profile_home) / "config.yaml"
+
+        # The launch profile config is untouched (no cross-profile bleed).
+        launch_written = (launch_home / "config.yaml").read_text(encoding="utf-8")
+        assert "launch-model" in launch_written, (
+            "launch profile config must not be mutated by a profile-scoped save"
+        )
+
+        # Dropping the override routes subsequent saves back to the launch profile.
+        reset_hermes_home_override(token)
+        token = None
+        server._save_cfg({"model": {"default": "launch-saved"}})
+        assert "launch-saved" in (launch_home / "config.yaml").read_text(encoding="utf-8")
+        assert "worker-saved" in (profile_home / "config.yaml").read_text(encoding="utf-8")
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+
+
+def _seed_live_session(sid, *, session_key, profile_home, history=None):
+    """Insert a minimal live session record into the gateway registry."""
+    server._sessions[sid] = {
+        "session_key": session_key,
+        "profile_home": profile_home,
+        "_finalized": False,
+        "history_lock": threading.Lock(),
+        "history": list(history or []),
+        "display_history_prefix": [],
+        "inflight_turn": None,
+        "running": False,
+        "created_at": time.time(),
+        "last_active": time.time(),
+        "transport": server._stdio_transport,
+    }
+    return server._sessions[sid]
+
+
+def test_session_resume_profile_scoped_does_not_reuse_other_profile_live(
+    monkeypatch, tmp_path
+):
+    """A live session in the launch profile must NOT satisfy a session.resume for
+    a different profile that happens to share the session key. profile_home must
+    be part of the reuse match — otherwise the worker resume binds the launch
+    agent (wrong config/model) and persists turns into the wrong profile DB
+    (crash class, STR-995/STR-991)."""
+    target = "shared-session-key"
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+
+    class ProfileDB:
+        def get_session(self, _t):
+            return {"id": target, "cwd": str(tmp_path)}
+
+        def get_session_by_title(self, _t):
+            return None
+
+        def reopen_session(self, _t):
+            pass
+
+        def get_messages_as_conversation(self, _t, include_ancestors=False):
+            return [{"role": "user", "content": "worker hi"}]
+
+    monkeypatch.setattr("hermes_state.SessionDB", lambda db_path=None: ProfileDB())
+    monkeypatch.setattr(server, "_profile_home", lambda _name: profile_home)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    try:
+        # A live session already exists in the LAUNCH profile under the same key.
+        _seed_live_session("L1", session_key=target, profile_home=None)
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": target, "profile": "worker"},
+            }
+        )
+
+        assert "error" not in resp
+        sid = resp["result"]["session_id"]
+        assert sid != "L1", "worker resume reused the launch-profile live session"
+        assert server._sessions[sid]["profile_home"] == str(profile_home)
+        # The launch live session is untouched.
+        assert server._sessions["L1"]["profile_home"] is None
+    finally:
+        server._sessions.clear()
+
+
+def test_session_resume_reuse_closes_orphaned_profile_db(monkeypatch, tmp_path):
+    """When a concurrent profile-scoped resume wins the live slot, the
+    freshly-opened profile SessionDB that never reached an agent must be closed
+    — otherwise every colliding reconnect leaks a SQLite handle (STR-995
+    contract 3). The launch db (_get_db singleton) must never be closed here."""
+    target = "worker-key"
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    closed = {"count": 0}
+
+    class ProfileDB:
+        def get_session(self, _t):
+            return {"id": target, "cwd": str(tmp_path)}
+
+        def get_session_by_title(self, _t):
+            return None
+
+        def reopen_session(self, _t):
+            pass
+
+        def get_messages_as_conversation(self, _t, include_ancestors=False):
+            return [{"role": "user", "content": "x"}]
+
+        def close(self):
+            closed["count"] += 1
+
+    monkeypatch.setattr("hermes_state.SessionDB", lambda db_path=None: ProfileDB())
+    monkeypatch.setattr(server, "_profile_home", lambda _name: profile_home)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+
+    try:
+        # An existing WORKER live session under the same key wins the reuse.
+        _seed_live_session(
+            "W1", session_key=target, profile_home=str(profile_home)
+        )
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": target, "profile": "worker"},
+            }
+        )
+
+        assert "error" not in resp
+        # Reused the existing worker live session (did not build a duplicate).
+        assert resp["result"]["session_id"] == "W1"
+        # The orphaned profile db opened for this request was closed, not leaked.
+        assert closed["count"] >= 1, "orphaned profile SessionDB handle leaked"
+    finally:
+        server._sessions.clear()
+
+
 def test_stored_session_runtime_overrides_skips_bare_billing_provider():
     """A bare billing bucket ("custom"/"auto"/"openrouter") must not be restored as the
     provider identity on resume. A custom endpoint that never used `/model` persists only
