@@ -2087,20 +2087,14 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     billing_provider = str(
         model_config.get("billing_provider") or row.get("billing_provider") or ""
     ).strip()
+    base_url = str(model_config.get("base_url") or "").strip()
     provider = explicit_provider
     if not provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
         provider = billing_provider
-    base_url = str(model_config.get("base_url") or "").strip()
-    # FIX (iOS resume "No LLM provider configured"): "custom" is a generic
-    # BILLING label the gateway assigns to non-standard providers (e.g. a local
-    # proxy), NOT a resolvable provider name. A session stored with
-    # billing_provider="custom" but NO base_url cannot reconstruct a working
-    # endpoint, so forcing provider="custom" into the override makes the agent
-    # rebuild fail on resume (a fresh session on the configured global provider
-    # builds fine). Drop the unresolvable provider so resume falls back to the
-    # configured global provider — the one the session actually ran on.
-    if provider == "custom" and not base_url:
-        provider = ""
+    elif not provider and billing_provider.lower() == "custom" and base_url:
+        # Bare "custom" billing bucket WITH a real base_url names a routable
+        # direct-alias endpoint, not the unresolvable bare class dropped above.
+        provider = billing_provider
     api_mode = str(model_config.get("api_mode") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
