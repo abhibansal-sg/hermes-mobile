@@ -1,10 +1,10 @@
 import XCTest
 @testable import HermesMobile
 
-/// Focused coverage for the file viewer's rendered-markdown mode selection
-/// (STR-659 arm A / STR-699). Exercises the pure, SwiftUI-free
-/// ``FileViewerMarkdown`` helpers so the mode-detection contract is locked
-/// independently of view rendering.
+/// Focused coverage for the file viewer's rendered-markdown path detection
+/// (STR-659 arm A / STR-699). The Source / Rendered / Diff mode contract lives
+/// in `FileViewerModeTests`; this file only locks the shared markdown
+/// eligibility heuristic.
 final class FileViewerMarkdownTests: XCTestCase {
 
     // MARK: - isMarkdownPath
@@ -45,43 +45,5 @@ final class FileViewerMarkdownTests: XCTestCase {
         XCTAssertFalse(FileViewerMarkdown.isMarkdownPath("archive.md.tar.gz"))
         XCTAssertTrue(FileViewerMarkdown.isMarkdownPath("weird.tar.md"))
         XCTAssertFalse(FileViewerMarkdown.isMarkdownPath("notmarkdown.txt"))
-    }
-
-    // MARK: - defaultViewMode
-
-    func testDefaultViewModeMarkdownWithoutDiffIsRendered() {
-        // Contract: a markdown file with no diff opens rendered.
-        XCTAssertEqual(
-            FileViewerMarkdown.defaultViewMode(isMarkdown: true, isDiffAvailable: false),
-            .rendered
-        )
-    }
-
-    func testDefaultViewModeMarkdownWithDiffIsSource() {
-        // When a diff IS available the diff arm owns presentation; source is the
-        // safe fallback and the user can still toggle to rendered.
-        XCTAssertEqual(
-            FileViewerMarkdown.defaultViewMode(isMarkdown: true, isDiffAvailable: true),
-            .source
-        )
-    }
-
-    func testDefaultViewModeNonMarkdownIsNil() {
-        XCTAssertNil(FileViewerMarkdown.defaultViewMode(isMarkdown: false, isDiffAvailable: false))
-        XCTAssertNil(FileViewerMarkdown.defaultViewMode(isMarkdown: false, isDiffAvailable: true))
-    }
-
-    // MARK: - ViewMode
-
-    func testViewModeExposesRenderedAndSourceCases() {
-        XCTAssertEqual(FileViewerMarkdown.ViewMode.allCases, [.rendered, .source])
-    }
-
-    func testViewModeIsEquatableAndHashableViaRawValue() {
-        // Round-trip through the raw value so the toggle's persistence surface
-        // (e.g. a future default) stays stable.
-        XCTAssertEqual(FileViewerMarkdown.ViewMode(rawValue: "rendered"), .rendered)
-        XCTAssertEqual(FileViewerMarkdown.ViewMode(rawValue: "source"), .source)
-        XCTAssertNil(FileViewerMarkdown.ViewMode(rawValue: "other"))
     }
 }

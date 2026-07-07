@@ -25,6 +25,15 @@ import UIKit
 /// a `@file:<path>` token is inserted in the composer WITHOUT touching
 /// ChatView/ComposerView here.
 ///
+/// **View modes** (STR-659/STR-701) — Source / Rendered (markdown-only) /
+/// Diff (only when a non-empty unified diff is available), picked via the
+/// leading toolbar menu when more than one applies. Auto-selection on load
+/// matches the desktop client: Diff > Rendered > Source
+/// (``FileViewerMode/autoSelect(diffText:isMarkdown:)``). The diff itself is
+/// loaded best-effort through `GET /api/fs/diff`; clean files, non-repo
+/// workspaces, and failed diff probes fall back to Rendered/Source without
+/// blocking the normal file read.
+///
 /// FULL NATIVE (UI-I): `ScrollView` + `Text` / `Image`; identity via `theme`/`tint`.
 struct FileViewerView: View {
     let rest: RestClient
@@ -50,6 +59,11 @@ struct FileViewerView: View {
     @State private var phase: PanelPhase<FSReadResult> = .loading
     @State private var imagePhase: ImagePhase = .idle
     @State private var didCopy = false
+    @State private var mode: FileViewerMode = .source
+    @State private var diffText: String?
+    /// Once the user picks a mode explicitly, auto-selection (on load or when
+    /// the diff fetch resolves) stops overriding their choice.
+    @State private var userDidSelectMode = false
 
     // MARK: - Image state machine
 
@@ -68,10 +82,19 @@ struct FileViewerView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
         .background(theme.bg)
-        .task { await load() }
+        .task(id: path) { await load() }
     }
 
     private var fileName: String { (path as NSString).lastPathComponent }
+
+    private var isMarkdownFile: Bool { FileViewerModeDetection.isMarkdown(path: path) }
+
+    /// Modes the toolbar picker should offer for the CURRENT file — always
+    /// includes Source; Rendered only for markdown; Diff only once a non-empty
+    /// diff has resolved.
+    private var availableModes: [FileViewerMode] {
+        FileViewerMode.availableModes(diffText: diffText, isMarkdown: isMarkdownFile)
+    }
 
     // MARK: - Content
 
@@ -86,10 +109,36 @@ struct FileViewerView: View {
                 Text(binarySizeLabel(result.size))
             }
         } else if let text = result.content {
-            textContent(text, truncated: result.truncated)
+            modeContent(text, truncated: result.truncated)
         } else {
             // encoding utf-8 but no content — degrade gracefully.
             ContentUnavailableView("No content", systemImage: "doc")
+        }
+    }
+
+    /// Routes text content to the active mode's renderer. `.rendered` and
+    /// `.diff` are only ever active when ``availableModes`` actually offers
+    /// them (markdown / non-empty diff respectively), so the `diffText ?? ""`
+    /// fallback here is defensive, not a real code path.
+    @ViewBuilder
+    private func modeContent(_ text: String, truncated: Bool) -> some View {
+        switch mode {
+        case .source:
+            textContent(text, truncated: truncated)
+        case .rendered:
+            ScrollView(.vertical) {
+                FileMarkdownBodyView(text: text.isEmpty ? "(empty file)" : text)
+                    .padding(16)
+                    .accessibilityIdentifier("fileViewerRendered")
+            }
+            .background(theme.bg)
+            .safeAreaInset(edge: .bottom) {
+                if truncated {
+                    truncationFooter
+                }
+            }
+        case .diff:
+            FileDiffView(diffText: diffText ?? "")
         }
     }
 
@@ -159,6 +208,25 @@ struct FileViewerView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+        // Mode picker (STR-701): only shown once there is an actual choice —
+        // a plain non-markdown, clean file has nothing but Source to offer.
+        if availableModes.count > 1 {
+            ToolbarItem(placement: .topBarLeading) {
+                Menu {
+                    ForEach(availableModes) { candidate in
+                        Button {
+                            userDidSelectMode = true
+                            mode = candidate
+                        } label: {
+                            Label(candidate.label, systemImage: candidate.systemImage)
+                        }
+                    }
+                } label: {
+                    Label(mode.label, systemImage: mode.systemImage)
+                }
+                .accessibilityIdentifier("fileViewerModePicker")
+            }
+        }
         ToolbarItem(placement: .topBarTrailing) {
             HStack(spacing: 4) {
                 // "Use in Message" — the mention seam (audit finding). Default
@@ -207,6 +275,13 @@ struct FileViewerView: View {
     private func load() async {
         if phase.value == nil { phase = .loading }
         imagePhase = .idle
+        diffText = nil
+        // Best-known mode BEFORE the diff resolves (no flicker to Source on
+        // markdown files that turn out to have a diff too — auto-select just
+        // upgrades to Diff a moment later if `refreshDiff` finds one).
+        if !userDidSelectMode {
+            mode = isMarkdownFile ? .rendered : .source
+        }
         do {
             let result = try await rest.fsRead(sessionId: sessionId, path: path)
             phase = .loaded(result)
@@ -216,8 +291,29 @@ struct FileViewerView: View {
             }
         } catch let error as FSReadError {
             phase = .failed(error.errorDescription ?? "Couldn't open file")
+            return
         } catch {
             phase = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            return
+        }
+        await refreshDiff()
+    }
+
+    /// Best-effort diff fetch (STR-701). Fires AFTER `phase` is already loaded:
+    /// the file content is on screen before this starts, so clean files,
+    /// non-repo workspaces, stale sessions, or endpoint failures never block
+    /// the normal file read.
+    private func refreshDiff() async {
+        do {
+            let result = try await rest.fsDiff(sessionId: sessionId, path: path)
+            diffText = result.hasChanges
+                ? FileViewerModeDetection.normalizedDiffText(result.diff)
+                : nil
+        } catch {
+            diffText = nil
+        }
+        if !userDidSelectMode {
+            mode = FileViewerMode.autoSelect(diffText: diffText, isMarkdown: isMarkdownFile)
         }
     }
 
