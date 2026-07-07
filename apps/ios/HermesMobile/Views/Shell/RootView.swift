@@ -54,6 +54,17 @@ struct RootView: View {
     /// ``showingInspector`` for the same reason.
     @State private var inspectorTab: InspectorTab = .inbox
 
+    #if DEBUG
+    /// STR-716: in-process live size-class override set by the DEBUG deep link
+    /// `hermesapp://debug/size-class/<compact|regular|auto>` (see
+    /// ``DebugSizeClassOverride``). `nil` = defer to the launch-env value then
+    /// the real size class. This is a `@State` (not a static) so flipping it
+    /// re-renders ``mainUI`` mid-process, letting automated iPad evidence force
+    /// the regular<->compact branch deterministically without OS Slide Over /
+    /// Split View or a relaunch.
+    @State private var debugSizeClassOverride: UserInterfaceSizeClass?
+    #endif
+
     var body: some View {
         content
             .environment(drawerState)
@@ -136,6 +147,22 @@ struct RootView: View {
                 )
                 .hermesThemed(themeStore)
             }
+            #if DEBUG
+            // STR-716: in-process size-class flip for automated iPad evidence
+            // (`hermesapp://debug/size-class/<compact|regular|auto>`). SwiftUI
+            // fans `.onOpenURL` out to every attached closure, so this debug
+            // handler runs alongside the real `HermesURLRouter` routing above
+            // without interfering with it (the router no-ops unknown hosts).
+            // Compiled out of Release.
+            .onOpenURL { url in
+                switch DebugSizeClassOverride.parse(url) {
+                case .compact: debugSizeClassOverride = .compact
+                case .regular: debugSizeClassOverride = .regular
+                case .clearAuto: debugSizeClassOverride = nil
+                case .notHandled: break
+                }
+            }
+            #endif
     }
 
     /// Binding driving the re-pair confirmation alert: `true` while a payload is
@@ -216,7 +243,7 @@ struct RootView: View {
 
     @ViewBuilder
     private var mainUI: some View {
-        if horizontalSizeClass == .regular {
+        if effectiveHorizontalSizeClass == .regular {
             SplitLayout(
                 showingInspector: $showingInspector,
                 inspectorTab: $inspectorTab
@@ -233,6 +260,25 @@ struct RootView: View {
         url.scheme?.lowercased() == "hermesapp"
             && url.host?.lowercased() == "debug"
             && url.pathComponents.dropFirst().map { $0.lowercased() } == ["open-settings"]
+    }
+
+    /// STR-716: the size class actually used to pick ``SplitLayout`` vs
+    /// ``CompactLayout``. In DEBUG builds this can be forced — at launch via
+    /// the `HERMES_UITEST_SIZE_CLASS` env seam, or in-process via the
+    /// `hermesapp://debug/size-class/<compact|regular|auto>` DEBUG deep link
+    /// (see ``DebugSizeClassOverride``) — so automated iPad evidence can flip
+    /// the branch deterministically without OS Slide Over/Split View, and
+    /// WITHOUT a relaunch. Release builds never reference the override — this
+    /// is just `horizontalSizeClass`.
+    private var effectiveHorizontalSizeClass: UserInterfaceSizeClass? {
+        #if DEBUG
+         DebugSizeClassOverride.effectiveSizeClass(
+             real: horizontalSizeClass,
+             liveOverride: debugSizeClassOverride
+        )
+        #else
+         horizontalSizeClass
+         #endif
     }
 }
 
@@ -320,6 +366,64 @@ enum InboxPresentationRouting {
         return .routeToInspector
     }
 }
+
+#if DEBUG
+/// STR-716: DEBUG-only horizontal size-class override seam for automated iPad
+/// regular<->compact UI evidence. Mirrors the existing `HERMES_UITEST_DEEPLINK`
+/// launch-env pattern (``HermesMobileApp``). Compiled out of Release entirely,
+/// so release behavior — and the binary — is unaffected.
+///
+/// Two entry points:
+/// 1. **Launch env** `HERMES_UITEST_SIZE_CLASS=compact|regular` — forces the
+///    branch from first render. Good for relaunch-based layout evidence, but a
+///    relaunch resets in-memory `@State`, so it alone CANNOT show an unsaved
+///    form value surviving a transition.
+/// 2. **In-process deep link** `hermesapp://debug/size-class/<compact|regular|auto>`
+///    — flips ``RootView/mainUI``'s branch mid-process (via
+///    ``RootView/debugSizeClassOverride``) without relaunching. `auto` clears
+///    the live override (back to env/real). Reachable by both
+///    `simctl openurl` and `XCUIApplication.openURL(_:)` (iOS 16.4+).
+///
+/// Absent/unrecognized values always fall through to the real size class.
+enum DebugSizeClassOverride {
+    /// Result of parsing a DEBUG size-class deep link.
+    enum URLResult: Equatable {
+        case compact
+        case regular
+        /// `hermesapp://debug/size-class/auto` — clear the live override.
+        case clearAuto
+        /// Not a size-class debug URL; the caller must leave the override as-is.
+        case notHandled
+    }
+
+     /// Resolves the effective size class for ``RootView/mainUI``. The app-level
+     /// launch-environment seam has already updated `real`; an in-process deep
+     /// link override wins over that value until cleared.
+     static func effectiveSizeClass(
+         real: UserInterfaceSizeClass?,
+         liveOverride: UserInterfaceSizeClass?
+     ) -> UserInterfaceSizeClass? {
+         liveOverride ?? real
+     }
+
+    /// Parses `hermesapp://debug/size-class/<compact|regular|auto>` (host/path
+    /// form, case-insensitive value). Any other URL — including other
+    /// `hermesapp://` routes the real router owns — returns `.notHandled`.
+    static func parse(_ url: URL) -> URLResult {
+        guard url.scheme?.lowercased() == "hermesapp",
+              url.host?.lowercased() == "debug" else { return .notHandled }
+        // pathComponents[0] == "/", [1] == "size-class", [2] == value
+        let pc = url.pathComponents
+        guard pc.count >= 3, pc[1].lowercased() == "size-class" else { return .notHandled }
+        switch pc[2].lowercased() {
+        case "compact": return .compact
+        case "regular": return .regular
+        case "auto": return .clearAuto
+        default: return .notHandled
+        }
+    }
+}
+#endif
 
 // MARK: - Regular width (split view)
 
