@@ -181,6 +181,78 @@ def test_authenticated_post_401_clears_and_remints_once(monkeypatch, tmp_path):
     assert json.loads(path.read_text())["agent_id"] == "new-agent"
 
 
+def test_relay_pairing_401_remints_and_persists_fresh_pairing(monkeypatch, tmp_path):
+    fake = _install_fake_httpx(
+        monkeypatch,
+        [
+            _FakeResponse(401, text="revoked"),
+            _FakeResponse(200, {"agent_id": "new-agent", "agent_secret": "new-secret"}),
+            _FakeResponse(200, {"pairing_secret": "new-pair"}),
+        ],
+    )
+    path = tmp_path / "push" / "relay.json"
+    client = relay.RelayClient(relay_url="https://relay", credentials_path=path)
+    client._write_credentials(
+        relay.RelayCredentials(
+            "https://relay",
+            "old-agent",
+            "old-secret",
+            pairing="old-pair",
+        )
+    )
+
+    relay_url, agent_id, pairing = asyncio.run(client.relay_pairing())
+
+    pairing_posts = [
+        call for call in fake.calls if call["url"].endswith("/v1/agents/pairing")
+    ]
+    assert relay_url == "https://relay"
+    assert agent_id == "new-agent"
+    assert pairing == "new-pair"
+    assert [call["headers"]["X-Hermes-Agent-Id"] for call in pairing_posts] == [
+        "old-agent",
+        "new-agent",
+    ]
+    assert json.loads(path.read_text()) == {
+        "agent_id": "new-agent",
+        "agent_secret": "new-secret",
+        "pairing": "new-pair",
+        "relay_url": "https://relay",
+    }
+
+
+def test_relay_pairing_401_then_attestation_required_drops_stale_file(
+    monkeypatch,
+    tmp_path,
+):
+    _install_fake_httpx(
+        monkeypatch,
+        [
+            _FakeResponse(401, text="revoked"),
+            _FakeResponse(
+                400,
+                {"detail": "attestation required"},
+                text="attestation required",
+            ),
+        ],
+    )
+    path = tmp_path / "push" / "relay.json"
+    client = relay.RelayClient(relay_url="https://relay", credentials_path=path)
+    client._write_credentials(
+        relay.RelayCredentials(
+            "https://relay",
+            "old-agent",
+            "old-secret",
+            pairing="old-pair",
+        )
+    )
+
+    with pytest.raises(relay.NeedsAttestation):
+        asyncio.run(client.relay_pairing())
+
+    assert not path.exists()
+
+
 def test_credentials_raise_needs_attestation(monkeypatch, tmp_path):
     _install_fake_httpx(
         monkeypatch,

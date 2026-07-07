@@ -282,7 +282,7 @@ class RelayClient:
         *,
         authenticated: bool,
         attestation: dict | None = None,
-    ) -> None:
+    ) -> httpx.Response:
         response: httpx.Response | None = None
         attempts = 2 if authenticated else 1
         for attempt in range(attempts):
@@ -307,6 +307,7 @@ class RelayClient:
             # that skips the loop fails loudly instead of crashing on None.
             raise RuntimeError("relay request produced no response")
         response.raise_for_status()
+        return response
 
     async def _credentials(self, attestation: dict | None = None) -> RelayCredentials:
         existing = self._read_credentials()
@@ -359,8 +360,9 @@ class RelayClient:
 
     async def relay_pairing(self) -> tuple[str, str, str]:
         """Return ``(relay_url, agent_id, pairing)`` for a relay setup link."""
+        await self._credentials()
+        pairing = await self._mint_pairing()
         creds = await self._credentials()
-        pairing = await self._mint_pairing(creds)
         return self.relay_url, creds.agent_id, pairing
 
     async def tunnel_status(self) -> dict:
@@ -388,18 +390,11 @@ class RelayClient:
                 return last
             await asyncio.sleep(max(0.1, interval_s))
 
-    async def _mint_pairing(self, creds: RelayCredentials) -> str:
+    async def _mint_pairing(self) -> str:
         """Rotate + fetch a fresh pairing token for an already-enrolled agent."""
-        headers = {
-            "X-Hermes-Agent-Id": creds.agent_id,
-            "Authorization": f"Bearer {creds.agent_secret}",
-        }
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                f"{self.relay_url}/v1/agents/pairing", headers=headers, json={}
-            )
-        response.raise_for_status()
+        response = await self._post("/v1/agents/pairing", {}, authenticated=True)
         pairing = str(response.json()["pairing_secret"])
+        creds = await self._credentials()
         # Persist alongside the existing identity so the file stays a valid
         # pairing record (drives setup / tunnel autostart in later slices).
         self._write_credentials(

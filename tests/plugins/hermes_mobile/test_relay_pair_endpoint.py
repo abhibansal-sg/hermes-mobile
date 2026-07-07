@@ -110,3 +110,34 @@ def test_post_relay_pair_rejects_missing_relay_url(client, monkeypatch):
     assert response.json()["code"] == 4001
     assert "relay URL" in response.json()["error"]
     assert calls == []
+
+
+def test_post_relay_pair_maps_attestation_required_without_secrets(
+    client,
+    relay_env,
+    monkeypatch,
+):
+    class AttestationRequiredClient:
+        async def relay_pairing(self):
+            raise relay.NeedsAttestation("relay requires attestation to enroll")
+
+    relay.set_relay_config(
+        relay_url="https://relay.example.test/root",
+        registration_token="registration-token-secret",
+        hermes_home=relay_env,
+    )
+    monkeypatch.setattr(
+        relay,
+        "relay_client",
+        lambda hermes_home=None: AttestationRequiredClient(),
+    )
+
+    response = client.post(f"{_PREFIX}/relay/pair", headers=_TOKEN_HEADER)
+
+    assert response.status_code == 428
+    assert response.json() == {
+        "error": "relay requires attestation to enroll",
+        "code": 4002,
+    }
+    assert "agent_secret" not in response.text
+    assert "registration-token-secret" not in response.text
