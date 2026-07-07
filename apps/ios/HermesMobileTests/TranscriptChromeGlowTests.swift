@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import HermesMobile
 
 /// Transcript-chrome glow-shell + context-line tests (STR-1029 / STR-1005).
@@ -210,6 +211,72 @@ final class TranscriptChromeGlowTests: XCTestCase {
         XCTAssertNotEqual(ChatView.StatusGlowToken.ringAlphaMin,
                           ChatView.StatusGlowToken.ringAlphaMax,
             "breathing must animate between two distinct alphas (not static)")
+    }
+
+    // MARK: - Reading measure reconciliation (STR-1102)
+    //
+    // STR-1098 named the previously-anonymous `720` regular-width clamp
+    // `ChatView.transcriptReadingMeasure`; STR-1102 reconciles the user
+    // `MessageBubble` column onto the same token instead of its own
+    // `screenWidth * 0.78` formula drifting independently at regular width.
+
+    /// Pins the shared token's value so an accidental edit is caught by CI
+    /// rather than silently drifting the transcript rows and bubble column
+    /// apart again.
+    func testTranscriptReadingMeasureValue() {
+        XCTAssertEqual(ChatView.transcriptReadingMeasure, 800, accuracy: 0.001)
+    }
+
+    /// Compact (iPhone) transcript rows must remain unbounded — unchanged by
+    /// the token reconciliation.
+    func testTranscriptRowMaxWidthCompactIsUnbounded() {
+        XCTAssertEqual(ChatView.transcriptRowMaxWidth(isCompact: true), .infinity)
+    }
+
+    /// Regular (iPad) transcript rows (status glow, context line) must use
+    /// the shared token, not an anonymous literal.
+    func testTranscriptRowMaxWidthRegularUsesSharedToken() {
+        XCTAssertEqual(
+            ChatView.transcriptRowMaxWidth(isCompact: false),
+            ChatView.transcriptReadingMeasure,
+            accuracy: 0.001)
+    }
+
+    /// Regular-width alignment parity: at an iPad logical width (1024pt,
+    /// matching the evidence harness), the user `MessageBubble` cap must
+    /// equal the transcript row cap — the exact drift STR-1098/STR-1102
+    /// exist to close.
+    func testUserBubbleRegularWidthMatchesTranscriptRowToken() {
+        let bubbleCap = MessageBubble.userBubbleMaxWidth(
+            screenWidth: 1_024, horizontalSizeClass: .regular)
+        let rowCap = ChatView.transcriptRowMaxWidth(isCompact: false)
+        XCTAssertEqual(bubbleCap, rowCap, accuracy: 0.001,
+            "regular-width MessageBubble cap must equal the shared transcript reading measure")
+        XCTAssertEqual(bubbleCap, ChatView.transcriptReadingMeasure, accuracy: 0.001)
+    }
+
+    /// Compact behavior is unchanged: at an iPhone logical width (390pt,
+    /// matching the evidence harness), the user bubble cap must still be the
+    /// original 78%-of-screen formula.
+    func testUserBubbleCompactWidthUnchanged() {
+        let cap = MessageBubble.userBubbleMaxWidth(
+            screenWidth: 390, horizontalSizeClass: .compact)
+        XCTAssertEqual(cap, 390 * 0.78, accuracy: 0.001)
+        XCTAssertEqual(cap, 390 * MessageBubble.userBubbleCompactWidthFraction, accuracy: 0.001)
+    }
+
+    /// A `nil` size class (e.g. no environment injected) must fall back to
+    /// the compact formula rather than silently widening to the iPad token —
+    /// the safer default for an unknown context.
+    func testUserBubbleNilSizeClassFallsBackToCompactFormula() {
+        let cap = MessageBubble.userBubbleMaxWidth(screenWidth: 390, horizontalSizeClass: nil)
+        XCTAssertEqual(cap, 390 * 0.78, accuracy: 0.001)
+    }
+
+    /// Pins the original 78% compact ratio so it cannot silently drift while
+    /// being refactored into a named constant.
+    func testUserBubbleCompactWidthFractionUnchanged() {
+        XCTAssertEqual(MessageBubble.userBubbleCompactWidthFraction, 0.78, accuracy: 0.001)
     }
 
     // MARK: - Helpers

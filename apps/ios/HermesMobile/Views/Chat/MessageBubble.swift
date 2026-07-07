@@ -2,7 +2,9 @@ import SwiftUI
 
 /// A single transcript entry.
 ///
-/// - User: a trailing-aligned bronze bubble, capped at 78% width.
+/// - User: a trailing-aligned bronze bubble, capped at 78% width in compact
+///   (iPhone) layouts and at the shared transcript reading measure
+///   (``ChatView/transcriptReadingMeasure``) in regular (iPad) layouts.
 /// - Assistant: a leading-aligned, bubble-less "document" — optional thinking,
 ///   a tool timeline, then markdown-rendered text with a streaming cursor.
 /// - System / tool: small, centered, secondary captions.
@@ -10,6 +12,10 @@ struct MessageBubble: View {
     @Environment(\.hermesTheme) private var theme
     @Environment(ConnectionStore.self) private var connectionStore
     @Environment(SessionStore.self) private var sessionStore
+    /// Drives the regular-width (iPad) user-bubble cap so it shares
+    /// ``ChatView/transcriptReadingMeasure`` with the status glow and context
+    /// line instead of drifting from its own 78%-of-screen formula (STR-1098).
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     /// The message to render.
     let message: ChatMessage
@@ -326,10 +332,28 @@ struct MessageBubble: View {
     /// threshold for the `isLongUserMessage` heuristic.
     static let userBubbleCollapsedLines = 8
 
-    /// Cap user bubbles at 78% of the screen width while letting short messages
-    /// hug their content.
+    /// Cap user bubbles at 78% of the screen width in compact (iPhone) layouts
+    /// while letting short messages hug their content; in regular (iPad)
+    /// layouts share ``ChatView/transcriptReadingMeasure`` with the inline
+    /// status glow and context line so the message column and its trailing
+    /// chrome rows share one cap (STR-1098).
     private var maxBubbleWidth: CGFloat {
-        UIScreen.main.bounds.width * 0.78
+        Self.userBubbleMaxWidth(
+            screenWidth: UIScreen.main.bounds.width,
+            horizontalSizeClass: horizontalSizeClass)
+    }
+
+    /// Fraction of the compact (iPhone) screen width a user bubble may occupy.
+    static let userBubbleCompactWidthFraction: CGFloat = 0.78
+
+    /// Pure width decision behind ``maxBubbleWidth``: the 78% compact cap, or
+    /// the shared ``ChatView/transcriptReadingMeasure`` token in regular
+    /// width. Static so tests can pin both branches without a live view.
+    static func userBubbleMaxWidth(screenWidth: CGFloat, horizontalSizeClass: UserInterfaceSizeClass?) -> CGFloat {
+        guard horizontalSizeClass == .regular else {
+            return screenWidth * userBubbleCompactWidthFraction
+        }
+        return ChatView.transcriptReadingMeasure
     }
 
     // MARK: - Assistant

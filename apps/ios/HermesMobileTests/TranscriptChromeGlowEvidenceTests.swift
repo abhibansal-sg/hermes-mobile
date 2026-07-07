@@ -62,7 +62,7 @@ final class TranscriptChromeGlowEvidenceTests: XCTestCase {
         // 2. iPad — glow active (regular, normal motion)
         try renderAndSave(
             name: "02-ipad-glow-active",
-            caption: "iPad · regular · glow ACTIVE — clamped to ≤720pt reading measure (not full-bleed)",
+            caption: "iPad · regular · glow ACTIVE — clamped to ≤\(Int(ChatView.transcriptReadingMeasure))pt reading measure (not full-bleed)",
             width: ipadWidth, sizeClass: .regular,
             content: transcriptTail(store: store, showGlow: true))
         paths.append("02-ipad-glow-active.png")
@@ -89,10 +89,20 @@ final class TranscriptChromeGlowEvidenceTests: XCTestCase {
         // 5. iPad — context line (regular width)
         try renderAndSave(
             name: "05-ipad-context-line",
-            caption: "iPad · regular · context line — clamped to ≤720pt reading measure",
+            caption: "iPad · regular · context line — clamped to ≤\(Int(ChatView.transcriptReadingMeasure))pt reading measure",
             width: ipadWidth, sizeClass: .regular,
             content: contextTail(summary: contextSummary))
         paths.append("05-ipad-context-line.png")
+
+        // 6. iPad — a real user MessageBubble rendered adjacent to the status
+        //    row, proving first-hand (not just asserted) that both share the
+        //    same regular-width reading measure (STR-1102).
+        try renderAndSave(
+            name: "06-ipad-bubble-and-status-parity",
+            caption: "iPad · regular · MessageBubble + TurnActivityBar share the \(Int(ChatView.transcriptReadingMeasure))pt reading measure",
+            width: ipadWidth, sizeClass: .regular,
+            content: bubbleAndStatusParityTail(store: store))
+        paths.append("06-ipad-bubble-and-status-parity.png")
 
         // Assert all PNGs exist and are non-trivially sized.
         for name in paths {
@@ -100,6 +110,16 @@ final class TranscriptChromeGlowEvidenceTests: XCTestCase {
             let size = try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int ?? 0
             XCTAssertGreaterThan(size, 2_000, "Evidence PNG \(name) is suspiciously small (\(size) bytes)")
         }
+
+        // Measured-cap parity: print + assert the same values the PNGs show,
+        // so the evidence is backed by a hard number, not just a rendered
+        // pixel comparison (STR-1102).
+        let regularBubbleCap = MessageBubble.userBubbleMaxWidth(
+            screenWidth: ipadWidth, horizontalSizeClass: .regular)
+        let regularRowCap = ChatView.transcriptRowMaxWidth(isCompact: false)
+        XCTAssertEqual(regularBubbleCap, regularRowCap, accuracy: 0.001,
+                        "Regular-width MessageBubble cap must equal the shared transcript reading measure")
+        print("=== STR-1102 REGULAR-WIDTH CAP PARITY: bubble=\(regularBubbleCap) row=\(regularRowCap) ===")
 
         // Print the directory for host-side extraction.
         print("\n=== STR-1029 GLOW EVIDENCE DIR ===\n\(evidenceDir.path)\n=== END ===\n")
@@ -177,6 +197,32 @@ final class TranscriptChromeGlowEvidenceTests: XCTestCase {
                 .padding(.top, ChatView.intraTurnGap)
             Color.clear.frame(height: 24)
         }
+    }
+
+    /// A transcript tail showing a real production `MessageBubble` (user role,
+    /// regular width) immediately above the production `TurnActivityBar`, so
+    /// the reconciled reading measure (STR-1102) is visible edge-to-edge in
+    /// one frame rather than only asserted numerically. Needs the same
+    /// `ConnectionStore`/`SessionStore` environment objects `MessageBubble`
+    /// reads in production.
+    @ViewBuilder
+    private func bubbleAndStatusParityTail(store: ChatStore) -> some View {
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: store)
+        let userMessage = ChatMessage(
+            role: .user,
+            text: "Let's reconcile the reading measure across the status row and the bubble column.")
+        VStack(alignment: .leading, spacing: 0) {
+            MessageBubble(message: userMessage)
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+            TurnActivityBar(chatStore: store)
+                .padding(.horizontal, 16)
+                .padding(.top, ChatView.intraTurnGap)
+            Color.clear.frame(height: 24)
+        }
+        .environment(connection)
+        .environment(sessions)
     }
 
     // MARK: - ImageRenderer bridge
