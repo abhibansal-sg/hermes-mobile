@@ -2413,6 +2413,29 @@ def _remove_custom_provider_credentials_from_config(slug: str) -> bool:
     return True
 
 
+def _delete_custom_provider_config_entry(slug: str) -> bool:
+    """Remove the entire ``providers.<slug>`` custom-provider entry.
+
+    STR-110: a custom provider is born as one atomic unit
+    ``{name, base_url, api_mode, key_env}`` from POST /providers/custom —
+    name/base_url/api_mode are how that credential is addressed, NOT
+    independent tuning. The disconnect path must therefore pop the WHOLE
+    subtree. Stripping only ``api_key``/``key_env`` left a
+    ``{name, base_url, api_mode}`` config husk that resurfaced as a ghost
+    authenticated/user-config row in the dashboard and provider list.
+    Returns True when an entry existed and was removed.
+    """
+    from hermes_cli.config import load_config, save_config
+
+    config = load_config()
+    providers = config.get("providers")
+    if not isinstance(providers, dict) or slug not in providers:
+        return False
+    providers.pop(slug, None)
+    save_config(config)
+    return True
+
+
 def _custom_provider_entries() -> Dict[str, Dict[str, Any]]:
     """Read all custom-provider config entries from config.yaml (ABH-257).
 
@@ -3216,12 +3239,15 @@ async def remove_provider_key(
                 cleared_env = True
         except ValueError:
             pass
-        # Remove credential fields from config.yaml. Pure credential-only custom
-        # entries are deleted entirely so stock model discovery cannot resurface
-        # an empty providers.<slug> husk as a ghost user-config row. Entries with
-        # non-credential tuning keep that tuning and lose only api_key/key_env.
+        # STR-110: remove the ENTIRE providers.<slug> custom-provider entry.
+        # Custom providers are written as one {name, base_url, api_mode,
+        # key_env} unit by POST /providers/custom, so name/base_url/api_mode
+        # are part of the credential unit — NOT independent tuning. Stripping
+        # only api_key/key_env left a {name, base_url, api_mode} husk that
+        # resurfaced as a ghost dashboard/provider-list row; deleting the whole
+        # subtree guarantees no husk survives the disconnect.
         try:
-            cleared_config = _remove_custom_provider_credentials_from_config(slug)
+            cleared_config = _delete_custom_provider_config_entry(slug)
         except ValueError:
             pass
 
