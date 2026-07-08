@@ -2143,6 +2143,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     billing_provider = str(
         model_config.get("billing_provider") or row.get("billing_provider") or ""
     ).strip()
+    base_url = str(model_config.get("base_url") or "").strip()
     provider = explicit_provider
     if not provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
         provider = billing_provider

@@ -703,6 +703,9 @@ final class ConnectionStore {
         phase = .connecting
 
         // Probe REST first to fail fast with a clear message before opening WS.
+        let previousToken = KeychainService.loadToken(server: trimmedURL)
+        let isSavedTokenReuse = issuedDeviceId == nil && previousToken == trimmedToken
+
         do {
             #if DEBUG
             if let statusRPC {
@@ -754,11 +757,13 @@ final class ConnectionStore {
         // holds a device token (so it does NOT re-issue). A nil id is ambiguous:
         // saved-token bootstrap/retry paths also call configure without an
         // issued id while reusing the already-stored device-token credential, so
-        // do not clear a recorded id here. Explicit self-revoke continues to clear
-        // via DevicesView, and manual shared-token pairing has no reliable signal
-        // in this call that the presented credential is not the stored one.
+        // preserve only when the presented token matches the stored one.
+        // Explicit self-revoke continues to clear via DevicesView, and nil-id
+        // manual/shared-token pairing clears any stale id so auto-upgrade can run.
         if let issuedDeviceId, !issuedDeviceId.isEmpty {
             DefaultsKeys.setDeviceId(issuedDeviceId, server: trimmedURL)
+        } else if !isSavedTokenReuse {
+            DefaultsKeys.setDeviceId(nil, server: trimmedURL)
         }
 
         startLongLivedTasks()

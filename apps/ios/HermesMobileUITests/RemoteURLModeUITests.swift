@@ -44,6 +44,7 @@ final class RemoteURLModeUITests: XCTestCase {
         app.launchEnvironment["HERMES_TOKEN"] = token
         // Seed the connection mode as remoteURL so the transport path is explicit.
         app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         // A successful connect lands on the chat shell — the drawerToggle in the
@@ -69,6 +70,7 @@ final class RemoteURLModeUITests: XCTestCase {
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
         app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         let drawerToggle = app.buttons["drawerToggle"]

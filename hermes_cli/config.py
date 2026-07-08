@@ -7420,61 +7420,70 @@ def save_env_value(key: str, value: str):
     read_kw = {"encoding": "utf-8-sig", "errors": "replace"}
     write_kw = {"encoding": "utf-8"}
 
-    lines = []
-    if env_path.exists():
-        with open(env_path, **read_kw) as f:
-            lines = f.readlines()
-        # Sanitize on every read: split concatenated keys, drop stale placeholders
-        lines = _sanitize_env_lines(lines)
+    # Serialize the full read-modify-write of .env (read -> sanitize ->
+    # _quote_env_value -> mutate -> atomic tempfile replace -> os.environ
+    # update -> invalidate_env_cache) so concurrent writers cannot interleave.
+    # Without this, a dashboard "Save"/rotate racing a "Disconnect"/Delete for
+    # the same slug can produce torn/partial lines and diverge the UI from
+    # server state (STR-111). The lock is reentrant (RLock) and shared with the
+    # config.yaml read/write paths; save/remove_env_value never call those, so
+    # no nesting concerns.
+    with _CONFIG_LOCK:
+        lines = []
+        if env_path.exists():
+            with open(env_path, **read_kw) as f:
+                lines = f.readlines()
+            # Sanitize on every read: split concatenated keys, drop stale placeholders
+            lines = _sanitize_env_lines(lines)
 
-    serialized_value = _quote_env_value(value)
+        serialized_value = _quote_env_value(value)
 
-    # Find and update or append
-    found = False
-    for i, line in enumerate(lines):
-        if line.strip().startswith(f"{key}="):
-            lines[i] = f"{key}={serialized_value}\n"
-            found = True
-            break
+        # Find and update or append
+        found = False
+        for i, line in enumerate(lines):
+            if line.strip().startswith(f"{key}="):
+                lines[i] = f"{key}={serialized_value}\n"
+                found = True
+                break
 
-    if not found:
-        # Ensure there's a newline at the end of the file before appending
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
-        lines.append(f"{key}={serialized_value}\n")
-    
-    fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix='.tmp', prefix='.env_')
-    # Preserve original permissions so Docker volume mounts aren't clobbered.
-    original_mode = None
-    if env_path.exists():
-        try:
-            original_mode = stat.S_IMODE(env_path.stat().st_mode)
-        except OSError:
-            pass
-    try:
-        with os.fdopen(fd, 'w', **write_kw) as f:
-            f.writelines(lines)
-            f.flush()
-            os.fsync(f.fileno())
-        atomic_replace(tmp_path, env_path)
-        # Preserve the original file mode (e.g. 0640 for Docker volume mounts)
-        # instead of letting _secure_file unconditionally tighten to 0600.
-        if original_mode is not None:
+        if not found:
+            # Ensure there's a newline at the end of the file before appending
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+            lines.append(f"{key}={serialized_value}\n")
+
+        fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix='.tmp', prefix='.env_')
+        # Preserve original permissions so Docker volume mounts aren't clobbered.
+        original_mode = None
+        if env_path.exists():
             try:
-                os.chmod(env_path, original_mode)
+                original_mode = stat.S_IMODE(env_path.stat().st_mode)
             except OSError:
                 pass
-        else:
-            _secure_file(env_path)
-    except BaseException:
         try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, 'w', **write_kw) as f:
+                f.writelines(lines)
+                f.flush()
+                os.fsync(f.fileno())
+            atomic_replace(tmp_path, env_path)
+            # Preserve the original file mode (e.g. 0640 for Docker volume mounts)
+            # instead of letting _secure_file unconditionally tighten to 0600.
+            if original_mode is not None:
+                try:
+                    os.chmod(env_path, original_mode)
+                except OSError:
+                    pass
+            else:
+                _secure_file(env_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
-    os.environ[key] = value
-    invalidate_env_cache()
+        os.environ[key] = value
+        invalidate_env_cache()
 
 
 def remove_env_value(key: str) -> bool:
@@ -7500,54 +7509,60 @@ def remove_env_value(key: str) -> bool:
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
     env_path = get_env_path()
-    if not env_path.exists():
-        os.environ.pop(key, None)
-        return False
 
     read_kw = {"encoding": "utf-8-sig", "errors": "replace"}
     write_kw = {"encoding": "utf-8"}
 
-    with open(env_path, **read_kw) as f:
-        lines = f.readlines()
-    lines = _sanitize_env_lines(lines)
+    # Serialize the full read-modify-write of .env (exists check -> read ->
+    # sanitize -> remove -> atomic tempfile replace -> os.environ pop ->
+    # invalidate_env_cache) under the same lock as save_env_value() so a
+    # racing save/remove pair for the same slug can't interleave (STR-111).
+    with _CONFIG_LOCK:
+        if not env_path.exists():
+            os.environ.pop(key, None)
+            return False
 
-    new_lines = [line for line in lines if not line.strip().startswith(f"{key}=")]
-    found = len(new_lines) < len(lines)
+        with open(env_path, **read_kw) as f:
+            lines = f.readlines()
+        lines = _sanitize_env_lines(lines)
 
-    if found:
-        fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix='.tmp', prefix='.env_')
-        # Preserve original permissions so Docker volume mounts aren't clobbered.
-        original_mode = None
-        try:
-            original_mode = stat.S_IMODE(env_path.stat().st_mode)
-        except OSError:
-            pass
-        try:
-            with os.fdopen(fd, 'w', **write_kw) as f:
-                f.writelines(new_lines)
-                f.flush()
-                os.fsync(f.fileno())
-            atomic_replace(tmp_path, env_path)
-            # Preserve the original file mode (e.g. 0640 for Docker volume
-            # mounts) instead of letting _secure_file unconditionally tighten
-            # to 0600. Mirrors save_env_value().
-            if original_mode is not None:
-                try:
-                    os.chmod(env_path, original_mode)
-                except OSError:
-                    pass
-            else:
-                _secure_file(env_path)
-        except BaseException:
+        new_lines = [line for line in lines if not line.strip().startswith(f"{key}=")]
+        found = len(new_lines) < len(lines)
+
+        if found:
+            fd, tmp_path = tempfile.mkstemp(dir=str(env_path.parent), suffix='.tmp', prefix='.env_')
+            # Preserve original permissions so Docker volume mounts aren't clobbered.
+            original_mode = None
             try:
-                os.unlink(tmp_path)
+                original_mode = stat.S_IMODE(env_path.stat().st_mode)
             except OSError:
                 pass
-            raise
+            try:
+                with os.fdopen(fd, 'w', **write_kw) as f:
+                    f.writelines(new_lines)
+                    f.flush()
+                    os.fsync(f.fileno())
+                atomic_replace(tmp_path, env_path)
+                # Preserve the original file mode (e.g. 0640 for Docker volume
+                # mounts) instead of letting _secure_file unconditionally tighten
+                # to 0600. Mirrors save_env_value().
+                if original_mode is not None:
+                    try:
+                        os.chmod(env_path, original_mode)
+                    except OSError:
+                        pass
+                else:
+                    _secure_file(env_path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
 
-    os.environ.pop(key, None)
-    invalidate_env_cache()
-    return found
+        os.environ.pop(key, None)
+        invalidate_env_cache()
+        return found
 
 
 def save_anthropic_oauth_token(value: str, save_fn=None):

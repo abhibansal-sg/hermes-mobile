@@ -20,6 +20,7 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
+import atexit
 import os
 import sys
 import tempfile
@@ -677,6 +678,11 @@ def _live_system_guard(request, monkeypatch):
         "daemon-reload", "try-restart", "reload-or-restart",
     )
     _PROCESS_KILLERS = ("pkill", "killall", "taskkill", "skill", "fuser")
+    # System audio players tools/voice_mode.py::play_audio_file falls back to
+    # when its sounddevice path is unavailable (afplay is native on macOS and
+    # needs no optional dependency at all, so it's the most reliably-reachable
+    # real-audio leak in the suite). See STR-860.
+    _AUDIO_PLAYER_BINS = ("afplay", "ffplay", "aplay")
 
     def _cmd_to_string(cmd) -> str:
         if cmd is None:
@@ -734,6 +740,18 @@ def _live_system_guard(request, monkeypatch):
                     return True
         return False
 
+    def _is_audio_playback_command(cmd) -> bool:
+        cmd_str = _cmd_to_string(cmd)
+        try:
+            tokens = _shlex.split(cmd_str)
+        except ValueError:
+            tokens = cmd_str.split()
+        for tok in tokens:
+            head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            if head in _AUDIO_PLAYER_BINS:
+                return True
+        return False
+
     def _check_subprocess_cmd(name, cmd):
         if _is_blocked_systemctl(cmd):
             raise RuntimeError(
@@ -750,6 +768,16 @@ def _live_system_guard(request, monkeypatch):
                 "targeting hermes/python could hit the live gateway. "
                 "Mark with @pytest.mark.live_system_guard_bypass if "
                 "intentional."
+            )
+        if _is_audio_playback_command(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — this would play real audio "
+                "through the host's speakers (tools.voice_mode.play_audio_file's "
+                "afplay/ffplay/aplay fallback). Mock subprocess.Popen or "
+                "tools.voice_mode.play_audio_file in the test instead, or mark "
+                "with @pytest.mark.live_system_guard_bypass if real playback "
+                "is genuinely needed."
             )
         # Block any subprocess that would run `hermes update` (or the
         # equivalent `python -m hermes_cli.main update`).  These commands
@@ -895,3 +923,236 @@ def _live_system_guard(request, monkeypatch):
         pass
 
     yield
+
+
+# ── Chrome/Chromium debug-launch guard ──────────────────────────────────────
+#
+# STR-860: ``_browser_connect`` in ``tui_gateway/server.py`` does a call-time
+# ``from hermes_cli.browser_connect import launch_chrome_debug`` and invokes
+# it directly whenever the default local CDP endpoint isn't already up. Left
+# unmocked, that call spawns a REAL ``/Applications/Google Chrome.app`` (or
+# other Chromium-family binary) process with a visible window. Three tests in
+# ``tests/test_tui_gateway_server.py`` believed they were preventing this by
+# patching ``hermes_cli.browser_connect.try_launch_chrome_debug`` — a legacy
+# wrapper (``return launch_chrome_debug(port, system).launched``) that
+# ``_browser_connect`` never calls. Those tests provided zero protection on
+# that path. (``try_launch_chrome_debug`` is NOT dead code in general — CLI's
+# ``HermesCLI._try_launch_chrome_debug`` still calls it — it's just dead on
+# the specific path these three tests exercise.)
+#
+# This autouse fixture makes a real launch impossible by default, suite-wide,
+# regardless of whether an individual test remembers to mock the right
+# symbol: ``launch_chrome_debug`` returns a non-launched
+# ``ChromeDebugLaunch()`` and never reaches ``subprocess.Popen`` — the only
+# spawn point in the whole browser-connect module. A test that needs
+# different launch semantics overrides it with its own
+# ``monkeypatch.setattr(...)`` after this fixture runs; monkeypatch undoes in
+# LIFO order so the test's patch simply wins for its duration.
+#
+# Deliberately NOT also stubbed here: ``get_chrome_debug_candidates``. It
+# never spawns anything itself (``manual_chrome_debug_command`` — the other
+# in-module caller besides ``launch_chrome_debug`` — only builds a display
+# string), and ``tests/cli/test_cli_browser_connect.py`` tests its real
+# candidate-detection logic directly (mocking ``shutil.which`` /
+# ``os.path.isfile``, not this function). Stubbing it globally to ``[]``
+# would silently break that real coverage for zero additional safety, since
+# ``launch_chrome_debug`` being replaced wholesale already makes it
+# unreachable from the one path that matters.
+#
+# One deliberate exemption: ``tests/cli/test_cli_browser_connect.py`` is the
+# dedicated unit-test file for ``launch_chrome_debug`` / ``try_launch_chrome_debug``
+# / ``get_chrome_debug_candidates`` themselves — it tests their REAL behavior
+# (candidate ordering, retry-next-candidate-on-crash, Windows quoting, ...).
+# Every test there that reaches the real ``subprocess.Popen`` already mocks
+# ``subprocess.Popen`` (and usually ``get_chrome_debug_candidates``) itself,
+# so it is independently hermetic without this guard — but globally replacing
+# ``launch_chrome_debug`` would neuter exactly the function those tests exist
+# to verify (some reach it via the still-live ``try_launch_chrome_debug`` ->
+# ``HermesCLI._try_launch_chrome_debug`` path, whose call-time lookup of
+# ``launch_chrome_debug`` inside ``browser_connect.py``'s own module globals
+# would otherwise resolve to this fixture's fake). Skip the patch there.
+#
+# Real-browser integration tests, if one is ever added, MUST be env-gated
+# (e.g. ``@pytest.mark.skipif(not os.environ.get("HERMES_TEST_REAL_CHROME"))``)
+# so they never run by default, in CI, or under a seat's default suite run.
+# No such test exists today, and none is added here.
+_CHROME_LAUNCH_GUARD_EXEMPT_FILES = frozenset({"tests/cli/test_cli_browser_connect.py"})
+
+
+@pytest.fixture(autouse=True)
+def _guard_chrome_debug_launch(request, monkeypatch):
+    """Hard-mock the real Chrome-family browser launch path (see above)."""
+    rel_path = os.path.relpath(str(request.node.fspath), start=str(PROJECT_ROOT))
+    if rel_path.replace(os.sep, "/") in _CHROME_LAUNCH_GUARD_EXEMPT_FILES:
+        yield
+        return
+
+    import hermes_cli.browser_connect as _browser_connect_mod
+
+    def _fake_launch_chrome_debug(port=None, system=None):
+        return _browser_connect_mod.ChromeDebugLaunch(launched=False, attempts=[])
+
+    monkeypatch.setattr(
+        _browser_connect_mod, "launch_chrome_debug", _fake_launch_chrome_debug
+    )
+    yield
+
+
+# ── TTS / audio-sink mute ───────────────────────────────────────────────────
+#
+# STR-860: two lazy-imported sinks can emit REAL audible sound through the
+# host's speakers if a test reaches them unmocked:
+#   • ``tools/tts_tool.py``'s ``stream_tts_to_speaker`` opens a
+#     ``sounddevice.OutputStream`` (behind ``_import_sounddevice()``).
+#   • ``tools/voice_mode.py``'s ``play_audio_file`` / ``play_beep`` open a
+#     ``sounddevice`` stream (behind ``_import_audio()``) or, failing that,
+#     fall back to a subprocess audio player (guarded separately above).
+# Neither sink is a core dependency (``sounddevice`` ships only in the
+# optional ``[voice]`` extra), so on a machine without it installed these
+# tests already degrade gracefully via ``ImportError``. But a dev/CI box that
+# DOES have the extra installed loses that free protection — any test that
+# forgets to mock these paths plays real audio. Default both lazy-import
+# wrappers to raise ``ImportError`` so the "no audio hardware" behavior the
+# suite already exercises is the behavior every test gets, regardless of
+# what's actually installed on the host.
+#
+# This deliberately does NOT touch ``tools.tts_tool.text_to_speech_tool`` or
+# ``check_tts_requirements`` — several tests
+# (``tests/tools/test_tts_max_text_length.py``,
+# ``tests/tools/test_tts_command_providers.py``,
+# ``tests/tools/test_tts_gemini.py``) call those directly to test their real
+# behavior (file generation, provider selection) and don't touch actual audio
+# hardware; muting them here would break real coverage for no safety benefit.
+# Tests that need a working fake ``sounddevice`` (e.g.
+# ``tests/tools/test_voice_mode.py``, ``tests/tools/test_voice_cli_integration.py``)
+# already patch ``_import_sounddevice`` / ``_import_audio`` themselves —
+# those patches simply take precedence over this default.
+def _muted_import_sounddevice():
+    raise ImportError("tests/conftest.py: sounddevice muted by default (STR-860)")
+
+
+def _muted_import_audio():
+    raise ImportError("tests/conftest.py: sounddevice muted by default (STR-860)")
+
+
+@pytest.fixture(autouse=True)
+def _mute_tts_audio_sinks(monkeypatch):
+    """Default the lazy sounddevice imports to "hardware unavailable" (see above)."""
+    try:
+        import tools.tts_tool as _tts_tool_mod
+    except ImportError:
+        _tts_tool_mod = None
+    if _tts_tool_mod is not None:
+        monkeypatch.setattr(
+            _tts_tool_mod, "_import_sounddevice", _muted_import_sounddevice, raising=False
+        )
+
+    try:
+        import tools.voice_mode as _voice_mode_mod
+    except ImportError:
+        _voice_mode_mod = None
+    if _voice_mode_mod is not None:
+        monkeypatch.setattr(
+            _voice_mode_mod, "_import_audio", _muted_import_audio, raising=False
+        )
+
+    yield
+
+
+# ── Chrome-debug-process leak reaper ────────────────────────────────────────
+#
+# STR-860: with the launch guard above, no test-run process should ever spawn
+# a real Chrome/Chromium debug instance. This is defense in depth for the
+# cases the guard can't cover — e.g. a test that bypasses the guard with
+# ``@pytest.mark.live_system_guard_bypass``-style direct ``subprocess.Popen``
+# usage, or a pre-existing leaked process from a run that crashed hard before
+# this guard existed.
+#
+# Reaping is scoped as tightly as possible so it can NEVER touch a user's
+# real, in-use browser profile:
+#   • cmdline must contain ``--remote-debugging-port`` (only debug-mode
+#     Chrome instances use this).
+#   • cmdline must ALSO contain a ``--user-data-dir`` whose path is inside
+#     the pytest tmp root (``/private/tmp/pytest-of-*`` on macOS, or
+#     ``$TMPDIR/pytest-of-*`` generally) — this is guaranteed for any process
+#     ``launch_chrome_debug`` would have spawned during a test run, because
+#     ``chrome_debug_data_dir()`` resolves under ``get_hermes_home()``, and
+#     ``HERMES_HOME`` is redirected to a per-test tempdir under the pytest
+#     tmp root by ``_hermetic_environment``. A real Chrome debug session a
+#     developer starts by hand uses their real ``HERMES_HOME`` and is never
+#     under this path, so it is never a match.
+# Runs both as a pytest session-finalizer (covers the common case: process
+# exits normally) and via ``atexit`` (covers a hard interpreter exit that
+# skips pytest's own teardown, e.g. an uncaught SystemExit).
+#
+# Honest limit: neither hook runs after ``SIGKILL`` — the process is gone
+# before any Python code, ours included, gets a chance to run. That gap is
+# covered by the launch guard above, not by this reaper: with real launches
+# blocked by default, there is nothing left to leak in the ``SIGKILL``
+# mid-run case.
+def _iter_pytest_tmp_roots():
+    roots = set()
+    tmp_env = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    roots.add(os.path.realpath(tmp_env))
+    roots.add(os.path.realpath("/tmp"))
+    roots.add(os.path.realpath("/private/tmp"))
+    return roots
+
+
+def _is_leaked_chrome_debug_process(proc) -> bool:
+    try:
+        cmdline = proc.cmdline()
+    except Exception:
+        return False
+    if not any("--remote-debugging-port" in tok for tok in cmdline):
+        return False
+    user_data_dir = None
+    for tok in cmdline:
+        if tok.startswith("--user-data-dir="):
+            user_data_dir = tok.split("=", 1)[1]
+            break
+    if not user_data_dir:
+        return False
+    real_dir = os.path.realpath(user_data_dir)
+    tmp_roots = _iter_pytest_tmp_roots()
+    if not any(
+        real_dir == root or real_dir.startswith(root.rstrip(os.sep) + os.sep)
+        for root in tmp_roots
+    ):
+        return False
+    # Extra belt-and-suspenders: only ever reap paths that look like our own
+    # pytest tmp dirs, never a bare "/tmp" or a user's real home directory.
+    return "pytest-of-" in real_dir or os.path.basename(os.path.dirname(real_dir)) == "hermes_test" or "chrome-debug" in real_dir
+
+
+def _reap_leaked_chrome_debug_processes():
+    try:
+        import psutil
+    except ImportError:
+        return
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            if not _is_leaked_chrome_debug_process(proc):
+                continue
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+        except Exception:
+            # Process already gone, or we lack permission — either way there's
+            # nothing left to reap.
+            continue
+
+
+atexit.register(_reap_leaked_chrome_debug_processes)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _reap_chrome_debug_leaks_at_session_end():
+    """Kill any pytest-tmp-scoped Chrome debug process that survived the run.
+
+    See block comment above for scoping rules and the honest SIGKILL caveat.
+    """
+    yield
+    _reap_leaked_chrome_debug_processes()

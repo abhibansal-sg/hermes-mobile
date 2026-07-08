@@ -12,6 +12,91 @@ final class LiveTurnReentryTests: XCTestCase {
     private let storedId = "stored-live-reentry"
     private let runtimeId = "rt-live-reentry"
 
+    private final class SessionStatusTransport: GatewayWebSocketTask, @unchecked Sendable {
+        private var inbox: [URLSessionWebSocketTask.Message] = []
+        private var waiter: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
+        private let lock = NSLock()
+
+        private(set) var sentMethods: [String] = []
+        private(set) var sentParams: [[String: Any]] = []
+
+        init() {
+            enqueue(.string(
+                #"{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready"}}"#
+            ))
+        }
+
+        func resume() {}
+        func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {}
+
+        func receive() async throws -> URLSessionWebSocketTask.Message {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                if !inbox.isEmpty {
+                    let next = inbox.removeFirst()
+                    lock.unlock()
+                    continuation.resume(returning: next)
+                } else {
+                    waiter = continuation
+                    lock.unlock()
+                }
+            }
+        }
+
+        func send(_ message: URLSessionWebSocketTask.Message) async throws {
+            guard case let .string(text) = message,
+                  let data = text.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let id = object["id"] as? String,
+                  let method = object["method"] as? String
+            else { return }
+
+            record(method: method, params: object["params"] as? [String: Any] ?? [:])
+            enqueue(.string(Self.statusResponseFrame(id: id)))
+            await Task.yield()
+        }
+
+        private func record(method: String, params: [String: Any]) {
+            lock.lock()
+            sentMethods.append(method)
+            sentParams.append(params)
+            lock.unlock()
+        }
+
+        private func enqueue(_ message: URLSessionWebSocketTask.Message) {
+            lock.lock()
+            if let waiter {
+                self.waiter = nil
+                lock.unlock()
+                waiter.resume(returning: message)
+            } else {
+                inbox.append(message)
+                lock.unlock()
+            }
+        }
+
+        private static func statusResponseFrame(id: String) -> String {
+            let result = #"""
+            {
+              "output": "partial assistant text",
+              "running": true,
+              "model": "gpt-5.5",
+              "provider": "openai",
+              "usage": {
+                "input": 1234,
+                "output": 56,
+                "total": 1290,
+                "context_used": 43210,
+                "context_max": 128000,
+                "context_percent": 34,
+                "compressions": 1
+              }
+            }
+            """#
+            return #"{"jsonrpc":"2.0","id":"\#(id)","result":\#(result)}"#
+        }
+    }
+
     private func makeStore() -> (ChatStore, SessionStore) {
         let chat = ChatStore()
         let sessions = SessionStore()
@@ -53,6 +138,32 @@ final class LiveTurnReentryTests: XCTestCase {
             lastActive: 0,
             cwd: nil
         )
+    }
+
+    func testSessionStatusRealWireDecodesStructuredResult() async throws {
+        let transport = SessionStatusTransport()
+        let client = HermesGatewayClient(transportFactory: { _ in transport })
+        try await client.connect(baseURL: URL(string: "ws://127.0.0.1:9999")!, token: "t")
+
+        let status: SessionStatusResult = try await client.request(
+            "session.status",
+            params: .object(["session_id": .string(runtimeId)]),
+            timeout: .seconds(2)
+        )
+
+        XCTAssertEqual(transport.sentMethods, ["session.status"])
+        XCTAssertEqual(transport.sentParams.first?["session_id"] as? String, runtimeId)
+        XCTAssertEqual(status.running, true)
+        XCTAssertEqual(status.model, "gpt-5.5")
+        XCTAssertEqual(status.provider, "openai")
+        XCTAssertEqual(status.usage?.input, 1234)
+        XCTAssertEqual(status.usage?.output, 56)
+        XCTAssertEqual(status.usage?.total, 1290)
+        XCTAssertEqual(status.usage?.contextUsed, 43_210)
+        XCTAssertEqual(status.usage?.contextMax, 128_000)
+        XCTAssertEqual(status.usage?.contextPercent, 34)
+        XCTAssertEqual(status.usage?.compressions, 1)
+        await client.disconnect()
     }
 
     func testStatusRunningRestoresStreamingPlaceholderStopStateAndActionGate() async {

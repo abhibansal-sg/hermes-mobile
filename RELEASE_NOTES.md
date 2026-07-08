@@ -1,3 +1,55 @@
+Build 96 — 2026-07-08
+
+WHAT'S NEW
+- Tool-row copy + dismiss parity (STR-518)
+- Inline glow transcript status shell (STR-1026)
+
+FIXED
+- Add mobile plugin toolset provider-select endpoint
+- STR-110 — remove custom-provider ghost config husk on disconnect
+- Mute app audio during UI tests (STR-1085)
+
+IMPROVED
+- Align push pair flow tests with new event keys STR-1215
+
+WORTH TRYING
+- Try: Tool-row copy + dismiss parity (STR-518)
+- Try: Inline glow transcript status shell (STR-1026)
+- Try: Add mobile plugin toolset provider-select endpoint
+
+(+3 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
+Build 95 — 2026-07-08
+
+FIXED
+- Stabilize size-class survival UI test
+- STR-272 repark refused ask prompt
+
+IMPROVED
+- Add STR-1021 provider key survival harness
+
+WORTH TRYING
+- Try: Stabilize size-class survival UI test
+- Try: STR-272 repark refused ask prompt
+
+(+6 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
+Build 94 — 2026-07-07
+
+FIXED
+- STR-272 repark refused ask prompt
+
+WORTH TRYING
+- Try: STR-272 repark refused ask prompt
+
+(+5 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 93 — 2026-07-07
 
 (+1 server-side/infra changes active on the gateway, no app UI change)

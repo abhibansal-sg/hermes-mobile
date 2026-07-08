@@ -399,6 +399,81 @@ final class RenderingTests: XCTestCase {
                      "Only image_generate should take the native image-card branch")
     }
 
+    // MARK: - Tool row copy payload (STR-518)
+
+    func testCopyPayloadPrefersSubstantialResultPreview() {
+        // >16 chars of result wins (desktop `hasSubstantialOutput` threshold).
+        let activity = ToolActivity(
+            id: "tool-1", name: "execute_code",
+            argsSummary: "{\"code\": \"print('hi')\"}",
+            progressText: "",
+            resultPreview: String(repeating: "x", count: 40),
+            state: .done, durationMs: nil, todos: nil
+        )
+        XCTAssertEqual(ToolActivityRow.copyPayload(for: activity), String(repeating: "x", count: 40))
+    }
+
+    func testCopyPayloadStripsANSIFromResult() {
+        let activity = ToolActivity(
+            id: "tool-1", name: "terminal",
+            argsSummary: "", progressText: "",
+            resultPreview: "\u{1B}[32mall good here, output is long\u{1B}[0m",
+            state: .done, durationMs: nil, todos: nil
+        )
+        XCTAssertEqual(ToolActivityRow.copyPayload(for: activity), "all good here, output is long")
+    }
+
+    func testCopyPayloadFallsBackToArgsWhenResultIsShort() {
+        // resultPreview ≤ 16 chars → args are the more useful payload.
+        let activity = ToolActivity(
+            id: "tool-1", name: "web_search",
+            argsSummary: "rust async runtime", progressText: "",
+            resultPreview: "no hits",
+            state: .done, durationMs: nil, todos: nil
+        )
+        XCTAssertEqual(ToolActivityRow.copyPayload(for: activity), "rust async runtime")
+    }
+
+    func testCopyPayloadFallsBackToShortResultWhenNoArgs() {
+        // Short non-empty result + no args must copy the RESULT, not the tool
+        // name — desktop (fallback-model/index.ts:1216-1218) prefers any
+        // non-empty detail over the title. Regression for STR-518 review fix.
+        let activity = ToolActivity(
+            id: "tool-1", name: "web_search",
+            argsSummary: "", progressText: "",
+            resultPreview: "no hits",
+            state: .done, durationMs: nil, todos: nil
+        )
+        XCTAssertEqual(ToolActivityRow.copyPayload(for: activity), "no hits",
+                       "A short result with no args must copy the result, not the tool name")
+    }
+
+    func testCopyPayloadFallsBackToNameWhenNoDetail() {
+        let activity = ToolActivity(
+            id: "tool-1", name: "mystery_tool", argsSummary: "   ",
+            progressText: "", resultPreview: "   ",
+            state: .running, durationMs: nil, todos: nil
+        )
+        XCTAssertEqual(ToolActivityRow.copyPayload(for: activity), "mystery_tool")
+    }
+
+    // MARK: - Tool row dismissal gate (STR-518)
+
+    func testCanDismissOnlyForTerminalStates() {
+        XCTAssertTrue(ToolClusterView.canDismiss(state: .done))
+        XCTAssertTrue(ToolClusterView.canDismiss(state: .failed))
+        XCTAssertFalse(ToolClusterView.canDismiss(state: .running),
+                       "Running rows must stay visible and never be dismissible")
+    }
+
+    func testPrunedDismissedIDsDropsStaleHides() {
+        let dismissed: Set<String> = ["a", "b", "z"]
+        let current: Set<String> = ["a", "b", "c"]
+        XCTAssertEqual(ToolClusterView.prunedDismissedIDs(dismissed, toolIDs: current),
+                       ["a", "b"],
+                       "Hides for ids no longer in the cluster must be pruned")
+    }
+
     private func XCTAssertProse(
         _ segment: MessageSegmenter.Segment,
         _ expected: String,

@@ -1,5 +1,17 @@
 import Foundation
 
+enum UITestAudioGuard {
+#if DEBUG
+    nonisolated(unsafe) static var argumentsForTesting: (() -> [String])?
+
+    static var isUITestAudioMuted: Bool {
+        (argumentsForTesting?() ?? ProcessInfo.processInfo.arguments).contains("--uitest-mute-audio")
+    }
+#else
+    static var isUITestAudioMuted: Bool { false }
+#endif
+}
+
 /// Composition root: builds the store graph once at launch.
 @MainActor
 final class AppEnvironment {
@@ -260,6 +272,8 @@ final class VoiceConversationAutoSpeakCoordinator {
         chat: ChatStore,
         controller: VoiceConversationController
     ) async {
+        guard !UITestAudioGuard.isUITestAudioMuted else { return }
+
         let reply = chat.latestCompletedAssistantReply(excluding: lastSpokenAssistantReplyId)
         if let reply {
             lastSpokenAssistantReplyId = reply.id

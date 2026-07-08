@@ -949,6 +949,14 @@ def notify(
     push failure can never break the calling gateway hook.
     """
     if os.environ.get("HERMES_MOBILE_RELAY_URL"):
+        # Mirror the direct-APNs per-event gate: a known alert event type
+        # must have at least one recipient whose preferences include it,
+        # otherwise we skip the relay enqueue and return 0. Unknown event
+        # types fall open to the legacy unconditional relay delivery.
+        if event_type in PUSH_EVENT_KINDS and not any(
+            recipients_for_event(event_type).values()
+        ):
+            return 0
         try:
             from . import relay_client
         except Exception:
