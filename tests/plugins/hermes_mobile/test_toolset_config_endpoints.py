@@ -378,6 +378,116 @@ def test_put_toolset_config_clears_env_and_returns_refreshed_safe_row(
 # ===========================================================================
 
 
+def test_put_toolset_provider_requires_token(loopback_client, monkeypatch):
+    _patch_toolset_helpers(monkeypatch)
+
+    r = loopback_client.put(
+        f"{_PREFIX}/toolsets/web/provider",
+        json={"provider": "Kagi"},
+    )
+
+    assert r.status_code == 401
+
+
+def test_put_toolset_provider_device_without_approve_scope_is_403(
+    loopback_client, monkeypatch
+):
+    _patch_toolset_helpers(monkeypatch)
+    monkeypatch.setattr(_api(), "_has_dashboard_api_auth", lambda _request: True)
+    monkeypatch.setattr(_api(), "_device_has_scope", lambda _request, _scope: False)
+
+    r = loopback_client.put(
+        f"{_PREFIX}/toolsets/web/provider",
+        json={"provider": "Kagi"},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 403
+
+
+def test_put_toolset_provider_unknown_toolset_is_4002(loopback_client, monkeypatch):
+    _patch_toolset_helpers(monkeypatch)
+
+    r = loopback_client.put(
+        f"{_PREFIX}/toolsets/nope/provider",
+        json={"provider": "Kagi"},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 400
+    assert r.json()["code"] == 4002
+
+
+def test_put_toolset_provider_unknown_provider_is_400(loopback_client, monkeypatch):
+    calls = _patch_toolset_helpers(monkeypatch)
+
+    r = loopback_client.put(
+        f"{_PREFIX}/toolsets/web/provider",
+        json={"provider": "NotARealProvider"},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 400, r.text
+    assert r.json()["code"] == 4001
+    assert calls["save_env"] == []
+    assert calls["remove_env"] == []
+
+
+def test_put_toolset_provider_persists_via_apply_provider_selection_and_activates(
+    loopback_client, monkeypatch
+):
+    """Selecting DuckDuckGo (currently inactive) must delegate to
+    apply_provider_selection()/save_config() — never hand-write
+    web.backend/image_gen.provider in the route — and the refreshed response
+    must mark the newly-selected provider active."""
+    import hermes_cli.config as config
+    import hermes_cli.tools_config as tools_config
+
+    _patch_toolset_helpers(monkeypatch, active_provider="Kagi")
+
+    apply_calls = []
+    save_calls = []
+
+    def _apply_provider_selection(ts_key, provider_name, cfg):
+        apply_calls.append((ts_key, provider_name, dict(cfg)))
+        # Emulate the real helper's side effect of writing config in place.
+        cfg.setdefault("web", {})["backend"] = "duckduckgo"
+
+    def _save_config(cfg, **kwargs):
+        save_calls.append(dict(cfg))
+
+    monkeypatch.setattr(
+        tools_config, "apply_provider_selection", _apply_provider_selection
+    )
+    monkeypatch.setattr(config, "save_config", _save_config)
+
+    # After the selection, treat DuckDuckGo as the active provider so the
+    # refreshed payload proves activation via is_active/active_provider.
+    monkeypatch.setattr(
+        tools_config,
+        "_is_provider_active",
+        lambda provider, cfg, *, force_fresh=False: provider.get("name")
+        == "DuckDuckGo",
+    )
+
+    r = loopback_client.put(
+        f"{_PREFIX}/toolsets/web/provider",
+        json={"provider": "DuckDuckGo"},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    assert apply_calls and apply_calls[0][0] == "web"
+    assert apply_calls[0][1] == "DuckDuckGo"
+    assert save_calls, "save_config must be called to persist the selection"
+
+    body = r.json()
+    assert body["name"] == "web"
+    assert body["active_provider"] == "DuckDuckGo"
+    ddg_row = next(p for p in body["providers"] if p["name"] == "DuckDuckGo")
+    assert ddg_row["is_active"] is True
+
+
 def test_put_toolset_config_managed_key_set_is_4006_and_preserves_live_env(
     loopback_client, monkeypatch
 ):

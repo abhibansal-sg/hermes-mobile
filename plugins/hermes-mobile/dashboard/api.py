@@ -2746,6 +2746,58 @@ async def set_toolset_config(
     return refreshed
 
 
+class ToolsetProviderBody(BaseModel):
+    provider: str
+
+
+@router.put("/toolsets/{name}/provider")
+async def set_toolset_provider(
+    name: str, body: ToolsetProviderBody, request: Request
+) -> Any:
+    """Persist a provider selection for a toolset (no key prompting).
+
+    Mirrors the desktop ``PUT /api/tools/toolsets/{name}/provider`` route —
+    delegates to the shared, non-interactive
+    ``hermes_cli.tools_config.apply_provider_selection`` so mobile and
+    desktop write identical config keys (``web.backend``, ``tts.provider``,
+    etc.). Never mutates ``.env`` or ``os.environ`` — credential mutation
+    stays exclusive to ``PUT /config``. Returns the refreshed config payload
+    so the caller sees ``active_provider``/``is_active`` update immediately.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(
+            status_code=403, detail="Device token lacks approve scope"
+        )
+
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.tools_config import apply_provider_selection
+
+    name = (name or "").strip()
+    if name not in _valid_toolset_config_names():
+        return _toolset_config_unknown_response(name)
+
+    provider = (body.provider or "").strip()
+    if not provider:
+        return JSONResponse(
+            status_code=400, content={"error": "provider required", "code": 4001}
+        )
+
+    config = load_config()
+    try:
+        apply_provider_selection(name, provider, config)
+    except KeyError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(exc).strip('"'), "code": 4001},
+        )
+    save_config(config)
+
+    refreshed, _allowed = _toolset_config_payload(name)
+    return refreshed
+
+
 @router.get("/providers")
 async def list_providers(request: Request) -> Dict[str, Any]:
     """List the provider universe + per-provider authenticated? flag.
