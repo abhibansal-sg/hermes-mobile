@@ -157,6 +157,20 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
         let rawMode = json["api_mode"]?.stringValue ?? ""
         self.apiMode = rawMode.isEmpty ? nil : ProviderAPIMode(rawValue: rawMode)
     }
+
+    func copy(isCurrent: Bool? = nil, authenticated: Bool? = nil) -> ProviderRow {
+        ProviderRow(
+            slug: slug,
+            name: name,
+            authType: authType,
+            isCurrent: isCurrent ?? self.isCurrent,
+            authenticated: authenticated ?? self.authenticated,
+            totalModels: totalModels,
+            models: models,
+            baseURL: baseURL,
+            apiMode: apiMode
+        )
+    }
 }
 
 /// `POST <prefix>/providers/{slug}/key` and `POST <prefix>/providers/custom`
