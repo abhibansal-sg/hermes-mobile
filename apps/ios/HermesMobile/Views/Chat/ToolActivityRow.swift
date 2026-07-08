@@ -74,11 +74,67 @@ struct ToolClusterView: View {
     }
 
     var body: some View {
-        if collapsed && tools.count >= 2 {
-            collapsedCluster
-        } else {
-            liveCluster
+        Group {
+            if collapsed && tools.count >= 2 {
+                collapsedCluster
+            } else {
+                liveCluster
+            }
         }
+        // STR-608: `expandedToolIDs`/`isExpanded` are seeded once in `init` —
+        // a live `tool.start` -> `tool.complete` update reuses the SAME tool
+        // id, so `tools`' identity (`.map(\.id)`, watched below for pruning /
+        // scroll) never changes and that seed never re-runs. Without this,
+        // a diff (or a failed file-edit's error) that arrives after the row
+        // is already rendered stays hidden behind a tap. Watching `tools`
+        // itself (content-equal, not just id-equal) catches that same-id
+        // transition and re-applies the STR-460 rule live.
+        .onChange(of: tools) { oldTools, newTools in
+            let sync = Self.syncExpansion(
+                previousTools: oldTools,
+                previousExpandedToolIDs: expandedToolIDs,
+                tools: newTools
+            )
+            expandedToolIDs = sync.expandedToolIDs
+            if sync.clusterShouldExpand {
+                isExpanded = true
+            }
+        }
+    }
+
+    /// Result of ``syncExpansion(previousTools:previousExpandedToolIDs:tools:)``.
+    struct ExpansionSync: Equatable {
+        /// The row-level expansion set after pruning removed ids and adding
+        /// any tool that newly satisfies `ToolActivityRow.defaultExpanded`.
+        let expandedToolIDs: Set<String>
+        /// Whether the outer (possibly-collapsed) cluster must be forced open
+        /// because some tool newly satisfies `defaultExpanded` this update.
+        let clusterShouldExpand: Bool
+    }
+
+    /// STR-608: pure helper for the live same-id transition, matched by `id`
+    /// against the tools array from BEFORE this update. A tool id that was
+    /// already `defaultExpanded` (and may have been manually collapsed by the
+    /// user since) is left alone — only a genuine transition (e.g. running/
+    /// no-diff -> done/fullDiff, or -> failed) forces it open. Ids no longer
+    /// present are pruned. `nonisolated static` so tests can verify the sync
+    /// contract without constructing a view.
+    nonisolated static func syncExpansion(
+        previousTools: [ToolActivity],
+        previousExpandedToolIDs: Set<String>,
+        tools: [ToolActivity]
+    ) -> ExpansionSync {
+        let previousByID = Dictionary(uniqueKeysWithValues: previousTools.map { ($0.id, $0) })
+        let currentIDs = Set(tools.map(\.id))
+        var expanded = previousExpandedToolIDs.intersection(currentIDs)
+        var clusterShouldExpand = false
+        for tool in tools {
+            let wasDefaultExpanded = previousByID[tool.id].map(ToolActivityRow.defaultExpanded(for:)) ?? false
+            guard !wasDefaultExpanded, ToolActivityRow.defaultExpanded(for: tool) else { continue }
+            expanded.insert(tool.id)
+            clusterShouldExpand = true
+        }
+        return ExpansionSync(expandedToolIDs: expanded, clusterShouldExpand: clusterShouldExpand)
     }
 
     // MARK: - Live / expanded timeline

@@ -516,6 +516,75 @@ final class RenderingTests: XCTestCase {
         XCTAssertFalse(ToolClusterView.defaultExpanded(for: [readTool, searchTool]))
     }
 
+    // MARK: - STR-608: live same-id transition must promote expansion
+
+    /// The exact bug scenario: a `patch` tool starts running (no diff), the
+    /// row is rendered and NOT expanded, then `tool.complete` arrives and
+    /// mutates that SAME tool id in place to carry a diff. Because the id set
+    /// is unchanged, only a content-based sync (not an id-set-based one)
+    /// catches this — this proves `syncExpansion` does, and that it forces
+    /// the outer cluster open too.
+    func testToolClusterSyncExpansionPromotesLiveSameIdDiffTransition() {
+        let runningPatch = ToolActivity(
+            id: "t1", name: "patch", argsSummary: "{}", progressText: "editing",
+            resultPreview: "", state: .running, durationMs: nil, todos: nil
+        )
+        let completedPatch = ToolActivity(
+            id: "t1", name: "patch", argsSummary: "{}", progressText: "",
+            resultPreview: "applied", state: .done, durationMs: 120, todos: nil,
+            fullDiff: "+added line"
+        )
+        let sync = ToolClusterView.syncExpansion(
+            previousTools: [runningPatch],
+            previousExpandedToolIDs: [],
+            tools: [completedPatch]
+        )
+        XCTAssertTrue(sync.expandedToolIDs.contains("t1"),
+                      "the tool row must expand once its live update carries a diff")
+        XCTAssertTrue(sync.clusterShouldExpand,
+                      "a collapsed cluster must be forced open when a tool newly defaults to expanded")
+    }
+
+    /// A failed file-edit that arrives live (same id, running -> failed) must
+    /// also be promoted — the error carve-out applies live, not just at init.
+    func testToolClusterSyncExpansionPromotesLiveSameIdFailureTransition() {
+        let runningWrite = ToolActivity(
+            id: "t1", name: "write_file", argsSummary: "{}", progressText: "writing",
+            resultPreview: "", state: .running, durationMs: nil, todos: nil
+        )
+        let failedWrite = ToolActivity(
+            id: "t1", name: "write_file", argsSummary: "{}", progressText: "",
+            resultPreview: "error: disk full", state: .failed, durationMs: nil, todos: nil
+        )
+        let sync = ToolClusterView.syncExpansion(
+            previousTools: [runningWrite],
+            previousExpandedToolIDs: [],
+            tools: [failedWrite]
+        )
+        XCTAssertTrue(sync.expandedToolIDs.contains("t1"))
+        XCTAssertTrue(sync.clusterShouldExpand)
+    }
+
+    /// Ids no longer present in the live update must still be pruned from the
+    /// expansion set (existing behavior, must not regress), while unrelated
+    /// already-expanded ids that are still present and still default-expanded
+    /// are left alone (no unnecessary re-forcing of a user's manual collapse).
+    func testToolClusterSyncExpansionPrunesRemovedIdsAndLeavesUnrelatedAlone() {
+        let diffTool = ToolActivity(
+            id: "t1", name: "patch", argsSummary: "{}", progressText: "",
+            resultPreview: "applied", state: .done, durationMs: 100, todos: nil,
+            fullDiff: "+line"
+        )
+        let sync = ToolClusterView.syncExpansion(
+            previousTools: [diffTool],
+            previousExpandedToolIDs: ["t1", "stale-removed-id"],
+            tools: [diffTool]
+        )
+        XCTAssertEqual(sync.expandedToolIDs, ["t1"])
+        XCTAssertFalse(sync.clusterShouldExpand,
+                       "no tool newly transitioned to default-expanded, so the cluster must not be force-reopened")
+    }
+
     private func XCTAssertProse(
         _ segment: MessageSegmenter.Segment,
         _ expected: String,
