@@ -60,6 +60,7 @@ final class LocalDesktopManualTokenUITests: XCTestCase {
         // Clear any saved config so the app lands on WelcomeView (needsSetup).
         app.launchArguments += ["-hermes.serverURL", ""]
         app.launchArguments += ["-hermes.connectionMode", ""]
+        app.launchArguments += ["--uitest-mute-audio"]
         // The HERMES_UITEST_DEEPLINK env var is the DEBUG seam that fires the
         // URL through HermesURLRouter.route after bootstrap, identical to onOpenURL.
         app.launchEnvironment["HERMES_UITEST_DEEPLINK"] = manualTokenDeepLink(gatewayURL: gatewayURL)

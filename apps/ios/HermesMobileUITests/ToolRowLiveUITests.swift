@@ -20,6 +20,7 @@ final class ToolRowLiveUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         // Connected draft chat shell (same landing assertions as
