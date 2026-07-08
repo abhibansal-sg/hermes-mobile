@@ -21,8 +21,36 @@ import XCTest
 @MainActor
 final class SessionRefreshTests: XCTestCase {
 
+    nonisolated private static let sessionStoreDefaultsKeys = [
+        DefaultsKeys.pinnedSessions,
+        DefaultsKeys.hideCron,
+        DefaultsKeys.groupByWorkspace,
+        DefaultsKeys.collapsedWorkspaces,
+        DefaultsKeys.pinnedWorkspaces,
+        DefaultsKeys.activeProfile,
+    ]
+
+    override func setUp() {
+        super.setUp()
+        Self.resetSessionStoreDefaults()
+    }
+
+    override func tearDown() {
+        Self.resetSessionStoreDefaults()
+        super.tearDown()
+    }
+
     // MARK: - Helpers
 
+    /// SessionStore intentionally loads pins and drawer preferences from
+    /// UserDefaults.standard. Scrubbing those keys keeps this suite from leaking
+    /// working-set membership across tests while still using the production
+    /// initializer and persistence path inside each test.
+    nonisolated private static func resetSessionStoreDefaults() {
+        for key in Self.sessionStoreDefaultsKeys {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+    }
     /// Build a minimal `SessionSummary` with only the fields relevant to sorting.
     private func makeSummary(
         id: String,
