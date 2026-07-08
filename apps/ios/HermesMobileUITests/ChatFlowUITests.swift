@@ -24,6 +24,7 @@ final class ChatFlowUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         // 1. Chat is home (Batch B drawer navigation): on a successful connect the
@@ -125,6 +126,7 @@ final class ChatFlowUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         let drawerToggle = app.buttons["drawerToggle"]
@@ -186,6 +188,7 @@ final class ChatFlowUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         let drawerToggle = app.buttons["drawerToggle"]
@@ -261,6 +264,7 @@ final class ChatFlowUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         let drawerToggle = app.buttons["drawerToggle"]
@@ -314,6 +318,7 @@ final class ChatFlowUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         let drawerToggle = app.buttons["drawerToggle"]

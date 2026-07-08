@@ -17,6 +17,10 @@ import XCTest
 ///    (the generation guard — the core stale-cancellation invariant)
 @MainActor
 final class VoiceConversationControllerTests: XCTestCase {
+    override func tearDown() {
+        UITestAudioGuard.argumentsForTesting = nil
+        super.tearDown()
+    }
 
     // MARK: - start → listening
 
@@ -176,6 +180,31 @@ final class VoiceConversationControllerTests: XCTestCase {
         XCTAssertTrue(fake.spokenTexts.isEmpty)
         XCTAssertEqual(controller.status, .listening, "blank/streaming/user-only completions still re-arm")
         XCTAssertEqual(fake.startListeningCount, 2)
+    }
+
+    func testAutoSpeakHandoffMutedSkipsControllerHandoffWithoutConsumingReply() async {
+        let (controller, fake) = makeController()
+        let chat = ChatStore()
+        let coordinator = VoiceConversationAutoSpeakCoordinator()
+        let replyId = UUID()
+        chat.messages = [
+            ChatMessage(role: .user, text: "prompt"),
+            ChatMessage(id: replyId, role: .assistant, text: "muted reply"),
+        ]
+        await reachThinking(controller: controller, fake: fake)
+
+        UITestAudioGuard.argumentsForTesting = { ["HermesMobileTests", "--uitest-mute-audio"] }
+        await coordinator.handleTurnComplete(chat: chat, controller: controller)
+
+        XCTAssertTrue(fake.spokenTexts.isEmpty)
+        XCTAssertEqual(controller.status, .thinking, "muted auto-speak must not hand off to the controller")
+        XCTAssertEqual(fake.startListeningCount, 1, "muted auto-speak must not re-arm through the controller")
+
+        UITestAudioGuard.argumentsForTesting = { ["HermesMobileTests"] }
+        await coordinator.handleTurnComplete(chat: chat, controller: controller)
+
+        XCTAssertEqual(fake.spokenTexts, ["muted reply"])
+        XCTAssertEqual(controller.status, .listening, "unmuted handoff should still see the skipped reply")
     }
 
     func testTurnCompletionPipelineRunsQueueDrainAndVoiceHandoff() {
