@@ -53,6 +53,7 @@ final class SessionRefreshTests: XCTestCase {
             UserDefaults.standard.removeObject(forKey: key)
         }
     }
+
     /// Build a minimal `SessionSummary` with only the fields relevant to sorting.
     private func makeSummary(
         id: String,
