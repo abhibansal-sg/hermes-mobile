@@ -218,6 +218,7 @@
 		DE591867806016D5E0B60181 /* VoiceConversationController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9653A94FDBF6636D8BA9DB9 /* VoiceConversationController.swift */; };
 		DFB714D510214D87ABBF22B8 /* ChatStoreBatchBTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FA642A8294F998AD8405915 /* ChatStoreBatchBTests.swift */; };
 		E03E75A04F0EB2619AA8805E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 26594EA5167E7A6317CE0697 /* Assets.xcassets */; };
+		5801A115900000000000B101 /* mermaid.min.js in Resources */ = {isa = PBXBuildFile; fileRef = 5801A115900000000000B100 /* mermaid.min.js */; };
 		E0ACE44B5C8CAE17BACA3C34 /* CronJobsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2CE855FD99F1E16574972AF /* CronJobsView.swift */; };
 		E27E5A95AF406F7AC7340532 /* DefaultsKeys.swift in Sources */ = {isa = PBXBuildFile; fileRef = D38A71D2C5A30B5D7B86D5AF /* DefaultsKeys.swift */; };
 		E29895C03CA0863AAE17CC4F /* ArtifactsGalleryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A61DAF847A1110C50477FEF /* ArtifactsGalleryTests.swift */; };
@@ -387,6 +388,7 @@
 		69F2B1C0FB89B075E999A37D /* FileSystemModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileSystemModelTests.swift; sourceTree = "<group>"; };
 		6A02BE5F1EA2BAEFCC179BA3 /* RelayTestPushStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTestPushStoreTests.swift; sourceTree = "<group>"; };
 		6A60E8ABAAC1CD00A2F23FBF /* CodeBlockView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeBlockView.swift; sourceTree = "<group>"; };
+		5801A115900000000000B100 /* mermaid.min.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = mermaid.min.js; sourceTree = "<group>"; };
 		6A8705BA6768729726A7B366 /* LocalDesktopManualTokenUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalDesktopManualTokenUITests.swift; sourceTree = "<group>"; };
 		6A9FA328FF7771B7CD32DCE4 /* ThinkingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThinkingView.swift; sourceTree = "<group>"; };
 		6AED0A12B048B9FFDDAEF815 /* ChatStoreF4ATests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStoreF4ATests.swift; sourceTree = "<group>"; };
@@ -972,6 +974,7 @@
 				EEA27F5DA2514ED03A75B7B7 /* RenderCache.swift */,
 				EB04EDFCBE7CEDA7E07B7FE7 /* SyntaxHighlighter.swift */,
 				B774266C71DEAC18236EF4D9 /* ZoomableImageView.swift */,
+				5801A115900000000000B100 /* mermaid.min.js */,
 			);
 			path = Rendering;
 			sourceTree = "<group>";
@@ -1213,6 +1216,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				E03E75A04F0EB2619AA8805E /* Assets.xcassets in Resources */,
+				5801A115900000000000B101 /* mermaid.min.js in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

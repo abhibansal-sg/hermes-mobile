@@ -269,6 +269,127 @@ final class RenderingTests: XCTestCase {
         }
     }
 
+    // MARK: - Rich fences (mermaid / svg routing)
+
+    func testMermaidFlowchartRoutesToRichDiagramMode() {
+        let code = """
+        graph TD
+          A[Start] --> B[Finish]
+        """
+
+        guard case .mermaid(let diagram) = RichFenceDecision.make(language: "mermaid", code: code) else {
+            return XCTFail("expected mermaid rich fence route")
+        }
+
+        XCTAssertEqual(diagram.layout, .flowchart)
+        XCTAssertEqual(diagram.nodes.map(\.id), ["A", "B"])
+        XCTAssertEqual(diagram.edges.count, 1)
+    }
+
+    /// Regression for the rejected STR-1078 source-preview path: a non-flowchart
+    /// family MUST select the real local mermaid.js renderer (`.webRenderer`),
+    /// never a source-only preview. This is the decision seam the contract
+    /// requires — it is asserted without a live WKWebView.
+    func testNonFlowchartMermaidRoutesToWebRenderer() {
+        let code = """
+        sequenceDiagram
+          participant User
+          User->>Hermes: Render this
+        """
+
+        guard case .mermaid(let diagram) = RichFenceDecision.make(language: "mermaid", code: code) else {
+            return XCTFail("expected sequenceDiagram to use the mermaid rich fence route")
+        }
+
+        XCTAssertEqual(diagram.layout, .webRenderer, "non-flowchart mermaid must use the real local web renderer, not a source-only preview")
+        XCTAssertEqual(diagram.source, code, "verbatim DSL must be carried for the renderer + copy/fallback")
+    }
+
+    func testMermaidRecognizesDesktopSupportedDiagramFamilies() {
+        let samples = [
+            """
+            classDiagram
+              class Animal
+            """,
+            """
+            stateDiagram-v2
+              [*] --> Ready
+            """,
+            """
+            erDiagram
+              USER ||--o{ ORDER : places
+            """,
+            """
+            pie title Pets
+              "Dogs" : 3
+            """,
+            """
+            gantt
+              title A plan
+              section Done
+              Task :a1, 2024-01-01, 3d
+            """
+        ]
+
+        for code in samples {
+            guard case .mermaid(let diagram) = RichFenceDecision.make(language: "mermaid", code: code) else {
+                return XCTFail("expected rich mermaid route for:\n\(code)")
+            }
+            XCTAssertEqual(diagram.layout, .webRenderer, "non-flowchart family must route to the web renderer")
+        }
+    }
+
+    func testMermaidWebRendererSourceIsPreservedVerbatim() {
+        // Whatever the model emitted must round-trip unchanged so the renderer
+        // draws the real diagram and the copy button reproduces the source.
+        let code = "sequenceDiagram\n  A->>B: hi <there> & \"x\""
+
+        guard case .mermaid(let diagram) = RichFenceDecision.make(language: "mermaid", code: code) else {
+            return XCTFail("expected mermaid route")
+        }
+        XCTAssertEqual(diagram.source, code)
+    }
+
+    func testSvgFenceRoutesToRichDiagramModeWhenSanitizedAndValid() {
+        let code = #"<svg viewBox="0 0 10 10"><circle cx="5" cy="5" r="4"/></svg>"#
+
+        guard case .svg(let sanitized) = RichFenceDecision.make(language: "svg", code: code) else {
+            return XCTFail("expected svg rich fence route")
+        }
+
+        XCTAssertEqual(sanitized.markup, code)
+    }
+
+    func testUnknownFenceLanguageUsesCodeMode() {
+        XCTAssertEqual(RichFenceDecision.make(language: "swift", code: "let x = 1"), .code)
+        XCTAssertEqual(RichFenceDecision.make(language: nil, code: "plain"), .code)
+        XCTAssertEqual(RichFenceDecision.make(language: "python extra info", code: "print(1)"), .code)
+    }
+
+    func testMalformedMermaidFallsBackToCodeMode() {
+        XCTAssertEqual(RichFenceDecision.make(language: "mermaid", code: "not a mermaid diagram"), .code)
+        XCTAssertEqual(RichFenceDecision.make(language: "mermaid", code: "graph TD\nA -->"), .code)
+    }
+
+    func testUnsafeSvgFallsBackToCodeModeAndPreservesSourceForCodeCard() {
+        let unsafe = #"<svg viewBox="0 0 10 10" onclick="alert(1)"><script>alert(1)</script><image href="https://example.com/x.png"/></svg>"#
+
+        XCTAssertEqual(RichFenceDecision.make(language: "svg", code: unsafe), .code)
+        XCTAssertNil(SVGSanitizer.sanitize(unsafe))
+        // The original markup survives ANSI-strip so the code-card copy keeps it.
+        XCTAssertEqual(AnsiText.strip(unsafe), unsafe)
+    }
+
+    func testSvgSanitizerRejectsExternalReferences() {
+        let externalHref = #"<svg><a href="javascript:alert(1)"><text>bad</text></a></svg>"#
+        let dataHref = #"<svg><use href="data:image/svg+xml;base64,AAAA"/></svg>"#
+        let remoteStyle = #"<svg><rect style="fill: url(https://example.com/a.svg#x)"/></svg>"#
+
+        XCTAssertNil(SVGSanitizer.sanitize(externalHref))
+        XCTAssertNil(SVGSanitizer.sanitize(dataHref))
+        XCTAssertNil(SVGSanitizer.sanitize(remoteStyle))
+    }
+
     // MARK: - AnsiText
 
     func testStripOrRenderPlainTextUnchanged() {
