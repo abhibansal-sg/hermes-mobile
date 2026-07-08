@@ -917,6 +917,113 @@ def test_custom_rejects_bad_api_mode(loopback_client, monkeypatch):
     assert r.status_code == 400
 
 
+def test_custom_rejects_fresh_unknown_api_mode(loopback_client, monkeypatch):
+    """STR-112: mobile may not create an arbitrary new custom-provider transport."""
+    calls = _patch_config(monkeypatch)
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/custom",
+        json={
+            "name": "myco",
+            "base_url": "https://api.my.co",
+            "api_mode": "responses",
+            "api_key": "sk-x",
+        },
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 400
+    assert r.json()["code"] == 4001
+    assert calls["save_env"] == []
+    assert calls["set_config"] == []
+
+
+def test_custom_preserves_existing_unknown_api_mode_without_validation_or_key_leak(
+    loopback_client, monkeypatch
+):
+    """STR-112: exact unknown api_mode preservation is allowed only for an
+    existing custom provider, keeps key_env storage, and skips misleading
+    OpenAI/Anthropic validation.
+    """
+    api = _api()
+
+    def _unexpected_validation(**_kw):
+        raise AssertionError("unknown preserved api_mode must not be network-validated")
+
+    monkeypatch.setattr(api, "_validate_provider_key", _unexpected_validation, raising=False)
+    _patch_inventory(monkeypatch, rows=[])
+    calls = _patch_config(
+        monkeypatch,
+        providers_in_config={
+            "myco": {
+                "name": "myco",
+                "base_url": "https://old.example/v1",
+                "api_mode": "responses",
+                "key_env": "MYCO_EXISTING_API_KEY",
+            },
+        },
+    )
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/custom",
+        json={
+            "name": "myco",
+            "base_url": "https://api.my.co/v1",
+            "api_mode": "responses",
+            "api_key": "sk-preserved-secret",
+        },
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    import hashlib as _hashlib
+
+    expected_env_var = "MYCO_" + _hashlib.sha1(b"myco").hexdigest()[:6] + "_API_KEY"
+    assert (expected_env_var, "sk-preserved-secret") in calls["save_env"]
+    assert ("providers.myco.base_url", "https://api.my.co/v1") in calls["set_config"]
+    assert ("providers.myco.api_mode", "responses") in calls["set_config"]
+    assert ("providers.myco.key_env", expected_env_var) in calls["set_config"]
+    assert ("providers.myco.api_key", "sk-preserved-secret") not in calls["set_config"]
+    assert not any(value == "sk-preserved-secret" for _, value in calls["set_config"])
+
+    body = r.json()
+    assert body["validated"] == "skipped"
+    assert "validation skipped" in body["validation_detail"]
+    assert "sk-preserved-secret" not in r.text
+
+
+def test_custom_preserves_existing_unknown_transport_alias(loopback_client, monkeypatch):
+    """STR-112: legacy providers.<name>.transport can authorize exact
+    preservation the same way as providers.<name>.api_mode.
+    """
+    _patch_inventory(monkeypatch, rows=[])
+    calls = _patch_config(
+        monkeypatch,
+        providers_in_config={
+            "myco": {
+                "name": "myco",
+                "base_url": "https://old.example/v1",
+                "transport": "responses",
+                "key_env": "MYCO_EXISTING_API_KEY",
+            },
+        },
+    )
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/custom",
+        json={
+            "name": "myco",
+            "base_url": "https://api.my.co/v1",
+            "api_mode": "responses",
+            "api_key": "sk-x",
+        },
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    assert ("providers.myco.api_mode", "responses") in calls["set_config"]
+    assert r.json()["validated"] == "skipped"
+
+
 def test_custom_rejects_unsafe_name(loopback_client, monkeypatch):
     """A provider name with a dot/bracket that could escape the providers
     subtree is rejected."""

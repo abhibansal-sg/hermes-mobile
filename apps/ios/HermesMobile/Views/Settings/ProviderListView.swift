@@ -542,6 +542,31 @@ struct EnterProviderKeyView: View {
 
 // MARK: - CustomProviderView (Tier B — custom OpenAI/Anthropic-compatible)
 
+struct CustomProviderAPIModeEditState: Equatable {
+    let knownMode: ProviderAPIMode?
+    let preservedRawMode: String?
+
+    init(existing: ProviderRow?) {
+        if let mode = existing?.apiMode {
+            self.knownMode = mode
+            self.preservedRawMode = nil
+        } else if let raw = existing?.rawAPIMode, !raw.isEmpty {
+            self.knownMode = nil
+            self.preservedRawMode = raw
+        } else {
+            self.knownMode = nil
+            self.preservedRawMode = nil
+        }
+    }
+
+    var isPreservingUnknownMode: Bool { preservedRawMode != nil }
+
+    var annotation: String? {
+        guard let raw = preservedRawMode else { return nil }
+        return "Stored API mode '\(raw)' is not editable in mobile; saving preserves it."
+    }
+}
+
 /// Register a custom OpenAI- or Anthropic-compatible provider (Tier B): name,
 /// base_url, api_mode picker, and a key. The entered key is held in `@State`
 /// only until Save, which writes it to the Keychain transiently, POSTs it once
@@ -577,6 +602,12 @@ struct CustomProviderView: View {
 
     /// True when opening in edit/rotate mode (an existing row was passed in).
     private var isEditing: Bool { existing != nil }
+    private var apiModeEditState: CustomProviderAPIModeEditState {
+        CustomProviderAPIModeEditState(existing: existing)
+    }
+    private var selectedRawAPIMode: String {
+        apiModeEditState.preservedRawMode ?? apiMode.rawValue
+    }
 
     private var canSave: Bool {
         !name.trimmingCharacters(in: .whitespaces).isEmpty
@@ -593,7 +624,7 @@ struct CustomProviderView: View {
                         .font(.title2.bold())
                         .foregroundStyle(theme.fg)
                     Text(isEditing
-                        ? "Update the base URL, API mode, or rotate the key for this provider. The name is locked (used as the upsert key)."
+                        ? "Update the base URL or rotate the key for this provider. The name is locked (used as the upsert key)."
                         : "Add any OpenAI- or Anthropic-compatible endpoint — a proxy, a self-host, or a third-party provider with a base URL.")
                         .font(.subheadline)
                         .foregroundStyle(theme.mutedFg)
@@ -634,13 +665,34 @@ struct CustomProviderView: View {
                     .submitLabel(.next)
                     .accessibilityIdentifier("customProviderBaseURLField")
 
-                Picker("API mode", selection: $apiMode) {
-                    ForEach(ProviderAPIMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
+                if apiModeEditState.isPreservingUnknownMode {
+                    HStack {
+                        Text("API mode")
+                            .foregroundStyle(theme.fg)
+                        Spacer()
+                        Text(apiModeEditState.preservedRawMode ?? "")
+                            .foregroundStyle(theme.mutedFg)
+                            .font(.callout.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                     }
+                    .accessibilityIdentifier("customProviderUnknownAPIMode")
+                    if let annotation = apiModeEditState.annotation {
+                        Text(annotation)
+                            .font(.footnote)
+                            .foregroundStyle(theme.mutedFg)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("customProviderUnknownAPIModeAnnotation")
+                    }
+                } else {
+                    Picker("API mode", selection: $apiMode) {
+                        ForEach(ProviderAPIMode.allCases) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .accessibilityIdentifier("customProviderAPIModePicker")
                 }
-                .pickerStyle(.menu)
-                .accessibilityIdentifier("customProviderAPIModePicker")
 
                 SecureField(isEditing ? "New API key" : "API key", text: $apiKey, prompt: Text(isEditing ? "Paste new API key" : "Paste API key"))
                     .textContentType(.password)
@@ -654,9 +706,7 @@ struct CustomProviderView: View {
                     Text(errorText)
                         .foregroundStyle(theme.destructive)
                 } else {
-                    Text(isEditing
-                        ? "Enter a new API key to rotate. The base URL and API mode can also be corrected. The key is sent once and stored securely on your gateway."
-                        : "The name must be letters, numbers, dashes, or underscores. The base URL must start with http:// or https://.")
+                    Text(footerText)
                 }
             }
 
@@ -700,7 +750,7 @@ struct CustomProviderView: View {
             if let existing {
                 name = existing.name
                 baseURL = existing.baseURL ?? "https://"
-                if let mode = existing.apiMode { apiMode = mode }
+                if let mode = apiModeEditState.knownMode { apiMode = mode }
             }
             if !isEditing { nameFieldFocused = true }
         }
@@ -731,7 +781,7 @@ struct CustomProviderView: View {
                 let result = try await rest.addCustomProvider(
                     name: trimmedName,
                     baseURL: trimmedBase,
-                    apiMode: apiMode,
+                    rawAPIMode: selectedRawAPIMode,
                     apiKey: trimmedKey
                 )
                 if result.validated == false {
@@ -744,6 +794,15 @@ struct CustomProviderView: View {
                 errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
         }
+    }
+
+    private var footerText: String {
+        if apiModeEditState.isPreservingUnknownMode {
+            return "Enter a new API key to rotate. The base URL can also be corrected. The key is sent once and stored securely on your gateway."
+        }
+        return isEditing
+            ? "Enter a new API key to rotate. The base URL and API mode can also be corrected. The key is sent once and stored securely on your gateway."
+            : "The name must be letters, numbers, dashes, or underscores. The base URL must start with http:// or https://."
     }
 
     /// Convenience create-only init (preserves the original call site shape).
