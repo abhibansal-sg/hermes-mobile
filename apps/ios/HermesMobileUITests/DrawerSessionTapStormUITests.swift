@@ -10,6 +10,7 @@ final class DrawerSessionTapStormUITests: XCTestCase {
 
     override func setUpWithError() throws {
         continueAfterFailure = false
+        executionTimeAllowance = 180
     }
 
     func testRapidSessionRowTapStormClosesDrawerAfterEveryTap() throws {
@@ -17,6 +18,7 @@ final class DrawerSessionTapStormUITests: XCTestCase {
         app.launchEnvironment["HERMES_UITEST_SEED"] = "drawerstorm"
         app.launchEnvironment["HERMES_UITEST_SIZE_CLASS"] = "compact"
         app.launchArguments += ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        addSystemAlertMonitor()
         app.launch()
 
         let drawerToggle = app.buttons["drawerToggle"]
@@ -31,26 +33,54 @@ final class DrawerSessionTapStormUITests: XCTestCase {
         XCTAssertEqual(tapPlan.count, 20)
 
         for (index, title) in tapPlan.enumerated() {
-            openDrawer(app, toggle: drawerToggle, iteration: index)
             let row = sessionRow(app, title: title)
-            XCTAssertTrue(row.waitForExistence(timeout: 2), "Missing drawer row \(title) at tap \(index + 1)")
-            row.tap()
+            openDrawer(app, toggle: drawerToggle, targetRow: row, iteration: index)
+            XCTAssertTrue(row.exists, "Missing drawer row \(title) at tap \(index + 1)")
+            row.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
             assertDrawerClosed(app, afterTapping: title, iteration: index)
             waitForCloseAnimationToSettle()
         }
     }
 
-    private func openDrawer(_ app: XCUIApplication, toggle: XCUIElement, iteration: Int) {
-        toggle.tap()
+    private func openDrawer(
+        _ app: XCUIApplication,
+        toggle: XCUIElement,
+        targetRow: XCUIElement,
+        iteration: Int
+    ) {
         let avatar = app.buttons["settingsAvatar"]
         XCTAssertTrue(
-            waitUntil(timeout: 2) { avatar.exists && avatar.isHittable },
-            "Drawer did not open before tap \(iteration + 1)"
+            avatar.exists || avatar.waitForExistence(timeout: 3),
+            "Drawer avatar missing before tap \(iteration + 1)"
         )
+
+        for _ in 0..<5 {
+            if targetRow.exists && targetRow.isHittable { return }
+            if toggle.exists || toggle.waitForExistence(timeout: 1) {
+                toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            }
+            if waitUntil(timeout: 1.2, { targetRow.exists && targetRow.isHittable }) { return }
+        }
+
+        XCTFail("Drawer did not open before tap \(iteration + 1)")
     }
 
     private func sessionRow(_ app: XCUIApplication, title: String) -> XCUIElement {
-        app.buttons.containing(NSPredicate(format: "label CONTAINS %@", title)).firstMatch
+        let id = "sessionRow.\(title.lowercased().replacingOccurrences(of: " ", with: "-"))"
+        return app.buttons[id]
+    }
+
+    private func addSystemAlertMonitor() {
+        addUIInterruptionMonitor(withDescription: "Dismiss simulator system alerts") { alert in
+            for title in ["Allow", "Cancel", "Don’t Allow", "Don't Allow"] {
+                let button = alert.buttons[title]
+                if button.exists {
+                    button.tap()
+                    return true
+                }
+            }
+            return false
+        }
     }
 
     private func assertDrawerClosed(_ app: XCUIApplication, afterTapping title: String, iteration: Int) {

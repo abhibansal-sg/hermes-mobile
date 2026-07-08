@@ -1517,7 +1517,7 @@ struct DrawerView: View {
             // than relying on the context-menu or swipe-action ViewBuilder scopes.
             .sensoryFeedback(.impact(weight: .medium, intensity: 0.7),
                              trigger: pinFeedbackTrigger)
-            .accessibilityIdentifier("sessionRow")
+            .accessibilityIdentifier(summary.id.hasPrefix("storm-") ? "sessionRow.\(summary.id)" : "sessionRow")
             .contextMenu {
                 rowContextMenu(for: summary, pinned: pinned)
             }

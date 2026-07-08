@@ -246,6 +246,20 @@ enum UITestSeed {
             environment.sessionStore.beforeOpenSeedForTesting = {
                 try? await Task.sleep(nanoseconds: 700_000_000)
             }
+            environment.sessionStore.resumeRPC = { storedId, _ in
+                guard let result = JSONValue.object([
+                    "session_id": .string("runtime-\(storedId)"),
+                    "stored_session_id": .string(storedId),
+                    "message_count": .number(8),
+                    "info": .object([
+                        "running": .bool(false),
+                        "lazy": .bool(false),
+                    ]),
+                ]).decoded(as: SessionOpenResult.self) else {
+                    throw URLError(.cannotDecodeContentData)
+                }
+                return result
+            }
             environment.sessionStore.transcriptFetch = { id in
                 return transcript(id.capitalized)
             }
