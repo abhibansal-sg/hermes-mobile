@@ -83,6 +83,32 @@ final class ConnectionPhaseTests: XCTestCase {
         XCTAssertEqual(ConnectionStore.hydrationTimeout, .seconds(8))
     }
 
+    // MARK: - STR-973A named grace windows
+
+    func testTransientGraceWindowIsTenSeconds() {
+        // The silent-reconnect grace window for a transport drop witnessed live
+        // during an active session. Pinned so a regression can't silently widen
+        // (masking real outages behind a longer no-warning window) or shrink it
+        // (flashing an error on blips that would have healed just past the old
+        // bound) without the test catching it.
+        XCTAssertEqual(ConnectionStore.transientGraceWindow, .seconds(10))
+    }
+
+    func testColdOpenGraceWindowIsFiveSeconds() {
+        // Shorter than `transientGraceWindow` — a dead socket found on cold
+        // open/foreground is far more often a stale-suspend reconnect than a
+        // real outage. Reserved for the foreground/cold-open path; pinned here
+        // regardless of current wiring so the constant can't drift unnoticed.
+        XCTAssertEqual(ConnectionStore.coldOpenGraceWindow, .seconds(5))
+    }
+
+    func testColdOpenGraceWindowIsShorterThanTransientGraceWindow() {
+        // The relative ordering is the actual contract STR-973A depends on:
+        // whichever grace window is in effect, cold-open must never wait as
+        // long as a live-witnessed transient drop.
+        XCTAssertLessThan(ConnectionStore.coldOpenGraceWindow, ConnectionStore.transientGraceWindow)
+    }
+
     func testFinishHydrationFromHydratingLandsConnectedOnFreshDraft() {
         // The convergence point both race branches (real hydration + timeout)
         // flow through: from `.hydrating`, with nothing active, it must reveal
