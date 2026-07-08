@@ -89,6 +89,12 @@ def broadcast_engine():
 
 
 @pytest.fixture
+def replay_ring():
+    """The plugin's replay_ring module (per-session resumable-stream ring)."""
+    return load_plugin_module("replay_ring")
+
+
+@pytest.fixture
 def wired_token_auth():
     """Wire the plugin's device-token registry into the S5 token-auth seam.
 
