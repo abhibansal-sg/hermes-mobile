@@ -93,6 +93,8 @@ final class SpeechPlayer {
     ///   `text` returns `.stopped` without starting anything.
     @discardableResult
     func speak(text: String, messageId: UUID? = nil, rest: RestClient) async -> SpeechPlaybackResult {
+        guard !UITestAudioGuard.isUITestAudioMuted else { return .completed }
+
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .stopped }
 

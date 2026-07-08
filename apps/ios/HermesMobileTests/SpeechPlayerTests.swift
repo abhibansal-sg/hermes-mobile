@@ -16,6 +16,10 @@ import XCTest
 /// decodable audio bytes or wall-clock duration.
 @MainActor
 final class SpeechPlayerTests: XCTestCase {
+    override func tearDown() {
+        UITestAudioGuard.argumentsForTesting = nil
+        super.tearDown()
+    }
 
     // MARK: - REST stubbing
 
@@ -196,6 +200,38 @@ final class SpeechPlayerTests: XCTestCase {
         XCTAssertFalse(sut.isActive)
     }
 
+    // MARK: - UI-test mute guard
+
+    func testUITestMuteAudioReturnsCompletedWithoutSynthesizingOrPlaying() async {
+        UITestAudioGuard.argumentsForTesting = { ["HermesMobileTests", "--uitest-mute-audio"] }
+        var synthesizeCallCount = 0
+        var makePlayerCallCount = 0
+        let fake = SpyAudioPlayer()
+        let rest = stubRest(dataURL: validDataURL)
+        let sut = SpeechPlayer(
+            makePlayer: { _ in
+                makePlayerCallCount += 1
+                return fake
+            },
+            synthesize: { _, _ in
+                synthesizeCallCount += 1
+                return self.validDataURL
+            }
+        )
+
+        let result = await sut.speak(text: "hello", messageId: UUID(), rest: rest)
+
+        XCTAssertEqual(result, .completed)
+        XCTAssertEqual(synthesizeCallCount, 0)
+        XCTAssertEqual(makePlayerCallCount, 0)
+        XCTAssertEqual(fake.prepareToPlayCallCount, 0)
+        XCTAssertEqual(fake.playCallCount, 0)
+        XCTAssertEqual(fake.stopCallCount, 0)
+        XCTAssertFalse(sut.isActive)
+        XCTAssertNil(sut.speakingMessageId)
+        XCTAssertNil(sut.lastError)
+    }
+
     // MARK: - Regression: per-generation termination reason (review finding)
 
     /// A `stop()` while the FIRST utterance's synthesis request is still in
@@ -291,11 +327,15 @@ final class SpeechPlayerTests: XCTestCase {
 private final class SpyAudioPlayer: SpeechAudioPlayer, @unchecked Sendable {
     var onFinish: (@Sendable () -> Void)?
     var playReturnValue = true
+    private(set) var prepareToPlayCallCount = 0
     private(set) var playCallCount = 0
     private(set) var stopCallCount = 0
     private var playContinuation: CheckedContinuation<Void, Never>?
 
-    func prepareToPlay() -> Bool { true }
+    func prepareToPlay() -> Bool {
+        prepareToPlayCallCount += 1
+        return true
+    }
 
     func play() -> Bool {
         playCallCount += 1
