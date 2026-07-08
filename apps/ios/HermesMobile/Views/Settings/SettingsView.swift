@@ -156,6 +156,7 @@ struct SettingsView: View {
                 accountSection
                 appearanceAndPanelsSection
                 notificationsAndSecuritySection
+                voiceSection
                 relayPushSection
                 approvalBypassSection
                 devicesSection
@@ -521,6 +522,26 @@ struct SettingsView: View {
             } else if PushRegistrar.shared.isEnabled {
                 Text("Choose which agent events notify you on this device.")
             }
+        }
+    }
+
+    // MARK: - Voice (STR-344 / STR-533 ambient auto-speak)
+
+    private var voiceSection: some View {
+        Section {
+            // Default-off: reads a completed assistant reply aloud when
+            // hands-free conversation mode is NOT active. Conversation mode
+            // always speaks its own replies regardless of this toggle.
+            Toggle(isOn: Binding(
+                get: { DefaultsKeys.voiceAutoTTSValue() },
+                set: { UserDefaults.standard.set($0, forKey: DefaultsKeys.voiceAutoTTS) }
+            )) {
+                SettingsRowLabel(icon: "speaker.wave.2", title: "Read replies aloud")
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsVoiceAutoTTSToggle")
+        } footer: {
+            Text("Speaks each completed assistant reply out loud when conversation mode is off.")
         }
     }
 

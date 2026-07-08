@@ -192,6 +192,115 @@ final class VoiceConversationControllerTests: XCTestCase {
         XCTAssertEqual(voiceHandoffCount, 1)
     }
 
+    func testTurnCompletionPipelineRunsAllThreeLegsIncludingAmbientAutoSpeak() {
+        var queueDrainCount = 0
+        var voiceHandoffCount = 0
+        var ambientSpeakCount = 0
+        let pipeline = VoiceConversationTurnCompletionPipeline(
+            drainQueue: { queueDrainCount += 1 },
+            completeVoiceTurn: { voiceHandoffCount += 1 },
+            speakAmbientReply: { ambientSpeakCount += 1 }
+        )
+
+        pipeline.run()
+
+        XCTAssertEqual(queueDrainCount, 1)
+        XCTAssertEqual(voiceHandoffCount, 1)
+        XCTAssertEqual(ambientSpeakCount, 1, "adding the ambient leg must not clobber the other two")
+    }
+
+    // MARK: - VoiceConversationAmbientAutoSpeakCoordinator (STR-533)
+
+    func testAmbientAutoSpeakSpeaksLatestCompletedReplyWhenEnabledAndConversationModeInactive() async {
+        let chat = ChatStore()
+        let coordinator = VoiceConversationAmbientAutoSpeakCoordinator()
+        chat.messages = [
+            ChatMessage(role: .user, text: "hi"),
+            ChatMessage(role: .assistant, text: "  hello there  "),
+        ]
+        var spoken: [String] = []
+
+        await coordinator.handleTurnComplete(
+            chat: chat,
+            conversationModeActive: false,
+            autoTTSEnabled: true,
+            speak: { reply in spoken.append(reply.text) }
+        )
+
+        XCTAssertEqual(spoken, ["  hello there  "], "the completed assistant reply must be handed to speak(_:)")
+    }
+
+    func testAmbientAutoSpeakStaysSilentWhenSettingIsOff() async {
+        let chat = ChatStore()
+        let coordinator = VoiceConversationAmbientAutoSpeakCoordinator()
+        chat.messages = [ChatMessage(role: .assistant, text: "hello there")]
+        var spoken: [String] = []
+
+        await coordinator.handleTurnComplete(
+            chat: chat,
+            conversationModeActive: false,
+            autoTTSEnabled: false,
+            speak: { reply in spoken.append(reply.text) }
+        )
+
+        XCTAssertTrue(spoken.isEmpty, "voice.auto_tts is default-off — must not speak until opted in")
+    }
+
+    func testAmbientAutoSpeakStaysSilentWhileConversationModeIsActive() async {
+        let chat = ChatStore()
+        let coordinator = VoiceConversationAmbientAutoSpeakCoordinator()
+        chat.messages = [ChatMessage(role: .assistant, text: "hello there")]
+        var spoken: [String] = []
+
+        await coordinator.handleTurnComplete(
+            chat: chat,
+            conversationModeActive: true,
+            autoTTSEnabled: true,
+            speak: { reply in spoken.append(reply.text) }
+        )
+
+        XCTAssertTrue(spoken.isEmpty, "conversation mode owns its own reply hand-off — ambient must defer to it")
+    }
+
+    func testAmbientAutoSpeakDoesNotRespeakSameReplyAcrossDuplicateCalls() async {
+        let chat = ChatStore()
+        let coordinator = VoiceConversationAmbientAutoSpeakCoordinator()
+        let replyId = UUID()
+        chat.messages = [ChatMessage(id: replyId, role: .assistant, text: "hello there")]
+        var spoken: [String] = []
+
+        await coordinator.handleTurnComplete(
+            chat: chat, conversationModeActive: false, autoTTSEnabled: true,
+            speak: { reply in spoken.append(reply.text) }
+        )
+        await coordinator.handleTurnComplete(
+            chat: chat, conversationModeActive: false, autoTTSEnabled: true,
+            speak: { reply in spoken.append(reply.text) }
+        )
+
+        XCTAssertEqual(spoken, ["hello there"], "a duplicate turn-complete for the same reply id must not re-speak")
+    }
+
+    func testAmbientAutoSpeakSpeaksEachNewReplyAcrossTurns() async {
+        let chat = ChatStore()
+        let coordinator = VoiceConversationAmbientAutoSpeakCoordinator()
+        chat.messages = [ChatMessage(role: .assistant, text: "first reply")]
+        var spoken: [String] = []
+
+        await coordinator.handleTurnComplete(
+            chat: chat, conversationModeActive: false, autoTTSEnabled: true,
+            speak: { reply in spoken.append(reply.text) }
+        )
+
+        chat.messages.append(ChatMessage(role: .assistant, text: "second reply"))
+        await coordinator.handleTurnComplete(
+            chat: chat, conversationModeActive: false, autoTTSEnabled: true,
+            speak: { reply in spoken.append(reply.text) }
+        )
+
+        XCTAssertEqual(spoken, ["first reply", "second reply"])
+    }
+
     func testEmptyReplyRearmsWithoutSpeaking() async {
         let (controller, fake) = makeController()
         await reachThinking(controller: controller, fake: fake)
