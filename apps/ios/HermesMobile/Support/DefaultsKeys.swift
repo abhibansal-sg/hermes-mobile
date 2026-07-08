@@ -256,6 +256,22 @@ enum DefaultsKeys {
         defaults.bool(forKey: toolTechnicalDetail)
     }
 
+    // MARK: Ambient voice auto-speak (STR-344 / STR-533)
+
+    /// `Bool` — whether a completed assistant reply is read aloud via TTS when
+    /// hands-free conversation mode (``VoiceConversationController``) is NOT
+    /// active. **Default false**: `UserDefaults.bool` reads the absent key as
+    /// `false`, so existing installs stay silent until the user opts in. Owned
+    /// by ``SettingsView`` (toggle) + the ambient auto-speak coordinator in
+    /// ``AppEnvironment`` (reader).
+    static let voiceAutoTTS = "hermes.voice.autoTTS"
+
+    /// Whether completed assistant replies should be read aloud outside
+    /// conversation mode. `false` unless the user turned it on.
+    static func voiceAutoTTSValue(_ defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: voiceAutoTTS)
+    }
+
     /// `Bool` — whether a Face ID / passcode check is required before a
     /// `sudo.request` / `secret.request` value can be entered AND before the
     /// `*.respond` reply is sent. **Default ON**: a *missing* key reads as `true`

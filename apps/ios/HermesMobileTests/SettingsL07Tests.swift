@@ -119,6 +119,37 @@ final class SettingsL07Tests: XCTestCase {
         XCTAssertFalse(DevicesView.isCurrentDevice("dev_1", recordedDeviceId: ""))
     }
 
+    // MARK: - voiceAutoTTS (STR-533 default-OFF ambient read-aloud toggle)
+
+    func testVoiceAutoTTSDefaultsOff() {
+        let defaults = UserDefaults(suiteName: "SettingsL07Tests.voiceAutoTTS1")!
+        defaults.removePersistentDomain(forName: "SettingsL07Tests.voiceAutoTTS1")
+        XCTAssertFalse(
+            DefaultsKeys.voiceAutoTTSValue(defaults),
+            "A missing voiceAutoTTS key must default to false (silent until opt-in)"
+        )
+    }
+
+    func testVoiceAutoTTSHonorsTrueWhenSet() {
+        let defaults = UserDefaults(suiteName: "SettingsL07Tests.voiceAutoTTS2")!
+        defaults.removePersistentDomain(forName: "SettingsL07Tests.voiceAutoTTS2")
+        defaults.set(true, forKey: DefaultsKeys.voiceAutoTTS)
+        XCTAssertTrue(
+            DefaultsKeys.voiceAutoTTSValue(defaults),
+            "Explicit true must be honored verbatim"
+        )
+    }
+
+    func testVoiceAutoTTSHonorsFalseWhenExplicitlySet() {
+        let defaults = UserDefaults(suiteName: "SettingsL07Tests.voiceAutoTTS3")!
+        defaults.removePersistentDomain(forName: "SettingsL07Tests.voiceAutoTTS3")
+        defaults.set(false, forKey: DefaultsKeys.voiceAutoTTS)
+        XCTAssertFalse(
+            DefaultsKeys.voiceAutoTTSValue(defaults),
+            "Explicit false must be honored verbatim"
+        )
+    }
+
     // MARK: - QuickCapture removal — DefaultsKeys no longer carries captureEnabled
 
     func testDefaultsKeysHasNoCaptureEnabledKeyConstant() {

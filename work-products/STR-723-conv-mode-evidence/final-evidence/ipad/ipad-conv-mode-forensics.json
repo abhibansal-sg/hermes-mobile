@@ -1,0 +1,133 @@
+{
+ "file": "/Users/abbhinnav/Developer/worktrees/str-723-conv-mode-evidence/work-products/STR-723-conv-mode-evidence/20260707-044021-str723-conv-mode/ipad-conv-mode.mp4",
+ "frames": 3178,
+ "duration_s": 99.01,
+ "cadence_median_ms": 33.33,
+ "budget_ms": 16.7,
+ "mean_ms": 31.16,
+ "p95_ms": 53.33,
+ "max_ms": 185.0,
+ "hitch_count": 186,
+ "hitches": [
+  {
+   "frame": 337,
+   "delta_ms": 185.0,
+   "t": 10.06,
+   "cls": "freeze"
+  },
+  {
+   "frame": 284,
+   "delta_ms": 165.0,
+   "t": 8.23,
+   "cls": "freeze"
+  },
+  {
+   "frame": 1276,
+   "delta_ms": 161.7,
+   "t": 40.03,
+   "cls": "freeze"
+  },
+  {
+   "frame": 317,
+   "delta_ms": 151.7,
+   "t": 9.26,
+   "cls": "freeze"
+  },
+  {
+   "frame": 2843,
+   "delta_ms": 138.3,
+   "t": 88.57,
+   "cls": "freeze"
+  },
+  {
+   "frame": 1928,
+   "delta_ms": 125.0,
+   "t": 59.07,
+   "cls": "freeze"
+  },
+  {
+   "frame": 40,
+   "delta_ms": 118.3,
+   "t": 1.15,
+   "cls": "freeze"
+  },
+  {
+   "frame": 316,
+   "delta_ms": 111.7,
+   "t": 9.15,
+   "cls": "freeze"
+  },
+  {
+   "frame": 393,
+   "delta_ms": 106.7,
+   "t": 11.9,
+   "cls": "freeze"
+  },
+  {
+   "frame": 285,
+   "delta_ms": 103.3,
+   "t": 8.4,
+   "cls": "freeze"
+  },
+  {
+   "frame": 515,
+   "delta_ms": 103.3,
+   "t": 15.67,
+   "cls": "freeze"
+  },
+  {
+   "frame": 1798,
+   "delta_ms": 100.0,
+   "t": 54.94,
+   "cls": "freeze"
+  },
+  {
+   "frame": 1717,
+   "delta_ms": 96.7,
+   "t": 53.81,
+   "cls": "stutter"
+  },
+  {
+   "frame": 422,
+   "delta_ms": 95.0,
+   "t": 12.83,
+   "cls": "stutter"
+  },
+  {
+   "frame": 861,
+   "delta_ms": 93.3,
+   "t": 26.59,
+   "cls": "stutter"
+  },
+  {
+   "frame": 1353,
+   "delta_ms": 91.7,
+   "t": 42.48,
+   "cls": "stutter"
+  },
+  {
+   "frame": 2931,
+   "delta_ms": 90.0,
+   "t": 91.58,
+   "cls": "stutter"
+  },
+  {
+   "frame": 778,
+   "delta_ms": 88.3,
+   "t": 24.0,
+   "cls": "stutter"
+  },
+  {
+   "frame": 612,
+   "delta_ms": 86.7,
+   "t": 18.73,
+   "cls": "stutter"
+  },
+  {
+   "frame": 914,
+   "delta_ms": 86.7,
+   "t": 28.35,
+   "cls": "stutter"
+  }
+ ]
+}

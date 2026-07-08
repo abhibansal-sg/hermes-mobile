@@ -1,0 +1,133 @@
+{
+ "file": "work-products/STR-723-conv-mode-evidence/20260707-051549-str723-fixed/iphone-conv-mode.mp4",
+ "frames": 7555,
+ "duration_s": 194.15,
+ "cadence_median_ms": 18.33,
+ "budget_ms": 16.7,
+ "mean_ms": 25.7,
+ "p95_ms": 33.33,
+ "max_ms": 22401.67,
+ "hitch_count": 775,
+ "hitches": [
+  {
+   "frame": 2576,
+   "delta_ms": 22401.7,
+   "t": 75.17,
+   "cls": "freeze"
+  },
+  {
+   "frame": 0,
+   "delta_ms": 14863.3,
+   "t": 0.0,
+   "cls": "freeze"
+  },
+  {
+   "frame": 2532,
+   "delta_ms": 6170.0,
+   "t": 67.91,
+   "cls": "freeze"
+  },
+  {
+   "frame": 133,
+   "delta_ms": 1358.3,
+   "t": 19.32,
+   "cls": "freeze"
+  },
+  {
+   "frame": 2622,
+   "delta_ms": 1346.7,
+   "t": 98.8,
+   "cls": "freeze"
+  },
+  {
+   "frame": 163,
+   "delta_ms": 456.7,
+   "t": 21.21,
+   "cls": "freeze"
+  },
+  {
+   "frame": 2383,
+   "delta_ms": 301.7,
+   "t": 63.2,
+   "cls": "freeze"
+  },
+  {
+   "frame": 41,
+   "delta_ms": 275.0,
+   "t": 15.93,
+   "cls": "freeze"
+  },
+  {
+   "frame": 1825,
+   "delta_ms": 228.3,
+   "t": 53.48,
+   "cls": "freeze"
+  },
+  {
+   "frame": 2307,
+   "delta_ms": 186.7,
+   "t": 61.68,
+   "cls": "freeze"
+  },
+  {
+   "frame": 162,
+   "delta_ms": 183.3,
+   "t": 21.03,
+   "cls": "freeze"
+  },
+  {
+   "frame": 5579,
+   "delta_ms": 181.7,
+   "t": 156.72,
+   "cls": "freeze"
+  },
+  {
+   "frame": 5578,
+   "delta_ms": 171.7,
+   "t": 156.54,
+   "cls": "freeze"
+  },
+  {
+   "frame": 2659,
+   "delta_ms": 168.3,
+   "t": 100.76,
+   "cls": "freeze"
+  },
+  {
+   "frame": 5205,
+   "delta_ms": 156.7,
+   "t": 148.99,
+   "cls": "freeze"
+  },
+  {
+   "frame": 2306,
+   "delta_ms": 140.0,
+   "t": 61.54,
+   "cls": "freeze"
+  },
+  {
+   "frame": 132,
+   "delta_ms": 123.3,
+   "t": 19.2,
+   "cls": "freeze"
+  },
+  {
+   "frame": 2623,
+   "delta_ms": 116.7,
+   "t": 100.14,
+   "cls": "freeze"
+  },
+  {
+   "frame": 2577,
+   "delta_ms": 115.0,
+   "t": 97.57,
+   "cls": "freeze"
+  },
+  {
+   "frame": 2358,
+   "delta_ms": 106.7,
+   "t": 62.71,
+   "cls": "freeze"
+  }
+ ]
+}

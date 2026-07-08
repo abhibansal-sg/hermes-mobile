@@ -72,6 +72,7 @@ final class AppEnvironment {
             )
         )
         let voiceAutoSpeak = VoiceConversationAutoSpeakCoordinator()
+        let voiceAmbientAutoSpeak = VoiceConversationAmbientAutoSpeakCoordinator()
         // Stores need back-references for RPC access and cross-store flows.
         sessionStore.attach(connection: connectionStore, chat: chatStore)
         chatStore.attach(connection: connectionStore, sessions: sessionStore, attachments: attachmentStore)
@@ -108,6 +109,23 @@ final class AppEnvironment {
                     await voiceAutoSpeak.handleTurnComplete(
                         chat: chatStore,
                         controller: voiceConversationController
+                    )
+                }
+            },
+            speakAmbientReply: { [
+                weak chatStore, weak voiceConversationController, weak speechPlayer, weak connectionStore,
+                voiceAmbientAutoSpeak
+            ] in
+                guard let chatStore, let voiceConversationController else { return }
+                Task {
+                    await voiceAmbientAutoSpeak.handleTurnComplete(
+                        chat: chatStore,
+                        conversationModeActive: voiceConversationController.isEnabled,
+                        autoTTSEnabled: DefaultsKeys.voiceAutoTTSValue(),
+                        speak: { [weak speechPlayer, weak connectionStore] reply in
+                            guard let player = speechPlayer, let rest = connectionStore?.rest else { return }
+                            _ = await player.speak(text: reply.text, messageId: reply.id, rest: rest)
+                        }
                     )
                 }
             }
@@ -264,16 +282,43 @@ final class VoiceConversationAutoSpeakCoordinator {
     }
 }
 
+/// Ambient (non-conversation-mode) read-aloud: speaks each newly completed
+/// assistant reply via TTS when hands-free conversation mode is NOT active and
+/// the user has opted in via ``DefaultsKeys/voiceAutoTTS``. Conversation mode
+/// owns its own reply hand-off (``VoiceConversationAutoSpeakCoordinator``) —
+/// this is a separate leg with its own dedup state so the two never fight over
+/// or double-speak the same utterance.
+@MainActor
+final class VoiceConversationAmbientAutoSpeakCoordinator {
+    private var lastSpokenAssistantReplyId: UUID?
+
+    func handleTurnComplete(
+        chat: ChatStore,
+        conversationModeActive: Bool,
+        autoTTSEnabled: Bool,
+        speak: (ChatMessage) async -> Void
+    ) async {
+        guard !conversationModeActive, autoTTSEnabled else { return }
+        guard let reply = chat.latestCompletedAssistantReply(excluding: lastSpokenAssistantReplyId) else { return }
+        lastSpokenAssistantReplyId = reply.id
+        await speak(reply)
+    }
+}
+
 /// Tiny composition seam for the app's turn-complete side effects. Keeping the
-/// queue drain and voice hand-off as peers makes it testable that installing
+/// queue drain and voice hand-offs as peers makes it testable that installing
 /// conversation-mode plumbing does not clobber the existing queue callback.
+/// `speakAmbientReply` defaults to a no-op so pre-existing 2-arg construction
+/// sites (and their pinning tests) keep compiling unchanged.
 @MainActor
 struct VoiceConversationTurnCompletionPipeline {
     var drainQueue: () -> Void
     var completeVoiceTurn: () -> Void
+    var speakAmbientReply: () -> Void = {}
 
     func run() {
         drainQueue()
         completeVoiceTurn()
+        speakAmbientReply()
     }
 }
