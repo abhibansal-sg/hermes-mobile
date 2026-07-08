@@ -140,6 +140,20 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
         let rawMode = json["api_mode"]?.stringValue ?? ""
         self.apiMode = rawMode.isEmpty ? nil : ProviderAPIMode(rawValue: rawMode)
     }
+
+    func copy(isCurrent: Bool? = nil, authenticated: Bool? = nil) -> ProviderRow {
+        ProviderRow(
+            slug: slug,
+            name: name,
+            authType: authType,
+            isCurrent: isCurrent ?? self.isCurrent,
+            authenticated: authenticated ?? self.authenticated,
+            totalModels: totalModels,
+            models: models,
+            baseURL: baseURL,
+            apiMode: apiMode
+        )
+    }
 }
 
 /// `POST <prefix>/providers/{slug}/key` and `POST <prefix>/providers/custom`
@@ -352,6 +366,7 @@ extension RestClient {
 //
 //   GET <prefix>/toolsets/{name}/config
 //   PUT <prefix>/toolsets/{name}/config {"key":"ENV_VAR", "value":"..."}
+//   PUT <prefix>/toolsets/{name}/provider {"provider":"tag"}
 //
 // The GET response is explicitly redacted: env vars carry `is_set` only, never
 // the stored value. PUT with an empty value clears the env var. This extension
@@ -535,6 +550,25 @@ extension RestClient {
         request.httpBody = try encodeBody(body, context: "toolsets.setConfig")
         let data = try await perform(request)
         let root = try decodeJSONValue(from: data, context: "toolsets.setConfig")
+        return ToolsetConfig(json: root)
+    }
+
+    /// `PUT <prefix>/toolsets/{name}/provider` — select the active provider for
+    /// a configurable toolset. The refreshed config is returned so callers can
+    /// update the active row from the server's canonical state.
+    @discardableResult
+    func selectToolsetProvider(name: String, provider: String) async throws -> ToolsetConfig {
+        let encodedName = name.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? name
+        var request = makeRequest(
+            path: "\(mobileAPIPrefix)/toolsets/\(encodedName)/provider", method: "PUT"
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: JSONValue = .object(["provider": .string(provider)])
+        request.httpBody = try encodeBody(body, context: "toolsets.selectProvider")
+        let data = try await perform(request)
+        let root = try decodeJSONValue(from: data, context: "toolsets.selectProvider")
         return ToolsetConfig(json: root)
     }
 }
