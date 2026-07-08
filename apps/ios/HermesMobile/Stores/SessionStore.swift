@@ -8,6 +8,59 @@ import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-
 private let sessionLog = Logger(subsystem: "ai.hermes.HermesMobile", category: "SessionStore")
 #endif
 
+/// Pure prompt-history navigation matching desktop's per-session cursor +
+/// draft-snapshot semantics. History is derived on demand from live messages;
+/// this type never stores or persists the history entries themselves.
+enum ComposerPromptHistory {
+    struct State: Equatable {
+        var cursorIndex: Int?
+        var draftSnapshot: String = ""
+    }
+
+    static func deriveUserHistory(from messages: [ChatMessage]) -> [String] {
+        messages.reversed().compactMap { message in
+            guard message.role == .user else { return nil }
+            let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.isEmpty ? nil : text
+        }
+    }
+
+    static func browseBackward(
+        history: [String],
+        currentDraft: String,
+        state: inout State
+    ) -> String? {
+        guard !history.isEmpty else { return nil }
+
+        let nextIndex: Int
+        if let cursor = state.cursorIndex {
+            guard cursor + 1 < history.count else { return nil }
+            nextIndex = cursor + 1
+        } else {
+            state.draftSnapshot = currentDraft
+            nextIndex = 0
+        }
+
+        state.cursorIndex = nextIndex
+        return history[nextIndex]
+    }
+
+    static func browseForward(history: [String], state: inout State) -> String? {
+        guard let cursor = state.cursorIndex else { return nil }
+
+        if cursor > 0 {
+            let nextIndex = cursor - 1
+            guard nextIndex < history.count else { return nil }
+            state.cursorIndex = nextIndex
+            return history[nextIndex]
+        }
+
+        let snapshot = state.draftSnapshot
+        state = State()
+        return snapshot
+    }
+}
+
 /// Observable owner of the session list and the active-session pointers.
 ///
 /// Talks to the gateway via `ConnectionStore.client` and seeds the transcript
@@ -177,6 +230,16 @@ final class SessionStore {
     /// of relying on a remount. Empty / whitespace-only drafts are removed instead
     /// of persisted as noise.
     private var composerDrafts: [String: String] = [:]
+
+    /// Bumped whenever a composer draft is mutated outside the focused field's
+    /// direct binding. ComposerView observes this to pull externally-recalled
+    /// prompt-history text into its local @State.
+    private(set) var composerDraftRevision = 0
+
+    /// Runtime-only prompt-history browse state keyed by the same draft identity
+    /// as ``composerDrafts``. This intentionally stores only cursor + original
+    /// draft snapshot, never a persisted prompt ring.
+    private var composerHistoryBrowses: [String: ComposerPromptHistory.State] = [:]
     /// The summary for the active session, if it's present in the loaded list.
     /// Used by app-side glue (e.g. the Live Activity title); `nil` for a session
     /// not yet in `sessions` (a brand-new create the list hasn't refreshed onto).
@@ -209,6 +272,59 @@ final class SessionStore {
         } else {
             composerDrafts[key] = draft
         }
+        composerDraftRevision &+= 1
+    }
+
+    /// Clear prompt-history cursor/snapshot state without changing the user's
+    /// saved draft. Passing a key resets one composer; nil resets all runtime
+    /// browse state for session switches and new chat.
+    func resetComposerHistoryBrowse(for key: String? = nil) {
+        if let key {
+            composerHistoryBrowses.removeValue(forKey: key)
+        } else {
+            composerHistoryBrowses.removeAll()
+        }
+    }
+
+    /// Browse backward through the active session's user prompt history.
+    @discardableResult
+    func recallPreviousComposerPrompt(messages: [ChatMessage]) -> Bool {
+        let key = activeComposerDraftKey
+        let history = ComposerPromptHistory.deriveUserHistory(from: messages)
+        var state = composerHistoryBrowses[key] ?? ComposerPromptHistory.State()
+        guard let recalled = ComposerPromptHistory.browseBackward(
+            history: history,
+            currentDraft: composerDraft(for: key),
+            state: &state
+        ) else {
+            return false
+        }
+
+        composerHistoryBrowses[key] = state
+        setComposerDraft(recalled, for: key)
+        return true
+    }
+
+    /// Browse forward toward the present composer draft snapshot.
+    @discardableResult
+    func recallNextComposerPrompt(messages: [ChatMessage]) -> Bool {
+        let key = activeComposerDraftKey
+        let history = ComposerPromptHistory.deriveUserHistory(from: messages)
+        var state = composerHistoryBrowses[key] ?? ComposerPromptHistory.State()
+        guard let recalled = ComposerPromptHistory.browseForward(
+            history: history,
+            state: &state
+        ) else {
+            return false
+        }
+
+        if state.cursorIndex == nil {
+            composerHistoryBrowses.removeValue(forKey: key)
+        } else {
+            composerHistoryBrowses[key] = state
+        }
+        setComposerDraft(recalled, for: key)
+        return true
     }
     /// True while a list/open/create RPC is in flight.
     #if DEBUG
@@ -2257,6 +2373,7 @@ final class SessionStore {
             pendingMessageJumpSnippet = nil
             pendingSearchScroll = nil
             pendingSearchScrollIsSnippet = false
+            resetComposerHistoryBrowse()
         }
 
         // Activate instantly — the chat view can present right away with a loading
@@ -2416,6 +2533,7 @@ final class SessionStore {
         isDraft = true
         activeRuntimeId = nil
         activeStoredId = nil
+        resetComposerHistoryBrowse()
         chat?.reset()
         chat?.seed(from: [])  // empty IS the (draft) transcript
         // A draft has NO session: drop the previous session's hot-swap state
