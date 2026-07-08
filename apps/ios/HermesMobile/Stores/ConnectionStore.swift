@@ -44,7 +44,9 @@ final class ConnectionStore {
     }
 
     /// Current high-level connection phase.
-    var phase: Phase = .connecting
+    var phase: Phase = .connecting {
+        didSet { notifyReadinessWaiters() }
+    }
     #if DEBUG
     /// JSON-safe mirror of ``phase`` for the gstack debug bridge snapshot
     /// (task UI-G). `phase` is a Swift enum and not JSON-serializable, so the
@@ -410,6 +412,11 @@ final class ConnectionStore {
     /// notes). Named so the test can pin it.
     static let coldOpenGraceWindow: Duration = .seconds(5)
 
+    /// Hard ceiling for a cold push tap that arrives before bootstrap/configure
+    /// has made REST/WS usable. The tap path must wait long enough for normal
+    /// cold launch bootstrap, but unconfigured/offline installs cannot hang.
+    static let pushTapReadinessTimeout: Duration = .seconds(10)
+
     /// The single, long-lived gateway client.
     let client = HermesGatewayClient()
 
@@ -435,6 +442,63 @@ final class ConnectionStore {
         return RestClient(
             baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
         )
+    }
+
+    /// Wait until session-list refresh has a usable transport, or until the
+    /// connection has reached a terminal not-ready state / timeout.
+    ///
+    /// This is deliberately narrower than full hydration: push-tap resolution only
+    /// needs REST (preferred by `SessionStore.refresh`) or an open WS client to
+    /// fetch `session.list`. A verified `configure()` stamps `serverURLString` and
+    /// `currentToken` before `.hydrating`, so `rest != nil` is enough to let the
+    /// miss path refresh without waiting for the branded loading screen to finish.
+    func waitUntilSessionRefreshReady(
+        timeout: Duration = ConnectionStore.pushTapReadinessTimeout
+    ) async -> Bool {
+        #if DEBUG
+        if let sessionRefreshReadinessOverride {
+            return await sessionRefreshReadinessOverride()
+        }
+        #endif
+        if await isSessionRefreshReady() { return true }
+        if isTerminallyNotReadyForSessionRefresh { return false }
+
+        let timeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            if Task.isCancelled { return }
+            await self?.notifyReadinessWaiters()
+        }
+        await waitForReadinessChange()
+        timeoutTask.cancel()
+
+        return await isSessionRefreshReady()
+    }
+
+    private func isSessionRefreshReady() async -> Bool {
+        if rest != nil { return true }
+        return await client.state == .open
+    }
+
+    private var isTerminallyNotReadyForSessionRefresh: Bool {
+        switch phase {
+        case .needsSetup, .offline:
+            return true
+        case .connecting, .hydrating, .connected, .reconnecting:
+            return false
+        }
+    }
+
+    private func waitForReadinessChange() async {
+        await withCheckedContinuation { continuation in
+            readinessWaiters.append(continuation)
+        }
+    }
+
+    private func notifyReadinessWaiters() {
+        guard !readinessWaiters.isEmpty else { return }
+        let waiters = readinessWaiters
+        readinessWaiters = []
+        waiters.forEach { $0.resume() }
     }
 
     /// A ``RestClient`` for the control-surface panels (model / personality /
@@ -483,6 +547,7 @@ final class ConnectionStore {
 
     /// The token for the active connection (kept in memory; also in Keychain).
     private var currentToken: String?
+    private var readinessWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// Servers where `POST /devices/issue` hit the device registry cap during
     /// this app run. A 409 is permanent until a device is revoked, so automatic
@@ -503,6 +568,11 @@ final class ConnectionStore {
     /// `RestClient.status()` call so unit tests can exercise verified configure
     /// persistence without a gateway.
     var statusRPC: ((_ url: URL, _ token: String) async throws -> Void)?
+
+    /// Injectable push-tap readiness result (tests). When non-nil, replaces the
+    /// live phase/transport wait so notification routing tests can deterministically
+    /// model cold-ready and cold-offline launches without sleeping for the timeout.
+    var sessionRefreshReadinessOverride: (() async -> Bool)?
 
     /// Injectable auth-revoke probe (tests). When non-nil, replaces the live
     /// `probeIsAuthRevoked` REST call with this closure's return value so unit

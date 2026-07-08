@@ -448,17 +448,31 @@ enum HermesURLRouter {
     /// - `attention` (approval / clarify): open the session; if it can't be
     ///   located even after a refresh, surface the inbox so the pending prompt is
     ///   still reachable.
-    /// - `turnComplete`: open the session (no inbox fallback — nothing to action).
+    /// - `turnComplete`: open the session; if the session cannot be resolved after
+    ///   readiness/refresh, surface the inbox rather than dead-ending the tap.
     static func routePushTap(
         _ tap: NotificationService.Tap,
         sessions: SessionStore,
-        inbox: InboxStore
+        inbox: InboxStore,
+        connection: ConnectionStore? = nil
     ) {
         switch tap {
         case .attention(let sessionId):
-            openForPush(runtimeSessionId: sessionId, sessions: sessions, inbox: inbox, surfaceInboxIfMissing: true)
+            openForPush(
+                runtimeSessionId: sessionId,
+                sessions: sessions,
+                inbox: inbox,
+                connection: connection,
+                surfaceInboxIfMissing: true
+            )
         case .turnComplete(let sessionId):
-            openForPush(runtimeSessionId: sessionId, sessions: sessions, inbox: inbox, surfaceInboxIfMissing: false)
+            openForPush(
+                runtimeSessionId: sessionId,
+                sessions: sessions,
+                inbox: inbox,
+                connection: connection,
+                surfaceInboxIfMissing: true
+            )
         }
     }
 
@@ -500,6 +514,7 @@ enum HermesURLRouter {
         runtimeSessionId: String,
         sessions: SessionStore,
         inbox: InboxStore,
+        connection: ConnectionStore?,
         surfaceInboxIfMissing: Bool
     ) {
         // Prefer the inbox's runtime→stored mapping; fall back to the raw id.
@@ -510,6 +525,15 @@ enum HermesURLRouter {
             return
         }
         Task {
+            if let connection {
+                let ready = await connection.waitUntilSessionRefreshReady()
+                guard ready else {
+                    if surfaceInboxIfMissing {
+                        inbox.requestPresentation()
+                    }
+                    return
+                }
+            }
             await sessions.refresh()
             if let summary = sessions.sessions.first(where: { $0.id == storedId }) {
                 sessions.open(summary)
