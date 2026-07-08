@@ -2057,6 +2057,7 @@ final class ChatStore {
             outgoing: outgoing,
             uploadedImagePaths: uploadedImagePaths
         )
+        sessions?.resetComposerHistoryBrowse(for: sessions?.activeComposerDraftKey)
         let userMessage = ChatMessage(role: .user, text: localDisplay)
         userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
         messages.append(userMessage)

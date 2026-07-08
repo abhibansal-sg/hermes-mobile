@@ -433,6 +433,16 @@ private struct SplitLayout: View {
                 .disabled(!RootKeyboardShortcutActions.hasSendableComposerText(sessions: sessions))
 
                 Button {
+                    recallPreviousComposerPrompt()
+                } label: { Text("Previous Prompt") }
+                .keyboardShortcut(.upArrow, modifiers: .command)
+
+                Button {
+                    recallNextComposerPrompt()
+                } label: { Text("Next Prompt") }
+                .keyboardShortcut(.downArrow, modifiers: .command)
+
+                Button {
                     openSettings()
                 } label: { Text("Settings") }
                 .keyboardShortcut(",", modifiers: .command)
@@ -465,6 +475,14 @@ private struct SplitLayout: View {
         RootKeyboardShortcutActions.sendCurrentComposerDraft(from: sessions) { text in
             Task { await chat.send(text: text, includeAttachments: false) }
         }
+    }
+
+    private func recallPreviousComposerPrompt() {
+        RootKeyboardShortcutActions.recallPreviousComposerPrompt(sessions: sessions, chat: chat)
+    }
+
+    private func recallNextComposerPrompt() {
+        RootKeyboardShortcutActions.recallNextComposerPrompt(sessions: sessions, chat: chat)
     }
 
     private func openSettings() {
@@ -517,8 +535,19 @@ enum RootKeyboardShortcutActions {
         guard !text.isEmpty else { return false }
 
         sessions.setComposerDraft("", for: key)
+        sessions.resetComposerHistoryBrowse(for: key)
         send(text)
         return true
+    }
+
+    @discardableResult
+    static func recallPreviousComposerPrompt(sessions: SessionStore, chat: ChatStore) -> Bool {
+        sessions.recallPreviousComposerPrompt(messages: chat.messages)
+    }
+
+    @discardableResult
+    static func recallNextComposerPrompt(sessions: SessionStore, chat: ChatStore) -> Bool {
+        sessions.recallNextComposerPrompt(messages: chat.messages)
     }
 
     static func openSettings(isPresented: Binding<Bool>) {

@@ -392,6 +392,13 @@ struct ComposerView: View {
             // leave it silently listening into the newly-loaded session.
             voice.end()
         }
+        .onChange(of: sessions.composerDraftRevision) { _, _ in
+            let stored = sessions.composerDraft(for: draftKey)
+            if stored != text {
+                text = stored
+                refreshSlashCommands()
+            }
+        }
         .onDisappear {
             sessions.setComposerDraft(text, for: draftKey)
         }
@@ -1025,6 +1032,7 @@ struct ComposerView: View {
         guard canSend else { return }
         let outgoing = trimmed
         text = ""
+        sessions.resetComposerHistoryBrowse(for: draftKey)
         // Fire the send haptic before the async send so the feedback lands
         // at the moment of the tap, not after the network round-trip.
         sendFeedbackTrigger &+= 1
@@ -1064,6 +1072,7 @@ struct ComposerView: View {
         queueStore.enqueue(trimmed, storedSessionId: sessions.activeStoredId)
         queueFeedbackTrigger &+= 1
         text = ""
+        sessions.resetComposerHistoryBrowse(for: draftKey)
     }
 
     /// Send the current text as a steering injection into the live turn.
