@@ -55,6 +55,63 @@ usage(){ sed -n '2,33p' "${BASH_SOURCE[0]}" >&2; }
 
 [ "$#" -eq 0 ] && { usage; exit 2; }
 
+# ---- live-gateway creds self-provisioning for `test` (STR-1339) --------------
+# WHY: live iOS XCUITests (ChatFlow / ConnectionModePicker / CrossClientSync /
+#   LocalDesktopManualToken) read HERMES_URL/HERMES_TOKEN, which xcodebuild
+#   forwards from TEST_RUNNER_HERMES_URL/TEST_RUNNER_HERMES_TOKEN. When the
+#   executor heartbeat env doesn't export those, the tests correctly XCTSkip →
+#   an all-skipped false-green → verifier bounce. That root cause bounced the
+#   composer-YOLO live test THREE times (STR-994→1006→1027) with never a code
+#   defect. This wrapper is the single choke point every dispatched `test` run
+#   flows through, so self-provisioning here self-heals EVERY future live iOS
+#   test with the smallest footprint (option 2 of STR-1339).
+#
+# CONTRACT (deliberately conservative):
+#   * Fires ONLY for the `test` action, and ONLY when BOTH TEST_RUNNER_HERMES_*
+#     are unset — an explicit caller value is always respected untouched.
+#   * NON-FATAL: if no dev-gateway.sh is found, its token is empty, or the
+#     gateway isn't reachable, we log and leave the vars unset → the tests
+#     XCTSkip exactly as before. We never fail a build over provisioning.
+#   * Opt out entirely with HERMES_NO_DEV_GATEWAY_AUTOPROVISION=1.
+#   * The token is never printed (only its length); no secret reaches the log.
+_find_dev_gateway_sh(){
+  local c
+  for c in \
+    "${HERMES_DEV_GATEWAY_SH:-}" \
+    "$REPO_ROOT/../hermes-loop/scripts/dev-gateway.sh" \
+    "$HOME/Developer/products/hermes-loop/scripts/dev-gateway.sh"; do
+    [ -n "$c" ] && [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+provision_test_runner_creds(){
+  [ "${HERMES_NO_DEV_GATEWAY_AUTOPROVISION:-0}" = "1" ] && return 0
+  # Respect an explicit caller: if EITHER var is set, don't half-provision.
+  if [ -n "${TEST_RUNNER_HERMES_URL:-}" ] || [ -n "${TEST_RUNNER_HERMES_TOKEN:-}" ]; then
+    log "live-test creds: TEST_RUNNER_HERMES_* already set by caller — not auto-provisioning."
+    return 0
+  fi
+  local url dg token
+  url="${HERMES_DEV_GATEWAY_URL:-http://127.0.0.1:${HERMES_DEV_PORT:-9200}}"
+  if ! dg="$(_find_dev_gateway_sh)"; then
+    log "live-test creds: no dev-gateway.sh found (set HERMES_DEV_GATEWAY_SH) — leaving TEST_RUNNER_* unset; live tests will XCTSkip."
+    return 0
+  fi
+  # Gateway must be reachable (unauthed /health 200) before we bother with a token.
+  if ! curl -fsS --max-time 4 "$url/health" >/dev/null 2>&1; then
+    log "live-test creds: dev gateway not reachable at $url/health — leaving TEST_RUNNER_* unset; live tests will XCTSkip."
+    return 0
+  fi
+  token="$("$dg" token 2>/dev/null | tr -d '[:space:]')"
+  if [ -z "$token" ]; then
+    log "live-test creds: dev-gateway.sh token empty — leaving TEST_RUNNER_* unset; live tests will XCTSkip."
+    return 0
+  fi
+  export TEST_RUNNER_HERMES_URL="$url"
+  export TEST_RUNNER_HERMES_TOKEN="$token"
+  log "live-test creds: auto-provisioned TEST_RUNNER_HERMES_URL=$url (token ${#token} chars, via $dg) — live iOS tests will run, not skip."
+}
+
 # True iff the log tail still shows we never got PAST build-description construction
 # (the precise wedge locus: CreateBuildDescription / the toolchain version+macro
 # probes). A healthy late-stage build [linking/packaging] will NOT match these, so
@@ -134,6 +191,12 @@ for a in "${args[@]}"; do
 done
 $have_proj || args=("-project" "$PROJ" "${args[@]}")
 $have_dd   || args+=("-derivedDataPath" "$DEFAULT_DD")
+
+# For the `test` action, self-provision live-gateway creds so live XCUITests run
+# instead of XCTSkip'ing (STR-1339). Runs before the build so the exported
+# TEST_RUNNER_HERMES_* are inherited by the xcodebuild child below. The action is
+# the first positional arg to this wrapper (e.g. `ios-build.sh test -scheme …`).
+[ "${1:-}" = "test" ] && provision_test_runner_creds
 
 # ---- run under watchdog (SIGTERM on timeout, NEVER -9) -----------------------
 preflight_wedge_check
