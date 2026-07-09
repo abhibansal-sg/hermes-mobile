@@ -57,6 +57,8 @@ _log = logging.getLogger(__name__)
 
 router = APIRouter()
 
+_DEBUG_SHARE_ROUTE_BUDGET_S = 15
+
 # Directory of the plugin package (parent of dashboard/).
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 _PLUGIN_PKG = "hermes_plugins.hermes_mobile"
@@ -528,10 +530,26 @@ async def debug_share_report(request: Request):
         raise HTTPException(status_code=403, detail="Device token lacks approve scope")
 
     try:
-        result = await asyncio.to_thread(
-            build_debug_share,
-            log_lines=200,
-            redact=True,
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                build_debug_share,
+                log_lines=200,
+                redact=True,
+            ),
+            timeout=_DEBUG_SHARE_ROUTE_BUDGET_S,
+        )
+    except asyncio.TimeoutError:
+        # STR-1210: a slow/rate-limited paste service must never hang this
+        # request past a bounded ceiling. The upload thread keeps running in
+        # the background (paste.rs/dpaste.com blocking sockets can't be
+        # cancelled); the caller gets a fast, honest answer and can retry.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Debug bundle upload did not finish within "
+                f"{_DEBUG_SHARE_ROUTE_BUDGET_S}s; it continues in the "
+                f"background. Retry, or run `hermes debug share` from the CLI."
+            ),
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=f"Upload failed: {exc}")
