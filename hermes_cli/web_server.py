@@ -4103,6 +4103,11 @@ async def search_sessions(q: str = "", limit: int = 20, offset: int = 0, scope: 
     """
     if not q or not q.strip():
         return {"results": []}
+    scope_norm = (scope or "all").strip().lower()
+    role_filter = {
+        "messages": ["user", "assistant"],
+        "code": ["tool"],
+    }.get(scope_norm)  # None for "all" / unknown → no role filter
     try:
         db = _open_session_db_for_profile(profile)
         try:
