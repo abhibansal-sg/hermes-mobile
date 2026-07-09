@@ -450,7 +450,16 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     # Loopback bind: accept the loopback names
     bound_lc = bound_host.lower()
     if bound_lc in _LOOPBACK_HOST_VALUES:
-        return host_only in _LOOPBACK_HOST_VALUES
+        if host_only in _LOOPBACK_HOST_VALUES:
+            return True
+        # Reverse-proxy / Tailscale Serve: Host is the public MagicDNS name
+        # while we stay bound to 127.0.0.1. Operator-owned allowlist only.
+        extra = os.environ.get("HERMES_DASHBOARD_ALLOWED_HOSTS", "")
+        if extra:
+            allowed = {h.strip().lower() for h in extra.split(",") if h.strip()}
+            if host_only in allowed:
+                return True
+        return False
 
     # Explicit non-loopback bind: require exact host match
     return host_only == bound_lc
