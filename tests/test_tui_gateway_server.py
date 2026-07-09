@@ -7,7 +7,7 @@ import time
 import types
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -897,15 +897,10 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
     ]
 
     assert server._history_to_messages(history) == [
-        {"role": "user", "text": "first prompt", "id": 0},
-        {
-            "context": "Searching files for resume",
-            "name": "search_files",
-            "role": "tool",
-            "id": 1,
-        },
-        {"role": "assistant", "text": "first answer", "id": 2},
-        {"role": "user", "text": "second prompt", "id": 3},
+        {"role": "user", "text": "first prompt"},
+        {"context": "Searching files for resume", "name": "search_files", "role": "tool"},
+        {"role": "assistant", "text": "first answer"},
+        {"role": "user", "text": "second prompt"},
     ]
 
 
@@ -922,14 +917,9 @@ def test_history_to_messages_keeps_reasoning_only_assistant_turn():
     ]
 
     assert server._history_to_messages(history) == [
-        {"role": "user", "text": "think about this", "id": 0},
-        {
-            "role": "assistant",
-            "text": "",
-            "reasoning": "step-by-step thoughts",
-            "id": 1,
-        },
-        {"role": "assistant", "text": "here is the answer", "id": 2},
+        {"role": "user", "text": "think about this"},
+        {"role": "assistant", "text": "", "reasoning": "step-by-step thoughts"},
+        {"role": "assistant", "text": "here is the answer"},
     ]
 
 
@@ -944,8 +934,8 @@ def test_history_to_messages_still_drops_empty_assistant_without_reasoning():
     ]
 
     assert server._history_to_messages(history) == [
-        {"role": "user", "text": "hi", "id": 0},
-        {"role": "assistant", "text": "real reply", "id": 1},
+        {"role": "user", "text": "hi"},
+        {"role": "assistant", "text": "real reply"},
     ]
 
 
@@ -966,52 +956,8 @@ def test_history_to_messages_renders_multimodal_content():
     ]
 
     assert server._history_to_messages(history) == [
-        {"role": "user", "text": "look here\ndata:image/png;base64,abc", "id": 0},
-        {"role": "assistant", "text": "saw it", "id": 1},
-    ]
-
-
-def test_history_to_messages_emits_stable_ids_across_growth():
-    # ARCH37 STEP 4 — the per-row `id` is a monotonic ordinal over the emitted
-    # array, and the build is deterministic from history order, so the id of a row
-    # that already existed is IDENTICAL after the conversation grows by new turns.
-    # This is what lets the iOS client reconcile cache (shorter) against network
-    # (longer) in place — the row whose content matches keeps its id, no remount.
-    base = [
-        {"role": "user", "content": "q1"},
-        {"role": "assistant", "content": "a1"},
-        {"role": "user", "content": "q2"},
-    ]
-    grown = base + [
-        {"role": "assistant", "content": "a2"},
-        {"role": "user", "content": "q3"},
-    ]
-
-    base_msgs = server._history_to_messages(base)
-    grown_msgs = server._history_to_messages(grown)
-
-    # Every row carries an id.
-    assert [m["id"] for m in base_msgs] == [0, 1, 2]
-    assert [m["id"] for m in grown_msgs] == [0, 1, 2, 3, 4]
-    # The first three rows kept their ids AND content across the growth (in-place
-    # reconcilable); only new rows were appended with new ids.
-    assert base_msgs == grown_msgs[: len(base_msgs)]
-
-
-def test_history_to_messages_id_stable_when_empty_rows_dropped():
-    # Dropping an empty-content assistant row (no text, no tool_calls) does not
-    # shift the ids of the rows that ARE emitted relative to a clean fetch of the
-    # same surviving rows — the ordinal is over the OUTPUT array, which is the
-    # stable, authoritative order the client reconciles against.
-    history = [
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": ""},  # dropped (empty, no tool_calls)
-        {"role": "assistant", "content": "answer"},
-    ]
-    msgs = server._history_to_messages(history)
-    assert msgs == [
-        {"role": "user", "text": "hi", "id": 0},
-        {"role": "assistant", "text": "answer", "id": 1},
+        {"role": "user", "text": "look here\ndata:image/png;base64,abc"},
+        {"role": "assistant", "text": "saw it"},
     ]
 
 
@@ -1067,8 +1013,8 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     )
 
     assert resp["result"]["messages"] == [
-        {"role": "user", "text": "root prompt", "id": 0},
-        {"role": "assistant", "text": "root answer", "id": 1},
+        {"role": "user", "text": "root prompt"},
+        {"role": "assistant", "text": "root answer"},
     ]
     assert captured["history_calls"] == [("tip", False), ("tip", True)]
 
@@ -1882,7 +1828,7 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
     monkeypatch.setattr(
         server,
         "_notify_session_boundary",
-        lambda event, session_id: calls["hooks"].append((event, session_id)),
+        lambda event, session_id, *_args: calls["hooks"].append((event, session_id)),
     )
 
     try:
@@ -2002,7 +1948,7 @@ def test_init_session_fires_reset_hook(monkeypatch):
     hooks = []
 
     class _FakeWorker:
-        def __init__(self, key, model):
+        def __init__(self, key, model, profile_home=None):
             self.key = key
 
         def close(self):
@@ -2014,7 +1960,7 @@ def test_init_session_fires_reset_hook(monkeypatch):
     monkeypatch.setattr(
         server,
         "_notify_session_boundary",
-        lambda event, session_id: hooks.append((event, session_id)),
+        lambda event, session_id, *_args: hooks.append((event, session_id)),
     )
 
     import tools.approval as _approval
@@ -2166,14 +2112,85 @@ def test_notification_event_routing_by_session_key(monkeypatch):
     monkeypatch.setattr(server, "_sessions", {"a": mine, "b": other})
 
     # My own event → handle it.
-    assert server._notification_event_belongs_elsewhere(mine, {"session_key": "mine"}) is False
+    assert server._notification_event_belongs_elsewhere("a", mine, {"session_key": "mine"}) is False
     # Global/system event with no owner → handle it.
-    assert server._notification_event_belongs_elsewhere(mine, {"session_key": ""}) is False
-    assert server._notification_event_belongs_elsewhere(mine, {}) is False
+    assert server._notification_event_belongs_elsewhere("a", mine, {"session_key": ""}) is False
+    assert server._notification_event_belongs_elsewhere("a", mine, {}) is False
     # Owned by another *live* session → defer to that session's poller.
-    assert server._notification_event_belongs_elsewhere(mine, {"session_key": "other"}) is True
+    assert server._notification_event_belongs_elsewhere("a", mine, {"session_key": "other"}) is True
     # Owner is gone (not in _sessions) → handle as fallback so it isn't lost.
-    assert server._notification_event_belongs_elsewhere(mine, {"session_key": "ghost"}) is False
+    assert server._notification_event_belongs_elsewhere("a", mine, {"session_key": "ghost"}) is False
+
+
+def test_async_delegation_event_prefers_origin_ui_session(monkeypatch):
+    """Detached subagent completions return to the commissioning TUI tab.
+
+    Regression: when the durable session key was stale/orphaned, whichever
+    desktop poller woke first could consume the async result and inject it into
+    an unrelated session.
+    """
+    mine = _session(session_key="current-key")
+    other = _session(session_key="unrelated-key")
+    monkeypatch.setattr(server, "_sessions", {"origin-sid": mine, "other-sid": other})
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    evt = {
+        "type": "async_delegation",
+        "session_key": "stale-or-rotated-key",
+        "origin_ui_session_id": "origin-sid",
+    }
+
+    assert server._notification_event_belongs_elsewhere("other-sid", other, evt) is True
+    assert server._notification_event_belongs_elsewhere("origin-sid", mine, evt) is False
+
+
+def test_notification_event_follows_compression_continuation(monkeypatch):
+    """Events keyed to a compressed parent route to the live continuation."""
+    old_parent = _session(session_key="old-parent")
+    live_tip = _session(session_key="new-tip")
+    monkeypatch.setattr(server, "_sessions", {"old-sid": old_parent, "tip-sid": live_tip})
+
+    class _DB:
+        def resolve_resume_session_id(self, session_id):
+            return "new-tip" if session_id == "old-parent" else session_id
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    evt = {"type": "async_delegation", "session_key": "old-parent"}
+
+    assert server._notification_event_belongs_elsewhere("old-sid", old_parent, evt) is True
+    assert server._notification_event_belongs_elsewhere("tip-sid", live_tip, evt) is False
+    # A third session must leave it alone for the continuation's poller.
+    third = _session(session_key="third")
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {"old-sid": old_parent, "tip-sid": live_tip, "third-sid": third},
+    )
+    assert server._notification_event_belongs_elsewhere("third-sid", third, evt) is True
+
+
+def test_finalized_origin_ui_session_falls_back_to_live_continuation(monkeypatch):
+    """A closed origin tab must not steal its resumed continuation's result."""
+    finalized_origin = _session(session_key="old-parent", _finalized=True)
+    live_tip = _session(session_key="new-tip")
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {"origin-sid": finalized_origin, "tip-sid": live_tip},
+    )
+
+    class _DB:
+        def resolve_resume_session_id(self, session_id):
+            return "new-tip" if session_id == "old-parent" else session_id
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    evt = {
+        "type": "async_delegation",
+        "session_key": "old-parent",
+        "origin_ui_session_id": "origin-sid",
+    }
+
+    assert server._notification_event_belongs_elsewhere("origin-sid", finalized_origin, evt) is True
+    assert server._notification_event_belongs_elsewhere("tip-sid", live_tip, evt) is False
 
 
 def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
@@ -4782,6 +4799,25 @@ def test_session_info_includes_session_title(monkeypatch):
     assert info["title"] == "Dashboard title"
 
 
+def test_session_info_includes_install_warning_for_pip(monkeypatch):
+    """pip installs surface install_warning; git installs don't (issue: pip/brew deprecation)."""
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda: "pip")
+
+    info = server._session_info(types.SimpleNamespace(tools=[], model="", provider=""))
+
+    assert "install_warning" in info
+    assert "pip" in info["install_warning"]
+    assert "platform-support" in info["install_warning"]
+
+
+def test_session_info_omits_install_warning_for_git(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda: "git")
+
+    info = server._session_info(types.SimpleNamespace(tools=[], model="", provider=""))
+
+    assert "install_warning" not in info
+
+
 # ---------------------------------------------------------------------------
 # History-mutating commands must reject while session.running is True.
 # Without these guards, prompt.submit's post-run history write either
@@ -5508,7 +5544,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     unregistered_keys: list[str] = []
 
     class _FakeWorker:
-        def __init__(self, key, model):
+        def __init__(self, key, model, profile_home=None):
             self.key = key
             self._closed = False
 
@@ -5534,7 +5570,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     release_build = threading.Event()
     build_entered = threading.Event()
 
-    def _slow_make_agent(sid, key, session_id=None, session_db=None):
+    def _slow_make_agent(sid, key, session_id=None, session_db=None, **_kwargs):
         build_started.set()
         build_entered.set()
         release_build.wait(timeout=3.0)
@@ -5629,7 +5665,7 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
     unregistered_keys: list[str] = []
 
     class _FakeWorker:
-        def __init__(self, key, model):
+        def __init__(self, key, model, profile_home=None):
             self.key = key
 
         def close(self):
@@ -5642,7 +5678,7 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
             self.base_url = ""
             self.api_key = ""
 
-    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None: _FakeAgent())
+    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None, **_kwargs: _FakeAgent())
     monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
     monkeypatch.setattr(
         server,
@@ -5733,7 +5769,7 @@ def test_get_db_degrades_cleanly_when_sessiondb_init_fails(monkeypatch):
 
 def test_session_create_continues_when_state_db_is_unavailable(monkeypatch):
     class _FakeWorker:
-        def __init__(self, key, model):
+        def __init__(self, key, model, profile_home=None):
             self.key = key
 
         def close(self):
@@ -5748,7 +5784,7 @@ def test_session_create_continues_when_state_db_is_unavailable(monkeypatch):
 
     emits = []
 
-    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None: _FakeAgent())
+    monkeypatch.setattr(server, "_make_agent", lambda sid, key, session_db=None, **_kwargs: _FakeAgent())
     monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_session_info", lambda _a, *a2: {"model": "x"})
@@ -5781,7 +5817,7 @@ def test_session_create_lazy_info_reports_desktop_contract(monkeypatch):
     date" on every launch even against a current backend."""
 
     class _FakeWorker:
-        def __init__(self, key, model):
+        def __init__(self, key, model, profile_home=None):
             self.key = key
 
         def close(self):
@@ -5847,16 +5883,9 @@ def test_session_delete_returns_db_unavailable_when_no_db(monkeypatch):
     assert "state.db unavailable" in resp["error"]["message"]
 
 
-def test_session_delete_evicts_non_running_live_session(monkeypatch):
-    """A live but NON-running session is auto-evicted (teardown) then deleted.
-
-    Previously this returned 4023 and refused; the app registers every opened
-    session live via session.resume, so refusing made delete reliably fail for
-    anything the user had touched.  The fix tears the live row down via the
-    session.close pop+teardown idiom, then deletes the on-disk state.
-    """
+def test_session_delete_refuses_active_session(monkeypatch):
+    """Cannot delete a session currently bound to a live TUI session."""
     called: list[str] = []
-    torn: list[dict] = []
 
     class _DB:
         def delete_session(self, sid, sessions_dir=None):
@@ -5864,9 +5893,7 @@ def test_session_delete_evicts_non_running_live_session(monkeypatch):
             return True
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "_teardown_session", lambda session: torn.append(session))
-    live_session = _session(running=False, session_key="key-live")
-    monkeypatch.setitem(server._sessions, "live-sid", live_session)
+    monkeypatch.setitem(server._sessions, "live", {"session_key": "key-live"})
     try:
         resp = server.handle_request(
             {
@@ -5876,166 +5903,12 @@ def test_session_delete_evicts_non_running_live_session(monkeypatch):
             }
         )
     finally:
-        server._sessions.pop("live-sid", None)
-
-    assert "result" in resp, resp
-    assert resp["result"] == {"deleted": "key-live", "evicted": True}
-    assert called == ["key-live"], "delete_session must run after eviction"
-    assert len(torn) == 1, "the live row must be torn down exactly once"
-    # The live row must be popped from _sessions before delete.
-    assert "live-sid" not in server._sessions
-
-
-def test_session_delete_interrupts_running_live_session(monkeypatch):
-    """A live RUNNING session is interrupted (stop the spending runtime),
-    pending prompts/approvals released, then evicted and deleted."""
-    called: list[str] = []
-    interrupted = {"count": 0}
-    cleared: list[str] = []
-    approvals: list[tuple] = []
-    torn: list[dict] = []
-
-    class _DB:
-        def delete_session(self, sid, sessions_dir=None):
-            called.append(sid)
-            return True
-
-    class _Agent:
-        def interrupt(self):
-            interrupted["count"] += 1
-
-    monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "_teardown_session", lambda session: torn.append(session))
-    monkeypatch.setattr(server, "_clear_pending", lambda sid=None: cleared.append(sid))
-
-    import tools.approval as approval
-
-    monkeypatch.setattr(
-        approval,
-        "resolve_gateway_approval",
-        lambda key, decision, resolve_all=False: approvals.append(
-            (key, decision, resolve_all)
-        ),
-    )
-
-    live_session = _session(agent=_Agent(), running=True, session_key="key-run")
-    monkeypatch.setitem(server._sessions, "run-sid", live_session)
-    try:
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "session.delete",
-                "params": {"session_id": "key-run"},
-            }
-        )
-    finally:
-        server._sessions.pop("run-sid", None)
-
-    assert "result" in resp, resp
-    assert resp["result"] == {"deleted": "key-run", "evicted": True}
-    assert interrupted["count"] == 1, "the in-flight agent must be interrupted"
-    # _clear_pending is scoped to the RUNTIME sid, not the stored key.
-    assert cleared == ["run-sid"]
-    # Approval release is keyed on the STORED session key, deny-all.
-    assert approvals == [("key-run", "deny", True)]
-    assert called == ["key-run"]
-    assert len(torn) == 1
-    assert "run-sid" not in server._sessions
-
-
-def test_session_delete_does_not_interrupt_non_running_session(monkeypatch):
-    """Eviction of a non-running session must NOT call agent.interrupt — no
-    turn is in flight, so an interrupt-free teardown is correct."""
-
-    class _DB:
-        def delete_session(self, sid, sessions_dir=None):
-            return True
-
-    class _Agent:
-        def interrupt(self):
-            raise AssertionError("must not interrupt a non-running session")
-
-    monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "_teardown_session", lambda session: None)
-    live_session = _session(agent=_Agent(), running=False, session_key="key-idle")
-    monkeypatch.setitem(server._sessions, "idle-sid", live_session)
-    try:
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "session.delete",
-                "params": {"session_id": "key-idle"},
-            }
-        )
-    finally:
-        server._sessions.pop("idle-sid", None)
-
-    assert resp["result"] == {"deleted": "key-idle", "evicted": True}
-
-
-def test_session_delete_refuses_when_eviction_fails(monkeypatch):
-    """If teardown raises, refuse with 4023 rather than delete a half-torn
-    session — the 4023 string is preserved for this fallback."""
-    called: list[str] = []
-
-    class _DB:
-        def delete_session(self, sid, sessions_dir=None):
-            called.append(sid)
-            return True
-
-    def _boom(session):
-        raise RuntimeError("worker close hung")
-
-    monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "_teardown_session", _boom)
-    live_session = _session(running=False, session_key="key-fail")
-    monkeypatch.setitem(server._sessions, "fail-sid", live_session)
-    try:
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "session.delete",
-                "params": {"session_id": "key-fail"},
-            }
-        )
-    finally:
-        server._sessions.pop("fail-sid", None)
+        server._sessions.pop("live", None)
 
     assert "error" in resp
     assert resp["error"]["code"] == 4023
-    assert "could not evict" in resp["error"]["message"]
-    assert called == [], "delete_session must not run when eviction fails"
-
-
-def test_session_delete_skips_finalized_live_row(monkeypatch):
-    """A finalized live row is NOT treated as live — delete proceeds straight
-    to the DB and reports evicted=False (mirrors _find_live_session_by_key)."""
-    called: list[str] = []
-    torn: list[dict] = []
-
-    class _DB:
-        def delete_session(self, sid, sessions_dir=None):
-            called.append(sid)
-            return True
-
-    monkeypatch.setattr(server, "_get_db", lambda: _DB())
-    monkeypatch.setattr(server, "_teardown_session", lambda session: torn.append(session))
-    finalized = _session(running=False, session_key="key-final", _finalized=True)
-    monkeypatch.setitem(server._sessions, "final-sid", finalized)
-    try:
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "session.delete",
-                "params": {"session_id": "key-final"},
-            }
-        )
-    finally:
-        server._sessions.pop("final-sid", None)
-
-    assert resp["result"] == {"deleted": "key-final", "evicted": False}
-    assert torn == [], "a finalized row must not be torn down again"
-    assert called == ["key-final"]
+    assert "active session" in resp["error"]["message"]
+    assert called == [], "delete_session must not be called for active sessions"
 
 
 def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
@@ -6114,8 +5987,7 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
     )
 
     assert "result" in resp, resp
-    # Stored-only session (no live row) → straight delete, evicted=False.
-    assert resp["result"] == {"deleted": "old-1", "evicted": False}
+    assert resp["result"] == {"deleted": "old-1"}
     assert captured["sid"] == "old-1"
     # sessions_dir must be forwarded so transcript files get cleaned up
     # too — not just the SQLite row.  The autouse _isolate_hermes_home
@@ -6201,6 +6073,52 @@ def test_model_options_propagates_list_exception(monkeypatch):
     assert "error" in resp
     assert resp["error"]["code"] == 5033
     assert "catalog blew up" in resp["error"]["message"]
+
+
+def test_model_options_hides_unconfigured_providers_by_default(monkeypatch):
+    from hermes_cli.inventory import ConfigContext
+
+    calls = []
+
+    monkeypatch.setattr(server, "_resolve_model", lambda: "")
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: ConfigContext(
+            current_provider="",
+            current_model="",
+            current_base_url="",
+            user_providers={},
+            custom_providers=[],
+        ),
+    )
+
+    def _fake_build_models_payload(_ctx, **kwargs):
+        calls.append(kwargs)
+        return {"providers": [], "model": "", "provider": ""}
+
+    monkeypatch.setattr(
+        "hermes_cli.inventory.build_models_payload",
+        _fake_build_models_payload,
+    )
+
+    resp = server._methods["model.options"](99, {"session_id": ""})
+    assert "result" in resp, resp
+    assert calls[-1]["explicit_only"] is False
+    assert calls[-1]["include_unconfigured"] is False
+
+    resp = server._methods["model.options"](
+        100,
+        {"session_id": "", "explicit_only": True},
+    )
+    assert "result" in resp, resp
+    assert calls[-1]["explicit_only"] is True
+
+    resp = server._methods["model.options"](
+        101,
+        {"session_id": "", "include_unconfigured": True},
+    )
+    assert "result" in resp, resp
+    assert calls[-1]["include_unconfigured"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -6619,8 +6537,8 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         )
         assert completed["result"].get("inflight") is None
         assert completed["result"]["messages"] == [
-            {"role": "user", "text": "write a long answer", "id": 0},
-            {"role": "assistant", "text": "partial answer complete", "id": 1},
+            {"role": "user", "text": "write a long answer"},
+            {"role": "assistant", "text": "partial answer complete"},
         ]
     finally:
         release.set()
@@ -6657,8 +6575,8 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
         assert resp["result"]["status"] == "working"
         assert resp["result"]["info"] == {"model": "model-b"}
         assert resp["result"]["messages"] == [
-            {"role": "user", "text": "new prompt", "id": 0},
-            {"role": "assistant", "text": "new answer", "id": 1},
+            {"role": "user", "text": "new prompt"},
+            {"role": "assistant", "text": "new answer"},
         ]
     finally:
         server._sessions.pop("sid-a", None)
@@ -6672,7 +6590,7 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
     """Drops `tool` rows like session.list does, returns the first hit."""
 
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False):
+        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
             return [
                 {"id": "tool-1", "source": "tool", "title": "noise", "started_at": 100},
                 {"id": "tui-1", "source": "tui", "title": "real", "started_at": 99},
@@ -6691,7 +6609,7 @@ def test_session_most_recent_returns_first_non_denied(monkeypatch):
 
 def test_session_most_recent_returns_null_when_only_tool_rows(monkeypatch):
     class _DB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False):
+        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
             return [{"id": "tool-1", "source": "tool", "started_at": 1}]
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
@@ -6709,7 +6627,7 @@ def test_session_most_recent_folds_db_exception_into_null_result(monkeypatch):
     'no answer' (Copilot review on #17130)."""
 
     class _BrokenDB:
-        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False):
+        def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
             raise RuntimeError("db locked")
 
     monkeypatch.setattr(server, "_get_db", lambda: _BrokenDB())
@@ -6965,8 +6883,9 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
         with (
             patch(
                 "hermes_cli.browser_connect.launch_chrome_debug",
-                return_value=ChromeDebugLaunch(launched=False, attempts=[]),
+                return_value=ChromeDebugLaunch(),
             ),
+            patch("hermes_cli.browser_connect.manual_chrome_debug_command", return_value=None),
             patch(
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
                 return_value=[],
@@ -6991,12 +6910,11 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
         == "Chromium-family browser isn't running with remote debugging — attempting to launch..."
     )
     assert any(
-        "--remote-debugging-port=9222" in line for line in resp["result"]["messages"]
+        "No supported Chromium-family browser executable was found" in line
+        for line in resp["result"]["messages"]
     )
     assert any(
-        "No supported Chromium-family browser executable was found" in line
-        or "Start a Chromium-family browser with remote debugging" in line
-        for line in resp["result"]["messages"]
+        "--remote-debugging-port=9222" in line for line in resp["result"]["messages"]
     )
     assert "BROWSER_CDP_URL" not in os.environ
     progress = [p["message"] for evt, p in emitted if evt == "browser.progress"]
@@ -7023,8 +6941,9 @@ def test_browser_manage_connect_no_session_skips_progress_events(monkeypatch):
         with (
             patch(
                 "hermes_cli.browser_connect.launch_chrome_debug",
-                return_value=ChromeDebugLaunch(launched=False, attempts=[]),
+                return_value=ChromeDebugLaunch(),
             ),
+            patch("hermes_cli.browser_connect.manual_chrome_debug_command", return_value=None),
             patch(
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
                 return_value=[],
@@ -7111,8 +7030,7 @@ def test_browser_manage_connect_default_local_retries_after_launch(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _opener)
     with patch.dict(sys.modules, {"tools.browser_tool": fake}):
         with patch(
-            "hermes_cli.browser_connect.launch_chrome_debug",
-            return_value=ChromeDebugLaunch(launched=True, attempts=[]),
+            "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=True
         ):
             resp = server.handle_request(
                 {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}
@@ -7125,64 +7043,6 @@ def test_browser_manage_connect_default_local_retries_after_launch(monkeypatch):
         "Chromium-family browser launched and listening on port 9222",
     ]
     assert os.environ["BROWSER_CDP_URL"] == "http://127.0.0.1:9222"
-
-
-def test_guard_chrome_debug_launch_binds_to_launch_chrome_debug(monkeypatch):
-    """Regression for the STR-860 patch-target drift.
-
-    ``_browser_connect`` calls ``hermes_cli.browser_connect.launch_chrome_debug``
-    at call time; the suite-wide autouse guard in ``tests/conftest.py`` must
-    mock that exact symbol, not the dead ``try_launch_chrome_debug`` wrapper
-    the three tests above used to patch (which no production code calls).
-
-    This test poisons every path a real launch could still take *except*
-    ``launch_chrome_debug`` itself, then asserts the real ``subprocess.Popen``
-    is never reached. If the conftest guard regressed to patching
-    ``try_launch_chrome_debug`` instead, the real ``launch_chrome_debug``
-    would run, see the fake non-empty candidate list set up below, and call
-    ``subprocess.Popen`` — which this test would then catch.
-    """
-    import hermes_cli.browser_connect as browser_connect
-
-    monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
-    monkeypatch.setattr(
-        browser_connect,
-        "get_chrome_debug_candidates",
-        lambda system: ["/nonexistent/not-a-real-chrome-binary"],
-    )
-
-    def _poisoned_try_launch(*_args, **_kwargs):
-        raise AssertionError(
-            "try_launch_chrome_debug was invoked — this dead legacy wrapper "
-            "is never called by production code; something is patching the "
-            "wrong symbol"
-        )
-
-    monkeypatch.setattr(browser_connect, "try_launch_chrome_debug", _poisoned_try_launch)
-
-    poisoned_popen = Mock(
-        side_effect=RuntimeError(
-            "real subprocess.Popen reached — the Chrome-launch guard did not bind"
-        )
-    )
-    monkeypatch.setattr(browser_connect.subprocess, "Popen", poisoned_popen)
-
-    fake = types.SimpleNamespace(
-        cleanup_all_browsers=lambda: None,
-        _get_cdp_override=lambda: os.environ.get("BROWSER_CDP_URL", ""),
-    )
-    with patch.dict(sys.modules, {"tools.browser_tool": fake}):
-        _stub_urlopen(monkeypatch, ok=False)
-        resp = server.handle_request(
-            {
-                "id": "1",
-                "method": "browser.manage",
-                "params": {"action": "connect", "url": "http://localhost:9222"},
-            }
-        )
-
-    poisoned_popen.assert_not_called()
-    assert resp["result"]["connected"] is False
 
 
 def test_browser_manage_connect_rejects_unreachable_endpoint(monkeypatch):
