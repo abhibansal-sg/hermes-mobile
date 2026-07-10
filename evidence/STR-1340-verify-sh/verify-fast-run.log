@@ -1,0 +1,5 @@
+── GATE: uv-lock
+── GATE: ruff
+── GATE: windows-footguns
+── ADVISORY: ty-typecheck
+── GATE: pytest
