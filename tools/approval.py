@@ -1434,6 +1434,11 @@ class _ApprovalEntry:
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
+# S5 approval-resolution observer seam. Observers run only after waiting agent
+# threads have been released and receive the resolver's auth context, so audit
+# failures can never stall the approval path.
+_RESOLVE_OBSERVERS: list = []
+
 
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register a per-session callback for sending approval requests to the user.
@@ -1462,7 +1467,8 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             audit: Optional[dict] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -1473,6 +1479,10 @@ def resolve_gateway_approval(session_key: str, choice: str,
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
     BLOCKED message so it can adapt instead of only hearing "denied".
+
+    *audit* is optional resolver context (credential/device/session metadata).
+    When supplied it is forwarded to registered S5 observers only after all
+    target entries have been released. Existing callers remain unchanged.
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
@@ -1493,6 +1503,15 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if reason:
             entry.reason = reason
         entry.event.set()
+
+    if audit and targets:
+        entries_data = [getattr(entry, "data", None) for entry in targets]
+        for observer in list(_RESOLVE_OBSERVERS):
+            try:
+                observer(session_key, choice, resolve_all, audit, entries_data)
+            except Exception:  # pragma: no cover - best-effort, never fatal
+                logger.debug("approval resolve observer failed", exc_info=True)
+
     return len(targets)
 
 
