@@ -638,3 +638,135 @@ struct PendingClarification: Sendable, Equatable {
     let sessionId: String
     let request: ClarifyRequestPayload
 }
+
+/// Coarse UI phase for the mobile "Undo last turn" + rollback flow.
+enum UndoRollbackPhase: Sendable, Equatable {
+    case idle
+    case loading
+    case empty
+    case awaitingConfirmation
+    case restoring
+    case restored
+    case failed
+
+    var isBusy: Bool {
+        switch self {
+        case .loading, .restoring: return true
+        default: return false
+        }
+    }
+
+    var bannerTitle: String? {
+        switch self {
+        case .loading: return "Undoing last turn…"
+        case .empty: return "Nothing to undo"
+        case .awaitingConfirmation: return "Review file rollback"
+        case .restoring: return "Restoring files…"
+        case .restored: return "Rollback restored"
+        case .failed: return "Undo failed"
+        case .idle: return nil
+        }
+    }
+}
+
+struct SessionUndoResult: Sendable, Equatable {
+    var removed: Int
+
+    init(json: JSONValue) {
+        self.removed = json["removed"]?.intValue ?? 0
+    }
+}
+
+struct RollbackCheckpoint: Identifiable, Sendable, Equatable {
+    var id: String { hash }
+    let hash: String
+    let timestamp: String
+    let message: String
+
+    init?(json: JSONValue) {
+        guard let hash = json["hash"]?.stringValue, !hash.isEmpty else { return nil }
+        self.hash = hash
+        self.timestamp = json["timestamp"]?.stringValue ?? ""
+        self.message = json["message"]?.stringValue ?? ""
+    }
+}
+
+struct RollbackListResult: Sendable, Equatable {
+    let enabled: Bool
+    let checkpoints: [RollbackCheckpoint]
+
+    init(json: JSONValue) {
+        self.enabled = json["enabled"]?.boolValue ?? false
+        self.checkpoints = json["checkpoints"]?.arrayValue?.compactMap(RollbackCheckpoint.init(json:)) ?? []
+    }
+}
+
+struct RollbackDiffResult: Sendable, Equatable {
+    let stat: String
+    let diff: String
+    let rendered: String?
+    let filePaths: [String]
+
+    init(json: JSONValue) {
+        self.stat = json["stat"]?.stringValue ?? ""
+        let diff = json["diff"]?.stringValue ?? ""
+        self.diff = diff
+        self.rendered = json["rendered"]?.stringValue
+        self.filePaths = Self.changedFilePaths(in: diff)
+    }
+
+    var displayText: String {
+        let body = rendered?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let body, !body.isEmpty { return body }
+        let raw = diff.trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty ? "No file diff reported for this checkpoint." : raw
+    }
+
+    private static func changedFilePaths(in diff: String) -> [String] {
+        var paths: [String] = []
+        var previousOldPath: String?
+
+        func appendPath(_ raw: String) {
+            let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !path.isEmpty, path != "/dev/null", !paths.contains(path) else { return }
+            paths.append(path)
+        }
+
+        for rawLine in diff.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(rawLine)
+            if line.hasPrefix("diff --git a/") {
+                let rest = String(line.dropFirst("diff --git a/".count))
+                if let separator = rest.range(of: " b/") {
+                    appendPath(String(rest[separator.upperBound...]))
+                }
+                previousOldPath = nil
+            } else if line.hasPrefix("--- a/") {
+                previousOldPath = String(line.dropFirst("--- a/".count))
+            } else if line.hasPrefix("+++ b/") {
+                appendPath(String(line.dropFirst("+++ b/".count)))
+                previousOldPath = nil
+            } else if line == "+++ /dev/null", let oldPath = previousOldPath {
+                appendPath(oldPath)
+                previousOldPath = nil
+            }
+        }
+
+        return paths
+    }
+}
+
+struct RollbackRestoreResult: Sendable, Equatable {
+    let success: Bool
+    let historyRemoved: Int
+
+    init(json: JSONValue) {
+        self.success = json["success"]?.boolValue ?? false
+        self.historyRemoved = json["history_removed"]?.intValue ?? 0
+    }
+}
+
+struct PendingRollbackRestore: Identifiable, Sendable, Equatable {
+    var id: String { checkpoint.hash }
+    let checkpoint: RollbackCheckpoint
+    let diff: RollbackDiffResult
+}

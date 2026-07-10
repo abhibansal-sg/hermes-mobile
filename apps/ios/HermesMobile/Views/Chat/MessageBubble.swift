@@ -35,6 +35,12 @@ struct MessageBubble: View {
     /// Invoked when the user chooses "Retry" on an assistant message. The host
     /// calls `ChatStore.retry(fromAssistantId:)`. `nil` hides the action.
     let onRetry: ((ChatMessage) -> Void)?
+    /// Invoked when the user chooses "Undo last turn" on the latest assistant
+    /// message. The host calls `ChatStore.undoLastTurn()`. `nil` hides the action.
+    let onUndoLastTurn: ((ChatMessage) -> Void)?
+    /// Bool mirror of `onUndoLastTurn != nil`, compared by `Equatable` so the
+    /// latest-assistant-only context action appears/disappears when the tail moves.
+    let showsUndoLastTurnAction: Bool
     /// Invoked when the user chooses "Speak" on an assistant message. Wiring to
     /// the speech player happens later; `nil` hides the action.
     let onSpeak: ((ChatMessage) -> Void)?
@@ -77,6 +83,7 @@ struct MessageBubble: View {
         message: ChatMessage,
         onEdit: ((ChatMessage) -> Void)? = nil,
         onRetry: ((ChatMessage) -> Void)? = nil,
+        onUndoLastTurn: ((ChatMessage) -> Void)? = nil,
         onSpeak: ((ChatMessage) -> Void)? = nil,
         onRestoreCheckpoint: ((ChatMessage) -> Void)? = nil,
         onBranch: ((ChatMessage) -> Void)? = nil,
@@ -87,6 +94,8 @@ struct MessageBubble: View {
         self.message = message
         self.onEdit = onEdit
         self.onRetry = onRetry
+        self.onUndoLastTurn = onUndoLastTurn
+        self.showsUndoLastTurnAction = onUndoLastTurn != nil
         self.onSpeak = onSpeak
         self.onRestoreCheckpoint = onRestoreCheckpoint
         self.onBranch = onBranch
@@ -157,6 +166,14 @@ struct MessageBubble: View {
                 onRetry(message)
             } label: {
                 Label("Retry", systemImage: "arrow.clockwise")
+            }
+            .disabled(!menuActionsEnabled)
+        }
+        if let onUndoLastTurn {
+            Button {
+                onUndoLastTurn(message)
+            } label: {
+                Label("Undo last turn", systemImage: "arrow.uturn.backward.circle")
             }
             .disabled(!menuActionsEnabled)
         }
@@ -1505,8 +1522,9 @@ extension MessageBubble: Equatable {
     /// Swift 6 strict concurrency: `Equatable.==` is a nonisolated requirement but a
     /// `View` is main-actor-isolated, so the witness may only read immutable
     /// `Sendable` storage — all three reads below are `let`s of `Sendable` type.
-    /// The action closures are intentionally excluded (not `Sendable`; their nil-ness
-    /// is stable per call site), so they cannot strand a real update.
+    /// `onUndoLastTurn` is latest-assistant-only, so its availability travels as
+    /// `showsUndoLastTurnAction`; the other action closures are intentionally
+    /// excluded (not `Sendable`; their nil-ness is stable per call site).
     ///
     /// A11y note: `bubbleAccessibilityLabel` is derived from `message.role` and
     /// `message.text`, both of which are already compared via `message ==` above —
@@ -1516,6 +1534,7 @@ extension MessageBubble: Equatable {
         lhs.message == rhs.message
             && lhs.menuActionsEnabled == rhs.menuActionsEnabled
             && lhs.assistantTurnActionsEnabled == rhs.assistantTurnActionsEnabled
+            && lhs.showsUndoLastTurnAction == rhs.showsUndoLastTurnAction
             && lhs.appearance == rhs.appearance
     }
 }

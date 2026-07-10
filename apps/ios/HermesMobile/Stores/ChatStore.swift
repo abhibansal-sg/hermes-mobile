@@ -155,6 +155,19 @@ final class ChatStore {
     #endif
     var lastError: String?
 
+    /// Mobile undo/rollback phase for the active session. Kept separate from
+    /// `lastError`: empty/success/loading are honest state, not failures.
+    var undoRollbackPhase: UndoRollbackPhase = .idle
+
+    /// A rollback checkpoint + diff awaiting the user's destructive restore
+    /// confirmation. Non-nil drives the restore sheet; `rollback.restore` is never
+    /// called while this is merely pending.
+    var pendingRollbackRestore: PendingRollbackRestore?
+
+    /// Test seam for the undo/rollback JSON-RPC chain. Production falls back to
+    /// `HermesGatewayClient.requestRaw` through `undoRollbackRequest`.
+    var undoRollbackRPC: ((String, JSONValue, Duration) async throws -> JSONValue)?
+
     /// Last `backfill()` REST failure, or `nil` if the most recent backfill
     /// succeeded or none has run. Observability for the mirror-recovery path:
     /// a foreign turn whose live stream was dropped relies entirely on backfill,
@@ -1465,6 +1478,132 @@ final class ChatStore {
             lastError = "Couldn't send the response. Please try again."
         }
         // `replyValue` / `value` go out of scope here; no copy is retained.
+    }
+
+    // MARK: - Undo last turn + rollback restore (ABH-412)
+
+    /// Undo the last user+assistant turn, then inspect the existing rollback
+    /// checkpoints for file changes. The destructive disk restore is split into
+    /// ``confirmPendingRollbackRestore()`` so the UI can show the diff and require
+    /// explicit confirmation before `rollback.restore` is sent.
+    func undoLastTurn() async {
+        guard !localTurnInFlight else {
+            lastError = "Agent is busy"
+            undoRollbackPhase = .failed
+            return
+        }
+        guard let sessionId = activeSessionId else {
+            lastError = "No active session"
+            undoRollbackPhase = .failed
+            return
+        }
+
+        pendingRollbackRestore = nil
+        undoRollbackPhase = .loading
+        lastError = nil
+
+        do {
+            let undo = SessionUndoResult(json: try await undoRollbackRequest(
+                "session.undo",
+                params: .object(["session_id": .string(sessionId)])
+            ))
+            guard undo.removed > 0 else {
+                undoRollbackPhase = .empty
+                return
+            }
+
+            // Refresh transcript optimistically after the server accepted the undo.
+            await backfill()
+
+            let rollbackList = RollbackListResult(json: try await undoRollbackRequest(
+                "rollback.list",
+                params: .object(["session_id": .string(sessionId)])
+            ))
+            guard rollbackList.enabled, let checkpoint = rollbackList.checkpoints.first else {
+                undoRollbackPhase = .restored
+                return
+            }
+
+            let diff = RollbackDiffResult(json: try await undoRollbackRequest(
+                "rollback.diff",
+                params: .object([
+                    "session_id": .string(sessionId),
+                    "hash": .string(checkpoint.hash),
+                ])
+            ))
+            pendingRollbackRestore = PendingRollbackRestore(checkpoint: checkpoint, diff: diff)
+            undoRollbackPhase = .awaitingConfirmation
+        } catch {
+            pendingRollbackRestore = nil
+            undoRollbackPhase = .failed
+            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    /// User cancelled the destructive restore prompt. The turn undo remains in
+    /// place; only the pending file rollback is dismissed.
+    func cancelPendingRollbackRestore() {
+        pendingRollbackRestore = nil
+        if undoRollbackPhase == .awaitingConfirmation {
+            undoRollbackPhase = .restored
+        }
+    }
+
+    /// Restore files from the checkpoint currently displayed in the confirmation
+    /// sheet. The turn has already been removed by `session.undo`, so each restore
+    /// is file-scoped; a full `rollback.restore` would pop another user+assistant
+    /// turn from server history.
+    func confirmPendingRollbackRestore() async {
+        guard !localTurnInFlight else {
+            lastError = "Agent is busy"
+            undoRollbackPhase = .failed
+            return
+        }
+        guard let sessionId = activeSessionId else {
+            lastError = "No active session"
+            undoRollbackPhase = .failed
+            return
+        }
+        guard let pending = pendingRollbackRestore else { return }
+
+        undoRollbackPhase = .restoring
+        lastError = nil
+        do {
+            guard !pending.diff.filePaths.isEmpty else {
+                throw GatewayError.rpc(code: 5021, message: "rollback.diff did not report restorable file paths")
+            }
+            for filePath in pending.diff.filePaths {
+                let restored = RollbackRestoreResult(json: try await undoRollbackRequest(
+                    "rollback.restore",
+                    params: .object([
+                        "session_id": .string(sessionId),
+                        "hash": .string(pending.checkpoint.hash),
+                        "file_path": .string(filePath),
+                    ])
+                ))
+                guard restored.success else {
+                    throw GatewayError.rpc(code: 5021, message: "rollback.restore did not report success for \(filePath)")
+                }
+            }
+            pendingRollbackRestore = nil
+            undoRollbackPhase = .restored
+            await backfill()
+        } catch {
+            undoRollbackPhase = .failed
+            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    private func undoRollbackRequest(
+        _ method: String,
+        params: JSONValue,
+        timeout: Duration = .seconds(30)
+    ) async throws -> JSONValue {
+        if let undoRollbackRPC {
+            return try await undoRollbackRPC(method, params, timeout)
+        }
+        guard let client else { throw GatewayError.notConnected }
+        return try await client.requestRaw(method, params: params, timeout: timeout)
     }
 
     // MARK: - Branch / checkpoint (F4A-A2)
