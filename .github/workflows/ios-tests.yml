@@ -48,8 +48,24 @@ jobs:
             -scheme HermesMobile \
             -destination "platform=iOS Simulator,name=${{ steps.dest.outputs.device }}" \
             -only-testing:HermesMobileTests \
-            CODE_SIGNING_ALLOWED=NO \
-            | tail -100
+            -parallel-testing-enabled NO \
+            -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult"
+          # STR-1481: CODE_SIGNING_ALLOWED=NO was dropped -- it breaks the test
+          # host's Keychain entitlement (SecItemAdd/SecItemCopyMatching silently
+          # fail under `try?`), corrupting ConnectionStoreReconnectTests +
+          # SessionStoreTokenSourceTests state on gateway-less runners. Ad-hoc
+          # signing is the default here and keeps Keychain access working.
+          # -parallel-testing-enabled NO avoids cross-test-clone contamination
+          # seen in WSLivenessTests under xcodebuild's parallel test runner.
+          # No `| tail -100`: the full log is left intact so a failing
+          # assertion's name and message are visible in the job log, not
+          # silently truncated away.
+
+      - name: Report failing tests
+        if: failure()
+        run: |
+          xcrun xcresulttool get test-results summary \
+            --path "$RUNNER_TEMP/ios-tests.xcresult" 2>/dev/null || true
 
       - name: Report
         if: always()

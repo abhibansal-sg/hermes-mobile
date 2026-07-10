@@ -15,6 +15,8 @@ final class PushRegistrarPairFlowTests: XCTestCase {
         DefaultsKeys.pushEventApproval,
         DefaultsKeys.pushEventClarify,
         DefaultsKeys.pushEventTurnComplete,
+        DefaultsKeys.pushEventTurnError,
+        DefaultsKeys.pushEventBackgroundDone,
     ]
 
     override func setUp() async throws {
@@ -49,7 +51,10 @@ final class PushRegistrarPairFlowTests: XCTestCase {
         registrar.didRegister(deviceToken: Data([0xde, 0xad, 0xbe, 0xef]))
         await waitUntil(postedRegistrations.count == 1, "first APNs token should POST once")
         XCTAssertEqual(postedRegistrations[0].token, "deadbeef")
-        XCTAssertEqual(postedRegistrations[0].events, ["approval", "clarify", "turn_complete"])
+        XCTAssertEqual(
+            postedRegistrations[0].events,
+            ["approval", "clarify", "turn_complete", "turn_error", "background_done"]
+        )
         XCTAssertEqual(
             UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken),
             "deadbeef"
@@ -115,7 +120,10 @@ final class PushRegistrarPairFlowTests: XCTestCase {
         // pauses mid-flight, simulating a slow network response.
         registrar.didRegister(deviceToken: Data([0xde, 0xad, 0xbe, 0xef]))
         await waitUntil(invocations.count == 1, "foreground register should start")
-        XCTAssertEqual(invocations[0].events, ["approval", "clarify", "turn_complete"])
+        XCTAssertEqual(
+            invocations[0].events,
+            ["approval", "clarify", "turn_complete", "turn_error", "background_done"]
+        )
 
         // The user flips a Settings toggle while A is in flight. This is the new
         // latest intent (B), and it must not race A as an independent POST.
@@ -131,9 +139,9 @@ final class PushRegistrarPairFlowTests: XCTestCase {
         firstContinuation?.resume(returning: .success)
         await waitUntil(completions.count == 2, "foreground and toggle registrations should settle")
 
-        let latestEvents = ["approval", "turn_complete"]
+        let latestEvents = ["approval", "turn_complete", "turn_error", "background_done"]
         XCTAssertEqual(invocations.map(\.events), [
-            ["approval", "clarify", "turn_complete"],
+            ["approval", "clarify", "turn_complete", "turn_error", "background_done"],
             latestEvents,
         ])
         XCTAssertEqual(completions.last?.events, latestEvents)
