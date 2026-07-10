@@ -65,10 +65,12 @@ final class DevicesTests: XCTestCase {
     override func setUp() {
         super.setUp()
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.deviceIdsByServer)
+        ConnectionStore.spotlightClearAllForTesting = nil
     }
 
     override func tearDown() {
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.deviceIdsByServer)
+        ConnectionStore.spotlightClearAllForTesting = nil
         super.tearDown()
     }
 
@@ -784,6 +786,22 @@ final class DevicesTests: XCTestCase {
         XCTAssertEqual(connection.phase, .needsSetup)
         XCTAssertFalse(connection.hasConnected)
         XCTAssertTrue(sessions.turnsInProgressIds.isEmpty)
+    }
+
+    func testSuccessfulSelfRevokeClearsSpotlightIndex() {
+        let sessions = SessionStore()
+        let chat = ChatStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        var clearCount = 0
+        ConnectionStore.spotlightClearAllForTesting = { clearCount += 1 }
+
+        DevicesView.applySuccessfulRevokeSideEffects(
+            wasCurrent: true,
+            serverURL: "https://self-revoke-spotlight:9119",
+            connection: connection
+        )
+
+        XCTAssertEqual(clearCount, 1)
     }
 
     func testSuccessfulOtherDeviceRevokeDoesNotDriveRepairState() {

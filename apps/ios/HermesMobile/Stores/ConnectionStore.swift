@@ -30,6 +30,12 @@ struct DraftModelSelection: Equatable, Sendable {
 final class ConnectionStore {
     private static let log = Logger(subsystem: "HermesMobile", category: "ConnectionStore")
 
+    #if DEBUG
+    /// Test seam for privacy-sensitive Spotlight purges. `nil` in app runs so the
+    /// production path calls ``SpotlightIndexer.clearAll`` directly.
+    static var spotlightClearAllForTesting: (() -> Void)?
+    #endif
+
     /// UI-facing connection lifecycle.
     enum Phase: Equatable {
         case needsSetup
@@ -786,6 +792,16 @@ final class ConnectionStore {
         self.chatStore = chatStore
     }
 
+    private static func clearSpotlightSessionIndexForPrivacy() {
+        #if DEBUG
+        if let clearAll = spotlightClearAllForTesting {
+            clearAll()
+            return
+        }
+        #endif
+        SpotlightIndexer.clearAll()
+    }
+
     // MARK: - Bootstrap
 
     /// Resolve the connection at launch: dev env override → saved config →
@@ -880,6 +896,7 @@ final class ConnectionStore {
     func configure(urlString: String, token: String, issuedDeviceId: String? = nil) async -> String? {
         let trimmedURL = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let previousServerURL = serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Scheme is restricted to http/https — `URL(string:)` happily accepts
         // `file:`, `javascript:`, `ftp:` etc., and a malformed QR code or a
@@ -948,6 +965,14 @@ final class ConnectionStore {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             phase = .offline(message)
             return message
+        }
+
+        if !previousServerURL.isEmpty, previousServerURL != trimmedURL {
+            // ABH-410 follow-up: when a verified re-pair switches servers, purge
+            // the previous server's indexed session titles from Spotlight before
+            // the new URL becomes the cache/index identity.
+            Self.log.notice("Server switch clearing Hermes Spotlight session index")
+            Self.clearSpotlightSessionIndexForPrivacy()
         }
 
         // Persist only after a verified connection.
@@ -1177,7 +1202,7 @@ final class ConnectionStore {
         // ABH-410: privacy cleanup for unpair/sign-out. Indexed session titles
         // live outside the app sandbox until explicitly removed from Spotlight.
         Self.log.notice("Disconnect clearing Hermes Spotlight session index")
-        SpotlightIndexer.clearAll()
+        Self.clearSpotlightSessionIndexForPrivacy()
         await client.disconnect()
         phase = .needsSetup
     }
@@ -1625,6 +1650,10 @@ final class ConnectionStore {
         hydrationTask = nil
         chatStore.handleConnectionDrop()
         sessionStore.clearAllTurnsInProgress()
+        // ABH-410 follow-up: self-revoke is a stronger privacy action than
+        // disconnect, so purge indexed session titles before routing to re-pair.
+        Self.log.notice("Self-device revoke clearing Hermes Spotlight session index")
+        Self.clearSpotlightSessionIndexForPrivacy()
         reauthRequired = true
         hasConnected = false
         consecutiveReconnectFailures = 0
