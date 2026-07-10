@@ -157,7 +157,6 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
         let rawMode = json["api_mode"]?.stringValue ?? ""
         self.apiMode = rawMode.isEmpty ? nil : ProviderAPIMode(rawValue: rawMode)
     }
-
 }
 
 /// `POST <prefix>/providers/{slug}/key` and `POST <prefix>/providers/custom`
