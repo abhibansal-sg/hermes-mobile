@@ -317,12 +317,12 @@ from hermes_cli.dashboard_auth.public_paths import (
 
 
 def _has_valid_session_token(request: Request) -> bool:
-    """True if the request carries a valid dashboard session token.
+    """True if the request carries a valid dashboard or registered token.
 
-    The dedicated session header avoids collisions with reverse proxies that
-    already use ``Authorization`` (for example Caddy ``basic_auth``). We still
-    accept the legacy Bearer path for backward compatibility with older
-    dashboard bundles.
+    The shared dashboard token remains the strict first path. Only after both
+    shared-token forms miss do we consult the pluggable S5 machine-token
+    registry. This is additive: a plugin can accept another credential but can
+    never weaken or reject the built-in shared-token checks.
     """
     session_header = request.headers.get(_SESSION_HEADER_NAME, "")
     if session_header and hmac.compare_digest(
@@ -333,7 +333,26 @@ def _has_valid_session_token(request: Request) -> bool:
 
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
-    return hmac.compare_digest(auth.encode(), expected.encode())
+    if hmac.compare_digest(auth.encode(), expected.encode()):
+        return True
+
+    from hermes_cli.dashboard_auth.token_auth import match_token
+
+    candidates = []
+    if session_header:
+        candidates.append(session_header)
+    if auth.startswith("Bearer "):
+        candidates.append(auth[len("Bearer "):])
+    for candidate in candidates:
+        identity = match_token(candidate)
+        if identity is not None:
+            try:
+                request.state.device = identity
+            except Exception:  # pragma: no cover - defensive
+                pass
+            return True
+
+    return False
 
 
 # Routes that may also authenticate via a ``?token=`` query param, for download
@@ -14453,7 +14472,17 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            consume_ticket(ticket)
+            info = consume_ticket(ticket)
+            if info.get("provider") == "device" and info.get("user_id"):
+                try:
+                    ws.state.device = {
+                        "device_id": info.get("device_id") or info["user_id"],
+                        "device_name": info.get("device_name"),
+                        "token_prefix": info.get("token_prefix"),
+                        "scopes": list(info.get("scopes") or []),
+                    }
+                except Exception:  # pragma: no cover - defensive
+                    pass
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
@@ -14469,7 +14498,43 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         return "no_credential", "none"
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
         return None, "token"
+
+    identity = _ws_token_identity(token)
+    if identity is not None:
+        try:
+            ws.state.device = identity
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return None, "device"
     return "token_mismatch", "token"
+
+
+def _ws_token_identity(token: str) -> Optional[dict]:
+    """Resolve an S5 machine token without affecting shared-token validity."""
+    from hermes_cli.dashboard_auth.token_auth import match_token
+
+    return match_token(token)
+
+
+def _ws_active_identity(ws: "WebSocket") -> Optional[dict]:
+    """Return the connection identity only while its token remains active."""
+    from hermes_cli.dashboard_auth.token_auth import identity_active
+
+    identity = getattr(ws.state, "device", None)
+    if not isinstance(identity, dict):
+        return None
+    return identity if identity_active(identity) else None
+
+
+async def _close_if_ws_device_revoked(ws: "WebSocket") -> bool:
+    """Close and report a token-authenticated socket whose identity was revoked."""
+    identity = getattr(ws.state, "device", None)
+    if not isinstance(identity, dict):
+        return False
+    if _ws_active_identity(ws) is not None:
+        return False
+    await ws.close(code=4401, reason="device revoked")
+    return True
 
 
 def _ws_auth_ok(ws: "WebSocket") -> bool:
@@ -15048,6 +15113,9 @@ async def console_ws(ws: WebSocket) -> None:
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
         return
 
+    if await _close_if_ws_device_revoked(ws):
+        return
+
     await ws.accept()
 
     profile = _console_profile_from_ws(ws)
@@ -15410,6 +15478,9 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
         return
 
+    if await _close_if_ws_device_revoked(ws):
+        return
+
     await ws.accept()
     _log.info("pty accepted peer=%s mode=%s cred=%s", peer, mode, cred)
 
@@ -15567,9 +15638,20 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    from tui_gateway.ws import handle_ws
+    if await _close_if_ws_device_revoked(ws):
+        return
 
-    await handle_ws(ws)
+    from tui_gateway.ws import handle_ws
+    from hermes_cli.dashboard_auth.token_auth import notify_socket
+
+    identity = _ws_active_identity(ws)
+    if identity:
+        notify_socket("register", identity, ws)
+    try:
+        await handle_ws(ws)
+    finally:
+        if identity:
+            notify_socket("deregister", identity, ws)
 
 
 # ---------------------------------------------------------------------------
@@ -15598,6 +15680,9 @@ async def pub_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
+    if await _close_if_ws_device_revoked(ws):
+        return
+
     channel = _channel_or_close_code(ws)
     if not channel:
         await ws.close(code=4400)
@@ -15624,6 +15709,9 @@ async def events_ws(ws: WebSocket) -> None:
 
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
+        return
+
+    if await _close_if_ws_device_revoked(ws):
         return
 
     channel = _channel_or_close_code(ws)
