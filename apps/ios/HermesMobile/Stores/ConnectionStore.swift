@@ -559,6 +559,12 @@ final class ConnectionStore {
     /// `.needsSetup` → `WelcomeView`. (ABH-82 follow-up.)
     private(set) var isBootstrapping = false
 
+    #if DEBUG
+    /// Test-only switch for exercising persisted-config bootstrap while the
+    /// build wrapper injects the DEV environment override for live tests.
+    var _skipEnvironmentBootstrapForTesting = false
+    #endif
+
     /// True when this install has a SAVED connection configuration — a previously-
     /// paired user. Read by `RootView` so the CACHE-FIRST shell (WhatsApp bar)
     /// renders for a paired user in `.offline`/`.connecting`/`.reconnecting` even
@@ -602,7 +608,8 @@ final class ConnectionStore {
         // SIMCTL_CHILD_/TEST_RUNNER_). DEBUG-gated so a production binary can
         // never be silently re-pointed via injected env vars (release audit).
         let env = ProcessInfo.processInfo.environment
-        if let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+        if !_skipEnvironmentBootstrapForTesting,
+           let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
            !url.isEmpty, !token.isEmpty {
             // A saved/dev-env config: this is a RETURNING user. Flag the launch
             // window so the shell shows the splash rather than `WelcomeView` even
@@ -622,14 +629,24 @@ final class ConnectionStore {
         #endif
 
         let savedURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
-        if let savedURL, !savedURL.isEmpty,
-           let token = KeychainService.loadToken(server: savedURL) {
+        if let savedURL, !savedURL.isEmpty {
             isBootstrapping = true
             // CACHE-FIRST (WhatsApp bar): paint the drawer from disk BEFORE the
             // REST probe — this is the fix for the empty-drawer / Welcome-on-
             // offline cold start. The probe's early-return offline path no longer
             // strands an empty drawer because the cache read already ran here.
             await paintCacheFirst(serverURLString: savedURL)
+
+            guard let token = KeychainService.loadToken(server: savedURL) else {
+                // A cached URL still identifies a returning user even when the
+                // token is unavailable on this install. Keep the cached shell
+                // visible; a fresh install has no saved URL and still reaches
+                // onboarding, while a failed manual/QR configure persists neither.
+                phase = .offline("Saved pairing token unavailable")
+                isBootstrapping = false
+                return
+            }
+
             _ = await configure(urlString: savedURL, token: token)
             isBootstrapping = false
             return
