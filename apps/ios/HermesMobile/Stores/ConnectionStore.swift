@@ -1367,7 +1367,11 @@ final class ConnectionStore {
             // `.failed` transitions the reconnect loop's own attempts emit —
             // `reconnectTask`/`graceTask` are both already non-nil by then.
             guard hasConnected, reconnectTask == nil, graceTask == nil else { return }
+            #if DEBUG
             startGraceWindow(duration: graceWindowOverride ?? Self.transientGraceWindow)
+            #else
+            startGraceWindow(duration: Self.transientGraceWindow)
+            #endif
         }
     }
 
