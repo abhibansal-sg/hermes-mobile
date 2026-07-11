@@ -3,6 +3,10 @@
 # the drawer opens and shows the session list. If this fails, nothing else matters.
 # Run: scripts/ui-test.sh cuj/cuj-01-launch-drawer.yaml
 # NOTE: asserts use display text until the accessibility-id pass lands (ABH: ui-ids).
+# COMPACT-WIDTH ONLY (iPhone). ChatView's "Open menu" toggle only exists when
+# `onToggleDrawer` is injected, which CompactLayout does and iPad's SplitLayout
+# does not (the sidebar is always visible there instead). Regular-width/iPad
+# devices use cuj-01-launch-drawer-ipad.yaml (STR-1450).
 appId: ai.hermes.app
 ---
 - launchApp
