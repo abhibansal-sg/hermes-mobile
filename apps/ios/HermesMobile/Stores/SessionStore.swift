@@ -1348,6 +1348,110 @@ final class SessionStore {
         return sorted
     }
 
+    // MARK: - Automation sessions slice (STR-351 / STR-542)
+
+    /// Automation (cron + subagent run) sessions, fetched and cached
+    /// independently of ``sessions``/``visibleSessions`` so the drawer
+    /// Automation group preview and the Settings → Cron → Recent Runs deep
+    /// surface (``AutomationRunsView``) share one live fetch contract instead
+    /// of each running its own private REST call. Never populated from, and
+    /// never merged into, ``sessions`` — Recents' cron/subagent exclusion is
+    /// unaffected by this slice's existence.
+    private(set) var automationSessions: [SessionSummary] = []
+
+    /// Count of ``automationSessions`` as of the most recent successful
+    /// fetch — i.e. the filtered row count, never the raw server-reported
+    /// total. `nil` until the first successful fetch completes (mirrors
+    /// ``totalSessions``). Deliberately NOT the server's `total` field: an
+    /// older gateway that ignores `source=cron,subagent` can return a page
+    /// containing human rows, which ``loadAutomationSessions()`` drops via
+    /// ``isAutomationSource(_:)`` — preserving the untrusted server total
+    /// here would let the slice's count silently disagree with its rows.
+    private(set) var automationSessionsTotal: Int? = nil
+
+    /// `true` while an automation-slice fetch is in flight. Distinct from
+    /// ``isLoading``, which gates the Recents fetch.
+    private(set) var isLoadingAutomationSessions: Bool = false
+
+    /// Human-readable error from the most recent automation-slice fetch, or
+    /// `nil` when it succeeded (or none has run yet).
+    private(set) var automationSessionsError: String? = nil
+
+    /// Monotonic token guarding ``loadAutomationSessions()`` the same way
+    /// ``refreshToken`` guards ``refresh()``: a slow, superseded response can
+    /// never overwrite a newer automation-slice result.
+    private var automationRefreshToken: Int = 0
+
+    /// Source values this slice both queries for and defends against at
+    /// ingress — the single source of truth for the REST query value
+    /// (`source=cron,subagent`) and the client-side filter, so the two can
+    /// never drift apart.
+    nonisolated static let automationSources = ["cron", "subagent"]
+
+    #if DEBUG
+    /// DEBUG-only seam: an explicit ``RestClient`` (typically
+    /// URLProtocol-stubbed in tests) used instead of the live
+    /// ``connection?.rest``. Lets tests prove ``loadAutomationSessions()``
+    /// populates ``automationSessions`` by driving the real `RestClient`
+    /// request path end-to-end, without hand-injecting the slice or standing
+    /// up a live gateway connection.
+    var automationRestClientForTesting: RestClient?
+    #endif
+
+    private var automationRest: RestClient? {
+        #if DEBUG
+        automationRestClientForTesting ?? connection?.rest
+        #else
+        connection?.rest
+        #endif
+    }
+
+    /// Load (or refresh) the automation sessions slice. The single shared
+    /// entry point for both the drawer Automation group preview and
+    /// ``AutomationRunsView``'s deep Settings surface, so the two surfaces
+    /// cannot drift onto two different fetch shapes (STR-351 reconciliation).
+    ///
+    /// Fetches cron + subagent rows with `include_children=true` (automation
+    /// runs commonly nest subagent children the default parent-only listing
+    /// hides), then re-applies ``isAutomationSource(_:)`` client-side as a
+    /// defense-in-depth guarantee: an older gateway that ignores the
+    /// `source`/`include_children` query params would otherwise hand back its
+    /// entire unfiltered session list here.
+    func loadAutomationSessions() async {
+        guard let rest = automationRest else {
+            automationSessionsError = "Not connected."
+            isLoadingAutomationSessions = false
+            return
+        }
+        isLoadingAutomationSessions = true
+        automationRefreshToken &+= 1
+        let myToken = automationRefreshToken
+        do {
+            let result = try await rest.sessionsWithTotal(
+                source: Self.automationSources.joined(separator: ","),
+                includeChildren: true
+            )
+            guard automationRefreshToken == myToken else { return }
+            let filteredAutomationRows = result.sessions.filter { Self.isAutomationSource($0.source) }
+            automationSessions = filteredAutomationRows
+            automationSessionsTotal = filteredAutomationRows.count
+            automationSessionsError = nil
+            isLoadingAutomationSessions = false
+        } catch {
+            guard automationRefreshToken == myToken else { return }
+            automationSessionsError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            isLoadingAutomationSessions = false
+        }
+    }
+
+    /// Defense-in-depth predicate: is this row's source one of
+    /// ``automationSources``? Applied at ingress in
+    /// ``loadAutomationSessions()`` so an older gateway that ignores the
+    /// `source`/`include_children` query params can never pollute the slice.
+    nonisolated static func isAutomationSource(_ source: String?) -> Bool {
+        automationSources.contains((source ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
     // MARK: - Workspace grouping (H2)
 
     /// One workspace section for the grouped Recents list: a stable group `id`

@@ -157,13 +157,17 @@ struct RestClient: Sendable {
     /// fixed enum value. `+` is additionally escaped to `%2B` below, since
     /// `URLComponents` otherwise leaves it literal and FastAPI/Starlette decode a
     /// literal `+` as a space.
+    /// `includeChildren` appends `include_children=true` so the dedicated
+    /// automation slice can surface subagent child sessions the default
+    /// parent-only listing hides. It remains `false` for existing callers.
     func sessionsWithTotal(
         limit: Int = 100,
         offset: Int = 0,
         minMessages: Int = 1,
         excludeSource: [String] = [],
         source: String? = nil,
-        cwdPrefix: String? = nil
+        cwdPrefix: String? = nil,
+        includeChildren: Bool = false
     ) async throws -> (sessions: [SessionSummary], total: Int?) {
         var queryItems = [
             URLQueryItem(name: "limit", value: "\(limit)"),
@@ -188,6 +192,9 @@ struct RestClient: Sendable {
         }
         if let cwdPrefix, !cwdPrefix.isEmpty {
             queryItems.append(URLQueryItem(name: "cwd_prefix", value: cwdPrefix))
+        }
+        if includeChildren {
+            queryItems.append(URLQueryItem(name: "include_children", value: "true"))
         }
         var components = URLComponents()
         components.queryItems = queryItems
