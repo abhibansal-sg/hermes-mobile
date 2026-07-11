@@ -809,6 +809,7 @@ final class ConnectionStore {
             await paintCacheFirst(serverURLString: url)
             _ = await configure(urlString: url, token: token)
             isBootstrapping = false
+            enterDraftAfterBootstrapConfigure()
             return
         }
         #endif
@@ -834,10 +835,31 @@ final class ConnectionStore {
 
             _ = await configure(urlString: savedURL, token: token)
             isBootstrapping = false
+            enterDraftAfterBootstrapConfigure()
             return
         }
 
         phase = .needsSetup
+    }
+
+    /// STR-249/STR-248: land a returning user's cold launch on the draft
+    /// composer even when `configure()` never reaches `startHydration()` — the
+    /// no-gateway-reachable case, where `configure()` returns at the REST probe
+    /// with `phase = .offline` and neither `finishHydration()` nor
+    /// `startReconnectLoop()` (the two other `enterDraftIfNoActiveSession()`
+    /// call sites) ever run, so the shell earned by `hasSavedConfiguration`
+    /// (RootView) stranded on the "No conversation" placeholder instead.
+    ///
+    /// Guarded on `phase != .needsSetup` so a revoked/invalid saved token —
+    /// which routes `configure()` to `.needsSetup` + `reauthRequired` for the
+    /// re-pair prompt — does NOT get silently swapped for a draft chat instead.
+    /// Safe to call unconditionally otherwise: on the connected/hydrating path
+    /// this races harmlessly against `finishHydration()`, since
+    /// `enterDraftIfNoActiveSession()` itself is idempotent once a draft (or a
+    /// real active session) already exists.
+    private func enterDraftAfterBootstrapConfigure() {
+        guard phase != .needsSetup else { return }
+        enterDraftIfNoActiveSession()
     }
 
     /// Bind the session cache scope to `serverURLString` and paint the drawer from
@@ -1078,9 +1100,7 @@ final class ConnectionStore {
         // Land on a fresh draft chat (chat-as-home), but only when nothing is
         // already active — a manual re-configure while a session is open must not
         // stomp it.
-        if sessionStore.activeStoredId == nil {
-            sessionStore.startDraft()
-        }
+        enterDraftIfNoActiveSession()
         phase = .connected
         // Enforce the invariant `phase == .connected ⟹ hasConnected == true`.
         // The normal path (configure() → client.connect() succeeds) already sets
@@ -1119,6 +1139,38 @@ final class ConnectionStore {
         // Hygiene (WhatsApp bar): run the daily-throttled eviction sweep so the
         // cache never grows unbounded. Self-throttled to once/24h in CacheStore.
         sessionStore.runEvictionIfNeeded()
+    }
+
+    /// Land the app on a fresh draft chat (chat-as-home) unless a real session
+    /// is already active or a draft has already been started — a manual
+    /// re-configure, a deep-link-opened session, or a session resumed by the
+    /// reconnect loop must not be stomped.
+    ///
+    /// Shared by every route that can land the app on `.connected`/shell
+    /// without going through a user-initiated "New Chat" tap: `finishHydration()`
+    /// (the initial connect), `startReconnectLoop()`'s success branch (STR-249: a
+    /// transport drop that interrupts the initial hydration race sends `phase`
+    /// to `.reconnecting` before the race resolves, which makes
+    /// `finishHydration()`'s `phase == .hydrating` guard a no-op — without this,
+    /// the reconnect-success path never entered draft mode either, so a cold
+    /// launch that blips once during connect stranded the user on the "No
+    /// conversation" placeholder instead of the composer), and `bootstrap()`
+    /// (STR-249: a cold launch with NO gateway reachable never reaches either of
+    /// the above — `configure()` returns at the REST probe with `phase = .offline`
+    /// BEFORE `startHydration()` ever runs, so `finishHydration()`'s call site
+    /// never fires and `hasConnected` stays false so the reconnect loop never
+    /// starts either — `hasSavedConfiguration` still earns the main shell, but
+    /// with no active session and no draft entered `chatStack` falls through to
+    /// the "No conversation" placeholder — CUJ-01/STR-248).
+    ///
+    /// `!sessionStore.isDraft` (not just `activeStoredId == nil`) makes this
+    /// idempotent across call sites that can legitimately race on the same cold
+    /// launch (e.g. bootstrap's own call racing finishHydration's later one), so
+    /// a second call can't reset an already-started draft and wipe anything
+    /// typed in the composer during the hydration window.
+    private func enterDraftIfNoActiveSession() {
+        guard sessionStore.activeStoredId == nil, !sessionStore.isDraft else { return }
+        sessionStore.startDraft()
     }
 
     // MARK: - Disconnect
@@ -1532,6 +1584,7 @@ final class ConnectionStore {
                     self.chatStore.handleConnectionDrop(stampWarning: false)
                     self.sessionStore.clearAllTurnsInProgress()
                     await self.recoverActiveSession()
+                    self.enterDraftIfNoActiveSession()
                     self.phase = .connected
                     self.reconnectTask = nil
                     self.consecutiveReconnectFailures = 0
