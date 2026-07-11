@@ -12,12 +12,12 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from push_relay import tunnel
 
@@ -37,6 +37,20 @@ _GENERIC_COPY: dict[PushKind, tuple[str, str]] = {
     "attention": ("Hermes needs your attention", "Open Fetch to continue."),
     "proactive": ("Hermes update", "Open Fetch to view the update."),
 }
+# STR-10A: the direct-APNs `aps.category` values, keyed by Hermes `event_type`.
+# This is the ONLY source `_payload()` trusts for `aps.category` — a relay
+# caller's own `category` field is accepted on the wire (for parity with the
+# direct-path call shape / future clients) but is never used to set
+# `aps.category` directly, so an authenticated-but-untrusted agent can't mint
+# an arbitrary iOS notification category through the relay.
+_EVENT_TYPE_CATEGORIES: dict[str, str] = {
+    "approval": "HERMES_APPROVAL",
+    "clarify": "HERMES_CLARIFY",
+    "turn_complete": "HERMES_TURN",
+    "turn_error": "HERMES_ERROR",
+    "background_done": "HERMES_TURN",
+}
+_MAX_HERMES_PAYLOAD_KEYS = 20
 # Default App ID(s) the relay's single APNs key is authorized for. A device that
 # registers any other bundle id (e.g. a stale ``com.brentwarner.hermes`` token
 # from before the rename) is rejected, so it can never be stored and silently
@@ -171,6 +185,20 @@ class PushEventBody(BaseModel):
     title: str | None = Field(default=None, max_length=120)
     body: str | None = Field(default=None, max_length=500)
     source: str | None = Field(default=None, max_length=80)
+    # STR-10A actionable-payload parity fields — all optional so legacy relay
+    # clients that only ever sent type/session_id/title/body/source keep
+    # working unchanged. See `_EVENT_TYPE_CATEGORIES` for why `category` is
+    # accepted here but not trusted to set `aps.category`.
+    event_type: str | None = Field(default=None, max_length=40)
+    category: str | None = Field(default=None, max_length=64)
+    payload: dict[str, Any] | None = Field(default=None)
+
+    @field_validator("payload")
+    @classmethod
+    def _bound_payload_size(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is not None and len(value) > _MAX_HERMES_PAYLOAD_KEYS:
+            raise ValueError(f"payload must have at most {_MAX_HERMES_PAYLOAD_KEYS} keys")
+        return value
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
@@ -676,6 +704,8 @@ class PushService:
         title: str | None,
         body: str | None,
         source: str | None = None,
+        event_type: str | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> dict:
         devices = self._store.list_devices(agent_id=agent_id, category=kind)
         event_id = self._store.record_event(
@@ -703,18 +733,20 @@ class PushService:
             if sender is None:
                 logger.warning("no push sender for platform %s", device.platform)
                 continue
-            payload = _payload(
+            device_payload = _payload(
                 kind=kind,
                 title=push_title,
                 body=push_body,
                 session_id=session_id,
                 sound=device.sound,
                 source=source,
+                event_type=event_type,
+                hermes_payload=payload,
             )
             # No apns-collapse-id: each reply/attention/proactive message is its own
             # notification. Grouping is handled by aps "thread-id" (see _payload), so
             # messages still thread by session without coalescing into one alert.
-            result = await sender.send(device=device, payload=payload, collapse_id=None)
+            result = await sender.send(device=device, payload=device_payload, collapse_id=None)
             if result.should_prune:
                 self._store.prune_device(
                     token=device.token,
@@ -929,6 +961,9 @@ def create_app(
         request: Request, body: PushEventBody, auth: AgentAuth = Depends(_require_agent)
     ) -> dict:
         _rate_limit(request, "push-events")
+        # `body.category` is intentionally not forwarded — `_payload()` derives
+        # `aps.category` solely from `_EVENT_TYPE_CATEGORIES[body.event_type]`
+        # so a relay caller can never mint an arbitrary iOS category string.
         return await push_service.send_event(
             agent_id=auth.agent_id,
             kind=body.type,
@@ -936,6 +971,8 @@ def create_app(
             title=body.title,
             body=body.body,
             source=body.source,
+            event_type=body.event_type,
+            payload=body.payload,
         )
 
     if settings.enable_tunnel:
@@ -1028,8 +1065,10 @@ def _payload(
     session_id: str | None,
     sound: bool,
     source: str | None,
+    event_type: str | None = None,
+    hermes_payload: dict[str, Any] | None = None,
 ) -> dict:
-    aps = {
+    aps: dict[str, Any] = {
         "alert": {"title": title, "body": body[:160]},
         "thread-id": session_id or "",
     }
@@ -1037,7 +1076,25 @@ def _payload(
         aps["interruption-level"] = "time-sensitive"
     if sound:
         aps["sound"] = "default"
-    return {"aps": aps, "session_id": session_id or "", "type": kind, "source": source}
+
+    result: dict[str, Any] = {"aps": aps, "session_id": session_id or "", "type": kind, "source": source}
+
+    # STR-10A: when the caller supplied event metadata, rebuild the same
+    # {aps.category, hermes: {...}} shape the direct-APNs path emits so relay
+    # mode preserves the actionable-push contract (approval/clarify action
+    # buttons, tap routing). Legacy callers with no event_type keep the flat
+    # shape above unchanged — never guess a category for them.
+    if event_type:
+        category = _EVENT_TYPE_CATEGORIES.get(event_type)
+        if category:
+            aps["category"] = category
+        hermes: dict[str, Any] = {"event_type": event_type}
+        if hermes_payload:
+            hermes.update(hermes_payload)
+        hermes.setdefault("session_id", session_id or "")
+        result["hermes"] = hermes
+
+    return result
 
 
 app = create_app()

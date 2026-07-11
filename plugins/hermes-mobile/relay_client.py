@@ -262,18 +262,28 @@ class RelayClient:
         title: str,
         body: str,
         source: str | None = None,
+        event_type: str | None = None,
+        category: str | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> None:
-        await self._post(
-            "/v1/push/events",
-            {
-                "type": kind,
-                "session_id": session_id,
-                "title": title,
-                "body": body,
-                "source": source,
-            },
-            authenticated=True,
-        )
+        json_body: dict[str, Any] = {
+            "type": kind,
+            "session_id": session_id,
+            "title": title,
+            "body": body,
+            "source": source,
+        }
+        # STR-10A: forward the direct-path actionable metadata (Hermes event
+        # kind, requested APNs category, custom hermes payload) so the relay
+        # can rebuild the same aps.category + hermes envelope direct APNs
+        # sends. All optional so legacy relay servers / callers keep working.
+        if event_type is not None:
+            json_body["event_type"] = event_type
+        if category is not None:
+            json_body["category"] = category
+        if payload is not None:
+            json_body["payload"] = payload
+        await self._post("/v1/push/events", json_body, authenticated=True)
 
     async def _post(
         self,
@@ -495,6 +505,9 @@ def send_event_background(
     title: str,
     body: str,
     source: str | None = None,
+    event_type: str | None = None,
+    category: str | None = None,
+    payload: dict[str, Any] | None = None,
     hermes_home: Path | None = None,
 ) -> None:
     """Fire-and-forget a push event to the relay. Never blocks the caller."""
@@ -504,6 +517,7 @@ def send_event_background(
     threading.Thread(
         target=_send_sync,
         args=(relay_kind, session_id, title, body, source, hermes_home),
+        kwargs={"event_type": event_type, "category": category, "payload": payload},
         daemon=True,
         name=f"hermes-mobile-push-{relay_kind}",
     ).start()
@@ -590,6 +604,10 @@ def _send_sync(
     body: str,
     source: str | None,
     hermes_home: Path | None,
+    *,
+    event_type: str | None = None,
+    category: str | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> None:
     try:
         asyncio.run(
@@ -599,6 +617,9 @@ def _send_sync(
                 title=title,
                 body=body,
                 source=source,
+                event_type=event_type,
+                category=category,
+                payload=payload,
             )
         )
     except RelayConfigurationError as exc:
