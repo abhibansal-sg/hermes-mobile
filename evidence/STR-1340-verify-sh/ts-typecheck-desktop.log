@@ -1,0 +1,4 @@
+
+> hermes@0.17.0 typecheck
+> tsc -p . --noEmit
+

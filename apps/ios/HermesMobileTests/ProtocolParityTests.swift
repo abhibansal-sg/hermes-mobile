@@ -500,6 +500,42 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertEqual(parsed.items.count, 20)
     }
 
+    /// STR-463: `resultSummary` must be derived from the FULL `payload.result`,
+    /// not the already-truncated `resultPreview`. Here the meaningful
+    /// `message` field sorts (alphabetically, per `compactDescription`) after
+    /// a long `filler` field that alone exceeds the 300-char preview cutoff —
+    /// so `resultPreview` never reaches "message" at all, while
+    /// `resultSummary` (built from the untruncated result) must still surface it.
+    func testToolCompleteSummaryDerivedFromFullResultBeyondPreviewTruncation() async throws {
+        let (chat, _) = makeStore()
+        chat.handle(event: localFrame(type: "message.start"))
+        chat.handle(event: localFrame(type: "tool.start", payload: .object([
+            "tool_id": .string("t-summary"), "name": .string("extract")])))
+        let filler = String(repeating: "x", count: 400)
+        chat.handle(event: localFrame(type: "tool.complete", payload: .object([
+            "tool_id": .string("t-summary"),
+            "name": .string("extract"),
+            "result": .object([
+                "filler": .string(filler),
+                "message": .string("archive extracted to /tmp/output"),
+            ]),
+            "duration_s": .number(0.3),
+        ])))
+        await waitUntil { chat.messages.last?.tools.first?.state == .done }
+
+        let tool = try XCTUnwrap(chat.messages.last?.tools.first)
+        XCTAssertTrue(tool.resultPreview.count <= 300, "resultPreview stays truncated")
+        XCTAssertFalse(
+            tool.resultPreview.contains("archive extracted"),
+            "the truncated preview never reaches the message field"
+        )
+        let summary = try XCTUnwrap(tool.resultSummary, "resultSummary must be derived even when the preview truncates")
+        XCTAssertTrue(
+            summary.contains("archive extracted to /tmp/output"),
+            "resultSummary reads the full untruncated result, not the truncated preview"
+        )
+    }
+
     // MARK: - Harness (mirrors ChatStoreForeignMirrorTests.makeStore)
 
     /// Poll a @MainActor condition until it holds or `timeout` elapses. Replaces
