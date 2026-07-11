@@ -74,6 +74,7 @@ WHAT'S NEW
 - Add UI scale setting to appearance settings
 
 FIXED
+- Show the chat composer on a returning user's offline cold launch (STR-248)
 - Return a bounded error when debug-share uploads exceed the route budget (STR-1210)
 - Gate iOS device-token auto-upgrade on server auth_required
 - Use windows_detach_popen_kwargs to prevent console window flash on Windows
@@ -88,6 +89,7 @@ IMPROVED
 WORTH TRYING
 - Try: Start conversation mode from chat, mute/unmute it, then use the always-visible stop control
 - Try: Enable automatic read-aloud in Settings and confirm ordinary dictation still waits for review
+- Try: Launch the app while the saved gateway is offline; the composer should still appear
 - Try: Self-provision live-gateway creds for ios-build.sh test lane
 - Try: Pass approve rule keys to approval gate
 - Try: Optionally mention approval owners on exec prompts
