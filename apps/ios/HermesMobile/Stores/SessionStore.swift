@@ -214,6 +214,56 @@ final class SessionStore {
     /// discarded so a slow prior response can never overwrite a newer list.
     /// Protected entirely on `@MainActor` — no atomics needed.
     private var refreshToken: Int = 0
+
+    /// Identity of one server-side Recents list universe. Cursor state is never
+    /// shared across gateways, path families, profile rails, or source filters.
+    private struct SessionListDeltaScope: Hashable {
+        let serverURL: String
+        let pathStyle: String
+        let activeProfile: String
+        let rail: String
+        let excludedSources: String
+        let source: String
+    }
+
+    /// Opaque plugin session-list cursors partitioned by list universe.
+    @ObservationIgnored
+    private var sessionListDeltaCursors: [SessionListDeltaScope: String] = [:]
+
+    /// Tombstones deferred while a row belongs to the active/pinned/live working
+    /// set. They are re-evaluated on every later delta so advancing the server
+    /// cursor cannot leave a protected row behind forever after protection ends.
+    @ObservationIgnored
+    private var pendingSessionListTombstones: [SessionListDeltaScope: Set<String>] = [:]
+
+    private func sessionListDeltaScope(
+        excludeSource: [String],
+        source: String? = nil
+    ) -> SessionListDeltaScope? {
+        let serverURL: String
+        if let live = connection?.serverURLString, !live.isEmpty {
+            serverURL = live
+        } else if sessionListDeltaFetch != nil {
+            serverURL = "__test__"
+        } else {
+            return nil
+        }
+        let pathStyle = connection?.rest?.pathStyle.rawValue
+            ?? (sessionListDeltaFetch == nil ? "none" : "__test__")
+        return SessionListDeltaScope(
+            serverURL: serverURL,
+            pathStyle: pathStyle,
+            activeProfile: activeProfile.trimmingCharacters(in: .whitespacesAndNewlines),
+            rail: usesAggregateRail ? "aggregate" : "single",
+            excludedSources: excludeSource.joined(separator: ","),
+            source: source?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        )
+    }
+
+    private func resetSessionListDeltaState() {
+        sessionListDeltaCursors.removeAll()
+        pendingSessionListTombstones.removeAll()
+    }
     /// Runtime `session_id` for the session bound to the current connection.
     var activeRuntimeId: String?
     /// Persistent `stored_session_id` for the active session (survives reconnects).
@@ -656,6 +706,7 @@ final class SessionStore {
         didSet {
             guard activeProfile != oldValue else { return }
             UserDefaults.standard.set(activeProfile, forKey: DefaultsKeys.activeProfile)
+            resetSessionListDeltaState()
         }
     }
 
@@ -814,6 +865,9 @@ final class SessionStore {
     /// stuck, which would revive the infinite-carry-forward bug.
     func clearAllTurnsInProgress() {
         turnsInProgress.removeAll()
+        // This hook is called on every disconnect/reconnect path. A fresh
+        // connection must seed its own cursor before requesting deltas.
+        resetSessionListDeltaState()
     }
 
     #if DEBUG
@@ -997,6 +1051,7 @@ final class SessionStore {
         initialFillTask = nil
         isFillingInitial = false
         loadedFloor = 0
+        resetSessionListDeltaState()
     }
 
     private var client: HermesGatewayClient? { connection?.client }
@@ -1696,6 +1751,7 @@ final class SessionStore {
             loadedCount = 0
             loadedOffset = 0
             seenServerSessionIds = []  // ABH-373
+            resetSessionListDeltaState()
             didColdReadCache = false
         }
 
@@ -1769,18 +1825,79 @@ final class SessionStore {
         // BUG B (heartbeat-reset guard): use `max(100, loadedCount)` so the
         // heartbeat's first-page re-fetch never shrinks a window that the
         // initial-fill loop already expanded to reach `initialVisibleTarget`.
-        if let rest = connection?.rest {
+        let rest = connection?.rest
+        if rest != nil || sessionListDeltaFetch != nil {
+            let deltaScope = !usesAggregateRail
+                && (sessionListDeltaFetch != nil || rest?.pathStyle == .plugin)
+                ? sessionListDeltaScope(excludeSource: Self.recentsExcludeSources)
+                : nil
             do {
                 // Floor the first-page window at what the initial fill reached so a
                 // post-fill heartbeat / gateway.ready replace can't collapse the
                 // drawer back to ~100 rows (fill30): `max(100, loadedFloor, loadedCount)`.
                 let fetchLimit = max(100, loadedFloor, loadedCount)
+                if let deltaScope {
+                    let previousCursor = sessionListDeltaCursors[deltaScope]
+                    let delta: SessionListDeltaResult?
+                    do {
+                        delta = try await resolvedSessionListDeltaFetch(
+                            rest: rest,
+                            limit: fetchLimit,
+                            updatedSince: previousCursor
+                        )
+                    } catch {
+                        delta = nil
+                    }
+                    guard refreshToken == myToken,
+                          sessionListDeltaScope(
+                              excludeSource: Self.recentsExcludeSources
+                          ) == deltaScope else { return }
+
+                    if let delta {
+                        sessionListDeltaCursors[deltaScope] = delta.cursor
+                        let didChange: Bool
+                        if previousCursor == nil {
+                            mergeSessionPage(delta.sessions, total: delta.total)
+                            reconcilePendingSessionListTombstones(
+                                afterAuthoritativePage: delta.sessions,
+                                scope: deltaScope
+                            )
+                            didChange = true
+                        } else {
+                            didChange = mergeSessionDelta(delta, scope: deltaScope)
+                        }
+                        if didChange {
+                            persistSessionListToCache()  // P3 write-through
+                            SpotlightIndexer.index(sessions: sessions)
+                        }
+                        lastError = nil
+                        ensureInitialFill()
+                        return
+                    }
+
+                    // A missing/old/malformed plugin endpoint must retry from a
+                    // full seed later. Continue through the stock REST path now.
+                    sessionListDeltaCursors[deltaScope] = nil
+                }
+
+                guard let rest else { return }
                 let result = try await rest.sessionsWithTotal(
                     limit: fetchLimit, minMessages: 1,
                     excludeSource: Self.recentsExcludeSources
                 )
                 guard refreshToken == myToken else { return }
+                if let deltaScope {
+                    guard sessionListDeltaScope(
+                        excludeSource: Self.recentsExcludeSources
+                    ) == deltaScope else { return }
+                }
                 mergeSessionPage(result.sessions, total: result.total)
+                if let deltaScope {
+                    reconcilePendingSessionListTombstones(
+                        afterAuthoritativePage: result.sessions,
+                        scope: deltaScope
+                    )
+                }
                 persistSessionListToCache()  // P3 write-through (fire-and-forget)
                 lastError = nil
 
@@ -1801,6 +1918,11 @@ final class SessionStore {
                 return
             } catch {
                 guard refreshToken == myToken else { return }
+                if let deltaScope {
+                    guard sessionListDeltaScope(
+                        excludeSource: Self.recentsExcludeSources
+                    ) == deltaScope else { return }
+                }
                 // Fall through to the WS RPC below.
             }
         }
@@ -1823,6 +1945,114 @@ final class SessionStore {
             guard refreshToken == myToken else { return }
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    private func resolvedSessionListDeltaFetch(
+        rest: RestClient?,
+        limit: Int,
+        updatedSince: String?
+    ) async throws -> SessionListDeltaResult? {
+        if let fetch = sessionListDeltaFetch {
+            return try await fetch(updatedSince, limit)
+        }
+        guard let rest else { return nil }
+        return await rest.sessionListDelta(
+            limit: limit,
+            minMessages: 1,
+            excludeSource: Self.recentsExcludeSources,
+            updatedSince: updatedSince
+        )
+    }
+
+    /// Reconcile deferred tombstones after a full, authoritative page. Rows
+    /// present in the page are live again; rows still present locally but absent
+    /// from the page are working-set survivors and remain pending until a later
+    /// refresh can remove them safely.
+    private func reconcilePendingSessionListTombstones(
+        afterAuthoritativePage page: [SessionSummary],
+        scope: SessionListDeltaScope
+    ) {
+        let incomingIds = Set(page.filter(Self.isHumanRecentsSession).map(\.id))
+        let currentIds = Set(sessions.map(\.id))
+        var pending = pendingSessionListTombstones[scope] ?? []
+        pending.subtract(incomingIds)
+        pending.formUnion(currentIds.subtracting(incomingIds))
+        pending.formIntersection(currentIds)
+        if pending.isEmpty {
+            pendingSessionListTombstones[scope] = nil
+        } else {
+            pendingSessionListTombstones[scope] = pending
+        }
+    }
+
+    /// Merge changed rows and deferred removals without replacing the loaded
+    /// grow-limit window. Returns whether the backing `sessions` rows changed so
+    /// empty heartbeats can skip cache and Spotlight rewrites.
+    private func mergeSessionDelta(
+        _ delta: SessionListDeltaResult,
+        scope: SessionListDeltaScope
+    ) -> Bool {
+        if let total = delta.total { totalSessions = total }
+
+        let incoming = delta.sessions.filter(Self.isHumanRecentsSession)
+        let incomingIds = Set(incoming.map(\.id))
+        let filteredChangedIds = Set(delta.sessions.map(\.id)).subtracting(incomingIds)
+        var pending = pendingSessionListTombstones[scope] ?? []
+        pending.formUnion(delta.tombstones.map(\.id))
+        pending.formUnion(filteredChangedIds)
+        // A current human row is authoritative evidence that a prior tombstone
+        // was superseded (for example, a session re-entered the list universe).
+        pending.subtract(incomingIds)
+
+        let removableIds = pending.subtracting(workingSetSessionIds())
+        let countBeforeRemoval = sessions.count
+        if !removableIds.isEmpty {
+            sessions.removeAll { removableIds.contains($0.id) }
+            pending.subtract(removableIds)
+        }
+        let didRemove = sessions.count != countBeforeRemoval
+
+        let priorLastActive: [String: Double] = sessions.reduce(into: [:]) { result, row in
+            if let lastActive = row.lastActive { result[row.id] = lastActive }
+        }
+        let reconciled = incoming.map { row -> SessionSummary in
+            guard let prior = priorLastActive[row.id],
+                  turnsInProgress.contains(row.id),
+                  prior > (row.lastActive ?? -.greatestFiniteMagnitude) else { return row }
+            var bumped = row
+            bumped.lastActive = prior
+            return bumped
+        }
+
+        var didUpsert = false
+        for row in reconciled {
+            if let index = sessions.firstIndex(where: { $0.id == row.id }) {
+                if sessions[index] != row {
+                    sessions[index] = row
+                    didUpsert = true
+                }
+            } else {
+                sessions.append(row)
+                didUpsert = true
+            }
+        }
+
+        if didUpsert {
+            // Match `visibleSessions`: descending activity with stable ordering
+            // when timestamps tie. Do not add an id tie-breaker here.
+            sessions.sort { lhs, rhs in
+                let left = lhs.lastActive ?? lhs.startedAt ?? -.greatestFiniteMagnitude
+                let right = rhs.lastActive ?? rhs.startedAt ?? -.greatestFiniteMagnitude
+                return left > right
+            }
+        }
+
+        if pending.isEmpty {
+            pendingSessionListTombstones[scope] = nil
+        } else {
+            pendingSessionListTombstones[scope] = pending
+        }
+        return didRemove || didUpsert
     }
 
     /// Non-destructive merge of an incoming page into `sessions` (ABH-86 item 3,
@@ -1907,15 +2137,7 @@ final class SessionStore {
 
         // Working-set: active session + live/working + pinned. These survive
         // even if the server's current page window omits them.
-        var workingIds = pinnedIds
-        if let active = activeStoredId { workingIds.insert(active) }
-        // Any session that has had broadcast activity in the live window counts
-        // as "working" — it is being actively used and the server will include
-        // it on the very next refresh.
-        let now = Date()
-        for (id, at) in lastActivityAt {
-            if now.timeIntervalSince(at) < Self.liveWindow { workingIds.insert(id) }
-        }
+        let workingIds = workingSetSessionIds()
 
         // Survivors: current rows absent from the incoming page but in the working set.
         let survivors = sessions.filter { !incomingIds.contains($0.id) && workingIds.contains($0.id) }
@@ -1968,6 +2190,19 @@ final class SessionStore {
         seenServerSessionIds = Set(pageIds)
         loadedCount = rawCount
         loadedOffset = rawCount
+    }
+
+    private func workingSetSessionIds() -> Set<String> {
+        var workingIds = pinnedIds
+        if let active = activeStoredId { workingIds.insert(active) }
+        // Any session that has had broadcast activity in the live window counts
+        // as working. Keep this distinct from `turnsInProgress`, which gates only
+        // optimistic timestamp carry-forward.
+        let now = Date()
+        for (id, at) in lastActivityAt {
+            if now.timeIntervalSince(at) < Self.liveWindow { workingIds.insert(id) }
+        }
+        return workingIds
     }
 
     /// ABH-86: optimistically bump a session's activity to NOW so a live frame
@@ -2236,6 +2471,13 @@ final class SessionStore {
             await task.value
             if !isFillingInitial { break }
         }
+    }
+
+    /// Test seam for priming pagination invariants around delta refreshes.
+    func setPaginationForTesting(loadedCount: Int, loadedOffset: Int, total: Int?) {
+        self.loadedCount = loadedCount
+        self.loadedOffset = loadedOffset
+        self.totalSessions = total
     }
 
     /// Resolve the page fetch for ``runInitialFill(generation:)``: the injected
@@ -3647,6 +3889,11 @@ final class SessionStore {
     /// live gateway. The closure returns a tuple of `(sessions, total?)` so
     /// tests can also verify that `totalSessions` is decoded and exposed.
     var sessionsFetch: (() async throws -> (sessions: [SessionSummary], total: Int?))?
+
+    /// Injectable seam for the plugin session-list delta endpoint. The first
+    /// parameter is the previously stored cursor, if any; the second is the
+    /// grow-limit window size requested for this refresh.
+    var sessionListDeltaFetch: ((String?, Int) async throws -> SessionListDeltaResult?)?
 
     /// Injectable seam for the initial-fill grow-limit loop (Bug B). Each call
     /// pops the next page from the array, letting tests stage multiple pages

@@ -170,6 +170,26 @@ struct ProfilesSessionsResult: Decodable, Sendable, Equatable {
     }
 }
 
+/// Incremental session-list response from the hermes-mobile plugin endpoint.
+///
+/// `cursor` is an opaque server high-water mark. `sessions` contains rows changed
+/// since the client's prior cursor (or the initial full seed when no cursor was
+/// sent). `tombstones` contains session ids that left the list universe and
+/// should be removed unless local working-set rules keep them alive.
+struct SessionListDeltaResult: Sendable, Equatable {
+    let sessions: [SessionSummary]
+    let tombstones: [SessionListTombstone]
+    let cursor: String
+    let total: Int?
+}
+
+/// A removed session-list row. The plugin may return either bare string ids or
+/// objects (`{"id": ...}` / `{"session_id": ...}`); the REST client normalizes
+/// both into this shape.
+struct SessionListTombstone: Sendable, Equatable {
+    let id: String
+}
+
 /// Result of `session.create` / `session.resume`.
 struct SessionOpenResult: Decodable, Sendable {
     let sessionId: String
