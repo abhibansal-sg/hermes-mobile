@@ -2544,6 +2544,22 @@ final class ChatStore {
         handle(event: event)
     }
 
+    /// DEBUG-ONLY: drive the REAL streaming reasoning path with a synthesized
+    /// `reasoning.delta` frame, exactly as a WS reasoning delta would. It carries
+    /// no `session_id`, so `ownership(of:)` classifies it `.local` and it flows
+    /// through `handle(event:)` → `thinkingBuffer` → `scheduleFlush` →
+    /// `flushBuffers` → `appendReasoningDelta` — the same coalesced render path a
+    /// live reasoning stream exercises. Used by the `thinking` UITestSeed mode to
+    /// render the live thinking block (pulsing label + inline timer + tail-scrolled
+    /// faded body) for sim-scoped evidence without a live gateway.
+    func debugInjectReasoningDelta(_ text: String) {
+        guard let event = GatewayEvent(params: .object([
+            "type": .string("reasoning.delta"),
+            "payload": .object(["text": .string(text)]),
+        ])) else { return }
+        handle(event: event)
+    }
+
     /// DEBUG-ONLY: end the synthesized stream (a `message.complete`), so the
     /// streaming row settles (cursor stops, action row appears) like a real turn.
     func debugCompleteStream() {

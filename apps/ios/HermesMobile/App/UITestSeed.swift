@@ -158,6 +158,48 @@ enum UITestSeed {
             return
         }
 
+        // "thinking" — STR-1062 evidence seed (no gateway): renders the clean
+        // thinking block in BOTH states for sim-scoped capture. Seeds a SETTLED
+        // assistant turn with reasoning + a stamped `reasoningElapsed` (so it
+        // collapses to the quiet "Thought for 6s" label), then drives the REAL
+        // streaming reasoning path (`debugInjectReasoningDelta` → thinkingBuffer →
+        // flushBuffers → appendReasoningDelta) so a LIVE assistant turn pulses with
+        // an inline timer and a tail-scrolled faded body, then settles. Proves the
+        // contract: a calm italic label + scroll body, NO brain glyph / kaomoji /
+        // spinner anywhere in the thinking block. Never compiled into Release.
+        if mode == "thinking" {
+            let settledReasoning = """
+            First I checked the last CI run on main — it passed eight minutes ago.
+            Then I probed staging and saw 502s: the deploy left a worker wedged at \
+            high CPU. A clean restart of staging-gateway should clear it.
+            """
+            let base: [ChatMessage] = [
+                ChatMessage(role: .user, text: "Is the staging deploy healthy?"),
+                ChatMessage(
+                    role: .assistant,
+                    text: "Staging was returning 502s from a wedged worker — a clean restart of staging-gateway clears it.",
+                    thinking: settledReasoning,
+                    reasoningElapsed: 6
+                ),
+                ChatMessage(role: .user, text: "Walk me through how you'd debug a flaky websocket test."),
+            ]
+            environment.connectionStore.phase = .connected
+            environment.sessionStore.activeStoredId = "uitest-thinking"
+            environment.chatStore.debugSeedTranscript(base)
+            Task { @MainActor in
+                // Drip reasoning through the real reasoning.delta path so the live
+                // thinking row pulses with a timer and a tail-scrolled faded body.
+                let steps = Self.thinkingStreamSteps()
+                for step in steps {
+                    try? await Task.sleep(nanoseconds: 350_000_000)  // ~350ms cadence
+                    environment.chatStore.debugInjectReasoningDelta(step)
+                }
+                try? await Task.sleep(nanoseconds: 1_200_000_000)  // let the timer read a few seconds
+                environment.chatStore.debugCompleteStream()
+            }
+            return
+        }
+
         // "heavy" — a static 60-message transcript of HEAVY rows (long markdown
         // with headers/lists/inline code, multi-line fenced code blocks, long
         // paragraphs) for flick-scroll cost measurement. Fully laid-out at seed.
@@ -615,6 +657,28 @@ enum UITestSeed {
             i += 1
         }
         return chunks
+    }
+
+    /// Reasoning chunks for the `thinking` evidence seed: plausible debugging
+    /// steps emitted one per ~350ms so the live thinking row shows a streaming,
+    /// tail-scrolled chain of thought (each step refreshes the active-step label
+    /// and grows the faded body) before `debugCompleteStream` settles it.
+    static func thinkingStreamSteps() -> [String] {
+        [
+            "I'd start by making the flake reproducible — run the test in a loop ",
+            "until it fails, since a one-off pass proves nothing. ",
+            "Next, isolate whether it's timing or state: add a deterministic clock ",
+            "and reset all shared fixtures between runs. ",
+            "Websockets in particular leak state across tests if the server ",
+            "isn't torn down — check that the connection is fully closed ",
+            "and the receive loop is cancelled, not just abandoned. ",
+            "Then look at ordering: parallel test runners can interleave ",
+            "handshakes on the same port, which reads as a flaky connect. ",
+            "Pin the assertions to the framed messages, never to wall-clock, ",
+            "and assert the close frame is exchanged before teardown. ",
+            "Finally, run it under repeats with thread sanitizer to catch ",
+            "any concurrent access the timing papered over. ",
+        ]
     }
 }
 #endif
