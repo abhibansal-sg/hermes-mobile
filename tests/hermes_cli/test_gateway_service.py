@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1531,6 +1532,7 @@ class TestGatewayServiceDetection:
         assert gateway_cli._is_service_running() is False
 
 class TestGatewaySystemServiceRouting:
+    @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux systemd/D-Bus")
     def test_systemd_restart_gracefully_restarts_running_service_and_waits(self, monkeypatch, capsys):
         calls = []
 
@@ -1576,6 +1578,7 @@ class TestGatewaySystemServiceRouting:
         out = capsys.readouterr().out.lower()
         assert "restarting gracefully" in out
 
+    @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux systemd/D-Bus")
     def test_systemd_restart_uses_systemd_main_pid_when_pid_file_is_missing(self, monkeypatch, capsys):
         calls = []
 
@@ -1635,6 +1638,7 @@ class TestGatewaySystemServiceRouting:
         assert gateway_cli._wait_for_systemd_service_restart(previous_pid=777, timeout=0.1) is True
         assert "restarted (pid 999)" in capsys.readouterr().out.lower()
 
+    @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux systemd/D-Bus")
     def test_systemd_restart_reports_start_limit_hit(self, monkeypatch, capsys):
         calls = []
 
@@ -1667,6 +1671,7 @@ class TestGatewaySystemServiceRouting:
         assert "rate-limited by systemd" in out
         assert "reset-failed" in out
 
+    @pytest.mark.skipif(sys.platform != "linux", reason="requires Linux systemd/D-Bus")
     def test_systemd_restart_recovers_failed_planned_restart(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
