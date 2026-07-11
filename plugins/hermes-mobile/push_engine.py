@@ -1648,8 +1648,29 @@ def handle_gateway_event(event: str, sid: str, payload: dict | None = None) -> N
     _push_hook(event, sid, payload)
 
 
-def activate() -> None:
-    """Wire the push engine into the gateway's S2 emit-observer seam."""
+def activate(ctx=None) -> None:
+    """Wire the push engine into the gateway.
+
+    Preferred path: the first-class ``post_emit_event`` plugin hook (stock
+    VALID_HOOKS as of the de-patch). Fallback (older cores): the S2
+    ``_EMIT_OBSERVERS`` module-level seam. Exactly ONE path is wired — the
+    gateway fires the hook in addition to the seam, so registering both
+    would double-send every push.
+    """
+    if ctx is not None:
+        try:
+            from hermes_cli.plugins import VALID_HOOKS
+
+            if "post_emit_event" in VALID_HOOKS:
+                def _hook_emit(event=None, session_id=None, payload=None, **_kw):
+                    if isinstance(event, str) and isinstance(session_id, str):
+                        handle_gateway_event(event, session_id, payload)
+
+                ctx.register_hook("post_emit_event", _hook_emit)
+                sweep_dead_live_activity_tokens()
+                return
+        except Exception:
+            pass
     from . import _append_unique
     from tui_gateway import server as _server
 

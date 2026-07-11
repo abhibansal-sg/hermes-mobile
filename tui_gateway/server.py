@@ -425,6 +425,9 @@ def _notify_session_boundary(
 # (the hermes-mobile push engine appends ``handle_gateway_event`` here); empty on
 # stock gateways so this is a strict no-op when no plugin is loaded.
 # See CONTRACT-DEPATCH.md seam S2.
+# NOTE: the first-class path is now the ``post_emit_event`` plugin hook
+# (hermes_cli.plugins.VALID_HOOKS); this module-level list remains as a
+# back-compat seam for plugins that predate the hook.
 _EMIT_OBSERVERS: list = []
 
 
@@ -435,6 +438,12 @@ def _notify_emit_observers(event: str, sid: str, payload: dict | None = None) ->
             _obs(event, sid, payload)
         except Exception:
             logger.debug("emit observer failed", exc_info=True)
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook("post_emit_event", event=event, session_id=sid, payload=payload)
+    except Exception:
+        logger.debug("post_emit_event hook failed", exc_info=True)
 
 
 def _claim_active_session_slot(
@@ -1175,6 +1184,14 @@ def write_json(obj: dict) -> bool:
                     _fanout(obj, sid, t)
                 except Exception:
                     pass
+            # First-class path: the ``post_frame_write`` plugin hook (the
+            # module-level list above remains as a back-compat seam).
+            try:
+                from hermes_cli.plugins import invoke_hook
+
+                invoke_hook("post_frame_write", frame=obj, session_id=sid, owner_transport=t)
+            except Exception:
+                pass
             return t.write(obj)
 
     return (current_transport() or _stdio_transport).write(obj)
