@@ -203,6 +203,69 @@ enum UITestSeed {
             return
         }
 
+        // "drawerstorm" — STR-1012 regression seed for compact drawer row-tap
+        // storms. It starts on Storm 1 with a populated drawer, then delays the
+        // real open seed so non-active taps prove the STR-1007 deadline path while
+        // active re-taps prove the synchronous close path.
+        if mode == "drawerstorm" {
+            func stored(_ role: String, _ text: String, _ i: Int) -> StoredMessage? {
+                StoredMessage(json: .object([
+                    "role": .string(role),
+                    "content": .string(text),
+                    "id": .number(Double(i)),
+                    "timestamp": .number(Double(1_700_010_000 + i)),
+                ]))
+            }
+            func transcript(_ tag: String) -> [StoredMessage] {
+                (0..<8).compactMap { i in
+                    stored(
+                        i.isMultiple(of: 2) ? "user" : "assistant",
+                        "\(tag) transcript row #\(i + 1)",
+                        i
+                    )
+                }
+            }
+            func summary(_ id: String, _ title: String, _ count: Int, _ ago: Double) -> SessionSummary? {
+                JSONValue.object([
+                    "id": .string(id),
+                    "title": .string(title),
+                    "message_count": .number(Double(count)),
+                    "last_active": .number(1_700_010_000 - ago),
+                    "started_at": .number(1_700_010_000 - ago - 100),
+                    "source": .string("user"),
+                ]).decoded(as: SessionSummary.self)
+            }
+
+            let list = (1...6).compactMap { index in
+                summary("storm-\(index)", "Storm \(index)", 8 + index, Double(index * 60))
+            }
+            environment.connectionStore.phase = .connected
+            environment.sessionStore.sessions = list
+            environment.sessionStore.activeStoredId = "storm-1"
+            environment.chatStore.debugSeedTranscript(ChatStore.toChatMessages(transcript("Storm 1")))
+            environment.sessionStore.beforeOpenSeedForTesting = {
+                try? await Task.sleep(nanoseconds: 700_000_000)
+            }
+            environment.sessionStore.resumeRPC = { storedId, _ in
+                guard let result = JSONValue.object([
+                    "session_id": .string("runtime-\(storedId)"),
+                    "stored_session_id": .string(storedId),
+                    "message_count": .number(8),
+                    "info": .object([
+                        "running": .bool(false),
+                        "lazy": .bool(false),
+                    ]),
+                ]).decoded(as: SessionOpenResult.self) else {
+                    throw URLError(.cannotDecodeContentData)
+                }
+                return result
+            }
+            environment.sessionStore.transcriptFetch = { id in
+                return transcript(id.capitalized)
+            }
+            return
+        }
+
         // "iddrift" — ARCH37 Step 1 risk gate: open a session whose CACHE copy is
         // 1+ rows SHORTER than the NETWORK copy (count drift), so the Phase-2 network
         // seed reconciles a LONGER row set onto the already-landed cache content. With
