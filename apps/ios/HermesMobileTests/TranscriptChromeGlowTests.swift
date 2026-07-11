@@ -108,6 +108,36 @@ final class TranscriptChromeGlowTests: XCTestCase {
         XCTAssertEqual(ChatView.turnActivityElapsedText(startedAt: started, now: now), "0s")
     }
 
+    // MARK: - 2b. Clean thinking block helpers (STR-1062)
+
+    func testThinkingDisplayStripsStatusFacesWithoutDroppingReasoning() {
+        let raw = """
+        ◉_◉ processing... Reading files
+        (¬‿¬) analyzing… Checking the store
+        Keep the actual reasoning sentence.
+        """
+
+        let cleaned = ThinkingDisplay.cleanedText(raw)
+
+        XCTAssertFalse(cleaned.contains("◉_◉"))
+        XCTAssertFalse(cleaned.contains("(¬‿¬)"))
+        XCTAssertFalse(cleaned.localizedCaseInsensitiveContains("processing..."))
+        XCTAssertFalse(cleaned.localizedCaseInsensitiveContains("analyzing…"))
+        XCTAssertTrue(cleaned.contains("Reading files"))
+        XCTAssertTrue(cleaned.contains("Checking the store"))
+        XCTAssertTrue(cleaned.contains("Keep the actual reasoning sentence."))
+    }
+
+    func testThinkingDisplayCollapsesSpinnerPlaceholderToEmpty() {
+        XCTAssertEqual(ThinkingDisplay.cleanedText("next thinking to process"), "")
+    }
+
+    func testThinkingDisplaySettledDurationFormat() {
+        XCTAssertEqual(ThinkingDisplay.settledLabel(duration: nil), "Thinking")
+        XCTAssertEqual(ThinkingDisplay.settledLabel(duration: 4.9), "Thought for 4s")
+        XCTAssertEqual(ThinkingDisplay.settledLabel(duration: 65), "Thought for 1m 5s")
+    }
+
     // MARK: - 3. Activity label logic (unchanged helpers still pass)
 
     func testLabelShowsActiveToolNameWhenPresent() {

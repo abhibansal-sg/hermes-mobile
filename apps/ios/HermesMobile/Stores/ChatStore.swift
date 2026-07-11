@@ -1042,6 +1042,7 @@ final class ChatStore {
             if let reasoning = completion?.reasoning, !reasoning.isEmpty {
                 message.applyFinalReasoning(reasoning)
             }
+            message.setReasoningElapsed(elapsed)
             if let warning = completion?.warning {
                 message.setWarningPart(warning)
             }

@@ -75,6 +75,10 @@ struct MessageBubble: View {
     /// session shows the working cursor/Stop state without a dangling end-of-turn
     /// row under older assistant prose.
     let assistantTurnActionsEnabled: Bool
+    /// Active turn start from ``ChatStore.turnStartedAt``. Thinking rows use this
+    /// for the live inline timer while streaming; settled rows read the duration
+    /// stamped on their own message.
+    let liveTurnStartedAt: Date?
 
     /// Appearance identity (theme + Dynamic Type), folded into `Equatable` (A1) so
     /// a theme/type-size switch re-renders the bubble even though `.equatable()`
@@ -98,6 +102,7 @@ struct MessageBubble: View {
         onBranch: ((ChatMessage) -> Void)? = nil,
         menuActionsEnabled: Bool = true,
         assistantTurnActionsEnabled: Bool = true,
+        liveTurnStartedAt: Date? = nil,
         appearance: BubbleAppearance = BubbleAppearance()
     ) {
         self.message = message
@@ -110,6 +115,7 @@ struct MessageBubble: View {
         self.onBranch = onBranch
         self.menuActionsEnabled = menuActionsEnabled
         self.assistantTurnActionsEnabled = assistantTurnActionsEnabled
+        self.liveTurnStartedAt = liveTurnStartedAt
         self.appearance = appearance
     }
 
@@ -482,12 +488,17 @@ struct MessageBubble: View {
     private func assistantPart(_ part: ChatMessagePart, showsCursor: Bool) -> some View {
         switch part {
         case .reasoning(_, let text):
-            if !text.isEmpty {
+            if !ThinkingDisplay.cleanedText(text).isEmpty {
                 // Wire-position thinking (§3.3): the accordion renders exactly
                 // where this `.reasoning` part sits in `parts` (never hoisted to
                 // the top) and auto-opens while the turn streams, collapsing when
                 // it settles. `message.isStreaming` drives that default.
-                ThinkingView(thinking: text, streaming: message.isStreaming)
+                ThinkingView(
+                    thinking: text,
+                    streaming: message.isStreaming,
+                    liveTurnStartedAt: liveTurnStartedAt,
+                    settledDuration: message.reasoningElapsed
+                )
             }
         case .tools(_, let tools, let collapsed, let turnElapsed):
             if !tools.isEmpty {
@@ -2158,6 +2169,7 @@ extension MessageBubble: Equatable {
             && lhs.menuActionsEnabled == rhs.menuActionsEnabled
             && lhs.assistantTurnActionsEnabled == rhs.assistantTurnActionsEnabled
             && lhs.showsUndoLastTurnAction == rhs.showsUndoLastTurnAction
+            && lhs.liveTurnStartedAt == rhs.liveTurnStartedAt
             && lhs.appearance == rhs.appearance
     }
 }
