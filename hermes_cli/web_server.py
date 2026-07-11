@@ -37,6 +37,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import zipfile
@@ -17068,6 +17069,175 @@ def _maybe_open_browser(
     threading.Thread(target=_open, daemon=True).start()
 
 
+# ── Off-loop stall watchdog (STR-12 / ABH-370) ───────────────────────────
+# The on-loop heartbeat installed in start_server (CF-1) only *logs* drift,
+# and only once the loop breathes again -- a wedge that never releases the
+# GIL leaves the dashboard dead for hours with nothing to detect it. The
+# pieces below add a second, independent detector that runs on a plain OS
+# thread (never the asyncio loop), so it keeps ticking even while the loop
+# itself is starved.
+#
+# 75s sits inside the 60-90s target window from STR-12: long enough that a
+# single slow request or GC pause doesn't false-trip, short enough that a
+# genuine GIL-wedge doesn't leave the dashboard dark for the hours we saw
+# in the field.
+_STALL_RESTART_THRESHOLD_S = 75.0
+_STALL_WATCHDOG_POLL_S = 5.0
+
+
+def _format_stall_forensics(
+    age: float,
+    threshold: float,
+    loop_thread: Optional[threading.Thread] = None,
+    frames: Optional[Dict[int, Any]] = None,
+) -> str:
+    """Render a stall forensics report from live thread stacks.
+
+    Reads from ``sys._current_frames()`` (or an injected ``frames`` mapping,
+    for tests) rather than anything that requires the event loop to
+    cooperate -- cooperation is exactly what a wedged loop can't offer. The
+    loop thread (when known) is reported first and tagged, since that's the
+    thread whose stack actually explains the stall.
+    """
+    if frames is None:
+        frames = sys._current_frames()
+    threads_by_id = {t.ident: t for t in threading.enumerate()}
+    loop_ident = loop_thread.ident if loop_thread is not None else None
+
+    lines = [
+        f"dashboard event loop stalled {age:.1f}s "
+        f"(threshold {threshold:.1f}s) -- self-heal triggered",
+    ]
+    for tid, frame in sorted(frames.items(), key=lambda kv: kv[0] != loop_ident):
+        thread = threads_by_id.get(tid)
+        name = thread.name if thread is not None else f"thread-{tid}"
+        marker = " [event loop]" if loop_ident is not None and tid == loop_ident else ""
+        lines.append(f"--- thread {name!r} (id={tid}){marker} ---")
+        lines.append("".join(traceback.format_stack(frame)).rstrip("\n"))
+    return "\n".join(lines)
+
+
+def _dump_stall_forensics(
+    age: float, threshold: float, loop_thread: Optional[threading.Thread] = None,
+) -> None:
+    try:
+        _log.error(_format_stall_forensics(age, threshold, loop_thread))
+    except Exception:
+        _log.exception("dashboard stall forensics dump failed")
+
+
+def _dump_pending_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    """Best-effort post-recovery task dump, scheduled back onto the loop.
+
+    Only fires if/when the loop resumes processing callbacks -- the trip
+    itself never depends on this, since a wedged loop may never run it.
+    """
+    try:
+        tasks = asyncio.all_tasks(loop)
+    except Exception:
+        return
+    _log.warning("dashboard stall recovery: %d pending asyncio task(s)", len(tasks))
+    for task in tasks:
+        _log.warning("  pending task: %r", task)
+
+
+def _default_stall_restart() -> None:
+    """Hard-exit the process -- the only reliable recovery when the loop is
+    wedged.
+
+    A graceful shutdown (uvicorn's lifespan, even ``loop.stop()``) needs the
+    event loop to run a coroutine/callback, which is exactly what's
+    unavailable during a GIL wedge -- attempting one would just hang
+    alongside everything else. ``os._exit`` terminates immediately without
+    Python-level cleanup; the process supervisor owns respawn: launchd
+    (macOS, ``ai.hermes.dashboard`` KeepAlive=true) or s6 (Docker, see
+    ``tests/docker/test_dashboard.py::test_dashboard_restarts_after_crash``)
+    both already treat a dashboard process exit as a sanctioned recovery
+    path.
+    """
+    _log.critical(
+        "dashboard stall watchdog: exiting process so the supervisor restarts it"
+    )
+    os._exit(1)
+
+
+class _LoopStallWatchdog:
+    """Polls an off-loop heartbeat timestamp on a plain thread and fires a
+    restart callback exactly once if it goes stale past ``stall_threshold``.
+
+    Deliberately NOT asyncio-based: the entire point is to keep observing
+    the loop from outside while the loop itself may be unable to run
+    anything at all.
+    """
+
+    def __init__(
+        self,
+        get_last_beat,
+        restart_callback=_default_stall_restart,
+        stall_threshold: float = _STALL_RESTART_THRESHOLD_S,
+        poll_interval: float = _STALL_WATCHDOG_POLL_S,
+        loop_thread: Optional[threading.Thread] = None,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
+        self._get_last_beat = get_last_beat
+        self._restart_callback = restart_callback
+        self._stall_threshold = stall_threshold
+        self._poll_interval = poll_interval
+        self._loop_thread = loop_thread
+        self._loop = loop
+        self._stop_event = threading.Event()
+        self._tripped_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="hermes-dashboard-stall-watchdog", daemon=True,
+        )
+
+    @property
+    def tripped(self) -> bool:
+        return self._tripped_event.is_set()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the watchdog. Safe to call from any thread, including its
+        own (it will not attempt to join itself)."""
+        self._stop_event.set()
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=self._poll_interval + 1.0)
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._poll_interval):
+            age = time.monotonic() - self._get_last_beat()
+            if age > self._stall_threshold:
+                self._trip(age)
+                return
+
+    def _trip(self, age: float) -> None:
+        if self._tripped_event.is_set():
+            return
+        self._tripped_event.set()
+        _log.error(
+            "dashboard event loop stalled %.1fs (threshold %.1fs) -- "
+            "triggering self-heal restart", age, self._stall_threshold,
+        )
+        try:
+            _dump_stall_forensics(age, self._stall_threshold, self._loop_thread)
+        except Exception:
+            _log.exception("stall forensics dump raised")
+        if self._loop is not None:
+            try:
+                self._loop.call_soon_threadsafe(_dump_pending_tasks, self._loop)
+            except Exception:
+                _log.debug(
+                    "could not schedule post-recovery task dump "
+                    "(loop likely not running)", exc_info=True,
+                )
+        try:
+            self._restart_callback()
+        except Exception:
+            _log.exception("stall watchdog restart callback raised")
+
+
 def start_server(
     host: str = "127.0.0.1",
     port: int = 9119,
@@ -17280,9 +17450,12 @@ def start_server(
             _hb_interval = 2.0
             _hb_stall_threshold = 5.0
             _hb_loop = asyncio.get_running_loop()
+            _hb_last_beat = time.monotonic()
 
             def _loop_heartbeat(expected: float) -> None:
+                nonlocal _hb_last_beat
                 now = _hb_loop.time()
+                _hb_last_beat = time.monotonic()
                 drift = now - expected
                 if drift > _hb_stall_threshold:
                     _log.warning(
@@ -17297,9 +17470,24 @@ def start_server(
                 _hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval
             )
 
-            await server.main_loop()
-            if server.started:
-                await server.shutdown()
+            # ── Off-loop self-heal watchdog (STR-12 / ABH-370) ───────────
+            # Runs on a real OS thread so it keeps polling even when the
+            # heartbeat above can't -- that's the whole failure mode this
+            # exists to catch. See _LoopStallWatchdog for the trip/forensics
+            # behavior. Stopped unconditionally in `finally` so a normal
+            # main_loop() return never leaves the thread running.
+            _stall_watchdog = _LoopStallWatchdog(
+                get_last_beat=lambda: _hb_last_beat,
+                loop_thread=threading.current_thread(),
+                loop=_hb_loop,
+            )
+            _stall_watchdog.start()
+            try:
+                await server.main_loop()
+                if server.started:
+                    await server.shutdown()
+            finally:
+                _stall_watchdog.stop()
 
     # On POSIX, keep the long-standing ``asyncio.run(_serve())`` behavior
     # unchanged — Python's default loop there is already a SelectorEventLoop

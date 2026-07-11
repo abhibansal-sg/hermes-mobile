@@ -1,0 +1,15 @@
+^D▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+Discovered 1 test files (~8 tests) under ['tests/test_web_server.py']; running with -j 28
+[100.0% |     8/~8 | ✓8 | ✗0] ✓ tests/test_web_server.py (8✓, 10.6s…
+
+=== Summary: 1 files, 8 tests passed, 0 failed (100% complete) in 10.6s (28 workers) ===
+  Durations cached to test_durations.json (1 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   1
+  Total subprocess CPU-wall: 10.6s  (runner wall: 10.6s, parallelism: 28x)
+  P50: 10.63s  P90: 10.63s  P95: 10.63s  P99: 10.63s  Max: 10.63s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+     10.63s  tests/test_web_server.py
