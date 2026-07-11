@@ -5083,6 +5083,58 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if agent is not _AGENT_PENDING_SENTINEL
         }
 
+    def _iter_all_adapters(self):
+        """Yield every live adapter (primary + multiplex profile adapters)."""
+        for adapter in (getattr(self, "adapters", None) or {}).values():
+            yield adapter
+        profile_adapters = getattr(self, "_profile_adapters", None) or {}
+        for _amap in profile_adapters.values():
+            for adapter in _amap.values():
+                yield adapter
+
+    def _adapter_active_turns(self) -> "dict[str, object]":
+        """Adapter-owned active human turns not yet promoted to runner tracking.
+
+        Returns ``{session_key: adapter}`` for sessions where an adapter has an
+        active processing guard (``_active_sessions``) whose owner task has not
+        already exited, and the runner has not yet claimed ``_running_agents``.
+
+        A human turn is in flight at the adapter/background-task layer — between
+        ``_start_session_processing`` installing the guard and the runner's
+        sentinel claim in ``_handle_message`` — before any concrete AIAgent
+        exists.  Shutdown drain accounting must count these so ``stop()`` does
+        not report ``active_at_start=0`` and proceed to teardown while a human
+        turn is still running (#27856 drain-accounting gap).
+        """
+        turns: "dict[str, object]" = {}
+        running = getattr(self, "_running_agents", {}) or {}
+        for adapter in self._iter_all_adapters():
+            active_sessions = getattr(adapter, "_active_sessions", None)
+            if not active_sessions:
+                continue
+            session_tasks = getattr(adapter, "_session_tasks", None) or {}
+            for session_key in active_sessions:
+                if session_key in running:
+                    continue
+                task = session_tasks.get(session_key)
+                if task is not None:
+                    done = getattr(task, "done", None)
+                    if callable(done) and done():
+                        continue
+                turns[session_key] = adapter
+        return turns
+
+    def _active_human_turn_keys(self) -> "set[str]":
+        """All session keys representing an in-flight human gateway turn at any
+        layer: real AIAgent entries, pending sentinels, and adapter-owned active
+        session guards/tasks not yet promoted to runner ``_running_agents``."""
+        keys: "set[str]" = set((getattr(self, "_running_agents", {}) or {}).keys())
+        keys.update(self._adapter_active_turns().keys())
+        return keys
+
+    def _active_human_turn_count(self) -> int:
+        return len(self._active_human_turn_keys())
+
     def _get_max_concurrent_sessions(self) -> Optional[int]:
         """Return the configured active chat session cap, if enabled."""
         try:
@@ -5637,14 +5689,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
-        last_active_count = self._running_agent_count()
+        last_active_count = self._active_human_turn_count()
         last_cron_count = self._active_cron_job_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
             nonlocal last_active_count, last_cron_count, last_status_at
             now = asyncio.get_running_loop().time()
-            active_count = self._running_agent_count()
+            active_count = self._active_human_turn_count()
             cron_count = self._active_cron_job_count()
             if (
                 force
@@ -5657,12 +5709,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_cron_count = cron_count
                 last_status_at = now
 
-        # Cron jobs run on the scheduler's own thread pool, outside
-        # ``self._running_agents`` — fold their in-flight count into the
-        # same wait/timeout this method already applies to chat sessions,
-        # or a cron job's tool work gets killed with zero warning the
-        # instant it's the only active thing running (#60432).
-        if not self._running_agents and last_cron_count == 0:
+        # Drain must wait for both independently tracked work classes:
+        # all active human turns (concrete agents, pending sentinels, and
+        # adapter-owned tasks not yet promoted to ``_running_agents``) plus
+        # cron jobs running on the scheduler's separate thread pool. Choosing
+        # either predicate alone lets shutdown tear down the other class. The
+        # returned snapshot stays concrete-agent-only so finalization never
+        # touches sentinel placeholders or cron jobs.
+        if last_active_count == 0 and last_cron_count == 0:
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -5672,12 +5726,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         deadline = asyncio.get_running_loop().time() + timeout
         while (
-            (self._running_agents or self._active_cron_job_count())
+            (self._active_human_turn_keys() or self._active_cron_job_count())
             and asyncio.get_running_loop().time() < deadline
         ):
             _maybe_update_status()
             await asyncio.sleep(0.1)
-        timed_out = bool(self._running_agents) or bool(self._active_cron_job_count())
+        timed_out = bool(
+            self._active_human_turn_keys() or self._active_cron_job_count()
+        )
         _maybe_update_status(force=True)
         # Refresh the real-agent snapshot before returning.  A pending-
         # sentinel or adapter-active turn can promote to a concrete AIAgent
@@ -5708,7 +5764,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         messages can be delivered. Best-effort: individual send failures are
         logged and swallowed so they never block the shutdown sequence.
         """
-        active = self._snapshot_running_agents()
+        active = self._active_human_turn_keys()
         restart_source = self._restart_command_source if self._restart_requested else None
 
         action = "restarting" if self._restart_requested else "shutting down"
@@ -5721,13 +5777,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         msg = f"⚠️ Gateway {action} — {hint}"
 
         notified: set[tuple[str, str, Optional[str]]] = set()
+        _running = getattr(self, "_running_agents", {}) or {}
         for session_key in active:
             source = None
+            _source_from_real_info = False
             try:
                 if getattr(self, "session_store", None) is not None:
                     self.session_store._ensure_loaded()
                     entry = self.session_store._entries.get(session_key)
                     source = getattr(entry, "origin", None) if entry else None
+                    if source is not None:
+                        _source_from_real_info = True
             except Exception as e:
                 logger.debug(
                     "Failed to load session origin for shutdown notification %s: %s",
@@ -5737,6 +5797,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if source is None:
                 source = self._get_cached_session_source(session_key)
+                if source is not None:
+                    _source_from_real_info = True
+
+            # A just-started turn (pending sentinel or adapter-active guard,
+            # no concrete AIAgent) is only notified when a real delivery
+            # source is available — the cached-at-claim source or a persisted
+            # session origin.  The parsed-key fallback below is a legacy
+            # heuristic for concrete agents whose origin wasn't persisted; for
+            # a just-started turn it can point at a chat the runner hasn't
+            # engaged yet, so we skip rather than risk a misrouted restart
+            # ping.  This preserves the "pending sentinels don't trigger
+            # notifications" contract for bare/test sentinels while still
+            # reaching a just-started human turn whose source was cached.
+            _concrete = _running.get(session_key)
+            _has_concrete_agent = (
+                _concrete is not None and _concrete is not _AGENT_PENDING_SENTINEL
+            )
+            if not _has_concrete_agent and not _source_from_real_info:
+                continue
 
             if source is not None:
                 platform_str = source.platform.value
@@ -8122,35 +8201,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             timeout = self._restart_drain_timeout
 
+            def _adapter_active_turns_for_stop() -> "dict[str, object]":
+                adapter_active_turns = getattr(self, "_adapter_active_turns", None)
+                if callable(adapter_active_turns):
+                    return adapter_active_turns()
+                return {}
+
+            def _active_human_turn_keys_for_stop() -> "set[str]":
+                active_human_turn_keys = getattr(self, "_active_human_turn_keys", None)
+                if callable(active_human_turn_keys):
+                    return active_human_turn_keys()
+                return set((getattr(self, "_running_agents", {}) or {}).keys())
+
+            def _active_human_turn_count_for_stop() -> int:
+                active_human_turn_count = getattr(self, "_active_human_turn_count", None)
+                if callable(active_human_turn_count):
+                    return active_human_turn_count()
+                return len(_active_human_turn_keys_for_stop())
+
             # Pre-mark sessions as resume_pending BEFORE the drain wait.
             # If the process is killed by the service manager during the
             # drain, the durable marker is already written so the next
             # gateway boot can recover in-flight sessions (#27856).
+            # Pending sentinels are included: a sentinel with an existing
+            # session entry must be marked so the next boot can resume it.
+            # ``mark_resume_pending`` returns False when no session entry
+            # exists, so bare sentinels with no durable state are skipped
+            # by the store guard, not by the runner sentinel type.
             _pre_drain_keys: list[str] = []
-            for _sk, _agent in list(self._running_agents.items()):
-                if _agent is _AGENT_PENDING_SENTINEL:
+            _pre_drain_reason = (
+                "restart_timeout" if self._restart_requested else "shutdown_timeout"
+            )
+            for _sk in list(self._running_agents.keys()):
+                try:
+                    self.session_store.mark_resume_pending(_sk, _pre_drain_reason)
+                    _pre_drain_keys.append(_sk)
+                except Exception as _e:
+                    logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
+            # Also pre-mark adapter-active turns discovered through the broader
+            # active-turn accounting — a turn in flight at the adapter/
+            # background-task layer (not yet claimed by ``_running_agents``)
+            # must survive a SIGKILL mid-drain so the next boot can resume it.
+            # ``mark_resume_pending`` is a no-op (returns False) when no session
+            # entry/transcript exists, so this never creates a misleading resume
+            # marker for a session with no durable state.
+            for _sk in _adapter_active_turns_for_stop():
+                if _sk in self._running_agents:
                     continue
                 try:
-                    self.session_store.mark_resume_pending(
-                        _sk,
-                        "restart_timeout" if self._restart_requested else "shutdown_timeout",
-                    )
+                    self.session_store.mark_resume_pending(_sk, _pre_drain_reason)
                     _pre_drain_keys.append(_sk)
                 except Exception as _e:
                     logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
 
             _cron_at_start = self._active_cron_job_count()
             _drain_started_at = time.monotonic()
+            _active_turns_at_start = _active_human_turn_count_for_stop()
+            _runner_active_at_start = self._running_agent_count()
             active_agents, timed_out = await self._drain_active_agents(timeout)
             logger.info(
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
-                "timed_out=%s, active_at_start=%d, active_now=%d, "
-                "cron_at_start=%d, cron_now=%d)",
+                "timed_out=%s, active_at_start=%d, runner_active_at_start=%d, "
+                "active_now=%d, cron_at_start=%d, cron_now=%d)",
                 _phase_elapsed(),
                 time.monotonic() - _drain_started_at,
                 timed_out,
-                len(active_agents),
-                self._running_agent_count(),
+                _active_turns_at_start,
+                _runner_active_at_start,
+                _active_human_turn_count_for_stop(),
                 _cron_at_start,
                 self._active_cron_job_count(),
             )
@@ -8171,10 +8289,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if timed_out:
                 logger.warning(
-                    "Gateway drain timed out after %.1fs with %d active agent(s) "
+                    "Gateway drain timed out after %.1fs with %d active human turn(s) "
                     "and %d in-flight cron job(s); interrupting remaining work.",
                     timeout,
-                    self._running_agent_count(),
+                    _active_human_turn_count_for_stop(),
                     self._active_cron_job_count(),
                 )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
@@ -8188,22 +8306,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (incremented below, threshold 3), which sets
                 # ``suspended=True`` and overrides resume_pending.
                 #
-                # Iterate self._running_agents (current) rather than the
-                # drain-start ``active_agents`` snapshot — the snapshot
+                # Iterate the broader active-turn set (current, not the
+                # drain-start ``active_agents`` snapshot) — the snapshot
                 # may include sessions that finished gracefully during
                 # the drain window, and marking those falsely would give
                 # them a stray restart-interruption system note on their
                 # next turn even though their previous turn completed
-                # cleanly.  Skip pending sentinels for the same reason
-                # _interrupt_running_agents() does: their agent hasn't
-                # started yet, there's nothing to interrupt, and the
-                # session shouldn't carry a misleading resume flag.
+                # cleanly.  This broader set also covers adapter-active
+                # turns and pending sentinels discovered through the
+                # active-turn accounting so a force-interrupted human
+                # turn still gets a resume marker where a session entry
+                # exists.  ``mark_resume_pending`` returns False when no
+                # session entry/transcript exists, so pending sentinels
+                # with no durable state do not create misleading resume
+                # markers — the session-store guard is the safety net,
+                # not the runner sentinel type.
                 _resume_reason = (
                     "restart_timeout" if self._restart_requested else "shutdown_timeout"
                 )
-                for _sk, _agent in list(self._running_agents.items()):
-                    if _agent is _AGENT_PENDING_SENTINEL:
-                        continue
+                for _sk in _active_human_turn_keys_for_stop():
                     try:
                         self.session_store.mark_resume_pending(_sk, _resume_reason)
                     except Exception as _e:
@@ -10264,6 +10385,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
         self._persist_active_agents()
+        # Cache the source the moment the turn is claimed so a shutdown
+        # notification can reach a just-started turn before
+        # ``_handle_message_with_agent`` has persisted the session origin.
+        # The cache is refreshed with the recovered/final source below, so a
+        # stale thread_id here is corrected before the turn completes.
+        self._cache_session_source(_quick_key, source)
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
