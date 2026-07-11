@@ -401,6 +401,12 @@ final class ConnectionStore {
     /// Speaks the path family the capability probe resolved (ABH-88) — `.legacy`
     /// until/unless the plugin-mount probe concludes `.available`.
     var rest: RestClient? {
+        #if DEBUG
+        // Test-only: a seeded override short-circuits the URL+token build so a
+        // stub `URLSession` can observe the calls made through `rest` (e.g. the
+        // auto-upgrade `issueDevice` round-trip). See `_restOverrideForTesting`.
+        if let _restOverrideForTesting { return _restOverrideForTesting }
+        #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
         return RestClient(
             baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
@@ -411,11 +417,30 @@ final class ConnectionStore {
     /// usage / cron / skills — now ``RestClient`` extension members), built from
     /// the same saved URL + token as `rest`, or `nil` if unconfigured.
     var control: RestClient? {
+        #if DEBUG
+        // Test-only: same seam as `rest` (see `_restOverrideForTesting`) so the
+        // control-surface client is equally stubbable in unit tests.
+        if let _restOverrideForTesting { return _restOverrideForTesting }
+        #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
         return RestClient(
             baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
         )
     }
+
+    #if DEBUG
+    /// Test-only override: when set, `rest`/`control` return this client instead
+    /// of building one from the saved URL + token, so a stub `URLSession`
+    /// (`URLProtocol`-injected) can observe the requests they issue — in
+    /// particular the auto-upgrade `issueDevice` call inside
+    /// `autoUpgradeToDeviceTokenIfNeeded(serverURL:)`, which is otherwise routed
+    /// through an internal `.ephemeral` session that no `URLProtocol` can
+    /// intercept. Mirrors the existing `_seed…ForTesting` conventions; compiled
+    /// out of Release, so there is no production surface and no secret exposure
+    /// (the stub client's session and token are entirely test-injected).
+    var _restOverrideForTesting: RestClient?
+
+    #endif
 
     /// The persistent prompt outbox/queue. Drained here after reconnect backfill.
     /// Wired by `AppEnvironment` (ChatStore holds no reference to it).
@@ -1392,7 +1417,16 @@ final class ConnectionStore {
     ///     never issue);
     ///   - no `device_id` already recorded for this server (already upgraded, or a
     ///     v2 QR handed us a device token — don't re-issue);
-    ///   - we are still configured against `serverURL` with a live token.
+    ///   - we are still configured against `serverURL` with a live token;
+    ///   - the server's live `GET /api/status` reports `auth_required == true`
+    ///     (STR-1568). A loopback/insecure dev-gateway runs `auth_required ==
+    ///     false`; there, the legacy shared-token-only `auth_middleware` is the
+    ///     ONLY active gate on `/api/*` — it has no device-token branch (that
+    ///     lives in `gated_auth_middleware`, which never engages on loopback) —
+    ///     so a device-upgraded phone would 401 on every request, app-wide, with
+    ///     no way back to the shared token short of a re-pair. Fail-safe on a
+    ///     missing/unreachable status (`nil`): keep the shared token, which the
+    ///     loopback gate always accepts.
     ///
     /// FAILURE IS SILENT (binding) for transient/status failures: if `issueDevice`
     /// throws (500 persist failure, 401, transport), the app KEEPS the shared
@@ -1420,6 +1454,12 @@ final class ConnectionStore {
         guard !deviceIssueLimitReachedServers.contains(serverURL) else { return }
         // Must still be the active configuration with a live token + REST client.
         guard serverURLString == serverURL, let rest else { return }
+
+        // STR-1568: only issue a device token when the server's own auth gate
+        // would actually accept one — see the gating note above. `try?` folds a
+        // transport/decode failure into the same fail-safe as `nil`: keep the
+        // shared token, retry on the next connect.
+        guard let status = try? await rest.status(), status.authRequired == true else { return }
 
         let issued: IssuedDevice
         do {

@@ -211,6 +211,16 @@ final class ServerCapabilities {
         probedAppVersion = nil
     }
 
+    #if DEBUG
+    /// DEBUG-only test seam: seed `devices` directly, skipping the real
+    /// `GET /api/devices` probe. Lets a test drive `ConnectionStore`'s
+    /// auto-upgrade path (which gates on `devices == .available`) without
+    /// standing up a stub for every probe endpoint. Absent in Release.
+    func _setDevicesForTesting(_ state: State) {
+        devices = state
+    }
+    #endif
+
     // MARK: - Passive / derived signals
 
     /// Record the outcome of a real push-register call (from ``PushRegistrar``).

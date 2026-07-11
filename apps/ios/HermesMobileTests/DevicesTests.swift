@@ -512,6 +512,119 @@ final class DevicesTests: XCTestCase {
         )
     }
 
+    // MARK: - Auto-upgrade auth gating (STR-1568)
+
+    /// Routes stub responses by URL path so one session answers both the live
+    /// `GET /api/status` auth-gate check and the `POST /api/devices/issue` call
+    /// the real `autoUpgradeToDeviceTokenIfNeeded` makes — exercising the actual
+    /// method end-to-end (not a mirrored decision function) via the STR-1417
+    /// `_restOverrideForTesting` seam.
+    final class AutoUpgradeRoutingProtocol: URLProtocol, @unchecked Sendable {
+        nonisolated(unsafe) static var statusBody = Data(#"{"auth_required":true}"#.utf8)
+        nonisolated(unsafe) static var statusCode = 200
+        nonisolated(unsafe) static var issueBody = Data()
+        nonisolated(unsafe) static var issueCode = 200
+        nonisolated(unsafe) static var issueCallCount = 0
+
+        static func reset() {
+            statusBody = Data(#"{"auth_required":true}"#.utf8)
+            statusCode = 200
+            issueBody = Data()
+            issueCode = 200
+            issueCallCount = 0
+        }
+
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+        override func startLoading() {
+            let path = request.url?.path ?? ""
+            let (body, status): (Data, Int)
+            if path.hasSuffix("/devices/issue") {
+                Self.issueCallCount += 1
+                (body, status) = (Self.issueBody, Self.issueCode)
+            } else {
+                (body, status) = (Self.statusBody, Self.statusCode)
+            }
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: status,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: body)
+            client?.urlProtocolDidFinishLoading(self)
+        }
+
+        override func stopLoading() {}
+    }
+
+    /// A `ConnectionStore` seeded as already connected + `devices == .available`
+    /// (so `autoUpgradeToDeviceTokenIfNeeded`'s early guards pass) with `rest`
+    /// overridden to the routing stub above.
+    private func makeAutoUpgradeConnection(server: String) -> ConnectionStore {
+        let connection = ConnectionStore(sessionStore: SessionStore(), chatStore: ChatStore())
+        connection._seedConnectedForTesting(serverURL: server, token: "shared_tok")
+        connection.capabilities._setDevicesForTesting(.available)
+        AutoUpgradeRoutingProtocol.reset()
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [AutoUpgradeRoutingProtocol.self]
+        connection._restOverrideForTesting = RestClient(
+            baseURL: URL(string: server)!,
+            token: "shared_tok",
+            session: URLSession(configuration: config),
+            pathStyle: .legacy
+        )
+        return connection
+    }
+
+    func testAutoUpgradeSkipsIssueWhenAuthNotRequiredOnLoopback() async {
+        // A loopback dev-gateway (`auth_required: false`) runs ONLY the legacy
+        // shared-token-only middleware on `/api/*` — a device token 401s there
+        // (the root cause STR-1568 traced). The auto-upgrade must see the live
+        // status and skip the issue call entirely, keeping the shared token.
+        let server = "http://127.0.0.1:9119"
+        let connection = makeAutoUpgradeConnection(server: server)
+        AutoUpgradeRoutingProtocol.statusBody = Data(#"{"auth_required":false}"#.utf8)
+
+        await connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
+
+        XCTAssertEqual(AutoUpgradeRoutingProtocol.issueCallCount, 0)
+        XCTAssertNil(DefaultsKeys.deviceId(server: server))
+    }
+
+    func testAutoUpgradeIssuesWhenAuthRequiredTrue() async {
+        // The gated (non-loopback / OAuth) path is unchanged: `auth_required:
+        // true` ⇒ proceed to issue + record the device token exactly as before.
+        let server = "https://gw.example:9119"
+        let connection = makeAutoUpgradeConnection(server: server)
+        AutoUpgradeRoutingProtocol.statusBody = Data(#"{"auth_required":true}"#.utf8)
+        AutoUpgradeRoutingProtocol.issueBody = Data("""
+        {"device_id":"dev_gated001","token":"tok_new_device","device_name":"iPhone",
+         "created_at":1700001234.0}
+        """.utf8)
+
+        await connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
+
+        XCTAssertEqual(AutoUpgradeRoutingProtocol.issueCallCount, 1)
+        XCTAssertEqual(DefaultsKeys.deviceId(server: server), "dev_gated001")
+    }
+
+    func testAutoUpgradeFailSafeSkipsIssueWhenStatusUnreachable() async {
+        // A transport/decode failure on the status check must fail SAFE — same
+        // outcome as `auth_required == false` — never fail open and let an issue
+        // call slip through blind because the gate itself couldn't be read.
+        let server = "https://flaky:9119"
+        let connection = makeAutoUpgradeConnection(server: server)
+        AutoUpgradeRoutingProtocol.statusBody = Data("not json".utf8)
+
+        await connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
+
+        XCTAssertEqual(AutoUpgradeRoutingProtocol.issueCallCount, 0)
+        XCTAssertNil(DefaultsKeys.deviceId(server: server))
+    }
+
     func testDeviceNameHintIsNonEmpty() {
         // The auto-upgrade device-name hint is always a non-empty label (generic
         // model name acceptable per the contract's open question).
