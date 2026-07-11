@@ -1,3 +1,75 @@
+Build 97 — 2026-07-11
+
+WHAT'S NEW
+- Pass approve rule keys to approval gate
+- Optionally mention approval owners on exec prompts
+- Add UI scale setting to appearance settings
+- User-defined deny rules that block commands even under yolo
+- Optional admin-only gate for exec-approval buttons
+- Native Baileys polls, clarify-as-poll, locations, and rich inbound metadata
+- /deny <reason> relays denial reason to the agent (port nanoclaw#2832)
+- Pre_tool_call approve action escalates to human gate
+
+FIXED
+- Green up the iOS CI lane (PR #111) without a live gateway
+- Avoid undo rollback double-pop
+- Restore approval resolver audit seam
+- Preserve S5 device auth across upstream catch-up
+- Reapply provider headers after model switch
+- Recover mobile chat reconnect
+- Support mobile OAuth login
+- Use windows_detach_popen_kwargs to prevent console window flash on Windows
+- Unpin Baileys from git commit, use published 7.0.0-rc13
+- Wire gateway notify round-trip into the plugin escalation gate
+- Include approval command in message content
+- Re-apply confirmation expiry on the cached-agent live-history path
+- Don't apply Codex gpt-5.5 autoraise notice when an external context engine is active
+- Run user-approved commands from a clean interrupt slate
+- Apply disabled-skill gate to CLI/TUI preloaded skills
+- Set client_max_size on the webhook Application
+- Set client_max_size on the webhook Application
+- Set client_max_size on the Twilio webhook Application
+- Contain and surface inbound media download failures (port nanoclaw#2895)
+- Apply platform-disabled skill gate to bundle invocations
+- Gate poll-vote events to Hermes-created polls + salvage follow-ups
+- Skip cua-driver refresh when Applications is unwritable
+- Apply pool-level keepalive to the process_bootstrap sibling builder
+- Require exact ./.. segments in the root-collapse hardline token
+- Honor documented WHATSAPP_CLOUD_ALLOWED_USERS / ALLOW_ALL_USERS
+- Recover final app-server text without completion
+- Apply prompt-caching decoration to the aggregator's one-shot synthesis call
+- Shut down abandoned init app + AUTHOR_MAP + cover the deadline helper
+- Apply private-page guard to browser_cdp frame_id routing
+- Poll messaging sessions so platform traffic appears live
+- Resolve LID sender IDs to phone numbers in bridge message payload
+- Close GOOGLE_API_KEY coverage gap + config/mappings write TOCTOU
+
+IMPROVED
+- Merge pull request #111 from abhibansal-sg/ci/ios-tests-lane
+- Macos-26 runner — repo uses iOS 26 SDK APIs (allowBluetoothHFP), Xcode on macos-15 too old
+- Add iOS focused unit-test lane (observe-first, PR-triggered on apps/ios/**)
+- Regression coverage for header reapplication on model switch
+- Add WhatsApp dashboard pairing flow
+- Scope Codex-native compaction to the app-server runtime
+- Finish shop-app→shop rename in zh-Hans docs
+- Isolate verification.status not_applicable test from stray tmp markers
+- Enforce WhatsApp Cloud webhook body limit while reading
+- Set explicit client_max_size on 3 uncapped aiohttp servers
+- Merge pull request #59131 from kshitijk4poor/revert/58698-pre-tool-approve
+- Revert "Merge pull request #58698 from kshitijk4poor/feat/pre-tool-call-approve-escalation"
+- Merge pull request #58698 from kshitijk4poor/feat/pre-tool-call-approve-escalation
+- Intake-gate regression coverage for documented env vars
+- Adopt shared utils + app-wide cleanups
+
+WORTH TRYING
+- Try: Pass approve rule keys to approval gate
+- Try: Optionally mention approval owners on exec prompts
+- Try: Add UI scale setting to appearance settings
+
+(+719 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 96 — 2026-07-08
 
 WHAT'S NEW
