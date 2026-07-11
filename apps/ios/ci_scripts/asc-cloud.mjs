@@ -124,9 +124,22 @@ async function ascFetch(method, urlOrPath, body, attempt = 1) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function mockAscFetch(method, urlOrPath) {
+  if (method !== 'GET') return undefined;
+
+  const workflowRaw = process.env.ASC_CLOUD_MOCK_WORKFLOW_RUNS_JSON;
+  if (workflowRaw) {
+    const match = /^\/ciWorkflows\/([^/?]+)\/buildRuns(?:\?|$)/.exec(urlOrPath);
+    if (match) {
+      try {
+        return { data: JSON.parse(workflowRaw), links: { next: null } };
+      } catch (err) {
+        throw new Error(`Invalid ASC_CLOUD_MOCK_WORKFLOW_RUNS_JSON: ${err.message}`);
+      }
+    }
+  }
+
   const raw = process.env.ASC_CLOUD_MOCK_BUILD_RUNS_JSON;
   if (!raw) return undefined;
-  if (method !== 'GET') return undefined;
 
   const match = /^\/ciBuildRuns\/([^/?]+)$/.exec(urlOrPath);
   if (!match) return undefined;
@@ -204,7 +217,9 @@ async function cmdFindRun(workflowId, sha, sinceMinutesArg) {
   }
   const sinceMinutes = Number(sinceMinutesArg) > 0 ? Number(sinceMinutesArg) : 180;
   const cutoff = Date.now() - sinceMinutes * 60_000;
-  const shaShort = sha.slice(0, 7);
+  const normalizedSha = sha.toLowerCase();
+  const fullSha = normalizedSha.length >= 40;
+  const shaShort = normalizedSha.slice(0, 7);
 
   // NOTE (STR-493 fix, 2026-07-06): the ciBuildRuns endpoint only accepts
   // sort=number|-number — createdDate is NOT a valid sort value (400
@@ -215,9 +230,13 @@ async function cmdFindRun(workflowId, sha, sinceMinutesArg) {
   // number descending, which is monotonic with recency for this workflow.
   const runs = await ascFetchAll(`/ciWorkflows/${workflowId}/buildRuns?limit=20&sort=-number`);
   const match = runs.find((r) => {
-    const commitSha = r.attributes?.sourceCommit?.commitSha ?? '';
+    const commitSha = (r.attributes?.sourceCommit?.commitSha ?? '').toLowerCase();
     const createdMs = r.attributes?.createdDate ? Date.parse(r.attributes.createdDate) : 0;
-    return commitSha.startsWith(shaShort) && createdMs >= cutoff;
+    const progress = r.attributes?.executionProgress ?? '';
+    const completion = r.attributes?.completionStatus ?? '';
+    const shaMatch = fullSha ? commitSha === normalizedSha : commitSha.startsWith(shaShort);
+    const adoptable = !(progress === 'COMPLETE' && completion !== 'SUCCEEDED');
+    return shaMatch && createdMs >= cutoff && adoptable;
   });
 
   if (!match) {
