@@ -24,6 +24,11 @@ const isOpen = (gateway: HermesGateway | null): boolean => gateway?.connectionSt
 // (e.g. inline ClarifyTool, model overlays) that call gateway methods without
 // the instance threaded down through props.
 export const $gateway = atom<HermesGateway | null>(null)
+export const $primaryGatewayReconnecting = atom(false)
+
+export function setPrimaryGatewayReconnecting(next: boolean): void {
+  $primaryGatewayReconnecting.set(next)
+}
 
 interface RegistryConfig {
   onEvent: (event: GatewayEvent) => void
