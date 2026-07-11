@@ -1,0 +1,15 @@
+STR-1520 merged-state validation 2026-07-11T10:42:13Z
+HEAD b1beed3eedf8d15e27440f2307fa2f8a48bcdd93
+BASE 207d652c1e51a3868248c4e810c16b8367c59570
+
+== identity ==
+b1beed3eedf8d15e27440f2307fa2f8a48bcdd93 Abhinav Bansal <abhibansal-sg@users.noreply.github.com> fix(ios): truthful connection state on iPad resize + no-session outage (STR-136)
+
+== diff check ==
+diff-check: PASS
+
+== verify self-test ==
+verify.sh self-test: PASS (bash -n clean, executable)
+
+== swift parse ==
+swiftc-parse: PASS (5 files)
