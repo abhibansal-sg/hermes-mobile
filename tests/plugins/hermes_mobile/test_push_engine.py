@@ -1126,3 +1126,130 @@ def test_notify_live_activity_relay_off_uses_existing_direct_apns_path(
     assert pn.notify_live_activity("sess-1", content_state) is True
     assert fake.calls[0]["path"] == f"/3/device/{_VALID_TOKEN}"
     assert fake.calls[0]["headers"]["apns-push-type"] == "liveactivity"
+
+
+# ===========================================================================
+# STR-987 — turn-complete attention gate + 4h apns-expiration
+#
+# The message.complete branch of _process_push_event now pushes based on
+# whether a live client WS still holds the session foregrounded, NOT on turn
+# duration. A locked/off/backgrounded phone drops its WS (no ``transport``),
+# so a quick turn that finishes after the phone is off still banners.
+# ===========================================================================
+
+
+class _LiveTransport:
+    """Stub gateway transport whose ``_closed`` mirrors a live/dead WS."""
+
+    def __init__(self, closed: bool = False):
+        self._closed = closed
+
+
+def _drive_message_complete(monkeypatch, session, *, turn_started=995.0):
+    """Run the message.complete branch with a captured ``notify`` and the
+    given session dict installed as the live gateway session for ``sid``.
+
+    Returns the list of ``notify`` call arg-tuples (``(args, kwargs)``).
+    """
+    calls = []
+
+    def _capture_notify(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 1
+
+    sid = "sess-attn"
+    monkeypatch.setattr(pn, "notify", _capture_notify)
+    monkeypatch.setattr(pn, "_gw_sessions", lambda: {sid: session})
+    # Silence the Live Activity hook (armed check is a no-op, but keep it inert).
+    monkeypatch.setattr(pn, "_live_activity_hook", lambda *a, **k: None)
+    pn._process_push_event(
+        "message.complete",
+        sid,
+        {"text": "All done."},
+        event_time=1000.0,
+        turn_started=turn_started,
+    )
+    return calls
+
+
+def test_attention_gate_pushes_when_no_transport_even_for_quick_turn(monkeypatch):
+    # (a) No WS attached (locked/off phone) => push, even for a 5s turn that
+    # the old 30s duration gate would have suppressed.
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls = _drive_message_complete(monkeypatch, {}, turn_started=995.0)
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == "turn_complete"
+    assert kwargs.get("expiration") == 14400
+
+
+def test_attention_gate_pushes_when_transport_closed(monkeypatch):
+    # (a') A transport that reports _closed=True is a dead WS — treat as
+    # backgrounded and push.
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    session = {"transport": _LiveTransport(closed=True)}
+    calls = _drive_message_complete(monkeypatch, session)
+    assert len(calls) == 1
+    assert calls[0][0][0] == "turn_complete"
+
+
+def test_attention_gate_suppresses_when_ws_foregrounded(monkeypatch):
+    # (b) A live WS (_closed=False) means the user is watching — no push.
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    session = {"transport": _LiveTransport(closed=False)}
+    calls = _drive_message_complete(monkeypatch, session)
+    assert calls == []
+
+
+def test_attention_gate_suppresses_for_kanban_worker(monkeypatch):
+    # (c) A dispatched worker never banners, even with no transport attached.
+    monkeypatch.setattr(pn, "_is_kanban_worker", lambda: True)
+    calls = _drive_message_complete(monkeypatch, {})
+    assert calls == []
+
+
+def test_attention_gate_clears_turn_start_stamp_regardless_of_push(monkeypatch):
+    # Registry hygiene: a foregrounded turn still drops its own start stamp so
+    # the session table doesn't leak stale timers.
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    session = {"transport": _LiveTransport(closed=False), "_push_turn_started": 995.0}
+    calls = _drive_message_complete(monkeypatch, session, turn_started=995.0)
+    assert calls == []  # foregrounded → suppressed
+    assert "_push_turn_started" not in session  # …but stamp was still popped
+
+
+def test_turn_complete_notify_sets_4h_apns_expiration(monkeypatch, isolated_home):
+    # (d) The turn_complete send plumbs expiration=14400 all the way to the
+    # APNs headers.
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    _arm_push(monkeypatch, isolated_home)
+    pn.register_token(_VALID_TOKEN, env="sandbox", events=["turn_complete"])
+    monkeypatch.setattr(pn, "_get_provider_jwt", lambda config: "JWT")
+
+    fake = _FakeConn(status_code=200)
+    import httpx
+    monkeypatch.setattr(httpx, "Client", lambda **kw: fake)
+
+    assert pn.notify(
+        "turn_complete", "Hermes finished", "All done.",
+        {"session_id": "sess-1"}, category="HERMES_TURN", expiration=14400,
+    ) == 1
+    assert fake.calls[0]["headers"]["apns-expiration"] == "14400"
+
+
+def test_time_sensitive_notify_keeps_zero_apns_expiration(monkeypatch, isolated_home):
+    # (d') Approval and other time-sensitive sends keep the default 0 window.
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    _arm_push(monkeypatch, isolated_home)
+    pn.register_token(_VALID_TOKEN, env="sandbox", events=["approval"])
+    monkeypatch.setattr(pn, "_get_provider_jwt", lambda config: "JWT")
+
+    fake = _FakeConn(status_code=200)
+    import httpx
+    monkeypatch.setattr(httpx, "Client", lambda **kw: fake)
+
+    assert pn.notify(
+        "approval", "Approval required", "Review this", {"session_id": "sess-1"},
+        category="HERMES_APPROVAL",
+    ) == 1
+    assert fake.calls[0]["headers"]["apns-expiration"] == "0"
