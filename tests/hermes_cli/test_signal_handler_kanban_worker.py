@@ -139,8 +139,8 @@ def _cleanup(proc: subprocess.Popen) -> None:
 
 
 @pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="SIGTERM semantics differ on Windows; kanban dispatcher is POSIX-only",
+    sys.platform != "linux",
+    reason="kanban dispatcher liveness semantics require Linux /proc",
 )
 def test_sigterm_with_kanban_task_env_terminates_quickly():
     """With HERMES_KANBAN_TASK set, SIGTERM should kill the process in <2s
