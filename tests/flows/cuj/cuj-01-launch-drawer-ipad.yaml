@@ -1,0 +1,18 @@
+# cuj-01-ipad — Cold launch reaches the chat surface with the split-view
+# sidebar already visible (regular-width / iPad counterpart of
+# cuj-01-launch-drawer.yaml, STR-1450).
+# CUJ-CATALOG: iPad's SplitLayout supplies its own always-visible sidebar, so
+# ChatView never injects an `onToggleDrawer` closure there and no "Open menu"
+# button exists to tap — asserting the sidebar contents directly is the
+# regular-width equivalent of "open the drawer" on iPhone.
+# Run: scripts/ui-test.sh cuj/cuj-01-launch-drawer-ipad.yaml
+# NOTE: asserts use display text until the accessibility-id pass lands (ABH: ui-ids).
+appId: ai.hermes.app
+---
+- launchApp
+- assertVisible: "Message Hermes…"
+- takeScreenshot: launch-home-ipad
+- assertVisible: "Sessions"
+- assertVisible: "Projects"
+- assertVisible: "Inbox"
+- takeScreenshot: drawer-open-ipad

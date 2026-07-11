@@ -55,7 +55,13 @@ final class ConnectionStore {
         case .needsSetup: return "needsSetup"
         case .connecting: return "connecting"
         case .hydrating: return "hydrating"
-        case .connected: return "connected"
+        // STR-973A: a `.connected` phase during the silent-grace window still
+        // reads as "connected" to every other consumer (RootView, the status
+        // banner, ChatView.isConnected) by design — only this stable label
+        // distinguishes it, so StateServer/gstack tooling can assert grace is
+        // active without a new `Phase` case (which would break the exhaustive
+        // `switch connection.phase` sites outside this file's scope).
+        case .connected: return isInGrace ? "connected(grace)" : "connected"
         case .reconnecting(let attempt): return "reconnecting(\(attempt))"
         case .offline(let reason): return "offline(\(reason ?? ""))"
         }
@@ -387,6 +393,23 @@ final class ConnectionStore {
     /// loading screen. Kept as a named constant so the test can pin it.
     static let hydrationTimeout: Duration = .seconds(8)
 
+    /// Silent-reconnect grace window for a transport drop DURING an active
+    /// session (`.closed`/`.failed` after `hasConnected`) — STR-973A. The
+    /// reconnect loop runs immediately and silently against this window; only
+    /// if every attempt still fails once it elapses do we surface the drop
+    /// (transcript warning + a visible `.reconnecting` phase). Named so the
+    /// test can pin it. See `handle(state:)` / `startGraceWindow`.
+    static let transientGraceWindow: Duration = .seconds(10)
+
+    /// Silent-reconnect grace window for a dead socket found on a cold app
+    /// open / foreground (as opposed to a drop witnessed live) — STR-973A.
+    /// Shorter than `transientGraceWindow`: a cold-open dead socket is far
+    /// more often a stale-suspend reconnect than a real outage. Reserved for
+    /// the foreground/cold-open detection path; not yet wired into
+    /// `handleScenePhase` in this change (kept out of scope — see issue
+    /// notes). Named so the test can pin it.
+    static let coldOpenGraceWindow: Duration = .seconds(5)
+
     /// The single, long-lived gateway client.
     let client = HermesGatewayClient()
 
@@ -401,6 +424,13 @@ final class ConnectionStore {
     /// Speaks the path family the capability probe resolved (ABH-88) — `.legacy`
     /// until/unless the plugin-mount probe concludes `.available`.
     var rest: RestClient? {
+        #if DEBUG
+        // Test-only: a seeded override short-circuits the URL+token build so a
+        // stub `URLSession` can observe/no-op the calls made through `rest`
+        // (e.g. reconnect's `recoverActiveSession` probes). See
+        // `_restOverrideForTesting`.
+        if let _restOverrideForTesting { return _restOverrideForTesting }
+        #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
         return RestClient(
             baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
@@ -411,11 +441,31 @@ final class ConnectionStore {
     /// usage / cron / skills — now ``RestClient`` extension members), built from
     /// the same saved URL + token as `rest`, or `nil` if unconfigured.
     var control: RestClient? {
+        #if DEBUG
+        // Test-only: same seam as `rest` (see `_restOverrideForTesting`) so the
+        // control-surface client is equally stubbable in unit tests.
+        if let _restOverrideForTesting { return _restOverrideForTesting }
+        #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
         return RestClient(
             baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
         )
     }
+
+    #if DEBUG
+    /// Test-only override: when set, `rest`/`control` return this client instead
+    /// of building one from the saved URL + token, so a stub `URLSession`
+    /// (`URLProtocol`-injected) can observe/no-op the requests they issue —
+    /// in particular the reconnect-path probes inside `recoverActiveSession()`
+    /// (`capabilities.probe`, `autoUpgradeToDeviceTokenIfNeeded`), which are
+    /// otherwise routed through an internal `.ephemeral` session that no
+    /// `URLProtocol` can intercept, and which leak real network calls to a
+    /// dead loopback gateway on a CI runner with no server (STR-1481). Mirrors
+    /// the existing `_seed…ForTesting` conventions; compiled out of Release,
+    /// so there is no production surface and no secret exposure (the stub
+    /// client's session and token are entirely test-injected).
+    var _restOverrideForTesting: RestClient?
+    #endif
 
     /// The persistent prompt outbox/queue. Drained here after reconnect backfill.
     /// Wired by `AppEnvironment` (ChatStore holds no reference to it).
@@ -464,6 +514,12 @@ final class ConnectionStore {
     /// must drive multiple consecutive failures (threshold ≥ 3) do not stall
     /// for seconds of wall-clock time. `nil` = normal exponential schedule.
     var reconnectBackoffOverride: Double?
+
+    /// Injectable grace-window override (tests). When non-nil, `startGraceWindow`
+    /// uses this value instead of `transientGraceWindow`/`coldOpenGraceWindow` so
+    /// expiry tests don't burn real wall-clock time. `nil` = the named windows.
+    /// Pattern mirrors `reconnectBackoffOverride`.
+    var graceWindowOverride: Duration?
 
     /// Injectable liveness probe (tests). When non-nil, replaces the live
     /// `client.probeLiveness()` call in `handleScenePhase` with this closure's
@@ -519,6 +575,27 @@ final class ConnectionStore {
     private static let intakeYieldEveryK = 32
     /// The in-flight reconnect loop, if any.
     private var reconnectTask: Task<Void, Never>?
+    /// The in-flight silent-grace timer, if any (STR-973A). Races the reconnect
+    /// loop's attempts: cancelled the moment an attempt succeeds (or the loop
+    /// exits for any other reason — auth revoke, vanished config) so a stale
+    /// timer can never fire after the phase has already resolved; left to fire
+    /// on its own if every attempt is still failing when it elapses, which
+    /// escalates to the visible drop (see `startGraceWindow`/`endGrace`/
+    /// `escalateGraceExpiry`).
+    private var graceTask: Task<Void, Never>?
+    /// True while a drop is being retried silently within the grace window
+    /// (STR-973A) — `phase` stays `.connected` and `ChatStore`/`SessionStore`
+    /// are NOT told the connection dropped, so an in-flight turn is never
+    /// stranded or stomped by a blip that heals inside the window. Flipped
+    /// false the moment grace ends, whether by healing or by expiry-escalation.
+    /// `private(set)` so `ChatStore.send()` can route a fresh send to the
+    /// outbox instead of surfacing a live-socket failure during grace.
+    private(set) var isInGrace = false
+    /// The reconnect loop's current attempt index, updated every iteration.
+    /// `escalateGraceExpiry()` reads this to stamp the visible `.reconnecting`
+    /// phase immediately at expiry, rather than waiting for the loop's next
+    /// iteration (which could be a full backoff delay away).
+    private var currentReconnectAttempt = 0
     /// The in-flight post-connect hydration coordinator, if any (ABH-82). Owns
     /// the `.hydrating → .connected` transition and the timeout fallback;
     /// cancelled on disconnect so a teardown mid-hydration can't later flip the
@@ -558,6 +635,12 @@ final class ConnectionStore {
     /// launch (no saved config) never sets this, so it falls straight through to
     /// `.needsSetup` → `WelcomeView`. (ABH-82 follow-up.)
     private(set) var isBootstrapping = false
+
+    #if DEBUG
+    /// Test-only switch for exercising persisted-config bootstrap while the
+    /// build wrapper injects the DEV environment override for live tests.
+    var _skipEnvironmentBootstrapForTesting = false
+    #endif
 
     /// True when this install has a SAVED connection configuration — a previously-
     /// paired user. Read by `RootView` so the CACHE-FIRST shell (WhatsApp bar)
@@ -602,7 +685,8 @@ final class ConnectionStore {
         // SIMCTL_CHILD_/TEST_RUNNER_). DEBUG-gated so a production binary can
         // never be silently re-pointed via injected env vars (release audit).
         let env = ProcessInfo.processInfo.environment
-        if let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+        if !_skipEnvironmentBootstrapForTesting,
+           let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
            !url.isEmpty, !token.isEmpty {
             // A saved/dev-env config: this is a RETURNING user. Flag the launch
             // window so the shell shows the splash rather than `WelcomeView` even
@@ -622,14 +706,24 @@ final class ConnectionStore {
         #endif
 
         let savedURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
-        if let savedURL, !savedURL.isEmpty,
-           let token = KeychainService.loadToken(server: savedURL) {
+        if let savedURL, !savedURL.isEmpty {
             isBootstrapping = true
             // CACHE-FIRST (WhatsApp bar): paint the drawer from disk BEFORE the
             // REST probe — this is the fix for the empty-drawer / Welcome-on-
             // offline cold start. The probe's early-return offline path no longer
             // strands an empty drawer because the cache read already ran here.
             await paintCacheFirst(serverURLString: savedURL)
+
+            guard let token = KeychainService.loadToken(server: savedURL) else {
+                // A cached URL still identifies a returning user even when the
+                // token is unavailable on this install. Keep the cached shell
+                // visible; a fresh install has no saved URL and still reaches
+                // onboarding, while a failed manual/QR configure persists neither.
+                phase = .offline("Saved pairing token unavailable")
+                isBootstrapping = false
+                return
+            }
+
             _ = await configure(urlString: savedURL, token: token)
             isBootstrapping = false
             return
@@ -938,6 +1032,12 @@ final class ConnectionStore {
         // the phase back to `.connected` (ABH-82).
         hydrationTask?.cancel()
         hydrationTask = nil
+        // A deliberate disconnect always wins over a silent-reconnect grace
+        // window in flight — never leave a stale grace timer able to fire
+        // after teardown.
+        graceTask?.cancel()
+        graceTask = nil
+        isInGrace = false
         hasConnected = false
         // A deliberate disconnect is not an auth revocation — clear the re-pair
         // flag so the welcome screen shows its normal first-run copy.
@@ -1185,21 +1285,61 @@ final class ConnectionStore {
             // reconnect loop sets `.connected` itself on success.
             if reconnectTask == nil, phase != .hydrating { phase = .connected }
         case .closed, .failed:
-            // A dropped transport can never deliver the in-flight turn's
-            // completion — tear down streaming state NOW so the post-reconnect
-            // `backfill()` isn't no-op'd by its own `guard !isStreaming`
-            // (R1 #9/#42). Idempotent, so the repeated `.failed` transitions
-            // of the reconnect loop's own attempts are harmless.
-            chatStore.handleConnectionDrop()
-            // ABH-178 belt-and-suspenders: a mid-turn socket drop must NOT leave
-            // any session's turnInProgress flag stuck — that would permanently
-            // carry-forward a local lastActive bump, reviving the ABH-157 bug.
-            sessionStore.clearAllTurnsInProgress()
-            // A drop after we were connected → reconnect. An expected close
-            // (disconnect/needsSetup) leaves `hasConnected` false.
-            guard hasConnected, reconnectTask == nil else { return }
-            startReconnectLoop()
+            // STR-973A silent reconnect: a drop after we were connected no
+            // longer finalizes the stream or shows `.reconnecting` right
+            // away. Start the grace window instead — it fires the reconnect
+            // loop immediately underneath (so a quick heal is fast) but
+            // withholds `chatStore.handleConnectionDrop()` / the visible
+            // `.reconnecting` phase until the grace window actually expires.
+            // An expected close (disconnect/needsSetup) leaves `hasConnected`
+            // false and this is a no-op. Idempotent against the repeated
+            // `.failed` transitions the reconnect loop's own attempts emit —
+            // `reconnectTask`/`graceTask` are both already non-nil by then.
+            guard hasConnected, reconnectTask == nil, graceTask == nil else { return }
+            startGraceWindow(duration: graceWindowOverride ?? Self.transientGraceWindow)
         }
+    }
+
+    // MARK: - Silent reconnect grace (STR-973A)
+
+    /// Start the silent-reconnect grace window: the reconnect loop fires
+    /// immediately underneath (attempt 0 has no backoff, so a quick heal is
+    /// still fast), but `phase` is held at `.connected` (with `isInGrace`
+    /// true) and the transcript is left untouched for `duration`. Only if
+    /// the window expires with retries still failing does
+    /// `escalateGraceExpiry()` finalize the stream and surface
+    /// `.reconnecting`.
+    private func startGraceWindow(duration: Duration) {
+        isInGrace = true
+        startReconnectLoop()
+        graceTask = Task { [weak self] in
+            try? await Task.sleep(for: duration)
+            guard let self, !Task.isCancelled else { return }
+            self.escalateGraceExpiry()
+        }
+    }
+
+    /// Grace expired while the reconnect loop is still failing: only now do
+    /// we drop the stranded stream/turn state and make the reconnect visible.
+    /// A no-op if grace already ended (the loop healed first, or a teardown
+    /// raced this timer) — `escalateGraceExpiry` must never resurrect a
+    /// settled phase.
+    private func escalateGraceExpiry() {
+        guard isInGrace else { return }
+        isInGrace = false
+        graceTask = nil
+        chatStore.handleConnectionDrop()
+        sessionStore.clearAllTurnsInProgress()
+        phase = .reconnecting(attempt: currentReconnectAttempt)
+    }
+
+    /// End the grace window without escalating — used on every reconnect-loop
+    /// exit path (success, config vanished, auth revoked) so a stale timer
+    /// can never fire after the phase has already moved on.
+    private func endGrace() {
+        graceTask?.cancel()
+        graceTask = nil
+        isInGrace = false
     }
 
     // MARK: - Reconnect
@@ -1214,7 +1354,13 @@ final class ConnectionStore {
             guard let self else { return }
             var attempt = 0
             while !Task.isCancelled {
-                self.phase = .reconnecting(attempt: attempt)
+                self.currentReconnectAttempt = attempt
+                // STR-973A: while grace is holding, keep `phase` at
+                // `.connected` — `escalateGraceExpiry()` is the only path
+                // allowed to surface `.reconnecting` during grace.
+                if !self.isInGrace {
+                    self.phase = .reconnecting(attempt: attempt)
+                }
 
                 // Attempt 0: connect immediately — no backoff delay.
                 // The loop can be (re)started from `handleScenePhase` on
@@ -1239,6 +1385,7 @@ final class ConnectionStore {
                     // chat shell in `.offline` with NO re-pair affordance
                     // (RootView only shows WelcomeView when hasConnected is
                     // false). Release audit P1.
+                    self.endGrace()
                     self.hasConnected = false
                     self.phase = .needsSetup
                     self.reconnectTask = nil
@@ -1252,6 +1399,26 @@ final class ConnectionStore {
                         try await self.client.connect(baseURL: url, token: token, mode: self.connectionMode)
                     }
                     if Task.isCancelled { return }
+                    // End grace immediately on the successful connect, BEFORE
+                    // the awaited recovery below — `recoverActiveSession()`
+                    // has genuine network suspensions, and while this task is
+                    // suspended the MainActor is free for the armed
+                    // `graceTask` to fire `escalateGraceExpiry()`. That guards
+                    // only on `isInGrace`, so leaving grace open here let a
+                    // late-firing timer stamp a spurious "Connection lost"
+                    // warning on a reconnect that had already succeeded
+                    // (STR-1126 regression). `handle(state:)` won't re-arm a
+                    // new grace window while `reconnectTask` is still
+                    // non-nil, so ending it this early is safe.
+                    self.endGrace()
+                    // A quick heal (attempt-0 success, typically still inside
+                    // grace): silently finalize any stream the drop left
+                    // stranded — REQUIRED for `backfill()`'s `guard
+                    // !isStreaming` to ever pass — but withhold the visible
+                    // "Connection lost" warning since the user never saw a
+                    // reconnect banner.
+                    self.chatStore.handleConnectionDrop(stampWarning: false)
+                    self.sessionStore.clearAllTurnsInProgress()
                     await self.recoverActiveSession()
                     self.phase = .connected
                     self.reconnectTask = nil
@@ -1267,6 +1434,9 @@ final class ConnectionStore {
                     if self.consecutiveReconnectFailures >= Self.authReprobeThreshold,
                        await self.probeIsAuthRevoked(url: url, token: token) {
                         if Task.isCancelled { return }
+                        // A hard auth revocation must never be swallowed by
+                        // grace — end it now and escalate straight to re-pair.
+                        self.endGrace()
                         self.reauthRequired = true
                         self.phase = .needsSetup
                         self.reconnectTask = nil

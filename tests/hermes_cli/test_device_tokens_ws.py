@@ -21,6 +21,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from starlette.requests import Request
 
 from hermes_cli import web_server
 from hermes_cli.dashboard_auth import token_auth
@@ -102,9 +103,30 @@ def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/w
     )
 
 
+def _fake_request(*, session_token: str = "", bearer_token: str = "") -> Request:
+    headers = []
+    if session_token:
+        headers.append((b"x-hermes-session-token", session_token.encode()))
+    if bearer_token:
+        headers.append((b"authorization", f"Bearer {bearer_token}".encode()))
+    return Request({"type": "http", "headers": headers, "state": {}})
+
+
 # ===========================================================================
 # LEGACY-TOKEN REGRESSION — runs first.
 # ===========================================================================
+
+
+def test_registered_token_passes_rest_auth_and_stashes_identity(fake_auth):
+    request = _fake_request(session_token=_FAKE_TOKEN)
+    assert web_server._has_valid_session_token(request) is True
+    assert request.state.device["device_id"] == _FAKE_IDENTITY["device_id"]
+
+
+def test_registered_bearer_token_passes_rest_auth(fake_auth):
+    request = _fake_request(bearer_token=_FAKE_TOKEN)
+    assert web_server._has_valid_session_token(request) is True
+    assert request.state.device["token_prefix"] == _FAKE_TOKEN[:8]
 
 
 def test_aaa_shared_token_still_passes_ws_auth(loopback):
