@@ -391,14 +391,22 @@ struct ToolClusterView: View {
 /// One row in an assistant turn's tool-activity timeline.
 ///
 /// Collapsed: leading state icon + tool name + a one-line summary, inside a
-/// `theme.muted` container. Tapping expands an inline panel showing the call
-/// arguments and the result directly (ABH-358: no second 'Show technical
-/// detail' toggle — expanding IS the intent to see detail).
+/// `theme.muted` container. Tapping expands an inline panel whose content
+/// depends on the global product/technical preference
+/// (`DefaultsKeys.toolTechnicalDetail`, STR-464): PRODUCT mode (default)
+/// shows the content-aware summary/error line from the STR-463 summary
+/// contract; TECHNICAL mode shows the raw call arguments + result preview
+/// (ABH-358's original "expanding IS the intent to see detail" behavior,
+/// now gated behind the explicit technical toggle rather than always-on).
 struct ToolActivityRow: View {
     /// The tool call to render. Updates in place as progress/result arrive.
     let activity: ToolActivity
 
     @Environment(\.hermesTheme) private var theme
+
+    /// Global product/technical preference for the expanded detail panel.
+    /// Persisted so the choice survives relaunch and applies to every row.
+    @AppStorage(DefaultsKeys.toolTechnicalDetail) private var technicalDetailEnabled = false
 
     private let externalExpansion: Binding<Bool>?
     /// Dismiss handler; non-`nil` only for dismissible (`.done`/`.failed`) rows.
@@ -508,44 +516,117 @@ struct ToolActivityRow: View {
         }
     }
 
+    /// What the expanded panel shows, gated by the global technical-detail
+    /// preference (STR-464, `DefaultsKeys.toolTechnicalDetail`). Product mode
+    /// (default) surfaces the STR-463 content-aware summary/error line — never
+    /// raw JSON. Technical mode carries the row's raw arguments + result
+    /// preview, matching ABH-358's original always-on debugging affordance.
+    /// `nonisolated static` (matching the row's other pure helpers) so tests
+    /// can verify the branch without constructing a view.
+    enum DetailContent: Equatable {
+        case summary(String)
+        case raw(argumentsSummary: String, resultPreview: String)
+    }
+
+    nonisolated static func detailContent(for activity: ToolActivity, technicalDetailEnabled: Bool) -> DetailContent {
+        technicalDetailEnabled
+            ? .raw(argumentsSummary: activity.argsSummary, resultPreview: activity.resultPreview)
+            : .summary(AnsiText.strip(activity.summaryLine))
+    }
+
     @ViewBuilder
     private var expandedDetail: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // ABH-358: expanding a tool row shows the technical detail
-            // (arguments + result) DIRECTLY — no second 'Show technical
-            // detail' toggle. The collapsed row is already the summary;
-            // expanding = intent to see the detail.
-            if hasCopyableDetail || onDismiss != nil {
-                detailActions
+            // Expanding a tool row shows detail sized to the global
+            // product/technical preference, surfaced via `detailModeToggle`
+            // below — no per-row second toggle beyond that single global
+            // control. The collapsed row is already the summary; expanding =
+            // intent to see MORE, either the calm product summary or the raw
+            // technical detail.
+            detailActions
+
+            switch Self.detailContent(for: activity, technicalDetailEnabled: technicalDetailEnabled) {
+            case .summary(let text):
+                productSummaryBlock(text)
+            case .raw:
+                technicalDetailBlocks
             }
 
-            if !activity.argsSummary.isEmpty {
-                detailBlock(title: "Arguments", body: activity.argsSummary)
-            }
-
+            // Inline diff for file-edit tools (STR-315/STR-582) renders in
+            // BOTH detail modes; the failure carve-out (STR-460) keeps the
+            // error/result text legible — the diff view never replaces it.
+            // The non-diff result content is already surfaced by the
+            // product/technical switch above (STR-464), so no bare
+            // resultBlock fallback here.
             if let diff = activity.fullDiff, !diff.isEmpty {
                 diffBlock(diff)
-                // Failure carve-out (STR-460): a failed file-edit tool must
-                // keep its error/result text legible — the diff view never
-                // replaces it.
                 if activity.state == .failed {
                     resultBlock
                 }
-            } else {
-                resultBlock
             }
         }
         .padding(.top, 2)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// Copy + Dismiss controls live in the EXPANDED body (not the header) so
-    /// they never compete with the disclosure caret's hit target — the same
-    /// lesson desktop applied when it moved copy out of the trailing slot
-    /// (STR-518 parity). Both are muted, plain-styled, trailing-aligned.
+    /// PRODUCT mode: the content-aware summary/error line, never raw JSON.
+    /// Falls back to the same calm running/duration/failed lines the
+    /// collapsed header already shows (STR-463) — never a fabricated success.
+    private func productSummaryBlock(_ text: String) -> some View {
+        detailBlock(
+            title: "Result",
+            titleTint: activity.state == .failed ? theme.statusError : nil
+        ) {
+            Text(text)
+                .font(.caption2.monospaced())
+                .foregroundStyle(activity.state == .failed ? theme.statusError : theme.fg)
+        }
+    }
+
+    /// TECHNICAL mode: raw call arguments + raw result preview, unchanged
+    /// from the row's original always-on behavior.
+    @ViewBuilder
+    private var technicalDetailBlocks: some View {
+        if !activity.argsSummary.isEmpty {
+            detailBlock(title: "Arguments", body: activity.argsSummary)
+        }
+
+        resultBlock
+    }
+
+    /// The global product/technical mode control (STR-464). Lives on the
+    /// tool-row surface itself — not buried in Settings — since expanding a
+    /// row is the moment the preference actually matters. Tapping flips
+    /// `technicalDetailEnabled`, which is `@AppStorage`-backed, so every
+    /// expanded row (this turn and future ones) re-renders in the new mode
+    /// immediately and the choice survives relaunch.
+    private var detailModeToggle: some View {
+        Button {
+            withAnimation(.snappy) { technicalDetailEnabled.toggle() }
+        } label: {
+            Label(
+                technicalDetailEnabled ? "Technical" : "Product",
+                systemImage: technicalDetailEnabled ? "curlybraces" : "text.alignleft"
+            )
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(theme.mutedFg)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Tool detail mode")
+        .accessibilityValue(technicalDetailEnabled ? "Technical" : "Product")
+        .accessibilityHint("Toggles every tool row between a product summary and raw technical detail")
+        .accessibilityIdentifier("toolDetailModeToggle")
+    }
+
+    /// Mode toggle + Copy + Dismiss controls live in the EXPANDED body (not
+    /// the header) so they never compete with the disclosure caret's hit
+    /// target — the same lesson desktop applied when it moved copy out of
+    /// the trailing slot (STR-518 parity). All three are muted, plain-styled.
     @ViewBuilder
     private var detailActions: some View {
         HStack(spacing: 14) {
+            detailModeToggle
+
             Spacer(minLength: 0)
 
             if hasCopyableDetail {
