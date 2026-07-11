@@ -1,0 +1,116 @@
+
+> hermes@0.17.0 build
+> node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && tsc -b && vite build && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps.mjs
+
+[write-build-stamp] WARNING: working tree is dirty.
+  Pinning to d9a6c239e8f9 but the packaged code may differ from that commit.
+  Commit your changes before publishing this build.
+[write-build-stamp] wrote apps/desktop/build/install-stamp.json -> d9a6c239e8f9 (str-1339-ios-live-creds-provision) [DIRTY]
+vite v8.1.0 building client environment for production...
+[2Ktransforming...Found 1 warning while optimizing generated CSS:
+
+[2m│   -moz-tab-size: 2;[22m
+[2m│ }[22m
+[2m│[22m text-* variant utilities. */ .btn-arc {
+[2m┆[22m      [33m[2m^--[22m Unexpected token Delim('*')[39m
+[2m┆[22m
+[2m│   background-image: linear-gradient(110deg, #5b6cff 0%, #8b5cf6 28%, #d946ef 58%, #fb7185 82%, #fb923c 100%);[22m
+[2m│   color: #fff;[22m
+
+[38;5;147m[LARGE_BARREL_MODULES] [0m../../node_modules/@tabler/icons-react/dist/esm/tabler-icons-react.mjs has 6149 re-exports. Eagerly resolving every entry can significantly slow down the build. Consider using `@rolldown/plugin-transform-imports` to rewrite imports at the source level so the barrel file is never loaded.
+ [38;5;240m │[0m 
+ [38;5;240m │[0m [38;5;115mHelp[0m: See https://github.com/rolldown/plugins/tree/main/packages/transform-imports for usage.
+
+✓ 4295 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                                            1.77 kB │ gzip:     0.82 kB
+dist/assets/KaTeX_Size3-Regular-CTq5MqoE.woff              4.42 kB
+dist/assets/KaTeX_Size4-Regular-Dl5lxZxV.woff2             4.92 kB
+dist/assets/KaTeX_Size2-Regular-Dy4dx90m.woff2             5.20 kB
+dist/assets/KaTeX_Size1-Regular-mCD8mA8B.woff2             5.46 kB
+dist/assets/KaTeX_Size4-Regular-BF-4gkZK.woff              5.98 kB
+dist/assets/KaTeX_Size2-Regular-oD1tc_U0.woff              6.18 kB
+dist/assets/KaTeX_Size1-Regular-C195tn64.woff              6.49 kB
+dist/assets/KaTeX_Caligraphic-Regular-Di6jR-x-.woff2       6.90 kB
+dist/assets/KaTeX_Caligraphic-Bold-Dq_IR9rO.woff2          6.91 kB
+dist/assets/KaTeX_Size3-Regular-DgpXs0kz.ttf               7.58 kB
+dist/assets/KaTeX_Caligraphic-Regular-CTRA-rTL.woff        7.65 kB
+dist/assets/KaTeX_Caligraphic-Bold-BEiXGLvX.woff           7.71 kB
+dist/assets/KaTeX_Script-Regular-D3wIWfF6.woff2            9.64 kB
+dist/assets/KaTeX_SansSerif-Regular-DDBCnlJ7.woff2        10.34 kB
+dist/assets/KaTeX_Size4-Regular-DWFBv043.ttf              10.36 kB
+dist/assets/KaTeX_Script-Regular-D5yQViql.woff            10.58 kB
+dist/assets/KaTeX_Fraktur-Regular-CTYiF6lA.woff2          11.31 kB
+dist/assets/KaTeX_Fraktur-Bold-CL6g_b3V.woff2             11.34 kB
+dist/assets/KaTeX_Size2-Regular-B7gKUWhC.ttf              11.50 kB
+dist/assets/KaTeX_SansSerif-Italic-C3H0VqGB.woff2         12.02 kB
+dist/assets/KaTeX_SansSerif-Bold-D1sUS0GD.woff2           12.21 kB
+dist/assets/KaTeX_Size1-Regular-Dbsnue_I.ttf              12.22 kB
+dist/assets/KaTeX_SansSerif-Regular-CS6fqUqJ.woff         12.31 kB
+dist/assets/KaTeX_Caligraphic-Regular-wX97UBjC.ttf        12.34 kB
+dist/assets/KaTeX_Caligraphic-Bold-ATXxdsX0.ttf           12.36 kB
+dist/assets/KaTeX_Fraktur-Regular-Dxdc4cR9.woff           13.20 kB
+dist/assets/KaTeX_Fraktur-Bold-BsDP51OF.woff              13.29 kB
+dist/assets/KaTeX_Typewriter-Regular-CO6r4hn1.woff2       13.56 kB
+dist/assets/KaTeX_SansSerif-Italic-DN2j7dab.woff          14.11 kB
+dist/assets/KaTeX_SansSerif-Bold-DbIhKOiC.woff            14.40 kB
+dist/assets/KaTeX_Typewriter-Regular-C0xS9mPB.woff        16.02 kB
+dist/assets/KaTeX_Math-BoldItalic-CZnvNsCZ.woff2          16.40 kB
+dist/assets/KaTeX_Math-Italic-t53AETM-.woff2              16.44 kB
+dist/assets/KaTeX_Script-Regular-C5JkGWo-.ttf             16.64 kB
+dist/assets/KaTeX_Main-BoldItalic-DxDJ3AOS.woff2          16.78 kB
+dist/assets/KaTeX_Main-Italic-NWA7e6Wa.woff2              16.98 kB
+dist/assets/KaTeX_Math-BoldItalic-iY-2wyZ7.woff           18.66 kB
+dist/assets/KaTeX_Math-Italic-DA0__PXp.woff               18.74 kB
+dist/assets/KaTeX_Main-BoldItalic-SpSLRI95.woff           19.41 kB
+dist/assets/KaTeX_SansSerif-Regular-BNo7hRIc.ttf          19.43 kB
+dist/assets/KaTeX_Fraktur-Regular-CB_wures.ttf            19.57 kB
+dist/assets/KaTeX_Fraktur-Bold-BdnERNNW.ttf               19.58 kB
+dist/assets/KaTeX_Main-Italic-BMLOBm91.woff               19.67 kB
+dist/assets/KaTeX_SansSerif-Italic-YYjJ1zSn.ttf           22.36 kB
+dist/assets/KaTeX_SansSerif-Bold-CFMepnvq.ttf             24.50 kB
+dist/assets/KaTeX_Main-Bold-Cx986IdX.woff2                25.32 kB
+dist/assets/KaTeX_Main-Regular-B22Nviop.woff2             26.27 kB
+dist/assets/KaTeX_Typewriter-Regular-D3Ib7_Hf.ttf         27.55 kB
+dist/assets/KaTeX_AMS-Regular-BQhdFMY1.woff2              28.07 kB
+dist/assets/KaTeX_Main-Bold-Jm3AIy58.woff                 29.91 kB
+dist/assets/KaTeX_Main-Regular-Dr94JaBh.woff              30.77 kB
+dist/assets/KaTeX_Math-BoldItalic-B3XSjfu4.ttf            31.19 kB
+dist/assets/KaTeX_Math-Italic-flOr_0UB.ttf                31.30 kB
+dist/assets/KaTeX_Main-BoldItalic-DzxPMmG6.ttf            32.96 kB
+dist/assets/KaTeX_AMS-Regular-DMm9YOAa.woff               33.51 kB
+dist/assets/KaTeX_Main-Italic-3WenGoN9.ttf                33.58 kB
+dist/assets/KaTeX_Main-Bold-waoOVXN0.ttf                  51.33 kB
+dist/assets/KaTeX_Main-Regular-ypZvNtVU.ttf               53.58 kB
+dist/assets/Collapse-Bold-mgICk9-_.woff2                  59.14 kB
+dist/assets/KaTeX_AMS-Regular-DRggAlZN.ttf                63.63 kB
+dist/assets/JetBrainsMono-Regular-CA-Os4ii.woff2          92.38 kB
+dist/assets/JetBrainsMono-Bold-CUogYd9I.woff2             94.62 kB
+dist/assets/JetBrainsMono-Italic-LIR7wr3B.woff2           96.42 kB
+dist/assets/codicon-DjkITdqj.ttf                         125.82 kB
+dist/assets/index-B0YuAZBj.css                           308.55 kB │ gzip:    51.94 kB
+dist/assets/index-DqedQaTL.js                         27,795.76 kB │ gzip: 5,965.60 kB
+
+✓ built in 1.86s
+[plugin builtin:vite-reporter] 
+(!) Some chunks are larger than 25000 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+
+  dist/electron-main.mjs  460.3kb
+
+⚡ Done in 20ms
+bundled /Users/abbhinnav/Developer/products/hermes-mobile/apps/desktop/dist/electron-main.mjs
+
+  dist/electron-preload.js  15.5kb
+
+⚡ Done in 1ms
+bundled /Users/abbhinnav/Developer/products/hermes-mobile/apps/desktop/dist/electron-preload.js
+[stage-native-deps] staged node-pty (darwin-arm64) -> /Users/abbhinnav/Developer/products/hermes-mobile/apps/desktop/dist/node_modules/node-pty
+
+> hermes@0.17.0 postbuild
+> node scripts/assert-dist-built.mjs
+
+✓ assert-dist-built: dist/index.html + assets present
