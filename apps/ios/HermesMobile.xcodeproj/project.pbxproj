@@ -127,9 +127,11 @@
 		74EBFB6D505626109F7DC00A /* SessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F0F4D0D8002319D627E02DD /* SessionStore.swift */; };
 		754443420BD5C9BA84CB2D29 /* SessionStoreTokenSourceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0D7DF96B6D98FE332025CFE /* SessionStoreTokenSourceTests.swift */; };
 		766B752D68ACF78389D103D2 /* GatewayRequestRaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4135CE0AB1B15A4137780192 /* GatewayRequestRaceTests.swift */; };
+		76D28964CD61468F691151F1 /* ConnectionTruthfulnessUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE6548095206B3FA0D9224B5 /* ConnectionTruthfulnessUITests.swift */; };
 		7864C5A052E7FFA8D23874F7 /* JSONRPCFramingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6A0932D05CF706A2082F527 /* JSONRPCFramingTests.swift */; };
 		7967EF3FCFB8FF62F5A6A11C /* ViewA11yTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF23BF6299D648E0914BCBE7 /* ViewA11yTests.swift */; };
 		79D7BA74E7E585700DB1126A /* BatchHTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A340CBE22C7B505DEB9EAB30 /* BatchHTests.swift */; };
+		79E79D58BA3BD7F93B94B5DE /* ConnectionTruthfulnessTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E46B952197A07A4BB6C2E59F /* ConnectionTruthfulnessTests.swift */; };
 		7A83DBCCF05BF66E978FEA10 /* HermesLayoutConstants.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE66351CFA3FED57CCEC2751 /* HermesLayoutConstants.swift */; };
 		7B03EA34CA03E97F1BDFF6B9 /* SharedStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F68ABDFD79AE8CA0E12069F5 /* SharedStore.swift */; };
 		7B5BF26785CFA4741743C94B /* ChatStoreF4ATests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AED0A12B048B9FFDDAEF815 /* ChatStoreF4ATests.swift */; };
@@ -534,6 +536,7 @@
 		E11909D98B0F5781E0DA91D1 /* HermesMobile.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = HermesMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		E11A41924097383D37603684 /* DeepLinkRouterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLinkRouterTests.swift; sourceTree = "<group>"; };
 		E2CE855FD99F1E16574972AF /* CronJobsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CronJobsView.swift; sourceTree = "<group>"; };
+		E46B952197A07A4BB6C2E59F /* ConnectionTruthfulnessTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionTruthfulnessTests.swift; sourceTree = "<group>"; };
 		E4CE3EAC7CF2A0C18EF11EB1 /* DebugBridgeWiring.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugBridgeWiring.swift; sourceTree = "<group>"; };
 		E4FF4A58BDFF41F477CE0F2E /* VoiceRecorderModuleBTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRecorderModuleBTests.swift; sourceTree = "<group>"; };
 		E5B995D6441FF0AE876F8CD2 /* HermesShortcuts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesShortcuts.swift; sourceTree = "<group>"; };
@@ -565,6 +568,7 @@
 		FDD4D428DCD98CDCD469C2F7 /* CacheSchema.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CacheSchema.swift; sourceTree = "<group>"; };
 		FDE99B5373A56D4136876F8A /* ChatStoreSeedParityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStoreSeedParityTests.swift; sourceTree = "<group>"; };
 		FE2B79561B6EB6D9134213D4 /* PendingIntentDraftTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PendingIntentDraftTests.swift; sourceTree = "<group>"; };
+		FE6548095206B3FA0D9224B5 /* ConnectionTruthfulnessUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionTruthfulnessUITests.swift; sourceTree = "<group>"; };
 		FF9B69B83C2BC83CDB2A1605 /* RestClient+Sessions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "RestClient+Sessions.swift"; sourceTree = "<group>"; };
 		FFAC17CF4510CF16B2BBCB9E /* UsageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -764,6 +768,7 @@
 				D731F787AED1C5CD0B16B86C /* A11yMechanicalUITests.swift */,
 				8F6A943F0BC5448AEDCEE0AC /* ChatFlowUITests.swift */,
 				D029CC4EA55FAAB71D3AA4D3 /* ConnectionModePickerUITests.swift */,
+				FE6548095206B3FA0D9224B5 /* ConnectionTruthfulnessUITests.swift */,
 				3F08F8ACDEE165624EE32ADF /* CrossClientSyncUITests.swift */,
 				8C5AF8902DEBD3AAEB4D0711 /* DrawerSessionTapStormUITests.swift */,
 				6A8705BA6768729726A7B366 /* LocalDesktopManualTokenUITests.swift */,
@@ -920,6 +925,7 @@
 				FDE99B5373A56D4136876F8A /* ChatStoreSeedParityTests.swift */,
 				7F204B0D2DECE61198DC0214 /* ConnectionPhaseTests.swift */,
 				24872443B57B418F80C270E9 /* ConnectionStoreReconnectTests.swift */,
+				E46B952197A07A4BB6C2E59F /* ConnectionTruthfulnessTests.swift */,
 				185C959B33CC2105062209B4 /* ContextMeterTests.swift */,
 				E11A41924097383D37603684 /* DeepLinkRouterTests.swift */,
 				E9D4BC09BAEC3E5BCC546F66 /* DevicesLiveTests.swift */,
@@ -1270,6 +1276,7 @@
 				12C1260BED19F8CBFB3CC906 /* A11yMechanicalUITests.swift in Sources */,
 				E53597632C7D8EAFFA84A490 /* ChatFlowUITests.swift in Sources */,
 				2CA4860A835ADF0F01EAE69F /* ConnectionModePickerUITests.swift in Sources */,
+				76D28964CD61468F691151F1 /* ConnectionTruthfulnessUITests.swift in Sources */,
 				B04D98152FE6C71B9341E8B4 /* CrossClientSyncUITests.swift in Sources */,
 				3DDF508AB8263F1F15A5F64D /* DrawerSessionTapStormUITests.swift in Sources */,
 				EDEB1B674368A7AD82195935 /* LocalDesktopManualTokenUITests.swift in Sources */,
@@ -1303,6 +1310,7 @@
 				D240AECBED85AA6D2B161A83 /* ChatStoreSeedParityTests.swift in Sources */,
 				06147AA99077BD3C371688C3 /* ConnectionPhaseTests.swift in Sources */,
 				BCB59825F9154396928FE6D9 /* ConnectionStoreReconnectTests.swift in Sources */,
+				79E79D58BA3BD7F93B94B5DE /* ConnectionTruthfulnessTests.swift in Sources */,
 				903A90AEE635376F613D0A73 /* ContextMeterTests.swift in Sources */,
 				C8FDBABB61DF3EEAC609590C /* DeepLinkRouterTests.swift in Sources */,
 				B50A5D2449D815A3E5C59264 /* DevicesLiveTests.swift in Sources */,

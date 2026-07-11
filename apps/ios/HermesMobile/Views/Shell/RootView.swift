@@ -267,6 +267,15 @@ private struct SplitLayout: View {
                 .navigationSplitViewColumnWidth(min: 280, ideal: 320, max: 380)
         } detail: {
             detailColumn
+                // Hoisted from the chat-only branch (STR-136 Finding B) so the
+                // banner renders in the empty-detail placeholder too — a real
+                // outage with no session/draft selected must still show truthful
+                // connection state. `ConnectionStatusBanner` is `EmptyView` while
+                // `.connected`, so the nominal case adds no chrome here.
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    ConnectionStatusBanner()
+                        .animation(.easeInOut(duration: 0.2), value: connection.phase)
+                }
                 .inspector(isPresented: $showingInspector) {
                     inspectorColumn
                         .inspectorColumnWidth(min: 280, ideal: 340, max: 460)
@@ -356,10 +365,6 @@ private struct SplitLayout: View {
                 // settings sheet — keep the chip in sync there).
                 modelName: connection.activeModelName
             )
-                .safeAreaInset(edge: .top, spacing: 0) {
-                    ConnectionStatusBanner()
-                        .animation(.easeInOut(duration: 0.2), value: connection.phase)
-                }
                 .toolbar {
                     // F4A-A2: a subagent-tree inspector toggle, shown only when the
                     // patched gateway has emitted subagent frames AND the active
@@ -1228,6 +1233,19 @@ private struct CompactLayout: View {
                     Button("New Chat") { sessions.startDraft() }
                         .buttonStyle(.borderedProminent)
                     Button("Sessions") { drawer.toggle() }
+                }
+                // The active-chat branch gets its connection banner from
+                // ChatView's own `compactFloatingHeader` (it isn't mounted here),
+                // so this placeholder needs its own — otherwise a real outage with
+                // no session selected shows no offline indication (STR-136
+                // Finding B). This NavigationStack has no full-bleed scrolling
+                // transcript to defeat, so `.safeAreaInset` here doesn't hit the
+                // STRIKE P0 constraint above. `ConnectionStatusBanner` is
+                // `EmptyView` while `.connected`, so the nominal case adds no
+                // chrome.
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    ConnectionStatusBanner()
+                        .animation(.easeInOut(duration: 0.2), value: connection.phase)
                 }
             }
         }

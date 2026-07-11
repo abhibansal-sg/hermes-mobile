@@ -518,6 +518,68 @@ enum UITestSeed {
             return
         }
 
+        // "toast-stale-resurrect" — STR-136 Finding A evidence: seed an error into
+        // `ChatStore.lastError` (as a failed send would), let its toast auto-dismiss
+        // after 4s, then remount `ChatView` the same way an iPad Split View / Stage
+        // Manager / Slide Over resize does — SplitLayout/CompactLayout both gate
+        // ChatView on `activeStoredId`, so flipping it to nil and back tears down
+        // and recreates the view exactly as swapping between the two layouts would,
+        // without needing OS-level window-resize automation (which XCUITest cannot
+        // drive deterministically on the simulator). Post-fix, `chatStore.lastError`
+        // is cleared when the toast dismisses, so the remount's `onAppear` has
+        // nothing stale to re-present.
+        if mode == "toast-stale-resurrect" {
+            let sessionId = "uitest-toast-resurrect"
+            environment.connectionStore.phase = .connected
+            environment.sessionStore.activeStoredId = sessionId
+            environment.chatStore.debugSeedTranscript([
+                ChatMessage(role: .user, text: "Trigger a failed send for STR-136 toast evidence."),
+            ])
+            environment.chatStore.lastError = "Seeded failure for STR-136 toast evidence"
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 4_500_000_000)  // past the 4s auto-dismiss
+                environment.sessionStore.activeStoredId = nil       // unmount ChatView
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                environment.sessionStore.activeStoredId = sessionId // remount ChatView
+            }
+            return
+        }
+
+        // "offline-no-session" — STR-136 Finding B evidence: a verified connection
+        // (so RootView's `.offline` gate shows the shell, not WelcomeView) that
+        // drops offline with NO active session/draft selected — the empty-detail
+        // placeholder branch. Post-fix, `ConnectionStatusBanner` is hoisted onto
+        // the shell container (SplitLayout) / mounted on the placeholder
+        // (CompactLayout) so it renders in this branch too, not just the chat one.
+        if mode == "offline-no-session" {
+            environment.connectionStore._seedConnectedForTesting(
+                serverURL: "https://uitest.invalid", token: "uitest-token")
+            // `_seedConnectedForTesting` never opens a real socket, so the app's
+            // own `handleScenePhase(.active)` (ConnectionStore.swift:1585) — which
+            // fires naturally as the app foregrounds at launch — reads the
+            // never-opened client as a dead socket and starts a REAL reconnect
+            // loop against the fake serverURL below. That loop's own
+            // `self.phase = .reconnecting(attempt:)` assignments race the
+            // `.offline` phase this seed sets, clobbering it within ~1s (observed:
+            // the banner settles on "reconnecting" text, not "offline"). Forcing
+            // `clientStateOverrideForScenePhase = .open` alone is NOT enough: with
+            // a non-dead socket, `handleScenePhase` falls into its
+            // `case .connected = self.phase` branch instead (phase is still
+            // `.connected` from the seed above) and runs a liveness probe — which,
+            // with no real transport, still fails and calls `startReconnectLoop()`
+            // itself (ConnectionStore.swift:1672). Both seams must be stubbed
+            // together so `handleScenePhase` takes neither reconnect path.
+            environment.connectionStore.clientStateOverrideForScenePhase = .open
+            environment.connectionStore.probeLivenessRPC = { _ in true }
+            environment.sessionStore.activeStoredId = nil
+            environment.sessionStore.sessions = []
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                environment.connectionStore.phase = .offline("Simulated outage for STR-136 evidence")
+            }
+            return
+        }
+
         environment.sessionStore.activeStoredId = "uitest-\(mode)"
         // Seed TIMING (scroll-race verification):
         //  • "long"/"short" — synchronous: content present at first layout.
