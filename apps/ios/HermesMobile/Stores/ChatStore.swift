@@ -1976,6 +1976,19 @@ final class ChatStore {
             return false
         }
 
+        // STR-973A silent reconnect: during grace the transport is down but
+        // the user must never see a send error — enqueue to the offline
+        // outbox instead, same as a fully-offline send. Attachments aren't
+        // supported by the outbox (text-only), so let those fall through to
+        // the real (failing) send path below. `isDraining` guards against a
+        // `QueueStore.drain()` replay's own `chat.send()` call re-enqueuing
+        // itself — drain owns its own re-insert-on-failure semantics and must
+        // reach the real RPC attempt.
+        if connection.isInGrace, !hasAttachments, connection.queueStore?.isDraining != true {
+            _ = connection.queueStore?.enqueue(trimmed, storedSessionId: sessions?.activeStoredId)
+            return true
+        }
+
         // Draft sessions: the first prompt materializes the real session
         // (session.create) before anything is uploaded or submitted. On failure
         // the user keeps their text and can retry without a half-started turn.
@@ -3561,7 +3574,13 @@ final class ChatStore {
     /// foreign mirror). Called from every connection-loss path
     /// (`ConnectionStore.handle(state:)`, `disconnect()`, the dead-socket
     /// scene-phase probe). Idempotent — a no-op when nothing is streaming.
-    func handleConnectionDrop() {
+    ///
+    /// `stampWarning` defaults to `true` (the visible "Connection lost"
+    /// bubble). STR-973A's silent-reconnect grace passes `false` on a quick
+    /// heal (attempt-0 succeeds inside the grace window): the stream state
+    /// still needs finalizing so `backfill()` can run, but the user never saw
+    /// a reconnect banner, so no warning should land in the transcript either.
+    func handleConnectionDrop(stampWarning: Bool = true) {
         clearAllCompactionIndicators()
         // An adopted foreign mirror dies with its transport: clear the mirror
         // bookkeeping (and its placeholder row) so the reconnect backfill can
@@ -3584,7 +3603,7 @@ final class ChatStore {
             // local turn that already accumulated ordered parts (text/tool) lands
             // the warning as an in-order `.warning` part too — keeping the part
             // list consistent with every other warning path (review fix #1).
-            if message.warning == nil { message.setWarningPart("Connection lost") }
+            if stampWarning, message.warning == nil { message.setWarningPart("Connection lost") }
         }
         pendingReconnectReconcileID = streamingMessageID
         if activeToolName != nil { onToolChange?(nil) }
