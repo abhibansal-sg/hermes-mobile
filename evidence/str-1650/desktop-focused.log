@@ -1,0 +1,13 @@
+
+> hermes@0.17.0 test:ui
+> vitest run --environment jsdom src/app/session/hooks/use-route-resume.test.tsx src/app/session/hooks/use-session-actions.test.tsx
+
+
+ RUN  v4.1.9 /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/desktop
+
+
+ Test Files  2 passed (2)
+      Tests  30 passed (30)
+   Start at  16:36:16
+   Duration  1.48s (transform 368ms, setup 0ms, import 915ms, tests 70ms, environment 1.34s)
+
