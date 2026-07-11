@@ -441,6 +441,111 @@ final class SessionRefreshTests: XCTestCase {
             "a still-live row remains protected while deferred tombstones settle")
     }
 
+    func testCursorDeltaTombstonesRewindGrowLimitCursor() async {
+        let store = makeStore()
+        let allRows = (0..<150).map {
+            makeSummary(id: "row-\($0)", lastActive: Double(150 - $0))
+        }
+        let seedRows = Array(allRows.prefix(100))
+        let removedRows = Array(allRows.prefix(60))
+        let remainingRows = Array(allRows.dropFirst(60))
+
+        store.sessionListDeltaFetch = { cursor, _ in
+            if cursor == nil {
+                return SessionListDeltaResult(
+                    sessions: seedRows, tombstones: [], cursor: "seed", total: 150
+                )
+            }
+            return SessionListDeltaResult(
+                sessions: [],
+                tombstones: removedRows.map { SessionListTombstone(id: $0.id) },
+                cursor: "tombstoned",
+                total: 90
+            )
+        }
+
+        await store.refresh()
+        XCTAssertEqual(store.loadedCount, 100, "setup: the first server window is consumed")
+        await store.refresh()
+
+        XCTAssertEqual(store.sessions.count, 40, "the sixty loaded tombstones leave forty rows")
+        XCTAssertEqual(store.loadedCount, 40,
+            "tombstoned server rows must stop counting as consumed grow-limit rows")
+        XCTAssertEqual(store.loadedOffset, 40,
+            "the load-more at-end guard must use the rewound server cursor")
+
+        await store.refresh()
+        XCTAssertEqual(store.loadedCount, 40,
+            "replayed tombstones must not rewind an already-removed seen id twice")
+        XCTAssertEqual(store.loadedOffset, 40)
+
+        var requestedLimits: [Int] = []
+        store.initialFillFetch = { limit in
+            requestedLimits.append(limit)
+            return (Array(remainingRows.prefix(limit)), remainingRows.count)
+        }
+        await store.loadMore()
+
+        XCTAssertEqual(requestedLimits, [90],
+            "loadMore must request the remaining current universe instead of stopping at a stale offset")
+        XCTAssertEqual(store.sessions.count, 90)
+        XCTAssertEqual(store.loadedCount, 90)
+        XCTAssertEqual(store.loadedOffset, 90)
+    }
+
+    func testCursorDeltaInvalidatesStaleInitialFillPage() async {
+        let store = makeStore()
+        let seedRows = (0..<5).map {
+            makeSummary(id: "seed-\($0)", lastActive: Double(100 - $0))
+        }
+        let futureTombstone = makeSummary(id: "future", lastActive: 90)
+        let currentTail = (5..<35).map {
+            makeSummary(id: "current-\($0)", lastActive: Double(100 - $0))
+        }
+
+        store.sessionListDeltaFetch = { cursor, _ in
+            if cursor == nil {
+                return SessionListDeltaResult(
+                    sessions: seedRows, tombstones: [], cursor: "seed", total: 60
+                )
+            }
+            return SessionListDeltaResult(
+                sessions: [],
+                tombstones: [SessionListTombstone(id: futureTombstone.id)],
+                cursor: "tombstoned",
+                total: 59
+            )
+        }
+
+        let gate = SessionRefreshGate()
+        var fillCalls = 0
+        store.initialFillFetch = { _ in
+            fillCalls += 1
+            if fillCalls == 1 {
+                await gate.wait()
+                // This grow-window response was computed before the delta removed
+                // `future`, so it is stale even though loadedCount did not change.
+                return (seedRows + [futureTombstone] + currentTail, 60)
+            }
+            return (seedRows + currentTail, 59)
+        }
+
+        await store.refresh()
+        await gate.waitUntilEntered()
+        await store.refresh()
+        XCTAssertFalse(store.sessions.contains { $0.id == futureTombstone.id },
+            "the delta removes the unseen row from the list universe")
+
+        await gate.open()
+        await store.awaitInitialFillForTesting()
+
+        XCTAssertGreaterThanOrEqual(fillCalls, 2,
+            "the pre-delta grow-window page must be discarded and fetched again")
+        XCTAssertFalse(store.sessions.contains { $0.id == futureTombstone.id },
+            "a page started before the tombstone must never resurrect that row")
+        XCTAssertGreaterThanOrEqual(store.sessions.count, SessionStore.initialVisibleTarget)
+    }
+
     func testProfileScopeChangeRequiresCursorlessSeed() async {
         let store = makeStore()
         let row = makeSummary(id: "row", lastActive: 1)
@@ -516,6 +621,37 @@ final class SessionRefreshTests: XCTestCase {
         )
         XCTAssertNil(legacyResult,
             "legacy pathStyle must not call the plugin session-list endpoint")
+    }
+}
+
+/// Deterministic rendezvous for interleaving a cursor delta with an in-flight
+/// initial-fill request. `waitUntilEntered()` proves the fetch is blocked before
+/// the test advances the cursor, avoiding scheduler-order false greens.
+private actor SessionRefreshGate {
+    private var isOpen = false
+    private var didEnter = false
+    private var blocked: [CheckedContinuation<Void, Never>] = []
+    private var entered: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        didEnter = true
+        let observers = entered
+        entered.removeAll()
+        for observer in observers { observer.resume() }
+        if isOpen { return }
+        await withCheckedContinuation { blocked.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        if didEnter { return }
+        await withCheckedContinuation { entered.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let waiters = blocked
+        blocked.removeAll()
+        for waiter in waiters { waiter.resume() }
     }
 }
 

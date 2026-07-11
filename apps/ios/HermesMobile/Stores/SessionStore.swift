@@ -215,6 +215,12 @@ final class SessionStore {
     /// Protected entirely on `@MainActor` — no atomics needed.
     private var refreshToken: Int = 0
 
+    /// Revision of the server-side Recents universe represented by `sessions`.
+    /// Unlike `refreshToken`, this does not cancel the dedicated initial fill on
+    /// every heartbeat. It changes only when a first-page replacement or cursor
+    /// delta can make an already-started grow-window response stale.
+    private var sessionListUniverseRevision: Int = 0
+
     /// Identity of one server-side Recents list universe. Cursor state is never
     /// shared across gateways, path families, profile rails, or source filters.
     private struct SessionListDeltaScope: Hashable {
@@ -1992,14 +1998,37 @@ final class SessionStore {
         _ delta: SessionListDeltaResult,
         scope: SessionListDeltaScope
     ) -> Bool {
+        let previousTotal = totalSessions
         if let total = delta.total { totalSessions = total }
 
         let incoming = delta.sessions.filter(Self.isHumanRecentsSession)
         let incomingIds = Set(incoming.map(\.id))
         let filteredChangedIds = Set(delta.sessions.map(\.id)).subtracting(incomingIds)
+        var departedIds = Set(delta.tombstones.map(\.id))
+        departedIds.formUnion(filteredChangedIds)
+        // A current human row wins if a defensive server response includes both
+        // an upsert and a tombstone for the same id.
+        departedIds.subtract(incomingIds)
+
+        let totalChanged = delta.total != nil && previousTotal != delta.total
+        if !incoming.isEmpty || !departedIds.isEmpty || totalChanged {
+            sessionListUniverseRevision &+= 1
+        }
+
+        // Grow-limit pagination counts rows in the CURRENT server universe. A
+        // tombstoned id that was previously consumed must stop advancing the
+        // cursor, even when its rendered row remains temporarily protected as
+        // active/pinned/live. Otherwise a reduced total can leave loadedOffset at
+        // or past the end while current rows still exist beyond the loaded window.
+        let departedSeenIds = departedIds.intersection(seenServerSessionIds)
+        if !departedSeenIds.isEmpty {
+            seenServerSessionIds.subtract(departedSeenIds)
+            loadedCount = max(0, loadedCount - departedSeenIds.count)
+            loadedOffset = loadedCount
+        }
+
         var pending = pendingSessionListTombstones[scope] ?? []
-        pending.formUnion(delta.tombstones.map(\.id))
-        pending.formUnion(filteredChangedIds)
+        pending.formUnion(departedIds)
         // A current human row is authoritative evidence that a prior tombstone
         // was superseded (for example, a session re-entered the list universe).
         pending.subtract(incomingIds)
@@ -2131,6 +2160,11 @@ final class SessionStore {
             loadedCount += newlySeenRawIds.count
             return
         }
+
+        // A full first-page response establishes a new authoritative universe.
+        // Initial-fill requests that started before this replacement must re-page
+        // even when the replacement happened to preserve `loadedCount`.
+        sessionListUniverseRevision &+= 1
 
         // First-page (replace) path — original ABH-86 merge semantics.
         let incomingIds = Set(incoming.map(\.id))
@@ -2412,6 +2446,7 @@ final class SessionStore {
             }
 
             let priorLoaded = loadedCount
+            let priorUniverseRevision = sessionListUniverseRevision
             let newLimit = loadedCount + Self.pageSize
             do {
                 let page = try await resolvedInitialFillFetch(limit: newLimit)
@@ -2425,11 +2460,13 @@ final class SessionStore {
                 // this page was in flight, resetting `loadedCount` (its window is
                 // `max(100, loadedFloor, loadedCount)`, so it never shrinks below the
                 // fill's progress — but it can land between our limit-compute and append).
-                // If `loadedCount` no longer matches what we paged from, this page
-                // is for a stale window: skip the append and re-loop to recompute a
-                // fresh `newLimit` from the current `loadedCount`. Prevents a stale
-                // large window double-counting on top of the replace.
-                guard loadedCount == priorLoaded else { continue }
+                // If `loadedCount` OR the server-universe revision no longer
+                // matches what we paged from, this page is for a stale window:
+                // skip the append and re-loop to recompute a fresh `newLimit`.
+                // The revision catches same-sized first-page replacements and
+                // unseen tombstones that cursor math alone cannot observe.
+                guard loadedCount == priorLoaded,
+                      sessionListUniverseRevision == priorUniverseRevision else { continue }
                 mergeSessionPage(page.sessions, total: page.total, isAppend: true)
                 loadedOffset = loadedCount
                 // Raise the high-water floor so a later first-page refresh re-fetches
@@ -2474,11 +2511,13 @@ final class SessionStore {
     }
 
     /// Test seam for priming pagination invariants around delta refreshes.
+    #if DEBUG
     func setPaginationForTesting(loadedCount: Int, loadedOffset: Int, total: Int?) {
         self.loadedCount = loadedCount
         self.loadedOffset = loadedOffset
         self.totalSessions = total
     }
+    #endif
 
     /// Resolve the page fetch for ``runInitialFill(generation:)``: the injected
     /// ``initialFillFetch`` seam in tests, else the live grow-limit fetch on the
