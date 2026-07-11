@@ -295,7 +295,9 @@ final class CacheFirstLaunchTests: XCTestCase {
         )
 
         sessions.prefetchRecentTranscripts()
-        try await Self.poll { PrefetchDeltaStubProtocol.sawDelta }
+        try await Self.poll {
+            (try? await cache.maxMessageId(for: "changed")) == 203
+        }
 
         let cached = try await cache.loadTranscript("changed") ?? []
         XCTAssertEqual(cached.map(\.text), ["cached-1", "cached-2", "tail-3"],
