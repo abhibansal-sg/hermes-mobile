@@ -1007,11 +1007,14 @@ final class ChatStore {
         let failedStatuses = ["error", "failed", "interrupted", "cancelled", "canceled"]
         let completionStatus = completion?.status?.lowercased()
         let completionFailed = completionStatus.map { failedStatuses.contains($0) } ?? false
+        let completionSucceeded = completionStatus == nil
+            || completionStatus == "complete"
+            || completionStatus == "completed"
         let shouldClearReconnectWarning = completion != nil
             && pendingReconnectReconcileID == id
             && completion?.warning == nil
             && !completionFailed
-            && (completionStatus == nil || completionStatus == "completed")
+            && completionSucceeded
         // Wall-clock the turn took, used to label a collapsed tool cluster.
         let elapsed = turnStartedAt.map { Date().timeIntervalSince($0) }
         // A2 (scarf): suppress the implicit animation on the streaming→final flip.
@@ -1036,9 +1039,10 @@ final class ChatStore {
                 message.setWarningPart(warning)
             }
             // Non-success terminal status (ABH-46 item 5): surface it on the
-            // bubble. `status` is "completed" on the happy path; anything
-            // error-like becomes the warning strip (without clobbering an
-            // explicit warning the server already sent).
+            // bubble. The live gateway sends `status: "complete"` on the happy
+            // path (`"completed"` is tolerated for legacy clients); anything
+            // error-like becomes the warning strip without clobbering an explicit
+            // warning the server already sent.
             if let status = completion?.status,
                failedStatuses.contains(status.lowercased()),
                message.warning == nil {
@@ -2053,6 +2057,7 @@ final class ChatStore {
             outgoing: outgoing,
             uploadedImagePaths: uploadedImagePaths
         )
+        sessions?.resetComposerHistoryBrowse(for: sessions?.activeComposerDraftKey)
         let userMessage = ChatMessage(role: .user, text: localDisplay)
         userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
         messages.append(userMessage)

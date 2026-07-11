@@ -135,6 +135,28 @@ final class CacheFirstLaunchTests: XCTestCase {
                       "an in-memory server binding satisfies the gate")
     }
 
+    func testBootstrapWithSavedURLWithoutTokenKeepsCachedShellAvailable() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+
+        let savedURL = "https://cache-only-\(UUID().uuidString).example"
+        UserDefaults.standard.set(savedURL, forKey: DefaultsKeys.serverURL)
+        connection._skipEnvironmentBootstrapForTesting = true
+        let scope = CacheScope(serverId: savedURL, profileId: DefaultsKeys.allProfilesScope)
+        try await cache.saveSessionList([makeSummary(id: "cached")], scope: scope)
+
+        await connection.bootstrap()
+
+        XCTAssertEqual(connection.serverURLString, savedURL)
+        XCTAssertTrue(connection.hasSavedConfiguration)
+        XCTAssertFalse(connection.isBootstrapping)
+        guard case .offline = connection.phase else {
+            return XCTFail("saved URL without a token should remain in the cached offline shell")
+        }
+        XCTAssertEqual(sessions.sessions.map(\.id), ["cached"])
+    }
+
     func testFailedConfigureLeavesGateClosed() async {
         // VALIDATION-BYPASS GUARANTEE (preserved): a garbage manual configure
         // persists nothing and leaves serverURLString empty, so the paired-user

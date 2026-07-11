@@ -212,8 +212,10 @@ final class ServerCapabilities {
     }
 
     #if DEBUG
-    /// DEBUG-only test seam for stores that need to exercise capability-gated
-    /// behavior without performing live gateway probes.
+    /// DEBUG-only test seam: seed `devices` directly, skipping the real
+    /// `GET /api/devices` probe. Lets a test drive `ConnectionStore`'s
+    /// auto-upgrade path (which gates on `devices == .available`) without
+    /// standing up a stub for every probe endpoint. Absent in Release.
     func _setDevicesForTesting(_ state: State) {
         devices = state
     }
@@ -250,6 +252,16 @@ final class ServerCapabilities {
         subagentEvents = .available
         persist()
     }
+
+    #if DEBUG
+    /// DEBUG-only: force the `profiles` capability state without a network
+    /// probe, so UITestSeed can populate the multi-profile drawer offline.
+    /// Mirrors the existing `profileThreadingAvailableForTesting` seam on
+    /// SessionStore. Never compiled into Release.
+    func _seedProfilesCapabilityForTesting(_ state: State) {
+        profiles = state
+    }
+    #endif
 
     // MARK: - Plugin-mount probe (ABH-88)
 

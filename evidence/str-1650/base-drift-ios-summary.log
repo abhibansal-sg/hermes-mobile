@@ -1,0 +1,8 @@
+STR-1650 final base-drift iOS reconciliation
+Command: scripts/ios-build.sh test -scheme HermesMobile -destination 'platform=iOS Simulator,name=iPhone 17 Pro' -only-testing:HermesMobileTests/ProfilesTests -only-testing:HermesMobileTests/SessionRefreshTests -only-testing:HermesMobileTests/ChatStoreReconnectReconcileTests -only-testing:HermesMobileTests/SessionListSourceFilterTests
+Result: TEST SUCCEEDED
+ChatStoreReconnectReconcileTests: 5 passed, 0 failed
+ProfilesTests: 35 passed, 0 failed
+SessionListSourceFilterTests: 11 passed, 0 failed
+SessionRefreshTests: 11 passed, 0 failed
+Selected tests: 62 passed, 0 failed

@@ -556,3 +556,93 @@ def test_pid_exists_zombie_via_proc_fallback_returns_false(monkeypatch):
 
     assert status._pid_exists(4242) is False
     kill.assert_not_called()
+@pytest.mark.asyncio
+async def test_drain_snapshot_includes_agent_promoted_from_sentinel_during_drain():
+    """Regression (STR-1069 review): _drain_active_agents must refresh the
+    real-agent snapshot before returning so a pending sentinel that promotes
+    to a concrete AIAgent during the drain window appears in the returned
+    snapshot.  Without the refresh, _finalize_shutdown_agents and restart-
+    failure counting receive the stale entry-time snapshot (empty for that
+    key) and the late-promoted agent is interrupted but never finalized.
+
+    The same fix covers adapter-active turns that promote during the drain
+    window — the refresh re-reads _running_agents regardless of how the
+    agent got there."""
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+
+    runner._running_agents = {session_key: gateway_run._AGENT_PENDING_SENTINEL}
+    runner._running_agents_ts = {session_key: 0.0}
+    assert runner._snapshot_running_agents() == {}
+
+    promoted_agent = MagicMock()
+
+    async def promote_mid_drain():
+        await asyncio.sleep(0.03)
+        runner._running_agents[session_key] = promoted_agent
+
+    promote_task = asyncio.create_task(promote_mid_drain())
+
+    snapshot, timed_out = await runner._drain_active_agents(0.05)
+    await promote_task
+
+    assert timed_out is True
+    assert session_key in snapshot
+    assert snapshot[session_key] is promoted_agent
+    assert gateway_run._AGENT_PENDING_SENTINEL not in snapshot.values()
+
+
+@pytest.mark.asyncio
+async def test_stop_finalizes_late_promoted_real_agent_from_sentinel(tmp_path, monkeypatch):
+    """Regression (STR-1069 review): a pending-sentinel turn that promotes to
+    a real AIAgent during the drain window must be finalized by stop().  The
+    refreshed snapshot from _drain_active_agents ensures _finalize_shutdown_
+    agents receives the promoted agent for transcript flush + resource
+    cleanup, while sentinel placeholders are still skipped."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner._restart_drain_timeout = 0.2
+
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: gateway_run._AGENT_PENDING_SENTINEL}
+    runner._running_agents_ts = {session_key: 0.0}
+
+    promoted_agent = MagicMock()
+
+    async def promote_mid_drain():
+        await asyncio.sleep(0.03)
+        runner._running_agents[session_key] = promoted_agent
+
+    promote_task = asyncio.create_task(promote_mid_drain())
+
+    finalized: dict[str, object] = {}
+
+    async def capture_finalize(active_agents):
+        finalized.update(active_agents)
+
+    runner._finalize_shutdown_agents = capture_finalize
+
+    # Simulate a real agent responding to interrupt by releasing its slot
+    # so the post-interrupt wait loop exits immediately instead of spinning
+    # the full 5 s grace window.
+    def _interrupt_and_release(_reason):
+        runner._running_agents.pop(session_key, None)
+
+    promoted_agent.interrupt = _interrupt_and_release
+
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("agent.auxiliary_client.shutdown_cached_clients"),
+    ):
+        await runner.stop()
+    await promote_task
+
+    assert session_key in finalized, (
+        "late-promoted real agent must be passed to _finalize_shutdown_agents"
+    )
+    assert finalized[session_key] is promoted_agent
+    assert gateway_run._AGENT_PENDING_SENTINEL not in finalized.values()

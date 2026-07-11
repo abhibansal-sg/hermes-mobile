@@ -1,0 +1,30 @@
+── GATE: uv-lock
+── GATE: hermes-ink-build
+── GATE: windows-footguns
+── GATE: ts-typecheck-ui-tui
+── GATE: ts-typecheck-web
+── GATE: ts-typecheck-bootstrap-installer
+── GATE: ts-typecheck-desktop
+── GATE: ts-typecheck-shared
+════ VERIFY RESULT ════
+  uv-lock: PASS
+  node-install: PASS (workspace links already present)
+  hermes-ink-build: PASS
+  windows-footguns: PASS
+  ts-typecheck-ui-tui: PASS
+  ts-typecheck-web: PASS
+  ts-typecheck-bootstrap-installer: PASS
+  ts-typecheck-desktop: PASS
+  ts-typecheck-shared: PASS
+──── skipped lanes ────
+  ruff: SKIPPED — no ruff binary found (.venv/bin/ruff, venv/bin/ruff, or PATH) — 'uv sync --extra dev' installs it
+  ty-typecheck: SKIPPED — no ty binary found — 'uv sync --extra dev' installs it
+  pytest: SKIPPED — no local .venv/venv — create one and run scripts/run_tests.sh for Python changes
+  vitest: SKIPPED — --fast
+  desktop-build: SKIPPED — --fast
+  ios-build: SKIPPED — --skip-ios / --fast
+  docker: SKIPPED — CI's own all-checks-pass gate excludes it (ci.yml: "so slow lol"); use CI's docker.yml or hermes-loop tooling for image validation
+  docs-site: SKIPPED — heavyweight (docusaurus build + ascii-guard install); run 'npm run build --prefix website' directly when docs/ or website/ changes
+  supply-chain-audit: SKIPPED — requires a GitHub API PR diff (base...head compare) — not a deterministic local check; CI runs it per-PR
+  osv-scanner: SKIPPED — requires network access to the OSV vulnerability DB; CI runs it per-PR and on a weekly schedule
+VERDICT: PASS

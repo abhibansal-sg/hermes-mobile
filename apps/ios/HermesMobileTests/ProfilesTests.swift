@@ -302,6 +302,87 @@ final class ProfilesTests: XCTestCase {
         XCTAssertEqual(filtered.map(\.id), ["a", "b"])
     }
 
+    func testDrawerProfileGroupsDefaultFirstThenAlphabetic() {
+        let rows = [
+            row("z1", profile: "zeta"),
+            row("d1", profile: "default"),
+            row("a1", profile: "alpha"),
+            row("blank", profile: nil),
+            row("a2", profile: "alpha"),
+        ]
+        let profiles = [
+            ProfileSummary(name: "zeta", isDefault: false, description: nil),
+            ProfileSummary(name: "default", isDefault: true, description: nil),
+            ProfileSummary(name: "alpha", isDefault: false, description: nil),
+        ]
+
+        let groups = SessionStore.drawerProfileGroups(rows: rows, profiles: profiles)
+
+        XCTAssertEqual(groups.map(\.profile), ["default", "alpha", "zeta"])
+        XCTAssertEqual(groups.map(\.label), ["default (default)", "alpha", "zeta"])
+        XCTAssertEqual(groups.map { $0.sessions.map(\.id) }, [["d1", "blank"], ["a1", "a2"], ["z1"]])
+    }
+
+    // MARK: - Collapsed-by-default + few-recent preview (STR-1022)
+
+    /// The collapse-state derivation is the spec of truth for "groups open
+    /// collapsed by default, default/active group expanded." Pure + instance-free
+    /// so it can be asserted without standing up a SessionStore.
+    private func profileMap(_ names: (String, Bool)...) -> [String: ProfileSummary] {
+        Dictionary(uniqueKeysWithValues: names.map { ($0.0, ProfileSummary(name: $0.0, isDefault: $0.1, description: nil)) })
+    }
+
+    func testCollapsedByDefaultRuleCollapsesNonDefaultExpandsDefault() {
+        let map = profileMap(("default", true), ("alpha", false), ("zeta", false))
+        let empty: Set<String> = []
+
+        // Default rule (no explicit decisions): default open, every other group collapsed.
+        XCTAssertFalse(SessionStore.isProfileGroupCollapsed("default", collapsed: empty, expanded: empty, profileMap: map))
+        XCTAssertTrue(SessionStore.isProfileGroupCollapsed("alpha", collapsed: empty, expanded: empty, profileMap: map))
+        XCTAssertTrue(SessionStore.isProfileGroupCollapsed("zeta", collapsed: empty, expanded: empty, profileMap: map))
+    }
+
+    func testExplicitExpandSurvivesDefaultRule() {
+        let map = profileMap(("default", true), ("alpha", false))
+        // The user expanded "alpha": an explicit-expand must beat the default-collapsed rule.
+        XCTAssertFalse(SessionStore.isProfileGroupCollapsed(
+            "alpha", collapsed: [], expanded: ["alpha"], profileMap: map
+        ))
+    }
+
+    func testExplicitCollapseBeatsDefaultExpandedForDefaultProfile() {
+        let map = profileMap(("default", true), ("alpha", false))
+        // The user collapsed the default group: an explicit-collapse must beat its default-expanded rule.
+        XCTAssertTrue(SessionStore.isProfileGroupCollapsed(
+            "default", collapsed: ["default"], expanded: [], profileMap: map
+        ))
+    }
+
+    func testExplicitExpandBeatsExplicitCollapseWhenBothPresent() {
+        // A profile can end up in both sets across a sequence of toggles; expand
+        // is the most recent intent (toggleCollapsed clears the opposite set, but
+        // the derivation must be robust if the invariant ever drifts).
+        let map = profileMap(("alpha", false))
+        XCTAssertFalse(SessionStore.isProfileGroupCollapsed(
+            "alpha", collapsed: ["alpha"], expanded: ["alpha"], profileMap: map
+        ))
+    }
+
+    func testNewlyDiscoveredProfileDefaultsToCollapsed() {
+        // A profile with no summary (appeared after first view) still applies the
+        // default rule: only the literal "default" name is treated as default.
+        let map = profileMap(("default", true))
+        XCTAssertTrue(SessionStore.isProfileGroupCollapsed(
+            "brandnew", collapsed: [], expanded: [], profileMap: map
+        ))
+    }
+
+    func testCollapsedPreviewCountIsSmallConstant() {
+        // Desktop-parity "few": a small, stable constant so multiple collapsed
+        // groups stay compact in the drawer. Pinning the value guards an accidental bump.
+        XCTAssertEqual(SessionStore.drawerCollapsedProfilePreviewCount, 3)
+    }
+
     // MARK: - create/resume profile threading decision
 
     func testThreadingAttachesProfileOnlyForSpecificNonDefaultScope() {

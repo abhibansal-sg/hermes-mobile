@@ -1328,6 +1328,59 @@ def test_session_cwd_set_profile_session_updates_profile_db(monkeypatch, tmp_pat
     assert "launch_update" not in captured
 
 
+def test_save_cfg_writes_profile_override_path_and_isolates_launch(monkeypatch, tmp_path):
+    """_save_cfg must write profile_home/config.yaml when a Path hermes-home
+    override is active, leaving the launch profile's config untouched — the
+    write-side counterpart of _load_cfg's override resolution
+    (STR-995/STR-991 profile-scoped config-write isolation)."""
+    launch_home = tmp_path / "launch"
+    profile_home = tmp_path / "profiles" / "worker"
+    launch_home.mkdir(parents=True)
+    profile_home.mkdir(parents=True)
+    (launch_home / "config.yaml").write_text(
+        "model:\n  default: launch-model\n", encoding="utf-8"
+    )
+    (profile_home / "config.yaml").write_text(
+        "model:\n  default: worker-model\n", encoding="utf-8"
+    )
+
+    monkeypatch.setattr(server, "_hermes_home", launch_home)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    token = None
+    try:
+        # Scope to the worker profile via a Path override and persist a change.
+        token = set_hermes_home_override(Path(profile_home))
+        server._save_cfg({"model": {"default": "worker-saved"}})
+
+        # The write landed in the profile's config, and the cache/path track it.
+        profile_written = (profile_home / "config.yaml").read_text(encoding="utf-8")
+        assert "worker-saved" in profile_written, (
+            "profile override must write profile_home/config.yaml, not launch config"
+        )
+        assert server._cfg_path == Path(profile_home) / "config.yaml"
+
+        # The launch profile config is untouched (no cross-profile bleed).
+        launch_written = (launch_home / "config.yaml").read_text(encoding="utf-8")
+        assert "launch-model" in launch_written, (
+            "launch profile config must not be mutated by a profile-scoped save"
+        )
+
+        # Dropping the override routes subsequent saves back to the launch profile.
+        reset_hermes_home_override(token)
+        token = None
+        server._save_cfg({"model": {"default": "launch-saved"}})
+        assert "launch-saved" in (launch_home / "config.yaml").read_text(encoding="utf-8")
+        assert "worker-saved" in (profile_home / "config.yaml").read_text(encoding="utf-8")
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+
+
 def test_stored_session_runtime_overrides_skips_bare_billing_provider():
     """A bare billing bucket ("custom"/"auto"/"openrouter") must not be restored as the
     provider identity on resume. A custom endpoint that never used `/model` persists only
@@ -2174,6 +2227,77 @@ def test_notification_event_routing_by_session_key(monkeypatch):
     assert server._notification_event_belongs_elsewhere("a", mine, {"session_key": "other"}) is True
     # Owner is gone (not in _sessions) → handle as fallback so it isn't lost.
     assert server._notification_event_belongs_elsewhere("a", mine, {"session_key": "ghost"}) is False
+
+
+def test_async_delegation_event_prefers_origin_ui_session(monkeypatch):
+    """Detached subagent completions return to the commissioning TUI tab.
+
+    Regression: when the durable session key was stale/orphaned, whichever
+    desktop poller woke first could consume the async result and inject it into
+    an unrelated session.
+    """
+    mine = _session(session_key="current-key")
+    other = _session(session_key="unrelated-key")
+    monkeypatch.setattr(server, "_sessions", {"origin-sid": mine, "other-sid": other})
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    evt = {
+        "type": "async_delegation",
+        "session_key": "stale-or-rotated-key",
+        "origin_ui_session_id": "origin-sid",
+    }
+
+    assert server._notification_event_belongs_elsewhere("other-sid", other, evt) is True
+    assert server._notification_event_belongs_elsewhere("origin-sid", mine, evt) is False
+
+
+def test_notification_event_follows_compression_continuation(monkeypatch):
+    """Events keyed to a compressed parent route to the live continuation."""
+    old_parent = _session(session_key="old-parent")
+    live_tip = _session(session_key="new-tip")
+    monkeypatch.setattr(server, "_sessions", {"old-sid": old_parent, "tip-sid": live_tip})
+
+    class _DB:
+        def resolve_resume_session_id(self, session_id):
+            return "new-tip" if session_id == "old-parent" else session_id
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    evt = {"type": "async_delegation", "session_key": "old-parent"}
+
+    assert server._notification_event_belongs_elsewhere("old-sid", old_parent, evt) is True
+    assert server._notification_event_belongs_elsewhere("tip-sid", live_tip, evt) is False
+    # A third session must leave it alone for the continuation's poller.
+    third = _session(session_key="third")
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {"old-sid": old_parent, "tip-sid": live_tip, "third-sid": third},
+    )
+    assert server._notification_event_belongs_elsewhere("third-sid", third, evt) is True
+
+
+def test_finalized_origin_ui_session_falls_back_to_live_continuation(monkeypatch):
+    """A closed origin tab must not steal its resumed continuation's result."""
+    finalized_origin = _session(session_key="old-parent", _finalized=True)
+    live_tip = _session(session_key="new-tip")
+    monkeypatch.setattr(
+        server,
+        "_sessions",
+        {"origin-sid": finalized_origin, "tip-sid": live_tip},
+    )
+
+    class _DB:
+        def resolve_resume_session_id(self, session_id):
+            return "new-tip" if session_id == "old-parent" else session_id
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    evt = {
+        "type": "async_delegation",
+        "session_key": "old-parent",
+        "origin_ui_session_id": "origin-sid",
+    }
+
+    assert server._notification_event_belongs_elsewhere("origin-sid", finalized_origin, evt) is True
+    assert server._notification_event_belongs_elsewhere("tip-sid", live_tip, evt) is False
 
 
 def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
@@ -4782,6 +4906,25 @@ def test_session_info_includes_session_title(monkeypatch):
     assert info["title"] == "Dashboard title"
 
 
+def test_session_info_includes_install_warning_for_pip(monkeypatch):
+    """pip installs surface install_warning; git installs don't (issue: pip/brew deprecation)."""
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda: "pip")
+
+    info = server._session_info(types.SimpleNamespace(tools=[], model="", provider=""))
+
+    assert "install_warning" in info
+    assert "pip" in info["install_warning"]
+    assert "platform-support" in info["install_warning"]
+
+
+def test_session_info_omits_install_warning_for_git(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda: "git")
+
+    info = server._session_info(types.SimpleNamespace(tools=[], model="", provider=""))
+
+    assert "install_warning" not in info
+
+
 # ---------------------------------------------------------------------------
 # History-mutating commands must reject while session.running is True.
 # Without these guards, prompt.submit's post-run history write either
@@ -6201,6 +6344,52 @@ def test_model_options_propagates_list_exception(monkeypatch):
     assert "error" in resp
     assert resp["error"]["code"] == 5033
     assert "catalog blew up" in resp["error"]["message"]
+
+
+def test_model_options_hides_unconfigured_providers_by_default(monkeypatch):
+    from hermes_cli.inventory import ConfigContext
+
+    calls = []
+
+    monkeypatch.setattr(server, "_resolve_model", lambda: "")
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: ConfigContext(
+            current_provider="",
+            current_model="",
+            current_base_url="",
+            user_providers={},
+            custom_providers=[],
+        ),
+    )
+
+    def _fake_build_models_payload(_ctx, **kwargs):
+        calls.append(kwargs)
+        return {"providers": [], "model": "", "provider": ""}
+
+    monkeypatch.setattr(
+        "hermes_cli.inventory.build_models_payload",
+        _fake_build_models_payload,
+    )
+
+    resp = server._methods["model.options"](99, {"session_id": ""})
+    assert "result" in resp, resp
+    assert calls[-1]["explicit_only"] is False
+    assert calls[-1]["include_unconfigured"] is False
+
+    resp = server._methods["model.options"](
+        100,
+        {"session_id": "", "explicit_only": True},
+    )
+    assert "result" in resp, resp
+    assert calls[-1]["explicit_only"] is True
+
+    resp = server._methods["model.options"](
+        101,
+        {"session_id": "", "include_unconfigured": True},
+    )
+    assert "result" in resp, resp
+    assert calls[-1]["include_unconfigured"] is True
 
 
 # ---------------------------------------------------------------------------

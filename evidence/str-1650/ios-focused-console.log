@@ -1,0 +1,19 @@
+[ios-build] live-test creds: auto-provisioned TEST_RUNNER_HERMES_URL=http://127.0.0.1:9200 (token 43 chars, via /Users/abbhinnav/Developer/products/hermes-loop/scripts/dev-gateway.sh) — live iOS tests will run, not skip.
+[ios-build] lock acquired. building: xcodebuild -project /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/HermesMobile.xcodeproj test -scheme HermesMobile -destination platform=iOS Simulator,name=iPhone 17 Pro -only-testing:HermesMobileTests/ProfilesTests -only-testing:HermesMobileTests/SessionRefreshTests -only-testing:HermesMobileTests/NotificationActionTests -only-testing:HermesMobileTests/RootKeyboardShortcutActionsTests -derivedDataPath /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/.derivedData
+[ios-build] derivedData=/Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/.derivedData (unless overridden) | timeout=1800s | log=/Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/evidence/str-1650/ios-focused-wrapper.log
+[ios-build] NOT successful (rc=65). last 15 log lines:
+Test session results, code coverage, and logs:
+	/Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.11_16-34-24-+0800.xcresult
+
+Testing failed:
+	Invalid redeclaration of 'copy(isCurrent:authenticated:)'
+	Testing cancelled because the build failed.
+
+** TEST FAILED **
+
+
+The following build commands failed:
+	SwiftCompile normal arm64 Compiling\ RenderCache.swift,\ RestClient+Approvals.swift,\ RestClient+Artifacts.swift,\ RestClient+Audio.swift,\ RestClient+Control.swift,\ RestClient+Devices.swift,\ RestClient+FS.swift,\ RestClient+Profiles.swift,\ RestClient+Providers.swift,\ RestClient+Sessions.swift /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/HermesMobile/Views/Chat/Rendering/RenderCache.swift /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/HermesMobile/Networking/Rest/RestClient+Approvals.swift /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/HermesMobile/Networking/Rest/RestClient+Artifacts.swift /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/HermesMobile/Networking/Audio/RestClient+Audio.swift /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/HermesMobile/Networking/Rest/RestClient+Control.swift /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/HermesMobile/Networking/Rest/RestClient+Devices.swift /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/HermesMobile/Networking/Rest/RestClient+FS.swift /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/HermesMobile/Networking/Rest/RestClient+Profiles.swift /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/HermesMobile/Networking/Rest/RestClient+Providers.swift /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/HermesMobile/Networking/Rest/RestClient+Sessions.swift (in target 'HermesMobile' from project 'HermesMobile')
+	SwiftCompile normal arm64 /Users/abbhinnav/Developer/products/hermes-mobile/.worktrees/str-1477-release/apps/ios/HermesMobile/Networking/Rest/RestClient+Providers.swift (in target 'HermesMobile' from project 'HermesMobile')
+	Testing project HermesMobile with scheme HermesMobile
+(3 failures)

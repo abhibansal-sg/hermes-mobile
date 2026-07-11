@@ -144,6 +144,27 @@ final class ChatStoreReconnectReconcileTests: XCTestCase {
                        "a clean completion for the reconciled resumed row must remove the stale connection-loss warning part")
     }
 
+    func testLiveGatewayCompleteStatusClearsConnectionLostWarningPart() async {
+        let (chat, _) = makeStore()
+
+        let interrupted = beginLocalPartialTurn(chat)
+        chat.handleConnectionDrop()
+        XCTAssertEqual(warningTexts(in: chat.messages.first(where: { $0.id == interrupted.id })), ["Connection lost"])
+
+        chat.handle(event: localFrame(type: "message.start", payload: ["role": "assistant"]))
+        chat.handle(event: localFrame(type: "message.complete", payload: [
+            "text": "fully recovered reply",
+            "status": "complete",
+        ]))
+
+        let assistantRows = chat.messages.filter { $0.role == .assistant }
+        XCTAssertEqual(assistantRows.count, 1)
+        XCTAssertEqual(assistantRows.first?.id, interrupted.id)
+        XCTAssertEqual(assistantRows.first?.text, "fully recovered reply")
+        XCTAssertEqual(warningTexts(in: assistantRows.first), [],
+                       "the live gateway's `complete` status must clear the stale connection-loss warning")
+    }
+
     func testFailedResumedCompletionKeepsWarningPart() async {
         let (chat, _) = makeStore()
 

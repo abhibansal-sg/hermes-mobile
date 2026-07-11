@@ -7,6 +7,7 @@ WHAT'S NEW
 - Add UI scale setting to appearance settings
 
 FIXED
+- Return a bounded error when debug-share uploads exceed the route budget (STR-1210)
 - Gate iOS device-token auto-upgrade on server auth_required
 - Use windows_detach_popen_kwargs to prevent console window flash on Windows
 - Unpin Baileys from git commit, use published 7.0.0-rc13
@@ -635,4 +636,3 @@ WORTH TRYING
 - Try: Server — plugin toolset-config routes (GET/PUT /toolsets/{name}/config) (ABH-224)
 
 (+4 server-side/infra changes active on the gateway, no app UI change)
-

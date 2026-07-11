@@ -163,6 +163,168 @@ final class NotificationActionTests: XCTestCase {
     }
 }
 
+// MARK: - Push tap cold-start routing
+
+@MainActor
+final class PushTapRoutingTests: XCTestCase {
+    private struct Stores {
+        let connection: ConnectionStore
+        let sessions: SessionStore
+        let chat: ChatStore
+        let inbox: InboxStore
+    }
+
+    private func makeStores() -> Stores {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let attachments = AttachmentStore()
+        let inbox = InboxStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        sessions.attach(connection: connection, chat: chat)
+        inbox.attach(connection: connection)
+        return Stores(connection: connection, sessions: sessions, chat: chat, inbox: inbox)
+    }
+
+    private func summary(id: String) -> SessionSummary {
+        SessionSummary(
+            id: id,
+            title: "Session \(id)",
+            preview: nil,
+            startedAt: nil,
+            messageCount: nil,
+            source: nil,
+            lastActive: nil,
+            cwd: nil
+        )
+    }
+
+    private func waitUntil(
+        _ condition: @escaping () -> Bool,
+        timeout: TimeInterval = 2.0
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() && Date() < deadline {
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+
+    func testCachedWarmTurnCompleteOpensSynchronouslyAndDoesNotReplay() async {
+        let s = makeStores()
+        s.sessions.sessions = [summary(id: "stored-warm")]
+        var readinessCalls = 0
+        var refreshCalls = 0
+        s.connection.sessionRefreshReadinessOverride = {
+            readinessCalls += 1
+            return true
+        }
+        s.sessions.sessionsFetch = {
+            refreshCalls += 1
+            return ([self.summary(id: "stored-warm")], 1)
+        }
+
+        HermesURLRouter.routePushTap(
+            .turnComplete(sessionId: "stored-warm"),
+            sessions: s.sessions,
+            inbox: s.inbox,
+            connection: s.connection
+        )
+
+        XCTAssertEqual(s.sessions.activeStoredId, "stored-warm")
+        XCTAssertEqual(readinessCalls, 0, "warm path must not enter readiness machinery")
+        XCTAssertEqual(refreshCalls, 0, "warm path must not schedule a miss refresh")
+        XCTAssertEqual(s.inbox.presentationRequestToken, 0)
+
+        await Task.yield()
+        XCTAssertEqual(s.sessions.activeStoredId, "stored-warm")
+        XCTAssertEqual(readinessCalls, 0)
+        XCTAssertEqual(refreshCalls, 0)
+    }
+
+    func testColdTurnCompleteWaitsForReadinessRefreshesAndOpens() async {
+        let s = makeStores()
+        var readinessCalls = 0
+        var refreshCalls = 0
+        s.connection.sessionRefreshReadinessOverride = {
+            readinessCalls += 1
+            return true
+        }
+        s.sessions.sessionsFetch = {
+            refreshCalls += 1
+            return ([self.summary(id: "stored-cold")], 1)
+        }
+
+        HermesURLRouter.routePushTap(
+            .turnComplete(sessionId: "stored-cold"),
+            sessions: s.sessions,
+            inbox: s.inbox,
+            connection: s.connection
+        )
+
+        await waitUntil { s.sessions.activeStoredId == "stored-cold" }
+        XCTAssertEqual(readinessCalls, 1)
+        XCTAssertEqual(refreshCalls, 1)
+        XCTAssertEqual(s.sessions.activeStoredId, "stored-cold")
+        XCTAssertEqual(s.inbox.presentationRequestToken, 0)
+    }
+
+    func testColdTurnCompleteNotReadyFallsBackToInbox() async {
+        let s = makeStores()
+        var readinessCalls = 0
+        var refreshCalls = 0
+        let tokenBefore = s.inbox.presentationRequestToken
+        s.connection.sessionRefreshReadinessOverride = {
+            readinessCalls += 1
+            return false
+        }
+        s.sessions.sessionsFetch = {
+            refreshCalls += 1
+            return ([], 0)
+        }
+
+        HermesURLRouter.routePushTap(
+            .turnComplete(sessionId: "missing"),
+            sessions: s.sessions,
+            inbox: s.inbox,
+            connection: s.connection
+        )
+
+        await waitUntil { s.inbox.presentationRequestToken > tokenBefore }
+        XCTAssertEqual(readinessCalls, 1)
+        XCTAssertEqual(refreshCalls, 0, "not-ready taps must not refresh against an unusable connection")
+        XCTAssertNil(s.sessions.activeStoredId)
+        XCTAssertEqual(s.inbox.presentationRequestToken, tokenBefore + 1)
+    }
+
+    func testColdAttentionWaitsForReadinessRefreshesAndOpensBeforeInboxFallback() async {
+        let s = makeStores()
+        var readinessCalls = 0
+        var refreshCalls = 0
+        s.connection.sessionRefreshReadinessOverride = {
+            readinessCalls += 1
+            return true
+        }
+        s.sessions.sessionsFetch = {
+            refreshCalls += 1
+            return ([self.summary(id: "stored-attention")], 1)
+        }
+
+        HermesURLRouter.routePushTap(
+            .attention(sessionId: "stored-attention"),
+            sessions: s.sessions,
+            inbox: s.inbox,
+            connection: s.connection
+        )
+
+        await waitUntil { s.sessions.activeStoredId == "stored-attention" }
+        XCTAssertEqual(readinessCalls, 1)
+        XCTAssertEqual(refreshCalls, 1)
+        XCTAssertEqual(s.sessions.activeStoredId, "stored-attention")
+        XCTAssertEqual(s.inbox.presentationRequestToken, 0)
+    }
+}
+
 // MARK: - Per-event push prefs round-trip (A4)
 
 /// Round-trips the notification toggles through `DefaultsKeys`, asserting

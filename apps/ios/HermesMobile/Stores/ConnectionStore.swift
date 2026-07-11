@@ -44,7 +44,9 @@ final class ConnectionStore {
     }
 
     /// Current high-level connection phase.
-    var phase: Phase = .connecting
+    var phase: Phase = .connecting {
+        didSet { notifyReadinessWaiters() }
+    }
     #if DEBUG
     /// JSON-safe mirror of ``phase`` for the gstack debug bridge snapshot
     /// (task UI-G). `phase` is a Swift enum and not JSON-serializable, so the
@@ -410,6 +412,11 @@ final class ConnectionStore {
     /// notes). Named so the test can pin it.
     static let coldOpenGraceWindow: Duration = .seconds(5)
 
+    /// Hard ceiling for a cold push tap that arrives before bootstrap/configure
+    /// has made REST/WS usable. The tap path must wait long enough for normal
+    /// cold launch bootstrap, but unconfigured/offline installs cannot hang.
+    static let pushTapReadinessTimeout: Duration = .seconds(10)
+
     /// The single, long-lived gateway client.
     let client = HermesGatewayClient()
 
@@ -427,7 +434,7 @@ final class ConnectionStore {
         #if DEBUG
         // Test-only: a seeded override short-circuits the URL+token build so a
         // stub `URLSession` can observe/no-op the calls made through `rest`
-        // (e.g. reconnect's `recoverActiveSession` probes). See
+        // (e.g. reconnect probes and the device auto-upgrade round-trip). See
         // `_restOverrideForTesting`.
         if let _restOverrideForTesting { return _restOverrideForTesting }
         #endif
@@ -435,6 +442,63 @@ final class ConnectionStore {
         return RestClient(
             baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
         )
+    }
+
+    /// Wait until session-list refresh has a usable transport, or until the
+    /// connection has reached a terminal not-ready state / timeout.
+    ///
+    /// This is deliberately narrower than full hydration: push-tap resolution only
+    /// needs REST (preferred by `SessionStore.refresh`) or an open WS client to
+    /// fetch `session.list`. A verified `configure()` stamps `serverURLString` and
+    /// `currentToken` before `.hydrating`, so `rest != nil` is enough to let the
+    /// miss path refresh without waiting for the branded loading screen to finish.
+    func waitUntilSessionRefreshReady(
+        timeout: Duration = ConnectionStore.pushTapReadinessTimeout
+    ) async -> Bool {
+        #if DEBUG
+        if let sessionRefreshReadinessOverride {
+            return await sessionRefreshReadinessOverride()
+        }
+        #endif
+        if await isSessionRefreshReady() { return true }
+        if isTerminallyNotReadyForSessionRefresh { return false }
+
+        let timeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            if Task.isCancelled { return }
+            await self?.notifyReadinessWaiters()
+        }
+        await waitForReadinessChange()
+        timeoutTask.cancel()
+
+        return await isSessionRefreshReady()
+    }
+
+    private func isSessionRefreshReady() async -> Bool {
+        if rest != nil { return true }
+        return await client.state == .open
+    }
+
+    private var isTerminallyNotReadyForSessionRefresh: Bool {
+        switch phase {
+        case .needsSetup, .offline:
+            return true
+        case .connecting, .hydrating, .connected, .reconnecting:
+            return false
+        }
+    }
+
+    private func waitForReadinessChange() async {
+        await withCheckedContinuation { continuation in
+            readinessWaiters.append(continuation)
+        }
+    }
+
+    private func notifyReadinessWaiters() {
+        guard !readinessWaiters.isEmpty else { return }
+        let waiters = readinessWaiters
+        readinessWaiters = []
+        waiters.forEach { $0.resume() }
     }
 
     /// A ``RestClient`` for the control-surface panels (model / personality /
@@ -457,7 +521,8 @@ final class ConnectionStore {
     /// of building one from the saved URL + token, so a stub `URLSession`
     /// (`URLProtocol`-injected) can observe/no-op the requests they issue —
     /// in particular the reconnect-path probes inside `recoverActiveSession()`
-    /// (`capabilities.probe`, `autoUpgradeToDeviceTokenIfNeeded`), which are
+    /// (`capabilities.probe`, `autoUpgradeToDeviceTokenIfNeeded`) and the
+    /// auto-upgrade `issueDevice` round-trip, which are
     /// otherwise routed through an internal `.ephemeral` session that no
     /// `URLProtocol` can intercept, and which leak real network calls to a
     /// dead loopback gateway on a CI runner with no server (STR-1481). Mirrors
@@ -482,6 +547,7 @@ final class ConnectionStore {
 
     /// The token for the active connection (kept in memory; also in Keychain).
     private var currentToken: String?
+    private var readinessWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// Servers where `POST /devices/issue` hit the device registry cap during
     /// this app run. A 409 is permanent until a device is revoked, so automatic
@@ -507,6 +573,15 @@ final class ConnectionStore {
     /// DEBUG-only test seam for deterministic auto-upgrade tests. Production
     /// builds always call `RestClient.issueDevice(name:)` directly.
     var issueDeviceRPC: (@Sendable (_ rest: RestClient, _ name: String) async throws -> IssuedDevice)?
+
+    /// DEBUG-only test seam for the STR-1568 `auth_required` gate inside
+    /// `autoUpgradeToDeviceTokenIfNeeded`. When non-nil, replaces the live
+    /// `RestClient.status()` call. Deliberately separate from
+    /// `_restOverrideForTesting`: single-flight/retry tests need `rest` to
+    /// keep reflecting `currentToken` live (they assert the post-swap token
+    /// through it), which a fixed `_restOverrideForTesting` client would
+    /// freeze.
+    var autoUpgradeStatusRPC: (@Sendable (_ rest: RestClient) async throws -> ServerStatus)?
     #endif
 
     #if DEBUG
@@ -514,6 +589,11 @@ final class ConnectionStore {
     /// `RestClient.status()` call so unit tests can exercise verified configure
     /// persistence without a gateway.
     var statusRPC: ((_ url: URL, _ token: String) async throws -> Void)?
+
+    /// Injectable push-tap readiness result (tests). When non-nil, replaces the
+    /// live phase/transport wait so notification routing tests can deterministically
+    /// model cold-ready and cold-offline launches without sleeping for the timeout.
+    var sessionRefreshReadinessOverride: (() async -> Bool)?
 
     /// Injectable auth-revoke probe (tests). When non-nil, replaces the live
     /// `probeIsAuthRevoked` REST call with this closure's return value so unit
@@ -648,6 +728,12 @@ final class ConnectionStore {
     /// `.needsSetup` → `WelcomeView`. (ABH-82 follow-up.)
     private(set) var isBootstrapping = false
 
+    #if DEBUG
+    /// Test-only switch for exercising persisted-config bootstrap while the
+    /// build wrapper injects the DEV environment override for live tests.
+    var _skipEnvironmentBootstrapForTesting = false
+    #endif
+
     /// True when this install has a SAVED connection configuration — a previously-
     /// paired user. Read by `RootView` so the CACHE-FIRST shell (WhatsApp bar)
     /// renders for a paired user in `.offline`/`.connecting`/`.reconnecting` even
@@ -691,7 +777,8 @@ final class ConnectionStore {
         // SIMCTL_CHILD_/TEST_RUNNER_). DEBUG-gated so a production binary can
         // never be silently re-pointed via injected env vars (release audit).
         let env = ProcessInfo.processInfo.environment
-        if let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+        if !_skipEnvironmentBootstrapForTesting,
+           let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
            !url.isEmpty, !token.isEmpty {
             // A saved/dev-env config: this is a RETURNING user. Flag the launch
             // window so the shell shows the splash rather than `WelcomeView` even
@@ -711,14 +798,24 @@ final class ConnectionStore {
         #endif
 
         let savedURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
-        if let savedURL, !savedURL.isEmpty,
-           let token = KeychainService.loadToken(server: savedURL) {
+        if let savedURL, !savedURL.isEmpty {
             isBootstrapping = true
             // CACHE-FIRST (WhatsApp bar): paint the drawer from disk BEFORE the
             // REST probe — this is the fix for the empty-drawer / Welcome-on-
             // offline cold start. The probe's early-return offline path no longer
             // strands an empty drawer because the cache read already ran here.
             await paintCacheFirst(serverURLString: savedURL)
+
+            guard let token = KeychainService.loadToken(server: savedURL) else {
+                // A cached URL still identifies a returning user even when the
+                // token is unavailable on this install. Keep the cached shell
+                // visible; a fresh install has no saved URL and still reaches
+                // onboarding, while a failed manual/QR configure persists neither.
+                phase = .offline("Saved pairing token unavailable")
+                isBootstrapping = false
+                return
+            }
+
             _ = await configure(urlString: savedURL, token: token)
             isBootstrapping = false
             return
@@ -1540,7 +1637,16 @@ final class ConnectionStore {
     ///     never issue);
     ///   - no `device_id` already recorded for this server (already upgraded, or a
     ///     v2 QR handed us a device token — don't re-issue);
-    ///   - we are still configured against `serverURL` with a live token.
+    ///   - we are still configured against `serverURL` with a live token;
+    ///   - the server's live `GET /api/status` reports `auth_required == true`
+    ///     (STR-1568). A loopback/insecure dev-gateway runs `auth_required ==
+    ///     false`; there, the legacy shared-token-only `auth_middleware` is the
+    ///     ONLY active gate on `/api/*` — it has no device-token branch (that
+    ///     lives in `gated_auth_middleware`, which never engages on loopback) —
+    ///     so a device-upgraded phone would 401 on every request, app-wide, with
+    ///     no way back to the shared token short of a re-pair. Fail-safe on a
+    ///     missing/unreachable status (`nil`): keep the shared token, which the
+    ///     loopback gate always accepts.
     ///
     /// FAILURE IS SILENT (binding) for transient/status failures: if `issueDevice`
     /// throws (500 persist failure, 401, transport), the app KEEPS the shared
@@ -1568,6 +1674,22 @@ final class ConnectionStore {
         guard !deviceIssueLimitReachedServers.contains(serverURL) else { return }
         // Must still be the active configuration with a live token + REST client.
         guard serverURLString == serverURL, let rest else { return }
+
+        // STR-1568: only issue a device token when the server's own auth gate
+        // would actually accept one — see the gating note above. `try?` folds a
+        // transport/decode failure into the same fail-safe as `nil`: keep the
+        // shared token, retry on the next connect.
+        let status: ServerStatus?
+        #if DEBUG
+        if let autoUpgradeStatusRPC {
+            status = try? await autoUpgradeStatusRPC(rest)
+        } else {
+            status = try? await rest.status()
+        }
+        #else
+        status = try? await rest.status()
+        #endif
+        guard let status, status.authRequired == true else { return }
 
         let issueTask: Task<IssuedDevice, Error>
         if let inFlight = autoUpgradeIssueTasks[serverURL] {

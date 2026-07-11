@@ -129,7 +129,8 @@ struct HermesMobileApp: App {
                         HermesURLRouter.routePushTap(
                             tap,
                             sessions: environment.sessionStore,
-                            inbox: environment.inboxStore
+                            inbox: environment.inboxStore,
+                            connection: environment.connectionStore
                         )
                     }
                     // Wire the notification-action backend (A2): APPROVE / DENY on

@@ -5679,6 +5679,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await asyncio.sleep(0.1)
         timed_out = bool(self._running_agents) or bool(self._active_cron_job_count())
         _maybe_update_status(force=True)
+        # Refresh the real-agent snapshot before returning.  A pending-
+        # sentinel or adapter-active turn can promote to a concrete AIAgent
+        # during the drain loop's awaits; ``_interrupt_running_agents()``
+        # sees it (iterates ``_running_agents`` directly) but the returned
+        # snapshot is what ``_finalize_shutdown_agents()`` and restart-
+        # failure counting use.  Returning the entry-time snapshot would
+        # skip finalization (transcript flush + resource cleanup) for a
+        # late-promoted real agent that was interrupted but never finalized,
+        # and would under-count it for stuck-loop detection.
+        snapshot = self._snapshot_running_agents()
         return snapshot, timed_out
 
     def _interrupt_running_agents(self, reason: str) -> None:

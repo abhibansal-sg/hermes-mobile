@@ -1994,7 +1994,15 @@ def _save_cfg(cfg: dict):
 
     from hermes_cli.config import atomic_config_write
 
-    path = _hermes_home / "config.yaml"
+    # Resolve the SAME effective config path as _load_cfg so a profile-scoped
+    # override (str or Path) writes the selected profile's config.yaml, not the
+    # launch profile's. Otherwise a profile handler that loads profile config
+    # and then persists a change would write it into the launch profile
+    # (STR-995/STR-991 profile-scoped config-write isolation). The cfg written
+    # and cached here is the raw user config — managed overlay stays read-side.
+    override = get_hermes_home_override()
+    home = Path(override) if override else _hermes_home
+    path = home / "config.yaml"
     atomic_config_write(path, cfg)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)

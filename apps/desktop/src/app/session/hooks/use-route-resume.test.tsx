@@ -259,6 +259,126 @@ describe('useRouteResume', () => {
     expect(resumeSession).toHaveBeenCalledTimes(1)
     expect(resumeSession).toHaveBeenCalledWith('session-1', true)
   })
+
+  // STR-1061: a restarted gateway surfaces as "error" (not just "closed")
+  // during the outage. The reconnect-resume must fire on the error→open edge
+  // too, not only on closed→open.
+  it('resumes the selected route again when the gateway reconnects via error state', () => {
+    const resumeSession = vi.fn(async () => undefined)
+    const startFreshSessionDraft = vi.fn()
+    const activeSessionIdRef: MutableRefObject<null | string> = { current: 'runtime-1' }
+    const creatingSessionRef = { current: false }
+    const runtimeIdByStoredSessionIdRef = { current: new Map([['session-1', 'runtime-1']]) }
+    const selectedStoredSessionIdRef: MutableRefObject<null | string> = { current: 'session-1' }
+
+    const { rerender } = render(
+      <RouteResumeHarness
+        activeSessionId="runtime-1"
+        activeSessionIdRef={activeSessionIdRef}
+        creatingSessionRef={creatingSessionRef}
+        currentView="chat"
+        freshDraftReady={false}
+        gatewayState="open"
+        locationPathname="/session-1"
+        resumeSession={resumeSession}
+        routedSessionId="session-1"
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        selectedStoredSessionId="session-1"
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        startFreshSessionDraft={startFreshSessionDraft}
+      />
+    )
+
+    expect(resumeSession).not.toHaveBeenCalled()
+
+    rerender(
+      <RouteResumeHarness
+        activeSessionId="runtime-1"
+        activeSessionIdRef={activeSessionIdRef}
+        creatingSessionRef={creatingSessionRef}
+        currentView="chat"
+        freshDraftReady={false}
+        gatewayState="error"
+        locationPathname="/session-1"
+        resumeSession={resumeSession}
+        routedSessionId="session-1"
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        selectedStoredSessionId="session-1"
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        startFreshSessionDraft={startFreshSessionDraft}
+      />
+    )
+
+    expect(resumeSession).not.toHaveBeenCalled()
+
+    rerender(
+      <RouteResumeHarness
+        activeSessionId="runtime-1"
+        activeSessionIdRef={activeSessionIdRef}
+        creatingSessionRef={creatingSessionRef}
+        currentView="chat"
+        freshDraftReady={false}
+        gatewayState="open"
+        locationPathname="/session-1"
+        resumeSession={resumeSession}
+        routedSessionId="session-1"
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        selectedStoredSessionId="session-1"
+        selectedStoredSessionIdRef={selectedStoredSessionIdRef}
+        startFreshSessionDraft={startFreshSessionDraft}
+      />
+    )
+
+    expect(resumeSession).toHaveBeenCalledTimes(1)
+    expect(resumeSession).toHaveBeenCalledWith('session-1', true)
+  })
+
+  // STR-1061: model a real gateway restart. The gateway was gone for minutes
+  // (open → error), then returned (error → open). Despite the cached runtime
+  // id still claiming session-1 is active on runtime-1, the reconnect edge must
+  // fire resumeSession exactly once. Multiple non-open→open transitions must
+  // each fire exactly once per edge — no dedup gaps, no double-fires.
+  it('fires resumeSession exactly once per reconnect edge across multiple gateway flaps', () => {
+    const resumeSession = vi.fn(async () => undefined)
+    const startFreshSessionDraft = vi.fn()
+    const activeSessionIdRef: MutableRefObject<null | string> = { current: 'runtime-1' }
+    const creatingSessionRef = { current: false }
+    const runtimeIdByStoredSessionIdRef = { current: new Map([['session-1', 'runtime-1']]) }
+    const selectedStoredSessionIdRef: MutableRefObject<null | string> = { current: 'session-1' }
+
+    const baseProps = {
+      activeSessionId: 'runtime-1',
+      activeSessionIdRef,
+      creatingSessionRef,
+      currentView: 'chat',
+      freshDraftReady: false,
+      locationPathname: '/session-1',
+      resumeSession,
+      routedSessionId: 'session-1',
+      runtimeIdByStoredSessionIdRef,
+      selectedStoredSessionId: 'session-1',
+      selectedStoredSessionIdRef,
+      startFreshSessionDraft
+    }
+
+    const { rerender } = render(<RouteResumeHarness {...baseProps} gatewayState="open" />)
+
+    expect(resumeSession).not.toHaveBeenCalled()
+
+    // Flap 1: open → error → open
+    rerender(<RouteResumeHarness {...baseProps} gatewayState="error" />)
+    rerender(<RouteResumeHarness {...baseProps} gatewayState="open" />)
+    expect(resumeSession).toHaveBeenCalledTimes(1)
+
+    // Flap 2: open → closed → open
+    rerender(<RouteResumeHarness {...baseProps} gatewayState="closed" />)
+    rerender(<RouteResumeHarness {...baseProps} gatewayState="open" />)
+    expect(resumeSession).toHaveBeenCalledTimes(2)
+
+    // Staying open does NOT re-fire (no edge).
+    rerender(<RouteResumeHarness {...baseProps} gatewayState="open" />)
+    expect(resumeSession).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe('useRouteResume bounded auto-retry after a failed resume', () => {

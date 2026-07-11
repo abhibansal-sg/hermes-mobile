@@ -998,8 +998,10 @@ struct DrawerView: View {
     @ViewBuilder
     private var recentSection: some View {
         Group {
+            let profileGroups = sessions.drawerProfileGroups()
             let groups = sessions.drawerSourceGroups()
-            let hasSourceRows = groups.contains { !$0.sessions.isEmpty }
+            let hasSourceRows = profileGroups.contains { !$0.sessions.isEmpty }
+                || groups.contains { !$0.sessions.isEmpty }
             if sessions.isLoading && !didCompleteFirstLoad && sessions.drawerPinnedSessions.isEmpty && !hasSourceRows {
                 ForEach(groups) { group in
                     Section {
@@ -1009,11 +1011,21 @@ struct DrawerView: View {
                     }
                 }
             } else {
-                ForEach(groups) { group in
-                    Section {
-                        sourceGroupRows(group)
-                    } header: {
-                        sourceGroupHeader(group)
+                if !profileGroups.isEmpty {
+                    ForEach(profileGroups) { profileGroup in
+                        Section {
+                            profileGroupRows(profileGroup)
+                        } header: {
+                            profileGroupHeader(profileGroup)
+                        }
+                    }
+                } else {
+                    ForEach(groups) { group in
+                        Section {
+                            sourceGroupRows(group)
+                        } header: {
+                            sourceGroupHeader(group)
+                        }
                     }
                 }
                 // Infinite scroll sentinel / loading row (UX1), after all static
@@ -1051,6 +1063,87 @@ struct DrawerView: View {
             group: group,
             action: group.kind == .chats ? AnyView(recentsFilterMenu) : nil
         )
+    }
+
+    private func profileGroupHeader(_ group: SessionStore.DrawerProfileGroup) -> some View {
+        DrawerProfileGroupHeader(
+            group: group,
+            isCollapsed: sessions.isProfileGroupCollapsed(group.profile),
+            action: group.profile == "default" ? AnyView(recentsFilterMenu) : nil
+        ) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                sessions.toggleCollapsed(profile: group.profile)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func profileGroupRows(_ group: SessionStore.DrawerProfileGroup) -> some View {
+        let isCollapsed = sessions.isProfileGroupCollapsed(group.profile)
+        if isCollapsed {
+            // STR-1022 few-recent preview: the top N newest rows across the WHOLE
+            // profile group (flattened newest-first, NOT split per source sub-group
+            // or workspace fold), then an expand affordance. `group.sessions` is
+            // already newest-first (sortedByActivity in drawerProfileGroups).
+            let previewCount = SessionStore.drawerCollapsedProfilePreviewCount
+            ForEach(group.sessions.prefix(previewCount)) { summary in
+                sessionRow(summary, pinned: false)
+                    .onAppear { maybePrefetchMore(rowId: summary.id) }
+            }
+            if group.sessions.count > previewCount {
+                profileGroupExpandRow(group, hiddenCount: group.sessions.count - previewCount)
+            }
+        } else {
+            // Expanded: full source-group (chats/telegram) + optional workspace
+            // folding — unchanged from STR-996.
+            ForEach(group.sourceGroups.filter { !$0.sessions.isEmpty }) { sourceGroup in
+                profileSourceGroupRows(sourceGroup)
+            }
+        }
+    }
+
+    /// STR-1022: the "show N more" affordance at the tail of a COLLAPSED profile
+    /// group's few-recent preview. Tapping expands the whole group (same toggle as
+    /// the group header). Hidden only when the preview already shows every row.
+    private func profileGroupExpandRow(
+        _ group: SessionStore.DrawerProfileGroup,
+        hiddenCount: Int
+    ) -> some View {
+        plainRow {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    sessions.toggleCollapsed(profile: group.profile)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(theme.mutedFg.opacity(0.7))
+                    Text("Show \(hiddenCount) more")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(theme.mutedFg)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .accessibilityLabel("Show \(hiddenCount) more in \(group.label)")
+        .accessibilityHint("Double-tap to expand")
+    }
+
+    @ViewBuilder
+    private func profileSourceGroupRows(_ group: SessionStore.DrawerSourceGroup) -> some View {
+        if group.kind == .chats && sessions.groupByWorkspace {
+            groupedSourceRows(group)
+        } else {
+            ForEach(group.sessions) { summary in
+                sessionRow(summary, pinned: false)
+                    .onAppear { maybePrefetchMore(rowId: summary.id) }
+            }
+        }
     }
 
     @ViewBuilder
@@ -1934,6 +2027,60 @@ private struct DrawerSourceGroupHeader: View {
     }
 }
 
+// MARK: - Profile group header
+
+/// Top-level All Profiles drawer section header. It owns the profile-first
+/// hierarchy; source/workspace grouping continues inside each expanded section.
+private struct DrawerProfileGroupHeader: View {
+    @Environment(\.hermesTheme) private var theme
+
+    let group: SessionStore.DrawerProfileGroup
+    let isCollapsed: Bool
+    var action: AnyView? = nil
+    var onToggle: () -> Void
+
+    var body: some View {
+        Button {
+            onToggle()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "person.crop.circle")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg)
+                    .frame(width: 14)
+                Text(group.label.uppercased())
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg)
+                    .lineLimit(1)
+                Text("\(group.count)")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg.opacity(0.82))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(theme.muted.opacity(0.7), in: Capsule())
+                Spacer(minLength: 0)
+                action
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg.opacity(0.55))
+                    .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                    .animation(.easeInOut(duration: 0.2), value: isCollapsed)
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 8)
+            .padding(.bottom, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .textCase(nil)
+        .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+        .accessibilityLabel("\(group.label), \(group.count) items\(isCollapsed ? ", collapsed" : "")")
+        .accessibilityHint(isCollapsed ? "Double-tap to expand" : "Double-tap to collapse")
+    }
+}
+
 // MARK: - Section header
 
 /// A drawer section header, used as the `header:` of a system `Section`. The
@@ -2243,6 +2390,13 @@ struct ProjectDetailView: View {
         .navigationTitle(project.label)
         .navigationBarTitleDisplayMode(.inline)
         .hermesThemed(themeStore)
+        .task(id: project.id) {
+            // ABH-407: server-scoped fetch (`cwd_prefix=project.root`), not a
+            // client-side scan of the global Recents list. `.task(id:)` re-fires
+            // if the pushed project changes identity within the same navigation
+            // stack slot.
+            await projectsStore.refreshSessions(for: project)
+        }
     }
 
     // MARK: - New session in this project
@@ -2291,15 +2445,22 @@ struct ProjectDetailView: View {
 
     @ViewBuilder
     private var sessionsSection: some View {
-        let projectSessions = projectsStore.sessions(for: project, in: sessions)
+        // ABH-407: server-scoped list (`cwd_prefix=project.root`), fetched by
+        // the `.task(id:)` in `body`. Not derived from the global `sessions`
+        // (SessionStore) Recents list.
+        let projectSessions = projectsStore.sessions(for: project)
+        let isLoadingSessions = projectsStore.isLoadingSessions(for: project)
+        let sessionsError = projectsStore.sessionsError(for: project)
 
         Section {
-            if sessions.isLoading && projectSessions.isEmpty {
+            if isLoadingSessions && projectSessions.isEmpty {
                 // Loading state: the session list hasn't arrived yet. Skeleton
                 // rows match the drawer's cold-load pattern.
                 ForEach(0..<3, id: \.self) { _ in
                     sessionSkeletonRow
                 }
+            } else if let sessionsError, projectSessions.isEmpty {
+                projectSessionsErrorRow(sessionsError)
             } else if projectSessions.isEmpty {
                 // Designed empty state: no sessions yet. Helpful, not blank.
                 emptyStateRow
@@ -2345,7 +2506,7 @@ struct ProjectDetailView: View {
         .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
     }
 
-    // MARK: - Skeleton + empty states
+    // MARK: - Skeleton + empty + error states
 
     private var sessionSkeletonRow: some View {
         HStack(spacing: 10) {
@@ -2390,6 +2551,39 @@ struct ProjectDetailView: View {
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
         .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+    }
+
+    private func projectSessionsErrorRow(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(theme.destructive)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Couldn’t load sessions")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(theme.fg)
+                Text(message)
+                    .font(.caption2)
+                    .foregroundStyle(theme.mutedFg)
+                    .lineLimit(3)
+                Button("Retry") {
+                    Task { await projectsStore.refreshSessions(for: project) }
+                }
+                .buttonStyle(.plain)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(theme.midground)
+                .accessibilityIdentifier("projectSessionsRetryButton")
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 10)
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
+        .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("projectSessionsErrorRow")
     }
 
     // MARK: - Actions

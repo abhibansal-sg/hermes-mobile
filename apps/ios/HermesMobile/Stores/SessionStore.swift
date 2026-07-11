@@ -8,6 +8,59 @@ import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-
 private let sessionLog = Logger(subsystem: "ai.hermes.HermesMobile", category: "SessionStore")
 #endif
 
+/// Pure prompt-history navigation matching desktop's per-session cursor +
+/// draft-snapshot semantics. History is derived on demand from live messages;
+/// this type never stores or persists the history entries themselves.
+enum ComposerPromptHistory {
+    struct State: Equatable {
+        var cursorIndex: Int?
+        var draftSnapshot: String = ""
+    }
+
+    static func deriveUserHistory(from messages: [ChatMessage]) -> [String] {
+        messages.reversed().compactMap { message in
+            guard message.role == .user else { return nil }
+            let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.isEmpty ? nil : text
+        }
+    }
+
+    static func browseBackward(
+        history: [String],
+        currentDraft: String,
+        state: inout State
+    ) -> String? {
+        guard !history.isEmpty else { return nil }
+
+        let nextIndex: Int
+        if let cursor = state.cursorIndex {
+            guard cursor + 1 < history.count else { return nil }
+            nextIndex = cursor + 1
+        } else {
+            state.draftSnapshot = currentDraft
+            nextIndex = 0
+        }
+
+        state.cursorIndex = nextIndex
+        return history[nextIndex]
+    }
+
+    static func browseForward(history: [String], state: inout State) -> String? {
+        guard let cursor = state.cursorIndex else { return nil }
+
+        if cursor > 0 {
+            let nextIndex = cursor - 1
+            guard nextIndex < history.count else { return nil }
+            state.cursorIndex = nextIndex
+            return history[nextIndex]
+        }
+
+        let snapshot = state.draftSnapshot
+        state = State()
+        return snapshot
+    }
+}
+
 /// Observable owner of the session list and the active-session pointers.
 ///
 /// Talks to the gateway via `ConnectionStore.client` and seeds the transcript
@@ -177,6 +230,16 @@ final class SessionStore {
     /// of relying on a remount. Empty / whitespace-only drafts are removed instead
     /// of persisted as noise.
     private var composerDrafts: [String: String] = [:]
+
+    /// Bumped whenever a composer draft is mutated outside the focused field's
+    /// direct binding. ComposerView observes this to pull externally-recalled
+    /// prompt-history text into its local @State.
+    private(set) var composerDraftRevision = 0
+
+    /// Runtime-only prompt-history browse state keyed by the same draft identity
+    /// as ``composerDrafts``. This intentionally stores only cursor + original
+    /// draft snapshot, never a persisted prompt ring.
+    private var composerHistoryBrowses: [String: ComposerPromptHistory.State] = [:]
     /// The summary for the active session, if it's present in the loaded list.
     /// Used by app-side glue (e.g. the Live Activity title); `nil` for a session
     /// not yet in `sessions` (a brand-new create the list hasn't refreshed onto).
@@ -209,6 +272,59 @@ final class SessionStore {
         } else {
             composerDrafts[key] = draft
         }
+        composerDraftRevision &+= 1
+    }
+
+    /// Clear prompt-history cursor/snapshot state without changing the user's
+    /// saved draft. Passing a key resets one composer; nil resets all runtime
+    /// browse state for session switches and new chat.
+    func resetComposerHistoryBrowse(for key: String? = nil) {
+        if let key {
+            composerHistoryBrowses.removeValue(forKey: key)
+        } else {
+            composerHistoryBrowses.removeAll()
+        }
+    }
+
+    /// Browse backward through the active session's user prompt history.
+    @discardableResult
+    func recallPreviousComposerPrompt(messages: [ChatMessage]) -> Bool {
+        let key = activeComposerDraftKey
+        let history = ComposerPromptHistory.deriveUserHistory(from: messages)
+        var state = composerHistoryBrowses[key] ?? ComposerPromptHistory.State()
+        guard let recalled = ComposerPromptHistory.browseBackward(
+            history: history,
+            currentDraft: composerDraft(for: key),
+            state: &state
+        ) else {
+            return false
+        }
+
+        composerHistoryBrowses[key] = state
+        setComposerDraft(recalled, for: key)
+        return true
+    }
+
+    /// Browse forward toward the present composer draft snapshot.
+    @discardableResult
+    func recallNextComposerPrompt(messages: [ChatMessage]) -> Bool {
+        let key = activeComposerDraftKey
+        let history = ComposerPromptHistory.deriveUserHistory(from: messages)
+        var state = composerHistoryBrowses[key] ?? ComposerPromptHistory.State()
+        guard let recalled = ComposerPromptHistory.browseForward(
+            history: history,
+            state: &state
+        ) else {
+            return false
+        }
+
+        if state.cursorIndex == nil {
+            composerHistoryBrowses.removeValue(forKey: key)
+        } else {
+            composerHistoryBrowses[key] = state
+        }
+        setComposerDraft(recalled, for: key)
+        return true
     }
     /// True while a list/open/create RPC is in flight.
     #if DEBUG
@@ -433,6 +549,96 @@ final class SessionStore {
         )
     }
 
+    /// Profile names whose All Profiles drawer groups are collapsed. Kept
+    /// separate from workspace collapse state so `work` as a profile name cannot
+    /// collide with `/.../work` as a workspace key.
+    ///
+    /// STR-1022: this now holds ONLY the user's EXPLICIT collapse decisions. The
+    /// effective state is derived in ``isProfileGroupCollapsed(_:)`` by overlaying
+    /// this set (and ``expandedProfiles``) on the default rule "collapse every
+    /// group except the default/active profile" — so a fresh view opens with every
+    /// non-default group collapsed (desktop parity) WITHOUT a one-shot seed, a
+    /// profile discovered later still defaults to collapsed, and the user's
+    /// expand/collapse choices survive restarts (persisted).
+    private(set) var collapsedProfiles: Set<String> = []
+
+    /// Profile names the user has explicitly EXPANDED beyond the collapsed-by-
+    /// default rule, so a non-default group they opened does not snap back to
+    /// collapsed on the next render/restart. Persisted alongside
+    /// ``collapsedProfiles``. See ``isProfileGroupCollapsed(_:)``.
+    private(set) var expandedProfiles: Set<String> = []
+
+    /// How many most-recent rows a COLLAPSED All Profiles group previews before
+    /// its "show more" expand affordance (STR-1022 desktop parity: collapsed-by-
+    /// default + few-recent preview). The desktop web app has no equivalent — iOS
+    /// already went further in STR-996 by grouping at all — so this is the
+    /// mobile-chosen "few": compact enough that several collapsed groups fit the
+    /// drawer, enough to preview recent activity. Tunable.
+    static let drawerCollapsedProfilePreviewCount = 3
+
+    /// Effective collapsed state for an All Profiles group. Derives from the
+    /// default rule (collapse every group EXCEPT the default/active profile)
+    /// overlaid with the user's explicit decisions, so the view never needs to
+    /// know whether a profile was seeded vs toggled.
+    func isProfileGroupCollapsed(_ profile: String) -> Bool {
+        Self.isProfileGroupCollapsed(
+            profile,
+            collapsed: collapsedProfiles,
+            expanded: expandedProfiles,
+            profileMap: profileSummaryMap
+        )
+    }
+
+    /// Pure collapse-state derivation (testable without an instance). Default
+    /// rule: a group is collapsed unless it is the default profile. Explicit
+    /// decisions win over the default.
+    nonisolated static func isProfileGroupCollapsed(
+        _ profile: String,
+        collapsed: Set<String>,
+        expanded: Set<String>,
+        profileMap: [String: ProfileSummary]
+    ) -> Bool {
+        if expanded.contains(profile) { return false }
+        if collapsed.contains(profile) { return true }
+        return !isDefaultDrawerProfile(profile, profileMap: profileMap)
+    }
+
+    private var profileSummaryMap: [String: ProfileSummary] {
+        Dictionary(uniqueKeysWithValues: profiles.map { ($0.name, $0) })
+    }
+
+    /// Toggle the collapsed state of a profile group. Records the EXPLICIT
+    /// decision in ``collapsedProfiles`` / ``expandedProfiles`` so the default
+    /// rule cannot undo it: expanding a default-collapsed group writes an
+    /// explicit-expand, and collapsing the default group writes an explicit-
+    /// collapse. Idempotent and independent of ``resetInitialFill()`` (the
+    /// STR-991 teardown path never touches collapse state).
+    func toggleCollapsed(profile: String) {
+        if isProfileGroupCollapsed(profile) {
+            collapsedProfiles.remove(profile)
+            expandedProfiles.insert(profile)
+        } else {
+            expandedProfiles.remove(profile)
+            collapsedProfiles.insert(profile)
+        }
+        persistCollapsedProfiles()
+        persistExpandedProfiles()
+    }
+
+    private func persistCollapsedProfiles() {
+        UserDefaults.standard.set(
+            Array(collapsedProfiles),
+            forKey: DefaultsKeys.collapsedProfiles
+        )
+    }
+
+    private func persistExpandedProfiles() {
+        UserDefaults.standard.set(
+            Array(expandedProfiles),
+            forKey: DefaultsKeys.expandedProfiles
+        )
+    }
+
     // MARK: - Multi-profile scope (F4b — DORMANT unless capability available)
 
     /// The active multi-profile SCOPE driving the rail (F4b). The sentinel
@@ -466,6 +672,16 @@ final class SessionStore {
     /// never satisfied on a stock gateway. Reset to empty when the capability is
     /// not available (a disconnect / stock reconnect).
     private(set) var profiles: [ProfileSummary] = []
+
+    #if DEBUG
+    /// DEBUG-only: set the profile list without a network `loadProfiles()`
+    /// call, so UITestSeed can populate the multi-profile drawer offline.
+    /// Pairs with `ServerCapabilities._seedProfilesCapabilityForTesting`.
+    /// Never compiled into Release.
+    func _seedProfilesForTesting(_ seeded: [ProfileSummary]) {
+        profiles = seeded
+    }
+    #endif
 
     /// Whether the multi-profile switcher should render: the server supports the
     /// endpoints AND there is more than one profile (the desktop's
@@ -749,6 +965,15 @@ final class SessionStore {
         // desktop's default "All profiles" view. Inert until the switcher is shown.
         activeProfile = defaults.string(forKey: DefaultsKeys.activeProfile)
             ?? DefaultsKeys.allProfilesScope
+        // STR-1022: profile-group collapse decisions are derived (see
+        // ``isProfileGroupCollapsed(_:)``); these two sets hold only the user's
+        // explicit overrides and are persisted so choices survive restarts.
+        if let collapsed = defaults.array(forKey: DefaultsKeys.collapsedProfiles) as? [String] {
+            collapsedProfiles = Set(collapsed)
+        }
+        if let expanded = defaults.array(forKey: DefaultsKeys.expandedProfiles) as? [String] {
+            expandedProfiles = Set(expanded)
+        }
     }
 
     /// Wire up the store graph. Called exactly once by `AppEnvironment`.
@@ -1001,12 +1226,95 @@ final class SessionStore {
     /// to render designed per-group empty states.
     func drawerSourceGroups() -> [DrawerSourceGroup] {
         let unpinned = drawerSourceCandidateSessions.filter { !pinnedIds.contains($0.id) }
-        return DrawerSourceKind.allCases.map { kind in
+        return Self.drawerSourceGroups(from: unpinned)
+    }
+
+    nonisolated static func drawerSourceGroups(from rows: [SessionSummary]) -> [DrawerSourceGroup] {
+        DrawerSourceKind.allCases.map { kind in
             DrawerSourceGroup(
                 kind: kind,
-                sessions: unpinned.filter { Self.drawerSourceKind(for: $0) == kind }
+                sessions: rows.filter { Self.drawerSourceKind(for: $0) == kind }
             )
         }
+    }
+
+    /// One owning-profile group for the All Profiles drawer. Rows remain full
+    /// `SessionSummary` values so row actions keep threading `summary.profile`.
+    struct DrawerProfileGroup: Identifiable, Equatable, Sendable {
+        let profile: String
+        let label: String
+        let sessions: [SessionSummary]
+
+        var id: String { profile }
+        var count: Int { sessions.count }
+        var sourceGroups: [DrawerSourceGroup] {
+            SessionStore.drawerSourceGroups(from: sessions)
+        }
+    }
+
+    /// All Profiles drawer groups: default profile first, then named profiles in
+    /// localized alphabetical order. Pinned rows stay in the global Pinned section
+    /// exactly as before; this groups the remaining drawer rows by their owner.
+    func drawerProfileGroups() -> [DrawerProfileGroup] {
+        guard isMultiProfileAvailable && isAllProfilesScope else { return [] }
+        let unpinned = drawerSourceCandidateSessions.filter { !pinnedIds.contains($0.id) }
+        return Self.drawerProfileGroups(rows: unpinned, profiles: profiles)
+    }
+
+    nonisolated static func drawerProfileGroups(
+        rows: [SessionSummary],
+        profiles: [ProfileSummary]
+    ) -> [DrawerProfileGroup] {
+        var order: [String] = []
+        var buckets: [String: [SessionSummary]] = [:]
+
+        for row in rows {
+            let profile = normalizedDrawerProfile(row.profile)
+            if buckets[profile] == nil {
+                buckets[profile] = []
+                order.append(profile)
+            }
+            buckets[profile]?.append(row)
+        }
+
+        let profileMap = Dictionary(uniqueKeysWithValues: profiles.map { ($0.name, $0) })
+        let sorted = order.sorted { lhs, rhs in
+            let lhsDefault = isDefaultDrawerProfile(lhs, profileMap: profileMap)
+            let rhsDefault = isDefaultDrawerProfile(rhs, profileMap: profileMap)
+            if lhsDefault != rhsDefault { return lhsDefault }
+            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+        }
+
+        return sorted.compactMap { profile in
+            guard let sessions = buckets[profile], !sessions.isEmpty else { return nil }
+            return DrawerProfileGroup(
+                profile: profile,
+                label: labelForProfile(profile, profileMap: profileMap),
+                sessions: sessions
+            )
+        }
+    }
+
+    private nonisolated static func normalizedDrawerProfile(_ raw: String?) -> String {
+        let trimmed = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "default" : trimmed
+    }
+
+    private nonisolated static func isDefaultDrawerProfile(
+        _ profile: String,
+        profileMap: [String: ProfileSummary]
+    ) -> Bool {
+        profile == "default" || profileMap[profile]?.isDefault == true
+    }
+
+    private nonisolated static func labelForProfile(
+        _ profile: String,
+        profileMap: [String: ProfileSummary]
+    ) -> String {
+        guard let summary = profileMap[profile], summary.isDefault else {
+            return profile
+        }
+        return "\(profile) (default)"
     }
 
     /// Rows eligible for the ABH-345 drawer source groups, after profile scope and
@@ -1020,17 +1328,17 @@ final class SessionStore {
         return Self.sortedByActivity(scoped)
     }
 
-    private static func drawerSourceKind(for row: SessionSummary) -> DrawerSourceKind? {
+    private nonisolated static func drawerSourceKind(for row: SessionSummary) -> DrawerSourceKind? {
         if isTelegramSource(row.source), isHumanRecentsSession(row) { return .telegram }
         if isHumanRecentsSession(row) { return .chats }
         return nil
     }
 
-    private static func isTelegramSource(_ source: String?) -> Bool {
+    private nonisolated static func isTelegramSource(_ source: String?) -> Bool {
         (source ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "telegram"
     }
 
-    private static func sortedByActivity(_ rows: [SessionSummary]) -> [SessionSummary] {
+    private nonisolated static func sortedByActivity(_ rows: [SessionSummary]) -> [SessionSummary] {
         var sorted = rows
         sorted.sort { lhs, rhs in
             let l = lhs.lastActive ?? lhs.startedAt ?? -.greatestFiniteMagnitude
@@ -2160,6 +2468,7 @@ final class SessionStore {
             pendingMessageJumpSnippet = nil
             pendingSearchScroll = nil
             pendingSearchScrollIsSnippet = false
+            resetComposerHistoryBrowse()
         }
 
         // Activate instantly — the chat view can present right away with a loading
@@ -2319,6 +2628,7 @@ final class SessionStore {
         isDraft = true
         activeRuntimeId = nil
         activeStoredId = nil
+        resetComposerHistoryBrowse()
         chat?.reset()
         chat?.seed(from: [])  // empty IS the (draft) transcript
         // A draft has NO session: drop the previous session's hot-swap state
@@ -3678,6 +3988,27 @@ final class ProjectsStore {
     /// successful fetch.
     private(set) var loadError: String?
 
+    // MARK: - Per-project sessions (ABH-407)
+
+    /// Server-scoped session lists for Project detail, keyed by ``Project/id``.
+    /// Populated by ``refreshSessions(for:)`` via `GET /api/sessions?cwd_prefix=…`
+    /// — independent of ``SessionStore/sessions`` (the global drawer Recents list)
+    /// so a project fetch can never corrupt Recents or the active session state.
+    private(set) var projectSessionsById: [String: [SessionSummary]] = [:]
+
+    /// Project ids with a fetch currently in flight (drives the detail loading state).
+    private(set) var projectSessionsLoadingIds: Set<String> = []
+
+    /// A human-readable error per project id from its last failed fetch, or absent.
+    /// Cleared on the next successful fetch for that project.
+    private(set) var projectSessionsErrorById: [String: String] = [:]
+
+    /// Testing seam: when set, ``refreshSessions(for:)`` calls this instead of
+    /// hitting the network via `connection?.rest` — mirrors
+    /// ``SessionStore/sessionsFetch``. Lets tests prove the store renders
+    /// exactly the (stubbed) server-scoped response without a live gateway.
+    var sessionsFetch: ((Project) async throws -> (sessions: [SessionSummary], total: Int?))?
+
     // MARK: - Back-reference (injected by AppEnvironment)
 
     /// The connection store, for REST access. `nil` until
@@ -3732,12 +4063,68 @@ final class ProjectsStore {
         }
     }
 
+    /// Fetch a project's sessions from the server with `cwd_prefix=project.root`
+    /// (ABH-407) and update ``projectSessionsById`` / ``projectSessionsLoadingIds``
+    /// / ``projectSessionsErrorById`` for that project's id. This is the primary
+    /// Project detail data source — it does NOT touch ``SessionStore/sessions``
+    /// (the global drawer Recents list) or the active session state.
+    ///
+    /// Safe to call repeatedly (detail-view appear, pull-to-refresh). Never
+    /// throws — failures land in ``projectSessionsErrorById`` and leave the last
+    /// successful list for this project intact so the UI doesn't flicker on a
+    /// transient network blip.
+    func refreshSessions(for project: Project) async {
+        let fetch: () async throws -> (sessions: [SessionSummary], total: Int?)
+        if let sessionsFetch {
+            fetch = { try await sessionsFetch(project) }
+        } else {
+            guard let rest = connection?.rest else {
+                projectSessionsErrorById[project.id] = "Not connected"
+                return
+            }
+            fetch = { try await rest.sessionsWithTotal(cwdPrefix: project.root) }
+        }
+        projectSessionsLoadingIds.insert(project.id)
+        defer { projectSessionsLoadingIds.remove(project.id) }
+        do {
+            let result = try await fetch()
+            projectSessionsById[project.id] = result.sessions
+            projectSessionsErrorById[project.id] = nil
+        } catch {
+            if projectSessionsById[project.id] == nil {
+                projectSessionsErrorById[project.id] = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+            }
+        }
+    }
+
+    /// The server-scoped session list for `project`, or `[]` if it hasn't
+    /// loaded yet (a designed loading/empty state in the detail view, not a
+    /// silent zero). Populated by ``refreshSessions(for:)``.
+    func sessions(for project: Project) -> [SessionSummary] {
+        projectSessionsById[project.id] ?? []
+    }
+
+    /// `true` while a ``refreshSessions(for:)`` fetch is in flight for `project`.
+    func isLoadingSessions(for project: Project) -> Bool {
+        projectSessionsLoadingIds.contains(project.id)
+    }
+
+    /// The last fetch error for `project`, or `nil`. Cleared on the next
+    /// successful ``refreshSessions(for:)`` call.
+    func sessionsError(for project: Project) -> String? {
+        projectSessionsErrorById[project.id]
+    }
+
     // MARK: - Derived queries
 
-    /// The sessions belonging to a project: those whose `cwd` resolves to the
+    /// Client-side fallback/test utility: the sessions belonging to a project
+    /// filtered from an already-loaded ``SessionStore`` by matching `cwd` to the
     /// project's `root` (exact match on the trimmed path, case-insensitive,
-    /// trailing-slash-insensitive). Read from ``SessionStore/sessions`` so the
-    /// project detail list stays live as sessions arrive / refresh.
+    /// trailing-slash-insensitive). ABH-407 moved Project detail's primary data
+    /// source to the server-side ``sessions(for:)`` / ``refreshSessions(for:)``
+    /// pair above (`cwd_prefix` query) — this method is kept for tests and as a
+    /// fallback utility, not as the detail view's data source.
     ///
     /// Returns `[]` when the session list hasn't loaded yet (a designed
     /// loading/empty state in the detail view, not a silent zero).
