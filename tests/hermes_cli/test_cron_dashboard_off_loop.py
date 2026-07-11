@@ -81,7 +81,12 @@ def test_blueprint_instantiate_create_job_off_loop(monkeypatch, loop_probe):
     assert resp.status_code == 200
     body = resp.json()
     # **spec kwargs must arrive at create_job intact through the partial.
-    assert body["kwargs_seen"] == ["name", "prompt", "schedule"]
+    assert body["kwargs_seen"] == [
+        "name",
+        "notify_provider_on_success",
+        "prompt",
+        "schedule",
+    ]
     assert ("call", False) in seen, (
         f"_call_cron_for_profile must run off the event loop; proof: {seen}"
     )
