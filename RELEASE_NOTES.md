@@ -125,6 +125,7 @@ WORTH TRYING
 Build 95 — 2026-07-08
 
 FIXED
+- Keep a newer WebSocket connection open when an older connect attempt fails (STR-958)
 - Stabilize size-class survival UI test
 - STR-272 repark refused ask prompt
 
@@ -132,6 +133,7 @@ IMPROVED
 - Add STR-1021 provider key survival harness
 
 WORTH TRYING
+- Try: Reconnect while an earlier connection attempt is still waiting for gateway readiness (STR-958)
 - Try: Stabilize size-class survival UI test
 - Try: STR-272 repark refused ask prompt
 
