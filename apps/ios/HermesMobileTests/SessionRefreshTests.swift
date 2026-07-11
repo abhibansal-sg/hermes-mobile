@@ -18,6 +18,8 @@ import XCTest
 ///    rapidly (via the `sessionsFetch` seam) results in one refresh, not N.
 /// 6. **Total decoded and exposed** — `totalSessions` is populated from the fetch
 ///    result; `nil` total preserves the previously-known value.
+/// 7. **Plugin cursor deltas** — empty, changed-row, tombstone, and request-shape
+///    behavior preserve the loaded working set and compatibility fallbacks.
 @MainActor
 final class SessionRefreshTests: XCTestCase {
 
@@ -311,6 +313,263 @@ final class SessionRefreshTests: XCTestCase {
         XCTAssertTrue(store.sessions.map(\.id).contains("activeSession"),
             "Hard-replace is no longer acceptable — active session must survive the merge")
     }
+
+    // MARK: - STR-1208 plugin cursor deltas
+
+    func testEmptyCursorDeltaLeavesExistingWindowAndOrderUntouched() async {
+        let store = makeStore()
+        let a = makeSummary(id: "A", lastActive: 100)
+        let b = makeSummary(id: "B", lastActive: 200)
+        var seenCursors: [String?] = []
+
+        // The seed intentionally keeps a backing order that differs from recency.
+        // An empty delta must not sort or replace that loaded window.
+        store.sessionListDeltaFetch = { cursor, _ in
+            seenCursors.append(cursor)
+            if cursor == nil {
+                return SessionListDeltaResult(
+                    sessions: [a, b], tombstones: [], cursor: "c1", total: 500
+                )
+            }
+            return SessionListDeltaResult(
+                sessions: [], tombstones: [], cursor: "c2", total: 500
+            )
+        }
+        // Terminate the detached fill deterministically without changing rows.
+        store.initialFillFetch = { _ in ([], 500) }
+
+        await store.refresh()
+        await store.awaitInitialFillForTesting()
+        XCTAssertEqual(store.sessions.map(\.id), ["A", "B"])
+
+        store.setPaginationForTesting(loadedCount: 250, loadedOffset: 250, total: 500)
+        let before = store.sessions
+        await store.refresh()
+
+        XCTAssertEqual(seenCursors, [nil, "c1"])
+        XCTAssertEqual(store.sessions, before,
+            "an up-to-date empty delta must not rebuild, sort, or clear the current list")
+        XCTAssertEqual(store.loadedCount, 250,
+            "delta heartbeats must preserve the grow-limit pagination window")
+        XCTAssertEqual(store.loadedOffset, 250,
+            "delta heartbeats must not reset the pagination offset")
+        XCTAssertEqual(store.totalSessions, 500)
+    }
+
+    func testChangedCursorDeltaMergesAndResortsByLastActive() async {
+        let store = makeStore()
+        let a = makeSummary(id: "A", lastActive: 100)
+        let b = makeSummary(id: "B", lastActive: 50)
+        store.sessionListDeltaFetch = { cursor, _ in
+            if cursor == nil {
+                return SessionListDeltaResult(
+                    sessions: [a, b], tombstones: [], cursor: "seed", total: 2
+                )
+            }
+            return SessionListDeltaResult(
+                sessions: [self.makeSummary(id: "B", lastActive: 400)],
+                tombstones: [],
+                cursor: "next",
+                total: 2
+            )
+        }
+
+        await store.refresh()
+        await store.refresh()
+
+        XCTAssertEqual(store.sessions.map(\.id), ["B", "A"])
+        XCTAssertEqual(store.sessions.first?.lastActive, 400)
+    }
+
+    func testCursorDeltaTombstonesDropOnlyNonWorkingSetRows() async {
+        let store = makeStore()
+        let old = makeSummary(id: "old", lastActive: 10)
+        let active = makeSummary(id: "active", lastActive: 20)
+        let pinned = makeSummary(id: "pinned", lastActive: 30)
+        let live = makeSummary(id: "live", lastActive: 40)
+        store.activeStoredId = "active"
+        store.togglePin(pinned)
+
+        store.sessionListDeltaFetch = { cursor, _ in
+            switch cursor {
+            case nil:
+                return SessionListDeltaResult(
+                    sessions: [live, pinned, active, old],
+                    tombstones: [],
+                    cursor: "seed",
+                    total: 4
+                )
+            case "seed":
+                return SessionListDeltaResult(
+                    sessions: [],
+                    tombstones: [old, active, pinned, live].map {
+                        SessionListTombstone(id: $0.id)
+                    },
+                    cursor: "tombstoned",
+                    total: 0
+                )
+            default:
+                return SessionListDeltaResult(
+                    sessions: [], tombstones: [], cursor: "settled", total: 0
+                )
+            }
+        }
+
+        await store.refresh()
+        store.noteActivity(storedId: "live")
+        await store.refresh()
+
+        var ids = Set(store.sessions.map(\.id))
+        XCTAssertFalse(ids.contains("old"),
+            "a tombstoned non-working-set row must be removed")
+        XCTAssertTrue(ids.contains("active"),
+            "active rows survive tombstones until the active working set changes")
+        XCTAssertTrue(ids.contains("pinned"),
+            "pinned rows survive tombstones")
+        XCTAssertTrue(ids.contains("live"),
+            "recent live rows survive tombstones")
+
+        // The server advances past a tombstone once. Deferred removals must be
+        // re-evaluated after local protection ends rather than persisting forever.
+        store.activeStoredId = nil
+        store.togglePin(pinned)
+        await store.refresh()
+        ids = Set(store.sessions.map(\.id))
+        XCTAssertFalse(ids.contains("active"))
+        XCTAssertFalse(ids.contains("pinned"))
+        XCTAssertTrue(ids.contains("live"),
+            "a still-live row remains protected while deferred tombstones settle")
+    }
+
+    func testProfileScopeChangeRequiresCursorlessSeed() async {
+        let store = makeStore()
+        let row = makeSummary(id: "row", lastActive: 1)
+        var seenCursors: [String?] = []
+        store.sessionListDeltaFetch = { cursor, _ in
+            seenCursors.append(cursor)
+            return SessionListDeltaResult(
+                sessions: cursor == nil ? [row] : [],
+                tombstones: [],
+                cursor: cursor == nil ? "seed" : "next",
+                total: 1
+            )
+        }
+
+        await store.refresh()
+        await store.refresh()
+        store.activeProfile = "work"
+        await store.refresh()
+
+        XCTAssertEqual(seenCursors, [nil, "seed", nil],
+            "a cursor from one profile rail must never suppress another rail's seed")
+    }
+
+    func testPluginSessionListDeltaQueryUsesCursorOnlyAfterSeed() async throws {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SessionListDeltaQueryProtocol.self]
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+        let rest = RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "test-token",
+            session: session,
+            pathStyle: .plugin
+        )
+
+        let seedResult = await rest.sessionListDelta(
+            limit: 125,
+            minMessages: 1,
+            excludeSource: SessionStore.recentsExcludeSources
+        )
+        let seed = try XCTUnwrap(seedResult)
+        XCTAssertEqual(seed.cursor, "seed+cursor")
+
+        let nextResult = await rest.sessionListDelta(
+            limit: 125,
+            minMessages: 1,
+            excludeSource: SessionStore.recentsExcludeSources,
+            updatedSince: seed.cursor
+        )
+        let next = try XCTUnwrap(nextResult)
+        XCTAssertEqual(next.cursor, "next")
+
+        let malformed = await rest.sessionListDelta(
+            limit: 125,
+            minMessages: 1,
+            excludeSource: SessionStore.recentsExcludeSources,
+            updatedSince: "malformed"
+        )
+        XCTAssertNil(malformed,
+            "a malformed delta must return nil so SessionStore uses the full REST list")
+
+        let legacy = RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "test-token",
+            session: session,
+            pathStyle: .legacy
+        )
+        let legacyResult = await legacy.sessionListDelta(
+            limit: 125,
+            minMessages: 1,
+            excludeSource: SessionStore.recentsExcludeSources,
+            updatedSince: seed.cursor
+        )
+        XCTAssertNil(legacyResult,
+            "legacy pathStyle must not call the plugin session-list endpoint")
+    }
+}
+
+/// Stateless transport proof for the plugin session-list request contract.
+/// Every unexpected request receives a valid-but-distinct delta, so assertions
+/// fail if the client sends the wrong path/filter/cursor or performs legacy I/O.
+private final class SessionListDeltaQueryProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let queryItems = Dictionary(uniqueKeysWithValues: components.queryItems?.compactMap { item in
+            item.value.map { (item.name, $0) }
+        } ?? [])
+        let filtersMatch = url.path == "/api/plugins/hermes-mobile/sessions"
+            && queryItems["limit"] == "125"
+            && queryItems["order"] == "recent"
+            && queryItems["archived"] == "exclude"
+            && queryItems["min_messages"] == "1"
+            && queryItems["exclude_sources"] == "cron,subagent"
+            && queryItems["source"] == nil
+
+        let body: String
+        switch queryItems["updated_since"] {
+        case nil where filtersMatch:
+            body = #"{"sessions":[],"tombstones":[],"cursor":"seed+cursor","total":0}"#
+        case "seed+cursor" where filtersMatch
+                && components.percentEncodedQuery?.contains(
+                    "updated_since=seed%2Bcursor"
+                ) == true:
+            body = #"{"sessions":[],"tombstones":[],"cursor":"next","total":0}"#
+        case "malformed" where filtersMatch:
+            body = #"{"sessions":[42],"tombstones":[],"cursor":"bad","total":0}"#
+        default:
+            body = #"{"sessions":[],"tombstones":[],"cursor":"unexpected","total":0}"#
+        }
+
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 // MARK: - ABH-178: explicit turnInProgress carry-forward gate
