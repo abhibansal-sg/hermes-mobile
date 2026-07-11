@@ -1,0 +1,225 @@
+
+> hermes-tui@0.0.1 test
+> vitest run
+
+
+[1m[30m[46m RUN [49m[39m[22m [36mv4.1.9 [39m[90m/Users/abbhinnav/Developer/products/hermes-mobile/ui-tui[39m
+
+ [32m✓[39m src/__tests__/theme.test.ts [2m([22m[2m29 tests[22m[2m)[22m[32m 60[2mms[22m[39m
+ [32m✓[39m src/__tests__/mathUnicode.test.ts [2m([22m[2m50 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/__tests__/platform.test.ts [2m([22m[2m46 tests[22m[2m)[22m[32m 40[2mms[22m[39m
+ [32m✓[39m src/__tests__/clipboard.test.ts [2m([22m[2m19 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m src/__tests__/subagentTree.test.ts [2m([22m[2m35 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/__tests__/terminalSetup.test.ts [2m([22m[2m20 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m src/lib/openExternalUrl.test.ts [2m([22m[2m20 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/__tests__/billingCommand.test.ts [2m([22m[2m14 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/termio/osc.test.ts [2m([22m[2m31 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m src/__tests__/text.test.ts [2m([22m[2m29 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+ [32m✓[39m src/__tests__/useConfigSync.test.ts [2m([22m[2m34 tests[22m[2m)[22m[32m 9[2mms[22m[39m
+ [32m✓[39m src/__tests__/textInputFastEcho.test.ts [2m([22m[2m33 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m src/__tests__/appChromeStatusRule.test.tsx [2m([22m[2m18 tests[22m[2m)[22m[32m 8[2mms[22m[39m
+ [32m✓[39m src/__tests__/activeSessionSwitcher.test.ts [2m([22m[2m16 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/__tests__/markdown.test.ts [2m([22m[2m28 tests[22m[2m)[22m[32m 67[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/termio/tokenize.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/log-update.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/__tests__/forceTruecolor.test.ts [2m([22m[2m10 tests[22m[2m)[22m[32m 62[2mms[22m[39m
+ [32m✓[39m src/__tests__/textInputWrap.test.ts [2m([22m[2m19 tests[22m[2m)[22m[32m 38[2mms[22m[39m
+ [32m✓[39m src/__tests__/gatewayClient.test.ts [2m([22m[2m13 tests[22m[2m)[22m[33m 373[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/parse-keypress.test.ts [2m([22m[2m14 tests[22m[2m)[22m[32m 7[2mms[22m[39m
+ [32m✓[39m src/__tests__/createGatewayEventHandler.test.ts [2m([22m[2m77 tests[22m[2m)[22m[32m 289[2mms[22m[39m
+ [32m✓[39m src/__tests__/externalLink.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 37[2mms[22m[39m
+ [32m✓[39m src/__tests__/blockLayout.test.ts [2m([22m[2m14 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/creditsCommand.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/__tests__/details.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/streamingMarkdown.test.ts [2m([22m[2m14 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/app-mouse.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/lib/liveProgress.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/submissionCore.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/__tests__/virtualHistoryOffsetCache.test.ts [2m([22m[2m6 tests[22m[2m)[22m[33m 558[2mms[22m[39m
+ [31m❯[39m src/__tests__/statusRule.test.ts [2m([22m[2m12 tests[22m[2m | [22m[31m2 failed[39m[2m)[22m[32m 7[2mms[22m[39m
+     [32m✓[39m keeps the status rule within the terminal width[32m 1[2mms[22m[39m
+     [32m✓[39m truncates the cwd segment before it can wrap in skinny terminals[32m 0[2mms[22m[39m
+     [32m✓[39m omits the cwd segment when there is no room for it[32m 0[2mms[22m[39m
+     [32m✓[39m budgets the cwd segment by display width, not utf-16 length[32m 0[2mms[22m[39m
+     [32m✓[39m reserves the high-priority left content so the cwd/branch yields first[32m 0[2mms[22m[39m
+     [32m✓[39m drops the cwd entirely when the essential left content needs the whole row[32m 0[2mms[22m[39m
+     [32m✓[39m keeps the default (no reservation) behaviour identical for legacy callers[32m 0[2mms[22m[39m
+[31m     [31m×[31m shows every segment on a wide terminal[39m[32m 3[2mms[22m[39m
+[31m     [31m×[31m collapses the context bar to a token count on narrow terminals[39m[32m 1[2mms[22m[39m
+     [32m✓[39m sheds tail segments in priority order as the terminal narrows[32m 0[2mms[22m[39m
+     [32m✓[39m reserves a bare spinner for the verb-less unicode style[32m 0[2mms[22m[39m
+     [32m✓[39m reserves room for the elapsed-time tail only when a turn is timed[32m 0[2mms[22m[39m
+[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1049l[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1049l[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1049l[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1049l[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1049l[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0; [32m✓[39m packages/hermes-ink/src/ink/ink-resize.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 18[2mms[22m[39m
+ [32m✓[39m src/lib/fuzzy.test.ts [2m([22m[2m15 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0;[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0; [32m✓[39m packages/hermes-ink/src/ink/ink-backpressure.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 21[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/ink-cursor-advance.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 21[2mms[22m[39m
+ [32m✓[39m src/__tests__/memoryMonitor.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 18[2mms[22m[39m
+ [31m❯[39m src/__tests__/virtualHeights.test.ts [2m([22m[2m10 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[32m 8[2mms[22m[39m
+     [32m✓[39m uses stable content keys across resumed message objects[32m 1[2mms[22m[39m
+     [32m✓[39m accounts for wrapping and preserved blank-block rhythm[32m 0[2mms[22m[39m
+[31m     [31m×[31m uses compound user prompt width when estimating user message wrapping[39m[32m 4[2mms[22m[39m
+     [32m✓[39m adds one row for a group-boundary lead gap[32m 0[2mms[22m[39m
+     [32m✓[39m includes detail sections when visible[32m 0[2mms[22m[39m
+     [32m✓[39m accounts for the response separator when assistant details are visible[32m 0[2mms[22m[39m
+     [32m✓[39m does not account for a response separator without visible details[32m 0[2mms[22m[39m
+     [32m✓[39m honors per-section visibility when estimating response separators[32m 0[2mms[22m[39m
+     [32m✓[39m reserves two extra rows for the inter-turn separator on non-first user messages[32m 0[2mms[22m[39m
+     [32m✓[39m caps wrapped-line counting so giant assistant turns do not block offset rebuilds[32m 2[2mms[22m[39m
+
+  dist/entry.js  3.3mb ⚠️
+
+⚡ Done in 127ms
+ [32m✓[39m src/__tests__/useInputHandlers.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/paths.test.ts [2m([22m[2m17 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m src/lib/memory.test.ts [2m([22m[2m7 tests[22m[2m)[22m[33m 668[2mms[22m[39m
+     [33m[2m✓[22m[39m accepts truthy spellings (true|yes|on, case-insensitive) as opt-in [33m 327[2mms[22m[39m
+ [32m✓[39m src/__tests__/bundleNoAsyncEsmDeadlock.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 230[2mms[22m[39m
+ [32m✓[39m src/__tests__/useSessionLifecycle.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/__tests__/wheelAccel.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/scroll.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/app-stdin-recovery.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/selection.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/reasoning.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/Users/abbhinnav/Developer/products/hermes-mobile/hermes_cli/commands.py", line 23, in <module>
+    from utils import is_truthy_value
+  File "/Users/abbhinnav/Developer/products/hermes-mobile/utils.py", line 14, in <module>
+    import yaml
+ModuleNotFoundError: No module named 'yaml'
+ [32m✓[39m src/__tests__/slashParity.test.ts [2m([22m[2m4 tests[22m[2m | [22m[33m3 skipped[39m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/brandingMcpCount.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 99[2mms[22m[39m
+ [32m✓[39m src/__tests__/approvalAction.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/terminalModes.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/parentLog.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 11[2mms[22m[39m
+ [32m✓[39m src/__tests__/emoji.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/utils/execFileNoThrow.test.ts [2m([22m[2m5 tests[22m[2m | [22m[33m1 skipped[39m[2m)[22m[33m 973[2mms[22m[39m
+     [33m[2m✓[22m[39m settles immediately on 'exit' when resolveOnExit is true, regardless of daemon stdio [33m 374[2mms[22m[39m
+     [33m[2m✓[22m[39m still surfaces the right code when resolveOnExit'd child exits non-zero [33m 342[2mms[22m[39m
+ [32m✓[39m src/__tests__/createSlashHandler.test.ts [2m([22m[2m67 tests[22m[2m)[22m[33m 973[2mms[22m[39m
+ [32m✓[39m src/__tests__/textInputCursorSourceOfTruth.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/__tests__/messages.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 15[2mms[22m[39m
+ [32m✓[39m src/__tests__/terminalParity.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/lib/resizeCoalescer.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/__tests__/viewportStore.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/events/cmd-shortcuts.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 17[2mms[22m[39m
+ [32m✓[39m src/__tests__/completionApply.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+[?1049l[?1006l[?1003l[?1002l[?1000l[>4m[<u[?1004l[?2004l[?25h]9;4;0; [32m✓[39m src/__tests__/textInputPassThrough.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/app-rawmode-mouse.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 34[2mms[22m[39m
+ [32m✓[39m src/__tests__/viewport.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/colorize.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/__tests__/osc52.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/useComposerState.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/appChromeStatusRuleDevCredits.test.tsx [2m([22m[2m1 test[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/lib/editor.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/__tests__/turnStore.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/__tests__/gatewayRecovery.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/providers.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/lib/text.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 5[2mms[22m[39m
+ [32m✓[39m src/__tests__/turnControllerNotice.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/constants.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/syntax.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/asCommandDispatch.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/components/Text.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/precisionWheel.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/termuxComposerLayout.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m src/__tests__/modelPicker.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/useVirtualHistoryHeights.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/textInputLineNav.test.ts [2m([22m[2m10 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/textInputRightClick.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/__tests__/orchestratorPromptSession.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/spawnHistoryStore.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 4[2mms[22m[39m
+ [32m✓[39m src/__tests__/stateIsolation.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/hit-test.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/__tests__/prompt.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/textInputBurstInput.test.ts [2m([22m[2m5 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/useCompletion.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/termux.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/lib/messages.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/petPane.test.tsx [2m([22m[2m2 tests[22m[2m)[22m[32m 17[2mms[22m[39m
+ [32m✓[39m src/__tests__/rpc.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/virtualHistoryClamp.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 3[2mms[22m[39m
+ [32m✓[39m src/lib/todo.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/terminal.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/journeyCommand.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/gracefulExit.test.ts [2m([22m[2m1 test[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/useQueue.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m packages/hermes-ink/src/ink/wrap-text.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/messageLine.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/statusBarTicker.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 2[2mms[22m[39m
+ [32m✓[39m src/__tests__/cursorDriftRegression.test.ts [2m([22m[2m4 tests[22m[2m)[22m[33m 2394[2mms[22m[39m
+     [33m[2m✓[22m[39m agrees with wrap-ansi at every typing-prefix of the user-reported message [33m 2392[2mms[22m[39m
+
+[31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 3 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+
+[41m[1m FAIL [22m[49m src/__tests__/statusRule.test.ts[2m > [22mstatusBarSegments[2m > [22mshows every segment on a wide terminal
+[31m[1mAssertionError[22m: expected { compactCtx: false, bar: true, …(5) } to deeply equal { compactCtx: false, bar: true, …(6) }[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[2m  {[22m
+[2m    "bar": true,[22m
+[2m    "bg": true,[22m
+[2m    "compactCtx": false,[22m
+[2m    "compressions": true,[22m
+[32m-   "cost": true,[39m
+[2m    "duration": true,[22m
+[2m    "subagents": true,[22m
+[2m    "voice": true,[22m
+[2m  }[22m
+
+[36m [2m❯[22m src/__tests__/statusRule.test.ts:[2m64:15[22m[39m
+    [90m 62|[39m     [35mconst[39m s [33m=[39m [34mstatusBarSegments[39m([34m120[39m)
+    [90m 63|[39m
+    [90m 64|[39m     [34mexpect[39m(s)[33m.[39m[34mtoEqual[39m({
+    [90m   |[39m               [31m^[39m
+    [90m 65|[39m       compactCtx[33m:[39m [35mfalse[39m[33m,[39m
+    [90m 66|[39m       bar[33m:[39m [35mtrue[39m[33m,[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/__tests__/statusRule.test.ts[2m > [22mstatusBarSegments[2m > [22mcollapses the context bar to a token count on narrow terminals
+[31m[1mAssertionError[22m: expected undefined to be false // Object.is equality[39m
+
+[32m- Expected:[39m
+false
+
+[31m+ Received:[39m
+undefined
+
+[36m [2m❯[22m src/__tests__/statusRule.test.ts:[2m82:20[22m[39m
+    [90m 80|[39m     [34mexpect[39m(s[33m.[39mbar)[33m.[39m[34mtoBe[39m([35mfalse[39m)
+    [90m 81|[39m     [34mexpect[39m(s[33m.[39mduration)[33m.[39m[34mtoBe[39m([35mfalse[39m)
+    [90m 82|[39m     [34mexpect[39m(s[33m.[39mcost)[33m.[39m[34mtoBe[39m([35mfalse[39m)
+    [90m   |[39m                    [31m^[39m
+    [90m 83|[39m   })
+    [90m 84|[39m
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯[22m[39m
+
+[41m[1m FAIL [22m[49m src/__tests__/virtualHeights.test.ts[2m > [22mvirtual height estimates[2m > [22muses compound user prompt width when estimating user message wrapping
+[31m[1mAssertionError[22m: expected 4 to be 3 // Object.is equality[39m
+
+[32m- Expected[39m
+[31m+ Received[39m
+
+[32m- 3[39m
+[31m+ 4[39m
+
+[36m [2m❯[22m src/__tests__/virtualHeights.test.ts:[2m23:94[22m[39m
+    [90m 21|[39m     [35mconst[39m msg[33m:[39m [33mMsg[39m [33m=[39m { role[33m:[39m [32m'user'[39m[33m,[39m text[33m:[39m [32m'x'[39m[33m.[39m[34mrepeat[39m([34m21[39m) }
+    [90m 22|[39m
+    [90m 23|[39m     expect(estimatedMsgHeight(msg, 26, { compact: false, details: fals…
+    [90m   |[39m                                                                                              [31m^[39m
+    [90m 24|[39m     expect(estimatedMsgHeight(msg, 26, { compact: false, details: fals…
+    [90m 25|[39m   })
+
+[31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯[22m[39m
+
+
+[2m Test Files [22m [1m[31m2 failed[39m[22m[2m | [22m[1m[32m105 passed[39m[22m[90m (107)[39m
+[2m      Tests [22m [1m[31m3 failed[39m[22m[2m | [22m[1m[32m1108 passed[39m[22m[2m | [22m[33m4 skipped[39m[90m (1115)[39m
+[2m   Start at [22m 06:43:06
+[2m   Duration [22m 3.32s[2m (transform 5.87s, setup 0ms, import 13.47s, tests 7.34s, environment 5ms)[22m
+
