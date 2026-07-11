@@ -204,7 +204,7 @@ final class ConnectionStore {
     /// Apply the typed `info` echoed by `session.create`/`session.resume` to
     /// the live session state. THIS is what keeps the composer pill session-
     /// true on every switch: the gateway sends the session's actual
-    /// model/provider/reasoning/fast on resume, but the app previously used
+    /// model/provider/reasoning/fast/yolo on resume, but the app previously used
     /// it only for profile confirmation — so the pill kept showing the LAST
     /// session's hot-swap (or the global default) until the picker was opened
     /// (build-27 QA).
@@ -221,6 +221,9 @@ final class ConnectionStore {
         }
         if let fast = info.fast {
             sessionFast = fast
+        }
+        if let yolo = info.yolo {
+            sessionYolo = yolo
         }
     }
 

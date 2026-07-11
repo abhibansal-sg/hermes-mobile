@@ -92,6 +92,8 @@ struct ComposerView: View {
     @State private var showModelPicker = false
     /// True while the composer YOLO / flow-state toggle RPC is in flight.
     @State private var yoloTogglePending = false
+    /// Transient status/error shown when the flow-state toggle is unavailable or fails.
+    @State private var yoloStatusNote: String?
 
     /// True once a hold-to-talk long-press has fired and a capture is live. Drives
     /// the press visuals and tells the drag handler whether a slide-away should
@@ -118,6 +120,17 @@ struct ComposerView: View {
     ) {
         sessions.setComposerDraft(text, for: oldKey)
         text = sessions.composerDraft(for: newKey)
+    }
+
+    static func yoloUnavailableReason(isConnected: Bool, activeRuntimeId: String?) -> String? {
+        guard isConnected else {
+            return "Connect to a gateway before changing flow-state approvals."
+        }
+        guard let activeRuntimeId,
+              !activeRuntimeId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "Send or open a live chat before changing flow-state approvals."
+        }
+        return nil
     }
 
     /// True while the recorder is capturing or transcribing — the input row is
@@ -204,6 +217,14 @@ struct ComposerView: View {
                     .transition(.opacity)
                     .accessibilityIdentifier("steerNote")
             }
+            if let yoloStatusNote {
+                Text(yoloStatusNote)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(theme.destructive)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.opacity)
+                    .accessibilityIdentifier("composerYoloStatus")
+            }
             if attachmentStore.hasPending {
                 attachmentStrip
             }
@@ -240,6 +261,7 @@ struct ComposerView: View {
         .animation(.easeInOut(duration: 0.18), value: voice.isEnabled)
         .animation(.easeInOut(duration: 0.18), value: queueStore.items.count)
         .animation(.easeInOut(duration: 0.18), value: steerNote)
+        .animation(.easeInOut(duration: 0.18), value: yoloStatusNote)
         .animation(.snappy(duration: 0.16), value: holdActive)
         // ABH-84: Session hot-swap picker — a half-height sheet (drag up to full,
         // like the Inbox) anchored to the composer chip. Sends config.set with
@@ -779,16 +801,11 @@ struct ComposerView: View {
                 .contentTransition(.symbolEffect(.replace))
         }
         .buttonStyle(.plain)
-        .disabled(!canToggleSessionYolo)
+        .disabled(yoloTogglePending)
         .accessibilityIdentifier("composerYoloToggle")
         .accessibilityLabel(connection.sessionYolo ? "Turn off flow-state approvals bypass" : "Turn on flow-state approvals bypass")
-        .accessibilityValue(connection.sessionYolo ? "On" : "Off")
-    }
-
-    private var canToggleSessionYolo: Bool {
-        guard isConnected, !yoloTogglePending else { return false }
-        guard let sid = sessions.activeRuntimeId, !sid.isEmpty else { return false }
-        return true
+        .accessibilityValue(yoloAccessibilityValue)
+        .accessibilityHint(yoloAccessibilityHint)
     }
 
     /// Entry point for hands-free conversation mode (STR-344 / STR-533): starts
@@ -823,6 +840,23 @@ struct ComposerView: View {
                 showMicDeniedAlert = true
             }
         }
+    }
+    private var yoloAccessibilityValue: String {
+        if yoloTogglePending { return "Updating" }
+        if Self.yoloUnavailableReason(isConnected: isConnected, activeRuntimeId: sessions.activeRuntimeId) != nil {
+            return "Unavailable"
+        }
+        return connection.sessionYolo ? "On" : "Off"
+    }
+
+    private var yoloAccessibilityHint: String {
+        if yoloTogglePending {
+            return "Flow-state approval setting is updating."
+        }
+        if let reason = Self.yoloUnavailableReason(isConnected: isConnected, activeRuntimeId: sessions.activeRuntimeId) {
+            return reason
+        }
+        return "Toggles approval bypass for this chat session only."
     }
 
     /// The single docked action glyph. SF Symbol `.replace` morphs between mic and
@@ -1109,16 +1143,29 @@ struct ComposerView: View {
     }
 
     private func toggleSessionYolo() {
-        guard let sid = sessions.activeRuntimeId, !sid.isEmpty else { return }
+        if let reason = Self.yoloUnavailableReason(isConnected: isConnected, activeRuntimeId: sessions.activeRuntimeId) {
+            showYoloStatusNote(reason)
+            return
+        }
+        guard let sid = sessions.activeRuntimeId else { return }
         let next = !connection.sessionYolo
         yoloTogglePending = true
         Task {
             defer { yoloTogglePending = false }
             do {
                 try await connection.sessionSetYolo(next, sessionId: sid)
+                yoloStatusNote = nil
             } catch {
-                showSteerNote("Couldn't toggle flow-state")
+                showYoloStatusNote("Couldn't change flow-state approvals. Try again.")
             }
+        }
+    }
+
+    private func showYoloStatusNote(_ note: String) {
+        yoloStatusNote = note
+        Task {
+            try? await Task.sleep(for: .seconds(3))
+            if yoloStatusNote == note { yoloStatusNote = nil }
         }
     }
 
