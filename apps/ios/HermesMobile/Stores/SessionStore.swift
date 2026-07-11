@@ -433,6 +433,20 @@ final class SessionStore {
         )
     }
 
+    /// Profile names whose All Profiles drawer groups are collapsed. Kept
+    /// separate from workspace collapse state so `work` as a profile name cannot
+    /// collide with `/.../work` as a workspace key.
+    private(set) var collapsedProfiles: Set<String> = []
+
+    /// Toggle the collapsed state of a profile group.
+    func toggleCollapsed(profile: String) {
+        if collapsedProfiles.contains(profile) {
+            collapsedProfiles.remove(profile)
+        } else {
+            collapsedProfiles.insert(profile)
+        }
+    }
+
     // MARK: - Multi-profile scope (F4b — DORMANT unless capability available)
 
     /// The active multi-profile SCOPE driving the rail (F4b). The sentinel
@@ -1001,12 +1015,95 @@ final class SessionStore {
     /// to render designed per-group empty states.
     func drawerSourceGroups() -> [DrawerSourceGroup] {
         let unpinned = drawerSourceCandidateSessions.filter { !pinnedIds.contains($0.id) }
-        return DrawerSourceKind.allCases.map { kind in
+        return Self.drawerSourceGroups(from: unpinned)
+    }
+
+    nonisolated static func drawerSourceGroups(from rows: [SessionSummary]) -> [DrawerSourceGroup] {
+        DrawerSourceKind.allCases.map { kind in
             DrawerSourceGroup(
                 kind: kind,
-                sessions: unpinned.filter { Self.drawerSourceKind(for: $0) == kind }
+                sessions: rows.filter { Self.drawerSourceKind(for: $0) == kind }
             )
         }
+    }
+
+    /// One owning-profile group for the All Profiles drawer. Rows remain full
+    /// `SessionSummary` values so row actions keep threading `summary.profile`.
+    struct DrawerProfileGroup: Identifiable, Equatable, Sendable {
+        let profile: String
+        let label: String
+        let sessions: [SessionSummary]
+
+        var id: String { profile }
+        var count: Int { sessions.count }
+        var sourceGroups: [DrawerSourceGroup] {
+            SessionStore.drawerSourceGroups(from: sessions)
+        }
+    }
+
+    /// All Profiles drawer groups: default profile first, then named profiles in
+    /// localized alphabetical order. Pinned rows stay in the global Pinned section
+    /// exactly as before; this groups the remaining drawer rows by their owner.
+    func drawerProfileGroups() -> [DrawerProfileGroup] {
+        guard isMultiProfileAvailable && isAllProfilesScope else { return [] }
+        let unpinned = drawerSourceCandidateSessions.filter { !pinnedIds.contains($0.id) }
+        return Self.drawerProfileGroups(rows: unpinned, profiles: profiles)
+    }
+
+    nonisolated static func drawerProfileGroups(
+        rows: [SessionSummary],
+        profiles: [ProfileSummary]
+    ) -> [DrawerProfileGroup] {
+        var order: [String] = []
+        var buckets: [String: [SessionSummary]] = [:]
+
+        for row in rows {
+            let profile = normalizedDrawerProfile(row.profile)
+            if buckets[profile] == nil {
+                buckets[profile] = []
+                order.append(profile)
+            }
+            buckets[profile]?.append(row)
+        }
+
+        let profileMap = Dictionary(uniqueKeysWithValues: profiles.map { ($0.name, $0) })
+        let sorted = order.sorted { lhs, rhs in
+            let lhsDefault = isDefaultDrawerProfile(lhs, profileMap: profileMap)
+            let rhsDefault = isDefaultDrawerProfile(rhs, profileMap: profileMap)
+            if lhsDefault != rhsDefault { return lhsDefault }
+            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+        }
+
+        return sorted.compactMap { profile in
+            guard let sessions = buckets[profile], !sessions.isEmpty else { return nil }
+            return DrawerProfileGroup(
+                profile: profile,
+                label: labelForProfile(profile, profileMap: profileMap),
+                sessions: sessions
+            )
+        }
+    }
+
+    private nonisolated static func normalizedDrawerProfile(_ raw: String?) -> String {
+        let trimmed = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "default" : trimmed
+    }
+
+    private nonisolated static func isDefaultDrawerProfile(
+        _ profile: String,
+        profileMap: [String: ProfileSummary]
+    ) -> Bool {
+        profile == "default" || profileMap[profile]?.isDefault == true
+    }
+
+    private nonisolated static func labelForProfile(
+        _ profile: String,
+        profileMap: [String: ProfileSummary]
+    ) -> String {
+        guard let summary = profileMap[profile], summary.isDefault else {
+            return profile
+        }
+        return "\(profile) (default)"
     }
 
     /// Rows eligible for the ABH-345 drawer source groups, after profile scope and
@@ -1020,17 +1117,17 @@ final class SessionStore {
         return Self.sortedByActivity(scoped)
     }
 
-    private static func drawerSourceKind(for row: SessionSummary) -> DrawerSourceKind? {
+    private nonisolated static func drawerSourceKind(for row: SessionSummary) -> DrawerSourceKind? {
         if isTelegramSource(row.source), isHumanRecentsSession(row) { return .telegram }
         if isHumanRecentsSession(row) { return .chats }
         return nil
     }
 
-    private static func isTelegramSource(_ source: String?) -> Bool {
+    private nonisolated static func isTelegramSource(_ source: String?) -> Bool {
         (source ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "telegram"
     }
 
-    private static func sortedByActivity(_ rows: [SessionSummary]) -> [SessionSummary] {
+    private nonisolated static func sortedByActivity(_ rows: [SessionSummary]) -> [SessionSummary] {
         var sorted = rows
         sorted.sort { lhs, rhs in
             let l = lhs.lastActive ?? lhs.startedAt ?? -.greatestFiniteMagnitude

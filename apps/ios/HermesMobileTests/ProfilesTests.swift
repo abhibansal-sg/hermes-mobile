@@ -302,6 +302,27 @@ final class ProfilesTests: XCTestCase {
         XCTAssertEqual(filtered.map(\.id), ["a", "b"])
     }
 
+    func testDrawerProfileGroupsDefaultFirstThenAlphabetic() {
+        let rows = [
+            row("z1", profile: "zeta"),
+            row("d1", profile: "default"),
+            row("a1", profile: "alpha"),
+            row("blank", profile: nil),
+            row("a2", profile: "alpha"),
+        ]
+        let profiles = [
+            ProfileSummary(name: "zeta", isDefault: false, description: nil),
+            ProfileSummary(name: "default", isDefault: true, description: nil),
+            ProfileSummary(name: "alpha", isDefault: false, description: nil),
+        ]
+
+        let groups = SessionStore.drawerProfileGroups(rows: rows, profiles: profiles)
+
+        XCTAssertEqual(groups.map(\.profile), ["default", "alpha", "zeta"])
+        XCTAssertEqual(groups.map(\.label), ["default (default)", "alpha", "zeta"])
+        XCTAssertEqual(groups.map { $0.sessions.map(\.id) }, [["d1", "blank"], ["a1", "a2"], ["z1"]])
+    }
+
     // MARK: - create/resume profile threading decision
 
     func testThreadingAttachesProfileOnlyForSpecificNonDefaultScope() {
