@@ -157,6 +157,7 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
         let rawMode = json["api_mode"]?.stringValue ?? ""
         self.apiMode = rawMode.isEmpty ? nil : ProviderAPIMode(rawValue: rawMode)
     }
+
 }
 
 /// `POST <prefix>/providers/{slug}/key` and `POST <prefix>/providers/custom`
@@ -369,6 +370,7 @@ extension RestClient {
 //
 //   GET <prefix>/toolsets/{name}/config
 //   PUT <prefix>/toolsets/{name}/config {"key":"ENV_VAR", "value":"..."}
+//   PUT <prefix>/toolsets/{name}/provider {"provider":"tag"}
 //
 // The GET response is explicitly redacted: env vars carry `is_set` only, never
 // the stored value. PUT with an empty value clears the env var. This extension
@@ -555,8 +557,9 @@ extension RestClient {
         return ToolsetConfig(json: root)
     }
 
-    /// `PUT <prefix>/toolsets/{name}/provider` — activate a provider for a
-    /// toolset. Returns the refreshed (still-redacted) config.
+    /// `PUT <prefix>/toolsets/{name}/provider` — select the active provider for
+    /// a configurable toolset. The refreshed config is returned so callers can
+    /// update the active row from the server's canonical state.
     @discardableResult
     func selectToolsetProvider(name: String, provider: String) async throws -> ToolsetConfig {
         let encodedName = name.addingPercentEncoding(

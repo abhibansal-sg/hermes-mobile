@@ -273,7 +273,13 @@ final class CacheFirstLaunchTests: XCTestCase {
         )
 
         sessions.prefetchRecentTranscripts()
-        try await Self.poll { PrefetchDeltaStubProtocol.sawDelta }
+        // `sawDelta` flips the instant the stub starts loading the request — before
+        // the response is even delivered back through URLSession, let alone decoded
+        // and merged into the on-disk cache. Poll the actual persisted merge instead,
+        // or this races the write and flakes under CI scheduling load (STR-1481).
+        try await Self.poll {
+            (((try? await cache.loadTranscript("changed")) ?? []).count) == 3
+        }
 
         let cached = try await cache.loadTranscript("changed") ?? []
         XCTAssertEqual(cached.map(\.text), ["cached-1", "cached-2", "tail-3"],

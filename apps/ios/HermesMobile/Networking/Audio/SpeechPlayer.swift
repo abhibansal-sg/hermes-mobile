@@ -52,6 +52,13 @@ final class SpeechPlayer {
     /// *later* generation torn down by another before the first request's
     /// `await` ever resumes — a single shared var would let the later call's
     /// reason clobber the earlier generation's before it's ever read.
+    ///
+    /// STR-690: only written when a generation is still suspended in
+    /// synthesis (no `pending` continuation yet) — the only case where a
+    /// request will ever call `consumeTerminationReason`. On the playback
+    /// path and idle teardown nothing reads it, so writing there only
+    /// orphaned entries; the map is bounded to at-most the set of
+    /// generations currently awaiting `synthesize(...)` (0 in steady state).
     private var terminationReasons: [UInt64: SpeechPlaybackResult] = [:]
     /// Performs the network synthesis call. Defaults to the real
     /// `RestClient.speak`; overridden in tests to control exactly when an
@@ -167,10 +174,21 @@ final class SpeechPlayer {
     /// late delegate callback) no-ops. Called by `stop()` (`.stopped`) and by
     /// `speak()` superseding a prior utterance (`.superseded`).
     private func terminate(with result: SpeechPlaybackResult) {
-        terminationReasons[generation] = result
         if let pending, pending.generation == generation {
+            // Playback was in flight for this generation: resume its awaiter
+            // directly. A generation that reached playback is past synthesis, so
+            // no in-flight request can still read a stored reason for it — recording
+            // one here would only orphan the map (STR-690).
             pending.continuation.resume(returning: result)
+        } else if isActive {
+            // No awaiter yet but this generation is live: a synthesis request for
+            // it is still suspended at `await synthesize(...)` and will read this
+            // reason post-await via consumeTerminationReason. Record it so it can
+            // report the reason its own generation actually ended with.
+            terminationReasons[generation] = result
         }
+        // else: idle teardown — the head-of-speak terminate before the very first
+        // utterance, or stop() while idle. Nothing consumes a reason here.
         pending = nil
         generation &+= 1
         clearState()   // also stops/tears down the player, if any
@@ -185,6 +203,11 @@ final class SpeechPlayer {
     private func consumeTerminationReason(for gen: UInt64) -> SpeechPlaybackResult {
         terminationReasons.removeValue(forKey: gen) ?? .superseded
     }
+
+    #if DEBUG
+    /// STR-690: lets tests assert the per-generation reason map does not leak.
+    var terminationReasonCountForTesting: Int { terminationReasons.count }
+    #endif
 
     /// Resolves the pending continuation for `generation` with `result`, iff
     /// that generation is still the live one — i.e. no `stop()`/supersede

@@ -35,6 +35,15 @@ final class ConnectionStoreReconnectTests: XCTestCase {
     /// Build a wired store graph (ConnectionStore + SessionStore + ChatStore).
     /// No live servers are touched; the `connectRPC` hook on the returned
     /// `ConnectionStore` is `nil` until the test sets it.
+    ///
+    /// `_restOverrideForTesting` (STR-1481) is seeded here — not just in
+    /// `configureWithoutGateway` — because `recoverActiveSession()` (exercised
+    /// by the `_seedAndStartReconnect`/`_seedConnectedForTesting` tests below,
+    /// not just the `configure()`-path ones) has its own fire-and-forget REST
+    /// probe on `self.rest`. Without this every hermetic test in this file
+    /// leaks a real request at a fake host, flooding CI logs with hundreds of
+    /// `-1004`/"HTTP load failed" lines.
+    #if DEBUG
     private func makeStore() -> (ConnectionStore, SessionStore, ChatStore) {
         let chat = ChatStore()
         let sessions = SessionStore()
@@ -42,8 +51,17 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let attachments = AttachmentStore()
         chat.attach(connection: connection, sessions: sessions, attachments: attachments)
         sessions.attach(connection: connection, chat: chat)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [InstantFailureProtocol.self]
+        connection._restOverrideForTesting = RestClient(
+            baseURL: URL(string: "https://stub.invalid")!,
+            token: "stub",
+            session: URLSession(configuration: config),
+            pathStyle: .legacy
+        )
         return (connection, sessions, chat)
     }
+    #endif
 
     /// 600 ms — enough for a `Task` spawned on the main executor to complete
     /// its attempt-0 pass (no backoff). The 120ms used by ChatStoreBatchBTests
@@ -82,6 +100,27 @@ final class ConnectionStoreReconnectTests: XCTestCase {
     }
 
     #if DEBUG
+    /// Fails every request instantly (`cannotConnectToHost`) — no real DNS
+    /// lookup or socket attempt. Backs the stub `_restOverrideForTesting`
+    /// client seeded in `makeStore()` (STR-1481): without it, every hermetic
+    /// test's fire-and-forget REST probe (`configure()`'s capability probe /
+    /// auto-upgrade, `recoverActiveSession()`'s reattach probe) tries to reach
+    /// a fake host and floods CI logs with hundreds of "HTTP load failed" /
+    /// `-1004` lines — which is what pushed the real failing assertion out of
+    /// the CI log's `tail -100` window. It is NOT the cause of the two
+    /// `configure()` state-corruption failures below — that turned out to be
+    /// `CODE_SIGNING_ALLOWED=NO` on the test host breaking Keychain
+    /// entitlements (see `.github/workflows/ios-tests.yml`) — but it's still
+    /// needed so hermetic runs make no real network calls at all.
+    private final class InstantFailureProtocol: URLProtocol, @unchecked Sendable {
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+        override func startLoading() {
+            client?.urlProtocol(self, didFailWithError: URLError(.cannotConnectToHost))
+        }
+        override func stopLoading() {}
+    }
+
     private func configureWithoutGateway(
         _ connection: ConnectionStore,
         serverURL: String,
@@ -544,5 +583,198 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertEqual(connection.phase, .connected)
         XCTAssertEqual(connection.serverURLString, stableURL,
                        "serverURLString must be unchanged after a successful reconnect")
+    }
+
+    // MARK: - STR-973A silent reconnect grace
+
+    /// The core "never flash an error on a quick heal" guarantee: a transport
+    /// drop whose attempt-0 reconnect succeeds inside the grace window must
+    /// never surface `.reconnecting` and must never stamp a "Connection lost"
+    /// warning — the interrupted stream is still finalized silently (so
+    /// `backfill()` can run) but with no visible trace of the blip.
+    func testHealInsideGraceProducesNoWarningAndNoVisibleReconnecting() async {
+        let (connection, sessions, chat) = makeStore()
+
+        // A long grace window: attempt 0 must heal well inside it, proving the
+        // heal — not the timer — is what ends grace.
+        connection.graceWindowOverride = .seconds(30)
+        connection.connectRPC = { _, _, _ in }
+
+        // Deliberately no `activeStoredId`: `recoverActiveSession()` then skips
+        // `backfill()` entirely, so the transcript below is left exactly as the
+        // silent finalize (or a stray visible warning) leaves it — a direct
+        // window onto `handleConnectionDrop(stampWarning:)`, undisturbed by a
+        // backfill overwrite that would trivially satisfy a "no warning" check
+        // regardless of what the finalize actually did.
+        connection._seedConnectedForTesting(serverURL: "http://localhost:9123", token: "test-stable-token")
+        sessions.activeRuntimeId = "rt-before-drop"
+        chat.handle(event: frame(type: "message.start", runtime: "rt-before-drop"))
+        chat.handle(event: frame(
+            type: "message.delta",
+            runtime: "rt-before-drop",
+            payload: .object(["text": .string("half a reply…")])
+        ))
+        chat.drainFlushForTesting()
+        XCTAssertTrue(chat.isStreaming, "precondition: the gateway dies during an active stream")
+
+        connection._handleGatewayStateForTesting(.failed("gateway process exited"))
+
+        // Synchronously, right after the drop: grace is live and the phase has
+        // NOT moved to a visible .reconnecting.
+        XCTAssertTrue(connection.isInGrace, "a fresh drop must enter grace, not go straight visible")
+        XCTAssertEqual(connection.phase, .connected, "phase must stay .connected while grace is live")
+
+        await connection.waitForReconnectForTesting()
+
+        XCTAssertEqual(connection.phase, .connected,
+                       "attempt-0 healing inside grace must converge to .connected")
+        XCTAssertFalse(connection.isInGrace, "a successful heal must end grace")
+        XCTAssertFalse(chat.isStreaming, "the interrupted stream must still be finalized silently")
+        XCTAssertNil(chat.messages.last?.warning,
+                     "a heal inside grace must never stamp a visible Connection lost warning")
+    }
+
+    /// STR-1126 regression: a grace timer that expires WHILE `recoverActiveSession()`
+    /// is still suspended on network I/O must never flash a visible
+    /// `.reconnecting` state on a reconnect that already succeeded.
+    ///
+    /// Before the fix, `endGrace()` ran AFTER the awaited
+    /// `recoverActiveSession()` call. `recoverActiveSession()` has genuine
+    /// `await` suspension points (`resumeActiveAfterReconnect`/`backfill`),
+    /// during which the MainActor is free — so the armed `graceTask`
+    /// continuation could fire `escalateGraceExpiry()`, whose only guard is
+    /// `isInGrace` (still `true`, since `endGrace()` hadn't run yet). That
+    /// unconditionally flipped `phase` to `.reconnecting` even though the
+    /// socket had already reconnected, only for the loop to silently
+    /// overwrite it back to `.connected` once `recoverActiveSession()`
+    /// finally returned — a spurious banner flash invisible to a
+    /// final-state-only assertion.
+    ///
+    /// This test seeds `activeStoredId` so `recoverActiveSession()` takes the
+    /// real `resumeActiveAfterReconnect()` + `backfill()` path, and stubs
+    /// `resumeRPC` to sleep well past a short `graceWindowOverride` deadline —
+    /// so the grace timer's expiry genuinely straddles the suspension. It then
+    /// inspects `phase`/`isInGrace` mid-flight (before `recoverActiveSession()`
+    /// resolves) to catch the race a final-state check would miss.
+    func testSuccessfulHealSurvivesGraceExpiryDuringSuspendedRecovery() async {
+        let (connection, sessions, chat) = makeStore()
+
+        // Short grace window: it WILL elapse before the resume stub below
+        // resolves, so the timer fires while the loop is still suspended
+        // inside `recoverActiveSession()`.
+        connection.graceWindowOverride = .milliseconds(50)
+        connection.connectRPC = { _, _, _ in }
+
+        // `activeStoredId` routes `recoverActiveSession()` through
+        // `resumeActiveAfterReconnect()` — the genuine network await this
+        // regression needs. The stub sleeps well past the grace deadline so
+        // the suspension straddles expiry.
+        sessions.activeStoredId = "stored-race"
+        sessions.resumeRPC = { stored, _ in
+            try? await Task.sleep(for: .milliseconds(300))
+            return self.stagedResumeResult(sessionId: "rt-after-reconnect", resumed: stored)
+        }
+        chat.backfillFetch = { _ in [] }
+
+        connection._seedConnectedForTesting(serverURL: "http://localhost:9123", token: "test-stable-token")
+        sessions.activeRuntimeId = "rt-before-drop"
+        chat.handle(event: frame(type: "message.start", runtime: "rt-before-drop"))
+        chat.handle(event: frame(
+            type: "message.delta",
+            runtime: "rt-before-drop",
+            payload: .object(["text": .string("half a reply…")])
+        ))
+        chat.drainFlushForTesting()
+        XCTAssertTrue(chat.isStreaming, "precondition: the gateway dies during an active stream")
+
+        connection._handleGatewayStateForTesting(.failed("gateway process exited"))
+        XCTAssertTrue(connection.isInGrace, "a fresh drop must enter grace")
+
+        // Land after the 50ms grace deadline but well before the 300ms resume
+        // stub resolves — recoverActiveSession() is still suspended here.
+        try? await Task.sleep(for: .milliseconds(150))
+
+        XCTAssertFalse(connection.isInGrace,
+                       "a successful connect must end grace immediately, not leave it dangling into the suspended recovery")
+        XCTAssertEqual(connection.phase, .connected,
+                       "grace expiring mid-recovery must never flash .reconnecting on a reconnect that already succeeded")
+
+        await connection.waitForReconnectForTesting()
+
+        XCTAssertEqual(connection.phase, .connected,
+                       "the loop must converge to .connected once recovery finishes")
+        XCTAssertFalse(connection.isInGrace, "grace must stay ended after the full recovery completes")
+        XCTAssertNil(chat.messages.last?.warning,
+                     "grace expiring mid-recovery must never stamp a spurious Connection lost warning on a healed reconnect")
+    }
+
+    /// The escalation path: grace expires while the reconnect loop is STILL
+    /// failing. Only then may the stranded turn be dropped visibly — exactly
+    /// one "Connection lost" warning, and the phase becomes `.reconnecting`.
+    func testGraceExpiryWithOngoingFailureStampsOneWarningAndEscalates() async {
+        let (connection, sessions, chat) = makeStore()
+
+        // A short, deterministic grace window; zero-delay backoff so the loop
+        // keeps retrying (and failing) fast underneath it.
+        connection.graceWindowOverride = .milliseconds(50)
+        connection.reconnectBackoffOverride = 0
+        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.probeIsAuthRevokedRPC = { false }
+
+        connection._seedConnectedForTesting(serverURL: "http://localhost:9123", token: "test-stable-token")
+        sessions.activeStoredId = "stored-grace-expiry"
+        sessions.activeRuntimeId = "rt-before-drop"
+        chat.handle(event: frame(type: "message.start", runtime: "rt-before-drop"))
+        chat.handle(event: frame(
+            type: "message.delta",
+            runtime: "rt-before-drop",
+            payload: .object(["text": .string("half a reply…")])
+        ))
+        chat.drainFlushForTesting()
+        XCTAssertTrue(chat.isStreaming, "precondition: the gateway dies during an active stream")
+
+        connection._handleGatewayStateForTesting(.failed("gateway process exited"))
+        XCTAssertTrue(connection.isInGrace, "a fresh drop must enter grace")
+
+        // Wait past the 50ms grace window; the retry loop is still failing
+        // throughout, so escalation must fire.
+        await settle()
+
+        XCTAssertFalse(connection.isInGrace, "grace must have expired and ended")
+        if case .reconnecting = connection.phase { /* expected */ } else {
+            XCTFail("expected .reconnecting after grace expiry with ongoing failure, got \(connection.phase)")
+        }
+        XCTAssertFalse(chat.isStreaming, "the stranded stream must be finalized on escalation")
+        XCTAssertEqual(chat.messages.last?.warning, "Connection lost",
+                       "exactly one visible warning must land once grace actually expires")
+
+        await connection.disconnect()
+    }
+
+    /// A hard auth revocation must never be swallowed by grace, no matter how
+    /// long the grace window is — the re-pair escalation is unconditional.
+    func testAuthRevocationDuringGraceStillRoutesToReauth() async {
+        let (connection, sessions, _) = makeStore()
+
+        // Deliberately long grace — proves the auth-revoke branch bypasses
+        // grace entirely rather than waiting for the timer.
+        connection.graceWindowOverride = .seconds(30)
+        connection.reconnectBackoffOverride = 0
+        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.probeIsAuthRevokedRPC = { true }
+
+        connection._seedConnectedForTesting(serverURL: "http://localhost:9123", token: "revoked-token")
+        sessions.activeStoredId = "stored-grace-auth"
+
+        connection._handleGatewayStateForTesting(.failed("gateway process exited"))
+        XCTAssertTrue(connection.isInGrace, "a fresh drop must enter grace")
+
+        await connection.waitForReconnectForTesting()
+
+        XCTAssertTrue(connection.reauthRequired,
+                      "an auth revocation must still flip reauthRequired even while grace was live")
+        XCTAssertEqual(connection.phase, .needsSetup,
+                       "an auth revocation must still route to .needsSetup regardless of grace")
+        XCTAssertFalse(connection.isInGrace, "grace must be ended, not left dangling, on auth revoke")
     }
 }

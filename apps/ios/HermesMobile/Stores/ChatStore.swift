@@ -155,6 +155,19 @@ final class ChatStore {
     #endif
     var lastError: String?
 
+    /// Mobile undo/rollback phase for the active session. Kept separate from
+    /// `lastError`: empty/success/loading are honest state, not failures.
+    var undoRollbackPhase: UndoRollbackPhase = .idle
+
+    /// A rollback checkpoint + diff awaiting the user's destructive restore
+    /// confirmation. Non-nil drives the restore sheet; `rollback.restore` is never
+    /// called while this is merely pending.
+    var pendingRollbackRestore: PendingRollbackRestore?
+
+    /// Test seam for the undo/rollback JSON-RPC chain. Production falls back to
+    /// `HermesGatewayClient.requestRaw` through `undoRollbackRequest`.
+    var undoRollbackRPC: ((String, JSONValue, Duration) async throws -> JSONValue)?
+
     /// Last `backfill()` REST failure, or `nil` if the most recent backfill
     /// succeeded or none has run. Observability for the mirror-recovery path:
     /// a foreign turn whose live stream was dropped relies entirely on backfill,
@@ -947,6 +960,10 @@ final class ChatStore {
         guard let id = payload.toolCallId else { return }
         let failed = Self.indicatesFailure(name: payload.name, result: payload.result)
         let preview = String(payload.result.compactDescription.prefix(300))
+        // Derived from the FULL `payload.result` — before the 300-char
+        // `resultPreview` truncation above — so a summary can still surface
+        // fields that live past character 300 of the raw preview.
+        let summary = ToolResultSummary.summaryLine(for: payload.result, failed: failed)
         // Retain the full structured todo array from the untruncated result so
         // the TodoCardView never re-parses the 300-char preview (which would
         // fail JSON parsing on any non-trivial list). The gateway puts the
@@ -957,6 +974,7 @@ final class ChatStore {
         mutateTool(id: id) { tool in
             tool.state = failed ? .failed : .done
             tool.resultPreview = preview
+            tool.resultSummary = summary
             tool.durationMs = payload.durationMs
             tool.todos = todos
         }
@@ -1467,6 +1485,132 @@ final class ChatStore {
         // `replyValue` / `value` go out of scope here; no copy is retained.
     }
 
+    // MARK: - Undo last turn + rollback restore (ABH-412)
+
+    /// Undo the last user+assistant turn, then inspect the existing rollback
+    /// checkpoints for file changes. The destructive disk restore is split into
+    /// ``confirmPendingRollbackRestore()`` so the UI can show the diff and require
+    /// explicit confirmation before `rollback.restore` is sent.
+    func undoLastTurn() async {
+        guard !localTurnInFlight else {
+            lastError = "Agent is busy"
+            undoRollbackPhase = .failed
+            return
+        }
+        guard let sessionId = activeSessionId else {
+            lastError = "No active session"
+            undoRollbackPhase = .failed
+            return
+        }
+
+        pendingRollbackRestore = nil
+        undoRollbackPhase = .loading
+        lastError = nil
+
+        do {
+            let undo = SessionUndoResult(json: try await undoRollbackRequest(
+                "session.undo",
+                params: .object(["session_id": .string(sessionId)])
+            ))
+            guard undo.removed > 0 else {
+                undoRollbackPhase = .empty
+                return
+            }
+
+            // Refresh transcript optimistically after the server accepted the undo.
+            await backfill()
+
+            let rollbackList = RollbackListResult(json: try await undoRollbackRequest(
+                "rollback.list",
+                params: .object(["session_id": .string(sessionId)])
+            ))
+            guard rollbackList.enabled, let checkpoint = rollbackList.checkpoints.first else {
+                undoRollbackPhase = .restored
+                return
+            }
+
+            let diff = RollbackDiffResult(json: try await undoRollbackRequest(
+                "rollback.diff",
+                params: .object([
+                    "session_id": .string(sessionId),
+                    "hash": .string(checkpoint.hash),
+                ])
+            ))
+            pendingRollbackRestore = PendingRollbackRestore(checkpoint: checkpoint, diff: diff)
+            undoRollbackPhase = .awaitingConfirmation
+        } catch {
+            pendingRollbackRestore = nil
+            undoRollbackPhase = .failed
+            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    /// User cancelled the destructive restore prompt. The turn undo remains in
+    /// place; only the pending file rollback is dismissed.
+    func cancelPendingRollbackRestore() {
+        pendingRollbackRestore = nil
+        if undoRollbackPhase == .awaitingConfirmation {
+            undoRollbackPhase = .restored
+        }
+    }
+
+    /// Restore files from the checkpoint currently displayed in the confirmation
+    /// sheet. The turn has already been removed by `session.undo`, so each restore
+    /// is file-scoped; a full `rollback.restore` would pop another user+assistant
+    /// turn from server history.
+    func confirmPendingRollbackRestore() async {
+        guard !localTurnInFlight else {
+            lastError = "Agent is busy"
+            undoRollbackPhase = .failed
+            return
+        }
+        guard let sessionId = activeSessionId else {
+            lastError = "No active session"
+            undoRollbackPhase = .failed
+            return
+        }
+        guard let pending = pendingRollbackRestore else { return }
+
+        undoRollbackPhase = .restoring
+        lastError = nil
+        do {
+            guard !pending.diff.filePaths.isEmpty else {
+                throw GatewayError.rpc(code: 5021, message: "rollback.diff did not report restorable file paths")
+            }
+            for filePath in pending.diff.filePaths {
+                let restored = RollbackRestoreResult(json: try await undoRollbackRequest(
+                    "rollback.restore",
+                    params: .object([
+                        "session_id": .string(sessionId),
+                        "hash": .string(pending.checkpoint.hash),
+                        "file_path": .string(filePath),
+                    ])
+                ))
+                guard restored.success else {
+                    throw GatewayError.rpc(code: 5021, message: "rollback.restore did not report success for \(filePath)")
+                }
+            }
+            pendingRollbackRestore = nil
+            undoRollbackPhase = .restored
+            await backfill()
+        } catch {
+            undoRollbackPhase = .failed
+            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    private func undoRollbackRequest(
+        _ method: String,
+        params: JSONValue,
+        timeout: Duration = .seconds(30)
+    ) async throws -> JSONValue {
+        if let undoRollbackRPC {
+            return try await undoRollbackRPC(method, params, timeout)
+        }
+        guard let client else { throw GatewayError.notConnected }
+        return try await client.requestRaw(method, params: params, timeout: timeout)
+    }
+
     // MARK: - Branch / checkpoint (F4A-A2)
 
     /// Restore the conversation to a checkpoint: re-run from the chosen USER
@@ -1830,6 +1974,19 @@ final class ChatStore {
         guard let connection, let client else {
             lastError = "No active session"
             return false
+        }
+
+        // STR-973A silent reconnect: during grace the transport is down but
+        // the user must never see a send error — enqueue to the offline
+        // outbox instead, same as a fully-offline send. Attachments aren't
+        // supported by the outbox (text-only), so let those fall through to
+        // the real (failing) send path below. `isDraining` guards against a
+        // `QueueStore.drain()` replay's own `chat.send()` call re-enqueuing
+        // itself — drain owns its own re-insert-on-failure semantics and must
+        // reach the real RPC attempt.
+        if connection.isInGrace, !hasAttachments, connection.queueStore?.isDraining != true {
+            _ = connection.queueStore?.enqueue(trimmed, storedSessionId: sessions?.activeStoredId)
+            return true
         }
 
         // Draft sessions: the first prompt materializes the real session
@@ -3013,7 +3170,8 @@ final class ChatStore {
                         return ToolActivity(
                             id: candidate, name: tool.name, argsSummary: tool.argsSummary,
                             progressText: tool.progressText, resultPreview: tool.resultPreview,
-                            state: tool.state, durationMs: tool.durationMs, todos: tool.todos
+                            state: tool.state, durationMs: tool.durationMs, todos: tool.todos,
+                            resultSummary: tool.resultSummary
                         )
                     }
                     // The cluster id is the first tool's id; re-derive after de-dup.
@@ -3416,7 +3574,13 @@ final class ChatStore {
     /// foreign mirror). Called from every connection-loss path
     /// (`ConnectionStore.handle(state:)`, `disconnect()`, the dead-socket
     /// scene-phase probe). Idempotent — a no-op when nothing is streaming.
-    func handleConnectionDrop() {
+    ///
+    /// `stampWarning` defaults to `true` (the visible "Connection lost"
+    /// bubble). STR-973A's silent-reconnect grace passes `false` on a quick
+    /// heal (attempt-0 succeeds inside the grace window): the stream state
+    /// still needs finalizing so `backfill()` can run, but the user never saw
+    /// a reconnect banner, so no warning should land in the transcript either.
+    func handleConnectionDrop(stampWarning: Bool = true) {
         clearAllCompactionIndicators()
         // An adopted foreign mirror dies with its transport: clear the mirror
         // bookkeeping (and its placeholder row) so the reconnect backfill can
@@ -3439,7 +3603,7 @@ final class ChatStore {
             // local turn that already accumulated ordered parts (text/tool) lands
             // the warning as an in-order `.warning` part too — keeping the part
             // list consistent with every other warning path (review fix #1).
-            if message.warning == nil { message.setWarningPart("Connection lost") }
+            if stampWarning, message.warning == nil { message.setWarningPart("Connection lost") }
         }
         pendingReconnectReconcileID = streamingMessageID
         if activeToolName != nil { onToolChange?(nil) }
