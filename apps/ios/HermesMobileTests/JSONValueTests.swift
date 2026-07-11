@@ -208,3 +208,101 @@ final class JSONValueTests: XCTestCase {
         XCTAssertEqual(dictLit, .object(["k": .string("v")]))
     }
 }
+
+/// STR-463: coverage for `ToolResultSummary`, the content-aware human-readable
+/// summarizer ported from desktop's `tool-result-summary.ts` (same behavior
+/// class, not byte-for-byte identical text).
+final class ToolResultSummaryTests: XCTestCase {
+
+    // MARK: - Wrapper unwrapping
+
+    func testUnwrapsNestedWrapperKeysToReachMeaningfulContent() {
+        let value: JSONValue = ["data": ["result": ["message": "Build succeeded in 4.2s"]]]
+        XCTAssertEqual(ToolResultSummary.summarize(value), "Build succeeded in 4.2s")
+    }
+
+    // MARK: - Priority fields (path/message/url take precedence)
+
+    func testPriorityURLFieldIsOrderedFirst() {
+        let value: JSONValue = ["extra": "ignored", "url": "https://example.com/report", "another": 42]
+        XCTAssertEqual(
+            ToolResultSummary.summarize(value),
+            "- Url: https://example.com/report\n- Another: 42\n- Extra: ignored"
+        )
+    }
+
+    // MARK: - Arrays
+
+    func testArraySummaryListsPriorityFieldsPerItem() {
+        let value: JSONValue = .array([
+            .object(["path": "/repo/src/App.swift", "status": "modified"]),
+            .object(["path": "/repo/src/Util.swift", "status": "modified"]),
+            .object(["path": "/repo/src/Test.swift", "status": "added"]),
+        ])
+        XCTAssertEqual(
+            ToolResultSummary.summarize(value),
+            "- /repo/src/App.swift (modified)\n- /repo/src/Util.swift (modified)\n- /repo/src/Test.swift (added)"
+        )
+    }
+
+    func testArrayFieldSummaryShowsCountAndFirstItem() {
+        let value: JSONValue = ["lines": .array([
+            .string("first line of output"), .string("second"), .string("third"),
+            .string("fourth"), .string("fifth"),
+        ])]
+        XCTAssertEqual(ToolResultSummary.summarize(value), "- Lines: 5 items (first line of output)")
+    }
+
+    // MARK: - Scalars
+
+    func testScalarStringResultSummarizesDirectly() {
+        XCTAssertEqual(
+            ToolResultSummary.summarize(.string("Done processing 42 records.")),
+            "Done processing 42 records."
+        )
+    }
+
+    // MARK: - Nested error detection
+
+    func testNestedErrorDetectionInsideWrapperAndErrorKey() {
+        let value: JSONValue = ["data": ["error": ["message": "permission denied: /etc/shadow"]]]
+        XCTAssertEqual(ToolResultSummary.errorMessage(in: value), "permission denied: /etc/shadow")
+    }
+
+    func testSuccessFalseWithMessageIsDetectedAsError() {
+        let value: JSONValue = ["success": false, "message": "connection refused"]
+        XCTAssertEqual(ToolResultSummary.errorMessage(in: value), "connection refused")
+    }
+
+    func testErrorLikeStatusIsDetectedAsError() {
+        let value: JSONValue = ["status": "failed", "message": "build step 3 failed"]
+        XCTAssertEqual(ToolResultSummary.errorMessage(in: value), "build step 3 failed")
+    }
+
+    // MARK: - Invalid JSON string fallback
+
+    func testInvalidJSONStringFallsBackToRawText() {
+        let malformed = "{not actually valid json"
+        XCTAssertEqual(ToolResultSummary.summarize(jsonString: malformed), malformed)
+    }
+
+    // MARK: - stderr is never treated as an error on its own
+
+    func testStderrAloneIsNotTreatedAsError() {
+        let value: JSONValue = ["stdout": "42 tests passed", "stderr": "npm warn deprecated", "success": true]
+        XCTAssertNil(ToolResultSummary.errorMessage(in: value))
+        XCTAssertEqual(
+            ToolResultSummary.summaryLine(for: value, failed: false),
+            "- Stderr: npm warn deprecated\n- Stdout: 42 tests passed"
+        )
+    }
+
+    func testFailedFlagWithOnlyStderrFallsBackToGeneralSummary() {
+        let value: JSONValue = ["stderr": "warning: deprecated flag used"]
+        XCTAssertNil(ToolResultSummary.errorMessage(in: value))
+        XCTAssertEqual(
+            ToolResultSummary.summaryLine(for: value, failed: true),
+            "- Stderr: warning: deprecated flag used"
+        )
+    }
+}

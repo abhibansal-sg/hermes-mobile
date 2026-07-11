@@ -17,7 +17,11 @@ jobs:
       - name: Check for unmapped contributor emails
         run: |
           # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # On this fork PRs target environment-and-workflows-overview, not main.
+          # Diff against the PR base ref so upstream history emails don't flood in.
+          BASE_REF="${GITHUB_BASE_REF:-environment-and-workflows-overview}"
+          git fetch origin "$BASE_REF" --depth=200 2>/dev/null || true
+          MERGE_BASE=$(git merge-base "origin/${BASE_REF}" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
