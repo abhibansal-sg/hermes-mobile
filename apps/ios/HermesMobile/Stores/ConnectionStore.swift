@@ -401,6 +401,13 @@ final class ConnectionStore {
     /// Speaks the path family the capability probe resolved (ABH-88) — `.legacy`
     /// until/unless the plugin-mount probe concludes `.available`.
     var rest: RestClient? {
+        #if DEBUG
+        // Test-only: a seeded override short-circuits the URL+token build so a
+        // stub `URLSession` can observe/no-op the calls made through `rest`
+        // (e.g. reconnect's `recoverActiveSession` probes). See
+        // `_restOverrideForTesting`.
+        if let _restOverrideForTesting { return _restOverrideForTesting }
+        #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
         return RestClient(
             baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
@@ -411,11 +418,31 @@ final class ConnectionStore {
     /// usage / cron / skills — now ``RestClient`` extension members), built from
     /// the same saved URL + token as `rest`, or `nil` if unconfigured.
     var control: RestClient? {
+        #if DEBUG
+        // Test-only: same seam as `rest` (see `_restOverrideForTesting`) so the
+        // control-surface client is equally stubbable in unit tests.
+        if let _restOverrideForTesting { return _restOverrideForTesting }
+        #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
         return RestClient(
             baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
         )
     }
+
+    #if DEBUG
+    /// Test-only override: when set, `rest`/`control` return this client instead
+    /// of building one from the saved URL + token, so a stub `URLSession`
+    /// (`URLProtocol`-injected) can observe/no-op the requests they issue —
+    /// in particular the reconnect-path probes inside `recoverActiveSession()`
+    /// (`capabilities.probe`, `autoUpgradeToDeviceTokenIfNeeded`), which are
+    /// otherwise routed through an internal `.ephemeral` session that no
+    /// `URLProtocol` can intercept, and which leak real network calls to a
+    /// dead loopback gateway on a CI runner with no server (STR-1481). Mirrors
+    /// the existing `_seed…ForTesting` conventions; compiled out of Release,
+    /// so there is no production surface and no secret exposure (the stub
+    /// client's session and token are entirely test-injected).
+    var _restOverrideForTesting: RestClient?
+    #endif
 
     /// The persistent prompt outbox/queue. Drained here after reconnect backfill.
     /// Wired by `AppEnvironment` (ChatStore holds no reference to it).

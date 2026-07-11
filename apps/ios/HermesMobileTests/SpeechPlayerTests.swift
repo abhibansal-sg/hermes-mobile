@@ -316,6 +316,49 @@ final class SpeechPlayerTests: XCTestCase {
         let secondResult = await secondTask.value
         XCTAssertEqual(secondResult, .stopped)
     }
+
+    // MARK: - Regression: terminationReasons must not leak (STR-690)
+
+    /// A normal finish never suspends in synthesis when `terminate(with:)`
+    /// runs, so nothing should ever be recorded into `terminationReasons` for
+    /// it — the map must be empty once the utterance resolves.
+    func testTerminationReasonsEmptyAfterNormalFinish() async {
+        let fake = SpyAudioPlayer()
+        let sut = SpeechPlayer(makePlayer: { _ in fake })
+        let rest = stubRest(dataURL: validDataURL)
+
+        let task = Task { await sut.speak(text: "hello there", rest: rest) }
+        await fake.waitUntilPlayCalled()
+        fake.finishPlayback()
+
+        let result = await task.value
+        XCTAssertEqual(result, .completed)
+        XCTAssertEqual(sut.terminationReasonCountForTesting, 0)
+    }
+
+    /// A second `speak()` after the first has already finished (idle
+    /// supersede) tears down an idle generation — no in-flight synthesis
+    /// request exists to ever read a stored reason, so nothing should be
+    /// recorded for it either.
+    func testTerminationReasonsEmptyAfterIdleSupersede() async {
+        let firstFake = SpyAudioPlayer()
+        let secondFake = SpyAudioPlayer()
+        var created: [SpyAudioPlayer] = [firstFake, secondFake]
+        let sut = SpeechPlayer(makePlayer: { _ in created.removeFirst() })
+        let rest = stubRest(dataURL: validDataURL)
+
+        let firstTask = Task { await sut.speak(text: "first", rest: rest) }
+        await firstFake.waitUntilPlayCalled()
+        firstFake.finishPlayback()
+        _ = await firstTask.value
+
+        let secondTask = Task { await sut.speak(text: "second", rest: rest) }
+        await secondFake.waitUntilPlayCalled()
+        secondFake.finishPlayback()
+        _ = await secondTask.value
+
+        XCTAssertEqual(sut.terminationReasonCountForTesting, 0)
+    }
 }
 
 // MARK: - Test doubles
