@@ -10152,7 +10152,13 @@ def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[st
     return annotated
 
 
-def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args, **kwargs):
+def _call_cron_for_profile(
+    target_profile: Optional[str],
+    func_name: str,
+    *args,
+    notify_provider_on_success: bool = False,
+    **kwargs,
+):
     """Run cron.jobs helpers against the selected profile's cron directory.
 
     cron.jobs keeps CRON_DIR/JOBS_FILE/OUTPUT_DIR as module globals resolved
@@ -10177,6 +10183,18 @@ def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args,
         cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
         try:
             result = getattr(cron_jobs, func_name)(*args, **kwargs)
+            if notify_provider_on_success and result:
+                try:
+                    from cron.scheduler import _notify_provider_jobs_changed
+
+                    _notify_provider_jobs_changed()
+                except Exception:
+                    _log.debug(
+                        "Failed to notify cron provider after %s for profile %s",
+                        func_name,
+                        profile_name,
+                        exc_info=True,
+                    )
         finally:
             cron_jobs.CRON_DIR = old_cron_dir
             cron_jobs.JOBS_FILE = old_jobs_file
@@ -10328,6 +10346,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: str = "default"):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            notify_provider_on_success=True,
         )
     except HTTPException:
         raise
@@ -10393,7 +10412,13 @@ def _update_cron_job_sync(job_id: str, body: CronJobUpdate, profile: Optional[st
             if "skills" in updates and "skill" not in updates:
                 effective["skill"] = None
             _validate_dashboard_cron_effective_job(effective)
-        job = _call_cron_for_profile(profile_name, "update_job", job_id, updates)
+        job = _call_cron_for_profile(
+            profile_name,
+            "update_job",
+            job_id,
+            updates,
+            notify_provider_on_success=True,
+        )
     except HTTPException:
         raise
     except ValueError as exc:
@@ -10412,7 +10437,12 @@ def _pause_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "pause_job", job_id)
+    job = _call_cron_for_profile(
+        selected,
+        "pause_job",
+        job_id,
+        notify_provider_on_success=True,
+    )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -10427,7 +10457,12 @@ def _resume_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "resume_job", job_id)
+    job = _call_cron_for_profile(
+        selected,
+        "resume_job",
+        job_id,
+        notify_provider_on_success=True,
+    )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -10442,7 +10477,12 @@ def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "trigger_job", job_id)
+    job = _call_cron_for_profile(
+        selected,
+        "trigger_job",
+        job_id,
+        notify_provider_on_success=True,
+    )
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -10458,7 +10498,12 @@ def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
     try:
-        removed = _call_cron_for_profile(selected, "remove_job", job_id)
+        removed = _call_cron_for_profile(
+            selected,
+            "remove_job",
+            job_id,
+            notify_provider_on_success=True,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not removed:
@@ -10625,7 +10670,13 @@ async def instantiate_blueprint(body: AutomationBlueprintInstantiate, profile: s
         # create_job does per-profile file I/O — keep it off the event loop
         # like the sibling cron endpoints (partial avoids **spec keys ever
         # colliding with the wrapper's own parameters).
-        _create = functools.partial(_call_cron_for_profile, profile, "create_job", **spec)
+        _create = functools.partial(
+            _call_cron_for_profile,
+            profile,
+            "create_job",
+            notify_provider_on_success=True,
+            **spec,
+        )
         return await _run_cron_dashboard_io(_create)
     except HTTPException:
         raise
