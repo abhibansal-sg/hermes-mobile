@@ -1,3 +1,31 @@
+Build 98 — 2026-07-11
+
+WHAT'S NEW
+- Self-provision live-gateway creds for ios-build.sh test lane
+- Pass approve rule keys to approval gate
+- Optionally mention approval owners on exec prompts
+- Add UI scale setting to appearance settings
+
+FIXED
+- Gate iOS device-token auto-upgrade on server auth_required
+- Use windows_detach_popen_kwargs to prevent console window flash on Windows
+- Unpin Baileys from git commit, use published 7.0.0-rc13
+- Wire gateway notify round-trip into the plugin escalation gate
+- Include approval command in message content
+
+IMPROVED
+- Cover tool-row dismissal pruning (STR-1259)
+- Add WhatsApp dashboard pairing flow
+
+WORTH TRYING
+- Try: Self-provision live-gateway creds for ios-build.sh test lane
+- Try: Pass approve rule keys to approval gate
+- Try: Optionally mention approval owners on exec prompts
+
+(+168 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 97 — 2026-07-11
 
 WHAT'S NEW
