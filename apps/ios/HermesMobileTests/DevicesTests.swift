@@ -631,6 +631,97 @@ final class DevicesTests: XCTestCase {
         XCTAssertFalse(ConnectionStore.deviceNameHint.isEmpty)
     }
 
+    // MARK: - Single-flight in-flight gate (STR-546/STR-512)
+
+    /// Coordinates a stubbed `issueDevice` round-trip so a test can hold it open
+    /// until both overlapping `autoUpgradeToDeviceTokenIfNeeded` calls have had a
+    /// chance to reach the single-flight guard, then release it once — proving
+    /// the second caller joined the first's `Task` rather than starting its own.
+    private actor IssueCallGate {
+        private(set) var callCount = 0
+        private var isOpen = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func recordCallAndWaitUntilOpen() async {
+            callCount += 1
+            if isOpen { return }
+            await withCheckedContinuation { waiters.append($0) }
+        }
+
+        func open() {
+            isOpen = true
+            waiters.forEach { $0.resume() }
+            waiters.removeAll()
+        }
+    }
+
+    private func decodeIssuedDevice(deviceId: String, token: String) throws -> IssuedDevice {
+        try JSONDecoder().decode(IssuedDevice.self, from: Data("""
+        {"device_id":"\(deviceId)","token":"\(token)","device_name":"iPhone",
+         "created_at":1700001234.0}
+        """.utf8))
+    }
+
+    func testAutoUpgradeSingleFlightSharesOneIssueCallForOverlappingRequests() async throws {
+        // Two overlapping auto-upgrade calls for the SAME server (e.g. the
+        // initial connect racing a reconnect-loop retry) must share one
+        // `/devices/issue` operation, not mint two device tokens against the
+        // same server (STR-512's orphan-token / 64-device-cap bug).
+        let server = "https://gw.example:9119"
+        let connection = makeAutoUpgradeConnection(server: server)
+        AutoUpgradeRoutingProtocol.statusBody = Data(#"{"auth_required":true}"#.utf8)
+
+        let gate = IssueCallGate()
+        let issued = try decodeIssuedDevice(deviceId: "dev_single_flight", token: "tok_single_flight")
+        connection.issueDeviceRPC = { _, _ in
+            await gate.recordCallAndWaitUntilOpen()
+            return issued
+        }
+
+        async let first: Void = connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
+        // Give the first call time to clear its guards, land in the suspended
+        // issue round-trip, and register itself as the in-flight task before the
+        // second call starts — otherwise the second could race ahead of the
+        // dictionary write and spuriously start its own task.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        async let second: Void = connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        await gate.open()
+        _ = await (first, second)
+
+        let callCount = await gate.callCount
+        XCTAssertEqual(
+            callCount, 1,
+            "overlapping auto-upgrade calls for the same server must share one issue operation"
+        )
+        XCTAssertEqual(DefaultsKeys.deviceId(server: server), "dev_single_flight")
+    }
+
+    func testAutoUpgradeRetryNotPermanentlySuppressedAfterGenericIssueFailure() async {
+        // A generic issue failure (not the typed 409 limit-reached path) must
+        // clear the single-flight gate on exit — a later legitimate retry (the
+        // next connect/reconnect) must still be able to issue, not find itself
+        // permanently stuck behind a dead in-flight entry.
+        let server = "https://gw.example:9119"
+        let connection = makeAutoUpgradeConnection(server: server)
+        AutoUpgradeRoutingProtocol.statusBody = Data(#"{"auth_required":true}"#.utf8)
+        AutoUpgradeRoutingProtocol.issueCode = 500
+
+        await connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
+        XCTAssertEqual(AutoUpgradeRoutingProtocol.issueCallCount, 1)
+        XCTAssertNil(DefaultsKeys.deviceId(server: server))
+
+        AutoUpgradeRoutingProtocol.issueCode = 200
+        AutoUpgradeRoutingProtocol.issueBody = Data("""
+        {"device_id":"dev_retry001","token":"tok_retry","device_name":"iPhone",
+         "created_at":1700001234.0}
+        """.utf8)
+
+        await connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
+        XCTAssertEqual(AutoUpgradeRoutingProtocol.issueCallCount, 2)
+        XCTAssertEqual(DefaultsKeys.deviceId(server: server), "dev_retry001")
+    }
+
     // MARK: - Current-device marking + revoke confirmation flow logic
 
     func testIsCurrentDeviceMatchesRecordedId() {

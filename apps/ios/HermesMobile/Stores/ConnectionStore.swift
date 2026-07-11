@@ -465,12 +465,30 @@ final class ConnectionStore {
     /// marker for an explicit user re-attempt after cleanup.
     private var deviceIssueLimitReachedServers = Set<String>()
 
+    /// Per-server single-flight guard for silent shared-token → device-token
+    /// upgrades (STR-546/STR-512). Multiple reconnect/configure paths can
+    /// overlap for the same active server; only one `/devices/issue` request
+    /// may be in flight for a server at a time, and joiners await that same
+    /// operation instead of minting a second device token. Cleared on every
+    /// exit path (success, typed 409, generic failure, Keychain-write
+    /// failure) so a later legitimate retry is never permanently suppressed.
+    private var autoUpgradeIssueTasks: [String: Task<IssuedDevice, Error>] = [:]
+
     /// Injectable connect implementation (tests). When non-nil the reconnect
     /// loop calls this closure instead of `client.connect(...)` — the same
     /// pattern as `SessionStore.resumeRPC`. Defaults to `nil`; the live path
     /// is taken in production (the nil-check is free). Set by unit tests to
     /// make the loop deterministic without a live socket.
     var connectRPC: ((_ url: URL, _ token: String, _ mode: ConnectionMode) async throws -> Void)?
+
+    #if DEBUG
+    /// DEBUG-only test seam for deterministic single-flight auto-upgrade tests
+    /// (STR-546): when non-nil, replaces the live `rest.issueDevice(name:)`
+    /// call so a test can delay/observe the issue round-trip without a live
+    /// server (e.g. suspend it to prove two overlapping callers share one
+    /// invocation). `nil` in production (the nil-check is free).
+    var issueDeviceRPC: (@Sendable (_ rest: RestClient, _ name: String) async throws -> IssuedDevice)?
+    #endif
 
     #if DEBUG
     /// Injectable configure status probe (tests). When non-nil, replaces the live
@@ -1461,9 +1479,37 @@ final class ConnectionStore {
         // shared token, retry on the next connect.
         guard let status = try? await rest.status(), status.authRequired == true else { return }
 
+        // STR-546/STR-512: single-flight the actual issue call per server.
+        // Overlapping auto-upgrade attempts for the same server (e.g. the
+        // initial connect racing a reconnect-loop retry) join the same
+        // in-flight `Task` instead of each minting their own device token —
+        // an unshared second issue would silently orphan the first and
+        // silently consume a second slot against the 64-device cap
+        // (STR-512). Cleared via `defer` on every exit from this function so
+        // a later legitimate retry (after a failure or a Keychain-write
+        // failure clears `device_id`) is never permanently suppressed.
+        let issueTask: Task<IssuedDevice, Error>
+        if let inFlight = autoUpgradeIssueTasks[serverURL] {
+            issueTask = inFlight
+        } else {
+            #if DEBUG
+            let issueDeviceRPC = issueDeviceRPC
+            #endif
+            issueTask = Task { [rest] in
+                #if DEBUG
+                if let issueDeviceRPC {
+                    return try await issueDeviceRPC(rest, Self.deviceNameHint)
+                }
+                #endif
+                return try await rest.issueDevice(name: Self.deviceNameHint)
+            }
+            autoUpgradeIssueTasks[serverURL] = issueTask
+        }
+        defer { autoUpgradeIssueTasks[serverURL] = nil }
+
         let issued: IssuedDevice
         do {
-            issued = try await rest.issueDevice(name: Self.deviceNameHint)
+            issued = try await issueTask.value
         } catch DeviceIssueError.limitReached(let maxDevices) {
             handleDeviceLimitReached(serverURL: serverURL, maxDevices: maxDevices)
             return
