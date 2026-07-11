@@ -194,8 +194,10 @@ actor HermesGatewayClient {
             try await awaitReady(timeout: .seconds(15))
         } catch {
             // Timed out or failed before ready: tear down and surface the error.
-            let message = (error as? GatewayError)?.errorDescription ?? error.localizedDescription
-            teardown(state: .failed(message), failPendingWith: GatewayError.notConnected)
+            if myGeneration == generation {
+                let message = (error as? GatewayError)?.errorDescription ?? error.localizedDescription
+                teardown(state: .failed(message), failPendingWith: GatewayError.notConnected)
+            }
             throw error
         }
     }

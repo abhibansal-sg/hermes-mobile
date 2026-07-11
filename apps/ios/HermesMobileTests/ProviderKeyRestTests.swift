@@ -179,6 +179,56 @@ final class ProviderKeyRestTests: XCTestCase {
         XCTAssertTrue(result.disconnected)
     }
 
+    // MARK: - STR-692: Custom provider metadata survives disconnect
+
+    func testCustomProviderRowDecodesTransportMetadata() async throws {
+        let body = Data(#"""
+        {"providers":[
+            {"slug":"my-proxy","name":"My Proxy","auth_type":"custom","is_current":false,"authenticated":true,"total_models":5,"base_url":"https://proxy.example.com","api_mode":"anthropic_messages","models":[{"id":"claude-3"}]}
+        ]}
+        """#.utf8)
+        let client = makeClient(style: .plugin, script: [(body, 200)])
+        let providers = try await client.listProviders()
+        XCTAssertEqual(providers.count, 1)
+        let row = providers[0]
+        XCTAssertEqual(row.authType, .custom)
+        XCTAssertEqual(row.baseURL, "https://proxy.example.com")
+        XCTAssertEqual(row.apiMode, .anthropicMessages)
+    }
+
+    func testProviderRowCopyPreservesCustomMetadataThroughDisconnect() {
+        let original = ProviderRow(
+            slug: "my-proxy",
+            name: "My Proxy",
+            authType: .custom,
+            isCurrent: true,
+            authenticated: true,
+            totalModels: 5,
+            models: ["claude-3"],
+            baseURL: "https://proxy.example.com",
+            apiMode: .anthropicMessages
+        )
+        let disconnected = original.copy(isCurrent: false, authenticated: false)
+        XCTAssertEqual(disconnected.slug, "my-proxy")
+        XCTAssertEqual(disconnected.authType, .custom)
+        XCTAssertFalse(disconnected.isCurrent)
+        XCTAssertFalse(disconnected.authenticated)
+        XCTAssertEqual(disconnected.totalModels, 5)
+        XCTAssertEqual(disconnected.models, ["claude-3"])
+        XCTAssertEqual(disconnected.baseURL, "https://proxy.example.com", "baseURL must survive disconnect")
+        XCTAssertEqual(disconnected.apiMode, .anthropicMessages, "apiMode must survive disconnect")
+    }
+
+    func testProviderRowCopyWithNilOverrides() {
+        let row = ProviderRow(
+            slug: "x", name: "X", authType: .apiKey, isCurrent: true,
+            authenticated: true, totalModels: 2, models: nil,
+            baseURL: "https://a.com", apiMode: .openai
+        )
+        let copy = row.copy()
+        XCTAssertEqual(copy, row, "no-arg copy must be identical")
+    }
+
     // MARK: - 4. The api_key rides the POST body, never the URL
 
     func testApiKeyRidesBodyNotURL() async throws {
@@ -425,11 +475,70 @@ final class ToolsetCredentialRestTests: XCTestCase {
         XCTAssertEqual(ToolsetConfig.displayName(for: "image_gen"), "Image Generation")
     }
 
+    func testSelectToolsetProviderUsesPathFamilyAndDecodesRefreshedConfig() async throws {
+        let body = Data(#"""
+        {
+          "name":"web",
+          "has_category":true,
+          "active_provider":"tavily",
+          "providers":[{
+            "name":"Tavily",
+            "badge":"recommended",
+            "tag":"tavily",
+            "requires_nous_auth":false,
+            "is_active":true,
+            "env_vars":[{
+              "key":"TAVILY_API_KEY",
+              "prompt":"Tavily API Key",
+              "url":null,
+              "default":null,
+              "is_set":true
+            }]
+          }]
+        }
+        """#.utf8)
+
+        for style in [APIPathStyle.legacy, .plugin] {
+            let prefix = style.mobileAPIPrefix
+            let client = makeClient(style: style, script: [(body, 200)])
+
+            let config = try await client.selectToolsetProvider(name: "web", provider: "tavily")
+
+            XCTAssertEqual(recordedPaths, ["\(prefix)/toolsets/web/provider"])
+            XCTAssertEqual(recordedMethods, ["PUT"])
+            XCTAssertEqual(config.name, "web")
+            XCTAssertEqual(config.activeProvider, "tavily")
+            XCTAssertTrue(config.providers[0].isActive)
+
+            let request = try XCTUnwrap(RecordingProtocol.requests.first)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+            XCTAssertFalse(request.url?.absoluteString.contains("tavily") ?? true, "provider must not leak into URL")
+            let object = try XCTUnwrap(jsonBody(for: request))
+            XCTAssertEqual(object["provider"] as? String, "tavily")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "X-Hermes-Session-Token"), "tok")
+        }
+    }
+
+    func testSelectToolsetProviderNon2xxSurfacesAsBadStatus() async {
+        let body = Data(#"{"error":"unknown provider","code":4004}"#.utf8)
+        let client = makeClient(style: .plugin, script: [(body, 400)])
+        do {
+            _ = try await client.selectToolsetProvider(name: "web", provider: "nonexistent")
+            XCTFail("expected badStatus")
+        } catch RestError.badStatus(let code, let errorBody) {
+            XCTAssertEqual(code, 400)
+            XCTAssertTrue(errorBody.contains("4004"))
+        } catch {
+            XCTFail("expected RestError.badStatus, got \(error)")
+        }
+    }
+
     func testCredentialEntryViewIsConstructedFromRedactedTargetOnly() {
         let target = ToolsetCredentialTarget(
             toolsetName: "web",
             toolsetDisplayName: "Web Search",
             providerName: "Tavily",
+            providerTag: "tavily",
             envVar: ToolsetEnvVar(
                 key: "TAVILY_API_KEY",
                 prompt: "Tavily API Key",
@@ -450,6 +559,82 @@ final class ToolsetCredentialRestTests: XCTestCase {
             Mirror(reflecting: view).children.contains { $0.label == "target" },
             "entry view should be reachable from the redacted target model"
         )
+    }
+
+    // MARK: - STR-697 retry: save/activate success copy
+
+    private func makeEnvVar(prompt: String) -> ToolsetEnvVar {
+        ToolsetEnvVar(key: "TAVILY_API_KEY", prompt: prompt, url: nil, defaultValue: nil, isSet: true)
+    }
+
+    private func makeConfig(activeTag: String?, providers: [ToolsetConfigProvider]) -> ToolsetConfig {
+        ToolsetConfig(name: "web", hasCategory: true, providers: providers, activeProvider: activeTag)
+    }
+
+    private func makeProvider(tag: String, name: String = "Tavily", isActive: Bool) -> ToolsetConfigProvider {
+        ToolsetConfigProvider(
+            toolsetName: "web",
+            name: name,
+            badge: "recommended",
+            tag: tag,
+            envVars: [makeEnvVar(prompt: "Tavily API Key")],
+            postSetup: nil,
+            requiresNousAuth: false,
+            isActive: isActive
+        )
+    }
+
+    func testSaveCopySaysKeySavedAndMadeActiveWhenProviderIsActive() {
+        // Full-success path: save() saved the key and activated the provider,
+        // so the refreshed config reports the provider active.
+        let target = ToolsetCredentialTarget(
+            toolsetName: "web",
+            toolsetDisplayName: "Web Search",
+            providerName: "Tavily",
+            providerTag: "tavily",
+            envVar: makeEnvVar(prompt: "Tavily API Key")
+        )
+        let refreshed = makeConfig(activeTag: "tavily", providers: [makeProvider(tag: "tavily", isActive: true)])
+
+        let message = ToolsetConfigSaveCopy.savedMessage(target: target, refreshed: refreshed)
+        XCTAssertEqual(
+            message,
+            "Saved Tavily API Key and made Tavily the active provider."
+        )
+    }
+
+    func testSaveCopyOnlyConfirmsKeySaveWhenProviderTagIsNil() {
+        // Legacy path: no provider tag, so save() never attempted activation.
+        let target = ToolsetCredentialTarget(
+            toolsetName: "web",
+            toolsetDisplayName: "Web Search",
+            providerName: "Tavily",
+            providerTag: nil,
+            envVar: makeEnvVar(prompt: "Tavily API Key")
+        )
+        let refreshed = makeConfig(activeTag: nil, providers: [makeProvider(tag: "tavily", isActive: false)])
+
+        let message = ToolsetConfigSaveCopy.savedMessage(target: target, refreshed: refreshed)
+        XCTAssertEqual(message, "Saved Tavily API Key.")
+    }
+
+    func testSaveCopyDoesNotClaimActivationWhenProviderStayedInactive() {
+        // Activation-failure path: save() persisted the key but
+        // selectToolsetProvider threw, so onSaved received the post-save config
+        // where the provider is still NOT active. The copy must not claim the
+        // provider was made active (the entry footer carries the failure reason).
+        let target = ToolsetCredentialTarget(
+            toolsetName: "web",
+            toolsetDisplayName: "Web Search",
+            providerName: "Tavily",
+            providerTag: "tavily",
+            envVar: makeEnvVar(prompt: "Tavily API Key")
+        )
+        let refreshed = makeConfig(activeTag: nil, providers: [makeProvider(tag: "tavily", isActive: false)])
+
+        let message = ToolsetConfigSaveCopy.savedMessage(target: target, refreshed: refreshed)
+        XCTAssertEqual(message, "Saved Tavily API Key.")
+        XCTAssertFalse(message.contains("active"), "activation-failure copy must not promise activation")
     }
 
     private func jsonBody(for request: URLRequest) throws -> [String: Any]? {

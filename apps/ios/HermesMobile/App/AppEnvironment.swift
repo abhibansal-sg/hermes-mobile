@@ -1,5 +1,17 @@
 import Foundation
 
+enum UITestAudioGuard {
+#if DEBUG
+    nonisolated(unsafe) static var argumentsForTesting: (() -> [String])?
+
+    static var isUITestAudioMuted: Bool {
+        (argumentsForTesting?() ?? ProcessInfo.processInfo.arguments).contains("--uitest-mute-audio")
+    }
+#else
+    static var isUITestAudioMuted: Bool { false }
+#endif
+}
+
 /// Composition root: builds the store graph once at launch.
 @MainActor
 final class AppEnvironment {
@@ -10,6 +22,7 @@ final class AppEnvironment {
     let queueStore: QueueStore
     let voiceRecorder: VoiceRecorder
     let speechPlayer: SpeechPlayer
+    let voiceConversationController: VoiceConversationController
     let inboxStore: InboxStore
     let appLock: AppLock
     let themeStore: ThemeStore
@@ -30,6 +43,36 @@ final class AppEnvironment {
             sessionStore: sessionStore,
             chatStore: chatStore
         )
+        let voiceConversationController = VoiceConversationController(
+            dependencies: .init(
+                startListening: { [weak voiceRecorder, weak connectionStore] in
+                    guard let rest = connectionStore?.rest else { return }
+                    await voiceRecorder?.start(rest: rest)
+                },
+                stopAndTranscribe: { [weak voiceRecorder, weak connectionStore] in
+                    guard let recorder = voiceRecorder, let rest = connectionStore?.rest else { return nil }
+                    return await recorder.stopAndTranscribe(rest: rest)
+                },
+                cancelListening: { [weak voiceRecorder] in
+                    voiceRecorder?.cancel()
+                },
+                submitTranscript: { [weak chatStore] transcript in
+                    _ = await chatStore?.send(text: transcript, includeAttachments: false)
+                },
+                speak: { [weak speechPlayer, weak connectionStore] text in
+                    guard let player = speechPlayer, let rest = connectionStore?.rest else { return }
+                    _ = await player.speak(text: text, rest: rest)
+                },
+                stopSpeaking: { [weak speechPlayer] in
+                    speechPlayer?.stop()
+                },
+                level: { [weak voiceRecorder] in
+                    voiceRecorder?.level ?? 0
+                }
+            )
+        )
+        let voiceAutoSpeak = VoiceConversationAutoSpeakCoordinator()
+        let voiceAmbientAutoSpeak = VoiceConversationAmbientAutoSpeakCoordinator()
         // Stores need back-references for RPC access and cross-store flows.
         sessionStore.attach(connection: connectionStore, chat: chatStore)
         chatStore.attach(connection: connectionStore, sessions: sessionStore, attachments: attachmentStore)
@@ -55,10 +98,41 @@ final class AppEnvironment {
         // Turn completion drives the queue's "send next" — ChatStore holds no
         // QueueStore reference, so this closure is the seam (see ChatStore).
         // It ALSO ends the in-flight-turn Live Activity (after its own 2s grace).
-        chatStore.onTurnComplete = { [weak queueStore, weak chatStore] in
+        let turnCompletionPipeline = VoiceConversationTurnCompletionPipeline(
+            drainQueue: { [weak queueStore, weak chatStore] in
+                guard let queueStore, let chatStore else { return }
+                Task { await queueStore.drain(chat: chatStore) }
+            },
+            completeVoiceTurn: { [weak chatStore, weak voiceConversationController, voiceAutoSpeak] in
+                guard let chatStore, let voiceConversationController else { return }
+                Task {
+                    await voiceAutoSpeak.handleTurnComplete(
+                        chat: chatStore,
+                        controller: voiceConversationController
+                    )
+                }
+            },
+            speakAmbientReply: { [
+                weak chatStore, weak voiceConversationController, weak speechPlayer, weak connectionStore,
+                voiceAmbientAutoSpeak
+            ] in
+                guard let chatStore, let voiceConversationController else { return }
+                Task {
+                    await voiceAmbientAutoSpeak.handleTurnComplete(
+                        chat: chatStore,
+                        conversationModeActive: voiceConversationController.isEnabled,
+                        autoTTSEnabled: DefaultsKeys.voiceAutoTTSValue(),
+                        speak: { [weak speechPlayer, weak connectionStore] reply in
+                            guard let player = speechPlayer, let rest = connectionStore?.rest else { return }
+                            _ = await player.speak(text: reply.text, messageId: reply.id, rest: rest)
+                        }
+                    )
+                }
+            }
+        )
+        chatStore.onTurnComplete = {
             LiveActivityManager.shared.end()
-            guard let queueStore, let chatStore else { return }
-            Task { await queueStore.drain(chat: chatStore) }
+            turnCompletionPipeline.run()
         }
         // Queue self-heal seams (the "No active session" / queues-forever trap on
         // desktop-driven sessions). A resume that BINDS a live runtime drains the
@@ -113,6 +187,7 @@ final class AppEnvironment {
         self.queueStore = queueStore
         self.voiceRecorder = voiceRecorder
         self.speechPlayer = speechPlayer
+        self.voiceConversationController = voiceConversationController
         self.inboxStore = inboxStore
         self.appLock = appLock
         self.themeStore = themeStore
@@ -181,5 +256,69 @@ final class AppEnvironment {
             let todayCost = usage.daily.last?.estimatedCost ?? usage.totals.totalEstimatedCost
             WidgetSnapshotWriter.update(tokensToday: todayTokens, costTodayUSD: todayCost)
         }
+    }
+}
+
+/// Coordinates the completed-turn reply hand-off for hands-free voice mode.
+///
+/// `ChatStore` remains the source of truth for transcript rows; this helper
+/// keeps only the stable assistant id that has already been handed to the voice
+/// loop so duplicate `onTurnComplete`/backfill paths do not re-speak it.
+@MainActor
+final class VoiceConversationAutoSpeakCoordinator {
+    private var lastSpokenAssistantReplyId: UUID?
+
+    func handleTurnComplete(
+        chat: ChatStore,
+        controller: VoiceConversationController
+    ) async {
+        guard !UITestAudioGuard.isUITestAudioMuted else { return }
+
+        let reply = chat.latestCompletedAssistantReply(excluding: lastSpokenAssistantReplyId)
+        if let reply {
+            lastSpokenAssistantReplyId = reply.id
+        }
+        await controller.handleTurnComplete(replyText: reply?.text)
+    }
+}
+
+/// Ambient (non-conversation-mode) read-aloud: speaks each newly completed
+/// assistant reply via TTS when hands-free conversation mode is NOT active and
+/// the user has opted in via ``DefaultsKeys/voiceAutoTTS``. Conversation mode
+/// owns its own reply hand-off (``VoiceConversationAutoSpeakCoordinator``) —
+/// this is a separate leg with its own dedup state so the two never fight over
+/// or double-speak the same utterance.
+@MainActor
+final class VoiceConversationAmbientAutoSpeakCoordinator {
+    private var lastSpokenAssistantReplyId: UUID?
+
+    func handleTurnComplete(
+        chat: ChatStore,
+        conversationModeActive: Bool,
+        autoTTSEnabled: Bool,
+        speak: (ChatMessage) async -> Void
+    ) async {
+        guard !conversationModeActive, autoTTSEnabled else { return }
+        guard let reply = chat.latestCompletedAssistantReply(excluding: lastSpokenAssistantReplyId) else { return }
+        lastSpokenAssistantReplyId = reply.id
+        await speak(reply)
+    }
+}
+
+/// Tiny composition seam for the app's turn-complete side effects. Keeping the
+/// queue drain and voice hand-offs as peers makes it testable that installing
+/// conversation-mode plumbing does not clobber the existing queue callback.
+/// `speakAmbientReply` defaults to a no-op so pre-existing 2-arg construction
+/// sites (and their pinning tests) keep compiling unchanged.
+@MainActor
+struct VoiceConversationTurnCompletionPipeline {
+    var drainQueue: () -> Void
+    var completeVoiceTurn: () -> Void
+    var speakAmbientReply: () -> Void = {}
+
+    func run() {
+        drainQueue()
+        completeVoiceTurn()
+        speakAmbientReply()
     }
 }

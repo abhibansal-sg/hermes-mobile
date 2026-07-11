@@ -134,3 +134,102 @@ def test_new_push_kinds_respect_registered_events_subset(monkeypatch, tmp_path):
     assert sent_tokens == []
     assert push.recipients_for_event("turn_error") == {}
     assert push.recipients_for_event("background_done") == {}
+
+
+def test_relay_notify_skips_event_kind_not_in_registered_prefs(monkeypatch, tmp_path):
+    """STR-1132/STR-1135: relay notify honors per-event toggles.
+
+    Relay mode + a token registered for ``["approval"]`` + ``notify("clarify")``
+    must NOT enqueue relay delivery and must return 0.
+    """
+    _isolate_home(monkeypatch, tmp_path)
+    push = load_plugin_module("push_engine")
+    relay = load_plugin_module("relay_client")
+
+    relay_calls = []
+
+    def fake_send_event_background(**kwargs):
+        relay_calls.append(kwargs)
+
+    monkeypatch.setenv("HERMES_MOBILE_RELAY_URL", "https://relay.example.test")
+    monkeypatch.setattr(relay, "send_event_background", fake_send_event_background)
+
+    assert push.register_token(_VALID_TOKEN, env="sandbox", events=["approval"])
+
+    result = push.notify(
+        "clarify",
+        "Question",
+        "Need input",
+        {"session_id": "sess-clarify", "source": "telegram"},
+    )
+
+    assert result == 0
+    assert relay_calls == []
+
+
+def test_relay_notify_emits_for_event_kind_in_registered_prefs(monkeypatch, tmp_path):
+    """STR-1132/STR-1135: relay notify emits for an opted-in event kind.
+
+    Relay mode + a token registered for ``["approval"]`` + ``notify("approval")``
+    must call ``send_event_background`` and return 1; the emitted relay kind
+    stays ``attention``.
+    """
+    _isolate_home(monkeypatch, tmp_path)
+    push = load_plugin_module("push_engine")
+    relay = load_plugin_module("relay_client")
+
+    relay_calls = []
+
+    def fake_send_event_background(**kwargs):
+        relay_calls.append(kwargs)
+
+    monkeypatch.setenv("HERMES_MOBILE_RELAY_URL", "https://relay.example.test")
+    monkeypatch.setattr(relay, "send_event_background", fake_send_event_background)
+
+    assert push.register_token(_VALID_TOKEN, env="sandbox", events=["approval"])
+
+    result = push.notify(
+        "approval",
+        "Approval needed",
+        "Review in Hermes",
+        {"session_id": "sess-approval", "source": "telegram"},
+    )
+
+    assert result == 1
+    assert len(relay_calls) == 1
+    assert relay_calls[0]["kind"] == "attention"
+    assert relay_calls[0]["session_id"] == "sess-approval"
+
+
+def test_relay_notify_falls_open_for_unknown_event_type(monkeypatch, tmp_path):
+    """STR-1132/STR-1135: unknown event types preserve the legacy relay path.
+
+    An event type outside ``PUSH_EVENT_KINDS`` is not subject to per-event
+    gating: relay delivery is enqueued unconditionally (legacy fall-open),
+    even when registered prefs would exclude known kinds.
+    """
+    _isolate_home(monkeypatch, tmp_path)
+    push = load_plugin_module("push_engine")
+    relay = load_plugin_module("relay_client")
+
+    relay_calls = []
+
+    def fake_send_event_background(**kwargs):
+        relay_calls.append(kwargs)
+
+    monkeypatch.setenv("HERMES_MOBILE_RELAY_URL", "https://relay.example.test")
+    monkeypatch.setattr(relay, "send_event_background", fake_send_event_background)
+
+    # No registered recipient wants this (unknown) kind, yet the legacy relay
+    # path must still kick it off.
+    assert push.register_token(_VALID_TOKEN, env="sandbox", events=["approval"])
+
+    result = push.notify(
+        "custom_admin_kind",
+        "Admin",
+        "Manual blast",
+        {"session_id": "sess-admin", "source": "internal"},
+    )
+
+    assert result == 1
+    assert len(relay_calls) == 1

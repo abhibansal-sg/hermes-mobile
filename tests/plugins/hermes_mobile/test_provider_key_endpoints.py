@@ -1079,11 +1079,14 @@ def test_delete_pure_credential_custom_provider_removes_config_entry_and_picker_
     assert slug not in {row.get("slug") for row in rows}
 
 
-def test_delete_tuning_bearing_custom_provider_preserves_tuning_keys(
+def test_delete_custom_provider_removes_full_entry_no_ghost_husk(
     loopback_client, monkeypatch
 ):
-    """ABH-218 A2: disconnecting a custom provider with non-credential tuning
-    keeps the tuning subtree but removes api_key/key_env.
+    """STR-110: disconnecting a custom provider removes the ENTIRE
+    providers.<slug> entry. name/base_url/api_mode are written as one atomic
+    unit with key_env by POST /providers/custom, so keeping them as "tuning"
+    left a ghost config husk that resurfaced as a dashboard/provider-list
+    authenticated row. No husk survives the disconnect.
     """
     import hashlib as _hashlib
 
@@ -1111,15 +1114,27 @@ def test_delete_tuning_bearing_custom_provider_preserves_tuning_keys(
     )
 
     assert r.status_code == 200, r.text
+    assert r.json()["disconnected"] is True
     assert expected_env in calls["remove_env"]
+    assert calls["save_config"], "DELETE should persist removal of providers.<slug>"
     saved = calls["save_config"][-1]
-    assert saved["providers"][slug] == {
-        "name": "Tuned Custom",
-        "base_url": "https://api.tuned.example/v1",
-        "api_mode": "openai",
-        "model": "tuned/model",
-    }
+    # STR-110: the WHOLE custom-provider entry is gone — no
+    # name/base_url/api_mode/model husk remains to resurface as a ghost row.
+    assert slug not in saved.get("providers", {})
     assert calls["set_config"] == []
+
+    import agent.models_dev as models_dev
+    import hermes_cli.models as models
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    monkeypatch.setattr(models_dev, "fetch_models_dev", lambda: {})
+    monkeypatch.setattr(models, "get_curated_nous_model_ids", lambda: [])
+    rows = list_authenticated_providers(
+        user_providers=saved.get("providers", {}),
+        custom_providers=[],
+        max_models=1,
+    )
+    assert slug not in {row.get("slug") for row in rows}
 
 
 # ===========================================================================
@@ -1283,11 +1298,11 @@ def test_custom_key_never_in_config_or_log_or_response(
 def test_delete_custom_provider_clears_key_everywhere(loopback_client, monkeypatch):
     """Regression (security review DEFECT 2): DELETE on a CUSTOM provider must
     actually remove the persisted key — from .env (remove_env_value on the
-    stored env var) AND from config.yaml (remove api_key/key_env while preserving
-    non-credential tuning). The pre-fix code only called clear_provider_auth
-    (which mutates the auth_store JSON, never config.yaml/.env), so
-    providers.<name>.key_env persisted and the runtime could still resolve the
-    key while the route returned disconnected:true.
+    stored env var) AND from config.yaml (STR-110: remove the ENTIRE
+    providers.<slug> custom-provider entry). The pre-fix code only called
+    clear_provider_auth (which mutates the auth_store JSON, never
+    config.yaml/.env), so providers.<name>.key_env persisted and the runtime
+    could still resolve the key while the route returned disconnected:true.
     """
     import hashlib as _hashlib
     slug = "acme-local"
@@ -1335,11 +1350,11 @@ def test_delete_custom_provider_clears_key_everywhere(loopback_client, monkeypat
         f"DELETE did not remove the custom provider's .env var {expected_env}; "
         f"remove_env_value calls: {calls2['remove_env']}"
     )
-    # config.yaml credential fields were removed while non-credential tuning was
-    # preserved (no empty api_key/key_env husk remains).
-    assert calls2["save_config"], "DELETE did not persist config credential removal"
-    saved_provider = calls2["save_config"][-1]["providers"][slug]
-    assert saved_provider == {"base_url": "https://api.acme.example/v1"}
+    # STR-110: the ENTIRE providers.<slug> custom-provider entry is removed on
+    # disconnect — base_url is part of the custom-provider unit, so no husk
+    # survives to resurface as a ghost dashboard/provider-list row.
+    assert calls2["save_config"], "DELETE did not persist config removal"
+    assert slug not in calls2["save_config"][-1].get("providers", {})
     assert calls2["set_config"] == []
 
     # The raw value under those keys is never a secret — and clear_provider_auth
@@ -1794,11 +1809,11 @@ def test_delete_custom_named_after_registered_slug_clears_key(
         f"BUG 3: DELETE did not remove custom .env var {expected_custom_env!r}; "
         f"remove_env calls: {calls['remove_env']}"
     )
-    # config.yaml credential fields MUST have been removed while the custom
-    # endpoint tuning survives.
-    assert calls["save_config"], "BUG 3: config credential removal was not saved"
-    saved_provider = calls["save_config"][-1]["providers"][slug]
-    assert saved_provider == {"base_url": "http://localhost:11434/v1"}
+    # STR-110: the ENTIRE providers.<slug> custom-provider entry is removed on
+    # disconnect — base_url is part of the custom-provider unit, so no husk
+    # survives to resurface as a ghost dashboard/provider-list row.
+    assert calls["save_config"], "BUG 3: config removal was not saved"
+    assert slug not in calls["save_config"][-1].get("providers", {})
     assert calls["set_config"] == []
 
 

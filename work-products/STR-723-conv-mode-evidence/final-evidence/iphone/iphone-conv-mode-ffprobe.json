@@ -1,0 +1,22 @@
+{
+    "programs": [
+
+    ],
+    "stream_groups": [
+
+    ],
+    "streams": [
+        {
+            "codec_name": "h264",
+            "width": 1206,
+            "height": 2622,
+            "avg_frame_rate": "9066/233",
+            "nb_frames": "7555"
+        }
+    ],
+    "format": {
+        "duration": "194.158333",
+        "size": "77298247",
+        "bit_rate": "3184957"
+    }
+}

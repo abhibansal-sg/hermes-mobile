@@ -128,6 +128,32 @@ final class PendingIntentDraftTests: XCTestCase {
         // It did not create a draft/session in the offline case.
         XCTAssertFalse(s.sessions.isDraft)
     }
+
+    func testAskReparksWhenSendIsNotAccepted() async {
+        let defaults = makeDefaults()
+        var didCreateSession = false
+        var sentPrompts: [String] = []
+
+        await PendingIntentRouter.deliverAskPrompt(
+            "retry me",
+            defaults: defaults,
+            createSessionNow: {
+                didCreateSession = true
+            },
+            send: { prompt in
+                sentPrompts.append(prompt)
+                return false
+            }
+        )
+
+        XCTAssertTrue(didCreateSession, "the prompt path should still create a session before sending")
+        XCTAssertEqual(sentPrompts, ["retry me"])
+        XCTAssertEqual(
+            PendingIntent.takePending(from: defaults),
+            .ask(prompt: "retry me"),
+            "a refused send must re-park the Ask Hermes prompt for retry"
+        )
+    }
 }
 
 /// Share-extension inbox drain coverage. Kept beside the pending-intent foreground

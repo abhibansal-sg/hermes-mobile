@@ -35,6 +35,15 @@ final class ConnectionStoreReconnectTests: XCTestCase {
     /// Build a wired store graph (ConnectionStore + SessionStore + ChatStore).
     /// No live servers are touched; the `connectRPC` hook on the returned
     /// `ConnectionStore` is `nil` until the test sets it.
+    ///
+    /// `_restOverrideForTesting` (STR-1481) is seeded here — not just in
+    /// `configureWithoutGateway` — because `recoverActiveSession()` (exercised
+    /// by the `_seedAndStartReconnect`/`_seedConnectedForTesting` tests below,
+    /// not just the `configure()`-path ones) has its own fire-and-forget REST
+    /// probe on `self.rest`. Without this every hermetic test in this file
+    /// leaks a real request at a fake host, flooding CI logs with hundreds of
+    /// `-1004`/"HTTP load failed" lines.
+    #if DEBUG
     private func makeStore() -> (ConnectionStore, SessionStore, ChatStore) {
         let chat = ChatStore()
         let sessions = SessionStore()
@@ -42,8 +51,17 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         let attachments = AttachmentStore()
         chat.attach(connection: connection, sessions: sessions, attachments: attachments)
         sessions.attach(connection: connection, chat: chat)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [InstantFailureProtocol.self]
+        connection._restOverrideForTesting = RestClient(
+            baseURL: URL(string: "https://stub.invalid")!,
+            token: "stub",
+            session: URLSession(configuration: config),
+            pathStyle: .legacy
+        )
         return (connection, sessions, chat)
     }
+    #endif
 
     /// 600 ms — enough for a `Task` spawned on the main executor to complete
     /// its attempt-0 pass (no backoff). The 120ms used by ChatStoreBatchBTests
@@ -81,9 +99,140 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         ]).decoded(as: SessionOpenResult.self)!
     }
 
+    #if DEBUG
+    /// Fails every request instantly (`cannotConnectToHost`) — no real DNS
+    /// lookup or socket attempt. Backs the stub `_restOverrideForTesting`
+    /// client seeded in `makeStore()` (STR-1481): without it, every hermetic
+    /// test's fire-and-forget REST probe (`configure()`'s capability probe /
+    /// auto-upgrade, `recoverActiveSession()`'s reattach probe) tries to reach
+    /// a fake host and floods CI logs with hundreds of "HTTP load failed" /
+    /// `-1004` lines — which is what pushed the real failing assertion out of
+    /// the CI log's `tail -100` window. It is NOT the cause of the two
+    /// `configure()` state-corruption failures below — that turned out to be
+    /// `CODE_SIGNING_ALLOWED=NO` on the test host breaking Keychain
+    /// entitlements (see `.github/workflows/ios-tests.yml`) — but it's still
+    /// needed so hermetic runs make no real network calls at all.
+    private final class InstantFailureProtocol: URLProtocol, @unchecked Sendable {
+        override class func canInit(with request: URLRequest) -> Bool { true }
+        override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+        override func startLoading() {
+            client?.urlProtocol(self, didFailWithError: URLError(.cannotConnectToHost))
+        }
+        override func stopLoading() {}
+    }
+
+    private func configureWithoutGateway(
+        _ connection: ConnectionStore,
+        serverURL: String,
+        token: String,
+        issuedDeviceId: String? = nil
+    ) async -> String? {
+        connection.statusRPC = { _, _ in }
+        connection.connectRPC = { _, _, _ in }
+        return await connection.configure(
+            urlString: serverURL,
+            token: token,
+            issuedDeviceId: issuedDeviceId
+        )
+    }
+    #endif
+
     // MARK: - ABH-355: mid-turn gateway death survives + re-attaches
 
     #if DEBUG
+    func testSavedTokenConfigurePreservesRecordedDeviceIdWhenIssuedDeviceIdIsNil() async {
+        let (connection, _, _) = makeStore()
+        let serverURL = "https://gw.example:9119"
+        let priorServerURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
+        KeychainService.deleteToken(server: serverURL)
+        defer {
+            KeychainService.deleteToken(server: serverURL)
+            DefaultsKeys.setDeviceId(nil, server: serverURL)
+            if let priorServerURL {
+                UserDefaults.standard.set(priorServerURL, forKey: DefaultsKeys.serverURL)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+            }
+        }
+        try? KeychainService.saveToken("stored-device-token", server: serverURL)
+        DefaultsKeys.setDeviceId("dev_existing", server: serverURL)
+
+        let failure = await configureWithoutGateway(
+            connection,
+            serverURL: serverURL,
+            token: "stored-device-token"
+        )
+
+        XCTAssertNil(failure)
+        XCTAssertEqual(
+            DefaultsKeys.deviceId(server: serverURL),
+            "dev_existing",
+            "saved-token bootstrap/retry configure must not erase the recorded device_id"
+        )
+    }
+
+    func testConfigureClearsStaleDeviceIdWhenNilIssuedDeviceIdUsesDifferentToken() async {
+        let (connection, _, _) = makeStore()
+        let serverURL = "https://gw.example:9121"
+        let priorServerURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
+        KeychainService.deleteToken(server: serverURL)
+        defer {
+            KeychainService.deleteToken(server: serverURL)
+            DefaultsKeys.setDeviceId(nil, server: serverURL)
+            if let priorServerURL {
+                UserDefaults.standard.set(priorServerURL, forKey: DefaultsKeys.serverURL)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+            }
+        }
+        try? KeychainService.saveToken("stored-device-token", server: serverURL)
+        DefaultsKeys.setDeviceId("dev_stale", server: serverURL)
+
+        let failure = await configureWithoutGateway(
+            connection,
+            serverURL: serverURL,
+            token: "manual-shared-token"
+        )
+
+        XCTAssertNil(failure)
+        XCTAssertNil(
+            DefaultsKeys.deviceId(server: serverURL),
+            "nil-id configure with a different token must clear stale device_id so auto-upgrade can issue a fresh device token"
+        )
+        XCTAssertEqual(KeychainService.loadToken(server: serverURL), "manual-shared-token")
+    }
+
+    func testConfigureRecordsNonNilIssuedDeviceId() async {
+        let (connection, _, _) = makeStore()
+        let serverURL = "https://gw.example:9120"
+        let priorServerURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
+        KeychainService.deleteToken(server: serverURL)
+        defer {
+            KeychainService.deleteToken(server: serverURL)
+            DefaultsKeys.setDeviceId(nil, server: serverURL)
+            if let priorServerURL {
+                UserDefaults.standard.set(priorServerURL, forKey: DefaultsKeys.serverURL)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+            }
+        }
+        DefaultsKeys.setDeviceId("dev_old", server: serverURL)
+
+        let failure = await configureWithoutGateway(
+            connection,
+            serverURL: serverURL,
+            token: "qr-v2-device-token",
+            issuedDeviceId: "dev_new"
+        )
+
+        XCTAssertNil(failure)
+        XCTAssertEqual(
+            DefaultsKeys.deviceId(server: serverURL),
+            "dev_new",
+            "QR v2/device-token configure must replace the recorded device_id"
+        )
+    }
+
     func testOutOfOrderForeignOwnershipMarkerDegradesWithoutCrashing() async {
         let (_, sessions, chat) = makeStore()
         sessions.activeStoredId = "stored-foreign-guard"

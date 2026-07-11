@@ -29,6 +29,7 @@ final class CrossClientSyncUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = base
         app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         // Connected chat shell rendered → open the navigation drawer.

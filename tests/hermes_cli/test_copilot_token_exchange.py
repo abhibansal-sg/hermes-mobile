@@ -100,7 +100,7 @@ class TestExchangeCopilotToken:
 
 
 class TestGetCopilotApiToken:
-    """Tests for get_copilot_api_token() — the fallback wrapper."""
+    """Tests for get_copilot_api_token() — the runtime exchange wrapper."""
 
     @patch("hermes_cli.copilot_auth.exchange_copilot_token")
     def test_returns_exchanged_token(self, mock_exchange):
@@ -112,12 +112,11 @@ class TestGetCopilotApiToken:
         assert base_url is None
 
     @patch("hermes_cli.copilot_auth.exchange_copilot_token", side_effect=ValueError("fail"))
-    def test_falls_back_to_raw_token(self, mock_exchange):
+    def test_raises_on_exchange_failure(self, mock_exchange):
         from hermes_cli.copilot_auth import get_copilot_api_token
 
-        api_token, base_url = get_copilot_api_token("gho_raw")
-        assert api_token == "gho_raw"
-        assert base_url is None
+        with pytest.raises(ValueError, match="fail"):
+            get_copilot_api_token("gho_raw")
 
     def test_empty_token_passthrough(self):
         from hermes_cli.copilot_auth import get_copilot_api_token
@@ -163,6 +162,17 @@ class TestCallerIntegration:
         token, source = _resolve_api_key_provider_secret("copilot", pconfig)
         assert token == "exchanged_jwt"
         assert source == "GH_TOKEN"
+        mock_exchange.assert_called_once_with("gho_raw")
+
+    @patch("hermes_cli.copilot_auth.resolve_copilot_token", return_value=("gho_raw", "GH_TOKEN"))
+    @patch("hermes_cli.copilot_auth.get_copilot_api_token", side_effect=ValueError("exchange failed"))
+    def test_auth_resolve_fails_closed_when_exchange_fails(self, mock_exchange, mock_resolve):
+        from hermes_cli.auth import _resolve_api_key_provider_secret
+
+        pconfig = MagicMock()
+        token, source = _resolve_api_key_provider_secret("copilot", pconfig)
+        assert token == ""
+        assert source == ""
         mock_exchange.assert_called_once_with("gho_raw")
 
 

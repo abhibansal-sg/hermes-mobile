@@ -21,6 +21,7 @@ final class ConnectionModePickerUITests: XCTestCase {
         // Clear saved config so this is a fresh first-run launch.
         app.launchArguments += ["-hermes.serverURL", ""]
         app.launchArguments += ["-hermes.connectionMode", ""]
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         // WelcomeView renders the mode picker — assert all three mode buttons exist.
@@ -50,6 +51,7 @@ final class ConnectionModePickerUITests: XCTestCase {
         app.launchArguments += ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchArguments += ["-hermes.serverURL", ""]
         app.launchArguments += ["-hermes.connectionMode", ""]
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         // Tap "Remote URL" mode button.
@@ -107,6 +109,7 @@ final class ConnectionModePickerUITests: XCTestCase {
         app.launchArguments += ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchArguments += ["-hermes.serverURL", ""]
         app.launchArguments += ["-hermes.connectionMode", ""]
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         // Tap "Local desktop" to select it.
@@ -122,6 +125,7 @@ final class ConnectionModePickerUITests: XCTestCase {
         let app2 = XCUIApplication()
         app2.launchArguments += ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app2.launchArguments += ["-hermes.serverURL", ""]
+        app2.launchArguments += ["--uitest-mute-audio"]
         app2.launch()
 
         // The Local desktop button should be selected (has .isSelected trait).

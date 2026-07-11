@@ -401,6 +401,13 @@ final class ConnectionStore {
     /// Speaks the path family the capability probe resolved (ABH-88) — `.legacy`
     /// until/unless the plugin-mount probe concludes `.available`.
     var rest: RestClient? {
+        #if DEBUG
+        // Test-only: a seeded override short-circuits the URL+token build so a
+        // stub `URLSession` can observe/no-op the calls made through `rest`
+        // (e.g. reconnect's `recoverActiveSession` probes). See
+        // `_restOverrideForTesting`.
+        if let _restOverrideForTesting { return _restOverrideForTesting }
+        #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
         return RestClient(
             baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
@@ -411,11 +418,31 @@ final class ConnectionStore {
     /// usage / cron / skills — now ``RestClient`` extension members), built from
     /// the same saved URL + token as `rest`, or `nil` if unconfigured.
     var control: RestClient? {
+        #if DEBUG
+        // Test-only: same seam as `rest` (see `_restOverrideForTesting`) so the
+        // control-surface client is equally stubbable in unit tests.
+        if let _restOverrideForTesting { return _restOverrideForTesting }
+        #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
         return RestClient(
             baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
         )
     }
+
+    #if DEBUG
+    /// Test-only override: when set, `rest`/`control` return this client instead
+    /// of building one from the saved URL + token, so a stub `URLSession`
+    /// (`URLProtocol`-injected) can observe/no-op the requests they issue —
+    /// in particular the reconnect-path probes inside `recoverActiveSession()`
+    /// (`capabilities.probe`, `autoUpgradeToDeviceTokenIfNeeded`), which are
+    /// otherwise routed through an internal `.ephemeral` session that no
+    /// `URLProtocol` can intercept, and which leak real network calls to a
+    /// dead loopback gateway on a CI runner with no server (STR-1481). Mirrors
+    /// the existing `_seed…ForTesting` conventions; compiled out of Release,
+    /// so there is no production surface and no secret exposure (the stub
+    /// client's session and token are entirely test-injected).
+    var _restOverrideForTesting: RestClient?
+    #endif
 
     /// The persistent prompt outbox/queue. Drained here after reconnect backfill.
     /// Wired by `AppEnvironment` (ChatStore holds no reference to it).
@@ -448,6 +475,11 @@ final class ConnectionStore {
     var connectRPC: ((_ url: URL, _ token: String, _ mode: ConnectionMode) async throws -> Void)?
 
     #if DEBUG
+    /// Injectable configure status probe (tests). When non-nil, replaces the live
+    /// `RestClient.status()` call so unit tests can exercise verified configure
+    /// persistence without a gateway.
+    var statusRPC: ((_ url: URL, _ token: String) async throws -> Void)?
+
     /// Injectable auth-revoke probe (tests). When non-nil, replaces the live
     /// `probeIsAuthRevoked` REST call with this closure's return value so unit
     /// tests can drive the threshold → `reauthRequired` flip without a server.
@@ -698,9 +730,21 @@ final class ConnectionStore {
         phase = .connecting
 
         // Probe REST first to fail fast with a clear message before opening WS.
-        let probe = RestClient(baseURL: url, token: trimmedToken)
+        let previousToken = KeychainService.loadToken(server: trimmedURL)
+        let isSavedTokenReuse = issuedDeviceId == nil && previousToken == trimmedToken
+
         do {
+            #if DEBUG
+            if let statusRPC {
+                try await statusRPC(url, trimmedToken)
+            } else {
+                let probe = RestClient(baseURL: url, token: trimmedToken)
+                _ = try await probe.status()
+            }
+            #else
+            let probe = RestClient(baseURL: url, token: trimmedToken)
             _ = try await probe.status()
+            #endif
         } catch {
             // An auth rejection on a probe means this token is no longer valid —
             // surface the re-pair affordance rather than a generic offline error
@@ -717,7 +761,11 @@ final class ConnectionStore {
         }
 
         do {
-            try await client.connect(baseURL: url, token: trimmedToken, mode: connectionMode)
+            if let connectRPC {
+                try await connectRPC(url, trimmedToken, connectionMode)
+            } else {
+                try await client.connect(baseURL: url, token: trimmedToken, mode: connectionMode)
+            }
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             phase = .offline(message)
@@ -733,11 +781,17 @@ final class ConnectionStore {
         // W3A-A QR v2: a `kind=device` pairing handed us a device token + its
         // server-minted `device_id`. Record the (non-secret) id so the panel can
         // mark "This device" and the auto-upgrade path sees this device already
-        // holds a device token (so it does NOT re-issue). The token is already in
-        // the Keychain above (it IS the stored credential). A v1/manual pairing
-        // passes `nil` here, so any stale id for this server is cleared and the
-        // post-connect auto-upgrade is free to issue a fresh device token.
-        DefaultsKeys.setDeviceId(issuedDeviceId, server: trimmedURL)
+        // holds a device token (so it does NOT re-issue). A nil id is ambiguous:
+        // saved-token bootstrap/retry paths also call configure without an
+        // issued id while reusing the already-stored device-token credential, so
+        // preserve only when the presented token matches the stored one.
+        // Explicit self-revoke continues to clear via DevicesView, and nil-id
+        // manual/shared-token pairing clears any stale id so auto-upgrade can run.
+        if let issuedDeviceId, !issuedDeviceId.isEmpty {
+            DefaultsKeys.setDeviceId(issuedDeviceId, server: trimmedURL)
+        } else if !isSavedTokenReuse {
+            DefaultsKeys.setDeviceId(nil, server: trimmedURL)
+        }
 
         startLongLivedTasks()
         hasConnected = true

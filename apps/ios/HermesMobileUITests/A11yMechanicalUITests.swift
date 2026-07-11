@@ -26,6 +26,7 @@ final class A11yMechanicalUITests: XCTestCase {
         app.launchArguments += ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchArguments += ["-hermes.serverURL", ""]
         app.launchArguments += ["-hermes.connectionMode", ""]
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         // Navigate: WelcomeView → Remote URL mode → Enter URL → ConnectionSetupView sheet.
@@ -71,6 +72,7 @@ final class A11yMechanicalUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchArguments += ["--uitest-mute-audio"]
         app.launch()
 
         // Wait for the connected chat shell.

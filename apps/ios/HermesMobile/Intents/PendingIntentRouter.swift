@@ -69,17 +69,37 @@ enum PendingIntentRouter {
                 return
             }
             Task {
-                do {
-                    try await sessions.createSessionNow()
-                } catch {
-                    // Could not create a session: re-park so we don't lose the
-                    // user's prompt; they'll get it on the next good foreground.
-                    intent.park(in: defaults)
-                    return
-                }
-                // `createSessionNow()` sets `activeRuntimeId`; `send` is a no-op without it.
-                await chat.send(text: prompt)
+                await deliverAskPrompt(
+                    prompt,
+                    defaults: defaults,
+                    createSessionNow: { try await sessions.createSessionNow() },
+                    send: { await chat.send(text: $0) }
+                )
             }
+        }
+    }
+
+    static func deliverAskPrompt(
+        _ prompt: String,
+        defaults: UserDefaults,
+        createSessionNow: @escaping @MainActor () async throws -> Void,
+        send: @escaping @MainActor (String) async -> Bool
+    ) async {
+        let intent = PendingIntent.ask(prompt: prompt)
+        do {
+            try await createSessionNow()
+        } catch {
+            // Could not create a session: re-park so we don't lose the user's
+            // prompt; they'll get it on the next good foreground.
+            intent.park(in: defaults)
+            return
+        }
+        // `createSessionNow()` sets `activeRuntimeId`; `send` can still refuse
+        // the prompt (busy, transport failure, lost runtime). Preserve it for a
+        // later foreground instead of silently dropping it.
+        let accepted = await send(prompt)
+        if !accepted {
+            intent.park(in: defaults)
         }
     }
 

@@ -57,6 +57,8 @@ _log = logging.getLogger(__name__)
 
 router = APIRouter()
 
+_DEBUG_SHARE_ROUTE_BUDGET_S = 15
+
 # Directory of the plugin package (parent of dashboard/).
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 _PLUGIN_PKG = "hermes_plugins.hermes_mobile"
@@ -528,10 +530,26 @@ async def debug_share_report(request: Request):
         raise HTTPException(status_code=403, detail="Device token lacks approve scope")
 
     try:
-        result = await asyncio.to_thread(
-            build_debug_share,
-            log_lines=200,
-            redact=True,
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                build_debug_share,
+                log_lines=200,
+                redact=True,
+            ),
+            timeout=_DEBUG_SHARE_ROUTE_BUDGET_S,
+        )
+    except asyncio.TimeoutError:
+        # STR-1210: a slow/rate-limited paste service must never hang this
+        # request past a bounded ceiling. The upload thread keeps running in
+        # the background (paste.rs/dpaste.com blocking sockets can't be
+        # cancelled); the caller gets a fast, honest answer and can retry.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Debug bundle upload did not finish within "
+                f"{_DEBUG_SHARE_ROUTE_BUDGET_S}s; it continues in the "
+                f"background. Retry, or run `hermes debug share` from the CLI."
+            ),
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=f"Upload failed: {exc}")
@@ -2413,6 +2431,29 @@ def _remove_custom_provider_credentials_from_config(slug: str) -> bool:
     return True
 
 
+def _delete_custom_provider_config_entry(slug: str) -> bool:
+    """Remove the entire ``providers.<slug>`` custom-provider entry.
+
+    STR-110: a custom provider is born as one atomic unit
+    ``{name, base_url, api_mode, key_env}`` from POST /providers/custom —
+    name/base_url/api_mode are how that credential is addressed, NOT
+    independent tuning. The disconnect path must therefore pop the WHOLE
+    subtree. Stripping only ``api_key``/``key_env`` left a
+    ``{name, base_url, api_mode}`` config husk that resurfaced as a ghost
+    authenticated/user-config row in the dashboard and provider list.
+    Returns True when an entry existed and was removed.
+    """
+    from hermes_cli.config import load_config, save_config
+
+    config = load_config()
+    providers = config.get("providers")
+    if not isinstance(providers, dict) or slug not in providers:
+        return False
+    providers.pop(slug, None)
+    save_config(config)
+    return True
+
+
 def _custom_provider_entries() -> Dict[str, Dict[str, Any]]:
     """Read all custom-provider config entries from config.yaml (ABH-257).
 
@@ -2718,6 +2759,58 @@ async def set_toolset_config(
         return JSONResponse(
             status_code=400, content={"error": str(exc), "code": 4001}
         )
+
+    refreshed, _allowed = _toolset_config_payload(name)
+    return refreshed
+
+
+class ToolsetProviderBody(BaseModel):
+    provider: str
+
+
+@router.put("/toolsets/{name}/provider")
+async def set_toolset_provider(
+    name: str, body: ToolsetProviderBody, request: Request
+) -> Any:
+    """Persist a provider selection for a toolset (no key prompting).
+
+    Mirrors the desktop ``PUT /api/tools/toolsets/{name}/provider`` route —
+    delegates to the shared, non-interactive
+    ``hermes_cli.tools_config.apply_provider_selection`` so mobile and
+    desktop write identical config keys (``web.backend``, ``tts.provider``,
+    etc.). Never mutates ``.env`` or ``os.environ`` — credential mutation
+    stays exclusive to ``PUT /config``. Returns the refreshed config payload
+    so the caller sees ``active_provider``/``is_active`` update immediately.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(
+            status_code=403, detail="Device token lacks approve scope"
+        )
+
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.tools_config import apply_provider_selection
+
+    name = (name or "").strip()
+    if name not in _valid_toolset_config_names():
+        return _toolset_config_unknown_response(name)
+
+    provider = (body.provider or "").strip()
+    if not provider:
+        return JSONResponse(
+            status_code=400, content={"error": "provider required", "code": 4001}
+        )
+
+    config = load_config()
+    try:
+        apply_provider_selection(name, provider, config)
+    except KeyError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(exc).strip('"'), "code": 4001},
+        )
+    save_config(config)
 
     refreshed, _allowed = _toolset_config_payload(name)
     return refreshed
@@ -3216,12 +3309,15 @@ async def remove_provider_key(
                 cleared_env = True
         except ValueError:
             pass
-        # Remove credential fields from config.yaml. Pure credential-only custom
-        # entries are deleted entirely so stock model discovery cannot resurface
-        # an empty providers.<slug> husk as a ghost user-config row. Entries with
-        # non-credential tuning keep that tuning and lose only api_key/key_env.
+        # STR-110: remove the ENTIRE providers.<slug> custom-provider entry.
+        # Custom providers are written as one {name, base_url, api_mode,
+        # key_env} unit by POST /providers/custom, so name/base_url/api_mode
+        # are part of the credential unit — NOT independent tuning. Stripping
+        # only api_key/key_env left a {name, base_url, api_mode} husk that
+        # resurfaced as a ghost dashboard/provider-list row; deleting the whole
+        # subtree guarantees no husk survives the disconnect.
         try:
-            cleared_config = _remove_custom_provider_credentials_from_config(slug)
+            cleared_config = _delete_custom_provider_config_entry(slug)
         except ValueError:
             pass
 
