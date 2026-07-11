@@ -1355,6 +1355,18 @@ final class ConnectionStore {
                         try await self.client.connect(baseURL: url, token: token, mode: self.connectionMode)
                     }
                     if Task.isCancelled { return }
+                    // End grace immediately on the successful connect, BEFORE
+                    // the awaited recovery below — `recoverActiveSession()`
+                    // has genuine network suspensions, and while this task is
+                    // suspended the MainActor is free for the armed
+                    // `graceTask` to fire `escalateGraceExpiry()`. That guards
+                    // only on `isInGrace`, so leaving grace open here let a
+                    // late-firing timer stamp a spurious "Connection lost"
+                    // warning on a reconnect that had already succeeded
+                    // (STR-1126 regression). `handle(state:)` won't re-arm a
+                    // new grace window while `reconnectTask` is still
+                    // non-nil, so ending it this early is safe.
+                    self.endGrace()
                     // A quick heal (attempt-0 success, typically still inside
                     // grace): silently finalize any stream the drop left
                     // stranded — REQUIRED for `backfill()`'s `guard
@@ -1364,7 +1376,6 @@ final class ConnectionStore {
                     self.chatStore.handleConnectionDrop(stampWarning: false)
                     self.sessionStore.clearAllTurnsInProgress()
                     await self.recoverActiveSession()
-                    self.endGrace()
                     self.phase = .connected
                     self.reconnectTask = nil
                     self.consecutiveReconnectFailures = 0
