@@ -427,7 +427,7 @@ final class ConnectionStore {
         #if DEBUG
         // Test-only: a seeded override short-circuits the URL+token build so a
         // stub `URLSession` can observe/no-op the calls made through `rest`
-        // (e.g. reconnect's `recoverActiveSession` probes). See
+        // (e.g. reconnect probes and the device auto-upgrade round-trip). See
         // `_restOverrideForTesting`.
         if let _restOverrideForTesting { return _restOverrideForTesting }
         #endif
@@ -457,7 +457,8 @@ final class ConnectionStore {
     /// of building one from the saved URL + token, so a stub `URLSession`
     /// (`URLProtocol`-injected) can observe/no-op the requests they issue —
     /// in particular the reconnect-path probes inside `recoverActiveSession()`
-    /// (`capabilities.probe`, `autoUpgradeToDeviceTokenIfNeeded`), which are
+    /// (`capabilities.probe`, `autoUpgradeToDeviceTokenIfNeeded`) and the
+    /// auto-upgrade `issueDevice` round-trip, which are
     /// otherwise routed through an internal `.ephemeral` session that no
     /// `URLProtocol` can intercept, and which leak real network calls to a
     /// dead loopback gateway on a CI runner with no server (STR-1481). Mirrors
@@ -1545,7 +1546,16 @@ final class ConnectionStore {
     ///     never issue);
     ///   - no `device_id` already recorded for this server (already upgraded, or a
     ///     v2 QR handed us a device token — don't re-issue);
-    ///   - we are still configured against `serverURL` with a live token.
+    ///   - we are still configured against `serverURL` with a live token;
+    ///   - the server's live `GET /api/status` reports `auth_required == true`
+    ///     (STR-1568). A loopback/insecure dev-gateway runs `auth_required ==
+    ///     false`; there, the legacy shared-token-only `auth_middleware` is the
+    ///     ONLY active gate on `/api/*` — it has no device-token branch (that
+    ///     lives in `gated_auth_middleware`, which never engages on loopback) —
+    ///     so a device-upgraded phone would 401 on every request, app-wide, with
+    ///     no way back to the shared token short of a re-pair. Fail-safe on a
+    ///     missing/unreachable status (`nil`): keep the shared token, which the
+    ///     loopback gate always accepts.
     ///
     /// FAILURE IS SILENT (binding) for transient/status failures: if `issueDevice`
     /// throws (500 persist failure, 401, transport), the app KEEPS the shared
@@ -1573,6 +1583,12 @@ final class ConnectionStore {
         guard !deviceIssueLimitReachedServers.contains(serverURL) else { return }
         // Must still be the active configuration with a live token + REST client.
         guard serverURLString == serverURL, let rest else { return }
+
+        // STR-1568: only issue a device token when the server's own auth gate
+        // would actually accept one — see the gating note above. `try?` folds a
+        // transport/decode failure into the same fail-safe as `nil`: keep the
+        // shared token, retry on the next connect.
+        guard let status = try? await rest.status(), status.authRequired == true else { return }
 
         let issued: IssuedDevice
         do {
