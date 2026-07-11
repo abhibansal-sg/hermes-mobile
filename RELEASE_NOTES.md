@@ -1,6 +1,8 @@
 Build 98 — 2026-07-11
 
 WHAT'S NEW
+- Hands-free iOS conversation mode with listening, transcribing, thinking, and speaking states
+- Optional automatic read-aloud for completed assistant replies
 - Self-provision live-gateway creds for ios-build.sh test lane
 - Pass approve rule keys to approval gate
 - Optionally mention approval owners on exec prompts
@@ -19,11 +21,13 @@ IMPROVED
 - Add WhatsApp dashboard pairing flow
 
 WORTH TRYING
+- Try: Start conversation mode from chat, mute/unmute it, then use the always-visible stop control
+- Try: Enable automatic read-aloud in Settings and confirm ordinary dictation still waits for review
 - Try: Self-provision live-gateway creds for ios-build.sh test lane
 - Try: Pass approve rule keys to approval gate
 - Try: Optionally mention approval owners on exec prompts
 
-(+168 server-side/infra changes active on the gateway, no app UI change)
+(+166 server-side/infra changes active on the gateway)
 
 ---
 
