@@ -218,6 +218,8 @@ struct SessionRuntimeInfo: Decodable, Sendable {
     let fast: Bool?
     /// Service tier string ("priority" / "").
     let serviceTier: String?
+    /// Effective approval-bypass state for this session.
+    let yolo: Bool?
 }
 
 /// Result of `session.status`.
