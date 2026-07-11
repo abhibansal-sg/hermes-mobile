@@ -2365,6 +2365,22 @@ final class SessionStore {
     /// Monotonic token for the most recent `open()`; background work from a
     /// superseded open (the user tapped another session) checks it and bails.
     private var openToken = UUID()
+    private var openRevealToken: UUID?
+    private static let drawerRevealDeadline: Duration = .milliseconds(300)
+
+    private func makeOpenReveal(
+        token: UUID,
+        callback: @MainActor @escaping () -> Void
+    ) -> @MainActor () -> Void {
+        openRevealToken = token
+        return { [weak self] in
+            guard let self,
+                  self.openToken == token,
+                  self.openRevealToken == token else { return }
+            self.openRevealToken = nil
+            callback()
+        }
+    }
 
     /// ABH-372 warm-switch cache: the already-normalized transcript snapshots
     /// from sessions opened in this app process. The disk cache avoids a network
@@ -2406,6 +2422,10 @@ final class SessionStore {
     /// wall-clock settle.
     private(set) var lastOpenResumeTask: Task<Void, Never>?
 
+    /// DEBUG-only hook for tests that need to hold the first-paint path while
+    /// exercising the drawer reveal deadline.
+    var beforeOpenSeedForTesting: (() async -> Void)?
+
     /// DEBUG-only: await the most recently spawned open-seed Task, then yield
     /// once so any main-actor mutations it enqueued have a chance to propagate.
     /// Call this in tests INSTEAD OF (or after) `settle()` to deterministically
@@ -2430,9 +2450,14 @@ final class SessionStore {
     ///   close on frame 0, async cache paint lands a frame later) let the content
     ///   swap land while the card was already moving — the reported desync.
     ///   Guarded by `openToken`, so a newer open()/draft that supersedes this tap
-    ///   in the same window never fires a stale close. `nil` (the default, every
-    ///   non-drawer caller) preserves the exact prior behavior.
+    ///   in the same window never fires a stale close. A selected-row re-tap fires
+    ///   the reveal immediately because the content is already active, and a 300 ms
+    ///   deadline races first paint so a missed paint signal cannot strand the
+    ///   drawer. `nil` (the default, every non-drawer caller) preserves the exact
+    ///   prior behavior.
     func open(_ summary: SessionSummary, revealOnFirstPaint: (@MainActor () -> Void)? = nil) {
+        let wasAlreadyActive = activeStoredId == summary.id
+
         // Leaving any draft: opening a stored session is no longer a draft.
         isDraft = false
         // Per-session state belongs to the PREVIOUS session — clear it now so the
@@ -2477,6 +2502,10 @@ final class SessionStore {
         // the seed's stored id, so they MUST land synchronously on the tap tick.
         let token = UUID()
         openToken = token
+        let reveal = revealOnFirstPaint.map { makeOpenReveal(token: token, callback: $0) }
+        if revealOnFirstPaint == nil {
+            openRevealToken = nil
+        }
         activeRuntimeId = nil          // gates the composer until resume lands
         activeStoredId = summary.id
         let rowProfile = profileParam(for: summary)
@@ -2487,6 +2516,16 @@ final class SessionStore {
         cancelEnsureRuntime()
         ensureRuntimeTargetId = summary.id
         ensureRuntimeAttempts = 0
+
+        if wasAlreadyActive {
+            reveal?()
+        } else if let reveal {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: Self.drawerRevealDeadline)
+                guard let self, self.openToken == token else { return }
+                reveal()
+            }
+        }
 
         // FIX 4 — DEFER the heavy transcript teardown off the drawer-tap runloop tick
         // so the drawer-close spring (.spring response 0.40, RootView) owns the first
@@ -2513,11 +2552,15 @@ final class SessionStore {
         // fetch then reconciles in place over either starting point.
         let seedTask = Task { [weak self] in
             guard let self, self.openToken == token else { return }
+            #if DEBUG
+            await self.beforeOpenSeedForTesting?()
+            guard self.openToken == token else { return }
+            #endif
             await self.seedTranscriptCacheFirst(
                 storedId: summary.id,
                 profile: rowProfile,
                 token: token,
-                onFirstPaint: revealOnFirstPaint
+                onFirstPaint: wasAlreadyActive ? nil : reveal
             )
         }
         #if DEBUG
@@ -2624,6 +2667,7 @@ final class SessionStore {
         // Supersede any in-flight `open()` so its resume can't reactivate, and any
         // on-demand re-resume so its result can't bind into this fresh draft.
         openToken = UUID()
+        openRevealToken = nil
         cancelEnsureRuntime()
         isDraft = true
         activeRuntimeId = nil
