@@ -960,6 +960,10 @@ final class ChatStore {
         guard let id = payload.toolCallId else { return }
         let failed = Self.indicatesFailure(name: payload.name, result: payload.result)
         let preview = String(payload.result.compactDescription.prefix(300))
+        // Derived from the FULL `payload.result` — before the 300-char
+        // `resultPreview` truncation above — so a summary can still surface
+        // fields that live past character 300 of the raw preview.
+        let summary = ToolResultSummary.summaryLine(for: payload.result, failed: failed)
         // Retain the full structured todo array from the untruncated result so
         // the TodoCardView never re-parses the 300-char preview (which would
         // fail JSON parsing on any non-trivial list). The gateway puts the
@@ -976,6 +980,7 @@ final class ChatStore {
         mutateTool(id: id) { tool in
             tool.state = failed ? .failed : .done
             tool.resultPreview = preview
+            tool.resultSummary = summary
             tool.durationMs = payload.durationMs
             tool.todos = todos
             tool.fullDiff = fullDiff
@@ -3166,7 +3171,8 @@ final class ChatStore {
                         return ToolActivity(
                             id: candidate, name: tool.name, argsSummary: tool.argsSummary,
                             progressText: tool.progressText, resultPreview: tool.resultPreview,
-                            state: tool.state, durationMs: tool.durationMs, todos: tool.todos
+                            state: tool.state, durationMs: tool.durationMs, todos: tool.todos,
+                            fullDiff: tool.fullDiff, resultSummary: tool.resultSummary
                         )
                     }
                     // The cluster id is the first tool's id; re-derive after de-dup.

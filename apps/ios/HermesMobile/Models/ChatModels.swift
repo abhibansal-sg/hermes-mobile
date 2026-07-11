@@ -620,17 +620,386 @@ struct ToolActivity: Identifiable, Sendable, Equatable {
     /// diff view never needs to fall back to a re-parse of truncated JSON.
     /// `nil` for non-file-edit tools or when the result carried no diff.
     var fullDiff: String? = nil
+    /// Content-aware human-readable summary derived from the FULL
+    /// `tool.complete` result (see ``ToolResultSummary``), before
+    /// ``resultPreview``'s 300-char truncation. `nil` when nothing meaningful
+    /// could be derived — callers fall back to a generic Done/Failed string.
+    var resultSummary: String?
 
     /// Human-friendly one-liner for collapsed rows.
     var summaryLine: String {
         switch state {
         case .running: return progressText.isEmpty ? "Running…" : progressText
         case .done:
+            if let resultSummary, !resultSummary.isEmpty { return resultSummary }
             if let durationMs {
                 return String(format: "Done in %.1fs", durationMs / 1000)
             }
             return "Done"
-        case .failed: return "Failed"
+        case .failed:
+            if let resultSummary, !resultSummary.isEmpty { return resultSummary }
+            return "Failed"
+        }
+    }
+}
+
+/// Heuristic JSON → human-readable summary for a tool's `tool.complete`
+/// result. Ported from the desktop's `tool-result-summary.ts` — same
+/// behavior class (wrapper unwrapping, priority fields, nested-error
+/// detection, clipping), not byte-for-byte identical output text.
+enum ToolResultSummary {
+    private static let wrapperKeys = ["data", "result", "output", "response", "payload"]
+    private static let priorityKeys = [
+        "title", "name", "path", "file", "filepath", "url", "href", "link",
+        "status", "id", "message", "summary", "description",
+    ]
+    private static let errorKeys = ["error", "errors", "failure", "exception"]
+    // `stderr` is deliberately excluded — many CLIs emit informational lines
+    // on stderr that aren't errors (matches desktop tool-result-summary.ts).
+    private static let errorMessageKeys = ["message", "reason", "detail"]
+    private static let nonErrorText: Set<String> = [
+        "", "0", "false", "none", "null", "nil", "ok", "success", "n/a", "na",
+    ]
+
+    // MARK: - Public API
+
+    /// The line to show for a completed/failed tool row, or `nil` if nothing
+    /// meaningful could be derived from `result`.
+    static func summaryLine(for result: JSONValue, failed: Bool) -> String? {
+        if failed, let error = errorMessage(in: result) {
+            return error
+        }
+        return summarize(result)
+    }
+
+    /// General (non-error) content-aware summary of an arbitrary tool result.
+    static func summarize(_ value: JSONValue) -> String? {
+        let unwrapped = unwrapPayload(value)
+        let primary = formatSummaryValue(unwrapped, depth: 0)
+        if !primary.isEmpty { return primary }
+        let fallback = formatSummaryValue(value, depth: 0)
+        return fallback.isEmpty ? nil : fallback
+    }
+
+    /// `summarize(_:)` for a raw JSON string result (falls back to the raw
+    /// text, clipped, when the string isn't valid JSON).
+    static func summarize(jsonString text: String) -> String? {
+        summarize(norm(.string(text)))
+    }
+
+    /// The deepest nested real error message in `value`, or `nil` if none is
+    /// detected. `stderr` alone never counts as an error signal.
+    static func errorMessage(in value: JSONValue) -> String? {
+        let text = findNestedError(value, depth: 0)
+        return text.isEmpty ? nil : text
+    }
+
+    /// `errorMessage(in:)` for a raw JSON string result.
+    static func errorMessage(jsonString text: String) -> String? {
+        errorMessage(in: norm(.string(text)))
+    }
+
+    // MARK: - JSON string coercion
+
+    private static func tryJson(_ text: String) -> JSONValue {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .string("") }
+        guard let first = trimmed.first, first == "{" || first == "[" || first == "\"" else {
+            return .string(text)
+        }
+        guard let data = trimmed.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(JSONValue.self, from: data) else {
+            return .string(text)
+        }
+        return decoded
+    }
+
+    private static func norm(_ value: JSONValue) -> JSONValue {
+        if case .string(let s) = value { return tryJson(s) }
+        return value
+    }
+
+    // MARK: - Text helpers
+
+    private static func normalizedText(_ s: String) -> String {
+        s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func titleCase(_ key: String) -> String {
+        key.split(whereSeparator: { $0 == "_" || $0 == "-" || $0 == "." })
+            .map(capitalize)
+            .joined(separator: " ")
+    }
+
+    private static func capitalize<S: StringProtocol>(_ s: S) -> String {
+        guard let first = s.first else { return String(s) }
+        return first.uppercased() + s.dropFirst()
+    }
+
+    private static func pluralize(_ n: Int, _ noun: String) -> String {
+        "\(n) \(noun)\(n == 1 ? "" : "s")"
+    }
+
+    private static func trimmingTrailingWhitespace(_ s: String) -> String {
+        var result = Substring(s)
+        while let last = result.last, last.isWhitespace { result.removeLast() }
+        return String(result)
+    }
+
+    private static func clipInline(_ value: String, max: Int = 180) -> String {
+        let collapsed = value.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard collapsed.count > max else { return collapsed }
+        let end = collapsed.index(collapsed.startIndex, offsetBy: max - 1)
+        return collapsed[..<end] + "…"
+    }
+
+    private static func clipBlock(_ value: String, maxChars: Int = 1800, maxLines: Int = 18) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let lines = trimmed.components(separatedBy: "\n")
+        var text = lines.prefix(maxLines).joined(separator: "\n")
+        var clipped = lines.count > maxLines
+        if text.count > maxChars {
+            let end = text.index(text.startIndex, offsetBy: maxChars - 1)
+            text = trimmingTrailingWhitespace(String(text[..<end]))
+            clipped = true
+        }
+        return (clipped && !text.hasSuffix("…")) ? text + "…" : text
+    }
+
+    private static func firstString(_ record: [String: JSONValue], keys: [String]) -> String {
+        for key in keys {
+            if case .string(let value)? = record[key] {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            }
+        }
+        return ""
+    }
+
+    private static func isWrapperKey(_ key: String) -> Bool { wrapperKeys.contains(key) }
+
+    private static func skipField(_ key: String, _ value: JSONValue) -> Bool {
+        if isWrapperKey(key) { return true }
+        if key == "success" || key == "ok", case .bool(true) = value { return true }
+        return false
+    }
+
+    /// Priority keys first (in priority order), then the rest, alphabetized
+    /// for determinism — `JSONValue.objectValue` is a `Dictionary` and does
+    /// not preserve wire field order (matches `compactDescription`'s sort).
+    private static func orderedKeys(_ keys: [String]) -> [String] {
+        let keySet = Set(keys)
+        let priority = priorityKeys.filter { keySet.contains($0) }
+        let prioritySet = Set(priority)
+        let rest = keys.filter { !prioritySet.contains($0) }.sorted()
+        return priority + rest
+    }
+
+    // MARK: - Scalar / record / array summarization
+
+    private static func summarizeScalar(_ value: JSONValue) -> String {
+        switch value {
+        case .string(let s): return clipInline(s)
+        case .number(let n):
+            if n.truncatingRemainder(dividingBy: 1) == 0, abs(n) < 1e15 { return String(Int64(n)) }
+            return String(n)
+        case .bool(let b): return b ? "true" : "false"
+        default: return ""
+        }
+    }
+
+    private static func summarizeRecordInline(_ record: [String: JSONValue], depth: Int) -> String {
+        if depth > 3 { return pluralize(record.count, "field") }
+        let title = firstString(record, keys: ["title", "name", "path", "file", "filepath", "url", "href", "link", "id"])
+        let status = firstString(record, keys: ["status", "category", "type"])
+        let message = firstString(record, keys: ["snippet", "summary", "description", "message"])
+
+        if !title.isEmpty, !status.isEmpty {
+            return "\(clipInline(title, max: 110)) (\(clipInline(status, max: 54)))"
+        }
+        if !title.isEmpty, !message.isEmpty, title != message {
+            return "\(clipInline(title, max: 90)) - \(clipInline(message, max: 84))"
+        }
+        if !title.isEmpty {
+            return clipInline(title, max: 150)
+        }
+
+        let pairs = orderedKeys(Array(record.keys))
+            .filter { !skipField($0, record[$0] ?? .null) }
+            .compactMap { key -> String? in
+                let s = summarizeScalar(record[key] ?? .null)
+                return s.isEmpty ? nil : "\(titleCase(key)): \(s)"
+            }
+            .prefix(2)
+        return pairs.isEmpty ? pluralize(record.count, "field") : pairs.joined(separator: " · ")
+    }
+
+    private static func summarizeListItem(_ item: JSONValue, depth: Int) -> String {
+        let value = norm(item)
+        switch value {
+        case .array(let arr): return pluralize(arr.count, "item")
+        case .object(let obj): return summarizeRecordInline(obj, depth: depth + 1)
+        case .null: return ""
+        default: return summarizeScalar(value)
+        }
+    }
+
+    private static func formatFieldValue(_ value: JSONValue, depth: Int) -> String {
+        let v = norm(value)
+        let scalar = summarizeScalar(v)
+        if !scalar.isEmpty { return scalar }
+        switch v {
+        case .array(let arr):
+            if arr.isEmpty { return "" }
+            let scalars = arr.map { summarizeScalar(norm($0)) }.filter { !$0.isEmpty }
+            if scalars.count == arr.count, arr.count <= 4 {
+                return clipInline(scalars.joined(separator: ", "))
+            }
+            let first = summarizeListItem(arr[0], depth: depth + 1)
+            return first.isEmpty ? pluralize(arr.count, "item") : "\(pluralize(arr.count, "item")) (\(first))"
+        case .object(let obj):
+            return summarizeRecordInline(obj, depth: depth + 1)
+        default:
+            return ""
+        }
+    }
+
+    private static func formatArraySummary(_ value: [JSONValue], depth: Int) -> String {
+        guard !value.isEmpty else { return "" }
+        let maxItems = 6
+        var lines = value.prefix(maxItems)
+            .map { summarizeListItem($0, depth: depth + 1) }
+            .filter { !$0.isEmpty }
+            .map { "- \($0)" }
+        guard !lines.isEmpty else { return "" }
+        if value.count > maxItems {
+            let remaining = value.count - maxItems
+            lines.append("- … \(pluralize(remaining, "more item"))")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func formatRecordSummary(_ record: [String: JSONValue], depth: Int) -> String {
+        let keys = Array(record.keys)
+        guard !keys.isEmpty else { return "" }
+
+        if depth <= 2 {
+            let direct = firstString(record, keys: ["message", "summary", "description", "preview", "text", "content"])
+            let meaningful = keys.filter { !skipField($0, record[$0] ?? .null) && !isWrapperKey($0) }
+            if !direct.isEmpty, meaningful.count <= 1 {
+                return clipBlock(direct)
+            }
+        }
+
+        let candidates = orderedKeys(keys).filter { !skipField($0, record[$0] ?? .null) }
+        let maxFields = 8
+        var lines: [String] = []
+        for key in candidates {
+            let formatted = formatFieldValue(record[key] ?? .null, depth: depth + 1)
+            guard !formatted.isEmpty else { continue }
+            lines.append("- \(titleCase(key)): \(formatted)")
+            if lines.count >= maxFields { break }
+        }
+        guard !lines.isEmpty else { return "" }
+        if candidates.count > lines.count {
+            lines.append("- … \(pluralize(candidates.count - lines.count, "more field"))")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func formatSummaryValue(_ value: JSONValue, depth: Int) -> String {
+        guard depth <= 4 else { return "" }
+        let v = norm(value)
+        switch v {
+        case .string(let s): return clipBlock(s)
+        case .number, .bool: return summarizeScalar(v)
+        case .null: return ""
+        case .array(let arr): return formatArraySummary(arr, depth: depth + 1)
+        case .object(let obj): return formatRecordSummary(obj, depth: depth + 1)
+        }
+    }
+
+    // MARK: - Wrapper unwrapping
+
+    private static func unwrapPayload(_ value: JSONValue) -> JSONValue {
+        var current = norm(value)
+        for _ in 0..<4 {
+            guard case .object(let record) = current else { return current }
+            guard let key = wrapperKeys.first(where: { record[$0].map { !$0.isNull } ?? false }) else {
+                return current
+            }
+            current = norm(record[key] ?? .null)
+        }
+        return current
+    }
+
+    // MARK: - Error detection
+
+    private static func hasMeaningfulErrorValue(_ value: JSONValue) -> Bool {
+        switch norm(value) {
+        case .null: return false
+        case .string(let s): return !nonErrorText.contains(normalizedText(s))
+        case .bool(let b): return b
+        case .number(let n): return n != 0
+        case .array(let arr): return arr.contains { hasMeaningfulErrorValue($0) }
+        case .object(let obj): return !obj.isEmpty
+        }
+    }
+
+    private static func hasErrorSignal(_ record: [String: JSONValue]) -> Bool {
+        if case .bool(false)? = record["success"] { return true }
+        if case .bool(false)? = record["ok"] { return true }
+        if case .string(let status)? = record["status"],
+           status.range(of: "\\b(error|failed|failure|fatal|exception)\\b", options: [.regularExpression, .caseInsensitive]) != nil {
+            return true
+        }
+        return errorKeys.contains { hasMeaningfulErrorValue(record[$0] ?? .null) }
+    }
+
+    private static func valueErrorText(_ value: JSONValue) -> String {
+        switch norm(value) {
+        case .string(let s):
+            return hasMeaningfulErrorValue(.string(s)) ? clipBlock(s, maxChars: 700, maxLines: 12) : ""
+        case .array(let arr):
+            let joined = arr.map(valueErrorText).filter { !$0.isEmpty }.prefix(3).joined(separator: "; ")
+            return clipBlock(joined, maxChars: 700, maxLines: 12)
+        case .object(let obj):
+            let direct = firstString(obj, keys: errorMessageKeys)
+            return direct.isEmpty ? "" : clipBlock(direct, maxChars: 700, maxLines: 12)
+        default:
+            return ""
+        }
+    }
+
+    private static func findNestedError(_ value: JSONValue, depth: Int) -> String {
+        guard depth <= 5 else { return "" }
+        switch norm(value) {
+        case .array(let arr):
+            for item in arr {
+                let nested = findNestedError(item, depth: depth + 1)
+                if !nested.isEmpty { return nested }
+            }
+            return ""
+        case .object(let record):
+            for key in errorKeys {
+                let candidate = record[key] ?? .null
+                guard hasMeaningfulErrorValue(candidate) else { continue }
+                let text = valueErrorText(candidate)
+                if !text.isEmpty { return text }
+            }
+            if hasErrorSignal(record) {
+                let direct = firstString(record, keys: errorMessageKeys)
+                if !direct.isEmpty { return clipBlock(direct, maxChars: 700, maxLines: 12) }
+            }
+            for key in errorKeys + wrapperKeys + ["details", "meta"] {
+                let nested = findNestedError(record[key] ?? .null, depth: depth + 1)
+                if !nested.isEmpty { return nested }
+            }
+            return ""
+        default:
+            return ""
         }
     }
 }
