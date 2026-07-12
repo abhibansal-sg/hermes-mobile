@@ -157,6 +157,41 @@ def test_live_activity_register_requires_device_to_own_session(
     assert push_engine.live_activity_token_for("owned-la") == (_LA_TOKEN_2, "sandbox")
 
 
+def test_live_activity_register_device_token_fails_closed_for_unclaimed_session(
+    client, devices
+):
+    owner, _intruder = devices
+    push_engine = load_plugin_module("push_engine")
+
+    denied = client.post(
+        f"{_PREFIX}/push/live-activity",
+        json={"token": _LA_TOKEN, "session_id": "unclaimed-la", "env": "sandbox"},
+        headers={"X-Hermes-Session-Token": owner["token"]},
+    )
+
+    assert denied.status_code == 403
+    assert denied.json() == {"detail": "Device token does not own session"}
+    assert push_engine.live_activity_token_for("unclaimed-la") is None
+    assert push_engine.live_activity_device_for("unclaimed-la") is None
+
+
+def test_live_activity_register_shared_token_allows_unclaimed_session(client, home):
+    push_engine = load_plugin_module("push_engine")
+
+    allowed = client.post(
+        f"{_PREFIX}/push/live-activity",
+        json={"token": _LA_TOKEN, "session_id": "shared-unclaimed-la", "env": "sandbox"},
+        headers=_SHARED_HEADER,
+    )
+
+    assert allowed.status_code == 200
+    assert push_engine.live_activity_token_for("shared-unclaimed-la") == (
+        _LA_TOKEN,
+        "sandbox",
+    )
+    assert push_engine.live_activity_device_for("shared-unclaimed-la") is None
+
+
 def test_live_activity_unregister_requires_device_to_own_session(
     client, devices, clean_gateway_sessions
 ):
@@ -199,3 +234,19 @@ def test_live_activity_unregister_requires_device_to_own_session(
     )
     assert shared.status_code == 200
     assert shared.json()["removed"] is True
+
+
+def test_live_activity_unregister_device_token_fails_closed_for_unclaimed_session(
+    client, devices
+):
+    owner, _intruder = devices
+
+    denied = client.request(
+        "DELETE",
+        f"{_PREFIX}/push/live-activity",
+        json={"token": _LA_TOKEN, "session_id": "unclaimed-la-delete"},
+        headers={"X-Hermes-Session-Token": owner["token"]},
+    )
+
+    assert denied.status_code == 403
+    assert denied.json() == {"detail": "Device token does not own session"}

@@ -187,7 +187,7 @@ def _device_owns_live_activity_session(
     )
     if isinstance(existing_owner, str) and existing_owner:
         return existing_owner == device_id
-    return True
+    return False
 
 
 # ---------------------------------------------------------------------------
