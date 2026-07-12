@@ -766,17 +766,24 @@ final class DevicesTests: XCTestCase {
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
         let server = "https://self-revoke:9119"
         DefaultsKeys.setDeviceId("dev_current", server: server)
-        connection.phase = .connected
+        connection._seedConnectedForTesting(serverURL: server, token: "revoked-device-token")
+        sessions.markTurnStarted(storedId: "stored-self-revoke")
+        XCTAssertTrue(connection.hasConnected, "precondition: self-revoke starts from a paired connection")
+        XCTAssertFalse(sessions.turnsInProgressIds.isEmpty,
+            "precondition: self-revoke can happen while a turn is in flight")
 
         DevicesView.applySuccessfulRevokeSideEffects(
             wasCurrent: true,
             serverURL: server,
             connection: connection
         )
+        connection._handleGatewayStateForTesting(.closed(reason: nil))
 
         XCTAssertNil(DefaultsKeys.deviceId(server: server))
         XCTAssertTrue(connection.reauthRequired)
         XCTAssertEqual(connection.phase, .needsSetup)
+        XCTAssertFalse(connection.hasConnected)
+        XCTAssertTrue(sessions.turnsInProgressIds.isEmpty)
     }
 
     func testSuccessfulOtherDeviceRevokeDoesNotDriveRepairState() {
