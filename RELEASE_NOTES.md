@@ -1,3 +1,38 @@
+Build 108 — 2026-07-12
+
+WHAT'S NEW
+- Salvage automation session slice (STR-542)
+
+FIXED
+- Restore project-session parity (STR-1057)
+- Keep compact empty-state CTA hit testing aligned (STR-54)
+- Preserve relay actionable payload parity (STR-273)
+- Single-flight device auto-upgrade issue (STR-546)
+- Guard Release grace-window override (STR-1693)
+- Fix ios composer prompt history recall (STR-1233, STR-349)
+- Group all-profile drawer recents (STR-996)
+- STR-1631 scope project sessions by cwd_prefix
+- STR-787 preserve provider metadata on disconnect
+- Gate iOS device-token auto-upgrade on server auth_required
+
+IMPROVED
+- Preserve linearized iOS reconciliation evidence
+- Add STR-1021 provider key survival harness
+- Merge pull request #113 from abhibansal-sg/dev-ios-claude/STR-1126
+- Wait for persisted prefetch delta (STR-1450)
+- Pin STR-973A named grace-window constants (STR-1126)
+- Stabilize STR-1012 drawer storm evidence
+- Add STR-1012 drawer tap storm UI coverage
+
+WORTH TRYING
+- Try: Salvage automation session slice (STR-542)
+- Try: Restore project-session parity (STR-1057)
+- Try: Keep compact empty-state CTA hit testing aligned (STR-54)
+
+(+60 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 98 — 2026-07-11
 
 WHAT'S NEW
