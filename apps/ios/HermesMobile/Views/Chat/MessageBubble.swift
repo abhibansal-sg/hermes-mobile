@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// A single transcript entry.
 ///
@@ -1385,11 +1386,15 @@ private struct MarkdownTableBlockView: View {
 
     private static let minCellWidth: CGFloat = 116
     private static let maxCellWidth: CGFloat = 240
+    private static let horizontalCellPadding: CGFloat = 12
 
     var body: some View {
+        let columnWidths = Self.resolvedColumnWidths(for: table)
+        let tableWidth = columnWidths.reduce(0, +)
+
         ScrollView(.horizontal, showsIndicators: true) {
             Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
-                gridRow(table.headers, isHeader: true, rowIndex: 0)
+                gridRow(table.headers, columnWidths: columnWidths, isHeader: true, rowIndex: 0)
                 if table.rows.isEmpty {
                     GridRow {
                         emptyRow
@@ -1397,11 +1402,11 @@ private struct MarkdownTableBlockView: View {
                     }
                 } else {
                     ForEach(Array(table.rows.enumerated()), id: \.offset) { rowIndex, cells in
-                        gridRow(cells, isHeader: false, rowIndex: rowIndex)
+                        gridRow(cells, columnWidths: columnWidths, isHeader: false, rowIndex: rowIndex)
                     }
                 }
             }
-            .fixedSize(horizontal: true, vertical: false)
+            .frame(width: tableWidth, alignment: .leading)
             .background(theme.codeBg, in: RoundedRectangle(cornerRadius: 12, style: .circular))
             .overlay(
                 RoundedRectangle(cornerRadius: 12, style: .circular)
@@ -1415,12 +1420,18 @@ private struct MarkdownTableBlockView: View {
         .accessibilityLabel("Markdown table with \(table.headers.count) columns and \(table.rows.count) rows")
     }
 
-    private func gridRow(_ cells: [String], isHeader: Bool, rowIndex: Int) -> some View {
+    private func gridRow(
+        _ cells: [String],
+        columnWidths: [CGFloat],
+        isHeader: Bool,
+        rowIndex: Int
+    ) -> some View {
         GridRow {
             ForEach(Array(cells.enumerated()), id: \.offset) { columnIndex, cell in
                 cellView(
                     text: cell,
                     columnIndex: columnIndex,
+                    columnWidth: columnWidths[columnIndex],
                     isHeader: isHeader,
                     rowIndex: rowIndex
                 )
@@ -1442,6 +1453,7 @@ private struct MarkdownTableBlockView: View {
     private func cellView(
         text: String,
         columnIndex: Int,
+        columnWidth: CGFloat,
         isHeader: Bool,
         rowIndex: Int
     ) -> some View {
@@ -1459,12 +1471,50 @@ private struct MarkdownTableBlockView: View {
             .lineLimit(nil)
             .fixedSize(horizontal: false, vertical: true)
             .multilineTextAlignment(textAlignment(for: alignment))
-            .padding(.horizontal, 12)
+            .padding(.horizontal, Self.horizontalCellPadding)
             .padding(.vertical, isHeader ? 9 : 10)
-            .frame(minWidth: Self.minCellWidth, maxWidth: Self.maxCellWidth, alignment: frameAlignment(for: alignment))
+            .frame(width: columnWidth, alignment: frameAlignment(for: alignment))
             .background(background)
             .overlay(Rectangle().stroke(theme.border.opacity(0.72), lineWidth: 0.5))
             .perfTextSelection()
+    }
+
+    /// Resolve one concrete width per column before SwiftUI lays out the grid.
+    /// A fixed frame then proposes that finite width through the cell padding to
+    /// `Text`, so long content must compute a multi-line height instead of being
+    /// measured as a single ideal-width line and clipped at the frame edge.
+    private static func resolvedColumnWidths(for table: MessageBubble.MarkdownTable) -> [CGFloat] {
+        table.headers.indices.map { columnIndex in
+            let headerWidth = idealCellWidth(table.headers[columnIndex], isHeader: true)
+            let bodyWidth = table.rows.reduce(CGFloat.zero) { widest, row in
+                guard row.indices.contains(columnIndex) else { return widest }
+                return max(widest, idealCellWidth(row[columnIndex], isHeader: false))
+            }
+            return min(max(ceil(max(headerWidth, bodyWidth)), minCellWidth), maxCellWidth)
+        }
+    }
+
+    /// Cheap single-line measurement used only to choose the column clamp. The
+    /// rendered SwiftUI `Text` still owns line breaking and final row height.
+    private static func idealCellWidth(_ text: String, isHeader: Bool) -> CGFloat {
+        let displayedText = text.isEmpty ? "—" : text
+        let textStyle: UIFont.TextStyle = isHeader ? .subheadline : .body
+        let weight: UIFont.Weight = isHeader ? .semibold : .regular
+        let systemFont = UIFont.systemFont(
+            ofSize: UIFont.preferredFont(forTextStyle: textStyle).pointSize,
+            weight: weight
+        )
+        let descriptor = systemFont.fontDescriptor.withDesign(.serif) ?? systemFont.fontDescriptor
+        let font = UIFont(descriptor: descriptor, size: systemFont.pointSize)
+        let bounds = NSAttributedString(
+            string: displayedText,
+            attributes: [.font: font]
+        ).boundingRect(
+            with: CGSize(width: 100_000, height: 10_000),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            context: nil
+        )
+        return bounds.width + (horizontalCellPadding * 2)
     }
 
     private func frameAlignment(for alignment: MessageBubble.MarkdownTable.Alignment) -> Alignment {
