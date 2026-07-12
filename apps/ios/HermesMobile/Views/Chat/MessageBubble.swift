@@ -10,6 +10,7 @@ struct MessageBubble: View {
     @Environment(\.hermesTheme) private var theme
     @Environment(ConnectionStore.self) private var connectionStore
     @Environment(SessionStore.self) private var sessionStore
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     /// The message to render.
     let message: ChatMessage
@@ -17,6 +18,13 @@ struct MessageBubble: View {
     // MARK: - CC-01: Streaming cursor pulse animation state
     /// Opacity driven by a repeating breathe animation while the turn streams.
     @State private var cursorPulseOpacity: Double = 1.0
+
+    // MARK: - STR-695: available-width capture (size-class / split-view safe)
+    /// Measured content width from the bubble's own geometry, captured via
+    /// `.onGeometryChange`. Replaces every former `UIScreen.main.bounds.width`
+    /// read so bubble + inline-image sizing stay correct in iPad split-view and
+    /// multi-scene (where `UIScreen.main` reports the wrong scene/window).
+    @State private var availableWidth: CGFloat = 0
 
     // MARK: - CC-02: Copy confirmation state (assistant message copy)
     /// Whether the assistant-message copy just fired — drives checkmark + haptic.
@@ -105,18 +113,27 @@ struct MessageBubble: View {
     }
 
     var body: some View {
-        if case .collapsed(let label) = message.presentation {
-            collapsedRow(label: label)
-        } else {
-            switch message.role {
-            case .user:
-                userBubble
-                    .contextMenu { userMenu }
-            case .assistant:
-                assistantBody
-                    .contextMenu { assistantMenu }
-            case .system, .tool:
-                metaRow
+        Group {
+            if case .collapsed(let label) = message.presentation {
+                collapsedRow(label: label)
+            } else {
+                switch message.role {
+                case .user:
+                    userBubble
+                        .contextMenu { userMenu }
+                case .assistant:
+                    assistantBody
+                        .contextMenu { assistantMenu }
+                case .system, .tool:
+                    metaRow
+                }
+            }
+        }
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.width
+        } action: { width in
+            if abs(width - availableWidth) > 0.5 {
+                availableWidth = width
             }
         }
     }
@@ -343,10 +360,25 @@ struct MessageBubble: View {
     /// threshold for the `isLongUserMessage` heuristic.
     static let userBubbleCollapsedLines = 8
 
-    /// Cap user bubbles at 78% of the screen width while letting short messages
-    /// hug their content.
+    /// True when the bubble is laid out in a compact width (iPhone portrait, or
+    /// a narrow iPad split-view column). Drives size-class-aware sizing so
+    /// neither bubble width nor inline image sizing depends on `UIScreen.main`.
+    private var isCompact: Bool { horizontalSizeClass == .compact }
+
+    /// Cap user bubbles at ~78% of the MEASURED available width while letting
+    /// short messages hug their content (STR-695). Replaces the former
+    /// `UIScreen.main.bounds.width * 0.78` heuristic, which broke in iPad
+    /// split-view and multi-scene (`UIScreen.main` returns the first scene's
+    /// bounds, not the column the bubble actually inhabits). Compact: ~78% of
+    /// the column. Regular (iPad full-width): same ratio but capped at 560pt so
+    /// a short message never stretches across a wide column.
     private var maxBubbleWidth: CGFloat {
-        UIScreen.main.bounds.width * 0.78
+        guard availableWidth > 0 else { return 320 }
+        let ratio: CGFloat = 0.78
+        if isCompact {
+            return availableWidth * ratio
+        }
+        return min(availableWidth * ratio, 560)
     }
 
     // MARK: - Assistant
@@ -509,9 +541,14 @@ struct MessageBubble: View {
                     // RenderCache.prose → AttributedString markdown path, while
                     // tables/task lists/blockquotes/lists become native SwiftUI
                     // blocks so GFM does not collapse into raw dashes and pipes.
-                    ForEach(Array(RenderCache.markdownBlocks(body).enumerated()), id: \.offset) { _, block in
-                        markdownBlock(block)
-                    }
+                    //
+                    // STR-695: markdown images (`![alt](source)`, standalone or
+                    // embedded mid-sentence) are split out here as block-level
+                    // image siblings, matching desktop, so prose images render
+                    // as native tappable images and surrounding paragraphs keep
+                    // their order around them instead of collapsing into inline
+                    // markdown.
+                    chatProseBlocks(body)
                 case .code(let language, let body):
                     CodeBlockView(language: language, code: body)
                 case .math(let latex, let display):
@@ -564,6 +601,167 @@ struct MessageBubble: View {
             .lineSpacing(Self.proseLineSpacing)
             .perfTextSelection()
             .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: - STR-695 assistant-prose markdown image blocks
+
+    /// A renderable piece of an assistant prose segment. Markdown images
+    /// (`![alt](source)`) are hoisted out as `.image` siblings so they render
+    /// as native block-level images (parity with desktop); every other run
+    /// keeps flowing through the cached GFM block parser as `.blocks`.
+    enum ChatProseEntry: Equatable, Sendable {
+        case blocks([MarkdownBlock])
+        case image(alt: String, source: String)
+    }
+
+    /// A one-line piece produced by ``splitLineByImages(_:)`` — either a prose
+    /// fragment (text surrounding an image, or a line with no image at all) or
+    /// a hoisted markdown image.
+    enum ChatProseLineSplit: Equatable, Sendable {
+        case prose(String)
+        case image(alt: String, source: String)
+    }
+
+    /// Lay out an assistant prose segment as GFM blocks interspersed with
+    /// markdown image siblings (STR-695). Inline images embedded in prose are
+    /// split out in order so a paragraph like `before ![alt](url) after`
+    /// renders as paragraph / image / paragraph; image entries reuse the
+    /// shipped `MarkdownImageBlockView` (zoomable lightbox + cache pieces);
+    /// everything else routes through the existing `markdownBlock` dispatch.
+    @ViewBuilder
+    private func chatProseBlocks(_ body: String) -> some View {
+        ForEach(Array(Self.chatProseEntries(body).enumerated()), id: \.offset) { _, entry in
+            switch entry {
+            case .blocks(let blocks):
+                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                    markdownBlock(block)
+                }
+            case .image(let alt, let source):
+                MarkdownImageBlockView(alt: alt, source: source)
+            }
+        }
+    }
+
+    /// Split a prose segment body into GFM-block batches interspersed with
+    /// markdown image block siblings (STR-695). A line like
+    /// `before ![alt](url) after` is split in place into prose / image / prose
+    /// so the surrounding paragraphs render in order around a native image
+    /// block, instead of collapsing the image into inline markdown. Non-image
+    /// lines are grouped and handed to the memoized `RenderCache.markdownBlocks`
+    /// parser per run, so the expensive table/list/paragraph parsing stays
+    /// cached and only runs once per unique chunk; the cheap per-line image
+    /// scan is the only work repeated on each re-render. Image extraction is
+    /// chat-local on purpose — it does not extend the shared `MarkdownBlock`
+    /// enum used elsewhere, so nothing outside this file is affected.
+    static func chatProseEntries(_ body: String) -> [ChatProseEntry] {
+        let lines = body.components(separatedBy: "\n")
+        var entries: [ChatProseEntry] = []
+        var pending: [String] = []
+
+        func flush() {
+            guard !pending.isEmpty else { return }
+            let chunk = pending.joined(separator: "\n")
+            pending.removeAll(keepingCapacity: true)
+            guard !chunk.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            entries.append(.blocks(RenderCache.markdownBlocks(chunk)))
+        }
+
+        for line in lines {
+            for piece in splitLineByImages(line) {
+                switch piece {
+                case .prose(let fragment):
+                    pending.append(fragment)
+                case .image(let alt, let source):
+                    flush()
+                    entries.append(.image(alt: alt, source: source))
+                }
+            }
+        }
+        flush()
+        return entries
+    }
+
+    /// Scan a single line for markdown image syntax `![alt](source)` anywhere
+    /// in the line and return it as alternating `.prose` / `.image` / `.prose`
+    /// pieces, preserving surrounding text in order (STR-695). A line with no
+    /// valid image returns a single `.prose(line)` element so callers can
+    /// append it verbatim. Handles backslash-escaped `]` inside alt text.
+    ///
+    /// Malformed syntax (missing `)`, empty source, dangling `![`) is left in
+    /// place as prose rather than being partially consumed, so a sentence like
+    /// "see ![note" never loses text. Source extends to the next `)`; URLs in
+    /// assistant prose do not contain raw parens.
+    static func splitLineByImages(_ line: String) -> [ChatProseLineSplit] {
+        let chars = Array(line)
+        var pieces: [ChatProseLineSplit] = []
+        var segmentStart = 0
+        var i = 0
+
+        while i < chars.count {
+            // Anchor on "!" only when followed by "[".
+            guard chars[i] == "!",
+                  i + 1 < chars.count,
+                  chars[i + 1] == "[" else {
+                i += 1
+                continue
+            }
+            let bang = i
+            // Alt text: from i+2 to the first unescaped "]".
+            var j = i + 2
+            var altChars: [Character] = []
+            while j < chars.count {
+                let c = chars[j]
+                if c == "\\", j + 1 < chars.count {
+                    altChars.append(chars[j + 1])
+                    j += 2
+                    continue
+                }
+                if c == "]" { break }
+                altChars.append(c)
+                j += 1
+            }
+            guard j < chars.count, chars[j] == "]",
+                  j + 1 < chars.count, chars[j + 1] == "(" else {
+                // Not an image — advance past this "!" and keep scanning so a
+                // later valid image on the same line still hoists.
+                i += 1
+                continue
+            }
+            let sourceStart = j + 2
+            var k = sourceStart
+            while k < chars.count, chars[k] != ")" { k += 1 }
+            guard k < chars.count, chars[k] == ")" else {
+                i += 1
+                continue
+            }
+            let source = String(chars[sourceStart..<k])
+                .trimmingCharacters(in: .whitespaces)
+            guard !source.isEmpty else {
+                i += 1
+                continue
+            }
+            // Valid image: emit any preceding prose fragment, then the image.
+            if bang > segmentStart {
+                let prefix = String(chars[segmentStart..<bang])
+                if !prefix.isEmpty {
+                    pieces.append(.prose(prefix))
+                }
+            }
+            pieces.append(.image(alt: String(altChars), source: source))
+            segmentStart = k + 1
+            i = k + 1
+        }
+
+        if segmentStart < chars.count {
+            let tail = String(chars[segmentStart..<chars.count])
+            if !tail.isEmpty {
+                pieces.append(.prose(tail))
+            }
+        }
+        if pieces.isEmpty {
+            pieces.append(.prose(line))
+        }
+        return pieces
     }
 
     // MARK: - ABH-360 GFM block parsing
@@ -1190,13 +1388,16 @@ private struct MarkdownTableBlockView: View {
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 0) {
-                row(table.headers, isHeader: true, rowIndex: 0)
+            Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
+                gridRow(table.headers, isHeader: true, rowIndex: 0)
                 if table.rows.isEmpty {
-                    emptyRow
+                    GridRow {
+                        emptyRow
+                            .gridCellColumns(max(table.headers.count, 1))
+                    }
                 } else {
                     ForEach(Array(table.rows.enumerated()), id: \.offset) { rowIndex, cells in
-                        row(cells, isHeader: false, rowIndex: rowIndex)
+                        gridRow(cells, isHeader: false, rowIndex: rowIndex)
                     }
                 }
             }
@@ -1214,8 +1415,8 @@ private struct MarkdownTableBlockView: View {
         .accessibilityLabel("Markdown table with \(table.headers.count) columns and \(table.rows.count) rows")
     }
 
-    private func row(_ cells: [String], isHeader: Bool, rowIndex: Int) -> some View {
-        HStack(alignment: .top, spacing: 0) {
+    private func gridRow(_ cells: [String], isHeader: Bool, rowIndex: Int) -> some View {
+        GridRow {
             ForEach(Array(cells.enumerated()), id: \.offset) { columnIndex, cell in
                 cellView(
                     text: cell,
@@ -1256,6 +1457,7 @@ private struct MarkdownTableBlockView: View {
             .font(.system(isHeader ? .subheadline : .body, design: .serif).weight(isHeader ? .semibold : .regular))
             .foregroundStyle(isHeader ? theme.fg : (text.isEmpty ? theme.mutedFg : theme.fg))
             .lineLimit(nil)
+            .fixedSize(horizontal: false, vertical: true)
             .multilineTextAlignment(textAlignment(for: alignment))
             .padding(.horizontal, 12)
             .padding(.vertical, isHeader ? 9 : 10)
@@ -1279,6 +1481,42 @@ private struct MarkdownTableBlockView: View {
         case .center: return .center
         case .trailing: return .trailing
         }
+    }
+}
+
+#Preview("Markdown table cell wrapping") {
+    ScrollView {
+        VStack(alignment: .leading, spacing: 20) {
+            MarkdownTableBlockView(
+                table: .init(
+                    headers: ["300-character cell", "Status"],
+                    alignments: [.leading, .center],
+                    rows: [[String(repeating: "This complete sentence must wrap inside its table cell. ", count: 6), "Readable"]]
+                )
+            )
+            MarkdownTableBlockView(
+                table: .init(
+                    headers: ["80-character token", "Result"],
+                    alignments: [.leading, .trailing],
+                    rows: [[String(repeating: "abcdefghij", count: 8), "1"]]
+                )
+            )
+            MarkdownTableBlockView(
+                table: .init(
+                    headers: ["One", "Two", "Three", "Four", "Five", "Six"],
+                    alignments: Array(repeating: .leading, count: 6),
+                    rows: [["Wide", "tables", "remain", "horizontally", "scrollable", "here"]]
+                )
+            )
+            MarkdownTableBlockView(
+                table: .init(
+                    headers: ["Key", "Value"],
+                    alignments: [.leading, .trailing],
+                    rows: [["Narrow table", "42"]]
+                )
+            )
+        }
+        .padding()
     }
 }
 
@@ -1359,6 +1597,196 @@ private struct MarkdownListBlockView: View {
     }
 }
 
+/// Block-level assistant-prose markdown image (STR-695). Renders a tappable
+/// thumbnail — remote `https://` via `AsyncImage` (with a real retry
+/// affordance on failure), `data:` inline via the shared
+/// `AttachmentBlobCache.decodeDataURL` — that opens the shipped
+/// `ZoomableImageView` lightbox on tap (pinch/zoom/pan/retry chrome already
+/// exists there). Sizing is size-class + measured-geometry aware, never
+/// `UIScreen.main`, so it stays correct in iPad split-view and multi-scene.
+struct MarkdownImageBlockView: View {
+    let alt: String
+    let source: String
+
+    @Environment(\.hermesTheme) private var theme
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @State private var presentZoom = false
+    @State private var availableWidth: CGFloat = 0
+    /// STR-695: refresh token for the remote `AsyncImage`. Bumped by the
+    /// failure affordance's "Tap to retry" button so SwiftUI tears down and
+    /// recreates the AsyncImage (re-fetching the URL) instead of pinning the
+    /// failed phase. The contract requires placeholder/failure/retry; without
+    /// this the failed thumbnail is a dead end.
+    @State private var retryToken: UUID = UUID()
+
+    private var remoteURL: URL? {
+        guard source.hasPrefix("http://") || source.hasPrefix("https://") else { return nil }
+        return URL(string: source)
+    }
+    private var isDataURL: Bool { source.hasPrefix("data:") }
+    private var isCompact: Bool { horizontalSizeClass == .compact }
+
+    /// Inline image max width (STR-695). Compact: a thumbnail that fits the
+    /// bubble column — at most ~82% of the measured width and never wider than
+    /// 300pt. Regular (iPad full-width): a larger inline preview capped at
+    /// 440pt so multi-line alt/caption stays readable and the image never
+    /// stretches across a wide column. Sizing is driven entirely by the view's
+    /// own geometry + size class — never `UIScreen.main` (which reports the
+    /// wrong scene in iPad split-view / multi-scene).
+    private var inlineMaxWidth: CGFloat {
+        guard availableWidth > 0 else { return isCompact ? 260 : 400 }
+        if isCompact {
+            return min(availableWidth * 0.82, 300)
+        }
+        return min(availableWidth * 0.66, 440)
+    }
+
+    /// Inline image max height. Compact: 340pt (thumbnail). Regular: 460pt.
+    private var inlineMaxHeight: CGFloat {
+        isCompact ? 340 : 460
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            thumbnail
+            if !alt.isEmpty {
+                Text(alt)
+                    .font(.caption)
+                    .foregroundStyle(theme.mutedFg)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.width
+        } action: { width in
+            if abs(width - availableWidth) > 0.5 {
+                availableWidth = width
+            }
+        }
+        .fullScreenCover(isPresented: $presentZoom) {
+            ZoomableImageView(
+                title: alt.isEmpty ? "Image" : alt,
+                remoteURL: remoteURL,
+                dataURL: isDataURL ? source : nil
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var thumbnail: some View {
+        if isDataURL {
+            if let image = ZoomableImageView.decodeDataURL(source) {
+                zoomButton { thumbnailFrame(Image(uiImage: image)) }
+            } else {
+                placeholder("Couldn't decode this image.")
+            }
+        } else if let remoteURL {
+            // `.id(retryToken)` is the retry contract: bumping the token
+            // recreates the AsyncImage and re-fetches. The failure branch
+            // renders its own Button (NOT nested in the zoom Button) so the
+            // "Tap to retry" affordance is the only action available.
+            AsyncImage(url: remoteURL, transaction: Transaction(animation: .snappy(duration: 0.2))) { phase in
+                switch phase {
+                case .empty:
+                    loading
+                case .success(let image):
+                    zoomButton { thumbnailFrame(image) }
+                case .failure:
+                    retryAffordance
+                @unknown default:
+                    retryAffordance
+                }
+            }
+            .id(retryToken)
+        } else {
+            placeholder("Unsupported image source.")
+        }
+    }
+
+    /// Zoom-on-tap affordance for a loaded image. Wrapped in its own ViewBuilder
+    /// so the success path keeps the `"markdownImage"` a11y identity and the
+    /// failure path can render a separate retry Button without nesting.
+    @ViewBuilder
+    private func zoomButton<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        Button {
+            presentZoom = true
+        } label: {
+            content()
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(alt.isEmpty ? "Image" : alt)
+        .accessibilityHint("Double-tap to zoom")
+        .accessibilityIdentifier("markdownImage")
+    }
+
+    /// STR-695 retry affordance for remote fetch failures. Distinct from the
+    /// decode-failure placeholder (which is deterministic and has no retry):
+    /// remote failures are often transient (network / auth / 5xx), so the
+    /// contract requires a tappable retry that re-runs the AsyncImage load.
+    private var retryAffordance: some View {
+        Button {
+            retryToken = UUID()
+        } label: {
+            VStack(spacing: 6) {
+                Image(systemName: "arrow.clockwise.circle")
+                    .font(.title3)
+                Text("Couldn't load this image.")
+                    .font(.caption)
+                Text("Tap to retry")
+                    .font(.caption2)
+                    .foregroundStyle(theme.accent)
+            }
+            .foregroundStyle(theme.mutedFg)
+            .frame(maxWidth: inlineMaxWidth, minHeight: 120)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(theme.bg.opacity(0.5), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Couldn't load this image. Double-tap to retry.")
+        .accessibilityHint("Reloads the image from the network.")
+        .accessibilityIdentifier("markdownImageRetry")
+    }
+
+    private func thumbnailFrame(_ image: Image) -> some View {
+        image
+            .resizable()
+            .scaledToFit()
+            .frame(maxWidth: inlineMaxWidth, maxHeight: inlineMaxHeight, alignment: .leading)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(theme.mutedFg.opacity(0.18), lineWidth: 1)
+            )
+    }
+
+    private var loading: some View {
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .fill(theme.bg.opacity(0.5))
+            .frame(maxWidth: inlineMaxWidth, minHeight: 160)
+            .overlay {
+                VStack(spacing: 6) {
+                    ProgressView()
+                    Text("Loading image…")
+                        .font(.caption2)
+                        .foregroundStyle(theme.mutedFg)
+                }
+            }
+    }
+
+    private func placeholder(_ message: String) -> some View {
+        VStack(spacing: 6) {
+            Image(systemName: "photo.badge.exclamationmark")
+                .font(.title3)
+            Text(message)
+                .font(.caption)
+        }
+        .foregroundStyle(theme.mutedFg)
+        .frame(maxWidth: inlineMaxWidth, minHeight: 120)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.bg.opacity(0.5), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
 private struct SentImageThumbnailView: View {
     enum Phase: Equatable {
         case idle
@@ -1405,7 +1833,11 @@ private struct SentImageThumbnailView: View {
     }
 
     private var thumbnailSize: CGSize {
-        let width = min(UIScreen.main.bounds.width * 0.58, 220)
+        // STR-695: fixed cap, no `UIScreen.main` read — the sent-image echo
+        // already lives inside a user bubble whose width is bounded by
+        // `maxBubbleWidth`, so a hard 220pt cap is correct in every size class
+        // and split-view configuration without referencing the screen.
+        let width: CGFloat = 220
         return CGSize(width: width, height: min(width * 0.72, 160))
     }
 
