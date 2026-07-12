@@ -50,6 +50,13 @@ struct ProviderListView: View {
     @State private var phase: PanelPhase<[ProviderRow]> = .loading
     @State private var actionError: String?
 
+    #if DEBUG
+    /// UITest-only provider rows. When present, the picker skips the network
+    /// load so same-process Settings-state tests can exercise the real
+    /// `EnterProviderKeyView` without a live gateway.
+    private let debugSeedProviders: [ProviderRow]?
+    #endif
+
     /// The provider whose EnterProviderKeyView is presented (Tier A push).
     @State private var pendingKeyProvider: ProviderRow?
 
@@ -64,6 +71,27 @@ struct ProviderListView: View {
     @State private var pendingDisconnect: ProviderRow?
     /// The slug currently being disconnected (disables its row while in flight).
     @State private var disconnectingSlug: String?
+
+    init(rest: RestClient, onProvidersChanged: (() -> Void)? = nil) {
+        self.rest = rest
+        self.onProvidersChanged = onProvidersChanged
+        #if DEBUG
+        self.debugSeedProviders = nil
+        #endif
+    }
+
+    #if DEBUG
+    init(
+        rest: RestClient,
+        debugSeedProviders: [ProviderRow],
+        onProvidersChanged: (() -> Void)? = nil
+    ) {
+        self.rest = rest
+        self.onProvidersChanged = onProvidersChanged
+        self.debugSeedProviders = debugSeedProviders
+        self._phase = State(initialValue: .loaded(debugSeedProviders))
+    }
+    #endif
 
     var body: some View {
         PanelContent(phase: phase, label: "Loading providers\u{2026}", retry: { Task { await load() } }) { providers in
@@ -305,6 +333,12 @@ struct ProviderListView: View {
     // MARK: - Load + mutate
 
     private func load() async {
+        #if DEBUG
+        if let debugSeedProviders {
+            phase = .loaded(debugSeedProviders)
+            return
+        }
+        #endif
         if phase.value == nil { phase = .loading }
         do {
             let providers = try await rest.listProviders()
@@ -329,15 +363,7 @@ struct ProviderListView: View {
             if var rows = phase.value {
                 if let index = rows.firstIndex(where: { $0.slug == provider.slug }) {
                     let existing = rows[index]
-                    rows[index] = ProviderRow(
-                        slug: existing.slug,
-                        name: existing.name,
-                        authType: existing.authType,
-                        isCurrent: false,
-                        authenticated: false,
-                        totalModels: existing.totalModels,
-                        models: existing.models
-                    )
+                    rows[index] = existing.copy(isCurrent: false, authenticated: false)
                     phase = .loaded(rows)
                 }
             }
@@ -463,6 +489,9 @@ struct EnterProviderKeyView: View {
                     .submitLabel(.go)
                     .focused($keyFieldFocused)
                     .onSubmit { if canSave { save() } }
+                    #if DEBUG
+                    .accessibilityValue(debugProviderKeyAccessibilityValue)
+                    #endif
                     .accessibilityIdentifier("providerKeyField")
             } footer: {
                 if let errorText {
@@ -538,6 +567,12 @@ struct EnterProviderKeyView: View {
             }
         }
     }
+
+    #if DEBUG
+    private var debugProviderKeyAccessibilityValue: String {
+        apiKey
+    }
+    #endif
 }
 
 // MARK: - CustomProviderView (Tier B — custom OpenAI/Anthropic-compatible)

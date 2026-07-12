@@ -377,3 +377,164 @@ def test_pairing_endpoint_requires_auth_and_rotates() -> None:
     assert res.status_code == 200
     rotated = res.json()["pairing_secret"]
     assert rotated and rotated != reg["pairing_secret"]
+
+
+# ---------------------------------------------------------------------------
+# STR-10A: actionable-payload parity (aps.category + hermes envelope)
+# ---------------------------------------------------------------------------
+
+
+def test_approval_event_rebuilds_actionable_category_and_hermes_envelope() -> None:
+    client, fake_apns = _client()
+    headers = _register_agent(client)
+    client.post(
+        "/v1/devices/register",
+        headers=headers,
+        json={
+            "token": "device-token",
+            "platform": "ios",
+            "environment": "sandbox",
+            "bundle_id": "ai.hermes.app",
+            "preferences": {"attention": True},
+        },
+    )
+
+    res = client.post(
+        "/v1/push/events",
+        headers=headers,
+        json={
+            "type": "attention",
+            "session_id": "sess-1",
+            "title": "Approval needed",
+            "body": "Review in Hermes",
+            "source": "telegram",
+            "event_type": "approval",
+            "category": "HERMES_APPROVAL",
+            "payload": {
+                "session_id": "sess-1",
+                "stored_session_id": "stored-1",
+                "destructive": True,
+                "approval_title": "Run rm -rf?",
+            },
+        },
+    )
+    assert res.status_code == 200
+    assert res.json()["sent"] == 1
+
+    sent_payload = fake_apns.sent[0]["payload"]
+    assert sent_payload["aps"]["category"] == "HERMES_APPROVAL"
+    assert sent_payload["hermes"]["event_type"] == "approval"
+    assert sent_payload["hermes"]["session_id"] == "sess-1"
+    assert sent_payload["hermes"]["stored_session_id"] == "stored-1"
+    assert sent_payload["hermes"]["destructive"] is True
+    assert sent_payload["hermes"]["approval_title"] == "Run rm -rf?"
+
+
+def test_clarify_event_rebuilds_actionable_category_and_hermes_envelope() -> None:
+    client, fake_apns = _client()
+    headers = _register_agent(client)
+    client.post(
+        "/v1/devices/register",
+        headers=headers,
+        json={
+            "token": "device-token",
+            "platform": "ios",
+            "environment": "sandbox",
+            "bundle_id": "ai.hermes.app",
+            "preferences": {"attention": True},
+        },
+    )
+
+    res = client.post(
+        "/v1/push/events",
+        headers=headers,
+        json={
+            "type": "attention",
+            "session_id": "sess-2",
+            "title": "Clarification needed",
+            "body": "Hermes needs a reply",
+            "source": "telegram",
+            "event_type": "clarify",
+            "category": "HERMES_CLARIFY",
+            "payload": {
+                "session_id": "sess-2",
+                "approval_id": "appr-9",
+                "response_action": "reply",
+            },
+        },
+    )
+    assert res.status_code == 200
+    assert res.json()["sent"] == 1
+
+    sent_payload = fake_apns.sent[0]["payload"]
+    assert sent_payload["aps"]["category"] == "HERMES_CLARIFY"
+    assert sent_payload["hermes"]["event_type"] == "clarify"
+    assert sent_payload["hermes"]["session_id"] == "sess-2"
+    assert sent_payload["hermes"]["approval_id"] == "appr-9"
+    assert sent_payload["hermes"]["response_action"] == "reply"
+
+
+def test_legacy_relay_event_without_metadata_keeps_flat_shape_and_no_category() -> None:
+    client, fake_apns = _client()
+    headers = _register_agent(client)
+    client.post(
+        "/v1/devices/register",
+        headers=headers,
+        json={
+            "token": "device-token",
+            "platform": "ios",
+            "environment": "sandbox",
+            "bundle_id": "ai.hermes.app",
+            "preferences": {"attention": True},
+        },
+    )
+
+    res = client.post(
+        "/v1/push/events",
+        headers=headers,
+        json={"type": "attention", "session_id": "sess-3", "title": "Ping", "body": "Legacy caller"},
+    )
+    assert res.status_code == 200
+    assert res.json()["sent"] == 1
+
+    sent_payload = fake_apns.sent[0]["payload"]
+    assert "category" not in sent_payload["aps"]
+    assert "hermes" not in sent_payload
+
+
+def test_relay_never_trusts_client_supplied_category_without_known_event_type() -> None:
+    # A caller sending an arbitrary/unknown event_type must not get an
+    # aps.category at all — the relay only ever derives it from its own
+    # allowlist, never from the client-supplied `category` string.
+    client, fake_apns = _client()
+    headers = _register_agent(client)
+    client.post(
+        "/v1/devices/register",
+        headers=headers,
+        json={
+            "token": "device-token",
+            "platform": "ios",
+            "environment": "sandbox",
+            "bundle_id": "ai.hermes.app",
+            "preferences": {"attention": True},
+        },
+    )
+
+    res = client.post(
+        "/v1/push/events",
+        headers=headers,
+        json={
+            "type": "attention",
+            "session_id": "sess-4",
+            "title": "Ping",
+            "body": "Untrusted",
+            "event_type": "totally_made_up",
+            "category": "ARBITRARY_ATTACKER_CATEGORY",
+        },
+    )
+    assert res.status_code == 200
+    assert res.json()["sent"] == 1
+
+    sent_payload = fake_apns.sent[0]["payload"]
+    assert "category" not in sent_payload["aps"]
+    assert sent_payload["hermes"]["event_type"] == "totally_made_up"

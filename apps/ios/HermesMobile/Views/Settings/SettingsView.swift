@@ -153,6 +153,11 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
+                #if DEBUG
+                if Self.providerKeySurvivalSeedEnabled {
+                    modelProviderSection
+                }
+                #endif
                 accountSection
                 appearanceAndPanelsSection
                 notificationsAndSecuritySection
@@ -160,7 +165,13 @@ struct SettingsView: View {
                 relayPushSection
                 approvalBypassSection
                 devicesSection
+                #if DEBUG
+                if !Self.providerKeySurvivalSeedEnabled {
+                    modelProviderSection
+                }
+                #else
                 modelProviderSection
+                #endif
                 toolsetKeysSection
                 creditsBillingSection
                 debugShareSection
@@ -631,16 +642,15 @@ struct SettingsView: View {
     /// the list surfaces the 404 as an inline error.
     @ViewBuilder
     private var modelProviderSection: some View {
-        if connectionStore.capabilities.pluginMount == .available,
-           let rest = connectionStore.rest {
+        #if DEBUG
+        if Self.providerKeySurvivalSeedEnabled,
+           let rest = Self.providerKeySurvivalSeedRest {
             Section {
                 NavigationLink {
-                    ProviderListView(rest: rest) {
-                        // Re-resolve the running model + repopulate the Model
-                        // picker so a newly-authenticated provider's models (or a
-                        // just-disconnected provider's removal) is reflected.
-                        Task { await connectionStore.refreshActiveModel() }
-                    }
+                    ProviderListView(
+                        rest: rest,
+                        debugSeedProviders: [Self.providerKeySurvivalSeedProvider]
+                    )
                     .background(theme.bg)
                 } label: {
                     SettingsRow(icon: "key.horizontal", title: "Model Provider", value: nil)
@@ -650,8 +660,60 @@ struct SettingsView: View {
             } footer: {
                 Text("Add or remove API keys for model providers. New chats use the provider you pick in Model.")
             }
+        } else if connectionStore.capabilities.pluginMount == .available,
+                  let rest = connectionStore.rest {
+            liveModelProviderSection(rest: rest)
+        }
+        #else
+        if connectionStore.capabilities.pluginMount == .available,
+           let rest = connectionStore.rest {
+            liveModelProviderSection(rest: rest)
+        }
+        #endif
+    }
+
+    private func liveModelProviderSection(rest: RestClient) -> some View {
+        Section {
+            NavigationLink {
+                ProviderListView(rest: rest) {
+                    // Re-resolve the running model + repopulate the Model
+                    // picker so a newly-authenticated provider's models (or a
+                    // just-disconnected provider's removal) is reflected.
+                    Task { await connectionStore.refreshActiveModel() }
+                }
+                .background(theme.bg)
+            } label: {
+                SettingsRow(icon: "key.horizontal", title: "Model Provider", value: nil)
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsModelProvider")
+        } footer: {
+            Text("Add or remove API keys for model providers. New chats use the provider you pick in Model.")
         }
     }
+
+    #if DEBUG
+    private static var providerKeySurvivalSeedEnabled: Bool {
+        ProcessInfo.processInfo.environment["HERMES_UITEST_PROVIDER_KEY_SURVIVAL"] == "1"
+    }
+
+    private static var providerKeySurvivalSeedRest: RestClient? {
+        guard let url = URL(string: "http://127.0.0.1") else { return nil }
+        return RestClient(baseURL: url, token: "uitest")
+    }
+
+    private static var providerKeySurvivalSeedProvider: ProviderRow {
+        ProviderRow(
+            slug: "openai",
+            name: "OpenAI",
+            authType: .apiKey,
+            isCurrent: false,
+            authenticated: false,
+            totalModels: 2,
+            models: ["gpt-5.5", "gpt-5.5-mini"]
+        )
+    }
+    #endif
 
     // MARK: - Toolset Keys (ABH-262 — feature-detected; plugin-mount only)
 

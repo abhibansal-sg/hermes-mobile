@@ -317,12 +317,12 @@ from hermes_cli.dashboard_auth.public_paths import (
 
 
 def _has_valid_session_token(request: Request) -> bool:
-    """True if the request carries a valid dashboard session token.
+    """True if the request carries a valid dashboard or registered token.
 
-    The dedicated session header avoids collisions with reverse proxies that
-    already use ``Authorization`` (for example Caddy ``basic_auth``). We still
-    accept the legacy Bearer path for backward compatibility with older
-    dashboard bundles.
+    The shared dashboard token remains the strict first path. Only after both
+    shared-token forms miss do we consult the pluggable S5 machine-token
+    registry. This is additive: a plugin can accept another credential but can
+    never weaken or reject the built-in shared-token checks.
     """
     session_header = request.headers.get(_SESSION_HEADER_NAME, "")
     if session_header and hmac.compare_digest(
@@ -333,7 +333,26 @@ def _has_valid_session_token(request: Request) -> bool:
 
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
-    return hmac.compare_digest(auth.encode(), expected.encode())
+    if hmac.compare_digest(auth.encode(), expected.encode()):
+        return True
+
+    from hermes_cli.dashboard_auth.token_auth import match_token
+
+    candidates = []
+    if session_header:
+        candidates.append(session_header)
+    if auth.startswith("Bearer "):
+        candidates.append(auth[len("Bearer "):])
+    for candidate in candidates:
+        identity = match_token(candidate)
+        if identity is not None:
+            try:
+                request.state.device = identity
+            except Exception:  # pragma: no cover - defensive
+                pass
+            return True
+
+    return False
 
 
 # Routes that may also authenticate via a ``?token=`` query param, for download
@@ -450,7 +469,16 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     # Loopback bind: accept the loopback names
     bound_lc = bound_host.lower()
     if bound_lc in _LOOPBACK_HOST_VALUES:
-        return host_only in _LOOPBACK_HOST_VALUES
+        if host_only in _LOOPBACK_HOST_VALUES:
+            return True
+        # Reverse-proxy / Tailscale Serve: Host is the public MagicDNS name
+        # while we stay bound to 127.0.0.1. Operator-owned allowlist only.
+        extra = os.environ.get("HERMES_DASHBOARD_ALLOWED_HOSTS", "")
+        if extra:
+            allowed = {h.strip().lower() for h in extra.split(",") if h.strip()}
+            if host_only in allowed:
+                return True
+        return False
 
     # Explicit non-loopback bind: require exact host match
     return host_only == bound_lc
@@ -3860,6 +3888,7 @@ def get_sessions(
     order: str = "created",
     source: str = None,
     exclude_sources: str = None,
+    include_children: bool = False,
     cwd_prefix: str = None,
     full: bool = False,
     profile: Optional[str] = None,
@@ -3898,17 +3927,19 @@ def get_sessions(
             min_message_count = max(0, min_messages)
             archived_only = archived == "only"
             include_archived = archived == "include"
-            # Optional source scoping: ``source`` includes a single class,
+            # Optional source scoping: ``source`` includes one or more classes,
             # ``exclude_sources`` (comma-separated) drops classes. The desktop
             # uses these to split recents (exclude=cron) from the cron-jobs
             # section (source=cron) into two independent lists.
+            source_list = [s.strip() for s in (source or "").split(",") if s.strip()]
             exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
             sessions = db.list_sessions_rich(
-                source=source or None,
+                source=source_list or None,
                 exclude_sources=exclude_list or None,
                 cwd_prefix=(cwd_prefix or None),
                 limit=limit,
                 offset=offset,
+                include_children=include_children,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
@@ -3919,13 +3950,13 @@ def get_sessions(
                 compact_rows=not full,
             )
             total = db.session_count(
-                source=source or None,
+                source=source_list or None,
                 cwd_prefix=(cwd_prefix or None),
                 exclude_sources=exclude_list or None,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
-                exclude_children=True,
+                exclude_children=not include_children,
             )
             now = time.time()
             for s in sessions:
@@ -4103,6 +4134,11 @@ async def search_sessions(q: str = "", limit: int = 20, offset: int = 0, scope: 
     """
     if not q or not q.strip():
         return {"results": []}
+    scope_norm = (scope or "all").strip().lower()
+    role_filter = {
+        "messages": ["user", "assistant"],
+        "code": ["tool"],
+    }.get(scope_norm)  # None for "all" / unknown → no role filter
     try:
         db = _open_session_db_for_profile(profile)
         try:
@@ -9114,6 +9150,54 @@ def _xai_device_poller(session_id: str) -> None:
             sess["error_message"] = str(e)
 
 
+def _http_response_error_detail(resp: Any) -> str:
+    """Best-effort extraction of a short provider error detail."""
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            parts = [
+                str(error.get(key, "")).strip()
+                for key in ("message", "error_description", "code", "type")
+                if str(error.get(key, "")).strip()
+            ]
+            if parts:
+                return ": ".join(parts)
+        if isinstance(error, str) and error.strip():
+            return error.strip()
+        for key in ("detail", "message", "error_description"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    text = str(getattr(resp, "text", "") or "").strip()
+    return text[:500]
+
+
+def _codex_device_code_start_error(resp: Any) -> str:
+    """Dashboard-facing OpenAI Codex device-code start failure."""
+    status = getattr(resp, "status_code", "unknown")
+    detail = _http_response_error_detail(resp)
+    lower = detail.lower()
+    if "device" in lower and ("authori" in lower or "enable" in lower):
+        message = (
+            "OpenAI rejected the device-code login request. Your OpenAI "
+            "account may need device-code authorization enabled before Hermes "
+            "can start this dashboard login. Enable device-code authorization "
+            "in OpenAI, then return here and click Login again."
+        )
+    else:
+        message = (
+            "OpenAI rejected the device-code login request. Please try Login "
+            "again from the dashboard after checking your OpenAI account settings."
+        )
+    if detail:
+        return f"{message} (HTTP {status}: {detail})"
+    return f"{message} (HTTP {status})"
+
+
 def _codex_full_login_worker(session_id: str) -> None:
     """Run the complete OpenAI Codex device-code flow.
 
@@ -9146,7 +9230,7 @@ def _codex_full_login_worker(session_id: str) -> None:
                 headers={"Content-Type": "application/json"},
             )
         if resp.status_code != 200:
-            raise RuntimeError(f"deviceauth/usercode returned {resp.status_code}")
+            raise RuntimeError(_codex_device_code_start_error(resp))
         device_data = resp.json()
         user_code = device_data.get("user_code", "")
         device_auth_id = device_data.get("device_auth_id", "")
@@ -10460,7 +10544,10 @@ async def cron_fire_webhook(request: Request):
     if not job_id:
         return JSONResponse({"error": "missing job_id"}, status_code=400)
 
-    profile = _find_cron_job_profile(job_id)
+    # _find_cron_job_profile walks every profile and lists its jobs (file
+    # I/O per profile) — run it off the event loop like the other cron
+    # dashboard endpoints.
+    profile = await _run_cron_dashboard_io(_find_cron_job_profile, job_id)
     if not profile:
         # Job is gone (cancelled / completed) — nothing to fire. 200 so NAS
         # does not retry a fire that is intentionally absent.
@@ -10535,7 +10622,11 @@ async def instantiate_blueprint(body: AutomationBlueprintInstantiate, profile: s
         # Blueprint-created jobs deliver to the dashboard's configured target by
         # default; the form's deliver slot overrides via spec["deliver"].
         spec.pop("origin", None)
-        return _call_cron_for_profile(profile, "create_job", **spec)
+        # create_job does per-profile file I/O — keep it off the event loop
+        # like the sibling cron endpoints (partial avoids **spec keys ever
+        # colliding with the wrapper's own parameters).
+        _create = functools.partial(_call_cron_for_profile, profile, "create_job", **spec)
+        return await _run_cron_dashboard_io(_create)
     except HTTPException:
         raise
     except Exception as e:
@@ -14384,7 +14475,17 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            consume_ticket(ticket)
+            info = consume_ticket(ticket)
+            if info.get("provider") == "device" and info.get("user_id"):
+                try:
+                    ws.state.device = {
+                        "device_id": info.get("device_id") or info["user_id"],
+                        "device_name": info.get("device_name"),
+                        "token_prefix": info.get("token_prefix"),
+                        "scopes": list(info.get("scopes") or []),
+                    }
+                except Exception:  # pragma: no cover - defensive
+                    pass
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
@@ -14400,7 +14501,43 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         return "no_credential", "none"
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
         return None, "token"
+
+    identity = _ws_token_identity(token)
+    if identity is not None:
+        try:
+            ws.state.device = identity
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return None, "device"
     return "token_mismatch", "token"
+
+
+def _ws_token_identity(token: str) -> Optional[dict]:
+    """Resolve an S5 machine token without affecting shared-token validity."""
+    from hermes_cli.dashboard_auth.token_auth import match_token
+
+    return match_token(token)
+
+
+def _ws_active_identity(ws: "WebSocket") -> Optional[dict]:
+    """Return the connection identity only while its token remains active."""
+    from hermes_cli.dashboard_auth.token_auth import identity_active
+
+    identity = getattr(ws.state, "device", None)
+    if not isinstance(identity, dict):
+        return None
+    return identity if identity_active(identity) else None
+
+
+async def _close_if_ws_device_revoked(ws: "WebSocket") -> bool:
+    """Close and report a token-authenticated socket whose identity was revoked."""
+    identity = getattr(ws.state, "device", None)
+    if not isinstance(identity, dict):
+        return False
+    if _ws_active_identity(ws) is not None:
+        return False
+    await ws.close(code=4401, reason="device revoked")
+    return True
 
 
 def _ws_auth_ok(ws: "WebSocket") -> bool:
@@ -14979,6 +15116,9 @@ async def console_ws(ws: WebSocket) -> None:
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
         return
 
+    if await _close_if_ws_device_revoked(ws):
+        return
+
     await ws.accept()
 
     profile = _console_profile_from_ws(ws)
@@ -15341,6 +15481,9 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
         return
 
+    if await _close_if_ws_device_revoked(ws):
+        return
+
     await ws.accept()
     _log.info("pty accepted peer=%s mode=%s cred=%s", peer, mode, cred)
 
@@ -15498,9 +15641,20 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    from tui_gateway.ws import handle_ws
+    if await _close_if_ws_device_revoked(ws):
+        return
 
-    await handle_ws(ws)
+    from tui_gateway.ws import handle_ws
+    from hermes_cli.dashboard_auth.token_auth import notify_socket
+
+    identity = _ws_active_identity(ws)
+    if identity:
+        notify_socket("register", identity, ws)
+    try:
+        await handle_ws(ws)
+    finally:
+        if identity:
+            notify_socket("deregister", identity, ws)
 
 
 # ---------------------------------------------------------------------------
@@ -15529,6 +15683,9 @@ async def pub_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
+    if await _close_if_ws_device_revoked(ws):
+        return
+
     channel = _channel_or_close_code(ws)
     if not channel:
         await ws.close(code=4400)
@@ -15555,6 +15712,9 @@ async def events_ws(ws: WebSocket) -> None:
 
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
+        return
+
+    if await _close_if_ws_device_revoked(ws):
         return
 
     channel = _channel_or_close_code(ws)

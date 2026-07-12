@@ -186,6 +186,15 @@ struct RootView: View {
             CompactLayout()
         }
     }
+
+    /// `hermesapp://debug/open-settings` opens the same root-owned Settings
+    /// sheet as the iPad shortcut/avatar. This host-driven DEBUG seam avoids
+    /// `XCUIApplication.open(_:)`, which relaunches the app under test.
+    static func isOpenSettingsURL(_ url: URL) -> Bool {
+        url.scheme?.lowercased() == "hermesapp"
+            && url.host?.lowercased() == "debug"
+            && url.pathComponents.dropFirst().map { $0.lowercased() } == ["open-settings"]
+    }
 }
 
 // MARK: - Regular width (split view)
@@ -433,6 +442,16 @@ private struct SplitLayout: View {
                 .disabled(!RootKeyboardShortcutActions.hasSendableComposerText(sessions: sessions))
 
                 Button {
+                    recallPreviousComposerPrompt()
+                } label: { Text("Previous Prompt") }
+                .keyboardShortcut(.upArrow, modifiers: .command)
+
+                Button {
+                    recallNextComposerPrompt()
+                } label: { Text("Next Prompt") }
+                .keyboardShortcut(.downArrow, modifiers: .command)
+
+                Button {
                     openSettings()
                 } label: { Text("Settings") }
                 .keyboardShortcut(",", modifiers: .command)
@@ -465,6 +484,14 @@ private struct SplitLayout: View {
         RootKeyboardShortcutActions.sendCurrentComposerDraft(from: sessions) { text in
             Task { await chat.send(text: text, includeAttachments: false) }
         }
+    }
+
+    private func recallPreviousComposerPrompt() {
+        RootKeyboardShortcutActions.recallPreviousComposerPrompt(sessions: sessions, chat: chat)
+    }
+
+    private func recallNextComposerPrompt() {
+        RootKeyboardShortcutActions.recallNextComposerPrompt(sessions: sessions, chat: chat)
     }
 
     private func openSettings() {
@@ -517,8 +544,19 @@ enum RootKeyboardShortcutActions {
         guard !text.isEmpty else { return false }
 
         sessions.setComposerDraft("", for: key)
+        sessions.resetComposerHistoryBrowse(for: key)
         send(text)
         return true
+    }
+
+    @discardableResult
+    static func recallPreviousComposerPrompt(sessions: SessionStore, chat: ChatStore) -> Bool {
+        sessions.recallPreviousComposerPrompt(messages: chat.messages)
+    }
+
+    @discardableResult
+    static func recallNextComposerPrompt(sessions: SessionStore, chat: ChatStore) -> Bool {
+        sessions.recallNextComposerPrompt(messages: chat.messages)
     }
 
     static func openSettings(isPresented: Binding<Bool>) {
@@ -1038,9 +1076,10 @@ private struct CompactLayout: View {
         // and no draft (delete of the open session, bare-root deep link,
         // archive-of-last), ChatView's empty-transcript state is a permanent
         // "Loading conversation…" spinner over a dead composer. Render a
-        // recoverable placeholder instead. The placeholder DOES still want a
-        // NavigationStack for its own title/chrome, so it keeps a minimal wrapper;
-        // the live chat path is the stack-free one that matters for the fix.
+        // recoverable placeholder instead. Like the live chat path, this
+        // placeholder is now stack-free (STR-54) — the empty-state CTAs sit
+        // directly in the `.geometryGroup()`'d card subtree so their
+        // hit-test geometry rides the card offset.
         Group {
             if sessions.activeStoredId != nil || sessions.isDraft {
                 ChatView(
@@ -1071,16 +1110,30 @@ private struct CompactLayout: View {
                 // overlay (under the pills), so the transcript scroll surface keeps
                 // a clean, uninsetted full-bleed top edge.
             } else {
-                NavigationStack {
-                    ContentUnavailableView {
-                        Label("No conversation", systemImage: "bubble.left.and.text.bubble.right")
-                    } description: {
-                        Text("Start a new chat or pick a session from the drawer.")
-                    } actions: {
-                        Button("New Chat") { sessions.startDraft() }
-                            .buttonStyle(.borderedProminent)
-                        Button("Sessions") { drawer.toggle() }
-                    }
+                // STR-54: NO NavigationStack wrapper here (mirrors the ChatView
+                // "STRIKE P0" removal above). This branch renders no title/toolbar
+                // chrome — the stack was pure inert scaffolding — but its
+                // UIKit-backed hosting controller mounts with whatever `.offset(x:)`
+                // the surrounding `.geometryGroup()`'d card happens to have at that
+                // instant. Reaching this branch by deleting the active session
+                // WHILE the drawer is open (offset == drawerWidth) baked that
+                // offset into the stack's accessibility/hit-test frame permanently:
+                // the card later animates back to its visually-correct offset 0,
+                // but the NavigationStack's own hit-test geometry never followed,
+                // leaving the "Sessions"/"New Chat" buttons rendered on-screen yet
+                // untappable there (repro'd via AXe: AX frame stuck at
+                // `x ≈ drawerWidth` while the screenshot showed them centered).
+                // Dropping the wrapper puts `ContentUnavailableView` directly in
+                // the `.geometryGroup()`'d subtree, so its hit-test geometry rides
+                // the offset rigidly like the rest of the card.
+                ContentUnavailableView {
+                    Label("No conversation", systemImage: "bubble.left.and.text.bubble.right")
+                } description: {
+                    Text("Start a new chat or pick a session from the drawer.")
+                } actions: {
+                    Button("New Chat") { sessions.startDraft() }
+                        .buttonStyle(.borderedProminent)
+                    Button("Sessions") { drawer.toggle() }
                 }
             }
         }

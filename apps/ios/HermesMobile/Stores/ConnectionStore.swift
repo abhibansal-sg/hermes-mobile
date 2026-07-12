@@ -44,7 +44,9 @@ final class ConnectionStore {
     }
 
     /// Current high-level connection phase.
-    var phase: Phase = .connecting
+    var phase: Phase = .connecting {
+        didSet { notifyReadinessWaiters() }
+    }
     #if DEBUG
     /// JSON-safe mirror of ``phase`` for the gstack debug bridge snapshot
     /// (task UI-G). `phase` is a Swift enum and not JSON-serializable, so the
@@ -55,7 +57,13 @@ final class ConnectionStore {
         case .needsSetup: return "needsSetup"
         case .connecting: return "connecting"
         case .hydrating: return "hydrating"
-        case .connected: return "connected"
+        // STR-973A: a `.connected` phase during the silent-grace window still
+        // reads as "connected" to every other consumer (RootView, the status
+        // banner, ChatView.isConnected) by design — only this stable label
+        // distinguishes it, so StateServer/gstack tooling can assert grace is
+        // active without a new `Phase` case (which would break the exhaustive
+        // `switch connection.phase` sites outside this file's scope).
+        case .connected: return isInGrace ? "connected(grace)" : "connected"
         case .reconnecting(let attempt): return "reconnecting(\(attempt))"
         case .offline(let reason): return "offline(\(reason ?? ""))"
         }
@@ -196,7 +204,7 @@ final class ConnectionStore {
     /// Apply the typed `info` echoed by `session.create`/`session.resume` to
     /// the live session state. THIS is what keeps the composer pill session-
     /// true on every switch: the gateway sends the session's actual
-    /// model/provider/reasoning/fast on resume, but the app previously used
+    /// model/provider/reasoning/fast/yolo on resume, but the app previously used
     /// it only for profile confirmation — so the pill kept showing the LAST
     /// session's hot-swap (or the global default) until the picker was opened
     /// (build-27 QA).
@@ -213,6 +221,9 @@ final class ConnectionStore {
         }
         if let fast = info.fast {
             sessionFast = fast
+        }
+        if let yolo = info.yolo {
+            sessionYolo = yolo
         }
     }
 
@@ -387,6 +398,28 @@ final class ConnectionStore {
     /// loading screen. Kept as a named constant so the test can pin it.
     static let hydrationTimeout: Duration = .seconds(8)
 
+    /// Silent-reconnect grace window for a transport drop DURING an active
+    /// session (`.closed`/`.failed` after `hasConnected`) — STR-973A. The
+    /// reconnect loop runs immediately and silently against this window; only
+    /// if every attempt still fails once it elapses do we surface the drop
+    /// (transcript warning + a visible `.reconnecting` phase). Named so the
+    /// test can pin it. See `handle(state:)` / `startGraceWindow`.
+    static let transientGraceWindow: Duration = .seconds(10)
+
+    /// Silent-reconnect grace window for a dead socket found on a cold app
+    /// open / foreground (as opposed to a drop witnessed live) — STR-973A.
+    /// Shorter than `transientGraceWindow`: a cold-open dead socket is far
+    /// more often a stale-suspend reconnect than a real outage. Reserved for
+    /// the foreground/cold-open detection path; not yet wired into
+    /// `handleScenePhase` in this change (kept out of scope — see issue
+    /// notes). Named so the test can pin it.
+    static let coldOpenGraceWindow: Duration = .seconds(5)
+
+    /// Hard ceiling for a cold push tap that arrives before bootstrap/configure
+    /// has made REST/WS usable. The tap path must wait long enough for normal
+    /// cold launch bootstrap, but unconfigured/offline installs cannot hang.
+    static let pushTapReadinessTimeout: Duration = .seconds(10)
+
     /// The single, long-lived gateway client.
     let client = HermesGatewayClient()
 
@@ -401,21 +434,106 @@ final class ConnectionStore {
     /// Speaks the path family the capability probe resolved (ABH-88) — `.legacy`
     /// until/unless the plugin-mount probe concludes `.available`.
     var rest: RestClient? {
+        #if DEBUG
+        // Test-only: a seeded override short-circuits the URL+token build so a
+        // stub `URLSession` can observe/no-op the calls made through `rest`
+        // (e.g. reconnect probes and the device auto-upgrade round-trip). See
+        // `_restOverrideForTesting`.
+        if let _restOverrideForTesting { return _restOverrideForTesting }
+        #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
         return RestClient(
             baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
         )
     }
 
+    /// Wait until session-list refresh has a usable transport, or until the
+    /// connection has reached a terminal not-ready state / timeout.
+    ///
+    /// This is deliberately narrower than full hydration: push-tap resolution only
+    /// needs REST (preferred by `SessionStore.refresh`) or an open WS client to
+    /// fetch `session.list`. A verified `configure()` stamps `serverURLString` and
+    /// `currentToken` before `.hydrating`, so `rest != nil` is enough to let the
+    /// miss path refresh without waiting for the branded loading screen to finish.
+    func waitUntilSessionRefreshReady(
+        timeout: Duration = ConnectionStore.pushTapReadinessTimeout
+    ) async -> Bool {
+        #if DEBUG
+        if let sessionRefreshReadinessOverride {
+            return await sessionRefreshReadinessOverride()
+        }
+        #endif
+        if await isSessionRefreshReady() { return true }
+        if isTerminallyNotReadyForSessionRefresh { return false }
+
+        let timeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            if Task.isCancelled { return }
+            await self?.notifyReadinessWaiters()
+        }
+        await waitForReadinessChange()
+        timeoutTask.cancel()
+
+        return await isSessionRefreshReady()
+    }
+
+    private func isSessionRefreshReady() async -> Bool {
+        if rest != nil { return true }
+        return await client.state == .open
+    }
+
+    private var isTerminallyNotReadyForSessionRefresh: Bool {
+        switch phase {
+        case .needsSetup, .offline:
+            return true
+        case .connecting, .hydrating, .connected, .reconnecting:
+            return false
+        }
+    }
+
+    private func waitForReadinessChange() async {
+        await withCheckedContinuation { continuation in
+            readinessWaiters.append(continuation)
+        }
+    }
+
+    private func notifyReadinessWaiters() {
+        guard !readinessWaiters.isEmpty else { return }
+        let waiters = readinessWaiters
+        readinessWaiters = []
+        waiters.forEach { $0.resume() }
+    }
+
     /// A ``RestClient`` for the control-surface panels (model / personality /
     /// usage / cron / skills — now ``RestClient`` extension members), built from
     /// the same saved URL + token as `rest`, or `nil` if unconfigured.
     var control: RestClient? {
+        #if DEBUG
+        // Test-only: same seam as `rest` (see `_restOverrideForTesting`) so the
+        // control-surface client is equally stubbable in unit tests.
+        if let _restOverrideForTesting { return _restOverrideForTesting }
+        #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
         return RestClient(
             baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
         )
     }
+
+    #if DEBUG
+    /// Test-only override: when set, `rest`/`control` return this client instead
+    /// of building one from the saved URL + token, so a stub `URLSession`
+    /// (`URLProtocol`-injected) can observe/no-op the requests they issue —
+    /// in particular the reconnect-path probes inside `recoverActiveSession()`
+    /// (`capabilities.probe`, `autoUpgradeToDeviceTokenIfNeeded`) and the
+    /// auto-upgrade `issueDevice` round-trip, which are
+    /// otherwise routed through an internal `.ephemeral` session that no
+    /// `URLProtocol` can intercept, and which leak real network calls to a
+    /// dead loopback gateway on a CI runner with no server (STR-1481). Mirrors
+    /// the existing `_seed…ForTesting` conventions; compiled out of Release,
+    /// so there is no production surface and no secret exposure (the stub
+    /// client's session and token are entirely test-injected).
+    var _restOverrideForTesting: RestClient?
+    #endif
 
     /// The persistent prompt outbox/queue. Drained here after reconnect backfill.
     /// Wired by `AppEnvironment` (ChatStore holds no reference to it).
@@ -432,6 +550,7 @@ final class ConnectionStore {
 
     /// The token for the active connection (kept in memory; also in Keychain).
     private var currentToken: String?
+    private var readinessWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// Servers where `POST /devices/issue` hit the device registry cap during
     /// this app run. A 409 is permanent until a device is revoked, so automatic
@@ -439,6 +558,15 @@ final class ConnectionStore {
     /// existing banner retry path calls `configure()` again, which clears the
     /// marker for an explicit user re-attempt after cleanup.
     private var deviceIssueLimitReachedServers = Set<String>()
+
+    /// Per-server single-flight guard for silent shared-token → device-token
+    /// upgrades (STR-546/STR-512). Multiple reconnect/configure paths can
+    /// overlap for the same active server; only one `/devices/issue` request
+    /// may be in flight for a server at a time, and joiners await that same
+    /// operation instead of minting a second device token. Cleared on every
+    /// exit path (success, typed 409, generic failure, Keychain-write
+    /// failure) so a later legitimate retry is never permanently suppressed.
+    private var autoUpgradeIssueTasks: [String: Task<IssuedDevice, Error>] = [:]
 
     /// Injectable connect implementation (tests). When non-nil the reconnect
     /// loop calls this closure instead of `client.connect(...)` — the same
@@ -448,10 +576,24 @@ final class ConnectionStore {
     var connectRPC: ((_ url: URL, _ token: String, _ mode: ConnectionMode) async throws -> Void)?
 
     #if DEBUG
+    /// DEBUG-only test seam for deterministic single-flight auto-upgrade tests
+    /// (STR-546): when non-nil, replaces the live `rest.issueDevice(name:)`
+    /// call so a test can delay/observe the issue round-trip without a live
+    /// server (e.g. suspend it to prove two overlapping callers share one
+    /// invocation). `nil` in production (the nil-check is free).
+    var issueDeviceRPC: (@Sendable (_ rest: RestClient, _ name: String) async throws -> IssuedDevice)?
+    #endif
+
+    #if DEBUG
     /// Injectable configure status probe (tests). When non-nil, replaces the live
     /// `RestClient.status()` call so unit tests can exercise verified configure
     /// persistence without a gateway.
     var statusRPC: ((_ url: URL, _ token: String) async throws -> Void)?
+
+    /// Injectable push-tap readiness result (tests). When non-nil, replaces the
+    /// live phase/transport wait so notification routing tests can deterministically
+    /// model cold-ready and cold-offline launches without sleeping for the timeout.
+    var sessionRefreshReadinessOverride: (() async -> Bool)?
 
     /// Injectable auth-revoke probe (tests). When non-nil, replaces the live
     /// `probeIsAuthRevoked` REST call with this closure's return value so unit
@@ -464,6 +606,12 @@ final class ConnectionStore {
     /// must drive multiple consecutive failures (threshold ≥ 3) do not stall
     /// for seconds of wall-clock time. `nil` = normal exponential schedule.
     var reconnectBackoffOverride: Double?
+
+    /// Injectable grace-window override (tests). When non-nil, `startGraceWindow`
+    /// uses this value instead of `transientGraceWindow`/`coldOpenGraceWindow` so
+    /// expiry tests don't burn real wall-clock time. `nil` = the named windows.
+    /// Pattern mirrors `reconnectBackoffOverride`.
+    var graceWindowOverride: Duration?
 
     /// Injectable liveness probe (tests). When non-nil, replaces the live
     /// `client.probeLiveness()` call in `handleScenePhase` with this closure's
@@ -519,6 +667,27 @@ final class ConnectionStore {
     private static let intakeYieldEveryK = 32
     /// The in-flight reconnect loop, if any.
     private var reconnectTask: Task<Void, Never>?
+    /// The in-flight silent-grace timer, if any (STR-973A). Races the reconnect
+    /// loop's attempts: cancelled the moment an attempt succeeds (or the loop
+    /// exits for any other reason — auth revoke, vanished config) so a stale
+    /// timer can never fire after the phase has already resolved; left to fire
+    /// on its own if every attempt is still failing when it elapses, which
+    /// escalates to the visible drop (see `startGraceWindow`/`endGrace`/
+    /// `escalateGraceExpiry`).
+    private var graceTask: Task<Void, Never>?
+    /// True while a drop is being retried silently within the grace window
+    /// (STR-973A) — `phase` stays `.connected` and `ChatStore`/`SessionStore`
+    /// are NOT told the connection dropped, so an in-flight turn is never
+    /// stranded or stomped by a blip that heals inside the window. Flipped
+    /// false the moment grace ends, whether by healing or by expiry-escalation.
+    /// `private(set)` so `ChatStore.send()` can route a fresh send to the
+    /// outbox instead of surfacing a live-socket failure during grace.
+    private(set) var isInGrace = false
+    /// The reconnect loop's current attempt index, updated every iteration.
+    /// `escalateGraceExpiry()` reads this to stamp the visible `.reconnecting`
+    /// phase immediately at expiry, rather than waiting for the loop's next
+    /// iteration (which could be a full backoff delay away).
+    private var currentReconnectAttempt = 0
     /// The in-flight post-connect hydration coordinator, if any (ABH-82). Owns
     /// the `.hydrating → .connected` transition and the timeout fallback;
     /// cancelled on disconnect so a teardown mid-hydration can't later flip the
@@ -955,6 +1124,12 @@ final class ConnectionStore {
         // the phase back to `.connected` (ABH-82).
         hydrationTask?.cancel()
         hydrationTask = nil
+        // A deliberate disconnect always wins over a silent-reconnect grace
+        // window in flight — never leave a stale grace timer able to fire
+        // after teardown.
+        graceTask?.cancel()
+        graceTask = nil
+        isInGrace = false
         hasConnected = false
         // A deliberate disconnect is not an auth revocation — clear the re-pair
         // flag so the welcome screen shows its normal first-run copy.
@@ -1202,21 +1377,65 @@ final class ConnectionStore {
             // reconnect loop sets `.connected` itself on success.
             if reconnectTask == nil, phase != .hydrating { phase = .connected }
         case .closed, .failed:
-            // A dropped transport can never deliver the in-flight turn's
-            // completion — tear down streaming state NOW so the post-reconnect
-            // `backfill()` isn't no-op'd by its own `guard !isStreaming`
-            // (R1 #9/#42). Idempotent, so the repeated `.failed` transitions
-            // of the reconnect loop's own attempts are harmless.
-            chatStore.handleConnectionDrop()
-            // ABH-178 belt-and-suspenders: a mid-turn socket drop must NOT leave
-            // any session's turnInProgress flag stuck — that would permanently
-            // carry-forward a local lastActive bump, reviving the ABH-157 bug.
-            sessionStore.clearAllTurnsInProgress()
-            // A drop after we were connected → reconnect. An expected close
-            // (disconnect/needsSetup) leaves `hasConnected` false.
-            guard hasConnected, reconnectTask == nil else { return }
-            startReconnectLoop()
+            // STR-973A silent reconnect: a drop after we were connected no
+            // longer finalizes the stream or shows `.reconnecting` right
+            // away. Start the grace window instead — it fires the reconnect
+            // loop immediately underneath (so a quick heal is fast) but
+            // withholds `chatStore.handleConnectionDrop()` / the visible
+            // `.reconnecting` phase until the grace window actually expires.
+            // An expected close (disconnect/needsSetup) leaves `hasConnected`
+            // false and this is a no-op. Idempotent against the repeated
+            // `.failed` transitions the reconnect loop's own attempts emit —
+            // `reconnectTask`/`graceTask` are both already non-nil by then.
+            guard hasConnected, reconnectTask == nil, graceTask == nil else { return }
+            #if DEBUG
+            startGraceWindow(duration: graceWindowOverride ?? Self.transientGraceWindow)
+            #else
+            startGraceWindow(duration: Self.transientGraceWindow)
+            #endif
         }
+    }
+
+    // MARK: - Silent reconnect grace (STR-973A)
+
+    /// Start the silent-reconnect grace window: the reconnect loop fires
+    /// immediately underneath (attempt 0 has no backoff, so a quick heal is
+    /// still fast), but `phase` is held at `.connected` (with `isInGrace`
+    /// true) and the transcript is left untouched for `duration`. Only if
+    /// the window expires with retries still failing does
+    /// `escalateGraceExpiry()` finalize the stream and surface
+    /// `.reconnecting`.
+    private func startGraceWindow(duration: Duration) {
+        isInGrace = true
+        startReconnectLoop()
+        graceTask = Task { [weak self] in
+            try? await Task.sleep(for: duration)
+            guard let self, !Task.isCancelled else { return }
+            self.escalateGraceExpiry()
+        }
+    }
+
+    /// Grace expired while the reconnect loop is still failing: only now do
+    /// we drop the stranded stream/turn state and make the reconnect visible.
+    /// A no-op if grace already ended (the loop healed first, or a teardown
+    /// raced this timer) — `escalateGraceExpiry` must never resurrect a
+    /// settled phase.
+    private func escalateGraceExpiry() {
+        guard isInGrace else { return }
+        isInGrace = false
+        graceTask = nil
+        chatStore.handleConnectionDrop()
+        sessionStore.clearAllTurnsInProgress()
+        phase = .reconnecting(attempt: currentReconnectAttempt)
+    }
+
+    /// End the grace window without escalating — used on every reconnect-loop
+    /// exit path (success, config vanished, auth revoked) so a stale timer
+    /// can never fire after the phase has already moved on.
+    private func endGrace() {
+        graceTask?.cancel()
+        graceTask = nil
+        isInGrace = false
     }
 
     // MARK: - Reconnect
@@ -1231,7 +1450,13 @@ final class ConnectionStore {
             guard let self else { return }
             var attempt = 0
             while !Task.isCancelled {
-                self.phase = .reconnecting(attempt: attempt)
+                self.currentReconnectAttempt = attempt
+                // STR-973A: while grace is holding, keep `phase` at
+                // `.connected` — `escalateGraceExpiry()` is the only path
+                // allowed to surface `.reconnecting` during grace.
+                if !self.isInGrace {
+                    self.phase = .reconnecting(attempt: attempt)
+                }
 
                 // Attempt 0: connect immediately — no backoff delay.
                 // The loop can be (re)started from `handleScenePhase` on
@@ -1256,6 +1481,7 @@ final class ConnectionStore {
                     // chat shell in `.offline` with NO re-pair affordance
                     // (RootView only shows WelcomeView when hasConnected is
                     // false). Release audit P1.
+                    self.endGrace()
                     self.hasConnected = false
                     self.phase = .needsSetup
                     self.reconnectTask = nil
@@ -1269,6 +1495,26 @@ final class ConnectionStore {
                         try await self.client.connect(baseURL: url, token: token, mode: self.connectionMode)
                     }
                     if Task.isCancelled { return }
+                    // End grace immediately on the successful connect, BEFORE
+                    // the awaited recovery below — `recoverActiveSession()`
+                    // has genuine network suspensions, and while this task is
+                    // suspended the MainActor is free for the armed
+                    // `graceTask` to fire `escalateGraceExpiry()`. That guards
+                    // only on `isInGrace`, so leaving grace open here let a
+                    // late-firing timer stamp a spurious "Connection lost"
+                    // warning on a reconnect that had already succeeded
+                    // (STR-1126 regression). `handle(state:)` won't re-arm a
+                    // new grace window while `reconnectTask` is still
+                    // non-nil, so ending it this early is safe.
+                    self.endGrace()
+                    // A quick heal (attempt-0 success, typically still inside
+                    // grace): silently finalize any stream the drop left
+                    // stranded — REQUIRED for `backfill()`'s `guard
+                    // !isStreaming` to ever pass — but withhold the visible
+                    // "Connection lost" warning since the user never saw a
+                    // reconnect banner.
+                    self.chatStore.handleConnectionDrop(stampWarning: false)
+                    self.sessionStore.clearAllTurnsInProgress()
                     await self.recoverActiveSession()
                     self.phase = .connected
                     self.reconnectTask = nil
@@ -1284,6 +1530,9 @@ final class ConnectionStore {
                     if self.consecutiveReconnectFailures >= Self.authReprobeThreshold,
                        await self.probeIsAuthRevoked(url: url, token: token) {
                         if Task.isCancelled { return }
+                        // A hard auth revocation must never be swallowed by
+                        // grace — end it now and escalate straight to re-pair.
+                        self.endGrace()
                         self.reauthRequired = true
                         self.phase = .needsSetup
                         self.reconnectTask = nil
@@ -1392,7 +1641,16 @@ final class ConnectionStore {
     ///     never issue);
     ///   - no `device_id` already recorded for this server (already upgraded, or a
     ///     v2 QR handed us a device token — don't re-issue);
-    ///   - we are still configured against `serverURL` with a live token.
+    ///   - we are still configured against `serverURL` with a live token;
+    ///   - the server's live `GET /api/status` reports `auth_required == true`
+    ///     (STR-1568). A loopback/insecure dev-gateway runs `auth_required ==
+    ///     false`; there, the legacy shared-token-only `auth_middleware` is the
+    ///     ONLY active gate on `/api/*` — it has no device-token branch (that
+    ///     lives in `gated_auth_middleware`, which never engages on loopback) —
+    ///     so a device-upgraded phone would 401 on every request, app-wide, with
+    ///     no way back to the shared token short of a re-pair. Fail-safe on a
+    ///     missing/unreachable status (`nil`): keep the shared token, which the
+    ///     loopback gate always accepts.
     ///
     /// FAILURE IS SILENT (binding) for transient/status failures: if `issueDevice`
     /// throws (500 persist failure, 401, transport), the app KEEPS the shared
@@ -1421,9 +1679,43 @@ final class ConnectionStore {
         // Must still be the active configuration with a live token + REST client.
         guard serverURLString == serverURL, let rest else { return }
 
+        // STR-1568: only issue a device token when the server's own auth gate
+        // would actually accept one — see the gating note above. `try?` folds a
+        // transport/decode failure into the same fail-safe as `nil`: keep the
+        // shared token, retry on the next connect.
+        guard let status = try? await rest.status(), status.authRequired == true else { return }
+
+        // STR-546/STR-512: single-flight the actual issue call per server.
+        // Overlapping auto-upgrade attempts for the same server (e.g. the
+        // initial connect racing a reconnect-loop retry) join the same
+        // in-flight `Task` instead of each minting their own device token —
+        // an unshared second issue would silently orphan the first and
+        // silently consume a second slot against the 64-device cap
+        // (STR-512). Cleared via `defer` on every exit from this function so
+        // a later legitimate retry (after a failure or a Keychain-write
+        // failure clears `device_id`) is never permanently suppressed.
+        let issueTask: Task<IssuedDevice, Error>
+        if let inFlight = autoUpgradeIssueTasks[serverURL] {
+            issueTask = inFlight
+        } else {
+            #if DEBUG
+            let issueDeviceRPC = issueDeviceRPC
+            #endif
+            issueTask = Task { [rest] in
+                #if DEBUG
+                if let issueDeviceRPC {
+                    return try await issueDeviceRPC(rest, Self.deviceNameHint)
+                }
+                #endif
+                return try await rest.issueDevice(name: Self.deviceNameHint)
+            }
+            autoUpgradeIssueTasks[serverURL] = issueTask
+        }
+        defer { autoUpgradeIssueTasks[serverURL] = nil }
+
         let issued: IssuedDevice
         do {
-            issued = try await rest.issueDevice(name: Self.deviceNameHint)
+            issued = try await issueTask.value
         } catch DeviceIssueError.limitReached(let maxDevices) {
             handleDeviceLimitReached(serverURL: serverURL, maxDevices: maxDevices)
             return

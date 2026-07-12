@@ -18,11 +18,15 @@ this relies on (get_running_job_ids, mark_running_jobs_interrupted).
 """
 
 import asyncio
+from contextlib import suppress
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from gateway.platforms.base import MessageEvent
+from gateway.session import build_session_key
 from tests.gateway.restart_test_helpers import make_restart_runner
+from tests.gateway.restart_test_helpers import make_restart_source
 
 
 @pytest.fixture(autouse=True)
@@ -126,6 +130,92 @@ class TestDrainWaitsForCronWork:
         await task
 
         assert timed_out is False
+
+    @pytest.mark.parametrize("first_to_finish", ("cron", "human"))
+    @pytest.mark.asyncio
+    async def test_drain_waits_until_human_and_cron_work_both_finish(
+        self, first_to_finish, monkeypatch
+    ):
+        """The combined drain remains active until both work classes clear.
+
+        Exercising both completion orders prevents either side of the rebase
+        conflict from replacing the other: the landed branch only observed
+        cron plus runner-owned agents, while PR #92 only observed the broader
+        adapter-active human-turn set.
+        """
+        import cron.scheduler as sched
+
+        runner, adapter = make_restart_runner()
+        release_human = asyncio.Event()
+
+        async def block_human_turn(_event):
+            await release_human.wait()
+
+        adapter.set_message_handler(block_human_turn)
+        event = MessageEvent(
+            text="work",
+            source=make_restart_source(),
+            message_id="str-1672-human",
+        )
+        await adapter.handle_message(event)
+        await asyncio.sleep(0)
+
+        session_key = build_session_key(event.source)
+        assert runner._running_agents == {}
+        assert session_key in adapter._active_sessions
+        sched._running_job_ids.add("str-1672-cron")
+
+        first_released = asyncio.Event()
+        human_polled_after_release = asyncio.Event()
+        cron_polled_after_release = asyncio.Event()
+        original_human_keys = runner._active_human_turn_keys
+        original_cron_count = runner._active_cron_job_count
+
+        def tracked_human_keys():
+            keys = original_human_keys()
+            if first_released.is_set():
+                human_polled_after_release.set()
+            return keys
+
+        def tracked_cron_count():
+            count = original_cron_count()
+            if first_released.is_set():
+                cron_polled_after_release.set()
+            return count
+
+        monkeypatch.setattr(runner, "_active_human_turn_keys", tracked_human_keys)
+        monkeypatch.setattr(runner, "_active_cron_job_count", tracked_cron_count)
+
+        drain_task = asyncio.create_task(runner._drain_active_agents(2.0))
+        try:
+            await asyncio.sleep(0)
+            assert drain_task.done() is False
+
+            first_released.set()
+            if first_to_finish == "cron":
+                sched._running_job_ids.discard("str-1672-cron")
+                await asyncio.wait_for(human_polled_after_release.wait(), timeout=1.0)
+            else:
+                release_human.set()
+                await asyncio.wait_for(cron_polled_after_release.wait(), timeout=1.0)
+
+            assert drain_task.done() is False, (
+                f"drain returned after {first_to_finish} work finished while "
+                "the other work class was still active"
+            )
+
+            release_human.set()
+            sched._running_job_ids.discard("str-1672-cron")
+            _snapshot, timed_out = await asyncio.wait_for(drain_task, timeout=2.0)
+            assert timed_out is False
+        finally:
+            release_human.set()
+            sched._running_job_ids.discard("str-1672-cron")
+            if not drain_task.done():
+                drain_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await drain_task
+            await adapter.cancel_background_tasks()
 
 
 class TestKillToolSubprocessesMarksCronInterrupted:

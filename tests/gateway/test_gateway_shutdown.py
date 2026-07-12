@@ -556,3 +556,318 @@ def test_pid_exists_zombie_via_proc_fallback_returns_false(monkeypatch):
 
     assert status._pid_exists(4242) is False
     kill.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Drain accounting for adapter-active human turns (STR-1069 / #27856)
+#
+# stop()/SIGTERM used to log active_at_start=0 and proceed to teardown even
+# when a human gateway turn was already in flight at the adapter/background-
+# task layer (guard installed, owner task running) or represented only by the
+# pending sentinel before a concrete AIAgent existed. _drain_active_agents
+# only waited on self._running_agents, and _snapshot_running_agents filtered
+# the sentinel, so drain-start logging/notification/finalize reported 0.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_drains_adapter_active_turn_when_runner_running_agents_empty(
+    monkeypatch,
+):
+    """A turn active only at the adapter/background-task layer (runner.
+    _running_agents empty) must keep stop() draining until that adapter task
+    finishes; adapter.disconnect must not be called before the task releases."""
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 5.0
+    disconnect_mock = AsyncMock()
+    monkeypatch.setattr(adapter, "disconnect", disconnect_mock)
+
+    release = asyncio.Event()
+
+    async def block_until_released(_event):
+        await release.wait()
+        return None
+
+    adapter.set_message_handler(block_until_released)
+    event = MessageEvent(text="work", source=make_restart_source(), message_id="1")
+    await adapter.handle_message(event)
+    await asyncio.sleep(0)  # let the background task start + claim the guard
+
+    # The runner has NOT claimed the turn yet — _running_agents is empty
+    # while the adapter owns the active session guard/owner task.
+    assert runner._running_agents == {}
+    session_key = build_session_key(event.source)
+    assert session_key in adapter._active_sessions
+    # The broader active-turn accounting still sees it.
+    assert session_key in runner._active_human_turn_keys()
+
+    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+        stop_task = asyncio.create_task(runner.stop())
+
+        # Let stop() enter the drain wait loop.
+        await asyncio.sleep(0.05)
+        assert disconnect_mock.await_count == 0, (
+            "adapter.disconnect must not be called while an adapter-active "
+            "human turn is still in flight"
+        )
+
+        # Release the adapter task so the drain can complete.
+        release.set()
+        await asyncio.wait_for(stop_task, timeout=10.0)
+
+    disconnect_mock.assert_awaited_once()
+    assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_pending_sentinel_turn_counts_as_active_but_is_skipped_by_finalize_and_interrupt():
+    """A pending-sentinel runner turn (claimed but no concrete AIAgent yet)
+    must count as active at drain start / wait path so stop() does not report
+    active_at_start=0, while the finalize snapshot and interrupt still skip the
+    sentinel placeholder."""
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: gateway_run._AGENT_PENDING_SENTINEL}
+    runner._running_agents_ts = {session_key: 0.0}
+
+    # 1) Sentinel counts as an active human turn at drain start.
+    assert runner._active_human_turn_count() == 1
+    assert session_key in runner._active_human_turn_keys()
+
+    # 2) The finalize snapshot is real-agents-only — sentinel is filtered out
+    #    so _finalize_shutdown_agents never touches the placeholder.
+    assert runner._snapshot_running_agents() == {}
+
+    # 3) Drain waits on the sentinel (does not early-return) and times out,
+    #    returning the empty real-agent snapshot.
+    snapshot, timed_out = await runner._drain_active_agents(0.05)
+    assert snapshot == {}
+    assert timed_out is True
+
+    # 4) Interrupt skips the sentinel — no crash, sentinel untouched.
+    runner._interrupt_running_agents("Gateway shutting down")
+    assert session_key in runner._running_agents  # sentinel still present
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notifies_just_started_sentinel_turn_with_thread_metadata():
+    """An active just-started turn (pending sentinel, source cached at claim
+    time) must still receive one shutdown/restart notification with thread
+    metadata — the broader active-turn accounting includes sentinels, and the
+    cached source lets the notification resolve the delivery target."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+    # Just-started turn: claimed as a sentinel, no concrete agent yet.
+    runner._running_agents = {session_key: gateway_run._AGENT_PENDING_SENTINEL}
+    # Source cached at claim time (the runner caches it at the sentinel claim).
+    runner._cache_session_source(session_key, source)
+    runner._restart_requested = True
+    runner._restart_command_source = None
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    sent_calls = getattr(adapter, "sent_calls")
+    assert len(sent_calls) == 1
+    chat_id, message, metadata = sent_calls[0]
+    assert chat_id == source.chat_id
+    assert "Gateway restarting" in message
+    assert metadata["thread_id"] == source.thread_id
+
+
+@pytest.mark.asyncio
+async def test_drain_no_longer_early_returns_when_only_adapter_active_turn_in_flight():
+    """Regression: _drain_active_agents must NOT early-return (reporting 0
+    active) when _running_agents is empty but an adapter-owned active session
+    task is still in flight. It must wait and time out instead."""
+    runner, adapter = make_restart_runner()
+    runner._restart_drain_timeout = 0.05
+
+    release = asyncio.Event()
+
+    async def block_until_released(_event):
+        await release.wait()
+        return None
+
+    adapter.set_message_handler(block_until_released)
+    event = MessageEvent(text="work", source=make_restart_source(), message_id="1")
+    await adapter.handle_message(event)
+    await asyncio.sleep(0)
+
+    assert runner._running_agents == {}
+    assert runner._active_human_turn_count() == 1
+
+    snapshot, timed_out = await runner._drain_active_agents(0.05)
+    # Adapter-active turn never finished within the window -> timed out.
+    assert timed_out is True
+    # No real agents -> empty finalize snapshot.
+    assert snapshot == {}
+
+    release.set()
+    # Let the blocked adapter task unwind so it does not leak past the test.
+    await asyncio.sleep(0.05)
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_forced_timeout_resume_pending_covers_pending_sentinels(monkeypatch):
+    """Regression (STR-1069 clause 4): forced-timeout shutdown must call
+    ``mark_resume_pending`` for pending-sentinel keys.  The runner must not
+    skip sentinels — the session-store no-entry guard is the safety net, not
+    the runner sentinel type.
+
+    Two scenarios:
+    1. Sentinel WITH a durable session entry → ``mark_resume_pending`` is
+       called and returns True (marker written).
+    2. Bare sentinel with NO session entry → ``mark_resume_pending`` is still
+       called (attempted) but returns False (no misleading marker created).
+    """
+    # --- Scenario 1: sentinel + existing session entry ---
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: gateway_run._AGENT_PENDING_SENTINEL}
+    runner._running_agents_ts = {session_key: 0.0}
+    runner._restart_drain_timeout = 0.0  # forced timeout
+
+    mark_resume_pending = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        runner.session_store, "mark_resume_pending", mark_resume_pending
+    )
+
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("agent.auxiliary_client.shutdown_cached_clients"),
+    ):
+        await runner.stop()
+
+    mark_calls = mark_resume_pending.call_args_list
+    assert mark_calls, "mark_resume_pending must be called for sentinel keys"
+    marked_keys = {c.args[0] for c in mark_calls if c.args}
+    assert session_key in marked_keys
+    marked_reasons = {c.args[1] for c in mark_calls if len(c.args) > 1}
+    assert "shutdown_timeout" in marked_reasons
+
+    # --- Scenario 2: bare sentinel, no session entry ---
+    runner2, _adapter2 = make_restart_runner()
+    source2 = make_restart_source(chat_id="999", thread_id="77")
+    session_key2 = build_session_key(source2)
+    runner2._running_agents = {session_key2: gateway_run._AGENT_PENDING_SENTINEL}
+    runner2._running_agents_ts = {session_key2: 0.0}
+    runner2._restart_drain_timeout = 0.0
+
+    mark_resume_pending2 = MagicMock(return_value=False)
+    monkeypatch.setattr(
+        runner2.session_store, "mark_resume_pending", mark_resume_pending2
+    )
+
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("agent.auxiliary_client.shutdown_cached_clients"),
+    ):
+        await runner2.stop()
+
+    mark_calls2 = mark_resume_pending2.call_args_list
+    assert mark_calls2, (
+        "mark_resume_pending must be attempted even for bare sentinels"
+    )
+    marked_keys2 = {c.args[0] for c in mark_calls2 if c.args}
+    assert session_key2 in marked_keys2
+    assert mark_resume_pending2.return_value is False, (
+        "bare sentinel with no session entry must not create a resume marker"
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_snapshot_includes_agent_promoted_from_sentinel_during_drain():
+    """Regression (STR-1069 review): _drain_active_agents must refresh the
+    real-agent snapshot before returning so a pending sentinel that promotes
+    to a concrete AIAgent during the drain window appears in the returned
+    snapshot.  Without the refresh, _finalize_shutdown_agents and restart-
+    failure counting receive the stale entry-time snapshot (empty for that
+    key) and the late-promoted agent is interrupted but never finalized.
+
+    The same fix covers adapter-active turns that promote during the drain
+    window — the refresh re-reads _running_agents regardless of how the
+    agent got there."""
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+
+    runner._running_agents = {session_key: gateway_run._AGENT_PENDING_SENTINEL}
+    runner._running_agents_ts = {session_key: 0.0}
+    assert runner._snapshot_running_agents() == {}
+
+    promoted_agent = MagicMock()
+
+    async def promote_mid_drain():
+        await asyncio.sleep(0.03)
+        runner._running_agents[session_key] = promoted_agent
+
+    promote_task = asyncio.create_task(promote_mid_drain())
+
+    snapshot, timed_out = await runner._drain_active_agents(0.05)
+    await promote_task
+
+    assert timed_out is True
+    assert session_key in snapshot
+    assert snapshot[session_key] is promoted_agent
+    assert gateway_run._AGENT_PENDING_SENTINEL not in snapshot.values()
+
+
+@pytest.mark.asyncio
+async def test_stop_finalizes_late_promoted_real_agent_from_sentinel(tmp_path, monkeypatch):
+    """Regression (STR-1069 review): a pending-sentinel turn that promotes to
+    a real AIAgent during the drain window must be finalized by stop().  The
+    refreshed snapshot from _drain_active_agents ensures _finalize_shutdown_
+    agents receives the promoted agent for transcript flush + resource
+    cleanup, while sentinel placeholders are still skipped."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner._restart_drain_timeout = 0.2
+
+    source = make_restart_source(thread_id="42")
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: gateway_run._AGENT_PENDING_SENTINEL}
+    runner._running_agents_ts = {session_key: 0.0}
+
+    promoted_agent = MagicMock()
+
+    async def promote_mid_drain():
+        await asyncio.sleep(0.03)
+        runner._running_agents[session_key] = promoted_agent
+
+    promote_task = asyncio.create_task(promote_mid_drain())
+
+    finalized: dict[str, object] = {}
+
+    async def capture_finalize(active_agents):
+        finalized.update(active_agents)
+
+    runner._finalize_shutdown_agents = capture_finalize
+
+    # Simulate a real agent responding to interrupt by releasing its slot
+    # so the post-interrupt wait loop exits immediately instead of spinning
+    # the full 5 s grace window.
+    def _interrupt_and_release(_reason):
+        runner._running_agents.pop(session_key, None)
+
+    promoted_agent.interrupt = _interrupt_and_release
+
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("agent.auxiliary_client.shutdown_cached_clients"),
+    ):
+        await runner.stop()
+    await promote_task
+
+    assert session_key in finalized, (
+        "late-promoted real agent must be passed to _finalize_shutdown_agents"
+    )
+    assert finalized[session_key] is promoted_agent
+    assert gateway_run._AGENT_PENDING_SENTINEL not in finalized.values()

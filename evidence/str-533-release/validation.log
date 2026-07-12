@@ -1,0 +1,7 @@
+STR-533 ship-completeness validation — 2026-07-11
+
+PASS: governor merge-proof for integration commit f9976ea5764e8429c12d4d44d558c7cf4b7ad056 on environment-and-workflows-overview (PR #62).
+PASS: f9976ea5764e8429c12d4d44d558c7cf4b7ad056 is an ancestor of TestFlight build 98 ship commit 5b441473da325bef18ab72514d15ccee979c295c.
+PASS: App Store Connect poll recorded build 98 state VALID.
+PASS: ship log recorded [asc-notes] What-to-Test set on build 98 (907 chars).
+PASS: RELEASE_NOTES.md now names hands-free conversation mode, ambient auto-speak, and focused phone checks.

@@ -1130,7 +1130,23 @@ def _reap_leaked_chrome_debug_processes():
         import psutil
     except ImportError:
         return
-    for proc in psutil.process_iter(["pid", "name"]):
+    # ``process_iter()`` is called with no attr names and its result is
+    # materialized into a list before iterating. Passing attr names (e.g.
+    # ``["pid", "name"]``) makes psutil eagerly resolve them while building
+    # each ``Process`` inside the generator; on macOS resolving ``name`` can
+    # fall back to ``cmdline()``, which raises PermissionError/SystemError
+    # for processes owned by other users. That raise surfaces from the
+    # generator's ``__next__`` *before* control reaches the per-process
+    # try/except below, so it would otherwise crash this whole finalizer
+    # (and its atexit twin) and fail the current test file. Nothing in this
+    # function reads the cached attrs, so dropping them is behavior
+    # preserving; materializing the list first ensures any such raise is
+    # caught by the outer try, not mid-loop.
+    try:
+        procs = list(psutil.process_iter())
+    except Exception:
+        return
+    for proc in procs:
         try:
             if not _is_leaked_chrome_debug_process(proc):
                 continue

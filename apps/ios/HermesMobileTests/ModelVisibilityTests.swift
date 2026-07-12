@@ -203,21 +203,43 @@ final class ModelVisibilityTests: XCTestCase {
         let store = ConnectionStore(sessionStore: SessionStore(), chatStore: ChatStore())
         store.applyRuntimeInfo(SessionRuntimeInfo(
             model: "gpt-5.5-2025-11-20", provider: "openai", running: nil, cwd: nil,
-            lazy: nil, profileName: nil, reasoningEffort: "high", fast: true, serviceTier: "priority"
+            lazy: nil, profileName: nil, reasoningEffort: "high", fast: true, serviceTier: "priority",
+            yolo: true
         ))
         XCTAssertEqual(store.sessionModelRaw, "gpt-5.5-2025-11-20")
         XCTAssertEqual(store.sessionModel, "gpt-5.5")
         XCTAssertEqual(store.sessionProvider, "openai")
         XCTAssertEqual(store.sessionReasoningEffort, "high")
         XCTAssertEqual(store.sessionFast, true)
+        XCTAssertEqual(store.sessionYolo, true)
 
         // Empty/nil fields must not clobber (a lazy resume echoes no model).
         store.applyRuntimeInfo(SessionRuntimeInfo(
             model: "", provider: nil, running: nil, cwd: nil,
-            lazy: true, profileName: nil, reasoningEffort: nil, fast: nil, serviceTier: nil
+            lazy: true, profileName: nil, reasoningEffort: nil, fast: nil, serviceTier: nil,
+            yolo: nil
         ))
         XCTAssertEqual(store.sessionModelRaw, "gpt-5.5-2025-11-20")
         XCTAssertEqual(store.sessionProvider, "openai")
+        XCTAssertEqual(store.sessionYolo, true)
+    }
+
+    func testComposerYoloUnavailableReasonExplainsDeadBoltStates() {
+        XCTAssertEqual(
+            ComposerView.yoloUnavailableReason(isConnected: false, activeRuntimeId: "runtime-1"),
+            "Connect to a gateway before changing flow-state approvals."
+        )
+        XCTAssertEqual(
+            ComposerView.yoloUnavailableReason(isConnected: true, activeRuntimeId: nil),
+            "Send or open a live chat before changing flow-state approvals."
+        )
+        XCTAssertEqual(
+            ComposerView.yoloUnavailableReason(isConnected: true, activeRuntimeId: "   "),
+            "Send or open a live chat before changing flow-state approvals."
+        )
+        XCTAssertNil(
+            ComposerView.yoloUnavailableReason(isConnected: true, activeRuntimeId: "runtime-1")
+        )
     }
 
     @MainActor

@@ -1,0 +1,17 @@
+▶ running per-file parallel test suite via run_tests_parallel.py
+  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)
+Discovered 2 test files (~345 tests) under ['tests/gateway/test_gateway_shutdown.py', 'tests/test_tui_gateway_server.py']; running with -j 28
+[ 93.6% |   323/~345 | ✓323 | ✗  0] ✓ tests/test_tui_gateway_server.py (323✓, 15.1s)
+[100.0% |   345/~345 | ✓345 | ✗  0] ✓ tests/gateway/test_gateway_shutdown.py (22✓, 17.9s)
+
+=== Summary: 2 files, 345 tests passed, 0 failed (100% complete) in 17.9s (28 workers) ===
+  Durations cached to test_durations.json (2 files)
+
+=== Per-file subprocess time distribution ===
+  Files:   2
+  Total subprocess CPU-wall: 33.0s  (runner wall: 17.9s, parallelism: 28x)
+  P50: 17.88s  P90: 17.88s  P95: 17.88s  P99: 17.88s  Max: 17.88s
+  <1s: 0 files (0%)  <2s: 0 files (0%)
+  Top 10 slowest:
+     17.88s  tests/gateway/test_gateway_shutdown.py
+     15.11s  tests/test_tui_gateway_server.py

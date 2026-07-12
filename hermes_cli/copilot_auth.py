@@ -413,12 +413,12 @@ def _derive_base_url_from_proxy_ep(token: str) -> Optional[str]:
 
 
 def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
-    """Exchange a raw GitHub token for a Copilot API token, with fallback.
+    """Exchange a raw GitHub token for a Copilot API token.
 
     Convenience wrapper: returns ``(api_token, base_url)`` on success, or
-    ``(raw_token, None)`` if the exchange fails (e.g. network error, unsupported
-    account type). This preserves existing behaviour for accounts that don't
-    need exchange while enabling access to internal-only models for those that do.
+    raises ``ValueError`` if the exchange fails. Runtime Copilot API calls must
+    fail closed rather than sending raw ``gho_`` / ``ghu_`` / ``github_pat_``
+    GitHub tokens as ``Authorization: Bearer`` to ``api.githubcopilot.com``.
 
     ``base_url`` is the account-specific API endpoint advertised by the
     exchange (``endpoints.api``, with a ``proxy-ep`` fallback), or None for
@@ -426,12 +426,8 @@ def get_copilot_api_token(raw_token: str) -> tuple[str, Optional[str]]:
     """
     if not raw_token:
         return raw_token, None
-    try:
-        api_token, _, base_url = exchange_copilot_token(raw_token)
-        return api_token, base_url
-    except Exception as exc:
-        logger.debug("Copilot token exchange failed, using raw token: %s", exc)
-        return raw_token, None
+    api_token, _, base_url = exchange_copilot_token(raw_token)
+    return api_token, base_url
 
 
 # ─── Copilot API Headers ───────────────────────────────────────────────────

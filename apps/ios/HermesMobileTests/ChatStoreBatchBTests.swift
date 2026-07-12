@@ -501,6 +501,80 @@ final class ChatStoreBatchBTests: XCTestCase {
                        "A's stale fetch must not seed over B's transcript")
     }
 
+    func testActiveSessionRevealFiresSynchronouslyOnRetap() async {
+        let (_, sessions) = makeStore()
+        var revealCount = 0
+
+        sessions.open(summary(storedId)) {
+            revealCount += 1
+        }
+
+        XCTAssertEqual(revealCount, 1, "active row retap must close on the tap tick")
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
+        await settle()
+        #endif
+        try? await Task.sleep(for: .milliseconds(350))
+        XCTAssertEqual(revealCount, 1, "active retap reveal must still be exactly-once")
+    }
+
+    func testDrawerRevealDeadlineRacesFirstPaintExactlyOnce() async {
+        let (_, sessions) = makeStore()
+        let gate = Gate()
+        #if DEBUG
+        sessions.beforeOpenSeedForTesting = {
+            await gate.wait()
+        }
+        #endif
+        var revealCount = 0
+
+        sessions.open(summary("stored-deadline")) {
+            revealCount += 1
+        }
+
+        XCTAssertEqual(revealCount, 0)
+        try? await Task.sleep(for: .milliseconds(350))
+        XCTAssertEqual(revealCount, 1, "deadline must close if first paint is delayed")
+
+        gate.release()
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
+        await settle()
+        #endif
+        XCTAssertEqual(revealCount, 1, "late first paint must not double-close")
+    }
+
+    func testSupersededDrawerRevealDeadlineCannotCloseOlderOpen() async {
+        let (_, sessions) = makeStore()
+        let gate = Gate()
+        #if DEBUG
+        sessions.beforeOpenSeedForTesting = {
+            await gate.wait()
+        }
+        #endif
+        var reveals: [String] = []
+
+        sessions.open(summary("stored-A")) {
+            reveals.append("A")
+        }
+        sessions.open(summary("stored-B")) {
+            reveals.append("B")
+        }
+
+        try? await Task.sleep(for: .milliseconds(350))
+        XCTAssertEqual(reveals, ["B"], "only the latest open owns the drawer close")
+
+        gate.release()
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #else
+        await settle()
+        #endif
+        XCTAssertEqual(reveals, ["B"], "stale first paint must not close after supersession")
+    }
+
     /// ABH-372: a session that was already opened once in this app process must
     /// repaint from the in-memory normalized snapshot immediately on a warm
     /// switch, before the authoritative delta/full fetch returns. The previous

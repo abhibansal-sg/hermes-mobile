@@ -149,20 +149,33 @@ struct RestClient: Sendable {
     /// so automation/agent-internal rows never enter the list (or its cache); the
     /// automation-runs feed passes `source: "cron"`. The server splits
     /// `exclude_sources` on commas.
+    ///
+    /// ABH-407: `cwdPrefix` scopes the list to sessions whose cwd starts with the
+    /// given path (Project detail). Built via `URLQueryItem`/`URLComponents` so the
+    /// raw path (spaces, slashes, etc.) is correctly percent-encoded — unlike the
+    /// other params above, a project root is arbitrary user-filesystem text, not a
+    /// fixed enum value. `+` is additionally escaped to `%2B` below, since
+    /// `URLComponents` otherwise leaves it literal and FastAPI/Starlette decode a
+    /// literal `+` as a space.
+    /// `includeChildren` appends `include_children=true` so the dedicated
+    /// automation slice can surface subagent child sessions the default
+    /// parent-only listing hides. It remains `false` for existing callers.
     func sessionsWithTotal(
         limit: Int = 100,
         offset: Int = 0,
         minMessages: Int = 1,
         excludeSource: [String] = [],
-        source: String? = nil
+        source: String? = nil,
+        cwdPrefix: String? = nil,
+        includeChildren: Bool = false
     ) async throws -> (sessions: [SessionSummary], total: Int?) {
-        var parts = [
-            "limit=\(limit)",
-            "order=recent",
-            "archived=exclude",
+        var queryItems = [
+            URLQueryItem(name: "limit", value: "\(limit)"),
+            URLQueryItem(name: "order", value: "recent"),
+            URLQueryItem(name: "archived", value: "exclude"),
         ]
-        if minMessages > 0 { parts.append("min_messages=\(minMessages)") }
-        if offset > 0       { parts.append("offset=\(offset)") }
+        if minMessages > 0 { queryItems.append(URLQueryItem(name: "min_messages", value: "\(minMessages)")) }
+        if offset > 0       { queryItems.append(URLQueryItem(name: "offset", value: "\(offset)")) }
         if !excludeSource.isEmpty {
             // Gateway FastAPI param is `exclude_sources` (PLURAL) — see
             // web_server.py /api/sessions. iOS historically sent the singular
@@ -172,12 +185,26 @@ struct RestClient: Sendable {
             // window and making a freshly-active desktop session far less likely to
             // be in it). Backward-safe: a stock gateway ignores an unknown param,
             // and the client-side filter remains the guarantee.
-            parts.append("exclude_sources=\(excludeSource.joined(separator: ","))")
+            queryItems.append(URLQueryItem(name: "exclude_sources", value: excludeSource.joined(separator: ",")))
         }
         if let source, !source.isEmpty {
-            parts.append("source=\(source)")
+            queryItems.append(URLQueryItem(name: "source", value: source))
         }
-        let path = "/api/sessions?" + parts.joined(separator: "&")
+        if let cwdPrefix, !cwdPrefix.isEmpty {
+            queryItems.append(URLQueryItem(name: "cwd_prefix", value: cwdPrefix))
+        }
+        if includeChildren {
+            queryItems.append(URLQueryItem(name: "include_children", value: "true"))
+        }
+        var components = URLComponents()
+        components.queryItems = queryItems
+        // URLComponents leaves "+" unescaped in a query (RFC 3986 allows it there
+        // unencoded), but FastAPI/Starlette's query parsing follows the
+        // application/x-www-form-urlencoded convention and decodes a literal "+"
+        // as a space. Escape it explicitly so a value containing "+" (e.g. a
+        // cwd_prefix project root) round-trips exactly instead of becoming a space.
+        let rawQuery = (components.percentEncodedQuery ?? "").replacingOccurrences(of: "+", with: "%2B")
+        let path = "/api/sessions?" + rawQuery
         let data = try await get(path: path)
         struct Wrapper: Decodable {
             let sessions: [SessionSummary]

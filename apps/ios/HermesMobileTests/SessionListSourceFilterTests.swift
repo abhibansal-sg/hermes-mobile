@@ -160,6 +160,150 @@ final class SessionListSourceFilterTests: XCTestCase {
         XCTAssertNil(queryItems["exclude_source"], "The singular param is ignored by the gateway and must not regress")
     }
 
+    // ABH-407 — Project detail's `cwd_prefix` REST query shape.
+    func testProjectDetailRestQueryIncludesPercentEncodedCwdPrefixAndPreservesOtherParams() async throws {
+        SessionListSourceFilterStubProtocol.nextResponse = (
+            data: #"{"sessions":[],"total":0}"#.data(using: .utf8)!,
+            status: 200
+        )
+        SessionListSourceFilterStubProtocol.requestedURL = nil
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SessionListSourceFilterStubProtocol.self]
+        let rest = RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "test-token",
+            session: URLSession(configuration: config)
+        )
+
+        // Exercises space, slash, "+", "&", and "=" in one root: FastAPI/Starlette
+        // decode a literal "+" as a space (application/x-www-form-urlencoded
+        // convention), so a root containing "+" must wire as "%2B" or it silently
+        // corrupts to a space server-side (STR-58 regression).
+        let projectRoot = "/Users/abbhinnav/My Projects/hermes+mobile&a=b"
+        _ = try await rest.sessionsWithTotal(cwdPrefix: projectRoot)
+
+        let requestedURL = try XCTUnwrap(SessionListSourceFilterStubProtocol.requestedURL)
+        let components = try XCTUnwrap(URLComponents(url: requestedURL, resolvingAgainstBaseURL: false))
+        let queryItems = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).compactMap { item in
+            item.value.map { (item.name, $0) }
+        })
+        XCTAssertEqual(components.path, "/api/sessions")
+        XCTAssertEqual(queryItems["cwd_prefix"], projectRoot,
+            "cwd_prefix must round-trip the exact project root, including its spaces, slashes, +, &, and =")
+        XCTAssertEqual(queryItems["order"], "recent",
+            "Project detail must not regress the order=recent (compression-chain-aware) semantics")
+        XCTAssertEqual(queryItems["archived"], "exclude",
+            "Project detail must not regress the archived=exclude semantics")
+        XCTAssertEqual(queryItems["min_messages"], "1",
+            "Project detail must not regress the min_messages=1 scaffold/empty-session filter")
+
+        let rawQuery = components.percentEncodedQuery ?? ""
+        XCTAssertFalse(rawQuery.contains(" "),
+            "the raw wire query must percent-encode the space in the project root, not send it literally")
+
+        // Foundation's decoded queryItems (checked above) can't tell "%2B" apart
+        // from a literal "+" — both decode back to "+". Only the raw wire string
+        // proves which one was actually sent, so assert on it directly.
+        let cwdPrefixSegment = try XCTUnwrap(
+            rawQuery.components(separatedBy: "&").first { $0.hasPrefix("cwd_prefix=") },
+            "cwd_prefix must appear as its own delimited query segment"
+        )
+        XCTAssertTrue(cwdPrefixSegment.contains("%2B"),
+            "'+' in the project root must be escaped to %2B on the wire, not left as a literal '+' " +
+            "(FastAPI/Starlette decode a literal '+' as a space)")
+        XCTAssertFalse(cwdPrefixSegment.contains("+"),
+            "the raw wire segment for cwd_prefix must not contain a literal '+'")
+        let cwdPrefixValue = String(cwdPrefixSegment.dropFirst("cwd_prefix=".count))
+        XCTAssertFalse(cwdPrefixValue.contains("&"),
+            "'&' inside the cwd_prefix value must be escaped, not left literal (would split the query wrong)")
+        XCTAssertFalse(cwdPrefixValue.contains("="),
+            "'=' inside the cwd_prefix value must be escaped, not left literal (would corrupt the key=value pairing)")
+    }
+
+    func testLoadAutomationSessionsFetchesLiveCronSubagentIncludeChildrenAndFiltersRows() async throws {
+        SessionListSourceFilterStubProtocol.nextResponse = (
+            data: #"""
+            {"sessions":[
+                {"id":"cronRun","title":"Nightly build","source":"cron","message_count":3,"last_active":500},
+                {"id":"subagentRun","title":"Delegate","source":"subagent","message_count":2,"last_active":400},
+                {"id":"leakedHuman","title":"Chat","source":"app","message_count":1,"last_active":300}
+            ],"total":3}
+            """#.data(using: .utf8)!,
+            status: 200
+        )
+        SessionListSourceFilterStubProtocol.requestedURL = nil
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SessionListSourceFilterStubProtocol.self]
+        let rest = RestClient(baseURL: URL(string: "http://127.0.0.1:9119")!, token: "test-token", session: URLSession(configuration: config))
+        let store = SessionStore()
+        store.automationRestClientForTesting = rest
+
+        await store.loadAutomationSessions()
+
+        // Prove the rows came from the live RestClient request path (not a
+        // hand-injected fixture): assert both the populated slice AND the
+        // exact query the store issued to get there.
+        XCTAssertEqual(store.automationSessions.map(\.id), ["cronRun", "subagentRun"],
+            "The client-side defense filter must drop a leaked non-automation row even though the server claimed to have already scoped it")
+        XCTAssertEqual(store.automationSessionsTotal, 2,
+            "The slice's total must reflect the filtered row count (2), never the untrusted server total (3) — otherwise a leaked human row inflates the count without a matching visible row")
+        XCTAssertNil(store.automationSessionsError)
+        XCTAssertFalse(store.isLoadingAutomationSessions)
+
+        let components = try XCTUnwrap(URLComponents(url: try XCTUnwrap(SessionListSourceFilterStubProtocol.requestedURL), resolvingAgainstBaseURL: false))
+        let queryItems = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).compactMap { item in item.value.map { (item.name, $0) } })
+        XCTAssertEqual(components.path, "/api/sessions")
+        XCTAssertEqual(queryItems["source"], "cron,subagent")
+        XCTAssertEqual(queryItems["include_children"], "true")
+    }
+
+    func testLoadAutomationSessionsAllLeakedRowsYieldHonestEmptyStateNotNonzeroTotal() async throws {
+        SessionListSourceFilterStubProtocol.nextResponse = (
+            data: #"""
+            {"sessions":[
+                {"id":"leakedHuman1","title":"Chat","source":"app","message_count":1,"last_active":300},
+                {"id":"leakedHuman2","title":"Telegram","source":"telegram","message_count":1,"last_active":200}
+            ],"total":2}
+            """#.data(using: .utf8)!,
+            status: 200
+        )
+        SessionListSourceFilterStubProtocol.requestedURL = nil
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SessionListSourceFilterStubProtocol.self]
+        let rest = RestClient(
+            baseURL: URL(string: "http://127.0.0.1:9119")!,
+            token: "test-token",
+            session: URLSession(configuration: config)
+        )
+        let store = SessionStore()
+        store.automationRestClientForTesting = rest
+
+        await store.loadAutomationSessions()
+
+        XCTAssertTrue(store.automationSessions.isEmpty,
+            "An older gateway that ignores source=cron,subagent and returns only human rows must yield an empty automation slice")
+        XCTAssertEqual(store.automationSessionsTotal, 0,
+            "The slice must never report a nonzero total while its row list is empty — that pairing would be a lie to the drawer/Settings empty state")
+        XCTAssertNil(store.automationSessionsError)
+    }
+
+    func testLoadAutomationSessionsSurfacesErrorWithoutTouchingHumanRecents() async throws {
+        SessionListSourceFilterStubProtocol.nextResponse = nil
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [SessionListSourceFilterStubProtocol.self]
+        let rest = RestClient(baseURL: URL(string: "http://127.0.0.1:9119")!, token: "test-token", session: URLSession(configuration: config))
+        let store = SessionStore()
+        store.automationRestClientForTesting = rest
+        store.sessions = [summary(id: "human", source: "app", messageCount: 2, lastActive: 100)]
+
+        await store.loadAutomationSessions()
+
+        XCTAssertTrue(store.automationSessions.isEmpty)
+        XCTAssertNotNil(store.automationSessionsError)
+        XCTAssertFalse(store.isLoadingAutomationSessions)
+        XCTAssertEqual(store.sessions.map(\.id), ["human"])
+    }
+
     func testSessionExportFetchesFullMessagesRouteAndRendersMarkdown() async throws {
         SessionListSourceFilterStubProtocol.nextResponse = (
             data: #"{"messages":[{"id":1,"role":"user","content":"Hello"},{"id":2,"role":"assistant","content":"Hi there"}]}"#.data(using: .utf8)!,

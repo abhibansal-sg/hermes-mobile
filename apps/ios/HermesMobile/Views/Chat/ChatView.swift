@@ -528,6 +528,19 @@ struct ChatView: View {
                     )
                     .hermesThemed(themeStore)
                 }
+                // ABH-412: file rollback confirmation after "Undo last turn".
+                // The sheet shows the server-provided diff; the destructive
+                // `rollback.restore` RPC is only sent from the confirmation dialog
+                // inside `RollbackRestoreSheet`.
+                .sheet(item: rollbackRestoreBinding) { pending in
+                    RollbackRestoreSheet(
+                        pending: pending,
+                        phase: chatStore.undoRollbackPhase,
+                        onCancel: { chatStore.cancelPendingRollbackRestore() },
+                        onConfirm: { await chatStore.confirmPendingRollbackRestore() }
+                    )
+                    .hermesThemed(themeStore)
+                }
                 // Secure prompt (F4A-A2): sudo / secret. Driven directly by the
                 // store's transient pending prompt — `.sheet(item:)` so a new
                 // request replaces an in-flight one cleanly. The value never
@@ -677,6 +690,20 @@ struct ChatView: View {
             chatStore.messages.append(ChatMessage(role: .system, text: plumbing.confirmation))
             showingWorkingDirPicker = false
         }
+    }
+
+    /// Binding that surfaces the pending rollback restore candidate to
+    /// `.sheet(item:)` and treats system dismiss as an explicit cancel, so a
+    /// stale destructive restore prompt cannot linger off-screen.
+    private var rollbackRestoreBinding: Binding<PendingRollbackRestore?> {
+        Binding(
+            get: { chatStore.pendingRollbackRestore },
+            set: { newValue in
+                if newValue == nil {
+                    chatStore.cancelPendingRollbackRestore()
+                }
+            }
+        )
     }
 
     /// Binding that surfaces the store's `pendingSecurePrompt` to `.sheet(item:)`
@@ -847,6 +874,7 @@ struct ChatView: View {
                 // windowed row still gets the correct turn-aware `topGap` relative to
                 // the (possibly off-window) message just above it.
                 let allRows = Array(chatStore.messages.enumerated())
+                let lastAssistantId = allRows.last(where: { $0.element.role == .assistant })?.element.id
                 let windowStart = max(0, allRows.count - windowSize)
                 let rows = Array(allRows[windowStart...])
                 // "Load earlier messages" chip — only when the window does not
@@ -873,6 +901,7 @@ struct ChatView: View {
                         message: message,
                         onEdit: editHandler,
                         onRetry: retryHandler,
+                        onUndoLastTurn: message.id == lastAssistantId ? undoLastTurnHandler : nil,
                         onSpeak: onSpeak,
                         onRestoreCheckpoint: restoreCheckpointHandler,
                         onBranch: branchHandler,
@@ -1504,6 +1533,10 @@ struct ChatView: View {
                 deviceLimitAdvisoryBanner(deviceLimitAdvisory)
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
+            if chatStore.undoRollbackPhase != .idle {
+                undoRollbackBanner(chatStore.undoRollbackPhase)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
             if let toastError {
                 errorToast(toastError)
                     .transition(.move(edge: .top).combined(with: .opacity))
@@ -1570,6 +1603,32 @@ struct ChatView: View {
         } else {
             inboxStore.requestPresentation()
         }
+    }
+
+    private func undoRollbackBanner(_ phase: UndoRollbackPhase) -> some View {
+        HStack(spacing: 8) {
+            if phase.isBusy {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: phase == .empty ? "tray" : "arrow.uturn.backward.circle.fill")
+                    .foregroundStyle(theme.midground)
+            }
+            Text(phase.bannerTitle ?? "Undo")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(theme.fg)
+            Spacer(minLength: 0)
+            if phase == .awaitingConfirmation {
+                Text("Diff ready")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(theme.mutedFg)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(theme.popover, in: Capsule())
+        .overlay(Capsule().stroke(theme.border.opacity(0.65), lineWidth: 1))
+        .shadow(color: .black.opacity(0.18), radius: 12, y: 6)
     }
 
     private func errorToast(_ message: String) -> some View {
@@ -2145,6 +2204,17 @@ struct ChatView: View {
         }
     }
 
+    /// Undo-last-turn handler passed only to the latest assistant bubble. This
+    /// removes the last user+assistant turn server-side, then opens the rollback
+    /// restore sheet if the session has a file checkpoint to inspect.
+    private var undoLastTurnHandler: ((ChatMessage) -> Void)? {
+        guard isGatewayConnected else { return nil }
+        return { _ in
+            guard menuActionsEnabled else { return }
+            Task { await chatStore.undoLastTurn() }
+        }
+    }
+
     /// Restore-checkpoint handler passed to user bubbles (F4A-A2) — non-nil
     /// whenever the gateway is connected. `menuActionsEnabled` gates execution.
     private var restoreCheckpointHandler: ((ChatMessage) -> Void)? {
@@ -2224,6 +2294,72 @@ private struct EditMessageSheet: View {
                 }
             }
             .onAppear { focused = true }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+private struct RollbackRestoreSheet: View {
+    let pending: PendingRollbackRestore
+    let phase: UndoRollbackPhase
+    let onCancel: () -> Void
+    let onConfirm: () async -> Void
+
+    @Environment(\.hermesTheme) private var theme
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Undo removed the last turn. Hermes found a file checkpoint you can restore.")
+                            .font(.subheadline)
+                            .foregroundStyle(theme.fg)
+                        if !pending.checkpoint.message.isEmpty {
+                            Text(pending.checkpoint.message)
+                                .font(.caption)
+                                .foregroundStyle(theme.mutedFg)
+                        }
+                        if !pending.diff.stat.isEmpty {
+                            Text(pending.diff.stat)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(theme.midground)
+                        }
+                        Text("Restoring files is destructive. Review the diff before tapping Restore.")
+                            .font(.caption)
+                            .foregroundStyle(theme.mutedFg)
+                    }
+                    Text(pending.diff.displayText)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .background(theme.codeBg, in: RoundedRectangle(cornerRadius: 12))
+                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(theme.border.opacity(0.6)))
+                }
+                .padding()
+            }
+            .background(theme.bg)
+            .navigationTitle("Restore files?")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Skip") { onCancel() }
+                        .disabled(phase == .restoring)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(role: .destructive) {
+                        Task { await onConfirm() }
+                    } label: {
+                        if phase == .restoring {
+                            ProgressView()
+                        } else {
+                            Text("Restore")
+                        }
+                    }
+                    .disabled(phase == .restoring)
+                }
+            }
         }
         .presentationDetents([.medium, .large])
     }

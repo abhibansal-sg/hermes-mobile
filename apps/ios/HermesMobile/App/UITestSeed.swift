@@ -203,6 +203,69 @@ enum UITestSeed {
             return
         }
 
+        // "drawerstorm" — STR-1012 regression seed for compact drawer row-tap
+        // storms. It starts on Storm 1 with a populated drawer, then delays the
+        // real open seed so non-active taps prove the STR-1007 deadline path while
+        // active re-taps prove the synchronous close path.
+        if mode == "drawerstorm" {
+            func stored(_ role: String, _ text: String, _ i: Int) -> StoredMessage? {
+                StoredMessage(json: .object([
+                    "role": .string(role),
+                    "content": .string(text),
+                    "id": .number(Double(i)),
+                    "timestamp": .number(Double(1_700_010_000 + i)),
+                ]))
+            }
+            func transcript(_ tag: String) -> [StoredMessage] {
+                (0..<8).compactMap { i in
+                    stored(
+                        i.isMultiple(of: 2) ? "user" : "assistant",
+                        "\(tag) transcript row #\(i + 1)",
+                        i
+                    )
+                }
+            }
+            func summary(_ id: String, _ title: String, _ count: Int, _ ago: Double) -> SessionSummary? {
+                JSONValue.object([
+                    "id": .string(id),
+                    "title": .string(title),
+                    "message_count": .number(Double(count)),
+                    "last_active": .number(1_700_010_000 - ago),
+                    "started_at": .number(1_700_010_000 - ago - 100),
+                    "source": .string("user"),
+                ]).decoded(as: SessionSummary.self)
+            }
+
+            let list = (1...6).compactMap { index in
+                summary("storm-\(index)", "Storm \(index)", 8 + index, Double(index * 60))
+            }
+            environment.connectionStore.phase = .connected
+            environment.sessionStore.sessions = list
+            environment.sessionStore.activeStoredId = "storm-1"
+            environment.chatStore.debugSeedTranscript(ChatStore.toChatMessages(transcript("Storm 1")))
+            environment.sessionStore.beforeOpenSeedForTesting = {
+                try? await Task.sleep(nanoseconds: 700_000_000)
+            }
+            environment.sessionStore.resumeRPC = { storedId, _ in
+                guard let result = JSONValue.object([
+                    "session_id": .string("runtime-\(storedId)"),
+                    "stored_session_id": .string(storedId),
+                    "message_count": .number(8),
+                    "info": .object([
+                        "running": .bool(false),
+                        "lazy": .bool(false),
+                    ]),
+                ]).decoded(as: SessionOpenResult.self) else {
+                    throw URLError(.cannotDecodeContentData)
+                }
+                return result
+            }
+            environment.sessionStore.transcriptFetch = { id in
+                return transcript(id.capitalized)
+            }
+            return
+        }
+
         // "iddrift" — ARCH37 Step 1 risk gate: open a session whose CACHE copy is
         // 1+ rows SHORTER than the NETWORK copy (count drift), so the Phase-2 network
         // seed reconciles a LONGER row set onto the already-landed cache content. With
@@ -297,6 +360,85 @@ enum UITestSeed {
             environment.sessionStore.sessions = list
             environment.sessionStore.activeStoredId = "demo-1"
             environment.connectionStore.phase = .connected
+            environment.chatStore.debugSeedTranscript(convo)
+            return
+        }
+
+        // "multiprofile" — DEBUG seed for the All Profiles drawer (STR-1022):
+        // 3 profiles (default + work + personal), each with multiple sessions,
+        // so the collapsed-by-default + few-recent preview + expand flow is
+        // demonstrable without a live multi-profile gateway. Forces the
+        // capability + profile list through DEBUG seams, sets activeProfile to
+        // the aggregate "all" scope, and injects transcriptFetch so tapping a
+        // row opens a transcript without a network call.
+        if mode == "multiprofile" {
+            let profileList = [
+                ProfileSummary(name: "default", isDefault: true, description: nil),
+                ProfileSummary(name: "work", isDefault: false, description: nil),
+                ProfileSummary(name: "personal", isDefault: false, description: nil),
+            ]
+            environment.connectionStore.capabilities._seedProfilesCapabilityForTesting(.available)
+            environment.sessionStore._seedProfilesForTesting(profileList)
+            environment.sessionStore.activeProfile = DefaultsKeys.allProfilesScope
+
+            func summary(_ id: String, _ title: String, _ count: Int, _ ago: Double, _ profile: String) -> SessionSummary? {
+                JSONValue.object([
+                    "id": .string(id), "title": .string(title),
+                    "message_count": .number(Double(count)),
+                    "last_active": .number(1_700_000_000 - ago),
+                    "started_at": .number(1_700_000_000 - ago - 1000),
+                    "source": .string("user"),
+                    "profile": .string(profile),
+                ]).decoded(as: SessionSummary.self)
+            }
+
+            let list: [SessionSummary] = [
+                // default profile — 5 sessions (expanded by default)
+                summary("mp-d1", "Deploy health check", 4, 60, "default"),
+                summary("mp-d2", "Refactor the auth module", 22, 3600, "default"),
+                summary("mp-d3", "Tokyo trip — 5-day itinerary", 16, 7200, "default"),
+                summary("mp-d4", "Fix the flaky websocket test", 31, 14400, "default"),
+                summary("mp-d5", "Morning brief", 8, 86400, "default"),
+                // work profile — 4 sessions (collapsed by default)
+                summary("mp-w1", "Q3 roadmap planning", 14, 120, "work"),
+                summary("mp-w2", "API gateway migration", 28, 1800, "work"),
+                summary("mp-w3", "Customer onboarding flow", 9, 7200, "work"),
+                summary("mp-w4", "Security audit prep", 19, 21600, "work"),
+                // personal profile — 3 sessions (collapsed by default)
+                summary("mp-p1", "Weekend hiking routes", 6, 600, "personal"),
+                summary("mp-p2", "Recipe collection", 11, 5400, "personal"),
+                summary("mp-p3", "Book recommendations", 7, 36000, "personal"),
+            ].compactMap { $0 }
+
+            environment.sessionStore.sessions = list
+            environment.sessionStore.activeStoredId = "mp-d1"
+            environment.connectionStore.phase = .connected
+
+            // Inject transcriptFetch so tapping a session row opens a
+            // transcript without a gateway call.
+            environment.sessionStore.transcriptFetch = { id in
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                func stored(_ role: String, _ text: String, _ i: Int) -> StoredMessage? {
+                    StoredMessage(json: .object([
+                        "role": .string(role),
+                        "content": .string(text),
+                        "id": .number(Double(i)),
+                        "timestamp": .number(Double(1_700_000_000 + i)),
+                    ]))
+                }
+                return (0..<4).compactMap { i in
+                    stored(i.isMultiple(of: 2) ? "user" : "assistant",
+                           "Seed message #\(i + 1) for \(id)", i)
+                }
+            }
+
+            // Seed the active session's transcript so ChatView renders.
+            let convo: [ChatMessage] = [
+                ChatMessage(role: .user, text: "Is the staging deploy healthy?"),
+                ChatMessage(role: .assistant,
+                            text: "CI is green on main. Staging is returning 502s "
+                                + "from a wedged worker. A restart will clear it."),
+            ]
             environment.chatStore.debugSeedTranscript(convo)
             return
         }

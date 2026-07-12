@@ -111,8 +111,7 @@ describe('connecting overlay vs recovery surface', () => {
     expect(isRecoveryShown()).toBe(false)
 
     // 3. Reconnect loops against the dead remote: gatewayState bounces closed
-    //    → error → closed. Until the escalation path sets boot.error, the app
-    //    remains usable instead of modal-blocked.
+    //    → error → closed. The app remains usable instead of modal-blocked.
     setGatewayState('error')
     rerender(
       <>
@@ -125,16 +124,16 @@ describe('connecting overlay vs recovery surface', () => {
     expect(isRecoveryShown()).toBe(false)
   })
 
-  it('FIX: once the prolonged reconnect raises a recoverable boot error, the recovery overlay takes over', () => {
-    // Mirrors what useGatewayBoot.scheduleReconnect() now does after ~45s of
-    // failed post-boot reconnects: it calls failDesktopBoot(), flipping the UI
-    // from the dead-end CONNECTING overlay to the recovery surface.
+  it('prolonged post-boot reconnects do not raise the initial boot recovery overlay', () => {
+    // Mirrors the durable reconnect contract: after a healthy boot, a prolonged
+    // gateway outage keeps retrying in the background and surfaces in chrome,
+    // not by reviving an initial-boot modal surface.
     setGatewayState('error')
     $desktopBoot.set({
       ...$desktopBoot.get(),
-      error: 'Lost connection to the Hermes gateway and could not reconnect.',
+      error: null,
       running: false,
-      visible: true
+      visible: false
     })
 
     render(
@@ -144,9 +143,7 @@ describe('connecting overlay vs recovery surface', () => {
       </>
     )
 
-    // Escape hatch is now reachable; the connecting overlay bows out.
-    expect(isRecoveryShown()).toBe(true)
-    expect(screen.getByText(/use local gateway/i)).toBeTruthy()
+    expect(isRecoveryShown()).toBe(false)
     expect(isConnectingShown()).toBe(false)
   })
 })

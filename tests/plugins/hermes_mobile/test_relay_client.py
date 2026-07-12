@@ -181,6 +181,57 @@ def test_authenticated_post_401_clears_and_remints_once(monkeypatch, tmp_path):
     assert json.loads(path.read_text())["agent_id"] == "new-agent"
 
 
+def test_send_event_omits_actionable_metadata_when_absent(monkeypatch, tmp_path):
+    fake = _install_fake_httpx(monkeypatch, [_FakeResponse(200, {})])
+    client = relay.RelayClient(relay_url="https://relay", credentials_path=tmp_path / "push" / "relay.json")
+    client._write_credentials(relay.RelayCredentials("https://relay", "agent-1", "secret-1"))
+
+    asyncio.run(client.send_event(kind="attention", session_id="s", title="t", body="b"))
+
+    body = fake.calls[0]["json"]
+    assert body == {
+        "type": "attention",
+        "session_id": "s",
+        "title": "t",
+        "body": "b",
+        "source": None,
+    }
+    assert "event_type" not in body
+    assert "category" not in body
+    assert "payload" not in body
+
+
+def test_send_event_forwards_actionable_metadata_when_present(monkeypatch, tmp_path):
+    fake = _install_fake_httpx(monkeypatch, [_FakeResponse(200, {})])
+    client = relay.RelayClient(relay_url="https://relay", credentials_path=tmp_path / "push" / "relay.json")
+    client._write_credentials(relay.RelayCredentials("https://relay", "agent-1", "secret-1"))
+
+    asyncio.run(
+        client.send_event(
+            kind="attention",
+            session_id="sess-1",
+            title="Approval needed",
+            body="Review in Hermes",
+            source="telegram",
+            event_type="approval",
+            category="HERMES_APPROVAL",
+            payload={"session_id": "sess-1", "stored_session_id": "stored-1", "destructive": False},
+        )
+    )
+
+    body = fake.calls[0]["json"]
+    assert body == {
+        "type": "attention",
+        "session_id": "sess-1",
+        "title": "Approval needed",
+        "body": "Review in Hermes",
+        "source": "telegram",
+        "event_type": "approval",
+        "category": "HERMES_APPROVAL",
+        "payload": {"session_id": "sess-1", "stored_session_id": "stored-1", "destructive": False},
+    }
+
+
 def test_credentials_raise_needs_attestation(monkeypatch, tmp_path):
     _install_fake_httpx(
         monkeypatch,
