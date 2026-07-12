@@ -43,7 +43,10 @@ final class RenderingTests: XCTestCase {
         guard case .table(let table) = blocks[0] else {
             return XCTFail("expected native markdown table block")
         }
-        XCTAssertEqual(table.rows, [[longSentence, unbrokenToken]])
+        XCTAssertEqual(
+            table.rows,
+            [[longSentence.trimmingCharacters(in: .whitespaces), unbrokenToken]]
+        )
     }
 
     func testSingleFencedBlockWithLanguage() {

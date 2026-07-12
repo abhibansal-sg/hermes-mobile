@@ -46,6 +46,43 @@ enum UITestSeed {
         }
         environment.connectionStore.phase = .connected
 
+        // Deterministic markdown-table evidence fixtures for the cell-wrapping
+        // regression. Each mode paints one production MessageBubble offline so
+        // simulator screenshots exercise the real parser and table view.
+        if mode.hasPrefix("tablewrap") {
+            let markdown: String
+            switch mode {
+            case "tablewrap-a":
+                markdown = """
+                | Link | Block kind | Dependency rule | Priority |
+                | --- | --- | --- | ---: |
+                | task_links | task_links + typed block_kind (dependency never sits in blocked) | dependency never sits in blocked; task_links stores the typed relation only | (priority integer preserves ordering across graph updates) |
+                """
+            case "tablewrap-b":
+                let longCell = String(String(
+                    repeating: "Every character in this three-hundred-character table fixture must remain visible and wrap naturally inside the fixed column width. ",
+                    count: 3
+                ).prefix(294)) + " END-B"
+                markdown = """
+                | 300-character cell | Status |
+                | --- | ---: |
+                | \(longCell) | Complete |
+                """
+            default:
+                markdown = """
+                | Key | Value |
+                | --- | ---: |
+                | Mode | Ready |
+                | Count | 42 |
+                """
+            }
+            environment.sessionStore.activeStoredId = "uitest-\(mode)"
+            environment.chatStore.debugSeedTranscript([
+                ChatMessage(role: .assistant, text: markdown),
+            ])
+            return
+        }
+
         // ── ROUND-2 STRESS MODES (measurement-first) ──────────────────────────
         // These reproduce the DEVICE costs the simulator masked: per-flush
         // re-segmentation + markdown rebuilds during streaming, heavy-row scroll
