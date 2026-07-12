@@ -1,3 +1,33 @@
+Build 110 — 2026-07-13
+
+FIXED
+- Force markdown table cells to wrap
+- Wrap markdown table cell text instead of truncating
+- Make self-revoke teardown durable
+
+WORTH TRYING
+- Try: Force markdown table cells to wrap
+- Try: Wrap markdown table cell text instead of truncating
+- Try: Make self-revoke teardown durable
+
+(+1 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
+Build 109 — 2026-07-13
+
+FIXED
+- Wrap markdown table cell text instead of truncating
+- Make self-revoke teardown durable
+
+WORTH TRYING
+- Try: Wrap markdown table cell text instead of truncating
+- Try: Make self-revoke teardown durable
+
+(+1 server-side/infra changes active on the gateway, no app UI change)
+
+---
+
 Build 108 — 2026-07-12
 
 WHAT'S NEW
