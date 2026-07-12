@@ -22,6 +22,30 @@ final class RenderingTests: XCTestCase {
         XCTAssertTrue(MessageSegmenter.segments("").isEmpty)
     }
 
+    func testLongMarkdownTableCellsSurviveSegmentationAndParsing() {
+        let longSentence = String(repeating: "A complete table cell sentence. ", count: 12)
+        let unbrokenToken = String(repeating: "abcdefghij", count: 8)
+        let markdown = """
+        | Description | Token |
+        | --- | --- |
+        | \(longSentence) | \(unbrokenToken) |
+        """
+
+        let segments = MessageSegmenter.segments(markdown)
+        XCTAssertEqual(segments.count, 1)
+        guard case .prose(let prose) = segments[0] else {
+            return XCTFail("expected markdown table to remain a prose segment")
+        }
+        XCTAssertEqual(prose, markdown)
+
+        let blocks = MessageBubble.markdownBlocks(prose)
+        XCTAssertEqual(blocks.count, 1)
+        guard case .table(let table) = blocks[0] else {
+            return XCTFail("expected native markdown table block")
+        }
+        XCTAssertEqual(table.rows, [[longSentence, unbrokenToken]])
+    }
+
     func testSingleFencedBlockWithLanguage() {
         let text = """
         here is code:
@@ -193,6 +217,43 @@ final class RenderingTests: XCTestCase {
         }
         XCTAssertEqual(language, "text")
         XCTAssertEqual(body, "$x^2$\n\\[y\\]")
+    }
+
+    // STR-695: markdown image syntax inside a fenced code block must stay raw
+    // code text — the chat-local image splitter only ever runs against `.prose`
+    // segments, so it never sees (and never hoists) an image reference that a
+    // model echoes back inside a code fence.
+    func testMarkdownImageSyntaxInsideFencedCodeStaysCodeNotHoisted() {
+        let text = """
+        Here is the markup:
+
+        ```md
+        ![alt](https://example.com/x.png)
+        ```
+
+        Done.
+        """
+        let segments = MessageSegmenter.segments(text)
+        XCTAssertEqual(segments.count, 3)
+        guard case .prose(let lead) = segments[0] else {
+            return XCTFail("expected leading prose, got \(segments[0])")
+        }
+        XCTAssertEqual(lead.trimmingCharacters(in: .whitespacesAndNewlines), "Here is the markup:")
+        guard case .code(let language, let body) = segments[1] else {
+            return XCTFail("expected the fenced block to stay code, got \(segments[1])")
+        }
+        XCTAssertEqual(language, "md")
+        XCTAssertEqual(body, "![alt](https://example.com/x.png)")
+
+        // The code segment's body is never handed to the image splitter, but
+        // prove the negative directly too: chatProseEntries applied to the raw
+        // fenced body still hoists it (proving the fence — not the parser — is
+        // what keeps it out of the prose path in the real render pipeline).
+        let entries = MessageBubble.chatProseEntries(body)
+        XCTAssertEqual(entries.count, 1)
+        guard case .image = entries[0] else {
+            return XCTFail("chatProseEntries alone has no fence awareness by design")
+        }
     }
 
     func testUnclosedMathDelimiterRemainsProseWhileStreaming() {
