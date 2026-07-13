@@ -2407,6 +2407,8 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    _initial_block_kind: Optional[str] = None,
+    _initial_block_reason: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2438,6 +2440,15 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    if _initial_block_kind is not None:
+        if initial_status != "blocked":
+            raise ValueError("initial block metadata requires initial_status='blocked'")
+        if _initial_block_kind not in VALID_BLOCK_KINDS:
+            raise ValueError(
+                f"block kind must be one of {sorted(VALID_BLOCK_KINDS)}"
+            )
+    elif _initial_block_reason is not None:
+        raise ValueError("initial block reason requires an initial block kind")
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -2635,8 +2646,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        block_kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2659,6 +2671,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        _initial_block_kind,
                     ),
                 )
                 for pid in parents:
@@ -2680,6 +2693,21 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                # ``create_blocked_task`` supplies the internal metadata below.
+                # The insertion and its sticky block event intentionally share
+                # this transaction: a dispatcher can therefore never observe a
+                # newly-created human gate in a claimable state.
+                if _initial_block_kind is not None:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": _initial_block_reason,
+                            "kind": _initial_block_kind,
+                            "recurrences": 0,
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -2687,6 +2715,74 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def create_blocked_task(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    body: Optional[str] = None,
+    assignee: Optional[str] = None,
+    created_by: Optional[str] = None,
+    workspace_kind: str = "scratch",
+    workspace_path: Optional[str] = None,
+    branch_name: Optional[str] = None,
+    tenant: Optional[str] = None,
+    priority: int = 0,
+    parents: Iterable[str] = (),
+    triage: bool = False,
+    idempotency_key: Optional[str] = None,
+    max_runtime_seconds: Optional[int] = None,
+    skills: Optional[Iterable[str]] = None,
+    max_retries: Optional[int] = None,
+    goal_mode: bool = False,
+    goal_max_turns: Optional[int] = None,
+    session_id: Optional[str] = None,
+    board: Optional[str] = None,
+    project_id: Optional[str] = None,
+    block_kind: str,
+    reason: str,
+) -> str:
+    """Create a task as a sticky human block in one transaction.
+
+    This has the same creation inputs as :func:`create_task`, but cannot be
+    made claimable: the row is inserted with ``status='blocked'``, its typed
+    ``block_kind`` is persisted, and the ``blocked`` event containing
+    ``reason`` is written before the transaction commits.  It is intended for
+    control cards such as approval or input gates, where creating a ready task
+    and blocking it in a second operation would let a dispatcher claim it.
+    """
+    if block_kind not in VALID_BLOCK_KINDS:
+        raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)}")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("reason is required")
+
+    return create_task(
+        conn,
+        title=title,
+        body=body,
+        assignee=assignee,
+        created_by=created_by,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+        branch_name=branch_name,
+        tenant=tenant,
+        priority=priority,
+        parents=parents,
+        triage=triage,
+        idempotency_key=idempotency_key,
+        max_runtime_seconds=max_runtime_seconds,
+        skills=skills,
+        max_retries=max_retries,
+        goal_mode=goal_mode,
+        goal_max_turns=goal_max_turns,
+        initial_status="blocked",
+        session_id=session_id,
+        board=board,
+        project_id=project_id,
+        _initial_block_kind=block_kind,
+        _initial_block_reason=reason,
+    )
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
@@ -5228,6 +5324,144 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # for a later dispatcher tick.
     recompute_ready(conn)
     return True
+
+
+def cancel_subtree(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    *,
+    keep_blocked: Optional[Iterable[str]] = None,
+) -> dict[str, Any]:
+    """Atomically cancel a task graph without releasing intermediate work.
+
+    All selected tasks are archived leaf-first, except selected ids in
+    ``keep_blocked`` which are left as unassigned ``blocked(kind=needs_input)``
+    control cards.  The operation refuses without writing if any selected task
+    still has a live worker PID.  Unlike repeatedly calling :func:`archive_task`,
+    it performs exactly one dependency recomputation after every archival is
+    committed, so a dependent cannot be made ready after just one parent is
+    archived.
+    """
+    selected = list(dict.fromkeys(str(task_id) for task_id in task_ids if task_id))
+    keep_ids = {
+        str(task_id) for task_id in (keep_blocked or ())
+        if task_id and str(task_id) in selected
+    }
+    result: dict[str, Any] = {"archived": [], "kept": [], "refused": None}
+    if not selected:
+        return result
+
+    with write_txn(conn):
+        placeholders = ",".join("?" * len(selected))
+        rows = conn.execute(
+            f"SELECT id, worker_pid FROM tasks WHERE id IN ({placeholders})",
+            selected,
+        ).fetchall()
+        rows_by_id = {row["id"]: row for row in rows}
+        missing = [task_id for task_id in selected if task_id not in rows_by_id]
+        if missing:
+            result["refused"] = f"unknown task id(s): {', '.join(missing)}"
+            return result
+
+        for task_id in selected:
+            pid = rows_by_id[task_id]["worker_pid"]
+            if pid and _pid_alive(int(pid)):
+                result["refused"] = f"task {task_id} has a live worker (pid {pid})"
+                return result
+
+        # Kahn's algorithm gives parent-before-child order over the selected
+        # archive set. Reversing it archives leaves first, so no intermediate
+        # parent archival can satisfy a still-live dependent.
+        archive_ids = [task_id for task_id in selected if task_id not in keep_ids]
+        indegree = {task_id: 0 for task_id in archive_ids}
+        children = {task_id: [] for task_id in archive_ids}
+        if archive_ids:
+            link_rows = conn.execute(
+                f"SELECT parent_id, child_id FROM task_links "
+                f"WHERE parent_id IN ({','.join('?' * len(archive_ids))}) "
+                f"AND child_id IN ({','.join('?' * len(archive_ids))})",
+                archive_ids + archive_ids,
+            ).fetchall()
+            for link in link_rows:
+                parent_id = link["parent_id"]
+                child_id = link["child_id"]
+                children[parent_id].append(child_id)
+                indegree[child_id] += 1
+        position = {task_id: index for index, task_id in enumerate(archive_ids)}
+        queue = sorted(
+            (task_id for task_id, degree in indegree.items() if degree == 0),
+            key=position.__getitem__,
+        )
+        topological: list[str] = []
+        while queue:
+            task_id = queue.pop(0)
+            topological.append(task_id)
+            for child_id in sorted(children[task_id], key=position.__getitem__):
+                indegree[child_id] -= 1
+                if indegree[child_id] == 0:
+                    queue.append(child_id)
+            queue.sort(key=position.__getitem__)
+        # ``link_tasks`` prevents cycles, but preserve deterministic, safe
+        # progress if an older/corrupt database contains one.
+        if len(topological) != len(archive_ids):
+            topological.extend(
+                task_id for task_id in archive_ids if task_id not in topological
+            )
+        archive_order = list(reversed(topological))
+
+        for task_id in archive_order:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None or row["status"] == "archived":
+                continue
+            conn.execute(
+                "UPDATE tasks SET status = 'archived', assignee = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ?",
+                (task_id,),
+            )
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                summary="task archived by subtree cancellation",
+            )
+            _append_event(conn, task_id, "archived", None, run_id=run_id)
+
+        for task_id in selected:
+            if task_id not in keep_ids:
+                continue
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', assignee = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "block_kind = 'needs_input' WHERE id = ?",
+                (task_id,),
+            )
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="blocked",
+                status="blocked",
+                summary="task retained as a cancellation control card",
+            )
+            _append_event(
+                conn,
+                task_id,
+                "blocked",
+                {"reason": "recipe_cancelled", "kind": "needs_input"},
+                run_id=run_id,
+            )
+
+        result["archived"] = archive_order
+        result["kept"] = [task_id for task_id in selected if task_id in keep_ids]
+
+    # One recomputation after the whole archival batch is visible. Calling
+    # archive_task in a loop would recompute after each parent and transiently
+    # release a dependent before its cancellation peers were archived.
+    recompute_ready(conn)
+    return result
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
