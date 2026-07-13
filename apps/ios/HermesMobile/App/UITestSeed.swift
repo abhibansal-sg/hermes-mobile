@@ -52,6 +52,34 @@ enum UITestSeed {
         if mode.hasPrefix("tablewrap") {
             let markdown: String
             switch mode {
+            case "tablewrap-v4-mixed":
+                markdown = """
+                | Detail | State | Retry |
+                | --- | --- | --- |
+                | This deliberately long cell wraps across multiple lines while its short neighbors remain single-line. | ✅ done | yes |
+                | **Inline bold content also participates in the measured width and still wraps without an ellipsis.** | ready | no |
+                """
+            case "tablewrap-v4-token":
+                markdown = """
+                | Setting | Value | Result |
+                | --- | --- | --- |
+                | Retry guard | `consecutive_failures + max_retries` | ✅ stable |
+                """
+            case "tablewrap-v4-heights":
+                markdown = """
+                | Detail | State |
+                | --- | --- |
+                | Short | ready |
+                | This long detail wraps evenly across several lines in its cell. | This long state also wraps evenly across several lines in its cell. |
+                """
+            case "tablewrap-v4-parity":
+                markdown = """
+                | Check | iOS | Desktop | Status |
+                | --- | --- | --- | --- |
+                | Short cells | ✅ done | ✅ done | yes |
+                | Failure path | ❌ blocked | ❌ blocked | no |
+                | Rich runs | **✅ bold** | `❌ code` | ready |
+                """
             case "tablewrap-a":
                 markdown = """
                 | Link | Block kind | Dependency rule | Priority |

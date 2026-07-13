@@ -1393,16 +1393,14 @@ private struct MarkdownTableBlockView: View {
         let tableWidth = columnWidths.reduce(0, +)
 
         ScrollView(.horizontal, showsIndicators: true) {
-            Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
-                gridRow(table.headers, columnWidths: columnWidths, isHeader: true, rowIndex: 0)
+            VStack(alignment: .leading, spacing: 0) {
+                tableRow(table.headers, columnWidths: columnWidths, isHeader: true, rowIndex: 0)
                 if table.rows.isEmpty {
-                    GridRow {
-                        emptyRow
-                            .gridCellColumns(max(table.headers.count, 1))
-                    }
+                    emptyRow
+                        .frame(width: tableWidth, alignment: .leading)
                 } else {
                     ForEach(Array(table.rows.enumerated()), id: \.offset) { rowIndex, cells in
-                        gridRow(cells, columnWidths: columnWidths, isHeader: false, rowIndex: rowIndex)
+                        tableRow(cells, columnWidths: columnWidths, isHeader: false, rowIndex: rowIndex)
                     }
                 }
             }
@@ -1420,13 +1418,13 @@ private struct MarkdownTableBlockView: View {
         .accessibilityLabel("Markdown table with \(table.headers.count) columns and \(table.rows.count) rows")
     }
 
-    private func gridRow(
+    private func tableRow(
         _ cells: [String],
         columnWidths: [CGFloat],
         isHeader: Bool,
         rowIndex: Int
     ) -> some View {
-        GridRow {
+        HStack(alignment: .top, spacing: 0) {
             ForEach(Array(cells.enumerated()), id: \.offset) { columnIndex, cell in
                 cellView(
                     text: cell,
@@ -1437,6 +1435,7 @@ private struct MarkdownTableBlockView: View {
                 )
             }
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private var emptyRow: some View {
@@ -1474,6 +1473,7 @@ private struct MarkdownTableBlockView: View {
             .padding(.horizontal, Self.horizontalCellPadding)
             .padding(.vertical, isHeader ? 9 : 10)
             .frame(width: columnWidth, alignment: frameAlignment(for: alignment))
+            .frame(maxHeight: .infinity, alignment: .top)
             .background(background)
             .overlay(Rectangle().stroke(theme.border.opacity(0.72), lineWidth: 0.5))
             .perfTextSelection()
@@ -1519,9 +1519,9 @@ private struct MarkdownTableBlockView: View {
 
     private func frameAlignment(for alignment: MessageBubble.MarkdownTable.Alignment) -> Alignment {
         switch alignment {
-        case .leading: return .leading
-        case .center: return .center
-        case .trailing: return .trailing
+        case .leading: return .topLeading
+        case .center: return .top
+        case .trailing: return .topTrailing
         }
     }
 
