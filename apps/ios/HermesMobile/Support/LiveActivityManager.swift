@@ -125,6 +125,27 @@ final class LiveActivityManager {
         isLive && !hasActiveTurn
     }
 
+    /// Pure state assembly shared by local ActivityKit refreshes and tests.
+    /// `startedAt` is copied unchanged into every state while only the fallback
+    /// elapsed counter advances; the widget can therefore count locally from a
+    /// single stable instant without per-second pushes.
+    nonisolated static func makeContentState(
+        phase: String,
+        toolName: String?,
+        needsApproval: Bool,
+        startedAt: Date?,
+        now: Date = Date()
+    ) -> HermesTurnAttributes.ContentState {
+        let elapsed = startedAt.map { Int(now.timeIntervalSince($0)) } ?? 0
+        return HermesTurnAttributes.ContentState(
+            phase: phase,
+            toolName: toolName,
+            elapsedSeconds: max(0, elapsed),
+            needsApproval: needsApproval,
+            startedAt: startedAt
+        )
+    }
+
     /// End the running activity if it is orphaned (no active gateway turn).
     ///
     /// Safe to call when no activity is running — `end()` is already idempotent.
@@ -518,12 +539,10 @@ final class LiveActivityManager {
 
     /// Build a content state from the manager's current bookkeeping.
     private func makeState(phaseOverride: String?) -> HermesTurnAttributes.ContentState {
-        let elapsed = startedAt.map { Int(Date().timeIntervalSince($0)) } ?? 0
         let phase = phaseOverride ?? derivedPhase()
-        return HermesTurnAttributes.ContentState(
+        return Self.makeContentState(
             phase: phase,
             toolName: currentToolName,
-            elapsedSeconds: max(0, elapsed),
             needsApproval: currentNeedsApproval,
             startedAt: startedAt
         )

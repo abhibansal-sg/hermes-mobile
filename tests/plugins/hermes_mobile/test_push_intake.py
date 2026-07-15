@@ -691,8 +691,13 @@ def _capture_live_activity(monkeypatch, pn, *, armed=True, has_token=True):
         lambda sid: ((("a" * 64), "sandbox") if has_token else None),
     )
 
-    def _fake_la(session_id, content_state, *, end=False):
-        la_calls.append({"sid": session_id, "cs": content_state, "end": end})
+    def _fake_la(session_id, content_state, *, end=False, priority=10):
+        la_calls.append({
+            "sid": session_id,
+            "cs": content_state,
+            "end": end,
+            "priority": priority,
+        })
         return True
 
     monkeypatch.setattr(pn, "notify_live_activity", _fake_la)
@@ -723,8 +728,9 @@ def test_live_activity_hook_noop_when_no_token(monkeypatch, push_engine):
 
 def test_live_activity_hook_tool_start_update(monkeypatch, push_engine):
     la = _capture_live_activity(monkeypatch, push_engine)
+    started = time.time() - 5
     server._sessions["sid_la"] = {"session_key": "k",
-                                  "_push_turn_started": time.time() - 5}
+                                  "_push_turn_started": started}
     try:
         push_engine._live_activity_hook("tool.start", "sid_la", {"name": "edit_file"})
     finally:
@@ -735,9 +741,14 @@ def test_live_activity_hook_tool_start_update(monkeypatch, push_engine):
     assert cs["toolName"] == "edit_file"
     assert cs["elapsedSeconds"] >= 5
     assert cs["needsApproval"] is False
+    assert cs["startedAtEpochSeconds"] == int(started)
     assert la[0]["end"] is False
+    assert la[0]["priority"] == 5
     # content-state uses the exact Swift Codable field names.
-    assert set(cs.keys()) == {"phase", "toolName", "elapsedSeconds", "needsApproval"}
+    assert set(cs.keys()) == {
+        "phase", "toolName", "elapsedSeconds", "needsApproval",
+        "startedAtEpochSeconds",
+    }
 
 
 def test_live_activity_hook_end_on_message_complete(monkeypatch, push_engine):
@@ -763,6 +774,7 @@ def test_live_activity_hook_end_on_interrupt(monkeypatch, push_engine):
         server._sessions.pop("sid_la", None)
     assert len(la) == 1
     assert la[0]["end"] is True
+    assert la[0]["priority"] == 10
 
 
 def test_live_activity_hook_dedupes_interrupt_then_complete_for_same_turn(
@@ -849,6 +861,7 @@ def test_live_activity_hook_approval_bypasses_throttle(monkeypatch, push_engine)
     assert len(la) == 1
     assert la[0]["cs"]["phase"] == "waiting"
     assert la[0]["cs"]["needsApproval"] is True
+    assert la[0]["priority"] == 10
 
 
 def test_live_activity_hook_blocked_status_bypasses_throttle(monkeypatch, push_engine):
@@ -867,6 +880,7 @@ def test_live_activity_hook_blocked_status_bypasses_throttle(monkeypatch, push_e
         server._sessions.pop("sid_la", None)
     assert len(la) == 1
     assert la[0]["cs"]["phase"] == "waiting"
+    assert la[0]["priority"] == 10
 
 
 def test_live_activity_hook_status_kind_uses_user_phase(monkeypatch, push_engine):
@@ -897,6 +911,141 @@ def test_live_activity_hook_approval_needs_approval_flag(monkeypatch, push_engin
         server._sessions.pop("sid_la", None)
     assert la[0]["cs"]["needsApproval"] is True
     assert la[0]["cs"]["phase"] == "waiting"
+
+
+def test_live_activity_hook_start_is_immediate_priority(monkeypatch, push_engine):
+    la = _capture_live_activity(monkeypatch, push_engine)
+    started = 1_700_000_000.75
+    server._sessions["sid_la"] = {
+        "session_key": "k",
+        "_push_turn_started": started,
+        "_la_last_update": started,
+    }
+    try:
+        push_engine._live_activity_hook(
+            "message.start", "sid_la", {}, event_time=started, turn_started=started
+        )
+    finally:
+        server._sessions.pop("sid_la", None)
+
+    assert len(la) == 1
+    assert la[0]["priority"] == 10
+    assert la[0]["cs"]["startedAtEpochSeconds"] == 1_700_000_000
+
+
+def test_live_activity_hook_coalesces_identical_visible_state_after_throttle(
+    monkeypatch, push_engine
+):
+    la = _capture_live_activity(monkeypatch, push_engine)
+    started = 1_700_000_000.0
+    server._sessions["sid_la"] = {
+        "session_key": "k",
+        "_push_turn_started": started,
+    }
+    try:
+        push_engine._live_activity_hook(
+            "tool.start", "sid_la", {"name": "terminal"}, event_time=started + 1
+        )
+        push_engine._live_activity_hook(
+            "tool.start", "sid_la", {"name": "terminal"}, event_time=started + 10
+        )
+    finally:
+        server._sessions.pop("sid_la", None)
+
+    assert len(la) == 1
+    assert la[0]["priority"] == 5
+
+
+def test_live_activity_hook_sends_changed_routine_state_at_priority_five(
+    monkeypatch, push_engine
+):
+    la = _capture_live_activity(monkeypatch, push_engine)
+    started = 1_700_000_000.0
+    server._sessions["sid_la"] = {
+        "session_key": "k",
+        "_push_turn_started": started,
+    }
+    try:
+        push_engine._live_activity_hook(
+            "tool.start", "sid_la", {"name": "terminal"}, event_time=started + 1
+        )
+        push_engine._live_activity_hook(
+            "tool.start", "sid_la", {"name": "edit_file"}, event_time=started + 5
+        )
+        push_engine._live_activity_hook(
+            "tool.complete", "sid_la", {"name": "edit_file"}, event_time=started + 9
+        )
+    finally:
+        server._sessions.pop("sid_la", None)
+
+    assert [call["cs"]["toolName"] for call in la] == ["terminal", "edit_file", None]
+    assert [call["priority"] for call in la] == [5, 5, 5]
+
+
+@pytest.mark.parametrize(
+    ("event", "payload", "phase", "needs_approval"),
+    [
+        ("approval.request", {"command": "rm"}, "waiting", True),
+        ("clarify.request", {"question": "Which one?"}, "waiting", False),
+        ("error", {"message": "failed"}, "error", False),
+    ],
+)
+def test_live_activity_hook_blocking_transitions_bypass_routine_coalescing(
+    monkeypatch, push_engine, event, payload, phase, needs_approval
+):
+    la = _capture_live_activity(monkeypatch, push_engine)
+    now = 1_700_000_003.0
+    server._sessions["sid_la"] = {
+        "session_key": "k",
+        "_push_turn_started": 1_700_000_000.0,
+        "_la_last_update": now,
+        "_la_last_semantic_state": (phase, None, needs_approval),
+    }
+    try:
+        push_engine._live_activity_hook(
+            event, "sid_la", payload, event_time=now
+        )
+    finally:
+        server._sessions.pop("sid_la", None)
+
+    assert len(la) == 1
+    assert la[0]["priority"] == 10
+    assert la[0]["cs"]["phase"] == phase
+    assert la[0]["cs"]["needsApproval"] is needs_approval
+
+
+def test_live_activity_hook_reuses_one_start_epoch_for_activity_lifetime(
+    monkeypatch, push_engine
+):
+    la = _capture_live_activity(monkeypatch, push_engine)
+    started = 1_700_000_000.875
+    server._sessions["sid_la"] = {
+        "session_key": "k",
+        "_push_turn_started": started,
+    }
+    try:
+        push_engine._live_activity_hook(
+            "message.start", "sid_la", {}, event_time=started, turn_started=started
+        )
+        push_engine._live_activity_hook(
+            "tool.start", "sid_la", {"name": "terminal"}, event_time=started + 4
+        )
+        push_engine._live_activity_hook(
+            "approval.request", "sid_la", {}, event_time=started + 5
+        )
+        push_engine._live_activity_hook(
+            "message.complete", "sid_la", {}, event_time=started + 6,
+            turn_started=started,
+        )
+    finally:
+        server._sessions.pop("sid_la", None)
+
+    assert len(la) == 4
+    assert {call["cs"]["startedAtEpochSeconds"] for call in la} == {
+        1_700_000_000
+    }
+    assert [call["priority"] for call in la] == [10, 5, 10, 10]
+    assert la[-1]["end"] is True
 
 
 # ===========================================================================
