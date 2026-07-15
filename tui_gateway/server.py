@@ -10267,11 +10267,16 @@ def _(rid, params: dict) -> dict:
 
 def _respond(rid, params, key):
     r = params.get("request_id", "")
+    device = _ws_device_identity()
+    if device is not None and "approve" not in (device.get("scopes") or []):
+        return _err(rid, 4030, "device token lacks approve scope")
     with _prompt_lock:
         entry = _pending.get(r)
         if not entry:
             return _err(rid, 4009, f"no pending {key} request")
-        _, ev = entry
+        owner_sid, ev = entry
+        if device is not None and not _ws_device_owns_session(device, owner_sid):
+            return _err(rid, 4030, "device does not own this session")
         _answers[r] = params.get(key, "")
         ev.set()
     return _ok(rid, {"status": "ok"})
@@ -10305,6 +10310,22 @@ def _ws_device_identity() -> Optional[dict]:
     if isinstance(device, dict) and device.get("device_id"):
         return device
     return None
+
+
+def _ws_device_owns_session(device: dict, session_id: str) -> bool:
+    device_id = device.get("device_id") if isinstance(device, dict) else None
+    if not device_id:
+        return False
+    try:
+        import importlib
+
+        device_tokens = importlib.import_module(
+            "hermes_plugins.hermes_mobile.device_tokens"
+        )
+        owner = device_tokens.device_identity_for_session(session_id)
+    except Exception:
+        return False
+    return isinstance(owner, dict) and owner.get("device_id") == device_id
 
 
 def _ws_resolve_audit(session_id: str, session_key: str) -> dict:
