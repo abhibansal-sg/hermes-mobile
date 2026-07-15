@@ -41,9 +41,7 @@ final class AppLock {
     /// Persisted opt-in flag. The toggle in `SettingsSheet` writes through
     /// ``setEnabled(_:)`` rather than touching `UserDefaults` directly so the
     /// in-memory lock state stays consistent with the preference.
-    var isEnabled: Bool {
-        UserDefaults.standard.bool(forKey: DefaultsKeys.appLockEnabled)
-    }
+    private(set) var isEnabled: Bool
 
     /// Time the app must have spent backgrounded before a re-foreground re-locks.
     static let foregroundGracePeriod: TimeInterval = 5 * 60
@@ -57,17 +55,23 @@ final class AppLock {
     /// `LAContext` (XCTest can't satisfy a biometric prompt). Production uses the
     /// default `LAContext`-backed implementation.
     private let authenticator: BiometricAuthenticating
+    private let defaults: UserDefaults
 
     /// A short reason string shown in the system biometric sheet.
     private static let reason = "Unlock Hermes"
 
     /// - Parameter authenticator: biometric backend; defaults to the live
     ///   `LAContext` implementation. Tests inject a stub.
-    init(authenticator: BiometricAuthenticating = LAContextAuthenticator()) {
+    init(
+        authenticator: BiometricAuthenticating = LAContextAuthenticator(),
+        defaults: UserDefaults = .standard
+    ) {
         self.authenticator = authenticator
+        self.defaults = defaults
+        self.isEnabled = defaults.bool(forKey: DefaultsKeys.appLockEnabled)
         // Start locked iff the feature is on, so launch shows the overlay before
         // `authenticateAtLaunch()` has a chance to run.
-        self.isLocked = UserDefaults.standard.bool(forKey: DefaultsKeys.appLockEnabled)
+        self.isLocked = defaults.bool(forKey: DefaultsKeys.appLockEnabled)
     }
 
     // MARK: - Preference
@@ -77,18 +81,44 @@ final class AppLock {
     /// Turning it **on** immediately locks and prompts (so the user proves they
     /// can get back in before they rely on it). Turning it **off** unlocks and
     /// clears any pending state.
-    func setEnabled(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: DefaultsKeys.appLockEnabled)
-        if enabled {
-            isLocked = true
-            backgroundedAt = nil
-            authenticate()
-        } else {
+    @discardableResult
+    func setEnabled(_ enabled: Bool) async -> Bool {
+        if !enabled {
+            defaults.set(false, forKey: DefaultsKeys.appLockEnabled)
+            isEnabled = false
             isLocked = false
             isAuthenticating = false
             lastError = nil
             backgroundedAt = nil
+            return true
         }
+
+        isAuthenticating = true
+        lastError = nil
+        let capability = await authenticator.capability()
+        guard capability.isAvailable else {
+            isAuthenticating = false
+            defaults.set(false, forKey: DefaultsKeys.appLockEnabled)
+            isEnabled = false
+            isLocked = false
+            lastError = capability.message
+            return false
+        }
+        let result = await authenticator.evaluate(reason: Self.reason)
+        isAuthenticating = false
+        guard result == .success else {
+            defaults.set(false, forKey: DefaultsKeys.appLockEnabled)
+            isEnabled = false
+            isLocked = false
+            lastError = result.message
+            return false
+        }
+
+        defaults.set(true, forKey: DefaultsKeys.appLockEnabled)
+        isEnabled = true
+        isLocked = false
+        backgroundedAt = nil
+        return true
     }
 
     // MARK: - Lifecycle hooks
@@ -159,10 +189,10 @@ final class AppLock {
             case .success:
                 self.isLocked = false
                 self.lastError = nil
-            case .failure(let message):
+            default:
                 // Stay locked; surface why so the overlay can offer a retry.
                 self.isLocked = true
-                self.lastError = message
+                self.lastError = result.message
             }
         }
     }
@@ -172,17 +202,51 @@ final class AppLock {
 
 /// Outcome of a biometric / passcode evaluation, normalised to a `Sendable`
 /// value so it can cross the actor boundary back to the `@MainActor` store.
-enum BiometricResult: Sendable {
+enum BiometricResult: Sendable, Equatable {
     case success
-    /// Authentication did not complete (failed, cancelled, unavailable). The
-    /// string is a user-facing explanation.
+    case passcodeNotSet
+    case unavailable(String)
+    case lockout(String)
+    case cancelled
     case failure(String)
+
+    static let passcodeGuidance = "App Lock requires an iOS device passcode. Enable a passcode in iOS Settings, then try again."
+
+    var message: String? {
+        switch self {
+        case .success: nil
+        case .passcodeNotSet: Self.passcodeGuidance
+        case .unavailable(let message), .lockout(let message), .failure(let message): message
+        case .cancelled: "Authentication cancelled."
+        }
+    }
 }
 
 /// Seam over `LAContext` so ``AppLock`` can be exercised in tests.
 protocol BiometricAuthenticating: Sendable {
+    func capability() async -> DeviceOwnerAuthenticationCapability
     /// Evaluate device-owner authentication, returning a normalised result.
     func evaluate(reason: String) async -> BiometricResult
+}
+
+enum DeviceOwnerAuthenticationCapability: Sendable, Equatable {
+    case biometrics
+    case passcodeFallback
+    case passcodeNotSet
+    case unavailable(String)
+    case lockout(String)
+
+    var isAvailable: Bool {
+        self == .biometrics || self == .passcodeFallback
+    }
+
+    var message: String? {
+        switch self {
+        case .biometrics, .passcodeFallback: nil
+        case .passcodeNotSet: BiometricResult.passcodeGuidance
+        case .unavailable(let message), .lockout(let message): message
+        }
+    }
 }
 
 /// Production `BiometricAuthenticating` backed by `LAContext`.
@@ -191,44 +255,67 @@ protocol BiometricAuthenticating: Sendable {
 /// when biometrics are unavailable or locked out — so the user is never
 /// permanently shut out of their own app on a device without Face ID enrolment.
 struct LAContextAuthenticator: BiometricAuthenticating {
+    func capability() async -> DeviceOwnerAuthenticationCapability {
+        let context = LAContext()
+        var ownerError: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &ownerError) else {
+            if ownerError?.code == LAError.passcodeNotSet.rawValue { return .passcodeNotSet }
+            if ownerError?.code == LAError.biometryLockout.rawValue {
+                return .lockout("Device-owner authentication is locked. Try again after unlocking your device.")
+            }
+            return .unavailable(ownerError?.localizedDescription ?? "Device-owner authentication is unavailable.")
+        }
+
+        var biometricError: NSError?
+        return context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &biometricError)
+            ? .biometrics
+            : .passcodeFallback
+    }
+
     func evaluate(reason: String) async -> BiometricResult {
         let context = LAContext()
         context.localizedFallbackTitle = "Enter Passcode"
 
-        // If the device has no biometrics *and* no passcode, there is nothing to
-        // evaluate — treat as unlocked rather than trapping the user behind a
-        // gate that can never be satisfied.
         var policyError: NSError?
         let policy: LAPolicy = .deviceOwnerAuthentication
         guard context.canEvaluatePolicy(policy, error: &policyError) else {
             if let policyError, policyError.code == LAError.passcodeNotSet.rawValue {
-                return .success
+                return .passcodeNotSet
             }
-            return .failure(policyError?.localizedDescription ?? "Authentication unavailable.")
+            if let policyError, policyError.code == LAError.biometryLockout.rawValue {
+                return .lockout("Biometrics locked out — enter your device passcode.")
+            }
+            return .unavailable(policyError?.localizedDescription ?? "Device-owner authentication is unavailable.")
         }
 
         do {
             let ok = try await context.evaluatePolicy(policy, localizedReason: reason)
             return ok ? .success : .failure("Authentication failed.")
         } catch let error as LAError {
-            return .failure(Self.message(for: error))
+            return Self.result(for: error)
         } catch {
             return .failure(error.localizedDescription)
         }
     }
 
-    private static func message(for error: LAError) -> String {
-        switch error.code {
+    static func result(for error: LAError) -> BiometricResult {
+        result(for: error.code, description: error.localizedDescription)
+    }
+
+    static func result(for code: LAError.Code, description: String = "Authentication failed.") -> BiometricResult {
+        switch code {
         case .userCancel, .appCancel, .systemCancel:
-            return "Authentication cancelled."
+            return .cancelled
+        case .passcodeNotSet:
+            return .passcodeNotSet
         case .userFallback:
-            return "Enter your passcode to continue."
+            return .failure("Enter your passcode to continue.")
         case .authenticationFailed:
-            return "Face ID / Touch ID not recognised."
+            return .failure("Face ID / Touch ID not recognised.")
         case .biometryLockout:
-            return "Biometrics locked out — enter your passcode."
+            return .lockout("Biometrics locked out — enter your device passcode.")
         default:
-            return error.localizedDescription
+            return .failure(description)
         }
     }
 }

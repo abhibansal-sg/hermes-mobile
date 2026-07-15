@@ -177,9 +177,9 @@ struct SecurePromptView: View {
             unlocked = true
             gateError = nil
             fieldFocused = true
-        case .failure(let message):
+        default:
             unlocked = false
-            gateError = message
+            gateError = result.message
         }
     }
 
