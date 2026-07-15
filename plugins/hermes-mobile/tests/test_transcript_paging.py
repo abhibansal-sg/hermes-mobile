@@ -86,6 +86,24 @@ def test_page_messages_returns_tail_window_and_backward_cursor():
     assert older.has_more_before is True
 
 
+def test_page_messages_around_returns_target_radius_window():
+    transcript_sync = load_plugin_module("transcript_sync")
+    page = transcript_sync.page_messages_around(_rows(10), around=5, radius=2)
+
+    assert [m["id"] for m in page.messages] == [3, 4, 5, 6, 7]
+    assert page.oldest_id == 3
+    assert page.has_more_before is True
+
+
+def test_page_messages_around_absent_target_is_empty():
+    transcript_sync = load_plugin_module("transcript_sync")
+    page = transcript_sync.page_messages_around(_rows(10), around=99, radius=2)
+
+    assert page.messages == []
+    assert page.oldest_id is None
+    assert page.has_more_before is False
+
+
 def test_session_messages_delta_no_new_params_is_byte_identical(monkeypatch):
     api = _load_api()
     rows = _rows(6)
@@ -123,3 +141,33 @@ def test_session_messages_delta_limit_before_pages_without_changing_cursor(monke
     assert older["max_id"] == 10
     assert older["page"]["oldest_id"] == 3
     assert older["page"]["has_more_before"] is True
+
+def test_session_messages_around_route_returns_target_radius(monkeypatch):
+    api = _load_api()
+    rows = _rows(10)
+    _install_fake_state(monkeypatch, rows)
+    monkeypatch.setattr(api, "_has_dashboard_api_auth", lambda request: True)
+    monkeypatch.setattr(api, "_device_owns_session", lambda request, session_id: True)
+
+    result = asyncio.run(api.session_messages_around("s1", _request(), around=5, radius=2))
+
+    assert [m["id"] for m in result["messages"]] == [3, 4, 5, 6, 7]
+    assert result["page"] == {
+        "oldest_id": 3,
+        "has_more_before": True,
+        "contains_target": True,
+    }
+
+
+def test_session_messages_around_route_enforces_device_session_ownership(monkeypatch):
+    api = _load_api()
+    _install_fake_state(monkeypatch, _rows(10))
+    monkeypatch.setattr(api, "_has_dashboard_api_auth", lambda request: True)
+    monkeypatch.setattr(api, "_device_owns_session", lambda request, session_id: False)
+
+    try:
+        asyncio.run(api.session_messages_around("s1", _request(), around=5, radius=2))
+    except api.HTTPException as exc:
+        assert exc.status_code == 403
+    else:  # pragma: no cover - assertion guard
+        raise AssertionError("device-token request for another session must be forbidden")

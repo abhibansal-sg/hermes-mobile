@@ -1690,7 +1690,7 @@ struct MarkdownTableBlockView: View {
     }
 }
 
-private struct MarkdownBlockquoteView: View {
+struct MarkdownBlockquoteView: View {
     @Environment(\.hermesTheme) private var theme
 
     let text: String

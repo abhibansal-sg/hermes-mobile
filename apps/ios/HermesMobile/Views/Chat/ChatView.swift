@@ -897,6 +897,17 @@ struct ChatView: View {
                 let lastAssistantId = allRows.last(where: { $0.element.role == .assistant })?.element.id
                 let windowStart = max(0, allRows.count - windowSize)
                 let rows = Array(allRows[windowStart...])
+                if chatStore.isLoadingJumpTarget {
+                    transcriptStatusChip(
+                        "Loading earlier messages…",
+                        identifier: "jumpTargetLoading"
+                    )
+                } else if let jumpError = chatStore.jumpTargetLoadError {
+                    transcriptStatusChip(
+                        jumpError,
+                        identifier: "jumpTargetError"
+                    )
+                }
                 // "Load earlier messages" chip — only when the window does not
                 // already cover the whole transcript. Tapping grows the window by
                 // another `transcriptWindow`. The grow is anchored to the previously
@@ -1306,46 +1317,20 @@ struct ChatView: View {
         let target = chatStore.messages.first { candidates.contains($0.id) }?.id
 
         guard let target else {
-            // M1 (Opus review): the target row is NOT in the currently-loaded
-            // transcript. The open path is CACHE-FIRST then NETWORK
-            // (`SessionStore.seedTranscriptCacheFirst`): the FIRST
-            // `transcriptGeneration` bump is often a STALE on-disk-cache partial
-            // seed that does not contain the matched row, while the SECOND bump
-            // (the authoritative network reconcile) usually does. Clearing the
-            // jump here would drop it on the stale cache bump and the scroll
-            // would silently never happen in the common stale-cache case.
-            //
-            // So: leave `pendingMessageJump` set and return — the next bump
-            // (after the network seed) re-runs this resolver. Bounded three ways
-            // so it can't live forever / loop:
-            //   (1) a successful scroll clears it (below),
-            //   (2) a session switch clears it (`.onChange(of: chatStore
-            //       .activeStoredSessionId)` + `SessionStore.open` switch clear),
-            //   (3) a small attempt cap (`pendingMessageJumpMaxAttempts`) —
-            //       after the cache + network + a late-reconcile hop a target
-            //       that is still absent is genuinely missing (coalesced turn /
-            //       stock gateway / compressed-out row). On the cap, fall back to
-            //       a snippet scroll (S2) then consume.
-            sessionStore.pendingMessageJumpAttempts += 1
-            if sessionStore.pendingMessageJumpAttempts
-                >= SessionStore.pendingMessageJumpMaxAttempts {
-                // S2: exact-id miss fallback — scroll to the search snippet's
-                // first occurrence so the user lands inside the right turn
-                // instead of a silent no-op at the bottom. Reuses the existing
-                // query-text scroll path (no new scroll machinery).
-                let snippet = sessionStore.pendingMessageJumpSnippet
-                sessionStore.pendingMessageJump = nil
-                sessionStore.pendingMessageJumpAttempts = 0
-                sessionStore.pendingMessageJumpSnippet = nil
-                if let snippet, !snippet.isEmpty {
-                    // BUG6 fix: this is a snippet-derived needle (prose slice from
-                    // pendingMessageJumpSnippet), not a literal user query — mark it
-                    // so jumpToSearchMatchIfNeeded collapses whitespace on both sides.
-                    sessionStore.pendingSearchScroll = snippet
-                    sessionStore.pendingSearchScrollIsSnippet = true
-                    jumpToSearchMatchIfNeeded(proxy)
+            // ABH-401: the target may be older than the loaded newest-50 window.
+            // Try one server-side radius window around the wire id before treating
+            // this as a genuine miss; the loading/error chip above makes this
+            // honest instead of a silent no-op.
+            if chatStore.canFetchJumpTarget(messageId: messageId) {
+                Task {
+                    let loaded = await chatStore.loadTranscriptAround(messageId: messageId)
+                    if !loaded {
+                        consumeUnresolvedMessageJump(proxy)
+                    }
                 }
+                return
             }
+            consumeUnresolvedMessageJump(proxy)
             return
         }
 
@@ -1355,10 +1340,14 @@ struct ChatView: View {
         // more to load.
         let total = chatStore.messages.count
         let targetIndex = chatStore.messages.firstIndex(where: { $0.id == target }) ?? 0
-        let distanceFromBottom = total - targetIndex
-        if distanceFromBottom > windowSize {
+        let revealedWindowSize = Self.windowSizeAfterJumpReveal(
+            currentWindowSize: windowSize,
+            messageCount: total,
+            targetIndex: targetIndex
+        )
+        if revealedWindowSize != windowSize {
             withAnimation(nil) {
-                windowSize = min(total, distanceFromBottom + Self.transcriptWindow)
+                windowSize = revealedWindowSize
             }
         }
 
@@ -1373,6 +1362,36 @@ struct ChatView: View {
                 proxy.scrollTo(target, anchor: .center)
             }
         }
+    }
+
+    private func consumeUnresolvedMessageJump(_ proxy: ScrollViewProxy) {
+        guard sessionStore.pendingMessageJump != nil else { return }
+        sessionStore.pendingMessageJumpAttempts += 1
+        if sessionStore.pendingMessageJumpAttempts
+            >= SessionStore.pendingMessageJumpMaxAttempts {
+            let snippet = sessionStore.pendingMessageJumpSnippet
+            sessionStore.pendingMessageJump = nil
+            sessionStore.pendingMessageJumpAttempts = 0
+            sessionStore.pendingMessageJumpSnippet = nil
+            if let snippet, !snippet.isEmpty {
+                sessionStore.pendingSearchScroll = snippet
+                sessionStore.pendingSearchScrollIsSnippet = true
+                jumpToSearchMatchIfNeeded(proxy)
+            }
+        }
+    }
+
+    private func transcriptStatusChip(_ text: String, identifier: String) -> some View {
+        Text(text)
+            .font(.footnote.weight(.medium))
+            .foregroundStyle(theme.mutedFg)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .chromePill(theme, in: Capsule())
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+            .accessibilityLabel(text)
+            .accessibilityIdentifier(identifier)
     }
 
     // MARK: - Load-earlier chip (R39 / Defect 2)
@@ -1398,6 +1417,24 @@ struct ChatView: View {
     ) -> Int {
         guard prependedRowCount > 0 else { return currentWindowSize }
         return currentWindowSize + prependedRowCount
+    }
+
+    /// ABH-401: when a target-centered around-window prepend places the jump row
+    /// above the eager tail slice, grow the render window until that target row is
+    /// constructed. Without this, the fetch can succeed but `scrollTo` has no
+    /// laid-out anchor to resolve (a dead-end scroll). Keep the existing window
+    /// when the target is already visible or the index is invalid.
+    nonisolated static func windowSizeAfterJumpReveal(
+        currentWindowSize: Int,
+        messageCount: Int,
+        targetIndex: Int
+    ) -> Int {
+        guard messageCount > 0, targetIndex >= 0, targetIndex < messageCount else {
+            return currentWindowSize
+        }
+        let distanceFromBottom = messageCount - targetIndex
+        guard distanceFromBottom > currentWindowSize else { return currentWindowSize }
+        return min(messageCount, distanceFromBottom + Self.transcriptWindow)
     }
 
     /// "Load earlier messages" affordance shown above the eager tail window when the

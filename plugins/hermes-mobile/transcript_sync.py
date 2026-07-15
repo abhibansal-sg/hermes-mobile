@@ -82,6 +82,40 @@ def page_messages(
     )
 
 
+def page_messages_around(
+    messages: List[Dict[str, Any]],
+    around: int,
+    radius: int,
+) -> MessagePage:
+    """Return an ascending radius window centered on ``around`` message id.
+
+    ``around`` is a stable DB message id from drawer search / deep link /
+    artifacts. If the target is absent, return an empty page so the client can
+    surface an honest unresolved-target state instead of silently no-oping.
+    """
+    try:
+        target_id = int(around)
+    except (TypeError, ValueError):
+        target_id = 0
+    safe_radius = max(0, min(int(radius or 0), 250))
+    target_index = next(
+        (idx for idx, message in enumerate(messages) if message.get("id") == target_id),
+        None,
+    )
+    if target_index is None:
+        return MessagePage(messages=[], oldest_id=None, has_more_before=False)
+
+    start = max(0, target_index - safe_radius)
+    end = min(len(messages), target_index + safe_radius + 1)
+    page = list(messages[start:end])
+    oldest_id = page[0].get("id") if page else None
+    return MessagePage(
+        messages=page,
+        oldest_id=oldest_id,
+        has_more_before=start > 0,
+    )
+
+
 def decide_delta(
     messages: List[Dict[str, Any]],
     after_id: int,

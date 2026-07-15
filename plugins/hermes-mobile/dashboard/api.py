@@ -1747,6 +1747,60 @@ async def session_messages_delta(
     return result
 
 
+@router.get("/sessions/{session_id}/messages/around")
+async def session_messages_around(
+    session_id: str,
+    request: Request,
+    around: int,
+    radius: int = 25,
+):
+    """Return a radius window centered on a stable wire message id.
+
+    Used by iOS jump/search/artifact navigation when the target is older than the
+    ABH-400 newest-window currently loaded on device. Read-only; auth mirrors the
+    transcript endpoint and device tokens must own the target session.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_owns_session(request, session_id):
+        raise HTTPException(status_code=403, detail="Device token does not own session")
+
+    from hermes_state import SessionDB, DEFAULT_DB_PATH
+
+    if not DEFAULT_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="state.db unavailable")
+
+    db = None
+    try:
+        db = SessionDB(read_only=True)
+        full = db.get_messages(session_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning("session_messages_around read failed for %s: %s", session_id, exc)
+        raise HTTPException(status_code=503, detail="transcript read failed")
+    finally:
+        try:
+            if db is not None and getattr(db, "_conn", None) is not None:
+                db._conn.close()
+        except Exception:
+            pass
+
+    transcript_sync = _plugin_module("transcript_sync")
+    safe_radius = max(0, min(int(radius or 0), 250))
+    page = transcript_sync.page_messages_around(full, around=around, radius=safe_radius)
+    messages = transcript_sync.shape_messages(page.messages, "full")
+    return {
+        "session_id": session_id,
+        "around": around,
+        "radius": safe_radius,
+        "messages": messages,
+        "page": {
+            "oldest_id": page.oldest_id,
+            "has_more_before": page.has_more_before,
+            "contains_target": any(m.get("id") == around for m in messages),
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Artifacts gallery — GET /artifacts
 #
