@@ -233,6 +233,50 @@ final class ProviderKeyRestTests: XCTestCase {
         )
     }
 
+    func testSetProviderKeyDecodesDefinitiveRejectWithPersistedFalse() async throws {
+        let body = Data(#"""
+        {"provider":{"slug":"deepseek","name":"DeepSeek","authenticated":false},"validated":false,"validation_detail":"invalid key","persisted":false}
+        """#.utf8)
+        let client = makeClient(style: .plugin, script: [(body, 200)])
+
+        let result = try await client.setProviderKey(slug: "deepseek", apiKey: "sk-bad")
+
+        XCTAssertEqual(result.validationStatus, .rejected)
+        XCTAssertEqual(result.persisted, false)
+        XCTAssertEqual(result.validationDetail, "invalid key")
+        XCTAssertEqual(
+            ProviderKeySaveDecision(result),
+            .rejected("invalid key The key was not saved; your previous credential is unchanged.")
+        )
+    }
+
+    func testProviderKeyRejectionMessageAppendsNotSavedNoteWhenNotPersisted() {
+        let message = providerKeyRejectionMessage(validationDetail: "invalid key", persisted: false)
+        XCTAssertTrue(message.contains("invalid key"))
+        XCTAssertTrue(message.contains("not saved"))
+    }
+
+    func testProviderKeyRejectionMessagePreservesOriginalWhenPersistedTrueOrNil() {
+        XCTAssertEqual(
+            providerKeyRejectionMessage(validationDetail: "invalid key", persisted: true),
+            "invalid key"
+        )
+        XCTAssertEqual(
+            providerKeyRejectionMessage(validationDetail: "invalid key", persisted: nil),
+            "invalid key"
+        )
+    }
+
+    func testProviderKeyRejectionMessageFallsBackWhenNoValidationDetail() {
+        XCTAssertEqual(
+            providerKeyRejectionMessage(validationDetail: nil, persisted: nil),
+            "Provider rejected this key"
+        )
+        let notPersisted = providerKeyRejectionMessage(validationDetail: nil, persisted: false)
+        XCTAssertTrue(notPersisted.contains("Provider rejected this key"))
+        XCTAssertTrue(notPersisted.contains("not saved"))
+    }
+
     func testRemoveProviderKeyDecodesDisconnectResult() async throws {
         let body = Data(#"{"slug":"deepseek","name":"DeepSeek","disconnected":true}"#.utf8)
         let client = makeClient(style: .plugin, script: [(body, 200)])

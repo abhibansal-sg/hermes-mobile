@@ -189,11 +189,11 @@ enum ProviderKeyValidationStatus: Sendable, Equatable {
     }
 }
 
-/// response. The refreshed provider row is nested under `provider`; validation
-/// result fields are siblings at the response root. A definitive rejection means
-/// the key was persisted but rejected by the upstream provider, so callers
-/// should keep entry UI open and show `validationDetail`. A skipped validation
-/// means the key may be persisted but was not verified.
+/// A definitive rejection means the upstream provider rejected the key. The
+/// `persisted` field distinguishes whether the rejected key was written:
+/// `false` means nothing was saved, while `true` or `nil` preserves the older
+/// persisted-on-reject behavior. A skipped validation means the key may be
+/// persisted but was not verified.
 struct ProviderKeyResult: Sendable, Equatable {
     let row: ProviderRow
     let validationStatus: ProviderKeyValidationStatus

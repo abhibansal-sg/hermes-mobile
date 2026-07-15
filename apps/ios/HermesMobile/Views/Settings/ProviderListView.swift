@@ -22,6 +22,12 @@ import SwiftUI
 // once, then deletes the Keychain copy (the gateway is the source of truth).
 // The key is never logged; `RestError` already truncates response bodies.
 
+func providerKeyRejectionMessage(validationDetail: String?, persisted: Bool?) -> String {
+    let base = validationDetail ?? "Provider rejected this key"
+    guard persisted == false else { return base }
+    return "\(base) The key was not saved; your previous credential is unchanged."
+}
+
 enum ProviderKeySaveDecision: Equatable {
     case confirmed
     case rejected(String)
@@ -32,7 +38,12 @@ enum ProviderKeySaveDecision: Equatable {
         case .verified:
             self = .confirmed
         case .rejected:
-            self = .rejected(result.validationDetail ?? "Provider rejected this key")
+            self = .rejected(
+                providerKeyRejectionMessage(
+                    validationDetail: result.validationDetail,
+                    persisted: result.persisted
+                )
+            )
         case .skipped, .unknown:
             self = .savedUnverified(
                 result.validationDetail

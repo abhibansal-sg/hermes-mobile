@@ -617,12 +617,13 @@ def test_set_key_never_logs_key_value(loopback_client, monkeypatch, caplog):
     assert secret not in caplog.text
 
 
-def test_set_key_rejected_key_reports_validation_false_and_persists(
+def test_set_key_rejected_key_reports_validation_false_and_does_not_persist(
     loopback_client, monkeypatch
 ):
-    """ABH-219: a definitively rejected provider key must not look like a silent
-    success. The key is still persisted so the user can replace/retry, but the
-    response carries validated:false + a recovery reason.
+    """STR-274 (STR-108 child): a definitively rejected provider key must not
+    be saved to .env or mirrored into os.environ. The response reports
+    validated:false + persisted:false, and a prior working credential in
+    os.environ is left intact (no rollback needed since nothing was written).
     """
     api = _api()
     monkeypatch.setattr(
@@ -637,6 +638,7 @@ def test_set_key_rejected_key_reports_validation_false_and_persists(
     )
     _patch_inventory(monkeypatch, rows=[_DEEPSEEK_ROW])
     calls = _patch_config(monkeypatch)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "prior-working-key")
 
     r = loopback_client.post(
         "/api/plugins/hermes-mobile/providers/deepseek/key",
@@ -646,12 +648,52 @@ def test_set_key_rejected_key_reports_validation_false_and_persists(
 
     assert r.status_code == 200, r.text
     body = r.json()
-    assert ("DEEPSEEK_API_KEY", "sk-rejected") in calls["save_env"]
-    assert body["persisted"] is True
+    assert calls["save_env"] == []
+    assert body["persisted"] is False
     assert body["validated"] is False
     assert "rejected" in body["validation_detail"].lower()
+    assert "not saved" in body["validation_detail"].lower()
     assert body["provider"]["authenticated"] is False
     assert "sk-rejected" not in r.text
+    # The prior working credential is untouched — no green-heal, no data loss.
+    assert os.environ.get("DEEPSEEK_API_KEY") == "prior-working-key"
+
+
+def test_set_key_rejected_key_with_no_prior_credential_stays_absent(
+    loopback_client, monkeypatch
+):
+    """STR-274: with no prior credential at all, a rejected submission must
+    leave the env var ABSENT — not present with the bad value — so a
+    follow-up GET /providers reload can't turn green off mere env-var
+    presence (the ABH-219 authenticated-by-presence heuristic)."""
+    api = _api()
+    monkeypatch.setattr(
+        api,
+        "_validate_provider_key",
+        lambda **_kw: {
+            "validated": False,
+            "validation_detail": "provider rejected the API key (403)",
+            "persisted": True,
+        },
+        raising=False,
+    )
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    _patch_inventory(monkeypatch, rows=[_DEEPSEEK_ROW])
+    calls = _patch_config(monkeypatch)
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/deepseek/key",
+        json={"api_key": "sk-bad-first-attempt"},
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert calls["save_env"] == []
+    assert body["persisted"] is False
+    assert body["validated"] is False
+    assert "DEEPSEEK_API_KEY" not in os.environ
+    assert "sk-bad-first-attempt" not in r.text
 
 
 def test_set_key_timeout_reports_validation_skipped_without_500(
@@ -1124,6 +1166,114 @@ def test_custom_managed_env_var_is_4006_and_does_not_overwrite_or_set_config(
     assert calls["save_env"] == []
     assert os.environ.get(expected_env_var) == "admin-pinned-value"
     assert calls["set_config"] == []
+
+
+def test_custom_new_provider_rejected_key_leaves_nothing_behind(
+    loopback_client, monkeypatch
+):
+    """STR-274 (STR-108 child): a brand-new custom provider whose key is
+    definitively rejected must not leave .env, os.environ, or
+    providers.<name>.* config behind."""
+    import hashlib as _hashlib
+
+    api = _api()
+    monkeypatch.setattr(
+        api,
+        "_validate_provider_key",
+        lambda **_kw: {
+            "validated": False,
+            "validation_detail": "provider rejected the API key (401)",
+            "persisted": True,
+        },
+        raising=False,
+    )
+    expected_env_var = "NEWCO_" + _hashlib.sha1(b"newco").hexdigest()[:6] + "_API_KEY"
+    monkeypatch.delenv(expected_env_var, raising=False)
+    _patch_inventory(monkeypatch, rows=[])
+    calls = _patch_config(monkeypatch)
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/custom",
+        json={
+            "name": "newco",
+            "base_url": "https://api.newco.example/v1",
+            "api_mode": "openai",
+            "api_key": "sk-bad-new-custom",
+        },
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["persisted"] is False
+    assert body["validated"] is False
+    assert calls["save_env"] == []
+    assert calls["set_config"] == []
+    assert calls["remove_env"] == []
+    assert calls["save_config"] == []
+    assert expected_env_var not in os.environ
+    assert "sk-bad-new-custom" not in r.text
+    # No providers.newco entry was ever created.
+    assert "newco" not in calls["config_state"].get("providers", {})
+
+
+def test_custom_edit_rejected_key_preserves_previous_config_and_env(
+    loopback_client, monkeypatch
+):
+    """STR-274 (STR-108 child): rotating an EXISTING custom provider with a
+    key that gets definitively rejected must preserve the previous
+    providers.<name> config and previous env-var value untouched — no
+    old-key removal, no credential strip, no upsert of the rejected key."""
+    import hashlib as _hashlib
+
+    api = _api()
+    monkeypatch.setattr(
+        api,
+        "_validate_provider_key",
+        lambda **_kw: {
+            "validated": False,
+            "validation_detail": "provider rejected the API key (401)",
+            "persisted": True,
+        },
+        raising=False,
+    )
+
+    existing_env = "MY_CO_" + _hashlib.sha1(b"my-co").hexdigest()[:6] + "_API_KEY"
+    existing_entry = {
+        "key_env": existing_env,
+        "base_url": "https://api.my-co.example/v1",
+        "api_mode": "openai",
+        "name": "my-co",
+    }
+    calls = _patch_config(
+        monkeypatch, providers_in_config={"my-co": dict(existing_entry)}
+    )
+    _patch_inventory(monkeypatch, rows=[])
+    monkeypatch.setenv(existing_env, "prior-working-custom-key")
+
+    r = loopback_client.post(
+        "/api/plugins/hermes-mobile/providers/custom",
+        json={
+            "name": "my-co",
+            "base_url": "https://api.my-co.new/v1",
+            "api_mode": "anthropic_messages",
+            "api_key": "sk-bad-rotation",
+        },
+        headers=_TOKEN_HEADER,
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["persisted"] is False
+    assert body["validated"] is False
+    assert calls["save_env"] == []
+    assert calls["set_config"] == []
+    assert calls["remove_env"] == []
+    assert calls["save_config"] == []
+    # Prior config entry and prior env value are byte-for-byte untouched.
+    assert calls["config_state"]["providers"]["my-co"] == existing_entry
+    assert os.environ.get(existing_env) == "prior-working-custom-key"
+    assert "sk-bad-rotation" not in r.text
 
 
 # ===========================================================================
