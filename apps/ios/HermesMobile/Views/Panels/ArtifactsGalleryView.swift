@@ -40,6 +40,7 @@ struct ArtifactsGalleryView: View {
     @State private var model = ArtifactsGalleryModel()
     /// The image artifact currently presented in the full-screen zoom viewer.
     @State private var selectedImageArtifact: Artifact?
+    @State private var selectedCachedImage: UIImage?
 
     // MARK: - Body
 
@@ -58,7 +59,7 @@ struct ArtifactsGalleryView: View {
         .fullScreenCover(item: $selectedImageArtifact) { artifact in
             ZoomableImageView(
                 title: artifact.displayName,
-                image: cachedBlobImage(for: artifact),
+                image: selectedCachedImage,
                 remoteURL: artifact.remoteURL,
                 dataURL: artifact.isDataURL ? artifact.urlOrPath : nil,
                 unavailableMessage: "This image artifact is not available on this device. Close the viewer or try again after opening the source session."
@@ -198,16 +199,19 @@ struct ArtifactsGalleryView: View {
     /// preserve the existing behavior: jump back to the source transcript.
     private func openArtifact(_ artifact: Artifact) {
         if artifact.kind == "image" {
-            selectedImageArtifact = artifact
+            Task {
+                selectedCachedImage = await cachedBlobImage(for: artifact)
+                selectedImageArtifact = artifact
+            }
         } else {
             openSourceSession(for: artifact)
         }
     }
 
-    private func cachedBlobImage(for artifact: Artifact) -> UIImage? {
+    private func cachedBlobImage(for artifact: Artifact) async -> UIImage? {
         guard let key = artifact.blobCacheKey(serverId: serverId, profileId: profileId)
         else { return nil }
-        return AttachmentBlobCache.shared.image(for: key)
+        return await AttachmentBlobCache.shared.image(for: key)
     }
 
     // MARK: - Open source session
@@ -476,6 +480,7 @@ private struct ArtifactThumbnail: View {
     let profileId: String
 
     @Environment(\.hermesTheme) private var theme
+    @State private var cachedImage: UIImage?
 
     private let cellSize: CGFloat = 100
     // Dynamic-Type-scaled icon/label sizes so tile text grows with Larger Text
@@ -496,6 +501,9 @@ private struct ArtifactThumbnail: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .stroke(theme.midground.opacity(0.15), lineWidth: 0.5)
         )
+        .task(id: artifact.id) {
+            cachedImage = await cachedBlobImage()
+        }
     }
 
     @ViewBuilder
@@ -510,7 +518,7 @@ private struct ArtifactThumbnail: View {
 
     @ViewBuilder
     private var imageThumbnail: some View {
-        if let cached = cachedBlobImage() {
+        if let cached = cachedImage {
             // Previously-fetched blob — instantaneous, no network.
             Image(uiImage: cached)
                 .resizable()
@@ -570,9 +578,12 @@ private struct ArtifactThumbnail: View {
     /// Look up a previously-cached image blob (e.g. loaded while reading a chat
     /// message). Returns `nil` when no cache key can be formed (no `size`, empty
     /// `serverId`) or when the image is not in memory.
-    private func cachedBlobImage() -> UIImage? {
+    private func cachedBlobImage() async -> UIImage? {
         guard let key = artifact.blobCacheKey(serverId: serverId, profileId: profileId)
         else { return nil }
-        return AttachmentBlobCache.shared.image(for: key)
+        return await AttachmentBlobCache.shared.image(
+            for: key,
+            maxPixelSize: CGSize(width: cellSize * 3, height: cellSize * 3)
+        )
     }
 }
