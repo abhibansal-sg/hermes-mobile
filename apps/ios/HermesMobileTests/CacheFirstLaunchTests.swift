@@ -170,6 +170,63 @@ final class CacheFirstLaunchTests: XCTestCase {
         XCTAssertEqual(connection.serverURLString, "")
     }
 
+    /// STR-249/STR-248 (CUJ-01 regression): a cold launch with NO gateway
+    /// reachable stranded a returning (saved-config) user on the "No
+    /// conversation" placeholder instead of the composer.
+    ///
+    /// Root cause: `configure()` returns at the REST probe with
+    /// `phase = .offline` BEFORE `startHydration()` ever runs — so
+    /// `finishHydration()`'s `enterDraftIfNoActiveSession()` never fires.
+    /// `hasConnected` also stays false in this path, so `startReconnectLoop()`
+    /// (the other call site) never starts either. `hasSavedConfiguration`
+    /// still earns the shell (RootView), but with no session active and no
+    /// draft entered, `chatStack` falls to the placeholder.
+    func testBootstrapOfflineEntersDraftWhenNoActiveSession() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+
+        let savedURL = "http://127.0.0.1:1"  // nothing listens: probe fails fast
+        UserDefaults.standard.set(savedURL, forKey: DefaultsKeys.serverURL)
+        try? KeychainService.saveToken("stored-device-token", server: savedURL)
+        defer { KeychainService.deleteToken(server: savedURL) }
+        connection._skipEnvironmentBootstrapForTesting = true
+
+        XCTAssertNil(sessions.activeStoredId)
+        XCTAssertFalse(sessions.isDraft)
+
+        await connection.bootstrap()
+
+        guard case .offline = connection.phase else {
+            return XCTFail("an unreachable saved gateway must leave phase .offline, got \(connection.phase)")
+        }
+        XCTAssertFalse(connection.isBootstrapping)
+        XCTAssertTrue(sessions.isDraft,
+                      "an offline cold launch for a returning user must land on the draft composer, not the empty-state placeholder")
+    }
+
+    /// The other half of the same fix: an offline bootstrap must NOT clobber a
+    /// session that was already made active before bootstrap ran (defensive —
+    /// mirrors the reconnect-loop non-clobber guarantee).
+    func testBootstrapOfflineDoesNotClobberActiveSession() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+
+        let savedURL = "http://127.0.0.1:1"
+        UserDefaults.standard.set(savedURL, forKey: DefaultsKeys.serverURL)
+        try? KeychainService.saveToken("stored-device-token", server: savedURL)
+        defer { KeychainService.deleteToken(server: savedURL) }
+        connection._skipEnvironmentBootstrapForTesting = true
+        sessions.activeStoredId = "already-active-session"
+
+        await connection.bootstrap()
+
+        XCTAssertEqual(sessions.activeStoredId, "already-active-session",
+                       "an already-active session must survive an offline-bootstrap draft-entry call")
+        XCTAssertFalse(sessions.isDraft)
+    }
+
     // MARK: - Prefetch (happy path + cancellation + skip-fresh)
 
     func testPrefetchWarmsUncachedRecentSessions() async throws {

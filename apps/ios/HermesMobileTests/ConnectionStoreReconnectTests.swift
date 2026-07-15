@@ -356,6 +356,50 @@ final class ConnectionStoreReconnectTests: XCTestCase {
                       "hasConnected must remain true after a gateway restart recovery")
     }
 
+    /// STR-249/STR-248: a transport drop that interrupts the initial hydration
+    /// race sends `phase` to `.reconnecting` before the race resolves, which
+    /// makes `finishHydration()`'s `phase == .hydrating` guard a no-op. Without
+    /// the reconnect-success draft-entry call, a cold launch that blips once
+    /// during connect strands the user on the "No conversation" placeholder
+    /// (activeStoredId == nil, isDraft == false) instead of the composer.
+    func testReconnectSuccessEntersDraftWhenNoActiveSession() async {
+        let (connection, sessions, _) = makeStore()
+
+        connection.connectRPC = { _, _, _ in }
+        XCTAssertNil(sessions.activeStoredId)
+        XCTAssertFalse(sessions.isDraft)
+
+        connection._seedAndStartReconnect(
+            serverURL: "http://localhost:9123",
+            token: "test-stable-token"
+        )
+        await connection.waitForReconnectForTesting()
+
+        XCTAssertEqual(connection.phase, .connected)
+        XCTAssertTrue(sessions.isDraft,
+                      "reconnect success with no active session must land on a draft chat, not the empty-state placeholder")
+    }
+
+    /// The other half of the same fix: a reconnect that resumes a REAL active
+    /// session must NOT be stomped by the shared draft-entry call.
+    func testReconnectSuccessDoesNotClobberActiveSession() async {
+        let (connection, sessions, _) = makeStore()
+
+        connection.connectRPC = { _, _, _ in }
+        sessions.activeStoredId = "already-active-session"
+
+        connection._seedAndStartReconnect(
+            serverURL: "http://localhost:9123",
+            token: "test-stable-token"
+        )
+        await connection.waitForReconnectForTesting()
+
+        XCTAssertEqual(connection.phase, .connected)
+        XCTAssertEqual(sessions.activeStoredId, "already-active-session",
+                       "an already-active session must survive a reconnect-success draft-entry call")
+        XCTAssertFalse(sessions.isDraft)
+    }
+
     /// A transient failure on attempt 0 followed by success on attempt 1
     /// (fail-once-then-succeed): the loop retries and still reaches `.connected`.
     ///
