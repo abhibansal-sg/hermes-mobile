@@ -72,10 +72,15 @@ final class MarkdownImageEvidenceUITests: XCTestCase {
             markdownImage.waitForExistence(timeout: 30),
             "Inline markdownImage (inline pixel) did not render in the seeded assistant prose"
         )
-        // Nudge the interruption monitor in case a stray system alert is up.
-        app.tap()
-        XCTAssertTrue(markdownImage.waitForExistence(timeout: 5),
-                      "markdownImage vanished after clearing any system alert")
+        // No blind "nudge" tap here (STR-1399 recurrence, root-caused via the
+        // failure's captured accessibility hierarchy): `XCUIApplication.tap()` hits
+        // the CENTER of the app window, which coincides with this exact button's
+        // frame (it fills most of the compact-width layout), so it silently opened
+        // the ZoomableImageView lightbox early — leaving the explicit tap below to
+        // fail "not hittable" against the now-covered element underneath. The
+        // interruption monitor above already fires on the next real interaction
+        // (the tap below), per its own doc comment, so a separate nudge tap is both
+        // unnecessary and actively unsafe here.
 
         // 2. Tap the inline image → the ZoomableImageView lightbox presents.
         markdownImage.tap()
