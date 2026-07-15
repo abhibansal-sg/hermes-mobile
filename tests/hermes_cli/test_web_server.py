@@ -3917,6 +3917,119 @@ class TestNewEndpoints:
         resp = self.client.get("/api/cron/jobs/nonexistent-id")
         assert resp.status_code == 404
 
+    def test_cron_job_outputs_return_latest_file_backed_markdown(self):
+        from hermes_cli import web_server
+
+        job = web_server._call_cron_for_profile(
+            "default",
+            "create_job",
+            None,
+            "every 1h",
+            name="script-only-report",
+            deliver="local",
+            script="report.py",
+            no_agent=True,
+        )
+        output_path = web_server._call_cron_for_profile(
+            "default",
+            "save_job_output",
+            job["id"],
+            "# Script output\n\nEverything ok.",
+        )
+
+        resp = self.client.get(
+            "/api/cron/jobs/script-only-report/outputs",
+            params={"profile": "default"},
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["job_id"] == job["id"]
+        assert data["profile"] == "default"
+        assert data["outputs"][0]["id"] == output_path.name
+        assert data["outputs"][0]["filename"] == output_path.name
+        assert data["outputs"][0]["preview"].startswith("# Script output")
+        assert data["latest"]["id"] == output_path.name
+        assert data["latest"]["body"] == "# Script output\n\nEverything ok."
+
+    def test_cron_job_output_detail_returns_markdown_body(self):
+        from hermes_cli import web_server
+
+        job = web_server._call_cron_for_profile(
+            "default",
+            "create_job",
+            None,
+            "every 1h",
+            name="detail-report",
+            deliver="local",
+            script="report.py",
+            no_agent=True,
+        )
+        output_path = web_server._call_cron_for_profile(
+            "default",
+            "save_job_output",
+            job["id"],
+            "plain stdout\n",
+        )
+
+        resp = self.client.get(
+            f"/api/cron/jobs/{job['id']}/outputs/{output_path.name}",
+            params={"profile": "default"},
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["job_id"] == job["id"]
+        assert data["id"] == output_path.name
+        assert data["body"] == "plain stdout\n"
+
+    def test_cron_job_output_unknown_id_returns_404(self):
+        from hermes_cli import web_server
+
+        job = web_server._call_cron_for_profile(
+            "default",
+            "create_job",
+            None,
+            "every 1h",
+            name="missing-output-report",
+            deliver="local",
+            script="report.py",
+            no_agent=True,
+        )
+
+        resp = self.client.get(
+            f"/api/cron/jobs/{job['id']}/outputs/2099-01-01_00-00-00.md",
+            params={"profile": "default"},
+        )
+
+        assert resp.status_code == 404
+
+    def test_cron_job_output_rejects_weird_output_id(self, tmp_path):
+        from hermes_constants import get_hermes_home
+        from hermes_cli import web_server
+
+        job = web_server._call_cron_for_profile(
+            "default",
+            "create_job",
+            None,
+            "every 1h",
+            name="sandbox-report",
+            deliver="local",
+            script="report.py",
+            no_agent=True,
+        )
+        outside = get_hermes_home() / "cron" / "output" / "secret.md"
+        outside.parent.mkdir(parents=True, exist_ok=True)
+        outside.write_text("do not leak", encoding="utf-8")
+
+        resp = self.client.get(
+            f"/api/cron/jobs/{job['id']}/outputs/secret.md",
+            params={"profile": "default"},
+        )
+
+        assert resp.status_code == 400
+        assert "do not leak" not in resp.text
+
     # --- Automation Blueprints ---
 
     def test_cron_blueprints_list(self):

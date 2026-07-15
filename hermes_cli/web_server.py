@@ -10219,6 +10219,16 @@ def _find_cron_job_profile(job_id: str) -> Optional[str]:
     return None
 
 
+def _resolve_cron_job_for_profile(profile: str, job_id: str) -> Optional[Dict[str, Any]]:
+    job = _call_cron_for_profile(profile, "get_job", job_id)
+    if job:
+        return job
+    for candidate in _call_cron_for_profile(profile, "list_jobs", True):
+        if candidate.get("id") == job_id or candidate.get("name") == job_id:
+            return candidate
+    return None
+
+
 def _list_cron_jobs_sync(profile: str = "all"):
     requested = (profile or "all").strip()
     if requested.lower() != "all":
@@ -10255,7 +10265,7 @@ def _get_cron_job_sync(job_id: str, profile: Optional[str] = None):
     selected = profile or _find_cron_job_profile(job_id)
     if not selected:
         raise HTTPException(status_code=404, detail="Job not found")
-    job = _call_cron_for_profile(selected, "get_job", job_id)
+    job = _resolve_cron_job_for_profile(selected, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -10285,7 +10295,7 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
     # job_id may be a human name; resolve to the canonical id used in run-session ids.
     canonical = job_id
     if selected:
-        job = _call_cron_for_profile(selected, "get_job", job_id)
+        job = _resolve_cron_job_for_profile(selected, job_id)
         if job and job.get("id"):
             canonical = str(job["id"])
 
@@ -10314,6 +10324,116 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
 @app.get("/api/cron/jobs/{job_id}/runs")
 async def list_cron_job_runs(job_id: str, profile: Optional[str] = None, limit: int = 20):
     return await _run_cron_dashboard_io(_list_cron_job_runs_sync, job_id, profile, limit)
+
+
+def _list_cron_job_outputs_sync(
+    job_id: str,
+    profile: Optional[str] = None,
+    limit: int = 20,
+    include_latest_body: bool = True,
+):
+    """File-backed markdown output documents for a cron job, newest first.
+
+    This complements ``/runs`` for ``no_agent`` script-only jobs: those runs
+    intentionally do not construct ``SessionDB``, but ``cron.scheduler`` still
+    persists their local delivery output via ``cron.jobs.save_job_output``.
+    """
+    selected = profile or _find_cron_job_profile(job_id)
+    if not selected:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = _resolve_cron_job_for_profile(selected, job_id)
+    if not job or not job.get("id"):
+        raise HTTPException(status_code=404, detail="Job not found")
+    canonical = str(job["id"])
+
+    try:
+        limit_n = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        limit_n = 20
+
+    try:
+        outputs = _call_cron_for_profile(selected, "list_job_outputs", canonical, limit_n)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    latest = None
+    if include_latest_body and outputs:
+        try:
+            latest = _call_cron_for_profile(
+                selected,
+                "read_job_output",
+                canonical,
+                outputs[0]["id"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "job_id": canonical,
+        "profile": selected,
+        "outputs": outputs,
+        "latest": latest,
+        "limit": limit_n,
+    }
+
+
+@app.get("/api/cron/jobs/{job_id}/outputs")
+async def list_cron_job_outputs(
+    job_id: str,
+    profile: Optional[str] = None,
+    limit: int = 20,
+    include_latest_body: bool = True,
+):
+    return await _run_cron_dashboard_io(
+        _list_cron_job_outputs_sync,
+        job_id,
+        profile,
+        limit,
+        include_latest_body,
+    )
+
+
+def _get_cron_job_output_sync(
+    job_id: str,
+    output_id: str,
+    profile: Optional[str] = None,
+):
+    """Return one file-backed cron output markdown document."""
+    selected = profile or _find_cron_job_profile(job_id)
+    if not selected:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = _resolve_cron_job_for_profile(selected, job_id)
+    if not job or not job.get("id"):
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    try:
+        output = _call_cron_for_profile(
+            selected,
+            "read_job_output",
+            str(job["id"]),
+            output_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not output:
+        raise HTTPException(status_code=404, detail="Cron output not found")
+    output["job_id"] = str(job["id"])
+    output["profile"] = selected
+    return output
+
+
+@app.get("/api/cron/jobs/{job_id}/outputs/{output_id}")
+async def get_cron_job_output(
+    job_id: str,
+    output_id: str,
+    profile: Optional[str] = None,
+):
+    return await _run_cron_dashboard_io(
+        _get_cron_job_output_sync,
+        job_id,
+        output_id,
+        profile,
+    )
 
 
 def _create_cron_job_sync(body: CronJobCreate, profile: str = "default"):

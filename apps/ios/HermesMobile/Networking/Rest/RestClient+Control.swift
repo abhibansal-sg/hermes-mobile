@@ -461,6 +461,68 @@ struct CronJob: Identifiable, Sendable, Equatable {
     var isPaused: Bool { state == "paused" || !enabled }
 }
 
+/// Metadata for one saved file-backed cron output.
+struct CronJobOutputMetadata: Identifiable, Sendable, Equatable {
+    let id: String
+    let filename: String?
+    let runAt: String?
+    let createdAt: String?
+    let size: Int?
+    let preview: String?
+
+    init(json: JSONValue) {
+        self.id = json["id"]?.coercedStringValue ?? json["filename"]?.stringValue ?? UUID().uuidString
+        self.filename = json["filename"]?.stringValue
+        self.runAt = json["run_at"]?.stringValue
+        self.createdAt = json["created_at"]?.stringValue
+        self.size = json["size"]?.intValue
+        self.preview = json["preview"]?.stringValue
+    }
+}
+
+/// Full body for one saved file-backed cron output.
+struct CronJobOutput: Identifiable, Sendable, Equatable {
+    let id: String
+    let filename: String?
+    let runAt: String?
+    let createdAt: String?
+    let size: Int?
+    let preview: String?
+    let body: String
+
+    init(json: JSONValue) {
+        let metadata = CronJobOutputMetadata(json: json)
+        self.id = metadata.id
+        self.filename = metadata.filename
+        self.runAt = metadata.runAt
+        self.createdAt = metadata.createdAt
+        self.size = metadata.size
+        self.preview = metadata.preview
+        self.body = json["body"]?.stringValue ?? ""
+    }
+}
+
+/// `GET /api/cron/jobs/{job_id}/outputs` response.
+struct CronJobOutputsResponse: Sendable, Equatable {
+    let jobId: String
+    let profile: String?
+    let outputs: [CronJobOutputMetadata]
+    let latest: CronJobOutput?
+    let limit: Int?
+
+    init(json: JSONValue) {
+        self.jobId = json["job_id"]?.coercedStringValue ?? ""
+        self.profile = json["profile"]?.stringValue
+        self.outputs = json["outputs"]?.arrayValue?.map(CronJobOutputMetadata.init(json:)) ?? []
+        if let latestJSON = json["latest"], !latestJSON.isNull {
+            self.latest = CronJobOutput(json: latestJSON)
+        } else {
+            self.latest = nil
+        }
+        self.limit = json["limit"]?.intValue
+    }
+}
+
 /// One target from `GET /api/cron/delivery-targets` → `targets[]`.
 /// Includes connected cron-capable gateway platforms plus the implicit local
 /// save-only target. `homeTargetSet == false` means the platform is configured
@@ -646,6 +708,41 @@ extension RestClient {
     func cronDeliveryTargets() async throws -> [CronDeliveryTarget] {
         let json = try await getJSON(path: "/api/cron/delivery-targets")
         return (json["targets"]?.arrayValue ?? []).map(CronDeliveryTarget.init(json:))
+    }
+
+    /// `GET /api/cron/jobs/{job_id}/outputs` — saved file-backed outputs for a
+    /// local no-agent cron job. `include_latest_body` lets the Scheduled Jobs
+    /// panel show the newest markdown output without a second request.
+    func cronJobOutputs(
+        jobId: String,
+        profile: String? = nil,
+        limit: Int = 20,
+        includeLatestBody: Bool = true
+    ) async throws -> CronJobOutputsResponse {
+        let encoded = jobId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? jobId
+        var query = [
+            "limit=\(max(1, min(limit, 100)))",
+            "include_latest_body=\(includeLatestBody ? "true" : "false")",
+        ]
+        if let profile, !profile.isEmpty {
+            let encodedProfile = profile.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? profile
+            query.insert("profile=\(encodedProfile)", at: 0)
+        }
+        let path = "/api/cron/jobs/\(encoded)/outputs?\(query.joined(separator: "&"))"
+        return CronJobOutputsResponse(json: try await getJSON(path: path))
+    }
+
+    /// `GET /api/cron/jobs/{job_id}/outputs/{output_id}` — full body for a
+    /// specific saved output row.
+    func cronJobOutput(jobId: String, outputId: String, profile: String? = nil) async throws -> CronJobOutput {
+        let encodedJob = jobId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? jobId
+        let encodedOutput = outputId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? outputId
+        var path = "/api/cron/jobs/\(encodedJob)/outputs/\(encodedOutput)"
+        if let profile, !profile.isEmpty {
+            let encodedProfile = profile.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? profile
+            path += "?profile=\(encodedProfile)"
+        }
+        return CronJobOutput(json: try await getJSON(path: path))
     }
 
     /// `POST /api/cron/jobs/{id}/trigger` — run now; returns the updated job.

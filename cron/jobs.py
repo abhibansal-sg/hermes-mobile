@@ -2022,6 +2022,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
 # accumulated one file per run forever and could fill the disk (#52383). Keep the
 # most recent N files per job; a non-positive value disables pruning (opt-out).
 _CRON_OUTPUT_DEFAULT_KEEP = 50
+_CRON_OUTPUT_FILENAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.md$")
 
 
 def _cron_output_keep() -> int:
@@ -2062,6 +2063,96 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
         except OSError as exc:
             logger.debug("Failed to prune cron output %s: %s", stale.name, exc)
     return deleted
+
+
+def _validate_job_output_id(output_id: str) -> str:
+    """Return a safe cron-output filename or raise ValueError.
+
+    Cron output files are implementation-owned timestamped markdown files.
+    Accepting arbitrary basenames would turn the detail reader into a generic
+    file reader inside the job output directory, so fail closed unless the id
+    matches files produced by ``save_job_output``.
+    """
+    text = str(output_id or "").strip()
+    if (
+        not text
+        or text in {".", ".."}
+        or "/" in text
+        or "\\" in text
+        or Path(text).name != text
+        or Path(text).is_absolute()
+        or Path(text).drive
+        or not _CRON_OUTPUT_FILENAME_RE.fullmatch(text)
+    ):
+        raise ValueError(f"Invalid cron output id: {output_id!r}")
+    return text
+
+
+def _job_output_file(job_id: str, output_id: str) -> Path:
+    job_output_dir = _job_output_dir(job_id).resolve()
+    filename = _validate_job_output_id(output_id)
+    candidate = (job_output_dir / filename).resolve()
+    try:
+        candidate.relative_to(job_output_dir)
+    except ValueError as exc:
+        raise ValueError(f"Invalid cron output id: {output_id!r}") from exc
+    return candidate
+
+
+def _job_output_metadata(path: Path, preview_chars: int = 240) -> Dict[str, Any]:
+    stat_result = path.stat()
+    run_at = None
+    try:
+        run_at = datetime.strptime(path.stem, "%Y-%m-%d_%H-%M-%S").isoformat()
+    except ValueError:
+        pass
+    preview = ""
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            preview = f.read(max(0, preview_chars))
+    except OSError:
+        preview = ""
+    return {
+        "id": path.name,
+        "filename": path.name,
+        "run_at": run_at,
+        "created_at": datetime.fromtimestamp(stat_result.st_mtime).isoformat(),
+        "size": stat_result.st_size,
+        "preview": preview,
+    }
+
+
+def list_job_outputs(job_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """List timestamped output documents for a cron job, newest first."""
+    try:
+        limit_n = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        limit_n = 20
+
+    job_output_dir = _job_output_dir(job_id)
+    try:
+        files = sorted(
+            (
+                f
+                for f in job_output_dir.glob("*.md")
+                if f.is_file() and _CRON_OUTPUT_FILENAME_RE.fullmatch(f.name)
+            ),
+            key=lambda f: f.name,
+            reverse=True,
+        )
+    except OSError:
+        return []
+    return [_job_output_metadata(path) for path in files[:limit_n]]
+
+
+def read_job_output(job_id: str, output_id: str) -> Optional[Dict[str, Any]]:
+    """Read one timestamped cron output document for a job."""
+    output_file = _job_output_file(job_id, output_id)
+    if not output_file.exists() or not output_file.is_file():
+        return None
+    data = _job_output_metadata(output_file)
+    data["body"] = output_file.read_text(encoding="utf-8")
+    return data
 
 
 def save_job_output(job_id: str, output: str):
