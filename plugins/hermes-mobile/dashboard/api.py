@@ -1374,6 +1374,10 @@ async def register_push_token(body: PushRegisterBody, request: Request) -> Dict[
         body.token, platform=body.platform, env=body.env, events=body.events
     ):
         raise HTTPException(status_code=400, detail="Invalid device token")
+    try:
+        _plugin_module("manifest_invalidation").invalidate("all", "push_registry")
+    except Exception:
+        _log.warning("push registration invalidation failed", exc_info=True)
     _register_relay_device_if_configured(body, engine)
     return {"ok": True}
 
@@ -1406,6 +1410,11 @@ async def unregister_push_token(body: PushUnregisterBody, request: Request) -> D
         raise HTTPException(status_code=401, detail="Unauthorized")
     engine = _plugin_module("push_engine")
     removed = engine.unregister_token(body.token)
+    if removed:
+        try:
+            _plugin_module("manifest_invalidation").invalidate("all", "push_registry")
+        except Exception:
+            _log.warning("push registration invalidation failed", exc_info=True)
     _unregister_relay_device_if_configured(body)
     return {"ok": True, "removed": removed}
 
