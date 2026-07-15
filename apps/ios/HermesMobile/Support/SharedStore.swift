@@ -91,6 +91,11 @@ enum SharedStore {
         return try? JSONDecoder().decode(WidgetSnapshot.self, from: data)
     }
 
+    static func clearSnapshot() {
+        defaults?.removeObject(forKey: snapshotKey)
+        if let url = snapshotURL { try? FileManager.default.removeItem(at: url) }
+    }
+
     // MARK: - Share-sheet inbox
 
     /// One item queued by the share extension for the app to drain.
