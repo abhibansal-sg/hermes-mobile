@@ -1171,7 +1171,7 @@ struct GeneratedImageToolCard: View {
             path: result.reference,
             contentVersion: version
         )
-        AttachmentBlobCache.shared.store(data, for: key)
+        Task { await AttachmentBlobCache.shared.store(data, for: key) }
     }
 
     private static func decodeDataURL(_ dataURL: String) -> (image: UIImage, data: Data)? {
@@ -1179,7 +1179,7 @@ struct GeneratedImageToolCard: View {
         // so this card, the prose markdown image path, and the ZoomableImageView
         // lightbox all share one data-URL contract instead of three divergent
         // base64 decoders.
-        AttachmentBlobCache.decodeDataURL(dataURL).map { ($0.image, $0.data) }
+        AttachmentBlobCache.decodeDataURLSynchronously(dataURL).map { ($0.image, $0.data) }
     }
 
     private enum LocalImagePhase {

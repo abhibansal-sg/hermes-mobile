@@ -288,7 +288,7 @@ struct ZoomableImageView: View {
         // STR-574: delegate to the shared `AttachmentBlobCache.decodeDataURL`
         // so the prose image path, this lightbox, and the generated-image tool
         // card all share one data-URL contract.
-        AttachmentBlobCache.decodeDataURL(value)?.image
+        AttachmentBlobCache.decodeDataURLSynchronously(value)?.image
     }
 }
 

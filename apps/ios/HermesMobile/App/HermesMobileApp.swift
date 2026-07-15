@@ -97,6 +97,7 @@ struct HermesMobileApp: App {
                 }
                 .animation(.spring(response: 0.3, dampingFraction: 0.85), value: sharedInboxToast)
                 .task {
+                    Task { await AttachmentBlobCache.shared.performMaintenance() }
                     #if DEBUG
                     // DEBUG-only main-thread hitch logger (HERMES_PERF_LOG=1). Cheap,
                     // allocation-free in steady state; durable measurement tooling.
@@ -198,6 +199,9 @@ struct HermesMobileApp: App {
                     // UX1: start/stop the 30-second foreground heartbeat so the
                     // session list refreshes without user interaction in the foreground.
                     environment.sessionStore.handleScenePhaseActive(newPhase == .active)
+                    if newPhase == .active {
+                        Task { await AttachmentBlobCache.shared.respondToLowAvailableCapacity() }
+                    }
                     // On foreground: apply parked App Intents, surface/drain the
                     // share inbox, and refresh the widgets' usage figures.
                     if newPhase == .active {
@@ -225,6 +229,11 @@ struct HermesMobileApp: App {
                     if case .connected = newPhase {
                         Task { await environment.inboxStore.refresh() }
                     }
+                }
+                .onReceive(NotificationCenter.default.publisher(
+                    for: UIApplication.didReceiveMemoryWarningNotification
+                )) { _ in
+                    Task { await AttachmentBlobCache.shared.handleMemoryWarning() }
                 }
                 .onOpenURL { url in
                     HermesURLRouter.route(
