@@ -264,7 +264,14 @@ final class InboxStore {
         do {
             _ = try await client.requestRaw("clarify.respond", params: .object(params))
         } catch {
-            rearm(item)
+            // STR-291: RPC 4009 "no pending clarify request" means the prompt
+            // was already resolved elsewhere (push-notification text-reply
+            // REST path, another client, or a duplicate answer). Re-arming
+            // would resurrect a phantom pending card that can never succeed.
+            // Only rearm on genuine transport / transient failures.
+            if !isAlreadyResolvedError(error) {
+                rearm(item)
+            }
         }
     }
 
@@ -293,5 +300,18 @@ final class InboxStore {
         var restored = item
         restored.state = .pending
         insert(restored)
+    }
+
+    /// Whether a respond error means the prompt was already resolved elsewhere
+    /// (STR-291). The gateway's shared `_respond` helper returns RPC 4009
+    /// "no pending <key> request" when the request id is already consumed —
+    /// for `clarify.respond` that means the answer landed via another path
+    /// (push-notification text-reply, another client, or a duplicate). Code
+    /// 4009 is also used for "session busy", so the message must match too.
+    func isAlreadyResolvedError(_ error: Error) -> Bool {
+        guard case .rpc(let code, let message) = error as? GatewayError,
+              code == 4009,
+              message.contains("no pending") else { return false }
+        return true
     }
 }
