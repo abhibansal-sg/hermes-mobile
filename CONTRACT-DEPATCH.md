@@ -95,7 +95,9 @@ S10 web_server REST live-delete guard (~34) + embedded-chat guard reorder (~12).
 S11 prompt receipt provider registry + pre-mutation `prompt.submit` call sites.
    PR: "gateway: pluggable prompt idempotency receipts". Core contains no
    mobile database path, schema, or retention policy; those live entirely in
-   `plugins/hermes-mobile/prompt_receipts.py`.
+   `plugins/hermes-mobile/prompt_receipts.py`. ID-enabled responses expose the
+   generic acceptance proof (`accepted`, `client_message_id`, `deduplicated`);
+   legacy requests without an id retain their stock response shape.
 S12 session.status structured runtime truth (~30 lines, server.py). Preserve the
    existing `output` while exposing the session record's boolean `running` and
    nullable agent metadata/usage. PR: "fix(gateway): return structured session

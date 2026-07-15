@@ -226,8 +226,12 @@ targets:
       - HermesMobileTests/WorkRepositoryLeaseTests.swift
       - HermesMobileTests/WorkRepositoryMigrationTests.swift
       - HermesMobileTests/WorkRepositoryTestSupport.swift
+      - HermesMobileTests/OutboxProcessorTests.swift
+      - HermesMobileTests/OutboxCrashBoundaryTests.swift
       - HermesMobile/Support/SharedStore.swift
       - HermesMobile/Work
+      - HermesMobile/Models/JSONValue.swift
+      - HermesMobile/Stores/OutboxProcessor.swift
     dependencies:
       - package: GRDB
         product: GRDB
@@ -235,6 +239,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.work.mac-tests
         GENERATE_INFOPLIST_FILE: true
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: OUTBOX_STANDALONE_TESTS
   HermesShareTests:
     type: bundle.unit-test
     platform: iOS

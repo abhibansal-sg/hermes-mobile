@@ -1410,7 +1410,11 @@ def _begin_prompt_receipt(rid: Any, params: dict) -> tuple[dict | None, dict | N
             "truncate_before_user_ordinal": truncate,
         }, None
     if state == "replay" and isinstance(outcome.get("disposition"), dict):
-        return None, _ok(rid, dict(outcome["disposition"]))
+        disposition = dict(outcome["disposition"])
+        disposition["accepted"] = True
+        disposition["client_message_id"] = canonical_id
+        disposition["deduplicated"] = True
+        return None, _ok(rid, disposition)
     if state == "conflict":
         return None, _err(
             rid, 4091, "client_message_id was already used for a different prompt"
@@ -1418,7 +1422,12 @@ def _begin_prompt_receipt(rid: Any, params: dict) -> tuple[dict | None, dict | N
     if state in {"in_progress", "indeterminate"}:
         return None, _ok(
             rid,
-            {"status": state, "client_message_id": canonical_id},
+            {
+                "status": state,
+                "accepted": False,
+                "client_message_id": canonical_id,
+                "deduplicated": False,
+            },
         )
     logger.warning("prompt receipt provider returned invalid outcome: %r", outcome)
     return None, _err(rid, 5037, "prompt receipt store unavailable")
@@ -1445,7 +1454,9 @@ def _complete_prompt_receipt(
         _release_prompt_receipt(receipt)
         return response
     disposition = dict(result)
+    disposition["accepted"] = True
     disposition["client_message_id"] = receipt["client_message_id"]
+    disposition["deduplicated"] = False
     try:
         receipt["provider"].complete(receipt["reservation"], disposition)
     except Exception as exc:
