@@ -98,6 +98,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var confirmingDisconnect = false
+    @State private var appLockGuidance: String?
     /// The sheet-internal navigation path. Pushes are driven by the system
     /// `NavigationLink(value:)` cells (Appearance, the control panels, About) and
     /// matched by `navigationDestination(for:)` — the native list-cell push.
@@ -527,7 +528,12 @@ struct SettingsView: View {
             // Security — App Lock Toggle with dynamic biometric label.
             Toggle(isOn: Binding(
                 get: { appLock.isEnabled },
-                set: { appLock.setEnabled($0) }
+                set: { enabled in
+                    Task {
+                        let changed = await appLock.setEnabled(enabled)
+                        appLockGuidance = changed ? nil : appLock.lastError
+                    }
+                }
             )) {
                 SettingsRowLabel(
                     icon: biometricSystemImage,
@@ -536,6 +542,13 @@ struct SettingsView: View {
             }
             .listRowBackground(theme.card)
             .accessibilityIdentifier("settingsAppLockToggle")
+
+            if let appLockGuidance {
+                Text(appLockGuidance)
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+                    .accessibilityIdentifier("settingsAppLockGuidance")
+            }
 
             // Secrets biometric gate — separate toggle from app-lock.
             Toggle(isOn: Binding(

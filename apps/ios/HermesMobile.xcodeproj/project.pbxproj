@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AB4510010000000000000001 /* AppLockTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB4510020000000000000001 /* AppLockTests.swift */; };
+		AB4510030000000000000001 /* SettingsViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB4510040000000000000001 /* SettingsViewTests.swift */; };
 		008861246FF59FC970E36245 /* VoiceConversationControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2F4CBCA9ADD167081BFA1AA /* VoiceConversationControllerTests.swift */; };
 		01ABF4D113BBDB4254B29BBA /* SubagentTreeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C8CBD8C7BDCFA9E6CB4D58 /* SubagentTreeView.swift */; };
 		02E81092BA6930AED0C99CB5 /* VoiceRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C028EAA9312823746769CE4 /* VoiceRecorder.swift */; };
@@ -327,6 +329,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AB4510020000000000000001 /* AppLockTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLockTests.swift; sourceTree = "<group>"; };
+		AB4510040000000000000001 /* SettingsViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewTests.swift; sourceTree = "<group>"; };
 		0072D507329D59E558597E06 /* AppearanceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceView.swift; sourceTree = "<group>"; };
 		054A2025ABF2E863DC174E33 /* WebhooksPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebhooksPanelView.swift; sourceTree = "<group>"; };
 		01BBD60417A4D85EDC321617 /* GreetingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GreetingTests.swift; sourceTree = "<group>"; };
@@ -934,6 +938,8 @@
 		DCAF922B1A9CC02164A1596F /* HermesMobileTests */ = {
 			isa = PBXGroup;
 			children = (
+				AB4510020000000000000001 /* AppLockTests.swift */,
+				AB4510040000000000000001 /* SettingsViewTests.swift */,
 				2A61DAF847A1110C50477FEF /* ArtifactsGalleryTests.swift */,
 				FC9C27DE26B8F86D42C41ADC /* AutoUpgradeGuardLatchTests.swift */,
 				48DF3123FEA22B7F3DA2A38C /* BatchGTests.swift */,
@@ -1333,6 +1339,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AB4510010000000000000001 /* AppLockTests.swift in Sources */,
+				AB4510030000000000000001 /* SettingsViewTests.swift in Sources */,
 				E29895C03CA0863AAE17CC4F /* ArtifactsGalleryTests.swift in Sources */,
 				7D721541C7EA25D790505B9C /* AutoUpgradeGuardLatchTests.swift in Sources */,
 				2ECBBD89549D0E2916F1DBF2 /* BatchGTests.swift in Sources */,
