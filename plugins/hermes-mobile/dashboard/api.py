@@ -1198,6 +1198,8 @@ async def pair_relay_device(request: Request) -> Any:
 
     try:
         relay_url_value, agent_id, pairing_secret = await relay.relay_client().relay_pairing()
+    except relay.NeedsAttestation as exc:
+        return JSONResponse(status_code=428, content={"error": str(exc), "code": 4002})
     except relay.RelayConfigurationError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc), "code": 4001})
 
