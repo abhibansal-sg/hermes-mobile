@@ -756,6 +756,13 @@ struct SubagentNode: Sendable, Equatable, Identifiable {
 
     /// Stable identity used both as the dictionary key and the SwiftUI id.
     let id: String
+    /// The runtime `session_id` that owns this branch — the `GatewayEvent`'s
+    /// session id at the time the node was created: our own active runtime for
+    /// a local turn, or the adopted foreign mirror's runtime for a mirrored
+    /// delegation tree. `subagent.interrupt` (STR-145) must target THIS
+    /// session, not whatever `activeSessionId`/`mirroringRuntimeId` happens to
+    /// resolve to later — the owning runtime is fixed at the branch's creation.
+    var sessionId: String
     /// Parent node id, or `nil` for a top-level branch.
     var parentId: String?
     var depth: Int
@@ -763,6 +770,11 @@ struct SubagentNode: Sendable, Equatable, Identifiable {
     var taskCount: Int
     var goal: String
     var model: String?
+    /// Whether the gateway sent a real `subagent_id` for this node (vs. the
+    /// synthesized `parent|taskIndex` fallback key for an id-less emitter).
+    /// `subagent.interrupt` matches on the server's `subagent_id`, so a
+    /// synthesized key can never be targeted.
+    var hasServerSubagentId: Bool
     /// The latest activity line (running thought / tool preview).
     var activity: String
     var status: Status
