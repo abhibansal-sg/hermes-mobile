@@ -889,13 +889,13 @@ struct SettingsView: View {
     /// live control surface; `about` is the local version page (no control
     /// client needed) and is excluded from ``pushable``.
     private enum ControlPanel: String, Identifiable, Hashable {
-        case appearance, model, personality, usage, cron, skills, learning, gateway, artifacts, logs, about
+        case appearance, model, personality, usage, cron, skills, learning, gateway, artifacts, logs, webhooks, about
         var id: String { rawValue }
 
         /// The panels that need a live control client (`appearance` + `about` do
         /// NOT — they are local pages, excluded from ``pushable``).
         static var pushable: [ControlPanel] {
-            [.model, .personality, .usage, .cron, .skills, .learning, .gateway, .artifacts, .logs]
+            [.model, .personality, .usage, .cron, .skills, .learning, .gateway, .artifacts, .logs, .webhooks]
         }
 
         var title: String {
@@ -910,6 +910,7 @@ struct SettingsView: View {
             case .gateway: return "Gateway Status"
             case .artifacts: return "Artifacts"
             case .logs: return "System Logs"
+            case .webhooks: return "Webhooks"
             case .about: return "About"
             }
         }
@@ -926,6 +927,10 @@ struct SettingsView: View {
             case .gateway: return "network"
             case .artifacts: return "photo.on.rectangle.angled"
             case .logs: return "doc.text.magnifyingglass"
+            // STR-338: verified present in the iOS 17 base SDK swiftinterface
+            // (SF Symbols 5). Falls back conceptually to `link`/
+            // `arrow.triangle.branch` if a future SDK ever drops it.
+            case .webhooks: return "point.3.connected.trianglepath.dotted"
             case .about: return "info.circle"
             }
         }
@@ -1004,6 +1009,22 @@ struct SettingsView: View {
                             "Not connected",
                             systemImage: "wifi.slash",
                             description: Text("Reconnect to view logs.")
+                        )
+                    }
+                case .webhooks:
+                    // STR-338: webhook subscription management. Uses the REST
+                    // client (not the WS control client) — /api/webhooks is a
+                    // stock GET/POST/DELETE/PUT route family, same posture as
+                    // `.logs`. Falls back to ContentUnavailableView when there
+                    // is no REST client (graceful 404 for ancient gateways —
+                    // same posture as Providers).
+                    if let rest = connectionStore.rest {
+                        WebhooksPanelView(rest: rest)
+                    } else {
+                        ContentUnavailableView(
+                            "Not connected",
+                            systemImage: "wifi.slash",
+                            description: Text("Reconnect to manage webhooks.")
                         )
                     }
                 case .appearance, .about:
