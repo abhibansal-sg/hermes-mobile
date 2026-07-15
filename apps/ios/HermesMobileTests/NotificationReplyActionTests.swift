@@ -19,6 +19,15 @@ final class NotificationReplyActionTests: XCTestCase {
         )
         XCTAssertTrue(reply is UNTextInputNotificationAction)
         XCTAssertEqual(reply.title, "Reply")
+        XCTAssertTrue(reply.options.contains(.authenticationRequired))
+        let approve = try XCTUnwrap(
+            approval.actions.first { $0.identifier == NotificationService.approveActionIdentifier }
+        )
+        let deny = try XCTUnwrap(
+            approval.actions.first { $0.identifier == NotificationService.denyActionIdentifier }
+        )
+        XCTAssertTrue(approve.options.contains(.authenticationRequired))
+        XCTAssertTrue(deny.options.contains(.authenticationRequired))
         XCTAssertFalse(
             approval.actions.contains { $0.identifier == NotificationService.replyActionIdentifier },
             "approval pushes stay Approve/Deny only; Reply is clarify-only"

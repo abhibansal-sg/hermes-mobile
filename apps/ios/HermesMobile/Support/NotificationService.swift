@@ -90,8 +90,6 @@ enum NotificationService {
 
     /// Install the app's tap router. Idempotent; safe to call at launch.
     static func setTapHandler(_ handler: @escaping @MainActor (Tap) -> Void) {
-        installDelegateIfNeeded()
-        registerCategories()
         tapHandler = handler
     }
 
@@ -125,8 +123,6 @@ enum NotificationService {
 
     /// Install the action backend resolver (endpoint + categories). Idempotent.
     static func setActionEndpointProvider(_ provider: @escaping @MainActor () -> ActionEndpoint?) {
-        installDelegateIfNeeded()
-        registerCategories()
         endpointProvider = provider
     }
 
@@ -533,7 +529,6 @@ enum NotificationService {
     /// has already denied alert delivery (the Settings UI must then show a real
     /// "not authorized" state, not a fake OK).
     static func requestAuthorizationStatusIfNeeded(force: Bool = false) async -> UNAuthorizationStatus {
-        installDelegateIfNeeded()
         registerCategories()
         let defaults = UserDefaults.standard
         let settings = await UNUserNotificationCenter.current().notificationSettings()
@@ -574,8 +569,6 @@ enum NotificationService {
     static func registerCategories() {
         guard !didRegisterCategories else { return }
         didRegisterCategories = true
-        installDelegateIfNeeded()
-
         UNUserNotificationCenter.current().setNotificationCategories(
             remoteNotificationCategoriesForTesting()
         )
@@ -599,7 +592,7 @@ enum NotificationService {
         let reply = UNTextInputNotificationAction(
             identifier: replyActionIdentifier,
             title: "Reply",
-            options: [],
+            options: [.authenticationRequired],
             textInputButtonTitle: "Send",
             textInputPlaceholder: "Reply to Hermes"
         )
@@ -686,124 +679,4 @@ enum NotificationService {
         generator.notificationOccurred(.success)
     }
 
-    // MARK: - Notification center delegate (presentation + tap routing)
-
-    private static var didInstallDelegate = false
-
-    private static func installDelegateIfNeeded() {
-        guard !didInstallDelegate else { return }
-        didInstallDelegate = true
-        UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
-    }
-
-    /// Notification-center delegate: presents banners while foregrounded and
-    /// routes taps. Stateless (the routing state lives in `tapHandler`), so the
-    /// unchecked cross-actor singleton is safe; the tap callback hops to the main
-    /// actor before touching any `@MainActor` state.
-    private final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
-        nonisolated(unsafe) static let shared = NotificationDelegate()
-
-        /// One-shot `@unchecked Sendable` carrier for a `UNUserNC` completion
-        /// handler so it can cross into the `@MainActor` Task that runs the
-        /// async action work. Apple documents these completion handlers as
-        /// callable from any thread, so the crossing is sound; the box is never
-        /// aliased or re-used.
-        private struct CompletionBox: @unchecked Sendable {
-            let handler: () -> Void
-        }
-
-        func userNotificationCenter(
-            _ center: UNUserNotificationCenter,
-            willPresent notification: UNNotification,
-            withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
-        ) {
-            completionHandler([.banner, .sound])
-        }
-
-        func userNotificationCenter(
-            _ center: UNUserNotificationCenter,
-            didReceive response: UNNotificationResponse,
-            withCompletionHandler completionHandler: @escaping () -> Void
-        ) {
-            let userInfo = response.notification.request.content.userInfo
-            let actionId = response.actionIdentifier
-
-            // Inline APPROVE / DENY actions (A2): resolve against the gateway,
-            // then call the completion handler when done so the system keeps the
-            // (possibly background-launched) process alive for the network call.
-            // `userInfo` is non-Sendable; `decodeApprovalAction` / the whole
-            // handler run on the main actor, so we snapshot the two Sendable bits
-            // (the choice + a Sendable copy of the payload) before hopping.
-            if let approve = NotificationService.approveChoice(for: actionId) {
-                // Decode here (pure transform; no actor crossing) to a Sendable
-                // payload, then hand only that across the boundary. The
-                // `completionHandler` is not `Sendable`-annotated, but UNUserNC
-                // documents it as callable from any thread, so it rides into the
-                // `@MainActor` Task through a one-shot transfer box (mirrors the
-                // `ActivityBox` pattern used for non-Sendable handoffs elsewhere).
-                let action = NotificationService.decodeApprovalAction(from: userInfo)
-                let completion = CompletionBox(handler: completionHandler)
-                Task { @MainActor in
-                    if let action {
-                        await NotificationService.handleApprovalAction(
-                            approve: approve,
-                            action: action
-                        )
-                    } else {
-                        // Malformed/older-server payload (no `hermes` block or
-                        // empty session id): every OTHER failure on this path
-                        // posts feedback — silence here meant the user "denied"
-                        // and nothing happened (R1 #90).
-                        NotificationService.postFeedbackNotification(
-                            title: "Couldn't respond",
-                            body: "Open Hermes to respond to this request."
-                        )
-                    }
-                    completion.handler()
-                }
-                return
-            }
-
-            // Inline REPLY text action for HERMES_CLARIFY. Only this category
-            // carries the action; approval pushes stay Approve/Deny only.
-            if actionId == NotificationService.replyActionIdentifier {
-                let action = NotificationService.decodeClarifyReplyAction(from: userInfo)
-                let text = (response as? UNTextInputNotificationResponse)?.userText ?? ""
-                let completion = CompletionBox(handler: completionHandler)
-                Task { @MainActor in
-                    if let action {
-                        await NotificationService.handleClarifyReplyAction(
-                            text: text,
-                            action: action
-                        )
-                    } else {
-                        NotificationService.postFeedbackNotification(
-                            title: "Couldn't reply",
-                            body: "Open Hermes to answer this question."
-                        )
-                    }
-                    completion.handler()
-                }
-                return
-            }
-
-            // Only the default action (a tap on the notification body) navigates;
-            // dismiss / unknown actions are not routed.
-            guard actionId == UNNotificationDefaultActionIdentifier else {
-                completionHandler()
-                return
-            }
-            // Decode synchronously on this callback's thread: `decodeTap` is a
-            // pure transform over the non-Sendable `userInfo` dictionary, so it
-            // never crosses an actor boundary. Only the resulting Sendable `Tap`
-            // is sent to the main actor, and the completion handler fires now —
-            // both avoid the Swift 6 "sending risks a data race" diagnostics.
-            let tap = NotificationService.decodeTap(from: userInfo)
-            completionHandler()
-            guard let tap else { return }
-            Task { @MainActor in
-                NotificationService.tapHandler?(tap)
-            }
-        }
-    }
 }
