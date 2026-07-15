@@ -31,12 +31,10 @@ struct StatusEntry: TimelineEntry {
     static let placeholder = StatusEntry(
         date: Date(),
         snapshot: SharedStore.WidgetSnapshot(
-            connected: true,
-            activeSessions: 2,
-            pendingApprovals: 1,
+            serverScope: "preview", serverRevision: "42", connectionState: .connected,
+            openSessionCount: 2, activeTurnCount: 1, pendingAttentionCount: 1,
             tokensToday: 18_400,
-            costTodayUSD: 0.42,
-            updatedAt: Date()
+            costToday: 0.42, fetchedAt: Date(), writtenAt: Date(), isStale: false
         )
     )
 }
@@ -89,9 +87,10 @@ struct StatusWidgetView: View {
     let entry: StatusEntry
 
     private var snapshot: SharedStore.WidgetSnapshot? { entry.snapshot }
-    private var connected: Bool { snapshot?.connected ?? false }
-    private var activeSessions: Int { snapshot?.activeSessions ?? 0 }
-    private var pendingApprovals: Int { snapshot?.pendingApprovals ?? 0 }
+    private var current: Bool { snapshot?.isEffectivelyStale(at: entry.date) == false }
+    private var openSessions: Int { snapshot?.openSessionCount ?? 0 }
+    private var activeTurns: Int { snapshot?.activeTurnCount ?? 0 }
+    private var pendingAttention: Int { snapshot?.pendingAttentionCount ?? 0 }
 
     var body: some View {
         switch family {
@@ -107,18 +106,18 @@ struct StatusWidgetView: View {
             header
             Spacer(minLength: 0)
             metric(
-                value: "\(activeSessions)",
-                label: activeSessions == 1 ? "session" : "sessions",
-                accessibilityLabel: activeSessionsAccessibilityLabel
+                value: "\(openSessions) / \(activeTurns)",
+                label: "open / active",
+                accessibilityLabel: countsAccessibilityLabel
             )
-            if pendingApprovals > 0 {
+            if pendingAttention > 0 {
                 approvalLine
             } else {
                 staleLine
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .widgetURL(pendingApprovals > 0 ? HermesWidgetLink.review : HermesWidgetLink.newSession)
+        .widgetURL(pendingAttention > 0 ? HermesWidgetLink.review : HermesWidgetLink.newSession)
     }
 
     private var mediumBody: some View {
@@ -131,12 +130,13 @@ struct StatusWidgetView: View {
             Spacer(minLength: 0)
             VStack(alignment: .trailing, spacing: 12) {
                 metric(
-                    value: "\(activeSessions)",
-                    label: activeSessions == 1 ? "active session" : "active sessions",
-                    accessibilityLabel: activeSessionsAccessibilityLabel
+                    value: "\(openSessions)",
+                    label: openSessions == 1 ? "open session" : "open sessions",
+                    accessibilityLabel: "\(openSessions) open sessions"
                 )
-                Link(destination: pendingApprovals > 0 ? HermesWidgetLink.review : HermesWidgetLink.open) {
-                    if pendingApprovals > 0 {
+                metric(value: "\(activeTurns)", label: activeTurns == 1 ? "active turn" : "active turns", accessibilityLabel: "\(activeTurns) active turns")
+                Link(destination: pendingAttention > 0 ? HermesWidgetLink.review : HermesWidgetLink.open) {
+                    if pendingAttention > 0 {
                         approvalLine
                     } else {
                         Label("Up to date", systemImage: "checkmark.circle")
@@ -158,15 +158,15 @@ struct StatusWidgetView: View {
                 .font(.headline)
             Spacer(minLength: 0)
             Circle()
-                .fill(connected ? Color.green : Color.secondary)
+                .fill(current ? Color.green : Color.secondary)
                 .frame(width: 9, height: 9)
-                .accessibilityLabel(connected ? "Connected" : "Offline")
+                .accessibilityLabel(current ? "Connected" : "Cached or offline")
         }
     }
 
-    private var activeSessionsAccessibilityLabel: String {
-        guard snapshot != nil else { return "Active sessions unavailable" }
-        return activeSessions == 1 ? "1 active session" : "\(activeSessions) active sessions"
+    private var countsAccessibilityLabel: String {
+        guard snapshot != nil else { return "Session counts unavailable" }
+        return "\(openSessions) open sessions, \(activeTurns) active turns"
     }
 
     private func metric(value: String, label: String, accessibilityLabel: String) -> some View {
@@ -183,19 +183,22 @@ struct StatusWidgetView: View {
     }
 
     private var approvalLine: some View {
-        Label("\(pendingApprovals) pending", systemImage: "exclamationmark.triangle.fill")
+        Label("\(pendingAttention) attention", systemImage: "exclamationmark.triangle.fill")
             .font(.caption.weight(.semibold))
             .foregroundStyle(.orange)
             .lineLimit(1)
             .accessibilityLabel(
-                pendingApprovals == 1 ? "1 pending approval" : "\(pendingApprovals) pending approvals"
+                pendingAttention == 1 ? "1 pending attention item" : "\(pendingAttention) pending attention items"
             )
     }
 
     private var staleLine: some View {
         Group {
-            if let updatedAt = snapshot?.updatedAt {
-                Text(updatedAt, style: .relative)
+            if let fetchedAt = snapshot?.fetchedAt {
+                HStack(spacing: 3) {
+                    Text(current ? "Updated" : "Cached · Last updated")
+                    Text(fetchedAt, style: .relative)
+                }
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             } else {

@@ -12,12 +12,10 @@ struct UsageEntry: TimelineEntry {
     static let placeholder = UsageEntry(
         date: Date(),
         snapshot: SharedStore.WidgetSnapshot(
-            connected: true,
-            activeSessions: 1,
-            pendingApprovals: 0,
+            serverScope: "preview", serverRevision: "42", connectionState: .connected,
+            openSessionCount: 1, activeTurnCount: 1, pendingAttentionCount: 0,
             tokensToday: 18_400,
-            costTodayUSD: 0.42,
-            updatedAt: Date()
+            costToday: 0.42, fetchedAt: Date(), writtenAt: Date(), isStale: false
         )
     )
 }
@@ -74,7 +72,7 @@ struct UsageWidgetView: View {
     }
 
     private var costText: String {
-        guard let cost = snapshot?.costTodayUSD else { return "—" }
+        guard let cost = snapshot?.costToday else { return "—" }
         return Self.costFormatter.string(from: NSNumber(value: cost)) ?? String(format: "$%.2f", cost)
     }
 
@@ -84,7 +82,7 @@ struct UsageWidgetView: View {
     }
 
     private var costAccessibilityValue: String {
-        guard snapshot?.costTodayUSD != nil else { return "Unavailable" }
+        guard snapshot?.costToday != nil else { return "Unavailable" }
         return "\(costText) estimated cost today"
     }
 
@@ -126,6 +124,20 @@ struct UsageWidgetView: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Estimated cost today")
             .accessibilityValue(costAccessibilityValue)
+
+            if let fetchedAt = snapshot?.fetchedAt {
+                HStack(spacing: 3) {
+                    Text(snapshot?.isEffectivelyStale(at: entry.date) == false ? "Updated" : "Cached · Last updated")
+                    Text(fetchedAt, style: .relative)
+                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+            } else {
+                Text("No usage update yet")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .widgetURL(HermesWidgetLink.open)

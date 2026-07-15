@@ -7,8 +7,16 @@ enum SharedStore {
     static let appGroupID = "group.ai.hermes.app"
     static let inboxDidChangeNotification = Notification.Name("SharedStore.inboxDidChange")
 
+    #if DEBUG
+    nonisolated(unsafe) static var testDefaults: UserDefaults?
+    nonisolated(unsafe) static var testSnapshotURL: URL?
+    #endif
+
     static var defaults: UserDefaults? {
-        UserDefaults(suiteName: appGroupID)
+        #if DEBUG
+        if let testDefaults { return testDefaults }
+        #endif
+        return UserDefaults(suiteName: appGroupID)
     }
 
     static var containerURL: URL? {
@@ -20,24 +28,66 @@ enum SharedStore {
     // MARK: - Widget snapshot
 
     /// Snapshot the app writes and widgets read. Keep flat + Codable-stable.
-    struct WidgetSnapshot: Codable, Sendable {
-        var connected: Bool
-        var activeSessions: Int
-        var pendingApprovals: Int
+    struct WidgetSnapshot: Codable, Sendable, Equatable {
+        static let currentSchemaVersion = 2
+        static let freshnessInterval: TimeInterval = 15 * 60
+
+        enum ConnectionState: String, Codable, Sendable {
+            case connected, connecting, offline
+        }
+
+        var schemaVersion: Int = currentSchemaVersion
+        var serverScope: String?
+        var serverRevision: String?
+        var connectionState: ConnectionState
+        var openSessionCount: Int?
+        var activeTurnCount: Int?
+        var pendingAttentionCount: Int?
         var tokensToday: Int?
-        var costTodayUSD: Double?
-        var updatedAt: Date
+        var costToday: Double?
+        var fetchedAt: Date?
+        var writtenAt: Date
+        var isStale: Bool
+
+        var isRevisionCommitted: Bool {
+            guard let revision = serverRevision else { return false }
+            return !revision.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+
+        func isEffectivelyStale(at now: Date = Date()) -> Bool {
+            guard !isStale, connectionState == .connected, isRevisionCommitted,
+                  let fetchedAt else { return true }
+            return now.timeIntervalSince(fetchedAt) > Self.freshnessInterval
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case schemaVersion = "schema_version"
+            case serverScope = "server_scope"
+            case serverRevision = "server_revision"
+            case connectionState = "connection_state"
+            case openSessionCount = "open_session_count"
+            case activeTurnCount = "active_turn_count"
+            case pendingAttentionCount = "pending_attention_count"
+            case tokensToday = "tokens_today"
+            case costToday = "cost_today"
+            case fetchedAt = "fetched_at"
+            case writtenAt = "written_at"
+            case isStale = "is_stale"
+        }
     }
 
-    private static let snapshotKey = "hermes.widgetSnapshot"
+    static let snapshotKey = "hermes.widgetSnapshot"
+    static let snapshotFilename = "widget-snapshot-v2.json"
 
-    static func writeSnapshot(_ snapshot: WidgetSnapshot) {
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
-        defaults?.set(data, forKey: snapshotKey)
+    static var snapshotURL: URL? {
+        #if DEBUG
+        if let testSnapshotURL { return testSnapshotURL }
+        #endif
+        return containerURL?.appendingPathComponent(snapshotFilename, isDirectory: false)
     }
 
     static func readSnapshot() -> WidgetSnapshot? {
-        guard let data = defaults?.data(forKey: snapshotKey) else { return nil }
+        guard let url = snapshotURL, let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(WidgetSnapshot.self, from: data)
     }
 
