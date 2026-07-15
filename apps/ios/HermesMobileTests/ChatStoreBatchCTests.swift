@@ -35,12 +35,21 @@ final class ChatStoreBatchCTests: XCTestCase {
         return (chat, sessions)
     }
 
-    /// A QueueStore over an isolated, throwaway defaults suite.
-    private func makeQueue() -> (QueueStore, UserDefaults) {
-        let suite = "test.hermes.queue.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return (QueueStore(defaults: defaults), defaults)
+    private func makeQueue() throws -> (QueueStore, WorkRepository, URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ChatStoreBatchC-\(UUID().uuidString)", isDirectory: true)
+        let observation = WorkRepositoryObservation()
+        let repository = try WorkRepository(
+            configuration: WorkRepositoryConfiguration(containerURL: directory),
+            observation: observation
+        )
+        let scope = try WorkScope(serverID: "https://gateway.test", profileID: "default")
+        let queue = QueueStore(
+            repository: repository,
+            observation: observation,
+            scopeProvider: { scope }
+        )
+        return (queue, repository, directory)
     }
 
     private func frame(
@@ -71,79 +80,34 @@ final class ChatStoreBatchCTests: XCTestCase {
 
     // MARK: - #17: session affinity
 
-    func testDrainSkipsPromptsStampedForOtherSessions() async {
-        let (chat, _) = makeStore()
-        let (queue, _) = makeQueue()
-        queue.enqueue("for the other session", storedSessionId: "stored-other")
-        queue.enqueue("for the active session", storedSessionId: storedId)
+    func testLiveSendIsDurableBeforeLocalEchoWithoutAConnection() async throws {
+        let (chat, sessions) = makeStore()
+        let (queue, repository, directory) = try makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        chat.attachOutbox(queue)
 
-        await queue.drain(chat: chat)
+        let sent = await chat.send(text: "durable first")
+        XCTAssertTrue(sent)
 
-        // The mismatched prompt was skipped — never sent, never dropped.
-        XCTAssertFalse(
-            chat.messages.contains { $0.text == "for the other session" },
-            "a prompt queued for session A must never deliver into session B"
-        )
-        // The matching prompt WAS attempted (its user bubble was appended
-        // before the disconnected client's RPC failed)…
-        XCTAssertTrue(chat.messages.contains { $0.text == "for the active session" })
-        // …and both prompts survive in order (the attempt wasn't accepted).
-        XCTAssertEqual(
-            queue.items.map(\.text),
-            ["for the other session", "for the active session"]
-        )
+        let jobs = try await repository.jobs()
+        XCTAssertEqual(jobs.count, 1)
+        XCTAssertEqual(jobs.first?.text, "durable first")
+        XCTAssertEqual(jobs.first?.storedSessionID, sessions.activeStoredId)
+        XCTAssertEqual(chat.messages.last?.clientMessageID, jobs.first?.clientMessageID)
+        XCTAssertEqual(chat.messages.last?.text, "durable first")
     }
 
-    // MARK: - #10/#50: no burn-through on unaccepted sends
-
-    func testDrainReenqueuesUnacceptedPromptAndPersistsIt() async {
+    func testExplicitQueuePersistsSessionAffinityWithoutEchoing() async throws {
         let (chat, _) = makeStore()
-        let (queue, defaults) = makeQueue()
-        let queued = queue.enqueue("important prompt", storedSessionId: storedId)
+        let (queue, repository, directory) = try makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
 
-        await queue.drain(chat: chat)  // disconnected client → send not accepted
+        let queued = await queue.enqueue("for A", storedSessionId: "stored-A")
 
-        XCTAssertFalse(chat.isStreaming)
-        XCTAssertEqual(queue.items.map(\.id), [queued!.id],
-                       "an unaccepted prompt is re-enqueued, exactly once")
-        // The re-enqueue is persisted: a fresh store over the same defaults
-        // (a relaunch) still has it.
-        let reloaded = QueueStore(defaults: defaults)
-        XCTAssertEqual(reloaded.items.map(\.text), ["important prompt"])
-    }
-
-    func testDrainStopsAfterFirstFailureInsteadOfBurningTheBacklog() async {
-        let (chat, _) = makeStore()
-        let (queue, _) = makeQueue()
-        queue.enqueue("first", storedSessionId: storedId)
-        queue.enqueue("second", storedSessionId: storedId)
-
-        await queue.drain(chat: chat)
-
-        // Only the first was attempted; the drain stopped rather than burning
-        // through the backlog against the same failure.
-        XCTAssertTrue(chat.messages.contains { $0.text == "first" })
-        XCTAssertFalse(chat.messages.contains { $0.text == "second" })
-        XCTAssertEqual(queue.items.map(\.text), ["first", "second"],
-                       "both prompts survive, order preserved")
-    }
-
-    // MARK: - #17: legacy persisted queue (pre-session-stamp) still decodes
-
-    func testLegacyPersistedQueueDecodesWithNilSessionStamp() throws {
-        let suite = "test.hermes.queue.legacy.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        // The exact pre-Batch-C on-disk shape: no storedSessionId key.
-        let legacy = "[{\"id\":\"\(UUID().uuidString)\",\"text\":\"old prompt\",\"createdAt\":0}]"
-        defaults.set(Data(legacy.utf8), forKey: DefaultsKeys.queue)
-
-        let queue = QueueStore(defaults: defaults)
-
-        XCTAssertEqual(queue.items.count, 1)
-        XCTAssertEqual(queue.items.first?.text, "old prompt")
-        XCTAssertNil(queue.items.first?.storedSessionId,
-                     "legacy items keep deliver-anywhere semantics")
+        XCTAssertEqual(queued?.storedSessionId, "stored-A")
+        let jobs = try await repository.jobs()
+        XCTAssertEqual(jobs.first?.storedSessionID, "stored-A")
+        XCTAssertTrue(chat.messages.isEmpty, "explicit queued work echoes only when claimed for sending")
     }
 
     // MARK: - #29: foreign complete is a turn completion (drain trigger)

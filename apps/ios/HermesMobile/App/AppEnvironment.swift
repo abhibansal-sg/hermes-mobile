@@ -20,6 +20,7 @@ final class AppEnvironment {
     let connectionStore: ConnectionStore
     let attachmentStore: AttachmentStore
     let queueStore: QueueStore
+    let workRepository: WorkRepository
     let voiceRecorder: VoiceRecorder
     let speechPlayer: SpeechPlayer
     let voiceConversationController: VoiceConversationController
@@ -33,7 +34,21 @@ final class AppEnvironment {
         let sessionStore = SessionStore()
         let chatStore = ChatStore()
         let attachmentStore = AttachmentStore()
-        let queueStore = QueueStore()
+        let workObservation = WorkRepositoryObservation()
+        let workRepository: WorkRepository
+        do {
+            workRepository = try WorkRepository(
+                configuration: .appGroup(),
+                observation: workObservation
+            )
+        } catch {
+            fatalError("Unable to open protected Hermes work repository: \(error.localizedDescription)")
+        }
+        let queueStore = QueueStore(
+            repository: workRepository,
+            observation: workObservation,
+            scopeProvider: { [weak sessionStore] in sessionStore?.durableWorkScope }
+        )
         let voiceRecorder = VoiceRecorder()
         let speechPlayer = SpeechPlayer()
         let inboxStore = InboxStore()
@@ -76,7 +91,76 @@ final class AppEnvironment {
         let voiceAmbientAutoSpeak = VoiceConversationAmbientAutoSpeakCoordinator()
         // Stores need back-references for RPC access and cross-store flows.
         sessionStore.attach(connection: connectionStore, chat: chatStore, attachments: attachmentStore)
+        sessionStore.attachWorkRepository(workRepository)
         chatStore.attach(connection: connectionStore, sessions: sessionStore, attachments: attachmentStore)
+        chatStore.attachOutbox(queueStore)
+        let outboxProcessor = OutboxProcessor(
+            repository: workRepository,
+            dependencies: .init(
+                currentScope: { [weak sessionStore] in sessionStore?.durableWorkScope },
+                activeStoredSessionID: { [weak sessionStore] in sessionStore?.activeStoredId },
+                canProcessPrompt: { [weak connectionStore, weak chatStore] in
+                    guard let connectionStore, let chatStore else { return false }
+                    guard case .connected = connectionStore.phase else { return false }
+                    return !chatStore.isStreaming && !chatStore.localTurnInFlight
+                },
+                createDestination: { [weak sessionStore] _ in
+                    guard let sessionStore else { throw OutboxProcessorError.destinationUnavailable }
+                    return try await sessionStore.createOutboxDestination()
+                },
+                resolveRuntime: { [weak sessionStore] storedID in
+                    await sessionStore?.runtimeForOutboxDestination(storedID)
+                },
+                uploadAsset: { [weak connectionStore, weak workRepository] job, snapshot in
+                    guard let connectionStore,
+                          let rest = connectionStore.rest,
+                          let client = connectionStore.client,
+                          let workRepository else {
+                        throw AttachmentError.notConfigured
+                    }
+                    let data = try await workRepository.assetData(snapshot.asset)
+                    let upload = try await rest.uploadDurable(
+                        data: data,
+                        filename: "\(snapshot.asset.assetID).jpg",
+                        mimeType: snapshot.asset.mimeType,
+                        ownerJobID: job.jobID
+                    )
+                    guard let runtimeID = await sessionStore.runtimeForOutboxDestination(
+                        job.destinationSessionID ?? job.storedSessionID ?? ""
+                    ) else { throw OutboxProcessorError.destinationUnavailable }
+                    _ = try await client.requestRaw(
+                        "image.attach",
+                        params: .object([
+                            "session_id": .string(runtimeID),
+                            "path": .string(upload.upload.path),
+                        ]),
+                        timeout: .seconds(30)
+                    )
+                    return OutboxUploadedAsset(
+                        transferID: upload.transferID,
+                        remotePath: upload.upload.path
+                    )
+                },
+                willSubmit: { [weak chatStore] job, paths in
+                    chatStore?.prepareOutboxSubmission(job: job, remotePaths: paths)
+                },
+                submit: { [weak chatStore] job, runtimeID, paths in
+                    guard let chatStore else { throw GatewayError.notConnected }
+                    return try await chatStore.submitOutboxPrompt(
+                        job: job,
+                        runtimeSessionID: runtimeID,
+                        remotePaths: paths
+                    )
+                }
+            )
+        )
+        queueStore.installProcessor(outboxProcessor)
+        Task {
+            try? await workRepository.importLegacyWork(
+                from: LegacyWorkImportSource(scope: sessionStore.durableWorkScope)
+            )
+            await queueStore.refresh()
+        }
         // ABH-351: ProjectsStore needs REST access (the /projects route) —
         // injected after ConnectionStore is built, same pattern as the others.
         projectsStore.attach(connection: connectionStore)
@@ -113,7 +197,7 @@ final class AppEnvironment {
         let turnCompletionPipeline = VoiceConversationTurnCompletionPipeline(
             drainQueue: { [weak queueStore, weak chatStore] in
                 guard let queueStore, let chatStore else { return }
-                Task { await queueStore.drain(chat: chatStore) }
+                queueStore.wake()
             },
             completeVoiceTurn: { [weak chatStore, weak voiceConversationController, voiceAutoSpeak] in
                 guard let chatStore, let voiceConversationController else { return }
@@ -152,12 +236,12 @@ final class AppEnvironment {
         // idle cold-path session emits no turn-completion to trigger a drain).
         sessionStore.onActiveRuntimeBound = { [weak queueStore, weak chatStore] in
             guard let queueStore, let chatStore else { return }
-            Task { await queueStore.drain(chat: chatStore) }
+            queueStore.wake()
         }
         // A resume that follows a compression chain tip re-stamps queued prompts
         // parent → continuation so drain's session-affinity guard doesn't skip them.
         sessionStore.onStoredIdMigrated = { [weak queueStore] oldId, newId in
-            queueStore?.restamp(from: oldId, to: newId)
+            Task { await queueStore?.restamp(from: oldId, to: newId) }
         }
         // Live Activity turn-lifecycle seams (X3): start on the first turn event,
         // track the running tool, and reflect a pending approval. The manager
@@ -233,6 +317,7 @@ final class AppEnvironment {
         self.chatStore = chatStore
         self.attachmentStore = attachmentStore
         self.queueStore = queueStore
+        self.workRepository = workRepository
         self.voiceRecorder = voiceRecorder
         self.speechPlayer = speechPlayer
         self.voiceConversationController = voiceConversationController

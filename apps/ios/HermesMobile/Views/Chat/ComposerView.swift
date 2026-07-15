@@ -1031,7 +1031,7 @@ struct ComposerView: View {
             Button {
                 showQueueSheet = true
             } label: {
-                Label("\(queueStore.items.count) queued", systemImage: "text.badge.plus")
+                Label("\(queueStore.pendingCount) pending", systemImage: "text.badge.plus")
                     .font(.caption.weight(.medium))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
@@ -1039,7 +1039,7 @@ struct ComposerView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(theme.mutedFg)
-            .accessibilityLabel("\(queueStore.items.count) queued prompts")
+            .accessibilityLabel("\(queueStore.pendingCount) pending prompts")
             Spacer(minLength: 0)
         }
     }
@@ -1110,10 +1110,17 @@ struct ComposerView: View {
     /// stored session yet) queues unstamped and delivers wherever active.
     private func enqueue() {
         guard canQueue else { return }
-        queueStore.enqueue(trimmed, storedSessionId: sessions.activeStoredId)
-        queueFeedbackTrigger &+= 1
-        text = ""
-        sessions.resetComposerHistoryBrowse(for: draftKey)
+        let outgoing = trimmed
+        Task {
+            guard await queueStore.enqueue(
+                outgoing,
+                storedSessionId: sessions.activeStoredId,
+                newSession: sessions.isDraft
+            ) != nil else { return }
+            queueFeedbackTrigger &+= 1
+            text = ""
+            sessions.resetComposerHistoryBrowse(for: draftKey)
+        }
     }
 
     /// Send the current text as a steering injection into the live turn.
@@ -1708,19 +1715,27 @@ private struct QueueSheet: View {
                         ForEach(queueStore.items) { item in
                             QueuedPromptRow(
                                 text: item.text,
-                                onCommit: { newText in queueStore.update(id: item.id, text: newText) }
+                                status: item.displayState.title,
+                                editable: item.isEditable,
+                                canRetry: item.canRetry,
+                                onCommit: { newText in
+                                    Task { await queueStore.update(id: item.id, text: newText) }
+                                },
+                                onRetry: { Task { await queueStore.retry(id: item.id) } }
                             )
                             .listRowBackground(theme.card)
+                            .moveDisabled(!item.isEditable)
                         }
                         .onDelete { offsets in
                             for index in offsets {
-                                queueStore.remove(id: queueStore.items[index].id)
+                                let id = queueStore.items[index].id
+                                Task { await queueStore.remove(id: id) }
                             }
                         }
                         // Drag-to-reorder: tapping the EditButton (leading toolbar)
                         // shows grab handles; releasing persists the new order.
                         .onMove { source, destination in
-                            queueStore.move(fromOffsets: source, toOffset: destination)
+                            Task { await queueStore.move(fromOffsets: source, toOffset: destination) }
                         }
                     }
                     .scrollContentBackground(.hidden)
@@ -1729,7 +1744,7 @@ private struct QueueSheet: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(theme.bg)
-            .navigationTitle("Queued (\(queueStore.items.count))")
+            .navigationTitle("Outbox (\(queueStore.pendingCount))")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 // EditButton toggles the List's edit mode so drag handles appear.
@@ -1756,15 +1771,29 @@ private struct QueueSheet: View {
 /// One editable queued-prompt row. Edits commit on submit / focus loss.
 private struct QueuedPromptRow: View {
     @State var text: String
+    let status: String
+    let editable: Bool
+    let canRetry: Bool
     let onCommit: (String) -> Void
+    let onRetry: () -> Void
 
     @FocusState private var focused: Bool
 
     var body: some View {
-        TextField("Queued prompt", text: $text, axis: .vertical)
-            .lineLimit(1...4)
-            .focused($focused)
-            .onSubmit { onCommit(text) }
+        VStack(alignment: .leading, spacing: 6) {
+            TextField("Queued prompt", text: $text, axis: .vertical)
+                .lineLimit(1...4)
+                .focused($focused)
+                .disabled(!editable)
+                .onSubmit { onCommit(text) }
+            HStack {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if canRetry {
+                    Button("Retry", action: onRetry).font(.caption.weight(.semibold))
+                }
+            }
+        }
             // Commit on focus LOSS too (release audit P1): the doc promised
             // it, but only `.onSubmit` was wired — tapping away (keyboard
             // dismiss, sheet drag) silently discarded the edit.
