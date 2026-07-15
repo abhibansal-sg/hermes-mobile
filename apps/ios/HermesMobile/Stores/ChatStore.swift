@@ -25,7 +25,8 @@ func fetchTranscriptPage(
     rest: RestClient,
     sessionId: String,
     limit: Int,
-    before: Int? = nil
+    before: Int? = nil,
+    shape: String? = nil
 ) async -> TranscriptPageFetch? {
     guard rest.pathStyle == .plugin else { return nil }
     let encodedId = sessionId.addingPercentEncoding(
@@ -35,6 +36,9 @@ func fetchTranscriptPage(
         + "?limit=\(max(1, limit))"
     if let before, before > 0 {
         path += "&before=\(before)"
+    }
+    if let shape, !shape.isEmpty {
+        path += "&shape=\(shape)"
     }
     do {
         let data = try await rest.get(path: path)

@@ -4172,6 +4172,7 @@ final class SessionStore {
 
         // Phase 2 — authoritative network seed, reconciled in place.
         guard let fetch = resolvedTranscriptFetch else { return }
+        var paintedFromNetworkSkeleton = false
         do {
             // ARCH37 STEP 3 — skip the redundant network seed only when the SAME
             // DISK copy we just painted is FRESH. A memory snapshot is an instant
@@ -4190,6 +4191,34 @@ final class SessionStore {
                 #endif
                 return
             }
+            if !paintedFromCache,
+               profile?.isEmpty ?? true,
+               transcriptFetch == nil,
+               transcriptFetchWithProfile == nil,
+               let rest = connection?.rest,
+               let page = await fetchTranscriptPage(
+                   rest: rest,
+                   sessionId: storedId,
+                   limit: ChatStore.transcriptOpenWindowLimit,
+                   shape: "skeleton"
+               ) {
+                guard openToken == token else { return }
+                let skeleton = page.messages
+                let normalized = await Self.normalizeOffMain(skeleton)
+                guard openToken == token else { return }
+                rememberWarmOpenSnapshot(normalized, for: storedId)
+                chat.seed(normalized: normalized)
+                chat.noteTranscriptPaging(
+                    oldestId: page.oldestId,
+                    hasMoreBefore: page.hasMoreBefore
+                )
+                paintedFromNetworkSkeleton = true
+                #if DEBUG
+                Self.logOpenLatency(
+                    phase: "network-skeleton-painted", storedId: storedId, since: openClock)
+                #endif
+            }
+
             let stored = try await fetch(storedId, profile)
             guard openToken == token else { return }  // superseded (R1 #28/#43)
             // ARCH37 STEP 2 — normalize OFF the main actor (the pure `toChatMessages`
@@ -4215,7 +4244,7 @@ final class SessionStore {
             // with-cache is a fully usable read) and stay silent. Only an EMPTY
             // transcript needs the recoverable error state — never an infinite
             // "Loading…" spinner (R1 #79).
-            if !paintedFromCache {
+            if !paintedFromCache && !paintedFromNetworkSkeleton {
                 chat.reset()
                 let description = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription

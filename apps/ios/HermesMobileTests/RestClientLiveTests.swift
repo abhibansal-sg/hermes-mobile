@@ -31,6 +31,27 @@ final class RestClientLiveTests: XCTestCase {
         XCTAssertEqual(page?.hasMoreBefore, true)
     }
 
+    func testTranscriptPageFetchCanRequestSkeletonShape() async {
+        TranscriptPageStubProtocol.nextResponse = (
+            #"{"messages":[{"id":51,"role":"assistant","content":"tail","reasoning_content":null}],"page":{"oldest_id":51,"has_more_before":false}}"#.data(using: .utf8)!,
+            200
+        )
+        TranscriptPageStubProtocol.requestedPath = nil
+        TranscriptPageStubProtocol.requestedQuery = nil
+        let rest = transcriptPageStubClient(pathStyle: .plugin)
+
+        let page = await fetchTranscriptPage(
+            rest: rest,
+            sessionId: "s1",
+            limit: 50,
+            shape: "skeleton"
+        )
+
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/plugins/hermes-mobile/sessions/s1/messages")
+        XCTAssertEqual(TranscriptPageStubProtocol.requestedQuery, "limit=50&shape=skeleton")
+        XCTAssertEqual(page?.messages.map(\.wireId), [51])
+    }
+
     func testTranscriptPageFetchIsPluginOnly() async {
         TranscriptPageStubProtocol.requestedPath = nil
         let rest = transcriptPageStubClient(pathStyle: .legacy)
