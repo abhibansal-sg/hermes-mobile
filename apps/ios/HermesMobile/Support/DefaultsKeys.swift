@@ -17,6 +17,14 @@ enum DefaultsKeys {
     /// `String` — the saved gateway base URL. Owned by ``ConnectionStore``.
     static let serverURL = "hermes.serverURL"
 
+    /// `Bool` — an explicit, durable user choice to suppress bootstrap and
+    /// reconnect work while preserving the pairing and every local cache.
+    static let connectionOffline = "hermes.connectionOffline"
+
+    /// `Data` — protected, non-content cleanup retry metadata. This contains
+    /// only the gateway URL and device id; never a credential or user content.
+    static let gatewayCleanupTombstone = "hermes.gatewayCleanupTombstone"
+
     // MARK: Appearance
 
     /// `String` (raw value) — the selected theme preset. Owned by ``ThemeStore``.

@@ -580,6 +580,9 @@ final class ConnectionStore {
     /// `AppEnvironment`; `ChatStore` holds no reference to it.
     weak var inboxStore: InboxStore?
 
+    /// The one offline cache instance, wired by AppEnvironment for scoped forget.
+    weak var cacheStore: CacheStore?
+
     private let sessionStore: SessionStore
     private let chatStore: ChatStore
 
@@ -820,6 +823,20 @@ final class ConnectionStore {
     /// Resolve the connection at launch: dev env override → saved config →
     /// `.needsSetup`.
     func bootstrap() async {
+        if UserDefaults.standard.string(forKey: DefaultsKeys.serverURL) == nil,
+           UserDefaults.standard.data(forKey: DefaultsKeys.gatewayCleanupTombstone) != nil {
+            // A prior Forget may have been terminated after credentials were
+            // removed but before every idempotent local owner ran. Resume it.
+            await forgetGateway()
+            return
+        }
+        if UserDefaults.standard.bool(forKey: DefaultsKeys.connectionOffline) {
+            if let savedURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL), !savedURL.isEmpty {
+                await paintCacheFirst(serverURLString: savedURL)
+            }
+            phase = .offline(nil)
+            return
+        }
         #if DEBUG
         // Dev-only override (sim/test runs inject HERMES_URL/HERMES_TOKEN via
         // SIMCTL_CHILD_/TEST_RUNNER_). DEBUG-gated so a production binary can
@@ -1214,7 +1231,19 @@ final class ConnectionStore {
         sessionStore.startDraft()
     }
 
-    // MARK: - Disconnect
+    // MARK: - Offline / forget
+
+    /// Enter durable offline mode without deleting or resetting user data.
+    func goOffline() async {
+        UserDefaults.standard.set(true, forKey: DefaultsKeys.connectionOffline)
+        await stopLiveWork(returningTo: .offline(nil), clearSpotlight: false)
+    }
+
+    /// Leave explicit offline mode and resume the normal saved-pairing bootstrap.
+    func reconnect() async {
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.connectionOffline)
+        await bootstrap()
+    }
 
     /// Tear down the connection, returning to `.needsSetup`.
     ///
@@ -1227,6 +1256,10 @@ final class ConnectionStore {
     /// dropped, or the second `next()` trapped. The tasks idle at their
     /// suspension points while disconnected and cost nothing.
     func disconnect() async {
+        await stopLiveWork(returningTo: .needsSetup, clearSpotlight: true)
+    }
+
+    private func stopLiveWork(returningTo finalPhase: Phase, clearSpotlight: Bool) async {
         reconnectTask?.cancel()
         reconnectTask = nil
         // Cancel any in-flight hydration so a teardown mid-load can't later flip
@@ -1266,10 +1299,64 @@ final class ConnectionStore {
         sessionStore.clearAllTurnsInProgress()
         // ABH-410: privacy cleanup for unpair/sign-out. Indexed session titles
         // live outside the app sandbox until explicitly removed from Spotlight.
-        Self.log.notice("Disconnect clearing Hermes Spotlight session index")
-        Self.clearSpotlightSessionIndexForPrivacy()
+        if clearSpotlight {
+            Self.log.notice("Disconnect clearing Hermes Spotlight session index")
+            Self.clearSpotlightSessionIndexForPrivacy()
+        }
         await client.disconnect()
-        phase = .needsSetup
+        phase = finalPhase
+    }
+
+    /// Authenticated caller-only privacy transaction. Local erasure always wins;
+    /// remote failure records a minimal retry tombstone without retaining token.
+    func forgetGateway(remoteCleanup: (() async throws -> Void)? = nil) async {
+        let defaults = UserDefaults.standard
+        let pending = defaults.data(forKey: DefaultsKeys.gatewayCleanupTombstone)
+            .flatMap { try? JSONDecoder().decode(GatewayCleanupTombstone.self, from: $0) }
+        guard let server = defaults.string(forKey: DefaultsKeys.serverURL) ?? pending?.server,
+              !server.isEmpty else {
+            await stopLiveWork(returningTo: .needsSetup, clearSpotlight: true)
+            return
+        }
+        let deviceId = DefaultsKeys.deviceId(server: server) ?? pending?.deviceId
+        let tombstone = GatewayCleanupTombstone(
+            server: server, deviceId: deviceId, remoteRetryNeeded: pending?.remoteRetryNeeded ?? false
+        )
+        if let data = try? JSONEncoder().encode(tombstone) {
+            // Write-ahead marker: every following step is repeatable, and launch
+            // resumes local cleanup when termination occurs between steps.
+            defaults.set(data, forKey: DefaultsKeys.gatewayCleanupTombstone)
+        }
+        var remoteFailed = false
+        do { try await remoteCleanup?() } catch { remoteFailed = true }
+        await stopLiveWork(returningTo: .needsSetup, clearSpotlight: true)
+        try? await cacheStore?.purgeGateway(serverId: server)
+        queueStore?.removeAll()
+        inboxStore?.removeAll()
+        PendingIntent.clearPending()
+        SharedStore.clearInbox()
+        SharedStore.clearSnapshot()
+        AttachmentBlobCache.shared.clearAll()
+        LiveActivityManager.shared.end()
+        defaults.removeObject(forKey: DefaultsKeys.serverURL)
+        defaults.removeObject(forKey: DefaultsKeys.connectionOffline)
+        defaults.removeObject(forKey: DefaultsKeys.serverCapabilities)
+        defaults.removeObject(forKey: DefaultsKeys.pushLastDeviceToken)
+        defaults.removeObject(forKey: DefaultsKeys.pushLastEvents)
+        defaults.removeObject(forKey: DefaultsKeys.pushLastEnv)
+        defaults.removeObject(forKey: DefaultsKeys.pushLastRegistrationScope)
+        defaults.removeObject(forKey: DefaultsKeys.pushRegistrationHealthy)
+        DefaultsKeys.setDeviceId(nil, server: server)
+        KeychainService.deleteToken(server: server)
+        serverURLString = ""
+        currentToken = nil
+        if remoteFailed {
+            if let data = try? JSONEncoder().encode(GatewayCleanupTombstone(
+                server: server, deviceId: deviceId, remoteRetryNeeded: true
+            )) { defaults.set(data, forKey: DefaultsKeys.gatewayCleanupTombstone) }
+        } else if pending?.remoteRetryNeeded != true {
+            defaults.removeObject(forKey: DefaultsKeys.gatewayCleanupTombstone)
+        }
     }
 
     // MARK: - Long-lived tasks

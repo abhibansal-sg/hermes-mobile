@@ -90,6 +90,7 @@ final class AppEnvironment {
             sessionStore.attachCache(cacheStore)
             chatStore.attachCache(cacheStore)
             inboxStore.attachCache(cacheStore)
+            connectionStore.cacheStore = cacheStore
         }
         // The inbox accumulates broadcast approval/clarify prompts and answers
         // them against each prompt's own runtime via the gateway client.

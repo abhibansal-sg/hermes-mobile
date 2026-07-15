@@ -97,7 +97,9 @@ struct SettingsView: View {
     /// Dismisses the sheet from the X item. F1 needs no `onDismiss`.
     @Environment(\.dismiss) private var dismiss
 
-    @State private var confirmingDisconnect = false
+    @State private var confirmingForget = false
+    @State private var confirmingForgetAgain = false
+    @State private var forgetAuthenticationError: String?
     @State private var appLockGuidance: String?
     /// The sheet-internal navigation path. Pushes are driven by the system
     /// `NavigationLink(value:)` cells (Appearance, the control panels, About) and
@@ -839,7 +841,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Connection (server value + destructive disconnect)
+    // MARK: - Connection
 
     @ViewBuilder
     private var connectionSection: some View {
@@ -854,31 +856,63 @@ struct SettingsView: View {
             }
             .listRowBackground(theme.card)
 
-            Button(role: .destructive) {
-                confirmingDisconnect = true
+            Button {
+                Task {
+                    await connectionStore.goOffline()
+                    dismiss()
+                }
             } label: {
                 SettingsRowLabel(
-                    icon: "rectangle.portrait.and.arrow.right",
-                    title: "Disconnect",
-                    destructive: true
+                    icon: "wifi.slash",
+                    title: "Go Offline"
                 )
             }
             .listRowBackground(theme.card)
-            .accessibilityIdentifier("settingsDisconnect")
+            .accessibilityIdentifier("settingsGoOffline")
+
+            Button(role: .destructive) {
+                confirmingForget = true
+            } label: {
+                SettingsRowLabel(icon: "trash", title: "Forget Gateway & Remove Local Data", destructive: true)
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsForgetGateway")
             .confirmationDialog(
-                "Disconnect from this server?",
-                isPresented: $confirmingDisconnect,
+                "Forget this gateway?",
+                isPresented: $confirmingForget,
                 titleVisibility: .visible
             ) {
-                Button("Disconnect", role: .destructive) {
+                Button("Continue", role: .destructive) { confirmingForgetAgain = true }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This permanently removes this gateway's local conversations, Inbox, drafts, attachments, and queued work.")
+            }
+            .confirmationDialog("Remove all local data?", isPresented: $confirmingForgetAgain, titleVisibility: .visible) {
+                Button("Forget Gateway & Remove Data", role: .destructive) {
                     Task {
-                        await connectionStore.disconnect()
+                        let result = await LAContextAuthenticator().evaluate(reason: "Confirm removing this gateway and its local data")
+                        guard result == .success else {
+                            forgetAuthenticationError = result.message ?? "Authentication failed."
+                            return
+                        }
+                        let rest = connectionStore.rest
+                        let server = connectionStore.serverURLString
+                        let deviceId = DefaultsKeys.deviceId(server: server)
+                        await connectionStore.forgetGateway(remoteCleanup: {
+                            if let rest, let deviceId { _ = try await rest.revokeDevice(id: deviceId) }
+                        })
                         dismiss()
                     }
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("You'll need the server URL and token to reconnect.")
+                Text("You will need to pair again. This cannot be undone.")
+            }
+            .alert("Couldn’t Authenticate", isPresented: Binding(
+                get: { forgetAuthenticationError != nil },
+                set: { if !$0 { forgetAuthenticationError = nil } }
+            )) { Button("OK", role: .cancel) {} } message: {
+                Text(forgetAuthenticationError ?? "Authentication failed.")
             }
         }
     }
@@ -1112,19 +1146,10 @@ struct SettingsView: View {
 
     // MARK: - Reconnect
 
-    /// Re-issue `configure` against the saved server + Keychain token, mirroring
-    /// the ``ConnectionStatusBanner`` retry path.
+    /// Explicitly leave durable offline mode and resume saved-pairing bootstrap.
     private func reconnect() {
         Task {
-            guard let url = URL(string: connectionStore.serverURLString),
-                  let host = url.host, !host.isEmpty,
-                  let token = KeychainService.loadToken(server: connectionStore.serverURLString) else {
-                return
-            }
-            _ = await connectionStore.configure(
-                urlString: connectionStore.serverURLString,
-                token: token
-            )
+            await connectionStore.reconnect()
         }
     }
 
