@@ -297,20 +297,60 @@ final class MessageBubbleA11yTests: XCTestCase {
         XCTAssertEqual(source, "https://example.com/x.png")
     }
 
-    func testChatProseEntriesLeavesInlineImageInProseBlocks() {
-        // An image embedded mid-sentence must stay inside the prose blocks run
-        // so it keeps flowing as inline markdown (not hoisted to a sibling).
+    func testChatProseEntriesSplitsInlineImageIntoParagraphImageParagraph() {
+        // STR-574 acceptance: a paragraph like `before ![alt](url) after` must
+        // NOT disappear or stay inline — it splits in order into paragraph /
+        // image / paragraph so the image renders as a native block sibling.
         let entries = MessageBubble.chatProseEntries("Look at ![this](https://example.com/x.png) now.")
 
-        XCTAssertEqual(entries.count, 1)
-        guard case .blocks(let blocks) = entries[0] else {
-            return XCTFail("inline image should remain in the prose blocks run")
+        XCTAssertEqual(entries.count, 3)
+
+        guard case .blocks(let leadBlocks) = entries[0] else {
+            return XCTFail("inline image should be preceded by a prose blocks run")
         }
-        XCTAssertEqual(blocks.count, 1)
-        guard case .paragraph(let text) = blocks.first else {
-            return XCTFail("expected a paragraph block")
+        XCTAssertEqual(leadBlocks.count, 1)
+        guard case .paragraph(let lead) = leadBlocks.first else {
+            return XCTFail("lead entry should be a paragraph block")
         }
-        XCTAssertEqual(text, "Look at ![this](https://example.com/x.png) now.")
+        XCTAssertEqual(lead, "Look at")
+
+        guard case .image(let alt, let source) = entries[1] else {
+            return XCTFail("middle entry should be the hoisted inline image")
+        }
+        XCTAssertEqual(alt, "this")
+        XCTAssertEqual(source, "https://example.com/x.png")
+
+        guard case .blocks(let tailBlocks) = entries[2] else {
+            return XCTFail("inline image should be followed by a prose blocks run")
+        }
+        XCTAssertEqual(tailBlocks.count, 1)
+        guard case .paragraph(let tail) = tailBlocks.first else {
+            return XCTFail("tail entry should be a paragraph block")
+        }
+        XCTAssertEqual(tail, "now.")
+    }
+
+    func testChatProseEntriesSplitsMultipleInlineImagesOnOneLine() {
+        // Two inline images on one line each hoist, with the prose between them
+        // becoming its own paragraph run.
+        let entries = MessageBubble.chatProseEntries("a ![one](https://example.com/1.png) b ![two](https://example.com/2.png) c")
+
+        XCTAssertEqual(entries.count, 5)
+        guard case .image(let alt1, _) = entries[1] else {
+            return XCTFail("second entry should be the first inline image")
+        }
+        XCTAssertEqual(alt1, "one")
+        guard case .blocks(let midBlocks) = entries[2] else {
+            return XCTFail("third entry should be the prose between the images")
+        }
+        guard case .paragraph(let mid) = midBlocks.first else {
+            return XCTFail("mid entry should be a paragraph block")
+        }
+        XCTAssertEqual(mid, "b")
+        guard case .image(let alt2, _) = entries[3] else {
+            return XCTFail("fourth entry should be the second inline image")
+        }
+        XCTAssertEqual(alt2, "two")
     }
 
     func testChatProseEntriesFallsBackToBlocksForMalformedImage() {
@@ -337,17 +377,22 @@ final class MessageBubbleA11yTests: XCTestCase {
         XCTAssertEqual(source, "https://example.com/x.png")
     }
 
-    func testMarkdownImageParserHandlesEscapedBracketInAlt() {
-        let parsed = MessageBubble.markdownImage(from: "![a\\]b](https://example.com/x.png)")
-        XCTAssertEqual(parsed?.alt, "a]b")
-        XCTAssertEqual(parsed?.source, "https://example.com/x.png")
+    func testSplitLineByImagesHandlesEscapedBracketInAlt() {
+        let pieces = MessageBubble.splitLineByImages("a ![a\\]b](https://example.com/x.png) b")
+        guard case .image(let alt, let source) = pieces[1] else {
+            return XCTFail("second piece should be the image with escaped bracket in alt")
+        }
+        XCTAssertEqual(alt, "a]b")
+        XCTAssertEqual(source, "https://example.com/x.png")
     }
 
-    func testMarkdownImageParserRejectsTrailingProseAfterImage() {
-        // A line that continues after the closing paren is prose, not a block image.
-        XCTAssertNil(MessageBubble.markdownImage(from: "![alt](https://example.com/x.png) is great"))
-        XCTAssertNil(MessageBubble.markdownImage(from: "![alt]()"))
-        XCTAssertNil(MessageBubble.markdownImage(from: "not even an image"))
+    func testSplitLineByImagesLeavesMalformedAndEmptySourceAsProse() {
+        // Malformed syntax and empty sources stay as prose; a valid image with
+        // trailing prose still hoists the image (split), per the STR-574 contract.
+        XCTAssertEqual(MessageBubble.splitLineByImages("![alt](https://example.com/x.png) is great"),
+                       [.image(alt: "alt", source: "https://example.com/x.png"), .prose(" is great")])
+        XCTAssertEqual(MessageBubble.splitLineByImages("![alt]()"), [.prose("![alt]()")])
+        XCTAssertEqual(MessageBubble.splitLineByImages("not even an image"), [.prose("not even an image")])
     }
 
     func testGitHubAlertRenderingEvidenceSnapshots() throws {

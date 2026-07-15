@@ -217,4 +217,24 @@ final class AttachmentBlobCache: @unchecked Sendable {
             try? fm.removeItem(at: entry)
         }
     }
+
+    // MARK: - Shared data-URL decode (STR-574)
+
+    /// Pure decoder for a `data:<mime>;base64,<payload>` URL, returning both the
+    /// decoded image and its raw bytes (the bytes are needed by callers that
+    /// cache the blob via ``store``). Single home for the data-URL contract so
+    /// the assistant-prose markdown image path (`MarkdownImageBlockView`), the
+    /// full-screen `ZoomableImageView` lightbox, and the generated-image tool
+    /// card all decode identically. Returns `nil` for non-`data:` input, a
+    /// missing comma, a non-base64 header, or bytes that fail to decode.
+    static func decodeDataURL(_ value: String) -> (image: UIImage, data: Data)? {
+        guard value.hasPrefix("data:"),
+              let comma = value.firstIndex(of: ",") else { return nil }
+        let header = value[..<comma]
+        guard header.contains(";base64") else { return nil }
+        let payload = String(value[value.index(after: comma)...])
+        guard let data = Data(base64Encoded: payload, options: [.ignoreUnknownCharacters]) else { return nil }
+        guard let image = UIImage(data: data) else { return nil }
+        return (image, data)
+    }
 }
