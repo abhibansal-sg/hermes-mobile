@@ -1,0 +1,644 @@
+import CryptoKit
+import Foundation
+import GRDB
+
+enum WorkRepositoryError: Error, LocalizedError, Equatable {
+    case appGroupUnavailable
+    case protectedDataUnavailable
+    case invalidScope
+    case invalidRelativePath
+    case jobNotFound
+    case draftNotFound
+    case assetNotFound
+    case invalidTransition(from: WorkJobState, to: WorkJobState)
+    case leaseLost
+
+    var errorDescription: String? {
+        switch self {
+        case .appGroupUnavailable:
+            "Couldn’t reach Hermes’ shared storage. Check the app is installed."
+        case .protectedDataUnavailable:
+            "Hermes’ protected storage is locked. Unlock the device and try again."
+        case .invalidScope:
+            "The work item has an invalid gateway scope."
+        case .invalidRelativePath:
+            "The work item contains an invalid asset path."
+        case .jobNotFound:
+            "The queued work item no longer exists."
+        case .draftNotFound:
+            "The draft no longer exists."
+        case .assetNotFound:
+            "The work asset no longer exists."
+        case .invalidTransition(let from, let to):
+            "Invalid work transition from \(from.rawValue) to \(to.rawValue)."
+        case .leaseLost:
+            "Another worker owns this work item."
+        }
+    }
+}
+
+struct WorkRepositoryConfiguration: Sendable {
+    static let databaseName = "hermes_work.sqlite"
+    static let assetsDirectoryName = "WorkAssets"
+
+    let databaseURL: URL
+    let assetsDirectoryURL: URL
+    let protectedDataAvailable: @Sendable () -> Bool
+
+    init(
+        containerURL: URL,
+        protectedDataAvailable: @escaping @Sendable () -> Bool = { true }
+    ) {
+        self.databaseURL = containerURL.appendingPathComponent(Self.databaseName)
+        self.assetsDirectoryURL = containerURL.appendingPathComponent(
+            Self.assetsDirectoryName,
+            isDirectory: true
+        )
+        self.protectedDataAvailable = protectedDataAvailable
+    }
+
+    static func appGroup(
+        protectedDataAvailable: @escaping @Sendable () -> Bool = { true }
+    ) throws -> WorkRepositoryConfiguration {
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: SharedStore.appGroupID
+        ) else {
+            throw WorkRepositoryError.appGroupUnavailable
+        }
+        return WorkRepositoryConfiguration(
+            containerURL: containerURL,
+            protectedDataAvailable: protectedDataAvailable
+        )
+    }
+}
+
+/// Shared, protected source of truth for drafts and queued user work.
+///
+/// Each process creates its own actor and `DatabasePool`. WAL and SQL leases
+/// coordinate those connections; no process-local singleton is used for
+/// correctness. The actor serializes its own callers, while GRDB performs all
+/// SQLite work away from `MainActor`.
+actor WorkRepository {
+    private static let protection: FileProtectionType = .completeUntilFirstUserAuthentication
+
+    let database: DatabasePool
+    private let configuration: WorkRepositoryConfiguration
+    private let observation: WorkRepositoryObservation?
+
+    init(
+        configuration: WorkRepositoryConfiguration,
+        observation: WorkRepositoryObservation? = nil
+    ) throws {
+        guard configuration.protectedDataAvailable() else {
+            throw WorkRepositoryError.protectedDataUnavailable
+        }
+
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(
+            at: configuration.databaseURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.protectionKey: Self.protection]
+        )
+        try fileManager.createDirectory(
+            at: configuration.assetsDirectoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.protectionKey: Self.protection]
+        )
+
+        var databaseConfiguration = Configuration()
+        databaseConfiguration.busyMode = .timeout(5)
+        databaseConfiguration.prepareDatabase { db in
+            // DatabasePool otherwise gives read-only connections GRDB's
+            // 10-second default; the cross-process contract requires 5 seconds
+            // for every connection in both processes.
+            try db.execute(sql: "PRAGMA busy_timeout = 5000")
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+            try db.execute(sql: "PRAGMA journal_mode = WAL")
+        }
+
+        let pool = try DatabasePool(
+            path: configuration.databaseURL.path,
+            configuration: databaseConfiguration
+        )
+        try WorkSchema.makeMigrator().migrate(pool)
+
+        self.database = pool
+        self.configuration = configuration
+        self.observation = observation
+
+        try Self.protectAndExcludeFromBackup(configuration.databaseURL)
+        try Self.protectAndExcludeFromBackup(configuration.assetsDirectoryURL)
+        Self.protectSQLiteCompanions(for: configuration.databaseURL)
+    }
+
+    static func openAppGroup(
+        scope: WorkScope?,
+        observation: WorkRepositoryObservation? = nil
+    ) async throws -> WorkRepository {
+        let repository = try WorkRepository(configuration: .appGroup(), observation: observation)
+        try await repository.importLegacyWork(from: LegacyWorkImportSource(scope: scope))
+        try await repository.refreshObservation()
+        return repository
+    }
+
+    // MARK: - Job CRUD
+
+    @discardableResult
+    func enqueue(_ input: WorkJobInput, assets: [WorkAssetInput] = []) async throws -> WorkJob {
+        try ensureProtectedDataAvailable()
+        let preparedAssets = try prepareAssets(assets)
+        let now = input.createdAt?.timeIntervalSince1970 ?? Date().timeIntervalSince1970
+        let job = makeJob(input, preparedAssets: preparedAssets, now: now)
+
+        do {
+            try await database.write { db in
+                try job.insert(db)
+                for (ordinal, prepared) in preparedAssets.enumerated() {
+                    try prepared.record.insert(db)
+                    try WorkJobAsset(
+                        jobID: job.jobID,
+                        assetID: prepared.record.assetID,
+                        ordinal: ordinal,
+                        transferID: nil,
+                        remotePath: nil,
+                        state: "local"
+                    ).insert(db)
+                }
+            }
+        } catch {
+            removePreparedFiles(preparedAssets)
+            throw error
+        }
+
+        await publishObservation()
+        return job
+    }
+
+    func job(id: String) throws -> WorkJob? {
+        try database.read { db in
+            try WorkJob.fetchOne(db, key: id)
+        }
+    }
+
+    func jobs(scope: WorkScope? = nil) throws -> [WorkJob] {
+        try database.read { db in
+            var request = WorkJob.order(Column("created_at"), Column("job_id"))
+            if let scope {
+                request = request
+                    .filter(Column("server_id") == scope.serverID)
+                    .filter(Column("profile_id") == scope.profileID)
+            }
+            return try request.fetchAll(db)
+        }
+    }
+
+    func databasePragmas() throws -> WorkDatabasePragmas {
+        try database.read { db in
+            WorkDatabasePragmas(
+                journalMode: try String.fetchOne(db, sql: "PRAGMA journal_mode") ?? "",
+                foreignKeysEnabled: (try Int.fetchOne(db, sql: "PRAGMA foreign_keys") ?? 0) == 1,
+                busyTimeoutMilliseconds: try Int.fetchOne(db, sql: "PRAGMA busy_timeout") ?? 0
+            )
+        }
+    }
+
+    /// Atomically claims the oldest eligible job. Ordering by `job_id` breaks
+    /// timestamp ties so two processes always choose the same candidate.
+    func claimNextJob(
+        scope: WorkScope? = nil,
+        owner: String,
+        now: Date,
+        leaseDuration: TimeInterval
+    ) throws -> WorkJob? {
+        guard !owner.isEmpty, leaseDuration > 0 else { throw WorkRepositoryError.leaseLost }
+        let timestamp = now.timeIntervalSince1970
+        let leaseExpiry = timestamp + leaseDuration
+        var scopeSQL = ""
+        var arguments: StatementArguments = [
+            owner, leaseExpiry, timestamp, timestamp, timestamp, timestamp,
+        ]
+        if let scope {
+            scopeSQL = " AND server_id = ? AND profile_id = ?"
+            arguments += [scope.serverID, scope.profileID]
+        }
+
+        return try database.write { db in
+            try WorkJob.fetchOne(
+                db,
+                sql: """
+                    UPDATE work_jobs
+                    SET lease_owner = ?, lease_expires_at = ?, updated_at = ?,
+                        attempt_count = attempt_count + 1
+                    WHERE job_id = (
+                        SELECT job_id
+                        FROM work_jobs
+                        WHERE state IN (
+                            'queued', 'creating_destination', 'uploading', 'submitting',
+                            'accepted', 'retry_wait'
+                        )
+                          AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                          AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+                          AND (expires_at IS NULL OR expires_at > ?)
+                          \(scopeSQL)
+                        ORDER BY created_at ASC, job_id ASC
+                        LIMIT 1
+                    )
+                    RETURNING *
+                    """,
+                arguments: arguments
+            )
+        }
+    }
+
+    @discardableResult
+    func transitionJob(
+        id: String,
+        from expectedState: WorkJobState,
+        to newState: WorkJobState,
+        owner: String? = nil,
+        now: Date = Date(),
+        destinationSessionID: String? = nil,
+        nextAttemptAt: Date? = nil,
+        errorCode: String? = nil,
+        errorMessage: String? = nil
+    ) async throws -> WorkJob {
+        guard Self.allowedTransitions[expectedState, default: []].contains(newState) else {
+            throw WorkRepositoryError.invalidTransition(from: expectedState, to: newState)
+        }
+
+        let timestamp = now.timeIntervalSince1970
+        let existing = try await database.write { db -> WorkJob in
+            guard var job = try WorkJob.fetchOne(db, key: id) else {
+                throw WorkRepositoryError.jobNotFound
+            }
+            guard job.state == expectedState else {
+                throw WorkRepositoryError.invalidTransition(from: job.state, to: newState)
+            }
+            if let owner, job.leaseOwner != owner {
+                throw WorkRepositoryError.leaseLost
+            }
+
+            job.state = newState
+            job.updatedAt = timestamp
+            if let destinationSessionID {
+                if let current = job.destinationSessionID, current != destinationSessionID {
+                    throw WorkRepositoryError.invalidTransition(from: expectedState, to: newState)
+                }
+                job.destinationSessionID = destinationSessionID
+            }
+            job.nextAttemptAt = nextAttemptAt?.timeIntervalSince1970
+            job.lastErrorCode = errorCode
+            job.lastErrorMessage = errorMessage
+            if newState == .accepted { job.acceptedAt = timestamp }
+            if newState == .completed { job.completedAt = timestamp }
+            try job.update(db)
+            return job
+        }
+        await publishObservation()
+        return existing
+    }
+
+    func releaseLease(id: String, owner: String, now: Date = Date()) async throws {
+        let changed = try await database.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE work_jobs
+                    SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                    WHERE job_id = ? AND lease_owner = ?
+                    """,
+                arguments: [now.timeIntervalSince1970, id, owner]
+            )
+            return db.changesCount
+        }
+        guard changed == 1 else { throw WorkRepositoryError.leaseLost }
+        await publishObservation()
+    }
+
+    func bindScope(jobID: String, scope: WorkScope, now: Date = Date()) async throws -> WorkJob {
+        let result = try await database.write { db -> WorkJob in
+            guard var job = try WorkJob.fetchOne(db, key: jobID) else {
+                throw WorkRepositoryError.jobNotFound
+            }
+            guard job.state == .waitingForScope, job.scope == nil else {
+                throw WorkRepositoryError.invalidTransition(from: job.state, to: .queued)
+            }
+            job.serverID = scope.serverID
+            job.profileID = scope.profileID
+            job.state = .queued
+            job.updatedAt = now.timeIntervalSince1970
+            try job.update(db)
+            return job
+        }
+        await publishObservation()
+        return result
+    }
+
+    func deleteJob(id: String) async throws {
+        let paths = try await database.write { db -> [String] in
+            guard try WorkJob.deleteOne(db, key: id) else { return [] }
+            return try Self.deleteUnreferencedAssetRows(db)
+        }
+        removeAssetFiles(paths)
+        await publishObservation()
+    }
+
+    // MARK: - Draft CRUD
+
+    @discardableResult
+    func upsertDraft(
+        scope: WorkScope,
+        contextKey: String,
+        storedSessionID: String? = nil,
+        text: String,
+        cwd: String? = nil,
+        modelSelectionJSON: String? = nil,
+        now: Date = Date()
+    ) async throws -> WorkDraft {
+        guard !contextKey.isEmpty else { throw WorkRepositoryError.invalidScope }
+        let timestamp = now.timeIntervalSince1970
+        let draft = try await database.write { db -> WorkDraft in
+            if var existing = try WorkDraft
+                .filter(Column("server_id") == scope.serverID)
+                .filter(Column("profile_id") == scope.profileID)
+                .filter(Column("context_key") == contextKey)
+                .fetchOne(db) {
+                existing.storedSessionID = storedSessionID
+                existing.text = text
+                existing.cwd = cwd
+                existing.modelSelectionJSON = modelSelectionJSON
+                existing.updatedAt = timestamp
+                try existing.update(db)
+                return existing
+            }
+            let created = WorkDraft(
+                draftID: UUID().uuidString.lowercased(),
+                serverID: scope.serverID,
+                profileID: scope.profileID,
+                contextKey: contextKey,
+                storedSessionID: storedSessionID,
+                text: text,
+                cwd: cwd,
+                modelSelectionJSON: modelSelectionJSON,
+                createdAt: timestamp,
+                updatedAt: timestamp
+            )
+            try created.insert(db)
+            return created
+        }
+        await publishObservation()
+        return draft
+    }
+
+    func drafts(scope: WorkScope) throws -> [WorkDraft] {
+        try database.read { db in
+            try WorkDraft
+                .filter(Column("server_id") == scope.serverID)
+                .filter(Column("profile_id") == scope.profileID)
+                .order(Column("updated_at").desc, Column("draft_id"))
+                .fetchAll(db)
+        }
+    }
+
+    func attachAsset(_ assetID: String, toDraft draftID: String, ordinal: Int) async throws {
+        try await database.write { db in
+            guard try WorkDraft.fetchOne(db, key: draftID) != nil else {
+                throw WorkRepositoryError.draftNotFound
+            }
+            guard try WorkAsset.fetchOne(db, key: assetID) != nil else {
+                throw WorkRepositoryError.assetNotFound
+            }
+            try WorkDraftAsset(draftID: draftID, assetID: assetID, ordinal: ordinal).insert(db)
+        }
+        await publishObservation()
+    }
+
+    func deleteDraft(id: String) async throws {
+        let paths = try await database.write { db -> [String] in
+            guard try WorkDraft.deleteOne(db, key: id) else { return [] }
+            return try Self.deleteUnreferencedAssetRows(db)
+        }
+        removeAssetFiles(paths)
+        await publishObservation()
+    }
+
+    // MARK: - Assets and observations
+
+    func assets(jobID: String) throws -> [WorkAsset] {
+        try database.read { db in
+            try WorkAsset.fetchAll(
+                db,
+                sql: """
+                    SELECT work_assets.*
+                    FROM work_assets
+                    JOIN job_assets USING (asset_id)
+                    WHERE job_assets.job_id = ?
+                    ORDER BY job_assets.ordinal
+                    """,
+                arguments: [jobID]
+            )
+        }
+    }
+
+    func assetFileExists(relativePath: String) throws -> Bool {
+        let url = try assetURL(relativePath: relativePath)
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    func refreshObservation() async throws {
+        await publishObservation()
+    }
+
+    // MARK: - Internals
+
+    private struct PreparedAsset: Sendable {
+        let record: WorkAsset
+        let url: URL
+    }
+
+    private static let allowedTransitions: [WorkJobState: Set<WorkJobState>] = [
+        .waitingForScope: [.queued, .cancelled, .expired],
+        .queued: [.creatingDestination, .uploading, .submitting, .retryWait, .failed, .cancelled, .expired],
+        .creatingDestination: [.uploading, .submitting, .retryWait, .failed, .cancelled, .expired],
+        .uploading: [.submitting, .retryWait, .failed, .cancelled, .expired],
+        .submitting: [.accepted, .retryWait, .failed, .cancelled, .expired],
+        .accepted: [.completed],
+        .retryWait: [.queued, .creatingDestination, .uploading, .submitting, .failed, .cancelled, .expired],
+        .failed: [.queued, .cancelled, .expired],
+        .completed: [],
+        .cancelled: [],
+        .expired: [],
+    ]
+
+    private func makeJob(
+        _ input: WorkJobInput,
+        preparedAssets: [PreparedAsset],
+        now: Double
+    ) -> WorkJob {
+        let jobID = input.jobID.uuidString.lowercased()
+        let assetHashes = preparedAssets.map(\.record.sha256)
+        let payload = [
+            input.kind.rawValue,
+            input.intentKind?.rawValue ?? "",
+            input.text ?? "",
+            input.sourceURL ?? "",
+            input.comment ?? "",
+            input.storedSessionID ?? "",
+            assetHashes.joined(separator: ","),
+        ].map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+
+        return WorkJob(
+            jobID: jobID,
+            kind: input.kind,
+            clientMessageID: jobID,
+            serverID: input.scope?.serverID,
+            profileID: input.scope?.profileID,
+            state: input.state,
+            intentKind: input.intentKind,
+            text: input.text,
+            sourceURL: input.sourceURL,
+            comment: input.comment,
+            storedSessionID: input.storedSessionID,
+            destinationSessionID: nil,
+            payloadHash: Self.sha256(Data(payload.utf8)),
+            attemptCount: 0,
+            nextAttemptAt: nil,
+            lastErrorCode: nil,
+            lastErrorMessage: nil,
+            leaseOwner: nil,
+            leaseExpiresAt: nil,
+            expiresAt: input.expiresAt?.timeIntervalSince1970,
+            legacyImportKey: input.legacyImportKey,
+            createdAt: now,
+            updatedAt: now,
+            acceptedAt: nil,
+            completedAt: nil
+        )
+    }
+
+    private func prepareAssets(_ inputs: [WorkAssetInput]) throws -> [PreparedAsset] {
+        var prepared: [PreparedAsset] = []
+        do {
+            for input in inputs {
+                let ext = input.fileExtension.lowercased()
+                guard !ext.isEmpty,
+                      ext.allSatisfy({ $0.isLetter || $0.isNumber }) else {
+                    throw WorkRepositoryError.invalidRelativePath
+                }
+                let assetID = UUID().uuidString.lowercased()
+                let relativePath = "\(assetID).\(ext)"
+                let url = try assetURL(relativePath: relativePath)
+                try input.data.write(to: url, options: [.atomic])
+                try FileManager.default.setAttributes(
+                    [.protectionKey: Self.protection],
+                    ofItemAtPath: url.path
+                )
+                try Self.protectAndExcludeFromBackup(url)
+                let now = Date().timeIntervalSince1970
+                prepared.append(PreparedAsset(
+                    record: WorkAsset(
+                        assetID: assetID,
+                        relativePath: relativePath,
+                        mimeType: input.mimeType,
+                        byteCount: input.data.count,
+                        sha256: Self.sha256(input.data),
+                        createdAt: now,
+                        lastAccessedAt: now
+                    ),
+                    url: url
+                ))
+            }
+            return prepared
+        } catch {
+            removePreparedFiles(prepared)
+            throw error
+        }
+    }
+
+    private func assetURL(relativePath: String) throws -> URL {
+        guard !relativePath.isEmpty,
+              !relativePath.hasPrefix("/"),
+              !relativePath.contains(".."),
+              !relativePath.contains("\\"),
+              (relativePath as NSString).pathComponents.count == 1 else {
+            throw WorkRepositoryError.invalidRelativePath
+        }
+        return configuration.assetsDirectoryURL.appendingPathComponent(relativePath)
+    }
+
+    private func removePreparedFiles(_ assets: [PreparedAsset]) {
+        for asset in assets {
+            try? FileManager.default.removeItem(at: asset.url)
+        }
+    }
+
+    private func removeAssetFiles(_ relativePaths: [String]) {
+        for path in relativePaths {
+            guard let url = try? assetURL(relativePath: path) else { continue }
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private static func deleteUnreferencedAssetRows(_ db: Database) throws -> [String] {
+        let rows = try Row.fetchAll(
+            db,
+            sql: """
+                SELECT relative_path
+                FROM work_assets AS asset
+                WHERE NOT EXISTS (SELECT 1 FROM job_assets WHERE asset_id = asset.asset_id)
+                  AND NOT EXISTS (SELECT 1 FROM draft_assets WHERE asset_id = asset.asset_id)
+                """
+        )
+        let paths = rows.map { $0["relative_path"] as String }
+        if !paths.isEmpty {
+            try db.execute(
+                sql: """
+                    DELETE FROM work_assets
+                    WHERE NOT EXISTS (SELECT 1 FROM job_assets WHERE asset_id = work_assets.asset_id)
+                      AND NOT EXISTS (SELECT 1 FROM draft_assets WHERE asset_id = work_assets.asset_id)
+                    """
+            )
+        }
+        return paths
+    }
+
+    private func publishObservation() async {
+        guard let observation else { return }
+        guard let snapshot = try? await database.read({ db in
+            WorkRepositorySnapshot(
+                jobs: try WorkJob.order(Column("created_at"), Column("job_id")).fetchAll(db),
+                drafts: try WorkDraft.order(Column("updated_at").desc).fetchAll(db)
+            )
+        }) else { return }
+        await observation.publish(snapshot)
+    }
+
+    private func ensureProtectedDataAvailable() throws {
+        guard configuration.protectedDataAvailable() else {
+            throw WorkRepositoryError.protectedDataUnavailable
+        }
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func protectAndExcludeFromBackup(_ url: URL) throws {
+        if FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.setAttributes(
+                [.protectionKey: protection],
+                ofItemAtPath: url.path
+            )
+        }
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableURL = url
+        try mutableURL.setResourceValues(values)
+    }
+
+    private static func protectSQLiteCompanions(for databaseURL: URL) {
+        for suffix in ["-wal", "-shm"] {
+            let companion = URL(fileURLWithPath: databaseURL.path + suffix)
+            try? protectAndExcludeFromBackup(companion)
+        }
+    }
+}
