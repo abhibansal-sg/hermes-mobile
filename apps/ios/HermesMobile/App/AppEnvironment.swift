@@ -180,6 +180,21 @@ final class AppEnvironment {
         connectionStore.queueStore = queueStore
         // Push registration: resolve base URL + token off the connection store.
         PushRegistrar.shared.attach(connection: connectionStore)
+        BackgroundRefreshCoordinator.shared.configure(
+            loadPairing: {
+                let defaults = UserDefaults.standard
+                guard let url = defaults.string(forKey: DefaultsKeys.serverURL)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !url.isEmpty,
+                      let token = KeychainService.loadToken(server: url), !token.isEmpty else { return nil }
+                let profile = defaults.string(forKey: DefaultsKeys.activeProfile) ?? DefaultsKeys.allProfilesScope
+                return BackgroundManifestScope(gatewayURL: url, scope: profile, token: token)
+            },
+            sync: { [weak sessionStore] _ in
+                // This is the existing foreground cache/cursor writer. The manifest
+                // issue replaces this closure with its atomic manifest operation.
+                await sessionStore?.refresh()
+            }
+        )
 
         self.sessionStore = sessionStore
         self.chatStore = chatStore
