@@ -1320,10 +1320,14 @@ struct ChatView: View {
         // more to load.
         let total = chatStore.messages.count
         let targetIndex = chatStore.messages.firstIndex(where: { $0.id == target }) ?? 0
-        let distanceFromBottom = total - targetIndex
-        if distanceFromBottom > windowSize {
+        let revealedWindowSize = Self.windowSizeAfterJumpReveal(
+            currentWindowSize: windowSize,
+            messageCount: total,
+            targetIndex: targetIndex
+        )
+        if revealedWindowSize != windowSize {
             withAnimation(nil) {
-                windowSize = min(total, distanceFromBottom + Self.transcriptWindow)
+                windowSize = revealedWindowSize
             }
         }
 
@@ -1366,6 +1370,7 @@ struct ChatView: View {
             .chromePill(theme, in: Capsule())
             .frame(maxWidth: .infinity)
             .padding(.vertical, 6)
+            .accessibilityLabel(text)
             .accessibilityIdentifier(identifier)
     }
 
@@ -1392,6 +1397,24 @@ struct ChatView: View {
     ) -> Int {
         guard prependedRowCount > 0 else { return currentWindowSize }
         return currentWindowSize + prependedRowCount
+    }
+
+    /// ABH-401: when a target-centered around-window prepend places the jump row
+    /// above the eager tail slice, grow the render window until that target row is
+    /// constructed. Without this, the fetch can succeed but `scrollTo` has no
+    /// laid-out anchor to resolve (a dead-end scroll). Keep the existing window
+    /// when the target is already visible or the index is invalid.
+    nonisolated static func windowSizeAfterJumpReveal(
+        currentWindowSize: Int,
+        messageCount: Int,
+        targetIndex: Int
+    ) -> Int {
+        guard messageCount > 0, targetIndex >= 0, targetIndex < messageCount else {
+            return currentWindowSize
+        }
+        let distanceFromBottom = messageCount - targetIndex
+        guard distanceFromBottom > currentWindowSize else { return currentWindowSize }
+        return min(messageCount, distanceFromBottom + Self.transcriptWindow)
     }
 
     /// "Load earlier messages" affordance shown above the eager tail window when the

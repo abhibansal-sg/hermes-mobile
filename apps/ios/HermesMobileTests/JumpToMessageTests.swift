@@ -815,6 +815,133 @@ final class JumpToOldMessageWindowTests: XCTestCase {
         XCTAssertEqual(sessions.pendingMessageJump, 5)
         await assertAroundFetchResolvesTarget(chat: chat)
     }
+
+    func testAroundWindowPrependGrowsRenderWindowToRevealTargetAnchor() {
+        let initialWindow = ChatView.transcriptWindow
+        let totalAfterAroundPrepend = initialWindow + 5
+        let targetIndex = 2
+
+        XCTAssertGreaterThan(
+            ChatView.renderWindowStart(
+                messageCount: totalAfterAroundPrepend,
+                windowSize: initialWindow
+            ),
+            targetIndex,
+            "precondition: after an around-window prepend ahead of the newest tail, the target is still above the eager tail slice"
+        )
+
+        let grown = ChatView.windowSizeAfterJumpReveal(
+            currentWindowSize: initialWindow,
+            messageCount: totalAfterAroundPrepend,
+            targetIndex: targetIndex
+        )
+
+        XCTAssertEqual(grown, totalAfterAroundPrepend,
+                       "ABH-401: the jump reveal must grow the render window until the prepended target row is constructed")
+        XCTAssertLessThanOrEqual(
+            ChatView.renderWindowStart(
+                messageCount: totalAfterAroundPrepend,
+                windowSize: grown
+            ),
+            targetIndex,
+            "ABH-401: after the grow, ScrollView.scrollTo has a laid-out target anchor instead of a dead-end hidden row"
+        )
+    }
+}
+
+// MARK: - ABH-401 jump-target loading / error state
+
+@MainActor
+final class JumpTargetLoadStateTests: XCTestCase {
+
+    private func stored(role: String, text: String, wireId: Int) -> StoredMessage {
+        StoredMessage(json: .object([
+            "role": .string(role),
+            "content": .string(text),
+            "id": .number(Double(wireId)),
+            "timestamp": .number(1_700_000_000 + Double(wireId)),
+        ]))!
+    }
+
+    private func makeChat() -> ChatStore {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let attachments = AttachmentStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        sessions.attach(connection: connection, chat: chat)
+        sessions.sessions = [SessionSummary(
+            id: "s1", title: "Long Session", preview: nil,
+            startedAt: 1_700_000_000, messageCount: 60, source: nil,
+            lastActive: 1_700_000_060, cwd: nil
+        )]
+        sessions.activeStoredId = "s1"
+        return chat
+    }
+
+    private func targetPage() -> TranscriptAroundFetch {
+        let page = (3...7).map { id in
+            stored(role: id % 2 == 0 ? "assistant" : "user", text: "message \(id)", wireId: id)
+        }
+        return TranscriptAroundFetch(
+            messages: page,
+            oldestId: 3,
+            hasMoreBefore: true,
+            containsTarget: true
+        )
+    }
+
+    func testLoadingJumpTargetFlagIsSetDuringFetchAndClearedAfterSuccess() async {
+        let chat = makeChat()
+        let gate = AsyncGate()
+        chat.transcriptAroundFetch = { _, _, _ in
+            await gate.waitForRelease()
+            return self.targetPage()
+        }
+
+        XCTAssertFalse(chat.isLoadingJumpTarget)
+        let task = Task { await chat.loadTranscriptAround(messageId: 5, radius: 2) }
+
+        await gate.waitUntilWaiting()
+        XCTAssertTrue(chat.isLoadingJumpTarget,
+                      "ABH-401: the loading chip must have a live store flag while the target-centered fetch is in flight")
+        XCTAssertNil(chat.jumpTargetLoadError,
+                     "starting a fresh jump fetch clears stale jump-target errors")
+
+        await gate.release()
+        let loaded = await task.value
+        XCTAssertTrue(loaded)
+        XCTAssertFalse(chat.isLoadingJumpTarget,
+                       "ABH-401: defer must clear the loading flag after a successful around-window fetch")
+        XCTAssertNil(chat.jumpTargetLoadError)
+    }
+
+    func testNilAroundFetchShowsLoadErrorAndClearsLoadingFlag() async {
+        let chat = makeChat()
+        chat.transcriptAroundFetch = { _, _, _ in nil }
+
+        let loaded = await chat.loadTranscriptAround(messageId: 5, radius: 2)
+
+        XCTAssertFalse(loaded)
+        XCTAssertFalse(chat.isLoadingJumpTarget,
+                       "ABH-401: a failed network fetch must not leave the loading chip stuck")
+        XCTAssertEqual(chat.jumpTargetLoadError, "Couldn’t load earlier messages.")
+    }
+
+    func testUnavailableAroundFetchShowsUnavailableCopyAndClearsLoadingFlag() async {
+        let chat = makeChat()
+        chat.transcriptAroundFetch = { _, _, _ in
+            TranscriptAroundFetch(messages: [], oldestId: nil, hasMoreBefore: false, containsTarget: false)
+        }
+
+        let loaded = await chat.loadTranscriptAround(messageId: 5, radius: 2)
+
+        XCTAssertFalse(loaded)
+        XCTAssertFalse(chat.isLoadingJumpTarget,
+                       "ABH-401: an empty/unavailable target response must not leave the loading chip stuck")
+        XCTAssertEqual(chat.jumpTargetLoadError, "That earlier message is no longer available.",
+                       "ABH-401: unavailable targets surface stable user-facing chip copy")
+    }
 }
 
 // MARK: - ABH-401 UI craft: mutual exclusion with ABH-400 "load earlier"
