@@ -65,7 +65,16 @@ class _FakeRelayClient:
         return self.status
 
     async def send_event(
-        self, *, kind, session_id, title, body, source=None
+        self,
+        *,
+        kind,
+        session_id,
+        title,
+        body,
+        source=None,
+        event_type=None,
+        category=None,
+        payload=None,
     ) -> None:
         self.send_calls += 1
 
