@@ -88,6 +88,10 @@ targets:
         NSUserActivityTypes:
           - ai.hermes.app.openSession
         NSSupportsLiveActivities: true
+        BGTaskSchedulerPermittedIdentifiers:
+          - ai.hermes.app.refresh
+        UIBackgroundModes:
+          - fetch
         CFBundleURLTypes:
           - CFBundleURLName: ai.hermes.app
             CFBundleURLSchemes:
