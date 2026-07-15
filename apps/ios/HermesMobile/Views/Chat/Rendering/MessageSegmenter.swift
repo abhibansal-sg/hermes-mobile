@@ -14,11 +14,13 @@ import Foundation
 /// matches how terminals and other chat clients render streaming code.
 enum MessageSegmenter {
 
-    /// A contiguous run of prose, fenced code, or LaTeX math.
+    /// A contiguous run of prose, fenced code, LaTeX math, or a rich URL
+    /// embed card.
     enum Segment: Identifiable, Equatable, Sendable {
         case prose(String)
         case code(language: String?, body: String)
         case math(latex: String, display: Bool)
+        case embed(RichURLEmbedDescriptor)
 
         /// Stable-enough identity for `ForEach`. The index prefix keeps
         /// otherwise-identical adjacent segments distinct.
@@ -30,6 +32,8 @@ enum MessageSegmenter {
                 return "c:\(language ?? "")|\(body.hashValue)"
             case .math(let latex, let display):
                 return "m:\(display ? "d" : "i")|\(latex.hashValue)"
+            case .embed(let descriptor):
+                return "e:\(descriptor.id)"
             }
         }
     }
@@ -148,10 +152,172 @@ enum MessageSegmenter {
         let display: Bool
     }
 
-    /// Split a prose run further around clear LaTeX math delimiters. This pass is
-    /// intentionally conservative for single-dollar math so normal currency prose
-    /// remains untouched and streaming tails with unclosed delimiters stay prose.
+    /// Split a prose run further around rich URL embeds and clear LaTeX math
+    /// delimiters. Bare supported URLs (YouTube, Vimeo, Instagram, Pinterest,
+    /// TikTok, X/Twitter, Spotify, Maps) are lifted
+    /// into standalone `.embed` segments; the prose around them is then
+    /// math-split as before. This pass is intentionally conservative for
+    /// single-dollar math so normal currency prose remains untouched and
+    /// streaming tails with unclosed delimiters stay prose. URLs inside fenced
+    /// code never reach here (code is split out first); URLs that are the
+    /// destination of a markdown inline link `[label](url)` are left as prose.
+    ///
+    /// Math regions are computed first so URLs that happen to appear inside
+    /// inline or display math are never lifted as embeds, and a non-embeddable
+    /// or markdown-link URL never prevents a later bare supported URL from
+    /// embedding.
     private static func proseAndMathSegments(_ text: String) -> [Segment] {
+        let protectedRanges = mathRanges(in: text)
+        var segments: [Segment] = []
+        var cursor = text.startIndex
+
+        while cursor < text.endIndex {
+            guard let embed = embedMatch(in: text, from: cursor, protectedRanges: protectedRanges) else {
+                // No more embeddable URLs — math-split the remaining tail.
+                let tail = String(text[cursor..<text.endIndex])
+                segments.append(contentsOf: mathSegments(tail))
+                return segments
+            }
+
+            if cursor < embed.start {
+                let before = String(text[cursor..<embed.start])
+                segments.append(contentsOf: mathSegments(before))
+            }
+
+            segments.append(.embed(embed.descriptor))
+            cursor = embed.end
+        }
+
+        return segments
+    }
+
+    // MARK: - Rich URL embed recognition
+
+    private struct EmbedMatch {
+        let start: String.Index
+        let end: String.Index
+        let descriptor: RichURLEmbedDescriptor
+    }
+
+    /// Find the next bare, supported URL in `text` starting from `start`.
+    /// Returns the exact character range (after trimming trailing punctuation)
+    /// and the resolved descriptor, or `nil` when no embeddable URL remains.
+    ///
+    /// URLs that fall inside a protected math region, that are a markdown
+    /// inline-link destination, or that the detector does not accept are
+    /// skipped — scanning advances past them so a later bare supported URL can
+    /// still embed.
+    private static func embedMatch(
+        in text: String,
+        from start: String.Index,
+        protectedRanges: [Range<String.Index>]
+    ) -> EmbedMatch? {
+        let trailingPunctuation: Set<Character> = [".", ",", ";", ":", "!", "?", ")", "]", "\u{201D}", "\u{2019}"]
+
+        var searchStart = start
+        while searchStart < text.endIndex {
+            guard let httpStart = nextURLOrigin(in: text, from: searchStart) else { return nil }
+
+            // A URL inside an inline/display math region stays part of the
+            // math; jump past the whole region and keep looking.
+            if let protectedRange = protectedRanges.first(where: { $0.contains(httpStart) }) {
+                searchStart = protectedRange.upperBound > httpStart
+                    ? protectedRange.upperBound
+                    : text.index(after: httpStart)
+                continue
+            }
+
+            // The URL token runs to the next whitespace (or end of string).
+            let tokenEnd = endOfURLToken(in: text, from: httpStart)
+
+            // A markdown inline-link destination `[label](url)` is a labelled
+            // link, not a bare URL — skip the whole token so a later bare URL
+            // can still embed.
+            if isMarkdownLinkDestination(text, at: httpStart) {
+                searchStart = tokenEnd
+                continue
+            }
+
+            // Progressively trim trailing punctuation (e.g. a period or closing
+            // paren that is prose, not part of the link) until the detector
+            // accepts the candidate.
+            var urlEnd = tokenEnd
+            while urlEnd > httpStart {
+                let candidate = String(text[httpStart..<urlEnd])
+                if let descriptor = RichURLEmbedDetector.detect(candidate) {
+                    return EmbedMatch(start: httpStart, end: urlEnd, descriptor: descriptor)
+                }
+                let prev = text.index(before: urlEnd)
+                guard trailingPunctuation.contains(text[prev]) else { break }
+                urlEnd = prev
+            }
+
+            // Not embeddable here — advance past this URL token and keep
+            // scanning for the next bare supported URL.
+            searchStart = tokenEnd
+        }
+
+        return nil
+    }
+
+    /// Index after the whitespace-delimited URL token that begins at
+    /// `httpStart` (the next whitespace character, or the end of the string).
+    private static func endOfURLToken(in text: String, from httpStart: String.Index) -> String.Index {
+        var urlEnd = httpStart
+        while urlEnd < text.endIndex, !text[urlEnd].isWhitespace {
+            urlEnd = text.index(after: urlEnd)
+        }
+        return urlEnd
+    }
+
+    /// Index of the next `http://` or `https://` occurrence at or after
+    /// `start`, or `nil`.
+    private static func nextURLOrigin(in text: String, from start: String.Index) -> String.Index? {
+        let searchRange = start..<text.endIndex
+        let https = text.range(of: "https://", range: searchRange)?.lowerBound
+        let http = text.range(of: "http://", range: searchRange)?.lowerBound
+        switch (https, http) {
+        case let (.some(a), .some(b)): return min(a, b)
+        case let (.some(a), .none): return a
+        case let (.none, .some(b)): return b
+        default: return nil
+        }
+    }
+
+    /// True when the URL beginning at `urlStart` is immediately preceded by
+    /// `](`, i.e. it is the destination of a markdown inline link rather than
+    /// a bare URL.
+    private static func isMarkdownLinkDestination(_ text: String, at urlStart: String.Index) -> Bool {
+        guard urlStart > text.startIndex else { return false }
+        let before = text.index(before: urlStart)
+        guard text[before] == "(", before > text.startIndex else { return false }
+        let beforeParen = text.index(before: before)
+        return text[beforeParen] == "]"
+    }
+
+    // MARK: - Math-only segmentation
+
+    /// Collect every `[start, end)` range that `mathSegments` would emit as a
+    /// `.math` segment. Used to protect math regions from URL-embed extraction
+    /// so a URL that appears inside inline or display math is never lifted out
+    /// as an embed.
+    private static func mathRanges(in text: String) -> [Range<String.Index>] {
+        var ranges: [Range<String.Index>] = []
+        var cursor = text.startIndex
+        while cursor < text.endIndex {
+            if let match = mathMatch(in: text, from: cursor) {
+                ranges.append(match.start..<match.end)
+                cursor = match.end > cursor ? match.end : text.index(after: cursor)
+            } else {
+                cursor = text.index(after: cursor)
+            }
+        }
+        return ranges
+    }
+
+    /// Split a prose run (already known to contain no embeddable URLs) around
+    /// clear LaTeX math delimiters. This is the historical math pass.
+    private static func mathSegments(_ text: String) -> [Segment] {
         var segments: [Segment] = []
         var cursor = text.startIndex
         var proseStart = cursor

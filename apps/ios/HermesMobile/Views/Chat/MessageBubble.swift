@@ -565,6 +565,8 @@ struct MessageBubble: View {
                     CodeBlockView(language: language, code: body)
                 case .math(let latex, let display):
                     MathSegmentView(latex: latex, display: display)
+                case .embed(let descriptor):
+                    RichURLEmbedCardView(descriptor: descriptor)
                 }
             }
             // CC-01 / round-2: the breathing streaming cursor is a single
