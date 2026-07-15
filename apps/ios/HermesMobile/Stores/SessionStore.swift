@@ -286,6 +286,9 @@ final class SessionStore {
     /// of relying on a remount. Empty / whitespace-only drafts are removed instead
     /// of persisted as noise.
     private var composerDrafts: [String: String] = [:]
+    private var workRepository: WorkRepository?
+    private weak var draftAttachments: AttachmentStore?
+    private var draftSaveTasks: [String: Task<Void, Never>] = [:]
 
     /// Bumped whenever a composer draft is mutated outside the focused field's
     /// direct binding. ComposerView observes this to pull externally-recalled
@@ -329,6 +332,67 @@ final class SessionStore {
             composerDrafts[key] = draft
         }
         composerDraftRevision &+= 1
+        scheduleComposerDraftSave(for: key)
+    }
+
+    func restoreComposerDraft(for key: String) {
+        guard let repository = workRepository, let scope = composerWorkScope else { return }
+        Task { [weak self] in
+            guard let self, let snapshot = try? await repository.draft(scope: scope, contextKey: key) else { return }
+            guard self.activeComposerDraftKey == key else { return }
+            self.composerDrafts[key] = snapshot.draft.text
+            self.draftCwd = snapshot.draft.cwd
+            if let json = snapshot.draft.modelSelectionJSON,
+               let data = json.data(using: .utf8),
+               let selection = try? JSONDecoder().decode(DraftModelSelection.self, from: data) {
+                self.connection?.draftSelection = selection
+            }
+            var bytes: [Data] = []
+            for asset in snapshot.assets {
+                if let data = try? await repository.assetData(asset) { bytes.append(data) }
+            }
+            self.draftAttachments?.restoreDraftAssets(bytes)
+            self.composerDraftRevision &+= 1
+        }
+    }
+
+    func flushComposerDraft() {
+        let key = activeComposerDraftKey
+        draftSaveTasks[key]?.cancel()
+        draftSaveTasks[key] = nil
+        persistComposerDraft(for: key)
+    }
+
+    private var composerWorkScope: WorkScope? {
+        guard let server = connection?.serverURLString.trimmingCharacters(in: .whitespacesAndNewlines), !server.isEmpty else { return nil }
+        let profile = activeProfile.trimmingCharacters(in: .whitespacesAndNewlines)
+        return try? WorkScope(serverID: server, profileID: profile.isEmpty ? DefaultsKeys.allProfilesScope : profile)
+    }
+
+    private func scheduleComposerDraftSave(for key: String) {
+        draftSaveTasks[key]?.cancel()
+        draftSaveTasks[key] = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled else { return }
+            self?.persistComposerDraft(for: key)
+        }
+    }
+
+    private func persistComposerDraft(for key: String) {
+        guard let repository = workRepository, let scope = composerWorkScope else { return }
+        let text = composerDrafts[key] ?? ""
+        let storedID = key == Self.composerDraftFallbackKey ? nil : key
+        let cwd = key == activeComposerDraftKey ? draftCwd : nil
+        let modelJSON: String?
+        if key == activeComposerDraftKey,
+           let selection = connection?.draftSelection,
+           let data = try? JSONEncoder().encode(selection) {
+            modelJSON = String(data: data, encoding: .utf8)
+        } else {
+            modelJSON = nil
+        }
+        let assets = key == activeComposerDraftKey ? (draftAttachments?.draftAssetInputs() ?? []) : []
+        Task { try? await repository.saveDraft(scope: scope, contextKey: key, storedSessionID: storedID, text: text, cwd: cwd, modelSelectionJSON: modelJSON, assets: assets) }
     }
 
     /// Clear prompt-history cursor/snapshot state without changing the user's
@@ -1066,9 +1130,15 @@ final class SessionStore {
     }
 
     /// Wire up the store graph. Called exactly once by `AppEnvironment`.
-    func attach(connection: ConnectionStore, chat: ChatStore) {
+    func attach(connection: ConnectionStore, chat: ChatStore, attachments: AttachmentStore? = nil) {
         self.connection = connection
         self.chat = chat
+        self.draftAttachments = attachments
+        Task { [weak self] in
+            guard let self else { return }
+            self.workRepository = try? await WorkRepository.openAppGroup(scope: self.composerWorkScope)
+            self.restoreComposerDraft(for: self.activeComposerDraftKey)
+        }
     }
 
     /// Reset the initial-fill guard so the next `refresh()` re-runs the

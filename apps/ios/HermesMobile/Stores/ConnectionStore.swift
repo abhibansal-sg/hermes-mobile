@@ -11,7 +11,7 @@ import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-
 /// the draft materializes, then applies session-scoped (ABH-84 follow-up).
 /// `reasoningEffort`/`fast` are nil when untouched (the session then keeps
 /// the global defaults).
-struct DraftModelSelection: Equatable, Sendable {
+struct DraftModelSelection: Codable, Equatable, Sendable {
     var model: String
     var provider: String
     var reasoningEffort: String?

@@ -176,6 +176,7 @@ struct HermesMobileApp: App {
                     environment.refreshUsageSnapshot()
                 }
                 .onChange(of: scenePhase) { _, newPhase in
+                    if newPhase != .active { environment.sessionStore.flushComposerDraft() }
                     environment.connectionStore.handleScenePhase(newPhase)
                     environment.appLock.handleScenePhase(newPhase)
                     // UX1: start/stop the 30-second foreground heartbeat so the

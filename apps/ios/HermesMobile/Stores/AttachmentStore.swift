@@ -138,6 +138,17 @@ final class AttachmentStore {
         pending.removeAll()
     }
 
+    func draftAssetInputs() -> [WorkAssetInput] {
+        pending.map { WorkAssetInput(data: $0.jpegData, mimeType: "image/jpeg", fileExtension: "jpg") }
+    }
+
+    func restoreDraftAssets(_ data: [Data]) {
+        pending = data.compactMap { bytes in
+            guard let image = UIImage(data: bytes) else { return nil }
+            return PendingAttachment(thumbnail: image, jpegData: bytes)
+        }
+    }
+
     // MARK: - Upload + attach
 
     /// Upload every pending attachment, bind it to the session, and return the

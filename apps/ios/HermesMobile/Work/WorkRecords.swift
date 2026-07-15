@@ -66,6 +66,7 @@ struct WorkDraft: Codable, FetchableRecord, PersistableRecord, Equatable, Sendab
     var text: String
     var cwd: String?
     var modelSelectionJSON: String?
+    var revision: Int
     var createdAt: Double
     var updatedAt: Double
 
@@ -77,9 +78,15 @@ struct WorkDraft: Codable, FetchableRecord, PersistableRecord, Equatable, Sendab
         case storedSessionID = "stored_session_id"
         case text, cwd
         case modelSelectionJSON = "model_selection_json"
+        case revision
         case createdAt = "created_at"
         case updatedAt = "updated_at"
     }
+}
+
+struct WorkDraftSnapshot: Equatable, Sendable {
+    let draft: WorkDraft
+    let assets: [WorkAsset]
 }
 
 struct WorkJob: Codable, FetchableRecord, PersistableRecord, Equatable, Sendable, Identifiable {
