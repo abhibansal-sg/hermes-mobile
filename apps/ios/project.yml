@@ -92,6 +92,7 @@ targets:
           - ai.hermes.app.refresh
         UIBackgroundModes:
           - fetch
+          - remote-notification
         CFBundleURLTypes:
           - CFBundleURLName: ai.hermes.app
             CFBundleURLSchemes:

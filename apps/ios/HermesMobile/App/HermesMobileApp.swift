@@ -378,6 +378,26 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 
     func application(
         _ application: UIApplication,
+        didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+        fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+    ) {
+        guard let invalidation = SilentSyncInvalidation.decode(userInfo) else {
+            completionHandler(.noData)
+            return
+        }
+        let completion = BackgroundFetchCompletion(completionHandler)
+        Task {
+            let result = await SilentSyncBridge.shared.handle(invalidation)
+            switch result {
+            case .newData: completion.call(.newData)
+            case .noData: completion.call(.noData)
+            case .failed: completion.call(.failed)
+            }
+        }
+    }
+
+    func application(
+        _ application: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
     ) {
         MainActor.assumeIsolated {
