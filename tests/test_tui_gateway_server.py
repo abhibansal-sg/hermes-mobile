@@ -2284,6 +2284,73 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
         server._sessions.pop("trunc-sid", None)
 
 
+def test_prompt_submit_without_client_message_id_keeps_legacy_shape(monkeypatch):
+    """An installed receipt provider must be invisible to legacy callers."""
+
+    class _Provider:
+        def reserve(self, **kwargs):
+            pytest.fail("legacy prompt must not call receipt provider")
+
+    class _Thread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    session = _session()
+    session["attached_images"] = []
+    monkeypatch.setattr(server, "PROMPT_RECEIPT_PROVIDERS", [_Provider()])
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *a, **k: None)
+    monkeypatch.setattr(server.threading, "Thread", _Thread)
+    server._sessions["legacy-sid"] = session
+    try:
+        response = server._methods["prompt.submit"](
+            "legacy-rid", {"session_id": "legacy-sid", "text": "hello"}
+        )
+        assert response == {
+            "jsonrpc": "2.0",
+            "id": "legacy-rid",
+            "result": {"status": "streaming"},
+        }
+    finally:
+        server._sessions.pop("legacy-sid", None)
+
+
+def test_prompt_submit_validates_canonical_client_id_before_mutation(monkeypatch):
+    """A non-canonical UUID cannot rebind, truncate, queue, or start a turn."""
+
+    class _Provider:
+        def reserve(self, **kwargs):
+            pytest.fail("invalid client id must be rejected before reservation")
+
+    original_history = [{"role": "user", "content": "keep"}]
+    session = _session(history=list(original_history), transport="original")
+    session["attached_images"] = []
+    monkeypatch.setattr(server, "PROMPT_RECEIPT_PROVIDERS", [_Provider()])
+    monkeypatch.setattr(server, "current_transport", lambda: "replacement")
+    server._sessions["canonical-sid"] = session
+    try:
+        response = server._methods["prompt.submit"](
+            "canonical-rid",
+            {
+                "session_id": "canonical-sid",
+                "text": "do not send",
+                "client_message_id": "550E8400-E29B-41D4-A716-446655440000",
+                "truncate_before_user_ordinal": 0,
+            },
+        )
+        assert response["error"]["code"] == 4004
+        assert session["transport"] == "original"
+        assert session["history"] == original_history
+        assert session["running"] is False
+        assert session.get("queued_prompt") is None
+    finally:
+        server._sessions.pop("canonical-sid", None)
+
+
 def test_session_create_does_not_persist_empty_row(monkeypatch):
     """session.create must NOT eagerly write a DB row.
 

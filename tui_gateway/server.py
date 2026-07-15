@@ -136,6 +136,13 @@ _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()
+# Generic, opt-in durability seam for clients that attach an idempotency key to
+# ``prompt.submit``.  Providers own persistence, liveness, and retention; the
+# gateway core only validates the wire identity and calls the first registered
+# provider before any prompt-handler mutation.  An empty registry is the stock
+# path: ``client_message_id`` is ignored and the legacy response is byte-for-byte
+# unchanged.
+PROMPT_RECEIPT_PROVIDERS: list[Any] = []
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
@@ -1280,6 +1287,147 @@ def method(name: str):
         return fn
 
     return dec
+
+
+def register_prompt_receipt_provider(provider: Any) -> None:
+    """Register one prompt idempotency provider, idempotently.
+
+    This deliberately accepts a structural provider instead of importing a
+    core ABC: receipt storage is edge capability and must remain plugin-owned.
+    Providers implement ``reserve(...)``, ``complete(reservation, result)``,
+    and ``release(reservation)``.
+    """
+    if provider is None:
+        return
+    provider_name = str(getattr(provider, "provider_name", "") or "")
+    if any(
+        existing is provider
+        or (
+            provider_name
+            and str(getattr(existing, "provider_name", "") or "") == provider_name
+        )
+        for existing in PROMPT_RECEIPT_PROVIDERS
+    ):
+        return
+    PROMPT_RECEIPT_PROVIDERS.append(provider)
+
+
+def _prompt_receipt_home(params: dict) -> Path:
+    """Resolve the profile home without mutating or building a session."""
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is not None and session.get("profile_home"):
+        return Path(str(session["profile_home"]))
+    profile_home = _profile_home(params.get("profile"))
+    return profile_home if profile_home is not None else get_hermes_home()
+
+
+def _begin_prompt_receipt(rid: Any, params: dict) -> tuple[dict | None, dict | None]:
+    """Reserve an ID-enabled prompt before the handler can mutate anything.
+
+    Returns ``(receipt_context, immediate_response)``.  No provider (or no
+    ``client_message_id`` key) is an exact legacy no-op.  Provider failures fail
+    closed: executing without a durable reservation would defeat the contract.
+    """
+    if "client_message_id" not in params:
+        return None, None
+
+    # Tool discovery normally loads plugins during the deferred agent build.
+    # A very fast first send can beat that timer, so ID-enabled requests perform
+    # the stock idempotent discovery pass before deciding the seam is disabled.
+    if not PROMPT_RECEIPT_PROVIDERS:
+        try:
+            from hermes_cli.plugins import discover_plugins
+
+            discover_plugins()
+        except Exception:
+            logger.debug("prompt receipt provider discovery failed", exc_info=True)
+    if not PROMPT_RECEIPT_PROVIDERS:
+        return None, None
+
+    raw_id = params.get("client_message_id")
+    if not isinstance(raw_id, str):
+        return None, _err(rid, 4004, "client_message_id must be a canonical UUID")
+    try:
+        canonical_id = str(uuid.UUID(raw_id))
+    except (ValueError, AttributeError):
+        canonical_id = ""
+    if canonical_id != raw_id:
+        return None, _err(rid, 4004, "client_message_id must be a canonical UUID")
+
+    truncate = params.get("truncate_before_user_ordinal")
+    if truncate is not None:
+        try:
+            truncate = int(truncate)
+        except (TypeError, ValueError):
+            return None, _err(
+                rid, 4004, "truncate_before_user_ordinal must be an integer"
+            )
+
+    provider = PROMPT_RECEIPT_PROVIDERS[0]
+    try:
+        outcome = provider.reserve(
+            profile_home=_prompt_receipt_home(params),
+            client_message_id=canonical_id,
+            session_id=params.get("session_id", ""),
+            text=params.get("text", ""),
+            truncate_before_user_ordinal=truncate,
+        )
+    except Exception as exc:
+        logger.warning("prompt receipt reservation failed: %s", exc)
+        return None, _err(rid, 5037, "prompt receipt store unavailable")
+
+    state = outcome.get("state") if isinstance(outcome, dict) else None
+    if state == "claimed":
+        return {
+            "client_message_id": canonical_id,
+            "provider": provider,
+            "reservation": outcome.get("reservation"),
+            "truncate_before_user_ordinal": truncate,
+        }, None
+    if state == "replay" and isinstance(outcome.get("disposition"), dict):
+        return None, _ok(rid, dict(outcome["disposition"]))
+    if state == "conflict":
+        return None, _err(
+            rid, 4091, "client_message_id was already used for a different prompt"
+        )
+    if state in {"in_progress", "indeterminate"}:
+        return None, _ok(
+            rid,
+            {"status": state, "client_message_id": canonical_id},
+        )
+    logger.warning("prompt receipt provider returned invalid outcome: %r", outcome)
+    return None, _err(rid, 5037, "prompt receipt store unavailable")
+
+
+def _release_prompt_receipt(receipt: dict | None) -> None:
+    """Drop a reservation when the request was rejected before acceptance."""
+    if receipt is None:
+        return
+    try:
+        receipt["provider"].release(receipt["reservation"])
+    except Exception:
+        logger.warning("prompt receipt release failed", exc_info=True)
+
+
+def _complete_prompt_receipt(
+    rid: Any, receipt: dict | None, response: dict
+) -> dict:
+    """Durably bind an accepted request to its original result disposition."""
+    if receipt is None:
+        return response
+    result = response.get("result")
+    if not isinstance(result, dict):
+        _release_prompt_receipt(receipt)
+        return response
+    disposition = dict(result)
+    disposition["client_message_id"] = receipt["client_message_id"]
+    try:
+        receipt["provider"].complete(receipt["reservation"], disposition)
+    except Exception as exc:
+        logger.warning("prompt receipt completion failed: %s", exc)
+        return _err(rid, 5037, "prompt receipt store unavailable")
+    return _ok(rid, disposition)
 
 
 def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
@@ -8561,8 +8709,14 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
+    receipt, receipt_response = _begin_prompt_receipt(rid, params)
+    if receipt_response is not None:
+        return receipt_response
+    if receipt is not None:
+        truncate_user_ordinal = receipt["truncate_before_user_ordinal"]
     session, err = _sess_nowait(params, rid)
     if err:
+        _release_prompt_receipt(receipt)
         return err
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
@@ -8575,18 +8729,23 @@ def _(rid, params: dict) -> dict:
             # interrupt the live turn) so it runs as the next turn. See
             # _handle_busy_submit for why the old "session busy" rejection
             # dropped messages when teardown outlived the client's retry window.
-            return _handle_busy_submit(rid, sid, session, text, t or session.get("transport"))
+            response = _handle_busy_submit(
+                rid, sid, session, text, t or session.get("transport")
+            )
+            return _complete_prompt_receipt(rid, receipt, response)
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
         # transcript, stale fork). After the run completes, submitting is fine:
         # the upgrade resumes the child's transcript as a normal conversation.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+            _release_prompt_receipt(receipt)
             return _err(rid, 4009, "subagent still running — wait for it to finish")
         if truncate_user_ordinal is not None:
             try:
                 ordinal = int(truncate_user_ordinal)
             except (TypeError, ValueError):
+                _release_prompt_receipt(receipt)
                 return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             history = session.get("history", [])
             user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
@@ -8596,6 +8755,7 @@ def _(rid, params: dict) -> dict:
             # truncating history to everything before it and persisting that loss
             # via replace_messages — an unrecoverable overwrite of the session DB.
             if ordinal < 0 or ordinal >= len(user_indices):
+                _release_prompt_receipt(receipt)
                 return _err(rid, 4018, "target user message is no longer in session history")
             truncated = history[: user_indices[ordinal]]
             session["history"] = truncated
@@ -8609,6 +8769,15 @@ def _(rid, params: dict) -> dict:
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
+
+    response = _complete_prompt_receipt(rid, receipt, _ok(rid, {"status": "streaming"}))
+    if "error" in response:
+        # No agent turn has started yet.  Release the in-memory claim so a
+        # receipt-store outage cannot leave the session permanently busy.
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        return response
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
@@ -8645,7 +8814,7 @@ def _(rid, params: dict) -> dict:
     # `running` flag (a turn that died without clearing it) and recover the latter.
     session["_run_thread"] = run_thread
     run_thread.start()
-    return _ok(rid, {"status": "streaming"})
+    return response
 
 
 def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) -> bool:
