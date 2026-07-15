@@ -68,6 +68,25 @@ final class PathStyleTests: XCTestCase {
         RecordingProtocol.requests.compactMap { $0.url?.path }
     }
 
+    func testUploadResultDecodesContentMetadataAndLegacyFallback() throws {
+        let current = try JSONDecoder().decode(
+            UploadResult.self,
+            from: Data(#"{"path":"/uploads/a.png","size":3,"mime":"image/png","content_version":"sha256:abc"}"#.utf8)
+        )
+        XCTAssertEqual(current.path, "/uploads/a.png")
+        XCTAssertEqual(current.size, 3)
+        XCTAssertEqual(current.mimeType, "image/png")
+        XCTAssertEqual(current.contentVersion, "sha256:abc")
+
+        let legacy = try JSONDecoder().decode(
+            UploadResult.self,
+            from: Data(#"{"path":"/uploads/old.png"}"#.utf8)
+        )
+        XCTAssertNil(legacy.size)
+        XCTAssertNil(legacy.mimeType)
+        XCTAssertNil(legacy.contentVersion)
+    }
+
     // MARK: - 1. Path family per call site
 
     func testPrefixSwapCoversEveryMobileCallSite() async throws {

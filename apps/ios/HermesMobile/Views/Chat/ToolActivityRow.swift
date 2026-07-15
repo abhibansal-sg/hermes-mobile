@@ -1143,7 +1143,12 @@ struct GeneratedImageToolCard: View {
                 return
             }
             localPhase = .loaded(decoded.image)
-            cacheBlob(decoded.data, rest: rest, sessionId: sessionId, size: imageResult.size)
+            cacheBlob(
+                decoded.data,
+                rest: rest,
+                sessionId: sessionId,
+                contentVersion: imageResult.contentVersion
+            )
         } catch let error as FSReadError {
             localPhase = .failed(error.errorDescription ?? "Couldn't load image")
         } catch {
@@ -1151,13 +1156,20 @@ struct GeneratedImageToolCard: View {
         }
     }
 
-    private func cacheBlob(_ data: Data, rest: RestClient, sessionId: String, size: Int) {
+    private func cacheBlob(
+        _ data: Data,
+        rest: RestClient,
+        sessionId: String,
+        contentVersion: String?
+    ) {
+        guard let version = contentVersion?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !version.isEmpty else { return }
         let key = AttachmentBlobCache.Key(
             serverId: rest.baseURL.absoluteString,
             profileId: sessions.activeProfile,
             sessionId: sessionId,
             path: result.reference,
-            size: size
+            contentVersion: version
         )
         AttachmentBlobCache.shared.store(data, for: key)
     }
