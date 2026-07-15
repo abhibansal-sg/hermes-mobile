@@ -10345,6 +10345,7 @@ def _(rid, params: dict) -> dict:
 def _respond(rid, params, key):
     r = params.get("request_id", "")
     device = _ws_device_identity()
+    # UPSTREAM-HOOK-WANTED: replace with upstream WS authz middleware (STR-53 RFC ask 1)
     if device is not None and "approve" not in (device.get("scopes") or []):
         return _err(rid, 4030, "device token lacks approve scope")
     with _prompt_lock:
