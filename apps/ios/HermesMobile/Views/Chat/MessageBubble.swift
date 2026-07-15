@@ -3,7 +3,9 @@ import UIKit
 
 /// A single transcript entry.
 ///
-/// - User: a trailing-aligned bronze bubble, capped at 78% width.
+/// - User: a trailing-aligned bronze bubble, capped at 78% width in compact
+///   (iPhone) layouts and at the shared transcript reading measure
+///   (``ChatView/transcriptReadingMeasure``) in regular (iPad) layouts.
 /// - Assistant: a leading-aligned, bubble-less "document" — optional thinking,
 ///   a tool timeline, then markdown-rendered text with a streaming cursor.
 /// - System / tool: small, centered, secondary captions.
@@ -11,6 +13,9 @@ struct MessageBubble: View {
     @Environment(\.hermesTheme) private var theme
     @Environment(ConnectionStore.self) private var connectionStore
     @Environment(SessionStore.self) private var sessionStore
+    /// Drives the regular-width (iPad) user-bubble cap so it shares
+    /// ``ChatView/transcriptReadingMeasure`` with the status glow and context
+    /// line instead of drifting from its own 78%-of-screen formula (STR-1098).
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     /// The message to render.
@@ -367,25 +372,31 @@ struct MessageBubble: View {
     /// threshold for the `isLongUserMessage` heuristic.
     static let userBubbleCollapsedLines = 8
 
-    /// True when the bubble is laid out in a compact width (iPhone portrait, or
-    /// a narrow iPad split-view column). Drives size-class-aware sizing so
-    /// neither bubble width nor inline image sizing depends on `UIScreen.main`.
-    private var isCompact: Bool { horizontalSizeClass == .compact }
-
-    /// Cap user bubbles at ~78% of the MEASURED available width while letting
-    /// short messages hug their content (STR-695). Replaces the former
-    /// `UIScreen.main.bounds.width * 0.78` heuristic, which broke in iPad
-    /// split-view and multi-scene (`UIScreen.main` returns the first scene's
-    /// bounds, not the column the bubble actually inhabits). Compact: ~78% of
-    /// the column. Regular (iPad full-width): same ratio but capped at 560pt so
-    /// a short message never stretches across a wide column.
+    /// Cap user bubbles from the MEASURED available width (STR-695), never
+    /// `UIScreen.main`: compact layouts use 78% of their actual column, while
+    /// regular layouts share ``ChatView/transcriptReadingMeasure`` as an upper
+    /// bound (STR-1098) and still clamp to narrow iPad split-view columns.
     private var maxBubbleWidth: CGFloat {
         guard availableWidth > 0 else { return 320 }
-        let ratio: CGFloat = 0.78
-        if isCompact {
-            return availableWidth * ratio
+        Self.userBubbleMaxWidth(
+            availableWidth: availableWidth,
+            horizontalSizeClass: horizontalSizeClass)
+    }
+
+    /// Fraction of the compact column width a user bubble may occupy.
+    static let userBubbleCompactWidthFraction: CGFloat = 0.78
+
+    /// Pure width decision behind ``maxBubbleWidth``: the 78% measured compact
+    /// cap, or the smaller of the measured regular column and the shared
+    /// transcript reading measure. Static so tests can pin both branches.
+    static func userBubbleMaxWidth(
+        availableWidth: CGFloat,
+        horizontalSizeClass: UserInterfaceSizeClass?
+    ) -> CGFloat {
+        guard horizontalSizeClass == .regular else {
+            return availableWidth * userBubbleCompactWidthFraction
         }
-        return min(availableWidth * ratio, 560)
+        return min(availableWidth, ChatView.transcriptReadingMeasure)
     }
 
     // MARK: - Assistant
