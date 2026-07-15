@@ -532,6 +532,13 @@ final class ChatStore {
     /// through the plugin REST route in ``resolvedTranscriptAroundFetch``.
     var transcriptAroundFetch: ((String, Int, Int) async -> TranscriptAroundFetch?)?
 
+    /// Test seam for the backward-page (``loadEarlierTranscript``) fetch. The
+    /// live app resolves the module-level ``fetchTranscriptPage`` against
+    /// `connection?.rest` directly; tests that need to control the timing of
+    /// this specific fetch (e.g. proving the ABH-401 conflict guard against
+    /// ``loadTranscriptAround``) inject an override here instead.
+    var transcriptPageFetch: ((String, Int, Int?) async -> TranscriptPageFetch?)?
+
     /// Context of the event currently being routed through ``handle(event:)``,
     /// used only to enrich the DEBUG streaming-setter telemetry so a write that
     /// happens *inside* event handling can name the inbound frame's ids. `nil`
@@ -2817,21 +2824,25 @@ final class ChatStore {
 
     /// Fetch and prepend one older server page. Used by ChatView's top affordance
     /// once the locally-loaded rows no longer have hidden in-memory rows above.
+    ///
+    /// ABH-401 CONFLICT GUARD: also bails while a `loadTranscriptAround` jump fetch
+    /// is in flight (`isLoadingJumpTarget`). Both methods build their prepended
+    /// seed from a synchronous snapshot of `messages` taken before their async
+    /// fetch resolves; if the two ran concurrently the loser's `seed(normalized:)`
+    /// would be built from a now-stale snapshot and silently drop whatever the
+    /// winner just prepended (a lost update — not just a redundant fetch). Mutual
+    /// exclusion between the two async prepend paths prevents that clobber.
     func loadEarlierTranscript() async {
         guard !isStreaming,
               !isLoadingEarlierTranscript,
+              !isLoadingJumpTarget,
               transcriptHasMoreBefore,
               let storedId = sessions?.activeStoredId,
               let before = oldestLoadedTranscriptWireId,
-              let rest = connection?.rest else { return }
+              let fetch = resolvedTranscriptPageFetch else { return }
         isLoadingEarlierTranscript = true
         defer { isLoadingEarlierTranscript = false }
-        guard let page = await fetchTranscriptPage(
-            rest: rest,
-            sessionId: storedId,
-            limit: Self.transcriptOpenWindowLimit,
-            before: before
-        ) else { return }
+        guard let page = await fetch(storedId, Self.transcriptOpenWindowLimit, before) else { return }
         if !page.messages.isEmpty {
             let older = Self.toChatMessages(page.messages)
             seed(normalized: older + messages)
@@ -2839,15 +2850,24 @@ final class ChatStore {
         noteTranscriptPaging(oldestId: page.oldestId, hasMoreBefore: page.hasMoreBefore)
     }
 
-    /// Whether the jump resolver may try the server's target-centered page.
+    /// Whether the jump resolver may try the server's target-centered page. Also
+    /// false while a `loadEarlierTranscript` backward-page fetch is in flight
+    /// (ABH-401 conflict guard) — `loadTranscriptAround` would bail on that same
+    /// condition, so checking it here avoids ChatView burning an attempt-cap slot
+    /// on a call already known to fail.
     func canFetchJumpTarget(messageId: Int) -> Bool {
-        !isLoadingJumpTarget && !jumpWindowFetchAttemptedMessageIds.contains(messageId)
+        !isLoadingJumpTarget && !isLoadingEarlierTranscript
+            && !jumpWindowFetchAttemptedMessageIds.contains(messageId)
     }
 
     /// Fetch a radius window around a jump target and prepend it to the loaded tail.
     /// Returns true when the server returned a page containing the target wire id.
+    ///
+    /// ABH-401 CONFLICT GUARD: also bails while a `loadEarlierTranscript` backward
+    /// page fetch is in flight (`isLoadingEarlierTranscript`) — see that method's
+    /// doc for why the two async prepend paths must be mutually exclusive.
     func loadTranscriptAround(messageId: Int, radius: Int = ChatStore.transcriptOpenWindowLimit) async -> Bool {
-        guard !isStreaming, !isLoadingJumpTarget,
+        guard !isStreaming, !isLoadingJumpTarget, !isLoadingEarlierTranscript,
               let storedId = sessions?.activeStoredId,
               let fetch = resolvedTranscriptAroundFetch else { return false }
         jumpWindowFetchAttemptedMessageIds.insert(messageId)
@@ -3605,6 +3625,19 @@ final class ChatStore {
                 around: messageId,
                 radius: radius
             )
+        }
+    }
+
+    /// The injected `transcriptPageFetch` test seam, or the default that
+    /// resolves the live `connection?.rest` and calls the module-level
+    /// ``fetchTranscriptPage``. Mirrors ``resolvedTranscriptAroundFetch``'s
+    /// injected-seam-first pattern so tests can control `loadEarlierTranscript`'s
+    /// fetch timing without a live REST client.
+    private var resolvedTranscriptPageFetch: ((String, Int, Int?) async -> TranscriptPageFetch?)? {
+        if let transcriptPageFetch { return transcriptPageFetch }
+        guard let rest = connection?.rest else { return nil }
+        return { sessionId, limit, before in
+            await fetchTranscriptPage(rest: rest, sessionId: sessionId, limit: limit, before: before)
         }
     }
 
