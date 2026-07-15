@@ -3609,3 +3609,264 @@ def _refresh_provider_row(slug: str, *, fallback_name: str = "") -> Dict[str, An
         "total_models": 0,
         "models": [],
     }
+
+
+# ---------------------------------------------------------------------------
+# Memory write-review (ABH-303) — REST surface for reviewing staged memory
+# writes. iOS consumes this structured JSON instead of parsing the ``/memory``
+# slash-command text. Mirrors the gateway's ``/memory`` pending/approve/
+# reject/approval path (gateway/slash_commands.py:_handle_memory_command +
+# hermes_cli.write_approval_commands.handle_pending_subcommand) but returns
+# JSON and NEVER exposes skill pending writes.
+#
+# Routes (under .../memory/):
+#   GET  /memory/pending    — {approval_enabled, pending:[...]}
+#   POST /memory/approve    — {id:"<id>"|"all"} -> {approved, failed, pending_count}
+#   POST /memory/reject     — {id:"<id>"|"all"} -> {rejected, pending_count}
+#   PUT  /memory/approval   — {enabled:bool} persists memory.write_approval
+#
+# Auth mirrors /approvals/respond and /devices/issue: the dashboard session
+# token AND the device ``approve`` scope (belt-and-suspenders). No full tokens
+# ever appear in responses or logs — pending records carry only review metadata.
+# ---------------------------------------------------------------------------
+
+
+class _MemoryIdBody(BaseModel):
+    # Optional + manually validated so a missing/empty id yields a 400 (the
+    # pinned contract) instead of FastAPI's 422 body-validation error.
+    id: Optional[str] = None
+
+
+class _MemoryApprovalBody(BaseModel):
+    enabled: bool
+
+
+# Staged pending ids are emitted by ``write_approval.stage_write`` as
+# ``uuid.uuid4().hex[:8]`` (exactly 8 lowercase hex). This allowlist is the
+# REST boundary defense: ``write_approval.get_pending``/``discard_pending``
+# build a filesystem path from the id, so a caller-supplied value like
+# ``../skills/<id>`` would traverse out of ``pending/memory`` into a sibling
+# subsystem. We reject anything that is not ``all`` or this exact shape
+# before the id is ever passed down.
+_MEMORY_TARGET_RE = _re.compile(r"^[0-9a-f]{8}$")
+
+
+def _validate_memory_target(raw: str) -> Optional[str]:
+    """Normalize and validate a memory review target id.
+
+    Returns the validated target (``"all"`` or an 8-lowercase-hex id), or
+    ``None`` when the value is malformed — in which case the caller must
+    respond 400 without forwarding the id to ``write_approval``.
+    """
+    target = (raw or "").strip()
+    if not target:
+        return None
+    if target.lower() == "all":
+        return "all"
+    if _MEMORY_TARGET_RE.fullmatch(target):
+        return target
+    return None
+
+
+def _memory_pending_item(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a staged memory pending record into the mobile review shape.
+
+    Carries the review header (id/summary/origin/created_at/action) plus the
+    proposed-write detail (target/content/old_text, and operations for a
+    batch) so mobile can render the full proposed write. Skill pending
+    records are never passed here — the caller scopes ``list_pending`` to
+    the MEMORY subsystem only.
+    """
+    payload = rec.get("payload") or {}
+    return {
+        "id": rec.get("id"),
+        "summary": rec.get("summary", ""),
+        "origin": rec.get("origin", "foreground"),
+        "created_at": rec.get("created_at", 0),
+        "action": rec.get("action") or payload.get("action", ""),
+        "target": payload.get("target", "memory"),
+        "content": payload.get("content"),
+        "old_text": payload.get("old_text"),
+        "operations": payload.get("operations"),
+    }
+
+
+@router.get("/memory/pending")
+async def list_memory_pending(request: Request) -> Dict[str, Any]:
+    """List staged memory writes for mobile review.
+
+    Returns ``{approval_enabled, pending:[...]}``. Each pending item carries
+    the review header plus the proposed-write detail. Skill pending writes
+    are NEVER exposed here. A missing/corrupt pending directory is an empty
+    list, never a 500.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
+
+    from tools import write_approval as wa
+
+    approval_enabled = wa.write_approval_enabled(wa.MEMORY)
+    try:
+        records = wa.list_pending(wa.MEMORY)
+    except Exception:
+        # A missing/corrupt pending directory must surface as an empty list,
+        # not a 500 (parity with the audit read endpoint's empty-on-failure).
+        _log.warning("memory pending list failed", exc_info=True)
+        records = []
+    return {
+        "approval_enabled": bool(approval_enabled),
+        "pending": [_memory_pending_item(r) for r in records],
+    }
+
+
+@router.post("/memory/approve")
+async def approve_memory_write(body: _MemoryIdBody, request: Request) -> Dict[str, Any]:
+    """Apply one (or all) staged memory writes via the same code path as
+    ``/memory approve``.
+
+    Body ``{id:"<pending-id>"|"all"}``. Loads a fresh on-disk MemoryStore via
+    ``load_on_disk_store()``, replays each staged record via
+    ``apply_memory_pending``, and discards ONLY the successful records.
+    Returns ``{approved, failed, pending_count}``. The id is validated at the
+    REST boundary — only ``all`` or an 8-hex staged memory id is accepted;
+    anything else (missing/empty/path separator/``..``) -> 400 before any
+    filesystem access. Unknown single id -> 404; ``all`` never 404s.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
+
+    from tools import write_approval as wa
+    from tools.memory_tool import apply_memory_pending, load_on_disk_store
+
+    target = _validate_memory_target(body.id or "")
+    if target is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "id must be 'all' or a pending memory id"},
+        )
+
+    records = wa.list_pending(wa.MEMORY)
+    if target == "all":
+        targets = list(records)
+    else:
+        rec = wa.get_pending(wa.MEMORY, target)
+        if not rec:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No pending memory write with id '{target}'.",
+            )
+        targets = [rec]
+
+    # Apply against ONE fresh on-disk store (matches /memory approve): each
+    # replay sees the result of the previous, so a batched "all" approve keeps
+    # sequential consistency (e.g. an add then a replace on the new entry).
+    store = load_on_disk_store()
+    applied = 0
+    failed: List[Dict[str, str]] = []
+    for rec in targets:
+        payload = rec.get("payload") or {}
+        try:
+            result = apply_memory_pending(payload, store)
+        except Exception as exc:
+            failed.append({"id": str(rec.get("id", "")), "error": str(exc)})
+            continue
+        if result.get("success"):
+            wa.discard_pending(wa.MEMORY, rec["id"])
+            applied += 1
+        else:
+            failed.append(
+                {"id": str(rec.get("id", "")), "error": result.get("error", "apply failed")}
+            )
+
+    return {
+        "approved": applied,
+        "failed": failed,
+        "pending_count": wa.pending_count(wa.MEMORY),
+    }
+
+
+@router.post("/memory/reject")
+async def reject_memory_write(body: _MemoryIdBody, request: Request) -> Dict[str, Any]:
+    """Discard one (or all) staged memory writes without applying.
+
+    Body ``{id:"<pending-id>"|"all"}``. Returns ``{rejected, pending_count}``.
+    The id is validated at the REST boundary — only ``all`` or an 8-hex staged
+    memory id is accepted; anything else (missing/empty/path separator/``..``)
+    -> 400 before any filesystem access. Unknown single id -> 404;
+    ``all`` never 404s.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
+
+    from tools import write_approval as wa
+
+    target = _validate_memory_target(body.id or "")
+    if target is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "id must be 'all' or a pending memory id"},
+        )
+
+    if target == "all":
+        rejected = 0
+        for rec in wa.list_pending(wa.MEMORY):
+            if wa.discard_pending(wa.MEMORY, rec["id"]):
+                rejected += 1
+        return {"rejected": rejected, "pending_count": wa.pending_count(wa.MEMORY)}
+
+    if wa.discard_pending(wa.MEMORY, target):
+        return {"rejected": 1, "pending_count": wa.pending_count(wa.MEMORY)}
+    raise HTTPException(
+        status_code=404,
+        detail=f"No pending memory write with id '{target}'.",
+    )
+
+
+@router.put("/memory/approval")
+async def set_memory_approval(body: _MemoryApprovalBody, request: Request) -> Dict[str, Any]:
+    """Toggle the ``memory.write_approval`` gate.
+
+    Persists ``memory.write_approval`` in config.yaml via the repo's atomic
+    YAML helper (``utils.atomic_yaml_write``) — the same write path the
+    gateway ``/memory approval`` handler uses. ``GET /memory/pending``
+    reflects the new setting immediately in-process: ``write_approval_enabled``
+    reads config cached on the file's (mtime_ns, size), and the atomic replace
+    changes both. Returns ``{enabled}``.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
+
+    import yaml as _yaml
+
+    from hermes_constants import get_hermes_home
+    from tools import write_approval as wa
+    from utils import atomic_yaml_write
+
+    config_path = get_hermes_home() / "config.yaml"
+    user_config: Dict[str, Any] = {}
+    if config_path.exists():
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                user_config = _yaml.safe_load(f) or {}
+        except Exception:
+            # A corrupt config must not block toggling the gate: start from an
+            # empty dict (the same recovery the gateway handler falls back to).
+            user_config = {}
+    if not isinstance(user_config, dict):
+        user_config = {}
+    mem_cfg = user_config.setdefault("memory", {})
+    if not isinstance(mem_cfg, dict):
+        mem_cfg = {}
+        user_config["memory"] = mem_cfg
+    mem_cfg["write_approval"] = bool(body.enabled)
+    atomic_yaml_write(config_path, user_config)
+
+    return {"enabled": wa.write_approval_enabled(wa.MEMORY)}
