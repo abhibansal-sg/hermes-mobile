@@ -30,6 +30,7 @@ def plugin_and_ctx():
     from hermes_cli.dashboard_auth import token_auth
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
     from tools import approval as _approval
+    from tui_gateway import server
 
     load_plugin_module("device_tokens")
     plugin = sys.modules[_PLUGIN_PKG]
@@ -43,6 +44,7 @@ def plugin_and_ctx():
         list(token_auth.IDENTITY_VALIDATORS),
         list(token_auth.SOCKET_OBSERVERS),
         list(_approval._RESOLVE_OBSERVERS),
+        list(server.PROMPT_RECEIPT_PROVIDERS),
     )
     try:
         yield plugin, ctx, manager
@@ -51,11 +53,13 @@ def plugin_and_ctx():
         token_auth.IDENTITY_VALIDATORS[:] = snapshot[1]
         token_auth.SOCKET_OBSERVERS[:] = snapshot[2]
         _approval._RESOLVE_OBSERVERS[:] = snapshot[3]
+        server.PROMPT_RECEIPT_PROVIDERS[:] = snapshot[4]
 
 
 def test_register_populates_every_seam_registry(plugin_and_ctx):
     from hermes_cli.dashboard_auth import token_auth
     from tools import approval as _approval
+    from tui_gateway import server
 
     plugin, ctx, manager = plugin_and_ctx
     device_tokens = load_plugin_module("device_tokens")
@@ -79,6 +83,10 @@ def test_register_populates_every_seam_registry(plugin_and_ctx):
         getattr(o, "__name__", "") == "_audit_resolution"
         for o in _approval._RESOLVE_OBSERVERS
     )
+    assert any(
+        provider.__class__.__name__ == "SQLitePromptReceiptProvider"
+        for provider in server.PROMPT_RECEIPT_PROVIDERS
+    )
     # S1 + S2 gateway wiring: on a core that ships the tui-gateway observer
     # hooks (this one), the plugin registers HOOKS and leaves the legacy
     # module-level seams EMPTY (double-wiring would double-deliver frames).
@@ -98,6 +106,7 @@ def test_register_is_idempotent(plugin_and_ctx):
     """A forced re-discovery must not double-wire any seam."""
     from hermes_cli.dashboard_auth import token_auth
     from tools import approval as _approval
+    from tui_gateway import server
 
     plugin, ctx, _manager = plugin_and_ctx
     plugin.register(ctx)
@@ -106,6 +115,7 @@ def test_register_is_idempotent(plugin_and_ctx):
         len(token_auth.IDENTITY_VALIDATORS),
         len(token_auth.SOCKET_OBSERVERS),
         len(_approval._RESOLVE_OBSERVERS),
+        len(server.PROMPT_RECEIPT_PROVIDERS),
     )
     plugin.register(ctx)
     assert counts == (
@@ -113,6 +123,7 @@ def test_register_is_idempotent(plugin_and_ctx):
         len(token_auth.IDENTITY_VALIDATORS),
         len(token_auth.SOCKET_OBSERVERS),
         len(_approval._RESOLVE_OBSERVERS),
+        len(server.PROMPT_RECEIPT_PROVIDERS),
     )
 
 
