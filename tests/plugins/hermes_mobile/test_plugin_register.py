@@ -87,10 +87,16 @@ def test_register_populates_every_seam_registry(plugin_and_ctx):
         getattr(o, "__name__", "") == "_audit_resolution"
         for o in _approval._RESOLVE_OBSERVERS
     )
-    # S1 + S2 gateway seams
-    assert broadcast.on_owner_write in server._EVENT_FANOUT_SUBSCRIBERS
-    assert push_engine.handle_gateway_event in server._EMIT_OBSERVERS
-    assert broadcast.on_transport in ws.TRANSPORT_OBSERVERS
+    # S1 + S2 gateway wiring: on a core that ships the tui-gateway observer
+    # hooks (this one), the plugin registers HOOKS and leaves the legacy
+    # module-level seams EMPTY (double-wiring would double-deliver frames).
+    hooks = manager._hooks
+    assert any(cb for cb in hooks.get("post_frame_write", [])), "post_frame_write not registered"
+    assert any(cb for cb in hooks.get("on_ws_transport_change", [])), "on_ws_transport_change not registered"
+    assert any(cb for cb in hooks.get("post_emit_event", [])), "post_emit_event not registered"
+    assert broadcast.on_owner_write not in server._EVENT_FANOUT_SUBSCRIBERS
+    assert push_engine.handle_gateway_event not in server._EMIT_OBSERVERS
+    assert broadcast.on_transport not in ws.TRANSPORT_OBSERVERS
     # CLI command registered on the manager facade
     cmd = manager._cli_commands.get("mobile-pair")
     assert cmd is not None

@@ -192,14 +192,14 @@ def register(ctx) -> None:
         push_engine = None
     if broadcast is not None:
         try:
-            broadcast.activate()
+            broadcast.activate(ctx)
         except Exception:
             # Never break host startup on a wiring failure; the gateway simply
             # behaves like stock (no fan-out) and logs why.
             _log.warning("hermes-mobile: broadcast seam wiring failed", exc_info=True)
     if push_engine is not None:
         try:
-            push_engine.activate()
+            push_engine.activate(ctx)
         except Exception:
             # Never break host startup on a wiring failure; the gateway simply
             # behaves like stock (no push) and logs why.

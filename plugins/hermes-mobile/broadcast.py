@@ -335,11 +335,41 @@ def on_owner_write(obj: dict, sid: str, owner: Any) -> None:
 # Seam wiring
 # ---------------------------------------------------------------------------
 
-def activate() -> None:
-    """Wire the fan-out engine into the gateway's S1 seams."""
+def activate(ctx=None) -> None:
+    """Wire the fan-out engine into the gateway.
+
+    Preferred path: the first-class ``post_frame_write`` /
+    ``on_ws_transport_change`` plugin hooks (stock VALID_HOOKS as of the
+    de-patch). Fallback (older cores without the hooks): the S1/S1a
+    module-level observer seams. Exactly ONE path is wired — the gateway
+    fires hooks in addition to seams, so registering both would double-
+    deliver every frame.
+    """
+    if ctx is not None and _hooks_available():
+        def _hook_frame(frame=None, session_id=None, owner_transport=None, **_kw):
+            if isinstance(frame, dict) and isinstance(session_id, str):
+                on_owner_write(frame, session_id, owner_transport)
+
+        def _hook_transport(action=None, transport=None, **_kw):
+            if isinstance(action, str) and transport is not None:
+                on_transport(action, transport)
+
+        ctx.register_hook("post_frame_write", _hook_frame)
+        ctx.register_hook("on_ws_transport_change", _hook_transport)
+        return
     from . import _append_unique
     from tui_gateway import server as _server
     from tui_gateway import ws as _ws
 
     _append_unique(_server, "_EVENT_FANOUT_SUBSCRIBERS", on_owner_write, "broadcast")
     _append_unique(_ws, "TRANSPORT_OBSERVERS", on_transport, "broadcast")
+
+
+def _hooks_available() -> bool:
+    """True when the host core ships the tui-gateway observer hooks."""
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+
+        return "post_frame_write" in VALID_HOOKS and "on_ws_transport_change" in VALID_HOOKS
+    except Exception:
+        return False

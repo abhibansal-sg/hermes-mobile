@@ -48,6 +48,14 @@ def _notify_transport_observers(action: str, transport: "WSTransport") -> None:
             _obs(action, transport)
         except Exception:
             _log.debug("transport observer failed", exc_info=True)
+    # First-class path: the ``on_ws_transport_change`` plugin hook (the
+    # module-level list above remains as a back-compat seam).
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook("on_ws_transport_change", action=action, transport=transport)
+    except Exception:
+        _log.debug("on_ws_transport_change hook failed", exc_info=True)
 
 
 # Max seconds a pool-dispatched handler will block waiting for the event loop
