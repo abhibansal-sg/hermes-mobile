@@ -691,7 +691,7 @@ async def revoke_device_token(device_id: str, request: Request):
     sockets_closed = 0
     for ws in device_tokens.get_device_sockets(device_id):
         try:
-            await ws.close(code=4401, reason="device revoked")
+            await ws.close(code=4401, reason="authentication revoked")
             sockets_closed += 1
         except Exception:  # pragma: no cover - socket already gone
             _log.debug("device-revoke WS close failed", exc_info=True)
