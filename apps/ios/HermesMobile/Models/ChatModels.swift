@@ -506,7 +506,8 @@ extension ChatMessage {
         name: String,
         preview: String,
         failed: Bool,
-        todos: [JSONValue]?
+        todos: [JSONValue]?,
+        fullDiff: String? = nil
     ) -> Bool {
         for index in parts.indices {
             guard case .tools(let id, var cluster, let collapsed, let elapsed) = parts[index] else { continue }
@@ -521,6 +522,7 @@ extension ChatMessage {
             cluster[ti].resultPreview = preview
             cluster[ti].state = failed ? .failed : .done
             cluster[ti].todos = todos
+            cluster[ti].fullDiff = fullDiff
             parts[index] = .tools(id: id, tools: cluster, collapsed: collapsed, turnElapsed: elapsed)
             return true
         }
@@ -611,6 +613,13 @@ struct ToolActivity: Identifiable, Sendable, Equatable {
     /// `resultPreview` — a real todo list overflows the preview and its JSON
     /// re-parse would fail, leaving the card blank. `nil` for non-todo tools.
     var todos: [JSONValue]?
+    /// Full unified diff for file-edit tools (`patch`/`write_file`/`edit_file`),
+    /// extracted from `result.inline_diff` (preferred) or `result.diff`, with
+    /// ANSI escapes and the leading desktop `┊ review diff` chrome stripped.
+    /// Untruncated — unlike `resultPreview`, which caps at 300 chars — so the
+    /// diff view never needs to fall back to a re-parse of truncated JSON.
+    /// `nil` for non-file-edit tools or when the result carried no diff.
+    var fullDiff: String? = nil
     /// Content-aware human-readable summary derived from the FULL
     /// `tool.complete` result (see ``ToolResultSummary``), before
     /// ``resultPreview``'s 300-char truncation. `nil` when nothing meaningful

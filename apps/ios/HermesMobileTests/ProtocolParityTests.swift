@@ -500,6 +500,66 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertEqual(parsed.items.count, 20)
     }
 
+    // MARK: - STR-460: inline diff rendering for file-edit tools
+
+    func testToolCompleteRetainsFullDiffForPatchTool() async throws {
+        let (chat, _) = makeStore()
+        chat.handle(event: localFrame(type: "message.start"))
+        chat.handle(event: localFrame(type: "tool.start", payload: .object([
+            "tool_id": .string("t1"), "name": .string("patch")])))
+        // Long enough that the 300-char resultPreview truncates the JSON blob —
+        // the diff must survive untruncated on `fullDiff` regardless.
+        let hunkLines = (0..<20).map { "+added context line number \($0) with enough text to pad" }
+        let diff = "┊ review diff\n" + hunkLines.joined(separator: "\n")
+        chat.handle(event: localFrame(type: "tool.complete", payload: .object([
+            "tool_id": .string("t1"),
+            "name": .string("patch"),
+            "result": .object(["inline_diff": .string(diff), "message": .string("applied")]),
+            "duration_s": .number(0.2),
+        ])))
+        await waitUntil { chat.messages.last?.tools.first?.state == .done }
+        let tool = try XCTUnwrap(chat.messages.last?.tools.first)
+        let fullDiff = try XCTUnwrap(tool.fullDiff)
+        XCTAssertFalse(fullDiff.hasPrefix("┊"), "leading review-diff chrome must be stripped")
+        XCTAssertTrue(fullDiff.contains("added context line number 19"), "diff kept untruncated")
+        XCTAssertGreaterThan(fullDiff.count, 300)
+        XCTAssertTrue(tool.resultPreview.count <= 300, "resultPreview stays truncated/normal")
+    }
+
+    func testToolCompleteRetainsFullDiffForWriteFileTool() async throws {
+        let (chat, _) = makeStore()
+        chat.handle(event: localFrame(type: "message.start"))
+        chat.handle(event: localFrame(type: "tool.start", payload: .object([
+            "tool_id": .string("t2"), "name": .string("write_file")])))
+        chat.handle(event: localFrame(type: "tool.complete", payload: .object([
+            "tool_id": .string("t2"),
+            "name": .string("write_file"),
+            "result": .object(["diff": .string("+new line\n-old line")]),
+            "duration_s": .number(0.1),
+        ])))
+        await waitUntil { chat.messages.last?.tools.first?.state == .done }
+        let tool = try XCTUnwrap(chat.messages.last?.tools.first)
+        XCTAssertEqual(tool.fullDiff, "+new line\n-old line")
+    }
+
+    /// Negative: a non-file-edit tool whose result happens to carry a `diff`
+    /// key must NOT be treated as a file-edit diff.
+    func testToolCompleteIgnoresDiffKeyForNonFileEditTool() async throws {
+        let (chat, _) = makeStore()
+        chat.handle(event: localFrame(type: "message.start"))
+        chat.handle(event: localFrame(type: "tool.start", payload: .object([
+            "tool_id": .string("t3"), "name": .string("web_search")])))
+        chat.handle(event: localFrame(type: "tool.complete", payload: .object([
+            "tool_id": .string("t3"),
+            "name": .string("web_search"),
+            "result": .object(["diff": .string("+not a real edit diff")]),
+            "duration_s": .number(0.1),
+        ])))
+        await waitUntil { chat.messages.last?.tools.first?.state == .done }
+        let tool = try XCTUnwrap(chat.messages.last?.tools.first)
+        XCTAssertNil(tool.fullDiff, "only patch/write_file/edit_file extract a diff")
+    }
+
     /// STR-463: `resultSummary` must be derived from the FULL `payload.result`,
     /// not the already-truncated `resultPreview`. Here the meaningful
     /// `message` field sorts (alphabetically, per `compactDescription`) after

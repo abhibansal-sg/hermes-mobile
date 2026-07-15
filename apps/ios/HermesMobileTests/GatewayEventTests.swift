@@ -356,4 +356,83 @@ final class GatewayEventTests: XCTestCase {
         XCTAssertNil(JSONValue.array([.string("x")]).coercedStringValue)
         XCTAssertNil(JSONValue.object(["k": .string("v")]).coercedStringValue)
     }
+
+    // MARK: - InlineFileDiff (STR-460 — inline diff rendering for file-edit tools)
+
+    func testFileEditToolNamesRecognised() {
+        XCTAssertTrue(InlineFileDiff.isFileEditTool("patch"))
+        XCTAssertTrue(InlineFileDiff.isFileEditTool("write_file"))
+        XCTAssertTrue(InlineFileDiff.isFileEditTool("edit_file"))
+        XCTAssertFalse(InlineFileDiff.isFileEditTool("read_file"))
+        XCTAssertFalse(InlineFileDiff.isFileEditTool("web_search"))
+        XCTAssertFalse(InlineFileDiff.isFileEditTool(nil))
+    }
+
+    func testInlineDiffPrefersInlineDiffOverDiff() {
+        let result: JSONValue = [
+            "inline_diff": "+from inline_diff",
+            "diff": "+from diff",
+        ]
+        XCTAssertEqual(InlineFileDiff.extract(from: result), "+from inline_diff")
+    }
+
+    func testInlineDiffFallsBackToDiffKey() {
+        let result: JSONValue = ["diff": "+from diff"]
+        XCTAssertEqual(InlineFileDiff.extract(from: result), "+from diff")
+    }
+
+    func testInlineDiffSkipsBlankInlineDiffAndFallsBackToDiff() {
+        let result: JSONValue = ["inline_diff": "   ", "diff": "+kept"]
+        XCTAssertEqual(InlineFileDiff.extract(from: result), "+kept")
+    }
+
+    func testInlineDiffNilWhenNeitherKeyPresent() {
+        XCTAssertNil(InlineFileDiff.extract(from: ["message": "ok"]))
+        XCTAssertNil(InlineFileDiff.extract(from: .null))
+    }
+
+    func testInlineDiffStripsAnsiAndReviewDiffChrome() {
+        let raw = "┊ review diff\n\u{1B}[32m+added line\u{1B}[0m\n\u{1B}[31m-removed line\u{1B}[0m"
+        let result: JSONValue = ["inline_diff": .string(raw)]
+        XCTAssertEqual(InlineFileDiff.extract(from: result), "+added line\n-removed line")
+    }
+
+    func testInlineDiffChromeStripIsCaseInsensitiveAndTrims() {
+        let raw = "  ┊ REVIEW DIFF  \n+line\n"
+        XCTAssertEqual(InlineFileDiff.stripChrome(raw), "+line")
+    }
+
+    func testInlineDiffDoesNotTruncateLongDiff() {
+        let longBody = Array(repeating: "+line of context that keeps going", count: 40).joined(separator: "\n")
+        XCTAssertGreaterThan(longBody.count, 300)
+        let result: JSONValue = ["inline_diff": .string(longBody)]
+        let extracted = InlineFileDiff.extract(from: result)
+        XCTAssertEqual(extracted, longBody)
+        XCTAssertGreaterThan(extracted?.count ?? 0, 300)
+    }
+
+    /// Stored `role: tool` rows carry `content` as a raw string
+    /// (`StoredMessage.content` — see `StoredMessageTests`/`ChatStoreSeedParityTests`),
+    /// which is frequently itself a JSON-encoded object. Extraction must parse
+    /// that stringified JSON to find `inline_diff`/`diff`, not just object keys
+    /// on a structured `JSONValue.object` (the live `tool.complete` shape).
+    func testInlineDiffExtractsFromStringifiedJSONContent() {
+        let stringified: JSONValue = .string(#"{"inline_diff": "+from stringified inline_diff", "ok": true}"#)
+        XCTAssertEqual(InlineFileDiff.extract(from: stringified), "+from stringified inline_diff")
+    }
+
+    func testInlineDiffStringifiedJSONFallsBackToDiffKey() {
+        let stringified: JSONValue = .string(#"{"diff": "+from stringified diff"}"#)
+        XCTAssertEqual(InlineFileDiff.extract(from: stringified), "+from stringified diff")
+    }
+
+    func testInlineDiffPlainStringContentWithoutJSONYieldsNil() {
+        XCTAssertNil(InlineFileDiff.extract(from: .string("wrote 12 lines to file.txt")))
+    }
+
+    func testInlineDiffStringifiedJSONArrayDoesNotMatch() {
+        // A JSON array (not an object) parses but must not be treated as a
+        // key/value candidate — guards `objectCandidate`'s `.objectValue != nil` gate.
+        XCTAssertNil(InlineFileDiff.extract(from: .string(#"["inline_diff", "diff"]"#)))
+    }
 }
