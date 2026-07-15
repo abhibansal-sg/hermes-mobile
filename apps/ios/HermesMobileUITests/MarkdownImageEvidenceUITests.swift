@@ -51,14 +51,26 @@ final class MarkdownImageEvidenceUITests: XCTestCase {
         app.launch()
 
         // 1. Inline render — the markdown image paints inside the seeded assistant
-        //    prose. The data-URL branch decodes offline, so this is deterministic
-        //    even if the remote fetch flakes. Query across any element type: the
+        //    prose. Target the data-URL ("inline pixel") image specifically, not
+        //    `.firstMatch` on the bare `markdownImage` identifier: the remote `https`
+        //    image (label "remote camera") only gains that identifier once its
+        //    `AsyncImage` transitions `.empty` -> `.success` (MessageBubble.swift's
+        //    `loading` placeholder carries no `markdownImage` id), which can happen
+        //    mid-test as the network fetch completes. `.firstMatch` re-resolves
+        //    lazily at tap-time, so it can land on that freshly-appeared element
+        //    while it's still mid-`.snappy` transition and not yet hittable —
+        //    exactly the "Failed to not hittable" seen on this test (STR-1399 root
+        //    cause). The data-URL image decodes synchronously offline and is the one
+        //    the test is documented to rely on ("always present offline"), so query
+        //    it by its alt-text label instead. Query across any element type: the
         //    `markdownImage` a11y id sits on a plain SwiftUI Button wrapping the
         //    thumbnail, which UIKit may surface as a button or an image.
-        let markdownImage = app.descendants(matching: .any)["markdownImage"].firstMatch
+        let markdownImage = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@ AND label == %@", "markdownImage", "inline pixel"))
+            .firstMatch
         XCTAssertTrue(
             markdownImage.waitForExistence(timeout: 30),
-            "Inline markdownImage did not render in the seeded assistant prose"
+            "Inline markdownImage (inline pixel) did not render in the seeded assistant prose"
         )
         // Nudge the interruption monitor in case a stray system alert is up.
         app.tap()

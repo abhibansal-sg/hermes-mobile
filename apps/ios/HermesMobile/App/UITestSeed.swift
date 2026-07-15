@@ -636,6 +636,7 @@ enum UITestSeed {
                 + "![inline pixel](\(dataPNG)) after — the prose continues past both "
                 + "images so paragraph/image/paragraph ordering is exercised."
             environment.sessionStore.activeStoredId = "uitest-mdimage"
+            environment.connectionStore.phase = .connected
             environment.chatStore.debugSeedTranscript([
                 ChatMessage(role: .user, text: "Show me the two inline images."),
                 ChatMessage(role: .assistant, text: prose),
