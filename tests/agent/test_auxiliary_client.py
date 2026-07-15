@@ -4191,10 +4191,13 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert response.choices[0].message.content == "summary"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        events_seen = {"count": 0}
+
         class _SlowAliveCreateStream:
             def __iter__(self):
                 for _ in range(5):
                     time.sleep(0.03)
+                    events_seen["count"] += 1
                     yield SimpleNamespace(type="response.in_progress")
 
             def close(self): pass
@@ -4203,17 +4206,18 @@ class TestCodexAuxiliaryAdapterTimeout:
             def create(self, **kwargs):
                 return _SlowAliveCreateStream()
 
-        fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
+        close = MagicMock()
+        fake_client = SimpleNamespace(responses=FakeResponses(), close=close)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        assert 1 <= events_seen["count"] < 5
+        close.assert_called_once_with()
 
 
 class TestCodexAuxiliaryToolMessageConversion:
