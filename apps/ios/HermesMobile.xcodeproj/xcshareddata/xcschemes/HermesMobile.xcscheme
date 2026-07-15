@@ -69,6 +69,17 @@
             parallelizable = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
+               BlueprintIdentifier = "2B84CFB750DE9BC73015DA43"
+               BuildableName = "KilledAppInboxReconciliationValidation.xctest"
+               BlueprintName = "KilledAppInboxReconciliationValidation"
+               ReferencedContainer = "container:HermesMobile.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
                BlueprintIdentifier = "C00951F041FFF58A58AF3997"
                BuildableName = "WorkRepositoryTests.xctest"
                BlueprintName = "WorkRepositoryTests"

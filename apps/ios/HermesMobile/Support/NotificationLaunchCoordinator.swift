@@ -51,6 +51,8 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
     private var tapHandler: (@MainActor @Sendable (NotificationService.Tap) -> Void)?
     private var endpointProvider:
         (@MainActor @Sendable () -> NotificationService.ActionEndpoint?)?
+    private var actionCompletionHandler: (@MainActor @Sendable () -> Void)?
+    private var owesActionReconciliation = false
     private var actionRequestIDsInFlight: Set<String> = []
     private var completedActionRequestIDs: Set<String> = []
 
@@ -73,6 +75,14 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
         endpointProvider = provider
         NotificationService.setActionEndpointProvider(provider)
         drainIfReady()
+    }
+
+    func attachActionCompletionHandler(_ handler: @escaping @MainActor @Sendable () -> Void) {
+        actionCompletionHandler = handler
+        if owesActionReconciliation {
+            owesActionReconciliation = false
+            handler()
+        }
     }
 
     func receive(_ event: Event) {
@@ -117,6 +127,7 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
                     )
                 }
                 self.finishAction(requestID: action?.requestId)
+                self.notifyActionCompletion()
                 completion.handler()
             }
         case .reply(let text, let action, let completion):
@@ -133,6 +144,7 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
                     )
                 }
                 self.finishAction(requestID: action?.approvalId)
+                self.notifyActionCompletion()
                 completion.handler()
             }
         }
@@ -150,6 +162,14 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
         guard let requestID, !requestID.isEmpty else { return }
         actionRequestIDsInFlight.remove(requestID)
         completedActionRequestIDs.insert(requestID)
+    }
+
+    private func notifyActionCompletion() {
+        if let actionCompletionHandler {
+            actionCompletionHandler()
+        } else {
+            owesActionReconciliation = true
+        }
     }
 
     nonisolated func userNotificationCenter(

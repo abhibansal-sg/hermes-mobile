@@ -10,6 +10,7 @@ import GRDB
 // Migration policy:
 //   - v1: create all three tables + four indexes (first ship)
 //   - Recognized versions migrate transactionally; v3 uses verified shadow tables.
+//   - v4 concretizes the reserved pending-attention table + scoped cursor metadata.
 
 enum CacheSchema {
 
@@ -23,7 +24,7 @@ enum CacheSchema {
     /// normal GRDB path on a live DB; the fingerprint bump means any DB so old
     /// it cannot ALTER cleanly takes the nuke-and-rebuild escape hatch instead —
     /// always safe (the cache is 100% reconstructible from the gateway).
-    static let currentFingerprint = "v3"
+    static let currentFingerprint = "v4"
 
     // MARK: - Migrator
 
@@ -215,6 +216,41 @@ enum CacheSchema {
             try db.execute(sql: "CREATE TABLE last_opened_session (serverId TEXT NOT NULL, manifestScope TEXT NOT NULL, profileId TEXT NOT NULL, sessionId TEXT NOT NULL, PRIMARY KEY(serverId,manifestScope))")
             let violations = try Row.fetchAll(db, sql: "PRAGMA foreign_key_check")
             guard violations.isEmpty else { throw DatabaseError(resultCode: .SQLITE_CONSTRAINT_FOREIGNKEY, message: "v3 foreign-key verification failed") }
+            try SyncMetaRecord(key: SyncMetaRecord.Key.schemaVersion, value: currentFingerprint).save(db)
+        }
+
+        // v4 — make the Phase-1 reserved attention identity table concrete for
+        // the Phase-0 killed-app Inbox. The row contains display-safe JSON only;
+        // cursor/instance metadata is scope-qualified and commits in the same
+        // transaction as every delta.
+        migrator.registerMigration("v4-pending-attention") { db in
+            try db.alter(table: "pending_attention_cache") { t in
+                t.add(column: "requestId", .text).notNull().defaults(to: "")
+                t.add(column: "sessionId", .text).notNull().defaults(to: "")
+                t.add(column: "storedSessionId", .text)
+                t.add(column: "kind", .text).notNull().defaults(to: "approval")
+                t.add(column: "payloadJSON", .blob).notNull().defaults(to: Data("{}".utf8))
+                t.add(column: "createdAt", .double).notNull().defaults(to: 0)
+                t.add(column: "expiresAt", .double)
+                t.add(column: "state", .text).notNull().defaults(to: AttentionLifecycle.pending.rawValue)
+                t.add(column: "revision", .integer).notNull().defaults(to: 0)
+                t.add(column: "updatedAt", .double).notNull().defaults(to: 0)
+            }
+            try db.create(
+                index: "pending_attention_scope_state",
+                on: "pending_attention_cache",
+                columns: ["serverId", "profileId", "state"],
+                ifNotExists: true
+            )
+            try db.create(table: "attention_reconciliation_meta", ifNotExists: true) { t in
+                t.column("serverId", .text).notNull()
+                t.column("profileId", .text).notNull()
+                t.column("serverInstanceId", .text).notNull()
+                t.column("cursor", .text).notNull()
+                t.column("revision", .integer).notNull()
+                t.column("updatedAt", .double).notNull()
+                t.primaryKey(["serverId", "profileId"])
+            }
             try SyncMetaRecord(key: SyncMetaRecord.Key.schemaVersion, value: currentFingerprint).save(db)
         }
 
