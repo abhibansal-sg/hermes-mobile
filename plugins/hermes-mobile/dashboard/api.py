@@ -7,6 +7,7 @@ verbatim from ``hermes_cli/web_server.py`` in the ABH-88 de-patch (W1):
 * ``POST /upload``                — attachment upload bridge (was /api/upload)
 * ``GET  /attachments/{name}``    — authenticated upload byte fetch for mobile thumbnails
 * ``POST /approvals/respond``     — REST approval resolve (was /api/approvals/respond)
+* ``GET  /attention/pending``     — revisioned approval/clarification reconciliation
 * ``GET  /approvals/audit``       — approval audit read   (was /api/approvals/audit)
 * ``POST /devices/issue``         — mint per-device token (was /api/devices/issue)
 * ``GET  /devices``               — list paired devices   (was /api/devices)
@@ -480,6 +481,35 @@ class ApprovalReplyBody(BaseModel):
     answer: str
 
 
+@router.get("/attention/pending")
+async def pending_attention(
+    request: Request,
+    cursor: Annotated[Optional[str], Query(max_length=512)] = None,
+):
+    """Return an auth-scoped snapshot/delta of actionable pending prompts."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "approve"):
+        raise HTTPException(status_code=403, detail="Device token lacks approve scope")
+
+    device_id = _request_device_id(request)
+    visibility = f"device:{device_id}" if device_id else "shared"
+    visibility_check = (
+        (lambda session_id: _device_owns_session(request, session_id))
+        if device_id
+        else (lambda _session_id: True)
+    )
+    attention = _plugin_module("pending_attention")
+    try:
+        return attention.build_pending_attention(
+            cursor=cursor,
+            visibility=visibility,
+            visibility_check=visibility_check,
+        )
+    except attention.InvalidCursor as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 @router.post("/approvals/respond")
 async def respond_to_approval(body: ApprovalRespondBody, request: Request):
     """Resolve a pending gateway approval for a runtime session.
@@ -499,15 +529,13 @@ async def respond_to_approval(body: ApprovalRespondBody, request: Request):
     choice = "once" if body.choice == "approve" else "deny"
 
     try:
-        from tui_gateway.server import _sessions
+        from tui_gateway.server import attention_session_identity
     except Exception as exc:  # pragma: no cover - gateway import unavailable
         raise HTTPException(status_code=503, detail=f"Gateway unavailable: {exc}")
 
-    session = _sessions.get(body.session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Unknown session")
-    session_key = session.get("session_key")
-    if not session_key:
+    identity = attention_session_identity(body.session_id)
+    session_key = (identity or {}).get("stored_session_id")
+    if identity is None or not session_key:
         raise HTTPException(status_code=404, detail="Unknown session")
     if not _device_owns_session(request, body.session_id):
         raise HTTPException(status_code=403, detail="Device token does not own session")
@@ -548,18 +576,16 @@ async def reply_to_clarify_approval(body: ApprovalReplyBody, request: Request):
 
     try:
         from tui_gateway.server import (
-            _answers,
-            _pending,
-            _pending_prompt_payloads,
-            _prompt_lock,
-            _sessions,
+            attention_session_identity,
+            pending_prompt_snapshot,
+            resolve_pending_clarification,
         )
     except Exception as exc:  # pragma: no cover - gateway import unavailable
         raise HTTPException(status_code=503, detail=f"Gateway unavailable: {exc}")
 
-    session = _sessions.get(body.session_id)
-    session_key = (session or {}).get("session_key")
-    if session is None or not session_key:
+    identity = attention_session_identity(body.session_id)
+    session_key = (identity or {}).get("stored_session_id")
+    if identity is None or not session_key:
         raise HTTPException(status_code=404, detail="Unknown session")
     if not _device_owns_session(request, body.session_id):
         raise HTTPException(status_code=403, detail="Device token does not own session")
@@ -574,26 +600,24 @@ async def reply_to_clarify_approval(body: ApprovalReplyBody, request: Request):
     if not rid:
         return {"resolved": False}
 
-    with _prompt_lock:
-        pending = _pending.get(rid)
-        if pending is None:
-            return {"resolved": False}
-        owner_sid, ev = pending
-        if owner_sid != body.session_id:
-            return {"resolved": False}
-        event, payload = _pending_prompt_payloads.get(rid, ("", {}))
-        if event != "clarify.request":
-            return {"resolved": False}
-        _answers[rid] = answer
-        ev.set()
+    record = next(
+        (item for item in pending_prompt_snapshot() if item["request_id"] == rid),
+        None,
+    )
+    if record is None or record["session_id"] != body.session_id:
+        return {"resolved": False}
+    if not resolve_pending_clarification(
+        rid,
+        session_id=body.session_id,
+        answer=answer,
+    ):
+        return {"resolved": False}
 
     try:
         audit_log = _plugin_module("audit_log")
-        preview = ""
-        if isinstance(payload, dict):
-            preview = audit_log._build_command_preview(
-                {"description": payload.get("question")}
-            )
+        preview = audit_log._build_command_preview(
+            {"description": (record.get("detail") or {}).get("question")}
+        )
         audit_log.append(
             session_id=audit.get("session_id", body.session_id),
             session_key=audit.get("session_key", session_key),

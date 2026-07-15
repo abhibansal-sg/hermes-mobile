@@ -31,6 +31,7 @@ either already upstream or no longer consumed by `plugins/hermes-mobile` / iOS.
 | S10 | OBSOLETE | Embedded-chat route guards are upstream. iOS closes its owned runtime before RPC delete and uses profile-scoped REST only for non-default rows, so the old REST live-delete core guard has no current consumer. |
 | S11 | STILL-NEEDED (generic) | `prompt.submit` exposes a generic receipt-provider registry and calls it before mutation. The hermes-mobile plugin owns SQLite, profile scoping, liveness, and 30-day retention (ABH-462 / R-48). |
 | S12 | STILL-NEEDED (small) | Stock `session.status` exposes only rendered text. The additive structured projection (`running`, nullable model/provider/usage) is generic gateway protocol completeness and an upstream-ready fix; authoritative runtime state is unreachable through a mobile plugin without replacing the core RPC. |
+| S13 | STILL-NEEDED (generic) | Approval and clarification owners expose lock-safe, display-redacted pending-record snapshots plus the existing clarification waiter resolver. The mobile plugin owns auth visibility, cursor signing, bounded delta/tombstone history, and the REST route (ABH-445 / R-03,R-53,R-54). |
 
 ## 1. Plugin package: `plugins/hermes-mobile/`
 Rides the STOCK plugin system (`hermes_cli/plugins.py` manager + dashboard
@@ -39,7 +40,11 @@ Rides the STOCK plugin system (`hermes_cli/plugins.py` manager + dashboard
 Modules (moved or already-new):
 - `api.py` — FastAPI router (auto-mounted `/api/plugins/hermes-mobile/…`):
   upload, approvals/respond, devices CRUD + audit list, fs/list + fs/read,
-  push register/prefs. (web_server clusters B,C,D,E,I → zero stock seams.)
+  pending-attention snapshot/delta, push register/prefs. (web_server clusters
+  B,C,D,E,I → zero stock seams.)
+- `pending_attention.py` — process-instance ID, per-credential visibility
+  journals, signed cursors, bounded upsert/tombstone retention, and owner
+  snapshot aggregation for the mobile reconciliation route.
 - `push_engine.py` (from `hermes_cli/push_notify.py`) — APNs + Live Activity.
   Event intake: approval pushes via STOCK `pre_approval_request` hook;
   session-end LA cleanup via `on_session_finalize`; long-turn/clarify pushes
@@ -93,6 +98,11 @@ S12 session.status structured runtime truth (~30 lines, server.py). Preserve the
    existing `output` while exposing the session record's boolean `running` and
    nullable agent metadata/usage. PR: "fix(gateway): return structured session
    status" — generic wire-contract completeness for every JSON-RPC client.
+S13 lock-safe pending-attention owner snapshots (`tools/approval.py`,
+   `tui_gateway/server.py`) plus the public clarification resolver. PR:
+   "gateway: expose safe pending interaction snapshots". The waiter maps and
+   their resolution locks are unreachable to a plugin without this read seam;
+   no mobile auth, cursor, retention, or HTTP policy lives in core.
 
 ## 3. Drops at rebase (Phase 2)
 Model-switch env-leak fix (upstream superseded + their `model_override` ⇒ most of
