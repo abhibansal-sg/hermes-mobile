@@ -215,6 +215,20 @@ final class SessionStore {
     /// Protected entirely on `@MainActor` — no atomics needed.
     private var refreshToken: Int = 0
 
+    /// Connection-lifecycle ownership for async session work. ConnectionStore
+    /// invalidates this whenever a gateway generation changes, so a suspended
+    /// refresh or session recovery cannot publish data from the prior gateway.
+    private var connectionWorkGeneration: UInt64 = 0
+
+    func invalidateConnectionWork() {
+        connectionWorkGeneration &+= 1
+        // Existing refresh paths already guard this token at every network
+        // result publication. Bumping it discards an in-flight response.
+        refreshToken &+= 1
+        resetInitialFill()
+        cancelEnsureRuntime()
+    }
+
     /// Revision of the server-side Recents universe represented by `sessions`.
     /// Unlike `refreshToken`, this does not cancel the dedicated initial fill on
     /// every heartbeat. It changes only when a first-page replacement or cursor
@@ -1950,6 +1964,7 @@ final class SessionStore {
     /// Otherwise — the dormant single-profile case AND the default-profile scope —
     /// it uses the existing `GET /api/sessions` path, byte-for-byte unchanged.
     func refresh() async {
+        let myConnectionWorkGeneration = connectionWorkGeneration
         isLoading = true
         defer { isLoading = false }
 
@@ -1973,6 +1988,7 @@ final class SessionStore {
         if let cacheStore, let scope = currentCacheScope,
            let previous = lastColdReadServerId, previous != scope.serverId {
             _ = try? await cacheStore.clearSessionsForOtherServers(keepingServerId: scope.serverId)
+            guard connectionWorkGeneration == myConnectionWorkGeneration else { return }
             // A different server's list is showing — drop the stale in-memory rows
             // and re-arm the cold paint so the new server repaints from its own
             // (now sole) cached rows rather than leaving the prior server's list
@@ -1986,6 +2002,7 @@ final class SessionStore {
         }
 
         await paintFromCache()
+        guard connectionWorkGeneration == myConnectionWorkGeneration else { return }
         if let cacheStore, let scope = currentCacheScope {
             // Bounded, resumable batches. Yield between transactions so cache
             // paint and interaction are never held behind historical indexing.
@@ -3481,6 +3498,7 @@ final class SessionStore {
     /// id on success, or `nil` if there is no active session to resume.
     @discardableResult
     func resumeActiveAfterReconnect() async -> String? {
+        let myConnectionWorkGeneration = connectionWorkGeneration
         guard let storedId = activeStoredId, client != nil || resumeRPC != nil else { return nil }
         do {
             // Re-resume into the same profile scope so a reconnect keeps the
@@ -3506,7 +3524,8 @@ final class SessionStore {
             // result; otherwise a live send would misroute into the resumed
             // session (the R1 #17 class, on the un-affinity-guarded live path).
             // Mirrors open()'s `openToken` re-check after its own resume await.
-            guard activeStoredId == storedId else { return nil }
+            guard activeStoredId == storedId,
+                  connectionWorkGeneration == myConnectionWorkGeneration else { return nil }
             activeRuntimeId = result.sessionId
             // A resume can follow a compression chain tip (parent → continuation);
             // re-stamp queued prompts so affinity-stamped ones aren't skipped forever.
