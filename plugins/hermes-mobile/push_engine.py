@@ -1694,13 +1694,17 @@ def handle_gateway_event(event: str, sid: str, payload: dict | None = None) -> N
     _push_hook(event, sid, payload)
 
 
-def handle_session_finalize(session_id: str | None = None, **_kwargs) -> None:
+def handle_session_finalize(
+    session_id: str | None = None,
+    runtime_session_id: str | None = None,
+    **_kwargs,
+) -> None:
     """End Live Activities for every runtime/stored id of a closing session.
 
     Stock Hermes already exposes ``on_session_finalize``. Deriving the runtime
     id from its live session table removes the old ``_runtime_sid`` core seam.
     """
-    ids: list[object] = [session_id]
+    ids: list[object] = [session_id, runtime_session_id]
     target = str(session_id or "")
     for runtime_sid, session in list(_gw_sessions().items()):
         agent = (session or {}).get("agent") if isinstance(session, dict) else None
