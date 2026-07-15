@@ -232,10 +232,9 @@ final class AppEnvironment {
         self.connectionStore = connectionStore
         self.projectsStore = projectsStore
 
-        // Publish an initial widget snapshot from the current (pre-bootstrap)
-        // state so the widgets render real data immediately rather than the
-        // "No data yet" placeholder, then keep it live via observation.
-        writeWidgetSnapshot()
+        // Do not publish process-local defaults before bootstrap. The shared
+        // disk snapshot remains authoritative until committed server state is
+        // available; observation below only patches connection state.
         startWidgetSnapshotObservation()
     }
 
@@ -245,21 +244,14 @@ final class AppEnvironment {
     /// store state the app already holds; `WidgetSnapshotWriter` debounces
     /// identical writes, so calling this liberally is cheap.
     func writeWidgetSnapshot() {
-        let connected: Bool
-        if case .connected = connectionStore.phase { connected = true } else { connected = false }
-        WidgetSnapshotWriter.write(
-            connected: connected,
-            activeSessions: activeSessionCount,
-            pendingApprovals: inboxStore.pendingCount
-        )
-    }
-
-    /// Best-effort "active sessions" count for the widget. The gateway doesn't
-    /// surface a live count here, so we use 1 when a session is open, else 0 —
-    /// the widget shows "active sessions", and the one the user is driving is the
-    /// meaningful figure on device.
-    private var activeSessionCount: Int {
-        sessionStore.activeStoredId != nil ? 1 : 0
+        var patch = WidgetSnapshotWriter.Patch()
+        if case .connected = connectionStore.phase {
+            patch.connectionState = .set(.connected)
+        } else {
+            patch.connectionState = .set(.offline)
+            patch.isStale = .set(true)
+        }
+        WidgetSnapshotWriter.write(patch)
     }
 
     /// Re-arm `withObservationTracking` so a change to any snapshot input
@@ -269,8 +261,6 @@ final class AppEnvironment {
         withObservationTracking {
             // Touch every input so Observation records a dependency on each.
             _ = connectionStore.phase
-            _ = inboxStore.pendingCount
-            _ = sessionStore.activeStoredId
         } onChange: { [weak self] in
             // `onChange` fires off the mutation; hop to the main actor to read the
             // stores and re-arm (both are MainActor-isolated).
