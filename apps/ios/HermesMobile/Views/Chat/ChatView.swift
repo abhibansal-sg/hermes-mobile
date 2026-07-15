@@ -1690,10 +1690,31 @@ struct ChatView: View {
         .background(theme.popover, in: RoundedRectangle(cornerRadius: 12))
     }
 
+    /// Whether a `presentToast` call carries a real message to show, vs. an
+    /// idempotent nil re-entry (e.g. `chatStore.lastError`'s own nil transition
+    /// after the auto-dismiss consumes it via ``consumeToastLatch``). Kept as a
+    /// static seam so the STR-136 Finding A guard invariant is unit-testable
+    /// without rendering the view.
+    static func isPresentableToastMessage(_ message: String?) -> Bool {
+        guard let message else { return false }
+        return !message.isEmpty
+    }
+
+    /// Clears the transient toast together with the `ChatStore` latch it was
+    /// shown from, so a later remount's `onAppear { presentToast(chatStore.lastError) }`
+    /// (STR-136 Finding A) has nothing stale to re-present. Kept as a static
+    /// seam, parameterized over the mutable binding, so the invariant is
+    /// unit-testable without rendering the view or waiting out the real 4s timer.
+    @MainActor
+    static func consumeToastLatch(toastError: inout String?, chatStore: ChatStore) {
+        toastError = nil
+        chatStore.lastError = nil
+    }
+
     /// Show a transient error toast and schedule its auto-dismiss after 4s.
     private func presentToast(_ message: String?) {
         toastDismissTask?.cancel()
-        guard let message, !message.isEmpty else {
+        guard Self.isPresentableToastMessage(message) else {
             toastError = nil
             return
         }
@@ -1701,7 +1722,10 @@ struct ChatView: View {
         toastDismissTask = Task {
             try? await Task.sleep(for: .seconds(4))
             guard !Task.isCancelled else { return }
-            toastError = nil
+            // The resulting `chatStore.lastError` nil transition re-enters
+            // `presentToast` via `.onChange`; `isPresentableToastMessage` guards
+            // it into a no-op there, so this is not re-entrant.
+            Self.consumeToastLatch(toastError: &toastError, chatStore: chatStore)
         }
     }
 
