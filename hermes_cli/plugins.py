@@ -212,6 +212,15 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",
+    # TUI-gateway observer hooks. These are observer-only: return values are
+    # ignored and callback failures must never break gateway traffic.
+    #
+    # post_emit_event: event: str, session_id: str, payload: dict | None
+    # post_frame_write: frame: dict, session_id: str, owner_transport: Any
+    # on_ws_transport_change: action: "connect" | "disconnect", transport: Any
+    "post_emit_event",
+    "post_frame_write",
+    "on_ws_transport_change",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"

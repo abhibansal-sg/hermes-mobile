@@ -1116,6 +1116,41 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
+def _notify_gateway_observers(hook: str, **kwargs) -> None:
+    """Fire a gateway observer hook best-effort; never break gateway I/O."""
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook(hook, **kwargs)
+    except Exception:
+        logger.debug("gateway observer hook %s failed", hook, exc_info=True)
+
+
+_OBSERVER_POOL: concurrent.futures.ThreadPoolExecutor | None = None
+_OBSERVER_POOL_LOCK = threading.Lock()
+
+
+def _notify_gateway_observers_nowait(hook: str, **kwargs) -> None:
+    """Fire an observer off the caller's event loop, preserving FIFO order."""
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        manager = get_plugin_manager()
+        if manager is None or not manager.has_hook(hook):
+            return
+    except Exception:
+        return
+
+    global _OBSERVER_POOL
+    with _OBSERVER_POOL_LOCK:
+        if _OBSERVER_POOL is None:
+            _OBSERVER_POOL = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="gw-observer",
+            )
+    _OBSERVER_POOL.submit(_notify_gateway_observers, hook, **kwargs)
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
@@ -1132,7 +1167,14 @@ def write_json(obj: dict) -> bool:
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+            ok = t.write(obj)
+            _notify_gateway_observers(
+                "post_frame_write",
+                frame=obj,
+                session_id=sid,
+                owner_transport=t,
+            )
+            return ok
 
     return (current_transport() or _stdio_transport).write(obj)
 
@@ -1142,6 +1184,12 @@ def _emit(event: str, sid: str, payload: dict | None = None):
     if payload is not None:
         params["payload"] = payload
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
+    _notify_gateway_observers(
+        "post_emit_event",
+        event=event,
+        session_id=sid,
+        payload=payload,
+    )
 
 
 def _emit_approval_request(sid: str, data: dict | None) -> None:

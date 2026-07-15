@@ -1694,6 +1694,26 @@ def handle_gateway_event(event: str, sid: str, payload: dict | None = None) -> N
     _push_hook(event, sid, payload)
 
 
+def handle_session_finalize(session_id: str | None = None, **_kwargs) -> None:
+    """End Live Activities for every runtime/stored id of a closing session.
+
+    Stock Hermes already exposes ``on_session_finalize``. Deriving the runtime
+    id from its live session table removes the old ``_runtime_sid`` core seam.
+    """
+    ids: list[object] = [session_id]
+    target = str(session_id or "")
+    for runtime_sid, session in list(_gw_sessions().items()):
+        agent = (session or {}).get("agent") if isinstance(session, dict) else None
+        candidates = {
+            str((session or {}).get("session_key") or ""),
+            str((session or {}).get("session_id") or ""),
+            str(getattr(agent, "session_id", "") or ""),
+        }
+        if target and target in candidates:
+            ids.extend((runtime_sid, *candidates))
+    end_live_activity_sessions(*ids)
+
+
 def activate(ctx=None) -> None:
     """Wire the push engine into the gateway.
 
@@ -1713,6 +1733,7 @@ def activate(ctx=None) -> None:
                         handle_gateway_event(event, session_id, payload)
 
                 ctx.register_hook("post_emit_event", _hook_emit)
+                ctx.register_hook("on_session_finalize", handle_session_finalize)
                 sweep_dead_live_activity_tokens()
                 return
         except Exception:

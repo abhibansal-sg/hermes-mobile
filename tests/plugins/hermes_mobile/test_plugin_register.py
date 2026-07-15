@@ -94,6 +94,7 @@ def test_register_populates_every_seam_registry(plugin_and_ctx):
     assert any(cb for cb in hooks.get("post_frame_write", [])), "post_frame_write not registered"
     assert any(cb for cb in hooks.get("on_ws_transport_change", [])), "on_ws_transport_change not registered"
     assert any(cb for cb in hooks.get("post_emit_event", [])), "post_emit_event not registered"
+    assert push_engine.handle_session_finalize in hooks.get("on_session_finalize", [])
     assert broadcast.on_owner_write not in server._EVENT_FANOUT_SUBSCRIBERS
     assert push_engine.handle_gateway_event not in server._EMIT_OBSERVERS
     assert broadcast.on_transport not in ws.TRANSPORT_OBSERVERS
