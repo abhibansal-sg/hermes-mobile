@@ -429,25 +429,25 @@ struct FileViewerView: View {
         // (or no scope) falls straight through to today's fetch path. The cache
         // is an accelerator, never a correctness dependency.
         let blobKey = blobCacheKey(result: result)
-        if let key = blobKey, let cached = AttachmentBlobCache.shared.image(for: key) {
+        if let key = blobKey, let cached = await AttachmentBlobCache.shared.image(for: key) {
             imagePhase = .loaded(cached)
             return
         }
 
         // Fast path: the initial fsRead already embedded a data URL.
-        if let dataURL = result.dataURL, let decoded = decodeDataURL(dataURL) {
+        if let dataURL = result.dataURL, let decoded = await decodeDataURL(dataURL) {
             imagePhase = .loaded(decoded.image)
-            cacheBlob(decoded.data, key: blobKey)
+            await cacheBlob(decoded.data, key: blobKey)
             return
         }
 
         // Slow path: request the image bytes via the format=data_url param.
         do {
             let imageResult = try await rest.fsReadAsDataURL(sessionId: sessionId, path: path)
-            if let dataURL = imageResult.dataURL, let decoded = decodeDataURL(dataURL) {
+            if let dataURL = imageResult.dataURL, let decoded = await decodeDataURL(dataURL) {
                 imagePhase = .loaded(decoded.image)
                 // Prefer the freshest server-reported content identity.
-                cacheBlob(decoded.data, key: blobCacheKey(result: imageResult) ?? blobKey)
+                await cacheBlob(decoded.data, key: blobCacheKey(result: imageResult) ?? blobKey)
                 return
             }
             // Server does not support the format param — show a clear failure.
@@ -478,23 +478,16 @@ struct FileViewerView: View {
 
     /// Persist freshly-decoded image bytes to the blob cache (cache-on-access).
     /// No-op when the key is nil. Fire-and-forget; never blocks the UI.
-    private func cacheBlob(_ data: Data, key: AttachmentBlobCache.Key?) {
+    private func cacheBlob(_ data: Data, key: AttachmentBlobCache.Key?) async {
         guard let key else { return }
-        AttachmentBlobCache.shared.store(data, for: key)
+        await AttachmentBlobCache.shared.store(data, for: key)
     }
 
     /// Decode a `data:<mime>;base64,<payload>` URL into a UIImage AND return the
     /// raw decoded bytes (so the bytes can be written to the blob cache without a
     /// re-encode). Returns `nil` when the URL is malformed or not a recognized
     /// image.
-    private func decodeDataURL(_ dataURL: String) -> (image: UIImage, data: Data)? {
-        guard dataURL.hasPrefix("data:"),
-              let commaIndex = dataURL.firstIndex(of: ",") else { return nil }
-        let header = dataURL[dataURL.startIndex..<commaIndex]
-        guard header.contains(";base64") else { return nil }
-        let payload = String(dataURL[dataURL.index(after: commaIndex)...])
-        guard let data = Data(base64Encoded: payload, options: [.ignoreUnknownCharacters]) else { return nil }
-        guard let image = UIImage(data: data) else { return nil }
-        return (image, data)
+    private func decodeDataURL(_ dataURL: String) async -> (image: UIImage, data: Data)? {
+        await AttachmentBlobCache.decodeDataURL(dataURL)
     }
 }

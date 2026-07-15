@@ -62,12 +62,12 @@ final class AttachmentStore {
         sessionId: String,
         path: String,
         contentVersion: String?
-    ) -> UIImage? {
+    ) async -> UIImage? {
         guard let key = Self.blobKey(serverId: serverId, profileId: profileId,
                                      sessionId: sessionId, path: path,
                                      contentVersion: contentVersion)
         else { return nil }
-        return AttachmentBlobCache.shared.image(for: key)
+        return await AttachmentBlobCache.shared.image(for: key)
     }
 
     /// Persist freshly-viewed/downloaded attachment image bytes to the on-disk
@@ -79,12 +79,12 @@ final class AttachmentStore {
         sessionId: String,
         path: String,
         contentVersion: String?
-    ) {
+    ) async {
         guard let key = Self.blobKey(serverId: serverId, profileId: profileId,
                                      sessionId: sessionId, path: path,
                                      contentVersion: contentVersion)
         else { return }
-        AttachmentBlobCache.shared.store(data, for: key)
+        await AttachmentBlobCache.shared.store(data, for: key)
     }
 
     /// Build the composite blob-cache key, or `nil` when `serverId` is blank

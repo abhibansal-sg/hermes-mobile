@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AB469001AB469001AB469001 /* AttachmentBlobCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB469002AB469002AB469002 /* AttachmentBlobCacheTests.swift */; };
+		AB4510010000000000000001 /* AppLockTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB4510020000000000000001 /* AppLockTests.swift */; };
+		AB4510030000000000000001 /* SettingsViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB4510040000000000000001 /* SettingsViewTests.swift */; };
+		AB443001AB443001AB443001 /* session_status_responses.json in Resources */ = {isa = PBXBuildFile; fileRef = AB443002AB443002AB443002 /* session_status_responses.json */; };
 		008861246FF59FC970E36245 /* VoiceConversationControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2F4CBCA9ADD167081BFA1AA /* VoiceConversationControllerTests.swift */; };
 		01ABF4D113BBDB4254B29BBA /* SubagentTreeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C8CBD8C7BDCFA9E6CB4D58 /* SubagentTreeView.swift */; };
 		02E81092BA6930AED0C99CB5 /* VoiceRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C028EAA9312823746769CE4 /* VoiceRecorder.swift */; };
@@ -436,6 +440,10 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AB469002AB469002AB469002 /* AttachmentBlobCacheTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttachmentBlobCacheTests.swift; sourceTree = "<group>"; };
+		AB4510020000000000000001 /* AppLockTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLockTests.swift; sourceTree = "<group>"; };
+		AB4510040000000000000001 /* SettingsViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewTests.swift; sourceTree = "<group>"; };
+		AB443002AB443002AB443002 /* session_status_responses.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = ../../../tests/fixtures/session_status_responses.json; sourceTree = "<group>"; };
 		0072D507329D59E558597E06 /* AppearanceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceView.swift; sourceTree = "<group>"; };
 		0127D3D1ADD45560D331E4E7 /* InboxStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InboxStoreTests.swift; sourceTree = "<group>"; };
 		01BBD60417A4D85EDC321617 /* GreetingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GreetingTests.swift; sourceTree = "<group>"; };
@@ -1227,6 +1235,10 @@
 		DCAF922B1A9CC02164A1596F /* HermesMobileTests */ = {
 			isa = PBXGroup;
 			children = (
+				AB469002AB469002AB469002 /* AttachmentBlobCacheTests.swift */,
+				AB4510020000000000000001 /* AppLockTests.swift */,
+				AB4510040000000000000001 /* SettingsViewTests.swift */,
+				AB443002AB443002AB443002 /* session_status_responses.json */,
 				FF1A16352D25B318F61869D2 /* AppDelegateBackgroundTransferTests.swift */,
 				EB63E56BCC408E1CAD65E85C /* AppLockTests.swift */,
 				2A61DAF847A1110C50477FEF /* ArtifactsGalleryTests.swift */,
@@ -1871,6 +1883,9 @@
 			files = (
 				F4633987B6FB65ECA7D8B8BB /* AppDelegateBackgroundTransferTests.swift in Sources */,
 				9DBF2619FF04E2E3F8964218 /* AppLockTests.swift in Sources */,
+				AB469001AB469001AB469001 /* AttachmentBlobCacheTests.swift in Sources */,
+				AB4510010000000000000001 /* AppLockTests.swift in Sources */,
+				AB4510030000000000000001 /* SettingsViewTests.swift in Sources */,
 				E29895C03CA0863AAE17CC4F /* ArtifactsGalleryTests.swift in Sources */,
 				7D721541C7EA25D790505B9C /* AutoUpgradeGuardLatchTests.swift in Sources */,
 				CECA8C533B2349B8CE05FBC1 /* BackgroundConfigurationTests.swift in Sources */,
