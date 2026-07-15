@@ -8131,7 +8131,17 @@ def _(rid, params: dict) -> dict:
 
 @method("session.branch")
 def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
+    session_id = params.get("session_id") or ""
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    device = _ws_device_identity()
+    # UPSTREAM-HOOK-WANTED: replace this branch-local WS device authz check
+    # with shared RPC authorization middleware when STR-53 lands.
+    if device is not None and not _ws_device_owns_session(device, session_id):
+        return _err(rid, 4030, "device does not own this session")
+    _start_agent_build(session_id, session)
+    err = _wait_agent(session, rid)
     if err:
         return err
     db = _get_db()
@@ -10267,11 +10277,16 @@ def _(rid, params: dict) -> dict:
 
 def _respond(rid, params, key):
     r = params.get("request_id", "")
+    device = _ws_device_identity()
+    if device is not None and "approve" not in (device.get("scopes") or []):
+        return _err(rid, 4030, "device token lacks approve scope")
     with _prompt_lock:
         entry = _pending.get(r)
         if not entry:
             return _err(rid, 4009, f"no pending {key} request")
-        _, ev = entry
+        owner_sid, ev = entry
+        if device is not None and not _ws_device_owns_session(device, owner_sid):
+            return _err(rid, 4030, "device does not own this session")
         _answers[r] = params.get(key, "")
         ev.set()
     return _ok(rid, {"status": "ok"})

@@ -10,7 +10,22 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.plugins.hermes_mobile.conftest import load_plugin_module
+from tui_gateway.transport import bind_transport, reset_transport
+
 _original_stdout = sys.stdout
+device_tokens = load_plugin_module("device_tokens")
+
+
+class _WsTransport:
+    def __init__(self, ws: object) -> None:
+        self._ws = ws
+
+    def write(self, _obj: dict) -> bool:
+        return True
+
+    def close(self) -> None:
+        return None
 
 
 @pytest.fixture(autouse=True)
@@ -1114,15 +1129,34 @@ def test_session_activate_rebinds_orphaned_ws_session_to_current_transport(serve
     assert not server._ws_session_is_orphaned(server._sessions[sid])
 
 
-def test_session_branch_persists_branched_from_marker(server, monkeypatch):
-    """TUI /branch must persist a _branched_from marker so the branch stays
-    visible in /resume and /sessions.
+def _device_identity(device: dict, scopes: list[str] | None = None) -> dict:
+    return {
+        "device_id": device["device_id"],
+        "device_name": device["device_name"],
+        "scopes": scopes or ["chat"],
+    }
 
-    Regression for issue #20856: the TUI branch leaves the parent live (it
-    never ends it with end_reason='branched'), so list_sessions_rich's legacy
-    heuristic never surfaces it — the stable model_config marker is the only
-    thing that keeps a TUI branch visible.
-    """
+
+def _own_session(session_id: str, device: dict) -> None:
+    ws = object()
+    transport = _WsTransport(ws)
+    device_tokens.register_ws_socket(device["device_id"], ws)
+    assert device_tokens.record_session_transport(session_id, transport) == {
+        "device_id": device["device_id"]
+    }
+
+
+def _call_as_ws_device(server, device: dict | None, request: dict) -> dict:
+    fake_ws = types.SimpleNamespace(state=types.SimpleNamespace(device=device))
+    token = bind_transport(_WsTransport(fake_ws))
+    try:
+        return server.handle_request(request)
+    finally:
+        reset_transport(token)
+
+
+@pytest.fixture()
+def branch_db(monkeypatch, server):
     create_calls = []
 
     class _DB:
@@ -1143,6 +1177,26 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
             return None
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    return create_calls
+
+
+@pytest.fixture()
+def branch_parent(server):
+    parent_sid = "parent01"
+    parent_key = "20260101_000000_parent"
+    server._sessions[parent_sid] = {
+        "session_key": parent_key,
+        "history": [{"role": "user", "content": "hello"}],
+        "history_lock": threading.Lock(),
+        "cols": 80,
+    }
+    return parent_sid, parent_key
+
+
+@pytest.fixture()
+def branch_runtime(monkeypatch, server, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    device_tokens._reset_for_tests()
     monkeypatch.setattr(server, "_resolve_model", lambda: "test/model")
     monkeypatch.setattr(server, "_new_session_key", lambda: "20260101_000001_child0")
     monkeypatch.setattr(
@@ -1156,27 +1210,59 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
     monkeypatch.setattr(server, "_set_session_context", lambda *_a, **_k: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_session_cwd", lambda _s: "/tmp/branch-cwd")
+    yield
+    device_tokens._reset_for_tests()
 
-    parent_sid = "parent01"
-    parent_key = "20260101_000000_parent"
-    server._sessions[parent_sid] = {
-        "session_key": parent_key,
-        "history": [{"role": "user", "content": "hello"}],
-        "history_lock": threading.Lock(),
-        "cols": 80,
-    }
 
-    resp = server.handle_request(
+def test_session_branch_persists_branched_from_marker(
+    server, branch_runtime, branch_db, branch_parent
+):
+    """TUI /branch must persist a _branched_from marker so the branch stays
+    visible in /resume and /sessions.
+
+    Regression for issue #20856: the TUI branch leaves the parent live (it
+    never ends it with end_reason='branched'), so list_sessions_rich's legacy
+    heuristic never surfaces it — the stable model_config marker is the only
+    thing that keeps a TUI branch visible.
+    """
+    parent_sid, parent_key = branch_parent
+    owner = device_tokens.issue(device_name="Owner Phone")
+    _own_session(parent_sid, owner)
+
+    resp = _call_as_ws_device(
+        server,
+        _device_identity(owner),
         {"id": "b1", "method": "session.branch", "params": {"session_id": parent_sid}}
     )
 
     assert "error" not in resp, resp
-    assert len(create_calls) == 1
-    new_key, kwargs = create_calls[0]
+    assert len(branch_db) == 1
+    new_key, kwargs = branch_db[0]
     assert new_key == "20260101_000001_child0"
     assert kwargs["parent_session_id"] == parent_key
     # The marker — without it the branch is invisible in /resume and /sessions.
     assert kwargs["model_config"] == {"_branched_from": parent_key}
+
+
+def test_session_branch_denies_non_owner_ws_device_without_cloning(
+    server, branch_runtime, branch_db, branch_parent
+):
+    """A device-token WS caller may only branch sessions owned by that device."""
+    parent_sid, _parent_key = branch_parent
+    owner = device_tokens.issue(device_name="Owner Phone")
+    intruder = device_tokens.issue(device_name="Intruder Phone")
+    _own_session(parent_sid, owner)
+
+    resp = _call_as_ws_device(
+        server,
+        _device_identity(intruder),
+        {"id": "b1", "method": "session.branch", "params": {"session_id": parent_sid}},
+    )
+
+    assert resp["error"]["code"] == 4030
+    assert resp["error"]["message"] == "device does not own this session"
+    assert branch_db == []
+    assert set(server._sessions) == {parent_sid}
 
 
 def test_make_agent_accepts_list_system_prompt(server, monkeypatch):
