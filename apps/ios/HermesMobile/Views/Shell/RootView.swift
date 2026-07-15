@@ -81,14 +81,6 @@ struct RootView: View {
     var body: some View {
         content
             .environment(drawerState)
-            // Outermost lock cover: sits above the entire UI (setup or main,
-            // compact or regular) so the blur hides the transcript regardless
-            // of width or connection phase. PRESERVED from the prior shell.
-            .overlay {
-                if appLock.isLocked {
-                    AppLockOverlay()
-                }
-            }
             .onChange(of: inbox.presentationRequestToken) { _, _ in
                 // Route the request to the right surface for the current shell.
                 // On regular width with the inspector mounted, satisfy it there
