@@ -122,6 +122,59 @@ final class CacheFirstLaunchTests: XCTestCase {
         XCTAssertTrue(sessions.sessions.isEmpty)
     }
 
+    func testHydratingUsesCachedShellButEmptyScopeUsesLoader() {
+        XCTAssertTrue(RootContentPolicy.showsCachedShell(
+            phase: .hydrating, hasCachedContent: true
+        ))
+        XCTAssertFalse(RootContentPolicy.showsCachedShell(
+            phase: .hydrating, hasCachedContent: false
+        ))
+        XCTAssertFalse(RootContentPolicy.showsCachedShell(
+            phase: .connected, hasCachedContent: true
+        ))
+    }
+
+    func testCommittedManifestTimestampSurvivesReloadAfterAWeek() async throws {
+        let cache = try makeInMemoryCache()
+        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
+        let timestamp = Date().addingTimeInterval(-7 * 86_400).timeIntervalSince1970
+        let json = """
+        {"revision":42,"cursor":"done","has_more":false,"server_time":\(timestamp)}
+        """
+        let page = try JSONDecoder().decode(SyncManifestPage.self, from: Data(json.utf8))
+        _ = try await cache.applyManifest(ManifestChain(validating: [page]), scope: scope)
+
+        let restored = try await cache.loadManifestProjection(scope: scope)
+        XCTAssertEqual(restored.revision, 42)
+        let restoredTime = try XCTUnwrap(restored.lastSyncedAt)
+        XCTAssertEqual(restoredTime.timeIntervalSince1970, timestamp, accuracy: 0.001)
+        let label = FreshnessPresentation.resolve(
+            phase: .offline("network unavailable"), manifestFreshness: restored.freshness,
+            lastSyncedAt: restored.lastSyncedAt,
+            now: Date(timeIntervalSince1970: timestamp + 7 * 86_400)
+        )
+        XCTAssertEqual(label.text, "Offline · Last synced 1w ago")
+    }
+
+    func testCachePaintRestoresLastOpenedSelectionAndTranscript() async throws {
+        let (connection, sessions, chat) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        chat.attachCache(cache)
+        connection.serverURLString = serverURL
+        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
+        let identity = CacheIdentity(serverId: serverURL, profileId: "default", sessionId: "remembered")
+        try await cache.saveSessionList([makeSummary(id: "remembered")], scope: scope)
+        try await cache.saveTranscript(identity: identity, messages: [stubStored("from disk")])
+        try await cache.saveLastOpenedSession(identity, manifestScope: scope)
+
+        await sessions.paintFromCache()
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(sessions.activeStoredId, "remembered")
+        XCTAssertEqual(chat.messages.last?.text, "from disk")
+    }
+
     // MARK: - RootView gate (paired+offline → mainUI, not Welcome)
 
     func testHasSavedConfigurationTrueAfterInMemoryBinding() {

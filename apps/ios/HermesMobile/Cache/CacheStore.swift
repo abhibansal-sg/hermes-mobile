@@ -31,6 +31,11 @@ actor CacheStore {
         let partial: Bool
     }
 
+    struct LastOpenedSession: Sendable, Equatable {
+        let profileId: String
+        let sessionId: String
+    }
+
     struct ManifestCommitPayload: Codable {
         let revision: Int64
         let cursor: String
@@ -39,6 +44,7 @@ actor CacheStore {
         let activeTurns: [ManifestActiveTurn]
         let transcriptHeads: [String: Int]
         let capabilities: Set<String>
+        let serverTime: Double?
     }
 
     // MARK: - Internal state (actor-isolated)
@@ -129,7 +135,27 @@ actor CacheStore {
                   let payload = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data) else {
                 return ManifestProjection(revision: 0, cursor: nil, sessions: legacySessions, attention: [], activeTurns: [], transcriptHeads: [:], capabilities: [], freshness: .cached)
             }
-            return ManifestProjection(revision: payload.revision, cursor: payload.cursor, sessions: payload.sessions, attention: payload.attention, activeTurns: payload.activeTurns, transcriptHeads: payload.transcriptHeads, capabilities: payload.capabilities, freshness: .cached)
+            return ManifestProjection(revision: payload.revision, cursor: payload.cursor, sessions: payload.sessions, attention: payload.attention, activeTurns: payload.activeTurns, transcriptHeads: payload.transcriptHeads, capabilities: payload.capabilities, freshness: .cached, lastSyncedAt: payload.serverTime.map(Date.init(timeIntervalSince1970:)))
+        }
+    }
+
+    func saveLastOpenedSession(_ identity: CacheIdentity, manifestScope: CacheScope) throws {
+        try db.write { db in
+            try db.execute(
+                sql: "INSERT OR REPLACE INTO last_opened_session (serverId, manifestScope, profileId, sessionId) VALUES (?, ?, ?, ?)",
+                arguments: [manifestScope.serverId, manifestScope.profileId, identity.profileId, identity.sessionId]
+            )
+        }
+    }
+
+    func loadLastOpenedSession(scope: CacheScope) throws -> LastOpenedSession? {
+        try db.read { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: "SELECT profileId, sessionId FROM last_opened_session WHERE serverId = ? AND manifestScope = ?",
+                arguments: [scope.serverId, scope.profileId]
+            ) else { return nil }
+            return LastOpenedSession(profileId: row["profileId"], sessionId: row["sessionId"])
         }
     }
 
@@ -171,11 +197,11 @@ actor CacheStore {
             for id in chain.tombstones { byID.removeValue(forKey: id) }
             for session in chain.sessions where !chain.tombstones.contains(session.id) { byID[session.id] = session }
             let projectedSessions = byID.values.sorted { ($0.lastActive ?? 0) > ($1.lastActive ?? 0) }
-            let payload = ManifestCommitPayload(revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities)
+            let payload = ManifestCommitPayload(revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities, serverTime: chain.serverTime)
             let encoded = try JSONEncoder().encode(payload)
             try SyncMetaRecord(key: SyncMetaRecord.Key.manifest(scope), value: String(decoding: encoded, as: UTF8.self)).save(db)
             let rows = try SessionCacheRecord.filter(Column("serverId") == scope.serverId).filter(Column("profileId") == scope.profileId).order(Column("lastActive").desc).fetchAll(db)
-            return ManifestProjection(revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities, freshness: .fresh)
+            return ManifestProjection(revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities, freshness: .fresh, lastSyncedAt: chain.serverTime.map(Date.init(timeIntervalSince1970:)))
         }
     }
 
