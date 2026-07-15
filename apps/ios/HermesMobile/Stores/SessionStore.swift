@@ -468,6 +468,20 @@ final class SessionStore {
     }
     var searchScope: SearchScope = .all
 
+    /// Sort order for the plugin search endpoint. Stock fallback ignores this
+    /// because `/api/sessions/search` does not expose sort.
+    enum SearchSort: String, CaseIterable, Sendable {
+        case newest, oldest, relevance
+        var label: String {
+            switch self {
+            case .newest: return "Newest"
+            case .oldest: return "Oldest"
+            case .relevance: return "Relevance"
+            }
+        }
+    }
+    var searchSort: SearchSort = .newest
+
     /// The query text whose first transcript occurrence the next-opened session
     /// should scroll to (search jump-to-match). Consumed + cleared by ChatView
     /// once it has scrolled. `nil` for a normal open.
@@ -3601,11 +3615,12 @@ final class SessionStore {
         query: String, offset: Int = 0, api: RestClient
     ) async throws -> (results: [SessionSearchResult], rawPageFull: Bool) {
         let roles = Self.roles(for: searchScope)
+        let sort = searchSort.rawValue
         do {
             // Plugin path: forward offset so load-more fetches subsequent
             // message pages. rawPageFull keys on the raw (pre-collapse) count.
             let (results, rawPageFull) = try await api.searchSessionsPlugin(
-                query: query, limit: Self.searchPageLimit, offset: offset, roles: roles
+                query: query, limit: Self.searchPageLimit, offset: offset, sort: sort, roles: roles
             )
             return (results, rawPageFull)
         } catch RestError.badStatus(404, _) {

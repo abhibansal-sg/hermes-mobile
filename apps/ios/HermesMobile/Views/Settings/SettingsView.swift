@@ -113,6 +113,8 @@ struct SettingsView: View {
     /// shared ``DefaultsKeys/displayName`` key so the chat greeting (F3) reads the
     /// same source of truth without re-presenting anything.
     @AppStorage(DefaultsKeys.displayName) private var displayName = ""
+    /// Whether typing `@` in the composer opens the file-mention autocomplete.
+    @AppStorage(DefaultsKeys.mentionAutocompleteEnabled) private var mentionAutocompleteEnabled = true
 
     // MARK: Per-event push prefs (F2-A / A4)
 
@@ -547,6 +549,14 @@ struct SettingsView: View {
             }
             .listRowBackground(theme.card)
             .accessibilityIdentifier("settingsSecretsbiometricToggle")
+
+            // Composer affordance — persisted Settings writer for the composer
+            // reader at ``DefaultsKeys/mentionAutocompleteEnabledValue``.
+            Toggle(isOn: $mentionAutocompleteEnabled) {
+                SettingsRowLabel(icon: "at", title: "File @-mentions")
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsMentionAutocompleteToggle")
         } footer: {
             if pushUnsupported {
                 Text("Notifications are not supported by this server.")
@@ -952,7 +962,8 @@ struct SettingsView: View {
                     // fast/reasoning controls are shown in Settings.
                     ModelPickerView(
                         control: control,
-                        gatewayClient: connectionStore.client
+                        gatewayClient: connectionStore.client,
+                        connectionStore: connectionStore
                     ) {
                         // Keep the running-model chip in sync after a switch made
                         // from Settings (F0 / Amendment B).

@@ -250,24 +250,11 @@ enum DefaultsKeys {
         defaults.bool(forKey: fileBrowserShowHidden)
     }
 
-    // MARK: Chat surface — tool detail + secure-prompt biometric (F4A-A2)
+    // MARK: Chat surface — secure-prompt biometric (F4A-A2)
     //
     // A2's disjoint DefaultsKeys block (A1 adds its file-browser / @-mention keys
-    // separately above — no shared lines).
-
-    /// `Bool` — whether the expanded tool row shows the TECHNICAL detail
-    /// (raw arguments + result preview) vs. the PRODUCT summary. **Default false**
-    /// = product/summary view (the contract's default). `UserDefaults.bool` reads
-    /// the absent key as `false`, so existing installs get the calmer summary.
-    /// Owned by ``ToolActivityRow`` (toggle) — persisted so the choice survives a
-    /// relaunch.
-    static let toolTechnicalDetail = "hermes.toolTechnicalDetail"
-
-    /// Whether the tool detail toggle is on the TECHNICAL (verbose) setting.
-    /// `false` (product/summary) unless the user turned it on.
-    static func toolTechnicalDetailValue(_ defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: toolTechnicalDetail)
-    }
+    // separately above — no shared lines). The former tool-detail verbosity key
+    // was deleted with ABH-410 because ABH-358 killed that toggle; do not resurrect it.
 
     // MARK: Ambient voice auto-speak (STR-344 / STR-533)
 

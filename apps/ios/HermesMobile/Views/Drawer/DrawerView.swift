@@ -746,6 +746,17 @@ struct DrawerView: View {
                     sessions.searchQueryChanged()
                 }
                 .accessibilityIdentifier("drawerSearchScope")
+
+                Picker("Sort", selection: $sessions.searchSort) {
+                    ForEach(SessionStore.SearchSort.allCases, id: \.self) { sort in
+                        Text(sort.label).tag(sort)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: sessions.searchSort) { _, _ in
+                    sessions.searchQueryChanged()
+                }
+                .accessibilityIdentifier("drawerSearchSort")
                 .transition(.opacity)
             }
         }

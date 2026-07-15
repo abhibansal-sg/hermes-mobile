@@ -45,6 +45,27 @@ final class SettingsL07Tests: XCTestCase {
         )
     }
 
+    // MARK: - Mention autocomplete Settings toggle semantics
+
+    func testMentionAutocompleteDefaultsOn() {
+        let defaults = UserDefaults(suiteName: "SettingsL07Tests.mentions")!
+        defaults.removePersistentDomain(forName: "SettingsL07Tests.mentions")
+        XCTAssertTrue(
+            DefaultsKeys.mentionAutocompleteEnabledValue(defaults),
+            "Missing mentionAutocompleteEnabled key must default to true"
+        )
+    }
+
+    func testMentionAutocompleteHonorsFalseWhenSet() {
+        let defaults = UserDefaults(suiteName: "SettingsL07Tests.mentions2")!
+        defaults.removePersistentDomain(forName: "SettingsL07Tests.mentions2")
+        defaults.set(false, forKey: DefaultsKeys.mentionAutocompleteEnabled)
+        XCTAssertFalse(
+            DefaultsKeys.mentionAutocompleteEnabledValue(defaults),
+            "Settings toggle must be able to turn @-mention autocomplete off"
+        )
+    }
+
     // MARK: - AppLock biometric label helpers
 
     func testBiometricLabelIsNonEmpty() {

@@ -204,6 +204,34 @@ final class PluginSearchTests: XCTestCase {
                       ".messages scope must include role=assistant in query, got \(query)")
     }
 
+    // MARK: - 4b. Sort → plugin query param
+
+    /// The drawer's search sort picker must pass the selected sort through to the
+    /// plugin endpoint as `sort=` so newest/oldest/relevance are real server
+    /// requests, not inert UI state.
+    func testSortBuildsPluginSortParam() async throws {
+        let json = #"{"query":"hi","results":[],"count":0,"offset":0}"#
+        SearchStubProtocol.responses = [(json.data(using: .utf8)!, 200)]
+        let client = pluginClient()
+
+        _ = try await client.searchSessionsPlugin(
+            query: "hi", sort: SessionStore.SearchSort.oldest.rawValue
+        )
+
+        guard let url = SearchStubProtocol.capturedURLs.first else {
+            XCTFail("No URL captured"); return
+        }
+        let query = url.query ?? ""
+        XCTAssertTrue(query.contains("sort=oldest"),
+                      "Plugin search must include selected sort=oldest, got \(query)")
+    }
+
+    func testSearchSortLabelsAreUserFacing() {
+        XCTAssertEqual(SessionStore.SearchSort.newest.label, "Newest")
+        XCTAssertEqual(SessionStore.SearchSort.oldest.label, "Oldest")
+        XCTAssertEqual(SessionStore.SearchSort.relevance.label, "Relevance")
+    }
+
     // MARK: - 5. Stale response guard
 
     /// The stale-response guard lives inside `searchQueryChanged`'s Task: if
