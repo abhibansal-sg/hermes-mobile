@@ -39,9 +39,18 @@ struct HermesTurnAttributes: ActivityAttributes, Sendable {
         /// locally-counting `Text(timerInterval:)` so the elapsed display
         /// advances continuously on-device — independent of update/push cadence
         /// (build-29 "timer stuck at 0": the static `elapsedSeconds` only moved
-        /// on a remote push that never arrived). Optional + omitted from server
-        /// pushes → decodes nil → static fallback (old payloads compatible).
+        /// on a remote push that never arrived). Encoded explicitly as Unix
+        /// `startedAtEpochSeconds`; missing fields decode nil so old payloads
+        /// keep the static fallback.
         public var startedAt: Date?
+
+        private enum CodingKeys: String, CodingKey {
+            case phase
+            case toolName
+            case elapsedSeconds
+            case needsApproval
+            case startedAtEpochSeconds
+        }
 
         public init(
             phase: String,
@@ -55,6 +64,30 @@ struct HermesTurnAttributes: ActivityAttributes, Sendable {
             self.elapsedSeconds = elapsedSeconds
             self.needsApproval = needsApproval
             self.startedAt = startedAt
+        }
+
+        public init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            phase = try values.decode(String.self, forKey: .phase)
+            toolName = try values.decodeIfPresent(String.self, forKey: .toolName)
+            elapsedSeconds = try values.decode(Int.self, forKey: .elapsedSeconds)
+            needsApproval = try values.decode(Bool.self, forKey: .needsApproval)
+            startedAt = try values.decodeIfPresent(
+                Double.self,
+                forKey: .startedAtEpochSeconds
+            ).map(Date.init(timeIntervalSince1970:))
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var values = encoder.container(keyedBy: CodingKeys.self)
+            try values.encode(phase, forKey: .phase)
+            try values.encodeIfPresent(toolName, forKey: .toolName)
+            try values.encode(elapsedSeconds, forKey: .elapsedSeconds)
+            try values.encode(needsApproval, forKey: .needsApproval)
+            try values.encodeIfPresent(
+                startedAt?.timeIntervalSince1970,
+                forKey: .startedAtEpochSeconds
+            )
         }
     }
 
@@ -86,9 +119,18 @@ enum HermesTurnAttributes {
         /// locally-counting `Text(timerInterval:)` so the elapsed display
         /// advances continuously on-device — independent of update/push cadence
         /// (build-29 "timer stuck at 0": the static `elapsedSeconds` only moved
-        /// on a remote push that never arrived). Optional + omitted from server
-        /// pushes → decodes nil → static fallback (old payloads compatible).
+        /// on a remote push that never arrived). Encoded explicitly as Unix
+        /// `startedAtEpochSeconds`; missing fields decode nil so old payloads
+        /// keep the static fallback.
         public var startedAt: Date?
+
+        private enum CodingKeys: String, CodingKey {
+            case phase
+            case toolName
+            case elapsedSeconds
+            case needsApproval
+            case startedAtEpochSeconds
+        }
 
         public init(
             phase: String,
@@ -102,6 +144,30 @@ enum HermesTurnAttributes {
             self.elapsedSeconds = elapsedSeconds
             self.needsApproval = needsApproval
             self.startedAt = startedAt
+        }
+
+        public init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            phase = try values.decode(String.self, forKey: .phase)
+            toolName = try values.decodeIfPresent(String.self, forKey: .toolName)
+            elapsedSeconds = try values.decode(Int.self, forKey: .elapsedSeconds)
+            needsApproval = try values.decode(Bool.self, forKey: .needsApproval)
+            startedAt = try values.decodeIfPresent(
+                Double.self,
+                forKey: .startedAtEpochSeconds
+            ).map(Date.init(timeIntervalSince1970:))
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var values = encoder.container(keyedBy: CodingKeys.self)
+            try values.encode(phase, forKey: .phase)
+            try values.encodeIfPresent(toolName, forKey: .toolName)
+            try values.encode(elapsedSeconds, forKey: .elapsedSeconds)
+            try values.encode(needsApproval, forKey: .needsApproval)
+            try values.encodeIfPresent(
+                startedAt?.timeIntervalSince1970,
+                forKey: .startedAtEpochSeconds
+            )
         }
     }
 }

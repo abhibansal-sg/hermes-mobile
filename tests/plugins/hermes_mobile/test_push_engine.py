@@ -574,6 +574,12 @@ def test_build_live_activity_headers():
     assert h["apns-topic"] == "ai.hermes.app.push-type.liveactivity"
     assert h["apns-priority"] == "10"
 
+    routine = pn.build_live_activity_headers(
+        provider_jwt="JWT", topic="ai.hermes.app", priority=5
+    )
+    assert routine["apns-priority"] == "5"
+    assert routine["apns-expiration"] == "0"
+
 
 def test_build_live_activity_payload_update():
     cs = {"phase": "tool", "toolName": "edit_file", "elapsedSeconds": 12,
@@ -598,13 +604,16 @@ def test_build_live_activity_payload_end_carries_dismissal_date():
 def test_live_activity_content_state_field_names_match_swift():
     """Guard: the content-state must carry the exact Codable field names from
     HermesTurnAttributes.ContentState (phase/toolName/elapsedSeconds/
-    needsApproval). A rename on the server would silently fail to decode."""
+    needsApproval/startedAtEpochSeconds). A rename on the server would silently
+    fail to decode."""
     cs = {"phase": "thinking", "toolName": None, "elapsedSeconds": 0,
-          "needsApproval": False}
+          "needsApproval": False, "startedAtEpochSeconds": 1_700_000_000}
     p = pn.build_live_activity_payload(cs)
     assert set(p["aps"]["content-state"].keys()) == {
-        "phase", "toolName", "elapsedSeconds", "needsApproval"
+        "phase", "toolName", "elapsedSeconds", "needsApproval",
+        "startedAtEpochSeconds",
     }
+    assert p["aps"]["content-state"]["startedAtEpochSeconds"] == 1_700_000_000
 
 
 # ===========================================================================
@@ -774,14 +783,61 @@ def test_notify_live_activity_sends_update(monkeypatch, isolated_home):
 
     cs = {"phase": "tool", "toolName": "edit_file", "elapsedSeconds": 5,
           "needsApproval": False}
-    assert pn.notify_live_activity("sess-1", cs) is True
+    assert pn.notify_live_activity("sess-1", cs, priority=5) is True
     assert len(fake.calls) == 1
     call = fake.calls[0]
     assert call["path"] == f"/3/device/{_VALID_TOKEN}"
     assert call["headers"]["apns-push-type"] == "liveactivity"
+    assert call["headers"]["apns-priority"] == "5"
     sent = json.loads(call["content"])
     assert sent["aps"]["event"] == "update"
     assert sent["aps"]["content-state"] == cs
+
+
+@requires_crypto
+@pytest.mark.parametrize(
+    ("environment", "host"),
+    [
+        ("sandbox", pn._APNS_HOST_SANDBOX),
+        ("production", pn._APNS_HOST_PROD),
+    ],
+)
+def test_live_activity_budget_and_terminal_dates_are_valid_in_each_apns_environment(
+    monkeypatch, isolated_home, environment, host
+):
+    _arm_push(monkeypatch, isolated_home)
+    pn.register_live_activity_token("sess-budget", _VALID_TOKEN, env=environment)
+    fake = _FakeConn(status_code=200)
+    client_kwargs = []
+
+    import httpx
+
+    def _client(**kwargs):
+        client_kwargs.append(kwargs)
+        return fake
+
+    monkeypatch.setattr(httpx, "Client", _client)
+    state = {
+        "phase": "thinking",
+        "toolName": None,
+        "elapsedSeconds": 8,
+        "needsApproval": False,
+        "startedAtEpochSeconds": 1_700_000_000,
+    }
+
+    assert pn.notify_live_activity("sess-budget", state, priority=5) is True
+    assert pn.notify_live_activity(
+        "sess-budget", {**state, "phase": "done"}, end=True, priority=10
+    ) is True
+
+    assert [call["headers"]["apns-priority"] for call in fake.calls] == ["5", "10"]
+    assert all(call["headers"]["apns-expiration"] == "0" for call in fake.calls)
+    assert all(kwargs["base_url"] == f"https://{host}:{pn._APNS_PORT}"
+               for kwargs in client_kwargs)
+    update_aps = json.loads(fake.calls[0]["content"])["aps"]
+    end_aps = json.loads(fake.calls[1]["content"])["aps"]
+    assert "dismissal-date" not in update_aps
+    assert end_aps["dismissal-date"] == end_aps["timestamp"]
 
 
 @requires_crypto
