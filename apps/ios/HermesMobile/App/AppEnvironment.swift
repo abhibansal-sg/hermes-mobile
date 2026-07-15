@@ -27,6 +27,7 @@ final class AppEnvironment {
     let appLock: AppLock
     let themeStore: ThemeStore
     let projectsStore: ProjectsStore
+    private let syncCoordinator: ManifestInvalidationCoordinator
 
     init() {
         let sessionStore = SessionStore()
@@ -178,6 +179,28 @@ final class AppEnvironment {
         }
         // ConnectionStore drains the offline outbox after reconnect backfill.
         connectionStore.queueStore = queueStore
+        // Silent pushes are invalidation hints only. Route them through the same
+        // authoritative refresh used by foreground recovery, then project the
+        // widget after that refresh has completed.
+        let syncCoordinator = ManifestInvalidationCoordinator { [weak sessionStore, weak connectionStore, weak inboxStore] _ in
+            guard let sessionStore, let connectionStore, let inboxStore else { throw CancellationError() }
+            try Task.checkCancellation()
+            await sessionStore.refresh()
+            try Task.checkCancellation()
+            await MainActor.run {
+                let connected: Bool
+                if case .connected = connectionStore.phase { connected = true } else { connected = false }
+                WidgetSnapshotWriter.write(
+                    connected: connected,
+                    activeSessions: sessionStore.activeStoredId == nil ? 0 : 1,
+                    pendingApprovals: inboxStore.pendingCount
+                )
+            }
+            return true
+        }
+        self.syncCoordinator = syncCoordinator
+        Task { await SilentSyncBridge.shared.attach(syncCoordinator) }
+
         // Push registration: resolve base URL + token off the connection store.
         PushRegistrar.shared.attach(connection: connectionStore)
         BackgroundRefreshCoordinator.shared.configure(
