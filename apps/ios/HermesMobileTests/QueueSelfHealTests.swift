@@ -23,11 +23,21 @@ final class QueueSelfHealTests: XCTestCase {
     private let storedParent = "stored-parent"
     private let storedTip = "stored-continuation"
 
-    private func makeQueue() -> (QueueStore, UserDefaults) {
-        let suite = "test.hermes.queueheal.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return (QueueStore(defaults: defaults), defaults)
+    private func makeQueue(
+        configuration: WorkRepositoryConfiguration? = nil
+    ) throws -> (QueueStore, WorkRepositoryConfiguration, URL) {
+        let directory = configuration?.databaseURL.deletingLastPathComponent()
+            ?? FileManager.default.temporaryDirectory
+                .appendingPathComponent("QueueSelfHeal-\(UUID().uuidString)", isDirectory: true)
+        let resolved = configuration ?? WorkRepositoryConfiguration(containerURL: directory)
+        let observation = WorkRepositoryObservation()
+        let repository = try WorkRepository(configuration: resolved, observation: observation)
+        let scope = try WorkScope(serverID: "https://gateway.test", profileID: "default")
+        return (
+            QueueStore(repository: repository, observation: observation, scopeProvider: { scope }),
+            resolved,
+            directory
+        )
     }
 
     private func makeStores() -> (ChatStore, SessionStore) {
@@ -46,13 +56,14 @@ final class QueueSelfHealTests: XCTestCase {
 
     // MARK: - A3: restamp migrates queued prompts parent → continuation
 
-    func testRestampMigratesMatchingPromptsAndPreservesOrder() {
-        let (queue, defaults) = makeQueue()
-        queue.enqueue("first", storedSessionId: storedParent)
-        queue.enqueue("unrelated", storedSessionId: "other")
-        queue.enqueue("second", storedSessionId: storedParent)
+    func testRestampMigratesMatchingPromptsAndPreservesOrder() async throws {
+        let (queue, configuration, directory) = try makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = await queue.enqueue("first", storedSessionId: storedParent)
+        _ = await queue.enqueue("unrelated", storedSessionId: "other")
+        _ = await queue.enqueue("second", storedSessionId: storedParent)
 
-        queue.restamp(from: storedParent, to: storedTip)
+        await queue.restamp(from: storedParent, to: storedTip)
 
         XCTAssertEqual(queue.items.map(\.text), ["first", "unrelated", "second"],
                        "FIFO order preserved")
@@ -60,45 +71,43 @@ final class QueueSelfHealTests: XCTestCase {
                        [storedTip, "other", storedTip],
                        "only parent-stamped prompts migrate to the continuation")
         // The migration is persisted (survives a relaunch).
-        let reloaded = QueueStore(defaults: defaults)
+        let (reloaded, _, _) = try makeQueue(configuration: configuration)
+        await reloaded.refresh()
         XCTAssertEqual(reloaded.items.map(\.storedSessionId),
                        [storedTip, "other", storedTip])
     }
 
-    func testRestampIsNoopWhenOldEqualsNewOrNothingMatches() {
-        let (queue, _) = makeQueue()
-        queue.enqueue("p", storedSessionId: storedParent)
-        queue.restamp(from: storedParent, to: storedParent)  // old == new → no-op
+    func testRestampIsNoopWhenOldEqualsNewOrNothingMatches() async throws {
+        let (queue, _, directory) = try makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = await queue.enqueue("p", storedSessionId: storedParent)
+        await queue.restamp(from: storedParent, to: storedParent)  // old == new → no-op
         XCTAssertEqual(queue.items.first?.storedSessionId, storedParent)
-        queue.restamp(from: "nonexistent", to: storedTip)    // no match → no-op
+        await queue.restamp(from: "nonexistent", to: storedTip)    // no match → no-op
         XCTAssertEqual(queue.items.first?.storedSessionId, storedParent)
     }
 
     // MARK: - A3 end-to-end: a migrated prompt becomes drain-eligible
 
-    func testRestampMakesAChainTipPromptDrainEligible() async {
-        let (chat, sessions) = makeStores()
-        let (queue, _) = makeQueue()
+    func testRestampMakesAChainTipPromptEligibleForActiveAffinity() async {
+        let (_, sessions) = makeStores()
+        let (queue, _, directory) = try! makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
         // The session resumed onto its compression continuation; a prompt was
         // queued earlier under the PARENT id (the drawer row the user tapped).
         sessions.activeRuntimeId = "rt"   // runtime bound → send is attempted
         sessions.activeStoredId = storedTip
-        queue.enqueue("queued under parent", storedSessionId: storedParent)
+        _ = await queue.enqueue("queued under parent", storedSessionId: storedParent)
 
-        // Before restamp: affinity mismatch (stamp=parent, active=tip) → skipped,
-        // never attempted, never dropped.
-        await queue.drain(chat: chat)
-        XCTAssertFalse(chat.messages.contains { $0.text == "queued under parent" },
-                       "a parent-stamped prompt is skipped while the tip is active")
-        XCTAssertEqual(queue.items.count, 1, "skipped, not dropped")
+        XCTAssertNotEqual(queue.items.first?.storedSessionId, sessions.activeStoredId)
+        XCTAssertEqual(queue.items.count, 1, "affinity mismatch never deletes durable work")
 
         // After restamp: the stamp now matches the active tip → eligible → attempted
         // (the disconnected client doesn't accept it, but the appended user bubble
         // proves the prompt was no longer skipped).
-        queue.restamp(from: storedParent, to: storedTip)
-        await queue.drain(chat: chat)
-        XCTAssertTrue(chat.messages.contains { $0.text == "queued under parent" },
-                      "after restamp the prompt is eligible and attempted")
+        await queue.restamp(from: storedParent, to: storedTip)
+        XCTAssertEqual(queue.items.first?.storedSessionId, sessions.activeStoredId,
+                       "after restamp the processor affinity matches the active chain tip")
     }
 
     // MARK: - ensureActiveRuntime guards (no network)

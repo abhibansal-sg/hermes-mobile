@@ -76,7 +76,9 @@ def test_replay_returns_original_disposition_without_second_execution(
         first = server._methods["prompt.submit"]("r1", _params(message_id))
         assert first["result"] == {
             "status": "streaming",
+            "accepted": True,
             "client_message_id": str(message_id),
+            "deduplicated": False,
         }
         assert len(isolated_gateway) == 1
 
@@ -87,7 +89,10 @@ def test_replay_returns_original_disposition_without_second_execution(
         restarted = receipts.SQLitePromptReceiptProvider(owner_id="process-b")
         monkeypatch.setattr(server, "PROMPT_RECEIPT_PROVIDERS", [restarted])
         second = server._methods["prompt.submit"]("r2", _params(message_id))
-        assert second["result"] == first["result"]
+        assert second["result"] == {
+            **first["result"],
+            "deduplicated": True,
+        }
         assert len(isolated_gateway) == 1
         assert session["history"] == []
         assert session.get("queued_prompt") is None
@@ -156,10 +161,12 @@ def test_concurrent_identical_requests_execute_once_and_report_in_progress(
         assert completion_entered.wait(timeout=5)
         submit("second")
         assert responses["second"]["result"]["status"] == "in_progress"
+        assert responses["second"]["result"]["accepted"] is False
         allow_completion.set()
         first.join(timeout=5)
         assert not first.is_alive()
         assert responses["first"]["result"]["status"] == "streaming"
+        assert responses["first"]["result"]["accepted"] is True
         assert len(isolated_gateway) == 1
 
         with sqlite3.connect(provider.database_path(tmp_path)) as conn:

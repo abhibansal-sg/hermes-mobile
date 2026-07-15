@@ -350,7 +350,7 @@ final class SessionStore {
     }
 
     func restoreComposerDraft(for key: String) {
-        guard let repository = workRepository, let scope = composerWorkScope else { return }
+        guard let repository = workRepository, let scope = durableWorkScope else { return }
         Task { [weak self] in
             guard let self, let snapshot = try? await repository.draft(scope: scope, contextKey: key) else { return }
             guard self.activeComposerDraftKey == key else { return }
@@ -377,10 +377,9 @@ final class SessionStore {
         persistComposerDraft(for: key)
     }
 
-    private var composerWorkScope: WorkScope? {
-        guard let server = connection?.serverURLString.trimmingCharacters(in: .whitespacesAndNewlines), !server.isEmpty else { return nil }
-        let profile = activeProfile.trimmingCharacters(in: .whitespacesAndNewlines)
-        return try? WorkScope(serverID: server, profileID: profile.isEmpty ? DefaultsKeys.allProfilesScope : profile)
+    var durableWorkScope: WorkScope? {
+        guard let currentCacheScope else { return nil }
+        return try? WorkScope(cacheScope: currentCacheScope)
     }
 
     private func scheduleComposerDraftSave(for key: String) {
@@ -393,7 +392,7 @@ final class SessionStore {
     }
 
     private func persistComposerDraft(for key: String) {
-        guard let repository = workRepository, let scope = composerWorkScope else { return }
+        guard let repository = workRepository, let scope = durableWorkScope else { return }
         let text = composerDrafts[key] ?? ""
         let storedID = key == Self.composerDraftFallbackKey ? nil : key
         let cwd = key == activeComposerDraftKey ? draftCwd : nil
@@ -1150,9 +1149,15 @@ final class SessionStore {
         self.draftAttachments = attachments
         Task { [weak self] in
             guard let self else { return }
-            self.workRepository = try? await WorkRepository.openAppGroup(scope: self.composerWorkScope)
+            guard self.workRepository == nil else { return }
+            self.workRepository = try? await WorkRepository.openAppGroup(scope: self.durableWorkScope)
             self.restoreComposerDraft(for: self.activeComposerDraftKey)
         }
+    }
+
+    func attachWorkRepository(_ repository: WorkRepository) {
+        workRepository = repository
+        restoreComposerDraft(for: activeComposerDraftKey)
     }
 
     /// Reset the initial-fill guard so the next `refresh()` re-runs the
@@ -3297,6 +3302,29 @@ final class SessionStore {
     func createSessionNow() async throws {
         startDraft()
         try await createDraftSession()
+    }
+
+    /// Materialize the destination for one durable new-session prompt. The
+    /// processor persists `storedSessionID` immediately after this returns and
+    /// therefore retries/resumes that destination instead of creating another.
+    func createOutboxDestination() async throws -> OutboxDestination {
+        if !isDraft { startDraft() }
+        try await createDraftSession()
+        guard let runtimeSessionID = activeRuntimeId,
+              let storedSessionID = activeStoredId else {
+            throw OutboxProcessorError.destinationUnavailable
+        }
+        return OutboxDestination(
+            runtimeSessionID: runtimeSessionID,
+            storedSessionID: storedSessionID
+        )
+    }
+
+    /// Resolve only the active affinity. A background queue item for session A
+    /// must never resume or submit into session B merely because B is visible.
+    func runtimeForOutboxDestination(_ storedSessionID: String) async -> String? {
+        guard activeStoredId == storedSessionID else { return nil }
+        return await ensureActiveRuntime()
     }
 
     /// Branch-in-new-chat (F4A-A2): create a brand-new session SEEDED with the

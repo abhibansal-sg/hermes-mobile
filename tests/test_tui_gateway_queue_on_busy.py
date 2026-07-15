@@ -136,7 +136,9 @@ def test_idempotent_busy_replay_does_not_interrupt_or_queue_twice(monkeypatch):
         assert session["queued_prompt"]["text"] == "next"
 
         second = server._methods["prompt.submit"]("r2", params)
-        assert second["result"] == first["result"]
+        assert first["result"]["accepted"] is True
+        assert first["result"]["deduplicated"] is False
+        assert second["result"] == {**first["result"], "deduplicated": True}
         assert calls["interrupt"] == 1
         assert session["queued_prompt"]["text"] == "next"
     finally:
