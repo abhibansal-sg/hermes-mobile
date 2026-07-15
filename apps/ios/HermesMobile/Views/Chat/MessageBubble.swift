@@ -428,7 +428,7 @@ struct MessageBubble: View {
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(MessageBubble.bubbleAccessibilityLabel(
                         role: message.role,
-                        text: message.text
+                        text: Self.accessibilityTextForMarkdown(message.text)
                     ))
             }
 
@@ -589,6 +589,8 @@ struct MessageBubble: View {
             MarkdownTableBlockView(table: table)
         case .blockquote(let text):
             MarkdownBlockquoteView(text: text)
+        case .alert(let alert):
+            MarkdownAlertView(alert: alert)
         case .taskItems(let items):
             MarkdownTaskListView(items: items)
         case .listItems(let items):
@@ -787,10 +789,53 @@ struct MessageBubble: View {
         let level: Int
     }
 
+    enum MarkdownAlertKind: String, Equatable, Sendable {
+        case note
+        case tip
+        case important
+        case warning
+        case caution
+
+        var label: String {
+            switch self {
+            case .note: return "Note"
+            case .tip: return "Tip"
+            case .important: return "Important"
+            case .warning: return "Warning"
+            case .caution: return "Caution"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .note: return "info.circle.fill"
+            case .tip: return "bolt.fill"
+            case .important: return "exclamationmark.circle.fill"
+            case .warning, .caution: return "exclamationmark.triangle.fill"
+            }
+        }
+
+        var accentColor: Color {
+            switch self {
+            case .note: return .blue
+            case .tip: return .green
+            case .important: return .purple
+            case .warning: return .orange
+            case .caution: return .pink
+            }
+        }
+    }
+
+    struct MarkdownAlert: Equatable, Sendable {
+        let kind: MarkdownAlertKind
+        let body: String
+    }
+
     enum MarkdownBlock: Equatable, Sendable {
         case paragraph(String)
         case table(MarkdownTable)
         case blockquote(String)
+        case alert(MarkdownAlert)
         case taskItems([MarkdownTaskItem])
         case listItems([MarkdownListItem])
     }
@@ -833,7 +878,11 @@ struct MessageBubble: View {
 
             if let quote = blockquoteRun(startingAt: index, lines: lines) {
                 flushParagraph()
-                blocks.append(.blockquote(quote.text))
+                if let alert = markdownAlert(fromBlockquoteText: quote.text) {
+                    blocks.append(.alert(alert))
+                } else {
+                    blocks.append(.blockquote(quote.text))
+                }
                 index = quote.nextIndex
                 continue
             }
@@ -858,6 +907,25 @@ struct MessageBubble: View {
 
         flushParagraph()
         return blocks
+    }
+
+    nonisolated static func accessibilityTextForMarkdown(_ text: String) -> String {
+        let lines = text.components(separatedBy: "\n")
+        var output: [String] = []
+        var index = 0
+
+        while index < lines.count {
+            if let quote = blockquoteRun(startingAt: index, lines: lines),
+               let alert = markdownAlert(fromBlockquoteText: quote.text) {
+                output.append("\(alert.kind.label): \(alert.body)")
+                index = quote.nextIndex
+            } else {
+                output.append(lines[index])
+                index += 1
+            }
+        }
+
+        return output.joined(separator: "\n")
     }
 
     private static func markdownTable(
@@ -962,6 +1030,32 @@ struct MessageBubble: View {
         var text = String(trimmed.dropFirst())
         if text.first == " " { text.removeFirst() }
         return text
+    }
+
+    private static func markdownAlert(fromBlockquoteText text: String) -> MarkdownAlert? {
+        var remainder = text[...]
+        while let first = remainder.first, first == " " || first == "\t" {
+            remainder.removeFirst()
+        }
+        guard remainder.hasPrefix("[!") else { return nil }
+
+        guard let close = remainder.firstIndex(of: "]") else { return nil }
+        let markerStart = remainder.index(remainder.startIndex, offsetBy: 2)
+        let marker = String(remainder[markerStart..<close]).lowercased()
+        guard let kind = MarkdownAlertKind(rawValue: marker) else { return nil }
+
+        remainder = remainder[remainder.index(after: close)...]
+        while let first = remainder.first, first == " " || first == "\t" {
+            remainder.removeFirst()
+        }
+        if remainder.first == "\r" {
+            remainder.removeFirst()
+        }
+        if remainder.first == "\n" {
+            remainder.removeFirst()
+        }
+
+        return MarkdownAlert(kind: kind, body: String(remainder))
     }
 
     private static func taskListRun(
@@ -1591,6 +1685,53 @@ private struct MarkdownBlockquoteView: View {
         .padding(.horizontal, 10)
         .background(theme.muted.opacity(0.18), in: RoundedRectangle(cornerRadius: 10, style: .circular))
         .accessibilityLabel("Quote: \(text)")
+    }
+}
+
+private struct MarkdownAlertView: View {
+    @Environment(\.hermesTheme) private var theme
+
+    let alert: MessageBubble.MarkdownAlert
+
+    var body: some View {
+        let accent = alert.kind.accentColor
+
+        VStack(alignment: .leading, spacing: 8) {
+            Label {
+                Text(alert.kind.label)
+                    .font(.caption.weight(.semibold))
+                    .textCase(.uppercase)
+            } icon: {
+                Image(systemName: alert.kind.systemImage)
+                    .font(.caption.weight(.semibold))
+            }
+            .foregroundStyle(accent)
+            .accessibilityHidden(true)
+
+            if !alert.body.isEmpty {
+                Text(RenderCache.prose(alert.body))
+                    .font(.system(.body, design: .serif))
+                    .foregroundStyle(theme.fg)
+                    .lineSpacing(3.5)
+                    .perfTextSelection()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(accent.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(accent.opacity(0.35), lineWidth: 1)
+        )
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(accent)
+                .frame(width: 4)
+                .padding(.vertical, 8)
+        }
+        .accessibilityLabel("\(alert.kind.label): \(alert.body)")
     }
 }
 
