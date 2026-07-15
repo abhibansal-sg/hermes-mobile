@@ -1,0 +1,2463 @@
+import SwiftUI
+import UserNotifications
+
+/// App settings, presented as a **full-height card sheet** (F2 / Amendment C),
+/// rebuilt on the native grouped **`List`** for UI Batch I (I2).
+///
+/// ## Native chrome principle (CONTRACT-UI-I, binding)
+///
+/// "System components render chrome; Hermes identity expresses through tint,
+/// typography, and content surfaces." Settings is pure chrome, so it is now a
+/// system `List` (`.insetGrouped`) whose rows are system primitives only —
+/// `NavigationLink`, `LabeledContent`, `Toggle`, `Button` — with **no**
+/// hand-rolled row containers, hairlines, or hit-target geometry. On iOS 26 the
+/// system gives the inset-grouped list its new Liquid Glass design for free; on
+/// 17–25 it renders the classic grouped list. Both are correct, zero custom
+/// drawing. This deletes the prior bug class entirely (the Appearance row's
+/// collapsed hit target, the manual hairline insets, the flat-row tap-through).
+///
+/// Hermes identity rides on top of the system list via `.tint(theme.midground)`
+/// (the toggles, the back-chevrons, the selection accents) and on the **content
+/// surfaces** the list hosts (the account header card, destructive coloring),
+/// not on the chrome itself. Row backgrounds are painted `theme.card` over a
+/// `theme.bg` canvas via `.scrollContentBackground(.hidden)` so the six themes
+/// keep their identity; on iOS 26 the system materials would otherwise win, but
+/// these are content fills (the contract keeps `card`/`bg` as content tokens).
+///
+/// ## Presentation contract (entry point for F1's drawer avatar) — UNCHANGED
+///
+/// `SettingsView` owns its **own** `NavigationStack` (sheet-internal pushes are
+/// fine — they mirror Claude) and supplies its **own** chrome: a standard
+/// toolbar with an `X` close item (leading, `settingsClose`), a centered
+/// "Settings" principal title, and an info item (trailing, `settingsInfo`).
+///
+/// F1 presents it as a `Bool`-binding sheet from the stable shell/layout owner
+/// (ABH-375: not local drawer state, which can be reset on cold first-commit).
+/// The canonical call site is:
+///
+/// ```swift
+/// // In RootView's compact/split layout owner, opened by DrawerView's avatar:
+/// @State private var showingSettings = false
+/// // … avatar button sets `showingSettings = true` …
+/// .sheet(isPresented: $showingSettings) {
+///     SettingsView(
+///         connectionStore: connection,
+///         sessionStore: sessions,
+///         appLock: appLock
+///     )
+///     .presentationDragIndicator(.hidden)   // contract: indicator hidden
+///     .hermesThemed(themeStore)             // re-install palette across the sheet boundary
+/// }
+/// ```
+///
+/// The view dismisses itself via `@Environment(\.dismiss)` from the X item, so F1
+/// needs no `onDismiss` plumbing — a plain `Bool` binding (or a `sheet(item:)`
+/// enum case) is sufficient. Nothing about Settings reaches back into the drawer.
+///
+/// > Why `.hermesThemed` at the call site, not here: SwiftUI does not reliably
+/// > inherit the custom `\.hermesTheme` environment value across a sheet
+/// > presentation boundary, and `SettingsView` does not receive the `ThemeStore`
+/// > as an init argument (it reads it from the environment for the Appearance
+/// > row). Re-installing at the presentation site keeps the whole sheet — and its
+/// > pushed panels — painted in the active palette. The `ThemeStore` must already
+/// > be in the environment at the call site (it is, app-wide).
+///
+/// ## Layout (native grouped sections)
+///
+/// An account+server **card** (display name, server URL) sits in the first
+/// section as content; the rest is grouped settings sections: Appearance + the
+/// control panels (each a push), inline Toggles (Notifications, Security),
+/// Connection (server value + destructive Disconnect), and About (version + push).
+/// Simple settings render their value inline via `LabeledContent` and never push;
+/// the control panels push within this sheet's own stack.
+struct SettingsView: View {
+    /// Owns the connection lifecycle (server URL, disconnect, control client).
+    let connectionStore: ConnectionStore
+    /// Owns the session list and active-session pointers.
+    let sessionStore: SessionStore
+    /// Biometric app-lock gate; drives the "Require Face ID" toggle.
+    let appLock: AppLock
+
+    #if DEBUG
+    /// STR-459/STR-462: DEBUG/UITest-only initial panel request (from
+    /// ``UITestSeed/requestedPanel``). When `"gateway"`, this sheet pushes
+    /// ``ControlPanel/gateway`` onto its own `NavigationPath` once, on appear,
+    /// so a cold launch with `HERMES_UITEST_PANEL=gateway` lands on Gateway
+    /// Status deterministically. `nil` (default) at every production call site.
+    var initialUITestPanel: String? = nil
+    /// Guards the one-time seed above against re-firing on subsequent appears.
+    @State private var didApplyUITestPanelSeed = false
+    #endif
+
+    /// The theme store. Read here so the Appearance row can show the current theme
+    /// name inline and the picker push can bind to it. The hosting sheet applies
+    /// `.hermesThemed` at the presentation site (see the presentation contract).
+    @Environment(ThemeStore.self) private var themeStore
+    @Environment(\.hermesTheme) private var theme
+    /// Dismisses the sheet from the X item. F1 needs no `onDismiss`.
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var confirmingDisconnect = false
+    /// The sheet-internal navigation path. Pushes are driven by the system
+    /// `NavigationLink(value:)` cells (Appearance, the control panels, About) and
+    /// matched by `navigationDestination(for:)` — the native list-cell push.
+    @State private var path = NavigationPath()
+
+    /// Dynamic-Type-scaled size for the disconnected-state "Reconnect" label
+    /// (base value preserves the default-size layout; grows with Larger Text).
+    @ScaledMetric(relativeTo: .subheadline) private var reconnectLabelFontSize: CGFloat = 14
+
+    // MARK: Identity (F2 / Amendment E)
+
+    /// The user's first name, the greeting source on the draft chat. Bound to the
+    /// shared ``DefaultsKeys/displayName`` key so the chat greeting (F3) reads the
+    /// same source of truth without re-presenting anything.
+    @AppStorage(DefaultsKeys.displayName) private var displayName = ""
+    /// Whether typing `@` in the composer opens the file-mention autocomplete.
+    @AppStorage(DefaultsKeys.mentionAutocompleteEnabled) private var mentionAutocompleteEnabled = true
+
+    // MARK: Per-event push prefs (F2-A / A4)
+
+    /// The per-event push toggles. All default ON. A change re-POSTs
+    /// `/api/push/register` with the new `events` list via
+    /// ``PushRegistrar/reRegisterEvents()``. The `@AppStorage` default of `true`
+    /// matches ``DefaultsKeys/pushEventEnabled(_:_:)``'s "absent ⇒ on" semantics.
+    @AppStorage(DefaultsKeys.pushEventApproval) private var notifyApproval = true
+    @AppStorage(DefaultsKeys.pushEventClarify) private var notifyClarify = true
+    @AppStorage(DefaultsKeys.pushEventTurnComplete) private var notifyTurnComplete = true
+    @AppStorage(DefaultsKeys.pushEventTurnError) private var notifyTurnError = true
+    @AppStorage(DefaultsKeys.pushEventBackgroundDone) private var notifyBackgroundDone = true
+
+    // MARK: Notifications permission bridge (P0)
+    //
+    // The toggle is disabled while authorization status is `.unknown` (probe on
+    // appear). If the user has `.denied` notification access, flipping the toggle
+    // ON is blocked: instead the toggle snaps back to OFF and an alert offers an
+    // "Open Settings" deep-link so they can re-grant.
+    //
+    // Only `.authorized` and `.provisional` allow the toggle to flip on normally.
+
+    /// Cached UNAuthorizationStatus — probed on appear and after the alert
+    /// dismisses (so re-granting in Settings is reflected immediately on return).
+    @State private var notifAuthStatus: UNAuthorizationStatus = .notDetermined
+    /// Whether the FIRST authorization probe has completed. The toggle is
+    /// disabled only until this is true (a brief "probing" window) — NOT on the
+    /// settled status. Critical fix: `.notDetermined` is BOTH the transient
+    /// pre-probe state AND the permanent "user never granted" state, so gating
+    /// the toggle on `notifAuthStatus == .notDetermined` left a user who had
+    /// never been asked with a PERMANENTLY disabled toggle — they could never tap
+    /// it to trigger the OS permission prompt (chicken-and-egg lockout). Gating on
+    /// `notifAuthProbed` instead enables the toggle once probed, so a
+    /// `.notDetermined` user can tap it and the `set` handler requests auth.
+    @State private var notifAuthProbed = false
+    /// Whether to show the "notifications denied — open Settings" alert.
+    @State private var showNotifDeniedAlert = false
+    /// True while the global YOLO / flow-state config.set RPC is in flight.
+    @State private var globalYoloPending = false
+    /// User-visible error if the global escalation RPC fails.
+    @State private var globalYoloError: String?
+    /// True while the server-side redacted debug bundle is being generated.
+    @State private var debugSharePending = false
+    /// Fetched debug-share result; drives the share/copy sheet.
+    @State private var debugShareResult: DebugShareReport?
+    /// User-visible error if debug-share generation fails.
+    @State private var debugShareError: String?
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            List {
+                #if DEBUG
+                if Self.providerKeySurvivalSeedEnabled {
+                    modelProviderSection
+                }
+                #endif
+                accountSection
+                appearanceAndPanelsSection
+                notificationsAndSecuritySection
+                voiceSection
+                relayPushSection
+                approvalBypassSection
+                devicesSection
+                #if DEBUG
+                if !Self.providerKeySurvivalSeedEnabled {
+                    modelProviderSection
+                }
+                #else
+                modelProviderSection
+                #endif
+                toolsetKeysSection
+                creditsBillingSection
+                debugShareSection
+                connectionSection
+                aboutSection
+            }
+            .listStyle(.insetGrouped)
+            // Content tokens paint the rows + canvas so the six themes keep their
+            // identity over the system grouped list (the contract keeps `card`/`bg`
+            // as content fills; the system would otherwise paint its own materials).
+            .scrollContentBackground(.hidden)
+            .background(theme.bg)
+            // PSF-04: use the standard navigationTitle so this root matches all
+            // pushed-stack panels (DevicesView, AboutPanel, etc.) — the system
+            // renders the inline title consistently; the custom `.principal`
+            // ToolbarItem it replaced was a bespoke re-implementation that differed
+            // from the pushed views and produced mismatched title sizes on iOS 26.
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { header }
+            .navigationDestination(for: ControlPanel.self) { panel in
+                panelView(panel)
+                    .background(theme.bg)
+            }
+            #if DEBUG
+            // STR-459/STR-462: one-time DEBUG/UITest navigation seed. Pushes
+            // Gateway Status deterministically when HERMES_UITEST_PANEL=gateway
+            // requested it; the guard flag stops a re-append on later appears
+            // (e.g. returning from a foreground probe).
+            .onAppear {
+                guard !didApplyUITestPanelSeed, initialUITestPanel == "gateway" else { return }
+                didApplyUITestPanelSeed = true
+                path.append(ControlPanel.gateway)
+            }
+            #endif
+            .task { await probeNotifStatus() }
+            // Re-probe when the sheet returns to active (e.g. after the user
+            // re-granted in the system Settings app).
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+                Task { await probeNotifStatus() }
+            }
+            .alert("Notifications Blocked", isPresented: $showNotifDeniedAlert) {
+                Button("Open Settings") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Notification access is blocked. Allow it in Settings to receive agent alerts on this device.")
+            }
+            .alert("Flow-state Toggle Failed", isPresented: Binding(
+                get: { globalYoloError != nil },
+                set: { if !$0 { globalYoloError = nil } }
+            )) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(globalYoloError ?? "")
+            }
+            .alert("Debug Report Failed", isPresented: Binding(
+                get: { debugShareError != nil },
+                set: { if !$0 { debugShareError = nil } }
+            )) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(debugShareError ?? "")
+            }
+            .sheet(item: $debugShareResult) { report in
+                DebugShareSheet(report: report)
+                    .hermesThemed(themeStore)
+            }
+        }
+    }
+
+    // MARK: - Header (X item / centered title / info item)
+
+    @ToolbarContentBuilder
+    private var header: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            // Standard toolbar close item. On iOS 26 the system renders toolbar
+            // items as floating glass automatically; on 17–25 classic — both
+            // correct, zero custom drawing. (`xmark` glyph keeps the established
+            // close affordance.)
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .accessibilityLabel("Close settings")
+            .accessibilityIdentifier("settingsClose")
+        }
+        // PSF-04: principal ToolbarItem removed — the title now comes from
+        // .navigationTitle("Settings") above, matching all pushed-stack panels.
+        ToolbarItem(placement: .topBarTrailing) {
+            // Info item → About (version). Pushes the same place as the About row
+            // so the affordance has a destination (mirrors Claude's info pill).
+            Button {
+                path.append(ControlPanel.about)
+            } label: {
+                Image(systemName: "info.circle")
+            }
+            .accessibilityLabel("About Hermes")
+            .accessibilityIdentifier("settingsInfo")
+        }
+    }
+
+    // MARK: - Account / server section (content card)
+
+    /// The account header card: an avatar circle with the user's initials, the
+    /// editable display name, and the server URL. A single content card hosted in
+    /// the list's first section (Claude's "account email card"). It is content,
+    /// not chrome, so it keeps its themed card fill + hairline.
+    private var accountSection: some View {
+        Section {
+            HStack(spacing: 14) {
+                avatarCircle
+                VStack(alignment: .leading, spacing: 2) {
+                    TextField("Your name", text: $displayName)
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(theme.fg)
+                        .textInputAutocapitalization(.words)
+                        .autocorrectionDisabled()
+                        .submitLabel(.done)
+                        .accessibilityIdentifier("displayNameField")
+                    Text(serverDisplay)
+                        .font(.footnote)
+                        .foregroundStyle(theme.mutedFg)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 4)
+            .listRowBackground(theme.card)
+        }
+    }
+
+    /// Circular avatar holding the display-name initials (or a person glyph when
+    /// the name is unset). Mirrors the drawer avatar so the two read as one
+    /// identity.
+    private var avatarCircle: some View {
+        ZStack {
+            Circle().fill(theme.midground)
+            if let initials = avatarInitials {
+                Text(initials)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(theme.midground.contrastingForeground)
+            } else {
+                Image(systemName: "person.fill")
+                    .font(.title3)
+                    .foregroundStyle(theme.midground.contrastingForeground)
+            }
+        }
+        .frame(width: 48, height: 48)
+        .accessibilityHidden(true)
+    }
+
+    /// Up to two uppercased initials from the display name, or `nil` when unset.
+    private var avatarInitials: String? {
+        guard let name = DefaultsKeys.displayNameValue() else { return nil }
+        let parts = name.split(separator: " ").prefix(2)
+        let letters = parts.compactMap { $0.first }.map(String.init)
+        let joined = letters.joined().uppercased()
+        return joined.isEmpty ? nil : joined
+    }
+
+    private var serverDisplay: String {
+        connectionStore.serverURLString.isEmpty ? "Not connected"
+                                                 : connectionStore.serverURLString
+    }
+
+    // MARK: - Appearance + control panels
+
+    @ViewBuilder
+    private var appearanceAndPanelsSection: some View {
+        Section {
+            // Appearance — inline current theme name; tap pushes the picker within
+            // this sheet's own NavigationStack via the system NavigationLink. The
+            // list cell IS the (full-width, ≥44pt) hit target — the system owns
+            // the geometry, deleting the prior collapsed-hit-target bug class.
+            NavigationLink(value: ControlPanel.appearance) {
+                SettingsRow(
+                    icon: "paintpalette",
+                    title: "Appearance",
+                    value: themeStore.current.label
+                )
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsAppearanceRow")
+
+            // Control panels — each pushes within this sheet's stack.
+            if connectionStore.control != nil {
+                ForEach(ControlPanel.pushable) { panel in
+                    NavigationLink(value: panel) {
+                        SettingsRow(
+                            icon: panel.systemImage,
+                            title: panel.title,
+                            value: panel.inlineValue(connectionStore: connectionStore)
+                        )
+                    }
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier(panel.accessibilityIdentifier)
+                }
+            } else {
+                // Disconnected placeholder: describe + offer a Reconnect CTA.
+                VStack(alignment: .leading, spacing: 8) {
+                    SettingsRow(
+                        icon: "cpu",
+                        title: "Connect to manage models, automations, and more.",
+                        value: nil,
+                        muted: true
+                    )
+                    Button {
+                        reconnect()
+                    } label: {
+                        Label("Reconnect", systemImage: "arrow.clockwise")
+                            .font(.system(size: reconnectLabelFontSize, weight: .medium))
+                            .foregroundStyle(theme.midground)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("settingsReconnect")
+                }
+                .listRowBackground(theme.card)
+            }
+        }
+    }
+
+    // MARK: - Notifications + Security (inline toggles)
+
+    @ViewBuilder
+    private var notificationsAndSecuritySection: some View {
+        Section {
+            // Notifications — inline Toggle (master opt-in).
+            // P0 PERMISSION BRIDGE: if the OS has denied notification access the
+            // toggle is blocked from turning on — instead it snaps back to OFF and
+            // an alert offers "Open Settings". While status is .notDetermined the
+            // toggle is disabled (we probe on appear and on foreground).
+            Toggle(isOn: Binding(
+                get: { PushRegistrar.shared.isEnabled },
+                set: { newValue in
+                    guard newValue else {
+                        // Turning off is always allowed.
+                        PushRegistrar.shared.setEnabled(false)
+                        return
+                    }
+                    switch notifAuthStatus {
+                    case .denied:
+                        // Snap the toggle back and show the alert.
+                        showNotifDeniedAlert = true
+                        // Don't call setEnabled — the toggle binding will revert.
+                    case .authorized, .provisional, .ephemeral:
+                        PushRegistrar.shared.setEnabled(true)
+                    case .notDetermined:
+                        // Let PushRegistrar request authorization normally.
+                        PushRegistrar.shared.setEnabled(true)
+                    @unknown default:
+                        PushRegistrar.shared.setEnabled(true)
+                    }
+                }
+            )) {
+                SettingsRowLabel(icon: "bell", title: "Notifications")
+            }
+            // Disable only while the FIRST probe is in flight, or when the server
+            // genuinely doesn't support push. A settled `.notDetermined` (user
+            // never granted) leaves the toggle ENABLED so tapping it triggers the
+            // OS permission prompt via the `set` handler above.
+            .disabled(pushUnsupported || !notifAuthProbed)
+            .listRowBackground(theme.card)
+
+            if PushRegistrar.shared.isEnabled && !pushUnsupported {
+                LabeledContent("Notifications") {
+                    Text(Self.notificationPermissionLabel(for: notifAuthStatus))
+                        .foregroundStyle(notifAuthStatus == .denied ? theme.destructive : theme.mutedFg)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("notificationPermissionState")
+
+                LabeledContent("Push token") {
+                    Text(Self.pushTokenRegistrationLabel(
+                        token: UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken)
+                    ))
+                    .foregroundStyle(theme.mutedFg)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("pushTokenRegistrationState")
+            }
+
+            // Per-event push prefs (A4): native Toggles, shown only when
+            // push is on (they have no effect otherwise). Each change re-POSTs
+            // /api/push/register with the new events list. Pure system Toggles —
+            // chrome via the system, identity via the .tint applied app-wide.
+            if PushRegistrar.shared.isEnabled && !pushUnsupported {
+                Toggle(isOn: $notifyApproval) {
+                    SettingsRowLabel(icon: "checkmark.shield", title: "Approvals")
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("notifyApprovalsToggle")
+                .onChange(of: notifyApproval) { _, _ in
+                    PushRegistrar.shared.reRegisterEvents()
+                }
+
+                Toggle(isOn: $notifyClarify) {
+                    SettingsRowLabel(icon: "questionmark.circle", title: "Questions")
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("notifyQuestionsToggle")
+                .onChange(of: notifyClarify) { _, _ in
+                    PushRegistrar.shared.reRegisterEvents()
+                }
+
+                Toggle(isOn: $notifyTurnComplete) {
+                    SettingsRowLabel(icon: "clock.badge.checkmark", title: "Long turns")
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("notifyLongTurnsToggle")
+                .onChange(of: notifyTurnComplete) { _, _ in
+                    PushRegistrar.shared.reRegisterEvents()
+                }
+
+                Toggle(isOn: $notifyTurnError) {
+                    SettingsRowLabel(icon: "exclamationmark.triangle", title: "Turn errors")
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("notifyTurnErrorToggle")
+                .onChange(of: notifyTurnError) { _, _ in
+                    PushRegistrar.shared.reRegisterEvents()
+                }
+
+                Toggle(isOn: $notifyBackgroundDone) {
+                    SettingsRowLabel(icon: "checkmark.circle", title: "Background job done")
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("notifyBackgroundDoneToggle")
+                .onChange(of: notifyBackgroundDone) { _, _ in
+                    PushRegistrar.shared.reRegisterEvents()
+                }
+            }
+
+            // Security — App Lock Toggle with dynamic biometric label.
+            Toggle(isOn: Binding(
+                get: { appLock.isEnabled },
+                set: { appLock.setEnabled($0) }
+            )) {
+                SettingsRowLabel(
+                    icon: biometricSystemImage,
+                    title: "Require \(biometricLabel)"
+                )
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsAppLockToggle")
+
+            // Secrets biometric gate — separate toggle from app-lock.
+            Toggle(isOn: Binding(
+                get: { DefaultsKeys.requiresBiometricForSecretsValue() },
+                set: { UserDefaults.standard.set($0, forKey: DefaultsKeys.requiresBiometricForSecrets) }
+            )) {
+                SettingsRowLabel(
+                    icon: biometricSystemImage,
+                    title: "Require \(biometricLabel) for secrets"
+                )
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsSecretsbiometricToggle")
+
+            // Composer affordance — persisted Settings writer for the composer
+            // reader at ``DefaultsKeys/mentionAutocompleteEnabledValue``.
+            Toggle(isOn: $mentionAutocompleteEnabled) {
+                SettingsRowLabel(icon: "at", title: "File @-mentions")
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsMentionAutocompleteToggle")
+        } footer: {
+            if pushUnsupported {
+                Text("Notifications are not supported by this server.")
+            } else if notifAuthStatus == .denied {
+                Text("Notification access is blocked. Tap Notifications to open Settings and re-grant.")
+            } else if PushRegistrar.shared.isEnabled {
+                Text("Choose which agent events notify you on this device.")
+            }
+        }
+    }
+
+    // MARK: - Voice (STR-344 / STR-533 ambient auto-speak)
+
+    private var voiceSection: some View {
+        Section {
+            // Default-off: reads a completed assistant reply aloud when
+            // hands-free conversation mode is NOT active. Conversation mode
+            // always speaks its own replies regardless of this toggle.
+            Toggle(isOn: Binding(
+                get: { DefaultsKeys.voiceAutoTTSValue() },
+                set: { UserDefaults.standard.set($0, forKey: DefaultsKeys.voiceAutoTTS) }
+            )) {
+                SettingsRowLabel(icon: "speaker.wave.2", title: "Read replies aloud")
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsVoiceAutoTTSToggle")
+        } footer: {
+            Text("Speaks each completed assistant reply out loud when conversation mode is off.")
+        }
+    }
+
+    // MARK: - Approval bypass (global escalation)
+
+    @ViewBuilder
+    private var approvalBypassSection: some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { connectionStore.sessionYolo },
+                set: { newValue in
+                    setGlobalYolo(newValue)
+                }
+            )) {
+                SettingsRowLabel(icon: "bolt.fill", title: "Global flow-state")
+            }
+            .disabled(globalYoloPending)
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsGlobalYoloToggle")
+        } footer: {
+            Text("Escalates approval bypass globally across sessions. Use the composer bolt for this chat only.")
+        }
+    }
+
+    // MARK: - Relay Push (ABH-282 — plugin-mount only)
+
+    /// The relay-push ENABLE section — a single push to ``RelaySettingsView``.
+    /// Rendered only once the hermes-mobile plugin mount is available, because
+    /// the config route lives at `/api/plugins/hermes-mobile/relay/config`.
+    @ViewBuilder
+    private var relayPushSection: some View {
+        if connectionStore.capabilities.pluginMount == .available,
+           let rest = connectionStore.rest {
+            Section {
+                NavigationLink {
+                    RelaySettingsView(rest: rest)
+                        .background(theme.bg)
+                } label: {
+                    SettingsRow(icon: "antenna.radiowaves.left.and.right", title: "Relay Push", value: nil)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsRelayPush")
+            } footer: {
+                Text("Configure the optional relay URL and registration token used for relay push mode.")
+            }
+        }
+    }
+
+    // MARK: - Devices (W3A-A — feature-detected; hidden on a stock server)
+
+    /// The W3a Devices section — a single push to ``DevicesView`` (the native
+    /// device list + revoke + approval audit). Rendered ONLY when the connected
+    /// gateway advertises the `devices` capability AND a live REST client exists;
+    /// on a stock hermes-agent (`devices != .available`) the whole section is
+    /// absent and the legacy shared token is untouched (W3a stock degradation).
+    @ViewBuilder
+    private var devicesSection: some View {
+        if connectionStore.capabilities.devices == .available,
+           let rest = connectionStore.rest {
+            Section {
+                NavigationLink {
+                    DevicesView(
+                        rest: rest,
+                        serverURL: connectionStore.serverURLString,
+                        authenticator: LAContextAuthenticator()
+                    )
+                } label: {
+                    SettingsRow(icon: "iphone.and.arrow.forward", title: "Devices", value: nil)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsDevices")
+            } footer: {
+                Text("Manage the devices paired with this server and review who approved what.")
+            }
+        }
+    }
+
+    // MARK: - Model Provider (ABH-183 — feature-detected; plugin-mount only)
+
+    /// The ABH-183 Model Provider section — a single push to
+    /// ``ProviderListView`` (the provider universe + authenticated? + add-key /
+    /// custom-provider / disconnect affordances). Rendered ONLY when the
+    /// connected gateway advertises the plugin mount (these routes live on
+    /// `/api/plugins/hermes-mobile/providers`); on a stock hermes-agent
+    /// (`pluginMount != .available`) the whole section is absent (graceful stock
+    /// degradation). On a plugin-mount gateway that PREDATES the provider routes,
+    /// the list surfaces the 404 as an inline error.
+    @ViewBuilder
+    private var modelProviderSection: some View {
+        #if DEBUG
+        if Self.providerKeySurvivalSeedEnabled,
+           let rest = Self.providerKeySurvivalSeedRest {
+            Section {
+                NavigationLink {
+                    ProviderListView(
+                        rest: rest,
+                        debugSeedProviders: [Self.providerKeySurvivalSeedProvider]
+                    )
+                    .background(theme.bg)
+                } label: {
+                    SettingsRow(icon: "key.horizontal", title: "Model Provider", value: nil)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsModelProvider")
+            } footer: {
+                Text("Add or remove API keys for model providers. New chats use the provider you pick in Model.")
+            }
+        } else if connectionStore.capabilities.pluginMount == .available,
+                  let rest = connectionStore.rest {
+            liveModelProviderSection(rest: rest)
+        }
+        #else
+        if connectionStore.capabilities.pluginMount == .available,
+           let rest = connectionStore.rest {
+            liveModelProviderSection(rest: rest)
+        }
+        #endif
+    }
+
+    private func liveModelProviderSection(rest: RestClient) -> some View {
+        Section {
+            NavigationLink {
+                ProviderListView(rest: rest) {
+                    // Re-resolve the running model + repopulate the Model
+                    // picker so a newly-authenticated provider's models (or a
+                    // just-disconnected provider's removal) is reflected.
+                    Task { await connectionStore.refreshActiveModel() }
+                }
+                .background(theme.bg)
+            } label: {
+                SettingsRow(icon: "key.horizontal", title: "Model Provider", value: nil)
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsModelProvider")
+        } footer: {
+            Text("Add or remove API keys for model providers. New chats use the provider you pick in Model.")
+        }
+    }
+
+    #if DEBUG
+    private static var providerKeySurvivalSeedEnabled: Bool {
+        ProcessInfo.processInfo.environment["HERMES_UITEST_PROVIDER_KEY_SURVIVAL"] == "1"
+    }
+
+    private static var providerKeySurvivalSeedRest: RestClient? {
+        guard let url = URL(string: "http://127.0.0.1") else { return nil }
+        return RestClient(baseURL: url, token: "uitest")
+    }
+
+    private static var providerKeySurvivalSeedProvider: ProviderRow {
+        ProviderRow(
+            slug: "openai",
+            name: "OpenAI",
+            authType: .apiKey,
+            isCurrent: false,
+            authenticated: false,
+            totalModels: 2,
+            models: ["gpt-5.5", "gpt-5.5-mini"]
+        )
+    }
+    #endif
+
+    // MARK: - Toolset Keys (ABH-262 — feature-detected; plugin-mount only)
+
+    /// The ABH-262 Toolset Keys section — a single push to
+    /// ``ToolsetConfigView`` (web + image_gen credential state, set, and
+    /// clear). Rendered ONLY when the connected gateway advertises the plugin
+    /// mount because the routes live at
+    /// `/api/plugins/hermes-mobile/toolsets/{name}/config`. Stored key values are
+    /// never returned by the gateway; the pushed form always starts blank.
+    @ViewBuilder
+    private var toolsetKeysSection: some View {
+        if connectionStore.capabilities.pluginMount == .available,
+           let rest = connectionStore.rest {
+            Section {
+                NavigationLink {
+                    ToolsetConfigView(rest: rest)
+                        .background(theme.bg)
+                } label: {
+                    SettingsRow(icon: "key.viewfinder", title: "Toolset Keys", value: nil)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsToolsetKeys")
+            } footer: {
+                Text("Add or clear keys for web search and image generation toolsets. Stored key values are never shown on the phone.")
+            }
+        }
+    }
+
+    // MARK: - Nous Credits / Billing (ABH-237 — view-only credits + auto-reload)
+
+    /// The ABH-237 credits/billing section — a single push to
+    /// ``CreditsBillingView``. Credits are display-only; top-up opens the portal
+    /// URL in the browser, and the only in-app mutation is the existing
+    /// auto-reload setting.
+    @ViewBuilder
+    private var creditsBillingSection: some View {
+        if connectionStore.control != nil {
+            Section {
+                NavigationLink {
+                    CreditsBillingView(client: connectionStore.client)
+                        .background(theme.bg)
+                } label: {
+                    SettingsRow(icon: "creditcard", title: "Nous Credits", value: nil)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsNousCredits")
+            } footer: {
+                Text("View your Nous balance and manage auto-reload. Top-ups open in the browser.")
+            }
+        }
+    }
+
+    // MARK: - Debug share (ABH-223 — plugin-mount only)
+
+    @ViewBuilder
+    private var debugShareSection: some View {
+        if connectionStore.capabilities.pluginMount == .available,
+           connectionStore.rest != nil {
+            Section {
+                Button {
+                    generateDebugShare()
+                } label: {
+                    HStack(spacing: 12) {
+                        SettingsRowLabel(icon: "ladybug", title: "Share debug report")
+                        Spacer(minLength: 8)
+                        if debugSharePending {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+                }
+                .disabled(debugSharePending)
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsShareDebugReport")
+            } footer: {
+                Text("Generates a redacted support bundle on the server and opens a share/copy sheet.")
+            }
+        }
+    }
+
+    // MARK: - Connection (server value + destructive disconnect)
+
+    @ViewBuilder
+    private var connectionSection: some View {
+        Section {
+            LabeledContent {
+                Text(serverDisplay)
+                    .foregroundStyle(theme.mutedFg)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            } label: {
+                SettingsRowLabel(icon: "network", title: "Server")
+            }
+            .listRowBackground(theme.card)
+
+            Button(role: .destructive) {
+                confirmingDisconnect = true
+            } label: {
+                SettingsRowLabel(
+                    icon: "rectangle.portrait.and.arrow.right",
+                    title: "Disconnect",
+                    destructive: true
+                )
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsDisconnect")
+            .confirmationDialog(
+                "Disconnect from this server?",
+                isPresented: $confirmingDisconnect,
+                titleVisibility: .visible
+            ) {
+                Button("Disconnect", role: .destructive) {
+                    Task {
+                        await connectionStore.disconnect()
+                        dismiss()
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("You'll need the server URL and token to reconnect.")
+            }
+        }
+    }
+
+    // MARK: - About (version inline + push)
+
+    @ViewBuilder
+    private var aboutSection: some View {
+        Section {
+            NavigationLink(value: ControlPanel.about) {
+                SettingsRow(icon: "info.circle", title: "About", value: appVersion)
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsAbout")
+        }
+    }
+
+    // MARK: - Control panels
+
+    /// The control panels reachable from Settings. `model … gateway` push the
+    /// live control surface; `about` is the local version page (no control
+    /// client needed) and is excluded from ``pushable``.
+    private enum ControlPanel: String, Identifiable, Hashable {
+        case appearance, model, personality, usage, cron, skills, learning, gateway, artifacts, logs, webhooks, about
+        var id: String { rawValue }
+
+        /// The panels that need a live control client (`appearance` + `about` do
+        /// NOT — they are local pages, excluded from ``pushable``).
+        static var pushable: [ControlPanel] {
+            [.model, .personality, .usage, .cron, .skills, .learning, .gateway, .artifacts, .logs, .webhooks]
+        }
+
+        var title: String {
+            switch self {
+            case .appearance: return "Appearance"
+            case .model: return "Model"
+            case .personality: return "Personality"
+            case .usage: return "Usage"
+            case .cron: return "Automations"
+            case .skills: return "Skills"
+            case .learning: return "Learning Journey"
+            case .gateway: return "Gateway Status"
+            case .artifacts: return "Artifacts"
+            case .logs: return "System Logs"
+            case .webhooks: return "Webhooks"
+            case .about: return "About"
+            }
+        }
+
+        var systemImage: String {
+            switch self {
+            case .appearance: return "paintpalette"
+            case .model: return "cpu"
+            case .personality: return "theatermasks"
+            case .usage: return "chart.bar"
+            case .cron: return "clock.arrow.circlepath"
+            case .skills: return "wand.and.stars"
+            case .learning: return "sparkles"
+            case .gateway: return "network"
+            case .artifacts: return "photo.on.rectangle.angled"
+            case .logs: return "doc.text.magnifyingglass"
+            // STR-338: verified present in the iOS 17 base SDK swiftinterface
+            // (SF Symbols 5). Falls back conceptually to `link`/
+            // `arrow.triangle.branch` if a future SDK ever drops it.
+            case .webhooks: return "point.3.connected.trianglepath.dotted"
+            case .about: return "info.circle"
+            }
+        }
+
+        var accessibilityIdentifier: String { "settings\(rawValue.capitalized)" }
+
+        /// The inline value shown on the row (right-aligned, before the chevron).
+        /// Only Model surfaces one — the running model name (F0) — so the
+        /// most-used panel reads its state without a push.
+        @MainActor
+        func inlineValue(connectionStore: ConnectionStore) -> String? {
+            switch self {
+            case .model: return connectionStore.activeModelName
+            default: return nil
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func panelView(_ panel: ControlPanel) -> some View {
+        switch panel {
+        case .appearance:
+            // Local page — no control client needed; pushes the theme picker
+            // within this sheet's own NavigationStack.
+            AppearanceView(store: themeStore)
+                .background(theme.bg)
+        case .about:
+            AboutPanel(appVersion: appVersion, connectionStore: connectionStore)
+        default:
+            if let control = connectionStore.control {
+                switch panel {
+                case .model:
+                    // ABH-84: pass the WS client so the global default
+                    // fast/reasoning controls are shown in Settings.
+                    ModelPickerView(
+                        control: control,
+                        gatewayClient: connectionStore.client,
+                        connectionStore: connectionStore
+                    ) {
+                        // Keep the running-model chip in sync after a switch made
+                        // from Settings (F0 / Amendment B).
+                        Task { await connectionStore.refreshActiveModel() }
+                    }
+                case .personality:
+                    PersonalityPickerView(
+                        control: control,
+                        client: connectionStore.client,
+                        activeSessionId: sessionStore.activeRuntimeId
+                    )
+                case .usage:
+                    UsageView(control: control)
+                case .cron:
+                    CronJobsView(control: control)
+                case .skills:
+                    SkillsBrowserView(control: control)
+                case .learning:
+                    LearningJourneyView(client: connectionStore.client)
+                case .gateway:
+                    GatewayStatusView(control: control)
+                case .artifacts:
+                    ArtifactsGalleryView(
+                        control: control,
+                        serverId: connectionStore.serverURLString,
+                        profileId: sessionStore.activeProfile,
+                        sessions: sessionStore
+                    )
+                case .logs:
+                    // ABH-368: System log viewer. Uses the REST client (not the
+                    // WS control client) — /api/logs is a stock GET route. Falls
+                    // back to ContentUnavailableView when there is no REST client
+                    // (same posture as the outer guard for `control`).
+                    if let rest = connectionStore.rest {
+                        SystemLogsView(rest: rest)
+                    } else {
+                        ContentUnavailableView(
+                            "Not connected",
+                            systemImage: "wifi.slash",
+                            description: Text("Reconnect to view logs.")
+                        )
+                    }
+                case .webhooks:
+                    // STR-338: webhook subscription management. Uses the REST
+                    // client (not the WS control client) — /api/webhooks is a
+                    // stock GET/POST/DELETE/PUT route family, same posture as
+                    // `.logs`. Falls back to ContentUnavailableView when there
+                    // is no REST client (graceful 404 for ancient gateways —
+                    // same posture as Providers).
+                    if let rest = connectionStore.rest {
+                        WebhooksPanelView(rest: rest)
+                    } else {
+                        ContentUnavailableView(
+                            "Not connected",
+                            systemImage: "wifi.slash",
+                            description: Text("Reconnect to manage webhooks.")
+                        )
+                    }
+                case .appearance, .about:
+                    EmptyView() // handled by the outer switch
+                }
+            } else {
+                ContentUnavailableView(
+                    "Not connected",
+                    systemImage: "wifi.slash",
+                    description: Text("Reconnect to manage this.")
+                )
+            }
+        }
+    }
+
+    // MARK: - Derived
+
+    /// Whether the connected gateway is known NOT to support push registration
+    /// (stock server, E1). Only `.unavailable` disables the toggle.
+    private var pushUnsupported: Bool {
+        connectionStore.capabilities.pushRegistry == .unavailable
+    }
+
+    /// Human-readable notification permission state for the honest push-status
+    /// rows. Internal/static so the regression test can prove denied permission
+    /// surfaces as "Not authorized" without rendering the full Settings sheet.
+    static func notificationPermissionLabel(for status: UNAuthorizationStatus) -> String {
+        switch status {
+        case .authorized, .provisional, .ephemeral:
+            return "Authorized"
+        case .denied:
+            return "Not authorized"
+        case .notDetermined:
+            return "Not requested"
+        @unknown default:
+            return "Unknown"
+        }
+    }
+
+    /// Human-readable gateway-token state for the honest push-status rows.
+    static func pushTokenRegistrationLabel(token: String?) -> String {
+        if let token, !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Registered"
+        }
+        return "Not registered"
+    }
+
+    /// "1.0 (1)" from the bundle's short version + build number.
+    private var appVersion: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "—"
+        let build = info?["CFBundleVersion"] as? String ?? "—"
+        return "\(short) (\(build))"
+    }
+
+    /// SF Symbol name for the device's biometric type (delegated to ``AppLock``).
+    private var biometricSystemImage: String { AppLock.biometricSystemImage }
+
+    /// Human label for the device's biometric type (delegated to ``AppLock``).
+    private var biometricLabel: String { AppLock.biometricLabel }
+
+    // MARK: - Notification authorization probe
+
+    /// Fetch the current UNAuthorizationStatus and store it in ``notifAuthStatus``.
+    /// Must be called on appear and on every foreground transition so the UI
+    /// reflects any change the user made in the system Settings app.
+    private func probeNotifStatus() async {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        notifAuthStatus = settings.authorizationStatus
+        notifAuthProbed = true
+    }
+
+    // MARK: - Reconnect
+
+    /// Re-issue `configure` against the saved server + Keychain token, mirroring
+    /// the ``ConnectionStatusBanner`` retry path.
+    private func reconnect() {
+        Task {
+            guard let url = URL(string: connectionStore.serverURLString),
+                  let host = url.host, !host.isEmpty,
+                  let token = KeychainService.loadToken(server: connectionStore.serverURLString) else {
+                return
+            }
+            _ = await connectionStore.configure(
+                urlString: connectionStore.serverURLString,
+                token: token
+            )
+        }
+    }
+
+    /// Settings escalation path for approval bypass. Unlike the composer bolt,
+    /// this deliberately sends `scope="global"`, so it persists in the gateway
+    /// config and affects every session until turned off.
+    private func setGlobalYolo(_ enabled: Bool) {
+        guard !globalYoloPending else { return }
+        globalYoloPending = true
+        Task {
+            defer { globalYoloPending = false }
+            do {
+                try await connectionStore.globalSetYolo(enabled)
+            } catch {
+                globalYoloError = "Couldn't update global flow-state: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Generate the server-side redacted debug bundle and present the share sheet.
+    private func generateDebugShare() {
+        guard !debugSharePending else { return }
+        guard let rest = connectionStore.rest else {
+            debugShareError = "Reconnect to a server before generating a debug report."
+            return
+        }
+        debugSharePending = true
+        Task {
+            defer { debugSharePending = false }
+            do {
+                let report = try await rest.debugShareReport()
+                debugShareResult = report
+            } catch {
+                debugShareError = "Couldn't generate debug report: \(error.localizedDescription)"
+            }
+        }
+    }
+}
+
+// MARK: - Native row primitives
+//
+// These are thin LABEL builders for system list cells — NOT custom row
+// containers. The enclosing `NavigationLink` / `Toggle` / `LabeledContent` /
+// `Button` owns the cell chrome, the hit target, the chevron, and the
+// separators; these only lay out the icon + title (+ optional inline value) the
+// system cell wraps. No backgrounds, no hairlines, no padding-as-geometry.
+
+/// A leading-icon + title label for a system list cell. Used as the label of a
+/// `Toggle`, `LabeledContent`, or destructive `Button`.
+private struct SettingsRowLabel: View {
+    @Environment(\.hermesTheme) private var theme
+
+    let icon: String
+    let title: String
+    var destructive: Bool = false
+
+    var body: some View {
+        Label {
+            Text(title)
+                .foregroundStyle(destructive ? theme.destructive : theme.fg)
+        } icon: {
+            Image(systemName: icon)
+                .foregroundStyle(destructive ? theme.destructive : theme.fg)
+        }
+    }
+}
+
+/// A list cell label that also carries an optional trailing inline value (the
+/// system `NavigationLink` adds the disclosure chevron). Used by the Appearance
+/// row, the pushable control panels, and About.
+private struct SettingsRow: View {
+    @Environment(\.hermesTheme) private var theme
+
+    let icon: String
+    let title: String
+    var value: String?
+    var muted: Bool = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Label {
+                Text(title)
+                    .foregroundStyle(muted ? theme.mutedFg : theme.fg)
+            } icon: {
+                Image(systemName: icon)
+                    .foregroundStyle(theme.fg)
+            }
+            if let value, !value.isEmpty {
+                Spacer(minLength: 8)
+                Text(value)
+                    .font(.body)
+                    .foregroundStyle(theme.mutedFg)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+    }
+}
+
+// MARK: - Debug-share sheet
+
+/// Result sheet for Settings → Share debug report.
+///
+/// Presents the redacted paste URLs returned by the server, a system ShareLink,
+/// and a copy fallback for users who need to paste the bundle into support chat.
+private struct DebugShareSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.hermesTheme) private var theme
+
+    let report: DebugShareReport
+    @State private var copied = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(report.sortedURLLabels, id: \.self) { label in
+                        if let url = report.urls[label], !url.isEmpty {
+                            LabeledContent(label) {
+                                Text(url)
+                                    .font(.footnote.monospaced())
+                                    .foregroundStyle(theme.mutedFg)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .textSelection(.enabled)
+                            }
+                            .listRowBackground(theme.card)
+                        }
+                    }
+                } header: {
+                    Text(report.redacted ? "Redacted debug report" : "Debug report")
+                } footer: {
+                    Text("Links auto-delete in \(Self.expiryText(report.autoDeleteSeconds)).")
+                }
+
+                if !report.failures.isEmpty {
+                    Section("Partial failures") {
+                        ForEach(report.failures, id: \.self) { failure in
+                            Text(failure)
+                                .foregroundStyle(theme.mutedFg)
+                                .listRowBackground(theme.card)
+                        }
+                    }
+                }
+
+                Section {
+                    ShareLink(item: report.shareText) {
+                        Label("Share links", systemImage: "square.and.arrow.up")
+                    }
+                    .disabled(report.shareText.isEmpty)
+                    .listRowBackground(theme.card)
+
+                    Button {
+                        UIPasteboard.general.string = report.shareText
+                        copied = true
+                    } label: {
+                        Label(copied ? "Copied" : "Copy links", systemImage: copied ? "checkmark" : "doc.on.doc")
+                    }
+                    .disabled(report.shareText.isEmpty)
+                    .listRowBackground(theme.card)
+                }
+            }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(theme.bg)
+            .navigationTitle("Debug Report")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private static func expiryText(_ seconds: Int) -> String {
+        let hours = seconds / 3600
+        if hours > 0 { return "\(hours)h" }
+        let minutes = max(1, seconds / 60)
+        return "\(minutes)m"
+    }
+}
+
+// MARK: - About panel (minimal+)
+
+/// The local "About" page pushed from the About row / info item.
+///
+/// Shows: app version, gateway version + release date (fetched lazily from the
+/// REST status endpoint if connected), and a Release Notes external link.
+/// No update-check machinery — that lives on the desktop. On a disconnected
+/// gateway the server rows show "—" (graceful degradation).
+private struct AboutPanel: View {
+    @Environment(\.hermesTheme) private var theme
+    @Environment(\.openURL) private var openURL
+
+    let appVersion: String
+    let connectionStore: ConnectionStore
+
+    /// Gateway version string from `GET /api/status`, e.g. "1.4.2".
+    @State private var gatewayVersion: String = "—"
+    /// Release date / build stamp from `GET /api/status` (closest available
+    /// proxy for a build SHA on the stock REST shape).
+    @State private var buildStamp: String = "—"
+
+    private static let releaseNotesURL = URL(
+        string: "https://github.com/NousResearch/hermes-agent/releases"
+    )!
+
+    var body: some View {
+        List {
+            Section("App") {
+                LabeledContent("Version", value: appVersion)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("aboutAppVersion")
+            }
+            Section("Gateway") {
+                LabeledContent("Version", value: gatewayVersion)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("aboutGatewayVersion")
+                LabeledContent("Build") {
+                    Text(buildStamp)
+                        .font(.footnote.monospaced())
+                        .foregroundStyle(theme.mutedFg)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("aboutBuildStamp")
+            }
+            Section {
+                Button {
+                    openURL(Self.releaseNotesURL)
+                } label: {
+                    Label("Release Notes", systemImage: "arrow.up.right.square")
+                        .foregroundStyle(theme.midground)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("aboutReleaseNotes")
+            }
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .background(theme.bg)
+        .navigationTitle("About")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await loadGatewayInfo() }
+    }
+
+    private func loadGatewayInfo() async {
+        guard let rest = connectionStore.rest else { return }
+        do {
+            let status = try await rest.gatewayStatus()
+            if let v = status.version, !v.isEmpty {
+                gatewayVersion = v
+            }
+            if let release = status.releaseDate, !release.isEmpty {
+                buildStamp = release
+            }
+        } catch {
+            // Graceful degradation: leave the "—" placeholders.
+        }
+    }
+}
+
+// MARK: - Credits / Billing panel
+
+private struct CreditsBillingView: View {
+    let client: HermesGatewayClient
+
+    @Environment(\.hermesTheme) private var theme
+    @Environment(\.openURL) private var openURL
+
+    @State private var phase: PanelPhase<CreditsBillingPayload> = .loading
+    @State private var autoReloadPending = false
+    @State private var actionError: String?
+
+    var body: some View {
+        PanelContent(phase: phase, label: "Loading credits…", retry: { Task { await load() } }) { payload in
+            List {
+                creditsSection(payload.credits)
+                autoReloadSection(payload.billing)
+            }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(theme.bg)
+            .refreshable { await load() }
+        }
+        .navigationTitle("Nous Credits")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await load() }
+        .alert("Couldn’t update auto-reload", isPresented: errorBinding) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(actionError ?? "")
+        }
+    }
+
+    @ViewBuilder
+    private func creditsSection(_ credits: NousCreditsView) -> some View {
+        Section {
+            if let identityLine = credits.identityLine, !identityLine.isEmpty {
+                LabeledContent("Account") {
+                    Text(identityLine)
+                        .foregroundStyle(theme.mutedFg)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.trailing)
+                        .textSelection(.enabled)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("creditsIdentityLine")
+            }
+
+            if credits.depleted {
+                Label("Credits depleted", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(theme.destructive)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("creditsDepletedWarning")
+            }
+
+            if credits.balanceLines.isEmpty {
+                Text("No Nous credit balance is available from this gateway yet.")
+                    .foregroundStyle(theme.mutedFg)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("creditsEmpty")
+            } else {
+                ForEach(Array(credits.balanceLines.enumerated()), id: \.offset) { index, line in
+                    Text(line)
+                        .foregroundStyle(theme.fg)
+                        .textSelection(.enabled)
+                        .listRowBackground(theme.card)
+                        .accessibilityIdentifier("creditsBalanceLine\(index)")
+                }
+            }
+
+            if let topupURL = credits.topupURL {
+                Button {
+                    openURL(topupURL)
+                } label: {
+                    Label("Top up in browser", systemImage: "safari")
+                        .foregroundStyle(theme.midground)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("creditsTopUpLink")
+            }
+        } header: {
+            Text("Credits")
+        } footer: {
+            Text("Top-ups open in your browser. The app does not start a payment flow.")
+        }
+    }
+
+    @ViewBuilder
+    private func autoReloadSection(_ billing: BillingState) -> some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { billing.autoReloadEnabled },
+                set: { newValue in Task { await setAutoReload(newValue) } }
+            )) {
+                Label {
+                    Text("Auto-reload")
+                        .foregroundStyle(theme.fg)
+                } icon: {
+                    Image(systemName: "arrow.clockwise.circle")
+                        .foregroundStyle(theme.fg)
+                }
+            }
+            .disabled(autoReloadPending)
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("billingAutoReloadToggle")
+
+            if let state = billing.billingState, !state.isEmpty {
+                LabeledContent("Billing state") {
+                    Text(state)
+                        .foregroundStyle(theme.mutedFg)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("billingStateLine")
+            }
+        } footer: {
+            Text("Auto-reload uses the gateway’s existing billing setting. Turn it off here any time.")
+        }
+    }
+
+    private var errorBinding: Binding<Bool> {
+        Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })
+    }
+
+    private func load() async {
+        if phase.value == nil { phase = .loading }
+        do {
+            async let credits = client.viewCredits()
+            async let billing = client.billingState()
+            phase = .loaded(CreditsBillingPayload(
+                credits: try await credits,
+                billing: try await billing
+            ))
+        } catch {
+            phase = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
+    }
+
+    private func setAutoReload(_ enabled: Bool) async {
+        guard !autoReloadPending else { return }
+        autoReloadPending = true
+        defer { autoReloadPending = false }
+        do {
+            let updated = try await client.setBillingAutoReload(enabled)
+            if let current = phase.value {
+                phase = .loaded(CreditsBillingPayload(credits: current.credits, billing: updated))
+            }
+        } catch {
+            actionError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+}
+
+private struct CreditsBillingPayload: Sendable, Equatable {
+    let credits: NousCreditsView
+    let billing: BillingState
+}
+
+// MARK: - ABH-368 System Logs Viewer
+
+/// The known log-file keys the server's `LOG_FILES` maps. This is a SUPPLEMENT
+/// to the runtime probe — the viewer lists these as the file picker options but
+/// labels any server-returned 400 ("Unknown log file") honestly. The keys are
+/// stable (they are the hermes_cli.logs.LOG_FILES dict keys: agent, errors,
+/// gateway, gui, desktop). New server-side keys are harmless: the viewer still
+/// works, the new key just is not pre-listed until this array is updated.
+private let knownLogFileKeys: [String] = ["agent", "errors", "gateway", "desktop"]
+
+/// A human label for a log file key. Falls back to the raw key for unknown
+/// values (defensive — never assume the gateway has only the documented set).
+private func logFileLabel(_ key: String) -> String {
+    switch key {
+    case "agent": return "Agent"
+    case "errors": return "Errors"
+    case "gateway": return "Gateway"
+    case "gui": return "GUI"
+    case "desktop": return "Desktop"
+    default: return key.capitalized
+    }
+}
+
+/// The system log viewer (ABH-368). Presents a filtered tail of a chosen log
+/// file with a file picker, a minimum-level filter, and a substring search
+/// field. Refreshes on every filter change. Every filter combination resolves
+/// to a real, honest state:
+///
+/// - **Loading**: spinner with the file name.
+/// - **Empty file** (`200` with `lines: []`): honest "No log lines" — NOT a
+///   fake error or a blank list.
+/// - **Fetch failure** (network / decode): honest error message with a Retry.
+/// - **Unknown file** (`400`): honest "Unknown log file" — the picker is
+///   defensive; if the server does not know a key, the viewer says so.
+///
+/// Design language: native grouped list, SF Symbols, monospaced log text,
+/// color-per-level semantics (ERROR reads as error via `theme.statusError`,
+/// WARNING via `theme.statusWarn`, etc.). Size-class sane on iPhone and iPad.
+private struct SystemLogsView: View {
+    @Environment(\.hermesTheme) private var theme
+
+    @State private var store: SystemLogsStore
+
+    init(rest: RestClient) {
+        _store = State(initialValue: SystemLogsStore(rest: rest))
+    }
+
+    var body: some View {
+        List {
+            // MARK: Filters section
+            Section {
+                filePickerRow
+                levelPickerRow
+                searchFieldRow
+            } header: {
+                Text("Filters")
+            } footer: {
+                if store.selectedLevel.isLevel || !store.searchText.isEmpty {
+                    Text("\(store.displayedCount) matching \(store.displayedCount == 1 ? "line" : "lines")")
+                        .font(.footnote)
+                }
+            }
+            .listRowBackground(theme.card)
+
+            // MARK: Log tail
+            logTailSection
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .background(theme.bg)
+        .navigationTitle("System Logs")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    store.refresh()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(store.phase.isLoading || store.phase.isError)
+                .accessibilityLabel("Refresh logs")
+                .accessibilityIdentifier("logsRefreshButton")
+            }
+        }
+        .task {
+            await store.loadIfNeeded()
+        }
+        // Refresh on filter change (file / level) and on submit of the search
+        // field. The search field is a plain TextField (not .searchable), so we
+        // use bare .onSubmit which fires on the keyboard Search / Return key.
+        .onChange(of: store.selectedFile) { _, _ in store.refresh() }
+        .onChange(of: store.selectedLevel) { _, _ in store.refresh() }
+        .onSubmit { store.refresh() }
+    }
+
+    // MARK: - Filter rows
+
+    private var filePickerRow: some View {
+        Picker(selection: $store.selectedFile) {
+            ForEach(knownLogFileKeys, id: \.self) { key in
+                Text(logFileLabel(key)).tag(key)
+            }
+        } label: {
+            SettingsRowLabel(icon: "doc.text", title: "Log File")
+        }
+        .accessibilityIdentifier("logsFilePicker")
+    }
+
+    private var levelPickerRow: some View {
+        Picker(selection: $store.selectedLevel) {
+            ForEach(SystemLogLevel.allCases) { level in
+                Text(level.label).tag(level)
+            }
+        } label: {
+            SettingsRowLabel(icon: "line.3.horizontal.decrease.circle", title: "Level")
+        }
+        .accessibilityIdentifier("logsLevelPicker")
+    }
+
+    private var searchFieldRow: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(theme.mutedFg)
+            TextField("Search log lines", text: $store.searchText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.search)
+                .accessibilityIdentifier("logsSearchField")
+            if !store.searchText.isEmpty {
+                Button {
+                    store.searchText = ""
+                    store.refresh()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(theme.mutedFg)
+                }
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .listRowBackground(theme.card)
+    }
+
+    // MARK: - Tail section (the actual log lines)
+
+    @ViewBuilder
+    private var logTailSection: some View {
+        switch store.phase {
+        case .idle:
+            EmptyView()
+
+        case .loading:
+            Section {
+                HStack(spacing: 12) {
+                    ProgressView()
+                    Text("Loading \(logFileLabel(store.selectedFile))…")
+                        .foregroundStyle(theme.mutedFg)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .listRowBackground(theme.card)
+            }
+
+        case .loaded(let result):
+            if result.lines.isEmpty {
+                Section {
+                    HStack(spacing: 12) {
+                        Image(systemName: "tray")
+                            .foregroundStyle(theme.mutedFg)
+                        Text(emptyMessage)
+                            .foregroundStyle(theme.mutedFg)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .listRowBackground(theme.card)
+                }
+            } else {
+                Section {
+                    ForEach(Array(result.lines.enumerated()), id: \.offset) { _, line in
+                        SystemLogLineRow(line: line, theme: theme)
+                    }
+                } header: {
+                    Text(logFileLabel(store.selectedFile))
+                }
+            }
+
+        case .error(let message):
+            Section {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 12) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .foregroundStyle(theme.statusError)
+                        Text(message)
+                            .foregroundStyle(theme.fg)
+                    }
+                    Button {
+                        store.refresh()
+                    } label: {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                            .font(.system(size: 15, weight: .medium))
+                    }
+                    .accessibilityIdentifier("logsRetryButton")
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .listRowBackground(theme.card)
+            } footer: {
+                Text("The server may be unreachable or the log file may not exist on this gateway.")
+                    .font(.footnote)
+            }
+        }
+    }
+
+    /// Honest empty message: tailored to the filter state so the user
+    /// understands WHY there are no lines (not just a blank list).
+    private var emptyMessage: String {
+        if store.selectedLevel.isLevel || !store.searchText.isEmpty {
+            return "No lines match the current filters."
+        }
+        return "This log file is empty."
+    }
+}
+
+/// One monospaced, color-coded log line. Color-per-level semantics:
+/// ERROR/CRITICAL → `statusError`, WARNING → `statusWarn`, INFO → `accent` or
+/// `fg`, DEBUG → `mutedFg`, unknown → `fg`. Long lines wrap so nothing is cut.
+private struct SystemLogLineRow: View {
+    let line: String
+    let theme: HermesTheme
+
+    /// The level extracted from the line (nil if unrecognizable).
+    private var level: SystemLogLevel? { extractLogLevel(line) }
+
+    private var lineColor: Color {
+        switch level {
+        case .error: return theme.statusError
+        case .warning: return theme.statusWarn
+        case .info: return theme.fg
+        case .debug: return theme.mutedFg
+        case .all, nil: return theme.fg
+        }
+    }
+
+    var body: some View {
+        Text(line)
+            .font(.system(size: 12, weight: .regular, design: .monospaced))
+            .foregroundStyle(lineColor)
+            .textSelection(.enabled)
+            .lineLimit(nil)
+            .fixedSize(horizontal: false, vertical: true)
+            .listRowSeparatorTint(theme.border)
+    }
+}
+
+/// The view-model for ``SystemLogsView``. Owns the filter state and the fetch
+/// phase, and drives the REST call through ``RestClient/systemLogs``.
+@MainActor
+private final class SystemLogsStore: ObservableObject {
+
+    /// The fetch outcome — a value type so the view can switch exhaustively.
+    enum Phase: Equatable {
+        case idle
+        case loading
+        case loaded(SystemLogResult)
+        case error(String)
+
+        var isLoading: Bool {
+            if case .loading = self { return true }
+            return false
+        }
+
+        var isError: Bool {
+            if case .error = self { return true }
+            return false
+        }
+    }
+
+    @Published var selectedFile: String = "agent"
+    @Published var selectedLevel: SystemLogLevel = .all
+    @Published var searchText: String = ""
+    @Published private(set) var phase: Phase = .idle
+
+    /// The count shown in the filter footer when filters narrow the result.
+    var displayedCount: Int {
+        if case .loaded(let result) = phase { return result.lines.count }
+        return 0
+    }
+
+    private let rest: RestClient
+
+    init(rest: RestClient) {
+        self.rest = rest
+    }
+
+    /// Load on first appearance only (idle → loading). Subsequent updates go
+    /// through ``refresh()``.
+    func loadIfNeeded() async {
+        guard case .idle = phase else { return }
+        await fetch()
+    }
+
+    /// Re-fetch with the current filter state. Called on filter change and on
+    /// the explicit Refresh / Retry buttons.
+    func refresh() {
+        Task { await fetch() }
+    }
+
+    private func fetch() async {
+        phase = .loading
+        do {
+            let result = try await rest.systemLogs(
+                file: selectedFile,
+                level: selectedLevel,
+                search: searchText
+            )
+            phase = .loaded(result)
+        } catch let error as SystemLogError {
+            phase = .error(error.errorDescription ?? "Failed to load logs.")
+        } catch {
+            phase = .error(
+                (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            )
+        }
+    }
+}
+
+
+// MARK: - ABH-262 toolset credential settings UI
+//
+// A plugin-mount Settings panel for non-model tool credentials (web and
+// image_gen to start). The server is the source of truth and deliberately returns
+// only redacted `is_set` booleans, never secret values. This view preserves that
+// contract: configured credentials render as status chips only, and the edit form
+// always starts with an empty SecureField.
+
+struct ToolsetConfigView: View {
+    let rest: RestClient
+
+    @Environment(\.hermesTheme) private var theme
+
+    @State private var phase: PanelPhase<[ToolsetConfig]> = .loading
+    @State private var actionError: String?
+    @State private var successText: String?
+    @State private var editTarget: ToolsetCredentialTarget?
+    @State private var clearTarget: ToolsetCredentialTarget?
+    @State private var mutatingTargetID: String?
+    @State private var activatingProviderID: String?
+
+    var body: some View {
+        PanelContent(phase: phase, label: "Loading toolset keys\u{2026}", retry: { Task { await load() } }) { configs in
+            List {
+                statusSection
+
+                if configs.isEmpty {
+                    emptySection
+                } else {
+                    ForEach(configs) { config in
+                        toolsetSection(config)
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(theme.bg)
+            .refreshable { await load() }
+        }
+        .navigationTitle("Toolset Keys")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await load() }
+        .alert("Couldn\u{2019}t update key", isPresented: errorBinding) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(actionError ?? "")
+        }
+        .sheet(item: $editTarget) { target in
+            NavigationStack {
+                ToolsetCredentialEntryView(rest: rest, target: target) { refreshed in
+                    replaceConfig(refreshed)
+                    successText = ToolsetConfigSaveCopy.savedMessage(
+                        target: target, refreshed: refreshed
+                    )
+                }
+            }
+            .environment(\.hermesTheme, theme)
+        }
+        .confirmationDialog(
+            "Clear this key?",
+            isPresented: clearDialogBinding,
+            titleVisibility: .visible,
+            presenting: clearTarget
+        ) { target in
+            Button("Clear Key", role: .destructive) {
+                Task { await clear(target) }
+            }
+            Button("Cancel", role: .cancel) { clearTarget = nil }
+        } message: { target in
+            Text("\(target.envVar.prompt) for \(target.providerName) will be removed from your gateway. You can set it again later.")
+        }
+    }
+
+    // MARK: - Sections
+
+    @ViewBuilder
+    private var statusSection: some View {
+        if let successText {
+            Section {
+                Label(successText, systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(theme.midground)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("toolsetKeySuccess")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var emptySection: some View {
+        Section {
+            ContentUnavailableView {
+                Label("No toolset keys", systemImage: "key.slash")
+            } description: {
+                Text("This server does not expose configurable web or image_gen credentials yet.")
+            }
+            .listRowBackground(theme.card)
+        }
+    }
+
+    @ViewBuilder
+    private func toolsetSection(_ config: ToolsetConfig) -> some View {
+        Section {
+            if config.providers.isEmpty {
+                Label("No providers available.", systemImage: "tray")
+                    .foregroundStyle(theme.mutedFg)
+                    .listRowBackground(theme.card)
+            } else {
+                ForEach(config.providers) { provider in
+                    providerBlock(provider, in: config)
+                }
+            }
+        } header: {
+            Text(config.displayName)
+        } footer: {
+            Text(toolsetFooter(config))
+        }
+    }
+
+    @ViewBuilder
+    private func providerBlock(_ provider: ToolsetConfigProvider, in config: ToolsetConfig) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(provider.name.isEmpty ? config.displayName : provider.name)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(theme.fg)
+                    .lineLimit(1)
+                if provider.isActive {
+                    Text("ACTIVE")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(theme.midground)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .overlay(Capsule().strokeBorder(theme.midground.opacity(0.4), lineWidth: 1))
+                }
+                if !provider.badge.isEmpty {
+                    Text(provider.badge)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(theme.mutedFg)
+                }
+                Spacer(minLength: 8)
+            }
+
+            if provider.requiresNousAuth {
+                Text("Requires Nous account authentication on the gateway.")
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+            }
+
+            if provider.envVars.isEmpty {
+                Text("No key entry is required for this provider.")
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+            } else {
+                ForEach(provider.envVars) { envVar in
+                    credentialRow(
+                        ToolsetCredentialTarget(
+                            toolsetName: config.name,
+                            toolsetDisplayName: config.displayName,
+                            providerName: provider.name.isEmpty ? config.displayName : provider.name,
+                            providerTag: provider.tag,
+                            envVar: envVar
+                        )
+                    )
+                }
+            }
+
+            if let postSetup = provider.postSetup, !postSetup.isEmpty {
+                Text(postSetup)
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if !provider.isActive {
+                Button {
+                    Task { await activate(provider, in: config) }
+                } label: {
+                    HStack(spacing: 6) {
+                        if activatingProviderID == provider.id {
+                            ProgressView().controlSize(.small)
+                            Text("Activating\u{2026}")
+                        } else {
+                            Label("Make Active", systemImage: "bolt.fill")
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .tint(theme.midground)
+                .disabled(activatingProviderID != nil)
+                .accessibilityIdentifier("toolsetActivate-\(config.name)-\(provider.tag)")
+            }
+        }
+        .padding(.vertical, 4)
+        .listRowBackground(theme.card)
+        .accessibilityIdentifier("toolsetProvider-\(config.name)-\(provider.name)")
+    }
+
+    @ViewBuilder
+    private func credentialRow(_ target: ToolsetCredentialTarget) -> some View {
+        let isMutating = mutatingTargetID == target.id
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(target.envVar.prompt)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(theme.fg)
+                    Text(target.envVar.key)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(theme.mutedFg)
+                }
+                Spacer(minLength: 8)
+                statusChip(isSet: target.envVar.isSet)
+            }
+
+            HStack(spacing: 12) {
+                Button(target.envVar.isSet ? "Replace" : "Set") {
+                    actionError = nil
+                    successText = nil
+                    editTarget = target
+                }
+                .buttonStyle(.bordered)
+                .tint(theme.midground)
+                .accessibilityIdentifier("toolsetSet-\(target.envVar.key)")
+
+                if target.envVar.isSet {
+                    Button(role: .destructive) {
+                        actionError = nil
+                        successText = nil
+                        clearTarget = target
+                    } label: {
+                        if isMutating {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text("Clear")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isMutating)
+                    .accessibilityIdentifier("toolsetClear-\(target.envVar.key)")
+                }
+
+                if let url = target.envVar.url, let destination = URL(string: url) {
+                    Link("Get key", destination: destination)
+                        .font(.subheadline)
+                        .accessibilityIdentifier("toolsetKeyURL-\(target.envVar.key)")
+                }
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    @ViewBuilder
+    private func statusChip(isSet: Bool) -> some View {
+        if isSet {
+            Label("Configured", systemImage: "checkmark.seal.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(theme.midground.contrastingForeground)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(theme.midground, in: Capsule())
+                .accessibilityLabel("Configured")
+        } else {
+            Text("Not set")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(theme.mutedFg)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .overlay(Capsule().strokeBorder(theme.mutedFg.opacity(0.35), lineWidth: 1))
+                .accessibilityLabel("Not set")
+        }
+    }
+
+    // MARK: - Load + mutate
+
+    private func load() async {
+        if phase.value == nil { phase = .loading }
+        actionError = nil
+        do {
+            var configs: [ToolsetConfig] = []
+            for name in ToolsetConfigCatalog.configurableNames {
+                do {
+                    let config = try await rest.getToolsetConfig(name: name)
+                    // A valid category may legitimately have zero providers; keep it
+                    // so the empty provider state is visible. Unknown toolsets are
+                    // handled by the 4002 path below.
+                    configs.append(config)
+                } catch {
+                    if ToolsetConfigErrorMessage.isUnknownToolset(error) {
+                        continue
+                    }
+                    throw error
+                }
+            }
+            phase = .loaded(configs)
+        } catch {
+            phase = .failed(ToolsetConfigErrorMessage.message(for: error))
+        }
+    }
+
+    private func clear(_ target: ToolsetCredentialTarget) async {
+        clearTarget = nil
+        mutatingTargetID = target.id
+        defer { mutatingTargetID = nil }
+        do {
+            let refreshed = try await rest.setToolsetCredential(
+                name: target.toolsetName,
+                key: target.envVar.key,
+                value: nil
+            )
+            replaceConfig(refreshed)
+            successText = "Cleared \(target.envVar.prompt)."
+        } catch {
+            actionError = ToolsetConfigErrorMessage.message(for: error)
+        }
+    }
+
+    private func activate(_ provider: ToolsetConfigProvider, in config: ToolsetConfig) async {
+        actionError = nil
+        successText = nil
+        activatingProviderID = provider.id
+        defer { activatingProviderID = nil }
+        do {
+            let refreshed = try await rest.selectToolsetProvider(
+                name: config.name,
+                provider: provider.tag
+            )
+            replaceConfig(refreshed)
+            let providerName = provider.name.isEmpty ? config.displayName : provider.name
+            successText = "Made \(providerName) the active \(config.displayName) provider."
+        } catch {
+            actionError = ToolsetConfigErrorMessage.message(for: error)
+        }
+    }
+
+    private func replaceConfig(_ refreshed: ToolsetConfig) {
+        guard var configs = phase.value else {
+            phase = .loaded([refreshed])
+            return
+        }
+        if let index = configs.firstIndex(where: { $0.name == refreshed.name }) {
+            configs[index] = refreshed
+        } else {
+            configs.append(refreshed)
+        }
+        phase = .loaded(configs)
+    }
+
+    // MARK: - Derived
+
+    private var errorBinding: Binding<Bool> {
+        Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })
+    }
+
+    private var clearDialogBinding: Binding<Bool> {
+        Binding(get: { clearTarget != nil }, set: { if !$0 { clearTarget = nil } })
+    }
+
+    private func toolsetFooter(_ config: ToolsetConfig) -> String {
+        if config.credentialCount == 0 {
+            return "No credentials are required for this toolset on this server."
+        }
+        let configured = config.configuredCredentialCount
+        let total = config.credentialCount
+        if configured == 0 {
+            return "No stored secrets are shown here. Enter a key to save it on the gateway."
+        }
+        return "\(configured) of \(total) key\(total == 1 ? "" : "s") configured. Stored values are never returned to the phone."
+    }
+}
+
+// MARK: - Entry form
+
+struct ToolsetCredentialEntryView: View {
+    let rest: RestClient
+    let target: ToolsetCredentialTarget
+    let onSaved: (ToolsetConfig) -> Void
+
+    @Environment(\.hermesTheme) private var theme
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var value = ""
+    @State private var errorText: String?
+    @State private var isSaving = false
+    @FocusState private var fieldFocused: Bool
+
+    private var canSave: Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isSaving
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(target.providerName)
+                        .font(.title2.bold())
+                        .foregroundStyle(theme.fg)
+                    Text("Enter the key for \(target.toolsetDisplayName). The current stored value is never sent back to the phone; replacing it starts from a blank secure field.")
+                        .font(.subheadline)
+                        .foregroundStyle(theme.mutedFg)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 4, trailing: 16))
+                .listRowBackground(Color.clear)
+            }
+
+            Section {
+                SecureField(target.envVar.prompt, text: $value, prompt: Text("Paste key"))
+                    .textContentType(.password)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.go)
+                    .focused($fieldFocused)
+                    .onSubmit { if canSave { save() } }
+                    .accessibilityIdentifier("toolsetCredentialField")
+            } footer: {
+                if let errorText {
+                    Text(errorText)
+                        .foregroundStyle(theme.destructive)
+                } else {
+                    Text("Saved to \(target.envVar.key) on your gateway. The app clears this field after the save completes.")
+                }
+            }
+
+            Section {
+                Button(action: save) {
+                    HStack {
+                        Spacer()
+                        if isSaving {
+                            ProgressView()
+                                .tint(theme.midground.contrastingForeground)
+                        } else {
+                            Text("Save Key")
+                                .fontWeight(.semibold)
+                        }
+                        Spacer()
+                    }
+                    .frame(minHeight: 22)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(theme.midground)
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                .listRowBackground(Color.clear)
+                .disabled(!canSave)
+                .accessibilityIdentifier("toolsetCredentialSaveButton")
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .background(theme.bg)
+        .navigationTitle(target.envVar.prompt)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel") { dismiss() }
+                    .accessibilityIdentifier("toolsetCredentialCancelButton")
+            }
+        }
+        .onAppear { fieldFocused = true }
+    }
+
+    private func save() {
+        guard canSave else { return }
+        fieldFocused = false
+        errorText = nil
+        isSaving = true
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            defer { isSaving = false }
+            // Phase 1 — persist the credential. A failure here means nothing
+            // was saved; surface it as the key-save error.
+            let savedConfig: ToolsetConfig
+            do {
+                savedConfig = try await rest.setToolsetCredential(
+                    name: target.toolsetName,
+                    key: target.envVar.key,
+                    value: trimmed
+                )
+            } catch {
+                errorText = ToolsetConfigErrorMessage.message(for: error)
+                return
+            }
+            value = ""
+
+            // No provider to activate — the key save is the whole operation.
+            guard let tag = target.providerTag else {
+                onSaved(savedConfig)
+                dismiss()
+                return
+            }
+
+            // Phase 2 — activate the provider. The key is already saved, so a
+            // failure here must NOT be reported as a generic key-save error,
+            // and must NOT discard the fact that the credential persisted.
+            do {
+                let activatedConfig = try await rest.selectToolsetProvider(
+                    name: target.toolsetName,
+                    provider: tag
+                )
+                onSaved(activatedConfig)
+                dismiss()
+            } catch {
+                // Reflect the saved credential into the parent (the provider is
+                // still NOT active in this config), then surface a distinct
+                // activation-failure message. Stay on the form so the user sees
+                // what happened instead of implying success.
+                onSaved(savedConfig)
+                let reason = ToolsetConfigErrorMessage.message(for: error)
+                errorText = "Key saved, but \(target.providerName) could not be made active: \(reason)"
+            }
+        }
+    }
+}
+
+struct ToolsetCredentialTarget: Identifiable, Sendable, Hashable {
+    let toolsetName: String
+    let toolsetDisplayName: String
+    let providerName: String
+    let providerTag: String?
+    let envVar: ToolsetEnvVar
+
+    var id: String { "\(toolsetName)::\(envVar.key)::\(providerName)" }
+}
+
+/// Success copy for the toolset credential save flow.
+///
+/// `save()` persists the key and then (when the target carries a provider tag)
+/// activates that provider. The single `onSaved(refreshed)` callback the parent
+/// receives cannot tell the two outcomes apart by itself, so this helper infers
+/// them from the refreshed config: if the target expected activation and the
+/// refreshed config reports that provider `isActive`, the key was saved AND the
+/// provider was made active — say so. Otherwise only confirm the key save
+/// (this also covers the activation-failure path, where the key was saved but
+/// the provider stayed inactive).
+enum ToolsetConfigSaveCopy {
+    static func savedMessage(target: ToolsetCredentialTarget, refreshed: ToolsetConfig) -> String {
+        let activated = target.providerTag.flatMap { tag in
+            refreshed.providers.first { $0.tag == tag }
+        }?.isActive ?? false
+        if target.providerTag != nil, activated {
+            return "Saved \(target.envVar.prompt) and made \(target.providerName) the active provider."
+        }
+        return "Saved \(target.envVar.prompt)."
+    }
+}
+
+enum ToolsetConfigErrorMessage {
+    static func message(for error: Error) -> String {
+        if let restError = error as? RestError {
+            switch restError {
+            case .badStatus(401, _):
+                return "This connection is not authorized. Reconnect to the gateway, then try again."
+            case .badStatus(403, _):
+                return "This device token lacks approve scope, so it cannot manage tool keys. Re-pair with an approving device token."
+            case .badStatus(_, let body):
+                if let parsed = parseServerMessage(body) { return parsed }
+            case .network, .decoding:
+                break
+            }
+        }
+        return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    }
+
+    static func isUnknownToolset(_ error: Error) -> Bool {
+        guard let restError = error as? RestError else { return false }
+        if case .badStatus(_, let body) = restError {
+            return serverCode(body) == 4002 || body.localizedCaseInsensitiveContains("unknown toolset")
+        }
+        return false
+    }
+
+    private static func parseServerMessage(_ body: String) -> String? {
+        switch serverCode(body) {
+        case 4001:
+            return serverText(body) ?? "The gateway rejected this key request."
+        case 4002:
+            return serverText(body) ?? "This gateway does not recognize that toolset."
+        case 4006:
+            return "This Hermes install is managed, so credentials are read-only here. Change the key on the desktop or server."
+        default:
+            return serverText(body)
+        }
+    }
+
+    private static func serverCode(_ body: String) -> Int? {
+        serverObject(body)?["code"] as? Int
+    }
+
+    private static func serverText(_ body: String) -> String? {
+        guard let object = serverObject(body) else { return nil }
+        if let error = object["error"] as? String { return error }
+        if let detail = object["detail"] as? String { return detail }
+        return nil
+    }
+
+    private static func serverObject(_ body: String) -> [String: Any]? {
+        guard let data = body.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return object
+    }
+}
