@@ -30,6 +30,16 @@ enum UITestSeed {
         ProcessInfo.processInfo.environment["HERMES_UITEST_SEED"]
     }
 
+    /// STR-459/STR-462: DEBUG/UITest-only navigation seed. When the launch
+    /// environment carries the exact value `HERMES_UITEST_PANEL=gateway`, the
+    /// shell (``RootView``'s `SplitLayout`/`CompactLayout`) cold-launches
+    /// straight into the Settings sheet's Gateway Status panel — no manual
+    /// taps — so a UI test can assert that panel deterministically. Any other
+    /// value (or the variable's absence) leaves navigation untouched.
+    static var requestedPanel: String? {
+        ProcessInfo.processInfo.environment["HERMES_UITEST_PANEL"] == "gateway" ? "gateway" : nil
+    }
+
     @MainActor
     static func apply(_ mode: String, environment: AppEnvironment) {
         let count = mode.contains("short") ? 2 : 40

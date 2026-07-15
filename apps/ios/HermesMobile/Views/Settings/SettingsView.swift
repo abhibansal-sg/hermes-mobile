@@ -78,6 +78,17 @@ struct SettingsView: View {
     /// Biometric app-lock gate; drives the "Require Face ID" toggle.
     let appLock: AppLock
 
+    #if DEBUG
+    /// STR-459/STR-462: DEBUG/UITest-only initial panel request (from
+    /// ``UITestSeed/requestedPanel``). When `"gateway"`, this sheet pushes
+    /// ``ControlPanel/gateway`` onto its own `NavigationPath` once, on appear,
+    /// so a cold launch with `HERMES_UITEST_PANEL=gateway` lands on Gateway
+    /// Status deterministically. `nil` (default) at every production call site.
+    var initialUITestPanel: String? = nil
+    /// Guards the one-time seed above against re-firing on subsequent appears.
+    @State private var didApplyUITestPanelSeed = false
+    #endif
+
     /// The theme store. Read here so the Appearance row can show the current theme
     /// name inline and the picker push can bind to it. The hosting sheet applies
     /// `.hermesThemed` at the presentation site (see the presentation contract).
@@ -196,6 +207,17 @@ struct SettingsView: View {
                 panelView(panel)
                     .background(theme.bg)
             }
+            #if DEBUG
+            // STR-459/STR-462: one-time DEBUG/UITest navigation seed. Pushes
+            // Gateway Status deterministically when HERMES_UITEST_PANEL=gateway
+            // requested it; the guard flag stops a re-append on later appears
+            // (e.g. returning from a foreground probe).
+            .onAppear {
+                guard !didApplyUITestPanelSeed, initialUITestPanel == "gateway" else { return }
+                didApplyUITestPanelSeed = true
+                path.append(ControlPanel.gateway)
+            }
+            #endif
             .task { await probeNotifStatus() }
             // Re-probe when the sheet returns to active (e.g. after the user
             // re-granted in the system Settings app).

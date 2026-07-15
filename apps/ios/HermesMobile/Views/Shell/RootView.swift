@@ -231,6 +231,14 @@ private struct SplitLayout: View {
     /// parity entry point at the split-view root.
     @State private var showingSettings = false
 
+    #if DEBUG
+    /// STR-485: one-shot latch for `seedGatewayPanelIfReady()` — guards against
+    /// firing twice within the same `SplitLayout` instance lifetime (defensive;
+    /// see that function's doc for why the state-machine already only visits a
+    /// live instance once per connect).
+    @State private var didSeedGatewayPanel = false
+    #endif
+
     /// Which inspector tab is shown (F4A-A2): the approval inbox or the subagent
     /// delegation tree. The tab picker only appears when subagent activity exists.
     @State private var inspectorTab: InspectorTab = .inbox
@@ -269,7 +277,31 @@ private struct SplitLayout: View {
         // SwiftUI does not reliably inherit custom environment values across
         // presentation/column boundaries. PRESERVED.
         .hermesThemed(themeStore)
+        #if DEBUG
+        // STR-459/STR-462/STR-485: DEBUG/UITest-only navigation seed. Cold-
+        // launches straight into the Settings sheet when
+        // HERMES_UITEST_PANEL=gateway is set, so a UI test can assert the
+        // Gateway Status panel with no manual taps. Byte-path absent from
+        // Release. Gated on `connection.control` (see
+        // `seedGatewayPanelIfReady()`) rather than a bare `.onAppear` — this
+        // `SplitLayout` instance also appears mid-`.connecting` (the
+        // `isBootstrapping` shell-early-reveal window), before the live
+        // connect has resolved, and is torn down/rebuilt when the phase
+        // machine passes through `.hydrating`.
+        .onAppear { seedGatewayPanelIfReady() }
+        .onChange(of: connection.phase) { _, _ in seedGatewayPanelIfReady() }
+        #endif
         .sheet(isPresented: $showingSettings) {
+            #if DEBUG
+            SettingsView(
+                connectionStore: connection,
+                sessionStore: sessions,
+                appLock: appLock,
+                initialUITestPanel: UITestSeed.requestedPanel
+            )
+            .presentationDragIndicator(.hidden)
+            .hermesThemed(themeStore)
+            #else
             SettingsView(
                 connectionStore: connection,
                 sessionStore: sessions,
@@ -277,8 +309,30 @@ private struct SplitLayout: View {
             )
             .presentationDragIndicator(.hidden)
             .hermesThemed(themeStore)
+            #endif
         }
     }
+
+    #if DEBUG
+    /// STR-485: fires the gateway-panel seed only once the live connection has
+    /// actually resolved a `RestClient` (`connection.control != nil`) — the
+    /// same gate `SettingsView.panelView(.gateway)` uses to decide between the
+    /// real `GatewayStatusView` and the "Not connected" placeholder. Firing on
+    /// a bare `.onAppear` raced the `.connecting`-phase reveal of this shell
+    /// (`isBootstrapping`), which precedes the REST-probe + WS-connect round
+    /// trip in `ConnectionStore.configure(_:)` — the pushed Settings sheet
+    /// landed on the placeholder, not `GatewayStatusView`, before the shell
+    /// was torn down again for `.hydrating`. Waiting for `control` and
+    /// re-checking on every phase change means the seed only fires once this
+    /// (possibly freshly-rebuilt) instance is showing a fully-connected shell.
+    private func seedGatewayPanelIfReady() {
+        guard !didSeedGatewayPanel,
+              UITestSeed.requestedPanel == "gateway",
+              connection.control != nil else { return }
+        didSeedGatewayPanel = true
+        showingSettings = true
+    }
+    #endif
 
     // MARK: Detail column
 
@@ -848,6 +902,14 @@ private struct CompactLayout: View {
     /// reset/drop the presentation write before SwiftUI anchors the sheet.
     @State private var showingSettings = false
 
+    #if DEBUG
+    /// STR-485: one-shot latch for `seedGatewayPanelIfReady()` — see the
+    /// `SplitLayout` counterpart's doc for why this instance can appear more
+    /// than once (destroyed/rebuilt across `.connecting` → `.hydrating` →
+    /// `.connected`) and why the guard still only fires once.
+    @State private var didSeedGatewayPanel = false
+    #endif
+
     /// `true` for the remainder of a touch sequence after the drawer pan has
     /// latched horizontal dominance. Bound into the chat subtree via
     /// `.scrollDisabled` so the transcript's vertical `ScrollView` stops tracking
@@ -1021,6 +1083,13 @@ private struct CompactLayout: View {
         }
         // Re-install the resolved palette + brand tint at this root. PRESERVED.
         .hermesThemed(themeStore)
+        #if DEBUG
+        // STR-459/STR-462/STR-485: DEBUG/UITest-only navigation seed — see
+        // `seedGatewayPanelIfReady()` for why this waits on `connection.control`
+        // rather than firing unconditionally on `.onAppear`.
+        .onAppear { seedGatewayPanelIfReady() }
+        .onChange(of: connection.phase) { _, _ in seedGatewayPanelIfReady() }
+        #endif
         .sheet(isPresented: $showingSettings) { settingsSheet }
         // Dismiss the composer keyboard whenever the drawer OPENS, from ANY
         // trigger — edge-swipe completion, the toolbar drawer button, ⌘F, or the
@@ -1043,10 +1112,34 @@ private struct CompactLayout: View {
         showingSettings = true
     }
 
+    #if DEBUG
+    /// STR-485: see the `SplitLayout` counterpart's doc — same gate, same
+    /// reason (`connection.control` is what `SettingsView.panelView(.gateway)`
+    /// checks to decide between the real panel and the "Not connected"
+    /// placeholder).
+    private func seedGatewayPanelIfReady() {
+        guard !didSeedGatewayPanel,
+              UITestSeed.requestedPanel == "gateway",
+              connection.control != nil else { return }
+        didSeedGatewayPanel = true
+        showingSettings = true
+    }
+    #endif
+
     /// Presents the Settings surface from the compact layout root. `SettingsView`
     /// still owns its internal `NavigationStack` and dismisses via its toolbar; the
     /// compact shell supplies only the stable presentation state and palette bridge.
     private var settingsSheet: some View {
+        #if DEBUG
+        SettingsView(
+            connectionStore: connection,
+            sessionStore: sessions,
+            appLock: appLock,
+            initialUITestPanel: UITestSeed.requestedPanel
+        )
+        .presentationDragIndicator(.hidden)
+        .hermesThemed(themeStore)
+        #else
         SettingsView(
             connectionStore: connection,
             sessionStore: sessions,
@@ -1054,6 +1147,7 @@ private struct CompactLayout: View {
         )
         .presentationDragIndicator(.hidden)
         .hermesThemed(themeStore)
+        #endif
     }
 
     // MARK: Chat stack
