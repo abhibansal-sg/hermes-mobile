@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import atexit
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -256,6 +257,94 @@ def build_alert_payload(
         custom.update(payload)
 
     return {"aps": aps, "hermes": custom}
+
+
+_CORRELATED_EVENTS = {
+    "approval.request": "approval",
+    "clarify.request": "clarify",
+    "message.complete": "turn_complete",
+}
+
+
+def _gateway_scope() -> str:
+    """Stable, non-secret namespace for one gateway/profile installation."""
+    try:
+        scope = str(_registry_path().parent.resolve())
+    except Exception:
+        scope = str(_registry_path().parent)
+    return "gw_" + hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
+
+
+def _active_turn_identity(sid: str) -> tuple[str, str]:
+    """Return the current stable turn/tool identities when event intake has them."""
+    turn_id = ""
+    tool_call_id = ""
+    try:
+        from tools import approval as approval_module
+
+        turn_id = str(approval_module._approval_turn_id.get() or "").strip()
+        tool_call_id = str(
+            approval_module._approval_tool_call_id.get() or ""
+        ).strip()
+    except Exception:
+        pass
+    session = _gw_sessions().get(sid) or {}
+    agent = session.get("agent") if isinstance(session, dict) else None
+    if not turn_id:
+        turn_id = str(getattr(agent, "_current_turn_id", "") or "").strip()
+    return turn_id, tool_call_id
+
+
+def _stable_event_identity(event: str, sid: str, data: dict) -> tuple[str, str]:
+    """Return (logical identity, turn id) without inventing a random fallback."""
+    turn_id, tool_call_id = _active_turn_identity(sid)
+    if event == "approval.request":
+        explicit = data.get("approval_id") or data.get("id") or data.get("request_id")
+        identity = str(explicit or "").strip()
+        if not identity:
+            identity = ":".join(part for part in (turn_id, tool_call_id) if part)
+    elif event == "clarify.request":
+        identity = str(data.get("request_id") or "").strip()
+    else:
+        identity = str(data.get("turn_id") or turn_id or "").strip()
+    if not identity:
+        # Legacy/minimal emitters may not carry an agent turn context. A stable
+        # content digest is deliberately deterministic (never UUID/random) and
+        # keeps identical re-emissions of the same logical payload correlated.
+        canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
+        identity = "content_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+    return identity, turn_id
+
+
+def enrich_correlated_event(event: str, sid: str, payload: dict | None) -> dict | None:
+    """Stamp one stable identity into both live frames and downstream APNs."""
+    kind = _CORRELATED_EVENTS.get(event)
+    if kind is None:
+        return payload
+    data = dict(payload or {})
+    identity, turn_id = _stable_event_identity(event, sid, data)
+    correlation_source = f"{kind}\0{sid}\0{identity}"
+    event_id = "evt_" + hashlib.sha256(
+        correlation_source.encode("utf-8")
+    ).hexdigest()[:32]
+    data["event_id"] = event_id
+    data["gateway_scope"] = _gateway_scope()
+    if turn_id:
+        data.setdefault("turn_id", turn_id)
+    if event == "approval.request":
+        # The approval itself must have a server identity. iOS may display an
+        # id-less legacy prompt, but it must never synthesize a UUID for dedupe.
+        data.setdefault("approval_id", identity)
+    return data
+
+
+def _hook_pre_emit(event=None, session_id=None, payload=None, **_kwargs):
+    if not isinstance(event, str) or not isinstance(session_id, str):
+        return None
+    enriched = enrich_correlated_event(event, session_id, payload)
+    if enriched is payload:
+        return None
+    return {"payload": enriched}
 
 
 def build_manifest_invalidation_payload(
@@ -883,6 +972,7 @@ def _notify_direct_apns(
     *,
     category: Optional[str] = None,
     expiration: int = 0,
+    collapse_id: Optional[str] = None,
 ) -> int:
     """Send an alert push through direct APNs to registered tokens.
 
@@ -916,7 +1006,10 @@ def _notify_direct_apns(
         return 0
 
     headers = build_push_headers(
-        provider_jwt=provider_jwt, topic=config.topic, expiration=expiration
+        provider_jwt=provider_jwt,
+        topic=config.topic,
+        expiration=expiration,
+        collapse_id=collapse_id,
     )
     body_bytes = json.dumps(
         build_alert_payload(
@@ -1045,6 +1138,7 @@ def notify(
     *,
     category: Optional[str] = None,
     expiration: int = 0,
+    collapse_id: Optional[str] = None,
 ) -> int:
     """Send an alert push to every registered device token.
 
@@ -1103,7 +1197,13 @@ def notify(
             _log.debug("relay push notify failed", exc_info=True)
             return 0
     return _notify_direct_apns(
-        event_type, title, body, payload, category=category, expiration=expiration
+        event_type,
+        title,
+        body,
+        payload,
+        category=category,
+        expiration=expiration,
+        collapse_id=collapse_id,
     )
 
 
@@ -1393,6 +1493,9 @@ def _push_approval_enrichment(sid: str, data: dict) -> dict:
     """Build the F2 approval ``hermes`` block: session_id + stored_session_id +
     destructive + approval_title."""
     enriched: dict = {"session_id": sid}
+    for key in ("event_id", "gateway_scope", "approval_id", "turn_id"):
+        if data.get(key):
+            enriched[key] = data[key]
     session = _gw_sessions().get(sid)
     stored = (session or {}).get("session_key")
     if stored:
@@ -1416,6 +1519,18 @@ def _push_approval_enrichment(sid: str, data: dict) -> dict:
     if title:
         enriched["approval_title"] = _push_safe_text(title, "", max_chars=120)
     return enriched
+
+
+def _push_route_context(sid: str, data: dict) -> dict:
+    """Shared APNs route/correlation context for clarify and turn completion."""
+    context: dict = {"session_id": sid}
+    stored = (_gw_sessions().get(sid) or {}).get("session_key")
+    if stored:
+        context["stored_session_id"] = stored
+    for key in ("event_id", "gateway_scope", "turn_id"):
+        if data.get(key):
+            context[key] = data[key]
+    return context
 
 
 def _live_activity_status_phase(data: dict) -> tuple[str, bool]:
@@ -1754,15 +1869,17 @@ def _process_push_event(
                 data.get("description") or data.get("target"),
                 "Review this approval in Hermes",
             )
+            alert_payload = _push_approval_enrichment(sid, data)
             notify(
                 "approval",
                 title,
                 body,
-                _push_approval_enrichment(sid, data),
+                alert_payload,
                 category="HERMES_APPROVAL",
+                collapse_id=alert_payload.get("event_id"),
             )
         elif event == "clarify.request":
-            clarify_payload = {"session_id": sid}
+            clarify_payload = _push_route_context(sid, data)
             request_id = str(data.get("request_id") or "").strip()
             if request_id:
                 clarify_payload.update(
@@ -1774,6 +1891,7 @@ def _process_push_event(
                 _push_safe_text(data.get("question"), "Input needed"),
                 clarify_payload,
                 category="HERMES_CLARIFY",
+                collapse_id=clarify_payload.get("event_id"),
             )
         elif event == "error":
             if _is_kanban_worker():
@@ -1839,13 +1957,15 @@ def _process_push_event(
             # 4h store-and-forward window: a locked/off phone should still get
             # the turn-complete banner when it wakes. Time-sensitive alerts
             # (approval/clarify/error/background) keep expiration=0.
+            turn_payload = _push_route_context(sid, data)
             notify(
                 "turn_complete",
                 "Hermes finished",
                 preview,
-                {"session_id": sid},
+                turn_payload,
                 category="HERMES_TURN",
                 expiration=14400,
+                collapse_id=turn_payload.get("event_id"),
             )
     except Exception:
         _log.debug("push hook failed", exc_info=True)
@@ -1934,6 +2054,7 @@ def activate(ctx=None) -> None:
                     if isinstance(event, str) and isinstance(session_id, str):
                         handle_gateway_event(event, session_id, payload)
 
+                ctx.register_hook("pre_emit_event", _hook_pre_emit)
                 ctx.register_hook("post_emit_event", _hook_emit)
                 ctx.register_hook("on_session_finalize", handle_session_finalize)
                 sweep_dead_live_activity_tokens()

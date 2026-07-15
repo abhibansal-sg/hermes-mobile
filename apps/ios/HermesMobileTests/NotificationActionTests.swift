@@ -144,6 +144,34 @@ final class NotificationActionTests: XCTestCase {
         XCTAssertNil(action.approvalTitle)
     }
 
+    func testDecodeCorrelatedAlertPreservesStableRouteIdentity() throws {
+        let userInfo: [AnyHashable: Any] = ["hermes": [
+            "event_type": "clarify",
+            "event_id": "evt-44",
+            "gateway_scope": "gw-1",
+            "session_id": "runtime-1",
+            "stored_session_id": "stored-1",
+        ]]
+        let alert = try XCTUnwrap(NotificationService.decodeCorrelatedAlert(from: userInfo))
+        XCTAssertEqual(alert.kind, .clarify)
+        XCTAssertEqual(alert.eventId, "evt-44")
+        XCTAssertEqual(alert.gatewayScope, "gw-1")
+        XCTAssertEqual(alert.sessionId, "runtime-1")
+        XCTAssertEqual(alert.storedSessionId, "stored-1")
+    }
+
+    func testDecodeCorrelatedAlertRejectsMissingServerIdentity() {
+        let userInfo: [AnyHashable: Any] = ["hermes": [
+            "event_type": "approval",
+            "session_id": "runtime-1",
+        ]]
+        XCTAssertNil(NotificationService.decodeCorrelatedAlert(from: userInfo))
+        let approval = ApprovalRequestPayload(payload: .object([
+            "title": .string("Legacy approval")
+        ]))
+        XCTAssertTrue(approval.id.isEmpty, "the client must not substitute a random UUID")
+    }
+
     // MARK: - action identifier → choice mapping
 
     func testApproveChoiceMapping() {

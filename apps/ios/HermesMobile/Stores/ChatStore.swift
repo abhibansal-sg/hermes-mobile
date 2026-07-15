@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI  // A2: withTransaction(Transaction(animation: nil)) on the finalize flip
+import UIKit
 import os
 #if DEBUG
 import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-G)
@@ -364,8 +365,13 @@ final class ChatStore {
     private var subagentRootIds: [String] = []
 
     private static let flushInterval: Duration = .milliseconds(40)
-    /// Only buzz on completion for turns that streamed longer than this.
-    private static let turnCompleteHapticThreshold: TimeInterval = 10
+    #if DEBUG
+    /// Focused notification-policy seams; production always resolves these
+    /// values from the persisted PushRegistrar/connection state.
+    var pushAlertAuthorityOverride: Bool?
+    var notificationDeviceScopeOverride: String?
+    var notificationForegroundOverride: Bool?
+    #endif
 
     init() {}
 
@@ -649,6 +655,8 @@ final class ChatStore {
         routingEvent = event
         defer { routingEvent = nil }
         #endif
+
+        handleNotificationPolicy(event)
 
         switch ownership(of: event) {
         case .unrelated:
@@ -1168,11 +1176,6 @@ final class ChatStore {
             activeToolCallId = nil
         }
 
-        // Success haptic only for turns that kept the user waiting a while.
-        if let started = turnStartedAt,
-           Date().timeIntervalSince(started) > Self.turnCompleteHapticThreshold {
-            NotificationService.turnCompleteHaptic()
-        }
         turnStartedAt = nil
 
         // The turn ended, so any prompt card still up is stale — it was
@@ -1299,25 +1302,98 @@ final class ChatStore {
         let sessionId = event.sessionId ?? activeSessionId ?? ""
         pendingApproval = PendingApproval(id: request.id, sessionId: sessionId, request: request)
         onApprovalChange?(true)
-        guard DefaultsKeys.pushEventEnabled(DefaultsKeys.pushEventApproval) else { return }
-        // First approval/clarify of the session is when we ask for permission.
-        NotificationService.requestAuthorizationIfNeeded()
-        NotificationService.postApprovalNotification(
-            title: request.title,
-            body: request.descriptionText ?? request.target ?? "Tap to review."
-        )
-        NotificationService.approvalHaptic()
     }
 
     private func handleClarifyRequest(_ event: GatewayEvent) {
         let request = ClarifyRequestPayload(payload: event.payload)
         let sessionId = event.sessionId ?? activeSessionId ?? ""
         pendingClarification = PendingClarification(sessionId: sessionId, request: request)
-        guard DefaultsKeys.pushEventEnabled(DefaultsKeys.pushEventClarify) else { return }
-        // First approval/clarify of the session is when we ask for permission.
-        NotificationService.requestAuthorizationIfNeeded()
-        NotificationService.postClarifyNotification(question: request.question)
-        NotificationService.approvalHaptic()
+    }
+
+    /// One ownership decision for live approval/clarify/complete events. APNs is
+    /// authoritative after a successful registration for this exact pairing;
+    /// otherwise the correlated local request is the explicit fallback.
+    private func handleNotificationPolicy(_ event: GatewayEvent) {
+        let kind: NotificationService.AlertKind
+        let preferenceKey: String
+        let title: String
+        let body: String
+        switch event.type {
+        case .approvalRequest:
+            let request = ApprovalRequestPayload(payload: event.payload)
+            kind = .approval
+            preferenceKey = DefaultsKeys.pushEventApproval
+            title = request.title
+            body = request.descriptionText ?? request.target ?? "Tap to review."
+        case .clarifyRequest:
+            let request = ClarifyRequestPayload(payload: event.payload)
+            kind = .clarify
+            preferenceKey = DefaultsKeys.pushEventClarify
+            title = "Agent needs input"
+            body = request.question
+        case .messageComplete:
+            kind = .turnComplete
+            preferenceKey = DefaultsKeys.pushEventTurnComplete
+            title = "Hermes finished"
+            let text = event.payload["text"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            body = text?.split(separator: "\n", maxSplits: 1).first.map(String.init)
+                ?? "Tap to view the response."
+        default:
+            return
+        }
+        guard DefaultsKeys.pushEventEnabled(preferenceKey) else { return }
+
+        let sessionId = event.sessionId ?? ""
+        let eventId = event.payload["event_id"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let gatewayScope = event.payload["gateway_scope"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let correlated: NotificationService.CorrelatedAlert?
+        if let eventId, !eventId.isEmpty,
+           let gatewayScope, !gatewayScope.isEmpty,
+           !sessionId.isEmpty {
+            correlated = .init(
+                kind: kind,
+                eventId: eventId,
+                gatewayScope: gatewayScope,
+                sessionId: sessionId,
+                storedSessionId: event.storedSessionId
+            )
+        } else {
+            correlated = nil
+        }
+
+        let selectedSession = sessionId == activeSessionId
+            || (event.storedSessionId != nil
+                && event.storedSessionId == sessions?.activeStoredId)
+        #if DEBUG
+        let authoritative = pushAlertAuthorityOverride
+            ?? PushRegistrar.shared.isAlertAuthorityRegistered
+        let deviceScope = notificationDeviceScopeOverride
+            ?? PushRegistrar.shared.notificationScope
+            ?? connection?.serverURLString
+            ?? "unconfigured"
+        let foreground = notificationForegroundOverride
+            ?? (UIApplication.shared.applicationState == .active)
+        #else
+        let authoritative = PushRegistrar.shared.isAlertAuthorityRegistered
+        let deviceScope = PushRegistrar.shared.notificationScope
+            ?? connection?.serverURLString
+            ?? "unconfigured"
+        let foreground = UIApplication.shared.applicationState == .active
+        #endif
+        if !authoritative {
+            NotificationService.requestAuthorizationIfNeeded()
+        }
+        NotificationService.handleLiveAlert(
+            correlated,
+            title: title,
+            body: body,
+            deviceScope: deviceScope,
+            pushIsAuthoritative: authoritative,
+            isActiveSession: selectedSession && foreground
+        )
     }
 
     // MARK: - Subagent tree (F4A-A2)

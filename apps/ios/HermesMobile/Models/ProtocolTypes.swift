@@ -605,7 +605,13 @@ struct ApprovalRequestPayload: Sendable, Identifiable, Equatable {
     let patternKey: String?
 
     init(payload: JSONValue) {
-        self.id = payload["id"]?.stringValue ?? UUID().uuidString
+        // Stable server identity only. An id-less legacy payload remains
+        // displayable, but the client never invents a UUID and then mistakes it
+        // for a cross-transport dedupe identity.
+        self.id = payload["approval_id"]?.stringValue
+            ?? payload["id"]?.stringValue
+            ?? payload["request_id"]?.stringValue
+            ?? ""
         let command = payload["command"]?.stringValue
         self.command = (command?.isEmpty == false) ? command : nil
         self.patternKey = payload["pattern_key"]?.stringValue

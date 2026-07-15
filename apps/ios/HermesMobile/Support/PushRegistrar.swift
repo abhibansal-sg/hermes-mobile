@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -77,6 +78,37 @@ final class PushRegistrar {
     /// `setEnabled`).
     private(set) var isEnabled: Bool
 
+    /// True only when this exact gateway/credential scope has a persisted,
+    /// successful push registration and the server capability remains healthy.
+    /// This is the ownership rule consumed by live-event notification fallback.
+    var isAlertAuthorityRegistered: Bool {
+        guard isEnabled,
+              connection?.capabilities.pushRegistry == .available,
+              UserDefaults.standard.bool(forKey: DefaultsKeys.pushRegistrationHealthy),
+              let token = UserDefaults.standard.string(
+                  forKey: DefaultsKeys.pushLastDeviceToken
+              ), !token.isEmpty,
+              let scope = currentRegistrationScope,
+              scope == UserDefaults.standard.string(
+                  forKey: DefaultsKeys.pushLastRegistrationScope
+              ) else { return false }
+        return true
+    }
+
+    /// Stable, non-secret namespace for the current gateway + device pairing.
+    /// Credential hashing makes a same-URL re-pair a fresh dedupe scope.
+    var notificationScope: String? { currentRegistrationScope }
+
+    private var currentRegistrationScope: String? {
+        guard let endpoint = resolveEndpoint(), let connection else { return nil }
+        let deviceId = DefaultsKeys.deviceId(server: connection.serverURLString) ?? "shared"
+        let raw = "\(endpoint.url.absoluteString)|\(deviceId)|\(endpoint.token)"
+        let digest = SHA256.hash(data: Data(raw.utf8)).map {
+            String(format: "%02x", $0)
+        }.joined()
+        return "device_" + digest.prefix(24)
+    }
+
     /// Flip the opt-in flag and (un)register accordingly. Disabling unregisters
     /// the remembered token server-side, then clears it locally so a later
     /// re-enable forces a fresh server register.
@@ -111,6 +143,8 @@ final class PushRegistrar {
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastDeviceToken)
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEvents)
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEnv)
+            UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastRegistrationScope)
+            UserDefaults.standard.set(false, forKey: DefaultsKeys.pushRegistrationHealthy)
             #if canImport(UIKit)
             UIApplication.shared.unregisterForRemoteNotifications()
             #endif
@@ -145,7 +179,12 @@ final class PushRegistrar {
             } else {
                 status = await NotificationService.requestAuthorizationStatusIfNeeded(force: forcePrompt)
             }
-            guard Self.authorizationAllowsRemoteRegistration(status) else { return }
+            guard Self.authorizationAllowsRemoteRegistration(status) else {
+                UserDefaults.standard.set(
+                    false, forKey: DefaultsKeys.pushRegistrationHealthy
+                )
+                return
+            }
             if let remoteNotificationsRegistrar {
                 remoteNotificationsRegistrar()
             } else {
@@ -183,7 +222,11 @@ final class PushRegistrar {
         // APNs host. A prefs change (A4) must re-POST even when token+env match.
         if UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken) == hex,
            lastRegisteredEvents == events,
-           lastRegisteredEnv == env {
+           lastRegisteredEnv == env,
+           currentRegistrationScope == UserDefaults.standard.string(
+               forKey: DefaultsKeys.pushLastRegistrationScope
+           ),
+           UserDefaults.standard.bool(forKey: DefaultsKeys.pushRegistrationHealthy) {
             return
         }
 
@@ -241,11 +284,18 @@ final class PushRegistrar {
                 UserDefaults.standard.set(hex, forKey: DefaultsKeys.pushLastDeviceToken)
                 lastRegisteredEvents = events
                 lastRegisteredEnv = env
+                UserDefaults.standard.set(
+                    currentRegistrationScope,
+                    forKey: DefaultsKeys.pushLastRegistrationScope
+                )
+                UserDefaults.standard.set(true, forKey: DefaultsKeys.pushRegistrationHealthy)
+            } else {
+                UserDefaults.standard.set(false, forKey: DefaultsKeys.pushRegistrationHealthy)
             }
         case .hardFail:
             // Transport error: inconclusive for the capability gate, nothing
             // remembered. The next enableIfAllowed() retries.
-            break
+            UserDefaults.standard.set(false, forKey: DefaultsKeys.pushRegistrationHealthy)
         }
     }
 
@@ -315,8 +365,7 @@ final class PushRegistrar {
     /// the next `enableIfAllowed()` retries. Called from the app delegate's
     /// `didFailToRegisterForRemoteNotificationsWithError`.
     func didFailToRegister(error: Error) {
-        // Best-effort: nothing to surface to the user. Kept as a seam so the
-        // AppDelegate adaptor has a symmetric place to forward the failure.
+        UserDefaults.standard.set(false, forKey: DefaultsKeys.pushRegistrationHealthy)
     }
 
     // MARK: - Configuration resolution

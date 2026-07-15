@@ -1,23 +1,204 @@
 import Foundation
+import CryptoKit
 import LocalAuthentication
 import UIKit
 import UserNotifications
 
-/// Local notifications + haptics for approval / clarification prompts and turn
-/// completion.
+/// Persisted, bounded dedupe ledger for system-alert delivery. Keys already
+/// contain gateway + device namespaces, so switching or re-pairing cannot make
+/// one installation suppress another. Main-actor isolation serializes APNs and
+/// live-event arrival races.
+@MainActor
+final class NotificationDeliveryLedger {
+    static let defaultTTL: TimeInterval = 24 * 60 * 60
+    static let defaultMaximumEntries = 256
+
+    private let defaults: UserDefaults
+    private let storageKey: String
+    private let ttl: TimeInterval
+    private let maximumEntries: Int
+
+    init(
+        defaults: UserDefaults = .standard,
+        storageKey: String = "hermes.notifications.deliveryLedger.v1",
+        ttl: TimeInterval = defaultTTL,
+        maximumEntries: Int = defaultMaximumEntries
+    ) {
+        self.defaults = defaults
+        self.storageKey = storageKey
+        self.ttl = ttl
+        self.maximumEntries = max(1, maximumEntries)
+    }
+
+    /// Atomically reserve one alert. Returns false when the same logical event
+    /// was already reserved/delivered inside the TTL window.
+    func claim(namespace: String, eventId: String, now: Date = Date()) -> Bool {
+        guard !namespace.isEmpty, !eventId.isEmpty else { return false }
+        let timestamp = now.timeIntervalSince1970
+        let cutoff = timestamp - ttl
+        var entries = load().filter { $0.value > cutoff }
+        let key = Self.digest("\(namespace)|\(eventId)")
+        if entries[key] != nil {
+            persist(entries)
+            return false
+        }
+        entries[key] = timestamp
+        if entries.count > maximumEntries {
+            let newest = entries.sorted { $0.value > $1.value }.prefix(maximumEntries)
+            entries = Dictionary(uniqueKeysWithValues: newest.map { ($0.key, $0.value) })
+        }
+        persist(entries)
+        return true
+    }
+
+    var entryCount: Int { load().count }
+
+    private func load() -> [String: TimeInterval] {
+        (defaults.dictionary(forKey: storageKey) as? [String: TimeInterval]) ?? [:]
+    }
+
+    private func persist(_ entries: [String: TimeInterval]) {
+        if entries.isEmpty {
+            defaults.removeObject(forKey: storageKey)
+        } else {
+            defaults.set(entries, forKey: storageKey)
+        }
+    }
+
+    nonisolated static func digest(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// APNs-authority policy, correlated local fallback, tap handling, and haptics.
 ///
 /// All entry points are `@MainActor`. Authorization is requested *lazily* — the
 /// first time an approval/clarify actually arrives — so the user is never
 /// ambushed with a permission dialog at first launch; the "asked once" flag is
 /// persisted in `UserDefaults`.
 ///
-/// Because iOS suspends the WebSocket while the app is backgrounded, these
-/// notifications effectively fire while the app is active or just-foregrounded.
-/// That is expected v1 behavior. The future path for true background delivery is
-/// APNs (the gateway pushing remote notifications when a turn needs the user),
-/// which would replace these local-only requests.
+/// A live event only schedules a local request when the persisted registration
+/// state says APNs is unavailable/unhealthy. Healthy registrations leave system
+/// alert ownership to APNs.
 @MainActor
 enum NotificationService {
+    enum AlertKind: String, Sendable, Equatable {
+        case approval
+        case clarify
+        case turnComplete = "turn_complete"
+    }
+
+    struct PresentationContext {
+        let deviceScope: String
+        let activeRuntimeId: String?
+        let activeStoredId: String?
+        let pushIsAuthoritative: Bool
+    }
+
+    struct CorrelatedAlert: Sendable, Equatable {
+        let kind: AlertKind
+        let eventId: String
+        let gatewayScope: String
+        let sessionId: String
+        let storedSessionId: String?
+
+        var namespaceComponent: String { gatewayScope }
+    }
+
+    nonisolated(unsafe) static var presentationContextProvider:
+        (@MainActor () -> PresentationContext?)?
+    nonisolated(unsafe) static var localRequestSink:
+        (@MainActor (UNNotificationRequest) -> Void)?
+    nonisolated(unsafe) static var hapticSink: (@MainActor (AlertKind) -> Void)?
+    private static var deliveryLedger = NotificationDeliveryLedger()
+
+    static func setPresentationContextProvider(
+        _ provider: @escaping @MainActor () -> PresentationContext?
+    ) {
+        presentationContextProvider = provider
+    }
+
+    static func setDeliveryLedgerForTesting(_ ledger: NotificationDeliveryLedger) {
+        deliveryLedger = ledger
+    }
+
+    /// Apply APNs-authority policy to a live event. Missing server identity is
+    /// never replaced with a client UUID: UI state still updates, but no system
+    /// alert can be safely deduplicated.
+    static func handleLiveAlert(
+        _ alert: CorrelatedAlert?,
+        title: String,
+        body: String,
+        deviceScope: String,
+        pushIsAuthoritative: Bool,
+        isActiveSession: Bool
+    ) {
+        guard let alert else { return }
+        let namespace = "\(alert.gatewayScope)|\(deviceScope)"
+
+        if isActiveSession {
+            // The visible session never needs a system banner. Whichever path
+            // arrives first reserves the event and owns the one in-app haptic.
+            if deliveryLedger.claim(namespace: namespace, eventId: alert.eventId) {
+                emitHaptic(alert.kind)
+            }
+            return
+        }
+        guard !pushIsAuthoritative else { return }
+        guard deliveryLedger.claim(namespace: namespace, eventId: alert.eventId) else { return }
+        postCorrelated(
+            alert,
+            title: title,
+            body: body,
+            namespace: namespace
+        )
+    }
+
+    /// Foreground APNs policy: first arrival may alert for a non-active session;
+    /// duplicates and the active session are silent. The ledger claim happens
+    /// before the active-session check so a later WebSocket fallback cannot race.
+    static func foregroundPresentationOptions(
+        userInfo: [AnyHashable: Any]
+    ) -> UNNotificationPresentationOptions {
+        guard let alert = decodeCorrelatedAlert(from: userInfo),
+              let context = presentationContextProvider?() else {
+            return [.banner, .sound]
+        }
+        let namespace = "\(alert.gatewayScope)|\(context.deviceScope)"
+        guard deliveryLedger.claim(namespace: namespace, eventId: alert.eventId) else {
+            return []
+        }
+        let active = alert.sessionId == context.activeRuntimeId
+            || (alert.storedSessionId != nil && alert.storedSessionId == context.activeStoredId)
+        if active {
+            emitHaptic(alert.kind)
+            return []
+        }
+        return [.banner, .sound]
+    }
+
+    nonisolated static func decodeCorrelatedAlert(
+        from userInfo: [AnyHashable: Any]
+    ) -> CorrelatedAlert? {
+        let custom = (userInfo["hermes"] as? [AnyHashable: Any]) ?? userInfo
+        guard let rawKind = custom["event_type"] as? String,
+              let kind = AlertKind(rawValue: rawKind),
+              let eventId = nonEmpty(custom["event_id"] as? String),
+              let gatewayScope = nonEmpty(custom["gateway_scope"] as? String),
+              let sessionId = nonEmpty(custom["session_id"] as? String) else { return nil }
+        return CorrelatedAlert(
+            kind: kind,
+            eventId: eventId,
+            gatewayScope: gatewayScope,
+            sessionId: sessionId,
+            storedSessionId: nonEmpty(custom["stored_session_id"] as? String)
+        )
+    }
+
+    private nonisolated static func nonEmpty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
     // Notification category identifiers — these are `UNNotificationCategory`
     // identifiers, NOT `UserDefaults` keys, so they stay local to this type.
     //
@@ -86,10 +267,10 @@ enum NotificationService {
     /// Wired once at launch by `HermesMobileApp` (it forwards to
     /// `HermesURLRouter.routePushTap`). Set on the main actor; read on the main
     /// actor from the delegate callback after a hop.
-    nonisolated(unsafe) static var tapHandler: (@MainActor (Tap) -> Void)?
+    nonisolated(unsafe) static var tapHandler: (@MainActor @Sendable (Tap) -> Void)?
 
     /// Install the app's tap router. Idempotent; safe to call at launch.
-    static func setTapHandler(_ handler: @escaping @MainActor (Tap) -> Void) {
+    static func setTapHandler(_ handler: @escaping @MainActor @Sendable (Tap) -> Void) {
         tapHandler = handler
     }
 
@@ -113,7 +294,8 @@ enum NotificationService {
     /// `PushRegistrar.makePoster()` resolves URL + token). Read on the main actor
     /// from the action callback. `nil` when the app isn't configured yet, in
     /// which case the action falls back to a feedback notification.
-    nonisolated(unsafe) static var endpointProvider: (@MainActor () -> ActionEndpoint?)?
+    nonisolated(unsafe) static var endpointProvider:
+        (@MainActor @Sendable () -> ActionEndpoint?)?
 
     /// Seam over `LAContext` so the destructive-approval gate is unit-testable
     /// (XCTest can't satisfy a real biometric prompt). Defaults to the live
@@ -128,7 +310,9 @@ enum NotificationService {
     #endif
 
     /// Install the action backend resolver (endpoint + categories). Idempotent.
-    static func setActionEndpointProvider(_ provider: @escaping @MainActor () -> ActionEndpoint?) {
+    static func setActionEndpointProvider(
+        _ provider: @escaping @MainActor @Sendable () -> ActionEndpoint?
+    ) {
         endpointProvider = provider
     }
 
@@ -406,7 +590,7 @@ enum NotificationService {
     /// Fire a local feedback notification for an action that couldn't land
     /// authoritatively (already handled, failed, not confirmed). No category /
     /// userInfo so a tap just opens the app.
-    private static func postFeedbackNotification(title: String, body: String) {
+    static func postFeedbackNotification(title: String, body: String) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
@@ -639,50 +823,53 @@ enum NotificationService {
         return [approvalCat, clarifyCat, turnCat]
     }
 
-    /// Fire a local notification for an approval request, immediately.
-    ///
-    /// `sessionId` (the runtime session id) is optional and, when supplied, is
-    /// stamped into `userInfo` under the same flat `{event_type, session_id}`
-    /// keys the remote APNs path uses (`decodeTap` reads both shapes) so a tap on
-    /// a *local* notification routes to its session too.
-    static func postApprovalNotification(title: String, body: String, sessionId: String? = nil) {
-        post(title: title, body: body, categoryIdentifier: approvalCategory,
-             eventType: "approval", sessionId: sessionId)
-    }
-
-    /// Fire a local notification for a clarification request, immediately.
-    static func postClarifyNotification(question: String, sessionId: String? = nil) {
-        post(
-            title: "Agent needs input",
-            body: question,
-            categoryIdentifier: clarifyCategory,
-            eventType: "clarify",
-            sessionId: sessionId
-        )
-    }
-
-    private static func post(
+    private static func postCorrelated(
+        _ alert: CorrelatedAlert,
         title: String,
         body: String,
-        categoryIdentifier: String,
-        eventType: String? = nil,
-        sessionId: String? = nil
+        namespace: String
     ) {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
-        content.categoryIdentifier = categoryIdentifier
-        var info: [AnyHashable: Any] = [:]
-        if let eventType { info["event_type"] = eventType }
-        if let sessionId, !sessionId.isEmpty { info["session_id"] = sessionId }
-        if !info.isEmpty { content.userInfo = info }
+        switch alert.kind {
+        case .approval: content.categoryIdentifier = approvalCategory
+        case .clarify: content.categoryIdentifier = clarifyCategory
+        case .turnComplete: content.categoryIdentifier = remoteTurnCategory
+        }
+        var info: [AnyHashable: Any] = [
+            "event_type": alert.kind.rawValue,
+            "event_id": alert.eventId,
+            "gateway_scope": alert.gatewayScope,
+            "session_id": alert.sessionId,
+        ]
+        if let storedSessionId = alert.storedSessionId {
+            info["stored_session_id"] = storedSessionId
+        }
+        content.userInfo = info
+        let identifier = "hermes." + NotificationDeliveryLedger.digest(
+            "\(namespace)|\(alert.eventId)"
+        ).prefix(40)
         let request = UNNotificationRequest(
-            identifier: UUID().uuidString,
-            content: content,
-            trigger: nil // deliver immediately
+            identifier: String(identifier), content: content, trigger: nil
         )
-        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+        if let localRequestSink {
+            localRequestSink(request)
+        } else {
+            UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+        }
+    }
+
+    private static func emitHaptic(_ kind: AlertKind) {
+        if let hapticSink {
+            hapticSink(kind)
+            return
+        }
+        switch kind {
+        case .approval, .clarify: approvalHaptic()
+        case .turnComplete: turnCompleteHaptic()
+        }
     }
 
     // MARK: - Haptics

@@ -140,6 +140,17 @@ struct HermesMobileApp: App {
                     // The notification-action backend is already installed by
                     // AppDelegate from persisted URL/Keychain state. Do not move
                     // it back here: this task can run after a killed-launch action.
+                    NotificationService.setPresentationContextProvider {
+                        guard let deviceScope = PushRegistrar.shared.notificationScope else {
+                            return nil
+                        }
+                        return NotificationService.PresentationContext(
+                            deviceScope: deviceScope,
+                            activeRuntimeId: environment.sessionStore.activeRuntimeId,
+                            activeStoredId: environment.sessionStore.activeStoredId,
+                            pushIsAuthoritative: PushRegistrar.shared.isAlertAuthorityRegistered
+                        )
+                    }
                     await environment.connectionStore.bootstrap()
                     #if DEBUG
                     // Inc-3b UITest seam: HERMES_UITEST_DEEPLINK fires a deep link

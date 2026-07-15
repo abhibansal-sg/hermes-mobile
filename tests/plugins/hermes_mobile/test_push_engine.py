@@ -141,6 +141,36 @@ def test_build_push_headers_collapse_id_truncated_to_64_bytes():
     assert len(headers["apns-collapse-id"]) == 64
 
 
+def test_correlated_event_identity_is_stable_and_gateway_scoped(monkeypatch, tmp_path):
+    monkeypatch.setattr(pn, "_registry_path", lambda: tmp_path / "push_tokens.json")
+    payload = {"request_id": "clarify-17", "question": "Which file?"}
+
+    first = pn.enrich_correlated_event("clarify.request", "runtime-1", payload)
+    second = pn.enrich_correlated_event("clarify.request", "runtime-1", dict(payload))
+
+    assert first["event_id"] == second["event_id"]
+    assert first["gateway_scope"] == second["gateway_scope"]
+    assert first["event_id"].startswith("evt_")
+    assert first["gateway_scope"].startswith("gw_")
+
+
+def test_approval_identity_is_server_supplied_without_random_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(pn, "_registry_path", lambda: tmp_path / "push_tokens.json")
+    monkeypatch.setattr(
+        pn, "_active_turn_identity", lambda _sid: ("turn-stable", "tool-call-stable")
+    )
+
+    enriched = pn.enrich_correlated_event(
+        "approval.request", "runtime-2", {"command": "rm -rf build"}
+    )
+
+    assert enriched["approval_id"] == "turn-stable:tool-call-stable"
+    assert enriched["turn_id"] == "turn-stable"
+    assert enriched["event_id"] == pn.enrich_correlated_event(
+        "approval.request", "runtime-2", {"command": "rm -rf build"}
+    )["event_id"]
+
+
 def test_build_push_headers_custom_priority_and_expiration():
     headers = pn.build_push_headers(
         provider_jwt="JWT", topic="t", priority=5, expiration=1234
@@ -1291,6 +1321,27 @@ def test_turn_complete_notify_sets_4h_apns_expiration(monkeypatch, isolated_home
         {"session_id": "sess-1"}, category="HERMES_TURN", expiration=14400,
     ) == 1
     assert fake.calls[0]["headers"]["apns-expiration"] == "14400"
+
+
+def test_notify_uses_event_identity_as_apns_collapse_id(monkeypatch, isolated_home):
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    _arm_push(monkeypatch, isolated_home)
+    pn.register_token(_VALID_TOKEN, env="sandbox", events=["approval"])
+    monkeypatch.setattr(pn, "_get_provider_jwt", lambda config: "JWT")
+    fake = _FakeConn(status_code=200)
+    import httpx
+    monkeypatch.setattr(httpx, "Client", lambda **kw: fake)
+
+    event_id = "evt_0123456789abcdef"
+    assert pn.notify(
+        "approval",
+        "Approval required",
+        "Review this",
+        {"session_id": "sess-1", "event_id": event_id},
+        category="HERMES_APPROVAL",
+        collapse_id=event_id,
+    ) == 1
+    assert fake.calls[0]["headers"]["apns-collapse-id"] == event_id
 
 
 def test_time_sensitive_notify_keeps_zero_apns_expiration(monkeypatch, isolated_home):
