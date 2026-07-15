@@ -700,8 +700,9 @@ final class ConnectionStore {
     /// (so a run of cheap frames still yields periodically even if it never crosses the
     /// time budget). Bursts of expensive frames cross the time budget first.
     private static let intakeYieldEveryK = 32
-    /// The in-flight reconnect loop, if any.
-    private var reconnectTask: Task<Void, Never>?
+    /// The in-flight reconnect loop, if any. The setter remains store-owned;
+    /// internal read access keeps reconnect-race tests able to assert teardown.
+    private(set) var reconnectTask: Task<Void, Never>?
     /// The in-flight silent-grace timer, if any (STR-973A). Races the reconnect
     /// loop's attempts: cancelled the moment an attempt succeeds (or the loop
     /// exits for any other reason — auth revoke, vanished config) so a stale
@@ -709,7 +710,9 @@ final class ConnectionStore {
     /// on its own if every attempt is still failing when it elapses, which
     /// escalates to the visible drop (see `startGraceWindow`/`endGrace`/
     /// `escalateGraceExpiry`).
-    private var graceTask: Task<Void, Never>?
+    /// Read visibility mirrors `reconnectTask`: current reconnect teardown is
+    /// complete only when both the retry loop and silent-grace timer are gone.
+    private(set) var graceTask: Task<Void, Never>?
     /// True while a drop is being retried silently within the grace window
     /// (STR-973A) — `phase` stays `.connected` and `ChatStore`/`SessionStore`
     /// are NOT told the connection dropped, so an in-flight turn is never
