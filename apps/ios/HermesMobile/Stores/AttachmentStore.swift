@@ -61,10 +61,11 @@ final class AttachmentStore {
         profileId: String,
         sessionId: String,
         path: String,
-        size: Int
+        contentVersion: String?
     ) -> UIImage? {
         guard let key = Self.blobKey(serverId: serverId, profileId: profileId,
-                                     sessionId: sessionId, path: path, size: size)
+                                     sessionId: sessionId, path: path,
+                                     contentVersion: contentVersion)
         else { return nil }
         return AttachmentBlobCache.shared.image(for: key)
     }
@@ -77,10 +78,11 @@ final class AttachmentStore {
         profileId: String,
         sessionId: String,
         path: String,
-        size: Int
+        contentVersion: String?
     ) {
         guard let key = Self.blobKey(serverId: serverId, profileId: profileId,
-                                     sessionId: sessionId, path: path, size: size)
+                                     sessionId: sessionId, path: path,
+                                     contentVersion: contentVersion)
         else { return }
         AttachmentBlobCache.shared.store(data, for: key)
     }
@@ -92,16 +94,18 @@ final class AttachmentStore {
         profileId: String,
         sessionId: String,
         path: String,
-        size: Int
+        contentVersion: String?
     ) -> AttachmentBlobCache.Key? {
         let trimmedServer = serverId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedServer.isEmpty else { return nil }
+        guard !trimmedServer.isEmpty,
+              let version = contentVersion?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !version.isEmpty else { return nil }
         return AttachmentBlobCache.Key(
             serverId: trimmedServer,
             profileId: profileId,
             sessionId: sessionId,
             path: path,
-            size: size
+            contentVersion: version
         )
     }
 

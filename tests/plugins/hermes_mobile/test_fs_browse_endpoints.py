@@ -18,6 +18,7 @@ api module now — monkeypatches/asserts target it via ``_api()`` below.
 from __future__ import annotations
 
 import os
+import hashlib
 import subprocess
 import sys
 
@@ -384,6 +385,33 @@ def test_read_text_file(loopback_client, session_cwd, _token_header):
     assert body["size"] == len("hello alpha\n")
     assert body["truncated"] is False
     assert body["path"] == "alpha.txt"
+    assert body["mime"] == "text/plain"
+    assert body["modified"] == pytest.approx(os.stat(_root / "alpha.txt").st_mtime)
+    expected_digest = hashlib.sha256("hello alpha\n".encode()).hexdigest()
+    assert body["content_version"] == f"sha256:{expected_digest}"
+
+
+def test_read_same_size_mutation_changes_content_version(
+    loopback_client, session_cwd, _token_header
+):
+    sid, root, _outside = session_cwd
+    target = root / "same-size.txt"
+    target.write_bytes(b"first")
+    first = loopback_client.get(
+        f"/api/plugins/hermes-mobile/fs/read?session_id={sid}&path=same-size.txt",
+        headers=_token_header,
+    ).json()
+
+    target.write_bytes(b"other")
+    second = loopback_client.get(
+        f"/api/plugins/hermes-mobile/fs/read?session_id={sid}&path=same-size.txt",
+        headers=_token_header,
+    ).json()
+
+    assert first["size"] == second["size"] == 5
+    assert first["content_version"] != second["content_version"]
+    assert str(root) not in first["content_version"]
+    assert str(root) not in second["content_version"]
 
 
 def test_read_text_in_subdir(loopback_client, session_cwd, _token_header):
@@ -405,6 +433,8 @@ def test_read_binary_file(loopback_client, session_cwd, _token_header):
     assert body["encoding"] == "binary"
     assert body["content"] is None
     assert body["size"] > 0
+    assert body["mime"] == "application/octet-stream"
+    assert body["content_version"].startswith("sha256:")
 
 
 def test_read_missing_session_id_400(loopback_client, _token_header):

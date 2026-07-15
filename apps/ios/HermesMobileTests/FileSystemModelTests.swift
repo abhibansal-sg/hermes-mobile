@@ -97,7 +97,9 @@ final class FileSystemModelTests: XCTestCase {
 
     func testReadResultUTF8WithTruncation() throws {
         let json = """
-        {"path":"a.txt","size":1500000,"encoding":"utf-8","content":"hello","truncated":true}
+        {"path":"a.txt","size":1500000,"modified":1700000123.5,"mime":"text/plain",
+         "content_version":"stat-sha256:abc","version":"rev-9",
+         "encoding":"utf-8","content":"hello","truncated":true}
         """
         let result = try decode(FSReadResult.self, json)
         XCTAssertEqual(result.encoding, .utf8)
@@ -105,6 +107,10 @@ final class FileSystemModelTests: XCTestCase {
         XCTAssertEqual(result.content, "hello")
         XCTAssertTrue(result.truncated)
         XCTAssertEqual(result.size, 1500000)
+        XCTAssertEqual(result.modified, 1700000123.5)
+        XCTAssertEqual(result.mimeType, "text/plain")
+        XCTAssertEqual(result.contentVersion, "stat-sha256:abc")
+        XCTAssertEqual(result.remoteVersion, "rev-9")
         XCTAssertNil(result.dataURL)
     }
 
@@ -135,6 +141,29 @@ final class FileSystemModelTests: XCTestCase {
         """
         let result = try decode(FSReadResult.self, json)
         XCTAssertNil(result.dataURL)
+        XCTAssertNil(result.contentVersion)
+        XCTAssertNil(result.modified)
+        XCTAssertNil(result.mimeType)
+        XCTAssertNil(result.remoteVersion)
+    }
+
+    func testBlobCacheKeyChangesForSameSizeContentReplacement() {
+        let first = AttachmentBlobCache.Key(
+            serverId: "https://gw.example",
+            profileId: "default",
+            sessionId: "session-1",
+            path: "image.png",
+            contentVersion: "sha256:first"
+        )
+        let replacement = AttachmentBlobCache.Key(
+            serverId: "https://gw.example",
+            profileId: "default",
+            sessionId: "session-1",
+            path: "image.png",
+            contentVersion: "sha256:other"
+        )
+
+        XCTAssertNotEqual(first, replacement)
     }
 
     // MARK: - /api/fs/diff

@@ -651,6 +651,15 @@ struct ServerStatus: Decodable, Sendable {
 /// `POST /api/upload` response (added on the hermes-mobile branch).
 struct UploadResult: Decodable, Sendable {
     let path: String
+    let size: Int?
+    let mimeType: String?
+    let contentVersion: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case path, size
+        case mimeType = "mime"
+        case contentVersion = "content_version"
+    }
 }
 
 // MARK: - Subagent delegation (F4A-A2)

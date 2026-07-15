@@ -72,6 +72,9 @@ final class ArtifactsGalleryTests: XCTestCase {
               "filename": "photo.png",
               "mime": "image/png",
               "size": 98765,
+              "content_version": "sha256:photo-v2",
+              "modified": 1699999999.5,
+              "version": "remote-rev-2",
               "snippet": null,
               "timestamp": 1700000000.0
             }
@@ -104,6 +107,9 @@ final class ArtifactsGalleryTests: XCTestCase {
         XCTAssertEqual(art.filename, "photo.png")
         XCTAssertEqual(art.mimeType, "image/png")
         XCTAssertEqual(art.size, 98765)
+        XCTAssertEqual(art.contentVersion, "sha256:photo-v2")
+        XCTAssertEqual(art.modified, 1699999999.5)
+        XCTAssertEqual(art.remoteVersion, "remote-rev-2")
         XCTAssertNil(art.snippet)
         let ts = try XCTUnwrap(art.timestamp, "timestamp must be present")
         XCTAssertEqual(ts, 1700000000.0, accuracy: 0.001)
@@ -178,15 +184,15 @@ final class ArtifactsGalleryTests: XCTestCase {
 
     // MARK: - 5. Blob cache key nil when no size
 
-    /// A link artifact (no `size`) must return `nil` from `blobCacheKey` — links
-    /// have no byte count so they cannot be cached or looked up by size.
+    /// A legacy artifact without `content_version` must bypass disk caching,
+    /// even if a byte size is present.
     func testBlobCacheKeyNilOnNoSize() {
         // Build an Artifact via JSON round-trip to exercise the real CodingKeys.
         let json = """
         {
           "session_id": "s1", "message_id": 1, "kind": "link",
           "url_or_path": "https://example.com", "session_title": null,
-          "filename": null, "mime": null, "size": null,
+          "filename": null, "mime": null, "size": 1024,
           "snippet": null, "timestamp": null
         }
         """.data(using: .utf8)!
@@ -194,7 +200,7 @@ final class ArtifactsGalleryTests: XCTestCase {
         let art = try! decoder.decode(Artifact.self, from: json)
 
         let key = art.blobCacheKey(serverId: "https://my-server.example", profileId: "default")
-        XCTAssertNil(key, "Link artifacts with no size must produce a nil cache key")
+        XCTAssertNil(key, "Legacy size-only artifacts must produce a nil cache key")
     }
 
     // MARK: - 6. Blob cache key nil on empty serverId
@@ -207,6 +213,7 @@ final class ArtifactsGalleryTests: XCTestCase {
           "session_id": "s2", "message_id": 2, "kind": "image",
           "url_or_path": "https://example.com/img.png", "session_title": null,
           "filename": null, "mime": "image/png", "size": 1024,
+          "content_version": "sha256:image-v1",
           "snippet": null, "timestamp": null
         }
         """.data(using: .utf8)!
@@ -215,6 +222,35 @@ final class ArtifactsGalleryTests: XCTestCase {
 
         let key = art.blobCacheKey(serverId: "   ", profileId: "default")
         XCTAssertNil(key, "Whitespace-only serverId must produce a nil cache key")
+    }
+
+    func testBlobCacheKeyUsesContentVersionNotSize() throws {
+        let template = """
+        {
+          "session_id": "s-version", "message_id": 3, "kind": "image",
+          "url_or_path": "/same/path.png", "session_title": null,
+          "filename": "path.png", "mime": "image/png", "size": 4,
+          "content_version": "%@", "snippet": null, "timestamp": null
+        }
+        """
+        let decoder = JSONDecoder()
+        let first = try decoder.decode(
+            Artifact.self,
+            from: Data(String(format: template, "sha256:first").utf8)
+        )
+        let second = try decoder.decode(
+            Artifact.self,
+            from: Data(String(format: template, "sha256:other").utf8)
+        )
+
+        let firstKey = try XCTUnwrap(first.blobCacheKey(
+            serverId: "https://gw.example", profileId: "default"
+        ))
+        let secondKey = try XCTUnwrap(second.blobCacheKey(
+            serverId: "https://gw.example", profileId: "default"
+        ))
+        XCTAssertNotEqual(firstKey, secondKey)
+        XCTAssertEqual(first.size, second.size)
     }
 
     // MARK: - 7. Display name fallback

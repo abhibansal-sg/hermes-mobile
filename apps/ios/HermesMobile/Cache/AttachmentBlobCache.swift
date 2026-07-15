@@ -20,12 +20,12 @@ import CryptoKit
 /// straight through to the network path — behaviour is byte-identical to today.
 ///
 /// **Scope key.** Keyed by the composite `(serverId, profileId, sessionId,
-/// path)` consistent with the session/transcript scoping builder's key shape
+/// path, contentVersion)` consistent with the session/transcript scoping builder's key shape
 /// (`serverId` = trimmed `ConnectionStore.serverURLString`; `profileId` =
 /// normalized `SessionStore.activeProfile`, blank/`"all"` → the canonical
-/// aggregate key). `size` (the server's reported byte count) is folded into the
-/// on-disk filename as a cheap content/version discriminator, so a file that
-/// changed length re-fetches instead of serving a stale blob.
+/// aggregate key). `contentVersion` is a server-provided opaque content identity
+/// (normally SHA-256). Callers MUST bypass this cache when an older gateway omits
+/// it; byte size is metadata, never attachment identity.
 ///
 /// **Eviction.** A 365-day horizon is DEFINED here (mirroring the cache scope
 /// decision) but, per the P4 scope, NO periodic evict is wired — `evictStale`
@@ -39,22 +39,27 @@ final class AttachmentBlobCache: @unchecked Sendable {
 
     /// Canonical scope-key components for a blob lookup/store. Mirrors the
     /// `(serverId, profileId)` composite the session/transcript scoping builder
-    /// keys on, extended with the per-image `(sessionId, path, size)` identity.
+    /// keys on, extended with `(sessionId, path, contentVersion)` identity.
     struct Key: Sendable, Hashable {
         let serverId: String
         let profileId: String
         let sessionId: String
         let path: String
-        /// Server-reported byte count — a cheap freshness/version discriminator
-        /// folded into the filename so a changed file re-fetches.
-        let size: Int
+        /// Opaque server content identity. Never derived from byte size alone.
+        let contentVersion: String
 
-        init(serverId: String, profileId: String, sessionId: String, path: String, size: Int) {
+        init(
+            serverId: String,
+            profileId: String,
+            sessionId: String,
+            path: String,
+            contentVersion: String
+        ) {
             self.serverId = Self.normalizeServer(serverId)
             self.profileId = Self.normalizeProfile(profileId)
             self.sessionId = sessionId
             self.path = path
-            self.size = size
+            self.contentVersion = contentVersion
         }
 
         /// Trimmed server URL string (the same identity used for the Keychain
@@ -115,10 +120,9 @@ final class AttachmentBlobCache: @unchecked Sendable {
 
     // MARK: - Filename
 
-    /// A stable, collision-resistant filename: SHA-256 of the scope-qualified
-    /// identity, with the byte `size` appended as a version discriminator. A
-    /// changed file (different `size`) maps to a different filename, so the old
-    /// blob is naturally bypassed (and aged out by a future evict).
+    /// A stable, collision-resistant filename: SHA-256 of the complete
+    /// scope-qualified identity, including the opaque content version. A
+    /// same-path, same-size replacement therefore maps to a different filename.
     private func fileURL(for key: Key) -> URL? {
         guard let baseURL else { return nil }
         let identity = [
@@ -126,10 +130,11 @@ final class AttachmentBlobCache: @unchecked Sendable {
             key.profileId,
             key.sessionId,
             key.path,
+            key.contentVersion,
         ].joined(separator: "\u{1f}") // unit separator — can't appear in a path
         let digest = SHA256.hash(data: Data(identity.utf8))
         let hex = digest.map { String(format: "%02x", $0) }.joined()
-        return baseURL.appendingPathComponent("\(hex)-\(key.size).blob")
+        return baseURL.appendingPathComponent("\(hex).blob")
     }
 
     // MARK: - Read

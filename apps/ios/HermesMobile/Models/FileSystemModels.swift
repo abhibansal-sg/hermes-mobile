@@ -83,6 +83,10 @@ enum FSEncoding: String, Decodable, Sendable {
 struct FSReadResult: Decodable, Equatable, Sendable {
     let path: String
     let size: Int
+    let modified: Double?
+    let mimeType: String?
+    let contentVersion: String?
+    let remoteVersion: String?
     let encoding: FSEncoding
     let content: String?
     let truncated: Bool
@@ -94,6 +98,10 @@ struct FSReadResult: Decodable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case path
         case size
+        case modified
+        case mimeType = "mime"
+        case contentVersion = "content_version"
+        case remoteVersion = "version"
         case encoding
         case content
         case truncated
@@ -104,6 +112,10 @@ struct FSReadResult: Decodable, Equatable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         path = try c.decodeIfPresent(String.self, forKey: .path) ?? ""
         size = try c.decodeIfPresent(Int.self, forKey: .size) ?? 0
+        modified = try c.decodeIfPresent(Double.self, forKey: .modified)
+        mimeType = try c.decodeIfPresent(String.self, forKey: .mimeType)
+        contentVersion = try c.decodeIfPresent(String.self, forKey: .contentVersion)
+        remoteVersion = try c.decodeIfPresent(String.self, forKey: .remoteVersion)
         encoding = try c.decodeIfPresent(FSEncoding.self, forKey: .encoding) ?? .binary
         content = try c.decodeIfPresent(String.self, forKey: .content)
         truncated = try c.decodeIfPresent(Bool.self, forKey: .truncated) ?? false
@@ -113,6 +125,10 @@ struct FSReadResult: Decodable, Equatable, Sendable {
     init(
         path: String,
         size: Int,
+        modified: Double? = nil,
+        mimeType: String? = nil,
+        contentVersion: String? = nil,
+        remoteVersion: String? = nil,
         encoding: FSEncoding,
         content: String?,
         truncated: Bool,
@@ -120,6 +136,10 @@ struct FSReadResult: Decodable, Equatable, Sendable {
     ) {
         self.path = path
         self.size = size
+        self.modified = modified
+        self.mimeType = mimeType
+        self.contentVersion = contentVersion
+        self.remoteVersion = remoteVersion
         self.encoding = encoding
         self.content = content
         self.truncated = truncated
