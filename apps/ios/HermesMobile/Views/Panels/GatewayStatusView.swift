@@ -332,6 +332,8 @@ struct GatewayStatusView: View {
 enum GatewayRecoveryAction: String, CaseIterable, Identifiable, Sendable {
     case restartGateway
     case updateHermes
+    case drainGateway
+    case cancelDrain
 
     var id: String { rawValue }
 
@@ -339,6 +341,11 @@ enum GatewayRecoveryAction: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .restartGateway: return "gateway-restart"
         case .updateHermes: return "hermes-update"
+        // Drain/cancel write a marker file synchronously — there is NO
+        // background action to poll, so these status names are unused by
+        // the action-status poller. They exist for symmetry / logging.
+        case .drainGateway: return "gateway-drain"
+        case .cancelDrain: return "gateway-drain-cancel"
         }
     }
 
@@ -346,6 +353,8 @@ enum GatewayRecoveryAction: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .restartGateway: return "Restart"
         case .updateHermes: return "Update"
+        case .drainGateway: return "Drain"
+        case .cancelDrain: return "Cancel Drain"
         }
     }
 
@@ -353,6 +362,8 @@ enum GatewayRecoveryAction: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .restartGateway: return "Restart Gateway"
         case .updateHermes: return "Update Hermes"
+        case .drainGateway: return "Drain Gateway"
+        case .cancelDrain: return "Cancel Drain"
         }
     }
 
@@ -360,6 +371,8 @@ enum GatewayRecoveryAction: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .restartGateway: return "Restarting gateway"
         case .updateHermes: return "Updating Hermes"
+        case .drainGateway: return "Draining gateway"
+        case .cancelDrain: return "Cancelling drain"
         }
     }
 
@@ -367,15 +380,33 @@ enum GatewayRecoveryAction: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .restartGateway: return "arrow.clockwise.circle.fill"
         case .updateHermes: return "arrow.down.circle.fill"
+        case .drainGateway: return "stop.circle.fill"
+        case .cancelDrain: return "play.circle.fill"
         }
     }
 
+    /// Restart is destructive (brief offline). Drain/cancel are reversible
+    /// operational toggles, not destructive — the gateway stays up and
+    /// in-flight turns finish. They use the midground tint, not destructive.
     var isDestructive: Bool { self == .restartGateway }
+
+    /// Whether this action spawns a pollable background subprocess (restart /
+    /// update) or completes synchronously on the POST (drain / cancel-drain).
+    /// The runner uses this to decide whether to enter the action-status poll
+    /// loop or finish immediately on the POST response.
+    var isImmediate: Bool {
+        switch self {
+        case .drainGateway, .cancelDrain: return true
+        case .restartGateway, .updateHermes: return false
+        }
+    }
 
     var confirmationTitle: String {
         switch self {
         case .restartGateway: return "Restart gateway?"
         case .updateHermes: return "Update Hermes?"
+        case .drainGateway: return "Drain gateway?"
+        case .cancelDrain: return "Cancel drain?"
         }
     }
 
@@ -385,6 +416,10 @@ enum GatewayRecoveryAction: String, CaseIterable, Identifiable, Sendable {
             return "The gateway will briefly go offline while it restarts. Active mobile connections may reconnect."
         case .updateHermes:
             return "Hermes will update on the host. The gateway may be unavailable while the update runs."
+        case .drainGateway:
+            return "The gateway will stop accepting NEW turns. Any turn already in flight will finish normally. You can cancel the drain to re-open the gateway. Existing connections are not dropped."
+        case .cancelDrain:
+            return "The gateway will resume accepting new turns immediately."
         }
     }
 }
@@ -397,6 +432,7 @@ struct GatewayBadgeSnapshot: Equatable, Sendable {
 @MainActor
 final class GatewayActionRunner: ObservableObject {
     typealias StartAction = (GatewayRecoveryAction) async throws -> ActionResponse
+    typealias StartDrainAction = (GatewayRecoveryAction) async throws -> DrainResponse
     typealias FetchStatus = (String, Int) async throws -> ActionStatus
     typealias Sleep = (UInt64) async throws -> Void
 
@@ -407,6 +443,7 @@ final class GatewayActionRunner: ObservableObject {
     @Published private(set) var lastFailedAction: GatewayRecoveryAction?
 
     private let startAction: StartAction
+    private let startDrainAction: StartDrainAction?
     private let fetchStatus: FetchStatus
     private let sleep: Sleep
 
@@ -421,6 +458,10 @@ final class GatewayActionRunner: ObservableObject {
             return "Connection is expected to show reconnecting/offline while the gateway restarts."
         case .updateHermes:
             return "Connection may show reconnecting/offline while Hermes updates."
+        case .drainGateway:
+            return "The gateway stays up — in-flight turns finish, new turns are refused."
+        case .cancelDrain:
+            return "The gateway is resuming normal operation."
         }
     }
 
@@ -430,7 +471,17 @@ final class GatewayActionRunner: ObservableObject {
                 switch action {
                 case .restartGateway: return try await control.restartGateway()
                 case .updateHermes: return try await control.updateHermes()
+                // Drain/cancel go through startDrainAction, not here. Returning
+                // a failure here is unreachable because perform() short-circuits
+                // immediate actions before calling startAction.
+                case .drainGateway, .cancelDrain:
+                    return ActionResponse(ok: false, pid: nil, name: action.statusName,
+                                          error: "drain-not-pollable", message: nil)
                 }
+            },
+            startDrainAction: { action in
+                let drainDirection: GatewayDrainAction = (action == .drainGateway) ? .drain : .cancel
+                return try await control.drainGateway(action: drainDirection)
             },
             fetchStatus: { name, lines in
                 try await control.actionStatus(name: name, lines: lines)
@@ -443,6 +494,18 @@ final class GatewayActionRunner: ObservableObject {
 
     init(startAction: @escaping StartAction, fetchStatus: @escaping FetchStatus, sleep: @escaping Sleep) {
         self.startAction = startAction
+        self.startDrainAction = nil
+        self.fetchStatus = fetchStatus
+        self.sleep = sleep
+    }
+
+    /// Inject an immediate (non-pollable) drain action for tests.
+    init(startAction: @escaping StartAction,
+         startDrainAction: @escaping StartDrainAction,
+         fetchStatus: @escaping FetchStatus,
+         sleep: @escaping Sleep) {
+        self.startAction = startAction
+        self.startDrainAction = startDrainAction
         self.fetchStatus = fetchStatus
         self.sleep = sleep
     }
@@ -464,6 +527,14 @@ final class GatewayActionRunner: ObservableObject {
         progressLines = []
         errorMessage = nil
         lastFailedAction = nil
+
+        // Immediate (marker-write) actions: the POST writes/removes the drain
+        // marker synchronously — there is NO background subprocess to poll, so
+        // finish (or fail) on the POST response and do NOT enter the poll loop.
+        if action.isImmediate {
+            await performImmediate(action)
+            return
+        }
 
         do {
             let response = try await startAction(action)
@@ -502,6 +573,58 @@ final class GatewayActionRunner: ObservableObject {
             fail(action, message: "\(action.buttonTitle) was cancelled.")
         } catch {
             fail(action, message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
+    }
+
+    /// Immediate (non-pollable) action path: drain begin / cancel.
+    ///
+    /// The POST writes/removes the drain marker synchronously — the gateway's
+    /// file-watcher flips state within ~1s. There is NO background subprocess
+    /// to poll, so we finish on the POST response: ok → success with an honest
+    /// progress line; ok==false or a thrown error → explicit failure (never a
+    /// silent no-op). Falls back to the pollable `startAction` closure when no
+    /// drain-specific closure is wired (defensive — the production init always
+    /// provides one).
+    private func performImmediate(_ action: GatewayRecoveryAction) async {
+        do {
+            let response: DrainResponse
+            if let startDrainAction {
+                response = try await startDrainAction(action)
+            } else {
+                // No drain closure wired — surface honestly instead of faking ok.
+                fail(action, message: "\(action.buttonTitle) is not available in this configuration.")
+                return
+            }
+            if response.ok {
+                progressLines = [immediateSummary(for: action, response: response)]
+                finishSuccessfully()
+            } else {
+                // Prefer the human-readable message over the machine error code.
+                let detail = response.message ?? response.error ?? "\(action.buttonTitle) was rejected by the gateway."
+                progressLines = response.message.map { [$0] } ?? []
+                fail(action, message: detail)
+            }
+        } catch {
+            fail(action, message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
+    }
+
+    /// One-line truthful summary of the immediate-action result for the
+    /// progress row (shown transiently before the panel refreshes).
+    private func immediateSummary(for action: GatewayRecoveryAction, response: DrainResponse) -> String {
+        switch action {
+        case .drainGateway:
+            if response.draining == true {
+                return "Drain requested — gateway is refusing new turns."
+            }
+            return "Drain requested."
+        case .cancelDrain:
+            if response.wasDraining == true {
+                return "Drain cancelled — gateway is resuming new turns."
+            }
+            return "Cancel requested (gateway was not draining)."
+        case .restartGateway, .updateHermes:
+            return action.progressTitle
         }
     }
 

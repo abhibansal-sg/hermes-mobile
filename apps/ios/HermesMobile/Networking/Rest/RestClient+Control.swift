@@ -234,6 +234,53 @@ struct ActionResponse: Codable, Sendable, Equatable {
     }
 }
 
+/// Direction for `POST /api/gateway/drain`.
+enum GatewayDrainAction: String, Sendable {
+    /// Begin draining: write the marker, gateway refuses new turns.
+    case drain
+    /// Cancel draining: remove the marker, gateway re-accepts.
+    case cancel
+}
+
+/// `POST /api/gateway/drain` response.
+///
+/// The begin-drain response carries `requested_at` / `suppress_notification` /
+/// `draining`; the cancel response carries `was_draining` instead. Every field
+/// is optional so both shapes (and partial payloads) decode without throwing.
+struct DrainResponse: Codable, Sendable, Equatable {
+    let ok: Bool
+    let action: String?
+    let requestedAt: String?
+    let draining: Bool?
+    let suppressNotification: Bool?
+    let wasDraining: Bool?
+    let error: String?
+    let message: String?
+
+    init(ok: Bool, action: String?, requestedAt: String?, draining: Bool?,
+         suppressNotification: Bool?, wasDraining: Bool?, error: String?, message: String?) {
+        self.ok = ok
+        self.action = action
+        self.requestedAt = requestedAt
+        self.draining = draining
+        self.suppressNotification = suppressNotification
+        self.wasDraining = wasDraining
+        self.error = error
+        self.message = message
+    }
+
+    init(json: JSONValue) {
+        self.ok = json["ok"]?.boolValue ?? false
+        self.action = json["action"]?.stringValue
+        self.requestedAt = json["requested_at"]?.stringValue
+        self.draining = json["draining"]?.boolValue
+        self.suppressNotification = json["suppress_notification"]?.boolValue
+        self.wasDraining = json["was_draining"]?.boolValue
+        self.error = json["error"]?.stringValue
+        self.message = json["message"]?.stringValue
+    }
+}
+
 /// `GET /api/actions/{name}/status?lines=N` response for background actions.
 struct ActionStatus: Codable, Sendable, Equatable {
     let name: String
@@ -552,6 +599,21 @@ extension RestClient {
     @discardableResult
     func updateHermes() async throws -> ActionResponse {
         ActionResponse(json: try await postJSON(path: "/api/hermes/update"))
+    }
+
+    /// `POST /api/gateway/drain` — begin or cancel a graceful gateway drain.
+    ///
+    /// `action: .drain` writes the `.drain_request.json` marker the gateway's
+    /// watcher observes (refuse new turns; in-flight finish); `action: .cancel`
+    /// removes it (revert to running). Idempotent on both sides. This endpoint
+    /// only writes/removes the marker — the gateway process owns the state
+    /// transition, so there is NO background action to poll (unlike
+    /// ``restartGateway`` / ``updateHermes`` which spawn a subprocess tracked
+    /// via `/api/actions/{name}/status`).
+    @discardableResult
+    func drainGateway(action: GatewayDrainAction) async throws -> DrainResponse {
+        let body: JSONValue = .object(["action": .string(action.rawValue)])
+        return DrainResponse(json: try await postJSON(path: "/api/gateway/drain", body: body))
     }
 
     /// `GET /api/actions/{name}/status?lines=N` — tail a background action log.
