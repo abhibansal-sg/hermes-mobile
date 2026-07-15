@@ -1,0 +1,83 @@
+name: iOS Tests
+
+# iOS lane for the autonomous pipeline (Abhi order 2026-07-11).
+# Runs focused HermesMobile unit suites on PRs that touch apps/ios/**.
+# OBSERVE-FIRST: not yet in the required gate — promote to required
+# once it proves stable/fast enough (watch 5-10 PRs).
+
+on:
+  pull_request:
+    paths:
+      - "apps/ios/**"
+      - ".github/workflows/ios-tests.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios-unit-tests:
+    name: iOS focused unit tests
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          xcodebuild -version
+
+      - name: Resolve destination
+        id: dest
+        run: |
+          # pick the newest available iPhone simulator on the runner
+          DEVICE=$(xcrun simctl list devices available | grep -Eo 'iPhone [0-9]+[^(]*' | sort -V | tail -1 | xargs)
+          echo "device=${DEVICE:-iPhone 16}" >> "$GITHUB_OUTPUT"
+          echo "Using simulator: ${DEVICE:-iPhone 16}"
+
+      - name: Build and test (focused suites)
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project apps/ios/HermesMobile.xcodeproj \
+            -scheme HermesMobile \
+            -destination "platform=iOS Simulator,name=${{ steps.dest.outputs.device }}" \
+            -only-testing:HermesMobileTests \
+            -parallel-testing-enabled NO \
+            -retry-tests-on-failure \
+            -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult"
+          # STR-1481: CODE_SIGNING_ALLOWED=NO was dropped -- it breaks the test
+          # host's Keychain entitlement (SecItemAdd/SecItemCopyMatching silently
+          # fail under `try?`), corrupting ConnectionStoreReconnectTests +
+          # SessionStoreTokenSourceTests state on gateway-less runners. Ad-hoc
+          # signing is the default here and keeps Keychain access working.
+          # -parallel-testing-enabled NO avoids cross-test-clone contamination
+          # seen in WSLivenessTests under xcodebuild's parallel test runner.
+          # -retry-tests-on-failure (default max 3 attempts, xcodebuild-native):
+          # a handful of pre-existing tests use fixed-duration settle() helpers
+          # (Task.sleep tuned against local-machine timing, e.g. WSLivenessTests
+          # 600ms) instead of condition polling, so they occasionally lose the
+          # race under CI-runner scheduling load -- a different single test each
+          # run (seen: CacheFirstLaunchTests, WSLivenessTests). Genuinely broken
+          # tests still fail every attempt and still fail the job; this only
+          # absorbs environment-timing noise. Systemic de-flaking of the
+          # fixed-sleep settle() pattern across ~9 test files is real, separate
+          # follow-up work, out of this issue's minimum-fix scope.
+          # No `| tail -100`: the full log is left intact so a failing
+          # assertion's name and message are visible in the job log, not
+          # silently truncated away.
+
+      - name: Report failing tests
+        if: failure()
+        run: |
+          xcrun xcresulttool get test-results summary \
+            --path "$RUNNER_TEMP/ios-tests.xcresult" 2>/dev/null || true
+
+      - name: Report
+        if: always()
+        run: echo "iOS focused unit tests finished with status ${{ job.status }}"

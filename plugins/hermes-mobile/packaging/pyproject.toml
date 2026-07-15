@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68,<81"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-mobile-plugin"
+version = "0.1.0"
+description = "HermesMobile iOS companion plugin for Hermes Agent: APNs push, multi-client broadcast, device pairing."
+readme = "README-pypi.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Abhinav Bansal" }]
+keywords = ["hermes-agent", "plugin", "ios", "push-notifications"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+# Runtime deps (fastapi, pydantic, etc.) are provided by the host Hermes
+# install — the plugin only loads inside a running Hermes process, so it
+# declares NO duplicate heavy dependencies of its own.
+dependencies = []
+
+[project.entry-points."hermes_agent.plugins"]
+hermes-mobile = "hermes_mobile_plugin"
+
+[project.urls]
+Homepage = "https://github.com/abhibansal-sg/hermes-mobile"
+
+[tool.setuptools]
+packages = ["hermes_mobile_plugin"]
+
+[tool.setuptools.package-data]
+hermes_mobile_plugin = ["**/*.py", "**/*.yaml", "**/*.sh"]
