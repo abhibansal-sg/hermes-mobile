@@ -140,9 +140,13 @@ final class PendingIntentDraftTests: XCTestCase {
             createSessionNow: {
                 didCreateSession = true
             },
+            currentSessionIdentity: { ("stored-1", "runtime-1") },
             send: { prompt in
                 sentPrompts.append(prompt)
-                return false
+                return .refusedAfterSubmitAttempt
+            },
+            cleanupSession: { _ in
+                XCTFail("an ambiguous post-submit refusal must never trigger cleanup")
             }
         )
 
@@ -153,6 +157,68 @@ final class PendingIntentDraftTests: XCTestCase {
             .ask(prompt: "retry me"),
             "a refused send must re-park the Ask Hermes prompt for retry"
         )
+    }
+
+    // MARK: - STR-815: orphan-session cleanup on a refused send
+
+    /// A send refused BEFORE `prompt.submit` ever reached the server
+    /// (`.refusedBeforeSubmit`) is demonstrably never delivered — the prompt is
+    /// re-parked AND the session created solely for this delivery is cleaned up.
+    func testAskCleansUpJustCreatedSessionWhenRefusedBeforeSubmit() async {
+        let defaults = makeDefaults()
+        var cleanedUpIds: [String] = []
+
+        await PendingIntentRouter.deliverAskPrompt(
+            "clean me up",
+            defaults: defaults,
+            createSessionNow: {},
+            currentSessionIdentity: { ("stored-just-created", "runtime-just-created") },
+            send: { _ in .refusedBeforeSubmit },
+            cleanupSession: { storedId in cleanedUpIds.append(storedId) }
+        )
+
+        XCTAssertEqual(
+            PendingIntent.takePending(from: defaults),
+            .ask(prompt: "clean me up"),
+            "the prompt must still be re-parked even when cleanup also runs"
+        )
+        XCTAssertEqual(cleanedUpIds, ["stored-just-created"],
+                       "the just-created (still-active) session is cleaned up")
+    }
+
+    /// If the active session drifted away from the one this delivery created
+    /// (user navigated elsewhere, another create/open raced in) between capture
+    /// and the refused send, cleanup must NOT touch whatever is active now — the
+    /// prompt is still re-parked, but nothing is deleted through the drifted
+    /// active-session path.
+    func testAskDoesNotCleanUpWhenActiveSessionDriftedBeforeRefusal() async {
+        let defaults = makeDefaults()
+        var identityReads = 0
+        var cleanupCalls = 0
+
+        await PendingIntentRouter.deliverAskPrompt(
+            "drifted",
+            defaults: defaults,
+            createSessionNow: {},
+            currentSessionIdentity: {
+                // Simulate drift: the FIRST read (right after create) captures
+                // the just-created session; every read after that (the
+                // pre-cleanup drift check) reports a DIFFERENT active session,
+                // as if the app navigated elsewhere in between.
+                identityReads += 1
+                return identityReads == 1 ? ("stored-created", "runtime-created") : ("stored-elsewhere", "runtime-elsewhere")
+            },
+            send: { _ in .refusedBeforeSubmit },
+            cleanupSession: { _ in cleanupCalls += 1 }
+        )
+
+        XCTAssertEqual(
+            PendingIntent.takePending(from: defaults),
+            .ask(prompt: "drifted"),
+            "the prompt is still re-parked despite the drift"
+        )
+        XCTAssertEqual(cleanupCalls, 0, "a drifted active session must never be cleaned up")
+        XCTAssertEqual(identityReads, 2, "identity is captured after create and re-read fresh at cleanup time, not cached")
     }
 }
 
