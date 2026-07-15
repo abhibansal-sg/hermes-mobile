@@ -31,6 +31,16 @@ actor CacheStore {
         let partial: Bool
     }
 
+    struct ManifestCommitPayload: Codable {
+        let revision: Int64
+        let cursor: String
+        let sessions: [SessionSummary]
+        let attention: [ManifestAttentionItem]
+        let activeTurns: [ManifestActiveTurn]
+        let transcriptHeads: [String: Int]
+        let capabilities: Set<String>
+    }
+
     // MARK: - Internal state (actor-isolated)
 
     private let db: DatabaseQueue
@@ -100,6 +110,72 @@ actor CacheStore {
             }
             let records = try request.order(Column("lastActive").desc).fetchAll(db)
             return try records.map { try $0.decodeSummary() }
+        }
+    }
+
+    /// Reads the last indivisible manifest snapshot. Session rows and metadata
+    /// are read in the same SQLite snapshot, so no consumer can observe mixed
+    /// revisions after relaunch.
+    func loadManifestProjection(scope: CacheScope) throws -> ManifestProjection {
+        try db.read { db in
+            let rows = try SessionCacheRecord
+                .filter(Column("serverId") == scope.serverId)
+                .filter(Column("profileId") == scope.profileId)
+                .order(Column("lastActive").desc)
+                .fetchAll(db)
+            let legacySessions = try rows.map { try $0.decodeSummary() }
+            guard let raw = try SyncMetaRecord.fetchOne(db, key: SyncMetaRecord.Key.manifest(scope))?.value,
+                  let data = raw.data(using: .utf8),
+                  let payload = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data) else {
+                return ManifestProjection(revision: 0, cursor: nil, sessions: legacySessions, attention: [], activeTurns: [], transcriptHeads: [:], capabilities: [], freshness: .cached)
+            }
+            return ManifestProjection(revision: payload.revision, cursor: payload.cursor, sessions: payload.sessions, attention: payload.attention, activeTurns: payload.activeTurns, transcriptHeads: payload.transcriptHeads, capabilities: payload.capabilities, freshness: .cached)
+        }
+    }
+
+    /// Applies the fully validated chain in one GRDB transaction. Tombstones
+    /// are unconditional on disk; survivor policy belongs to the in-memory
+    /// working-set overlay and can never repersist a removed row.
+    func applyManifest(_ chain: ManifestChain, scope: CacheScope) throws -> ManifestProjection {
+        try db.write { db in
+            if let oldRaw = try SyncMetaRecord.fetchOne(db, key: SyncMetaRecord.Key.manifest(scope))?.value,
+               let data = oldRaw.data(using: .utf8),
+               let old = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data),
+               chain.revision <= old.revision {
+                let rows = try SessionCacheRecord.filter(Column("serverId") == scope.serverId).filter(Column("profileId") == scope.profileId).order(Column("lastActive").desc).fetchAll(db)
+                return ManifestProjection(revision: old.revision, cursor: old.cursor, sessions: old.sessions, attention: old.attention, activeTurns: old.activeTurns, transcriptHeads: old.transcriptHeads, capabilities: old.capabilities, freshness: .fresh)
+            }
+
+            for id in chain.tombstones {
+                try SessionCacheRecord
+                    .filter(Column("id") == id)
+                    .filter(Column("serverId") == scope.serverId)
+                    .filter(Column("profileId") == scope.profileId)
+                    .deleteAll(db)
+            }
+            for summary in chain.sessions where !chain.tombstones.contains(summary.id) {
+                let existing = try SessionCacheRecord.fetchOne(db, key: summary.id)
+                // The legacy cache table's id-only PK predates scoped manifests.
+                // Keep another profile's same-id row untouched; the authoritative
+                // scoped session array is persisted in the manifest payload below.
+                if let existing, (existing.serverId != scope.serverId || existing.profileId != scope.profileId) { continue }
+                let record = try SessionCacheRecord.make(from: summary, scope: scope, isPinned: existing?.isPinned ?? false, lastAccessedAt: existing?.lastAccessedAt ?? 0, transcriptCachedAt: existing?.transcriptCachedAt, maxMessageId: existing?.maxMessageId)
+                try record.save(db)
+            }
+            let previous: [SessionSummary]
+            if chain.reset { previous = [] }
+            else if let raw = try SyncMetaRecord.fetchOne(db, key: SyncMetaRecord.Key.manifest(scope))?.value,
+                    let data = raw.data(using: .utf8), let old = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data) { previous = old.sessions }
+            else { previous = (try? SessionCacheRecord.filter(Column("serverId") == scope.serverId).filter(Column("profileId") == scope.profileId).fetchAll(db).map { try $0.decodeSummary() }) ?? [] }
+            var byID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+            for id in chain.tombstones { byID.removeValue(forKey: id) }
+            for session in chain.sessions where !chain.tombstones.contains(session.id) { byID[session.id] = session }
+            let projectedSessions = byID.values.sorted { ($0.lastActive ?? 0) > ($1.lastActive ?? 0) }
+            let payload = ManifestCommitPayload(revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities)
+            let encoded = try JSONEncoder().encode(payload)
+            try SyncMetaRecord(key: SyncMetaRecord.Key.manifest(scope), value: String(decoding: encoded, as: UTF8.self)).save(db)
+            let rows = try SessionCacheRecord.filter(Column("serverId") == scope.serverId).filter(Column("profileId") == scope.profileId).order(Column("lastActive").desc).fetchAll(db)
+            return ManifestProjection(revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities, freshness: .fresh)
         }
     }
 
