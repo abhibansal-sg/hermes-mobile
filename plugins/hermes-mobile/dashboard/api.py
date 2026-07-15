@@ -3195,7 +3195,23 @@ async def add_custom_provider(
         return JSONResponse(
             status_code=400, content={"error": "invalid base_url", "code": 4001}
         )
-    if api_mode not in _CUSTOM_PROVIDER_API_MODES:
+    cfg = load_config_readonly()
+    providers_cfg = cfg.get("providers") if isinstance(cfg, dict) else {}
+    existing_provider = (
+        providers_cfg.get(name)
+        if isinstance(providers_cfg, dict)
+        else None
+    )
+    existing_modes = set()
+    if isinstance(existing_provider, dict):
+        for key in ("api_mode", "transport"):
+            existing_value = existing_provider.get(key)
+            if isinstance(existing_value, str) and existing_value:
+                existing_modes.add(existing_value)
+    preserving_unknown_api_mode = (
+        api_mode not in _CUSTOM_PROVIDER_API_MODES and api_mode in existing_modes
+    )
+    if api_mode not in _CUSTOM_PROVIDER_API_MODES and not preserving_unknown_api_mode:
         return JSONResponse(
             status_code=400,
             content={
@@ -3291,13 +3307,20 @@ async def add_custom_provider(
         )
 
     os.environ[env_var] = api_key
-    validation = await asyncio.to_thread(
-        _validate_provider_key,
-        api_key=api_key,
-        base_url=base_url,
-        api_mode=api_mode,
-        timeout=_PROVIDER_KEY_VALIDATION_TIMEOUT_SECONDS,
-    )
+    if preserving_unknown_api_mode:
+        validation = _provider_key_validation_payload(
+            "skipped",
+            "validation skipped; existing custom provider uses an API mode "
+            "this mobile build cannot validate",
+        )
+    else:
+        validation = await asyncio.to_thread(
+            _validate_provider_key,
+            api_key=api_key,
+            base_url=base_url,
+            api_mode=api_mode,
+            timeout=_PROVIDER_KEY_VALIDATION_TIMEOUT_SECONDS,
+        )
 
     _provider_audit(request, "custom provider added", name)
 

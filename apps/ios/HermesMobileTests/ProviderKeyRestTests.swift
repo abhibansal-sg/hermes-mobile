@@ -76,6 +76,23 @@ final class ProviderKeyRestTests: XCTestCase {
         RecordingProtocol.requests.compactMap { $0.httpMethod }
     }
 
+    private func recordedBodyString(_ request: URLRequest) -> String {
+        var bodyData = request.httpBody ?? Data()
+        if bodyData.isEmpty, let stream = request.httpBodyStream {
+            stream.open()
+            var drained = Data()
+            let bufferSize = 1_024
+            while stream.hasBytesAvailable {
+                var buffer = [UInt8](repeating: 0, count: bufferSize)
+                let read = stream.read(&buffer, maxLength: bufferSize)
+                if read > 0 { drained.append(buffer, count: read) } else { break }
+            }
+            stream.close()
+            bodyData = drained
+        }
+        return String(data: bodyData, encoding: .utf8) ?? ""
+    }
+
     // MARK: - 1. Path family + method per call site
 
     func testPathFamilyAndMethodPerCallSite() async throws {
@@ -278,6 +295,64 @@ final class ProviderKeyRestTests: XCTestCase {
         XCTAssertEqual(copy, row, "no-arg copy must be identical")
     }
 
+    // MARK: - STR-112: unknown custom-provider api_mode preservation
+
+    func testSTR112ProviderRowPreservesUnknownCustomProviderAPIMode() {
+        let row = ProviderRow(json: .object([
+            "slug": .string("myco"),
+            "name": .string("myco"),
+            "auth_type": .string("custom"),
+            "is_current": .bool(false),
+            "authenticated": .bool(true),
+            "total_models": .number(0),
+            "base_url": .string("https://api.my.co/v1"),
+            "api_mode": .string("responses"),
+        ]))
+
+        XCTAssertNil(row.apiMode)
+        XCTAssertEqual(row.rawAPIMode, "responses")
+    }
+
+    func testSTR112UnknownCustomProviderEditSendsPreservedRawAPIMode() async throws {
+        let providerBody = Data(#"{"provider":{"slug":"myco","name":"myco","authenticated":true}}"#.utf8)
+        let client = makeClient(style: .plugin, script: [(providerBody, 200)])
+        _ = try await client.addCustomProvider(
+            name: "myco",
+            baseURL: "https://api.my.co/v1",
+            rawAPIMode: "responses",
+            apiKey: "sk-rotate"
+        )
+
+        let request = try XCTUnwrap(RecordingProtocol.requests.first)
+        let bodyString = recordedBodyString(request)
+        XCTAssertTrue(bodyString.contains(#""api_mode":"responses""#), bodyString)
+        XCTAssertFalse(bodyString.contains(#""api_mode":"openai""#), bodyString)
+    }
+
+    func testSTR112UnknownCustomProviderEditStateAnnotatesPreservation() {
+        let row = ProviderRow(
+            slug: "myco",
+            name: "myco",
+            authType: .custom,
+            isCurrent: false,
+            authenticated: true,
+            totalModels: 0,
+            models: nil,
+            baseURL: "https://api.my.co/v1",
+            apiMode: nil,
+            rawAPIMode: "responses"
+        )
+
+        let state = CustomProviderAPIModeEditState(existing: row)
+        XCTAssertNil(state.knownMode)
+        XCTAssertEqual(state.preservedRawMode, "responses")
+        XCTAssertTrue(state.isPreservingUnknownMode)
+        XCTAssertEqual(
+            state.annotation,
+            "Stored API mode 'responses' is not editable in mobile; saving preserves it."
+        )
+    }
+
     // MARK: - 4. The api_key rides the POST body, never the URL
 
     func testApiKeyRidesBodyNotURL() async throws {
@@ -295,20 +370,7 @@ final class ProviderKeyRestTests: XCTestCase {
         // `httpBodyStream` for an outgoing request, so drain the stream as a
         // fallback — the security property (key rides the BODY, never the URL)
         // holds either way.
-        var bodyData = request.httpBody ?? Data()
-        if bodyData.isEmpty, let stream = request.httpBodyStream {
-            stream.open()
-            var drained = Data()
-            let bufferSize = 1_024
-            while stream.hasBytesAvailable {
-                var buffer = [UInt8](repeating: 0, count: bufferSize)
-                let read = stream.read(&buffer, maxLength: bufferSize)
-                if read > 0 { drained.append(buffer, count: read) } else { break }
-            }
-            stream.close()
-            bodyData = drained
-        }
-        let bodyString = String(data: bodyData, encoding: .utf8) ?? ""
+        let bodyString = recordedBodyString(request)
         XCTAssertTrue(bodyString.contains("sk-secret"), "api_key missing from body: \(bodyString)")
         // The auth header is the session token (carried by makeRequest).
         XCTAssertEqual(request.value(forHTTPHeaderField: "X-Hermes-Session-Token"), "tok")

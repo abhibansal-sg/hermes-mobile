@@ -85,6 +85,10 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
     /// ABH-257: api_mode for a custom provider (present only on custom rows).
     /// Used to pre-fill the edit/rotate form. `nil` for registered providers.
     let apiMode: ProviderAPIMode?
+    /// STR-112: exact raw api_mode from a custom provider row. Known values map
+    /// to ``apiMode`` as before; unknown values remain available for edit/save
+    /// preservation instead of silently falling back to OpenAI-compatible.
+    let rawAPIMode: String?
 
     var id: String { slug }
 
@@ -107,7 +111,8 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
         totalModels: Int,
         models: [String]?,
         baseURL: String? = nil,
-        apiMode: ProviderAPIMode? = nil
+        apiMode: ProviderAPIMode? = nil,
+        rawAPIMode: String? = nil
     ) {
         self.slug = slug
         self.name = name
@@ -118,6 +123,7 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
         self.models = models
         self.baseURL = baseURL
         self.apiMode = apiMode
+        self.rawAPIMode = rawAPIMode ?? apiMode?.rawValue
     }
 
     func copy(
@@ -155,6 +161,7 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
         // ABH-257: custom-provider transport metadata for the edit/rotate form.
         self.baseURL = json["base_url"]?.stringValue
         let rawMode = json["api_mode"]?.stringValue ?? ""
+        self.rawAPIMode = rawMode.isEmpty ? nil : rawMode
         self.apiMode = rawMode.isEmpty ? nil : ProviderAPIMode(rawValue: rawMode)
     }
 }
@@ -324,6 +331,25 @@ extension RestClient {
         apiMode: ProviderAPIMode,
         apiKey: String
     ) async throws -> ProviderKeyResult {
+        try await addCustomProvider(
+            name: name,
+            baseURL: baseURL,
+            rawAPIMode: apiMode.rawValue,
+            apiKey: apiKey
+        )
+    }
+
+    /// STR-112 edit/rotate path: existing custom providers may carry a raw
+    /// transport string newer than this mobile build. Preserve and resubmit the
+    /// exact string; the server accepts it only when it matches an existing
+    /// stored provider mode.
+    @discardableResult
+    func addCustomProvider(
+        name: String,
+        baseURL: String,
+        rawAPIMode: String,
+        apiKey: String
+    ) async throws -> ProviderKeyResult {
         var request = makeRequest(
             path: "\(mobileAPIPrefix)/providers/custom", method: "POST"
         )
@@ -331,7 +357,7 @@ extension RestClient {
         let body: JSONValue = .object([
             "name": .string(name),
             "base_url": .string(baseURL),
-            "api_mode": .string(apiMode.rawValue),
+            "api_mode": .string(rawAPIMode),
             "api_key": .string(apiKey),
         ])
         request.httpBody = try encodeBody(body, context: "providers.custom")
