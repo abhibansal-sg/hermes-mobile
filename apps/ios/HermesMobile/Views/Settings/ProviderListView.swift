@@ -91,6 +91,8 @@ struct ProviderListView: View {
     @State private var pendingDisconnect: ProviderRow?
     /// The slug currently being disconnected (disables its row while in flight).
     @State private var disconnectingSlug: String?
+    /// The in-flight disconnect mutation, cancelled when the list disappears.
+    @State private var disconnectTask: Task<Void, Never>?
 
     init(rest: RestClient, onProvidersChanged: (() -> Void)? = nil) {
         self.rest = rest
@@ -174,11 +176,17 @@ struct ProviderListView: View {
             presenting: pendingDisconnect
         ) { provider in
             Button("Disconnect", role: .destructive) {
-                Task { await disconnect(provider) }
+                disconnectTask?.cancel()
+                disconnectTask = Task { await disconnect(provider) }
             }
             Button("Cancel", role: .cancel) { pendingDisconnect = nil }
         } message: { provider in
             Text("\u{201C}\(provider.name)\u{201D} will no longer be available for new chats. You can re-add the key any time.")
+        }
+        .onDisappear {
+            disconnectTask?.cancel()
+            disconnectTask = nil
+            disconnectingSlug = nil
         }
     }
 
@@ -277,7 +285,7 @@ struct ProviderListView: View {
             // tap a no-op for them while still letting the swipe Disconnect fire.
             .contentShape(Rectangle())
             .onTapGesture {
-                guard canProvision else { return }
+                guard canProvision, disconnectingSlug == nil else { return }
                 actionError = nil
                 if provider.authType == .custom {
                     pendingEditCustom = provider
@@ -374,11 +382,16 @@ struct ProviderListView: View {
         pendingDisconnect = nil
         actionError = nil
         disconnectingSlug = provider.slug
-        defer { disconnectingSlug = nil }
+        defer {
+            KeychainService.deleteProviderKey(slug: provider.slug)
+            if !Task.isCancelled {
+                disconnectingSlug = nil
+                disconnectTask = nil
+            }
+        }
         do {
             _ = try await rest.removeProviderKey(slug: provider.slug)
-            // Drop the transient client copy if one lingered.
-            KeychainService.deleteProviderKey(slug: provider.slug)
+            guard !Task.isCancelled else { return }
             // Flip the row locally: same slug, now unauthenticated.
             if var rows = phase.value {
                 if let index = rows.firstIndex(where: { $0.slug == provider.slug }) {
@@ -389,6 +402,7 @@ struct ProviderListView: View {
             }
             onProvidersChanged?()
         } catch {
+            guard !Task.isCancelled else { return }
             actionError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
@@ -479,6 +493,7 @@ struct EnterProviderKeyView: View {
     @State private var errorText: String?
     @State private var noticeText: String?
     @State private var isSaving = false
+    @State private var saveTask: Task<Void, Never>?
     @FocusState private var keyFieldFocused: Bool
 
     private var canSave: Bool {
@@ -555,6 +570,11 @@ struct EnterProviderKeyView: View {
         .navigationTitle(provider.name)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { keyFieldFocused = true }
+        .onDisappear {
+            saveTask?.cancel()
+            saveTask = nil
+            isSaving = false
+        }
     }
 
     private func save() {
@@ -574,13 +594,18 @@ struct EnterProviderKeyView: View {
             errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             return
         }
-        Task {
+        saveTask?.cancel()
+        saveTask = Task {
             defer {
                 KeychainService.deleteProviderKey(slug: slug)
-                isSaving = false
+                if !Task.isCancelled {
+                    isSaving = false
+                    saveTask = nil
+                }
             }
             do {
                 let result = try await rest.setProviderKey(slug: slug, apiKey: trimmed)
+                guard !Task.isCancelled else { return }
                 switch ProviderKeySaveDecision(result) {
                 case .confirmed:
                     onSaved(result.row)
@@ -591,9 +616,9 @@ struct EnterProviderKeyView: View {
                 case .savedUnverified(let message):
                     noticeText = message
                     onSaved(result.row)
-                    return
                 }
             } catch {
+                guard !Task.isCancelled else { return }
                 errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
         }
@@ -665,6 +690,7 @@ struct CustomProviderView: View {
     @State private var errorText: String?
     @State private var noticeText: String?
     @State private var isSaving = false
+    @State private var saveTask: Task<Void, Never>?
     @FocusState private var nameFieldFocused: Bool
 
     /// True when opening in edit/rotate mode (an existing row was passed in).
@@ -824,6 +850,11 @@ struct CustomProviderView: View {
             }
             if !isEditing { nameFieldFocused = true }
         }
+        .onDisappear {
+            saveTask?.cancel()
+            saveTask = nil
+            isSaving = false
+        }
     }
 
     private func save() {
@@ -843,10 +874,14 @@ struct CustomProviderView: View {
             errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             return
         }
-        Task {
+        saveTask?.cancel()
+        saveTask = Task {
             defer {
                 KeychainService.deleteProviderKey(slug: trimmedName)
-                isSaving = false
+                if !Task.isCancelled {
+                    isSaving = false
+                    saveTask = nil
+                }
             }
             do {
                 let result = try await rest.addCustomProvider(
@@ -855,6 +890,7 @@ struct CustomProviderView: View {
                     rawAPIMode: selectedRawAPIMode,
                     apiKey: trimmedKey
                 )
+                guard !Task.isCancelled else { return }
                 switch ProviderKeySaveDecision(result) {
                 case .confirmed:
                     onAdded(result.row)
@@ -865,9 +901,9 @@ struct CustomProviderView: View {
                 case .savedUnverified(let message):
                     noticeText = message
                     onAdded(result.row)
-                    return
                 }
             } catch {
+                guard !Task.isCancelled else { return }
                 errorText = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
         }
