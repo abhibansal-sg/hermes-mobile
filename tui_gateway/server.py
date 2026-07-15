@@ -8037,6 +8037,14 @@ def _(rid, params: dict) -> dict:
 
 @method("session.status")
 def _(rid, params: dict) -> dict:
+    """Return the human status report plus machine-readable runtime truth.
+
+    ``running`` comes directly from the live gateway session record; callers
+    must not infer it from ``output``.  Model/provider/usage are null until an
+    agent exists (for example, for a newly-created lazy session).  Once an
+    agent exists, usage is the canonical ``_get_usage`` object and may omit
+    optional measurements such as context-window occupancy when unavailable.
+    """
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -8068,9 +8076,15 @@ def _(rid, params: dict) -> dict:
             updated = _dt(meta.get(field), created)
             break
 
-    usage = _get_usage(agent) if agent is not None else {}
-    provider = getattr(agent, "provider", None) or "unknown"
-    model = getattr(agent, "model", None) or "(unknown)"
+    usage = _get_usage(agent) if agent is not None else None
+    raw_provider = getattr(agent, "provider", None) if agent is not None else None
+    raw_model = getattr(agent, "model", None) if agent is not None else None
+    structured_provider = str(raw_provider) if raw_provider else None
+    structured_model = str(raw_model) if raw_model else None
+    # Preserve the established human-readable fallbacks byte-for-byte for TUI
+    # and CLI consumers while exposing honest nulls to structured clients.
+    provider = raw_provider or "unknown"
+    model = raw_model or "(unknown)"
     lines = [
         "Hermes TUI Status",
         "",
@@ -8085,11 +8099,20 @@ def _(rid, params: dict) -> dict:
             f"Model: {model} ({provider})",
             f"Created: {created.strftime('%Y-%m-%d %H:%M')}",
             f"Last Activity: {updated.strftime('%Y-%m-%d %H:%M')}",
-            f"Tokens: {int(usage.get('total') or 0):,}",
+            f"Tokens: {int((usage or {}).get('total') or 0):,}",
             f"Agent Running: {'Yes' if session.get('running') else 'No'}",
         ]
     )
-    return _ok(rid, {"output": "\n".join(lines)})
+    return _ok(
+        rid,
+        {
+            "output": "\n".join(lines),
+            "running": bool(session.get("running")),
+            "model": structured_model,
+            "provider": structured_provider,
+            "usage": usage,
+        },
+    )
 
 
 @method("session.history")

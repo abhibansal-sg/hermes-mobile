@@ -30,6 +30,7 @@ either already upstream or no longer consumed by `plugins/hermes-mobile` / iOS.
 | S9 | OBSOLETE | The plugin enriches fan-out frames with `stored_session_id`; no desktop foreign-frame core adoption seam is referenced. |
 | S10 | OBSOLETE | Embedded-chat route guards are upstream. iOS closes its owned runtime before RPC delete and uses profile-scoped REST only for non-default rows, so the old REST live-delete core guard has no current consumer. |
 | S11 | STILL-NEEDED (generic) | `prompt.submit` exposes a generic receipt-provider registry and calls it before mutation. The hermes-mobile plugin owns SQLite, profile scoping, liveness, and 30-day retention (ABH-462 / R-48). |
+| S12 | STILL-NEEDED (small) | Stock `session.status` exposes only rendered text. The additive structured projection (`running`, nullable model/provider/usage) is generic gateway protocol completeness and an upstream-ready fix; authoritative runtime state is unreachable through a mobile plugin without replacing the core RPC. |
 
 ## 1. Plugin package: `plugins/hermes-mobile/`
 Rides the STOCK plugin system (`hermes_cli/plugins.py` manager + dashboard
@@ -88,6 +89,10 @@ S11 prompt receipt provider registry + pre-mutation `prompt.submit` call sites.
    PR: "gateway: pluggable prompt idempotency receipts". Core contains no
    mobile database path, schema, or retention policy; those live entirely in
    `plugins/hermes-mobile/prompt_receipts.py`.
+S12 session.status structured runtime truth (~30 lines, server.py). Preserve the
+   existing `output` while exposing the session record's boolean `running` and
+   nullable agent metadata/usage. PR: "fix(gateway): return structured session
+   status" — generic wire-contract completeness for every JSON-RPC client.
 
 ## 3. Drops at rebase (Phase 2)
 Model-switch env-leak fix (upstream superseded + their `model_override` ⇒ most of
