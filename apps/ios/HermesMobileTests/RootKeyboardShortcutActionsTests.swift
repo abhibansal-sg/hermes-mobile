@@ -17,13 +17,38 @@ final class RootKeyboardShortcutActionsTests: XCTestCase {
         sessions.setComposerDraft("  hello keyboard  ", for: key)
         var sent: [String] = []
 
-        let didSend = RootKeyboardShortcutActions.sendCurrentComposerDraft(from: sessions) { text in
+        let didSend = RootKeyboardShortcutActions.sendCurrentComposerDraft(
+            from: sessions,
+            isStreaming: false
+        ) { text in
             sent.append(text)
         }
 
         XCTAssertTrue(didSend)
         XCTAssertEqual(sent, ["hello keyboard"])
         XCTAssertEqual(sessions.composerDraft(for: key), "")
+    }
+
+    func testStreamingSendCurrentComposerDraftDoesNotClearOrSend() {
+        let sessions = SessionStore()
+        let key = sessions.activeComposerDraftKey
+        sessions.setComposerDraft("  keep me queued  ", for: key)
+        var sent: [String] = []
+
+        XCTAssertFalse(RootKeyboardShortcutActions.canSendComposerDraft(
+            sessions: sessions,
+            isStreaming: true
+        ))
+        let didSend = RootKeyboardShortcutActions.sendCurrentComposerDraft(
+            from: sessions,
+            isStreaming: true
+        ) { text in
+            sent.append(text)
+        }
+
+        XCTAssertFalse(didSend)
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertEqual(sessions.composerDraft(for: key), "  keep me queued  ")
     }
 
     func testSendCurrentComposerDraftNoOpsForWhitespaceDraft() {
@@ -255,6 +280,8 @@ final class RootKeyboardShortcutActionsTests: XCTestCase {
         XCTAssertTrue(source.contains("sendCurrentComposerDraft"))
         XCTAssertTrue(source.contains("recallPreviousComposerPrompt"))
         XCTAssertTrue(source.contains("recallNextComposerPrompt"))
+        XCTAssertTrue(source.contains("canSendComposerDraft"))
+        XCTAssertTrue(source.contains("isStreaming: chat.isStreaming"))
         XCTAssertTrue(source.contains("openSettings"))
         XCTAssertTrue(source.contains("navigateBack"))
         XCTAssertTrue(source.contains("navigateForward"))
