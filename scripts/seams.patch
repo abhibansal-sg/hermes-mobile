@@ -182,19 +182,25 @@ index 118a988e1..09d59106a 100644
          _tickets[ticket] = (int(time.time()) + TTL_SECONDS, info)
          _gc_expired_locked()
 diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
-index 6ca393fca..b64c5d5ef 100644
+index 6ca393fca..921638f08 100644
 --- a/hermes_cli/plugins.py
 +++ b/hermes_cli/plugins.py
-@@ -212,6 +212,15 @@ VALID_HOOKS: Set[str] = {
+@@ -212,6 +212,21 @@ VALID_HOOKS: Set[str] = {
      "kanban_task_claimed",
      "kanban_task_completed",
      "kanban_task_blocked",
 +    # TUI-gateway observer hooks. These are observer-only: return values are
 +    # ignored and callback failures must never break gateway traffic.
 +    #
++    # pre_emit_event: event: str, session_id: str, payload: dict | None
++    #   A callback may return {"payload": <dict | None>} to enrich the event
++    #   before it is written. Results are chained in plugin registration order.
++    #   This is intentionally a narrow payload transform; event/session identity
++    #   and delivery remain owned by the gateway.
 +    # post_emit_event: event: str, session_id: str, payload: dict | None
 +    # post_frame_write: frame: dict, session_id: str, owner_transport: Any
 +    # on_ws_transport_change: action: "connect" | "disconnect", transport: Any
++    "pre_emit_event",
 +    "post_emit_event",
 +    "post_frame_write",
 +    "on_ws_transport_change",
@@ -640,7 +646,7 @@ index 7c58062ed..f9066bd35 100644
          from tools.environments.base import touch_activity_if_due
      except Exception:  # pragma: no cover
 diff --git a/tui_gateway/server.py b/tui_gateway/server.py
-index febb4ec0d..6339887ea 100644
+index febb4ec0d..55c1267a2 100644
 --- a/tui_gateway/server.py
 +++ b/tui_gateway/server.py
 @@ -8,6 +8,7 @@ import json
@@ -715,7 +721,7 @@ index febb4ec0d..6339887ea 100644
  
      # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
      # Use session_id (from agent.session_id) not session_key — after compression,
-@@ -1116,6 +1135,41 @@ def _default_session_cwd() -> str:
+@@ -1116,6 +1135,62 @@ def _default_session_cwd() -> str:
      return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
  
  
@@ -727,6 +733,27 @@ index febb4ec0d..6339887ea 100644
 +        invoke_hook(hook, **kwargs)
 +    except Exception:
 +        logger.debug("gateway observer hook %s failed", hook, exc_info=True)
++
++
++def _transform_gateway_event_payload(
++    event: str, sid: str, payload: dict | None
++) -> dict | None:
++    """Apply registered pre-emit payload enrichers without changing routing."""
++    try:
++        from hermes_cli.plugins import invoke_hook
++
++        current = payload
++        for result in invoke_hook(
++            "pre_emit_event", event=event, session_id=sid, payload=current
++        ):
++            if isinstance(result, dict) and "payload" in result:
++                candidate = result["payload"]
++                if candidate is None or isinstance(candidate, dict):
++                    current = candidate
++        return current
++    except Exception:
++        logger.debug("gateway pre-emit transform failed", exc_info=True)
++        return payload
 +
 +
 +_OBSERVER_POOL: concurrent.futures.ThreadPoolExecutor | None = None
@@ -757,7 +784,7 @@ index febb4ec0d..6339887ea 100644
  def write_json(obj: dict) -> bool:
      """Emit one JSON frame. Routes via the most-specific transport available.
  
-@@ -1132,7 +1186,14 @@ def write_json(obj: dict) -> bool:
+@@ -1132,16 +1207,30 @@ def write_json(obj: dict) -> bool:
      if obj.get("method") == "event":
          sid = ((obj.get("params") or {}).get("session_id")) or ""
          if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
@@ -773,7 +800,10 @@ index febb4ec0d..6339887ea 100644
  
      return (current_transport() or _stdio_transport).write(obj)
  
-@@ -1142,6 +1203,12 @@ def _emit(event: str, sid: str, payload: dict | None = None):
+ 
+ def _emit(event: str, sid: str, payload: dict | None = None):
++    payload = _transform_gateway_event_payload(event, sid, payload)
+     params = {"type": event, "session_id": sid}
      if payload is not None:
          params["payload"] = payload
      write_json({"jsonrpc": "2.0", "method": "event", "params": params})
@@ -786,7 +816,7 @@ index febb4ec0d..6339887ea 100644
  
  
  def _emit_approval_request(sid: str, data: dict | None) -> None:
-@@ -1224,6 +1291,147 @@ def method(name: str):
+@@ -1224,6 +1313,147 @@ def method(name: str):
      return dec
  
  
@@ -934,7 +964,7 @@ index febb4ec0d..6339887ea 100644
  def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
      """Validate a JSON-RPC request enough for safe local dispatch."""
      if not isinstance(req, dict):
-@@ -2038,12 +2246,156 @@ def _enable_gateway_prompts() -> None:
+@@ -2038,12 +2268,156 @@ def _enable_gateway_prompts() -> None:
  # ── Blocking prompt factory ──────────────────────────────────────────
  
  
@@ -1092,7 +1122,7 @@ index febb4ec0d..6339887ea 100644
          _pending_prompt_payloads[rid] = (event, dict(payload))
      answered = False
      answer = ""
-@@ -6177,12 +6529,9 @@ def _(rid, params: dict) -> dict:
+@@ -6177,12 +6551,9 @@ def _(rid, params: dict) -> dict:
  def _(rid, params: dict) -> dict:
      """Delete a stored session and its on-disk transcript files.
  
@@ -1108,7 +1138,7 @@ index febb4ec0d..6339887ea 100644
      """
      target = params.get("session_id", "")
      if not target:
-@@ -6190,21 +6539,52 @@ def _(rid, params: dict) -> dict:
+@@ -6190,21 +6561,52 @@ def _(rid, params: dict) -> dict:
      db = _get_db()
      if db is None:
          return _db_unavailable_error(rid, code=5036)
@@ -1172,7 +1202,7 @@ index febb4ec0d..6339887ea 100644
      sessions_dir = get_hermes_home() / "sessions"
      try:
          deleted = db.delete_session(target, sessions_dir=sessions_dir)
-@@ -6212,7 +6592,8 @@ def _(rid, params: dict) -> dict:
+@@ -6212,7 +6614,8 @@ def _(rid, params: dict) -> dict:
          return _err(rid, 5036, f"delete failed: {e}")
      if not deleted:
          return _err(rid, 4007, "session not found")
@@ -1182,7 +1212,7 @@ index febb4ec0d..6339887ea 100644
  
  
  @method("session.title")
-@@ -7802,6 +8183,14 @@ def _(rid, params: dict) -> dict:
+@@ -7802,6 +8205,14 @@ def _(rid, params: dict) -> dict:
  
  @method("session.status")
  def _(rid, params: dict) -> dict:
@@ -1197,7 +1227,7 @@ index febb4ec0d..6339887ea 100644
      session, err = _sess_nowait(params, rid)
      if err:
          return err
-@@ -7833,9 +8222,15 @@ def _(rid, params: dict) -> dict:
+@@ -7833,9 +8244,15 @@ def _(rid, params: dict) -> dict:
              updated = _dt(meta.get(field), created)
              break
  
@@ -1216,7 +1246,7 @@ index febb4ec0d..6339887ea 100644
      lines = [
          "Hermes TUI Status",
          "",
-@@ -7850,11 +8245,20 @@ def _(rid, params: dict) -> dict:
+@@ -7850,11 +8267,20 @@ def _(rid, params: dict) -> dict:
              f"Model: {model} ({provider})",
              f"Created: {created.strftime('%Y-%m-%d %H:%M')}",
              f"Last Activity: {updated.strftime('%Y-%m-%d %H:%M')}",
@@ -1239,7 +1269,7 @@ index febb4ec0d..6339887ea 100644
  
  
  @method("session.history")
-@@ -8073,7 +8477,16 @@ def _(rid, params: dict) -> dict:
+@@ -8073,7 +8499,16 @@ def _(rid, params: dict) -> dict:
  
  @method("session.branch")
  def _(rid, params: dict) -> dict:
@@ -1257,7 +1287,7 @@ index febb4ec0d..6339887ea 100644
      if err:
          return err
      db = _get_db()
-@@ -8465,8 +8878,14 @@ def _(rid, params: dict) -> dict:
+@@ -8465,8 +8900,14 @@ def _(rid, params: dict) -> dict:
  def _(rid, params: dict) -> dict:
      sid, text = params.get("session_id", ""), params.get("text", "")
      truncate_user_ordinal = params.get("truncate_before_user_ordinal")
@@ -1272,7 +1302,7 @@ index febb4ec0d..6339887ea 100644
          return err
      # Re-bind to the current client transport for this request. This keeps
      # streaming events on the active websocket even if an earlier disconnect
-@@ -8479,18 +8898,23 @@ def _(rid, params: dict) -> dict:
+@@ -8479,18 +8920,23 @@ def _(rid, params: dict) -> dict:
              # interrupt the live turn) so it runs as the next turn. See
              # _handle_busy_submit for why the old "session busy" rejection
              # dropped messages when teardown outlived the client's retry window.
@@ -1297,7 +1327,7 @@ index febb4ec0d..6339887ea 100644
                  return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
              history = session.get("history", [])
              user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
-@@ -8500,6 +8924,7 @@ def _(rid, params: dict) -> dict:
+@@ -8500,6 +8946,7 @@ def _(rid, params: dict) -> dict:
              # truncating history to everything before it and persisting that loss
              # via replace_messages — an unrecoverable overwrite of the session DB.
              if ordinal < 0 or ordinal >= len(user_indices):
@@ -1305,7 +1335,7 @@ index febb4ec0d..6339887ea 100644
                  return _err(rid, 4018, "target user message is no longer in session history")
              truncated = history[: user_indices[ordinal]]
              session["history"] = truncated
-@@ -8514,6 +8939,15 @@ def _(rid, params: dict) -> dict:
+@@ -8514,6 +8961,15 @@ def _(rid, params: dict) -> dict:
          session["last_active"] = time.time()
          _start_inflight_turn(session, text)
  
@@ -1321,7 +1351,7 @@ index febb4ec0d..6339887ea 100644
      # Persist the DB row lazily, now that the user has actually sent a message.
      _ensure_session_db_row(session)
      # A branch becomes real here: copy its parent's transcript into the row so it
-@@ -8549,7 +8983,7 @@ def _(rid, params: dict) -> dict:
+@@ -8549,7 +9005,7 @@ def _(rid, params: dict) -> dict:
      # `running` flag (a turn that died without clearing it) and recover the latter.
      session["_run_thread"] = run_thread
      run_thread.start()
@@ -1330,7 +1360,7 @@ index febb4ec0d..6339887ea 100644
  
  
  def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) -> bool:
-@@ -10231,15 +10665,75 @@ def _(rid, params: dict) -> dict:
+@@ -10231,15 +10687,75 @@ def _(rid, params: dict) -> dict:
  # ── Methods: respond ─────────────────────────────────────────────────
  
  
@@ -1407,7 +1437,7 @@ index febb4ec0d..6339887ea 100644
          _answers[r] = params.get(key, "")
          ev.set()
      return _ok(rid, {"status": "ok"})
-@@ -10271,16 +10765,28 @@ def _(rid, params: dict) -> dict:
+@@ -10271,16 +10787,28 @@ def _(rid, params: dict) -> dict:
      session, err = _sess(params, rid)
      if err:
          return err
@@ -1438,7 +1468,7 @@ index febb4ec0d..6339887ea 100644
                  )
              },
          )
-@@ -10363,6 +10869,8 @@ def _(rid, params: dict) -> dict:
+@@ -10363,6 +10891,8 @@ def _(rid, params: dict) -> dict:
          agent = session.get("agent") if session else None
          if agent is not None:
              current_fast = getattr(agent, "service_tier", None) == "priority"
@@ -1447,7 +1477,7 @@ index febb4ec0d..6339887ea 100644
          else:
              current_fast = _load_service_tier() == "priority"
  
-@@ -10402,7 +10910,15 @@ def _(rid, params: dict) -> dict:
+@@ -10402,7 +10932,15 @@ def _(rid, params: dict) -> dict:
                      "fast mode is not available for this model",
                  )
  
@@ -1464,7 +1494,7 @@ index febb4ec0d..6339887ea 100644
          if agent is not None:
              agent.service_tier = "priority" if nv == "fast" else None
              current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-@@ -11368,17 +11884,20 @@ def _(rid, params: dict) -> dict:
+@@ -11368,17 +11906,20 @@ def _(rid, params: dict) -> dict:
          )
          return _ok(rid, {"value": effort, "display": display})
      if key == "fast":

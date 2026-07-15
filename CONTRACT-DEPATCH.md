@@ -12,7 +12,7 @@ plugin and only the irreducible host seams below remain in core.
 ## Baseline (supersession sweep 2026-07-15, merge-base 306e2d231)
 The iOS overlay is rebased onto pristine upstream commit `306e2d231`. The old
 fork carried roughly 1,257 core-patch lines; the re-applied core seam set is 9
-files, +486/-75 lines before this ledger/patch regeneration. Everything else is
+files, +701/-80 lines at this ledger/patch regeneration. Everything else is
 either already upstream or no longer consumed by `plugins/hermes-mobile` / iOS.
 
 ### Seam verdicts on the new base
@@ -20,7 +20,7 @@ either already upstream or no longer consumed by `plugins/hermes-mobile` / iOS.
 | Seam | Verdict | New-base disposition / evidence |
 |---|---|---|
 | S1 | STILL-NEEDED (reduced) | First-class `post_frame_write` and `on_ws_transport_change` hooks only; no legacy subscriber lists (`hermes_cli/plugins.py`, `tui_gateway/server.py`, `tui_gateway/ws.py`). |
-| S2 | STILL-NEEDED (reduced) | First-class `post_emit_event` plus runtime id metadata on upstream's existing `on_session_finalize`; no `_EMIT_OBSERVERS` or synthetic finalize event. |
+| S2 | STILL-NEEDED (reduced) | First-class `pre_emit_event` payload transform and `post_emit_event` observer plus runtime id metadata on upstream's existing `on_session_finalize`; no `_EMIT_OBSERVERS` or synthetic finalize event. The pre-transform lets the mobile plugin stamp one correlation identity before both owner and broadcast delivery. |
 | S3 | SUPERSEDED / reduced | Upstream `_session_info` already includes provider. `_runtime_sid` storage is dropped; finalize receives the existing record's `_sid` as transient hook metadata. |
 | S4 | STILL-NEEDED (small) | Reasoning is already session-scoped upstream. Only `config.set/get fast` needed adaptation to `create_service_tier_override`. |
 | S5 | STILL-NEEDED | The stock provider registry covers exact Bearer-token REST routes, but not rich device metadata, plugin routes, WS tickets, live revocation, socket indexing, or resolver audit identity. Generic registries and guarded call sites remain. Every device-capable dashboard WS route now enters one shared lifecycle that indexes only active device identities and closes revoke/register races (ABH-449). |
@@ -67,8 +67,10 @@ Modules (moved or already-new):
 S1 write_json broadcast hook (~3 lines, server.py) — after owner write, iterate a
    module-level subscriber set the plugin populates. PR: "gateway: event fan-out
    subscribers".
-S2 _emit subscriber (~1 line + finalize ~5 + interrupt ~4, server.py) — generic
-   post-emit observer list. PR: "gateway: emit observers" (push rides it).
+S2 _emit transform/observer (small helper + call, server.py) — generic chained
+   `pre_emit_event` payload transformation followed by the existing post-emit
+   observer. PR: "gateway: event payload transforms + emit observers" (mobile
+   correlation and push ride it; all identity/policy remains plugin-owned).
 S3 `_runtime_sid` in session record (1 line) + `provider` in `_session_info`
    (1 line). PR: trivial info-completeness.
 S4 config.set session-scoping for reasoning/fast (~120 lines today) — REWRITE

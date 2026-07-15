@@ -1145,6 +1145,27 @@ def _notify_gateway_observers(hook: str, **kwargs) -> None:
         logger.debug("gateway observer hook %s failed", hook, exc_info=True)
 
 
+def _transform_gateway_event_payload(
+    event: str, sid: str, payload: dict | None
+) -> dict | None:
+    """Apply registered pre-emit payload enrichers without changing routing."""
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        current = payload
+        for result in invoke_hook(
+            "pre_emit_event", event=event, session_id=sid, payload=current
+        ):
+            if isinstance(result, dict) and "payload" in result:
+                candidate = result["payload"]
+                if candidate is None or isinstance(candidate, dict):
+                    current = candidate
+        return current
+    except Exception:
+        logger.debug("gateway pre-emit transform failed", exc_info=True)
+        return payload
+
+
 _OBSERVER_POOL: concurrent.futures.ThreadPoolExecutor | None = None
 _OBSERVER_POOL_LOCK = threading.Lock()
 
@@ -1199,6 +1220,7 @@ def write_json(obj: dict) -> bool:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    payload = _transform_gateway_event_payload(event, sid, payload)
     params = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload

@@ -215,9 +215,15 @@ VALID_HOOKS: Set[str] = {
     # TUI-gateway observer hooks. These are observer-only: return values are
     # ignored and callback failures must never break gateway traffic.
     #
+    # pre_emit_event: event: str, session_id: str, payload: dict | None
+    #   A callback may return {"payload": <dict | None>} to enrich the event
+    #   before it is written. Results are chained in plugin registration order.
+    #   This is intentionally a narrow payload transform; event/session identity
+    #   and delivery remain owned by the gateway.
     # post_emit_event: event: str, session_id: str, payload: dict | None
     # post_frame_write: frame: dict, session_id: str, owner_transport: Any
     # on_ws_transport_change: action: "connect" | "disconnect", transport: Any
+    "pre_emit_event",
     "post_emit_event",
     "post_frame_write",
     "on_ws_transport_change",

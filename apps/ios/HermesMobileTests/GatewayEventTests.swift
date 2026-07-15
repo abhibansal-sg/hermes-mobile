@@ -263,7 +263,7 @@ final class GatewayEventTests: XCTestCase {
 
     func testApprovalRequestPayloadDefaults() {
         let approval = ApprovalRequestPayload(payload: .object([:]))
-        XCTAssertFalse(approval.id.isEmpty)               // falls back to a UUID
+        XCTAssertTrue(approval.id.isEmpty) // never invent a random dedupe identity
         XCTAssertEqual(approval.title, "Approval required")
         XCTAssertNil(approval.descriptionText)
         XCTAssertNil(approval.action)
