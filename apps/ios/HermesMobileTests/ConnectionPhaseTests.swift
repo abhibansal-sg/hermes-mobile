@@ -83,6 +83,41 @@ final class ConnectionPhaseTests: XCTestCase {
         XCTAssertEqual(ConnectionStore.hydrationTimeout, .seconds(8))
     }
 
+    func testFreshnessStatesHaveDistinctVoiceOverTextAndAuthority() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let weekAgo = now.addingTimeInterval(-7 * 86_400)
+        let cases: [(ConnectionStore.Phase, ManifestFreshness, FreshnessPresentation.Kind, String)] = [
+            (.connecting, .cached, .connecting, "Connecting to server"),
+            (.hydrating, .cached, .syncing, "Synchronizing cached content"),
+            (.connected, .fresh, .fresh, "Content is fresh"),
+            (.offline("network unavailable"), .cached, .offline, "Offline. Last synced 1w ago"),
+            (.offline("sync failed"), .cached, .failedCached, "Synchronization failed. Cached data is shown"),
+            (.connected, .partial, .partial, "Partial synchronization result"),
+        ]
+        var labels = Set<String>()
+        for (phase, freshness, kind, label) in cases {
+            let value = FreshnessPresentation.resolve(
+                phase: phase, manifestFreshness: freshness,
+                lastSyncedAt: weekAgo, now: now
+            )
+            XCTAssertEqual(value.kind, kind)
+            XCTAssertEqual(value.accessibilityLabel, label)
+            labels.insert(value.accessibilityLabel)
+            XCTAssertEqual(value.allowsRemoteMutations, kind == .fresh)
+        }
+        XCTAssertEqual(labels.count, cases.count)
+    }
+
+    func testCompactAndSplitLayoutsShareFreshnessValue() {
+        let value = FreshnessPresentation.resolve(
+            phase: .hydrating, manifestFreshness: .cached, lastSyncedAt: nil
+        )
+        // RootView computes this before its size-class branch, so both layouts
+        // receive the same immutable presentation without changing selection.
+        XCTAssertEqual(value.text, "Syncing")
+        XCTAssertFalse(value.allowsRemoteMutations)
+    }
+
     // MARK: - STR-973A named grace windows
 
     func testTransientGraceWindowIsTenSeconds() {

@@ -954,6 +954,12 @@ final class SessionStore {
     /// Wired once by `AppEnvironment.attachCache(_:)`.
     private var cacheStore: CacheStore?
 
+    /// The last atomically committed manifest state, restored with the drawer.
+    /// It is the shared freshness source for compact and split shells.
+    private(set) var manifestFreshness: ManifestFreshness = .cached
+    private(set) var manifestLastSyncedAt: Date?
+    private(set) var manifestRevision: Int64 = 0
+
     /// Latches `true` after the first `refresh()` has run the cold-launch cache
     /// read. The read only fires when `sessions` is still empty (cold launch),
     /// so a warm in-memory list is never overwritten by a (possibly older) disk
@@ -1650,6 +1656,11 @@ final class SessionStore {
         didColdReadCache = true
         if sessions.isEmpty, let cacheStore, let scope = currentCacheScope {
             lastColdReadServerId = scope.serverId
+            if let manifest = try? await cacheStore.loadManifestProjection(scope: scope) {
+                manifestFreshness = manifest.freshness
+                manifestLastSyncedAt = manifest.lastSyncedAt
+                manifestRevision = manifest.revision
+            }
             if let cached = try? await cacheStore.loadSessionList(scope: scope), !cached.isEmpty {
                 // Re-check emptiness after the await: a concurrent network
                 // refresh may have populated the list while we were reading
@@ -1668,6 +1679,13 @@ final class SessionStore {
                     // subsequent grow-limit appends is accurate.
                     seenServerSessionIds = Set(cached.map(\.id))
                     loadedCount = cached.count
+                    if let lastOpened = try? await cacheStore.loadLastOpenedSession(scope: scope),
+                       let summary = sessions.first(where: {
+                           $0.id == lastOpened.sessionId
+                               && (lastOpened.profileId == "default" || $0.profile == lastOpened.profileId)
+                       }) {
+                        open(summary)
+                    }
                     loadedOffset = cached.count
                 }
             }
@@ -2939,6 +2957,10 @@ final class SessionStore {
         }
         activeRuntimeId = nil          // gates the composer until resume lands
         activeStoredId = summary.id
+        if let cacheStore, let scope = currentCacheScope,
+           let identity = cacheIdentity(summary.id, profile: summary.profile) {
+            Task { try? await cacheStore.saveLastOpenedSession(identity, manifestScope: scope) }
+        }
         let rowProfile = profileParam(for: summary)
         // Fresh user intent to use this session: supersede any in-flight on-demand
         // re-resume (it was for the PREVIOUS session — its result must not bind

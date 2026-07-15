@@ -15,10 +15,12 @@ struct SyncManifestPage: Decodable, Sendable, Equatable {
     let transcriptHeads: [String: Int]
     let deviceRegistered: Bool?
     let capabilities: [String]
+    let serverTime: Double?
 
     enum CodingKeys: String, CodingKey {
         case revision, cursor, nextCursor, hasMore, reset, sessions, tombstones
         case attention, activeTurns, transcriptHeads, deviceRegistered, capabilities
+        case serverTime = "server_time"
     }
 
     init(from decoder: Decoder) throws {
@@ -34,6 +36,7 @@ struct SyncManifestPage: Decodable, Sendable, Equatable {
         transcriptHeads = try c.decodeIfPresent([String: Int].self, forKey: .transcriptHeads) ?? [:]
         deviceRegistered = try c.decodeIfPresent(Bool.self, forKey: .deviceRegistered)
         capabilities = try c.decodeIfPresent([String].self, forKey: .capabilities) ?? []
+        serverTime = try c.decodeIfPresent(Double.self, forKey: .serverTime)
         let raw = try c.decodeIfPresent([ManifestTombstone].self, forKey: .tombstones) ?? []
         tombstones = raw.map(\.id)
     }
@@ -77,6 +80,7 @@ struct ManifestChain: Sendable, Equatable {
     let transcriptHeads: [String: Int]
     let deviceRegistered: Bool?
     let capabilities: Set<String>
+    let serverTime: Double?
 
     init(validating pages: [SyncManifestPage]) throws {
         guard let first = pages.first else { throw ManifestValidationError.emptyChain }
@@ -98,6 +102,7 @@ struct ManifestChain: Sendable, Equatable {
         transcriptHeads = pages.reduce(into: [:]) { $0.merge($1.transcriptHeads) { _, new in new } }
         deviceRegistered = pages.compactMap(\.deviceRegistered).last
         capabilities = Set(pages.flatMap(\.capabilities))
+        serverTime = pages.compactMap(\.serverTime).last
     }
 }
 
@@ -114,6 +119,14 @@ struct ManifestProjection: Sendable, Equatable {
     let transcriptHeads: [String: Int]
     let capabilities: Set<String>
     let freshness: ManifestFreshness
+    let lastSyncedAt: Date?
+
+    init(revision: Int64, cursor: String?, sessions: [SessionSummary], attention: [ManifestAttentionItem], activeTurns: [ManifestActiveTurn], transcriptHeads: [String: Int], capabilities: Set<String>, freshness: ManifestFreshness, lastSyncedAt: Date? = nil) {
+        self.revision = revision; self.cursor = cursor; self.sessions = sessions
+        self.attention = attention; self.activeTurns = activeTurns
+        self.transcriptHeads = transcriptHeads; self.capabilities = capabilities
+        self.freshness = freshness; self.lastSyncedAt = lastSyncedAt
+    }
 
     static let empty = ManifestProjection(revision: 0, cursor: nil, sessions: [], attention: [], activeTurns: [], transcriptHeads: [:], capabilities: [], freshness: .cached)
 }
