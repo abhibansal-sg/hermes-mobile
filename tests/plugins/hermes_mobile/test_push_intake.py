@@ -916,7 +916,6 @@ def test_session_close_unregisters_live_activity_runtime(monkeypatch, wired_gate
         return True
 
     monkeypatch.setattr(pn, "unregister_live_activity_token", _fake_unregister)
-    monkeypatch.setattr(server_mod, "_notify_session_boundary", lambda *a, **k: None)
     agent = types.SimpleNamespace(session_id="stored-session")
     server_mod._sessions["sid-la-close"] = _session(
         agent=agent, _runtime_sid="sid-la-close"

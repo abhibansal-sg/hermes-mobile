@@ -405,17 +405,22 @@ def _load_busy_input_mode() -> str:
 
 
 def _notify_session_boundary(
-    event_type: str, session_id: str | None, platform: str | None = None
+    event_type: str,
+    session_id: str | None,
+    platform: str | None = None,
+    runtime_session_id: str | None = None,
 ) -> None:
     """Fire session lifecycle hooks with CLI parity."""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
 
-        _invoke_hook(
-            event_type,
-            session_id=session_id,
-            platform=_resolve_agent_platform(platform),
-        )
+        kwargs = {
+            "session_id": session_id,
+            "platform": _resolve_agent_platform(platform),
+        }
+        if runtime_session_id:
+            kwargs["runtime_session_id"] = runtime_session_id
+        _invoke_hook(event_type, **kwargs)
     except Exception:
         pass
 
@@ -616,7 +621,12 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
-    _notify_session_boundary("on_session_finalize", session_id, _session_source(session))
+    _notify_session_boundary(
+        "on_session_finalize",
+        session_id,
+        _session_source(session),
+        runtime_session_id=str(session.get("_sid") or "") or None,
+    )
 
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
     # Use session_id (from agent.session_id) not session_key — after compression,
