@@ -264,7 +264,8 @@ def build_alert_payload(
 # A Live Activity push targets the activity's own push token (NOT the app's
 # device token) and uses a dedicated apns-push-type/topic. The content-state
 # keys MUST match HermesTurnAttributes.ContentState exactly (Swift Codable):
-#   phase: String, toolName: String?, elapsedSeconds: Int, needsApproval: Bool
+#   phase: String, toolName: String?, elapsedSeconds: Int, needsApproval: Bool,
+#   startedAtEpochSeconds: Double?
 # ---------------------------------------------------------------------------
 
 # Per the contract: the Live Activity topic is the bundle id suffixed with the
@@ -1006,6 +1007,7 @@ def notify_live_activity(
     content_state: Dict[str, Any],
     *,
     end: bool = False,
+    priority: int = 10,
 ) -> bool:
     """Send a Live Activity remote update (or end) for ``session_id``.
 
@@ -1017,7 +1019,9 @@ def notify_live_activity(
     relay delivery failures are surfaced via relay warnings/failure counters.
 
     ``content_state`` MUST use the ``HermesTurnAttributes.ContentState`` Codable
-    field names (``phase``, ``toolName``, ``elapsedSeconds``, ``needsApproval``).
+    field names (``phase``, ``toolName``, ``elapsedSeconds``, ``needsApproval``,
+    ``startedAtEpochSeconds``). ``priority`` is 10 for lifecycle/blocking
+    transitions and 5 for routine progress updates.
 
     Never raises: errors are logged and swallowed so a failed LA push can never
     break the calling gateway hook.
@@ -1065,7 +1069,9 @@ def notify_live_activity(
         return False
 
     headers = build_live_activity_headers(
-        provider_jwt=provider_jwt, topic=config.topic
+        provider_jwt=provider_jwt,
+        topic=config.topic,
+        priority=priority,
     )
     body_bytes = json.dumps(
         build_live_activity_payload(content_state, end=end)
@@ -1128,10 +1134,12 @@ def _session_holds_foreground(session) -> bool:
     return t is not None and not getattr(t, "_closed", False)
 
 
-# Minimum seconds between Live Activity remote updates for one session. The
-# final/end update is always sent (it bypasses the throttle) so the activity
-# never gets stuck on a stale frame.
+# Minimum seconds between routine Live Activity remote updates for one session.
+# Lifecycle/blocking updates bypass this budget floor so user action and terminal
+# state are delivered immediately.
 _LIVE_ACTIVITY_THROTTLE_S = 3.0
+_LIVE_ACTIVITY_PRIORITY_ROUTINE = 5
+_LIVE_ACTIVITY_PRIORITY_IMMEDIATE = 10
 _PUSH_QUEUE_MAX = 512
 _PUSH_ALERT_EVENTS = frozenset(
     {
@@ -1148,7 +1156,9 @@ _LIVE_ACTIVITY_EVENTS = frozenset(
         "tool.start",
         "tool.complete",
         "approval.request",
+        "clarify.request",
         "status.update",
+        "error",
         "message.complete",
         "session.interrupt",
     }
@@ -1310,14 +1320,39 @@ def _live_activity_status_phase(data: dict) -> tuple[str, bool]:
     return "thinking", False
 
 
-def _live_activity_end_content_state(elapsed_seconds: int = 0) -> dict:
-    """Terminal Live Activity content-state shared by every turn-death path."""
-    return {
-        "phase": "done",
-        "toolName": None,
+def _live_activity_content_state(
+    *,
+    phase: str,
+    tool_name: str | None,
+    elapsed_seconds: int,
+    needs_approval: bool,
+    started_at_epoch_seconds: int | None,
+) -> dict:
+    """Build the exact ActivityKit state shape shared by every event path."""
+    state = {
+        "phase": phase,
+        "toolName": tool_name,
         "elapsedSeconds": max(0, int(elapsed_seconds or 0)),
-        "needsApproval": False,
+        "needsApproval": needs_approval,
     }
+    if started_at_epoch_seconds is not None:
+        state["startedAtEpochSeconds"] = started_at_epoch_seconds
+    return state
+
+
+def _live_activity_end_content_state(
+    elapsed_seconds: int = 0,
+    *,
+    started_at_epoch_seconds: int | None = None,
+) -> dict:
+    """Terminal Live Activity content-state shared by every turn-death path."""
+    return _live_activity_content_state(
+        phase="done",
+        tool_name=None,
+        elapsed_seconds=elapsed_seconds,
+        needs_approval=False,
+        started_at_epoch_seconds=started_at_epoch_seconds,
+    )
 
 
 def _unique_live_activity_session_ids(*session_ids: object) -> list[str]:
@@ -1333,10 +1368,18 @@ def _send_live_activity_end_frame(session_id: str, *, elapsed_seconds: int = 0) 
     """Best-effort terminal frame for one registered Live Activity token."""
     if live_activity_token_for(session_id) is None:
         return False
+    session = _gw_sessions().get(session_id) or {}
+    started_at = session.get("_la_started_at_epoch_seconds")
+    if started_at is None and session.get("_push_turn_started") is not None:
+        started_at = int(session["_push_turn_started"])
     return notify_live_activity(
         session_id,
-        _live_activity_end_content_state(elapsed_seconds),
+        _live_activity_end_content_state(
+            elapsed_seconds,
+            started_at_epoch_seconds=started_at,
+        ),
         end=True,
+        priority=_LIVE_ACTIVITY_PRIORITY_IMMEDIATE,
     )
 
 
@@ -1414,12 +1457,12 @@ def _live_activity_hook(
     """Drive ActivityKit Live Activity remote updates from gateway events.
 
     Silent no-op unless push is armed AND the session has a registered Live
-    Activity token. Updates on tool.start / tool.complete / status.update /
-    message.start; ends on message.complete / interrupt. Throttled to one
-    update per :data:`_LIVE_ACTIVITY_THROTTLE_S` per session; the end frame is
-    always sent. ``content-state`` uses the exact HermesTurnAttributes
-    .ContentState Codable field names (phase/toolName/elapsedSeconds/
-    needsApproval).
+    Activity token. Routine tool/progress frames use APNs priority 5 and are
+    coalesced by visible semantic state plus the three-second budget floor.
+    Start, approval, clarification, blocking status, error, and end transitions
+    use priority 10 and bypass routine coalescing. ``content-state`` uses the
+    exact HermesTurnAttributes.ContentState Codable field names and carries one
+    stable Unix start epoch for the activity lifetime.
     """
     try:
         if not APNsConfig.from_env().is_armed():
@@ -1432,18 +1475,43 @@ def _live_activity_hook(
         is_end = event in ("message.complete", "session.interrupt")
         now = event_time or time.time()
 
-        # Elapsed seconds from the turn start stamped on message.start.
+        # Elapsed seconds and the stable wire epoch both derive from the turn
+        # start stamped on message.start. The integer epoch is cached separately
+        # so every frame has byte-identical start-time semantics even as elapsed
+        # seconds advance.
         current_started = (session or {}).get("_push_turn_started")
         started = turn_started
         if started is None:
             started = current_started
+        if event == "message.start" and started is None:
+            started = now
+        started_at_epoch_seconds = (session or {}).get(
+            "_la_started_at_epoch_seconds"
+        )
+        if event == "message.start":
+            started_at_epoch_seconds = int(started)
+            if session is not None:
+                session["_la_started_at_epoch_seconds"] = started_at_epoch_seconds
+        elif started_at_epoch_seconds is None and started is not None:
+            started_at_epoch_seconds = int(started)
+            if session is not None:
+                session["_la_started_at_epoch_seconds"] = started_at_epoch_seconds
+        elif started_at_epoch_seconds is None:
+            # A registered activity can outlive incomplete gateway bookkeeping
+            # (for example an interrupt before message.start was retained). Give
+            # that lifetime one stable epoch rather than changing it per frame.
+            started_at_epoch_seconds = int(now)
+            if session is not None:
+                session["_la_started_at_epoch_seconds"] = started_at_epoch_seconds
         elapsed = int(max(0.0, now - started)) if started else 0
-        bypass_throttle = is_end
+        immediate = is_end
 
         if event == "message.start":
             if session is not None:
                 session.pop("_la_end_sent_turn_started", None)
+                session.pop("_la_last_semantic_state", None)
             phase, tool_name, needs_approval = "thinking", None, False
+            immediate = True
         elif event == "tool.start":
             phase = "tool"
             tool_name = str(data.get("name")) if data.get("name") else None
@@ -1452,12 +1520,18 @@ def _live_activity_hook(
             phase, tool_name, needs_approval = "thinking", None, False
         elif event == "approval.request":
             phase, tool_name, needs_approval = "waiting", None, True
-            bypass_throttle = True
+            immediate = True
+        elif event == "clarify.request":
+            phase, tool_name, needs_approval = "waiting", None, False
+            immediate = True
         elif event == "status.update":
             phase, needs_approval = _live_activity_status_phase(data)
             tool_name = None
             if str(data.get("kind") or "").strip().lower() in _LA_BLOCKING_STATUS_KINDS:
-                bypass_throttle = True
+                immediate = True
+        elif event == "error":
+            phase, tool_name, needs_approval = "error", None, False
+            immediate = True
         elif is_end:
             if (
                 session is not None
@@ -1475,25 +1549,38 @@ def _live_activity_hook(
         else:
             return
 
-        content_state = (
-            _live_activity_end_content_state(elapsed)
-            if is_end
-            else {
-                "phase": phase,
-                "toolName": tool_name,
-                "elapsedSeconds": elapsed,
-                "needsApproval": needs_approval,
-            }
+        content_state = _live_activity_content_state(
+            phase=phase,
+            tool_name=tool_name,
+            elapsed_seconds=elapsed,
+            needs_approval=needs_approval,
+            started_at_epoch_seconds=started_at_epoch_seconds,
         )
 
-        # Throttle non-final updates to >=3s/session; the end frame always goes.
-        if not is_end and session is not None:
-            last = session.get("_la_last_update", 0.0)
-            if not bypass_throttle and (now - last) < _LIVE_ACTIVITY_THROTTLE_S:
+        # Routine frames only spend budget when user-visible state changed.
+        # elapsedSeconds is deliberately excluded: the stable start epoch lets
+        # ActivityKit render elapsed time locally without timer-refresh pushes.
+        semantic_state = (phase, tool_name, needs_approval)
+        if not immediate and session is not None:
+            if session.get("_la_last_semantic_state") == semantic_state:
                 return
+            last = session.get("_la_last_update", 0.0)
+            if (now - last) < _LIVE_ACTIVITY_THROTTLE_S:
+                return
+        if session is not None:
             session["_la_last_update"] = now
+            session["_la_last_semantic_state"] = semantic_state
 
-        notify_live_activity(sid, content_state, end=is_end)
+        notify_live_activity(
+            sid,
+            content_state,
+            end=is_end,
+            priority=(
+                _LIVE_ACTIVITY_PRIORITY_IMMEDIATE
+                if immediate
+                else _LIVE_ACTIVITY_PRIORITY_ROUTINE
+            ),
+        )
     except Exception:
         _log.debug("live activity hook failed", exc_info=True)
 
