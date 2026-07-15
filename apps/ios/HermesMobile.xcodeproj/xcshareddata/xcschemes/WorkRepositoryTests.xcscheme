@@ -9,15 +9,29 @@
       <BuildActionEntries>
          <BuildActionEntry
             buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "70E50CB4B9752A34FC91EDBF"
+               BuildableName = "HermesShareTests.xctest"
+               BlueprintName = "HermesShareTests"
+               ReferencedContainer = "container:HermesMobile.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
             buildForRunning = "YES"
             buildForProfiling = "YES"
             buildForArchiving = "YES"
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "E084E7061D97A1CB68FAED6E"
-               BuildableName = "HermesMobile.app"
-               BlueprintName = "HermesMobile"
+               BlueprintIdentifier = "0297D2E997BD7387AAFD8923"
+               BuildableName = "HermesWorkTestHost.app"
+               BlueprintName = "HermesWorkTestHost"
                ReferencedContainer = "container:HermesMobile.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -29,9 +43,9 @@
             buildForAnalyzing = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "7B04007FC76BC95C646A4BA8"
-               BuildableName = "HermesMobileTests.xctest"
-               BlueprintName = "HermesMobileTests"
+               BlueprintIdentifier = "C00951F041FFF58A58AF3997"
+               BuildableName = "WorkRepositoryTests.xctest"
+               BlueprintName = "WorkRepositoryTests"
                ReferencedContainer = "container:HermesMobile.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -41,29 +55,18 @@
       buildConfiguration = "Debug"
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
-      shouldUseLaunchSchemeArgsEnv = "NO"
+      shouldUseLaunchSchemeArgsEnv = "YES"
       onlyGenerateCoverageForSpecifiedTargets = "NO">
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "E084E7061D97A1CB68FAED6E"
-            BuildableName = "HermesMobile.app"
-            BlueprintName = "HermesMobile"
+            BlueprintIdentifier = "0297D2E997BD7387AAFD8923"
+            BuildableName = "HermesWorkTestHost.app"
+            BlueprintName = "HermesWorkTestHost"
             ReferencedContainer = "container:HermesMobile.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
       <Testables>
-         <TestableReference
-            skipped = "NO"
-            parallelizable = "NO">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "7B04007FC76BC95C646A4BA8"
-               BuildableName = "HermesMobileTests.xctest"
-               BlueprintName = "HermesMobileTests"
-               ReferencedContainer = "container:HermesMobile.xcodeproj">
-            </BuildableReference>
-         </TestableReference>
          <TestableReference
             skipped = "NO"
             parallelizable = "NO">
@@ -86,32 +89,9 @@
                ReferencedContainer = "container:HermesMobile.xcodeproj">
             </BuildableReference>
          </TestableReference>
-         <TestableReference
-            skipped = "NO"
-            parallelizable = "NO">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "F974E240959519AA0BE1D74B"
-               BuildableName = "HermesMobileUITests.xctest"
-               BlueprintName = "HermesMobileUITests"
-               ReferencedContainer = "container:HermesMobile.xcodeproj">
-            </BuildableReference>
-         </TestableReference>
       </Testables>
       <CommandLineArguments>
       </CommandLineArguments>
-      <EnvironmentVariables>
-         <EnvironmentVariable
-            key = "HERMES_URL"
-            value = "$(TEST_RUNNER_HERMES_URL)"
-            isEnabled = "YES">
-         </EnvironmentVariable>
-         <EnvironmentVariable
-            key = "HERMES_TOKEN"
-            value = "$(TEST_RUNNER_HERMES_TOKEN)"
-            isEnabled = "YES">
-         </EnvironmentVariable>
-      </EnvironmentVariables>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Debug"
@@ -127,14 +107,12 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "E084E7061D97A1CB68FAED6E"
-            BuildableName = "HermesMobile.app"
-            BlueprintName = "HermesMobile"
+            BlueprintIdentifier = "0297D2E997BD7387AAFD8923"
+            BuildableName = "HermesWorkTestHost.app"
+            BlueprintName = "HermesWorkTestHost"
             ReferencedContainer = "container:HermesMobile.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
-      <CommandLineArguments>
-      </CommandLineArguments>
    </LaunchAction>
    <ProfileAction
       buildConfiguration = "Release"
@@ -146,9 +124,9 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "E084E7061D97A1CB68FAED6E"
-            BuildableName = "HermesMobile.app"
-            BlueprintName = "HermesMobile"
+            BlueprintIdentifier = "0297D2E997BD7387AAFD8923"
+            BuildableName = "HermesWorkTestHost.app"
+            BlueprintName = "HermesWorkTestHost"
             ReferencedContainer = "container:HermesMobile.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>

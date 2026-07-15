@@ -19,8 +19,8 @@ packages:
   # the ios-clean procedure (see HermesMobile/App/DebugBridgeWiring.swift).
   DebugBridge:
     path: DebugBridge
-  # Offline-first cache layer (P1/P2). HermesMobile only; NOT linked into
-  # HermesWidgets or HermesShare — neither extension has a persistence need.
+  # Offline-first cache plus the protected app-group WorkRepository. The share
+  # extension links GRDB so it can atomically enqueue into the same database.
   GRDB:
     url: https://github.com/groue/GRDB.swift
     from: "7.0.0"
@@ -30,6 +30,16 @@ packages:
     url: https://github.com/mgriebling/SwiftMath
     from: "1.7.3"
 targets:
+  HermesWorkTestHost:
+    type: application
+    platform: iOS
+    sources:
+      - HermesWorkTestHost
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.work-test-host
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: true
   HermesMobile:
     type: application
     platform: iOS
@@ -124,6 +134,10 @@ targets:
     sources:
       - HermesShare
       - HermesMobile/Support/SharedStore.swift
+      - HermesMobile/Work
+    dependencies:
+      - package: GRDB
+        product: GRDB
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.share
@@ -148,7 +162,13 @@ targets:
     type: bundle.unit-test
     platform: iOS
     sources:
-      - HermesMobileTests
+      - path: HermesMobileTests
+        excludes:
+          - LegacyWorkImportTests.swift
+          - WorkRepositoryCrossProcessTests.swift
+          - WorkRepositoryLeaseTests.swift
+          - WorkRepositoryMigrationTests.swift
+          - WorkRepositoryTestSupport.swift
     dependencies:
       - target: HermesMobile
       # GRDB direct link so CacheLayerTests can call DatabaseQueue(configuration:)
@@ -158,6 +178,65 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.tests
+        GENERATE_INFOPLIST_FILE: true
+  WorkRepositoryTests:
+    type: bundle.unit-test
+    platform: iOS
+    hostApplication: HermesWorkTestHost
+    sources:
+      - HermesMobileTests/LegacyWorkImportTests.swift
+      - HermesMobileTests/WorkRepositoryCrossProcessTests.swift
+      - HermesMobileTests/WorkRepositoryLeaseTests.swift
+      - HermesMobileTests/WorkRepositoryMigrationTests.swift
+      - HermesMobileTests/WorkRepositoryTestSupport.swift
+      - HermesMobile/Support/SharedStore.swift
+      - HermesMobile/Work
+    dependencies:
+      - target: HermesWorkTestHost
+      - package: GRDB
+        product: GRDB
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.work.tests
+        GENERATE_INFOPLIST_FILE: true
+  WorkRepositoryMacTests:
+    # Tool-hosted mirror for CI/hosts where CoreSimulator is unavailable. It
+    # compiles the exact same repository sources and test cases as the iOS target.
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - HermesMobileTests/LegacyWorkImportTests.swift
+      - HermesMobileTests/WorkRepositoryCrossProcessTests.swift
+      - HermesMobileTests/WorkRepositoryLeaseTests.swift
+      - HermesMobileTests/WorkRepositoryMigrationTests.swift
+      - HermesMobileTests/WorkRepositoryTestSupport.swift
+      - HermesMobile/Support/SharedStore.swift
+      - HermesMobile/Work
+    dependencies:
+      - package: GRDB
+        product: GRDB
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.work.mac-tests
+        GENERATE_INFOPLIST_FILE: true
+  HermesShareTests:
+    type: bundle.unit-test
+    platform: iOS
+    hostApplication: HermesWorkTestHost
+    sources:
+      - HermesShareTests
+      - HermesShare/SharedInboxWriter.swift
+      - HermesShare/SharedItemLoader.swift
+      - HermesMobile/Support/SharedStore.swift
+      - HermesMobile/Work
+    dependencies:
+      - target: HermesWorkTestHost
+      - package: GRDB
+        product: GRDB
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.share.tests
         GENERATE_INFOPLIST_FILE: true
   HermesMobileUITests:
     type: bundle.ui-testing
@@ -182,6 +261,8 @@ schemes:
       config: Debug
       targets:
         - HermesMobileTests
+        - WorkRepositoryTests
+        - HermesShareTests
         - HermesMobileUITests
       # Live UI tests (ChatFlowUITests / CrossClientSyncUITests) read HERMES_URL /
       # HERMES_TOKEN from the UI-test-runner process environment and forward them
@@ -196,3 +277,22 @@ schemes:
         - variable: HERMES_TOKEN
           value: $(TEST_RUNNER_HERMES_TOKEN)
           isEnabled: true
+  WorkRepositoryTests:
+    build:
+      targets:
+        HermesWorkTestHost: all
+        WorkRepositoryTests: [test]
+        HermesShareTests: [test]
+    test:
+      config: Debug
+      targets:
+        - WorkRepositoryTests
+        - HermesShareTests
+  WorkRepositoryMacTests:
+    build:
+      targets:
+        WorkRepositoryMacTests: [test]
+    test:
+      config: Debug
+      targets:
+        - WorkRepositoryMacTests
