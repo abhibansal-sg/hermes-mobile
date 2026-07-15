@@ -1963,10 +1963,11 @@ def _load_cfg() -> dict:
         # Honor a per-session profile override (see session.resume) so a resumed
         # remote profile loads ITS config (model, skills, prompt); otherwise the
         # launch profile's _hermes_home. Cache is keyed on the resolved path, so
-        # profiles don't clobber each other.
+        # profiles don't clobber each other. set_hermes_home_override accepts
+        # both str and Path, so resolve either form here (STR-995).
         override = get_hermes_home_override()
-        home = override if isinstance(override, str) and override else _hermes_home
-        p = Path(home) / "config.yaml"
+        home = Path(override) if override else _hermes_home
+        p = home / "config.yaml"
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
@@ -5576,6 +5577,23 @@ def _deferred_session_record(
     }
 
 
+def _close_orphaned_profile_db(db, profile_home) -> None:
+    """Close a freshly-opened profile SessionDB that never reached an agent.
+
+    A profile-scoped resume opens its own ``SessionDB(profile_home/state.db)``
+    up front (``session.resume``). When a concurrent resume already won the live
+    slot and the request reuses that winner instead, the db opened here is
+    orphaned — never handed to an agent, never closed. Each colliding reconnect
+    would leak a SQLite handle (STR-995 contract 3). The launch db (``_get_db``)
+    is a process-global singleton and must NOT be closed here.
+    """
+    if profile_home is not None and hasattr(db, "close"):
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
 def _claim_or_reuse_live(
     sid: str, session_key: str, record: dict, lease
 ) -> tuple[str, dict] | None:
@@ -5583,7 +5601,7 @@ def _claim_or_reuse_live(
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
     with _session_resume_lock:
-        live = _find_live_session_by_key(session_key)
+        live = _find_live_session_by_key(session_key, record.get("profile_home"))
         if live is not None:
             if lease is not None:
                 lease.release()
@@ -5697,8 +5715,9 @@ def _(rid, params: dict) -> dict:
 
     # Fast path: if the session is already live, reuse it under the lock.
     with _session_resume_lock:
-        live = _find_live_session_by_key(target)
+        live = _find_live_session_by_key(target, profile_home)
         if live is not None:
+            _close_orphaned_profile_db(db, profile_home)
             return _ok(rid, _reuse_live_payload(*live))
 
     # Lazy/watch resume: register the live session WITHOUT building an agent.
@@ -5738,6 +5757,7 @@ def _(rid, params: dict) -> dict:
             lazy=True,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
+            _close_orphaned_profile_db(db, profile_home)
             return _ok(rid, _reuse_live_payload(*live))
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
@@ -5816,6 +5836,7 @@ def _(rid, params: dict) -> dict:
             resume_runtime_overrides=overrides or None,
         )
         if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
+            _close_orphaned_profile_db(db, profile_home)
             return _ok(rid, _reuse_live_payload(*live))
 
         _schedule_agent_build(sid)
@@ -5905,7 +5926,7 @@ def _(rid, params: dict) -> dict:
     # live session while we were building. Re-check under the lock; if it won,
     # discard our just-built agent and reuse theirs (no worker/poller wired yet).
     with _session_resume_lock:
-        live = _find_live_session_by_key(target)
+        live = _find_live_session_by_key(target, profile_home)
         if live is not None:
             try:
                 if hasattr(agent, "close"):
@@ -6078,12 +6099,40 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
-def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+# Sentinel for _find_live_session_by_key: match a live session across ALL
+# profiles (legacy/mirror callers). Distinct from an explicit None, which means
+# "scope to the launch profile only". The lazy child-mirror path uses this so it
+# keeps relaying a child's stream into its watch window regardless of profile.
+_PROFILE_MATCH_ANY = object()
+
+
+def _find_live_session_by_key(
+    session_key: str, profile_home=_PROFILE_MATCH_ANY
+) -> tuple[str, dict] | None:
+    scoped = profile_home is not _PROFILE_MATCH_ANY
+    want_home = str(profile_home) if (scoped and profile_home) else None
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
             continue
-        if _session_lookup_key(session, fallback=sid) == session_key:
-            return sid, session
+        if _session_lookup_key(session, fallback=sid) != session_key:
+            continue
+        # Profile scoping (session.resume only): a live session is reusable only
+        # when it belongs to the SAME profile home. Without this, a same-key
+        # session in the launch/default profile satisfies a resume for
+        # profile="worker" (and vice versa), binding the wrong live session — its
+        # agent was built with the launch config/model and persists turns into the
+        # wrong profile DB (STR-995/STR-991 crash class). A launch resume
+        # (profile_home None) must likewise not reuse a profile-scoped live
+        # session. The lazy child-mirror path opts out (sentinel default) so it
+        # never breaks.
+        if scoped:
+            live_home = session.get("profile_home")
+            if want_home is None:
+                if live_home is not None:
+                    continue
+            elif str(live_home) != want_home:
+                continue
+        return sid, session
     return None
 
 
