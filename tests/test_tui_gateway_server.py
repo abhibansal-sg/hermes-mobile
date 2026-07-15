@@ -17,6 +17,13 @@ from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
 
 
+SESSION_STATUS_RESPONSES = json.loads(
+    (Path(__file__).parent / "fixtures" / "session_status_responses.json").read_text(
+        encoding="utf-8"
+    )
+)
+
+
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -4650,6 +4657,7 @@ def test_commands_catalog_filters_gateway_only_commands_and_keeps_status_visible
 
 
 def test_session_status_reads_live_gateway_agent(monkeypatch):
+    expected = SESSION_STATUS_RESPONSES["running"]["result"]
     agent = types.SimpleNamespace(
         model="live-model",
         provider="live-provider",
@@ -4667,6 +4675,74 @@ def test_session_status_reads_live_gateway_agent(monkeypatch):
             }
 
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: expected["usage"])
+    try:
+        resp = server.handle_request(
+            {
+                "id": "fixture",
+                "method": "session.status",
+                "params": {"session_id": "sid"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    result = resp["result"]
+    assert {key: result[key] for key in ("running", "model", "provider", "usage")} == {
+        key: expected[key] for key in ("running", "model", "provider", "usage")
+    }
+    assert isinstance(result["running"], bool)
+    assert isinstance(result["model"], str)
+    assert isinstance(result["provider"], str)
+    assert isinstance(result["usage"], dict)
+
+    # The existing text contract remains available and retains its established
+    # wording; structured clients do not need to parse it for runtime truth.
+    out = result["output"]
+    assert "Hermes TUI Status" in out
+    assert "Session ID: session-key" in out
+    assert "Title: Live TUI" in out
+    assert "Model: live-model (live-provider)" in out
+    assert "Tokens: 1,290" in out
+    assert "Agent Running: Yes" in out
+
+
+@pytest.mark.parametrize("fixture_name", ["idle", "partial_usage"])
+def test_session_status_idle_shapes_are_structured_and_never_running(
+    monkeypatch, fixture_name
+):
+    expected = SESSION_STATUS_RESPONSES[fixture_name]["result"]
+    agent = types.SimpleNamespace(model=expected["model"], provider=expected["provider"])
+    server._sessions["sid"] = _session(agent=agent, running=False)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: expected["usage"])
+    try:
+        resp = server.handle_request(
+            {
+                "id": "fixture",
+                "method": "session.status",
+                "params": {"session_id": "sid"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    result = resp["result"]
+    assert result["running"] is False
+    assert isinstance(result["running"], bool)
+    assert result["model"] == expected["model"]
+    assert result["provider"] == expected["provider"]
+    assert result["usage"] == expected["usage"]
+    assert result["output"].endswith("Agent Running: No")
+    if fixture_name == "partial_usage":
+        assert "context_used" not in result["usage"]
+
+
+def test_session_status_unbuilt_agent_uses_documented_null_metadata(monkeypatch):
+    session = _session(running=False)
+    session["agent"] = None
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: None)
     try:
         resp = server.handle_request(
             {"id": "1", "method": "session.status", "params": {"session_id": "sid"}}
@@ -4674,13 +4750,24 @@ def test_session_status_reads_live_gateway_agent(monkeypatch):
     finally:
         server._sessions.pop("sid", None)
 
-    out = resp["result"]["output"]
-    assert "Hermes TUI Status" in out
-    assert "Session ID: session-key" in out
-    assert "Title: Live TUI" in out
-    assert "Model: live-model (live-provider)" in out
-    assert "Tokens: 1,234" in out
-    assert "Agent Running: Yes" in out
+    result = resp["result"]
+    assert result["running"] is False
+    assert result["model"] is None
+    assert result["provider"] is None
+    assert result["usage"] is None
+    assert "Model: (unknown) (unknown)" in result["output"]
+
+
+def test_session_status_missing_session_stays_an_explicit_rpc_error():
+    resp = server.handle_request(
+        {
+            "id": "fixture",
+            "method": "session.status",
+            "params": {"session_id": "missing"},
+        }
+    )
+
+    assert resp == SESSION_STATUS_RESPONSES["missing"]
 
 
 def test_skills_reload_runs_in_gateway_process(monkeypatch):

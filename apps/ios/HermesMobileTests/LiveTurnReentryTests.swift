@@ -1,6 +1,42 @@
 import XCTest
 @testable import HermesMobile
 
+/// Shared verbatim with the Python gateway tests. The one source fixture is
+/// copied into the XCTest bundle so server and iOS decode the same examples.
+private enum SessionStatusResponseFixtures {
+    private static let frames: [String: JSONValue] = {
+        let bundle = Bundle(for: SessionStatusFixtureBundleToken.self)
+        let url = bundle.url(
+            forResource: "session_status_responses",
+            withExtension: "json"
+        )!
+        let data = try! Data(contentsOf: url)
+        return try! JSONDecoder().decode([String: JSONValue].self, from: data)
+    }()
+
+    static func frame(named name: String, id: String = "fixture") -> JSONValue {
+        guard case .object(var frame) = frames[name] else {
+            preconditionFailure("Missing session.status fixture: \(name)")
+        }
+        frame["id"] = .string(id)
+        return .object(frame)
+    }
+
+    static func wireFrame(named name: String, id: String) -> String {
+        let data = try! JSONEncoder().encode(frame(named: name, id: id))
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    static func result(named name: String) -> SessionStatusResult {
+        guard let result = frame(named: name)["result"]?.decoded(as: SessionStatusResult.self) else {
+            preconditionFailure("Fixture \(name) has no SessionStatusResult")
+        }
+        return result
+    }
+}
+
+private final class SessionStatusFixtureBundleToken: NSObject {}
+
 /// ABH-371 — live re-entry.
 ///
 /// A stored transcript seed is not enough to decide the UI is idle: a session can
@@ -19,8 +55,10 @@ final class LiveTurnReentryTests: XCTestCase {
 
         private(set) var sentMethods: [String] = []
         private(set) var sentParams: [[String: Any]] = []
+        private let fixtureName: String
 
-        init() {
+        init(fixtureName: String = "running") {
+            self.fixtureName = fixtureName
             enqueue(.string(
                 #"{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready"}}"#
             ))
@@ -52,7 +90,7 @@ final class LiveTurnReentryTests: XCTestCase {
             else { return }
 
             record(method: method, params: object["params"] as? [String: Any] ?? [:])
-            enqueue(.string(Self.statusResponseFrame(id: id)))
+            enqueue(.string(SessionStatusResponseFixtures.wireFrame(named: fixtureName, id: id)))
             await Task.yield()
         }
 
@@ -75,26 +113,6 @@ final class LiveTurnReentryTests: XCTestCase {
             }
         }
 
-        private static func statusResponseFrame(id: String) -> String {
-            let result = #"""
-            {
-              "output": "partial assistant text",
-              "running": true,
-              "model": "gpt-5.5",
-              "provider": "openai",
-              "usage": {
-                "input": 1234,
-                "output": 56,
-                "total": 1290,
-                "context_used": 43210,
-                "context_max": 128000,
-                "context_percent": 34,
-                "compressions": 1
-              }
-            }
-            """#
-            return #"{"jsonrpc":"2.0","id":"\#(id)","result":\#(result)}"#
-        }
     }
 
     private func makeStore() -> (ChatStore, SessionStore) {
@@ -117,7 +135,7 @@ final class LiveTurnReentryTests: XCTestCase {
     }
 
     private func status(running: Bool) -> SessionStatusResult {
-        JSONValue.object(["running": .bool(running)]).decoded(as: SessionStatusResult.self)!
+        SessionStatusResponseFixtures.result(named: running ? "running" : "idle")
     }
 
     private func openResult(runtimeId: String, storedId: String) -> SessionOpenResult {
@@ -154,8 +172,8 @@ final class LiveTurnReentryTests: XCTestCase {
         XCTAssertEqual(transport.sentMethods, ["session.status"])
         XCTAssertEqual(transport.sentParams.first?["session_id"] as? String, runtimeId)
         XCTAssertEqual(status.running, true)
-        XCTAssertEqual(status.model, "gpt-5.5")
-        XCTAssertEqual(status.provider, "openai")
+        XCTAssertEqual(status.model, "live-model")
+        XCTAssertEqual(status.provider, "live-provider")
         XCTAssertEqual(status.usage?.input, 1234)
         XCTAssertEqual(status.usage?.output, 56)
         XCTAssertEqual(status.usage?.total, 1290)
@@ -163,6 +181,27 @@ final class LiveTurnReentryTests: XCTestCase {
         XCTAssertEqual(status.usage?.contextMax, 128_000)
         XCTAssertEqual(status.usage?.contextPercent, 34)
         XCTAssertEqual(status.usage?.compressions, 1)
+        await client.disconnect()
+    }
+
+    func testSessionStatusMissingWireReturnsRPCError() async throws {
+        let transport = SessionStatusTransport(fixtureName: "missing")
+        let client = HermesGatewayClient(transportFactory: { _ in transport })
+        try await client.connect(baseURL: URL(string: "ws://127.0.0.1:9999")!, token: "t")
+
+        do {
+            let _: SessionStatusResult = try await client.request(
+                "session.status",
+                params: .object(["session_id": .string("missing")]),
+                timeout: .seconds(2)
+            )
+            XCTFail("a missing runtime must remain an explicit RPC error")
+        } catch let GatewayError.rpc(code, message) {
+            XCTAssertEqual(code, 4001)
+            XCTAssertEqual(message, "session not found")
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
         await client.disconnect()
     }
 
@@ -259,5 +298,48 @@ final class LiveTurnReentryTests: XCTestCase {
                        "the runtime-bound queue drain must see restored busy state, not the pre-status idle gap")
         XCTAssertEqual(chat.messages.map(\.role), [.user, .assistant, .assistant])
         XCTAssertTrue(chat.messages.last?.isStreaming == true)
+    }
+}
+
+/// ABH-443 protocol-shape coverage. These tests deliberately decode the same
+/// checked-in fixtures asserted by tests/test_tui_gateway_server.py.
+final class ProtocolTypesTests: XCTestCase {
+    func testSessionStatusRunningAndIdleFixturesDecodeStableTypes() throws {
+        let running = SessionStatusResponseFixtures.result(named: "running")
+        XCTAssertEqual(running.running, true)
+        XCTAssertEqual(running.model, "live-model")
+        XCTAssertEqual(running.provider, "live-provider")
+        XCTAssertEqual(running.usage?.total, 1_290)
+
+        let idle = SessionStatusResponseFixtures.result(named: "idle")
+        XCTAssertEqual(idle.running, false)
+        XCTAssertEqual(idle.model, "idle-model")
+        XCTAssertEqual(idle.provider, "idle-provider")
+        XCTAssertEqual(idle.usage?.total, 0)
+    }
+
+    func testSessionStatusPartialUsageLeavesUnavailableMeasurementsNil() throws {
+        let status = SessionStatusResponseFixtures.result(named: "partial_usage")
+        XCTAssertEqual(status.running, false)
+        XCTAssertEqual(status.usage?.input, 120)
+        XCTAssertEqual(status.usage?.total, 120)
+        XCTAssertNil(status.usage?.contextUsed)
+        XCTAssertNil(status.usage?.contextMax)
+        XCTAssertNil(status.usage?.contextPercent)
+        XCTAssertNil(status.usage?.compressions)
+    }
+
+    func testSessionStatusMissingFixtureIsErrorNotOmittedRunning() throws {
+        let frame = SessionStatusResponseFixtures.frame(named: "missing")
+        XCTAssertNil(frame["result"])
+        XCTAssertEqual(frame["error"]?["code"]?.intValue, 4001)
+        XCTAssertEqual(frame["error"]?["message"]?.stringValue, "session not found")
+    }
+
+    func testLegacyTextOnlyStatusDoesNotClaimRunning() throws {
+        let legacy: JSONValue = .object(["output": .string("Agent Running: Yes")])
+        let status = try XCTUnwrap(legacy.decoded(as: SessionStatusResult.self))
+        XCTAssertNil(status.running)
+        XCTAssertFalse(status.running == true)
     }
 }

@@ -55,6 +55,14 @@ terminal.resize         clipboard.paste         image.attach
 
 `session.active_list`, `session.activate`, and `session.close` are the process-local live-session controls used by the TUI session switcher. Use `session.list` / `/resume` for saved transcript discovery; use the active-session methods only for sessions that are currently open in the TUI gateway process.
 
+`session.status` keeps its human-readable `output` and also returns top-level
+`running` (boolean), `model` (string or null), `provider` (string or null), and
+`usage` (object or null). `running` is sourced from the live session record and
+is the only field clients should use to decide whether a turn is in flight.
+Model, provider, and usage are null until a lazy session has built its agent;
+individual optional usage measurements are absent when the runtime cannot
+report them. A missing session remains a JSON-RPC `4001` error.
+
 ### Events streamed back
 
 `message.delta`, `message.complete`, `tool.start`, `tool.progress`, `tool.complete`, `approval.request`, `clarify.request`, `sudo.request`, `sudo.expire`, `secret.request`, `secret.expire`, `gateway.ready`, plus session lifecycle and error events. Expiry events carry the original `{ request_id }`; external hosts should clear only the matching pending prompt.

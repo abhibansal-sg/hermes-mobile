@@ -499,7 +499,7 @@ index 7c58062ed..58f905c24 100644
  
  
 diff --git a/tui_gateway/server.py b/tui_gateway/server.py
-index febb4ec0d..b4f006d95 100644
+index febb4ec0d..a0d9dc0c2 100644
 --- a/tui_gateway/server.py
 +++ b/tui_gateway/server.py
 @@ -136,6 +136,13 @@ _stdout_lock = threading.Lock()
@@ -868,7 +868,64 @@ index febb4ec0d..b4f006d95 100644
  
  
  @method("session.title")
-@@ -8073,7 +8308,16 @@ def _(rid, params: dict) -> dict:
+@@ -7802,6 +8037,14 @@ def _(rid, params: dict) -> dict:
+ 
+ @method("session.status")
+ def _(rid, params: dict) -> dict:
++    """Return the human status report plus machine-readable runtime truth.
++
++    ``running`` comes directly from the live gateway session record; callers
++    must not infer it from ``output``.  Model/provider/usage are null until an
++    agent exists (for example, for a newly-created lazy session).  Once an
++    agent exists, usage is the canonical ``_get_usage`` object and may omit
++    optional measurements such as context-window occupancy when unavailable.
++    """
+     session, err = _sess_nowait(params, rid)
+     if err:
+         return err
+@@ -7833,9 +8076,15 @@ def _(rid, params: dict) -> dict:
+             updated = _dt(meta.get(field), created)
+             break
+ 
+-    usage = _get_usage(agent) if agent is not None else {}
+-    provider = getattr(agent, "provider", None) or "unknown"
+-    model = getattr(agent, "model", None) or "(unknown)"
++    usage = _get_usage(agent) if agent is not None else None
++    raw_provider = getattr(agent, "provider", None) if agent is not None else None
++    raw_model = getattr(agent, "model", None) if agent is not None else None
++    structured_provider = str(raw_provider) if raw_provider else None
++    structured_model = str(raw_model) if raw_model else None
++    # Preserve the established human-readable fallbacks byte-for-byte for TUI
++    # and CLI consumers while exposing honest nulls to structured clients.
++    provider = raw_provider or "unknown"
++    model = raw_model or "(unknown)"
+     lines = [
+         "Hermes TUI Status",
+         "",
+@@ -7850,11 +8099,20 @@ def _(rid, params: dict) -> dict:
+             f"Model: {model} ({provider})",
+             f"Created: {created.strftime('%Y-%m-%d %H:%M')}",
+             f"Last Activity: {updated.strftime('%Y-%m-%d %H:%M')}",
+-            f"Tokens: {int(usage.get('total') or 0):,}",
++            f"Tokens: {int((usage or {}).get('total') or 0):,}",
+             f"Agent Running: {'Yes' if session.get('running') else 'No'}",
+         ]
+     )
+-    return _ok(rid, {"output": "\n".join(lines)})
++    return _ok(
++        rid,
++        {
++            "output": "\n".join(lines),
++            "running": bool(session.get("running")),
++            "model": structured_model,
++            "provider": structured_provider,
++            "usage": usage,
++        },
++    )
+ 
+ 
+ @method("session.history")
+@@ -8073,7 +8331,16 @@ def _(rid, params: dict) -> dict:
  
  @method("session.branch")
  def _(rid, params: dict) -> dict:
@@ -886,7 +943,7 @@ index febb4ec0d..b4f006d95 100644
      if err:
          return err
      db = _get_db()
-@@ -8465,8 +8709,14 @@ def _(rid, params: dict) -> dict:
+@@ -8465,8 +8732,14 @@ def _(rid, params: dict) -> dict:
  def _(rid, params: dict) -> dict:
      sid, text = params.get("session_id", ""), params.get("text", "")
      truncate_user_ordinal = params.get("truncate_before_user_ordinal")
@@ -901,7 +958,7 @@ index febb4ec0d..b4f006d95 100644
          return err
      # Re-bind to the current client transport for this request. This keeps
      # streaming events on the active websocket even if an earlier disconnect
-@@ -8479,18 +8729,23 @@ def _(rid, params: dict) -> dict:
+@@ -8479,18 +8752,23 @@ def _(rid, params: dict) -> dict:
              # interrupt the live turn) so it runs as the next turn. See
              # _handle_busy_submit for why the old "session busy" rejection
              # dropped messages when teardown outlived the client's retry window.
@@ -926,7 +983,7 @@ index febb4ec0d..b4f006d95 100644
                  return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
              history = session.get("history", [])
              user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
-@@ -8500,6 +8755,7 @@ def _(rid, params: dict) -> dict:
+@@ -8500,6 +8778,7 @@ def _(rid, params: dict) -> dict:
              # truncating history to everything before it and persisting that loss
              # via replace_messages — an unrecoverable overwrite of the session DB.
              if ordinal < 0 or ordinal >= len(user_indices):
@@ -934,7 +991,7 @@ index febb4ec0d..b4f006d95 100644
                  return _err(rid, 4018, "target user message is no longer in session history")
              truncated = history[: user_indices[ordinal]]
              session["history"] = truncated
-@@ -8514,6 +8770,15 @@ def _(rid, params: dict) -> dict:
+@@ -8514,6 +8793,15 @@ def _(rid, params: dict) -> dict:
          session["last_active"] = time.time()
          _start_inflight_turn(session, text)
  
@@ -950,7 +1007,7 @@ index febb4ec0d..b4f006d95 100644
      # Persist the DB row lazily, now that the user has actually sent a message.
      _ensure_session_db_row(session)
      # A branch becomes real here: copy its parent's transcript into the row so it
-@@ -8549,7 +8814,7 @@ def _(rid, params: dict) -> dict:
+@@ -8549,7 +8837,7 @@ def _(rid, params: dict) -> dict:
      # `running` flag (a turn that died without clearing it) and recover the latter.
      session["_run_thread"] = run_thread
      run_thread.start()
@@ -959,7 +1016,7 @@ index febb4ec0d..b4f006d95 100644
  
  
  def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) -> bool:
-@@ -10231,15 +10496,71 @@ def _(rid, params: dict) -> dict:
+@@ -10231,15 +10519,71 @@ def _(rid, params: dict) -> dict:
  # ── Methods: respond ─────────────────────────────────────────────────
  
  
@@ -1032,7 +1089,7 @@ index febb4ec0d..b4f006d95 100644
          _answers[r] = params.get(key, "")
          ev.set()
      return _ok(rid, {"status": "ok"})
-@@ -10271,16 +10592,28 @@ def _(rid, params: dict) -> dict:
+@@ -10271,16 +10615,28 @@ def _(rid, params: dict) -> dict:
      session, err = _sess(params, rid)
      if err:
          return err
@@ -1063,7 +1120,7 @@ index febb4ec0d..b4f006d95 100644
                  )
              },
          )
-@@ -10363,6 +10696,8 @@ def _(rid, params: dict) -> dict:
+@@ -10363,6 +10719,8 @@ def _(rid, params: dict) -> dict:
          agent = session.get("agent") if session else None
          if agent is not None:
              current_fast = getattr(agent, "service_tier", None) == "priority"
@@ -1072,7 +1129,7 @@ index febb4ec0d..b4f006d95 100644
          else:
              current_fast = _load_service_tier() == "priority"
  
-@@ -10402,7 +10737,15 @@ def _(rid, params: dict) -> dict:
+@@ -10402,7 +10760,15 @@ def _(rid, params: dict) -> dict:
                      "fast mode is not available for this model",
                  )
  
@@ -1089,7 +1146,7 @@ index febb4ec0d..b4f006d95 100644
          if agent is not None:
              agent.service_tier = "priority" if nv == "fast" else None
              current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-@@ -11368,17 +11711,20 @@ def _(rid, params: dict) -> dict:
+@@ -11368,17 +11734,20 @@ def _(rid, params: dict) -> dict:
          )
          return _ok(rid, {"value": effort, "display": display})
      if key == "fast":
