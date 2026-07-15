@@ -214,8 +214,8 @@ struct DevicesView: View {
 
     /// Revoke `device` after a passing biometric gate. On a passing gate the
     /// `DELETE` fires; on success the row is removed locally. If the user revoked
-    /// THIS device, the recorded `device_id` is cleared so the existing 401
-    /// re-pair path fires on the next request (the server token is now invalid).
+    /// THIS device, the shared Forget transaction erases the invalid local
+    /// credential and former-gateway surfaces before repair UI is presented.
     private func revokeWithGate(_ device: PairedDevice) async {
         pendingRevoke = nil
         actionError = nil
@@ -238,7 +238,7 @@ struct DevicesView: View {
 
         let wasCurrent = isCurrentDevice(device)
         devices.removeAll { $0.deviceId == device.deviceId }
-        Self.applySuccessfulRevokeSideEffects(
+        await Self.applySuccessfulRevokeSideEffects(
             wasCurrent: wasCurrent,
             serverURL: serverURL,
             connection: connection
@@ -308,20 +308,20 @@ struct DevicesView: View {
     }
 
     /// Apply side effects after a clean revoke. For a self-revoke, `wasCurrent`
-    /// is synchronous ground truth: route to re-pair immediately instead of
-    /// waiting for the external-revocation reconnect debounce.
+    /// is ground truth: complete the local privacy transaction and then route
+    /// to re-pair instead of waiting for the external-revocation debounce.
     static func applySuccessfulRevokeSideEffects(
         wasCurrent: Bool,
         serverURL: String,
         connection: ConnectionStore
-    ) {
+    ) async {
         guard wasCurrent else { return }
-        // This device just revoked itself. Clear the recorded id so a re-scan
-        // auto-upgrades to a FRESH device token. The Keychain still holds the
-        // now-invalid device token; bootstrap/configure auth handling covers
-        // relaunches, while the live UI routes to re-pair synchronously here.
-        DefaultsKeys.setDeviceId(nil, server: serverURL)
-        connection.requireRepairAfterCurrentDeviceRevoked()
+        // The server has already invalidated this install's credential. Run the
+        // exact same idempotent local privacy transaction as Settings before
+        // presenting repair/onboarding, so the invalid Keychain token and every
+        // former-gateway surface are gone together.
+        await connection.forgetGateway(serverOverride: serverURL)
+        connection.requireRepairAfterCurrentDeviceRevoked(clearPrivacySurfaces: false)
     }
 
     /// Relative date for an epoch-seconds timestamp. Clamped to the past: the

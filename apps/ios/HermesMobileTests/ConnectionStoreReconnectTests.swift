@@ -30,6 +30,25 @@ import XCTest
 @MainActor
 final class ConnectionStoreReconnectTests: XCTestCase {
 
+    private actor SuspensionGate {
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var didEnter = false
+
+        func suspend() async {
+            didEnter = true
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func waitUntilEntered() async {
+            while !didEnter { await Task.yield() }
+        }
+
+        func release() {
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
     // MARK: - Helpers
 
     /// Build a wired store graph (ConnectionStore + SessionStore + ChatStore).
@@ -90,6 +109,19 @@ final class ConnectionStoreReconnectTests: XCTestCase {
             "role": .string(role),
             "content": .string(text),
         ]))!
+    }
+
+    private func sessionSummary(_ id: String) -> SessionSummary {
+        SessionSummary(
+            id: id,
+            title: "Stale session",
+            preview: nil,
+            startedAt: nil,
+            messageCount: nil,
+            source: "ios",
+            lastActive: nil,
+            cwd: nil
+        )
     }
 
     private func stagedResumeResult(sessionId: String, resumed: String) -> SessionOpenResult {
@@ -820,5 +852,161 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertEqual(connection.phase, .needsSetup,
                        "an auth revocation must still route to .needsSetup regardless of grace")
         XCTAssertFalse(connection.isInGrace, "grace must be ended, not left dangling, on auth revoke")
+    }
+
+    // MARK: - ABH-448 connection-generation fencing
+
+    func testLateOpenAndClosedFromForgottenGenerationCannotRestoreConnection() async {
+        let (connection, _, _) = makeStore()
+        let server = "https://generation-socket.example"
+        UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
+        connection._seedConnectedForTesting(serverURL: server, token: "revoked")
+        let staleGeneration = connection._connectionGenerationForTesting
+
+        await connection.forgetGateway()
+        connection._handleGatewayStateForTesting(.open, generation: staleGeneration)
+        connection._handleGatewayStateForTesting(.closed(reason: nil), generation: staleGeneration)
+        connection._handleGatewayStateForTesting(.open)
+
+        XCTAssertEqual(connection.phase, .needsSetup)
+        XCTAssertFalse(connection.hasConnected)
+        XCTAssertNil(connection.reconnectTask)
+    }
+
+    func testSuspendedBootstrapCannotPublishAfterForgetChangesGeneration() async {
+        let (connection, _, _) = makeStore()
+        let gate = SuspensionGate()
+        let server = "https://generation-bootstrap.example"
+        UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
+        try? KeychainService.saveToken("token", server: server)
+        connection._skipEnvironmentBootstrapForTesting = true
+        connection.statusRPC = { _, _ in await gate.suspend() }
+        connection.connectRPC = { _, _, _ in }
+        defer { KeychainService.deleteToken(server: server) }
+
+        let bootstrap = Task { await connection.bootstrap() }
+        await gate.waitUntilEntered()
+        await connection.forgetGateway()
+        await gate.release()
+        await bootstrap.value
+
+        XCTAssertEqual(connection.phase, .needsSetup)
+        XCTAssertFalse(connection.hasConnected)
+        XCTAssertNil(connection.reconnectTask)
+    }
+
+    func testSuspendedHydrationCannotFinishAfterForgetChangesGeneration() async {
+        let (connection, sessions, _) = makeStore()
+        let gate = SuspensionGate()
+        let server = "https://generation-hydrate.example"
+        sessions.sessionsFetch = {
+            await gate.suspend()
+            return ([self.sessionSummary("stale-hydration")], 1)
+        }
+
+        let configureError = await configureWithoutGateway(
+            connection, serverURL: server, token: "token"
+        )
+        XCTAssertNil(configureError)
+        await gate.waitUntilEntered()
+        await connection.forgetGateway()
+        await gate.release()
+        await settle()
+
+        XCTAssertEqual(connection.phase, .needsSetup)
+        XCTAssertFalse(connection.hasConnected)
+        XCTAssertNil(connection.reconnectTask)
+        XCTAssertTrue(sessions.sessions.isEmpty,
+                      "stale hydration must not repopulate forgotten session surfaces")
+    }
+
+    func testSuspendedReconnectCompletionCannotPublishConnectedAfterForget() async {
+        let (connection, _, _) = makeStore()
+        let gate = SuspensionGate()
+        let server = "https://generation-connect.example"
+        UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
+        connection.connectRPC = { _, _, _ in await gate.suspend() }
+
+        connection._seedAndStartReconnect(serverURL: server, token: "token")
+        await gate.waitUntilEntered()
+        await connection.forgetGateway()
+        await gate.release()
+        await connection.waitForReconnectForTesting()
+
+        XCTAssertEqual(connection.phase, .needsSetup)
+        XCTAssertFalse(connection.hasConnected)
+        XCTAssertNil(connection.reconnectTask)
+    }
+
+    func testSuspendedSessionRecoveryCannotPublishConnectedAfterForget() async {
+        let (connection, sessions, _) = makeStore()
+        let gate = SuspensionGate()
+        let server = "https://generation-recover.example"
+        UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
+        connection.connectRPC = { _, _, _ in }
+        sessions.activeStoredId = "stored-stale"
+        sessions.resumeRPC = { stored, _ in
+            await gate.suspend()
+            return self.stagedResumeResult(sessionId: "runtime-stale", resumed: stored)
+        }
+
+        connection._seedAndStartReconnect(serverURL: server, token: "token")
+        await gate.waitUntilEntered()
+        await connection.forgetGateway()
+        await gate.release()
+        await connection.waitForReconnectForTesting()
+
+        XCTAssertEqual(connection.phase, .needsSetup)
+        XCTAssertFalse(connection.hasConnected)
+        XCTAssertNil(connection.reconnectTask)
+        XCTAssertNil(sessions.activeRuntimeId,
+                     "stale recovery must not bind its runtime into the forgotten session")
+    }
+
+    func testSuspendedForegroundHealthProbeCannotScheduleReconnectAfterForget() async {
+        let (connection, _, _) = makeStore()
+        let gate = SuspensionGate()
+        let server = "https://generation-scene.example"
+        UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
+        connection._seedConnectedForTesting(serverURL: server, token: "token")
+        connection.clientStateOverrideForScenePhase = .open
+        connection.probeLivenessRPC = { _ in
+            await gate.suspend()
+            return false
+        }
+
+        connection.handleScenePhase(.active)
+        await gate.waitUntilEntered()
+        await connection.forgetGateway()
+        await gate.release()
+        await settle()
+
+        XCTAssertEqual(connection.phase, .needsSetup)
+        XCTAssertFalse(connection.hasConnected)
+        XCTAssertNil(connection.reconnectTask)
+    }
+
+    func testSuspendedAuthProbeCannotEscalateOrReconnectAfterForget() async {
+        let (connection, _, _) = makeStore()
+        let gate = SuspensionGate()
+        let server = "https://generation-auth-probe.example"
+        UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
+        connection.reconnectBackoffOverride = 0
+        connection.connectRPC = { _, _, _ in throw URLError(.cannotConnectToHost) }
+        connection.probeIsAuthRevokedRPC = {
+            await gate.suspend()
+            return true
+        }
+
+        connection._seedAndStartReconnect(serverURL: server, token: "token")
+        await gate.waitUntilEntered()
+        await connection.forgetGateway()
+        await gate.release()
+        await connection.waitForReconnectForTesting()
+
+        XCTAssertEqual(connection.phase, .needsSetup)
+        XCTAssertFalse(connection.reauthRequired)
+        XCTAssertFalse(connection.hasConnected)
+        XCTAssertNil(connection.reconnectTask)
     }
 }

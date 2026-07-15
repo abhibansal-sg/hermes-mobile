@@ -28,7 +28,9 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
         let (connection, queue, _) = makeStore()
         _ = queue.enqueue("private queued prompt")
 
-        await connection.forgetGateway { throw URLError(.notConnectedToInternet) }
+        await connection.forgetGateway(remoteCleanup: {
+            throw URLError(.notConnectedToInternet)
+        })
 
         XCTAssertNil(defaults.string(forKey: DefaultsKeys.serverURL))
         XCTAssertNil(DefaultsKeys.deviceId(server: server))
@@ -48,11 +50,18 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
         defaults.set(server, forKey: DefaultsKeys.serverURL)
         DefaultsKeys.setDeviceId("forgotten-device", server: server)
         DefaultsKeys.setDeviceId("other-device", server: other)
-        defer { DefaultsKeys.setDeviceId(nil, server: other) }
+        try? KeychainService.saveToken("forgotten-token", server: server)
+        defer {
+            DefaultsKeys.setDeviceId(nil, server: other)
+            KeychainService.deleteToken(server: server)
+        }
         let (connection, _, _) = makeStore()
         await connection.forgetGateway()
         await connection.forgetGateway()
+        XCTAssertNil(KeychainService.loadToken(server: server))
         XCTAssertEqual(DefaultsKeys.deviceId(server: other), "other-device")
         XCTAssertEqual(connection.phase, .needsSetup)
+        XCTAssertFalse(connection.hasConnected)
+        XCTAssertNil(connection.reconnectTask)
     }
 }

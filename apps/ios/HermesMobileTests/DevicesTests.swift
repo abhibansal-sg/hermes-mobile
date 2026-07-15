@@ -824,19 +824,22 @@ final class DevicesTests: XCTestCase {
         XCTAssertTrue(shouldAutoUpgrade(capability: .available, hasRecordedId: false))
     }
 
-    func testSuccessfulSelfRevokeDrivesRepairStateSynchronouslyFromWasCurrent() {
+    func testSuccessfulSelfRevokeForgetsLocallyBeforeDrivingRepairState() async {
         let sessions = SessionStore()
         let chat = ChatStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
         let server = "https://self-revoke:9119"
+        UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
+        try? KeychainService.saveToken("revoked-device-token", server: server)
         DefaultsKeys.setDeviceId("dev_current", server: server)
+        defer { KeychainService.deleteToken(server: server) }
         connection._seedConnectedForTesting(serverURL: server, token: "revoked-device-token")
         sessions.markTurnStarted(storedId: "stored-self-revoke")
         XCTAssertTrue(connection.hasConnected, "precondition: self-revoke starts from a paired connection")
         XCTAssertFalse(sessions.turnsInProgressIds.isEmpty,
             "precondition: self-revoke can happen while a turn is in flight")
 
-        DevicesView.applySuccessfulRevokeSideEffects(
+        await DevicesView.applySuccessfulRevokeSideEffects(
             wasCurrent: true,
             serverURL: server,
             connection: connection
@@ -844,20 +847,22 @@ final class DevicesTests: XCTestCase {
         connection._handleGatewayStateForTesting(.closed(reason: nil))
 
         XCTAssertNil(DefaultsKeys.deviceId(server: server))
+        XCTAssertNil(KeychainService.loadToken(server: server))
+        XCTAssertNil(UserDefaults.standard.string(forKey: DefaultsKeys.serverURL))
         XCTAssertTrue(connection.reauthRequired)
         XCTAssertEqual(connection.phase, .needsSetup)
         XCTAssertFalse(connection.hasConnected)
         XCTAssertTrue(sessions.turnsInProgressIds.isEmpty)
     }
 
-    func testSuccessfulSelfRevokeClearsSpotlightIndex() {
+    func testSuccessfulSelfRevokeClearsSpotlightIndex() async {
         let sessions = SessionStore()
         let chat = ChatStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
         var clearCount = 0
         ConnectionStore.spotlightClearAllForTesting = { clearCount += 1 }
 
-        DevicesView.applySuccessfulRevokeSideEffects(
+        await DevicesView.applySuccessfulRevokeSideEffects(
             wasCurrent: true,
             serverURL: "https://self-revoke-spotlight:9119",
             connection: connection
@@ -866,23 +871,59 @@ final class DevicesTests: XCTestCase {
         XCTAssertEqual(clearCount, 1)
     }
 
-    func testSuccessfulOtherDeviceRevokeDoesNotDriveRepairState() {
+    func testSuccessfulOtherDeviceRevokeDoesNotDriveRepairState() async {
         let sessions = SessionStore()
         let chat = ChatStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
         let server = "https://other-revoke:9119"
+        UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
+        try? KeychainService.saveToken("current-token", server: server)
         DefaultsKeys.setDeviceId("dev_current", server: server)
         connection.phase = .connected
+        defer {
+            KeychainService.deleteToken(server: server)
+            UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+            DefaultsKeys.setDeviceId(nil, server: server)
+        }
 
-        DevicesView.applySuccessfulRevokeSideEffects(
+        await DevicesView.applySuccessfulRevokeSideEffects(
             wasCurrent: false,
             serverURL: server,
             connection: connection
         )
 
         XCTAssertEqual(DefaultsKeys.deviceId(server: server), "dev_current")
+        XCTAssertEqual(KeychainService.loadToken(server: server), "current-token")
+        XCTAssertEqual(UserDefaults.standard.string(forKey: DefaultsKeys.serverURL), server)
         XCTAssertFalse(connection.reauthRequired)
         XCTAssertEqual(connection.phase, .connected)
+    }
+
+    func testRepeatedSuccessfulSelfRevokeCallbacksRemainIdempotent() async {
+        let sessions = SessionStore()
+        let chat = ChatStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let server = "https://self-revoke-repeat:9119"
+        UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
+        try? KeychainService.saveToken("revoked-token", server: server)
+        DefaultsKeys.setDeviceId("dev_current", server: server)
+        connection._seedConnectedForTesting(serverURL: server, token: "revoked-token")
+        defer { KeychainService.deleteToken(server: server) }
+
+        await DevicesView.applySuccessfulRevokeSideEffects(
+            wasCurrent: true, serverURL: server, connection: connection
+        )
+        await DevicesView.applySuccessfulRevokeSideEffects(
+            wasCurrent: true, serverURL: server, connection: connection
+        )
+
+        XCTAssertNil(KeychainService.loadToken(server: server))
+        XCTAssertNil(DefaultsKeys.deviceId(server: server))
+        XCTAssertNil(UserDefaults.standard.string(forKey: DefaultsKeys.serverURL))
+        XCTAssertEqual(connection.phase, .needsSetup)
+        XCTAssertTrue(connection.reauthRequired)
+        XCTAssertFalse(connection.hasConnected)
+        XCTAssertNil(connection.reconnectTask)
     }
 
     func testDeviceRowDetailLineUsesPrefixNeverToken() {
