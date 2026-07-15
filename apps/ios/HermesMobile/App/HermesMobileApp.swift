@@ -134,18 +134,9 @@ struct HermesMobileApp: App {
                             connection: environment.connectionStore
                         )
                     }
-                    // Wire the notification-action backend (A2): APPROVE / DENY on
-                    // a HERMES_APPROVAL push resolves against the gateway via this
-                    // resolved endpoint (same loopback URL + Keychain token as the
-                    // push registrar). `nil` when unconfigured → the action falls
-                    // back to a feedback notification.
-                    appDelegate.notificationCoordinator.attachActionEndpointProvider {
-                        PushRegistrar.shared.resolveEndpoint().map {
-                            NotificationService.ActionEndpoint(
-                                baseURL: $0.url, token: $0.token, pathStyle: $0.pathStyle
-                            )
-                        }
-                    }
+                    // The notification-action backend is already installed by
+                    // AppDelegate from persisted URL/Keychain state. Do not move
+                    // it back here: this task can run after a killed-launch action.
                     await environment.connectionStore.bootstrap()
                     #if DEBUG
                     // Inc-3b UITest seam: HERMES_UITEST_DEEPLINK fires a deep link
@@ -370,6 +361,8 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         notificationCoordinator.install()
+        let resolver = PersistedNotificationEndpointResolver()
+        notificationCoordinator.attachActionEndpointProvider { resolver.resolve() }
         return true
     }
 
