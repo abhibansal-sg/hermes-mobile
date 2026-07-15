@@ -23,7 +23,7 @@ either already upstream or no longer consumed by `plugins/hermes-mobile` / iOS.
 | S2 | STILL-NEEDED (reduced) | First-class `post_emit_event` plus runtime id metadata on upstream's existing `on_session_finalize`; no `_EMIT_OBSERVERS` or synthetic finalize event. |
 | S3 | SUPERSEDED / reduced | Upstream `_session_info` already includes provider. `_runtime_sid` storage is dropped; finalize receives the existing record's `_sid` as transient hook metadata. |
 | S4 | STILL-NEEDED (small) | Reasoning is already session-scoped upstream. Only `config.set/get fast` needed adaptation to `create_service_tier_override`. |
-| S5 | STILL-NEEDED | The stock provider registry covers exact Bearer-token REST routes, but not rich device metadata, plugin routes, WS tickets, live revocation, socket indexing, or resolver audit identity. Generic registries and guarded call sites remain. |
+| S5 | STILL-NEEDED | The stock provider registry covers exact Bearer-token REST routes, but not rich device metadata, plugin routes, WS tickets, live revocation, socket indexing, or resolver audit identity. Generic registries and guarded call sites remain. Every device-capable dashboard WS route now enters one shared lifecycle that indexes only active device identities and closes revoke/register races (ABH-449). |
 | S6 | STILL-NEEDED | Stock `session.delete` still returned 4023 for a live row. It now interrupts a running turn, releases prompts/approvals, tears down, deletes, and reports `evicted`. |
 | S7 | SUPERSEDED | Upstream `WSTransport` already schedules loop-owned writes, coalesces token frames, and preserves control-frame ordering. |
 | S8 | SUPERSEDED | `exclude_sources` is already implemented in `hermes_state.py` and both dashboard session APIs. |
@@ -69,8 +69,11 @@ S4 config.set session-scoping for reasoning/fast (~120 lines today) — REWRITE
    (session_overrides dict consulted at agent build). PR: "session-scoped
    reasoning/fast overrides" — natural extension of their own fix.
 S5 Device-token auth branches not coverable by the auth-provider registry
-   (`_ws_auth_reason` WS branch, `mint_ticket extra`, ws-handler revoke checks —
-   ~40 lines worst case). PR: "pluggable WS auth / ticket extras".
+   (`_ws_auth_reason` WS branch, `mint_ticket extra`, shared device-socket
+   lifecycle on every accepting WS handler, resolver audit call sites). The
+   lifecycle is provider-neutral and notifies generic socket observers; the
+   plugin owns the per-device index and revoke/register race guard. PR:
+   "pluggable WS auth / ticket extras / authenticated socket lifecycle".
 S6 session.delete live-evict (~35-line helper + shim in the RPC handler).
    PR: UX fix — delete shouldn't 4023 on live sessions.
 S7 WSTransport non-blocking owner-write queue (~175 lines, class rewrite).

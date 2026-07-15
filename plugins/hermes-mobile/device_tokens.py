@@ -402,13 +402,23 @@ def is_device_active(device_id: Optional[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def register_ws_socket(device_id: str, ws: Any) -> None:
+def register_ws_socket(device_id: str, ws: Any) -> bool:
     """Attribute a live WS socket to a device (called via the token-auth
-    socket observers when the WS accept path resolved a device identity)."""
+    socket observers when the WS accept path resolved a device identity).
+
+    Registration and the local revoke deny-set are checked under one socket
+    index critical section.  Once revocation records the device ID, a racing
+    route can no longer add a late socket after the revoke endpoint snapshots
+    the index.
+    """
     if not device_id:
-        return
+        return False
     with _ws_index_lock:
+        with _deny_lock:
+            if device_id in _revoked_device_ids:
+                return False
         _ws_device_sockets.setdefault(device_id, set()).add(ws)
+        return True
 
 
 def deregister_ws_socket(device_id: str, ws: Any) -> None:
