@@ -78,8 +78,11 @@ final class ProtocolParityTests: XCTestCase {
         let last = try XCTUnwrap(chat.messages.last)
         XCTAssertEqual(last.thinking, "the full settled reasoning",
                        "final reasoning replaces streamed deltas")
+        XCTAssertNotNil(last.reasoningElapsed,
+                        "reasoning duration is captured from the active turn before turnStartedAt is cleared")
         XCTAssertEqual(last.warning, "Turn interrupted")
         XCTAssertFalse(chat.isStreaming)
+        XCTAssertNil(chat.turnStartedAt, "completion clears the active turn source after stamping the message")
     }
 
     // MARK: - Item 6: approval payload surfaces the real command

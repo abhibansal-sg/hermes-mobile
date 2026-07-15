@@ -61,6 +61,11 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
     /// streaming bubble before its first delta lands.
     var parts: [ChatMessagePart]
     var isStreaming: Bool
+    /// Settled reasoning wall-clock seconds, captured from the turn's existing
+    /// start timestamp when `message.complete` arrives. Live rendering continues
+    /// to read ``ChatStore.turnStartedAt`` directly; this preserves the completed
+    /// transcript label after the store clears the active turn.
+    var reasoningElapsed: TimeInterval?
     /// Settable so the seed producer can advance a coalesced turn's timestamp to
     /// its latest contributing wire row (desktop `active.timestamp = …`). Live
     /// streaming never reassigns it.
@@ -83,6 +88,7 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
         thinking: String = "",
         tools: [ToolActivity] = [],
         isStreaming: Bool = false,
+        reasoningElapsed: TimeInterval? = nil,
         usage: UsageStats? = nil,
         warning: String? = nil,
         timestamp: Date = Date(),
@@ -91,6 +97,7 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
         self.id = id
         self.role = role
         self.isStreaming = isStreaming
+        self.reasoningElapsed = reasoningElapsed
         self.timestamp = timestamp
         self.presentation = presentation
 
@@ -359,6 +366,11 @@ extension ChatMessage {
             // within-row order — and there is no streamed position to honor).
             parts.insert(.reasoning(id: newRunID("reasoning"), text: finalReasoning), at: 0)
         }
+    }
+
+    mutating func setReasoningElapsed(_ elapsed: TimeInterval?) {
+        guard thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else { return }
+        reasoningElapsed = elapsed
     }
 
     mutating func upsertToolActivity(_ activity: ToolActivity) {

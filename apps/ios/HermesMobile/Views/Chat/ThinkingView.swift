@@ -14,14 +14,25 @@ import SwiftUI
 ///
 /// Rendered only when `thinking` is non-empty.
 struct ThinkingView: View {
+    private static let liveWindowHeight: CGFloat = 172
+    private static let liveWindowBottomID = "thinking-live-window-bottom"
+    private static let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
     /// The accumulated reasoning text for the turn.
     let thinking: String
     /// Whether the owning turn is still streaming. Drives the auto-open default
     /// until the user takes manual control. Defaults to `false` so existing call
     /// sites / previews render the calm collapsed state unchanged.
     var streaming: Bool = false
+    /// The owning turn's existing start timestamp from ``ChatStore.turnStartedAt``.
+    /// Used only for the live elapsed label; settled labels use the duration
+    /// stamped onto the message at completion before the store clears that start.
+    var liveTurnStartedAt: Date?
+    /// Settled duration captured by ``ChatStore`` from the same turn start.
+    var settledDuration: TimeInterval?
 
     @Environment(\.hermesTheme) private var theme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// The effective expansion state. `nil` means "no explicit user choice yet,
     /// follow the streaming-driven default"; a non-nil value is the user's own
@@ -40,6 +51,9 @@ struct ThinkingView: View {
     /// final at first paint; only a live `streaming` transition AFTER appearance
     /// animates (the watch-it-settle UX during an in-view turn).
     @State private var hasAppeared = false
+    @State private var pulse = false
+    @State private var now = Date()
+    @State private var liveScrollTarget: String? = Self.liveWindowBottomID
 
     /// Auto behavior: open while streaming, collapsed once settled.
     private var autoExpanded: Bool { streaming }
@@ -60,37 +74,126 @@ struct ThinkingView: View {
         )
     }
 
+    private var cleanedThinking: String {
+        ThinkingDisplay.cleanedText(thinking)
+    }
+
+    private var activeStepText: String {
+        ThinkingDisplay.activeStepText(from: cleanedThinking)
+    }
+
+    private var liveElapsedText: String {
+        ThinkingDisplay.elapsedText(startedAt: liveTurnStartedAt, now: now)
+    }
+
     var body: some View {
         DisclosureGroup(isExpanded: isExpanded) {
-            ScrollView {
-                Text(thinking)
-                    .font(.caption)
-                    .italic()
-                    .foregroundStyle(theme.mutedFg)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 4)
-            }
-            .frame(maxHeight: 240)
+            thinkingBody
         } label: {
-            // VC-07: label is "Thinking" (settled) / "Thinking…" (streaming).
-            // CC-08: animate the label transition so "Thinking…" eases to
-            // "Thinking" when the turn settles rather than cutting.
-            Label(streaming ? "Thinking…" : "Thinking", systemImage: "brain")
-                .font(.caption)
-                .italic()
-                .foregroundStyle(theme.mutedFg)
-                .animation(settleAnimation, value: streaming)
-                .accessibilityHint("Double-tap to expand chain of thought")
+            thinkingLabel
         }
         .tint(theme.mutedFg)
-        // When the turn settles, animate the auto-collapse so an untouched
-        // accordion eases shut rather than snapping. A user who has taken manual
-        // control (`userExpanded != nil`) is unaffected — their state is sticky.
-        // ARCH37 Step 5: `settleAnimation` is nil until the view has appeared, so
-        // the SEED-PATH first paint lands at its final (collapsed) height with no
-        // animated height delta — only a live in-view settle animates.
-        .animation(settleAnimation, value: streaming)
-        .onAppear { hasAppeared = true }
+        .onReceive(Self.tick) { now = $0 }
+        .onAppear {
+            hasAppeared = true
+            liveScrollTarget = Self.liveWindowBottomID
+            guard streaming, !reduceMotion else { return }
+            withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) {
+                pulse = true
+            }
+        }
+        .onChange(of: streaming) { _, isStreaming in
+            liveScrollTarget = Self.liveWindowBottomID
+            if isStreaming, !reduceMotion {
+                withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) {
+                    pulse = true
+                }
+            } else {
+                pulse = false
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var thinkingLabel: some View {
+        if streaming {
+            HStack(spacing: 8) {
+                Text(activeStepText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 12)
+                Text(liveElapsedText)
+                    .monospacedDigit()
+                    .fontDesign(.monospaced)
+                    .foregroundStyle(theme.midground.opacity(0.55))
+            }
+            .font(.caption)
+            .italic()
+            .foregroundStyle(theme.mutedFg)
+            .opacity(reduceMotion ? 1.0 : (pulse ? 1.0 : 0.55))
+            .brightness(reduceMotion ? 0 : (pulse ? 0.06 : 0))
+            .accessibilityHint("Double-tap to expand chain of thought")
+        } else {
+            Text(ThinkingDisplay.settledLabel(duration: settledDuration))
+                .font(.caption)
+                .italic()
+                .monospacedDigit()
+                .foregroundStyle(theme.mutedFg)
+                .accessibilityHint("Double-tap to expand chain of thought")
+        }
+    }
+
+    @ViewBuilder
+    private var thinkingBody: some View {
+        if streaming {
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        bodyText
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.liveWindowBottomID)
+                    }
+                    .scrollTargetLayout()
+                }
+                .scrollPosition(id: $liveScrollTarget, anchor: .bottom)
+                .frame(height: Self.liveWindowHeight)
+                .mask(alignment: .top) {
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0),
+                            .init(color: .black, location: 0.16),
+                            .init(color: .black, location: 1),
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
+                .accessibilityIdentifier("thinkingLiveWindow")
+                .onAppear {
+                    liveScrollTarget = Self.liveWindowBottomID
+                    proxy.scrollTo(Self.liveWindowBottomID, anchor: .bottom)
+                }
+                .onChange(of: cleanedThinking) { _, _ in
+                    liveScrollTarget = Self.liveWindowBottomID
+                    proxy.scrollTo(Self.liveWindowBottomID, anchor: .bottom)
+                }
+            }
+        } else {
+            ScrollView {
+                bodyText
+            }
+            .frame(maxHeight: 240)
+        }
+    }
+
+    private var bodyText: some View {
+        Text(cleanedThinking)
+            .font(.caption)
+            .italic()
+            .foregroundStyle(theme.mutedFg)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
     }
 }
