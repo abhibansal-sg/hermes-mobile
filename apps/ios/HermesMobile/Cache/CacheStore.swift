@@ -17,6 +17,20 @@ import GRDB
 
 actor CacheStore {
 
+    struct OfflineSearchHit: Sendable, Equatable {
+        let scope: CacheScope
+        let sessionId: String
+        let wireId: Int?
+        let ordinal: Int
+        let role: String
+        let snippet: String
+    }
+
+    struct OfflineSearchPage: Sendable, Equatable {
+        let hits: [OfflineSearchHit]
+        let partial: Bool
+    }
+
     // MARK: - Internal state (actor-isolated)
 
     private let db: DatabaseQueue
@@ -201,7 +215,8 @@ actor CacheStore {
     func saveTranscript(
         sessionId: String,
         messages: [StoredMessage],
-        wireIds: [Int?]? = nil
+        wireIds: [Int?]? = nil,
+        scope explicitScope: CacheScope? = nil
     ) throws {
         try db.write { db in
             // Guard: sessions excluded from human Recents are never transcript-cached.
@@ -212,6 +227,20 @@ actor CacheStore {
                 source: sessionRecord.source,
                 messageCount: sessionRecord.messageCount
             ) else { return }
+            let scope = explicitScope ?? CacheScope(
+                serverId: sessionRecord.serverId, profileId: sessionRecord.profileId
+            )
+
+            // The scoped mirror and its FTS rows are replaced atomically with the
+            // canonical transcript write. Virtual tables have no FK cascade.
+            try db.execute(
+                sql: "DELETE FROM transcript_fts WHERE serverId = ? AND profileId = ? AND sessionId = ?",
+                arguments: [scope.serverId, scope.profileId, sessionId]
+            )
+            try db.execute(
+                sql: "DELETE FROM offline_message_cache WHERE serverId = ? AND profileId = ? AND sessionId = ?",
+                arguments: [scope.serverId, scope.profileId, sessionId]
+            )
 
             // Delete existing rows for this session
             try MessageRowRecord
@@ -233,6 +262,27 @@ actor CacheStore {
                     message: message
                 )
                 try row.insert(db)
+                try db.execute(
+                    sql: """
+                        INSERT INTO offline_message_cache
+                        (serverId, profileId, sessionId, ordinal, wireId, role, timestamp, rowJSON)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                    arguments: [scope.serverId, scope.profileId, sessionId, ordinal,
+                                wireId, row.role, row.timestamp, row.rowJSON]
+                )
+                if let text = Self.searchableText(message), !text.isEmpty {
+                    try db.execute(
+                        sql: """
+                            INSERT INTO transcript_fts
+                            (serverId, profileId, sessionId, messageKey, wireId, ordinal, role, content)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                        arguments: [scope.serverId, scope.profileId, sessionId,
+                                    wireId.map(String.init) ?? "o:\(ordinal)", wireId,
+                                    ordinal, message.role, text]
+                    )
+                }
                 if let wid = wireId {
                     maxWireId = max(maxWireId ?? Int.min, wid)
                 }
@@ -244,6 +294,175 @@ actor CacheStore {
             updated.maxMessageId = maxWireId ?? sessionRecord.maxMessageId
             try updated.save(db)
         }
+    }
+
+    /// Append rows while preserving their scoped ordinal identity. The read and
+    /// replacement execute as one actor operation; `saveTranscript` performs the
+    /// actual cache + FTS replacement atomically in its database transaction.
+    func appendTranscript(
+        sessionId: String, messages: [StoredMessage], scope: CacheScope
+    ) throws {
+        let existing = try loadTranscript(scope: scope, sessionId: sessionId) ?? []
+        try saveTranscript(sessionId: sessionId, messages: existing + messages, scope: scope)
+    }
+
+    /// Scope-safe local search. FTS syntax is never accepted from callers: the
+    /// quoted phrase treats punctuation as text and prevents malformed MATCH.
+    func searchTranscript(
+        query: String, scope: CacheScope, roles: [String] = [], limit: Int = 50
+    ) throws -> OfflineSearchPage {
+        try db.read { db in
+            let terms = query.split(whereSeparator: { $0.isWhitespace })
+                .map { "\"\($0.replacingOccurrences(of: "\"", with: "\"\""))\"" }
+                .joined(separator: " AND ")
+            guard !terms.isEmpty else { return OfflineSearchPage(hits: [], partial: false) }
+            var sql = """
+                SELECT serverId, profileId, sessionId, wireId, ordinal, role,
+                       snippet(transcript_fts, 7, '<b>', '</b>', '…', 18) AS snippet
+                FROM transcript_fts
+                WHERE transcript_fts MATCH ? AND serverId = ? AND profileId = ?
+                """
+            var arguments: StatementArguments = [terms, scope.serverId, scope.profileId]
+            if !roles.isEmpty {
+                sql += " AND role IN (\(Array(repeating: "?", count: roles.count).joined(separator: ",")))"
+                arguments += StatementArguments(roles)
+            }
+            sql += " ORDER BY rowid LIMIT ?"
+            arguments += [limit]
+            let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
+            let hits = rows.map { row in
+                OfflineSearchHit(
+                    scope: scope, sessionId: row["sessionId"], wireId: row["wireId"],
+                    ordinal: row["ordinal"], role: row["role"], snippet: row["snippet"]
+                )
+            }
+            let progress = try Row.fetchOne(
+                db,
+                sql: "SELECT complete FROM offline_search_backfill WHERE serverId = ? AND profileId = ?",
+                arguments: [scope.serverId, scope.profileId]
+            )
+            return OfflineSearchPage(hits: hits, partial: (progress?["complete"] as Bool?) != true)
+        }
+    }
+
+    /// Index at most `batchSize` legacy cached rows for one scope. Callers run
+    /// this from an unstructured startup task, so opening the database and first
+    /// paint never wait for a full historical scan. Progress commits with each
+    /// batch and therefore resumes after termination.
+    @discardableResult
+    func backfillSearchIndex(scope: CacheScope, batchSize: Int = 100) throws -> Bool {
+        try db.write { db in
+            let progress = try Row.fetchOne(
+                db, sql: "SELECT lastRowId, complete FROM offline_search_backfill WHERE serverId=? AND profileId=?",
+                arguments: [scope.serverId, scope.profileId]
+            )
+            if (progress?["complete"] as Bool?) == true { return true }
+            let lastRowId: Int64 = progress?["lastRowId"] ?? 0
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT m.rowid AS sourceRowId, m.sessionId, m.ordinal, m.wireId, m.role,
+                       m.timestamp, m.rowJSON
+                FROM message_row_cache m JOIN session_cache s ON s.id=m.sessionId
+                WHERE s.serverId=? AND s.profileId=? AND m.rowid>? ORDER BY m.rowid LIMIT ?
+                """, arguments: [scope.serverId, scope.profileId, lastRowId, batchSize])
+            var highWater = lastRowId
+            for row in rows {
+                let sourceRowId: Int64 = row["sourceRowId"]
+                highWater = max(highWater, sourceRowId)
+                let data: Data = row["rowJSON"]
+                let message = try JSONDecoder().decode(StoredMessageMirror.self, from: data).toStoredMessage()
+                let sessionId: String = row["sessionId"]
+                let ordinal: Int = row["ordinal"]
+                let wireId: Int? = row["wireId"]
+                try db.execute(sql: """
+                    INSERT OR REPLACE INTO offline_message_cache
+                    (serverId,profileId,sessionId,ordinal,wireId,role,timestamp,rowJSON)
+                    VALUES (?,?,?,?,?,?,?,?)
+                    """, arguments: [scope.serverId, scope.profileId, sessionId, ordinal,
+                                      wireId, message.role, message.timestamp, data])
+                if let text = Self.searchableText(message), !text.isEmpty {
+                    try db.execute(sql: """
+                        INSERT INTO transcript_fts
+                        (serverId,profileId,sessionId,messageKey,wireId,ordinal,role,content)
+                        VALUES (?,?,?,?,?,?,?,?)
+                        """, arguments: [scope.serverId, scope.profileId, sessionId,
+                                          wireId.map(String.init) ?? "o:\(ordinal)", wireId,
+                                          ordinal, message.role, text])
+                }
+            }
+            let complete = rows.count < batchSize
+            try db.execute(sql: """
+                INSERT INTO offline_search_backfill(serverId,profileId,lastRowId,complete)
+                VALUES (?,?,?,?) ON CONFLICT(serverId,profileId) DO UPDATE SET
+                lastRowId=excluded.lastRowId, complete=excluded.complete
+                """, arguments: [scope.serverId, scope.profileId, highWater, complete])
+            return complete
+        }
+    }
+
+    /// Loads the exact scoped cached row selected by an offline hit.
+    func loadTranscript(scope: CacheScope, sessionId: String) throws -> [StoredMessage]? {
+        try db.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT rowJSON FROM offline_message_cache
+                    WHERE serverId = ? AND profileId = ? AND sessionId = ? ORDER BY ordinal
+                    """,
+                arguments: [scope.serverId, scope.profileId, sessionId]
+            )
+            guard !rows.isEmpty else { return nil }
+            return try rows.map { row in
+                let data: Data = row["rowJSON"]
+                return try JSONDecoder().decode(StoredMessageMirror.self, from: data).toStoredMessage()
+            }
+        }
+    }
+
+    /// Explicit tombstone cleanup; FTS5 cannot participate in FK cascades.
+    func removeSession(scope: CacheScope, sessionId: String) throws {
+        try db.write { db in
+            try db.execute(sql: "DELETE FROM transcript_fts WHERE serverId=? AND profileId=? AND sessionId=?",
+                           arguments: [scope.serverId, scope.profileId, sessionId])
+            try db.execute(sql: "DELETE FROM offline_message_cache WHERE serverId=? AND profileId=? AND sessionId=?",
+                           arguments: [scope.serverId, scope.profileId, sessionId])
+        }
+    }
+
+    /// Destructive primitive reserved for the future Forget Gateway flow.
+    @discardableResult
+    func purgeGateway(serverId: String) throws -> Int {
+        try db.write { db in
+            let count = try Int.fetchOne(db, sql: "SELECT count(*) FROM transcript_fts WHERE serverId=?", arguments: [serverId]) ?? 0
+            try db.execute(sql: "DELETE FROM transcript_fts WHERE serverId=?", arguments: [serverId])
+            for table in ["offline_message_cache", "offline_search_backfill", "session_cache"] {
+                try db.execute(sql: "DELETE FROM \(table) WHERE serverId=?", arguments: [serverId])
+            }
+            // Optional foundation tables are purged when present; this keeps the
+            // primitive forward-compatible without creating speculative schema.
+            for table in ["attention_cache", "turn_cache", "head_cache", "cursor_cache", "last_opened_cache", "widget_source_state"] {
+                if try db.tableExists(table) {
+                    try db.execute(sql: "DELETE FROM \(table) WHERE serverId=?", arguments: [serverId])
+                }
+            }
+            return count
+        }
+    }
+
+    private static func searchableText(_ message: StoredMessage) -> String? {
+        guard ["user", "assistant", "tool"].contains(message.role) else { return nil }
+        func flatten(_ value: JSONValue) -> [String] {
+            switch value {
+            case .string(let value): return [value]
+            case .array(let values): return values.flatMap(flatten)
+            case .object(let value):
+                // Only textual leaves are indexed; image/data URL payloads and
+                // opaque binary fields are intentionally excluded.
+                return value.filter { !["data", "image", "image_url", "audio"].contains($0.key.lowercased()) }
+                    .flatMap { flatten($0.value) }
+            default: return []
+            }
+        }
+        return flatten(message.content).filter { !$0.hasPrefix("data:") }.joined(separator: "\n")
     }
 
     // MARK: - Upsert page (individual session update)
