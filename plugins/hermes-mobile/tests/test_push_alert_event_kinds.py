@@ -31,6 +31,18 @@ def _run_push_events_inline(monkeypatch, push):
     monkeypatch.setattr(push, "_enqueue_push_event", fake_enqueue)
 
 
+def test_push_registry_persists_authenticated_device_binding(monkeypatch, tmp_path):
+    _isolate_home(monkeypatch, tmp_path)
+    push = load_plugin_module("push_engine")
+    assert push.register_token(_VALID_TOKEN, env="sandbox", device_id="device-1")
+    assert push.registry_entries()[0]["device_id"] == "device-1"
+
+    # Re-registration is the only legacy-row backfill path.
+    assert push.register_token(_VALID_TOKEN, env="production", device_id="device-2")
+    entries = push.registry_entries()
+    assert len(entries) == 1 and entries[0]["device_id"] == "device-2"
+
+
 def test_error_event_notifies_turn_error_kind(monkeypatch, tmp_path):
     _isolate_home(monkeypatch, tmp_path)
     push = load_plugin_module("push_engine")
