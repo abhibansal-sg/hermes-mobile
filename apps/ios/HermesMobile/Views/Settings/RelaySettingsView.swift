@@ -1,4 +1,6 @@
+import CoreImage.CIFilterBuiltins
 import SwiftUI
+import UIKit
 
 /// Settings surface for ABH-282 relay push ENABLE.
 ///
@@ -10,6 +12,7 @@ import SwiftUI
 struct RelaySettingsView: View {
     @Environment(\.hermesTheme) private var theme
     @State private var store: RelayStore
+    @State private var pairLinkCopied = false
 
     init(rest: RestClient) {
         _store = State(initialValue: RelayStore(rest: rest))
@@ -231,7 +234,37 @@ struct RelaySettingsView: View {
                     .accessibilityIdentifier("relayPairSummary")
             }
 
+            if let pairingDeepLink = store.pairingDeepLink {
+                RelayPairQRCodeView(payload: pairingDeepLink)
+                    .frame(maxWidth: .infinity)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("relayPairQRCode")
+
+                ShareLink(item: pairingDeepLink) {
+                    Label("Share pairing link", systemImage: "square.and.arrow.up")
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("relayPairShareLink")
+
+                Button {
+                    UIPasteboard.general.string = pairingDeepLink
+                    pairLinkCopied = true
+                } label: {
+                    Label("Copy pairing link", systemImage: "doc.on.doc")
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("relayPairCopyLink")
+
+                if pairLinkCopied {
+                    Label("Pairing link copied.", systemImage: "checkmark.circle")
+                        .foregroundStyle(theme.midground)
+                        .listRowBackground(theme.card)
+                        .accessibilityIdentifier("relayPairLinkCopied")
+                }
+            }
+
             Button {
+                pairLinkCopied = false
                 Task { await store.pair() }
             } label: {
                 HStack {
@@ -331,5 +364,45 @@ struct RelaySettingsView: View {
         case "failing", "unconfigured": .red
         default: theme.mutedFg
         }
+    }
+}
+
+private struct RelayPairQRCodeView: View {
+    private static let context = CIContext()
+    private let payload: String
+
+    init(payload: String) {
+        self.payload = payload
+    }
+
+    var body: some View {
+        VStack(alignment: .center, spacing: 8) {
+            if let image = makeQRCode(from: payload) {
+                Image(uiImage: image)
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 180, height: 180)
+                    .accessibilityLabel("Relay pairing QR code")
+            } else {
+                Image(systemName: "qrcode")
+                    .font(.system(size: 96))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 180, height: 180)
+                    .accessibilityLabel("Relay pairing QR code unavailable")
+            }
+        }
+        .padding(.vertical, 8)
+    }
+
+    private func makeQRCode(from payload: String) -> UIImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(payload.utf8)
+        filter.correctionLevel = "M"
+        guard
+            let outputImage = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: 12, y: 12)),
+            let cgImage = Self.context.createCGImage(outputImage, from: outputImage.extent)
+        else { return nil }
+        return UIImage(cgImage: cgImage)
     }
 }

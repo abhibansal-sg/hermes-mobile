@@ -63,6 +63,10 @@ final class RelayStore {
         return "Relay \(relayPairing.relayURL), agent \(relayPairing.agentID), pairing prefix \(relayPairing.pairingPrefix)…"
     }
 
+    var pairingDeepLink: String? {
+        relayPairing?.deepLink
+    }
+
     var statusSummary: String {
         guard let relayStatus else {
             return enabled ? "Relay health: not checked." : "Relay health: unconfigured."
@@ -200,15 +204,26 @@ final class RelayStore {
         }
     }
 
-    private func apply(_ config: RelayConfig) {
+    func apply(_ config: RelayConfig) {
+        let existingPairing = relayPairing
+        let configuredRelayURL = config.relayURL ?? ""
         enabled = !(config.relayURL ?? "").isEmpty
-        relayURLDraft = config.relayURL ?? ""
+        relayURLDraft = configuredRelayURL
         tokenDraft = ""
         clearTokenOnSave = false
         registrationTokenSet = config.registrationTokenSet
         registrationTokenPrefix = config.registrationTokenPrefix
         pushKinds = config.pushKinds
-        relayPairing = nil
+        if
+            enabled,
+            let existingPairing,
+            configuredRelayURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                == existingPairing.relayURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        {
+            relayPairing = existingPairing
+        } else {
+            relayPairing = nil
+        }
         relayStatus = nil
     }
 
@@ -311,9 +326,25 @@ struct RelayPairingPayload: Sendable, Equatable {
 
     var pairingPrefix: String { String(pairingSecret.prefix(8)) }
 
+    var deepLink: String {
+        "hermesapp://pair?relay=\(Self.encodeQueryValue(relayURL))&agent=\(Self.encodeQueryValue(agentID))&pairing=\(Self.encodeQueryValue(pairingSecret))&kind=relay"
+    }
+
     init(json: JSONValue) {
         self.relayURL = json["relay"]?.stringValue ?? ""
         self.agentID = json["agent"]?.stringValue ?? ""
         self.pairingSecret = json["pairing"]?.stringValue ?? ""
+    }
+
+    init(relayURL: String, agentID: String, pairingSecret: String) {
+        self.relayURL = relayURL
+        self.agentID = agentID
+        self.pairingSecret = pairingSecret
+    }
+
+    private static func encodeQueryValue(_ value: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
     }
 }
