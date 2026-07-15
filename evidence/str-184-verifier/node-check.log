@@ -1,0 +1,2 @@
+=== node --check asc-cloud.mjs (PR head de3ef3f8f4e347326169c6c2bb455a4c5583eb2f) ===
+node --check: OK

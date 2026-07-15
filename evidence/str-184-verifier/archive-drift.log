@@ -1,0 +1,38 @@
+=== STR-184 archive-drift regression guard (STR-173, unchanged) ===
+== STR-554 Child B hermetic tests ==
+T1: non-ff archive tip refused before push
+  PASS: non-ff archive tip refused (rc=1)
+  PASS: divergence message names ancestor check
+  PASS: archive untouched after refusal (tip moved 0)
+T2: ff archive tip synced + pushed
+  PASS: ff archive sync succeeded (rc=0)
+  PASS: archive tip advanced to ship sha
+  PASS: sync message printed
+T3: archive already at ship sha (idempotent)
+  PASS: idempotent re-sync succeeded (rc=0)
+  PASS: idempotent message printed
+T4: empty/unreadable archive tip refused
+  PASS: empty archive refused (rc=1)
+  PASS: unreadable message printed
+T5: drift gate rejects stale SHA
+  PASS: stale SHA rejected (rc=1)
+  PASS: DRIFT FAIL message printed
+  PASS: no SHIPPED banner on drift
+T6: drift gate accepts matching SHA
+  PASS: matching SHA accepted (rc=0)
+  PASS: no DRIFT message on match
+T7: empty BUILT_SHA rejected
+  PASS: empty SHA rejected (rc=1)
+  PASS: DRIFT FAIL on empty
+T8: no forced-update or plus-refspec in ship-testflight.sh
+  PASS: no forced-update / plus-refspec in /Users/abbhinnav/Developer/products/hermes-loop/scripts/ship-testflight.sh
+T9: drift gate precedes CLOUD_OK=1 in cloud path
+  PASS: drift gate (line 280) precedes CLOUD_OK=1 (line 281)
+T10: archive sync precedes find-run/trigger in cloud path
+  PASS: archive sync (line 250) precedes find-run (line 261)
+T11: diff scope check
+  PASS: scripts/ diff scope clean
+  NOTE: pre-existing workspace changes outside this child's fence (not authored by this unit): contracts/capacity-directive.json contracts/capacity-forecast.json logs/disk-reaper.launchd.out.log logs/disk-reaper.log runtime/tmp-reap.log team-ledgers/architect.jsonl team-ledgers/dev-ios-codex.jsonl team-ledgers/dev-ios-grok.jsonl team-ledgers/dev-utility-codex.jsonl team-ledgers/hermes-cos.jsonl team-ledgers/release.jsonl team-ledgers/verifier.jsonl
+
+ALL TESTS PASSED
+archive-drift exit=0

@@ -1,0 +1,8 @@
+=== STR-184 notes-gate test | hermes-loop ship-testflight.sh (e921338, on main) ===
+== STR-184 What-to-Test gate tests ==
+  PASS: non-zero asc-notes exit fails even with success banner
+  PASS: exit 0 plus success banner passes
+  PASS: exit 0 without success banner fails
+
+ALL TESTS PASSED
+notes-gate exit=0

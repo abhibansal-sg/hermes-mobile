@@ -1,0 +1,11 @@
+=== STR-184 find-run test | PR#130 head | de3ef3f8f4e347326169c6c2bb455a4c5583eb2f ===
+== STR-184 asc-cloud find-run tests ==
+  PASS: full 40-char SHA skips same-prefix collision
+  PASS: abbreviated SHA still matches by prefix
+  PASS: IN_PROGRESS run is adoptable
+  PASS: COMPLETE + SUCCEEDED run is adoptable
+  PASS: COMPLETE + FAILED run is not adoptable
+  PASS: COMPLETE + CANCELED run is not adoptable
+
+ALL TESTS PASSED
+find-run exit=0
