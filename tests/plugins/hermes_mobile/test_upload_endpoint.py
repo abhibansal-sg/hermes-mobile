@@ -12,6 +12,7 @@ at import time. The upload knobs (``_UPLOAD_DIR``,
 from __future__ import annotations
 
 import sys
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -54,6 +55,8 @@ def test_upload_attachment_succeeds_under_cap(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["size"] == 3
+    assert body["mime"] == "image/png"
+    assert body["content_version"] == f"sha256:{hashlib.sha256(b'abc').hexdigest()}"
     stored = Path(body["path"])
     assert stored.parent == upload_dir
     assert stored.read_bytes() == b"abc"

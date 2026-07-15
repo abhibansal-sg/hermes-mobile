@@ -28,6 +28,7 @@ the W2 auth-provider conversion).
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import hashlib
 import importlib
 import importlib.util
@@ -47,7 +48,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from typing import Annotated
 
@@ -213,6 +214,36 @@ _UPLOAD_MAX_FILES = 200
 _UPLOAD_MAX_AGE_SECONDS = 7 * 24 * 3600
 
 
+def _sha256_content_version(data: bytes) -> str:
+    """Return an opaque, path-free content identity for bounded bytes."""
+    return f"sha256:{hashlib.sha256(data).hexdigest()}"
+
+
+def _stat_content_version(st: os.stat_result) -> str:
+    """Return an opaque version for files too large to hash in this endpoint.
+
+    The token intentionally contains only a digest of remote metadata. It never
+    includes the absolute path, while nanosecond mtime + size make same-size
+    replacements visible on files whose full bytes are outside the read bound.
+    """
+    material = f"{int(st.st_size)}:{int(st.st_mtime_ns)}".encode("ascii")
+    return f"stat-sha256:{hashlib.sha256(material).hexdigest()}"
+
+
+def _file_response_metadata(
+    path: str, st: os.stat_result, data: Optional[bytes] = None
+) -> Dict[str, Any]:
+    """Build the common attachment/fs metadata response shape."""
+    return {
+        "size": int(st.st_size),
+        "modified": float(st.st_mtime),
+        "mime": mimetypes.guess_type(path)[0] or "application/octet-stream",
+        "content_version": (
+            _sha256_content_version(data) if data is not None else _stat_content_version(st)
+        ),
+    }
+
+
 def _resolve_uploaded_attachment(name: str) -> Path:
     """Resolve an opaque upload filename under ``_UPLOAD_DIR``.
 
@@ -308,7 +339,12 @@ async def upload_attachment(request: Request):
         raise HTTPException(status_code=500, detail=f"Could not store upload: {exc}")
 
     _prune_uploads()
-    return {"path": str(dest), "size": len(data)}
+    return {
+        "path": str(dest),
+        "size": len(data),
+        "mime": mimetypes.guess_type(dest.name)[0] or "application/octet-stream",
+        "content_version": _sha256_content_version(data),
+    }
 
 
 @router.get("/attachments/{name}")
@@ -327,8 +363,40 @@ async def fetch_uploaded_attachment(name: str, request: Request):
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Attachment not found")
 
+    try:
+        with path.open("rb") as fh:
+            data = fh.read(_MAX_ATTACHMENT_UPLOAD_BYTES + 1)
+            st = os.fstat(fh.fileno())
+    except OSError:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    if len(data) > _MAX_ATTACHMENT_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Attachment too large")
+
+    content_version = _sha256_content_version(data)
+    etag = f'"{content_version}"'
+    last_modified = email.utils.formatdate(st.st_mtime, usegmt=True)
+    headers = {
+        "ETag": etag,
+        "Content-Length": str(len(data)),
+        "Last-Modified": last_modified,
+        "Content-Disposition": f'inline; filename="{path.name}"',
+    }
+
+    # If-None-Match uses weak comparison semantics. Accept either our strong
+    # token or a weak spelling of the same token, plus the wildcard form.
+    requested_etags = {
+        value.strip().removeprefix("W/")
+        for value in request.headers.get("if-none-match", "").split(",")
+        if value.strip()
+    }
+    if "*" in requested_etags or etag in requested_etags:
+        return Response(
+            status_code=304,
+            headers={"ETag": etag, "Last-Modified": last_modified},
+        )
+
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    return FileResponse(path, media_type=media_type, filename=path.name)
+    return Response(content=data, media_type=media_type, headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -977,7 +1045,8 @@ async def fs_read(request: Request, session_id: str = "", path: str = ""):
         return JSONResponse(status_code=404, content={"error": "not a file"})
 
     try:
-        size = int(os.path.getsize(abspath))
+        initial_stat = os.stat(abspath)
+        size = int(initial_stat.st_size)
     except OSError:
         return JSONResponse(status_code=404, content={"error": "not a file"})
 
@@ -987,6 +1056,7 @@ async def fs_read(request: Request, session_id: str = "", path: str = ""):
         try:
             with open(abspath, "rb") as fh:
                 head = fh.read(_MAX_FS_READ_BYTES)
+                read_stat = os.fstat(fh.fileno())
         except OSError:
             return JSONResponse(status_code=404, content={"error": "not a file"})
         text = _decode_truncated_utf8(head)
@@ -996,34 +1066,37 @@ async def fs_read(request: Request, session_id: str = "", path: str = ""):
             )
         return {
             "path": path,
-            "size": size,
             "encoding": "utf-8",
             "content": text,
             "truncated": True,
+            **_file_response_metadata(abspath, read_stat),
         }
 
     try:
         with open(abspath, "rb") as fh:
             data = fh.read(_MAX_FS_READ_BYTES)
+            read_stat = os.fstat(fh.fileno())
     except OSError:
         return JSONResponse(status_code=404, content={"error": "not a file"})
+
+    metadata = _file_response_metadata(abspath, read_stat, data)
 
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return {
             "path": path,
-            "size": size,
             "encoding": "binary",
             "content": None,
+            **metadata,
         }
 
     return {
         "path": path,
-        "size": size,
         "encoding": "utf-8",
         "content": text,
         "truncated": False,
+        **metadata,
     }
 
 
@@ -1816,7 +1889,8 @@ async def session_messages_around(
 #
 # Response:
 #   {type, results:[{session_id, session_title, message_id, kind, url_or_path,
-#                    filename?, mime?, size?, snippet?, timestamp}],
+#                    filename?, mime?, size?, content_version?, modified?,
+#                    version?, snippet?, timestamp}],
 #    total, offset}
 #
 # Extraction strategy (pure / deterministic, no FTS needed):
@@ -1846,6 +1920,51 @@ _FILE_PATH_MIN_LEN = 3
 
 _URL_RE = _re.compile(r"https?://[^\s\"'<>()[\]{},;\\]+", _re.IGNORECASE)
 _CONTENT_JSON_PREFIX = "\x00json:"
+
+
+def _safe_artifact_version(value: Any) -> Optional[str]:
+    """Return a stored opaque version token without ever echoing a raw path."""
+    if not isinstance(value, str):
+        return None
+    token = value.strip()
+    if (
+        not token
+        or os.path.isabs(token)
+        or token.startswith(("~/", "\\\\"))
+        or _re.match(r"^[A-Za-z]:[\\/]", token)
+    ):
+        return None
+    return token
+
+
+def _artifact_metadata(*sources: Any) -> Dict[str, Any]:
+    """Collect optional version metadata already present in transcript parts."""
+    mappings = [source for source in sources if isinstance(source, dict)]
+
+    def first(*keys: str) -> Any:
+        for source in mappings:
+            for key in keys:
+                value = source.get(key)
+                if value is not None:
+                    return value
+        return None
+
+    modified = first("modified", "last_modified", "mtime")
+    try:
+        modified = float(modified) if modified is not None else None
+    except (TypeError, ValueError):
+        modified = None
+    version = first("version", "revision", "remote_version")
+    if version is not None and not isinstance(version, str):
+        version = str(version)
+
+    return {
+        "content_version": _safe_artifact_version(
+            first("content_version", "sha256", "etag")
+        ),
+        "modified": modified,
+        "version": version,
+    }
 
 
 def _decode_content_local(raw: Any) -> Any:
@@ -1890,6 +2009,7 @@ def _extract_images(row: Dict[str, Any]) -> List[Dict[str, Any]]:
             filename = None
             mime = None
             size = None
+            metadata: Dict[str, Any] = {}
 
             if ptype in ("image", "image_url"):
                 # image_url parts: {"type":"image_url","image_url":{"url":"..."}}
@@ -1903,6 +2023,8 @@ def _extract_images(row: Dict[str, Any]) -> List[Dict[str, Any]]:
                     raw_data = img_block.get("data")
                     url_or_path = raw_data[:80] if isinstance(raw_data, str) else ""
                 mime = img_block.get("media_type")
+                size = img_block.get("size") or part.get("size")
+                metadata = _artifact_metadata(img_block, part)
             elif ptype == "document":
                 # Document attachments: {"type":"document","source":{"type":"url","url":"..."}}
                 src = part.get("source") or {}
@@ -1915,6 +2037,7 @@ def _extract_images(row: Dict[str, Any]) -> List[Dict[str, Any]]:
                 mime = src.get("media_type")
                 filename = part.get("name") or part.get("title")
                 size = part.get("size")
+                metadata = _artifact_metadata(src, part)
 
             if not url_or_path:
                 continue
@@ -1926,6 +2049,7 @@ def _extract_images(row: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "mime": mime,
                 "size": size,
                 "snippet": None,
+                **metadata,
             })
         except Exception:
             # Skip this part; continue extracting from remaining parts.
@@ -1943,7 +2067,7 @@ def _extract_files(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     artifacts: List[Dict[str, Any]] = []
 
-    def _push_path(raw_path: Any) -> None:
+    def _push_path(raw_path: Any, source: Optional[Dict[str, Any]] = None) -> None:
         if not isinstance(raw_path, str):
             return
         p = raw_path.strip()
@@ -1956,9 +2080,13 @@ def _extract_files(row: Dict[str, Any]) -> List[Dict[str, Any]]:
             "kind": "file",
             "url_or_path": p,
             "filename": fname,
-            "mime": None,
-            "size": None,
+            "mime": (
+                source.get("mime") or source.get("mime_type") or mimetypes.guess_type(p)[0]
+                if source else mimetypes.guess_type(p)[0]
+            ),
+            "size": source.get("size") if source else None,
             "snippet": None,
+            **_artifact_metadata(source),
         })
 
     # Scan tool_calls JSON (assistant messages that call tools).
@@ -1980,7 +2108,7 @@ def _extract_files(row: Dict[str, Any]) -> List[Dict[str, Any]]:
                         continue
                     for key, val in args.items():
                         if key.lower() in _FILE_PATH_KEYS:
-                            _push_path(val)
+                            _push_path(val, args)
         except Exception:
             pass
 
@@ -1992,13 +2120,13 @@ def _extract_files(row: Dict[str, Any]) -> List[Dict[str, Any]]:
         for part in candidates:
             if isinstance(part, dict):
                 for key in _FILE_PATH_KEYS:
-                    _push_path(part.get(key))
+                    _push_path(part.get(key), part)
             elif isinstance(part, str):
                 try:
                     obj = _json.loads(part)
                     if isinstance(obj, dict):
                         for key in _FILE_PATH_KEYS:
-                            _push_path(obj.get(key))
+                            _push_path(obj.get(key), obj)
                 except Exception:
                     pass
 
@@ -2056,6 +2184,9 @@ def _extract_links(row: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "mime": None,
                 "size": None,
                 "snippet": snippet[:200],
+                "content_version": None,
+                "modified": None,
+                "version": None,
             })
 
     return artifacts
@@ -2180,6 +2311,9 @@ def _scan_artifacts_sync(
                             "filename": hit.get("filename"),
                             "mime": hit.get("mime"),
                             "size": hit.get("size"),
+                            "content_version": hit.get("content_version"),
+                            "modified": hit.get("modified"),
+                            "version": hit.get("version"),
                             "snippet": hit.get("snippet"),
                             "timestamp": ts,
                         })

@@ -428,7 +428,7 @@ struct FileViewerView: View {
         // (server, profile). A hit short-circuits the network entirely; a miss
         // (or no scope) falls straight through to today's fetch path. The cache
         // is an accelerator, never a correctness dependency.
-        let blobKey = blobCacheKey(size: result.size)
+        let blobKey = blobCacheKey(result: result)
         if let key = blobKey, let cached = AttachmentBlobCache.shared.image(for: key) {
             imagePhase = .loaded(cached)
             return
@@ -446,8 +446,8 @@ struct FileViewerView: View {
             let imageResult = try await rest.fsReadAsDataURL(sessionId: sessionId, path: path)
             if let dataURL = imageResult.dataURL, let decoded = decodeDataURL(dataURL) {
                 imagePhase = .loaded(decoded.image)
-                // Prefer the freshest server-reported size for the cache key.
-                cacheBlob(decoded.data, key: blobCacheKey(size: imageResult.size) ?? blobKey)
+                // Prefer the freshest server-reported content identity.
+                cacheBlob(decoded.data, key: blobCacheKey(result: imageResult) ?? blobKey)
                 return
             }
             // Server does not support the format param — show a clear failure.
@@ -462,15 +462,17 @@ struct FileViewerView: View {
     /// The on-disk blob-cache key for THIS file, or `nil` when the scope is
     /// incomplete (serverId empty) — in which case the cache is bypassed and the
     /// network path runs exactly as today.
-    private func blobCacheKey(size: Int) -> AttachmentBlobCache.Key? {
+    private func blobCacheKey(result: FSReadResult) -> AttachmentBlobCache.Key? {
         let trimmedServer = serverId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedServer.isEmpty else { return nil }
+        guard !trimmedServer.isEmpty,
+              let version = result.contentVersion?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !version.isEmpty else { return nil }
         return AttachmentBlobCache.Key(
             serverId: trimmedServer,
             profileId: profileId,
             sessionId: sessionId,
             path: path,
-            size: size
+            contentVersion: version
         )
     }
 

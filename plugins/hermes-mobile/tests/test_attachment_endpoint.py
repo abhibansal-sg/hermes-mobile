@@ -8,6 +8,7 @@ opaque filename, under the same dashboard-token auth gate as upload.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 
 import pytest
@@ -57,6 +58,29 @@ def test_attachment_fetch_returns_image_bytes_and_content_type(client, api_modul
     assert resp.status_code == 200, resp.text
     assert resp.content == image_bytes
     assert resp.headers["content-type"].startswith("image/png")
+    expected_version = f"sha256:{hashlib.sha256(image_bytes).hexdigest()}"
+    assert resp.headers["etag"] == f'"{expected_version}"'
+    assert resp.headers["content-length"] == str(len(image_bytes))
+    assert "last-modified" in resp.headers
+
+
+def test_attachment_fetch_honors_if_none_match(client, api_module, monkeypatch, tmp_path):
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    name = "abcdef0123456789abcdef0123456789.png"
+    image_bytes = b"same attachment"
+    (upload_dir / name).write_bytes(image_bytes)
+    monkeypatch.setattr(api_module, "_UPLOAD_DIR", upload_dir)
+
+    first = client.get(f"/api/plugins/hermes-mobile/attachments/{name}")
+    conditional = client.get(
+        f"/api/plugins/hermes-mobile/attachments/{name}",
+        headers={"If-None-Match": first.headers["etag"]},
+    )
+
+    assert conditional.status_code == 304
+    assert conditional.content == b""
+    assert conditional.headers["etag"] == first.headers["etag"]
 
 
 def test_attachment_fetch_requires_auth(api_module, monkeypatch, tmp_path):

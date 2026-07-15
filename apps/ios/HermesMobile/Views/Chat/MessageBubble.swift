@@ -2094,12 +2094,6 @@ private struct SentImageThumbnailView: View {
             return
         }
 
-        let key = cacheKey
-        if !force, let key, let image = AttachmentBlobCache.shared.image(for: key) {
-            phase = .loaded(image)
-            return
-        }
-
         phase = .loading
         do {
             let data = try await rest.attachmentData(name: attachment.name)
@@ -2107,26 +2101,15 @@ private struct SentImageThumbnailView: View {
                 phase = .failed("Attachment is not a decodable image")
                 return
             }
-            if let key {
-                AttachmentBlobCache.shared.store(data, for: key)
-            }
             phase = .loaded(image)
         } catch {
             phase = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
         }
     }
 
-    private var cacheKey: AttachmentBlobCache.Key? {
-        let server = serverId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !server.isEmpty else { return nil }
-        return AttachmentBlobCache.Key(
-            serverId: server,
-            profileId: profileId,
-            sessionId: sessionId,
-            path: "uploads/\(attachment.name)",
-            size: 0
-        )
-    }
+    // Persisted transcript hints contain only the opaque upload name, not its
+    // content version. Safely bypass the disk blob cache for this legacy shape;
+    // a size/zero fallback could serve stale bytes after replacement.
 }
 
 /// The user-bubble background + border chrome. Factored into a modifier so the

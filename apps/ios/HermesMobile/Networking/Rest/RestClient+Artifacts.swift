@@ -32,6 +32,12 @@ struct Artifact: Decodable, Identifiable, Sendable, Equatable {
     let mimeType: String?
     /// Server-reported byte count for files/images; `nil` for links.
     let size: Int?
+    /// Opaque server content identity (normally SHA-256).
+    let contentVersion: String?
+    /// Remote modification time in Unix seconds, when known.
+    let modified: Double?
+    /// Provider-specific revision/version metadata, when known.
+    let remoteVersion: String?
     /// For links: the surrounding prose fragment; otherwise `nil`.
     let snippet: String?
     /// Unix-seconds message timestamp.
@@ -64,6 +70,9 @@ struct Artifact: Decodable, Identifiable, Sendable, Equatable {
         case filename
         case mimeType     = "mime"
         case size
+        case contentVersion = "content_version"
+        case modified
+        case remoteVersion  = "version"
         case snippet
         case timestamp
     }
@@ -125,17 +134,19 @@ struct Artifact: Decodable, Identifiable, Sendable, Equatable {
     }
 
     /// Build an ``AttachmentBlobCache/Key`` for thumbnail look-up / storage.
-    /// Returns `nil` when `serverId` is empty or `size` is absent (links never
-    /// carry a size, so they are never cached).
+    /// Returns `nil` when scope or content version is absent. Older gateways
+    /// therefore bypass persistent caching instead of trusting byte size.
     func blobCacheKey(serverId: String, profileId: String) -> AttachmentBlobCache.Key? {
         let trimmed = serverId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let sz = size else { return nil }
+        guard !trimmed.isEmpty,
+              let version = contentVersion?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !version.isEmpty else { return nil }
         return AttachmentBlobCache.Key(
             serverId: trimmed,
             profileId: profileId,
             sessionId: sessionId,
             path: urlOrPath,
-            size: sz
+            contentVersion: version
         )
     }
 }

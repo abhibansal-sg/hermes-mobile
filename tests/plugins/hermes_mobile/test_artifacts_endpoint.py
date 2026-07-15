@@ -138,6 +138,9 @@ def artifact_db(tmp_path, monkeypatch):
                 "type": "url",
                 "url": "https://cdn.example.com/report.pdf",
                 "media_type": "application/pdf",
+                "content_version": "sha256:report-v2",
+                "modified": 1700000001.25,
+                "version": "cdn-rev-4",
             },
             "size": 204800,
         },
@@ -159,7 +162,14 @@ def artifact_db(tmp_path, monkeypatch):
             "type": "function",
             "function": {
                 "name": "read_file",
-                "arguments": json.dumps({"path": "/home/user/notes.txt"}),
+                "arguments": json.dumps({
+                    "path": "/home/user/notes.txt",
+                    "size": 42,
+                    "mime": "text/plain",
+                    "content_version": "sha256:notes-v3",
+                    "modified": 1700000020.0,
+                    "version": "tool-rev-3",
+                }),
             },
         }
     ])
@@ -396,6 +406,9 @@ class TestImageExtraction:
         assert doc["filename"] == "report.pdf"
         assert doc["mime"] == "application/pdf"
         assert doc["size"] == 204800
+        assert doc["content_version"] == "sha256:report-v2"
+        assert doc["modified"] == 1700000001.25
+        assert doc["version"] == "cdn-rev-4"
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +452,18 @@ class TestFileExtraction:
         assert "/home/user/notes.txt" in paths
         assert "~/projects/output.py" in paths
         assert "/tmp/scratch.txt" in paths
+
+    def test_file_version_metadata_flows(self, client, _token_header, artifact_db):
+        r = client.get(_URL, params={"type": "files", "limit": 200}, headers=_token_header)
+        notes = next(
+            item for item in r.json()["results"]
+            if item["url_or_path"] == "/home/user/notes.txt"
+        )
+        assert notes["size"] == 42
+        assert notes["mime"] == "text/plain"
+        assert notes["content_version"] == "sha256:notes-v3"
+        assert notes["modified"] == 1700000020.0
+        assert notes["version"] == "tool-rev-3"
 
 
 # ---------------------------------------------------------------------------
