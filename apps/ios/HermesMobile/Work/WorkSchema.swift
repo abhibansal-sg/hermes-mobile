@@ -130,6 +130,11 @@ enum WorkSchema {
                     ON transfers(state, next_attempt_at, created_at);
                 """)
         }
+        migrator.registerMigration("work-v2-draft-revisions") { db in
+            try db.alter(table: "drafts") { table in
+                table.add(column: "revision", .integer).notNull().defaults(to: 1)
+            }
+        }
         return migrator
     }
 }

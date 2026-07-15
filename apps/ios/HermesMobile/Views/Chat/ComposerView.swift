@@ -392,6 +392,7 @@ struct ComposerView: View {
         }
         .onAppear {
             text = sessions.composerDraft(for: draftKey)
+            sessions.restoreComposerDraft(for: draftKey)
             // Deliver watchdog (B3) / interruption (B4) SALVAGE transcripts into
             // the field — the recorder ends those captures itself (no explicit
             // stop call site to receive the text), so register the same append
@@ -403,12 +404,14 @@ struct ComposerView: View {
             refreshSlashCommands()
         }
         .onChange(of: draftKey) { oldKey, newKey in
+            sessions.flushComposerDraft()
             Self.applyDraftKeyChange(
                 text: &text,
                 sessions: sessions,
                 oldKey: oldKey,
                 newKey: newKey
             )
+            sessions.restoreComposerDraft(for: newKey)
             // Session switch / new draft (STR-533 contract item 5): conversation
             // mode is scoped to the chat it was started on, so a switch must not
             // leave it silently listening into the newly-loaded session.
@@ -421,8 +424,12 @@ struct ComposerView: View {
                 refreshSlashCommands()
             }
         }
+        .onChange(of: attachmentStore.pending.count) { _, _ in
+            sessions.setComposerDraft(text, for: draftKey)
+        }
         .onDisappear {
             sessions.setComposerDraft(text, for: draftKey)
+            sessions.flushComposerDraft()
         }
         // Disconnect / REST unavailable (STR-533 contract item 5): both
         // `startListening` and `speak` dependencies in AppEnvironment require

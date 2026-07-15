@@ -75,7 +75,7 @@ final class AppEnvironment {
         let voiceAutoSpeak = VoiceConversationAutoSpeakCoordinator()
         let voiceAmbientAutoSpeak = VoiceConversationAmbientAutoSpeakCoordinator()
         // Stores need back-references for RPC access and cross-store flows.
-        sessionStore.attach(connection: connectionStore, chat: chatStore)
+        sessionStore.attach(connection: connectionStore, chat: chatStore, attachments: attachmentStore)
         chatStore.attach(connection: connectionStore, sessions: sessionStore, attachments: attachmentStore)
         // ABH-351: ProjectsStore needs REST access (the /projects route) —
         // injected after ConnectionStore is built, same pattern as the others.
