@@ -10488,6 +10488,8 @@ def _(rid, params: dict) -> dict:
         agent = session.get("agent") if session else None
         if agent is not None:
             current_fast = getattr(agent, "service_tier", None) == "priority"
+        elif session is not None and session.get("create_service_tier_override") is not None:
+            current_fast = session.get("create_service_tier_override") == "priority"
         else:
             current_fast = _load_service_tier() == "priority"
 
@@ -10527,7 +10529,15 @@ def _(rid, params: dict) -> dict:
                     "fast mode is not available for this model",
                 )
 
-        _write_config_key("agent.service_tier", nv)
+        if session is not None:
+            # Composer/runtime changes are scoped to this live session.  An
+            # empty override explicitly means normal mode even when the global
+            # profile default is fast.
+            session["create_service_tier_override"] = (
+                "priority" if nv == "fast" else ""
+            )
+        else:
+            _write_config_key("agent.service_tier", nv)
         if agent is not None:
             agent.service_tier = "priority" if nv == "fast" else None
             current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
@@ -11493,17 +11503,20 @@ def _(rid, params: dict) -> dict:
         )
         return _ok(rid, {"value": effort, "display": display})
     if key == "fast":
+        session = _sessions.get(params.get("session_id", ""))
+        if session is not None:
+            agent = session.get("agent")
+            if agent is not None:
+                fast = getattr(agent, "service_tier", None) == "priority"
+            elif session.get("create_service_tier_override") is not None:
+                fast = session.get("create_service_tier_override") == "priority"
+            else:
+                fast = _load_service_tier() == "priority"
+        else:
+            fast = _load_service_tier() == "priority"
         return _ok(
             rid,
-            {
-                "value": (
-                    "fast"
-                    if (session := _sessions.get(params.get("session_id", "")))
-                    and getattr(session.get("agent"), "service_tier", None)
-                    == "priority"
-                    else ("fast" if _load_service_tier() == "priority" else "normal")
-                ),
-            },
+            {"value": "fast" if fast else "normal"},
         )
     if key == "busy":
         return _ok(rid, {"value": _load_busy_input_mode()})
