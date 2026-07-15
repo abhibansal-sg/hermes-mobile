@@ -325,10 +325,11 @@ def _capture_notify(monkeypatch, pn):
     """Patch push_engine.notify and return the captured-calls list."""
     calls = []
 
-    def _fake_notify(event_type, title, body, payload=None, *, category=None):
+    def _fake_notify(event_type, title, body, payload=None, *, category=None, **kw):
         calls.append({
             "event_type": event_type, "title": title, "body": body,
             "payload": payload, "category": category,
+            "expiration": kw.get("expiration"),
         })
         return 1
 
@@ -553,7 +554,10 @@ def test_push_hook_turn_complete_category_for_long_turn(monkeypatch, push_engine
     assert calls[0]["body"] == "All done"
 
 
-def test_push_hook_turn_complete_skipped_for_short_turn(monkeypatch, push_engine):
+def test_push_hook_turn_complete_short_turn_pushes_when_unfocused(monkeypatch, push_engine):
+    # STR-987 attention gate: duration no longer suppresses. A short turn with
+    # NO live client WS (locked/off/killed phone) must push — this was the
+    # Board's quick-turn-then-phone-off scenario the old 30s gate broke.
     calls = _capture_notify(monkeypatch, push_engine)
     server._sessions["sid_short"] = {"session_key": "ks"}
     server._sessions["sid_short"]["_push_turn_started"] = time.time() - 2
@@ -561,6 +565,28 @@ def test_push_hook_turn_complete_skipped_for_short_turn(monkeypatch, push_engine
         push_engine._process_push_event("message.complete", "sid_short", {"text": "quick"})
     finally:
         server._sessions.pop("sid_short", None)
+    assert len(calls) == 1
+    assert calls[0]["event_type"] == "turn_complete"
+    assert calls[0]["expiration"] == 14400
+
+
+def test_push_hook_turn_complete_suppressed_when_foregrounded(monkeypatch, push_engine):
+    # STR-987 attention gate: a live client WS holding the session foregrounded
+    # means the user is watching — no banner, regardless of turn duration.
+    calls = _capture_notify(monkeypatch, push_engine)
+
+    class _LiveWS:
+        _closed = False
+
+    server._sessions["sid_fg"] = {
+        "session_key": "kf",
+        "transport": _LiveWS(),
+        "_push_turn_started": time.time() - 100,
+    }
+    try:
+        push_engine._process_push_event("message.complete", "sid_fg", {"text": "watched"})
+    finally:
+        server._sessions.pop("sid_fg", None)
     assert calls == []
 
 
