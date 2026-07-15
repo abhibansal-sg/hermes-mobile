@@ -1486,7 +1486,9 @@ private extension Array where Element == ChatMessagePart {
     }
 }
 
-private struct MarkdownTableBlockView: View {
+/// Internal so the file viewer's rendered-markdown mode (STR-699) can reuse the
+/// exact chat block presentation instead of a second renderer.
+struct MarkdownTableBlockView: View {
     @Environment(\.hermesTheme) private var theme
 
     let table: MessageBubble.MarkdownTable
@@ -1701,7 +1703,7 @@ private struct MarkdownBlockquoteView: View {
     }
 }
 
-private struct MarkdownAlertView: View {
+struct MarkdownAlertView: View {
     @Environment(\.hermesTheme) private var theme
 
     let alert: MessageBubble.MarkdownAlert
@@ -1748,7 +1750,7 @@ private struct MarkdownAlertView: View {
     }
 }
 
-private struct MarkdownTaskListView: View {
+struct MarkdownTaskListView: View {
     @Environment(\.hermesTheme) private var theme
 
     let items: [MessageBubble.MarkdownTaskItem]
@@ -1775,7 +1777,7 @@ private struct MarkdownTaskListView: View {
     }
 }
 
-private struct MarkdownListBlockView: View {
+struct MarkdownListBlockView: View {
     @Environment(\.hermesTheme) private var theme
 
     let items: [MessageBubble.MarkdownListItem]

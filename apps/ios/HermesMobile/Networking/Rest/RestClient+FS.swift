@@ -124,6 +124,29 @@ extension RestClient {
         }
     }
 
+    // MARK: - Diff a file under the session cwd
+
+    /// `GET /api/fs/diff?session_id=…&path=…` — fetch a working-tree-vs-HEAD
+    /// diff for one sandboxed session-cwd path. Clean/non-repo outcomes are
+    /// successful empty diffs. Same 403/404 mapping as ``fsRead``.
+    func fsDiff(sessionId: String, path: String) async throws -> FSDiffResult {
+        let request = makeRequest(
+            path: "\(mobileAPIPrefix)/fs/diff?" + Self.fsQuery(sessionId: sessionId, path: path),
+            method: "GET"
+        )
+        do {
+            let data = try await perform(request)
+            return try decode(
+                FSDiffResult.self,
+                from: data,
+                context: "fs.diff",
+                strategy: .useDefaultKeys
+            )
+        } catch let error as RestError {
+            throw Self.mapFSError(error)
+        }
+    }
+
     // MARK: - Helpers
 
     /// Build the `session_id`/`path` query string, percent-encoding both so a

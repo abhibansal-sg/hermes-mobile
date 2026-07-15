@@ -5,8 +5,12 @@ import UIKit
 /// `GET /api/fs/read` (Module F4A-A1). Handles all content outcomes:
 ///
 /// **Text** (`encoding == "utf-8"`, `content != nil`)
-///   - Mono font, selectable; `[Preview truncated]` appended + footer note when
-///     the server cut the file at the 1 MB cap.
+///   - Syntax-highlighted (language inferred from `path` extension via
+///     `SyntaxHighlighter`/`RenderCache`) with a muted read-only line-number
+///     gutter; selectable; long lines scroll horizontally without clipping the
+///     gutter. Unknown/no extension → plain monospaced (never crashes).
+///     `[Preview truncated]` appended + footer note when the server cut the
+///     file at the 1 MB cap.
 ///
 /// **Image** (path extension is a known image type)
 ///   - Requests the file with `&format=data_url`; renders the returned
@@ -24,6 +28,15 @@ import UIKit
 /// `onMentionFile(path)`. Default no-op; the integrator wires the closure so
 /// a `@file:<path>` token is inserted in the composer WITHOUT touching
 /// ChatView/ComposerView here.
+///
+/// **View modes** (STR-659/STR-701) — Source / Rendered (markdown-only) /
+/// Diff (only when a non-empty unified diff is available), picked via the
+/// leading toolbar menu when more than one applies. Auto-selection on load
+/// matches the desktop client: Diff > Rendered > Source
+/// (``FileViewerMode/autoSelect(diffText:isMarkdown:)``). The diff itself is
+/// loaded best-effort through `GET /api/fs/diff`; clean files, non-repo
+/// workspaces, and failed diff probes fall back to Rendered/Source without
+/// blocking the normal file read.
 ///
 /// FULL NATIVE (UI-I): `ScrollView` + `Text` / `Image`; identity via `theme`/`tint`.
 struct FileViewerView: View {
@@ -50,6 +63,11 @@ struct FileViewerView: View {
     @State private var phase: PanelPhase<FSReadResult> = .loading
     @State private var imagePhase: ImagePhase = .idle
     @State private var didCopy = false
+    @State private var mode: FileViewerMode = .source
+    @State private var diffText: String?
+    /// Once the user picks a mode explicitly, auto-selection (on load or when
+    /// the diff fetch resolves) stops overriding their choice.
+    @State private var userDidSelectMode = false
 
     // MARK: - Image state machine
 
@@ -68,10 +86,19 @@ struct FileViewerView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
         .background(theme.bg)
-        .task { await load() }
+        .task(id: path) { await load() }
     }
 
     private var fileName: String { (path as NSString).lastPathComponent }
+
+    private var isMarkdownFile: Bool { FileViewerModeDetection.isMarkdown(path: path) }
+
+    /// Modes the toolbar picker should offer for the CURRENT file — always
+    /// includes Source; Rendered only for markdown; Diff only once a non-empty
+    /// diff has resolved.
+    private var availableModes: [FileViewerMode] {
+        FileViewerMode.availableModes(diffText: diffText, isMarkdown: isMarkdownFile)
+    }
 
     // MARK: - Content
 
@@ -86,10 +113,36 @@ struct FileViewerView: View {
                 Text(binarySizeLabel(result.size))
             }
         } else if let text = result.content {
-            textContent(text, truncated: result.truncated)
+            modeContent(text, truncated: result.truncated)
         } else {
             // encoding utf-8 but no content — degrade gracefully.
             ContentUnavailableView("No content", systemImage: "doc")
+        }
+    }
+
+    /// Routes text content to the active mode's renderer. `.rendered` and
+    /// `.diff` are only ever active when ``availableModes`` actually offers
+    /// them (markdown / non-empty diff respectively), so the `diffText ?? ""`
+    /// fallback here is defensive, not a real code path.
+    @ViewBuilder
+    private func modeContent(_ text: String, truncated: Bool) -> some View {
+        switch mode {
+        case .source:
+            textContent(text, truncated: truncated)
+        case .rendered:
+            ScrollView(.vertical) {
+                FileMarkdownBodyView(text: text.isEmpty ? "(empty file)" : text)
+                    .padding(16)
+                    .accessibilityIdentifier("fileViewerRendered")
+            }
+            .background(theme.bg)
+            .safeAreaInset(edge: .bottom) {
+                if truncated {
+                    truncationFooter
+                }
+            }
+        case .diff:
+            FileDiffView(diffText: diffText ?? "")
         }
     }
 
@@ -97,14 +150,22 @@ struct FileViewerView: View {
 
     @ViewBuilder
     private func textContent(_ text: String, truncated: Bool) -> some View {
-        ScrollView([.vertical, .horizontal]) {
-            Text(text.isEmpty ? "(empty file)" : text)
-                .font(.system(.callout, design: .monospaced))
-                .foregroundStyle(theme.fg)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(16)
-                .accessibilityIdentifier("fileViewerText")
+        // Vertical scroll wraps both the empty placeholder and the source grid
+        // so the truncation footer applies uniformly. Horizontal scrolling is
+        // delegated to the code column's own ScrollView so the line-number
+        // gutter stays pinned as the left column (mirrors desktop SourceView).
+        ScrollView(.vertical) {
+            if text.isEmpty {
+                Text("(empty file)")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(theme.fg)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(16)
+                    .accessibilityIdentifier("fileViewerText")
+            } else {
+                sourceTextGrid(text)
+            }
         }
         .background(theme.bg)
         .safeAreaInset(edge: .bottom) {
@@ -112,6 +173,92 @@ struct FileViewerView: View {
                 truncationFooter
             }
         }
+    }
+
+    /// Highlighted source laid out as a read-only line-number gutter (left,
+    /// pinned during horizontal scroll) beside the horizontally-scrollable,
+    /// syntax-highlighted code column (right). Mirrors the desktop
+    /// `preview-file.tsx` `SourceView` two-column grid without porting its
+    /// virtualization / edit / diff / interactive line-selection.
+    ///
+    /// Both columns share `.system(.body, design: .monospaced)` so the gutter
+    /// stays line-for-line aligned with the code (identical line metrics).
+    @ViewBuilder
+    private func sourceTextGrid(_ text: String) -> some View {
+        let lineCount = Self.lineCount(for: text)
+        HStack(alignment: .top, spacing: 12) {
+            // Line-number gutter — read-only display only. Stays pinned as the
+            // left column while the code column scrolls horizontally; scrolls
+            // vertically in lockstep with the code (same font/line metrics).
+            // Hidden from accessibility: the code Text (fileViewerText) is the
+            // screen-reader surface; reading every number would be noise.
+            Text(Self.lineNumberString(lineCount: lineCount))
+                .font(.system(.body, design: .monospaced))
+                .foregroundStyle(theme.mutedFg)
+                .frame(width: Self.gutterWidth(forLineCount: lineCount), alignment: .trailing)
+                .accessibilityHidden(true)
+
+            // Code column — horizontally scrollable so long lines pan, never clip.
+            // The highlighter bakes `theme.fg` (and semantic colours) per-run into
+            // the AttributedString, so no `.foregroundStyle` is needed here —
+            // matches CodeBlockView's rendering of the same highlighter output.
+            ScrollView(.horizontal, showsIndicators: true) {
+                Text(highlightedSource(text))
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.trailing, 16)
+                    .accessibilityIdentifier("fileViewerText")
+            }
+        }
+        .padding(.top, 16)
+        .padding(.bottom, 16)
+        .padding(.leading, 16)
+    }
+
+    /// Theme-aware, memoized highlighted source for `text`, using the language
+    /// inferred from `path`. Unknown/no-extension files fall through to plain
+    /// monospaced (the highlighter's baseColor-only output) — never crashes.
+    private func highlightedSource(_ text: String) -> AttributedString {
+        RenderCache.highlight(text, language: Self.highlightLanguage(forPath: path), baseColor: theme.fg)
+    }
+
+    // MARK: - Source helpers (pure / testable)
+
+    /// Number of rendered lines for `text`: newline count + 1 (a trailing
+    /// newline yields a final empty line, matching how `Text` renders it).
+    /// Empty input is `0` so the gutter is skipped entirely for empty files.
+    static func lineCount(for text: String) -> Int {
+        guard !text.isEmpty else { return 0 }
+        return text.reduce(into: 1) { count, ch in if ch == "\n" { count += 1 } }
+    }
+
+    /// The gutter string `"1\n2\n…\nN"` for `lineCount` lines. Right-aligned in
+    /// the gutter frame so single- and multi-digit numbers share a right edge
+    /// (matches the desktop SourceView right-aligned gutter).
+    static func lineNumberString(lineCount: Int) -> String {
+        guard lineCount > 0 else { return "" }
+        return (1...lineCount).map(String.init).joined(separator: "\n")
+    }
+
+    /// Gutter width that fits the widest line number without clipping while
+    /// staying modest on small screens: ~8pt per monospaced body digit + a
+    /// trailing pad, clamped to [28, 80]. A 4-digit file (~9999 lines) ≈ 44pt.
+    static func gutterWidth(forLineCount lineCount: Int) -> CGFloat {
+        let digits = max(1, String(max(1, lineCount)).count)
+        return min(max(CGFloat(digits) * 8 + 12, 28), 80)
+    }
+
+    /// Infer a `SyntaxHighlighter` language alias from the file `path`'s
+    /// extension. Returns `nil` for no/unknown extensions so the highlighter
+    /// renders plain monospaced text. Covers every alias the highlighter knows
+    /// (swift, py/python, js/jsx/mjs/cjs, ts/tsx, sh/zsh/bash, json/jsonc/json5,
+    /// yaml/yml, go/golang, rs/rust, sql, html/htm/xml, css/scss) via the
+    /// extension (`.swift`, `.py`, `.ts`, `.sh`, `.json`, …).
+    static func highlightLanguage(forPath path: String) -> String? {
+        let ext = (path as NSString).pathExtension
+        guard !ext.isEmpty, SyntaxHighlighter.isSupported(ext) else { return nil }
+        return ext
     }
 
     private var truncationFooter: some View {
@@ -159,6 +306,25 @@ struct FileViewerView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+        // Mode picker (STR-701): only shown once there is an actual choice —
+        // a plain non-markdown, clean file has nothing but Source to offer.
+        if availableModes.count > 1 {
+            ToolbarItem(placement: .topBarLeading) {
+                Menu {
+                    ForEach(availableModes) { candidate in
+                        Button {
+                            userDidSelectMode = true
+                            mode = candidate
+                        } label: {
+                            Label(candidate.label, systemImage: candidate.systemImage)
+                        }
+                    }
+                } label: {
+                    Label(mode.label, systemImage: mode.systemImage)
+                }
+                .accessibilityIdentifier("fileViewerModePicker")
+            }
+        }
         ToolbarItem(placement: .topBarTrailing) {
             HStack(spacing: 4) {
                 // "Use in Message" — the mention seam (audit finding). Default
@@ -207,6 +373,13 @@ struct FileViewerView: View {
     private func load() async {
         if phase.value == nil { phase = .loading }
         imagePhase = .idle
+        diffText = nil
+        // Best-known mode BEFORE the diff resolves (no flicker to Source on
+        // markdown files that turn out to have a diff too — auto-select just
+        // upgrades to Diff a moment later if `refreshDiff` finds one).
+        if !userDidSelectMode {
+            mode = isMarkdownFile ? .rendered : .source
+        }
         do {
             let result = try await rest.fsRead(sessionId: sessionId, path: path)
             phase = .loaded(result)
@@ -216,8 +389,29 @@ struct FileViewerView: View {
             }
         } catch let error as FSReadError {
             phase = .failed(error.errorDescription ?? "Couldn't open file")
+            return
         } catch {
             phase = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            return
+        }
+        await refreshDiff()
+    }
+
+    /// Best-effort diff fetch (STR-701). Fires AFTER `phase` is already loaded:
+    /// the file content is on screen before this starts, so clean files,
+    /// non-repo workspaces, stale sessions, or endpoint failures never block
+    /// the normal file read.
+    private func refreshDiff() async {
+        do {
+            let result = try await rest.fsDiff(sessionId: sessionId, path: path)
+            diffText = result.hasChanges
+                ? FileViewerModeDetection.normalizedDiffText(result.diff)
+                : nil
+        } catch {
+            diffText = nil
+        }
+        if !userDidSelectMode {
+            mode = FileViewerMode.autoSelect(diffText: diffText, isMarkdown: isMarkdownFile)
         }
     }
 

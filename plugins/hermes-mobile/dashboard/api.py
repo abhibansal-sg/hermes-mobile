@@ -11,7 +11,7 @@ verbatim from ``hermes_cli/web_server.py`` in the ABH-88 de-patch (W1):
 * ``POST /devices/issue``         — mint per-device token (was /api/devices/issue)
 * ``GET  /devices``               — list paired devices   (was /api/devices)
 * ``DELETE /devices/{device_id}`` — revoke device         (was /api/devices/{id})
-* ``GET  /fs/list`` / ``GET /fs/read`` — sandboxed session-cwd browse
+* ``GET  /fs/list`` / ``GET /fs/read`` / ``GET /fs/diff`` — sandboxed session-cwd browse
 * ``POST/DELETE /push/register`` + ``/push/live-activity`` — APNs registry
   (formerly ``hermes_cli.push_notify.router`` at /api/push/*)
 
@@ -52,6 +52,7 @@ from pydantic import BaseModel
 from typing import Annotated
 
 from hermes_cli.debug import build_debug_share
+from hermes_cli.web_git import file_diff_vs_head
 
 _log = logging.getLogger(__name__)
 
@@ -1023,6 +1024,44 @@ async def fs_read(request: Request, session_id: str = "", path: str = ""):
         "encoding": "utf-8",
         "content": text,
         "truncated": False,
+    }
+
+
+@router.get("/fs/diff")
+async def fs_diff(request: Request, session_id: str = "", path: str = ""):
+    """Return a working-tree-vs-HEAD diff for one path under a session cwd.
+
+    Query params: ``session_id`` (required), ``path`` (required, relative to the
+    cwd root). The path is resolved through the same realpath sandbox guard as
+    ``/fs/list`` and ``/fs/read``. Clean tracked files, missing paths, and
+    non-repositories are normal empty results: ``diff:""`` and
+    ``has_changes:false``. Untracked files use the shared dashboard git helper,
+    which returns an all-add ``--no-index`` diff only when git reports the file
+    as genuinely untracked.
+    """
+    if not _has_dashboard_api_auth(request):
+        return JSONResponse(status_code=401, content={"error": "unauthorized"})
+
+    if not session_id:
+        return JSONResponse(
+            status_code=400, content={"error": "session_id required"}
+        )
+    if not path:
+        return JSONResponse(status_code=400, content={"error": "path required"})
+
+    try:
+        root, abspath = _resolve_under_session_cwd(session_id, path)
+    except FsSandboxError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.error})
+
+    rel_path = os.path.relpath(abspath, root)
+    if rel_path == ".":
+        rel_path = ""
+    diff = file_diff_vs_head(root, rel_path)
+    return {
+        "path": path,
+        "diff": diff,
+        "has_changes": bool(diff.strip()),
     }
 
 

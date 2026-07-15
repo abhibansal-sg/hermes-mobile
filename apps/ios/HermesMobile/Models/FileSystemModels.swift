@@ -145,6 +145,36 @@ struct FSReadResult: Decodable, Equatable, Sendable {
     ]
 }
 
+// MARK: - /api/fs/diff
+
+/// The `GET /api/fs/diff` `200` body: a working-tree-vs-HEAD diff for one
+/// sandboxed session-cwd path. Clean tracked files, missing paths, and non-git
+/// directories return an empty diff with `hasChanges == false`.
+struct FSDiffResult: Decodable, Equatable, Sendable {
+    let path: String
+    let diff: String
+    let hasChanges: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case path
+        case diff
+        case hasChanges = "has_changes"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        path = try c.decodeIfPresent(String.self, forKey: .path) ?? ""
+        diff = try c.decodeIfPresent(String.self, forKey: .diff) ?? ""
+        hasChanges = try c.decodeIfPresent(Bool.self, forKey: .hasChanges) ?? false
+    }
+
+    init(path: String, diff: String, hasChanges: Bool) {
+        self.path = path
+        self.diff = diff
+        self.hasChanges = hasChanges
+    }
+}
+
 // MARK: - Surfaced read errors
 
 /// A read outcome the viewer renders specially (distinct from a transport
