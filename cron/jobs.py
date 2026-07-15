@@ -1389,8 +1389,22 @@ def remove_job(job_id: str) -> bool:
             # Clean up output directory to prevent orphaned dirs accumulating
             if job_output_dir.exists():
                 shutil.rmtree(job_output_dir)
+            _best_effort_prune_cron_sessions(canonical_id, keep_latest=0)
             return True
     return False
+
+
+def _best_effort_prune_cron_sessions(job_id: str, *, keep_latest: int) -> None:
+    try:
+        from cron.session_retention import purge_cron_job_sessions
+
+        purge_cron_job_sessions(job_id, keep_latest=keep_latest)
+    except Exception:
+        logger.warning(
+            "Failed to prune cron sessions for job %s",
+            job_id,
+            exc_info=True,
+        )
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
@@ -1404,10 +1418,15 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
     """
+    from cron.session_retention import DEFAULT_CRON_SESSION_KEEP_LATEST
+
+    retention_keep_latest: Optional[int] = None
+    found = False
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
+                found = True
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
@@ -1448,7 +1467,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         # Remove the job (limit reached)
                         jobs.pop(i)
                         save_jobs(jobs)
-                        return
+                        retention_keep_latest = 0
+                        break
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -1483,9 +1503,18 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                retention_keep_latest = DEFAULT_CRON_SESSION_KEEP_LATEST
+                break
 
-        logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        if not found:
+            logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+            return
+
+    if retention_keep_latest is not None:
+        _best_effort_prune_cron_sessions(
+            job_id,
+            keep_latest=retention_keep_latest,
+        )
 
 
 def claim_dispatch(job_id: str) -> bool:
