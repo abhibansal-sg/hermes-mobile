@@ -1648,6 +1648,11 @@ struct DrawerView: View {
 
     @ViewBuilder
     private func rowContextMenu(for summary: SessionSummary, pinned: Bool) -> some View {
+        let freshness = FreshnessPresentation.resolve(
+            phase: connection.phase,
+            manifestFreshness: sessions.manifestFreshness,
+            lastSyncedAt: sessions.manifestLastSyncedAt
+        )
         Button {
             pinFeedbackTrigger = UUID()   // DC-01: pin haptic (fires at row level)
             sessions.togglePin(summary)
@@ -1668,6 +1673,8 @@ struct DrawerView: View {
         } label: {
             Label("Archive", systemImage: "archivebox")
         }
+        .disabled(!freshness.allowsRemoteMutations)
+        .accessibilityHint(freshness.allowsRemoteMutations ? "Archives this session" : freshness.mutationUnavailableExplanation)
         Button {
             exportSession(summary)
         } label: {
@@ -1687,6 +1694,8 @@ struct DrawerView: View {
             Label("Delete", systemImage: "trash")
                 .foregroundStyle(theme.destructive)
         }
+        .disabled(!freshness.allowsRemoteMutations)
+        .accessibilityHint(freshness.allowsRemoteMutations ? "Deletes this session" : freshness.mutationUnavailableExplanation)
     }
 
     // MARK: - Floating "New chat" capsule

@@ -12,6 +12,7 @@ import SwiftUI
 struct InboxView: View {
     @Environment(InboxStore.self) private var inbox
     @Environment(SessionStore.self) private var sessions
+    @Environment(ConnectionStore.self) private var connection
     // Resolved from the store rather than `\.hermesTheme`: this view is presented
     // inside a sheet whose NavigationStack root (and thus its `.hermesThemed`)
     // lives upstream, and SwiftUI does not reliably carry custom EnvironmentValues
@@ -26,7 +27,15 @@ struct InboxView: View {
             } else {
                 List {
                     ForEach(inbox.pendingItems) { item in
-                        InboxItemRow(item: item, inbox: inbox, sessionTitle: sessionTitle(for: item), theme: theme)
+                        InboxItemRow(
+                            item: item, inbox: inbox,
+                            sessionTitle: sessionTitle(for: item), theme: theme,
+                            authority: FreshnessPresentation.resolve(
+                                phase: connection.phase,
+                                manifestFreshness: sessions.manifestFreshness,
+                                lastSyncedAt: sessions.manifestLastSyncedAt
+                            )
+                        )
                             .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
                             .listRowSeparator(.hidden)
                             .listRowBackground(theme.bg)
@@ -119,6 +128,7 @@ private struct InboxItemRow: View {
     let inbox: InboxStore
     let sessionTitle: String
     let theme: HermesTheme
+    let authority: FreshnessPresentation
 
     @State private var freeText = ""
     /// True while a respond RPC is in flight — gates re-entry and disables the
@@ -134,6 +144,13 @@ private struct InboxItemRow: View {
                 approvalBody(request)
             case .clarify(let request):
                 clarifyBody(request)
+            }
+
+            if !authority.allowsRemoteMutations {
+                Label(authority.mutationUnavailableExplanation, systemImage: "lock")
+                    .font(.caption2)
+                    .foregroundStyle(theme.mutedFg)
+                    .accessibilityIdentifier("inboxAuthorityGate")
             }
         }
         .padding(14)
@@ -204,7 +221,7 @@ private struct InboxItemRow: View {
             .tint(theme.midground)
             .accessibilityHint("Approves this request for the agent")
         }
-        .disabled(isResponding)
+        .disabled(isResponding || !authority.allowsRemoteMutations)
 
         Button {
             respondApproval(approve: true, all: true)
@@ -213,7 +230,7 @@ private struct InboxItemRow: View {
                 .font(.caption)
         }
         .buttonStyle(.plain)
-        .disabled(isResponding)
+        .disabled(isResponding || !authority.allowsRemoteMutations)
         .foregroundStyle(theme.mutedFg)
         .frame(maxWidth: .infinity, alignment: .center)
         .accessibilityHint("Approves all pending requests for this turn")
@@ -236,6 +253,7 @@ private struct InboxItemRow: View {
                     }
                     .buttonStyle(.bordered)
                     .tint(theme.midground)
+                    .disabled(isResponding || !authority.allowsRemoteMutations)
                 }
             }
         }
@@ -260,7 +278,7 @@ private struct InboxItemRow: View {
     }
 
     private var canSubmitFreeText: Bool {
-        !freeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        authority.allowsRemoteMutations && !freeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func submitFreeText() {

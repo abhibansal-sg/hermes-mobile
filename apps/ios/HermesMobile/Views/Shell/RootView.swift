@@ -20,6 +20,7 @@ import UIKit
 struct RootView: View {
     @Environment(ConnectionStore.self) private var connection
     @Environment(SessionStore.self) private var sessions
+    @Environment(ChatStore.self) private var chat
     @Environment(AppLock.self) private var appLock
     @Environment(InboxStore.self) private var inbox
     @Environment(ThemeStore.self) private var themeStore
@@ -250,11 +251,14 @@ struct RootView: View {
             // Integrator reconciles if B4 has not landed.
             WelcomeView()
         case .hydrating:
-            // ABH-82: a verified connection whose gateway state is still being
-            // pulled. Show the branded loading screen rather than flashing the
-            // empty shell. ConnectionStore guarantees this is transient (an 8s
-            // timeout fallback flips it to `.connected`), so it never strands.
-            HydrationLoadingView()
+            if RootContentPolicy.showsCachedShell(
+                phase: connection.phase,
+                hasCachedContent: hasCachedContent
+            ) {
+                mainUI
+            } else {
+                HydrationLoadingView()
+            }
         case .connecting, .reconnecting, .offline:
             // P0 GATE (ABH-82 follow-up): a `.connecting`/`.offline` phase only
             // earns the chat shell once a connection has actually been verified
@@ -295,15 +299,31 @@ struct RootView: View {
 
     @ViewBuilder
     private var mainUI: some View {
-        if effectiveHorizontalSizeClass == .regular {
-            SplitLayout(
-                showingInspector: $showingInspector,
-                inspectorTab: $inspectorTab,
-                onOpenSettings: openSettings
-            )
-        } else {
-            CompactLayout(onOpenSettings: openSettings)
+        VStack(spacing: 0) {
+            FreshnessBanner(presentation: freshnessPresentation)
+            if effectiveHorizontalSizeClass == .regular {
+                SplitLayout(
+                    showingInspector: $showingInspector,
+                    inspectorTab: $inspectorTab,
+                    onOpenSettings: openSettings
+                )
+            } else {
+                CompactLayout(onOpenSettings: openSettings)
+            }
         }
+    }
+
+    private var hasCachedContent: Bool {
+        !sessions.sessions.isEmpty || sessions.activeStoredId != nil
+            || !chat.messages.isEmpty || sessions.manifestRevision > 0
+    }
+
+    private var freshnessPresentation: FreshnessPresentation {
+        FreshnessPresentation.resolve(
+            phase: connection.phase,
+            manifestFreshness: sessions.manifestFreshness,
+            lastSyncedAt: sessions.manifestLastSyncedAt
+        )
     }
 
     /// `hermesapp://debug/open-settings` opens the same root-owned Settings
@@ -332,6 +352,89 @@ struct RootView: View {
         #else
          horizontalSizeClass
          #endif
+    }
+}
+
+/// Pure routing policy kept outside SwiftUI so loader/no-loader behavior is
+/// testable without a simulator. Hydration controls freshness, not shell
+/// visibility, once any scoped cache has painted.
+enum RootContentPolicy {
+    static func showsCachedShell(
+        phase: ConnectionStore.Phase,
+        hasCachedContent: Bool
+    ) -> Bool {
+        phase == .hydrating && hasCachedContent
+    }
+}
+
+/// One vocabulary for shell, Sessions, Inbox, and widget-facing summaries.
+/// `accessibilityLabel` is deliberately explicit instead of relying on the
+/// visual punctuation being pronounced consistently by VoiceOver.
+struct FreshnessPresentation: Equatable, Sendable {
+    enum Kind: Equatable, Sendable {
+        case connecting, syncing, fresh, offline, failedCached, partial
+    }
+
+    let kind: Kind
+    let text: String
+    let accessibilityLabel: String
+
+    var allowsRemoteMutations: Bool { kind == .fresh }
+    var mutationUnavailableExplanation: String {
+        "Available after synchronization establishes a fresh connection."
+    }
+
+    static func resolve(
+        phase: ConnectionStore.Phase,
+        manifestFreshness: ManifestFreshness,
+        lastSyncedAt: Date?,
+        now: Date = Date()
+    ) -> Self {
+        switch phase {
+        case .connecting:
+            return .init(kind: .connecting, text: "Connecting", accessibilityLabel: "Connecting to server")
+        case .hydrating, .reconnecting:
+            return .init(kind: .syncing, text: "Syncing", accessibilityLabel: "Synchronizing cached content")
+        case .offline(let reason):
+            if reason.localizedCaseInsensitiveContains("sync") && reason.localizedCaseInsensitiveContains("fail") {
+                return .init(kind: .failedCached, text: "Sync failed · Cached data shown", accessibilityLabel: "Synchronization failed. Cached data is shown")
+            }
+            let suffix = lastSyncedAt.map { " · Last synced " + relative($0, now: now) } ?? ""
+            return .init(kind: .offline, text: "Offline" + suffix, accessibilityLabel: "Offline" + suffix.replacingOccurrences(of: " · ", with: ". "))
+        case .connected:
+            // A completed verified hydration establishes live authority even on
+            // a legacy gateway without the manifest capability. Explicit
+            // `.partial` remains honest about that capability fallback.
+            if manifestFreshness != .partial {
+                return .init(kind: .fresh, text: "Fresh", accessibilityLabel: "Content is fresh")
+            }
+            return .init(kind: .partial, text: "Partial result", accessibilityLabel: "Partial synchronization result")
+        case .needsSetup:
+            return .init(kind: .connecting, text: "Connecting", accessibilityLabel: "Connection setup required")
+        }
+    }
+
+    private static func relative(_ date: Date, now: Date) -> String {
+        let seconds = max(0, Int(now.timeIntervalSince(date)))
+        if seconds >= 604_800 { return "\(seconds / 604_800)w ago" }
+        if seconds >= 86_400 { return "\(seconds / 86_400)d ago" }
+        if seconds >= 3_600 { return "\(seconds / 3_600)h ago" }
+        if seconds >= 60 { return "\(seconds / 60)m ago" }
+        return "just now"
+    }
+}
+
+private struct FreshnessBanner: View {
+    let presentation: FreshnessPresentation
+
+    var body: some View {
+        Text(presentation.text)
+            .font(.caption.weight(.semibold))
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 5)
+            .background(.ultraThinMaterial)
+            .accessibilityLabel(presentation.accessibilityLabel)
+            .accessibilityIdentifier("syncFreshness")
     }
 }
 
