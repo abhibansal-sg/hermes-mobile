@@ -482,17 +482,42 @@ class TestRunJob:
         app = _create_app(adapter)
         triggered_job = {**SAMPLE_JOB, "last_run": "2025-01-01T00:00:00Z"}
         mock_trigger = MagicMock(return_value=triggered_job)
+        mock_notify = MagicMock()
         async with TestClient(TestServer(app)) as cli:
             with patch(
                 f"{_MOD}._CRON_AVAILABLE", True
             ), patch(
                 f"{_MOD}._cron_trigger", mock_trigger
+            ), patch(
+                f"{_MOD}._notify_cron_provider_jobs_changed", mock_notify
             ):
                 resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["job"] == triggered_job
                 mock_trigger.assert_called_once_with(VALID_JOB_ID)
+                mock_notify.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_run_job_not_found_does_not_notify(self, adapter):
+        """POST /api/jobs/{id}/run returns 404 without notifying for missing jobs."""
+        app = _create_app(adapter)
+        mock_trigger = MagicMock(return_value=None)
+        mock_notify = MagicMock()
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_trigger", mock_trigger
+            ), patch(
+                f"{_MOD}._notify_cron_provider_jobs_changed", mock_notify
+            ):
+                resp = await cli.post(f"/api/jobs/{VALID_JOB_ID}/run")
+                assert resp.status == 404
+                data = await resp.json()
+                assert data["error"] == "Job not found"
+                mock_trigger.assert_called_once_with(VALID_JOB_ID)
+                mock_notify.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
