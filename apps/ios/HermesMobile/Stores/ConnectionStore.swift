@@ -103,6 +103,22 @@ final class ConnectionStore {
     /// `configure` and on `disconnect`. (D3 RE-PAIR FLOW.)
     var reauthRequired = false
 
+    /// `true` when the app is in the re-pair/repair posture because the current
+    /// device's pairing died — set by `requireRepairAfterCurrentDeviceRevoked()`
+    /// (self-revoke via Settings → Devices) and by the auth-rejection loops, all
+    /// of which flip `phase` to `.needsSetup` AND arm `reauthRequired` together.
+    ///
+    /// Distinct from a fresh unconfigured app: there `rest == nil` already routes
+    /// a pair deep link to the immediate-apply path. Here a STALE server URL +
+    /// token are still in place (the revoke does not wipe them), so `rest != nil`
+    /// even though there is no live session to protect. The pair deep link is the
+    /// intended recovery action in this state, NOT a destructive re-pair — the
+    /// router reads this to skip the disconnect-confirmation gate. (STR-903.)
+    var isAwaitingRePair: Bool {
+        if case .needsSetup = phase, reauthRequired { return true }
+        return false
+    }
+
     /// Non-blocking advisory for a device-token auto-upgrade that hit the server's
     /// device registry cap. Unlike `.offline`, this DOES NOT describe transport
     /// health and must never gate the composer: the shared token remains live, so
