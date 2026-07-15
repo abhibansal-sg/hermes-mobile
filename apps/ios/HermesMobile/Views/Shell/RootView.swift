@@ -32,11 +32,27 @@ struct RootView: View {
     @State private var drawerState = DrawerState()
 
     /// Presents the inbox when something requests it via
-    /// `InboxStore.requestPresentation()` — the push-tap / bare-root fallback
-    /// for a session that isn't loaded. The token previously had NO observer,
-    /// so those taps dead-ended silently (R1 #5/#63). A sheet at this root is
-    /// the one surface that exists on BOTH width classes.
+    /// `InboxStore.requestPresentation()` — the compact-width / fallback surface
+    /// for a session that isn't loaded (push-tap, bare root, widget). The token
+    /// previously had NO observer, so those taps dead-ended silently (R1 #5/#63).
+    /// A sheet at this root is the one surface that exists on BOTH width
+    /// classes; on regular width the request is instead routed to the inspector
+    /// column (see ``InboxPresentationRouting``), so this sheet is the FALLBACK
+    /// only, never a duplicate over an already-visible inspector inbox.
     @State private var showingInboxSheet = false
+
+    /// Regular-width inspector presentation state, owned here (STR-297) so an
+    /// inbox presentation request can be routed to the inspector instead of
+    /// opening a duplicate modal `InboxView` sheet over it. ``SplitLayout``
+    /// renders the column through these bindings; the toolbar toggles mutate
+    /// them directly. Kept on ``RootView`` (not ``SplitLayout``) because the
+    /// ``InboxStore/presentationRequestToken`` observer lives here.
+    @State private var showingInspector = false
+
+    /// Which inspector tab is presented on regular width (F4A-A2): the approval
+    /// inbox or the subagent delegation tree. Owned here alongside
+    /// ``showingInspector`` for the same reason.
+    @State private var inspectorTab: InspectorTab = .inbox
 
     var body: some View {
         content
@@ -50,10 +66,30 @@ struct RootView: View {
                 }
             }
             .onChange(of: inbox.presentationRequestToken) { _, _ in
-                // Never cover the onboarding flow; a pre-pairing push tap has
-                // nothing actionable to show anyway.
-                guard connection.phase != .needsSetup else { return }
-                showingInboxSheet = true
+                // Route the request to the right surface for the current shell.
+                // On regular width with the inspector mounted, satisfy it there
+                // (opening/selecting the inbox tab) instead of stacking a modal
+                // `InboxView` sheet over an already-visible inspector inbox
+                // (STR-290). The sheet remains the FALLBACK for compact width
+                // and for any state where the inspector column is not mounted.
+                switch InboxPresentationRouting.decide(
+                    phase: connection.phase,
+                    hasConnected: connection.hasConnected,
+                    isBootstrapping: connection.isBootstrapping,
+                    hasSavedConfiguration: connection.hasSavedConfiguration,
+                    horizontalSizeClass: horizontalSizeClass,
+                    inspectorOnInbox: showingInspector && inspectorTab == .inbox
+                ) {
+                case .routeToInspector:
+                    inspectorTab = .inbox
+                    showingInspector = true
+                case .presentRootSheet:
+                    showingInboxSheet = true
+                case .ignore:
+                    // Onboarding (.needsSetup) shows nothing; an inspector
+                    // already on the inbox tab is an idempotent no-op.
+                    break
+                }
             }
             .sheet(isPresented: $showingInboxSheet) {
                 NavigationStack {
@@ -181,7 +217,10 @@ struct RootView: View {
     @ViewBuilder
     private var mainUI: some View {
         if horizontalSizeClass == .regular {
-            SplitLayout()
+            SplitLayout(
+                showingInspector: $showingInspector,
+                inspectorTab: $inspectorTab
+            )
         } else {
             CompactLayout()
         }
@@ -197,7 +236,102 @@ struct RootView: View {
     }
 }
 
+// MARK: - Inbox presentation routing (STR-290 / STR-297)
+
+/// Pure decision seam for where an inbox presentation request should land.
+/// Mirrors ``RootView``'s `content`/`mainUI` eligibility exactly so the regular-
+/// width inspector is only targeted when it is actually mounted: `.connected`,
+/// or a `.connecting`/`.reconnecting`/`.offline` phase that has earned the shell
+/// (`hasConnected || isBootstrapping || hasSavedConfiguration`). `.hydrating` and
+/// the pre-`hasConnected` fallback render `WelcomeView`/`HydrationLoadingView`,
+/// NOT the shell, so no inspector exists there — those states fall back to the
+/// root sheet. Kept pure (no UI harness) so the routing matrix is pinned by tests.
+enum InboxPresentationRouting {
+    /// Where an inbox presentation request should go.
+    enum Decision: Equatable {
+        /// Open/select the regular inspector's inbox tab (switches from the
+        /// subagents tab, or opens the hidden inspector). Idempotent in effect
+        /// when the inspector is already on the inbox tab (the caller never
+        /// sees this case for "already on inbox" — see ``ignore``).
+        case routeToInspector
+        /// Present the root `InboxView` sheet. The compact-width and
+        /// non-mounted-mainUI fallback; the one surface on both width classes.
+        case presentRootSheet
+        /// Do nothing. Used for the `.needsSetup` onboarding guard (no surface
+        /// at all) and for an inspector already showing the inbox tab (an
+        /// idempotent no-op — no sheet, no mutation).
+        case ignore
+    }
+
+    /// True when ``RootView``'s `content` renders `mainUI` — i.e. the shell that
+    /// hosts the regular-width inspector column is on screen. This mirrors
+    /// `content`/`mainUI` exactly; the inspector is NOT mounted during
+    /// `.hydrating`, `.needsSetup`, or a pre-`hasConnected` fallback.
+    static func isMainUIActive(
+        phase: ConnectionStore.Phase,
+        hasConnected: Bool,
+        isBootstrapping: Bool,
+        hasSavedConfiguration: Bool
+    ) -> Bool {
+        switch phase {
+        case .connected:
+            return true
+        case .connecting, .reconnecting, .offline:
+            return hasConnected || isBootstrapping || hasSavedConfiguration
+        case .needsSetup, .hydrating:
+            return false
+        }
+    }
+
+    /// Decide where an inbox presentation request should land.
+    ///
+    /// - Parameters:
+    ///   - inspectorOnInbox: `true` when the regular inspector is currently
+    ///     visible AND on the inbox tab (`showingInspector && inspectorTab == .inbox`).
+    static func decide(
+        phase: ConnectionStore.Phase,
+        hasConnected: Bool,
+        isBootstrapping: Bool,
+        hasSavedConfiguration: Bool,
+        horizontalSizeClass: UserInterfaceSizeClass?,
+        inspectorOnInbox: Bool
+    ) -> Decision {
+        // Onboarding guard preserved: a pre-pairing push tap has nothing
+        // actionable to show on any surface.
+        if phase == .needsSetup { return .ignore }
+
+        let mainUIActive = isMainUIActive(
+            phase: phase,
+            hasConnected: hasConnected,
+            isBootstrapping: isBootstrapping,
+            hasSavedConfiguration: hasSavedConfiguration
+        )
+
+        // The regular inspector column only exists when the shell is mounted AND
+        // the width class is regular. Anywhere else — compact width, hydrating,
+        // the pre-hasConnected fallback — the root sheet is the only surface.
+        guard mainUIActive, horizontalSizeClass == .regular else {
+            return .presentRootSheet
+        }
+
+        // Inspector is mounted: route there. If it already shows the inbox tab,
+        // the request is an idempotent no-op (no sheet, no mutation).
+        if inspectorOnInbox { return .ignore }
+        return .routeToInspector
+    }
+}
+
 // MARK: - Regular width (split view)
+
+/// Which inspector column is shown on regular width (F4A-A2): the approval
+/// inbox or the subagent delegation tree. Defined at file scope so both
+/// ``RootView`` (which owns the presentation state) and ``SplitLayout`` (which
+/// renders the column) can share it.
+private enum InspectorTab: String, CaseIterable, Identifiable {
+    case inbox = "Inbox"
+    case subagents = "Subagents"
+    var id: String { rawValue }
+}
 
 /// Regular-width layout (iPad, landscape): a two-column `NavigationSplitView`
 /// — sidebar (``DrawerView``) + detail (``ChatView`` or a placeholder) — with
@@ -222,9 +356,15 @@ private struct SplitLayout: View {
     @Environment(ThemeStore.self) private var themeStore
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
-    /// Drives the optional inspector column (the approval inbox). Starts hidden;
-    /// toggled from the detail toolbar.
-    @State private var showingInspector = false
+    /// Drives the optional inspector column (the approval inbox). Owned by
+    /// ``RootView`` and injected so a deep-link/push inbox request can route
+    /// here (STR-297) instead of opening a duplicate modal sheet over it.
+    @Binding var showingInspector: Bool
+
+    /// Which inspector tab is shown (F4A-A2). Owned by ``RootView`` for the same
+    /// reason as ``showingInspector``; the tab picker only appears when subagent
+    /// activity exists.
+    @Binding var inspectorTab: InspectorTab
 
     /// Presents Settings from the iPad hardware-keyboard layer (⌘,). The sidebar
     /// avatar still owns the visible Settings affordance; this is the keyboard-only
@@ -238,17 +378,6 @@ private struct SplitLayout: View {
     /// live instance once per connect).
     @State private var didSeedGatewayPanel = false
     #endif
-
-    /// Which inspector tab is shown (F4A-A2): the approval inbox or the subagent
-    /// delegation tree. The tab picker only appears when subagent activity exists.
-    @State private var inspectorTab: InspectorTab = .inbox
-
-    private enum InspectorTab: String, CaseIterable, Identifiable {
-        case inbox = "Inbox"
-        case subagents = "Subagents"
-        var id: String { rawValue }
-    }
-
     /// Drives the ⌘F shortcut: set `true` to ask the sidebar to move first
     /// responder into its search field. Published into the environment so
     /// ``DrawerView`` (which owns the search `TextField`) can observe the rising

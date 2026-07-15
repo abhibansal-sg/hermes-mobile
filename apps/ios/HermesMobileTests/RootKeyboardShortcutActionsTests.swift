@@ -200,4 +200,174 @@ final class RootKeyboardShortcutActionsTests: XCTestCase {
         XCTAssertTrue(source.contains("navigateForward"))
         XCTAssertTrue(source.contains("toggleAppearanceDarkMode"))
     }
+
+    // MARK: - Inbox presentation routing (STR-290 / STR-297)
+
+    private func routingDecision(
+        phase: ConnectionStore.Phase,
+        horizontalSizeClass: UserInterfaceSizeClass?,
+        inspectorOnInbox: Bool,
+        hasConnected: Bool = true,
+        isBootstrapping: Bool = false,
+        hasSavedConfiguration: Bool = true
+    ) -> InboxPresentationRouting.Decision {
+        InboxPresentationRouting.decide(
+            phase: phase,
+            hasConnected: hasConnected,
+            isBootstrapping: isBootstrapping,
+            hasSavedConfiguration: hasSavedConfiguration,
+            horizontalSizeClass: horizontalSizeClass,
+            inspectorOnInbox: inspectorOnInbox
+        )
+    }
+
+    func testInboxRoutingRegularConnectedRoutesToInspectorNotSheet() {
+        // (a) regular + connected + shell-visible → inspector, NOT the sheet.
+        let decision = routingDecision(
+            phase: .connected,
+            horizontalSizeClass: .regular,
+            inspectorOnInbox: false
+        )
+        XCTAssertEqual(decision, .routeToInspector)
+    }
+
+    func testInboxRoutingCompactConnectedRoutesToSheetFallback() {
+        // (b) compact + connected → root sheet fallback (no inspector on compact).
+        let decision = routingDecision(
+            phase: .connected,
+            horizontalSizeClass: .compact,
+            inspectorOnInbox: false
+        )
+        XCTAssertEqual(decision, .presentRootSheet)
+    }
+
+    func testInboxRoutingNeedsSetupRoutesToNeitherSurface() {
+        // (c) needsSetup → neither sheet nor inspector, on BOTH width classes.
+        let regular = routingDecision(
+            phase: .needsSetup,
+            horizontalSizeClass: .regular,
+            inspectorOnInbox: false
+        )
+        let compact = routingDecision(
+            phase: .needsSetup,
+            horizontalSizeClass: .compact,
+            inspectorOnInbox: false
+        )
+        let alreadyOnInbox = routingDecision(
+            phase: .needsSetup,
+            horizontalSizeClass: .regular,
+            inspectorOnInbox: true
+        )
+        XCTAssertEqual(regular, .ignore)
+        XCTAssertEqual(compact, .ignore)
+        XCTAssertEqual(alreadyOnInbox, .ignore)
+    }
+
+    func testInboxRoutingRegularInspectorAlreadyOnInboxIsIdempotentNoSheet() {
+        // (d) regular + connected + inspector already on inbox → no sheet, no
+        // mutation (idempotent).
+        let decision = routingDecision(
+            phase: .connected,
+            horizontalSizeClass: .regular,
+            inspectorOnInbox: true
+        )
+        XCTAssertEqual(decision, .ignore)
+    }
+
+    func testInboxRoutingRegularInspectorOnSubagentsSwitchesToInboxNoSheet() {
+        // (e) regular + connected + inspector visible on subagents → switch to
+        // inbox (routeToInspector), no sheet. inspectorOnInbox is false here
+        // because the visible tab is .subagents.
+        let decision = routingDecision(
+            phase: .connected,
+            horizontalSizeClass: .regular,
+            inspectorOnInbox: false
+        )
+        XCTAssertEqual(decision, .routeToInspector)
+    }
+
+    func testInboxRoutingHydratingFallsBackToSheetEvenOnRegular() {
+        // Hydrating renders HydrationLoadingView, not the shell, so no inspector
+        // is mounted — fall back to the root sheet (the original behavior).
+        let decision = routingDecision(
+            phase: .hydrating,
+            horizontalSizeClass: .regular,
+            inspectorOnInbox: false
+        )
+        XCTAssertEqual(decision, .presentRootSheet)
+    }
+
+    func testInboxRoutingPreHasConnectedFallbackUsesSheetNotInspector() {
+        // A `.connecting` phase that has NOT earned the shell renders
+        // WelcomeView — no inspector. Fall back to the sheet. This is the
+        // validation-bypass guard mirrored exactly from `content`.
+        let decision = routingDecision(
+            phase: .connecting,
+            horizontalSizeClass: .regular,
+            inspectorOnInbox: false,
+            hasConnected: false,
+            isBootstrapping: false,
+            hasSavedConfiguration: false
+        )
+        XCTAssertEqual(decision, .presentRootSheet)
+    }
+
+    func testInboxRoutingReconnectingWithSavedConfigEarnsShellAndRoutesToInspector() {
+        // A returning user going through a reconnect (cache-first) HAS earned the
+        // shell via hasSavedConfiguration, so the inspector is mounted and the
+        // request routes there on regular width.
+        let reconnecting = routingDecision(
+            phase: .reconnecting(attempt: 1),
+            horizontalSizeClass: .regular,
+            inspectorOnInbox: false,
+            hasConnected: false,
+            isBootstrapping: false,
+            hasSavedConfiguration: true
+        )
+        let offline = routingDecision(
+            phase: .offline(nil),
+            horizontalSizeClass: .regular,
+            inspectorOnInbox: false,
+            hasConnected: false,
+            isBootstrapping: false,
+            hasSavedConfiguration: true
+        )
+        XCTAssertEqual(reconnecting, .routeToInspector)
+        XCTAssertEqual(offline, .routeToInspector)
+    }
+
+    func testInboxRoutingNilSizeClassFallsBackToSheet() {
+        // An unknown/nil size class cannot be the regular inspector host.
+        let decision = routingDecision(
+            phase: .connected,
+            horizontalSizeClass: nil,
+            inspectorOnInbox: false
+        )
+        XCTAssertEqual(decision, .presentRootSheet)
+    }
+
+    func testInboxRoutingIsMainUIActiveMirrorsContentEligibility() {
+        // Directly pin the shell-mount eligibility matrix that decide() relies on.
+        XCTAssertTrue(InboxPresentationRouting.isMainUIActive(
+            phase: .connected, hasConnected: false, isBootstrapping: false, hasSavedConfiguration: false
+        ))
+        XCTAssertTrue(InboxPresentationRouting.isMainUIActive(
+            phase: .connecting, hasConnected: true, isBootstrapping: false, hasSavedConfiguration: false
+        ))
+        XCTAssertTrue(InboxPresentationRouting.isMainUIActive(
+            phase: .reconnecting(attempt: 2), hasConnected: false, isBootstrapping: true, hasSavedConfiguration: false
+        ))
+        XCTAssertTrue(InboxPresentationRouting.isMainUIActive(
+            phase: .offline("low battery"), hasConnected: false, isBootstrapping: false, hasSavedConfiguration: true
+        ))
+        XCTAssertFalse(InboxPresentationRouting.isMainUIActive(
+            phase: .needsSetup, hasConnected: true, isBootstrapping: true, hasSavedConfiguration: true
+        ))
+        XCTAssertFalse(InboxPresentationRouting.isMainUIActive(
+            phase: .hydrating, hasConnected: true, isBootstrapping: true, hasSavedConfiguration: true
+        ))
+        XCTAssertFalse(InboxPresentationRouting.isMainUIActive(
+            phase: .connecting, hasConnected: false, isBootstrapping: false, hasSavedConfiguration: false
+        ))
+    }
 }
