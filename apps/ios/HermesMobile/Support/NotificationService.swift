@@ -121,6 +121,12 @@ enum NotificationService {
     nonisolated(unsafe) static var biometricAuthenticator: BiometricAuthenticating
         = LAContextAuthenticator()
 
+    #if DEBUG
+    /// Injectable approval sender for killed-launch action tests.
+    nonisolated(unsafe) static var approvalActionSender:
+        ((ActionEndpoint, ApprovalActionPayload, Bool) async -> RestClient.ApprovalRespondOutcome)?
+    #endif
+
     /// Install the action backend resolver (endpoint + categories). Idempotent.
     static func setActionEndpointProvider(_ provider: @escaping @MainActor () -> ActionEndpoint?) {
         endpointProvider = provider
@@ -192,16 +198,16 @@ enum NotificationService {
             return
         }
 
-        let rest = RestClient(
-            baseURL: endpoint.baseURL, token: endpoint.token, pathStyle: endpoint.pathStyle
-        )
-        let outcome = await rest.respondToApproval(
-            sessionId: action.sessionId,
-            approve: approve,
-            // A single inline action answers just this request (not approve-all);
-            // approve-all is an in-app affordance (handled by InboxStore).
-            all: false
-        )
+        let outcome: RestClient.ApprovalRespondOutcome
+        #if DEBUG
+        if let sender = approvalActionSender {
+            outcome = await sender(endpoint, action, approve)
+        } else {
+            outcome = await sendApproval(endpoint: endpoint, action: action, approve: approve)
+        }
+        #else
+        outcome = await sendApproval(endpoint: endpoint, action: action, approve: approve)
+        #endif
 
         switch outcome {
         case .resolved:
@@ -218,6 +224,17 @@ enum NotificationService {
                 body: "The request didn't go through. Open Hermes to respond."
             )
         }
+    }
+
+    private static func sendApproval(
+        endpoint: ActionEndpoint, action: ApprovalActionPayload, approve: Bool
+    ) async -> RestClient.ApprovalRespondOutcome {
+        let rest = RestClient(
+            baseURL: endpoint.baseURL, token: endpoint.token, pathStyle: endpoint.pathStyle
+        )
+        return await rest.respondToApproval(
+            sessionId: action.sessionId, approve: approve, all: false
+        )
     }
 
     // MARK: - Clarify text reply handling (ABH-296)
@@ -460,6 +477,8 @@ enum NotificationService {
     struct ApprovalActionPayload: Sendable, Equatable {
         /// Runtime session id — the target of `POST /api/approvals/respond`.
         let sessionId: String
+        /// Stable gateway request id used to suppress duplicate APNs delivery.
+        let requestId: String?
         /// Persistent stored session id, when the push carried it.
         let storedSessionId: String?
         /// `true` when the approval marks a destructive/dangerous action: gates
@@ -485,8 +504,11 @@ enum NotificationService {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let title = (block["approval_title"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestId = ((block["approval_id"] as? String) ?? (block["request_id"] as? String))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         return ApprovalActionPayload(
             sessionId: sessionId,
+            requestId: (requestId?.isEmpty == false) ? requestId : nil,
             storedSessionId: (stored?.isEmpty == false) ? stored : nil,
             // Tolerate both a real JSON bool and a "true"/"1" string, since some
             // APNs JSON paths stringify booleans.

@@ -87,12 +87,14 @@ final class NotificationActionTests: XCTestCase {
             "hermes": [
                 "session_id": "sess-runtime",
                 "stored_session_id": "sess-stored",
+                "request_id": "approval-42",
                 "destructive": true,
                 "approval_title": "rm -rf build/",
             ],
         ]
         let action = try XCTUnwrap(NotificationService.decodeApprovalAction(from: userInfo))
         XCTAssertEqual(action.sessionId, "sess-runtime")
+        XCTAssertEqual(action.requestId, "approval-42")
         XCTAssertEqual(action.storedSessionId, "sess-stored")
         XCTAssertTrue(action.destructive)
         XCTAssertEqual(action.approvalTitle, "rm -rf build/")
