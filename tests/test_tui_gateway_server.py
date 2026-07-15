@@ -5131,19 +5131,25 @@ def test_prompt_submit_leftover_steer_redelivered_as_queued_prompt(monkeypatch):
     gateway must redeliver it as the next user turn via _enqueue_prompt so
     it isn't silently dropped (mobile/TUI parity with gateway/run).
 
-    Asserts the leftover text + current-turn transport are stored in
-    queued_prompt (drained next by _drain_queued_prompt), and that the
-    just-finished assistant turn still completes with status `complete`."""
+    Exercises the real queued-prompt drain and asserts the leftover text runs
+    as a second turn on the current transport, while the just-finished
+    assistant turn still completes with status `complete`."""
     _steer = "please continue with my steer"
 
     class _Agent:
+        def __init__(self):
+            self.prompts = []
+
         def run_conversation(
             self, prompt, conversation_history=None, stream_callback=None
         ):
+            self.prompts.append(prompt)
             return {
-                "final_response": "done",
-                "messages": [{"role": "assistant", "content": "done"}],
-                "pending_steer": _steer,
+                "final_response": f"done {len(self.prompts)}",
+                "messages": [
+                    {"role": "assistant", "content": f"done {len(self.prompts)}"}
+                ],
+                "pending_steer": _steer if len(self.prompts) == 1 else None,
             }
 
     class _ImmediateThread:
@@ -5154,20 +5160,15 @@ def test_prompt_submit_leftover_steer_redelivered_as_queued_prompt(monkeypatch):
             self._target()
 
     _transport = object()
-    server._sessions["sid"] = _session(agent=_Agent(), transport=_transport)
+    agent = _Agent()
+    server._sessions["sid"] = _session(agent=agent, transport=_transport)
     emits: list[tuple] = []
-    drained: list[bool] = []
-
-    def _fake_drain(*_a, **_kw):
-        drained.append(True)
-        return False  # do not recursively dispatch while proving queue state
 
     try:
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
-        monkeypatch.setattr(server, "_drain_queued_prompt", _fake_drain)
 
         resp = server.handle_request(
             {
@@ -5178,22 +5179,19 @@ def test_prompt_submit_leftover_steer_redelivered_as_queued_prompt(monkeypatch):
         )
         assert resp.get("result"), f"got error: {resp.get('error')}"
 
-        # Leftover steer is staged as the next user turn, with the
-        # current turn's transport pinned for redelivery.
-        queued = server._sessions["sid"].get("queued_prompt")
-        assert queued is not None, "leftover /steer was not queued for redelivery"
-        assert queued["text"] == _steer
-        assert queued["transport"] is _transport
+        # The real tail drain consumed the leftover steer as the next turn and
+        # retained the transport that owns the current conversation.
+        assert agent.prompts == ["hi", _steer]
+        assert server._sessions["sid"].get("queued_prompt") is None
+        assert server._sessions["sid"].get("transport") is _transport
+        assert server._sessions["sid"].get("running") is False
 
-        # The tail drain path was reached (it would consume this queue next).
-        assert drained == [True]
-
-        # The just-finished assistant turn completed normally — leftover
-        # steer is not an error/interrupt.
+        # Both the original response and the redelivered steer complete
+        # normally; the leftover steer is not an error/interrupt.
         complete_calls = [a for a in emits if a[0] == "message.complete"]
-        assert len(complete_calls) == 1
-        _, _, payload = complete_calls[0]
-        assert payload["status"] == "complete", (
+        assert len(complete_calls) == 2
+        assert [a[2]["text"] for a in complete_calls] == ["done 1", "done 2"]
+        assert all(a[2]["status"] == "complete" for a in complete_calls), (
             "leftover steer must not turn the finished turn into an error/interrupt"
         )
     finally:
