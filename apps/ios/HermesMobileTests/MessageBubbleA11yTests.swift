@@ -494,6 +494,72 @@ final class MessageBubbleA11yTests: XCTestCase {
                           "menuActionsEnabled change must break equality")
     }
 
+    /// STR-574 evidence capture (opt-in). Hosts the assistant prose (with one
+    /// `data:` image and one unreachable remote `https://` image) in a REAL
+    /// UIWindow on the simulator screen so `xcrun simctl io booted recordVideo`
+    /// can capture the live rendering, the failure/retry affordance, and the
+    /// size-class sizing. Driven by env var so it stays a no-op in normal runs.
+    ///
+    /// Usage from the worktree:
+    ///   HERMES_STR695_EVIDENCE_SECS=14 scripts/ios-build.sh test \
+    ///     -scheme HermesMobile \
+    ///     -destination 'platform=iOS Simulator,id=<BOOTED_IPHONE_UDID>' \
+    ///     -only-testing:HermesMobileTests/MessageBubbleA11yTests/testSTR695InlineImageEvidenceOnScreen
+    ///   (with `xcrun simctl io booted recordVideo /tmp/str-695-evidence/iphone.mp4 &`
+    ///    running concurrently)
+    func testSTR695InlineImageEvidenceOnScreen() throws {
+        let secs = ProcessInfo.processInfo.environment["HERMES_STR695_EVIDENCE_SECS"].flatMap(Double.init) ?? 0
+        try XCTSkipIf(secs <= 0, "STR-695 evidence capture is opt-in via HERMES_STR695_EVIDENCE_SECS")
+
+        // One reachable inline data-URL image (proves success rendering) and
+        // one unreachable remote URL (proves the failure/retry affordance).
+        // 127.0.0.1:9 refuses connections synchronously on the simulator.
+        let message = ChatMessage(
+            role: .assistant,
+            text: """
+            Here is the rendered chart and a remote thumbnail:
+
+            ![inline chart](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==)
+
+            And a remote image that will fail to load, exercising the retry affordance:
+
+            ![remote thumbnail](https://127.0.0.1:9/never-reaches.png)
+            """,
+            isStreaming: false
+        )
+        let environment = AppEnvironment()
+        let prose = MessageBubble(message: message)
+            .environment(\.hermesTheme, HermesThemePresets.nousLight)
+            .environment(environment.connectionStore)
+            .environment(environment.sessionStore)
+            .padding(20)
+            .background(HermesThemePresets.nousLight.bg)
+
+        try presentOnWindow(prose, forSeconds: secs)
+    }
+
+    /// Hosts `view` in a fresh key window on the active foreground scene for
+    /// `secs` seconds, pumping the runloop so SwiftUI renders and AsyncImage
+    /// phase transitions (empty -> failure) land on screen. Tears down on exit.
+    private func presentOnWindow<V: View>(_ view: V, forSeconds secs: TimeInterval) throws {
+        let scene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+            ?? UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        guard let windowScene = scene else {
+            throw NSError(domain: "STR695Evidence", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "no foreground UIWindowScene to host evidence"])
+        }
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = UIHostingController(rootView: view)
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        let deadline = Date(timeIntervalSinceNow: secs)
+        while Date() < deadline {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.25))
+        }
+    }
+
     private func writeSnapshot<V: View>(_ view: V, size: CGSize, url: URL) throws {
         let controller = UIHostingController(rootView: view.frame(width: size.width, height: size.height, alignment: .topLeading))
         controller.view.bounds = CGRect(origin: .zero, size: size)
