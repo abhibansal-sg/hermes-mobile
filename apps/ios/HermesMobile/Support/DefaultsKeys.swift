@@ -112,6 +112,17 @@ enum DefaultsKeys {
     /// ``PushRegistrar``.
     static let pushLastEnv = "hermes.push.lastEnv"
 
+    /// `String` — non-secret hash of gateway URL + credential/device identity
+    /// used for the last successful alert-token registration. Prevents a token
+    /// registered against one pairing from becoming APNs authority after a
+    /// gateway switch or re-pair. Owned by ``PushRegistrar``.
+    static let pushLastRegistrationScope = "hermes.push.lastRegistrationScope"
+
+    /// `Bool` — whether the most recent APNs/gateway registration attempt is
+    /// known healthy. Missing is deliberately false (local fallback) until a
+    /// successful registration proves remote delivery is authoritative.
+    static let pushRegistrationHealthy = "hermes.push.registrationHealthy"
+
     /// `Bool` — whether notification authorization has already been requested once,
     /// so the prompt isn't re-shown. Owned by ``NotificationService``.
     static let notificationsDidRequestAuthorization =

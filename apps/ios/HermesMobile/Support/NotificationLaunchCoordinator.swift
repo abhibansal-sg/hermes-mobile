@@ -36,6 +36,11 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
         let handler: () -> Void
     }
 
+    private struct PresentationBox: @unchecked Sendable {
+        let userInfo: [AnyHashable: Any]
+        let completion: (UNNotificationPresentationOptions) -> Void
+    }
+
     enum Event: Sendable {
         case tap(NotificationService.Tap)
         case approval(Bool, NotificationService.ApprovalActionPayload?, CompletionBox)
@@ -43,8 +48,9 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
     }
 
     private var pending: [Event] = []
-    private var tapHandler: ((NotificationService.Tap) -> Void)?
-    private var endpointProvider: (() -> NotificationService.ActionEndpoint?)?
+    private var tapHandler: (@MainActor @Sendable (NotificationService.Tap) -> Void)?
+    private var endpointProvider:
+        (@MainActor @Sendable () -> NotificationService.ActionEndpoint?)?
     private var actionRequestIDsInFlight: Set<String> = []
     private var completedActionRequestIDs: Set<String> = []
 
@@ -53,14 +59,16 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
         NotificationService.registerCategories()
     }
 
-    func attachTapHandler(_ handler: @escaping (NotificationService.Tap) -> Void) {
+    func attachTapHandler(
+        _ handler: @escaping @MainActor @Sendable (NotificationService.Tap) -> Void
+    ) {
         tapHandler = handler
         NotificationService.setTapHandler(handler)
         drainIfReady()
     }
 
     func attachActionEndpointProvider(
-        _ provider: @escaping () -> NotificationService.ActionEndpoint?
+        _ provider: @escaping @MainActor @Sendable () -> NotificationService.ActionEndpoint?
     ) {
         endpointProvider = provider
         NotificationService.setActionEndpointProvider(provider)
@@ -149,7 +157,15 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([.banner, .sound])
+        let box = PresentationBox(
+            userInfo: notification.request.content.userInfo,
+            completion: completionHandler
+        )
+        Task { @MainActor in
+            box.completion(
+                NotificationService.foregroundPresentationOptions(userInfo: box.userInfo)
+            )
+        }
     }
 
     nonisolated func userNotificationCenter(

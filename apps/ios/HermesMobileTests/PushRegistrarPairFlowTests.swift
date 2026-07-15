@@ -11,6 +11,8 @@ final class PushRegistrarPairFlowTests: XCTestCase {
         DefaultsKeys.pushLastDeviceToken,
         DefaultsKeys.pushLastEvents,
         DefaultsKeys.pushLastEnv,
+        DefaultsKeys.pushLastRegistrationScope,
+        DefaultsKeys.pushRegistrationHealthy,
         DefaultsKeys.notificationsDidRequestAuthorization,
         DefaultsKeys.pushEventApproval,
         DefaultsKeys.pushEventClarify,
@@ -85,6 +87,7 @@ final class PushRegistrarPairFlowTests: XCTestCase {
         try? await Task.sleep(for: .milliseconds(50))
 
         XCTAssertEqual(apnsRegisterCalls, 0)
+        XCTAssertFalse(UserDefaults.standard.bool(forKey: DefaultsKeys.pushRegistrationHealthy))
         XCTAssertEqual(SettingsView.notificationPermissionLabel(for: .denied), "Not authorized")
         XCTAssertEqual(SettingsView.pushTokenRegistrationLabel(token: nil), "Not registered")
     }

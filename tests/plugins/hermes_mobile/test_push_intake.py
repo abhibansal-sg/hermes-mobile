@@ -136,10 +136,13 @@ class _FakePushEngine:
         self.direct_calls += 1
         return self.accepted
 
-    def register_token(self, token, *, platform="ios", env="", events=None) -> bool:
-        self.registered.append(
-            {"token": token, "platform": platform, "env": env, "events": events}
-        )
+    def register_token(
+        self, token, *, platform="ios", env="", events=None, device_id=None
+    ) -> bool:
+        item = {"token": token, "platform": platform, "env": env, "events": events}
+        if device_id is not None:
+            item["device_id"] = device_id
+        self.registered.append(item)
         return True
 
     def unregister_token(self, token) -> bool:
@@ -330,6 +333,7 @@ def _capture_notify(monkeypatch, pn):
             "event_type": event_type, "title": title, "body": body,
             "payload": payload, "category": category,
             "expiration": kw.get("expiration"),
+            "collapse_id": kw.get("collapse_id"),
         })
         return 1
 
@@ -338,6 +342,28 @@ def _capture_notify(monkeypatch, pn):
     # the armed-check cheap and deterministic regardless of env.
     monkeypatch.setattr(pn, "live_activity_token_for", lambda sid: None)
     return calls
+
+
+def test_activate_registers_correlation_transform_before_push_observer(
+    monkeypatch, push_engine
+):
+    hooks = {}
+
+    class _Context:
+        def register_hook(self, name, callback):
+            hooks[name] = callback
+
+    monkeypatch.setattr(push_engine, "sweep_dead_live_activity_tokens", lambda: None)
+    push_engine.activate(_Context())
+
+    assert list(hooks).index("pre_emit_event") < list(hooks).index("post_emit_event")
+    result = hooks["pre_emit_event"](
+        event="clarify.request",
+        session_id="sid-hook",
+        payload={"request_id": "request-stable", "question": "Which file?"},
+    )
+    assert result["payload"]["event_id"].startswith("evt_")
+    assert result["payload"]["gateway_scope"].startswith("gw_")
 
 
 def test_push_hook_stamps_and_enqueues_without_sending(monkeypatch, push_engine):
@@ -495,6 +521,34 @@ def test_push_hook_approval_enriched_and_categorized(monkeypatch, push_engine):
     assert p["approval_title"] == "rm -rf /"
 
 
+def test_live_event_and_approval_apns_share_stable_identity(monkeypatch, push_engine, tmp_path):
+    monkeypatch.setattr(
+        push_engine, "_registry_path", lambda: tmp_path / "push_tokens.json"
+    )
+    monkeypatch.setattr(
+        push_engine,
+        "_active_turn_identity",
+        lambda _sid: ("turn-44", "tool-9"),
+    )
+    live_payload = push_engine.enrich_correlated_event(
+        "approval.request", "sid-correlated", {"command": "rm -rf build"}
+    )
+    calls = _capture_notify(monkeypatch, push_engine)
+    server._sessions["sid-correlated"] = {"session_key": "stored-correlated"}
+    try:
+        push_engine._process_push_event(
+            "approval.request", "sid-correlated", live_payload
+        )
+    finally:
+        server._sessions.pop("sid-correlated", None)
+
+    assert live_payload["approval_id"] == "turn-44:tool-9"
+    assert calls[0]["payload"]["event_id"] == live_payload["event_id"]
+    assert calls[0]["payload"]["gateway_scope"] == live_payload["gateway_scope"]
+    assert calls[0]["payload"]["approval_id"] == live_payload["approval_id"]
+    assert calls[0]["collapse_id"] == live_payload["event_id"]
+
+
 def test_push_hook_approval_destructive_false_without_pattern(monkeypatch, push_engine):
     calls = _capture_notify(monkeypatch, push_engine)
     server._sessions["sid_appr2"] = {"session_key": "k2"}
@@ -524,6 +578,48 @@ def test_push_hook_clarify_category(monkeypatch, push_engine):
         "approval_id": "rid-123",
         "response_action": "reply",
     }
+
+
+def test_clarify_and_turn_complete_apns_preserve_live_event_ids(monkeypatch, push_engine):
+    calls = _capture_notify(monkeypatch, push_engine)
+    push_engine._process_push_event(
+        "clarify.request",
+        "sid-c",
+        {
+            "question": "Which file?",
+            "request_id": "rid-123",
+            "event_id": "evt-clarify",
+            "gateway_scope": "gw-one",
+        },
+    )
+    server._sessions["sid-t"] = {
+        "transport": None,
+        "session_key": "stored-turn",
+    }
+    try:
+        push_engine._process_push_event(
+            "message.complete",
+            "sid-t",
+            {
+                "text": "Done",
+                "event_id": "evt-turn",
+                "gateway_scope": "gw-one",
+                "turn_id": "turn-one",
+            },
+        )
+    finally:
+        server._sessions.pop("sid-t", None)
+
+    assert calls[0]["payload"]["event_id"] == "evt-clarify"
+    assert calls[0]["collapse_id"] == "evt-clarify"
+    assert calls[1]["payload"] == {
+        "session_id": "sid-t",
+        "stored_session_id": "stored-turn",
+        "event_id": "evt-turn",
+        "gateway_scope": "gw-one",
+        "turn_id": "turn-one",
+    }
+    assert calls[1]["collapse_id"] == "evt-turn"
 
 
 def test_push_hook_bounds_and_scrubs_lock_screen_body(monkeypatch, push_engine):
