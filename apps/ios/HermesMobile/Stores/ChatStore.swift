@@ -11,6 +11,13 @@ struct TranscriptPageFetch: Sendable {
     let hasMoreBefore: Bool
 }
 
+struct TranscriptAroundFetch: Sendable {
+    let messages: [StoredMessage]
+    let oldestId: Int?
+    let hasMoreBefore: Bool
+    let containsTarget: Bool
+}
+
 /// Plugin-only backward-paged transcript fetch. Kept outside RestClient.swift for
 /// ABH-400's narrow scope fence; it reuses RestClient's internal request/JSON
 /// helpers without changing the existing no-param delta handshake method.
@@ -38,6 +45,36 @@ func fetchTranscriptPage(
             messages: array.compactMap(StoredMessage.init(json:)),
             oldestId: page?["oldest_id"]?.intValue,
             hasMoreBefore: page?["has_more_before"]?.boolValue ?? false
+        )
+    } catch {
+        return nil
+    }
+}
+
+/// Plugin-only target-centered transcript fetch for jump/search/artifact opens.
+/// Returns the target ± radius without forcing a full transcript load.
+func fetchTranscriptAround(
+    rest: RestClient,
+    sessionId: String,
+    around messageId: Int,
+    radius: Int
+) async -> TranscriptAroundFetch? {
+    guard rest.pathStyle == .plugin else { return nil }
+    let encodedId = sessionId.addingPercentEncoding(
+        withAllowedCharacters: .urlPathAllowed
+    ) ?? sessionId
+    let path = "\(rest.pathStyle.mobileAPIPrefix)/sessions/\(encodedId)/messages/around"
+        + "?around=\(messageId)&radius=\(max(0, radius))"
+    do {
+        let data = try await rest.get(path: path)
+        let root = try rest.decodeJSONValue(from: data, context: "messagesAround")
+        guard let array = root["messages"]?.arrayValue else { return nil }
+        let page = root["page"]
+        return TranscriptAroundFetch(
+            messages: array.compactMap(StoredMessage.init(json:)),
+            oldestId: page?["oldest_id"]?.intValue,
+            hasMoreBefore: page?["has_more_before"]?.boolValue ?? false,
+            containsTarget: page?["contains_target"]?.boolValue ?? false
         )
     } catch {
         return nil
@@ -403,7 +440,10 @@ final class ChatStore {
     nonisolated static let transcriptOpenWindowLimit = 50
     private(set) var transcriptHasMoreBefore = false
     private(set) var isLoadingEarlierTranscript = false
+    private(set) var isLoadingJumpTarget = false
+    private(set) var jumpTargetLoadError: String?
     private var oldestLoadedTranscriptWireId: Int?
+    private var jumpWindowFetchAttemptedMessageIds: Set<Int> = []
 
     /// Runtime sessions whose gateway status currently reports a mid-turn
     /// context compaction. Keyed by runtime `session_id` (desktop parity): a
@@ -487,6 +527,10 @@ final class ChatStore {
     /// after `init`. Returns the stored transcript or throws the REST error
     /// (which ``backfill()`` now surfaces rather than swallows).
     var backfillFetch: ((String) async throws -> [StoredMessage])?
+
+    /// Test seam for target-centered jump fetches. The live app resolves this
+    /// through the plugin REST route in ``resolvedTranscriptAroundFetch``.
+    var transcriptAroundFetch: ((String, Int, Int) async -> TranscriptAroundFetch?)?
 
     /// Context of the event currently being routed through ``handle(event:)``,
     /// used only to enrich the DEBUG streaming-setter telemetry so a write that
@@ -2795,6 +2839,39 @@ final class ChatStore {
         noteTranscriptPaging(oldestId: page.oldestId, hasMoreBefore: page.hasMoreBefore)
     }
 
+    /// Whether the jump resolver may try the server's target-centered page.
+    func canFetchJumpTarget(messageId: Int) -> Bool {
+        !isLoadingJumpTarget && !jumpWindowFetchAttemptedMessageIds.contains(messageId)
+    }
+
+    /// Fetch a radius window around a jump target and prepend it to the loaded tail.
+    /// Returns true when the server returned a page containing the target wire id.
+    func loadTranscriptAround(messageId: Int, radius: Int = ChatStore.transcriptOpenWindowLimit) async -> Bool {
+        guard !isStreaming, !isLoadingJumpTarget,
+              let storedId = sessions?.activeStoredId,
+              let fetch = resolvedTranscriptAroundFetch else { return false }
+        jumpWindowFetchAttemptedMessageIds.insert(messageId)
+        isLoadingJumpTarget = true
+        jumpTargetLoadError = nil
+        defer { isLoadingJumpTarget = false }
+
+        guard let page = await fetch(storedId, messageId, radius) else {
+            jumpTargetLoadError = "Couldn’t load earlier messages."
+            return false
+        }
+        guard page.containsTarget, !page.messages.isEmpty else {
+            jumpTargetLoadError = "That earlier message is no longer available."
+            return false
+        }
+
+        let around = Self.toChatMessages(page.messages)
+        let aroundIds = Set(around.map(\.id))
+        seed(normalized: around + messages.filter { !aroundIds.contains($0.id) })
+        noteTranscriptPaging(oldestId: page.oldestId, hasMoreBefore: page.hasMoreBefore)
+        jumpTargetLoadError = nil
+        return true
+    }
+
     /// The id of a foreign-mirror placeholder assistant row that
     /// `teardownForeignStream` left in place (contract Batch E §3.7) for the
     /// recovery `backfill()`/`seed()` to reconcile ONTO — rather than removing it
@@ -3517,6 +3594,20 @@ final class ChatStore {
         }
     }
 
+    /// The injected target-centered jump fetch, or the plugin REST route.
+    private var resolvedTranscriptAroundFetch: ((String, Int, Int) async -> TranscriptAroundFetch?)? {
+        if let transcriptAroundFetch { return transcriptAroundFetch }
+        guard let rest = connection?.rest else { return nil }
+        return { sessionId, messageId, radius in
+            await fetchTranscriptAround(
+                rest: rest,
+                sessionId: sessionId,
+                around: messageId,
+                radius: radius
+            )
+        }
+    }
+
     /// The injected `backfillFetch`, or the default that resolves the live REST
     /// client. Built lazily because `connection` is wired after `init`; tests
     /// override `backfillFetch` directly.
@@ -3613,7 +3704,10 @@ final class ChatStore {
         lastBackfillError = nil
         transcriptHasMoreBefore = false
         isLoadingEarlierTranscript = false
+        isLoadingJumpTarget = false
+        jumpTargetLoadError = nil
         oldestLoadedTranscriptWireId = nil
+        jumpWindowFetchAttemptedMessageIds = []
         // A pending foreign-reconcile adoption belongs to the session being torn
         // down (§3.7); never let it bleed into the next session's first seed.
         pendingForeignReconcileID = nil

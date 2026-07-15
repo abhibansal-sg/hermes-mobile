@@ -692,3 +692,127 @@ final class ArtifactJumpRegressionTests: XCTestCase {
                       "the matched bubble must contain the link URL")
     }
 }
+
+// MARK: - ABH-401 jump/search to pre-window messages
+
+@MainActor
+final class JumpToOldMessageWindowTests: XCTestCase {
+
+    private func stored(role: String, text: String, wireId: Int) -> StoredMessage {
+        StoredMessage(json: .object([
+            "role": .string(role),
+            "content": .string(text),
+            "id": .number(Double(wireId)),
+            "timestamp": .number(1_700_000_000 + Double(wireId)),
+        ]))!
+    }
+
+    private func summary(id: String = "s1") -> SessionSummary {
+        SessionSummary(
+            id: id,
+            title: "Long Session",
+            preview: nil,
+            startedAt: 1_700_000_000,
+            messageCount: 60,
+            source: nil,
+            lastActive: 1_700_000_060,
+            cwd: nil
+        )
+    }
+
+    private func makeStores() -> (ChatStore, SessionStore, ConnectionStore, InboxStore) {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let attachments = AttachmentStore()
+        let inbox = InboxStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        sessions.attach(connection: connection, chat: chat)
+        inbox.attach(connection: connection)
+        sessions.sessions = [summary()]
+        return (chat, sessions, connection, inbox)
+    }
+
+    private func installWindowFetch(on chat: ChatStore) -> [StoredMessage] {
+        let all = (1...60).map { id in
+            stored(role: id % 2 == 0 ? "assistant" : "user", text: "message \(id)", wireId: id)
+        }
+        chat.transcriptAroundFetch = { sessionId, messageId, radius in
+            XCTAssertEqual(sessionId, "s1")
+            XCTAssertEqual(messageId, 5)
+            XCTAssertEqual(radius, 2)
+            let page = all.filter { row in
+                guard let wire = row.wireId else { return false }
+                return wire >= 3 && wire <= 7
+            }
+            return TranscriptAroundFetch(
+                messages: page,
+                oldestId: 3,
+                hasMoreBefore: true,
+                containsTarget: true
+            )
+        }
+        chat.seed(from: Array(all.suffix(10)))
+        chat.noteTranscriptPaging(oldestId: 51, hasMoreBefore: true)
+        XCTAssertNil(chat.messages.first { ChatStore.messageJumpCandidateIDs(for: 5).contains($0.id) },
+                     "precondition: target is older than the loaded newest window")
+        return all
+    }
+
+    private func assertAroundFetchResolvesTarget(chat: ChatStore) async {
+        let loaded = await chat.loadTranscriptAround(messageId: 5, radius: 2)
+        XCTAssertTrue(loaded, "around-window fetch should report that it loaded the target")
+        let target = chat.messages.first { ChatStore.messageJumpCandidateIDs(for: 5).contains($0.id) }
+        XCTAssertNotNil(target, "target wire id 5 should be present after the around-window prepend")
+        XCTAssertEqual(chat.messages.first?.text, "message 3",
+                       "around-window rows should prepend ahead of the newest tail without full-loading")
+    }
+
+    func testDrawerSearchJumpLoadsAroundWindowForTargetOlderThanTail() async {
+        let (chat, sessions, _, _) = makeStores()
+        _ = installWindowFetch(on: chat)
+
+        let result = SessionSearchResult(
+            id: "s1", snippet: "message 5", role: "user", source: nil, model: nil,
+            sessionStarted: 1_700_000_000, messageId: 5
+        )
+        sessions.searchQuery = "message 5"
+        sessions.open(searchResult: result)
+
+        XCTAssertEqual(sessions.pendingMessageJump, 5)
+        await assertAroundFetchResolvesTarget(chat: chat)
+    }
+
+    func testDeepLinkJumpLoadsAroundWindowForTargetOlderThanTail() async {
+        let (chat, sessions, connection, inbox) = makeStores()
+        sessions.activeStoredId = "s1"
+        _ = installWindowFetch(on: chat)
+
+        HermesURLRouter.route(
+            URL(string: "hermesapp://session/s1?message=5")!,
+            connection: connection,
+            sessions: sessions,
+            chat: chat,
+            inbox: inbox
+        )
+
+        XCTAssertEqual(sessions.pendingMessageJump, 5)
+        await assertAroundFetchResolvesTarget(chat: chat)
+    }
+
+    func testArtifactsGalleryJumpLoadsAroundWindowForTargetOlderThanTail() async {
+        let (chat, sessions, _, _) = makeStores()
+        _ = installWindowFetch(on: chat)
+
+        // Mirrors ArtifactsGalleryView.openSourceSession(for:): it synthesizes a
+        // SessionSearchResult carrying the artifact's producing messageId.
+        let artifactResult = SessionSearchResult(
+            id: "s1", snippet: "message 5", role: nil, source: nil, model: nil,
+            sessionStarted: 1_700_000_005, messageId: 5
+        )
+        sessions.open(searchResult: artifactResult)
+
+        XCTAssertEqual(sessions.pendingMessageJump, 5)
+        await assertAroundFetchResolvesTarget(chat: chat)
+    }
+}
