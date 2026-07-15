@@ -243,6 +243,12 @@ struct SessionRuntimeInfo: Decodable, Sendable {
 }
 
 /// Result of `session.status`.
+///
+/// `running` is authoritative only when it is exactly `true`; it stays optional
+/// so the app remains compatible with older gateways that returned only the
+/// human-readable `output`. `model`, `provider`, and `usage` are nil before a
+/// lazy session has built its agent. A non-nil usage object may still omit
+/// measurements the active provider/runtime cannot report.
 struct SessionStatusResult: Decodable, Sendable {
     let running: Bool?
     let model: String?

@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		AB4510010000000000000001 /* AppLockTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB4510020000000000000001 /* AppLockTests.swift */; };
 		AB4510030000000000000001 /* SettingsViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB4510040000000000000001 /* SettingsViewTests.swift */; };
+		AB443001AB443001AB443001 /* session_status_responses.json in Resources */ = {isa = PBXBuildFile; fileRef = AB443002AB443002AB443002 /* session_status_responses.json */; };
 		008861246FF59FC970E36245 /* VoiceConversationControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2F4CBCA9ADD167081BFA1AA /* VoiceConversationControllerTests.swift */; };
 		01ABF4D113BBDB4254B29BBA /* SubagentTreeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0C8CBD8C7BDCFA9E6CB4D58 /* SubagentTreeView.swift */; };
 		02E81092BA6930AED0C99CB5 /* VoiceRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C028EAA9312823746769CE4 /* VoiceRecorder.swift */; };
@@ -334,6 +335,7 @@
 /* Begin PBXFileReference section */
 		AB4510020000000000000001 /* AppLockTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLockTests.swift; sourceTree = "<group>"; };
 		AB4510040000000000000001 /* SettingsViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsViewTests.swift; sourceTree = "<group>"; };
+		AB443002AB443002AB443002 /* session_status_responses.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = ../../../tests/fixtures/session_status_responses.json; sourceTree = "<group>"; };
 		0072D507329D59E558597E06 /* AppearanceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceView.swift; sourceTree = "<group>"; };
 		01BBD60417A4D85EDC321617 /* GreetingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GreetingTests.swift; sourceTree = "<group>"; };
 		01E6D69ED0E4210BAF05D00F /* MentionCompletion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MentionCompletion.swift; sourceTree = "<group>"; };
@@ -948,6 +950,7 @@
 			children = (
 				AB4510020000000000000001 /* AppLockTests.swift */,
 				AB4510040000000000000001 /* SettingsViewTests.swift */,
+				AB443002AB443002AB443002 /* session_status_responses.json */,
 				2A61DAF847A1110C50477FEF /* ArtifactsGalleryTests.swift */,
 				FC9C27DE26B8F86D42C41ADC /* AutoUpgradeGuardLatchTests.swift */,
 				48DF3123FEA22B7F3DA2A38C /* BatchGTests.swift */,
@@ -1182,6 +1185,7 @@
 			buildConfigurationList = 4A8053146615346B324A482D /* Build configuration list for PBXNativeTarget "HermesMobileTests" */;
 			buildPhases = (
 				C1B6E45123C8F8FCD73F69C1 /* Sources */,
+				AB443003AB443003AB443003 /* Resources */,
 				4B148CF33ADB5FA35DEB595E /* Frameworks */,
 			);
 			buildRules = (
@@ -1301,6 +1305,14 @@
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		AB443003AB443003AB443003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AB443001AB443001AB443001 /* session_status_responses.json in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		8E5F38C741065CFEF6FF717A /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
