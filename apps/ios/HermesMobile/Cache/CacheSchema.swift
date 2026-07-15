@@ -148,6 +148,37 @@ enum CacheSchema {
             try meta.save(db)
         }
 
+        // ABH-460 — scope-safe transcript mirror + FTS5.  The mirror deliberately
+        // owns its complete identity instead of inheriting the legacy global
+        // session id, so equal session ids in two profiles remain distinct.
+        migrator.registerMigration("v3-offline-search") { db in
+            try db.create(table: "offline_message_cache", ifNotExists: true) { t in
+                t.column("serverId", .text).notNull()
+                t.column("profileId", .text).notNull()
+                t.column("sessionId", .text).notNull()
+                t.column("ordinal", .integer).notNull()
+                t.column("wireId", .integer)
+                t.column("role", .text).notNull()
+                t.column("timestamp", .double)
+                t.column("rowJSON", .blob).notNull()
+                t.primaryKey(["serverId", "profileId", "sessionId", "ordinal"])
+            }
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
+                    serverId UNINDEXED, profileId UNINDEXED, sessionId UNINDEXED,
+                    messageKey UNINDEXED, wireId UNINDEXED, ordinal UNINDEXED,
+                    role UNINDEXED, content, tokenize='unicode61 remove_diacritics 2'
+                )
+                """)
+            try db.create(table: "offline_search_backfill", ifNotExists: true) { t in
+                t.column("serverId", .text).notNull()
+                t.column("profileId", .text).notNull()
+                t.column("lastRowId", .integer).notNull().defaults(to: 0)
+                t.column("complete", .boolean).notNull().defaults(to: false)
+                t.primaryKey(["serverId", "profileId"])
+            }
+        }
+
         return migrator
     }
 

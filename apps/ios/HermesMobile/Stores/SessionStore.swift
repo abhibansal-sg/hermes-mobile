@@ -431,6 +431,8 @@ final class SessionStore {
     var searchResults: [SessionSearchResult] = []
     /// True while a search request is in flight (after the debounce fires).
     var isSearching: Bool = false
+    /// True while the active scope's bounded historical FTS backfill remains.
+    var searchIsPartial: Bool = false
     /// True while a load-more page fetch is in flight.
     var isSearchLoadingMore: Bool = false
     /// `true` when the last fetched page was full (== limit), meaning more
@@ -1880,6 +1882,15 @@ final class SessionStore {
         }
 
         await paintFromCache()
+        if let cacheStore, let scope = currentCacheScope {
+            // Bounded, resumable batches. Yield between transactions so cache
+            // paint and interaction are never held behind historical indexing.
+            Task.detached(priority: .utility) {
+                while (try? await cacheStore.backfillSearchIndex(scope: scope)) == false {
+                    await Task.yield()
+                }
+            }
+        }
 
         // Bump and capture the token for this request. Any response that arrives
         // with a smaller captured value was superseded and is discarded.
@@ -2156,6 +2167,11 @@ final class SessionStore {
         if !removableIds.isEmpty {
             sessions.removeAll { removableIds.contains($0.id) }
             pending.subtract(removableIds)
+            if let cacheStore, let cacheScope = currentCacheScope {
+                for id in removableIds {
+                    Task { try? await cacheStore.removeSession(scope: cacheScope, sessionId: id) }
+                }
+            }
         }
         let didRemove = sessions.count != countBeforeRemoval
 
@@ -3468,15 +3484,10 @@ final class SessionStore {
         #if DEBUG
         let apiOrNil: RestClient? = restAPI
         // Allow the seam to bypass the restAPI requirement in tests.
-        guard apiOrNil != nil || searchFetch != nil else {
-            searchResults = []
-            return
-        }
+        let canSearchRemote = apiOrNil != nil || searchFetch != nil
         #else
-        guard let api = restAPI else {
-            searchResults = []
-            return
-        }
+        let api = restAPI
+        let canSearchRemote = api != nil
         #endif
 
         // Reset pagination state for the new query and bump the generation so
@@ -3494,6 +3505,23 @@ final class SessionStore {
             self.isSearching = true
             defer { self.isSearching = false }
             do {
+                // Local results publish first and remain visible while the
+                // concurrent remote request is in flight (including offline).
+                if let cache = self.cacheStore, let scope = self.currentCacheScope {
+                    let page = try await cache.searchTranscript(
+                        query: trimmed, scope: scope,
+                        roles: Self.roles(for: self.searchScope), limit: Self.searchPageLimit
+                    )
+                    guard self.searchGeneration == generation else { return }
+                    self.searchResults = page.hits.map {
+                        SessionSearchResult(
+                            id: $0.sessionId, snippet: $0.snippet, role: $0.role,
+                            source: nil, model: nil, sessionStarted: nil, messageId: $0.wireId
+                        )
+                    }
+                    self.searchIsPartial = page.partial
+                }
+                guard canSearchRemote else { return }
                 #if DEBUG
                 let (results, rawPageFull): ([SessionSearchResult], Bool)
                 if let seam = self.searchFetch {
@@ -3506,6 +3534,7 @@ final class SessionStore {
                     return
                 }
                 #else
+                guard let api else { return }
                 let (results, rawPageFull) = try await self.fetchSearch(
                     query: trimmed, offset: 0, api: api
                 )
@@ -3513,7 +3542,12 @@ final class SessionStore {
                 if Task.isCancelled { return }
                 // Guard against a stale response landing after the user typed on.
                 guard self.searchGeneration == generation else { return }
-                self.searchResults = results
+                let existing = Set(self.searchResults.map {
+                    "\($0.id)|\($0.messageId.map(String.init) ?? "")"
+                })
+                self.searchResults.append(contentsOf: results.filter {
+                    !existing.contains("\($0.id)|\($0.messageId.map(String.init) ?? "")")
+                })
                 // Advance offset by the page limit (not collapsed count) so
                 // the next load-more request starts at the correct message offset.
                 self.searchOffset = Self.searchPageLimit
@@ -3524,7 +3558,7 @@ final class SessionStore {
                 self.lastError = nil
             } catch {
                 if Task.isCancelled { return }
-                self.searchResults = []
+                // A remote failure must never flash already-published local hits.
                 self.lastError = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
             }
@@ -3714,6 +3748,7 @@ final class SessionStore {
         isSearchLoadingMore = false
         searchHasMore = false
         searchOffset = 0
+        searchIsPartial = false
     }
 
     // MARK: - Pins
