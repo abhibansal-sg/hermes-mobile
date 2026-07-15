@@ -442,6 +442,11 @@ final class ChatStore {
     private(set) var isLoadingEarlierTranscript = false
     private(set) var isLoadingJumpTarget = false
     private(set) var jumpTargetLoadError: String?
+    /// True after a target-centered around-window prepend may have created a
+    /// sparse `[around] + gap + [tail]` transcript. In that shape the visible row
+    /// order is useful for jumping, but user ordinals are no longer safe to send
+    /// as absolute gateway indices until a full transcript seed replaces it.
+    private(set) var transcriptWindowIsDiscontiguous = false
     private var oldestLoadedTranscriptWireId: Int?
     private var jumpWindowFetchAttemptedMessageIds: Set<Int> = []
 
@@ -527,6 +532,12 @@ final class ChatStore {
     /// after `init`. Returns the stored transcript or throws the REST error
     /// (which ``backfill()`` now surfaces rather than swallows).
     var backfillFetch: ((String) async throws -> [StoredMessage])?
+
+    /// Full-transcript fetch used by the truncate-ordinal safety gate. Unlike the
+    /// ABH-400 open/backfill path, this deliberately bypasses the plugin tail-page
+    /// route: edit/retry/checkpoint ordinals are gateway-absolute and therefore
+    /// require every earlier user turn to be loaded before submission.
+    var fullTranscriptFetch: ((String) async throws -> [StoredMessage])?
 
     /// Test seam for target-centered jump fetches. The live app resolves this
     /// through the plugin REST route in ``resolvedTranscriptAroundFetch``.
@@ -1839,6 +1850,7 @@ final class ChatStore {
             lastError = "Agent is busy"
             return
         }
+        guard await ensureFullTranscriptLoadedBeforeTruncation() else { return }
         guard let index = messages.firstIndex(where: { $0.id == messageId }),
               messages[index].role == .user else { return }
         let text = messages[index].text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2328,6 +2340,7 @@ final class ChatStore {
             lastError = "Agent is busy"
             return
         }
+        guard await ensureFullTranscriptLoadedBeforeTruncation() else { return }
         guard let index = messages.firstIndex(where: { $0.id == messageId }),
               messages[index].role == .user else { return }
         let ordinal = userOrdinal(at: index)
@@ -2342,6 +2355,8 @@ final class ChatStore {
             lastError = "Agent is busy"
             return
         }
+        guard messages.contains(where: { $0.id == assistantId }) else { return }
+        guard await ensureFullTranscriptLoadedBeforeTruncation() else { return }
         guard let assistantIndex = messages.firstIndex(where: { $0.id == assistantId }) else { return }
         // Walk back to the nearest preceding user message.
         guard let userIndex = messages[..<assistantIndex].lastIndex(where: { $0.role == .user }) else { return }
@@ -2357,6 +2372,52 @@ final class ChatStore {
     private func userOrdinal(at index: Int) -> Int {
         if let cached = userOrdinals[messages[index].id] { return cached }
         return messages[..<index].lazy.filter { $0.role == .user }.count
+    }
+
+    private var needsFullTranscriptBeforeTruncation: Bool {
+        transcriptHasMoreBefore || transcriptWindowIsDiscontiguous
+    }
+
+    /// `truncate_before_user_ordinal` is interpreted by the gateway against the
+    /// FULL stored history. A locally-loaded tail window (or sparse around+tail
+    /// window) produces only window-relative ordinals, so edit/retry/checkpoint
+    /// must first replace `messages` with a full, contiguous transcript.
+    private func ensureFullTranscriptLoadedBeforeTruncation() async -> Bool {
+        guard needsFullTranscriptBeforeTruncation else { return true }
+        guard !isStreaming else {
+            lastError = "Agent is busy"
+            return false
+        }
+        guard !isLoadingEarlierTranscript, !isLoadingJumpTarget else {
+            lastError = "Loading earlier messages — try again in a moment."
+            return false
+        }
+        guard let storedId = sessions?.activeStoredId else {
+            lastError = "No active session"
+            return false
+        }
+        guard let fetch = resolvedFullTranscriptFetch else {
+            lastError = "Couldn't load the full conversation. Try again."
+            return false
+        }
+
+        isLoadingEarlierTranscript = true
+        defer { isLoadingEarlierTranscript = false }
+        do {
+            let stored = try await fetch(storedId)
+            guard storedId == sessions?.activeStoredId else { return false }
+            seed(from: stored)
+            noteTranscriptPaging(oldestId: stored.first?.wireId, hasMoreBefore: false)
+            transcriptWindowIsDiscontiguous = false
+            lastError = nil
+            if let cacheStore {
+                Task { try? await cacheStore.saveTranscript(sessionId: storedId, messages: stored) }
+            }
+            return true
+        } catch {
+            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return false
+        }
     }
 
     /// Shared edit/retry submit: truncate the local transcript from
@@ -2816,6 +2877,7 @@ final class ChatStore {
     /// fallback). A full 50-row tail may have older rows; clicking once verifies
     /// against the server and clears the affordance if not.
     func noteTranscriptSeedWindow(_ stored: [StoredMessage]) {
+        transcriptWindowIsDiscontiguous = false
         noteTranscriptPaging(
             oldestId: stored.first?.wireId,
             hasMoreBefore: stored.count >= Self.transcriptOpenWindowLimit
@@ -2887,6 +2949,7 @@ final class ChatStore {
         let around = Self.toChatMessages(page.messages)
         let aroundIds = Set(around.map(\.id))
         seed(normalized: around + messages.filter { !aroundIds.contains($0.id) })
+        transcriptWindowIsDiscontiguous = true
         noteTranscriptPaging(oldestId: page.oldestId, hasMoreBefore: page.hasMoreBefore)
         jumpTargetLoadError = nil
         return true
@@ -3641,6 +3704,15 @@ final class ChatStore {
         }
     }
 
+    /// The injected full-transcript safety fetch, or the stock REST messages
+    /// endpoint. This intentionally does NOT use the plugin page-window route:
+    /// it is paid only when a truncate action needs absolute ordinals.
+    private var resolvedFullTranscriptFetch: ((String) async throws -> [StoredMessage])? {
+        if let fullTranscriptFetch { return fullTranscriptFetch }
+        guard let rest = connection?.rest else { return nil }
+        return { sessionId in try await rest.messages(sessionId: sessionId) }
+    }
+
     /// The injected `backfillFetch`, or the default that resolves the live REST
     /// client. Built lazily because `connection` is wired after `init`; tests
     /// override `backfillFetch` directly.
@@ -3736,6 +3808,7 @@ final class ChatStore {
         // state (see ChatView's loading/error split, R1 #79).
         lastBackfillError = nil
         transcriptHasMoreBefore = false
+        transcriptWindowIsDiscontiguous = false
         isLoadingEarlierTranscript = false
         isLoadingJumpTarget = false
         jumpTargetLoadError = nil
