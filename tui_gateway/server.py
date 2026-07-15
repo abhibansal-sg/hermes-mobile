@@ -8121,7 +8121,16 @@ def _(rid, params: dict) -> dict:
 
 @method("session.branch")
 def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
+    session_id = params.get("session_id") or ""
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    if (device := _ws_device_identity()) is not None and not _ws_device_owns_session(
+        device, session_id
+    ):
+        return _err(rid, 4030, "device does not own this session")
+    _start_agent_build(session_id, session)
+    err = _wait_agent(session, rid)
     if err:
         return err
     db = _get_db()
@@ -10279,15 +10288,71 @@ def _(rid, params: dict) -> dict:
 # ── Methods: respond ─────────────────────────────────────────────────
 
 
+def _ws_device_identity() -> Optional[dict]:
+    transport = current_transport()
+    ws = getattr(transport, "_ws", None)
+    identity = getattr(getattr(ws, "state", None), "device", None)
+    if isinstance(identity, dict) and identity.get("device_id"):
+        return identity
+    return None
+
+
+def _ws_device_owns_session(device: dict, session_id: str) -> bool:
+    """Fail-closed ownership check for device-authenticated WS RPCs."""
+    device_id = device.get("device_id") if isinstance(device, dict) else None
+    if not device_id:
+        return False
+    try:
+        import importlib
+
+        device_tokens = importlib.import_module(
+            "hermes_plugins.hermes_mobile.device_tokens"
+        )
+        owner = device_tokens.device_identity_for_session(session_id)
+    except Exception:
+        return False
+    return isinstance(owner, dict) and owner.get("device_id") == device_id
+
+
+def _ws_resolve_audit(session_id: str, session_key: str) -> dict:
+    device = _ws_device_identity()
+    if device is not None:
+        return {
+            "credential": "device",
+            "device_id": device.get("device_id"),
+            "device_name": device.get("device_name"),
+            "token_prefix": device.get("token_prefix"),
+            "session_id": session_id,
+            "session_key": session_key,
+        }
+    return {
+        "credential": (
+            "shared"
+            if getattr(current_transport(), "_ws", None) is not None
+            else "internal"
+        ),
+        "device_id": None,
+        "device_name": None,
+        "token_prefix": None,
+        "session_id": session_id,
+        "session_key": session_key,
+    }
+
+
 def _respond(rid, params, key, *, allow_expired=False):
     r = params.get("request_id", "")
+    device = _ws_device_identity()
+    if device is not None and "approve" not in (device.get("scopes") or []):
+        return _err(rid, 4030, "device token lacks approve scope")
     with _prompt_lock:
         entry = _pending.get(r)
         if not entry:
             if allow_expired and r:
                 return _ok(rid, {"status": "expired"})
             return _err(rid, 4009, f"no pending {key} request")
-        _, ev = entry
+        owner_sid, ev = entry
+        if device is not None and not _ws_device_owns_session(device, owner_sid):
+            return _err(rid, 4030, "device does not own this session")
         _answers[r] = params.get(key, "")
         ev.set()
     return _ok(rid, {"status": "ok"})
@@ -10319,16 +10384,28 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    assert session is not None
     try:
         from tools.approval import resolve_gateway_approval
 
+        device = _ws_device_identity()
+        if device is not None and "approve" not in (device.get("scopes") or []):
+            return _err(rid, 4030, "device token lacks approve scope")
+        session_id = params.get("session_id") or ""
+        if device is not None and not _ws_device_owns_session(device, session_id):
+            return _err(rid, 4030, "device does not own this session")
+        session_key = session["session_key"]
+        choice = params.get("choice", "deny")
+        if choice == "approve":
+            choice = "once"
         return _ok(
             rid,
             {
                 "resolved": resolve_gateway_approval(
-                    session["session_key"],
-                    params.get("choice", "deny"),
+                    session_key,
+                    choice,
                     resolve_all=params.get("all", False),
+                    audit=_ws_resolve_audit(session_id, session_key),
                 )
             },
         )

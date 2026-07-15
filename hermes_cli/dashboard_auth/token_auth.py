@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Awaitable, Callable, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
@@ -55,6 +55,52 @@ _log = logging.getLogger(__name__)
 # itself here at import/startup; the seam only acts on registered paths.
 _token_routes: set[str] = set()
 _lock = threading.Lock()
+
+# Generic identity seams for machine credentials that need richer metadata
+# than TokenPrincipal carries (device name, token prefix, revocation state),
+# plus live-socket indexing for immediate revocation.
+TOKEN_AUTHENTICATORS: List[
+    Callable[[str], Optional[Dict[str, Any]]]
+] = []
+IDENTITY_VALIDATORS: List[Callable[[Dict[str, Any]], bool]] = []
+SOCKET_OBSERVERS: List[Callable[[str, Dict[str, Any], Any], None]] = []
+
+
+def match_token(token: str) -> Optional[Dict[str, Any]]:
+    """Return the first registered rich identity for *token*, best-effort."""
+    if not token:
+        return None
+    for authenticator in list(TOKEN_AUTHENTICATORS):
+        try:
+            identity = authenticator(token)
+        except Exception:
+            _log.debug("token authenticator errored", exc_info=True)
+            continue
+        if isinstance(identity, dict):
+            return identity
+    return None
+
+
+def identity_active(identity: Any) -> bool:
+    """Return False only when a validator explicitly revokes an identity."""
+    if not isinstance(identity, dict):
+        return False
+    for validator in list(IDENTITY_VALIDATORS):
+        try:
+            if not validator(identity):
+                return False
+        except Exception:
+            _log.debug("identity validator errored", exc_info=True)
+    return True
+
+
+def notify_socket(action: str, identity: Dict[str, Any], ws: Any) -> None:
+    """Notify observers that an identity's live socket changed."""
+    for observer in list(SOCKET_OBSERVERS):
+        try:
+            observer(action, identity, ws)
+        except Exception:
+            _log.debug("socket observer errored", exc_info=True)
 
 
 def register_token_route(path: str) -> None:

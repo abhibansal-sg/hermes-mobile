@@ -89,6 +89,27 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+def _device_token_auth(request: Request) -> bool:
+    """Authenticate an API request through a registered rich-token matcher."""
+    if not request.url.path.startswith("/api/"):
+        return False
+
+    session_header = request.headers.get("X-Hermes-Session-Token", "")
+    auth = request.headers.get("authorization", "")
+    candidates = [session_header] if session_header else []
+    if auth.lower().startswith("bearer "):
+        candidates.append(auth.split(" ", 1)[1])
+
+    from hermes_cli.dashboard_auth.token_auth import match_token
+
+    for candidate in candidates:
+        identity = match_token(candidate)
+        if identity is not None:
+            request.state.device = identity
+            return True
+    return False
+
+
 def _ordered_session_providers(
     provider_hint: str | None,
 ) -> list[DashboardAuthProvider]:
@@ -295,6 +316,9 @@ async def gated_auth_middleware(
 
     path = request.url.path
     if _path_is_public(path):
+        return await call_next(request)
+
+    if _device_token_auth(request):
         return await call_next(request)
 
     at, _rt = read_session_cookies(request)

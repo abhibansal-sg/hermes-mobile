@@ -73,6 +73,7 @@ def test_register_late_wires_every_core_seam_after_attrs_restore(
     seams behind the authenticator membership check.
     """
     from hermes_cli.dashboard_auth import token_auth
+    from hermes_cli import plugins as plugin_core
     from tools import approval as _approval
     from tui_gateway import server, ws
 
@@ -80,6 +81,19 @@ def test_register_late_wires_every_core_seam_after_attrs_restore(
     device_tokens = load_plugin_module("device_tokens")
     push_engine = load_plugin_module("push_engine")
     broadcast = load_plugin_module("broadcast")
+
+    # Exercise the compatibility fallback intentionally: this stock core has
+    # first-class hooks, so hide them for the duration of this older-core test.
+    for hook in (
+        "post_emit_event",
+        "post_frame_write",
+        "on_ws_transport_change",
+    ):
+        monkeypatch.setattr(
+            plugin_core,
+            "VALID_HOOKS",
+            plugin_core.VALID_HOOKS - {hook},
+        )
 
     delayed_lists = [
         (token_auth, "IDENTITY_VALIDATORS"),
@@ -90,7 +104,7 @@ def test_register_late_wires_every_core_seam_after_attrs_restore(
         (ws, "TRANSPORT_OBSERVERS"),
     ]
     for module, name in delayed_lists:
-        monkeypatch.delattr(module, name, raising=True)
+        monkeypatch.delattr(module, name, raising=False)
 
     caplog.clear()
     plugin.register(ctx)

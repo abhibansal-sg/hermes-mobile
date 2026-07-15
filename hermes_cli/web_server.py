@@ -338,7 +338,20 @@ def _has_valid_session_token(request: Request) -> bool:
 
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
-    return hmac.compare_digest(auth.encode(), expected.encode())
+    if hmac.compare_digest(auth.encode(), expected.encode()):
+        return True
+
+    from hermes_cli.dashboard_auth.token_auth import match_token
+
+    candidates = [session_header] if session_header else []
+    if auth.lower().startswith("bearer "):
+        candidates.append(auth.split(" ", 1)[1])
+    for candidate in candidates:
+        identity = match_token(candidate)
+        if identity is not None:
+            request.state.device = identity
+            return True
+    return False
 
 
 # Routes that may also authenticate via a ``?token=`` query param, for download
@@ -14736,7 +14749,14 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            consume_ticket(ticket)
+            info = consume_ticket(ticket)
+            if info.get("provider") == "device" and info.get("user_id"):
+                ws.state.device = {
+                    "device_id": info.get("device_id") or info["user_id"],
+                    "device_name": info.get("device_name"),
+                    "token_prefix": info.get("token_prefix"),
+                    "scopes": list(info.get("scopes") or []),
+                }
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
@@ -14752,7 +14772,54 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         return "no_credential", "none"
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
         return None, "token"
+    identity = _ws_token_identity(token)
+    if identity is not None:
+        ws.state.device = identity
+        return None, "device"
     return "token_mismatch", "token"
+
+
+def _ws_token_identity(token: str) -> Optional[dict]:
+    """Resolve a rich machine identity without changing shared-token auth."""
+    from hermes_cli.dashboard_auth.token_auth import match_token
+
+    return match_token(token)
+
+
+def _ws_active_identity(ws: "WebSocket") -> Optional[dict]:
+    """Return the connection identity only while its token remains active."""
+    from hermes_cli.dashboard_auth.token_auth import identity_active
+
+    identity = getattr(ws.state, "device", None)
+    if not isinstance(identity, dict):
+        return None
+    return identity if identity_active(identity) else None
+
+
+async def _close_if_ws_device_revoked(ws: "WebSocket") -> bool:
+    """Close a token-authenticated socket whose identity was revoked."""
+    identity = getattr(ws.state, "device", None)
+    if not isinstance(identity, dict):
+        return False
+    if _ws_active_identity(ws) is not None:
+        return False
+    await ws.close(code=4401, reason="device revoked")
+    return True
+
+
+@contextmanager
+def _ws_live_socket_index(ws: "WebSocket"):
+    """Register a token-authenticated socket until its handler exits."""
+    from hermes_cli.dashboard_auth.token_auth import notify_socket
+
+    identity = _ws_active_identity(ws)
+    if identity:
+        notify_socket("register", identity, ws)
+    try:
+        yield identity
+    finally:
+        if identity:
+            notify_socket("deregister", identity, ws)
 
 
 def _ws_auth_ok(ws: "WebSocket") -> bool:
@@ -15331,6 +15398,9 @@ async def console_ws(ws: WebSocket) -> None:
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
         return
 
+    if await _close_if_ws_device_revoked(ws):
+        return
+
     await ws.accept()
 
     profile = _console_profile_from_ws(ws)
@@ -15372,24 +15442,33 @@ async def console_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
-    _log.info(
-        "console accepted peer=%s mode=%s cred=%s context=%s profile=%s",
-        peer,
-        mode,
-        cred,
-        context,
-        profile or "current",
-    )
-    await _console_send(
-        ws,
-        send_lock,
-        {
-            "type": "ready",
-            "context": context,
-            "profile": profile or "current",
-            "prompt": _CONSOLE_PROMPT,
-        },
-    )
+    live_socket_index = _ws_live_socket_index(ws)
+    live_socket_index.__enter__()
+    try:
+        _log.info(
+            "console accepted peer=%s mode=%s cred=%s context=%s profile=%s",
+            peer,
+            mode,
+            cred,
+            context,
+            profile or "current",
+        )
+        await _console_send(
+            ws,
+            send_lock,
+            {
+                "type": "ready",
+                "context": context,
+                "profile": profile or "current",
+                "prompt": _CONSOLE_PROMPT,
+            },
+        )
+    except WebSocketDisconnect:
+        live_socket_index.__exit__(None, None, None)
+        return
+    except BaseException:
+        live_socket_index.__exit__(None, None, None)
+        raise
 
     active_task: asyncio.Task | None = None
     pending_confirmation: Optional[str] = None
@@ -15648,6 +15727,7 @@ async def console_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        live_socket_index.__exit__(None, None, None)
         if active_task and not active_task.done():
             active_task.cancel()
             try:
@@ -15691,6 +15771,9 @@ async def pty_ws(ws: WebSocket) -> None:
     if client_reason is not None:
         _log.warning("pty refused: %s", client_reason)
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
+        return
+
+    if await _close_if_ws_device_revoked(ws):
         return
 
     await ws.accept()
@@ -15850,9 +15933,20 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    from tui_gateway.ws import handle_ws
+    if await _close_if_ws_device_revoked(ws):
+        return
 
-    await handle_ws(ws)
+    from tui_gateway.ws import handle_ws
+    from hermes_cli.dashboard_auth.token_auth import notify_socket
+
+    identity = _ws_active_identity(ws)
+    if identity:
+        notify_socket("register", identity, ws)
+    try:
+        await handle_ws(ws)
+    finally:
+        if identity:
+            notify_socket("deregister", identity, ws)
 
 
 # ---------------------------------------------------------------------------
@@ -15881,6 +15975,9 @@ async def pub_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
+    if await _close_if_ws_device_revoked(ws):
+        return
+
     channel = _channel_or_close_code(ws)
     if not channel:
         await ws.close(code=4400)
@@ -15889,8 +15986,9 @@ async def pub_ws(ws: WebSocket) -> None:
     await ws.accept()
 
     try:
-        while True:
-            await _broadcast_event(ws.app, channel, await ws.receive_text())
+        with _ws_live_socket_index(ws):
+            while True:
+                await _broadcast_event(ws.app, channel, await ws.receive_text())
     except WebSocketDisconnect:
         pass
 
@@ -15909,6 +16007,9 @@ async def events_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
+    if await _close_if_ws_device_revoked(ws):
+        return
+
     channel = _channel_or_close_code(ws)
     if not channel:
         await ws.close(code=4400)
@@ -15921,11 +16022,12 @@ async def events_ws(ws: WebSocket) -> None:
         event_channels.setdefault(channel, set()).add(ws)
 
     try:
-        while True:
-            # Subscribers don't speak — the receive() just blocks until
-            # disconnect so the connection stays open as long as the
-            # browser holds it.
-            await ws.receive_text()
+        with _ws_live_socket_index(ws):
+            while True:
+                # Subscribers don't speak — the receive() just blocks until
+                # disconnect so the connection stays open as long as the
+                # browser holds it.
+                await ws.receive_text()
     except WebSocketDisconnect:
         pass
     finally:

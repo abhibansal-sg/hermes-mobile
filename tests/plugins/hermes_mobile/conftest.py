@@ -42,17 +42,40 @@ def mounted_mobile_dashboard_api(_hermetic_environment):
     the module is missing so we do not duplicate routes in the shared FastAPI
     app.
     """
-    if _API_MODULE_NAME not in sys.modules:
+    expected_api = (PLUGIN_DIR / "dashboard" / "api.py").resolve()
+    mounted_api = sys.modules.get(_API_MODULE_NAME)
+    mounted_path = Path(getattr(mounted_api, "__file__", "")).resolve() if mounted_api else None
+    if mounted_path != expected_api:
         from hermes_cli import web_server
 
-        # Importing web_server normally performs the mount. Only re-run the
-        # mount if that import still did not register the module (the stale
-        # real-config/disabled-plugin case). Avoiding an unconditional second
-        # mount is important because FastAPI keeps the first route handler in
-        # dispatch order, while sys.modules would point at the second module.
-        if _API_MODULE_NAME not in sys.modules:
-            web_server._get_dashboard_plugins(force_rescan=True)
-            web_server._mount_plugin_api_routes()
+        # Collection can import web_server before the hermetic HERMES_HOME is
+        # active and mount a developer-installed copy of the plugin. Replace
+        # those routes with this checkout's bundled plugin so route handlers
+        # and test-loaded plugin modules share one registry.
+        prefix = "/api/plugins/hermes-mobile"
+        web_server.app.routes[:] = [
+            route
+            for route in web_server.app.routes
+            if not str(getattr(route, "path", "")).startswith(prefix)
+        ]
+        sys.modules.pop(_API_MODULE_NAME, None)
+        web_server._get_dashboard_plugins(force_rescan=True)
+        route_count = len(web_server.app.routes)
+        web_server._mount_plugin_api_routes()
+        # The production import mounts plugin APIs before the SPA catch-all.
+        # Preserve that ordering for this late test-only recovery.
+        added = web_server.app.routes[route_count:]
+        if added:
+            del web_server.app.routes[route_count:]
+            catch_all = next(
+                (
+                    index
+                    for index, route in enumerate(web_server.app.routes)
+                    if getattr(route, "path", None) == "/{full_path:path}"
+                ),
+                len(web_server.app.routes),
+            )
+            web_server.app.routes[catch_all:catch_all] = added
     assert _API_MODULE_NAME in sys.modules
 
 
@@ -155,18 +178,25 @@ def wired_gateway():
     Yields ``(server, ws, push_engine, broadcast)`` and unwires afterwards so
     other gateway tests see pristine seam lists.
     """
+    from hermes_cli.plugins import (
+        PluginContext,
+        PluginManifest,
+        get_plugin_manager,
+    )
     from tui_gateway import server, ws
 
     push = load_plugin_module("push_engine")
     bcast = load_plugin_module("broadcast")
-    push.activate()
-    bcast.activate()
+    manager = get_plugin_manager()
+    before = {name: list(callbacks) for name, callbacks in manager._hooks.items()}
+    ctx = PluginContext(
+        PluginManifest(name="hermes-mobile", key="hermes-mobile"),
+        manager,
+    )
+    push.activate(ctx)
+    bcast.activate(ctx)
     try:
         yield server, ws, push, bcast
     finally:
-        if push.handle_gateway_event in server._EMIT_OBSERVERS:
-            server._EMIT_OBSERVERS.remove(push.handle_gateway_event)
-        if bcast.on_owner_write in server._EVENT_FANOUT_SUBSCRIBERS:
-            server._EVENT_FANOUT_SUBSCRIBERS.remove(bcast.on_owner_write)
-        if bcast.on_transport in ws.TRANSPORT_OBSERVERS:
-            ws.TRANSPORT_OBSERVERS.remove(bcast.on_transport)
+        manager._hooks.clear()
+        manager._hooks.update(before)
