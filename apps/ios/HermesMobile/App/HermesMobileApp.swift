@@ -249,6 +249,17 @@ struct HermesMobileApp: App {
                         inbox: environment.inboxStore
                     )
                 }
+                // Highest app layer: covers sheets, alerts, toasts, navigation,
+                // attachments, and every connection phase before iOS snapshots
+                // the scene. The content-free privacy cover wins while inactive;
+                // on return, the authentication cover remains when required.
+                .overlay {
+                    if environment.appLock.isPrivacyShieldVisible {
+                        PrivacyShieldCover()
+                    } else if environment.appLock.isLocked {
+                        AppLockOverlay()
+                    }
+                }
         }
     }
 
