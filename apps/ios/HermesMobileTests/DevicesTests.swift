@@ -26,15 +26,20 @@ final class DevicesTests: XCTestCase {
     /// Minimal URLProtocol stub for `issueDevice` status/error tests.
     final class IssueDeviceProtocol: URLProtocol, @unchecked Sendable {
         nonisolated(unsafe) static var response: (Data, Int) = (Data(), 200)
+        nonisolated(unsafe) static var issueRequestCount = 0
 
         static func reset(body: Data, status: Int) {
             response = (body, status)
+            issueRequestCount = 0
         }
 
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
         override func startLoading() {
+            if request.url?.path.hasSuffix("/devices/issue") == true {
+                Self.issueRequestCount += 1
+            }
             let (body, status) = Self.response
             let response = HTTPURLResponse(
                 url: request.url!,
@@ -266,6 +271,63 @@ final class DevicesTests: XCTestCase {
 
         XCTAssertNil(connection.deviceLimitAdvisory)
         XCTAssertEqual(connection.phase, .connected)
+        XCTAssertTrue(connection._isDeviceIssueLimitReachedSuppressedForTesting(serverURL: server))
+    }
+
+    func testRetryDeviceUpgradeAfterRevokeClearsSuppressionAndReEntersAutoUpgrade() async {
+        let server = "https://retry-success.example:9119"
+        KeychainService.deleteToken(server: server)
+        defer {
+            KeychainService.deleteToken(server: server)
+            DefaultsKeys.setDeviceId(nil, server: server)
+        }
+        IssueDeviceProtocol.reset(
+            body: Data(#"{"device_id":"dev_retry","token":"tok_retry","device_name":"iPhone","created_at":1}"#.utf8),
+            status: 200
+        )
+
+        let sessions = SessionStore()
+        let chat = ChatStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        connection._seedConnectedForTesting(serverURL: server, token: "shared-token")
+        connection.capabilities._setDevicesForTesting(.available)
+        connection._restOverrideForTesting = makeIssueClient(body: IssueDeviceProtocol.response.0, status: IssueDeviceProtocol.response.1)
+        connection._handleDeviceLimitReachedForTesting(serverURL: server, maxDevices: 64)
+
+        await connection.retryDeviceUpgrade(serverURL: server)
+
+        XCTAssertFalse(connection._isDeviceIssueLimitReachedSuppressedForTesting(serverURL: server))
+        XCTAssertEqual(DefaultsKeys.deviceId(server: server), "dev_retry")
+        XCTAssertNil(connection.deviceLimitAdvisory)
+        XCTAssertEqual(IssueDeviceProtocol.issueRequestCount, 1)
+    }
+
+    func testRetryDeviceUpgradeThatStillHitsLimitRearmsSuppressionAndShowsAdvisory() async {
+        let server = "https://retry-limit.example:9119"
+        KeychainService.deleteToken(server: server)
+        defer {
+            KeychainService.deleteToken(server: server)
+            DefaultsKeys.setDeviceId(nil, server: server)
+        }
+        IssueDeviceProtocol.reset(
+            body: Data(#"{"error":"device limit reached","max_devices":64}"#.utf8),
+            status: 409
+        )
+
+        let sessions = SessionStore()
+        let chat = ChatStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        connection._seedConnectedForTesting(serverURL: server, token: "shared-token")
+        connection.capabilities._setDevicesForTesting(.available)
+        connection._restOverrideForTesting = makeIssueClient(body: IssueDeviceProtocol.response.0, status: IssueDeviceProtocol.response.1)
+        connection._handleDeviceLimitReachedForTesting(serverURL: server, maxDevices: nil)
+
+        await connection.retryDeviceUpgrade(serverURL: server)
+
+        XCTAssertTrue(connection._isDeviceIssueLimitReachedSuppressedForTesting(serverURL: server))
+        XCTAssertNil(DefaultsKeys.deviceId(server: server))
+        XCTAssertEqual(connection.deviceLimitAdvisory, ConnectionStore.deviceLimitReachedMessage(maxDevices: 64))
+        XCTAssertEqual(IssueDeviceProtocol.issueRequestCount, 1)
     }
 
     func testDeviceLimitReachedDuringHydrationDoesNotForceOffline() {

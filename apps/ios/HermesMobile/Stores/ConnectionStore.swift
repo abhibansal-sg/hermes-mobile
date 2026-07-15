@@ -141,6 +141,16 @@ final class ConnectionStore {
         deviceLimitAdvisory = nil
     }
 
+    func retryDeviceUpgrade(serverURL: String) async {
+        deviceIssueLimitReachedServers.remove(serverURL)
+
+        await autoUpgradeToDeviceTokenIfNeeded(serverURL: serverURL)
+
+        if DefaultsKeys.deviceId(server: serverURL) != nil {
+            deviceLimitAdvisory = nil
+        }
+    }
+
     /// Short display name of the gateway's currently-configured main model
     /// (F0 / Amendment B). Sourced from `GET /api/model/info` on connect and
     /// re-fetched after a model switch. `nil` until the first successful probe
@@ -1912,6 +1922,7 @@ final class ConnectionStore {
     func _isDeviceIssueLimitReachedSuppressedForTesting(serverURL: String) -> Bool {
         deviceIssueLimitReachedServers.contains(serverURL)
     }
+
     #endif
 
     /// The best client-side device-name hint available without a new entitlement.
