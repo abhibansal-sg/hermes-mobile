@@ -139,7 +139,7 @@ def _core_has_symbol_checker():
         from hermes_cli import web_server as core
 
         return (lambda sym: hasattr(core, sym)), "import"
-    except Exception as exc:  # pragma: no cover - env break / bare python3 fallback
+    except (Exception, SystemExit) as exc:  # pragma: no cover - bare python fallback
         try:
             symbols = _static_web_server_symbols()
         except Exception as static_exc:

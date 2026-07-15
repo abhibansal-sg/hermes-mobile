@@ -6,13 +6,29 @@ candidate. Sustainable across upstream evolution; adoptable by Nous.
 **Hard requirements:** both topologies work natively —
 (A) standalone gateway, desktop remote + iOS remote (current);
 (B) desktop EMBEDDED gateway (stock `mode:"local"`), iOS connects to it.
-**Target API:** design against `upstream/main`'s plugin surface (verified stable
-across the 549-commit drift; upstream only ADDED registries).
+**Target API:** design against pristine `upstream/main`; capability stays in the
+plugin and only the irreducible host seams below remain in core.
 
-## Baseline (inventory 2026-06-10, merge-base 3c231eb39)
-Production stock-file mods ≈ 1,820 lines (+~1,252 test lines that move with their
-code): verdicts ~900 PLUGIN / ~870 SEAM / ~50 DROP. Full per-hunk inventory in the
-ABH-88 Linear thread.
+## Baseline (supersession sweep 2026-07-15, merge-base 306e2d231)
+The iOS overlay is rebased onto pristine upstream commit `306e2d231`. The old
+fork carried roughly 1,257 core-patch lines; the re-applied core seam set is 9
+files, +486/-75 lines before this ledger/patch regeneration. Everything else is
+either already upstream or no longer consumed by `plugins/hermes-mobile` / iOS.
+
+### Seam verdicts on the new base
+
+| Seam | Verdict | New-base disposition / evidence |
+|---|---|---|
+| S1 | STILL-NEEDED (reduced) | First-class `post_frame_write` and `on_ws_transport_change` hooks only; no legacy subscriber lists (`hermes_cli/plugins.py`, `tui_gateway/server.py`, `tui_gateway/ws.py`). |
+| S2 | STILL-NEEDED (reduced) | First-class `post_emit_event` plus runtime id metadata on upstream's existing `on_session_finalize`; no `_EMIT_OBSERVERS` or synthetic finalize event. |
+| S3 | SUPERSEDED / reduced | Upstream `_session_info` already includes provider. `_runtime_sid` storage is dropped; finalize receives the existing record's `_sid` as transient hook metadata. |
+| S4 | STILL-NEEDED (small) | Reasoning is already session-scoped upstream. Only `config.set/get fast` needed adaptation to `create_service_tier_override`. |
+| S5 | STILL-NEEDED | The stock provider registry covers exact Bearer-token REST routes, but not rich device metadata, plugin routes, WS tickets, live revocation, socket indexing, or resolver audit identity. Generic registries and guarded call sites remain. |
+| S6 | STILL-NEEDED | Stock `session.delete` still returned 4023 for a live row. It now interrupts a running turn, releases prompts/approvals, tears down, deletes, and reports `evicted`. |
+| S7 | SUPERSEDED | Upstream `WSTransport` already schedules loop-owned writes, coalesces token frames, and preserves control-frame ordering. |
+| S8 | SUPERSEDED | `exclude_sources` is already implemented in `hermes_state.py` and both dashboard session APIs. |
+| S9 | OBSOLETE | The plugin enriches fan-out frames with `stored_session_id`; no desktop foreign-frame core adoption seam is referenced. |
+| S10 | OBSOLETE | Embedded-chat route guards are upstream. iOS closes its owned runtime before RPC delete and uses profile-scoped REST only for non-default rows, so the old REST live-delete core guard has no current consumer. |
 
 ## 1. Plugin package: `plugins/hermes-mobile/`
 Rides the STOCK plugin system (`hermes_cli/plugins.py` manager + dashboard

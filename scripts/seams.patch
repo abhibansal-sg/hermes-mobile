@@ -1,67 +1,918 @@
-diff --git a/tui_gateway/server.py b/tui_gateway/server.py
-index 1b2ff0d97..7b82609e2 100644
---- a/tui_gateway/server.py
-+++ b/tui_gateway/server.py
-@@ -347,6 +347,23 @@ def _notify_session_boundary(event_type: str, session_id: str | None) -> None:
+diff --git a/hermes_cli/dashboard_auth/middleware.py b/hermes_cli/dashboard_auth/middleware.py
+index caa1b3a6e..5907bea13 100644
+--- a/hermes_cli/dashboard_auth/middleware.py
++++ b/hermes_cli/dashboard_auth/middleware.py
+@@ -89,6 +89,27 @@ def _client_ip(request: Request) -> str:
+     return request.client.host if request.client else ""
+ 
+ 
++def _device_token_auth(request: Request) -> bool:
++    """Authenticate an API request through a registered rich-token matcher."""
++    if not request.url.path.startswith("/api/"):
++        return False
++
++    session_header = request.headers.get("X-Hermes-Session-Token", "")
++    auth = request.headers.get("authorization", "")
++    candidates = [session_header] if session_header else []
++    if auth.lower().startswith("bearer "):
++        candidates.append(auth.split(" ", 1)[1])
++
++    from hermes_cli.dashboard_auth.token_auth import match_token
++
++    for candidate in candidates:
++        identity = match_token(candidate)
++        if identity is not None:
++            request.state.device = identity
++            return True
++    return False
++
++
+ def _ordered_session_providers(
+     provider_hint: str | None,
+ ) -> list[DashboardAuthProvider]:
+@@ -297,6 +318,9 @@ async def gated_auth_middleware(
+     if _path_is_public(path):
+         return await call_next(request)
+ 
++    if _device_token_auth(request):
++        return await call_next(request)
++
+     at, _rt = read_session_cookies(request)
+     provider_hint = read_session_provider(request)
+     if not at and not _rt:
+diff --git a/hermes_cli/dashboard_auth/routes.py b/hermes_cli/dashboard_auth/routes.py
+index 5b833e5df..5fac62d91 100644
+--- a/hermes_cli/dashboard_auth/routes.py
++++ b/hermes_cli/dashboard_auth/routes.py
+@@ -626,7 +626,31 @@ async def api_auth_ws_ticket(request: Request):
+     expected pattern.
+     """
+     sess = getattr(request.state, "session", None)
+-    if sess is None:
++    device = getattr(request.state, "device", None)
++    if sess is not None:
++        user_id = sess.user_id
++        provider = sess.provider
++        ticket_extra = None
++        audit_fields = {"provider": provider, "user_id": user_id}
++    elif isinstance(device, dict) and device.get("device_id"):
++        if "chat" not in (device.get("scopes") or []):
++            raise HTTPException(status_code=403, detail="Device token lacks chat scope")
++        user_id = str(device["device_id"])
++        provider = "device"
++        ticket_extra = {
++            "device_id": device.get("device_id"),
++            "device_name": device.get("device_name"),
++            "token_prefix": device.get("token_prefix"),
++            "scopes": list(device.get("scopes") or []),
++        }
++        audit_fields = {
++            "provider": provider,
++            "user_id": user_id,
++            "device_id": device.get("device_id"),
++            "device_name": device.get("device_name"),
++            "token_prefix": device.get("token_prefix"),
++        }
++    else:
+         # Middleware should already have rejected, but check defensively.
+         raise HTTPException(status_code=401, detail="Unauthorized")
+ 
+@@ -634,11 +658,10 @@ async def api_auth_ws_ticket(request: Request):
+     # don't load the ticket store.
+     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
+ 
+-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
++    ticket = mint_ticket(user_id=user_id, provider=provider, extra=ticket_extra)
+     audit_log(
+         AuditEvent.WS_TICKET_MINTED,
+-        provider=sess.provider,
+-        user_id=sess.user_id,
++        **audit_fields,
+         ip=_client_ip(request),
+     )
+     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
+diff --git a/hermes_cli/dashboard_auth/token_auth.py b/hermes_cli/dashboard_auth/token_auth.py
+index 320b4cdb5..5a9237c8e 100644
+--- a/hermes_cli/dashboard_auth/token_auth.py
++++ b/hermes_cli/dashboard_auth/token_auth.py
+@@ -40,7 +40,7 @@ from __future__ import annotations
+ 
+ import logging
+ import threading
+-from typing import Awaitable, Callable, Optional, Tuple
++from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+ 
+ from fastapi import Request
+ from fastapi.responses import JSONResponse, Response
+@@ -56,6 +56,52 @@ _log = logging.getLogger(__name__)
+ _token_routes: set[str] = set()
+ _lock = threading.Lock()
+ 
++# Generic identity seams for machine credentials that need richer metadata
++# than TokenPrincipal carries (device name, token prefix, revocation state),
++# plus live-socket indexing for immediate revocation.
++TOKEN_AUTHENTICATORS: List[
++    Callable[[str], Optional[Dict[str, Any]]]
++] = []
++IDENTITY_VALIDATORS: List[Callable[[Dict[str, Any]], bool]] = []
++SOCKET_OBSERVERS: List[Callable[[str, Dict[str, Any], Any], None]] = []
++
++
++def match_token(token: str) -> Optional[Dict[str, Any]]:
++    """Return the first registered rich identity for *token*, best-effort."""
++    if not token:
++        return None
++    for authenticator in list(TOKEN_AUTHENTICATORS):
++        try:
++            identity = authenticator(token)
++        except Exception:
++            _log.debug("token authenticator errored", exc_info=True)
++            continue
++        if isinstance(identity, dict):
++            return identity
++    return None
++
++
++def identity_active(identity: Any) -> bool:
++    """Return False only when a validator explicitly revokes an identity."""
++    if not isinstance(identity, dict):
++        return False
++    for validator in list(IDENTITY_VALIDATORS):
++        try:
++            if not validator(identity):
++                return False
++        except Exception:
++            _log.debug("identity validator errored", exc_info=True)
++    return True
++
++
++def notify_socket(action: str, identity: Dict[str, Any], ws: Any) -> None:
++    """Notify observers that an identity's live socket changed."""
++    for observer in list(SOCKET_OBSERVERS):
++        try:
++            observer(action, identity, ws)
++        except Exception:
++            _log.debug("socket observer errored", exc_info=True)
++
+ 
+ def register_token_route(path: str) -> None:
+     """Mark ``path`` (exact match) as token-authable.
+diff --git a/hermes_cli/dashboard_auth/ws_tickets.py b/hermes_cli/dashboard_auth/ws_tickets.py
+index 118a988e1..09d59106a 100644
+--- a/hermes_cli/dashboard_auth/ws_tickets.py
++++ b/hermes_cli/dashboard_auth/ws_tickets.py
+@@ -59,7 +59,9 @@ class TicketInvalid(Exception):
+     """Ticket missing, expired, or already consumed."""
+ 
+ 
+-def mint_ticket(*, user_id: str, provider: str) -> str:
++def mint_ticket(
++    *, user_id: str, provider: str, extra: Optional[Dict[str, Any]] = None
++) -> str:
+     """Generate a one-shot ticket bound to this user identity.
+ 
+     The returned token is base64url, 43 bytes of entropy (32-byte random
+@@ -72,6 +74,8 @@ def mint_ticket(*, user_id: str, provider: str) -> str:
+         "provider": provider,
+         "minted_at": int(time.time()),
+     }
++    if extra:
++        info.update(extra)
+     with _lock:
+         _tickets[ticket] = (int(time.time()) + TTL_SECONDS, info)
+         _gc_expired_locked()
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 6ca393fca..b64c5d5ef 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -212,6 +212,15 @@ VALID_HOOKS: Set[str] = {
+     "kanban_task_claimed",
+     "kanban_task_completed",
+     "kanban_task_blocked",
++    # TUI-gateway observer hooks. These are observer-only: return values are
++    # ignored and callback failures must never break gateway traffic.
++    #
++    # post_emit_event: event: str, session_id: str, payload: dict | None
++    # post_frame_write: frame: dict, session_id: str, owner_transport: Any
++    # on_ws_transport_change: action: "connect" | "disconnect", transport: Any
++    "post_emit_event",
++    "post_frame_write",
++    "on_ws_transport_change",
+ }
+ 
+ ENTRY_POINTS_GROUP = "hermes_agent.plugins"
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index 406e18f5c..bf229d706 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -338,7 +338,20 @@ def _has_valid_session_token(request: Request) -> bool:
+ 
+     auth = request.headers.get("authorization", "")
+     expected = f"Bearer {_SESSION_TOKEN}"
+-    return hmac.compare_digest(auth.encode(), expected.encode())
++    if hmac.compare_digest(auth.encode(), expected.encode()):
++        return True
++
++    from hermes_cli.dashboard_auth.token_auth import match_token
++
++    candidates = [session_header] if session_header else []
++    if auth.lower().startswith("bearer "):
++        candidates.append(auth.split(" ", 1)[1])
++    for candidate in candidates:
++        identity = match_token(candidate)
++        if identity is not None:
++            request.state.device = identity
++            return True
++    return False
+ 
+ 
+ # Routes that may also authenticate via a ``?token=`` query param, for download
+@@ -14736,7 +14749,14 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
+             return "no_credential", "none"
+ 
+         try:
+-            consume_ticket(ticket)
++            info = consume_ticket(ticket)
++            if info.get("provider") == "device" and info.get("user_id"):
++                ws.state.device = {
++                    "device_id": info.get("device_id") or info["user_id"],
++                    "device_name": info.get("device_name"),
++                    "token_prefix": info.get("token_prefix"),
++                    "scopes": list(info.get("scopes") or []),
++                }
+             return None, "ticket"
+         except TicketInvalid as exc:
+             audit_log(
+@@ -14752,9 +14772,56 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
+         return "no_credential", "none"
+     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+         return None, "token"
++    identity = _ws_token_identity(token)
++    if identity is not None:
++        ws.state.device = identity
++        return None, "device"
+     return "token_mismatch", "token"
+ 
+ 
++def _ws_token_identity(token: str) -> Optional[dict]:
++    """Resolve a rich machine identity without changing shared-token auth."""
++    from hermes_cli.dashboard_auth.token_auth import match_token
++
++    return match_token(token)
++
++
++def _ws_active_identity(ws: "WebSocket") -> Optional[dict]:
++    """Return the connection identity only while its token remains active."""
++    from hermes_cli.dashboard_auth.token_auth import identity_active
++
++    identity = getattr(ws.state, "device", None)
++    if not isinstance(identity, dict):
++        return None
++    return identity if identity_active(identity) else None
++
++
++async def _close_if_ws_device_revoked(ws: "WebSocket") -> bool:
++    """Close a token-authenticated socket whose identity was revoked."""
++    identity = getattr(ws.state, "device", None)
++    if not isinstance(identity, dict):
++        return False
++    if _ws_active_identity(ws) is not None:
++        return False
++    await ws.close(code=4401, reason="device revoked")
++    return True
++
++
++@contextmanager
++def _ws_live_socket_index(ws: "WebSocket"):
++    """Register a token-authenticated socket until its handler exits."""
++    from hermes_cli.dashboard_auth.token_auth import notify_socket
++
++    identity = _ws_active_identity(ws)
++    if identity:
++        notify_socket("register", identity, ws)
++    try:
++        yield identity
++    finally:
++        if identity:
++            notify_socket("deregister", identity, ws)
++
++
+ def _ws_auth_ok(ws: "WebSocket") -> bool:
+     """True when the WS-upgrade credential is accepted. See _ws_auth_reason."""
+     return _ws_auth_reason(ws)[0] is None
+@@ -15331,6 +15398,9 @@ async def console_ws(ws: WebSocket) -> None:
+         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
+         return
+ 
++    if await _close_if_ws_device_revoked(ws):
++        return
++
+     await ws.accept()
+ 
+     profile = _console_profile_from_ws(ws)
+@@ -15372,24 +15442,33 @@ async def console_ws(ws: WebSocket) -> None:
+         await ws.close(code=1011)
+         return
+ 
+-    _log.info(
+-        "console accepted peer=%s mode=%s cred=%s context=%s profile=%s",
+-        peer,
+-        mode,
+-        cred,
+-        context,
+-        profile or "current",
+-    )
+-    await _console_send(
+-        ws,
+-        send_lock,
+-        {
+-            "type": "ready",
+-            "context": context,
+-            "profile": profile or "current",
+-            "prompt": _CONSOLE_PROMPT,
+-        },
+-    )
++    live_socket_index = _ws_live_socket_index(ws)
++    live_socket_index.__enter__()
++    try:
++        _log.info(
++            "console accepted peer=%s mode=%s cred=%s context=%s profile=%s",
++            peer,
++            mode,
++            cred,
++            context,
++            profile or "current",
++        )
++        await _console_send(
++            ws,
++            send_lock,
++            {
++                "type": "ready",
++                "context": context,
++                "profile": profile or "current",
++                "prompt": _CONSOLE_PROMPT,
++            },
++        )
++    except WebSocketDisconnect:
++        live_socket_index.__exit__(None, None, None)
++        return
++    except BaseException:
++        live_socket_index.__exit__(None, None, None)
++        raise
+ 
+     active_task: asyncio.Task | None = None
+     pending_confirmation: Optional[str] = None
+@@ -15648,6 +15727,7 @@ async def console_ws(ws: WebSocket) -> None:
+     except WebSocketDisconnect:
+         pass
+     finally:
++        live_socket_index.__exit__(None, None, None)
+         if active_task and not active_task.done():
+             active_task.cancel()
+             try:
+@@ -15693,6 +15773,9 @@ async def pty_ws(ws: WebSocket) -> None:
+         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
+         return
+ 
++    if await _close_if_ws_device_revoked(ws):
++        return
++
+     await ws.accept()
+     _log.info("pty accepted peer=%s mode=%s cred=%s", peer, mode, cred)
+ 
+@@ -15850,9 +15933,20 @@ async def gateway_ws(ws: WebSocket) -> None:
+         await ws.close(code=4403)
+         return
+ 
++    if await _close_if_ws_device_revoked(ws):
++        return
++
+     from tui_gateway.ws import handle_ws
++    from hermes_cli.dashboard_auth.token_auth import notify_socket
+ 
+-    await handle_ws(ws)
++    identity = _ws_active_identity(ws)
++    if identity:
++        notify_socket("register", identity, ws)
++    try:
++        await handle_ws(ws)
++    finally:
++        if identity:
++            notify_socket("deregister", identity, ws)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -15881,6 +15975,9 @@ async def pub_ws(ws: WebSocket) -> None:
+         await ws.close(code=4403)
+         return
+ 
++    if await _close_if_ws_device_revoked(ws):
++        return
++
+     channel = _channel_or_close_code(ws)
+     if not channel:
+         await ws.close(code=4400)
+@@ -15889,8 +15986,9 @@ async def pub_ws(ws: WebSocket) -> None:
+     await ws.accept()
+ 
+     try:
+-        while True:
+-            await _broadcast_event(ws.app, channel, await ws.receive_text())
++        with _ws_live_socket_index(ws):
++            while True:
++                await _broadcast_event(ws.app, channel, await ws.receive_text())
+     except WebSocketDisconnect:
          pass
  
+@@ -15909,6 +16007,9 @@ async def events_ws(ws: WebSocket) -> None:
+         await ws.close(code=4403)
+         return
  
-+# ── S2 seam: post-emit observers (hermes-mobile plugin) ────────────────────────
-+# Generic observer list notified after every emitted event. Populated by plugins
-+# (the hermes-mobile push engine appends ``handle_gateway_event`` here); empty on
-+# stock gateways so this is a strict no-op when no plugin is loaded.
-+# See CONTRACT-DEPATCH.md seam S2.
-+_EMIT_OBSERVERS: list = []
++    if await _close_if_ws_device_revoked(ws):
++        return
 +
+     channel = _channel_or_close_code(ws)
+     if not channel:
+         await ws.close(code=4400)
+@@ -15921,11 +16022,12 @@ async def events_ws(ws: WebSocket) -> None:
+         event_channels.setdefault(channel, set()).add(ws)
+ 
+     try:
+-        while True:
+-            # Subscribers don't speak — the receive() just blocks until
+-            # disconnect so the connection stays open as long as the
+-            # browser holds it.
+-            await ws.receive_text()
++        with _ws_live_socket_index(ws):
++            while True:
++                # Subscribers don't speak — the receive() just blocks until
++                # disconnect so the connection stays open as long as the
++                # browser holds it.
++                await ws.receive_text()
+     except WebSocketDisconnect:
+         pass
+     finally:
+diff --git a/tools/approval.py b/tools/approval.py
+index 7c58062ed..58f905c24 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -1506,6 +1506,10 @@ class _ApprovalEntry:
+ _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
+ _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+ 
++# Resolver-context observers. Unlike the waiting-thread approval hooks, these
++# receive the identity of the REST/WS caller that actually resolved a request.
++_RESOLVE_OBSERVERS: list = []
 +
-+def _notify_emit_observers(event: str, sid: str, payload: dict | None = None) -> None:
-+    """Best-effort fan-out of an emitted event to every S2 observer."""
-+    for _obs in list(_EMIT_OBSERVERS):
-+        try:
-+            _obs(event, sid, payload)
-+        except Exception:
-+            logger.debug("emit observer failed", exc_info=True)
+ 
+ def register_gateway_notify(session_key: str, cb) -> None:
+     """Register a per-session callback for sending approval requests to the user.
+@@ -1534,7 +1538,8 @@ def unregister_gateway_notify(session_key: str) -> None:
+ 
+ def resolve_gateway_approval(session_key: str, choice: str,
+                              resolve_all: bool = False,
+-                             reason: Optional[str] = None) -> int:
++                             reason: Optional[str] = None,
++                             audit: Optional[dict] = None) -> int:
+     """Called by the gateway's /approve or /deny handler to unblock
+     waiting agent thread(s).
+ 
+@@ -1546,6 +1551,9 @@ def resolve_gateway_approval(session_key: str, choice: str,
+     deny (``/deny <reason>``).  It is relayed back to the agent in the
+     BLOCKED message so it can adapt instead of only hearing "denied".
+ 
++    *audit* is optional resolver identity/session metadata forwarded to
++    observers after the waiting agent threads have been released.
 +
+     Returns the number of approvals resolved (0 means nothing was pending).
+     """
+     with _lock:
+@@ -1565,6 +1573,14 @@ def resolve_gateway_approval(session_key: str, choice: str,
+         if reason:
+             entry.reason = reason
+         entry.event.set()
 +
- def _claim_active_session_slot(
-     session_key: str,
-     *,
-@@ -723,6 +740,15 @@ def _profile_configured_cwd(profile_home: Path | None) -> str | None:
-         return None
++    if audit and targets:
++        entries_data = [getattr(entry, "data", None) for entry in targets]
++        for observer in list(_RESOLVE_OBSERVERS):
++            try:
++                observer(session_key, choice, resolve_all, audit, entries_data)
++            except Exception:
++                logger.debug("approval resolve observer failed", exc_info=True)
+     return len(targets)
  
  
-+# S1a seam (hermes-mobile broadcast plugin): write_json fan-out subscribers.
-+# ``broadcast.activate()`` appends ``on_owner_write`` here; each subscriber is
-+# called with ``(obj, sid, owner_transport)`` AFTER the owner write so that
-+# session-scoped event frames mirror to every OTHER connected client (multi-client
-+# desktop<->mobile sync). Empty on stock gateways (no fan-out, identical behaviour).
-+# See CONTRACT-DEPATCH.md seam S1a.
-+_EVENT_FANOUT_SUBSCRIBERS: list = []
+diff --git a/tui_gateway/server.py b/tui_gateway/server.py
+index febb4ec0d..2eca8589b 100644
+--- a/tui_gateway/server.py
++++ b/tui_gateway/server.py
+@@ -405,17 +405,22 @@ def _load_busy_input_mode() -> str:
+ 
+ 
+ def _notify_session_boundary(
+-    event_type: str, session_id: str | None, platform: str | None = None
++    event_type: str,
++    session_id: str | None,
++    platform: str | None = None,
++    runtime_session_id: str | None = None,
+ ) -> None:
+     """Fire session lifecycle hooks with CLI parity."""
+     try:
+         from hermes_cli.plugins import invoke_hook as _invoke_hook
+ 
+-        _invoke_hook(
+-            event_type,
+-            session_id=session_id,
+-            platform=_resolve_agent_platform(platform),
+-        )
++        kwargs = {
++            "session_id": session_id,
++            "platform": _resolve_agent_platform(platform),
++        }
++        if runtime_session_id:
++            kwargs["runtime_session_id"] = runtime_session_id
++        _invoke_hook(event_type, **kwargs)
+     except Exception:
+         pass
+ 
+@@ -616,7 +621,12 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
+ 
+     session_key = session.get("session_key")
+     session_id = getattr(agent, "session_id", None) or session_key
+-    _notify_session_boundary("on_session_finalize", session_id, _session_source(session))
++    _notify_session_boundary(
++        "on_session_finalize",
++        session_id,
++        _session_source(session),
++        runtime_session_id=str(session.get("_sid") or "") or None,
++    )
+ 
+     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
+     # Use session_id (from agent.session_id) not session_key — after compression,
+@@ -1116,6 +1126,41 @@ def _default_session_cwd() -> str:
+     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
+ 
+ 
++def _notify_gateway_observers(hook: str, **kwargs) -> None:
++    """Fire a gateway observer hook best-effort; never break gateway I/O."""
++    try:
++        from hermes_cli.plugins import invoke_hook
++
++        invoke_hook(hook, **kwargs)
++    except Exception:
++        logger.debug("gateway observer hook %s failed", hook, exc_info=True)
++
++
++_OBSERVER_POOL: concurrent.futures.ThreadPoolExecutor | None = None
++_OBSERVER_POOL_LOCK = threading.Lock()
++
++
++def _notify_gateway_observers_nowait(hook: str, **kwargs) -> None:
++    """Fire an observer off the caller's event loop, preserving FIFO order."""
++    try:
++        from hermes_cli.plugins import get_plugin_manager
++
++        manager = get_plugin_manager()
++        if manager is None or not manager.has_hook(hook):
++            return
++    except Exception:
++        return
++
++    global _OBSERVER_POOL
++    with _OBSERVER_POOL_LOCK:
++        if _OBSERVER_POOL is None:
++            _OBSERVER_POOL = concurrent.futures.ThreadPoolExecutor(
++                max_workers=1,
++                thread_name_prefix="gw-observer",
++            )
++    _OBSERVER_POOL.submit(_notify_gateway_observers, hook, **kwargs)
 +
 +
  def write_json(obj: dict) -> bool:
      """Emit one JSON frame. Routes via the most-specific transport available.
  
-@@ -739,6 +765,14 @@ def write_json(obj: dict) -> bool:
+@@ -1132,7 +1177,14 @@ def write_json(obj: dict) -> bool:
      if obj.get("method") == "event":
          sid = ((obj.get("params") or {}).get("session_id")) or ""
          if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-+            # S1a: mirror this session-scoped frame to every OTHER connected client.
-+            # Each subscriber is isolated + non-blocking; a fan-out failure degrades
-+            # ONLY the mirror, never the owner write below.
-+            for _fanout in _EVENT_FANOUT_SUBSCRIBERS:
-+                try:
-+                    _fanout(obj, sid, t)
-+                except Exception:
-+                    pass
-             return t.write(obj)
+-            return t.write(obj)
++            ok = t.write(obj)
++            _notify_gateway_observers(
++                "post_frame_write",
++                frame=obj,
++                session_id=sid,
++                owner_transport=t,
++            )
++            return ok
  
      return (current_transport() or _stdio_transport).write(obj)
-@@ -749,6 +783,7 @@ def _emit(event: str, sid: str, payload: dict | None = None):
+ 
+@@ -1142,6 +1194,12 @@ def _emit(event: str, sid: str, payload: dict | None = None):
      if payload is not None:
          params["payload"] = payload
      write_json({"jsonrpc": "2.0", "method": "event", "params": params})
-+    _notify_emit_observers(event, sid, payload)
++    _notify_gateway_observers(
++        "post_emit_event",
++        event=event,
++        session_id=sid,
++        payload=payload,
++    )
  
  
- def _status_update(sid: str, kind: str, text: str | None = None):
+ def _emit_approval_request(sid: str, data: dict | None) -> None:
+@@ -6177,12 +6235,9 @@ def _(rid, params: dict) -> dict:
+ def _(rid, params: dict) -> dict:
+     """Delete a stored session and its on-disk transcript files.
+ 
+-    Used by the TUI resume picker (``d`` key) so users can prune old
+-    sessions without dropping to the CLI.  Refuses to delete a session
+-    that is currently active in this gateway process — those rows are
+-    still being written to and removing them out from under the live
+-    agent corrupts message ordering and trips FK constraints when the
+-    next message append flushes.
++    A matching live session is interrupted when necessary and torn down before
++    its durable row is deleted.  This lets non-TUI clients delete sessions they
++    previously resumed without leaving a spending runtime behind.
+     """
+     target = params.get("session_id", "")
+     if not target:
+@@ -6190,21 +6245,52 @@ def _(rid, params: dict) -> dict:
+     db = _get_db()
+     if db is None:
+         return _db_unavailable_error(rid, code=5036)
+-    # Block deletion of any session currently bound to a live TUI session
+-    # in this process.  The picker hides the active session anyway, but a
+-    # racing caller could still target it.  Snapshot via ``list(...)``
+-    # because ``_sessions`` is mutated by concurrent RPCs on the thread
+-    # pool — iterating the dict directly can raise ``RuntimeError:
+-    # dictionary changed size during iteration``.  If even the snapshot
+-    # raises, fail closed (refuse the delete) rather than fail open.
++    # Snapshot under the sessions lock. If enumeration fails, refuse the
++    # delete rather than risk removing durable state beneath a live writer.
+     try:
+         with _sessions_lock:
+-            snapshot = list(_sessions.values())
++            snapshot = list(_sessions.items())
+     except Exception as e:
+         return _err(rid, 5036, f"could not enumerate active sessions: {e}")
+-    active = {s.get("session_key") for s in snapshot if s.get("session_key")}
+-    if target in active:
+-        return _err(rid, 4023, "cannot delete an active session")
++
++    live = next(
++        (
++            (sid, session)
++            for sid, session in snapshot
++            if not session.get("_finalized")
++            and _session_lookup_key(session, fallback=sid) == target
++        ),
++        None,
++    )
++    evicted = False
++    if live is not None:
++        sid, session = live
++        try:
++            if session.get("running"):
++                agent = session.get("agent")
++                if agent is not None and hasattr(agent, "interrupt"):
++                    agent.interrupt()
++                _clear_pending(sid)
++                try:
++                    from tools.approval import resolve_gateway_approval
++
++                    resolve_gateway_approval(target, "deny", resolve_all=True)
++                except Exception:
++                    logger.debug(
++                        "failed to release approvals during session delete",
++                        exc_info=True,
++                    )
++            with _session_resume_lock:
++                with _sessions_lock:
++                    if _sessions.get(sid) is not session:
++                        raise RuntimeError("live session changed during eviction")
++                    _sessions.pop(sid, None)
++                session["_sid"] = sid
++                _teardown_session(session)
++            evicted = True
++        except Exception as e:
++            return _err(rid, 4023, f"could not evict active session before delete: {e}")
++
+     sessions_dir = get_hermes_home() / "sessions"
+     try:
+         deleted = db.delete_session(target, sessions_dir=sessions_dir)
+@@ -6212,7 +6298,8 @@ def _(rid, params: dict) -> dict:
+         return _err(rid, 5036, f"delete failed: {e}")
+     if not deleted:
+         return _err(rid, 4007, "session not found")
+-    return _ok(rid, {"deleted": target})
++    _emit("session.deleted", target, None)
++    return _ok(rid, {"deleted": target, "evicted": evicted})
+ 
+ 
+ @method("session.title")
+@@ -8073,7 +8160,16 @@ def _(rid, params: dict) -> dict:
+ 
+ @method("session.branch")
+ def _(rid, params: dict) -> dict:
+-    session, err = _sess(params, rid)
++    session_id = params.get("session_id") or ""
++    session, err = _sess_nowait(params, rid)
++    if err:
++        return err
++    if (device := _ws_device_identity()) is not None and not _ws_device_owns_session(
++        device, session_id
++    ):
++        return _err(rid, 4030, "device does not own this session")
++    _start_agent_build(session_id, session)
++    err = _wait_agent(session, rid)
+     if err:
+         return err
+     db = _get_db()
+@@ -10231,15 +10327,71 @@ def _(rid, params: dict) -> dict:
+ # ── Methods: respond ─────────────────────────────────────────────────
+ 
+ 
++def _ws_device_identity() -> Optional[dict]:
++    transport = current_transport()
++    ws = getattr(transport, "_ws", None)
++    identity = getattr(getattr(ws, "state", None), "device", None)
++    if isinstance(identity, dict) and identity.get("device_id"):
++        return identity
++    return None
++
++
++def _ws_device_owns_session(device: dict, session_id: str) -> bool:
++    """Fail-closed ownership check for device-authenticated WS RPCs."""
++    device_id = device.get("device_id") if isinstance(device, dict) else None
++    if not device_id:
++        return False
++    try:
++        import importlib
++
++        device_tokens = importlib.import_module(
++            "hermes_plugins.hermes_mobile.device_tokens"
++        )
++        owner = device_tokens.device_identity_for_session(session_id)
++    except Exception:
++        return False
++    return isinstance(owner, dict) and owner.get("device_id") == device_id
++
++
++def _ws_resolve_audit(session_id: str, session_key: str) -> dict:
++    device = _ws_device_identity()
++    if device is not None:
++        return {
++            "credential": "device",
++            "device_id": device.get("device_id"),
++            "device_name": device.get("device_name"),
++            "token_prefix": device.get("token_prefix"),
++            "session_id": session_id,
++            "session_key": session_key,
++        }
++    return {
++        "credential": (
++            "shared"
++            if getattr(current_transport(), "_ws", None) is not None
++            else "internal"
++        ),
++        "device_id": None,
++        "device_name": None,
++        "token_prefix": None,
++        "session_id": session_id,
++        "session_key": session_key,
++    }
++
++
+ def _respond(rid, params, key, *, allow_expired=False):
+     r = params.get("request_id", "")
++    device = _ws_device_identity()
++    if device is not None and "approve" not in (device.get("scopes") or []):
++        return _err(rid, 4030, "device token lacks approve scope")
+     with _prompt_lock:
+         entry = _pending.get(r)
+         if not entry:
+             if allow_expired and r:
+                 return _ok(rid, {"status": "expired"})
+             return _err(rid, 4009, f"no pending {key} request")
+-        _, ev = entry
++        owner_sid, ev = entry
++        if device is not None and not _ws_device_owns_session(device, owner_sid):
++            return _err(rid, 4030, "device does not own this session")
+         _answers[r] = params.get(key, "")
+         ev.set()
+     return _ok(rid, {"status": "ok"})
+@@ -10271,16 +10423,28 @@ def _(rid, params: dict) -> dict:
+     session, err = _sess(params, rid)
+     if err:
+         return err
++    assert session is not None
+     try:
+         from tools.approval import resolve_gateway_approval
+ 
++        device = _ws_device_identity()
++        if device is not None and "approve" not in (device.get("scopes") or []):
++            return _err(rid, 4030, "device token lacks approve scope")
++        session_id = params.get("session_id") or ""
++        if device is not None and not _ws_device_owns_session(device, session_id):
++            return _err(rid, 4030, "device does not own this session")
++        session_key = session["session_key"]
++        choice = params.get("choice", "deny")
++        if choice == "approve":
++            choice = "once"
+         return _ok(
+             rid,
+             {
+                 "resolved": resolve_gateway_approval(
+-                    session["session_key"],
+-                    params.get("choice", "deny"),
++                    session_key,
++                    choice,
+                     resolve_all=params.get("all", False),
++                    audit=_ws_resolve_audit(session_id, session_key),
+                 )
+             },
+         )
+@@ -10363,6 +10527,8 @@ def _(rid, params: dict) -> dict:
+         agent = session.get("agent") if session else None
+         if agent is not None:
+             current_fast = getattr(agent, "service_tier", None) == "priority"
++        elif session is not None and session.get("create_service_tier_override") is not None:
++            current_fast = session.get("create_service_tier_override") == "priority"
+         else:
+             current_fast = _load_service_tier() == "priority"
+ 
+@@ -10402,7 +10568,15 @@ def _(rid, params: dict) -> dict:
+                     "fast mode is not available for this model",
+                 )
+ 
+-        _write_config_key("agent.service_tier", nv)
++        if session is not None:
++            # Composer/runtime changes are scoped to this live session.  An
++            # empty override explicitly means normal mode even when the global
++            # profile default is fast.
++            session["create_service_tier_override"] = (
++                "priority" if nv == "fast" else ""
++            )
++        else:
++            _write_config_key("agent.service_tier", nv)
+         if agent is not None:
+             agent.service_tier = "priority" if nv == "fast" else None
+             current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+@@ -11368,17 +11542,20 @@ def _(rid, params: dict) -> dict:
+         )
+         return _ok(rid, {"value": effort, "display": display})
+     if key == "fast":
++        session = _sessions.get(params.get("session_id", ""))
++        if session is not None:
++            agent = session.get("agent")
++            if agent is not None:
++                fast = getattr(agent, "service_tier", None) == "priority"
++            elif session.get("create_service_tier_override") is not None:
++                fast = session.get("create_service_tier_override") == "priority"
++            else:
++                fast = _load_service_tier() == "priority"
++        else:
++            fast = _load_service_tier() == "priority"
+         return _ok(
+             rid,
+-            {
+-                "value": (
+-                    "fast"
+-                    if (session := _sessions.get(params.get("session_id", "")))
+-                    and getattr(session.get("agent"), "service_tier", None)
+-                    == "priority"
+-                    else ("fast" if _load_service_tier() == "priority" else "normal")
+-                ),
+-            },
++            {"value": "fast" if fast else "normal"},
+         )
+     if key == "busy":
+         return _ok(rid, {"value": _load_busy_input_mode()})
+diff --git a/tui_gateway/ws.py b/tui_gateway/ws.py
+index 2ab4798df..b1562cf66 100644
+--- a/tui_gateway/ws.py
++++ b/tui_gateway/ws.py
+@@ -299,6 +299,11 @@ async def handle_ws(ws: Any) -> None:
+         _log.info("ws accepted peer=%s", peer)
+ 
+         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
++        server._notify_gateway_observers_nowait(
++            "on_ws_transport_change",
++            action="connect",
++            transport=transport,
++        )
+ 
+         # The desktop app and dashboard chat reach the agent through this WS
+         # sidecar, NOT through tui_gateway.entry.main() (the stdio TUI path that
+@@ -427,6 +432,11 @@ async def handle_ws(ws: Any) -> None:
+         detached_sessions = 0
+         if transport is not None:
+             transport.close()
++            server._notify_gateway_observers_nowait(
++                "on_ws_transport_change",
++                action="disconnect",
++                transport=transport,
++            )
+ 
+             # Reap sessions this transport owned (close_on_disconnect sidecar
+             # sessions) or detach the rest to the drop sentinel so later emits
