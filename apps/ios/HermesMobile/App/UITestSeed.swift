@@ -622,6 +622,28 @@ enum UITestSeed {
             return
         }
 
+        // "mdimage" — STR-695/STR-1399 acceptance seed for inline markdown
+        // images. A remote PNG exercises AsyncImage while the inline data URL
+        // keeps the UI test deterministic without network access.
+        if mode == "mdimage" {
+            let dataPNG = "data:image/png;base64,"
+                + "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+"
+                + "AAAAEklEQVR42mP4z8DwHxkzkC4AADxAH+Ea86VIAAAAAElFTkSuQmCC"
+            let remotePNG =
+                "https://raw.githubusercontent.com/jdecked/twemoji/main/assets/72x72/1f4f7.png"
+            let prose = "Here is the render check. before "
+                + "![remote camera](\(remotePNG)) middle "
+                + "![inline pixel](\(dataPNG)) after — the prose continues past both "
+                + "images so paragraph/image/paragraph ordering is exercised."
+            environment.sessionStore.activeStoredId = "uitest-mdimage"
+            environment.connectionStore.phase = .connected
+            environment.chatStore.debugSeedTranscript([
+                ChatMessage(role: .user, text: "Show me the two inline images."),
+                ChatMessage(role: .assistant, text: prose),
+            ])
+            return
+        }
+
         environment.sessionStore.activeStoredId = "uitest-\(mode)"
         // Seed TIMING (scroll-race verification):
         //  • "long"/"short" — synchronous: content present at first layout.

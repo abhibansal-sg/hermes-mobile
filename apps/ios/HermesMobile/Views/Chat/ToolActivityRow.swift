@@ -927,6 +927,7 @@ struct GeneratedImageToolCard: View {
     @State private var localPhase: LocalImagePhase = .idle
     @State private var remoteRetryID = UUID()
     @State private var showRawReference = false
+    @State private var presentZoom = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1030,7 +1031,7 @@ struct GeneratedImageToolCard: View {
     private func renderedImage(_ image: Image) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                withAnimation(.snappy(duration: 0.2)) { showRawReference.toggle() }
+                presentZoom = true
             } label: {
                 image
                     .resizable()
@@ -1044,8 +1045,15 @@ struct GeneratedImageToolCard: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Generated image")
-            .accessibilityHint("Double-tap to \(showRawReference ? "hide" : "show") the image path")
+            .accessibilityHint("Double-tap to zoom")
             .accessibilityIdentifier("generatedImageToolImage")
+
+            Button(showRawReference ? "Hide path" : "Show path") {
+                withAnimation(.snappy(duration: 0.2)) { showRawReference.toggle() }
+            }
+            .font(.caption.weight(.medium))
+            .buttonStyle(.plain)
+            .foregroundStyle(theme.midground)
 
             if showRawReference {
                 Text(result.reference)
@@ -1055,6 +1063,20 @@ struct GeneratedImageToolCard: View {
                     .truncationMode(.middle)
                     .textSelection(.enabled)
                     .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .fullScreenCover(isPresented: $presentZoom) {
+            // STR-574: reuse the same ZoomableImageView lightbox the assistant-
+            // prose markdown image path uses, instead of a divergent non-zoom
+            // preview. Source precedence mirrors `content` above.
+            if let remoteURL = result.remoteURL {
+                ZoomableImageView(title: "Generated image", remoteURL: remoteURL)
+            } else if result.isDataURL {
+                ZoomableImageView(title: "Generated image", dataURL: result.reference)
+            } else if case .loaded(let loaded) = localPhase {
+                ZoomableImageView(title: "Generated image", image: loaded)
+            } else {
+                ZoomableImageView(title: "Generated image")
             }
         }
     }
@@ -1141,14 +1163,11 @@ struct GeneratedImageToolCard: View {
     }
 
     private static func decodeDataURL(_ dataURL: String) -> (image: UIImage, data: Data)? {
-        guard dataURL.hasPrefix("data:"),
-              let commaIndex = dataURL.firstIndex(of: ",") else { return nil }
-        let header = dataURL[dataURL.startIndex..<commaIndex]
-        guard header.contains(";base64") else { return nil }
-        let payload = String(dataURL[dataURL.index(after: commaIndex)...])
-        guard let data = Data(base64Encoded: payload, options: [.ignoreUnknownCharacters]),
-              let image = UIImage(data: data) else { return nil }
-        return (image, data)
+        // STR-574: delegate to the shared `AttachmentBlobCache.decodeDataURL`
+        // so this card, the prose markdown image path, and the ZoomableImageView
+        // lightbox all share one data-URL contract instead of three divergent
+        // base64 decoders.
+        AttachmentBlobCache.decodeDataURL(dataURL).map { ($0.image, $0.data) }
     }
 
     private enum LocalImagePhase {

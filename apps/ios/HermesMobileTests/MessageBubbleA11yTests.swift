@@ -238,6 +238,163 @@ final class MessageBubbleA11yTests: XCTestCase {
         XCTAssertFalse(text.contains("[!CAUTION]"))
     }
 
+    // MARK: - STR-574 assistant-prose markdown image block extraction
+
+    func testChatProseEntriesHoistsStandaloneImageAsBlockSibling() {
+        let entries = MessageBubble.chatProseEntries("""
+        Here is a diagram:
+
+        ![architecture](https://example.com/diagram.png)
+
+        After the image.
+        """)
+
+        XCTAssertEqual(entries.count, 3)
+
+        guard case .blocks(let leadBlocks) = entries[0] else {
+            return XCTFail("first entry should be GFM blocks (the lead paragraph)")
+        }
+        XCTAssertEqual(leadBlocks.count, 1)
+        guard case .paragraph(let lead) = leadBlocks.first else {
+            return XCTFail("first entry should be a paragraph block")
+        }
+        XCTAssertEqual(lead, "Here is a diagram:")
+
+        guard case .image(let alt, let source) = entries[1] else {
+            return XCTFail("second entry should be a hoisted image block sibling")
+        }
+        XCTAssertEqual(alt, "architecture")
+        XCTAssertEqual(source, "https://example.com/diagram.png")
+
+        guard case .blocks(let tailBlocks) = entries[2] else {
+            return XCTFail("third entry should be GFM blocks (the trailing paragraph)")
+        }
+        XCTAssertEqual(tailBlocks.count, 1)
+        guard case .paragraph(let tail) = tailBlocks.first else {
+            return XCTFail("third entry should be a paragraph block")
+        }
+        XCTAssertEqual(tail, "After the image.")
+    }
+
+    func testChatProseEntriesExtractsDataURLImage() {
+        let entries = MessageBubble.chatProseEntries("![chart](data:image/png;base64,iVBORw0KGgo=)")
+
+        XCTAssertEqual(entries.count, 1)
+        guard case .image(let alt, let source) = entries[0] else {
+            return XCTFail("expected a hoisted data: URL image block")
+        }
+        XCTAssertEqual(alt, "chart")
+        XCTAssertEqual(source, "data:image/png;base64,iVBORw0KGgo=")
+    }
+
+    func testChatProseEntriesHandlesEmptyAlt() {
+        let entries = MessageBubble.chatProseEntries("![](https://example.com/x.png)")
+
+        guard case .image(let alt, let source) = entries[0] else {
+            return XCTFail("expected an image block with empty alt")
+        }
+        XCTAssertEqual(alt, "")
+        XCTAssertEqual(source, "https://example.com/x.png")
+    }
+
+    func testChatProseEntriesSplitsInlineImageIntoParagraphImageParagraph() {
+        // STR-574 acceptance: a paragraph like `before ![alt](url) after` must
+        // NOT disappear or stay inline — it splits in order into paragraph /
+        // image / paragraph so the image renders as a native block sibling.
+        let entries = MessageBubble.chatProseEntries("Look at ![this](https://example.com/x.png) now.")
+
+        XCTAssertEqual(entries.count, 3)
+
+        guard case .blocks(let leadBlocks) = entries[0] else {
+            return XCTFail("inline image should be preceded by a prose blocks run")
+        }
+        XCTAssertEqual(leadBlocks.count, 1)
+        guard case .paragraph(let lead) = leadBlocks.first else {
+            return XCTFail("lead entry should be a paragraph block")
+        }
+        XCTAssertEqual(lead, "Look at")
+
+        guard case .image(let alt, let source) = entries[1] else {
+            return XCTFail("middle entry should be the hoisted inline image")
+        }
+        XCTAssertEqual(alt, "this")
+        XCTAssertEqual(source, "https://example.com/x.png")
+
+        guard case .blocks(let tailBlocks) = entries[2] else {
+            return XCTFail("inline image should be followed by a prose blocks run")
+        }
+        XCTAssertEqual(tailBlocks.count, 1)
+        guard case .paragraph(let tail) = tailBlocks.first else {
+            return XCTFail("tail entry should be a paragraph block")
+        }
+        XCTAssertEqual(tail, "now.")
+    }
+
+    func testChatProseEntriesSplitsMultipleInlineImagesOnOneLine() {
+        // Two inline images on one line each hoist, with the prose between them
+        // becoming its own paragraph run.
+        let entries = MessageBubble.chatProseEntries("a ![one](https://example.com/1.png) b ![two](https://example.com/2.png) c")
+
+        XCTAssertEqual(entries.count, 5)
+        guard case .image(let alt1, _) = entries[1] else {
+            return XCTFail("second entry should be the first inline image")
+        }
+        XCTAssertEqual(alt1, "one")
+        guard case .blocks(let midBlocks) = entries[2] else {
+            return XCTFail("third entry should be the prose between the images")
+        }
+        guard case .paragraph(let mid) = midBlocks.first else {
+            return XCTFail("mid entry should be a paragraph block")
+        }
+        XCTAssertEqual(mid, "b")
+        guard case .image(let alt2, _) = entries[3] else {
+            return XCTFail("fourth entry should be the second inline image")
+        }
+        XCTAssertEqual(alt2, "two")
+    }
+
+    func testChatProseEntriesFallsBackToBlocksForMalformedImage() {
+        // Missing closing paren must not be hoisted; it stays prose.
+        let entries = MessageBubble.chatProseEntries("![alt](https://example.com")
+
+        XCTAssertEqual(entries.count, 1)
+        guard case .blocks(let blocks) = entries[0] else {
+            return XCTFail("malformed image should fall back to prose blocks")
+        }
+        XCTAssertEqual(blocks.count, 1)
+        guard case .paragraph = blocks.first else {
+            return XCTFail("expected a paragraph block")
+        }
+    }
+
+    func testChatProseEntriesHoistsIndentedImageLine() {
+        let entries = MessageBubble.chatProseEntries("    ![indented](https://example.com/x.png)")
+
+        guard case .image(let alt, let source) = entries[0] else {
+            return XCTFail("indented standalone image should still hoist as a block")
+        }
+        XCTAssertEqual(alt, "indented")
+        XCTAssertEqual(source, "https://example.com/x.png")
+    }
+
+    func testSplitLineByImagesHandlesEscapedBracketInAlt() {
+        let pieces = MessageBubble.splitLineByImages("a ![a\\]b](https://example.com/x.png) b")
+        guard case .image(let alt, let source) = pieces[1] else {
+            return XCTFail("second piece should be the image with escaped bracket in alt")
+        }
+        XCTAssertEqual(alt, "a]b")
+        XCTAssertEqual(source, "https://example.com/x.png")
+    }
+
+    func testSplitLineByImagesLeavesMalformedAndEmptySourceAsProse() {
+        // Malformed syntax and empty sources stay as prose; a valid image with
+        // trailing prose still hoists the image (split), per the STR-574 contract.
+        XCTAssertEqual(MessageBubble.splitLineByImages("![alt](https://example.com/x.png) is great"),
+                       [.image(alt: "alt", source: "https://example.com/x.png"), .prose(" is great")])
+        XCTAssertEqual(MessageBubble.splitLineByImages("![alt]()"), [.prose("![alt]()")])
+        XCTAssertEqual(MessageBubble.splitLineByImages("not even an image"), [.prose("not even an image")])
+    }
+
     func testGitHubAlertRenderingEvidenceSnapshots() throws {
         let message = ChatMessage(
             role: .assistant,
@@ -335,6 +492,72 @@ final class MessageBubbleA11yTests: XCTestCase {
         let disabled = MessageBubble(message: msg, menuActionsEnabled: false, appearance: appearance)
         XCTAssertNotEqual(enabled, disabled,
                           "menuActionsEnabled change must break equality")
+    }
+
+    /// STR-574 evidence capture (opt-in). Hosts the assistant prose (with one
+    /// `data:` image and one unreachable remote `https://` image) in a REAL
+    /// UIWindow on the simulator screen so `xcrun simctl io booted recordVideo`
+    /// can capture the live rendering, the failure/retry affordance, and the
+    /// size-class sizing. Driven by env var so it stays a no-op in normal runs.
+    ///
+    /// Usage from the worktree:
+    ///   HERMES_STR695_EVIDENCE_SECS=14 scripts/ios-build.sh test \
+    ///     -scheme HermesMobile \
+    ///     -destination 'platform=iOS Simulator,id=<BOOTED_IPHONE_UDID>' \
+    ///     -only-testing:HermesMobileTests/MessageBubbleA11yTests/testSTR695InlineImageEvidenceOnScreen
+    ///   (with `xcrun simctl io booted recordVideo /tmp/str-695-evidence/iphone.mp4 &`
+    ///    running concurrently)
+    func testSTR695InlineImageEvidenceOnScreen() throws {
+        let secs = ProcessInfo.processInfo.environment["HERMES_STR695_EVIDENCE_SECS"].flatMap(Double.init) ?? 0
+        try XCTSkipIf(secs <= 0, "STR-695 evidence capture is opt-in via HERMES_STR695_EVIDENCE_SECS")
+
+        // One reachable inline data-URL image (proves success rendering) and
+        // one unreachable remote URL (proves the failure/retry affordance).
+        // 127.0.0.1:9 refuses connections synchronously on the simulator.
+        let message = ChatMessage(
+            role: .assistant,
+            text: """
+            Here is the rendered chart and a remote thumbnail:
+
+            ![inline chart](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==)
+
+            And a remote image that will fail to load, exercising the retry affordance:
+
+            ![remote thumbnail](https://127.0.0.1:9/never-reaches.png)
+            """,
+            isStreaming: false
+        )
+        let environment = AppEnvironment()
+        let prose = MessageBubble(message: message)
+            .environment(\.hermesTheme, HermesThemePresets.nousLight)
+            .environment(environment.connectionStore)
+            .environment(environment.sessionStore)
+            .padding(20)
+            .background(HermesThemePresets.nousLight.bg)
+
+        try presentOnWindow(prose, forSeconds: secs)
+    }
+
+    /// Hosts `view` in a fresh key window on the active foreground scene for
+    /// `secs` seconds, pumping the runloop so SwiftUI renders and AsyncImage
+    /// phase transitions (empty -> failure) land on screen. Tears down on exit.
+    private func presentOnWindow<V: View>(_ view: V, forSeconds secs: TimeInterval) throws {
+        let scene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+            ?? UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        guard let windowScene = scene else {
+            throw NSError(domain: "STR695Evidence", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "no foreground UIWindowScene to host evidence"])
+        }
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = UIHostingController(rootView: view)
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        let deadline = Date(timeIntervalSinceNow: secs)
+        while Date() < deadline {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.25))
+        }
     }
 
     private func writeSnapshot<V: View>(_ view: V, size: CGSize, url: URL) throws {
