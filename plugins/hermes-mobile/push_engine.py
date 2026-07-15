@@ -258,6 +258,28 @@ def build_alert_payload(
     return {"aps": aps, "hermes": custom}
 
 
+def build_manifest_invalidation_payload(
+    scope: str, revision: int, reason: str
+) -> Dict[str, Any]:
+    """Build the frozen data-free background sync envelope."""
+    return {
+        "aps": {"content-available": 1},
+        "sync": {"scope": scope, "revision": revision, "reason": reason},
+    }
+
+
+def build_manifest_invalidation_headers(
+    *, provider_jwt: str, topic: str, scope: str
+) -> Dict[str, str]:
+    return build_push_headers(
+        provider_jwt=provider_jwt,
+        topic=topic,
+        push_type="background",
+        priority=5,
+        collapse_id=f"hermes-sync:{scope}",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Live Activity (ActivityKit) remote-update payload + headers.
 #
@@ -929,6 +951,78 @@ def _notify_direct_apns(
         _log.info("push notify: pruned %d unregistered token(s)", len(stale))
 
     return accepted
+
+
+def _notify_direct_manifest_invalidation(
+    scope: str, revision: int, reason: str
+) -> int:
+    """Send one frozen silent envelope to every token, ignoring alert prefs."""
+    config = APNsConfig.from_env()
+    recipients = registered_tokens_by_env()
+    if not config.is_armed() or not any(recipients.values()):
+        return 0
+    try:
+        import httpx
+        provider_jwt = _get_provider_jwt(config)
+    except Exception:
+        _log.warning("manifest invalidation push unavailable", exc_info=True)
+        return 0
+    headers = build_manifest_invalidation_headers(
+        provider_jwt=provider_jwt, topic=config.topic, scope=scope
+    )
+    encoded = json.dumps(
+        build_manifest_invalidation_payload(scope, revision, reason),
+        separators=(",", ":"),
+    ).encode("utf-8")
+    hosts = {"sandbox": _APNS_HOST_SANDBOX, "production": _APNS_HOST_PROD}
+    accepted, stale = 0, []
+    for env, tokens in recipients.items():
+        try:
+            with httpx.Client(
+                http2=True, base_url=f"https://{hosts.get(env, config.host)}:{_APNS_PORT}",
+                timeout=10.0,
+            ) as conn:
+                for token in tokens:
+                    try:
+                        status, _text = _send_one(
+                            conn, device_token=token, headers=headers, body=encoded
+                        )
+                        accepted += status == 200
+                        if status == 410:
+                            stale.append(token)
+                    except Exception:
+                        _log.warning(
+                            "manifest invalidation failed for one token", exc_info=True
+                        )
+        except Exception:
+            _log.warning("manifest invalidation APNs connection failed", exc_info=True)
+    _drop_tokens(stale)
+    return accepted
+
+
+def notify_manifest_invalidation(scope: str, revision: int, reason: str) -> int:
+    """Best-effort direct/relay background send; never raises."""
+    try:
+        payload = build_manifest_invalidation_payload(scope, revision, reason)
+        if os.environ.get("HERMES_MOBILE_RELAY_URL"):
+            from . import relay_client
+
+            topic = APNsConfig.from_env().topic
+            relay_client.send_manifest_invalidation_background(
+                payload=payload,
+                headers={
+                    "apns-topic": topic,
+                    "apns-push-type": "background",
+                    "apns-priority": "5",
+                    "apns-expiration": "0",
+                    "apns-collapse-id": f"hermes-sync:{scope}"[:64],
+                },
+            )
+            return 1
+        return _notify_direct_manifest_invalidation(scope, revision, reason)
+    except Exception:
+        _log.warning("manifest invalidation push failed", exc_info=True)
+        return 0
 
 
 def notify(
@@ -1682,6 +1776,12 @@ def handle_gateway_event(event: str, sid: str, payload: dict | None = None) -> N
     * ``session.interrupt`` — mirrors the old explicit ``_push_hook`` call in
       the ``session.interrupt`` RPC handler (ends any in-flight Live Activity).
     """
+    try:
+        from .manifest_invalidation import handle_gateway_event as invalidate_event
+
+        invalidate_event(event, sid, payload)
+    except Exception:
+        _log.warning("manifest invalidation journal failed", exc_info=True)
     if event == "session.finalize":
         data = payload or {}
         unregister_live_activity_tokens(

@@ -524,6 +524,35 @@ def send_event_background(
     ).start()
 
 
+def send_manifest_invalidation_background(
+    *, payload: dict[str, Any], headers: dict[str, str], hermes_home: Path | None = None
+) -> None:
+    """Forward the frozen silent APNs body and background semantics unchanged."""
+    threading.Thread(
+        target=_send_manifest_invalidation_sync,
+        kwargs={"payload": payload, "headers": headers, "hermes_home": hermes_home},
+        daemon=True,
+        name="hermes-mobile-manifest-invalidation",
+    ).start()
+
+
+def _send_manifest_invalidation_sync(
+    *, payload: dict[str, Any], headers: dict[str, str], hermes_home: Path | None
+) -> None:
+    try:
+        asyncio.run(
+            relay_client(hermes_home=hermes_home)._post(
+                "/v1/push/background",
+                {"payload": payload, "headers": headers},
+                authenticated=True,
+            )
+        )
+        _reset_delivery_failures()
+    except Exception:
+        _record_delivery_failure()
+        log.warning("relay manifest invalidation failed", exc_info=True)
+
+
 def register_device_background(
     *,
     token: str,
