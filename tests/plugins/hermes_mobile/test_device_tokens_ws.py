@@ -22,7 +22,9 @@ directly.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 from urllib.parse import urlencode
 
@@ -217,8 +219,57 @@ def test_revoke_endpoint_closes_live_socket_with_4401(loopback, home):
     assert body["revoked"] is True
     assert body["sockets_closed"] == 1
     assert closed["code"] == 4401
-    assert closed["reason"] == "device revoked"
+    assert closed["reason"] == "authentication revoked"
     # Socket deregistered after the cut.
+    assert device_tokens.get_device_sockets(issued["device_id"]) == []
+
+
+def test_every_device_auth_websocket_uses_reusable_lifecycle():
+    """Any new dashboard route using the device-capable auth helpers must
+    explicitly enter the shared socket lifecycle or this audit fails."""
+    audited = {}
+    for route in web_server.app.routes:
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None or endpoint.__module__ != web_server.__name__:
+            continue
+        source = inspect.getsource(endpoint)
+        if "_ws_auth_reason(" not in source and "_ws_auth_ok(" not in source:
+            continue
+        audited[getattr(route, "path", "")] = source
+
+    assert set(audited) == {
+        "/api/console",
+        "/api/pty",
+        "/api/ws",
+        "/api/pub",
+        "/api/events",
+    }
+    assert all("_ws_device_socket_lifecycle(" in source for source in audited.values())
+
+
+def test_gateway_device_token_socket_is_live_cut_and_deregistered(
+    dashboard_ws_enabled, home, wired_token_auth, monkeypatch
+):
+    issued = device_tokens.issue(device_name="gateway")
+    from hermes_cli import mcp_startup
+
+    monkeypatch.setattr(mcp_startup, "start_background_mcp_discovery", lambda **_: None)
+
+    with dashboard_ws_enabled.websocket_connect(
+        _ws_url("/api/ws", issued["token"]),
+        headers=_WS_HEADERS,
+    ) as conn:
+        ready = conn.receive_json()
+        assert ready["params"]["type"] == "gateway.ready"
+        assert len(device_tokens.get_device_sockets(issued["device_id"])) == 1
+
+        body = _revoke_device(dashboard_ws_enabled, issued["device_id"])
+        assert body["sockets_closed"] == 1
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            conn.receive_text()
+        assert exc.value.code == 4401
+
     assert device_tokens.get_device_sockets(issued["device_id"]) == []
 
 
@@ -292,6 +343,56 @@ def test_console_ready_send_disconnect_deregisters_device_socket(
     assert device_tokens.get_device_sockets(issued["device_id"]) == []
 
 
+def test_pty_device_token_socket_is_live_cut_and_deregistered(
+    dashboard_ws_enabled, home, wired_token_auth, monkeypatch
+):
+    issued = device_tokens.issue(device_name="pty")
+    closed = threading.Event()
+
+    class _BlockingBridge:
+        def __init__(self) -> None:
+            self.sent_ready = False
+
+        def read(self, timeout):
+            if not self.sent_ready:
+                self.sent_ready = True
+                return b"pty-ready"
+            closed.wait(timeout)
+            return None if closed.is_set() else b""
+
+        def resize(self, *, cols, rows):
+            pass
+
+        def write(self, raw):
+            pass
+
+        def close(self):
+            closed.set()
+
+    async def resolve_pty(**kwargs):
+        return (["fake-hermes-tui"], None, None)
+
+    monkeypatch.setattr(web_server, "_resolve_chat_argv_async", resolve_pty)
+    monkeypatch.setattr(web_server.PtyBridge, "spawn", lambda *args, **kwargs: _BlockingBridge())
+
+    with dashboard_ws_enabled.websocket_connect(
+        _ws_url("/api/pty", issued["token"]),
+        headers=_WS_HEADERS,
+    ) as conn:
+        assert conn.receive_bytes() == b"pty-ready"
+        assert len(device_tokens.get_device_sockets(issued["device_id"])) == 1
+
+        body = _revoke_device(dashboard_ws_enabled, issued["device_id"])
+        assert body["sockets_closed"] == 1
+
+        with pytest.raises(WebSocketDisconnect) as exc:
+            conn.receive_bytes()
+        assert exc.value.code == 4401
+
+    assert closed.wait(1)
+    assert device_tokens.get_device_sockets(issued["device_id"]) == []
+
+
 @pytest.mark.parametrize(
     ("path", "reader"),
     [
@@ -322,23 +423,66 @@ def test_pub_events_device_token_socket_is_live_cut_and_deregistered(
     assert device_tokens.get_device_sockets(issued["device_id"]) == []
 
 
-def test_shared_token_pub_socket_is_not_indexed_or_cut(
+def test_revoke_isolated_from_shared_token_and_other_device_sockets(
     dashboard_ws_enabled, home, wired_token_auth
 ):
-    issued = device_tokens.issue(device_name="shared-control")
+    revoked = device_tokens.issue(device_name="revoked")
+    other = device_tokens.issue(device_name="other")
 
     with dashboard_ws_enabled.websocket_connect(
+        _ws_url("/api/pub", revoked["token"], channel="revoked-device"),
+        headers=_WS_HEADERS,
+    ) as revoked_conn, dashboard_ws_enabled.websocket_connect(
+        _ws_url("/api/pub", other["token"], channel="other-device"),
+        headers=_WS_HEADERS,
+    ) as other_conn, dashboard_ws_enabled.websocket_connect(
         _ws_url("/api/pub", web_server._SESSION_TOKEN, channel="shared-token"),
         headers=_WS_HEADERS,
-    ) as conn:
-        assert device_tokens.get_device_sockets(issued["device_id"]) == []
+    ) as shared_conn:
+        assert len(device_tokens.get_device_sockets(revoked["device_id"])) == 1
+        assert len(device_tokens.get_device_sockets(other["device_id"])) == 1
 
-        body = _revoke_device(dashboard_ws_enabled, issued["device_id"])
+        body = _revoke_device(dashboard_ws_enabled, revoked["device_id"])
         assert body["revoked"] is True
-        assert body["sockets_closed"] == 0
+        assert body["sockets_closed"] == 1
 
-        conn.send_text('{"type":"still-open"}')
+        with pytest.raises(WebSocketDisconnect) as exc:
+            revoked_conn.receive_text()
+        assert exc.value.code == 4401
 
+        assert len(device_tokens.get_device_sockets(other["device_id"])) == 1
+        other_conn.send_text('{"type":"other-still-open"}')
+        shared_conn.send_text('{"type":"shared-still-open"}')
+
+    assert device_tokens.get_device_sockets(revoked["device_id"]) == []
+    assert device_tokens.get_device_sockets(other["device_id"]) == []
+
+
+def test_natural_disconnect_racing_revoke_is_idempotent(loopback, home):
+    issued = device_tokens.issue(device_name="disconnect-race")
+
+    class _NaturallyDisconnectedWS:
+        async def close(self, code=1000, reason=""):
+            device_tokens.deregister_ws_socket(issued["device_id"], self)
+            await asyncio.sleep(0)
+            raise WebSocketDisconnect(code=1006)
+
+    sock = _NaturallyDisconnectedWS()
+    device_tokens.register_ws_socket(issued["device_id"], sock)
+
+    client = TestClient(web_server.app, base_url="http://127.0.0.1:8080")
+    body = _revoke_device(client, issued["device_id"])
+
+    assert body["revoked"] is True
+    assert body["sockets_closed"] == 0
+    assert device_tokens.get_device_sockets(issued["device_id"]) == []
+
+
+def test_revoked_device_cannot_register_late_socket(home):
+    issued = device_tokens.issue(device_name="late-register")
+    assert device_tokens.revoke(issued["device_id"]) is True
+
+    assert device_tokens.register_ws_socket(issued["device_id"], object()) is False
     assert device_tokens.get_device_sockets(issued["device_id"]) == []
 
 
@@ -354,4 +498,31 @@ def test_events_missing_channel_does_not_leak_device_socket(
         ):
             pass
     assert exc.value.code == 4400
+    assert device_tokens.get_device_sockets(issued["device_id"]) == []
+
+
+@pytest.mark.parametrize(
+    ("path", "params"),
+    [
+        ("/api/ws", {}),
+        ("/api/console", {}),
+        ("/api/pty", {}),
+        ("/api/pub", {"channel": "revoked-reconnect"}),
+        ("/api/events", {"channel": "revoked-reconnect"}),
+    ],
+)
+def test_revoked_device_cannot_reconnect_to_audited_websocket(
+    dashboard_ws_enabled, home, wired_token_auth, path, params
+):
+    issued = device_tokens.issue(device_name=f"reconnect-{path}")
+    assert device_tokens.revoke(issued["device_id"]) is True
+
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with dashboard_ws_enabled.websocket_connect(
+            _ws_url(path, issued["token"], **params),
+            headers=_WS_HEADERS,
+        ):
+            pass
+
+    assert exc.value.code == 4401
     assert device_tokens.get_device_sockets(issued["device_id"]) == []

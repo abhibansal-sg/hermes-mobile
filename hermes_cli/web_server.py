@@ -14796,29 +14796,47 @@ def _ws_active_identity(ws: "WebSocket") -> Optional[dict]:
     return identity if identity_active(identity) else None
 
 
-async def _close_if_ws_device_revoked(ws: "WebSocket") -> bool:
-    """Close a token-authenticated socket whose identity was revoked."""
-    identity = getattr(ws.state, "device", None)
-    if not isinstance(identity, dict):
-        return False
-    if _ws_active_identity(ws) is not None:
-        return False
-    await ws.close(code=4401, reason="device revoked")
-    return True
+_WS_AUTH_REVOKED_REASON = "authentication revoked"
 
 
-@contextmanager
-def _ws_live_socket_index(ws: "WebSocket"):
-    """Register a token-authenticated socket until its handler exits."""
+@asynccontextmanager
+async def _ws_device_socket_lifecycle(ws: "WebSocket"):
+    """Index one device-authenticated socket for its whole accepted lifetime.
+
+    Shared-token, ticket, and internal-credential sockets without a device
+    identity pass through without notification.  Device revocation can race
+    both sides of registration: the pre-check rejects an already-dead identity,
+    while the post-registration check closes a socket revoked in between.  The
+    provider's registration callback also refuses locally revoked device IDs,
+    closing the remaining register-after-revoke window.
+    """
     from hermes_cli.dashboard_auth.token_auth import notify_socket
 
-    identity = _ws_active_identity(ws)
-    if identity:
+    identity = getattr(ws.state, "device", None)
+    if not isinstance(identity, dict):
+        yield True
+        return
+
+    registered = False
+    if _ws_active_identity(ws) is not None:
         notify_socket("register", identity, ws)
+        registered = True
+
+    if _ws_active_identity(ws) is None:
+        if registered:
+            notify_socket("deregister", identity, ws)
+        try:
+            await ws.close(code=4401, reason=_WS_AUTH_REVOKED_REASON)
+        except Exception:
+            # A simultaneous natural disconnect may win the close race.
+            _log.debug("device-auth WS was already closed", exc_info=True)
+        yield False
+        return
+
     try:
-        yield identity
+        yield True
     finally:
-        if identity:
+        if registered:
             notify_socket("deregister", identity, ws)
 
 
@@ -15398,11 +15416,16 @@ async def console_ws(ws: WebSocket) -> None:
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
         return
 
-    if await _close_if_ws_device_revoked(ws):
-        return
-
     await ws.accept()
 
+    async with _ws_device_socket_lifecycle(ws) as auth_active:
+        if auth_active:
+            await _console_ws_authenticated(ws, peer=peer, mode=mode, cred=cred)
+
+
+async def _console_ws_authenticated(
+    ws: WebSocket, *, peer: str, mode: str, cred: str
+) -> None:
     profile = _console_profile_from_ws(ws)
     context = _dashboard_console_context()
     send_lock = asyncio.Lock()
@@ -15442,8 +15465,6 @@ async def console_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
-    live_socket_index = _ws_live_socket_index(ws)
-    live_socket_index.__enter__()
     try:
         _log.info(
             "console accepted peer=%s mode=%s cred=%s context=%s profile=%s",
@@ -15464,10 +15485,8 @@ async def console_ws(ws: WebSocket) -> None:
             },
         )
     except WebSocketDisconnect:
-        live_socket_index.__exit__(None, None, None)
         return
     except BaseException:
-        live_socket_index.__exit__(None, None, None)
         raise
 
     active_task: asyncio.Task | None = None
@@ -15727,7 +15746,6 @@ async def console_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
-        live_socket_index.__exit__(None, None, None)
         if active_task and not active_task.done():
             active_task.cancel()
             try:
@@ -15773,10 +15791,16 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=4408, reason=_ws_close_reason(client_reason))
         return
 
-    if await _close_if_ws_device_revoked(ws):
-        return
-
     await ws.accept()
+
+    async with _ws_device_socket_lifecycle(ws) as auth_active:
+        if auth_active:
+            await _pty_ws_authenticated(ws, peer=peer, mode=mode, cred=cred)
+
+
+async def _pty_ws_authenticated(
+    ws: WebSocket, *, peer: str, mode: str, cred: str
+) -> None:
     _log.info("pty accepted peer=%s mode=%s cred=%s", peer, mode, cred)
 
     # On native Windows, the POSIX PTY bridge can't be imported.  Tell the
@@ -15933,20 +15957,11 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if await _close_if_ws_device_revoked(ws):
-        return
-
     from tui_gateway.ws import handle_ws
-    from hermes_cli.dashboard_auth.token_auth import notify_socket
 
-    identity = _ws_active_identity(ws)
-    if identity:
-        notify_socket("register", identity, ws)
-    try:
-        await handle_ws(ws)
-    finally:
-        if identity:
-            notify_socket("deregister", identity, ws)
+    async with _ws_device_socket_lifecycle(ws) as auth_active:
+        if auth_active:
+            await handle_ws(ws)
 
 
 # ---------------------------------------------------------------------------
@@ -15975,9 +15990,6 @@ async def pub_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if await _close_if_ws_device_revoked(ws):
-        return
-
     channel = _channel_or_close_code(ws)
     if not channel:
         await ws.close(code=4400)
@@ -15985,12 +15997,14 @@ async def pub_ws(ws: WebSocket) -> None:
 
     await ws.accept()
 
-    try:
-        with _ws_live_socket_index(ws):
+    async with _ws_device_socket_lifecycle(ws) as auth_active:
+        if not auth_active:
+            return
+        try:
             while True:
                 await _broadcast_event(ws.app, channel, await ws.receive_text())
-    except WebSocketDisconnect:
-        pass
+        except WebSocketDisconnect:
+            pass
 
 
 @app.websocket("/api/events")
@@ -16007,9 +16021,6 @@ async def events_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if await _close_if_ws_device_revoked(ws):
-        return
-
     channel = _channel_or_close_code(ws)
     if not channel:
         await ws.close(code=4400)
@@ -16022,7 +16033,9 @@ async def events_ws(ws: WebSocket) -> None:
         event_channels.setdefault(channel, set()).add(ws)
 
     try:
-        with _ws_live_socket_index(ws):
+        async with _ws_device_socket_lifecycle(ws) as auth_active:
+            if not auth_active:
+                return
             while True:
                 # Subscribers don't speak — the receive() just blocks until
                 # disconnect so the connection stays open as long as the
