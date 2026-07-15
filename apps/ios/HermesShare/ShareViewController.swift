@@ -62,11 +62,13 @@ final class ShareViewController: UIViewController {
     // MARK: - Actions
 
     private func queue(content: SharedItemLoader.LoadedShareContent, comment: String) {
-        do {
-            try SharedInboxWriter.queue(content: content, comment: comment)
-            complete()
-        } catch {
-            presentError(error)
+        Task { [weak self] in
+            do {
+                try await SharedInboxWriter.queue(content: content, comment: comment)
+                self?.complete()
+            } catch {
+                self?.presentError(error)
+            }
         }
     }
 
