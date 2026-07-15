@@ -91,9 +91,19 @@ final class MarkdownImageEvidenceUITests: XCTestCase {
         )
 
         // 3. Close → the lightbox dismisses and the inline image returns.
-        let close = app.buttons["zoomableImageCloseButton"]
+        // Query by type+label, not the `zoomableImageCloseButton` identifier: every
+        // descendant inside ZoomableImageView's GeometryReader/ZStack (the image, the
+        // captions, and this Close button) reports the CONTAINER's own
+        // "zoomableImageView" identifier instead of its own explicit
+        // `.accessibilityIdentifier(...)` — a real, reproducible SwiftUI accessibility
+        // quirk confirmed via two independent xcresult UI-hierarchy dumps
+        // (`app.buttons["zoomableImageCloseButton"]` never matches). Out of scope to
+        // fix in ZoomableImageView.swift here (STR-1399 scope is test/seed-only); the
+        // "Close" label is unique on this screen so type+label is an unambiguous,
+        // deterministic substitute.
+        let close = app.buttons.matching(NSPredicate(format: "label == %@", "Close")).firstMatch
         XCTAssertTrue(close.waitForExistence(timeout: 5),
-                      "Close button (zoomableImageCloseButton) missing in the lightbox")
+                      "Close button (label 'Close') missing in the lightbox")
         close.tap()
 
         let dismissed = XCTNSPredicateExpectation(
