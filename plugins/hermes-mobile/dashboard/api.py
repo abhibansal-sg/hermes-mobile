@@ -3156,7 +3156,7 @@ async def set_provider_key(
     # Refresh via the shared inventory builder; project to the mobile-safe
     # provider shape (NEVER carries the key value).
     provider_data = _refresh_provider_row(slug, fallback_name=pconfig.name)
-    provider_data["authenticated"] = validation.get("validated") is not False
+    provider_data["authenticated"] = validation.get("validated") is True
     return {"provider": provider_data, **validation}
 
 
@@ -3361,7 +3361,7 @@ async def add_custom_provider(
     _provider_audit(request, "custom provider added", name)
 
     provider_data = _refresh_provider_row(name, fallback_name=name)
-    provider_data["authenticated"] = validation.get("validated") is not False
+    provider_data["authenticated"] = validation.get("validated") is True
     return {"provider": provider_data, **validation}
 
 

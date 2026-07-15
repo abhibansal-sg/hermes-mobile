@@ -168,19 +168,42 @@ struct ProviderRow: Identifiable, Sendable, Equatable, Hashable {
 
 /// `POST <prefix>/providers/{slug}/key` and `POST <prefix>/providers/custom`
 /// response. The refreshed provider row is nested under `provider`; validation
-/// result fields are siblings at the response root. A definitive
-/// `validated == false` means the key was persisted but rejected by the upstream
-/// provider, so callers should keep entry UI open and show `validationDetail`.
+/// result fields are siblings at the response root. Preserve the gateway's
+/// tri-state validation result: accepted, rejected, or saved-but-not-verified.
+enum ProviderKeyValidationStatus: Sendable, Equatable {
+    case verified
+    case rejected
+    case skipped
+    case unknown
+
+    init(json: JSONValue?) {
+        if json?.boolValue == true {
+            self = .verified
+        } else if json?.boolValue == false {
+            self = .rejected
+        } else if json?.stringValue == "skipped" {
+            self = .skipped
+        } else {
+            self = .unknown
+        }
+    }
+}
+
+/// response. The refreshed provider row is nested under `provider`; validation
+/// result fields are siblings at the response root. A definitive rejection means
+/// the key was persisted but rejected by the upstream provider, so callers
+/// should keep entry UI open and show `validationDetail`. A skipped validation
+/// means the key may be persisted but was not verified.
 struct ProviderKeyResult: Sendable, Equatable {
     let row: ProviderRow
-    let validated: Bool?
+    let validationStatus: ProviderKeyValidationStatus
     let validationDetail: String?
     let persisted: Bool?
 
     init(root: JSONValue) {
         let providerJSON = root["provider"] ?? root
         self.row = ProviderRow(json: providerJSON)
-        self.validated = root["validated"]?.boolValue
+        self.validationStatus = ProviderKeyValidationStatus(json: root["validated"])
         self.validationDetail = root["validation_detail"]?.stringValue
         self.persisted = root["persisted"]?.boolValue
     }
@@ -283,14 +306,14 @@ extension RestClient {
     /// 4003-class "set up on desktop" reject for OAuth-only providers), honours
     /// `is_managed()` (4006 read-only for managed installs), and persists via the
     /// stock `save_env_value`. Returns the refreshed provider row with models
-    /// populated and `authenticated == true`, plus root-level validation status.
+    /// populated, plus root-level validation status.
     /// NEVER echoes the key.
     ///
     /// `apiKey` is held transiently in the Keychain by the caller
     /// (``KeychainService/saveProviderKey``) for this POST, then deleted — the
     /// gateway is the source of truth. Throws ``RestError`` (`badStatus`) on a
-    /// 4003/4006 structural reject; an upstream key reject can arrive as a
-    /// successful response with `validated == false` and `validation_detail`.
+    /// 4003/4006 structural reject; upstream validation can arrive as a
+    /// successful response with `validated == true`, `false`, or `"skipped"`.
     @discardableResult
     func setProviderKey(slug: String, apiKey: String) async throws -> ProviderKeyResult {
         let encodedSlug = slug.addingPercentEncoding(
@@ -316,14 +339,13 @@ extension RestClient {
     /// `set_config_value` (the same path the desktop `hermes set` uses). Validates
     /// the name is a safe dotted-key segment, the base_url is an http(s) URL, the
     /// api_mode is in the allowed set, and the api_key is non-empty. Honours
-    /// `is_managed()` (4006). Returns the refreshed provider row with
-    /// `authenticated == true`, plus root-level validation status. NEVER echoes
-    /// the key.
+    /// `is_managed()` (4006). Returns the refreshed provider row plus root-level
+    /// validation status. NEVER echoes the key.
     ///
     /// `apiKey` is held transiently in the Keychain by the caller, then deleted.
     /// Throws ``RestError`` (`badStatus`) on a structural validation/managed
-    /// reject; an upstream key reject can arrive as a successful response with
-    /// `validated == false` and `validation_detail`.
+    /// reject; upstream validation can arrive as a successful response with
+    /// `validated == true`, `false`, or `"skipped"`.
     @discardableResult
     func addCustomProvider(
         name: String,
