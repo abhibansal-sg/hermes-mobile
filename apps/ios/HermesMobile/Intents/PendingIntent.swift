@@ -88,4 +88,15 @@ enum PendingIntent: Equatable, Sendable {
         defaults.removeObject(forKey: DefaultsKeys.pendingIntentPrompt)
         return PendingIntent(storageValue: raw)
     }
+
+
+    static func clearPending(from defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: DefaultsKeys.pendingIntentPrompt)
+    }
+}
+
+struct GatewayCleanupTombstone: Codable, Equatable, Sendable {
+    let server: String
+    let deviceId: String?
+    var remoteRetryNeeded = false
 }

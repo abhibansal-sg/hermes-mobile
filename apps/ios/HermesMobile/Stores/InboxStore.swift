@@ -448,6 +448,11 @@ final class InboxStore {
         }
     }
 
+    /// Privacy reset used by Forget Gateway. Repeated calls are harmless.
+    func removeAll() {
+        items.removeAll()
+    }
+
     // MARK: - Response bookkeeping
 
     private func commitState(id: String, state: ItemState) async {
