@@ -183,20 +183,37 @@ def _session_rows(scope: str, active_keys: set[tuple[str, str]]) -> tuple[list[d
 
 def capture_runtime() -> tuple[list[dict], list[dict], set[tuple[str, str]]]:
     try:
+        from tools.approval import pending_approval_snapshot
         from tui_gateway.server import (
-            _pending, _pending_prompt_payloads, _prompt_lock,
-            _sessions, _sessions_lock,
+            _sessions,
+            _sessions_lock,
+            attention_session_identities,
+            pending_prompt_snapshot,
         )
     except Exception as exc:
         raise ManifestError(503, "state_unavailable", f"Gateway state unavailable: {exc}")
     with _sessions_lock:
         copied_sessions = [(str(sid), dict(rec)) for sid, rec in _sessions.items()]
-    with _prompt_lock:
-        copied_pending = [(str(rid), str(owner), dict(_pending_prompt_payloads.get(rid, ("", {}))[1]), _pending_prompt_payloads.get(rid, ("", {}))[0]) for rid, (owner, _event) in _pending.items()]
+    runtime_by_stored = {
+        str(item.get("stored_session_id") or ""): str(item.get("session_id") or "")
+        for item in attention_session_identities()
+        if item.get("stored_session_id") and item.get("session_id")
+    }
+    copied_attention = []
+    for source in pending_approval_snapshot():
+        item = dict(source)
+        stored_id = str(item.get("stored_session_id") or "")
+        item["session_id"] = runtime_by_stored.get(stored_id, stored_id)
+        copied_attention.append(item)
+    copied_attention.extend(pending_prompt_snapshot())
     by_runtime = {sid: rec for sid, rec in copied_sessions}
     active: list[dict] = []
     keys: set[tuple[str, str]] = set()
-    pending_owners = {owner for _rid, owner, _payload, _event in copied_pending}
+    pending_owners = {
+        str(item.get("session_id") or "")
+        for item in copied_attention
+        if item.get("status") in {"pending", "failed_retry", "responding"}
+    }
     for sid, rec in copied_sessions:
         if not rec.get("running") and sid not in pending_owners:
             continue
@@ -210,27 +227,22 @@ def capture_runtime() -> tuple[list[dict], list[dict], set[tuple[str, str]]]:
             "state": "waiting_for_attention" if sid in pending_owners else "running",
         })
     attention: list[dict] = []
-    for rid, owner, payload, event in copied_pending:
+    for source in copied_attention:
+        item = dict(source)
+        owner = str(item.get("session_id") or "")
         rec = by_runtime.get(owner, {})
-        stored = rec.get("session_key")
+        stored = item.get("stored_session_id") or rec.get("session_key")
         profile = _profile_for_home(Path(rec["profile_home"])) if rec.get("profile_home") else "default"
-        kind = "clarify" if event == "clarify.request" else "approval"
-        choices = payload.get("choices") if isinstance(payload.get("choices"), list) else []
-        attention.append({
-            "id": rid, "session_id": owner, "stored_session_id": str(stored) if stored else None,
-            "profile": profile, "kind": kind,
-            "safe_title": "Clarification required" if kind == "clarify" else "Approval required",
-            "detail": {
-                "prompt": str(payload.get("question") or payload.get("prompt") or "")[:500] or None,
-                "description": str(payload.get("description") or "")[:500] or None,
-                "target": str(payload.get("target") or "")[:200] or None,
-                "choices": [str(c.get("label") if isinstance(c, dict) else c)[:100] for c in choices[:20]],
-                "request_id": str(payload.get("request_id") or rid),
-            },
-            "destructive": bool(payload.get("destructive")), "created_at": float(payload.get("created_at") or 0),
-            "expires_at": float(payload["expires_at"]) if payload.get("expires_at") is not None else None,
-            "status": "pending",
-        })
+        if item.get("kind") == "clarify":
+            detail = dict(item.get("detail") or {})
+            detail.setdefault("prompt", detail.get("question"))
+            item["detail"] = detail
+        item.update(
+            session_id=owner,
+            stored_session_id=str(stored) if stored else None,
+            profile=profile,
+        )
+        attention.append(item)
     return attention, active, keys
 
 
