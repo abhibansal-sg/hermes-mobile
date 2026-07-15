@@ -29,6 +29,7 @@ either already upstream or no longer consumed by `plugins/hermes-mobile` / iOS.
 | S8 | SUPERSEDED | `exclude_sources` is already implemented in `hermes_state.py` and both dashboard session APIs. |
 | S9 | OBSOLETE | The plugin enriches fan-out frames with `stored_session_id`; no desktop foreign-frame core adoption seam is referenced. |
 | S10 | OBSOLETE | Embedded-chat route guards are upstream. iOS closes its owned runtime before RPC delete and uses profile-scoped REST only for non-default rows, so the old REST live-delete core guard has no current consumer. |
+| S11 | STILL-NEEDED (generic) | `prompt.submit` exposes a generic receipt-provider registry and calls it before mutation. The hermes-mobile plugin owns SQLite, profile scoping, liveness, and 30-day retention (ABH-462 / R-48). |
 
 ## 1. Plugin package: `plugins/hermes-mobile/`
 Rides the STOCK plugin system (`hermes_cli/plugins.py` manager + dashboard
@@ -83,6 +84,10 @@ S9 Desktop foreign-frame adoption ref-threading (~60 lines across 3 files) —
    ships only WITH the desktop multi-client PR; until then stays in fork.
 S10 web_server REST live-delete guard (~34) + embedded-chat guard reorder (~12).
    Bundle into S6's PR.
+S11 prompt receipt provider registry + pre-mutation `prompt.submit` call sites.
+   PR: "gateway: pluggable prompt idempotency receipts". Core contains no
+   mobile database path, schema, or retention policy; those live entirely in
+   `plugins/hermes-mobile/prompt_receipts.py`.
 
 ## 3. Drops at rebase (Phase 2)
 Model-switch env-leak fix (upstream superseded + their `model_override` ⇒ most of

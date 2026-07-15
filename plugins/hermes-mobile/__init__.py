@@ -12,6 +12,8 @@ Modules:
 * ``gitbranch``   — fork-free branch lookup for the session.create fast path.
 * ``mobile_pair`` — the ``hermes mobile-pair`` CLI command (QR pairing),
   registered through the stock ``register_cli_command`` facade.
+* ``prompt_receipts`` — profile-scoped SQLite idempotency receipts for
+  ID-enabled ``prompt.submit`` requests.
 * ``dashboard/api.py`` — REST routes, auto-mounted by the dashboard plugin
   system at ``/api/plugins/hermes-mobile/`` (upload, approvals, devices,
   fs browse, push registration).
@@ -182,6 +184,15 @@ def _wire_token_auth() -> None:
     _append_unique(token_auth, "SOCKET_OBSERVERS", _observe_socket, "token-auth")
 
 
+def _wire_prompt_receipts() -> None:
+    """Register the plugin-owned SQLite provider on the generic gateway seam."""
+    from tui_gateway import server
+
+    from .prompt_receipts import PROVIDER
+
+    server.register_prompt_receipt_provider(PROVIDER)
+
+
 def register(ctx) -> None:
     """Stock plugin entry point — wire the gateway seams + CLI command."""
     try:
@@ -230,6 +241,12 @@ def register(ctx) -> None:
         _wire_approval_audit()
     except Exception:
         _log.warning("hermes-mobile: approval-audit wiring failed", exc_info=True)
+    try:
+        _wire_prompt_receipts()
+    except Exception:
+        # Plugin-disabled and wiring-failure behavior is deliberately stock:
+        # the empty core registry makes client_message_id a no-op.
+        _log.warning("hermes-mobile: prompt-receipt wiring failed", exc_info=True)
     try:
         ctx.register_cli_command(
             name="mobile-pair",

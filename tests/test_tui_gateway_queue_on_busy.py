@@ -96,6 +96,53 @@ def test_busy_steer_mode_falls_back_to_queue_when_rejected(monkeypatch):
     assert session["queued_prompt"]["text"] == "nudge"
 
 
+def test_idempotent_busy_replay_does_not_interrupt_or_queue_twice(monkeypatch):
+    """A replay returns the stored disposition before busy-policy mutation."""
+
+    class _Provider:
+        disposition = None
+
+        def reserve(self, **kwargs):
+            if self.disposition is not None:
+                return {"state": "replay", "disposition": self.disposition}
+            return {"state": "claimed", "reservation": "only"}
+
+        def complete(self, reservation, disposition):
+            assert reservation == "only"
+            self.disposition = dict(disposition)
+
+        def release(self, reservation):
+            raise AssertionError("accepted busy prompt must not be released")
+
+    calls = {"interrupt": 0}
+    agent = types.SimpleNamespace(
+        interrupt=lambda: calls.__setitem__("interrupt", calls["interrupt"] + 1)
+    )
+    session = _session(agent=agent, running=True, profile_home="/tmp/profile")
+    provider = _Provider()
+    monkeypatch.setattr(server, "PROMPT_RECEIPT_PROVIDERS", [provider])
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    monkeypatch.setattr(server, "current_transport", lambda: None)
+    server._sessions["busy-sid"] = session
+    params = {
+        "session_id": "busy-sid",
+        "text": "next",
+        "client_message_id": "550e8400-e29b-41d4-a716-446655440000",
+    }
+    try:
+        first = server._methods["prompt.submit"]("r1", params)
+        assert first["result"]["status"] == "queued"
+        assert calls["interrupt"] == 1
+        assert session["queued_prompt"]["text"] == "next"
+
+        second = server._methods["prompt.submit"]("r2", params)
+        assert second["result"] == first["result"]
+        assert calls["interrupt"] == 1
+        assert session["queued_prompt"]["text"] == "next"
+    finally:
+        server._sessions.pop("busy-sid", None)
+
+
 # ── _drain_queued_prompt ───────────────────────────────────────────────────
 
 def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
