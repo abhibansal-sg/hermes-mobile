@@ -46,6 +46,20 @@ struct CacheScope: Sendable, Equatable {
     static let legacy = CacheScope(serverId: "__legacy__", profileId: "__legacy__")
 }
 
+/// Concrete row identity. `profileId` is always the row's actual profile;
+/// unlike `CacheScope`, it is never the aggregate `all` manifest selector.
+struct CacheIdentity: Sendable, Equatable, Hashable {
+    let serverId: String
+    let profileId: String
+    let sessionId: String
+
+    init(serverId: String, profileId: String, sessionId: String) {
+        self.serverId = serverId.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.profileId = profileId.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.sessionId = sessionId
+    }
+}
+
 // MARK: - SessionCacheRecord
 //
 // One row per session (raw, includes cron). The full SessionSummary is stored

@@ -620,10 +620,11 @@ private extension Data {
 func fetchTranscriptDeltaAware(
     rest: RestClient,
     cacheStore: CacheStore?,
-    sessionId: String
+    sessionId: String,
+    identity: CacheIdentity?
 ) async throws -> [StoredMessage] {
-    if let cacheStore,
-       let cursor = try? await cacheStore.deltaCursor(for: sessionId),
+    if let cacheStore, let identity,
+       let cursor = try? await cacheStore.deltaCursor(for: identity),
        cursor.afterId > 0,
        let delta = await rest.messagesDelta(
            sessionId: sessionId,
@@ -635,7 +636,7 @@ func fetchTranscriptDeltaAware(
             // An empty tail (client already caught up) returns the cache unchanged.
             var cached: [StoredMessage] = []
             // `try?` flattens loadTranscript's `[StoredMessage]?` to a single optional.
-            if let rows = try? await cacheStore.loadTranscript(sessionId) {
+            if let rows = try? await cacheStore.loadTranscript(identity) {
                 cached = rows
             }
             return cached + delta.messages

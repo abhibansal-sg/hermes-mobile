@@ -8,6 +8,8 @@ import GRDB
 // a JSON blob via StoredMessageMirror. See CONTRACT-OFFLINE-CACHE.md §2.2.
 
 struct MessageRowRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
+    var serverId: String
+    var profileId: String
     /// FK -> session_cache.id (ON DELETE CASCADE)
     var sessionId: String
     /// Position in the fetched transcript (0-based); rebuild order authority
@@ -29,7 +31,7 @@ struct MessageRowRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
 extension MessageRowRecord {
     /// Build a MessageRowRecord from a StoredMessage at a given ordinal position.
     static func make(
-        sessionId: String,
+        identity: CacheIdentity,
         ordinal: Int,
         wireId: Int?,
         message: StoredMessage
@@ -37,7 +39,9 @@ extension MessageRowRecord {
         let mirror = message.toMirror()
         let data = try JSONEncoder().encode(mirror)
         return MessageRowRecord(
-            sessionId: sessionId,
+            serverId: identity.serverId,
+            profileId: identity.profileId,
+            sessionId: identity.sessionId,
             ordinal: ordinal,
             wireId: wireId,
             role: message.role,
