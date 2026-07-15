@@ -42,9 +42,6 @@ actor CacheStore {
     /// Throws if the database cannot be opened or migrated.
     init() throws {
         let dbURL = try Self.dbURL()
-        // Drop-and-rebuild escape hatch: nuke on fingerprint mismatch
-        CacheSchema.nukeIfSchemaMismatch(at: dbURL)
-
         var config = Configuration()
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA journal_mode = WAL")
@@ -94,11 +91,14 @@ actor CacheStore {
     /// rows never bleed into another server's list.
     func loadSessionList(scope: CacheScope) throws -> [SessionSummary] {
         try db.read { db in
-            let records = try SessionCacheRecord
+            var request = SessionCacheRecord
                 .filter(Column("serverId") == scope.serverId)
-                .filter(Column("profileId") == scope.profileId)
-                .order(Column("lastActive").desc)
-                .fetchAll(db)
+            if scope.profileId == CacheScope.allProfilesKey {
+                request = request.filter(Column("profileId") != CacheScope.legacy.profileId)
+            } else {
+                request = request.filter(Column("profileId") == scope.profileId)
+            }
+            let records = try request.order(Column("lastActive").desc).fetchAll(db)
             return try records.map { try $0.decodeSummary() }
         }
     }
@@ -112,10 +112,13 @@ actor CacheStore {
     func saveSessionList(_ summaries: [SessionSummary], scope: CacheScope) throws {
         try db.write { db in
             for summary in summaries {
-                let existing = try SessionCacheRecord.fetchOne(db, key: summary.id)
+                let profile = summary.profile?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let actualProfile = (profile?.isEmpty == false) ? profile! : (scope.profileId == CacheScope.allProfilesKey ? "default" : scope.profileId)
+                let identity = CacheIdentity(serverId: scope.serverId, profileId: actualProfile, sessionId: summary.id)
+                let existing = try Self.session(identity, in: db)
                 let record = try SessionCacheRecord.make(
                     from: summary,
-                    scope: scope,
+                    scope: CacheScope(serverId: identity.serverId, profileId: identity.profileId),
                     isPinned: existing?.isPinned ?? false,
                     lastAccessedAt: existing?.lastAccessedAt ?? 0,
                     transcriptCachedAt: existing?.transcriptCachedAt,
@@ -153,9 +156,9 @@ actor CacheStore {
     // MARK: - Transcript read
 
     /// Returns true if the session has cached transcript rows.
-    func hasTranscript(_ sessionId: String) throws -> Bool {
+    func hasTranscript(_ identity: CacheIdentity) throws -> Bool {
         try db.read { db in
-            guard let record = try SessionCacheRecord.fetchOne(db, key: sessionId) else {
+            guard let record = try Self.session(identity, in: db) else {
                 return false
             }
             return record.transcriptCachedAt != nil
@@ -180,9 +183,9 @@ actor CacheStore {
     /// lastActive) and never skips a reconcile on an unprovable copy. The caller's
     /// fast-path gate also requires a non-nil `lastActive` before consulting this,
     /// so a nil here both fails the skip AND keeps the session in the prefetch set.
-    func transcriptIsFresh(_ sessionId: String, lastActive: Double?) throws -> Bool {
+    func transcriptIsFresh(_ identity: CacheIdentity, lastActive: Double?) throws -> Bool {
         try db.read { db in
-            guard let record = try SessionCacheRecord.fetchOne(db, key: sessionId),
+            guard let record = try Self.session(identity, in: db),
                   let cachedAt = record.transcriptCachedAt else {
                 return false
             }
@@ -195,10 +198,12 @@ actor CacheStore {
     /// Load the cached transcript for `sessionId` as an ordered array of
     /// StoredMessage values (sorted by ordinal ASC). Returns nil if no rows
     /// exist. The caller reconstructs [ChatMessage] via toChatMessages.
-    func loadTranscript(_ sessionId: String) throws -> [StoredMessage]? {
+    func loadTranscript(_ identity: CacheIdentity) throws -> [StoredMessage]? {
         try db.read { db in
             let rows = try MessageRowRecord
-                .filter(Column("sessionId") == sessionId)
+                .filter(Column("serverId") == identity.serverId)
+                .filter(Column("profileId") == identity.profileId)
+                .filter(Column("sessionId") == identity.sessionId)
                 .order(Column("ordinal").asc)
                 .fetchAll(db)
             guard !rows.isEmpty else { return nil }
@@ -213,14 +218,14 @@ actor CacheStore {
     /// order as `messages`). Sets transcriptCachedAt and maxMessageId on the
     /// session row. No-ops for sessions that are not human-Recents-eligible.
     func saveTranscript(
-        sessionId: String,
+        identity: CacheIdentity,
         messages: [StoredMessage],
         wireIds: [Int?]? = nil,
         scope explicitScope: CacheScope? = nil
     ) throws {
         try db.write { db in
             // Guard: sessions excluded from human Recents are never transcript-cached.
-            guard let sessionRecord = try SessionCacheRecord.fetchOne(db, key: sessionId) else {
+            guard let sessionRecord = try Self.session(identity, in: db) else {
                 return
             }
             guard SessionStore.isHumanRecentsSession(
@@ -244,7 +249,9 @@ actor CacheStore {
 
             // Delete existing rows for this session
             try MessageRowRecord
-                .filter(Column("sessionId") == sessionId)
+                .filter(Column("serverId") == identity.serverId)
+                .filter(Column("profileId") == identity.profileId)
+                .filter(Column("sessionId") == identity.sessionId)
                 .deleteAll(db)
 
             // Insert fresh rows
@@ -256,7 +263,7 @@ actor CacheStore {
                 // cursor column + the persisted-row identity stay in sync.
                 let wireId = wireIds?[ordinal] ?? message.wireId
                 let row = try MessageRowRecord.make(
-                    sessionId: sessionId,
+                    identity: identity,
                     ordinal: ordinal,
                     wireId: wireId,
                     message: message
@@ -475,10 +482,12 @@ actor CacheStore {
     /// (the active scope is authoritative for where the row currently lives).
     func upsertSession(_ summary: SessionSummary, scope: CacheScope) throws {
         try db.write { db in
-            let existing = try SessionCacheRecord.fetchOne(db, key: summary.id)
+            let profile = summary.profile ?? (scope.profileId == CacheScope.allProfilesKey ? "default" : scope.profileId)
+            let identity = CacheIdentity(serverId: scope.serverId, profileId: profile, sessionId: summary.id)
+            let existing = try Self.session(identity, in: db)
             let record = try SessionCacheRecord.make(
                 from: summary,
-                scope: scope,
+                scope: CacheScope(serverId: identity.serverId, profileId: identity.profileId),
                 isPinned: existing?.isPinned ?? false,
                 lastAccessedAt: existing?.lastAccessedAt ?? 0,
                 transcriptCachedAt: existing?.transcriptCachedAt,
@@ -492,9 +501,9 @@ actor CacheStore {
 
     /// Bump `lastAccessedAt` to now for `sessionId`. Called on every session open
     /// to prevent eviction of actively-used sessions.
-    func touchSession(_ sessionId: String) throws {
+    func touchSession(_ identity: CacheIdentity) throws {
         try db.write { db in
-            guard var record = try SessionCacheRecord.fetchOne(db, key: sessionId) else {
+            guard var record = try Self.session(identity, in: db) else {
                 return
             }
             record.lastAccessedAt = Date().timeIntervalSince1970
@@ -507,9 +516,9 @@ actor CacheStore {
     /// Clear `transcriptCachedAt` and `maxMessageId` for `sessionId`, forcing a
     /// re-fetch on next open. Used when a `message.complete` or list-diff marks a
     /// session as dirty.
-    func markTranscriptDirty(_ sessionId: String) throws {
+    func markTranscriptDirty(_ identity: CacheIdentity) throws {
         try db.write { db in
-            guard var record = try SessionCacheRecord.fetchOne(db, key: sessionId) else {
+            guard var record = try Self.session(identity, in: db) else {
                 return
             }
             record.transcriptCachedAt = nil
@@ -543,20 +552,19 @@ actor CacheStore {
 
             guard !stale.isEmpty else { return 0 }
 
-            let staleIds = stale.map(\.id)
-            // Delete transcript rows (CASCADE also fires but we do it explicitly)
-            try MessageRowRecord
-                .filter(staleIds.contains(Column("sessionId")))
-                .deleteAll(db)
-
             // Clear transcript cursor fields on evicted sessions
             for var record in stale {
+                try MessageRowRecord
+                    .filter(Column("serverId") == record.serverId)
+                    .filter(Column("profileId") == record.profileId)
+                    .filter(Column("sessionId") == record.id)
+                    .deleteAll(db)
                 record.transcriptCachedAt = nil
                 record.maxMessageId = nil
                 try record.save(db)
             }
 
-            return staleIds.count
+            return stale.count
         }
     }
 
@@ -602,9 +610,9 @@ actor CacheStore {
     // MARK: - maxMessageId query
 
     /// Return the max wireId persisted for a session (the per-session cursor).
-    func maxMessageId(for sessionId: String) throws -> Int? {
+    func maxMessageId(for identity: CacheIdentity) throws -> Int? {
         try db.read { db in
-            try SessionCacheRecord.fetchOne(db, key: sessionId)?.maxMessageId
+            try Self.session(identity, in: db)?.maxMessageId
         }
     }
 
@@ -616,15 +624,25 @@ actor CacheStore {
     /// rewind / compaction) is detected and forces a full re-sync. Returns nil when
     /// there is no cached transcript or no wire-backed rows — the caller then does a
     /// full fetch (no cursor to send).
-    func deltaCursor(for sessionId: String) throws -> (afterId: Int, prefixCount: Int)? {
+    func deltaCursor(for identity: CacheIdentity) throws -> (afterId: Int, prefixCount: Int)? {
         try db.read { db in
-            guard let record = try SessionCacheRecord.fetchOne(db, key: sessionId),
+            guard let record = try Self.session(identity, in: db),
                   let afterId = record.maxMessageId else { return nil }
             let prefixCount = try MessageRowRecord
-                .filter(Column("sessionId") == sessionId)
+                .filter(Column("serverId") == identity.serverId)
+                .filter(Column("profileId") == identity.profileId)
+                .filter(Column("sessionId") == identity.sessionId)
                 .filter(Column("wireId") != nil)
                 .fetchCount(db)
             return (afterId, prefixCount)
         }
+    }
+
+    private static func session(_ identity: CacheIdentity, in db: Database) throws -> SessionCacheRecord? {
+        try SessionCacheRecord
+            .filter(Column("serverId") == identity.serverId)
+            .filter(Column("profileId") == identity.profileId)
+            .filter(Column("id") == identity.sessionId)
+            .fetchOne(db)
     }
 }

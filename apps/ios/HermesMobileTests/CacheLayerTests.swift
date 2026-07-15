@@ -22,6 +22,25 @@ import GRDB
 /// A default test scope so the P1/P2 round-trip tests (which predate P4
 /// scoping) keep exercising one canonical (server, profile) partition.
 private let testScope = CacheScope(serverId: "https://test.example", profileId: "all")
+private func testIdentity(_ id: String, scope: CacheScope = testScope) -> CacheIdentity {
+    CacheIdentity(serverId: scope.serverId,
+                  profileId: scope.profileId == CacheScope.allProfilesKey ? "default" : scope.profileId,
+                  sessionId: id)
+}
+
+// Source APIs intentionally have no id-only overloads. These test-target-only
+// shims keep older behavioral fixtures concise while still binding a composite
+// identity at the call boundary.
+extension CacheStore {
+    func hasTranscript(_ id: String) throws -> Bool { try hasTranscript(testIdentity(id)) }
+    func transcriptIsFresh(_ id: String, lastActive: Double?) throws -> Bool { try transcriptIsFresh(testIdentity(id), lastActive: lastActive) }
+    func loadTranscript(_ id: String) throws -> [StoredMessage]? { try loadTranscript(testIdentity(id)) }
+    func saveTranscript(sessionId: String, messages: [StoredMessage], wireIds: [Int?]? = nil) throws { try saveTranscript(identity: testIdentity(sessionId), messages: messages, wireIds: wireIds) }
+    func touchSession(_ id: String) throws { try touchSession(testIdentity(id)) }
+    func markTranscriptDirty(_ id: String) throws { try markTranscriptDirty(testIdentity(id)) }
+    func maxMessageId(for id: String) throws -> Int? { try maxMessageId(for: testIdentity(id)) }
+    func deltaCursor(for id: String) throws -> (afterId: Int, prefixCount: Int)? { try deltaCursor(for: testIdentity(id)) }
+}
 
 private func makeInMemoryStore() throws -> CacheStore {
     var config = Configuration()
@@ -553,10 +572,7 @@ final class CacheScopePartitionTests: XCTestCase {
         XCTAssertEqual(third.map(\.id), ["one"])
     }
 
-    func testUpsertRestampsScopeWhenRowMovesProfiles() async throws {
-        // A session id is globally unique; if the same id is upserted under a new
-        // profile scope (the aggregate rail tags rows with their own profile), the
-        // row's scope follows the active scope it was last written under.
+    func testUpsertSameIdCoexistsAcrossProfiles() async throws {
         let store = try makeInMemoryStore()
         let p1 = CacheScope(serverId: serverA, profileId: "p1")
         let p2 = CacheScope(serverId: serverA, profileId: "p2")
@@ -567,7 +583,7 @@ final class CacheScopePartitionTests: XCTestCase {
         try await store.upsertSession(makeSession(id: "moving"), scope: p2)
         let leftP1 = try await store.loadSessionList(scope: p1)
         let movedP2 = try await store.loadSessionList(scope: p2)
-        XCTAssertTrue(leftP1.isEmpty, "Row left the old profile scope")
+        XCTAssertEqual(leftP1.map(\.id), ["moving"])
         XCTAssertEqual(movedP2.map(\.id), ["moving"])
     }
 }
@@ -576,11 +592,11 @@ final class CacheScopePartitionTests: XCTestCase {
 
 final class CacheV2MigrationTests: XCTestCase {
 
-    func testV2StampsFingerprintV2() async throws {
+    func testV3StampsFingerprintV3() async throws {
         let store = try makeInMemoryStore()
         let version = try await store.readMeta(SyncMetaRecord.Key.schemaVersion)
-        XCTAssertEqual(version, "v2")
-        XCTAssertEqual(CacheSchema.currentFingerprint, "v2")
+        XCTAssertEqual(version, "v3")
+        XCTAssertEqual(CacheSchema.currentFingerprint, "v3")
     }
 
     func testV2ScopeColumnsExistAndAreQueryable() async throws {
@@ -622,6 +638,12 @@ final class CacheV2MigrationTests: XCTestCase {
                 t.primaryKey("key", .text)
                 t.column("value", .text).notNull()
             }
+            try db.create(table: "message_row_cache") { t in
+                t.column("sessionId", .text).notNull().references("session_cache", onDelete: .cascade)
+                t.column("ordinal", .integer).notNull(); t.column("wireId", .integer)
+                t.column("role", .text).notNull(); t.column("timestamp", .double); t.column("rowJSON", .blob).notNull()
+                t.primaryKey(["sessionId", "ordinal"])
+            }
             // Mark v1 as applied so the migrator only runs v2 on top.
             try db.execute(sql: "CREATE TABLE IF NOT EXISTS grdb_migrations (identifier TEXT NOT NULL PRIMARY KEY)")
             try db.execute(sql: "INSERT OR IGNORE INTO grdb_migrations(identifier) VALUES ('v1')")
@@ -643,5 +665,54 @@ final class CacheV2MigrationTests: XCTestCase {
         }
         XCTAssertEqual(serverId, CacheScope.legacy.serverId)
         XCTAssertEqual(profileId, CacheScope.legacy.profileId)
+    }
+}
+
+final class CacheV3CompositeIdentityTests: XCTestCase {
+    func testAttachmentKeyRetainsCompositeIdentity() {
+        let a = AttachmentBlobCache.Key(serverId: "server-a", profileId: "work", sessionId: "same", path: "x.png", size: 10)
+        let b = AttachmentBlobCache.Key(serverId: "server-b", profileId: "work", sessionId: "same", path: "x.png", size: 10)
+        let c = AttachmentBlobCache.Key(serverId: "server-a", profileId: "home", sessionId: "same", path: "x.png", size: 10)
+        XCTAssertNotEqual(a, b)
+        XCTAssertNotEqual(a, c)
+    }
+
+    func testDuplicateSessionIdsCoexistAndCascadeIndependently() async throws {
+        let store = try makeInMemoryStore()
+        let a = CacheScope(serverId: "server", profileId: "a")
+        let b = CacheScope(serverId: "server", profileId: "b")
+        try await store.saveSessionList([makeSession(id: "same", title: "A")], scope: a)
+        try await store.saveSessionList([makeSession(id: "same", title: "B")], scope: b)
+        let ia = testIdentity("same", scope: a), ib = testIdentity("same", scope: b)
+        try await store.saveTranscript(identity: ia, messages: [makeStoredMessage(role: "user")])
+        try await store.saveTranscript(identity: ib, messages: [makeStoredMessage(role: "assistant")])
+        XCTAssertEqual(try await store.loadSessionList(scope: a).first?.title, "A")
+        XCTAssertEqual(try await store.loadSessionList(scope: b).first?.title, "B")
+        XCTAssertEqual(try await store.loadTranscript(ia)?.first?.role, "user")
+        XCTAssertEqual(try await store.loadTranscript(ib)?.first?.role, "assistant")
+    }
+
+    func testAggregateReadsActualProfilesWithoutOwningRows() async throws {
+        let store = try makeInMemoryStore()
+        let aggregate = CacheScope(serverId: "server", profileId: "all")
+        try await store.saveSessionList([
+            SessionSummary(id: "a", title: "A", preview: nil, startedAt: nil, messageCount: 1, source: nil, lastActive: 2, cwd: nil, profile: "work"),
+            SessionSummary(id: "b", title: "B", preview: nil, startedAt: nil, messageCount: 1, source: nil, lastActive: 1, cwd: nil, profile: "home")
+        ], scope: aggregate)
+        XCTAssertEqual(Set(try await store.loadSessionList(scope: aggregate).map(\.id)), ["a", "b"])
+        XCTAssertEqual(try await store.loadSessionList(scope: CacheScope(serverId: "server", profileId: "work")).map(\.id), ["a"])
+    }
+
+    func testV3SchemaUsesCompositeKeysAndForeignKey() throws {
+        let queue = try DatabaseQueue()
+        try CacheSchema.makeMigrator().migrate(queue)
+        try queue.read { db in
+            let sessionPK = try Row.fetchAll(db, sql: "PRAGMA table_info(session_cache)").filter { ($0["pk"] as Int) > 0 }
+            XCTAssertEqual(sessionPK.count, 3)
+            let messagePK = try Row.fetchAll(db, sql: "PRAGMA table_info(message_row_cache)").filter { ($0["pk"] as Int) > 0 }
+            XCTAssertEqual(messagePK.count, 4)
+            XCTAssertEqual(try Row.fetchAll(db, sql: "PRAGMA foreign_key_list(message_row_cache)").count, 3)
+            XCTAssertFalse(try Row.fetchAll(db, sql: "PRAGMA index_list(session_cache)").isEmpty)
+        }
     }
 }

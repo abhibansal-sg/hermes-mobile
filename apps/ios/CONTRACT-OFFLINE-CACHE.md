@@ -33,6 +33,12 @@ All model facts below re-verified against source + the LIVE dashboard
 
 **Verdict: SQLite through GRDB.swift, wrapped in a single `CacheStore` actor. No SwiftData, no Core Data, no hand-rolled `libsqlite3`.**
 
+Identity invariant (R-46): every server-derived row is keyed by its concrete
+`(serverId, profileId, objectId)` identity. Aggregate manifest scope is a query
+selector, never a row profile. Future outbox and panel tables must carry the
+same composite server/profile identity (plus their object key); they are not
+pre-created before their owning phases ship.
+
 ### 1.1 Decision rationale
 
 - **SwiftData — eliminated.** iOS 17.0/17.1 shipped with cascade-delete no-ops,

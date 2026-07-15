@@ -979,6 +979,13 @@ final class SessionStore {
         return CacheScope(serverId: serverURL, profileId: activeProfile)
     }
 
+    func cacheIdentity(_ sessionId: String, profile: String? = nil) -> CacheIdentity? {
+        guard let scope = currentCacheScope else { return nil }
+        let actual = profile?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let profileId = actual?.isEmpty == false ? actual! : (scope.profileId == CacheScope.allProfilesKey ? "default" : scope.profileId)
+        return CacheIdentity(serverId: scope.serverId, profileId: profileId, sessionId: sessionId)
+    }
+
     /// The serverId the cache cold-read was last partitioned by, so a SERVER
     /// switch (new gateway) can be detected at the top of `refresh()` and trigger
     /// the clear-other-servers policy + a fresh cold read for the new server.
@@ -1704,10 +1711,14 @@ final class SessionStore {
         // source/count filters and sorts by recency, so it is the right source. Map to a Sendable tuple so
         // the detached sweep captures plain values, not SessionSummary state.
         let openId = activeStoredId
-        let targets: [(id: String, lastActive: Double?)] = visibleSessions
+        guard let cacheScope = currentCacheScope else { return }
+        let targets: [(identity: CacheIdentity, lastActive: Double?)] = visibleSessions
             .filter { $0.id != openId }
             .prefix(Self.prefetchSessionCount)
-            .map { ($0.id, $0.lastActive) }
+            .map {
+                let profile = $0.profile ?? (cacheScope.profileId == CacheScope.allProfilesKey ? "default" : cacheScope.profileId)
+                return (CacheIdentity(serverId: cacheScope.serverId, profileId: profile, sessionId: $0.id), $0.lastActive)
+            }
         guard !targets.isEmpty else { return }
 
         let concurrency = Self.prefetchConcurrency
@@ -1723,20 +1734,21 @@ final class SessionStore {
                     if Task.isCancelled { break }
                     // Skip a session whose disk copy is already current.
                     if (try? await cacheStore.transcriptIsFresh(
-                        target.id, lastActive: target.lastActive)) == true {
+                        target.identity, lastActive: target.lastActive)) == true {
                         continue
                     }
                     if inFlight >= concurrency {
                         await group.next()
                         inFlight -= 1
                     }
-                    let sessionId = target.id
+                    let identity = target.identity
+                    let sessionId = identity.sessionId
                     group.addTask(priority: .utility) {
                         if Task.isCancelled { return }
                         guard let stored = try? await fetch(sessionId) else { return }
                         if Task.isCancelled { return }
                         try? await cacheStore.saveTranscript(
-                            sessionId: sessionId, messages: stored)
+                            identity: identity, messages: stored)
                     }
                     inFlight += 1
                 }
@@ -1778,12 +1790,15 @@ final class SessionStore {
             // without a cursor keep the ABH-400 page-window prefetch behavior.
             if let cacheStore {
                 do {
-                    if let cursor = try await cacheStore.deltaCursor(for: sessionId),
+                    guard let scope = await self.currentCacheScope else { return try await rest.messages(sessionId: sessionId) }
+                    let identity = CacheIdentity(serverId: scope.serverId, profileId: scope.profileId == CacheScope.allProfilesKey ? "default" : scope.profileId, sessionId: sessionId)
+                    if let cursor = try await cacheStore.deltaCursor(for: identity),
                        cursor.afterId > 0 {
                         return try await fetchTranscriptDeltaAware(
                             rest: rest,
                             cacheStore: cacheStore,
-                            sessionId: sessionId
+                            sessionId: sessionId,
+                            identity: identity
                         )
                     }
                 } catch {
@@ -1801,7 +1816,8 @@ final class SessionStore {
             return try await fetchTranscriptDeltaAware(
                 rest: rest,
                 cacheStore: cacheStore,
-                sessionId: sessionId
+                sessionId: sessionId,
+                identity: await self.cacheIdentity(sessionId)
             )
         }
     }
@@ -4171,11 +4187,12 @@ final class SessionStore {
         if !paintedFromCache, let cacheStore {
             // `touchSession` bumps `lastAccessedAt` so an actively-opened session
             // never ages out of the eviction horizon.
-            try? await cacheStore.touchSession(storedId)
+            guard let identity = cacheIdentity(storedId, profile: profile) else { return }
+            try? await cacheStore.touchSession(identity)
             if openToken == token,           // not superseded while reading disk
-               (try? await cacheStore.hasTranscript(storedId)) == true,
+               (try? await cacheStore.hasTranscript(identity)) == true,
                openToken == token,
-               let cached = try? await cacheStore.loadTranscript(storedId),
+               let cached = try? await cacheStore.loadTranscript(identity),
                openToken == token {          // re-check after every await
                 // ARCH37 STEP 2 — normalize the cached rows OFF main, hop to main
                 // only for the in-place reconcile (the FIRST painted frame).
@@ -4217,7 +4234,8 @@ final class SessionStore {
             // "fresh" is never over-broad.
             if paintedFromDisk, let cacheStore,
                let lastActive = sessions.first(where: { $0.id == storedId })?.lastActive,
-               (try? await cacheStore.transcriptIsFresh(storedId, lastActive: lastActive)) == true {
+               let identity = cacheIdentity(storedId, profile: profile),
+               (try? await cacheStore.transcriptIsFresh(identity, lastActive: lastActive)) == true {
                 guard openToken == token else { return }
                 #if DEBUG
                 Self.logOpenLatency(
@@ -4242,7 +4260,7 @@ final class SessionStore {
             // P3 write-through: persist the freshly-fetched transcript so the
             // next open paints it from disk. Fire-and-forget, OFF the UI path.
             if let cacheStore {
-                Task { try? await cacheStore.saveTranscript(sessionId: storedId, messages: stored) }
+                if let identity = cacheIdentity(storedId, profile: profile) { Task { try? await cacheStore.saveTranscript(identity: identity, messages: stored) } }
             }
         } catch {
             guard openToken == token else { return }  // superseded (R1 #28/#43)
@@ -4280,11 +4298,12 @@ final class SessionStore {
         // reset-on-miss: a chain-tip seed reconciles over already-painted content,
         // so a miss simply leaves it for the network fetch below).
         if let cacheStore {
-            try? await cacheStore.touchSession(storedId)
+            guard let identity = cacheIdentity(storedId, profile: profile) else { return }
+            try? await cacheStore.touchSession(identity)
             if openToken == token,
-               (try? await cacheStore.hasTranscript(storedId)) == true,
+               (try? await cacheStore.hasTranscript(identity)) == true,
                openToken == token,
-               let cached = try? await cacheStore.loadTranscript(storedId),
+               let cached = try? await cacheStore.loadTranscript(identity),
                openToken == token {
                 let cachedWindow = Array(cached.suffix(ChatStore.transcriptOpenWindowLimit))
                 let normalized = await Self.normalizeOffMain(cachedWindow)
@@ -4304,7 +4323,7 @@ final class SessionStore {
             chat.seed(normalized: normalized)
             chat.noteTranscriptSeedWindow(stored)
             if let cacheStore {
-                Task { try? await cacheStore.saveTranscript(sessionId: storedId, messages: stored) }
+                if let identity = cacheIdentity(storedId, profile: profile) { Task { try? await cacheStore.saveTranscript(identity: identity, messages: stored) } }
             }
         } catch {
             guard openToken == token else { return }  // superseded (R1 #28/#43)
@@ -4373,7 +4392,7 @@ final class SessionStore {
             ) {
                 return page.messages
             }
-            return try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId)
+            return try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId, identity: self.cacheIdentity(sessionId))
         }
     }
 

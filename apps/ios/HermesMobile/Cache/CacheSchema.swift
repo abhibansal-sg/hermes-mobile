@@ -9,10 +9,7 @@ import GRDB
 //
 // Migration policy:
 //   - v1: create all three tables + four indexes (first ship)
-//   - Future migrations are ADDITIVE (ALTER TABLE ADD COLUMN, new indexes, FTS5)
-//   - Drop-and-rebuild escape hatch: if `schemaVersion` in sync_meta no longer
-//     matches the expected fingerprint, wipe and re-open. The cache is 100%
-//     reconstructible from the gateway so this is always safe.
+//   - Recognized versions migrate transactionally; v3 uses verified shadow tables.
 
 enum CacheSchema {
 
@@ -26,7 +23,7 @@ enum CacheSchema {
     /// normal GRDB path on a live DB; the fingerprint bump means any DB so old
     /// it cannot ALTER cleanly takes the nuke-and-rebuild escape hatch instead —
     /// always safe (the cache is 100% reconstructible from the gateway).
-    static let currentFingerprint = "v2"
+    static let currentFingerprint = "v3"
 
     // MARK: - Migrator
 
@@ -177,6 +174,48 @@ enum CacheSchema {
                 t.column("complete", .boolean).notNull().defaults(to: false)
                 t.primaryKey(["serverId", "profileId"])
             }
+        }
+
+        // v3 makes scope part of identity. Shadow tables keep recognized v2
+        // databases paintable throughout the transaction and permit complete
+        // count/FK validation before the atomic rename.
+        migrator.registerMigration("v3") { db in
+            try db.execute(sql: "PRAGMA defer_foreign_keys = ON")
+            try db.create(table: "session_cache_v3") { t in
+                t.column("serverId", .text).notNull(); t.column("profileId", .text).notNull()
+                t.column("id", .text).notNull(); t.column("summaryJSON", .blob).notNull()
+                t.column("lastActive", .double); t.column("messageCount", .integer); t.column("source", .text)
+                t.column("archived", .boolean).notNull().defaults(to: false); t.column("isPinned", .boolean).notNull().defaults(to: false)
+                t.column("lastAccessedAt", .double).notNull().defaults(to: 0); t.column("transcriptCachedAt", .double); t.column("maxMessageId", .integer)
+                t.primaryKey(["serverId", "profileId", "id"])
+            }
+            try db.create(table: "message_row_cache_v3") { t in
+                t.column("serverId", .text).notNull(); t.column("profileId", .text).notNull(); t.column("sessionId", .text).notNull(); t.column("ordinal", .integer).notNull()
+                t.column("wireId", .integer); t.column("role", .text).notNull(); t.column("timestamp", .double); t.column("rowJSON", .blob).notNull()
+                t.primaryKey(["serverId", "profileId", "sessionId", "ordinal"])
+                t.foreignKey(["serverId", "profileId", "sessionId"], references: "session_cache_v3", columns: ["serverId", "profileId", "id"], onDelete: .cascade)
+            }
+            try db.execute(sql: "INSERT INTO session_cache_v3 SELECT serverId,profileId,id,summaryJSON,lastActive,messageCount,source,archived,isPinned,lastAccessedAt,transcriptCachedAt,maxMessageId FROM session_cache")
+            try db.execute(sql: "INSERT INTO message_row_cache_v3 SELECT s.serverId,s.profileId,m.sessionId,m.ordinal,m.wireId,m.role,m.timestamp,m.rowJSON FROM message_row_cache m JOIN session_cache s ON s.id=m.sessionId")
+            let oldSessions = try Int.fetchOne(db, sql: "SELECT count(*) FROM session_cache") ?? 0
+            let newSessions = try Int.fetchOne(db, sql: "SELECT count(*) FROM session_cache_v3") ?? 0
+            let oldMessages = try Int.fetchOne(db, sql: "SELECT count(*) FROM message_row_cache") ?? 0
+            let newMessages = try Int.fetchOne(db, sql: "SELECT count(*) FROM message_row_cache_v3") ?? 0
+            guard oldSessions == newSessions, oldMessages == newMessages else { throw DatabaseError(resultCode: .SQLITE_CONSTRAINT, message: "v3 shadow-copy count mismatch") }
+            try db.drop(table: "message_row_cache"); try db.drop(table: "session_cache")
+            try db.rename(table: "session_cache_v3", to: "session_cache"); try db.rename(table: "message_row_cache_v3", to: "message_row_cache")
+            try db.create(index: "session_cache_scope_lastActive", on: "session_cache", columns: ["serverId", "profileId", "lastActive"])
+            try db.create(index: "message_row_cache_identity_wireId", on: "message_row_cache", columns: ["serverId", "profileId", "sessionId", "wireId"])
+            try db.create(table: "manifest_scope_state") { t in
+                t.column("serverId", .text).notNull(); t.column("manifestScope", .text).notNull(); t.column("revision", .text); t.column("finalCursor", .text); t.column("capabilitiesVersion", .text); t.column("serverTime", .double); t.column("localFetchedTime", .double); t.column("widgetJSON", .blob); t.column("deviceRegistrationState", .blob); t.primaryKey(["serverId", "manifestScope"])
+            }
+            for (name, tail) in [("pending_attention_cache", "id TEXT NOT NULL, PRIMARY KEY(serverId,profileId,id)"), ("active_turn_cache", "sessionId TEXT NOT NULL, PRIMARY KEY(serverId,profileId,sessionId)"), ("transcript_head_cache", "sessionId TEXT NOT NULL, PRIMARY KEY(serverId,profileId,sessionId)")] {
+                try db.execute(sql: "CREATE TABLE \(name) (serverId TEXT NOT NULL, profileId TEXT NOT NULL, \(tail))")
+            }
+            try db.execute(sql: "CREATE TABLE last_opened_session (serverId TEXT NOT NULL, manifestScope TEXT NOT NULL, profileId TEXT NOT NULL, sessionId TEXT NOT NULL, PRIMARY KEY(serverId,manifestScope))")
+            let violations = try Row.fetchAll(db, sql: "PRAGMA foreign_key_check")
+            guard violations.isEmpty else { throw DatabaseError(resultCode: .SQLITE_CONSTRAINT_FOREIGNKEY, message: "v3 foreign-key verification failed") }
+            try SyncMetaRecord(key: SyncMetaRecord.Key.schemaVersion, value: currentFingerprint).save(db)
         }
 
         return migrator
