@@ -3579,7 +3579,9 @@ final class ChatStore {
             // disk. Fire-and-forget, OFF the UI path; CacheStore no-ops for cron
             // sessions (never transcript-cached, per the decided scope).
             if let cacheStore {
-                Task { try? await cacheStore.saveTranscript(sessionId: storedId, messages: stored) }
+                if let identity = sessions?.cacheIdentity(storedId) {
+                    Task { try? await cacheStore.saveTranscript(identity: identity, messages: stored) }
+                }
             }
             // The seed is the authoritative post-reconnect/post-restart
             // reconcile: any approval/clarify card still up belongs to a turn
@@ -3657,7 +3659,7 @@ final class ChatStore {
             ) {
                 return page.messages
             }
-            return try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId)
+            return try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId, identity: sessions?.cacheIdentity(sessionId))
         }
     }
 
