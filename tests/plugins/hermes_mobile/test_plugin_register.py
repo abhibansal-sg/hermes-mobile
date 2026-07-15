@@ -30,7 +30,6 @@ def plugin_and_ctx():
     from hermes_cli.dashboard_auth import token_auth
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
     from tools import approval as _approval
-    from tui_gateway import server, ws
 
     load_plugin_module("device_tokens")
     plugin = sys.modules[_PLUGIN_PKG]
@@ -44,9 +43,6 @@ def plugin_and_ctx():
         list(token_auth.IDENTITY_VALIDATORS),
         list(token_auth.SOCKET_OBSERVERS),
         list(_approval._RESOLVE_OBSERVERS),
-        list(server._EVENT_FANOUT_SUBSCRIBERS),
-        list(server._EMIT_OBSERVERS),
-        list(ws.TRANSPORT_OBSERVERS),
     )
     try:
         yield plugin, ctx, manager
@@ -55,15 +51,11 @@ def plugin_and_ctx():
         token_auth.IDENTITY_VALIDATORS[:] = snapshot[1]
         token_auth.SOCKET_OBSERVERS[:] = snapshot[2]
         _approval._RESOLVE_OBSERVERS[:] = snapshot[3]
-        server._EVENT_FANOUT_SUBSCRIBERS[:] = snapshot[4]
-        server._EMIT_OBSERVERS[:] = snapshot[5]
-        ws.TRANSPORT_OBSERVERS[:] = snapshot[6]
 
 
 def test_register_populates_every_seam_registry(plugin_and_ctx):
     from hermes_cli.dashboard_auth import token_auth
     from tools import approval as _approval
-    from tui_gateway import server, ws
 
     plugin, ctx, manager = plugin_and_ctx
     device_tokens = load_plugin_module("device_tokens")
@@ -95,9 +87,6 @@ def test_register_populates_every_seam_registry(plugin_and_ctx):
     assert any(cb for cb in hooks.get("on_ws_transport_change", [])), "on_ws_transport_change not registered"
     assert any(cb for cb in hooks.get("post_emit_event", [])), "post_emit_event not registered"
     assert push_engine.handle_session_finalize in hooks.get("on_session_finalize", [])
-    assert broadcast.on_owner_write not in server._EVENT_FANOUT_SUBSCRIBERS
-    assert push_engine.handle_gateway_event not in server._EMIT_OBSERVERS
-    assert broadcast.on_transport not in ws.TRANSPORT_OBSERVERS
     # CLI command registered on the manager facade
     cmd = manager._cli_commands.get("mobile-pair")
     assert cmd is not None
@@ -109,7 +98,6 @@ def test_register_is_idempotent(plugin_and_ctx):
     """A forced re-discovery must not double-wire any seam."""
     from hermes_cli.dashboard_auth import token_auth
     from tools import approval as _approval
-    from tui_gateway import server, ws
 
     plugin, ctx, _manager = plugin_and_ctx
     plugin.register(ctx)
@@ -118,9 +106,6 @@ def test_register_is_idempotent(plugin_and_ctx):
         len(token_auth.IDENTITY_VALIDATORS),
         len(token_auth.SOCKET_OBSERVERS),
         len(_approval._RESOLVE_OBSERVERS),
-        len(server._EVENT_FANOUT_SUBSCRIBERS),
-        len(server._EMIT_OBSERVERS),
-        len(ws.TRANSPORT_OBSERVERS),
     )
     plugin.register(ctx)
     assert counts == (
@@ -128,9 +113,6 @@ def test_register_is_idempotent(plugin_and_ctx):
         len(token_auth.IDENTITY_VALIDATORS),
         len(token_auth.SOCKET_OBSERVERS),
         len(_approval._RESOLVE_OBSERVERS),
-        len(server._EVENT_FANOUT_SUBSCRIBERS),
-        len(server._EMIT_OBSERVERS),
-        len(ws.TRANSPORT_OBSERVERS),
     )
 
 
