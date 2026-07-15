@@ -55,6 +55,9 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
 
     let id: UUID
     let role: ChatRole
+    /// Stable durable-outbox identity for optimistic user echoes. Nil for
+    /// server-seeded/legacy rows.
+    let clientMessageID: String?
     // (deterministic-id factory defined in the extension below)
     /// Ordered assistant-turn parts — the SOLE content source of truth. This
     /// ordering IS visual order (desktop §4a). Empty for a freshly-created
@@ -83,6 +86,7 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
     init(
         id: UUID = UUID(),
         role: ChatRole,
+        clientMessageID: String? = nil,
         parts: [ChatMessagePart] = [],
         text: String = "",
         thinking: String = "",
@@ -96,6 +100,7 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
     ) {
         self.id = id
         self.role = role
+        self.clientMessageID = clientMessageID
         self.isStreaming = isStreaming
         self.reasoningElapsed = reasoningElapsed
         self.timestamp = timestamp

@@ -206,6 +206,8 @@ actor WorkRepository {
     /// timestamp ties so two processes always choose the same candidate.
     func claimNextJob(
         scope: WorkScope? = nil,
+        activeStoredSessionID: String? = nil,
+        enforceSessionAffinity: Bool = false,
         owner: String,
         now: Date,
         leaseDuration: TimeInterval
@@ -220,6 +222,15 @@ actor WorkRepository {
         if let scope {
             scopeSQL = " AND server_id = ? AND profile_id = ?"
             arguments += [scope.serverID, scope.profileID]
+        }
+        var affinitySQL = ""
+        if enforceSessionAffinity {
+            if let activeStoredSessionID {
+                affinitySQL = " AND (COALESCE(destination_session_id, stored_session_id) IS NULL OR COALESCE(destination_session_id, stored_session_id) = ?)"
+                arguments += [activeStoredSessionID]
+            } else {
+                affinitySQL = " AND COALESCE(destination_session_id, stored_session_id) IS NULL"
+            }
         }
 
         return try database.write { db in
@@ -240,6 +251,7 @@ actor WorkRepository {
                           AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
                           AND (expires_at IS NULL OR expires_at > ?)
                           \(scopeSQL)
+                          \(affinitySQL)
                         ORDER BY created_at ASC, job_id ASC
                         LIMIT 1
                     )
@@ -339,6 +351,192 @@ actor WorkRepository {
             return try Self.deleteUnreferencedAssetRows(db)
         }
         removeAssetFiles(paths)
+        await publishObservation()
+    }
+
+    /// Editing and reordering are intentionally restricted to work that no
+    /// processor has claimed. Once a lease exists, immutable payload semantics
+    /// (and the server receipt fingerprint) must win over queue UI affordances.
+    @discardableResult
+    func updateQueuedPrompt(id: String, text: String, now: Date = Date()) async throws -> WorkJob {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw WorkRepositoryError.jobNotFound }
+        let result = try await database.write { db -> WorkJob in
+            guard var job = try WorkJob.fetchOne(db, key: id) else {
+                throw WorkRepositoryError.jobNotFound
+            }
+            guard job.kind == .prompt, job.state == .queued, job.leaseOwner == nil else {
+                throw WorkRepositoryError.invalidTransition(from: job.state, to: job.state)
+            }
+            job.text = trimmed
+            job.payloadHash = Self.payloadHash(
+                kind: job.kind,
+                intentKind: job.intentKind,
+                text: trimmed,
+                sourceURL: job.sourceURL,
+                comment: job.comment,
+                storedSessionID: job.storedSessionID,
+                assetHashes: try Self.assetHashes(db, jobID: job.jobID)
+            )
+            job.updatedAt = now.timeIntervalSince1970
+            try job.update(db)
+            return job
+        }
+        await publishObservation()
+        return result
+    }
+
+    func reorderQueuedPrompts(ids: [String], now: Date = Date()) async throws {
+        guard !ids.isEmpty else { return }
+        try await database.write { db in
+            let jobs = try WorkJob.filter(ids.contains(Column("job_id"))).fetchAll(db)
+            guard jobs.count == ids.count,
+                  jobs.allSatisfy({ $0.kind == .prompt && $0.state == .queued && $0.leaseOwner == nil }) else {
+                throw WorkRepositoryError.leaseLost
+            }
+            let floor = jobs.map(\.createdAt).min() ?? now.timeIntervalSince1970
+            for (index, id) in ids.enumerated() {
+                try db.execute(
+                    sql: "UPDATE work_jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                    arguments: [floor + Double(index) * 0.000_001, now.timeIntervalSince1970, id]
+                )
+            }
+        }
+        await publishObservation()
+    }
+
+    func restampQueuedPrompts(from oldID: String, to newID: String, now: Date = Date()) async throws {
+        guard oldID != newID else { return }
+        try await database.write { db in
+            let jobs = try WorkJob.fetchAll(
+                db,
+                sql: """
+                SELECT * FROM work_jobs
+                WHERE kind = ? AND state = ? AND lease_owner IS NULL AND stored_session_id = ?
+                """,
+                arguments: [WorkJobKind.prompt.rawValue, WorkJobState.queued.rawValue, oldID]
+            )
+            for var job in jobs {
+                job.storedSessionID = newID
+                job.payloadHash = Self.payloadHash(
+                    kind: job.kind,
+                    intentKind: job.intentKind,
+                    text: job.text,
+                    sourceURL: job.sourceURL,
+                    comment: job.comment,
+                    storedSessionID: newID,
+                    assetHashes: try Self.assetHashes(db, jobID: job.jobID)
+                )
+                job.updatedAt = now.timeIntervalSince1970
+                try job.update(db)
+            }
+        }
+        await publishObservation()
+    }
+
+    @discardableResult
+    func retryFailedJob(id: String, now: Date = Date()) async throws -> WorkJob {
+        let result = try await database.write { db -> WorkJob in
+            guard var job = try WorkJob.fetchOne(db, key: id) else {
+                throw WorkRepositoryError.jobNotFound
+            }
+            guard job.state == .failed else {
+                throw WorkRepositoryError.invalidTransition(from: job.state, to: .queued)
+            }
+            job.state = .queued
+            job.nextAttemptAt = nil
+            job.lastErrorCode = nil
+            job.lastErrorMessage = nil
+            job.leaseOwner = nil
+            job.leaseExpiresAt = nil
+            job.updatedAt = now.timeIntervalSince1970
+            try job.update(db)
+            return job
+        }
+        await publishObservation()
+        return result
+    }
+
+    func cancelJob(id: String, now: Date = Date()) async throws {
+        try await database.write { db in
+            guard var job = try WorkJob.fetchOne(db, key: id) else { return }
+            guard !job.state.isTerminal else { return }
+            job.state = .cancelled
+            job.leaseOwner = nil
+            job.leaseExpiresAt = nil
+            job.updatedAt = now.timeIntervalSince1970
+            try job.update(db)
+        }
+        await publishObservation()
+    }
+
+    func jobAssets(jobID: String) throws -> [WorkJobAssetSnapshot] {
+        try database.read { db in
+            let links = try WorkJobAsset
+                .filter(Column("job_id") == jobID)
+                .order(Column("ordinal"))
+                .fetchAll(db)
+            return try links.map { link in
+                guard let asset = try WorkAsset.fetchOne(db, key: link.assetID) else {
+                    throw WorkRepositoryError.assetNotFound
+                }
+                return WorkJobAssetSnapshot(link: link, asset: asset)
+            }
+        }
+    }
+
+    func updateJobAsset(
+        jobID: String,
+        ordinal: Int,
+        owner: String,
+        state: String,
+        transferID: String? = nil,
+        remotePath: String? = nil
+    ) async throws {
+        guard ["local", "transferring", "uploaded", "failed"].contains(state) else {
+            throw WorkRepositoryError.assetNotFound
+        }
+        try await database.write { db in
+            guard let job = try WorkJob.fetchOne(db, key: jobID), job.leaseOwner == owner else {
+                throw WorkRepositoryError.leaseLost
+            }
+            guard var link = try WorkJobAsset
+                .filter(Column("job_id") == jobID)
+                .filter(Column("ordinal") == ordinal)
+                .fetchOne(db) else { throw WorkRepositoryError.assetNotFound }
+            link.state = state
+            if let transferID { link.transferID = transferID }
+            if let remotePath { link.remotePath = remotePath }
+            try link.update(db)
+        }
+        await publishObservation()
+    }
+
+    /// Records a non-accepted server disposition/transport outcome without
+    /// deleting the job. Releasing the lease makes a later explicit wake safe;
+    /// the stable client id remains untouched.
+    func retainPendingJob(
+        id: String,
+        owner: String,
+        status: String,
+        message: String? = nil,
+        nextAttemptAt: Date? = nil,
+        now: Date = Date()
+    ) async throws {
+        let changed = try await database.write { db -> Int in
+            try db.execute(
+                sql: """
+                    UPDATE work_jobs
+                    SET last_error_code = ?, last_error_message = ?, next_attempt_at = ?,
+                        lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                    WHERE job_id = ? AND lease_owner = ?
+                    """,
+                arguments: [status, message, nextAttemptAt?.timeIntervalSince1970,
+                            now.timeIntervalSince1970, id, owner]
+            )
+            return db.changesCount
+        }
+        guard changed == 1 else { throw WorkRepositoryError.leaseLost }
         await publishObservation()
     }
 
@@ -585,15 +783,6 @@ actor WorkRepository {
     ) -> WorkJob {
         let jobID = input.jobID.uuidString.lowercased()
         let assetHashes = preparedAssets.map(\.record.sha256)
-        let payload = [
-            input.kind.rawValue,
-            input.intentKind?.rawValue ?? "",
-            input.text ?? "",
-            input.sourceURL ?? "",
-            input.comment ?? "",
-            input.storedSessionID ?? "",
-            assetHashes.joined(separator: ","),
-        ].map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
 
         return WorkJob(
             jobID: jobID,
@@ -608,7 +797,15 @@ actor WorkRepository {
             comment: input.comment,
             storedSessionID: input.storedSessionID,
             destinationSessionID: nil,
-            payloadHash: Self.sha256(Data(payload.utf8)),
+            payloadHash: Self.payloadHash(
+                kind: input.kind,
+                intentKind: input.intentKind,
+                text: input.text,
+                sourceURL: input.sourceURL,
+                comment: input.comment,
+                storedSessionID: input.storedSessionID,
+                assetHashes: assetHashes
+            ),
             attemptCount: 0,
             nextAttemptAt: nil,
             lastErrorCode: nil,
@@ -729,6 +926,30 @@ actor WorkRepository {
 
     private static func sha256(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func payloadHash(
+        kind: WorkJobKind,
+        intentKind: WorkIntentKind?,
+        text: String?,
+        sourceURL: String?,
+        comment: String?,
+        storedSessionID: String?,
+        assetHashes: [String]
+    ) -> String {
+        let payload = [kind.rawValue, intentKind?.rawValue ?? "", text ?? "",
+                       sourceURL ?? "", comment ?? "", storedSessionID ?? "",
+                       assetHashes.joined(separator: ",")]
+            .map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+        return sha256(Data(payload.utf8))
+    }
+
+    private static func assetHashes(_ db: Database, jobID: String) throws -> [String] {
+        try String.fetchAll(db, sql: """
+            SELECT work_assets.sha256 FROM work_assets
+            JOIN job_assets USING (asset_id)
+            WHERE job_assets.job_id = ? ORDER BY job_assets.ordinal
+            """, arguments: [jobID])
     }
 
     private static func protectAndExcludeFromBackup(_ url: URL) throws {

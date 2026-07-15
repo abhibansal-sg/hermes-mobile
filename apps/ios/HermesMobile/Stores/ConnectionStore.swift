@@ -2257,8 +2257,12 @@ final class ConnectionStore {
             // with a live runtime session, or the queue would burn through with
             // a "No active session" error (see QueueStore drain notes).
             if sessionStore.activeRuntimeId != nil {
+<<<<<<< HEAD
                 await queueStore?.drain(chat: chatStore)
                 guard isActiveGeneration(generation) else { return false }
+=======
+                queueStore?.wake()
+>>>>>>> d93378383 (feat(ios): drive prompt sends from durable outbox (ABH-440))
             }
         }
         await sessionStore.refresh()

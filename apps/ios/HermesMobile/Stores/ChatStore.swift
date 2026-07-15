@@ -306,6 +306,7 @@ final class ChatStore {
     private var connection: ConnectionStore?
     private var sessions: SessionStore?
     private var attachments: AttachmentStore?
+    private weak var queueStore: QueueStore?
 
     /// The offline-first local cache (P1/P2 layer). Optional and defaulting to
     /// `nil` so every unit test that never injects one behaves EXACTLY as before:
@@ -320,6 +321,10 @@ final class ChatStore {
     /// `attach` signature — called by every store-graph test — is untouched.
     func attachCache(_ cache: CacheStore) {
         self.cacheStore = cache
+    }
+
+    func attachOutbox(_ queueStore: QueueStore) {
+        self.queueStore = queueStore
     }
 
     /// `id` of the assistant message currently being streamed into.
@@ -2252,6 +2257,32 @@ final class ChatStore {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasAttachments = includeAttachments && (attachments?.hasPending ?? false)
         guard !trimmed.isEmpty || hasAttachments else { return false }
+
+        // Production sends enter the protected repository before session
+        // creation, upload, local echo, or prompt.submit. Unit-store graphs that
+        // do not install an outbox retain the legacy direct path below.
+        if let queueStore {
+            let assetInputs = hasAttachments ? (attachments?.draftAssetInputs() ?? []) : []
+            guard let queued = await queueStore.enqueue(
+                trimmed,
+                storedSessionId: sessions?.activeStoredId,
+                assets: assetInputs,
+                newSession: sessions?.isDraft == true,
+                wake: false
+            ) else {
+                lastError = "Couldn’t save this prompt to the outbox."
+                return false
+            }
+            attachments?.removeAll()
+            presentOutboxEcho(
+                clientMessageID: queued.clientMessageID,
+                text: queued.text,
+                remotePaths: []
+            )
+            lastError = nil
+            queueStore.wake()
+            return true
+        }
         guard let connection, let client else {
             lastError = "No active session"
             return false
@@ -2266,7 +2297,7 @@ final class ChatStore {
         // itself — drain owns its own re-insert-on-failure semantics and must
         // reach the real RPC attempt.
         if connection.isInGrace, !hasAttachments, connection.queueStore?.isDraining != true {
-            _ = connection.queueStore?.enqueue(trimmed, storedSessionId: sessions?.activeStoredId)
+            _ = await connection.queueStore?.enqueue(trimmed, storedSessionId: sessions?.activeStoredId)
             return true
         }
 
@@ -2361,6 +2392,81 @@ final class ChatStore {
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             return false
         }
+    }
+
+    func prepareOutboxSubmission(job: WorkJob, remotePaths: [String]) {
+        presentOutboxEcho(
+            clientMessageID: job.clientMessageID,
+            text: job.text ?? "",
+            remotePaths: remotePaths
+        )
+    }
+
+    func submitOutboxPrompt(
+        job: WorkJob,
+        runtimeSessionID: String,
+        remotePaths: [String]
+    ) async throws -> OutboxSubmitResult {
+        guard let client else { throw GatewayError.notConnected }
+        prepareOutboxSubmission(job: job, remotePaths: remotePaths)
+        pendingReconnectReconcileID = nil
+        beginLocalTurn()
+        setStreaming(true, reason: "outbox.submit")
+        lastError = nil
+        lastSendReachedServer = true
+        do {
+            let result = try await client.requestRaw(
+                "prompt.submit",
+                params: .object([
+                    "session_id": .string(runtimeSessionID),
+                    "text": .string(job.text ?? ""),
+                    "client_message_id": .string(job.clientMessageID),
+                ])
+            )
+            let receipt = OutboxSubmitResult(json: result)
+            if !(receipt.accepted && OutboxProcessor.acceptedDispositions.contains(receipt.status)) {
+                endLocalTurn()
+                setStreaming(false, reason: "outbox.pendingReceipt")
+            }
+            return receipt
+        } catch {
+            endLocalTurn()
+            setStreaming(false, reason: "outbox.transportError")
+            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            throw error
+        }
+    }
+
+    private func presentOutboxEcho(
+        clientMessageID: String,
+        text: String,
+        remotePaths: [String]
+    ) {
+        let display = Self.localSentImageDisplayText(
+            outgoing: text,
+            uploadedImagePaths: remotePaths
+        )
+        if let index = messages.firstIndex(where: { $0.clientMessageID == clientMessageID }) {
+            let existing = messages[index]
+            guard existing.text != display else { return }
+            messages[index] = ChatMessage(
+                id: existing.id,
+                role: .user,
+                clientMessageID: clientMessageID,
+                text: display,
+                timestamp: existing.timestamp,
+                presentation: existing.presentation
+            )
+            return
+        }
+        sessions?.resetComposerHistoryBrowse(for: sessions?.activeComposerDraftKey)
+        let userMessage = ChatMessage(
+            role: .user,
+            clientMessageID: clientMessageID,
+            text: display
+        )
+        userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
+        messages.append(userMessage)
     }
 
     /// Build the local echo text for a just-sent user row after mobile has already

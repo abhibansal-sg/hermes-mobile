@@ -195,6 +195,11 @@ struct WorkJobAsset: Codable, FetchableRecord, PersistableRecord, Equatable, Sen
     }
 }
 
+struct WorkJobAssetSnapshot: Equatable, Sendable {
+    let link: WorkJobAsset
+    let asset: WorkAsset
+}
+
 struct WorkDraftAsset: Codable, FetchableRecord, PersistableRecord, Equatable, Sendable {
     static let databaseTableName = "draft_assets"
 
