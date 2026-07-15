@@ -151,7 +151,15 @@ def test_issue_device_token_missing_fields_returns_none(monkeypatch):
 
 @pytest.fixture
 def stub_env(monkeypatch):
-    monkeypatch.setattr(mobile_pair, "_detect_dashboard_url", lambda: "https://h.ts.net:9119")
+    monkeypatch.setattr(
+        mobile_pair,
+        "_detect_pair_address",
+        lambda: mobile_pair._PairAddress(
+            "https://h.ts.net:9119",
+            mobile_pair.STABILITY_STABLE,
+            "test",
+        ),
+    )
     monkeypatch.setattr(mobile_pair, "_read_dashboard_token", lambda: "SHARED")
     monkeypatch.setattr(mobile_pair, "_render_ansi_qr", lambda payload: None)
 
@@ -171,6 +179,86 @@ def test_command_default_mints_and_emits_v2(stub_env, monkeypatch, capsys):
     assert "token=SHARED" not in out
     assert "--tui" in out
     assert "HERMES_DASHBOARD_TUI=1" in out
+
+
+def test_command_mints_against_discovered_loopback_port(monkeypatch, capsys):
+    captured = {}
+    monkeypatch.setattr(
+        mobile_pair,
+        "_detect_pair_address",
+        lambda: mobile_pair._PairAddress(
+            "http://127.0.0.1:9145",
+            mobile_pair.STABILITY_EPHEMERAL,
+            "connection.json (local probe)",
+        ),
+    )
+    monkeypatch.setattr(mobile_pair, "_read_dashboard_token", lambda: "SHARED")
+    monkeypatch.setattr(mobile_pair, "_render_ansi_qr", lambda payload: None)
+
+    def _issue_device_token(url, token):
+        captured["url"] = url
+        captured["token"] = token
+        return {"token": "DEVTOK", "device_id": "dev_abc"}
+
+    monkeypatch.setattr(mobile_pair, "_issue_device_token", _issue_device_token)
+
+    rc = mobile_pair.mobile_pair_command(SimpleNamespace(url=None))
+
+    assert rc == 0
+    assert captured == {"url": "http://127.0.0.1:9145", "token": "SHARED"}
+    assert "Server: http://127.0.0.1:9145" in capsys.readouterr().out
+
+
+def test_command_mints_against_discovered_localhost_port(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        mobile_pair,
+        "_detect_pair_address",
+        lambda: mobile_pair._PairAddress(
+            "http://localhost:9145",
+            mobile_pair.STABILITY_EPHEMERAL,
+            "connection.json (local probe)",
+        ),
+    )
+    monkeypatch.setattr(mobile_pair, "_read_dashboard_token", lambda: "SHARED")
+    monkeypatch.setattr(mobile_pair, "_render_ansi_qr", lambda payload: None)
+    monkeypatch.setattr(
+        mobile_pair,
+        "_issue_device_token",
+        lambda url, token: captured.setdefault("url", url)
+        and {"token": "DEVTOK", "device_id": "dev_abc"},
+    )
+
+    rc = mobile_pair.mobile_pair_command(SimpleNamespace(url=None))
+
+    assert rc == 0
+    assert captured["url"] == "http://localhost:9145"
+
+
+def test_command_remote_no_override_mints_against_local_default(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        mobile_pair,
+        "_detect_pair_address",
+        lambda: mobile_pair._PairAddress(
+            "https://desktop.tailnet.ts.net:9443",
+            mobile_pair.STABILITY_STABLE,
+            "connection.json remote",
+        ),
+    )
+    monkeypatch.setattr(mobile_pair, "_read_dashboard_token", lambda: "SHARED")
+    monkeypatch.setattr(mobile_pair, "_render_ansi_qr", lambda payload: None)
+    monkeypatch.setattr(
+        mobile_pair,
+        "_issue_device_token",
+        lambda url, token: captured.setdefault("url", url)
+        and {"token": "DEVTOK", "device_id": "dev_abc"},
+    )
+
+    rc = mobile_pair.mobile_pair_command(SimpleNamespace(url=None))
+
+    assert rc == 0
+    assert captured["url"] == "http://127.0.0.1:9119"
 
 
 def test_command_shared_token_legacy_path_no_issue_call(stub_env, monkeypatch, capsys):
