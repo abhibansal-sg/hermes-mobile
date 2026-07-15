@@ -18,6 +18,9 @@ struct HermesMobileApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
+        // Recreate the fixed background session before SwiftUI starts bootstrap.
+        // iOS may deliver relaunch events immediately after this delegate is installed.
+        TransferManager.shared.initializeEarly()
         Self.installTransparentNavigationBarAppearance()
     }
 
@@ -405,6 +408,18 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             case .failed: completion.call(.failed)
             }
         }
+    }
+
+    func application(
+        _ application: UIApplication,
+        handleEventsForBackgroundURLSession identifier: String,
+        completionHandler: @escaping () -> Void
+    ) {
+        guard identifier == TransferManager.backgroundSessionIdentifier else {
+            completionHandler()
+            return
+        }
+        TransferManager.shared.setBackgroundCompletionHandler(completionHandler)
     }
 
     func application(

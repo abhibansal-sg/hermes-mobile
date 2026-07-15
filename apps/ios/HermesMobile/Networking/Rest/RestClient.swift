@@ -440,21 +440,19 @@ struct RestClient: Sendable {
 
     /// `POST /api/upload` — multipart upload of a single file under field `file`.
     func upload(data: Data, filename: String, mimeType: String) async throws -> UploadResult {
-        let boundary = "Boundary-\(UUID().uuidString)"
-        let body = multipartBody(
+        let request = makeRequest(path: "\(mobileAPIPrefix)/upload", method: "POST")
+        guard let url = request.url else { throw RestError.network("Invalid upload URL") }
+        let transfer = try await TransferManager.shared.uploadMultipart(
             data: data,
             filename: filename,
             mimeType: mimeType,
-            boundary: boundary
+            to: url,
+            headers: request.allHTTPHeaderFields ?? [:]
         )
-        var request = makeRequest(path: "\(mobileAPIPrefix)/upload", method: "POST")
-        request.setValue(
-            "multipart/form-data; boundary=\(boundary)",
-            forHTTPHeaderField: "Content-Type"
-        )
-        request.httpBody = body
-        let responseData = try await perform(request)
-        return try decode(UploadResult.self, from: responseData, context: "upload")
+        guard let status = transfer.httpStatus, (200...299).contains(status) else {
+            throw RestError.badStatus(transfer.httpStatus ?? 0, body: "Background upload failed")
+        }
+        return try decode(UploadResult.self, from: transfer.responseBody ?? Data(), context: "upload")
     }
 
     // MARK: - Request plumbing
