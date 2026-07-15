@@ -24,6 +24,24 @@ import WidgetKit
 /// - a usage fetch on foreground       → `tokensToday` / `costTodayUSD`
 @MainActor
 enum WidgetSnapshotWriter {
+    enum FieldPatch<Value> {
+        case retain
+        case set(Value)
+        case clear
+    }
+
+    struct Patch {
+        var serverScope: FieldPatch<String> = .retain
+        var serverRevision: FieldPatch<String> = .retain
+        var connectionState: FieldPatch<SharedStore.WidgetSnapshot.ConnectionState> = .retain
+        var openSessionCount: FieldPatch<Int> = .retain
+        var activeTurnCount: FieldPatch<Int> = .retain
+        var pendingAttentionCount: FieldPatch<Int> = .retain
+        var tokensToday: FieldPatch<Int> = .retain
+        var costToday: FieldPatch<Double> = .retain
+        var fetchedAt: FieldPatch<Date> = .retain
+        var isStale: FieldPatch<Bool> = .retain
+    }
 
     /// Last snapshot we wrote, used to skip no-op rewrites. Compared on the
     /// meaningful fields only (`updatedAt` always differs, so it's excluded).
@@ -41,30 +59,37 @@ enum WidgetSnapshotWriter {
     ///   - pendingApprovals: number of approval/clarify prompts awaiting the user.
     ///   - tokensToday: today's token total, if a usage fetch has resolved.
     ///   - costTodayUSD: today's estimated cost in USD, if available.
-    static func write(
-        connected: Bool,
-        activeSessions: Int,
-        pendingApprovals: Int,
-        tokensToday: Int? = nil,
-        costTodayUSD: Double? = nil
-    ) {
-        // Preserve previously-published usage when this caller didn't supply it
-        // (e.g. a connection-phase change shouldn't blank the token counts).
-        let resolvedTokens = tokensToday ?? lastWritten?.tokensToday
-        let resolvedCost = costTodayUSD ?? lastWritten?.costTodayUSD
-
-        let snapshot = SharedStore.WidgetSnapshot(
-            connected: connected,
-            activeSessions: max(0, activeSessions),
-            pendingApprovals: max(0, pendingApprovals),
-            tokensToday: resolvedTokens,
-            costTodayUSD: resolvedCost,
-            updatedAt: Date()
+    static func write(_ patch: Patch, now: Date = Date()) {
+        let disk = loadLatest(now: now)
+        var snapshot = disk ?? SharedStore.WidgetSnapshot(
+            serverScope: nil, serverRevision: nil, connectionState: .offline,
+            openSessionCount: nil, activeTurnCount: nil, pendingAttentionCount: nil,
+            tokensToday: nil, costToday: nil, fetchedAt: nil,
+            writtenAt: now, isStale: true
         )
+        apply(patch.serverScope, to: &snapshot.serverScope)
+        apply(patch.serverRevision, to: &snapshot.serverRevision)
+        apply(patch.connectionState, to: &snapshot.connectionState)
+        applyNonnegative(patch.openSessionCount, to: &snapshot.openSessionCount)
+        applyNonnegative(patch.activeTurnCount, to: &snapshot.activeTurnCount)
+        applyNonnegative(patch.pendingAttentionCount, to: &snapshot.pendingAttentionCount)
+        applyNonnegative(patch.tokensToday, to: &snapshot.tokensToday)
+        apply(patch.costToday, to: &snapshot.costToday)
+        apply(patch.fetchedAt, to: &snapshot.fetchedAt)
+        apply(patch.isStale, to: &snapshot.isStale)
+        if case .set(let proposed) = patch.serverRevision,
+           let current = disk?.serverRevision,
+           compareRevision(proposed, current) == .orderedAscending {
+            return
+        }
+        snapshot.schemaVersion = SharedStore.WidgetSnapshot.currentSchemaVersion
+        snapshot.writtenAt = now
 
-        guard hasMeaningfulChange(from: lastWritten, to: snapshot) else { return }
-        lastWritten = snapshot
-        SharedStore.writeSnapshot(snapshot)
+        var comparable = snapshot
+        comparable.writtenAt = disk?.writtenAt ?? now
+        guard disk != comparable else { lastWritten = disk; return }
+        guard persistAtomically(snapshot) else { return }
+        lastWritten = snapshot // no-op optimization only; never a merge source
         reloadWidgets()
     }
 
@@ -75,28 +100,80 @@ enum WidgetSnapshotWriter {
     /// If nothing has been written yet, seeds a disconnected baseline so the
     /// usage values aren't dropped on the floor.
     static func update(tokensToday: Int?, costTodayUSD: Double?) {
-        let base = lastWritten
-        write(
-            connected: base?.connected ?? false,
-            activeSessions: base?.activeSessions ?? 0,
-            pendingApprovals: base?.pendingApprovals ?? 0,
-            tokensToday: tokensToday,
-            costTodayUSD: costTodayUSD
-        )
+        var patch = Patch()
+        patch.tokensToday = tokensToday.map(FieldPatch.set) ?? .retain
+        patch.costToday = costTodayUSD.map(FieldPatch.set) ?? .retain
+        write(patch)
     }
 
     /// True when any user-visible field differs (ignoring `updatedAt`), so we
     /// only touch WidgetKit when the widgets would actually render differently.
-    private static func hasMeaningfulChange(
-        from old: SharedStore.WidgetSnapshot?,
-        to new: SharedStore.WidgetSnapshot
-    ) -> Bool {
-        guard let old else { return true }
-        return old.connected != new.connected
-            || old.activeSessions != new.activeSessions
-            || old.pendingApprovals != new.pendingApprovals
-            || old.tokensToday != new.tokensToday
-            || old.costTodayUSD != new.costTodayUSD
+    private static func loadLatest(now: Date) -> SharedStore.WidgetSnapshot? {
+        if let current = SharedStore.readSnapshot() { return current }
+        guard let data = SharedStore.defaults?.data(forKey: SharedStore.snapshotKey),
+              let legacy = try? JSONDecoder().decode(LegacySnapshot.self, from: data) else { return nil }
+        let migrated = SharedStore.WidgetSnapshot(
+            serverScope: nil, serverRevision: nil,
+            connectionState: legacy.connected ? .connected : .offline,
+            openSessionCount: legacy.activeSessions,
+            activeTurnCount: nil, pendingAttentionCount: legacy.pendingApprovals,
+            tokensToday: legacy.tokensToday, costToday: legacy.costTodayUSD,
+            fetchedAt: legacy.updatedAt, writtenAt: now, isStale: true
+        )
+        if persistAtomically(migrated) {
+            SharedStore.defaults?.removeObject(forKey: SharedStore.snapshotKey)
+        }
+        return migrated
+    }
+
+    private struct LegacySnapshot: Codable {
+        var connected: Bool
+        var activeSessions: Int
+        var pendingApprovals: Int
+        var tokensToday: Int?
+        var costTodayUSD: Double?
+        var updatedAt: Date
+    }
+
+    private static func apply<T>(_ patch: FieldPatch<T>, to value: inout T?) {
+        switch patch { case .retain: break; case .set(let new): value = new; case .clear: value = nil }
+    }
+
+    private static func apply<T>(_ patch: FieldPatch<T>, to value: inout T) {
+        if case .set(let new) = patch { value = new }
+    }
+
+    private static func applyNonnegative(_ patch: FieldPatch<Int>, to value: inout Int?) {
+        switch patch { case .retain: break; case .set(let new): value = max(0, new); case .clear: value = nil }
+    }
+
+    private static func compareRevision(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        if let left = Int64(lhs), let right = Int64(rhs) {
+            if left < right { return .orderedAscending }
+            if left > right { return .orderedDescending }
+            return .orderedSame
+        }
+        return lhs.compare(rhs, options: .numeric)
+    }
+
+    private static func persistAtomically(_ snapshot: SharedStore.WidgetSnapshot) -> Bool {
+        guard let destination = SharedStore.snapshotURL,
+              let data = try? JSONEncoder().encode(snapshot) else { return false }
+        let fm = FileManager.default
+        let temporary = destination.deletingLastPathComponent()
+            .appendingPathComponent(".\(UUID().uuidString).tmp")
+        do {
+            try data.write(to: temporary, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            if fm.fileExists(atPath: destination.path) {
+                _ = try fm.replaceItemAt(destination, withItemAt: temporary)
+            } else {
+                try fm.moveItem(at: temporary, to: destination)
+            }
+            return true
+        } catch {
+            try? fm.removeItem(at: temporary)
+            return false
+        }
     }
 
     private static func reloadWidgets() {
