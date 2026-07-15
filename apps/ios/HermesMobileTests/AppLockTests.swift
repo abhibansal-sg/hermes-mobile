@@ -1,4 +1,5 @@
 import LocalAuthentication
+import SwiftUI
 import XCTest
 @testable import HermesMobile
 
@@ -108,4 +109,90 @@ private actor SequencedAuthenticator: BiometricAuthenticating {
     func evaluate(reason: String) async -> BiometricResult {
         results.isEmpty ? .failure("Unexpected evaluation.") : results.removeFirst()
     }
+}
+
+@MainActor
+final class PrivacyShieldAppLockTests: XCTestCase {
+    private let defaultsKey = DefaultsKeys.appLockEnabled
+
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: defaultsKey)
+        super.tearDown()
+    }
+
+    func testBriefInactiveVisitPreservesAuthenticationGracePeriod() async {
+        UserDefaults.standard.set(true, forKey: defaultsKey)
+        var instant = Date(timeIntervalSince1970: 1_000)
+        let authenticator = AuthenticationSpy()
+        let lock = AppLock(authenticator: authenticator, now: { instant })
+
+        lock.authenticateAtLaunch()
+        await waitUntil { !lock.isLocked }
+        let launchCalls = await authenticator.callCount
+
+        lock.handleScenePhase(.inactive)
+        instant.addTimeInterval(2)
+        lock.handleScenePhase(.active)
+
+        XCTAssertFalse(lock.isLocked)
+        XCTAssertFalse(lock.isPrivacyShieldVisible)
+        let callsAfterReturn = await authenticator.callCount
+        XCTAssertEqual(callsAfterReturn, launchCalls)
+    }
+
+    func testReturnAfterGracePeriodKeepsCoverUntilAuthenticationSucceeds() async {
+        UserDefaults.standard.set(true, forKey: defaultsKey)
+        var instant = Date(timeIntervalSince1970: 2_000)
+        let authenticator = AuthenticationSpy()
+        let lock = AppLock(authenticator: authenticator, now: { instant })
+
+        lock.authenticateAtLaunch()
+        await waitUntil { !lock.isLocked }
+        await authenticator.suspendNextEvaluation()
+
+        lock.handleScenePhase(.background)
+        instant.addTimeInterval(AppLock.foregroundGracePeriod)
+        lock.handleScenePhase(.active)
+
+        XCTAssertTrue(lock.isLocked, "the opaque lock cover must replace the snapshot shield")
+        XCTAssertFalse(lock.isPrivacyShieldVisible)
+        await authenticator.resolveSuspendedEvaluation()
+        await waitUntil { !lock.isLocked }
+        XCTAssertFalse(lock.isLocked)
+    }
+
+    private func waitUntil(
+        _ predicate: @escaping @MainActor () -> Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        for _ in 0..<100 where !predicate() {
+            await Task.yield()
+        }
+        XCTAssertTrue(predicate(), file: file, line: line)
+    }
+}
+
+private actor AuthenticationSpy: BiometricAuthenticating {
+    private(set) var callCount = 0
+    private var shouldSuspend = false
+    private var continuation: CheckedContinuation<BiometricResult, Never>?
+
+    func suspendNextEvaluation() {
+        shouldSuspend = true
+    }
+
+    func resolveSuspendedEvaluation() {
+        continuation?.resume(returning: .success)
+        continuation = nil
+    }
+
+    func evaluate(reason: String) async -> BiometricResult {
+        callCount += 1
+        guard shouldSuspend else { return .success }
+        shouldSuspend = false
+        return await withCheckedContinuation { continuation = $0 }
+    }
+
+    func capability() async -> DeviceOwnerAuthenticationCapability { .biometrics }
 }

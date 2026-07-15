@@ -28,6 +28,12 @@ final class AppLock {
     /// disabled entirely).
     private(set) var isLocked: Bool
 
+    /// Process-local snapshot privacy boundary. Unlike ``isLocked``, this is
+    /// independent of the App Lock preference and never controls authentication.
+    /// It is raised synchronously as the scene resigns active so iOS captures an
+    /// opaque surface rather than the app's current content.
+    private(set) var isPrivacyShieldVisible: Bool = false
+
     /// True while a biometric prompt is actually on screen. Used by the overlay
     /// to avoid stacking a second prompt (e.g. a rapid scene-phase bounce) and to
     /// gate its manual "Unlock" button.
@@ -57,6 +63,9 @@ final class AppLock {
     private let authenticator: BiometricAuthenticating
     private let defaults: UserDefaults
 
+    /// Injectable wall clock for deterministic grace-period tests.
+    private let now: () -> Date
+
     /// A short reason string shown in the system biometric sheet.
     private static let reason = "Unlock Hermes"
 
@@ -64,10 +73,12 @@ final class AppLock {
     ///   `LAContext` implementation. Tests inject a stub.
     init(
         authenticator: BiometricAuthenticating = LAContextAuthenticator(),
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = .standard,
+        now: @escaping () -> Date = Date.init
     ) {
         self.authenticator = authenticator
         self.defaults = defaults
+        self.now = now
         self.isEnabled = defaults.bool(forKey: DefaultsKeys.appLockEnabled)
         // Start locked iff the feature is on, so launch shows the overlay before
         // `authenticateAtLaunch()` has a chance to run.
@@ -140,16 +151,22 @@ final class AppLock {
     /// `.active` re-locks (and prompts) only when more than
     /// ``foregroundGracePeriod`` has elapsed since then.
     func handleScenePhase(_ scenePhase: ScenePhase) {
-        guard isEnabled else { return }
-
         switch scenePhase {
         case .background, .inactive:
+            // This assignment deliberately precedes the App Lock preference
+            // check. Snapshot privacy applies even when authentication is off.
+            isPrivacyShieldVisible = true
+            guard isEnabled else { return }
             // Record only the first transition out of active; a later `.inactive`
             // while already backgrounded must not reset the clock.
             if backgroundedAt == nil {
-                backgroundedAt = Date()
+                backgroundedAt = now()
             }
         case .active:
+            // The lock cover (when needed) remains opaque after this independent
+            // snapshot shield is removed.
+            isPrivacyShieldVisible = false
+            guard isEnabled else { return }
             defer { backgroundedAt = nil }
             // Already locked (cold launch, or a prior failed prompt) → just make
             // sure a prompt is in flight.
@@ -158,7 +175,7 @@ final class AppLock {
                 return
             }
             if let leftAt = backgroundedAt,
-               Date().timeIntervalSince(leftAt) >= Self.foregroundGracePeriod {
+               now().timeIntervalSince(leftAt) >= Self.foregroundGracePeriod {
                 isLocked = true
                 authenticate()
             }
@@ -195,6 +212,18 @@ final class AppLock {
                 self.lastError = result.message
             }
         }
+    }
+}
+
+/// Deliberately content-free, fully opaque app-switcher snapshot cover.
+///
+/// This view must not gain branding, connection details, session metadata, or
+/// other dynamic text: it is a privacy boundary, not a lock-screen redesign.
+struct PrivacyShieldCover: View {
+    var body: some View {
+        Color.black
+            .ignoresSafeArea()
+            .accessibilityHidden(true)
     }
 }
 
