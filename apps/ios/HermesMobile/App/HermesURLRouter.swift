@@ -464,6 +464,7 @@ enum HermesURLRouter {
         inbox: InboxStore,
         connection: ConnectionStore? = nil
     ) {
+        Task { await inbox.refresh() }
         switch tap {
         case .attention(let sessionId):
             openForPush(

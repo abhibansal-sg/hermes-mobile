@@ -55,6 +55,7 @@ struct InboxView: View {
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
                 .background(theme.bg)
+                .refreshable { await inbox.refresh() }
             }
         }
         .navigationTitle("Inbox")
@@ -70,6 +71,13 @@ struct InboxView: View {
                     .font(.headline.weight(.semibold))
                     .foregroundStyle(theme.fg)
                     .lineLimit(1)
+            }
+            ToolbarItem(placement: .secondaryAction) {
+                Button {
+                    Task { await inbox.refresh() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
             }
             // R1 #94: `.expired` items accumulate in the store forever with no
             // tidy-up affordance — wire the previously-dead `clearExpired()`.
@@ -152,6 +160,15 @@ private struct InboxItemRow: View {
                     .foregroundStyle(theme.mutedFg)
                     .accessibilityIdentifier("inboxAuthorityGate")
             }
+            if item.state == .failedRetryable {
+                Label("Response failed — tap an action to retry", systemImage: "arrow.clockwise.circle")
+                    .font(.caption2)
+                    .foregroundStyle(theme.statusWarn)
+            } else if item.state == .responding {
+                Label("Waiting for server confirmation…", systemImage: "clock")
+                    .font(.caption2)
+                    .foregroundStyle(theme.mutedFg)
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -221,7 +238,7 @@ private struct InboxItemRow: View {
             .tint(theme.midground)
             .accessibilityHint("Approves this request for the agent")
         }
-        .disabled(isResponding || !authority.allowsRemoteMutations)
+        .disabled(isResponding || item.state == .responding || !authority.allowsRemoteMutations)
 
         Button {
             respondApproval(approve: true, all: true)
@@ -230,7 +247,7 @@ private struct InboxItemRow: View {
                 .font(.caption)
         }
         .buttonStyle(.plain)
-        .disabled(isResponding || !authority.allowsRemoteMutations)
+        .disabled(isResponding || item.state == .responding || !authority.allowsRemoteMutations)
         .foregroundStyle(theme.mutedFg)
         .frame(maxWidth: .infinity, alignment: .center)
         .accessibilityHint("Approves all pending requests for this turn")
@@ -253,7 +270,7 @@ private struct InboxItemRow: View {
                     }
                     .buttonStyle(.bordered)
                     .tint(theme.midground)
-                    .disabled(isResponding || !authority.allowsRemoteMutations)
+                    .disabled(isResponding || item.state == .responding || !authority.allowsRemoteMutations)
                 }
             }
         }
@@ -278,7 +295,8 @@ private struct InboxItemRow: View {
     }
 
     private var canSubmitFreeText: Bool {
-        authority.allowsRemoteMutations && !freeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        authority.allowsRemoteMutations && item.state != .responding
+            && !freeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func submitFreeText() {

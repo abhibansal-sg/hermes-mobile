@@ -137,6 +137,9 @@ struct HermesMobileApp: App {
                             connection: environment.connectionStore
                         )
                     }
+                    appDelegate.notificationCoordinator.attachActionCompletionHandler {
+                        Task { await environment.inboxStore.refresh() }
+                    }
                     // The notification-action backend is already installed by
                     // AppDelegate from persisted URL/Keychain state. Do not move
                     // it back here: this task can run after a killed-launch action.
@@ -151,7 +154,9 @@ struct HermesMobileApp: App {
                             pushIsAuthoritative: PushRegistrar.shared.isAlertAuthorityRegistered
                         )
                     }
+                    await environment.inboxStore.hydrateCachedGateway()
                     await environment.connectionStore.bootstrap()
+                    await environment.inboxStore.refresh()
                     #if DEBUG
                     // Inc-3b UITest seam: HERMES_UITEST_DEEPLINK fires a deep link
                     // immediately after bootstrap, exactly as if onOpenURL had been
@@ -205,6 +210,7 @@ struct HermesMobileApp: App {
                         attemptSharedInboxDrain()
                         PushRegistrar.shared.ensureRegisteredForPairedGateway()
                         environment.refreshUsageSnapshot()
+                        Task { await environment.inboxStore.refresh() }
                     }
                 }
                 .onChange(of: environment.connectionStore.phase) { _, newPhase in
@@ -216,6 +222,9 @@ struct HermesMobileApp: App {
                         notifyInboxDidChange: { SharedStore.notifyInboxDidChange() },
                         drain: { attemptSharedInboxDrain() }
                     )
+                    if case .connected = newPhase {
+                        Task { await environment.inboxStore.refresh() }
+                    }
                 }
                 .onOpenURL { url in
                     HermesURLRouter.route(

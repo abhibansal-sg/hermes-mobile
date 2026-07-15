@@ -139,6 +139,219 @@ actor CacheStore {
         }
     }
 
+    // MARK: - Pending attention
+
+    /// Load the Inbox and its cursor from one SQLite read snapshot. Callers use
+    /// this before networking on launch, so a killed app paints the exact last
+    /// committed pending count and rows.
+    func loadAttentionSnapshot(scope: CacheScope) throws -> AttentionSnapshot {
+        try db.read { db in try Self.attentionSnapshot(scope: scope, db: db) }
+    }
+
+    /// Persist a provisional WebSocket prompt. A server-revisioned, responding,
+    /// failed, or terminal row always wins over an unrevisioned replay.
+    func upsertLiveAttention(_ item: PersistedAttentionItem, scope: CacheScope) throws -> AttentionSnapshot {
+        try db.write { db in
+            let existing = try Self.attentionItem(id: item.id, scope: scope, db: db)
+            if existing == nil || (existing?.revision == 0 && existing?.state == .pending) {
+                try Self.saveAttentionItem(item, scope: scope, db: db)
+            }
+            return try Self.attentionSnapshot(scope: scope, db: db)
+        }
+    }
+
+    /// Commit a local response overlay before/after the RPC. The row stays in
+    /// the database until a later tombstone or reset snapshot confirms server
+    /// resolution.
+    func markAttentionState(id: String, state: AttentionLifecycle, scope: CacheScope) throws -> AttentionSnapshot {
+        try db.write { db in
+            if var item = try Self.attentionItem(id: id, scope: scope, db: db),
+               !item.state.isTerminal {
+                item.state = state
+                item.updatedAt = Date().timeIntervalSince1970
+                try Self.saveAttentionItem(item, scope: scope, db: db)
+            }
+            return try Self.attentionSnapshot(scope: scope, db: db)
+        }
+    }
+
+    /// `message.complete` is authoritative live server truth that the prompt
+    /// window closed. Expire every still-visible item for that runtime in the
+    /// same transaction as the count change.
+    func expireAttention(sessionId: String, scope: CacheScope) throws -> AttentionSnapshot {
+        try db.write { db in
+            let items = try Self.attentionItems(scope: scope, db: db)
+            for var item in items where item.sessionId == sessionId && item.state.contributesToPendingCount {
+                item.state = .expired
+                item.updatedAt = Date().timeIntervalSince1970
+                try Self.saveAttentionItem(item, scope: scope, db: db)
+            }
+            return try Self.attentionSnapshot(scope: scope, db: db)
+        }
+    }
+
+    /// Apply one server snapshot/delta and its opaque cursor indivisibly.
+    /// Repeated/older revisions are idempotent; equal-revision server upserts do
+    /// not overwrite a responding/failed overlay.
+    func applyPendingAttention(_ envelope: PendingAttentionEnvelope, scope: CacheScope) throws -> AttentionSnapshot {
+        try db.write { db in
+            let priorMeta = try Self.attentionMetadata(scope: scope, db: db)
+            let protected: [String: PersistedAttentionItem] = (envelope.reset
+                && (priorMeta == nil || priorMeta?.serverInstanceId == envelope.serverInstanceId))
+                ? Dictionary(uniqueKeysWithValues: try Self.attentionItems(scope: scope, db: db)
+                    .filter { $0.state == .responding || $0.state == .failedRetryable || $0.state.isTerminal }
+                    .map { ($0.id, $0) })
+                : [:]
+            if envelope.reset || priorMeta?.serverInstanceId != envelope.serverInstanceId {
+                try db.execute(
+                    sql: "DELETE FROM pending_attention_cache WHERE serverId=? AND profileId=?",
+                    arguments: [scope.serverId, scope.profileId]
+                )
+            }
+
+            var highWater = (priorMeta?.serverInstanceId == envelope.serverInstanceId)
+                ? (priorMeta?.revision ?? 0) : 0
+            for record in envelope.upserts {
+                highWater = max(highWater, record.revision)
+                if let local = protected[record.id], local.revision == 0 || local.revision >= record.revision {
+                    try Self.saveAttentionItem(local, scope: scope, db: db)
+                    continue
+                }
+                let incoming = PersistedAttentionItem(server: record)
+                if let existing = try Self.attentionItem(id: record.id, scope: scope, db: db) {
+                    guard record.revision >= existing.revision else { continue }
+                    if record.revision == existing.revision,
+                       existing.state == .responding || existing.state == .failedRetryable || existing.state.isTerminal {
+                        continue
+                    }
+                }
+                try Self.saveAttentionItem(incoming, scope: scope, db: db)
+            }
+
+            for tombstone in envelope.tombstones {
+                highWater = max(highWater, tombstone.revision)
+                guard var existing = try Self.attentionItem(id: tombstone.id, scope: scope, db: db),
+                      tombstone.revision >= existing.revision else { continue }
+                existing.revision = tombstone.revision
+                existing.state = tombstone.status == "expired" ? .expired : .resolvedElsewhere
+                existing.updatedAt = tombstone.deletedAt
+                try Self.saveAttentionItem(existing, scope: scope, db: db)
+            }
+
+            try db.execute(
+                sql: """
+                    INSERT INTO attention_reconciliation_meta
+                    (serverId,profileId,serverInstanceId,cursor,revision,updatedAt)
+                    VALUES (?,?,?,?,?,?)
+                    ON CONFLICT(serverId,profileId) DO UPDATE SET
+                      serverInstanceId=excluded.serverInstanceId,
+                      cursor=excluded.cursor,
+                      revision=excluded.revision,
+                      updatedAt=excluded.updatedAt
+                    """,
+                arguments: [scope.serverId, scope.profileId, envelope.serverInstanceId,
+                            envelope.cursor, highWater, Date().timeIntervalSince1970]
+            )
+            return try Self.attentionSnapshot(scope: scope, db: db)
+        }
+    }
+
+    func removeTerminalAttention(scope: CacheScope, id: String? = nil) throws -> AttentionSnapshot {
+        try db.write { db in
+            var sql = "DELETE FROM pending_attention_cache WHERE serverId=? AND profileId=? AND state IN (?,?)"
+            var arguments: StatementArguments = [scope.serverId, scope.profileId,
+                                                   AttentionLifecycle.resolvedElsewhere.rawValue,
+                                                   AttentionLifecycle.expired.rawValue]
+            if let id {
+                sql += " AND id=?"
+                arguments += [id]
+            }
+            try db.execute(sql: sql, arguments: arguments)
+            return try Self.attentionSnapshot(scope: scope, db: db)
+        }
+    }
+
+    func removeAttention(scope: CacheScope, id: String) throws -> AttentionSnapshot {
+        try db.write { db in
+            try db.execute(
+                sql: "DELETE FROM pending_attention_cache WHERE serverId=? AND profileId=? AND id=?",
+                arguments: [scope.serverId, scope.profileId, id]
+            )
+            return try Self.attentionSnapshot(scope: scope, db: db)
+        }
+    }
+
+    /// Optional privacy cleanup on a verified gateway switch. Scope-filtered
+    /// reads already prevent bleed; this also removes abandoned partitions.
+    func clearAttentionForOtherGateways(keepingServerId: String) throws {
+        try db.write { db in
+            try db.execute(sql: "DELETE FROM pending_attention_cache WHERE serverId != ?", arguments: [keepingServerId])
+            try db.execute(sql: "DELETE FROM attention_reconciliation_meta WHERE serverId != ?", arguments: [keepingServerId])
+        }
+    }
+
+    private static func attentionItems(scope: CacheScope, db: Database) throws -> [PersistedAttentionItem] {
+        let rows = try Row.fetchAll(
+            db,
+            sql: "SELECT payloadJSON FROM pending_attention_cache WHERE serverId=? AND profileId=? ORDER BY createdAt DESC, id ASC",
+            arguments: [scope.serverId, scope.profileId]
+        )
+        return try rows.map { row in
+            let data: Data = row["payloadJSON"]
+            return try JSONDecoder().decode(PersistedAttentionItem.self, from: data)
+        }
+    }
+
+    private static func attentionItem(id: String, scope: CacheScope, db: Database) throws -> PersistedAttentionItem? {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: "SELECT payloadJSON FROM pending_attention_cache WHERE serverId=? AND profileId=? AND id=?",
+            arguments: [scope.serverId, scope.profileId, id]
+        ) else { return nil }
+        let data: Data = row["payloadJSON"]
+        return try JSONDecoder().decode(PersistedAttentionItem.self, from: data)
+    }
+
+    private static func saveAttentionItem(_ item: PersistedAttentionItem, scope: CacheScope, db: Database) throws {
+        let payload = try JSONEncoder().encode(item)
+        try db.execute(
+            sql: """
+                INSERT INTO pending_attention_cache
+                (serverId,profileId,id,requestId,sessionId,storedSessionId,kind,payloadJSON,createdAt,expiresAt,state,revision,updatedAt)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(serverId,profileId,id) DO UPDATE SET
+                  requestId=excluded.requestId, sessionId=excluded.sessionId,
+                  storedSessionId=excluded.storedSessionId, kind=excluded.kind,
+                  payloadJSON=excluded.payloadJSON, createdAt=excluded.createdAt,
+                  expiresAt=excluded.expiresAt, state=excluded.state,
+                  revision=excluded.revision, updatedAt=excluded.updatedAt
+                """,
+            arguments: [scope.serverId, scope.profileId, item.id, item.requestId,
+                        item.sessionId, item.storedSessionId, item.kind, payload,
+                        item.createdAt, item.expiresAt, item.state.rawValue,
+                        item.revision, item.updatedAt]
+        )
+    }
+
+    private static func attentionMetadata(scope: CacheScope, db: Database) throws -> AttentionReconciliationMetadata? {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: "SELECT serverInstanceId,cursor,revision,updatedAt FROM attention_reconciliation_meta WHERE serverId=? AND profileId=?",
+            arguments: [scope.serverId, scope.profileId]
+        ) else { return nil }
+        return AttentionReconciliationMetadata(
+            serverInstanceId: row["serverInstanceId"], cursor: row["cursor"],
+            revision: row["revision"], updatedAt: row["updatedAt"]
+        )
+    }
+
+    private static func attentionSnapshot(scope: CacheScope, db: Database) throws -> AttentionSnapshot {
+        AttentionSnapshot(
+            items: try attentionItems(scope: scope, db: db),
+            metadata: try attentionMetadata(scope: scope, db: db)
+        )
+    }
+
     func saveLastOpenedSession(_ identity: CacheIdentity, manifestScope: CacheScope) throws {
         try db.write { db in
             try db.execute(
@@ -548,7 +761,7 @@ actor CacheStore {
             }
             // Optional foundation tables are purged when present; this keeps the
             // primitive forward-compatible without creating speculative schema.
-            for table in ["attention_cache", "turn_cache", "head_cache", "cursor_cache", "last_opened_cache", "widget_source_state"] {
+            for table in ["pending_attention_cache", "attention_reconciliation_meta", "attention_cache", "turn_cache", "head_cache", "cursor_cache", "last_opened_cache", "widget_source_state"] {
                 if try db.tableExists(table) {
                     try db.execute(sql: "DELETE FROM \(table) WHERE serverId=?", arguments: [serverId])
                 }

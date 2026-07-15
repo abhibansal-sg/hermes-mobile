@@ -592,11 +592,11 @@ final class CacheScopePartitionTests: XCTestCase {
 
 final class CacheV2MigrationTests: XCTestCase {
 
-    func testV3StampsFingerprintV3() async throws {
+    func testV4StampsFingerprintV4() async throws {
         let store = try makeInMemoryStore()
         let version = try await store.readMeta(SyncMetaRecord.Key.schemaVersion)
-        XCTAssertEqual(version, "v3")
-        XCTAssertEqual(CacheSchema.currentFingerprint, "v3")
+        XCTAssertEqual(version, "v4")
+        XCTAssertEqual(CacheSchema.currentFingerprint, "v4")
     }
 
     func testV2ScopeColumnsExistAndAreQueryable() async throws {

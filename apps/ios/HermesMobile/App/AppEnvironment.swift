@@ -89,10 +89,20 @@ final class AppEnvironment {
         if let cacheStore = try? CacheStore() {
             sessionStore.attachCache(cacheStore)
             chatStore.attachCache(cacheStore)
+            inboxStore.attachCache(cacheStore)
         }
         // The inbox accumulates broadcast approval/clarify prompts and answers
         // them against each prompt's own runtime via the gateway client.
         inboxStore.attach(connection: connectionStore)
+        inboxStore.onCommittedSnapshot = { snapshot in
+            var patch = WidgetSnapshotWriter.Patch()
+            patch.pendingAttentionCount = .set(snapshot.pendingCount)
+            if let metadata = snapshot.metadata {
+                patch.serverRevision = .set(String(metadata.revision))
+                patch.fetchedAt = .set(Date(timeIntervalSince1970: metadata.updatedAt))
+            }
+            WidgetSnapshotWriter.write(patch)
+        }
         // ConnectionStore's event router also fans approval/clarify/complete to
         // the inbox (see route(event:)); give it the back-reference.
         connectionStore.inboxStore = inboxStore
@@ -182,19 +192,18 @@ final class AppEnvironment {
         // Silent pushes are invalidation hints only. Route them through the same
         // authoritative refresh used by foreground recovery, then project the
         // widget after that refresh has completed.
-        let syncCoordinator = ManifestInvalidationCoordinator { [weak sessionStore, weak connectionStore, weak inboxStore] _ in
-            guard let sessionStore, let connectionStore, let inboxStore else { throw CancellationError() }
+        let syncCoordinator = ManifestInvalidationCoordinator { [weak sessionStore, weak connectionStore] _ in
+            guard let sessionStore, let connectionStore else { throw CancellationError() }
             try Task.checkCancellation()
             await sessionStore.refresh()
             try Task.checkCancellation()
             await MainActor.run {
                 let connected: Bool
                 if case .connected = connectionStore.phase { connected = true } else { connected = false }
-                WidgetSnapshotWriter.write(
-                    connected: connected,
-                    activeSessions: sessionStore.activeStoredId == nil ? 0 : 1,
-                    pendingApprovals: inboxStore.pendingCount
-                )
+                var patch = WidgetSnapshotWriter.Patch()
+                patch.connectionState = .set(connected ? .connected : .offline)
+                patch.activeTurnCount = .set(sessionStore.activeStoredId == nil ? 0 : 1)
+                WidgetSnapshotWriter.write(patch)
             }
             return true
         }
