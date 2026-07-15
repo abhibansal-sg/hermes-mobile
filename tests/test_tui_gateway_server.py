@@ -96,6 +96,82 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
+def test_pending_prompt_snapshot_is_safe_and_resolves_original_waiter():
+    sid = "pending-prompt-runtime"
+    rid = "pending-prompt-request"
+    event = threading.Event()
+    server._sessions[sid] = {"session_key": "pending-prompt-stored"}
+    with server._prompt_lock:
+        server._pending[rid] = (sid, event)
+        server._pending_prompt_payloads[rid] = (
+            "clarify.request",
+            {
+                "question": "Use api_key=SUPERSECRET or the safe profile?",
+                "choices": [{"label": "safe"}],
+                "created_at": 10.0,
+                "expires_at": 20.0,
+                "status": "pending",
+                "revision": server._next_pending_prompt_revision_locked(),
+            },
+        )
+    try:
+        snapshot = server.pending_prompt_snapshot()
+        assert len(snapshot) == 1
+        record = snapshot[0]
+        assert record["id"] == f"clarify:{rid}"
+        assert record["request_id"] == rid
+        assert record["session_id"] == sid
+        assert record["stored_session_id"] == "pending-prompt-stored"
+        assert record["created_at"] == 10.0
+        assert record["expires_at"] == 20.0
+        assert "SUPERSECRET" not in str(record)
+
+        old_revision = record["revision"]
+        assert server.resolve_pending_clarification(
+            rid, session_id=sid, answer="safe"
+        )
+        assert event.is_set()
+        assert server._answers[rid] == "safe"
+        responding = server.pending_prompt_snapshot()[0]
+        assert responding["status"] == "responding"
+        assert responding["revision"] > old_revision
+    finally:
+        with server._prompt_lock:
+            server._pending.pop(rid, None)
+            server._pending_prompt_payloads.pop(rid, None)
+            server._answers.pop(rid, None)
+        server._sessions.pop(sid, None)
+
+
+def test_pending_prompt_snapshot_excludes_secrets_and_observes_expiry():
+    sid = "pending-prompt-expiry"
+    server._sessions[sid] = {"session_key": "pending-prompt-expiry-stored"}
+    result = {}
+
+    def block():
+        result["answer"] = server._block(
+            "clarify.request",
+            sid,
+            {"question": "Which option?", "choices": ["one"]},
+            timeout=0.05,
+        )
+
+    thread = threading.Thread(target=block)
+    thread.start()
+    for _ in range(100):
+        if server.pending_prompt_snapshot():
+            break
+        time.sleep(0.005)
+    assert server.pending_prompt_snapshot()
+    thread.join(timeout=2)
+    try:
+        assert not thread.is_alive()
+        assert result["answer"] == ""
+        assert server.pending_prompt_snapshot() == []
+    finally:
+        server._sessions.pop(sid, None)
+
+
 def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
     class DbContext:
         def __init__(self, db):
@@ -1872,7 +1948,7 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
     monkeypatch.setattr(
         server,
         "_notify_session_boundary",
-        lambda event, session_id, *_args: calls["hooks"].append((event, session_id)),
+        lambda event, session_id, *_args, **_kwargs: calls["hooks"].append((event, session_id)),
     )
 
     try:
@@ -3004,7 +3080,7 @@ def test_config_set_fast_updates_live_agent_and_config(monkeypatch):
             "foo": "bar",
             "service_tier": "priority",
         }
-        assert ("agent.service_tier", "fast") in writes
+        assert writes == [], "live-session fast mode must not mutate global config"
         assert ("session.info", "sid", {"model": "x"}) in emits
 
         resp_normal = server.handle_request(
@@ -3017,7 +3093,7 @@ def test_config_set_fast_updates_live_agent_and_config(monkeypatch):
         assert resp_normal["result"]["value"] == "normal"
         assert agent.service_tier is None
         assert agent.request_overrides == {"foo": "bar"}
-        assert ("agent.service_tier", "normal") in writes
+        assert writes == [], "live-session normal mode must not mutate global config"
     finally:
         server._sessions.pop("sid", None)
 
@@ -6163,8 +6239,8 @@ def test_session_delete_returns_db_unavailable_when_no_db(monkeypatch):
     assert "state.db unavailable" in resp["error"]["message"]
 
 
-def test_session_delete_refuses_active_session(monkeypatch):
-    """Cannot delete a session currently bound to a live TUI session."""
+def test_session_delete_evicts_active_session(monkeypatch):
+    """Deleting a live TUI session evicts it before deleting persisted state."""
     called: list[str] = []
 
     class _DB:
@@ -6185,10 +6261,8 @@ def test_session_delete_refuses_active_session(monkeypatch):
     finally:
         server._sessions.pop("live", None)
 
-    assert "error" in resp
-    assert resp["error"]["code"] == 4023
-    assert "active session" in resp["error"]["message"]
-    assert called == [], "delete_session must not be called for active sessions"
+    assert resp["result"] == {"deleted": "key-live", "evicted": True}
+    assert called == ["key-live"]
 
 
 def test_session_delete_fails_closed_when_active_snapshot_raises(monkeypatch):
@@ -6267,7 +6341,7 @@ def test_session_delete_success_returns_deleted_id(monkeypatch):
     )
 
     assert "result" in resp, resp
-    assert resp["result"] == {"deleted": "old-1"}
+    assert resp["result"] == {"deleted": "old-1", "evicted": False}
     assert captured["sid"] == "old-1"
     # sessions_dir must be forwarded so transcript files get cleaned up
     # too — not just the SQLite row.  The autouse _isolate_hermes_home

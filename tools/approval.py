@@ -15,6 +15,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -1491,9 +1492,26 @@ _permanent_approved: set = set()
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = (
+        "event",
+        "data",
+        "result",
+        "reason",
+        "request_id",
+        "created_at",
+        "expires_at",
+        "revision",
+    )
 
-    def __init__(self, data: dict):
+    def __init__(
+        self,
+        data: dict,
+        *,
+        request_id: str,
+        created_at: float,
+        expires_at: float,
+        revision: int,
+    ):
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
@@ -1501,14 +1519,78 @@ class _ApprovalEntry:
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+        self.request_id = request_id
+        self.created_at = created_at
+        self.expires_at = expires_at
+        self.revision = revision
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_pending_attention_revision = 0
 
 # Resolver-context observers. Unlike the waiting-thread approval hooks, these
 # receive the identity of the REST/WS caller that actually resolved a request.
 _RESOLVE_OBSERVERS: list = []
+
+
+def _next_pending_attention_revision_locked() -> int:
+    """Return the next approval-record revision while ``_lock`` is held."""
+    global _pending_attention_revision
+    _pending_attention_revision += 1
+    return _pending_attention_revision
+
+
+def pending_approval_snapshot() -> list[dict]:
+    """Return display-safe pending gateway approvals under the owner lock.
+
+    This is the public read boundary for reconciliation clients.  It never
+    exposes the command/code/tool arguments stored on ``_ApprovalEntry``;
+    callers receive only a redacted description and the decision labels that
+    the existing approval surface already supports.
+    """
+    from agent.redact import redact_sensitive_text
+
+    with _lock:
+        records: list[dict] = []
+        for session_key, queue in _gateway_queues.items():
+            for entry in queue:
+                data = entry.data if isinstance(entry.data, dict) else {}
+                description = redact_sensitive_text(
+                    str(data.get("description") or "Approval required"), force=True
+                )
+                description = re.sub(
+                    r"(?i)\b(api[_ -]?key|token|secret|password|credential|authorization)"
+                    r"\s*[:=]\s*([^\s,;]+)",
+                    r"\1=***",
+                    description,
+                )[:500]
+                if data.get("smart_denied"):
+                    choices = ["once", "deny"]
+                elif data.get("allow_permanent") is False:
+                    choices = ["once", "session", "deny"]
+                else:
+                    choices = ["once", "session", "always", "deny"]
+                records.append(
+                    {
+                        "id": f"approval:{entry.request_id}",
+                        "request_id": entry.request_id,
+                        "kind": "approval",
+                        "session_id": session_key,
+                        "stored_session_id": session_key,
+                        "safe_title": "Approval required",
+                        "detail": {
+                            "description": description,
+                            "choices": choices,
+                        },
+                        "destructive": True,
+                        "created_at": entry.created_at,
+                        "expires_at": entry.expires_at,
+                        "status": "pending",
+                        "revision": entry.revision,
+                    }
+                )
+        return records
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2553,8 +2635,25 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
 
-    entry = _ApprovalEntry(approval_data)
+    timeout = _get_approval_timeout()
+    created_at = time.time()
     with _lock:
+        request_id = str(approval_data.get("request_id") or "").strip()
+        if not request_id:
+            request_id = secrets.token_hex(16)
+        entry = _ApprovalEntry(
+            approval_data,
+            request_id=request_id,
+            created_at=created_at,
+            expires_at=created_at + max(timeout, 0),
+            revision=_next_pending_attention_revision_locked(),
+        )
+        # These fields are additive on the existing live approval event and
+        # make its identity agree with the reconciliation snapshot.
+        approval_data["request_id"] = entry.request_id
+        approval_data["created_at"] = entry.created_at
+        approval_data["expires_at"] = entry.expires_at
+        approval_data["revision"] = entry.revision
         _gateway_queues.setdefault(session_key, []).append(entry)
 
     def _drop_entry() -> None:
@@ -2590,8 +2689,6 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # every ~10s to the agent's inactivity tracker — otherwise the gateway
     # watchdog kills the agent while the user is still responding. Mirrors
     # _wait_for_process() cadence.
-    timeout = _get_approval_timeout()
-
     try:
         from tools.environments.base import touch_activity_if_due
     except Exception:  # pragma: no cover

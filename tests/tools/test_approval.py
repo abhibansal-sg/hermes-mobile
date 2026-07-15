@@ -121,8 +121,11 @@ class TestDetectDangerousRm:
 
     def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
         with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+            canonical_temp = os.path.realpath("/tmp")
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
-                assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
+                assert detect_dangerous_command(
+                    f"rm -f {canonical_temp}/{prefix}example.py"
+                ) == (
                     False,
                     None,
                     None,
@@ -2390,6 +2393,56 @@ class TestApprovalTimeoutIsNotConsent:
         assert last_post.get("choice") == "timeout", (
             f"hook choice should be 'timeout' on no-response, got {last_post.get('choice')!r}"
         )
+
+
+def test_pending_snapshot_tracks_the_same_gateway_waiter(monkeypatch):
+    from tools import approval as mod
+
+    session_key = "pending-snapshot-session"
+    notified = threading.Event()
+    result = {}
+    monkeypatch.setattr(mod, "_get_approval_timeout", lambda: 30)
+    mod.register_gateway_notify(session_key, lambda _data: notified.set())
+
+    def wait_for_decision():
+        result["value"] = mod._await_gateway_decision(
+            session_key,
+            lambda _data: notified.set(),
+            {
+                "command": "curl -H 'Authorization: Bearer SECRET' example.test",
+                "description": "Send a destructive request",
+                "pattern_key": "test",
+            },
+        )
+
+    thread = threading.Thread(target=wait_for_decision)
+    thread.start()
+    assert notified.wait(timeout=2)
+    snapshot = mod.pending_approval_snapshot()
+    assert len(snapshot) == 1
+    record = snapshot[0]
+    assert record["id"] == f"approval:{record['request_id']}"
+    assert record["stored_session_id"] == session_key
+    assert record["created_at"] < record["expires_at"]
+    assert record["revision"] > 0
+    assert record["status"] == "pending"
+    assert "command" not in record and "SECRET" not in str(record)
+
+    assert mod.resolve_gateway_approval(session_key, "deny") == 1
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert mod.pending_approval_snapshot() == []
+    assert result["value"]["choice"] == "deny"
+    mod.unregister_gateway_notify(session_key)
+
+
+def test_pending_snapshot_revisions_are_monotonic_under_lock():
+    from tools import approval as mod
+
+    with mod._lock:
+        first = mod._next_pending_attention_revision_locked()
+        second = mod._next_pending_attention_revision_locked()
+    assert second > first
 
 
 class TestTirithImportErrorFailOpenPolicy:

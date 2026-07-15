@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -130,6 +131,7 @@ _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
+_pending_prompt_revision = 0
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
@@ -2244,12 +2246,156 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
+def _next_pending_prompt_revision_locked() -> int:
+    """Return the next prompt revision while ``_prompt_lock`` is held."""
+    global _pending_prompt_revision
+    _pending_prompt_revision += 1
+    return _pending_prompt_revision
+
+
+def pending_prompt_snapshot() -> list[dict]:
+    """Return display-safe pending clarification records.
+
+    Clarification waiters are serialized under the same lock used by
+    ``clarify.respond``.  Sudo, secret, terminal-read, and generic input
+    prompts are deliberately excluded from this public attention surface.
+    """
+    from agent.redact import redact_sensitive_text
+
+    with _prompt_lock:
+        pending = []
+        for request_id, (session_id, _event) in _pending.items():
+            event, original = _pending_prompt_payloads.get(request_id, ("", {}))
+            if event != "clarify.request":
+                continue
+            payload = dict(original) if isinstance(original, dict) else {}
+            question = redact_sensitive_text(
+                str(payload.get("question") or ""), force=True
+            )
+            question = re.sub(
+                r"(?i)\b(api[_ -]?key|token|secret|password|credential|authorization)"
+                r"\s*[:=]\s*([^\s,;]+)",
+                r"\1=***",
+                question,
+            )[:500]
+            raw_choices = payload.get("choices")
+            choices = []
+            if isinstance(raw_choices, list):
+                for choice in raw_choices[:20]:
+                    label = choice.get("label") if isinstance(choice, dict) else choice
+                    safe_label = redact_sensitive_text(str(label or ""), force=True)
+                    safe_label = re.sub(
+                        r"(?i)\b(api[_ -]?key|token|secret|password|credential|authorization)"
+                        r"\s*[:=]\s*([^\s,;]+)",
+                        r"\1=***",
+                        safe_label,
+                    )
+                    choices.append(safe_label[:100])
+            pending.append(
+                {
+                    "id": f"clarify:{request_id}",
+                    "request_id": request_id,
+                    "kind": "clarify",
+                    "session_id": session_id,
+                    "stored_session_id": None,
+                    "safe_title": "Clarification required",
+                    "detail": {"question": question, "choices": choices},
+                    "destructive": False,
+                    "created_at": float(payload.get("created_at") or 0.0),
+                    "expires_at": (
+                        float(payload["expires_at"])
+                        if payload.get("expires_at") is not None
+                        else None
+                    ),
+                    "status": str(payload.get("status") or "pending"),
+                    "revision": int(payload.get("revision") or 0),
+                }
+            )
+
+    # Session identity is owned by this module too, but uses a different lock.
+    # Copy it after releasing _prompt_lock so resolution never waits on the
+    # broader session table lock.
+    with _sessions_lock:
+        identities = {
+            sid: _session_lookup_key(session, fallback=sid)
+            for sid, session in _sessions.items()
+        }
+    for record in pending:
+        record["stored_session_id"] = identities.get(
+            record["session_id"], record["session_id"]
+        )
+    return pending
+
+
+def attention_session_identity(session_id: str) -> dict | None:
+    """Return one public runtime/stored identity used by attention APIs."""
+    with _sessions_lock:
+        session = _sessions.get(session_id)
+        if session is None or session.get("_finalized"):
+            return None
+        agent = session.get("agent")
+        stored_session_id = str(
+            getattr(agent, "session_id", None) or session.get("session_key") or ""
+        )
+        if not stored_session_id:
+            return None
+        return {
+            "session_id": session_id,
+            "stored_session_id": stored_session_id,
+        }
+
+
+def attention_session_identities() -> list[dict]:
+    """Return all live runtime/stored identity pairs under the session lock."""
+    with _sessions_lock:
+        identities = []
+        for sid, session in _sessions.items():
+            if session.get("_finalized"):
+                continue
+            agent = session.get("agent")
+            stored_session_id = str(
+                getattr(agent, "session_id", None) or session.get("session_key") or ""
+            )
+            if stored_session_id:
+                identities.append(
+                    {"session_id": sid, "stored_session_id": stored_session_id}
+                )
+        return identities
+
+
+def resolve_pending_clarification(
+    request_id: str,
+    *,
+    session_id: str,
+    answer: str,
+) -> bool:
+    """Resolve one clarification against the original in-memory waiter."""
+    with _prompt_lock:
+        pending = _pending.get(request_id)
+        if pending is None or pending[0] != session_id:
+            return False
+        event, payload = _pending_prompt_payloads.get(request_id, ("", {}))
+        if event != "clarify.request":
+            return False
+        if isinstance(payload, dict):
+            payload["status"] = "responding"
+            payload["revision"] = _next_pending_prompt_revision_locked()
+        _answers[request_id] = answer
+        pending[1].set()
+        return True
+
+
 def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
-    rid = uuid.uuid4().hex[:8]
+    rid = uuid.uuid4().hex
     ev = threading.Event()
+    created_at = time.time()
     with _prompt_lock:
         _pending[rid] = (sid, ev)
         payload["request_id"] = rid
+        payload["created_at"] = created_at
+        payload["expires_at"] = created_at + max(timeout, 0)
+        payload["status"] = "pending"
+        payload["revision"] = _next_pending_prompt_revision_locked()
         _pending_prompt_payloads[rid] = (event, dict(payload))
     answered = False
     answer = ""
@@ -10584,6 +10730,10 @@ def _respond(rid, params, key, *, allow_expired=False):
         owner_sid, ev = entry
         if device is not None and not _ws_device_owns_session(device, owner_sid):
             return _err(rid, 4030, "device does not own this session")
+        _prompt_event, payload = _pending_prompt_payloads.get(r, ("", {}))
+        if isinstance(payload, dict):
+            payload["status"] = "responding"
+            payload["revision"] = _next_pending_prompt_revision_locked()
         _answers[r] = params.get(key, "")
         ev.set()
     return _ok(rid, {"status": "ok"})
