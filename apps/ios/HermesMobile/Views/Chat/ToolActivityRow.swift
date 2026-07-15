@@ -814,7 +814,7 @@ enum DiffLineKind: Sendable, Equatable {
 }
 
 /// One displayable line of a parsed diff.
-struct DiffLine: Sendable, Equatable, Identifiable {
+struct ToolDiffLine: Sendable, Equatable, Identifiable {
     let id: Int
     let kind: DiffLineKind
     let text: String
@@ -829,10 +829,10 @@ enum DiffRendering {
         return .context
     }
 
-    static func lines(in diff: String) -> [DiffLine] {
+    static func lines(in diff: String) -> [ToolDiffLine] {
         diff.split(separator: "\n", omittingEmptySubsequences: false).enumerated().map { index, substring in
             let text = String(substring)
-            return DiffLine(id: index, kind: classify(text), text: text)
+            return ToolDiffLine(id: index, kind: classify(text), text: text)
         }
     }
 

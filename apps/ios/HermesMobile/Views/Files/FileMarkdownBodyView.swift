@@ -39,6 +39,8 @@ struct FileMarkdownBodyView: View {
                     CodeBlockView(language: language, code: body)
                 case .math(let latex, let display):
                     MathSegmentView(latex: latex, display: display)
+                case .embed(let descriptor):
+                    RichURLEmbedCardView(descriptor: descriptor)
                 }
             }
         }
