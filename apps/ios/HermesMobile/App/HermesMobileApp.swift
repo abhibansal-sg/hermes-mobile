@@ -126,7 +126,7 @@ struct HermesMobileApp: App {
                     // graph. Registered before bootstrap so a cold-launch tap —
                     // which iOS delivers right after launch — is honored once the
                     // session list is refreshed inside the router.
-                    NotificationService.setTapHandler { tap in
+                    appDelegate.notificationCoordinator.attachTapHandler { tap in
                         HermesURLRouter.routePushTap(
                             tap,
                             sessions: environment.sessionStore,
@@ -139,7 +139,7 @@ struct HermesMobileApp: App {
                     // resolved endpoint (same loopback URL + Keychain token as the
                     // push registrar). `nil` when unconfigured → the action falls
                     // back to a feedback notification.
-                    NotificationService.setActionEndpointProvider {
+                    appDelegate.notificationCoordinator.attachActionEndpointProvider {
                         PushRegistrar.shared.resolveEndpoint().map {
                             NotificationService.ActionEndpoint(
                                 baseURL: $0.url, token: $0.token, pathStyle: $0.pathStyle
@@ -363,6 +363,16 @@ private struct UITestSizeClassOverride: ViewModifier {
 /// `PushRegistrar` is `@MainActor`; these UIKit callbacks land on the main
 /// thread, so `MainActor.assumeIsolated` is safe and avoids a hop.
 final class AppDelegate: NSObject, UIApplicationDelegate {
+    let notificationCoordinator = NotificationLaunchCoordinator()
+
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        notificationCoordinator.install()
+        return true
+    }
+
     func application(
         _ application: UIApplication,
         didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
