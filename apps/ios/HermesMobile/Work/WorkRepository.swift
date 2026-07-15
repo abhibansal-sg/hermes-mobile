@@ -148,7 +148,7 @@ actor WorkRepository {
         try ensureProtectedDataAvailable()
         let preparedAssets = try prepareAssets(assets)
         let now = input.createdAt?.timeIntervalSince1970 ?? Date().timeIntervalSince1970
-        let job = makeJob(input, preparedAssets: preparedAssets, now: now)
+        let job = Self.makeJob(input, preparedAssets: preparedAssets, now: now)
 
         do {
             try await database.write { db in
@@ -366,6 +366,7 @@ actor WorkRepository {
                 existing.text = text
                 existing.cwd = cwd
                 existing.modelSelectionJSON = modelSelectionJSON
+                existing.revision += 1
                 existing.updatedAt = timestamp
                 try existing.update(db)
                 return existing
@@ -379,6 +380,7 @@ actor WorkRepository {
                 text: text,
                 cwd: cwd,
                 modelSelectionJSON: modelSelectionJSON,
+                revision: 1,
                 createdAt: timestamp,
                 updatedAt: timestamp
             )
@@ -397,6 +399,113 @@ actor WorkRepository {
                 .order(Column("updated_at").desc, Column("draft_id"))
                 .fetchAll(db)
         }
+    }
+
+    func draft(scope: WorkScope, contextKey: String) throws -> WorkDraftSnapshot? {
+        try database.read { db in
+            guard let draft = try WorkDraft
+                .filter(Column("server_id") == scope.serverID)
+                .filter(Column("profile_id") == scope.profileID)
+                .filter(Column("context_key") == contextKey)
+                .fetchOne(db) else { return nil }
+            let assets = try WorkAsset.fetchAll(db, sql: """
+                SELECT work_assets.* FROM work_assets
+                JOIN draft_assets USING (asset_id)
+                WHERE draft_assets.draft_id = ? ORDER BY draft_assets.ordinal
+                """, arguments: [draft.draftID])
+            return WorkDraftSnapshot(draft: draft, assets: assets)
+        }
+    }
+
+    /// Saves the complete composer state in one transaction. Asset bytes are
+    /// copied into protected WorkAssets before their rows become visible.
+    @discardableResult
+    func saveDraft(
+        scope: WorkScope,
+        contextKey: String,
+        storedSessionID: String?,
+        text: String,
+        cwd: String?,
+        modelSelectionJSON: String?,
+        assets: [WorkAssetInput],
+        now: Date = Date()
+    ) async throws -> WorkDraft? {
+        let isEmpty = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && assets.isEmpty
+        if isEmpty {
+            if let existing = try draft(scope: scope, contextKey: contextKey) {
+                try await deleteDraft(id: existing.draft.draftID)
+            }
+            return nil
+        }
+        let prepared = try prepareAssets(assets)
+        let timestamp = now.timeIntervalSince1970
+        do {
+            let result = try await database.write { db -> (WorkDraft, [String]) in
+                var draft: WorkDraft
+                if var existing = try WorkDraft
+                    .filter(Column("server_id") == scope.serverID)
+                    .filter(Column("profile_id") == scope.profileID)
+                    .filter(Column("context_key") == contextKey).fetchOne(db) {
+                    existing.storedSessionID = storedSessionID
+                    existing.text = text
+                    existing.cwd = cwd
+                    existing.modelSelectionJSON = modelSelectionJSON
+                    existing.revision += 1
+                    existing.updatedAt = timestamp
+                    try existing.update(db)
+                    draft = existing
+                } else {
+                    draft = WorkDraft(draftID: UUID().uuidString.lowercased(), serverID: scope.serverID,
+                        profileID: scope.profileID, contextKey: contextKey, storedSessionID: storedSessionID,
+                        text: text, cwd: cwd, modelSelectionJSON: modelSelectionJSON, revision: 1,
+                        createdAt: timestamp, updatedAt: timestamp)
+                    try draft.insert(db)
+                }
+                try WorkDraftAsset.filter(Column("draft_id") == draft.draftID).deleteAll(db)
+                for (ordinal, item) in prepared.enumerated() {
+                    try item.record.insert(db)
+                    try WorkDraftAsset(draftID: draft.draftID, assetID: item.record.assetID, ordinal: ordinal).insert(db)
+                }
+                return (draft, try Self.deleteUnreferencedAssetRows(db))
+            }
+            removeAssetFiles(result.1)
+            await publishObservation()
+            return result.0
+        } catch {
+            removePreparedFiles(prepared)
+            throw error
+        }
+    }
+
+    func assetData(_ asset: WorkAsset) throws -> Data {
+        try Data(contentsOf: assetURL(relativePath: asset.relativePath))
+    }
+
+    /// Creates the prompt job and acknowledges exactly the revision submitted.
+    /// A newer edit remains as a draft; an unchanged revision is cleared.
+    func convertDraftToJob(
+        draftID: String,
+        acknowledgedRevision: Int,
+        jobID: UUID = UUID(),
+        now: Date = Date()
+    ) async throws -> WorkJob {
+        let timestamp = now.timeIntervalSince1970
+        let result = try await database.write { db -> (WorkJob, [String]) in
+            guard let draft = try WorkDraft.fetchOne(db, key: draftID) else { throw WorkRepositoryError.draftNotFound }
+            guard draft.revision == acknowledgedRevision else { throw WorkRepositoryError.draftNotFound }
+            let links = try WorkDraftAsset.filter(Column("draft_id") == draftID).order(Column("ordinal")).fetchAll(db)
+            let input = WorkJobInput(jobID: jobID, kind: .prompt, scope: try WorkScope(serverID: draft.serverID, profileID: draft.profileID), state: .queued, text: draft.text, storedSessionID: draft.storedSessionID, createdAt: now)
+            let job = Self.makeJob(input, preparedAssets: [], now: timestamp)
+            try job.insert(db)
+            for link in links {
+                try WorkJobAsset(jobID: job.jobID, assetID: link.assetID, ordinal: link.ordinal, transferID: nil, remotePath: nil, state: "local").insert(db)
+            }
+            try WorkDraft.deleteOne(db, key: draftID)
+            return (job, try Self.deleteUnreferencedAssetRows(db))
+        }
+        removeAssetFiles(result.1)
+        await publishObservation()
+        return result.0
     }
 
     func attachAsset(_ assetID: String, toDraft draftID: String, ordinal: Int) async throws {
@@ -469,7 +578,7 @@ actor WorkRepository {
         .expired: [],
     ]
 
-    private func makeJob(
+    private static func makeJob(
         _ input: WorkJobInput,
         preparedAssets: [PreparedAsset],
         now: Double
