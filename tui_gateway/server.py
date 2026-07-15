@@ -6225,12 +6225,9 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     """Delete a stored session and its on-disk transcript files.
 
-    Used by the TUI resume picker (``d`` key) so users can prune old
-    sessions without dropping to the CLI.  Refuses to delete a session
-    that is currently active in this gateway process — those rows are
-    still being written to and removing them out from under the live
-    agent corrupts message ordering and trips FK constraints when the
-    next message append flushes.
+    A matching live session is interrupted when necessary and torn down before
+    its durable row is deleted.  This lets non-TUI clients delete sessions they
+    previously resumed without leaving a spending runtime behind.
     """
     target = params.get("session_id", "")
     if not target:
@@ -6238,21 +6235,52 @@ def _(rid, params: dict) -> dict:
     db = _get_db()
     if db is None:
         return _db_unavailable_error(rid, code=5036)
-    # Block deletion of any session currently bound to a live TUI session
-    # in this process.  The picker hides the active session anyway, but a
-    # racing caller could still target it.  Snapshot via ``list(...)``
-    # because ``_sessions`` is mutated by concurrent RPCs on the thread
-    # pool — iterating the dict directly can raise ``RuntimeError:
-    # dictionary changed size during iteration``.  If even the snapshot
-    # raises, fail closed (refuse the delete) rather than fail open.
+    # Snapshot under the sessions lock. If enumeration fails, refuse the
+    # delete rather than risk removing durable state beneath a live writer.
     try:
         with _sessions_lock:
-            snapshot = list(_sessions.values())
+            snapshot = list(_sessions.items())
     except Exception as e:
         return _err(rid, 5036, f"could not enumerate active sessions: {e}")
-    active = {s.get("session_key") for s in snapshot if s.get("session_key")}
-    if target in active:
-        return _err(rid, 4023, "cannot delete an active session")
+
+    live = next(
+        (
+            (sid, session)
+            for sid, session in snapshot
+            if not session.get("_finalized")
+            and _session_lookup_key(session, fallback=sid) == target
+        ),
+        None,
+    )
+    evicted = False
+    if live is not None:
+        sid, session = live
+        try:
+            if session.get("running"):
+                agent = session.get("agent")
+                if agent is not None and hasattr(agent, "interrupt"):
+                    agent.interrupt()
+                _clear_pending(sid)
+                try:
+                    from tools.approval import resolve_gateway_approval
+
+                    resolve_gateway_approval(target, "deny", resolve_all=True)
+                except Exception:
+                    logger.debug(
+                        "failed to release approvals during session delete",
+                        exc_info=True,
+                    )
+            with _session_resume_lock:
+                with _sessions_lock:
+                    if _sessions.get(sid) is not session:
+                        raise RuntimeError("live session changed during eviction")
+                    _sessions.pop(sid, None)
+                session["_sid"] = sid
+                _teardown_session(session)
+            evicted = True
+        except Exception as e:
+            return _err(rid, 4023, f"could not evict active session before delete: {e}")
+
     sessions_dir = get_hermes_home() / "sessions"
     try:
         deleted = db.delete_session(target, sessions_dir=sessions_dir)
@@ -6260,7 +6288,8 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5036, f"delete failed: {e}")
     if not deleted:
         return _err(rid, 4007, "session not found")
-    return _ok(rid, {"deleted": target})
+    _emit("session.deleted", target, None)
+    return _ok(rid, {"deleted": target, "evicted": evicted})
 
 
 @method("session.title")
