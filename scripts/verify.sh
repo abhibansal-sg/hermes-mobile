@@ -15,6 +15,7 @@
 #   scripts/verify.sh --skip-ios                     # skip the iOS build gate only
 #   scripts/verify.sh --skip-ts                       # skip all TypeScript gates (typecheck/vitest/desktop-build)
 #   scripts/verify.sh --skip-pytest                    # skip the Python test gate
+#   scripts/verify.sh --changed <base-ref>             # pytest only for tests affected by base-ref...HEAD
 #   scripts/verify.sh --scheme <scheme> --destination <dest>   # override iOS build target
 #   scripts/verify.sh --self-test                       # only check this script itself is well-formed
 #
@@ -27,7 +28,7 @@
 #   ty-typecheck      ty check .                                  (ADVISORY — CI's own lint-diff job is exit-zero;
 #                                                                   repo currently carries pre-existing ty debt,
 #                                                                   see reason printed at gate time)
-#   pytest            scripts/run_tests.sh                          (blocking — matches tests.yml)
+#   pytest            scripts/run_tests.sh [affected test files]    (blocking — matches tests.yml)
 #   ts-typecheck      npm run typecheck per workspace package         (blocking — matches typecheck.yml matrix)
 #   vitest            npm run test for ui-tui + web                    (blocking)
 #   desktop-build      npm run build --prefix apps/desktop               (blocking — matches typecheck.yml desktop-build)
@@ -53,6 +54,7 @@ SKIP_IOS=0
 SKIP_TS=0
 SKIP_PYTEST=0
 SELF_TEST=0
+CHANGED_BASE_REF=""
 # TS workspace packages that ship a `typecheck` script (matches
 # .github/workflows/typecheck.yml's matrix exactly).
 TS_TYPECHECK_PACKAGES=(ui-tui web apps/bootstrap-installer apps/desktop apps/shared)
@@ -65,6 +67,15 @@ while [[ $# -gt 0 ]]; do
     --skip-ios) SKIP_IOS=1; shift;;
     --skip-ts) SKIP_TS=1; shift;;
     --skip-pytest) SKIP_PYTEST=1; shift;;
+    --changed)
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+        echo "verify.sh: --changed requires <base-ref>" >&2
+        echo "usage: scripts/verify.sh --changed <base-ref> [flags]" >&2
+        exit 2
+      fi
+      CHANGED_BASE_REF="$2"
+      shift 2
+      ;;
     --scheme) SCHEME="$2"; shift 2;;
     --destination) DESTINATION="$2"; shift 2;;
     --self-test) SELF_TEST=1; shift;;
@@ -201,7 +212,15 @@ fi
 if [ "$SKIP_PYTEST" = "1" ]; then
   skip pytest "--skip-pytest"
 elif { [ -f pyproject.toml ] || [ -d tests ]; } && { [ -d .venv ] || [ -d venv ]; }; then
-  gate pytest ./scripts/run_tests.sh
+  if [ -n "$CHANGED_BASE_REF" ]; then
+    gate pytest "$PY_BIN" ./scripts/changed_tests.py "$CHANGED_BASE_REF"
+    # gate() keeps full command output in /tmp. Surface the selector's
+    # intentionally bounded summary even on PASS so affected coverage is
+    # visible in the verifier transcript.
+    grep '^\[verify --changed\]' /tmp/verify-pytest.log || true
+  else
+    gate pytest ./scripts/run_tests.sh
+  fi
 elif [ -f pyproject.toml ] || [ -d tests ]; then
   skip pytest "no local .venv/venv — create one and run scripts/run_tests.sh for Python changes"
 else
@@ -271,7 +290,9 @@ skip supply-chain-audit "requires a GitHub API PR diff (base...head compare) —
 skip osv-scanner "requires network access to the OSV vulnerability DB; CI runs it per-PR and on a weekly schedule"
 
 echo "════ VERIFY RESULT ════"
-for r in "${RESULTS[@]}"; do echo "  $r"; done
+if [ "${#RESULTS[@]}" -gt 0 ]; then
+  for r in "${RESULTS[@]}"; do echo "  $r"; done
+fi
 echo "──── skipped lanes ────"
 for s in "${SKIPPED[@]}"; do echo "  $s"; done
 if [ "$FAIL" = "0" ]; then echo "VERDICT: PASS"; exit 0; else echo "VERDICT: FAIL"; exit 1; fi
