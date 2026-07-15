@@ -169,6 +169,30 @@ def _device_owns_session(request: Request, session_id: str) -> bool:
     return isinstance(owner, dict) and owner.get("device_id") == device_id
 
 
+def _device_owns_stored_session(request: Request, stored_session_id: str) -> bool:
+    """Resolve persisted identity through live runtime correlations, fail closed.
+
+    The device-token index is intentionally keyed by runtime session ID.  A
+    manifest row is keyed by stored session ID, so bridge the two only through
+    an unambiguous live ``session_key`` match; never infer ownership from a
+    title, token prefix, or another persisted field.
+    """
+    if _request_device_id(request) is None:
+        return True
+    if _device_owns_session(request, stored_session_id):
+        return True
+    try:
+        from tui_gateway.server import _sessions, _sessions_lock
+        with _sessions_lock:
+            runtime_ids = [
+                str(runtime_id) for runtime_id, rec in _sessions.items()
+                if rec.get("session_key") == stored_session_id
+            ]
+    except Exception:
+        return False
+    return len(runtime_ids) == 1 and _device_owns_session(request, runtime_ids[0])
+
+
 def _device_owns_live_activity_session(
     request: Request, session_id: str, engine: Any
 ) -> bool:
@@ -189,6 +213,43 @@ def _device_owns_live_activity_session(
     if isinstance(existing_owner, str) and existing_owner:
         return existing_owner == device_id
     return False
+
+
+def _manifest_error(exc: Any) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status,
+        content={"error": {
+            "code": exc.code,
+            "message": exc.message,
+            "reset_required": bool(exc.reset),
+            "retry_after_seconds": None,
+        }},
+    )
+
+
+@router.get("/sync/manifest")
+async def sync_manifest(request: Request, scope: str = Query(...), cursor: Optional[str] = None):
+    """Return one immutable page of the plugin-owned mobile sync manifest."""
+    if not _has_dashboard_api_auth(request):
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    if _is_device_auth(request) and not _device_has_scope(request, "chat"):
+        sync = _plugin_module("sync_manifest")
+        return _manifest_error(sync.ManifestError(403, "insufficient_scope", "Device token lacks chat scope"))
+    sync = _plugin_module("sync_manifest")
+    device_id = _request_device_id(request)
+    visibility = f"device:{device_id}" if device_id else "shared"
+    engine = _plugin_module("push_engine")
+    try:
+        return sync.build_manifest(
+            scope=scope, cursor=cursor, visibility=visibility,
+            visibility_check=lambda session_id: _device_owns_stored_session(request, session_id),
+            device_registered=sync.device_is_registered(device_id, engine.registry_entries()),
+        )
+    except sync.ManifestError as exc:
+        return _manifest_error(exc)
+    except Exception:
+        _log.exception("sync manifest failed")
+        return _manifest_error(sync.ManifestError(503, "state_unavailable", "Authoritative state could not be snapshotted"))
 
 
 # ---------------------------------------------------------------------------
@@ -1371,7 +1432,8 @@ async def register_push_token(body: PushRegisterBody, request: Request) -> Dict[
         raise HTTPException(status_code=401, detail="Unauthorized")
     engine = _plugin_module("push_engine")
     if not engine.register_token(
-        body.token, platform=body.platform, env=body.env, events=body.events
+        body.token, platform=body.platform, env=body.env, events=body.events,
+        device_id=_request_device_id(request),
     ):
         raise HTTPException(status_code=400, detail="Invalid device token")
     _register_relay_device_if_configured(body, engine)

@@ -457,6 +457,7 @@ def register_token(
     platform: str = "ios",
     env: str = "",
     events: Optional[List[str]] = None,
+    device_id: Optional[str] = None,
 ) -> bool:
     """Add (or refresh) a device token in the registry. Returns False if the
     token is malformed.
@@ -488,6 +489,8 @@ def register_token(
                     entry.pop("events", None)
                 else:
                     entry["events"] = normalized_events
+                if device_id:
+                    entry["device_id"] = device_id
                 _save_registry(entries)
                 return True
         new_entry: Dict[str, Any] = {
@@ -496,6 +499,8 @@ def register_token(
         }
         if normalized_events is not None:
             new_entry["events"] = normalized_events
+        if device_id:
+            new_entry["device_id"] = device_id
         entries.append(new_entry)
         _save_registry(entries)
     return True
@@ -526,6 +531,12 @@ def registered_tokens() -> List[str]:
         if n:
             out.append(n)
     return out
+
+
+def registry_entries() -> List[Dict[str, Any]]:
+    """Return a defensive copy for authorization-aware registry projections."""
+    with _registry_lock:
+        return copy.deepcopy(_load_registry())
 
 
 def registered_tokens_by_env() -> Dict[str, List[str]]:
