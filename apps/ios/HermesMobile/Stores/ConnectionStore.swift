@@ -117,12 +117,10 @@ final class ConnectionStore {
     /// (self-revoke via Settings → Devices) and by the auth-rejection loops, all
     /// of which flip `phase` to `.needsSetup` AND arm `reauthRequired` together.
     ///
-    /// Distinct from a fresh unconfigured app: there `rest == nil` already routes
-    /// a pair deep link to the immediate-apply path. Here a STALE server URL +
-    /// token are still in place (the revoke does not wipe them), so `rest != nil`
-    /// even though there is no live session to protect. The pair deep link is the
-    /// intended recovery action in this state, NOT a destructive re-pair — the
-    /// router reads this to skip the disconnect-confirmation gate. (STR-903.)
+    /// Distinct from a fresh unconfigured app. Auth rejection can still leave a
+    /// stale configured REST surface, while self-revoke now completes Forget and
+    /// erases it; in either posture a pair link is recovery, not a destructive
+    /// switch, so the router skips its disconnect-confirmation gate. (STR-903.)
     var isAwaitingRePair: Bool {
         if case .needsSetup = phase, reauthRequired { return true }
         return false
@@ -588,7 +586,32 @@ final class ConnectionStore {
 
     /// The token for the active connection (kept in memory; also in Keychain).
     private var currentToken: String?
+    /// Monotonic ownership token for every connection lifecycle. Any task that
+    /// crosses an await captures this value and must revalidate it before it can
+    /// publish connection state or schedule more work. Configure and every
+    /// terminal transition advance it, permanently fencing continuations that
+    /// belonged to the prior gateway.
+    private var connectionGeneration: UInt64 = 0
     private var readinessWaiters: [CheckedContinuation<Void, Never>] = []
+
+    @discardableResult
+    private func advanceConnectionGeneration() -> UInt64 {
+        connectionGeneration &+= 1
+        sessionStore.invalidateConnectionWork()
+        return connectionGeneration
+    }
+
+    private func isCurrentGeneration(_ generation: UInt64) -> Bool {
+        generation == connectionGeneration
+    }
+
+    private func isActiveGeneration(_ generation: UInt64) -> Bool {
+        guard isCurrentGeneration(generation), hasConnected, !reauthRequired else { return false }
+        switch phase {
+        case .needsSetup, .offline: return false
+        case .connecting, .hydrating, .connected, .reconnecting: return true
+        }
+    }
 
     /// Servers where `POST /devices/issue` hit the device registry cap during
     /// this app run. A 409 is permanent until a device is revoked, so automatic
@@ -823,6 +846,11 @@ final class ConnectionStore {
     /// Resolve the connection at launch: dev env override → saved config →
     /// `.needsSetup`.
     func bootstrap() async {
+        let generation = advanceConnectionGeneration()
+        await bootstrap(generation: generation)
+    }
+
+    private func bootstrap(generation: UInt64) async {
         if UserDefaults.standard.string(forKey: DefaultsKeys.serverURL) == nil,
            UserDefaults.standard.data(forKey: DefaultsKeys.gatewayCleanupTombstone) != nil {
             // A prior Forget may have been terminated after credentials were
@@ -833,6 +861,7 @@ final class ConnectionStore {
         if UserDefaults.standard.bool(forKey: DefaultsKeys.connectionOffline) {
             if let savedURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL), !savedURL.isEmpty {
                 await paintCacheFirst(serverURLString: savedURL)
+                guard isCurrentGeneration(generation) else { return }
             }
             phase = .offline(nil)
             return
@@ -856,7 +885,11 @@ final class ConnectionStore {
             // resolves from, so it must be set before the paint — the later
             // `configure()` re-stamps it (trimmed) verbatim on a verified connect.
             await paintCacheFirst(serverURLString: url)
-            _ = await configure(urlString: url, token: token)
+            guard isCurrentGeneration(generation) else { return }
+            _ = await configure(
+                urlString: url, token: token, issuedDeviceId: nil, generation: generation
+            )
+            guard isCurrentGeneration(generation) else { return }
             isBootstrapping = false
             enterDraftAfterBootstrapConfigure()
             return
@@ -871,6 +904,7 @@ final class ConnectionStore {
             // offline cold start. The probe's early-return offline path no longer
             // strands an empty drawer because the cache read already ran here.
             await paintCacheFirst(serverURLString: savedURL)
+            guard isCurrentGeneration(generation) else { return }
 
             guard let token = KeychainService.loadToken(server: savedURL) else {
                 // A cached URL still identifies a returning user even when the
@@ -882,7 +916,10 @@ final class ConnectionStore {
                 return
             }
 
-            _ = await configure(urlString: savedURL, token: token)
+            _ = await configure(
+                urlString: savedURL, token: token, issuedDeviceId: nil, generation: generation
+            )
+            guard isCurrentGeneration(generation) else { return }
             isBootstrapping = false
             enterDraftAfterBootstrapConfigure()
             return
@@ -946,6 +983,21 @@ final class ConnectionStore {
     ///   post-connect auto-upgrade transparently swaps the shared token for a
     ///   device token if the server advertises the `devices` capability.
     func configure(urlString: String, token: String, issuedDeviceId: String? = nil) async -> String? {
+        let generation = advanceConnectionGeneration()
+        return await configure(
+            urlString: urlString,
+            token: token,
+            issuedDeviceId: issuedDeviceId,
+            generation: generation
+        )
+    }
+
+    private func configure(
+        urlString: String,
+        token: String,
+        issuedDeviceId: String?,
+        generation: UInt64
+    ) async -> String? {
         let trimmedURL = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         let previousServerURL = serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -967,6 +1019,16 @@ final class ConnectionStore {
         // Cancel any reconnect loop tied to a previous configuration.
         reconnectTask?.cancel()
         reconnectTask = nil
+        hydrationTask?.cancel()
+        hydrationTask = nil
+        graceTask?.cancel()
+        graceTask = nil
+        sessionRefreshDebounceTask?.cancel()
+        sessionRefreshDebounceTask = nil
+        isInGrace = false
+        // Until this generation is verified, queued state from the prior socket
+        // must not qualify as active (especially a late `.open`).
+        hasConnected = false
         deviceIssueLimitReachedServers.remove(trimmedURL)
         deviceLimitAdvisory = nil
 
@@ -993,6 +1055,7 @@ final class ConnectionStore {
             _ = try await probe.status()
             #endif
         } catch {
+            guard isCurrentGeneration(generation) else { return nil }
             // An auth rejection on a probe means this token is no longer valid —
             // surface the re-pair affordance rather than a generic offline error
             // (D3 RE-PAIR FLOW). This covers both an explicit re-auth attempt and
@@ -1006,6 +1069,7 @@ final class ConnectionStore {
             phase = .offline(message)
             return message
         }
+        guard isCurrentGeneration(generation) else { return nil }
 
         do {
             if let connectRPC {
@@ -1014,10 +1078,12 @@ final class ConnectionStore {
                 try await client.connect(baseURL: url, token: trimmedToken, mode: connectionMode)
             }
         } catch {
+            guard isCurrentGeneration(generation) else { return nil }
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             phase = .offline(message)
             return message
         }
+        guard isCurrentGeneration(generation) else { return nil }
 
         if !previousServerURL.isEmpty, previousServerURL != trimmedURL {
             // ABH-410 follow-up: when a verified re-pair switches servers, purge
@@ -1064,18 +1130,22 @@ final class ConnectionStore {
         // shows features optimistically until a probe proves one unavailable.
         // NOT part of the hydration gate — it never blocks the loading screen.
         Task { [weak self] in
-            guard let self, let rest = self.rest else { return }
+            guard let self, self.isActiveGeneration(generation),
+                  let rest = self.rest else { return }
             await self.capabilities.probe(serverURL: trimmedURL, rest: rest)
+            guard self.isActiveGeneration(generation) else { return }
             // F4b: once the `profiles` capability has settled, load the profile
             // list backing the switcher (a no-op clearing the cache on a stock
             // gateway). Gated inside `loadProfiles()` on `profiles == .available`.
             await self.sessionStore.loadProfiles()
+            guard self.isActiveGeneration(generation) else { return }
             // W3A-A: once the `devices` capability has settled, transparently
             // auto-upgrade a legacy shared token to a per-device token (a no-op on
             // a stock gateway, where `devices` is `.unavailable`, and on a device
             // that already holds a device token for this server). Runs AFTER the
             // probe so it sees the settled capability.
             await self.autoUpgradeToDeviceTokenIfNeeded(serverURL: trimmedURL)
+            guard self.isActiveGeneration(generation) else { return }
         }
 
         // ABH-82: coordinate the `.hydrating → .connected` transition. The
@@ -1083,7 +1153,7 @@ final class ConnectionStore {
         // probe; both are raced against `hydrationTimeout` so a slow or hung
         // probe can never strand the loading screen. On completion (whichever
         // wins) we land on a fresh new-chat draft and reveal the connected UI.
-        startHydration()
+        startHydration(generation: generation)
         return nil
     }
 
@@ -1102,16 +1172,19 @@ final class ConnectionStore {
     /// returns early on cancellation, so `Task.isCancelled` distinguishes a real
     /// completion from a cancelled one; `finishHydration` re-fires the refresh in
     /// the background when this never set the flag.
-    private func runHydrationRefresh() async {
+    private func runHydrationRefresh(generation: UInt64) async {
+        guard isActiveGeneration(generation) else { return }
         await sessionStore.refresh()
-        if !Task.isCancelled { hydrationRefreshCompleted = true }
+        guard !Task.isCancelled, isActiveGeneration(generation) else { return }
+        hydrationRefreshCompleted = true
     }
 
-    private func startHydration() {
+    private func startHydration(generation: UInt64) {
+        guard isActiveGeneration(generation) else { return }
         hydrationTask?.cancel()
         hydrationRefreshCompleted = false
         hydrationTask = Task { [weak self] in
-            guard let self else { return }
+            guard let self, self.isActiveGeneration(generation) else { return }
             await withTaskGroup(of: Void.self) { group in
                 // Branch 1: the real hydration — pull the session list (so the
                 // drawer is populated when the shell reveals) AND resolve the
@@ -1125,9 +1198,9 @@ final class ConnectionStore {
                 // the outer race intact (this branch finishes only when BOTH are
                 // done) while letting the chip resolve in parallel. (ABH-84 QA.)
                 group.addTask { [weak self] in
-                    guard let self else { return }
-                    async let sessions: Void = self.runHydrationRefresh()
-                    async let model: Void = self.refreshActiveModel()
+                    guard let self, self.isActiveGeneration(generation) else { return }
+                    async let sessions: Void = self.runHydrationRefresh(generation: generation)
+                    async let model: Void = self.refreshActiveModel(generation: generation)
                     _ = await (sessions, model)
                 }
                 // Branch 2: the hard timeout fallback. Proceeds to `.connected`
@@ -1140,8 +1213,8 @@ final class ConnectionStore {
                 _ = await group.next()
                 group.cancelAll()
             }
-            if Task.isCancelled { return }
-            self.finishHydration()
+            guard !Task.isCancelled, self.isActiveGeneration(generation) else { return }
+            self.finishHydration(generation: generation)
         }
     }
 
@@ -1154,6 +1227,13 @@ final class ConnectionStore {
     /// here, so pinning its guard + side effects is the seam that proves the
     /// timeout fallback lands on `.connected` + a fresh draft (ABH-82).
     func finishHydration() {
+        finishHydration(generation: connectionGeneration, requireActive: false)
+    }
+
+    private func finishHydration(generation: UInt64, requireActive: Bool = true) {
+        guard isCurrentGeneration(generation),
+              !reauthRequired,
+              (!requireActive || hasConnected) else { return }
         guard phase == .hydrating else { return }
         // Land on a fresh draft chat (chat-as-home), but only when nothing is
         // already active — a manual re-configure while a session is open must not
@@ -1174,7 +1254,9 @@ final class ConnectionStore {
         // whenever the model is still unresolved so the chip fills in shortly
         // after connect instead of staying blank until a force-quit. (ABH-84 QA.)
         if activeModelName == nil {
-            Task { [weak self] in await self?.refreshActiveModel() }
+            Task { [weak self] in
+                await self?.refreshActiveModel(generation: generation)
+            }
         }
         // STALE-DRAWER FIX: the hydration race cancels the session-list `refresh()`
         // when the 8s timeout branch wins — which it reliably does for a large account
@@ -1187,7 +1269,11 @@ final class ConnectionStore {
         // fresh state shortly after connect. Opening a session then fetches its fresh
         // transcript on its own (the delta route falls back to a full resync).
         if !hydrationRefreshCompleted {
-            Task { [weak self] in await self?.sessionStore.refresh() }
+            Task { [weak self] in
+                guard let self, self.isActiveGeneration(generation) else { return }
+                await self.sessionStore.refresh()
+                guard self.isActiveGeneration(generation) else { return }
+            }
         }
         // CACHE-FIRST coverage (WhatsApp bar): hydration has settled and the
         // session list is populated — warm the top-N recent transcripts in the
@@ -1259,13 +1345,20 @@ final class ConnectionStore {
         await stopLiveWork(returningTo: .needsSetup, clearSpotlight: true)
     }
 
-    private func stopLiveWork(returningTo finalPhase: Phase, clearSpotlight: Bool) async {
+    private func stopLiveWork(
+        returningTo finalPhase: Phase?,
+        clearSpotlight: Bool,
+        generation ownedGeneration: UInt64? = nil
+    ) async {
+        let generation = ownedGeneration ?? advanceConnectionGeneration()
         reconnectTask?.cancel()
         reconnectTask = nil
         // Cancel any in-flight hydration so a teardown mid-load can't later flip
         // the phase back to `.connected` (ABH-82).
         hydrationTask?.cancel()
         hydrationTask = nil
+        sessionRefreshDebounceTask?.cancel()
+        sessionRefreshDebounceTask = nil
         // A deliberate disconnect always wins over a silent-reconnect grace
         // window in flight — never leave a stale grace timer able to fire
         // after teardown.
@@ -1304,18 +1397,33 @@ final class ConnectionStore {
             Self.clearSpotlightSessionIndexForPrivacy()
         }
         await client.disconnect()
-        phase = finalPhase
+        guard isCurrentGeneration(generation) else { return }
+        if let finalPhase { phase = finalPhase }
     }
 
     /// Authenticated caller-only privacy transaction. Local erasure always wins;
     /// remote failure records a minimal retry tombstone without retaining token.
-    func forgetGateway(remoteCleanup: (() async throws -> Void)? = nil) async {
+    /// `serverOverride` lets a just-revoked device identify the credential even
+    /// if persisted URL cleanup raced ahead of its callback.
+    func forgetGateway(
+        remoteCleanup: (() async throws -> Void)? = nil,
+        serverOverride: String? = nil
+    ) async {
+        let generation = advanceConnectionGeneration()
+        // Keep onboarding hidden until every local privacy owner has completed.
+        phase = .connecting
         let defaults = UserDefaults.standard
         let pending = defaults.data(forKey: DefaultsKeys.gatewayCleanupTombstone)
             .flatMap { try? JSONDecoder().decode(GatewayCleanupTombstone.self, from: $0) }
-        guard let server = defaults.string(forKey: DefaultsKeys.serverURL) ?? pending?.server,
+        guard let server = serverOverride
+                ?? defaults.string(forKey: DefaultsKeys.serverURL)
+                ?? pending?.server,
               !server.isEmpty else {
-            await stopLiveWork(returningTo: .needsSetup, clearSpotlight: true)
+            await stopLiveWork(
+                returningTo: nil, clearSpotlight: true, generation: generation
+            )
+            guard isCurrentGeneration(generation) else { return }
+            phase = .needsSetup
             return
         }
         let deviceId = DefaultsKeys.deviceId(server: server) ?? pending?.deviceId
@@ -1329,8 +1437,11 @@ final class ConnectionStore {
         }
         var remoteFailed = false
         do { try await remoteCleanup?() } catch { remoteFailed = true }
-        await stopLiveWork(returningTo: .needsSetup, clearSpotlight: true)
+        guard isCurrentGeneration(generation) else { return }
+        await stopLiveWork(returningTo: nil, clearSpotlight: true, generation: generation)
+        guard isCurrentGeneration(generation) else { return }
         try? await cacheStore?.purgeGateway(serverId: server)
+        guard isCurrentGeneration(generation) else { return }
         queueStore?.removeAll()
         inboxStore?.removeAll()
         PendingIntent.clearPending()
@@ -1357,6 +1468,8 @@ final class ConnectionStore {
         } else if pending?.remoteRetryNeeded != true {
             defaults.removeObject(forKey: DefaultsKeys.gatewayCleanupTombstone)
         }
+        guard isCurrentGeneration(generation) else { return }
+        phase = .needsSetup
     }
 
     // MARK: - Long-lived tasks
@@ -1377,8 +1490,12 @@ final class ConnectionStore {
                 // gates. Lossless: every frame is still routed in order.
                 var holdStart = ContinuousClock.now
                 var sinceYield = 0
-                for await event in self.client.events {
-                    self.route(event: event)
+                var iterator = self.client.events.makeAsyncIterator()
+                while !Task.isCancelled {
+                    let generation = self.connectionGeneration
+                    guard let event = await iterator.next() else { return }
+                    guard self.isActiveGeneration(generation) else { continue }
+                    self.route(event: event, generation: generation)
                     sinceYield += 1
                     if sinceYield >= Self.intakeYieldEveryK
                         || ContinuousClock.now - holdStart >= Self.intakeYieldBudget {
@@ -1392,15 +1509,19 @@ final class ConnectionStore {
         if stateObserverTask == nil {
             stateObserverTask = Task { [weak self] in
                 guard let self else { return }
-                for await state in self.client.stateChanges {
-                    self.handle(state: state)
+                var iterator = self.client.stateChanges.makeAsyncIterator()
+                while !Task.isCancelled {
+                    let generation = self.connectionGeneration
+                    guard let state = await iterator.next() else { return }
+                    guard self.isActiveGeneration(generation) else { continue }
+                    self.handle(state: state, generation: generation)
                 }
             }
         }
     }
 
     /// Fan a single gateway event out to the right store.
-    private func route(event: GatewayEvent) {
+    private func route(event: GatewayEvent, generation: UInt64) {
         // The router task now outlives disconnects (R1 #11 — cancelling it
         // killed the single-consumer stream), so frames the dead socket
         // buffered into the unbounded stream can drain AFTER a deliberate
@@ -1410,7 +1531,7 @@ final class ConnectionStore {
         // never be dropped) — gate on it so a ghost frame from a server the
         // user just left can't re-claim a turn or mutate store state
         // (ABH-52 judge round).
-        guard hasConnected else { return }
+        guard isActiveGeneration(generation) else { return }
         // ABH-46 item 8: a frame carrying `broadcast_gap` means the gateway's
         // bounded per-client broadcast queue dropped frames before this one
         // (F3 overflow policy, ws.py:253). The live stream has a hole, so
@@ -1419,13 +1540,20 @@ final class ConnectionStore {
         // normal routing — the carrying frame itself is still applied below.
         if let gap = event.broadcastGap, gap > 0 {
             Task {
+                guard self.isActiveGeneration(generation) else { return }
                 await self.chatStore.backfill()
+                guard self.isActiveGeneration(generation) else { return }
                 await self.sessionStore.refresh()
+                guard self.isActiveGeneration(generation) else { return }
             }
         }
         switch event.type {
         case .gatewayReady:
-            Task { await self.sessionStore.refresh() }
+            Task {
+                guard self.isActiveGeneration(generation) else { return }
+                await self.sessionStore.refresh()
+                guard self.isActiveGeneration(generation) else { return }
+            }
         case .messageStart, .messageDelta, .messageComplete,
              .thinkingDelta, .reasoningDelta,
              .toolStart, .toolProgress, .toolComplete,
@@ -1494,7 +1622,7 @@ final class ConnectionStore {
                     // authoritative, so the carry-forward can release.
                     sessionStore.markTurnCompleted(storedId: activityStoredId)
                 }
-                scheduleSessionRefresh()
+                scheduleSessionRefresh(generation: generation)
             case .error:
                 // A gateway error is a turn TERMINAL (ChatStore also handles it).
                 // Clear the turn-in-progress flag so the carry-forward releases
@@ -1538,12 +1666,15 @@ final class ConnectionStore {
     /// direct `sessionStore.refresh()` (not via this debounce) and `recoverActiveSession`
     /// also ends with a direct refresh — the debounce is exclusively for the
     /// per-message streaming triggers.
-    private func scheduleSessionRefresh() {
+    private func scheduleSessionRefresh(generation: UInt64) {
+        guard isActiveGeneration(generation) else { return }
         sessionRefreshDebounceTask?.cancel()
         sessionRefreshDebounceTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(Self.sessionRefreshDebounceMs))
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled, let self,
+                  self.isActiveGeneration(generation) else { return }
             await self.sessionStore.refresh()
+            guard self.isActiveGeneration(generation) else { return }
         }
     }
 
@@ -1566,7 +1697,8 @@ final class ConnectionStore {
 
     /// React to a transport state transition: keep `phase` honest and start the
     /// reconnect loop when an established connection drops.
-    private func handle(state: GatewayConnectionState) {
+    private func handle(state: GatewayConnectionState, generation: UInt64) {
+        guard isActiveGeneration(generation) else { return }
         switch state {
         case .idle, .connecting:
             break
@@ -1575,7 +1707,8 @@ final class ConnectionStore {
             // `.open` right after `configure` sets `.hydrating`; the hydration
             // coordinator owns the `.hydrating → .connected` transition. The
             // reconnect loop sets `.connected` itself on success.
-            if reconnectTask == nil, phase != .hydrating { phase = .connected }
+            if reconnectTask == nil, phase != .hydrating,
+               isActiveGeneration(generation) { phase = .connected }
         case .closed, .failed:
             // STR-973A silent reconnect: a drop after we were connected no
             // longer finalizes the stream or shows `.reconnecting` right
@@ -1589,9 +1722,12 @@ final class ConnectionStore {
             // `reconnectTask`/`graceTask` are both already non-nil by then.
             guard hasConnected, reconnectTask == nil, graceTask == nil else { return }
             #if DEBUG
-            startGraceWindow(duration: graceWindowOverride ?? Self.transientGraceWindow)
+            startGraceWindow(
+                duration: graceWindowOverride ?? Self.transientGraceWindow,
+                generation: generation
+            )
             #else
-            startGraceWindow(duration: Self.transientGraceWindow)
+            startGraceWindow(duration: Self.transientGraceWindow, generation: generation)
             #endif
         }
     }
@@ -1605,13 +1741,15 @@ final class ConnectionStore {
     /// the window expires with retries still failing does
     /// `escalateGraceExpiry()` finalize the stream and surface
     /// `.reconnecting`.
-    private func startGraceWindow(duration: Duration) {
+    private func startGraceWindow(duration: Duration, generation: UInt64) {
+        guard isActiveGeneration(generation) else { return }
         isInGrace = true
-        startReconnectLoop()
+        startReconnectLoop(generation: generation)
         graceTask = Task { [weak self] in
             try? await Task.sleep(for: duration)
-            guard let self, !Task.isCancelled else { return }
-            self.escalateGraceExpiry()
+            guard let self, !Task.isCancelled,
+                  self.isActiveGeneration(generation) else { return }
+            self.escalateGraceExpiry(generation: generation)
         }
     }
 
@@ -1620,8 +1758,8 @@ final class ConnectionStore {
     /// A no-op if grace already ended (the loop healed first, or a teardown
     /// raced this timer) — `escalateGraceExpiry` must never resurrect a
     /// settled phase.
-    private func escalateGraceExpiry() {
-        guard isInGrace else { return }
+    private func escalateGraceExpiry(generation: UInt64) {
+        guard isInGrace, isActiveGeneration(generation) else { return }
         isInGrace = false
         graceTask = nil
         chatStore.handleConnectionDrop()
@@ -1645,11 +1783,13 @@ final class ConnectionStore {
     /// any added latency. Subsequent attempts wait
     /// `min(0.5 * 2^attempt, 30)s + jitter(0…0.5s)` before retrying. On
     /// success, re-resumes the active session and backfills the transcript.
-    private func startReconnectLoop() {
+    private func startReconnectLoop(generation: UInt64) {
+        guard isActiveGeneration(generation), reconnectTask == nil else { return }
         reconnectTask = Task { [weak self] in
-            guard let self else { return }
+            guard let self, self.isActiveGeneration(generation) else { return }
             var attempt = 0
             while !Task.isCancelled {
+                guard self.isActiveGeneration(generation) else { return }
                 self.currentReconnectAttempt = attempt
                 // STR-973A: while grace is holding, keep `phase` at
                 // `.connected` — `escalateGraceExpiry()` is the only path
@@ -1671,7 +1811,7 @@ final class ConnectionStore {
                     #endif
                     try? await Task.sleep(for: .seconds(delay))
                 }
-                if Task.isCancelled { return }
+                guard !Task.isCancelled, self.isActiveGeneration(generation) else { return }
 
                 guard let url = URL(string: self.serverURLString),
                       let token = self.currentToken else {
@@ -1694,7 +1834,8 @@ final class ConnectionStore {
                     } else {
                         try await self.client.connect(baseURL: url, token: token, mode: self.connectionMode)
                     }
-                    if Task.isCancelled { return }
+                    guard !Task.isCancelled,
+                          self.isActiveGeneration(generation) else { return }
                     // End grace immediately on the successful connect, BEFORE
                     // the awaited recovery below — `recoverActiveSession()`
                     // has genuine network suspensions, and while this task is
@@ -1715,13 +1856,18 @@ final class ConnectionStore {
                     // reconnect banner.
                     self.chatStore.handleConnectionDrop(stampWarning: false)
                     self.sessionStore.clearAllTurnsInProgress()
-                    await self.recoverActiveSession()
+                    guard await self.recoverActiveSession(generation: generation),
+                          !Task.isCancelled,
+                          self.isActiveGeneration(generation) else { return }
                     self.enterDraftIfNoActiveSession()
+                    guard self.isActiveGeneration(generation) else { return }
                     self.phase = .connected
                     self.reconnectTask = nil
                     self.consecutiveReconnectFailures = 0
                     return
                 } catch {
+                    guard !Task.isCancelled,
+                          self.isActiveGeneration(generation) else { return }
                     // The WS handshake error is not typed as auth, so once a
                     // string of reconnects keep failing we re-probe REST to tell
                     // an auth *revocation* (→ re-pair) apart from plain
@@ -1730,7 +1876,8 @@ final class ConnectionStore {
                     self.consecutiveReconnectFailures += 1
                     if self.consecutiveReconnectFailures >= Self.authReprobeThreshold,
                        await self.probeIsAuthRevoked(url: url, token: token) {
-                        if Task.isCancelled { return }
+                        guard !Task.isCancelled,
+                              self.isActiveGeneration(generation) else { return }
                         // A hard auth revocation must never be swallowed by
                         // grace — end it now and escalate straight to re-pair.
                         self.endGrace()
@@ -1739,6 +1886,8 @@ final class ConnectionStore {
                         self.reconnectTask = nil
                         return
                     }
+                    guard !Task.isCancelled,
+                          self.isActiveGeneration(generation) else { return }
                     // Keep trying; bump the attempt for a longer next backoff.
                     attempt += 1
                 }
@@ -1796,17 +1945,25 @@ final class ConnectionStore {
     /// External revocations still go through the reconnect-loop debounce; this
     /// path is only for the Settings → Devices branch where the UI already knows
     /// from `wasCurrent` that the current install revoked its own token.
-    func requireRepairAfterCurrentDeviceRevoked() {
+    func requireRepairAfterCurrentDeviceRevoked(clearPrivacySurfaces: Bool = true) {
+        advanceConnectionGeneration()
         reconnectTask?.cancel()
         reconnectTask = nil
         hydrationTask?.cancel()
         hydrationTask = nil
+        sessionRefreshDebounceTask?.cancel()
+        sessionRefreshDebounceTask = nil
+        graceTask?.cancel()
+        graceTask = nil
+        isInGrace = false
         chatStore.handleConnectionDrop()
         sessionStore.clearAllTurnsInProgress()
         // ABH-410 follow-up: self-revoke is a stronger privacy action than
         // disconnect, so purge indexed session titles before routing to re-pair.
-        Self.log.notice("Self-device revoke clearing Hermes Spotlight session index")
-        Self.clearSpotlightSessionIndexForPrivacy()
+        if clearPrivacySurfaces {
+            Self.log.notice("Self-device revoke clearing Hermes Spotlight session index")
+            Self.clearSpotlightSessionIndexForPrivacy()
+        }
         reauthRequired = true
         hasConnected = false
         consecutiveReconnectFailures = 0
@@ -1981,16 +2138,20 @@ final class ConnectionStore {
     ///
     /// Must only be called from unit tests — absent in Release.
     func _seedAndStartReconnect(serverURL: String, token: String) {
+        let generation = advanceConnectionGeneration()
         serverURLString = serverURL
         currentToken = token
         hasConnected = true
-        startReconnectLoop()
+        reauthRequired = false
+        phase = .connected
+        startReconnectLoop(generation: generation)
     }
 
     /// DEBUG-only test seam: seed the app as already paired and connected without
     /// starting a reconnect loop. Used by ABH-355 regression coverage to exercise
     /// the real state-observer drop path from a connected, mid-stream shell.
     func _seedConnectedForTesting(serverURL: String, token: String) {
+        advanceConnectionGeneration()
         serverURLString = serverURL
         currentToken = token
         hasConnected = true
@@ -2002,7 +2163,16 @@ final class ConnectionStore {
     /// ABH-355 mid-turn disconnect test on the production handler (`handle(state:)`)
     /// instead of duplicating reconnect/drop logic in the test.
     func _handleGatewayStateForTesting(_ state: GatewayConnectionState) {
-        handle(state: state)
+        handle(state: state, generation: connectionGeneration)
+    }
+
+    var _connectionGenerationForTesting: UInt64 { connectionGeneration }
+
+    func _handleGatewayStateForTesting(
+        _ state: GatewayConnectionState,
+        generation: UInt64
+    ) {
+        handle(state: state, generation: generation)
     }
 
     func _handleDeviceLimitReachedForTesting(serverURL: String, maxDevices: Int?) {
@@ -2031,7 +2201,9 @@ final class ConnectionStore {
 
     /// After a (re)connect, re-resume the active session so its runtime id is
     /// valid on the new connection, then backfill the transcript over REST.
-    private func recoverActiveSession() async {
+    @discardableResult
+    private func recoverActiveSession(generation: UInt64) async -> Bool {
+        guard isActiveGeneration(generation) else { return false }
         // Re-probe capabilities after a reconnect — FORCED (R1 #57): this path
         // only runs after the socket genuinely dropped, and a restart on the
         // same URL may have swapped a stock↔patched gateway; the same-URL
@@ -2054,38 +2226,47 @@ final class ConnectionStore {
         // contract in configure().
         if let rest {
             Task { [weak self] in
-                guard let self else { return }
+                guard let self, self.isActiveGeneration(generation) else { return }
                 await self.capabilities.probe(
                     serverURL: self.serverURLString, rest: rest, force: true
                 )
+                guard self.isActiveGeneration(generation) else { return }
                 // Capability-dependent settles run BEHIND the probe but OFF the
                 // reconnect-critical path (same ordering as configure()).
                 // W3A-A: retry the device-token auto-upgrade — covers a server
                 // that gained device routes while offline, or a prior failed
                 // issue. No-op once a device token is held.
                 await self.autoUpgradeToDeviceTokenIfNeeded(serverURL: self.serverURLString)
+                guard self.isActiveGeneration(generation) else { return }
                 // F4b: re-load the switcher profile list now the capability is
                 // re-affirmed (clears the cache on a stock gateway).
                 await self.sessionStore.loadProfiles()
+                guard self.isActiveGeneration(generation) else { return }
             }
         }
         // Re-resolve the running model — it may have changed while we were
         // offline (another client switched it) (F0).
-        await refreshActiveModel()
+        await refreshActiveModel(generation: generation)
+        guard isActiveGeneration(generation) else { return false }
         if sessionStore.activeStoredId != nil {
             await sessionStore.resumeActiveAfterReconnect()
+            guard isActiveGeneration(generation) else { return false }
             await chatStore.backfill()
+            guard isActiveGeneration(generation) else { return false }
             // Flush the offline outbox now the transcript is current — but only
             // with a live runtime session, or the queue would burn through with
             // a "No active session" error (see QueueStore drain notes).
             if sessionStore.activeRuntimeId != nil {
                 await queueStore?.drain(chat: chatStore)
+                guard isActiveGeneration(generation) else { return false }
             }
         }
         await sessionStore.refresh()
+        guard isActiveGeneration(generation) else { return false }
         // CACHE-FIRST coverage (WhatsApp bar): re-warm the recent transcripts now
         // the list is current again — covers sessions that moved while offline.
         sessionStore.prefetchRecentTranscripts()
+        return true
     }
 
     // MARK: - Scene phase
@@ -2107,15 +2288,17 @@ final class ConnectionStore {
             return
         }
         guard hasConnected else { return }
+        let generation = connectionGeneration
 
         Task { [weak self] in
-            guard let self else { return }
+            guard let self, self.isActiveGeneration(generation) else { return }
             #if DEBUG
             let _liveState = await self.client.state
             let socketState = self.clientStateOverrideForScenePhase ?? _liveState
             #else
             let socketState = await self.client.state
             #endif
+            guard self.isActiveGeneration(generation) else { return }
             let dead: Bool
             switch socketState {
             case .closed, .failed: dead = true
@@ -2148,7 +2331,8 @@ final class ConnectionStore {
                 // interrupted; reconcile the LA so an orphaned "Thinking" activity
                 // is dismissed rather than expiring on the lock screen at staleAfter.
                 LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
-                self.startReconnectLoop()
+                guard self.isActiveGeneration(generation) else { return }
+                self.startReconnectLoop(generation: generation)
             } else if case .connected = self.phase {
                 // ABH-177: verify the socket is still alive with a read-only ping
                 // before attempting the REST backfill. A silent-dead socket that
@@ -2171,6 +2355,7 @@ final class ConnectionStore {
                 #else
                 alive = await self.client.probeLiveness()
                 #endif
+                guard self.isActiveGeneration(generation) else { return }
                 guard alive else {
                     // ABH-177: the real `probeLiveness` path calls `handleSocketFailure`
                     // which sets transport state to `.failed`; the existing state observer
@@ -2187,7 +2372,8 @@ final class ConnectionStore {
                         self.reconnectTask?.cancel()
                         self.reconnectTask = nil
                     }
-                    self.startReconnectLoop()
+                    guard self.isActiveGeneration(generation) else { return }
+                    self.startReconnectLoop(generation: generation)
                     return
                 }
                 // ABH-182 Inc-1: on a healthy foreground, reconcile the LA so
@@ -2195,13 +2381,14 @@ final class ConnectionStore {
                 // whose message.complete was missed) is dismissed.
                 LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
                 await self.chatStore.backfill()
+                guard self.isActiveGeneration(generation) else { return }
                 // ABH-86 item 5: refresh the session list on foreground so the
                 // drawer reflects changes made on other clients while the app
                 // was backgrounded. Uses the shared coalesced seam so a
                 // simultaneous streaming trigger and a foreground collapse to one
                 // fetch. The reconnect path already ends with `recoverActiveSession`
                 // → `sessionStore.refresh()`, so this only runs on a live socket.
-                self.scheduleSessionRefresh()
+                self.scheduleSessionRefresh(generation: generation)
             }
         }
     }
@@ -2216,8 +2403,19 @@ final class ConnectionStore {
     /// surface is configured. Best-effort: a probe failure leaves the prior
     /// value untouched rather than blanking the chip on a transient error.
     func refreshActiveModel() async {
+        await refreshActiveModel(generation: connectionGeneration, requireActive: false)
+    }
+
+    private func refreshActiveModel(
+        generation: UInt64,
+        requireActive: Bool = true
+    ) async {
+        guard isCurrentGeneration(generation),
+              (!requireActive || isActiveGeneration(generation)) else { return }
         guard let control else { return }
         guard let info = try? await control.modelInfo() else { return }
+        guard isCurrentGeneration(generation),
+              (!requireActive || isActiveGeneration(generation)) else { return }
         activeModelName = Self.shortModelName(provider: info.provider, model: info.model)
     }
 
