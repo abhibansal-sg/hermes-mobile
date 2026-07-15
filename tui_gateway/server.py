@@ -8131,7 +8131,17 @@ def _(rid, params: dict) -> dict:
 
 @method("session.branch")
 def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
+    session_id = params.get("session_id") or ""
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    device = _ws_device_identity()
+    # UPSTREAM-HOOK-WANTED: replace this branch-local WS device authz check
+    # with shared RPC authorization middleware when STR-53 lands.
+    if device is not None and not _ws_device_owns_session(device, session_id):
+        return _err(rid, 4030, "device does not own this session")
+    _start_agent_build(session_id, session)
+    err = _wait_agent(session, rid)
     if err:
         return err
     db = _get_db()
