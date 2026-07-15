@@ -58,10 +58,25 @@ class _FakeRelayClient:
     def __init__(self, status: dict):
         self.status = status
         self.calls = 0
+        self.send_calls = 0
 
     async def tunnel_status(self) -> dict:
         self.calls += 1
         return self.status
+
+    async def send_event(
+        self,
+        *,
+        kind,
+        session_id,
+        title,
+        body,
+        source=None,
+        event_type=None,
+        category=None,
+        payload=None,
+    ) -> None:
+        self.send_calls += 1
 
 
 def test_relay_status_requires_auth(client):
@@ -134,3 +149,37 @@ def test_relay_status_reports_failing_when_delivery_failures_exist(
     assert body["health"] == "failing"
     assert body["health"] != "ok"
     assert body["tunnel_status"] == {"ok": True, "agent_online": True}
+
+
+def test_relay_status_recovers_after_successful_delivery(
+    client, relay_env, monkeypatch
+):
+    relay.set_relay_config(relay_url="https://relay.example.test", hermes_home=relay_env)
+    relay._record_delivery_failure()
+    assert relay.relay_delivery_failure_count() == 1
+
+    fake = _FakeRelayClient({"ok": True, "agent_online": True})
+    monkeypatch.setattr(relay, "relay_client", lambda *a, **kw: fake)
+
+    # Pre-success: a recorded failure latches health to "failing".
+    response = client.get(f"{_PREFIX}/relay/status", headers=_TOKEN_HEADER)
+
+    assert response.status_code == 200
+    pre = response.json()
+    assert pre["health"] == "failing"
+    assert pre["delivery_failure_count"] == 1
+
+    # Drive the actual recovery path: a successful _send_sync delivery resets
+    # the failure latch — do not call _reset_delivery_failures() directly.
+    relay._send_sync("replies", "session-1", "Title", "Body", "test", None)
+
+    assert relay.relay_delivery_failure_count() == 0
+    assert fake.send_calls == 1
+
+    # Post-success: healthy tunnel + zero failures reports "ok".
+    response = client.get(f"{_PREFIX}/relay/status", headers=_TOKEN_HEADER)
+
+    assert response.status_code == 200
+    post = response.json()
+    assert post["health"] == "ok"
+    assert post["delivery_failure_count"] == 0
