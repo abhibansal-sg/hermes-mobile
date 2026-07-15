@@ -13,6 +13,19 @@ import XCTest
 /// gate (live dashboard on 9123); see CONTRACT-F2.md.
 final class NotificationActionTests: XCTestCase {
 
+    @MainActor
+    func testNotificationActionCompletionTriggersInboxReconciliation() async {
+        let coordinator = NotificationLaunchCoordinator()
+        coordinator.attachActionEndpointProvider { nil }
+        let reconciled = expectation(description: "attention reconciliation requested")
+        coordinator.attachActionCompletionHandler { reconciled.fulfill() }
+        coordinator.receive(.approval(
+            true, nil,
+            .init(handler: {})
+        ))
+        await fulfillment(of: [reconciled], timeout: 1)
+    }
+
     // MARK: - aps.category decode
 
     func testApsCategoryReadsNestedApsBlock() {

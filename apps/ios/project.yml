@@ -169,6 +169,8 @@ targets:
           - WorkRepositoryLeaseTests.swift
           - WorkRepositoryMigrationTests.swift
           - WorkRepositoryTestSupport.swift
+      - path: ../../tests/fixtures/session_status_responses.json
+        buildPhase: resources
     dependencies:
       - target: HermesMobile
       # GRDB direct link so CacheLayerTests can call DatabaseQueue(configuration:)
@@ -178,6 +180,19 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.tests
+        GENERATE_INFOPLIST_FILE: true
+  KilledAppInboxReconciliationValidation:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - KilledAppInboxReconciliationValidation
+    dependencies:
+      - target: HermesMobile
+      - package: GRDB
+        product: GRDB
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.killed-inbox-validation
         GENERATE_INFOPLIST_FILE: true
   WorkRepositoryTests:
     type: bundle.unit-test
@@ -261,6 +276,7 @@ schemes:
       config: Debug
       targets:
         - HermesMobileTests
+        - KilledAppInboxReconciliationValidation
         - WorkRepositoryTests
         - HermesShareTests
         - HermesMobileUITests
