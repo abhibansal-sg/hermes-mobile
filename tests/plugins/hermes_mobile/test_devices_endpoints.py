@@ -294,6 +294,52 @@ def test_issue_registry_limit_returns_409(client, home, monkeypatch):
     assert r.json() == {"error": "device limit reached", "max_devices": 1}
 
 
+def test_issue_recovers_after_revoke_under_registry_limit(
+    client, home, monkeypatch, wired_token_auth
+):
+    monkeypatch.setattr(device_tokens, "_MAX_DEVICES", 1)
+
+    first = client.post(
+        f"{_PREFIX}/devices/issue",
+        json={"device_name": "Phone A"},
+        headers=_SHARED_HEADER,
+    )
+    assert first.status_code == 200
+    a = first.json()
+
+    limit = client.post(
+        f"{_PREFIX}/devices/issue",
+        json={"device_name": "Phone B"},
+        headers=_SHARED_HEADER,
+    )
+    assert limit.status_code == 409
+    assert limit.json() == {"error": "device limit reached", "max_devices": 1}
+
+    revoked = client.delete(
+        f"{_PREFIX}/devices/{a['device_id']}",
+        headers=_SHARED_HEADER,
+    )
+    assert revoked.status_code == 200
+
+    second = client.post(
+        f"{_PREFIX}/devices/issue",
+        json={"device_name": "Phone B"},
+        headers=_SHARED_HEADER,
+    )
+    assert second.status_code == 200
+    b = second.json()
+    assert b["device_id"] != a["device_id"]
+
+    devices = client.get(f"{_PREFIX}/devices", headers=_SHARED_HEADER)
+    assert devices.status_code == 200
+    assert [d["device_id"] for d in devices.json()["devices"]] == [b["device_id"]]
+    assert client.get(
+        f"{_PREFIX}/devices",
+        headers={"X-Hermes-Session-Token": a["token"]},
+    ).status_code == 401
+    assert client.get(f"{_PREFIX}/devices", headers=_SHARED_HEADER).status_code == 200
+
+
 def test_device_token_cannot_issue_another_device(client, home, wired_token_auth):
     issued = client.post(
         f"{_PREFIX}/devices/issue", json={"device_name": "x"}, headers=_SHARED_HEADER
