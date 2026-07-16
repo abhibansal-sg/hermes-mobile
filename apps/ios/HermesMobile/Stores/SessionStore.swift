@@ -237,13 +237,18 @@ final class SessionStore {
 
     /// Identity of one server-side Recents list universe. Cursor state is never
     /// shared across gateways, path families, profile rails, or source filters.
-    private struct SessionListDeltaScope: Hashable {
+    private struct SessionListDeltaScope: Hashable, Codable {
         let serverURL: String
         let pathStyle: String
         let activeProfile: String
         let rail: String
         let excludedSources: String
         let source: String
+    }
+
+    private struct PersistedSessionListCursor: Codable {
+        let scope: SessionListDeltaScope
+        let cursor: String
     }
 
     /// Opaque plugin session-list cursors partitioned by list universe.
@@ -283,6 +288,25 @@ final class SessionStore {
     private func resetSessionListDeltaState() {
         sessionListDeltaCursors.removeAll()
         pendingSessionListTombstones.removeAll()
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.sessionListDeltaCursors)
+    }
+
+    func flushSessionListDeltaCursors(defaults: UserDefaults = .standard) {
+        let persisted = sessionListDeltaCursors
+            .map { PersistedSessionListCursor(scope: $0.key, cursor: $0.value) }
+            .sorted {
+                let left = [$0.scope.serverURL, $0.scope.pathStyle, $0.scope.activeProfile,
+                            $0.scope.rail, $0.scope.excludedSources, $0.scope.source].joined(separator: "|")
+                let right = [$1.scope.serverURL, $1.scope.pathStyle, $1.scope.activeProfile,
+                             $1.scope.rail, $1.scope.excludedSources, $1.scope.source].joined(separator: "|")
+                return left < right
+            }
+        if persisted.isEmpty {
+            defaults.removeObject(forKey: DefaultsKeys.sessionListDeltaCursors)
+        } else if let data = try? JSONEncoder().encode(persisted) {
+            defaults.set(data, forKey: DefaultsKeys.sessionListDeltaCursors)
+        }
+        _ = defaults.synchronize()
     }
     /// Runtime `session_id` for the session bound to the current connection.
     var activeRuntimeId: String?
@@ -303,6 +327,17 @@ final class SessionStore {
     private var workRepository: WorkRepository?
     private weak var draftAttachments: AttachmentStore?
     private var draftSaveTasks: [String: Task<Void, Never>] = [:]
+
+    private struct ComposerDraftPersistenceSnapshot: Sendable {
+        let repository: WorkRepository
+        let scope: WorkScope
+        let contextKey: String
+        let storedSessionID: String?
+        let text: String
+        let cwd: String?
+        let modelSelectionJSON: String?
+        let assets: [WorkAssetInput]
+    }
 
     /// Bumped whenever a composer draft is mutated outside the focused field's
     /// direct binding. ComposerView observes this to pull externally-recalled
@@ -377,6 +412,14 @@ final class SessionStore {
         persistComposerDraft(for: key)
     }
 
+    func flushComposerDraftDurably() async {
+        let key = activeComposerDraftKey
+        draftSaveTasks[key]?.cancel()
+        draftSaveTasks[key] = nil
+        guard let snapshot = composerDraftPersistenceSnapshot(for: key) else { return }
+        await Self.saveComposerDraft(snapshot)
+    }
+
     var durableWorkScope: WorkScope? {
         guard let currentCacheScope else { return nil }
         return try? WorkScope(cacheScope: currentCacheScope)
@@ -392,7 +435,14 @@ final class SessionStore {
     }
 
     private func persistComposerDraft(for key: String) {
-        guard let repository = workRepository, let scope = durableWorkScope else { return }
+        guard let snapshot = composerDraftPersistenceSnapshot(for: key) else { return }
+        Task { await Self.saveComposerDraft(snapshot) }
+    }
+
+    private func composerDraftPersistenceSnapshot(
+        for key: String
+    ) -> ComposerDraftPersistenceSnapshot? {
+        guard let repository = workRepository, let scope = durableWorkScope else { return nil }
         let text = composerDrafts[key] ?? ""
         let storedID = key == Self.composerDraftFallbackKey ? nil : key
         let cwd = key == activeComposerDraftKey ? draftCwd : nil
@@ -405,7 +455,30 @@ final class SessionStore {
             modelJSON = nil
         }
         let assets = key == activeComposerDraftKey ? (draftAttachments?.draftAssetInputs() ?? []) : []
-        Task { try? await repository.saveDraft(scope: scope, contextKey: key, storedSessionID: storedID, text: text, cwd: cwd, modelSelectionJSON: modelJSON, assets: assets) }
+        return ComposerDraftPersistenceSnapshot(
+            repository: repository,
+            scope: scope,
+            contextKey: key,
+            storedSessionID: storedID,
+            text: text,
+            cwd: cwd,
+            modelSelectionJSON: modelJSON,
+            assets: assets
+        )
+    }
+
+    private nonisolated static func saveComposerDraft(
+        _ snapshot: ComposerDraftPersistenceSnapshot
+    ) async {
+        try? await snapshot.repository.saveDraft(
+            scope: snapshot.scope,
+            contextKey: snapshot.contextKey,
+            storedSessionID: snapshot.storedSessionID,
+            text: snapshot.text,
+            cwd: snapshot.cwd,
+            modelSelectionJSON: snapshot.modelSelectionJSON,
+            assets: snapshot.assets
+        )
     }
 
     /// Clear prompt-history cursor/snapshot state without changing the user's
@@ -1114,8 +1187,7 @@ final class SessionStore {
     /// connection it was started under. At most one sweep runs at a time.
     private var prefetchTask: Task<Void, Never>?
 
-    init() {
-        let defaults = UserDefaults.standard
+    init(defaults: UserDefaults = .standard) {
         if let stored = defaults.array(forKey: DefaultsKeys.pinnedSessions) as? [String] {
             pinnedIds = Set(stored)
         }
@@ -1131,6 +1203,13 @@ final class SessionStore {
         // desktop's default "All profiles" view. Inert until the switcher is shown.
         activeProfile = defaults.string(forKey: DefaultsKeys.activeProfile)
             ?? DefaultsKeys.allProfilesScope
+        if let data = defaults.data(forKey: DefaultsKeys.sessionListDeltaCursors),
+           let persisted = try? JSONDecoder().decode([PersistedSessionListCursor].self, from: data) {
+            sessionListDeltaCursors = Dictionary(
+                persisted.map { ($0.scope, $0.cursor) },
+                uniquingKeysWith: { _, latest in latest }
+            )
+        }
         // STR-1022: profile-group collapse decisions are derived (see
         // ``isProfileGroupCollapsed(_:)``); these two sets hold only the user's
         // explicit overrides and are persisted so choices survive restarts.

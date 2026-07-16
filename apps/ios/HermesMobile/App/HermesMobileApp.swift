@@ -4,6 +4,77 @@ import SwiftUI
 import UIKit
 #endif
 
+@MainActor
+struct BackgroundTaskClient {
+    var begin: (String, @escaping () -> Void) -> UIBackgroundTaskIdentifier
+    var end: (UIBackgroundTaskIdentifier) -> Void
+
+    static let live = BackgroundTaskClient(
+        begin: { name, expiration in
+            UIApplication.shared.beginBackgroundTask(withName: name, expirationHandler: expiration)
+        },
+        end: { UIApplication.shared.endBackgroundTask($0) }
+    )
+}
+
+@MainActor
+final class StateFlushCoordinator {
+    struct Dependencies {
+        var flushDraft: () async -> Void
+        var suspendOutbox: () async -> Void
+        var flushSyncCursor: () -> Void
+        var flushWidgetSnapshot: () -> Void
+        var flushPendingNavigation: () async -> Void
+    }
+
+    private let backgroundTasks: BackgroundTaskClient
+    private let dependencies: Dependencies
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+    private var flushTask: Task<Void, Never>?
+
+    init(backgroundTasks: BackgroundTaskClient = .live, dependencies: Dependencies) {
+        self.backgroundTasks = backgroundTasks
+        self.dependencies = dependencies
+    }
+
+    func enterBackground() {
+        guard flushTask == nil, identifier == .invalid else { return }
+        identifier = backgroundTasks.begin("Hermes state flush") { [weak self] in
+            Task { @MainActor in self?.expire() }
+        }
+        guard identifier != .invalid else { return }
+        flushTask = Task { [weak self] in
+            guard let self else { return }
+            await self.dependencies.flushDraft()
+            guard !Task.isCancelled else { self.finish(); return }
+            await self.dependencies.suspendOutbox()
+            guard !Task.isCancelled else { self.finish(); return }
+            self.dependencies.flushSyncCursor()
+            self.dependencies.flushWidgetSnapshot()
+            await self.dependencies.flushPendingNavigation()
+            self.finish()
+        }
+    }
+
+    func waitUntilIdleForTesting() async {
+        while let task = flushTask { await task.value }
+    }
+
+    private func expire() {
+        guard identifier != .invalid else { return }
+        flushTask?.cancel()
+        finish()
+    }
+
+    private func finish() {
+        guard identifier != .invalid else { return }
+        let completed = identifier
+        identifier = .invalid
+        flushTask = nil
+        backgroundTasks.end(completed)
+    }
+}
+
 @main
 struct HermesMobileApp: App {
     @State private var environment = AppEnvironment()
@@ -193,7 +264,10 @@ struct HermesMobileApp: App {
                     environment.refreshUsageSnapshot()
                 }
                 .onChange(of: scenePhase) { _, newPhase in
-                    if newPhase != .active { environment.sessionStore.flushComposerDraft() }
+                    if newPhase == .inactive { environment.sessionStore.flushComposerDraft() }
+                    if newPhase == .background {
+                        environment.stateFlushCoordinator.enterBackground()
+                    }
                     environment.connectionStore.handleScenePhase(newPhase)
                     environment.appLock.handleScenePhase(newPhase)
                     // UX1: start/stop the 30-second foreground heartbeat so the

@@ -269,4 +269,39 @@ final class OutboxProcessorTests: XCTestCase {
         let persisted = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(persisted?.state, .completed)
     }
+
+    func testBackgroundSuspendReleasesLeaseAtDurableStage() async throws {
+        let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let job = try await harness.repository.enqueue(WorkJobInput(
+            kind: .prompt,
+            scope: harness.scope,
+            text: "background me",
+            storedSessionID: "stored-A"
+        ))
+        let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
+            currentScope: { harness.scope },
+            activeStoredSessionID: { "stored-A" },
+            canProcessPrompt: { true },
+            createDestination: { _ in throw Ambiguous() },
+            resolveRuntime: { _ in "runtime-A" },
+            uploadAsset: { _, _ in throw Ambiguous() },
+            willSubmit: { _, _ in },
+            submit: { _, _, _ in
+                try await Task.sleep(for: .seconds(30))
+                return OutboxSubmitResult(status: "streaming", accepted: true)
+            }
+        ))
+
+        processor.wake()
+        for _ in 0..<100 {
+            if try await harness.repository.job(id: job.jobID)?.leaseOwner != nil { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        await processor.suspendForBackground()
+
+        let persisted = try await harness.repository.job(id: job.jobID)
+        XCTAssertEqual(persisted?.state, .submitting)
+        XCTAssertNil(persisted?.leaseOwner)
+        XCTAssertNil(persisted?.leaseExpiresAt)
+    }
 }

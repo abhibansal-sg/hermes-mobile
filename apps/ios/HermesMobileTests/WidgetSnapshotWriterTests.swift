@@ -82,6 +82,16 @@ final class WidgetSnapshotWriterTests: XCTestCase {
         XCTAssertEqual(try snapshot().tokensToday, 12)
     }
 
+    func testBackgroundFlushRewritesAuthoritativeSnapshot() throws {
+        writeFull(revision: "21", tokens: 210, open: 2)
+        try FileManager.default.removeItem(at: SharedStore.testSnapshotURL!)
+
+        WidgetSnapshotWriter.flush()
+
+        XCTAssertEqual(try snapshot().serverRevision, "21")
+        XCTAssertEqual(try snapshot().tokensToday, 210)
+    }
+
     func testEffectiveStalenessRequiresConnectionRevisionAndFreshFetch() {
         let now = Date(timeIntervalSince1970: 10_000)
         var value = makeSnapshot(revision: "1", fetchedAt: now.addingTimeInterval(-899))

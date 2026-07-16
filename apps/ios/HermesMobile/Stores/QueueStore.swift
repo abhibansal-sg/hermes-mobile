@@ -195,6 +195,10 @@ final class QueueStore {
         processor?.wake()
     }
 
+    func suspendForBackground() async {
+        await processor?.suspendForBackground()
+    }
+
     func refresh() async {
         try? await repository.refreshObservation()
     }

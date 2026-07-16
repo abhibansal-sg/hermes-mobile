@@ -88,6 +88,15 @@ final class OutboxProcessor {
         while let task = drainTask { await task.value }
     }
 
+    func suspendForBackground() async {
+        wakePending = false
+        let running = drainTask
+        running?.cancel()
+        await running?.value
+        drainTask = nil
+        try? await repository.flushForBackground(releasingLeasesOwnedBy: owner)
+    }
+
     private func drainPass() async {
         drainPassCount += 1
         activeDrainCount += 1

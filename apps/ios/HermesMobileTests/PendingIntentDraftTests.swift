@@ -440,3 +440,89 @@ final class SharedInboxDrainerTests: XCTestCase {
         XCTAssertEqual(s.sessions.activeStoredId, "stored-first", "the drainer lands on the newest share")
     }
 }
+
+@MainActor
+final class StateFlushCoordinatorTests: XCTestCase {
+    func testBackgroundFlushRunsLocalOwnersInOrderAndCoalescesEdges() async {
+        var expiration: (() -> Void)?
+        var ended: [UIBackgroundTaskIdentifier] = []
+        var order: [String] = []
+        let token = UIBackgroundTaskIdentifier(rawValue: 7)
+        let coordinator = StateFlushCoordinator(
+            backgroundTasks: BackgroundTaskClient(
+                begin: { _, handler in expiration = handler; return token },
+                end: { ended.append($0) }
+            ),
+            dependencies: .init(
+                flushDraft: { order.append("draft") },
+                suspendOutbox: { order.append("outbox") },
+                flushSyncCursor: { order.append("cursor") },
+                flushWidgetSnapshot: { order.append("widget") },
+                flushPendingNavigation: { order.append("navigation") }
+            )
+        )
+
+        coordinator.enterBackground()
+        coordinator.enterBackground()
+        await coordinator.waitUntilIdleForTesting()
+
+        XCTAssertNotNil(expiration)
+        XCTAssertEqual(order, ["draft", "outbox", "cursor", "widget", "navigation"])
+        XCTAssertEqual(ended, [token])
+    }
+
+    func testExpirationCancelsAndEndsExactlyOnce() async {
+        var expiration: (() -> Void)?
+        var endCount = 0
+        let token = UIBackgroundTaskIdentifier(rawValue: 8)
+        let coordinator = StateFlushCoordinator(
+            backgroundTasks: BackgroundTaskClient(
+                begin: { _, handler in expiration = handler; return token },
+                end: { _ in endCount += 1 }
+            ),
+            dependencies: .init(
+                flushDraft: { try? await Task.sleep(for: .seconds(30)) },
+                suspendOutbox: {},
+                flushSyncCursor: {},
+                flushWidgetSnapshot: {},
+                flushPendingNavigation: {}
+            )
+        )
+
+        coordinator.enterBackground()
+        await Task.yield()
+        expiration?()
+        expiration?()
+        await coordinator.waitUntilIdleForTesting()
+
+        XCTAssertEqual(endCount, 1)
+    }
+
+    func testForceFlushCommitsLatestDraftRevisionBeforeReturning() async throws {
+        let test = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: test.directory) }
+        let suiteName = "StateFlushDraft-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let repository = try WorkRepository(configuration: test.configuration)
+        let sessions = SessionStore(defaults: defaults)
+        let chat = ChatStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        connection.serverURLString = "https://gateway.test"
+        sessions.attach(connection: connection, chat: chat)
+        sessions.attachWorkRepository(repository)
+        sessions.setComposerDraft("latest unsent revision", for: sessions.activeComposerDraftKey)
+
+        await sessions.flushComposerDraftDurably()
+
+        let scope = try WorkScope(
+            serverID: "https://gateway.test",
+            profileID: DefaultsKeys.allProfilesScope
+        )
+        let persisted = try await repository.draft(
+            scope: scope,
+            contextKey: SessionStore.composerDraftFallbackKey
+        )
+        XCTAssertEqual(persisted?.draft.text, "latest unsent revision")
+    }
+}
