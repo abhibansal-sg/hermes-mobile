@@ -325,11 +325,12 @@ final class AppIntentWorkRepositoryTests: XCTestCase {
             scopeProvider: { scope }
         )
         let sessions = SessionStore()
+        let now = Date()
         let first = try await repository.enqueueAppIntent(
-            kind: .openSessions, now: .init(timeIntervalSince1970: 10)
+            kind: .openSessions, now: now
         )
         let second = try await repository.enqueueAppIntent(
-            kind: .newSession, now: .init(timeIntervalSince1970: 11)
+            kind: .newSession, now: now.addingTimeInterval(1)
         )
         let openedSessions = expectation(
             forNotification: .hermesOpenSessionsIntent,
