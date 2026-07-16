@@ -151,6 +151,23 @@ final class AppEnvironment {
                         runtimeSessionID: runtimeID,
                         remotePaths: paths
                     )
+                },
+                processLocalAppIntent: { [weak sessionStore] job in
+                    guard let sessionStore else { return false }
+                    switch job.intentKind {
+                    case .openSessions:
+                        await sessionStore.closeActive()
+                        NotificationCenter.default.post(
+                            name: .hermesOpenSessionsIntent,
+                            object: nil
+                        )
+                        return true
+                    case .newSession:
+                        sessionStore.startDraft()
+                        return true
+                    case .askHermes, nil:
+                        return false
+                    }
                 }
             )
         )
