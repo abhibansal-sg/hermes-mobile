@@ -115,6 +115,10 @@ enum PendingIntent: Equatable, Sendable {
     static func clearPending(from defaults: UserDefaults = .standard) {
         defaults.removeObject(forKey: DefaultsKeys.pendingIntentPrompt)
     }
+
+    static func flushPendingStorage(from defaults: UserDefaults = .standard) {
+        _ = defaults.synchronize()
+    }
 }
 
 struct GatewayCleanupTombstone: Codable, Equatable, Sendable {

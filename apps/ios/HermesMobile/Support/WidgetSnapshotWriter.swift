@@ -106,6 +106,13 @@ enum WidgetSnapshotWriter {
         write(patch)
     }
 
+    /// Forces the authoritative in-memory/disk snapshot through the atomic file
+    /// writer before suspension. No network fetch or WidgetKit keepalive occurs.
+    static func flush() {
+        guard let snapshot = lastWritten ?? SharedStore.readSnapshot() else { return }
+        if persistAtomically(snapshot) { lastWritten = snapshot }
+    }
+
     /// True when any user-visible field differs (ignoring `updatedAt`), so we
     /// only touch WidgetKit when the widgets would actually render differently.
     private static func loadLatest(now: Date) -> SharedStore.WidgetSnapshot? {

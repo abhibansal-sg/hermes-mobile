@@ -317,6 +317,37 @@ final class SessionRefreshTests: XCTestCase {
 
     // MARK: - STR-1208 plugin cursor deltas
 
+    func testBackgroundFlushedCursorRestoresAcrossRelaunch() async throws {
+        let suiteName = "SessionCursorFlush-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let first = SessionStore(defaults: defaults)
+        first.sessionListDeltaFetch = { _, _ in
+            SessionListDeltaResult(
+                sessions: [self.makeSummary(id: "A", lastActive: 100)],
+                tombstones: [],
+                cursor: "persisted-cursor",
+                total: 1
+            )
+        }
+        first.initialFillFetch = { _ in ([], 1) }
+        await first.refresh()
+        first.flushSessionListDeltaCursors(defaults: defaults)
+
+        let relaunched = SessionStore(defaults: defaults)
+        var observedCursor: String?
+        relaunched.sessionListDeltaFetch = { cursor, _ in
+            observedCursor = cursor
+            return SessionListDeltaResult(
+                sessions: [], tombstones: [], cursor: cursor ?? "missing", total: 1
+            )
+        }
+        relaunched.initialFillFetch = { _ in ([], 1) }
+        await relaunched.refresh()
+
+        XCTAssertEqual(observedCursor, "persisted-cursor")
+    }
+
     func testEmptyCursorDeltaLeavesExistingWindowAndOrderUntouched() async {
         let store = makeStore()
         let a = makeSummary(id: "A", lastActive: 100)

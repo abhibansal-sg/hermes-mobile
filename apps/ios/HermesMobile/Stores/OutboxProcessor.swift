@@ -59,6 +59,7 @@ final class OutboxProcessor {
     private var dependencies: Dependencies
     private var drainTask: Task<Void, Never>?
     private var wakePending = false
+    private var suspended = false
 
     private(set) var drainPassCount = 0
     private(set) var activeDrainCount = 0
@@ -73,7 +74,7 @@ final class OutboxProcessor {
 
     func wake() {
         wakePending = true
-        guard drainTask == nil else { return }
+        guard !suspended, drainTask == nil else { return }
         drainTask = Task { [weak self] in
             guard let self else { return }
             while self.wakePending, !Task.isCancelled {
@@ -86,6 +87,21 @@ final class OutboxProcessor {
 
     func waitUntilIdleForTesting() async {
         while let task = drainTask { await task.value }
+    }
+
+    func suspendForBackground() async {
+        suspended = true
+        wakePending = false
+        let running = drainTask
+        running?.cancel()
+        await running?.value
+        drainTask = nil
+        try? await repository.flushForBackground(releasingLeasesOwnedBy: owner)
+    }
+
+    func resumeFromBackground() {
+        suspended = false
+        if wakePending { wake() }
     }
 
     private func drainPass() async {
