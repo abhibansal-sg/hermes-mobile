@@ -86,11 +86,17 @@ class TestFinalizeSessionUsesAgentSessionId:
             agent=agent,
             session_key="parent-session",
             history=[{"role": "user", "content": "hello"}],
+            _sid="runtime-session",
         )
+        boundary_calls = []
 
         # Monkeypatch _get_db to return our test DB
         with patch.object(server, "_get_db", return_value=db):
-            with patch.object(server, "_notify_session_boundary", lambda *a: None):
+            with patch.object(
+                server,
+                "_notify_session_boundary",
+                lambda *args, **kwargs: boundary_calls.append((args, kwargs)),
+            ):
                 server._finalize_session(session, end_reason="tui_close")
 
         # The continuation session should be ended
@@ -100,6 +106,12 @@ class TestFinalizeSessionUsesAgentSessionId:
             "not the already-ended parent"
         )
         assert continuation["end_reason"] == "tui_close"
+        assert boundary_calls == [
+            (
+                ("on_session_finalize", "continuation-session", "tui"),
+                {"runtime_session_id": "runtime-session"},
+            )
+        ]
 
     def test_finalize_fallback_to_session_key_when_agent_is_none(self, tmp_path):
         """When agent is None (e.g. session never fully initialized),
@@ -112,7 +124,11 @@ class TestFinalizeSessionUsesAgentSessionId:
         session = _tui_session(agent=None, session_key="orphan-key")
 
         with patch.object(server, "_get_db", return_value=db):
-            with patch.object(server, "_notify_session_boundary", lambda *a: None):
+            with patch.object(
+                server,
+                "_notify_session_boundary",
+                lambda *args, **_kwargs: None,
+            ):
                 server._finalize_session(session, end_reason="tui_close")
 
         row = db.get_session("orphan-key")
