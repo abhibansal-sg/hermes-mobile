@@ -368,6 +368,33 @@ actor WorkRepository {
         return result.0
     }
 
+    /// Prunes terminal work only after its retry/audit retention window has elapsed.
+    @discardableResult
+    func cleanupFinishedWork(
+        now: Date = Date(),
+        retention: TimeInterval = 14 * 24 * 60 * 60
+    ) async throws -> Int {
+        try ensureProtectedDataAvailable()
+        let cutoff = now.timeIntervalSince1970 - retention
+        let result = try await database.write { db -> (Int, [String]) in
+            let before = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM work_jobs") ?? 0
+            try db.execute(
+                sql: """
+                    DELETE FROM work_jobs
+                    WHERE state IN ('completed','cancelled','expired')
+                      AND updated_at <= ?
+                    """,
+                arguments: [cutoff]
+            )
+            let paths = try Self.deleteUnreferencedAssetRows(db)
+            let after = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM work_jobs") ?? 0
+            return (before - after, paths)
+        }
+        removeAssetFiles(result.1)
+        await publishObservation()
+        return result.0
+    }
+
     func job(id: String) throws -> WorkJob? {
         try database.read { db in
             try WorkJob.fetchOne(db, key: id)

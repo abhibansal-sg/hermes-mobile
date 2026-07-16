@@ -16,7 +16,7 @@ final class BackgroundRefreshCoordinatorTests: XCTestCase {
         let scheduler = SchedulerSpy()
         var requests = 0
         let coordinator = BackgroundRefreshCoordinator(
-            scheduler: scheduler, loadPairing: { nil }, sync: { _ in requests += 1 }
+            scheduler: scheduler, loadPairing: { nil }, sync: { _ in requests += 1; return .success }
         )
         _ = coordinator.registerAtLaunch()
         coordinator.scheduleNext()
@@ -32,7 +32,10 @@ final class BackgroundRefreshCoordinatorTests: XCTestCase {
         let scheduler = SchedulerSpy()
         var received: BackgroundManifestScope?
         let expected = pairing(scope: "profile:work")
-        let coordinator = makeCoordinator(scheduler: scheduler, pairing: expected) { received = $0 }
+        let coordinator = makeCoordinator(scheduler: scheduler, pairing: expected) {
+            received = $0
+            return .success
+        }
         _ = coordinator.registerAtLaunch()
         let task = TaskSpy()
         scheduler.handler?(task)
@@ -47,7 +50,7 @@ final class BackgroundRefreshCoordinatorTests: XCTestCase {
         let coordinator = BackgroundRefreshCoordinator(
             scheduler: scheduler,
             loadPairing: { nil }, // URL may exist, but token resolution failed.
-            sync: { _ in requests += 1 }
+            sync: { _ in requests += 1; return .success }
         )
         _ = coordinator.registerAtLaunch()
         let task = TaskSpy(); scheduler.handler?(task)
@@ -77,13 +80,16 @@ final class BackgroundRefreshCoordinatorTests: XCTestCase {
         let coordinator = makeCoordinator(scheduler: scheduler) { _ in
             calls += 1
             await gate.wait()
+            return .success
         }
-        async let first: Void = coordinator.syncNowIfPaired()
-        async let second: Void = coordinator.syncNowIfPaired()
+        async let first = coordinator.syncNowIfPaired()
+        async let second = coordinator.syncNowIfPaired()
         await settle()
         XCTAssertEqual(calls, 1)
         gate.open()
-        try await first; try await second
+        let outcomes = await (first, second)
+        XCTAssertEqual(outcomes.0, .success)
+        XCTAssertEqual(outcomes.1, .success)
     }
 
     func testExpirationCancelsAtomicOperationAndCompletesOnce() async {
@@ -93,6 +99,7 @@ final class BackgroundRefreshCoordinatorTests: XCTestCase {
             try await Task.sleep(for: .seconds(30))
             try Task.checkCancellation()
             committed = true // represents the one transaction + widget projection boundary
+            return .success
         }
         _ = coordinator.registerAtLaunch()
         let task = TaskSpy(); scheduler.handler?(task)
@@ -108,9 +115,66 @@ final class BackgroundRefreshCoordinatorTests: XCTestCase {
         var order: [String] = []
         let coordinator = makeCoordinator(scheduler: scheduler) { _ in
             order += ["validate-all-pages", "commit-revision", "project-widget"]
+            return .success
         }
-        try await coordinator.syncNowIfPaired()
+        _ = await coordinator.syncNowIfPaired()
         XCTAssertEqual(order, ["validate-all-pages", "commit-revision", "project-widget"])
+    }
+
+    func testRetryableFailureReschedulesSoonAndAuthFailureStops() async {
+        for (outcome, expectedSubmissions) in [
+            (BackgroundRefreshOutcome.retryableFailure, 1),
+            (.authFailure, 0),
+        ] {
+            let scheduler = SchedulerSpy()
+            let coordinator = makeCoordinator(scheduler: scheduler) { _ in outcome }
+            _ = coordinator.registerAtLaunch()
+            let task = TaskSpy(); scheduler.handler?(task)
+            await settle()
+            XCTAssertEqual(scheduler.events.filter { $0.hasPrefix("submit:") }.count, expectedSubmissions)
+            XCTAssertEqual(task.completions, [false])
+        }
+    }
+
+    func testBudgetTimeoutCancelsOperationAndUsesRetryPolicy() async {
+        let scheduler = SchedulerSpy()
+        let coordinator = BackgroundRefreshCoordinator(
+            scheduler: scheduler,
+            runtimeBudget: .milliseconds(5),
+            loadPairing: { self.pairing() },
+            sync: { _ in
+                try await Task.sleep(for: .seconds(30))
+                return .success
+            }
+        )
+        _ = coordinator.registerAtLaunch()
+        let task = TaskSpy(); scheduler.handler?(task)
+        try? await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(task.completions, [false])
+        XCTAssertEqual(scheduler.events.filter { $0.hasPrefix("submit:") }.count, 1)
+    }
+
+    func testMaintenanceRunsOnceAfterSuccessfulCoalescedSync() async {
+        let scheduler = SchedulerSpy()
+        var maintenanceRuns = 0
+        let coordinator = BackgroundRefreshCoordinator(
+            scheduler: scheduler,
+            loadPairing: { self.pairing() },
+            sync: { _ in .noChange },
+            maintenance: { maintenanceRuns += 1 }
+        )
+        async let first = coordinator.syncNowIfPaired()
+        async let second = coordinator.syncNowIfPaired()
+        _ = await (first, second)
+        XCTAssertEqual(maintenanceRuns, 1)
+    }
+
+    func testRegisterAtLaunchIsIdempotent() {
+        let scheduler = SchedulerSpy()
+        let coordinator = makeCoordinator(scheduler: scheduler)
+        XCTAssertTrue(coordinator.registerAtLaunch())
+        XCTAssertTrue(coordinator.registerAtLaunch())
+        XCTAssertEqual(scheduler.events.filter { $0.hasPrefix("register:") }.count, 1)
     }
 
     private func makeCoordinator(
@@ -118,7 +182,7 @@ final class BackgroundRefreshCoordinatorTests: XCTestCase {
         pairing: BackgroundManifestScope? = BackgroundManifestScope(
             gatewayURL: "https://gateway.example", scope: "all", token: "secret"
         ),
-        sync: @escaping (BackgroundManifestScope) async throws -> Void = { _ in }
+        sync: @escaping (BackgroundManifestScope) async throws -> BackgroundRefreshOutcome = { _ in .success }
     ) -> BackgroundRefreshCoordinator {
         BackgroundRefreshCoordinator(scheduler: scheduler, loadPairing: { pairing }, sync: sync)
     }

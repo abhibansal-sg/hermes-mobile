@@ -289,6 +289,34 @@ final class WorkRepositoryLeaseTests: XCTestCase {
         XCTAssertFalse(assetExists)
         XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
     }
+
+    func testFinishedWorkRetentionPrunesOldRowsAndAssetsOnly() async throws {
+        let (configuration, directory) = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = try WorkRepository(configuration: configuration)
+        let old = Date().addingTimeInterval(-20 * 24 * 60 * 60)
+        let job = try await repository.enqueue(
+            WorkJobInput(kind: .prompt, scope: try workTestScope(), text: "old", createdAt: old),
+            assets: [WorkAssetInput(
+                data: Data("old-asset".utf8),
+                mimeType: "text/plain",
+                fileExtension: "txt"
+            )]
+        )
+        try await repository.transitionJob(id: job.jobID, from: .queued, to: .submitting, now: old)
+        try await repository.transitionJob(id: job.jobID, from: .submitting, to: .accepted, now: old)
+        try await repository.transitionJob(id: job.jobID, from: .accepted, to: .completed, now: old)
+        let snapshots = try await repository.jobAssets(jobID: job.jobID)
+        let assetPath = try XCTUnwrap(snapshots.first?.asset.relativePath)
+
+        let removed = try await repository.cleanupFinishedWork(now: Date())
+
+        let persisted = try await repository.job(id: job.jobID)
+        let assetExists = try await repository.assetFileExists(relativePath: assetPath)
+        XCTAssertEqual(removed, 1)
+        XCTAssertNil(persisted)
+        XCTAssertFalse(assetExists)
+    }
 }
 
 private func XCTAssertThrowsErrorAsync(
