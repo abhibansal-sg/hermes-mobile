@@ -37,6 +37,17 @@ final class DevicesTests: XCTestCase {
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
         override func startLoading() {
+            if request.url?.path.hasSuffix("/api/status") == true {
+                let status = Data(#"{"auth_required":true}"#.utf8)
+                let response = HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: status)
+                client?.urlProtocolDidFinishLoading(self)
+                return
+            }
             if request.url?.path.hasSuffix("/devices/issue") == true {
                 Self.issueRequestCount += 1
             }

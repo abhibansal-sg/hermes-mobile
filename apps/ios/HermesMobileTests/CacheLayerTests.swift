@@ -111,6 +111,24 @@ final class CacheMigrationTests: XCTestCase {
         XCTAssertNoThrow(try CacheSchema.makeV1Migrator().migrate(queue))
         XCTAssertNoThrow(try CacheSchema.makeV1Migrator().migrate(queue))
     }
+
+    func testMessageRowCacheForeignKeyUsesFinalSessionTable() throws {
+        var config = Configuration()
+        config.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+        }
+        let queue = try DatabaseQueue(configuration: config)
+
+        try CacheSchema.makeMigrator().migrate(queue)
+
+        let parents = try queue.read { db in
+            try String.fetchAll(
+                db,
+                sql: "SELECT \"table\" FROM pragma_foreign_key_list('message_row_cache')"
+            )
+        }
+        XCTAssertEqual(Set(parents), [SessionCacheRecord.databaseTableName])
+    }
 }
 
 // MARK: - Round-Trip Persistence Tests
@@ -480,17 +498,19 @@ final class CacheScopePartitionTests: XCTestCase {
         XCTAssertEqual(Set(home.map(\.id)), ["h1"])
     }
 
-    func testAggregateScopeIsolatedFromNamedProfile() async throws {
+    func testAggregateScopeIncludesConcreteProfilesOnItsServer() async throws {
         let store = try makeInMemoryStore()
         let allScope = CacheScope(serverId: serverA, profileId: "all")
         let namedScope = CacheScope(serverId: serverA, profileId: "client-x")
+        let otherServerScope = CacheScope(serverId: serverB, profileId: "client-x")
 
         try await store.saveSessionList([makeSession(id: "agg1")], scope: allScope)
         try await store.saveSessionList([makeSession(id: "named1")], scope: namedScope)
+        try await store.saveSessionList([makeSession(id: "other1")], scope: otherServerScope)
 
         let agg = try await store.loadSessionList(scope: allScope)
         let named = try await store.loadSessionList(scope: namedScope)
-        XCTAssertEqual(agg.map(\.id), ["agg1"])
+        XCTAssertEqual(Set(agg.map(\.id)), ["agg1", "named1"])
         XCTAssertEqual(named.map(\.id), ["named1"])
     }
 
@@ -542,14 +562,15 @@ final class CacheScopePartitionTests: XCTestCase {
 
         try await store.saveSessionList([makeSession(id: "a1")], scope: scopeA)
         try await store.saveSessionList([makeSession(id: "b1")], scope: scopeB)
-        try await store.saveTranscript(sessionId: "b1", messages: [makeStoredMessage()])
-        let hadB1 = try await store.hasTranscript("b1")
+        let identityB = testIdentity("b1", scope: scopeB)
+        try await store.saveTranscript(identity: identityB, messages: [makeStoredMessage()])
+        let hadB1 = try await store.hasTranscript(identityB)
         XCTAssertTrue(hadB1)
 
         try await store.clearSessionsForOtherServers(keepingServerId: serverA)
 
         // b1's session row is gone, so its transcript rows cascaded away too.
-        let hasB1 = try await store.hasTranscript("b1")
+        let hasB1 = try await store.hasTranscript(identityB)
         XCTAssertFalse(hasB1, "FK cascade must drop the other server's transcript rows")
     }
 
@@ -592,11 +613,10 @@ final class CacheScopePartitionTests: XCTestCase {
 
 final class CacheV2MigrationTests: XCTestCase {
 
-    func testV4StampsFingerprintV4() async throws {
+    func testMigrationStampsCurrentFingerprint() async throws {
         let store = try makeInMemoryStore()
         let version = try await store.readMeta(SyncMetaRecord.Key.schemaVersion)
-        XCTAssertEqual(version, "v4")
-        XCTAssertEqual(CacheSchema.currentFingerprint, "v4")
+        XCTAssertEqual(version, CacheSchema.currentFingerprint)
     }
 
     func testV2ScopeColumnsExistAndAreQueryable() async throws {
