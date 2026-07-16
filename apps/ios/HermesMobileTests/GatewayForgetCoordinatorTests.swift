@@ -3,15 +3,23 @@ import XCTest
 
 @MainActor
 final class GatewayForgetCoordinatorTests: XCTestCase {
-    private func makeStore() -> (ConnectionStore, QueueStore, InboxStore) {
+    private func makeStore() throws -> (ConnectionStore, QueueStore, InboxStore, URL) {
         let sessions = SessionStore()
         let chat = ChatStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
-        let queue = QueueStore()
+        let test = try makeWorkRepositoryTestConfiguration()
+        let observation = WorkRepositoryObservation()
+        let repository = try WorkRepository(configuration: test.configuration, observation: observation)
+        let scope = try workTestScope()
+        let queue = QueueStore(
+            repository: repository,
+            observation: observation,
+            scopeProvider: { scope }
+        )
         let inbox = InboxStore()
         connection.queueStore = queue
         connection.inboxStore = inbox
-        return (connection, queue, inbox)
+        return (connection, queue, inbox, test.directory)
     }
 
     func testRemoteFailureCannotBlockLocalForgetAndLeavesMinimalTombstone() async throws {
@@ -25,8 +33,9 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
             defaults.removeObject(forKey: DefaultsKeys.gatewayCleanupTombstone)
             defaults.removeObject(forKey: DefaultsKeys.pendingIntentPrompt)
         }
-        let (connection, queue, _) = makeStore()
-        _ = queue.enqueue("private queued prompt")
+        let (connection, queue, _, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = await queue.enqueue("private queued prompt")
 
         await connection.forgetGateway(remoteCleanup: {
             throw URLError(.notConnectedToInternet)
@@ -43,7 +52,7 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
         XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("private"))
     }
 
-    func testForgetIsIdempotentAndDoesNotClearAnotherGatewayIdentity() async {
+    func testForgetIsIdempotentAndDoesNotClearAnotherGatewayIdentity() async throws {
         let defaults = UserDefaults.standard
         let server = "https://forgotten.example"
         let other = "https://other.example"
@@ -55,7 +64,8 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
             DefaultsKeys.setDeviceId(nil, server: other)
             KeychainService.deleteToken(server: server)
         }
-        let (connection, _, _) = makeStore()
+        let (connection, _, _, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
         await connection.forgetGateway()
         await connection.forgetGateway()
         XCTAssertNil(KeychainService.loadToken(server: server))
@@ -64,4 +74,26 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
         XCTAssertFalse(connection.hasConnected)
         XCTAssertNil(connection.reconnectTask)
     }
+}
+
+private func makeWorkRepositoryTestConfiguration(
+    protectedDataAvailable: @escaping @Sendable () -> Bool = { true }
+) throws -> (configuration: WorkRepositoryConfiguration, directory: URL) {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("GatewayForgetTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return (
+        WorkRepositoryConfiguration(
+            containerURL: directory,
+            protectedDataAvailable: protectedDataAvailable
+        ),
+        directory
+    )
+}
+
+private func workTestScope(
+    serverID: String = "https://gateway.example",
+    profileID: String = "default"
+) throws -> WorkScope {
+    try WorkScope(serverID: serverID, profileID: profileID)
 }
