@@ -107,9 +107,15 @@ actor CacheStore {
     /// rows never bleed into another server's list.
     func loadSessionList(scope: CacheScope) throws -> [SessionSummary] {
         try db.read { db in
-            let request = SessionCacheRecord
+            var request = SessionCacheRecord
                 .filter(Column("serverId") == scope.serverId)
-                .filter(Column("profileId") == scope.profileId)
+            if scope.profileId == CacheScope.allProfilesKey {
+                // `all` is a query selector over concrete profile rows, never a
+                // stored row profile (CONTRACT-OFFLINE-CACHE identity invariant).
+                request = request.filter(Column("profileId") != CacheScope.legacy.profileId)
+            } else {
+                request = request.filter(Column("profileId") == scope.profileId)
+            }
             let records = try request.order(Column("lastActive").desc).fetchAll(db)
             return try records.map { try $0.decodeSummary() }
         }

@@ -498,17 +498,19 @@ final class CacheScopePartitionTests: XCTestCase {
         XCTAssertEqual(Set(home.map(\.id)), ["h1"])
     }
 
-    func testAggregateScopeIsolatedFromNamedProfile() async throws {
+    func testAggregateScopeIncludesConcreteProfilesOnItsServer() async throws {
         let store = try makeInMemoryStore()
         let allScope = CacheScope(serverId: serverA, profileId: "all")
         let namedScope = CacheScope(serverId: serverA, profileId: "client-x")
+        let otherServerScope = CacheScope(serverId: serverB, profileId: "client-x")
 
         try await store.saveSessionList([makeSession(id: "agg1")], scope: allScope)
         try await store.saveSessionList([makeSession(id: "named1")], scope: namedScope)
+        try await store.saveSessionList([makeSession(id: "other1")], scope: otherServerScope)
 
         let agg = try await store.loadSessionList(scope: allScope)
         let named = try await store.loadSessionList(scope: namedScope)
-        XCTAssertEqual(agg.map(\.id), ["agg1"])
+        XCTAssertEqual(Set(agg.map(\.id)), ["agg1", "named1"])
         XCTAssertEqual(named.map(\.id), ["named1"])
     }
 
