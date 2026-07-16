@@ -205,7 +205,7 @@ struct ComposerView: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            if !queueStore.items.isEmpty {
+            if queueStore.pendingCount > 0 {
                 queueChip
             }
             // Transient steer-outcome note (auto-clears after 2 s).

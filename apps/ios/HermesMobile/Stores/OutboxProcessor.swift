@@ -17,8 +17,14 @@ struct OutboxSubmitResult: Equatable, Sendable {
     let deduplicated: Bool
 
     init(json: JSONValue) {
-        status = json["status"]?.stringValue ?? "indeterminate"
-        accepted = json["accepted"]?.boolValue ?? false
+        let responseStatus = json["status"]?.stringValue ?? "indeterminate"
+        status = responseStatus
+        // Prompt receipts are an optional gateway extension. Stock/older
+        // gateways return only a successful legacy disposition after executing
+        // the submit. Respect an explicit receipt verdict when present; without
+        // one, the completed RPC plus an accepted legacy status is authoritative.
+        accepted = json["accepted"]?.boolValue
+            ?? ["streaming", "queued", "steered"].contains(responseStatus)
         clientMessageID = json["client_message_id"]?.stringValue
         deduplicated = json["deduplicated"]?.boolValue ?? false
     }
