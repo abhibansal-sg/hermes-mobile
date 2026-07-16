@@ -1442,7 +1442,7 @@ final class ConnectionStore {
         guard isCurrentGeneration(generation) else { return }
         try? await cacheStore?.purgeGateway(serverId: server)
         guard isCurrentGeneration(generation) else { return }
-        queueStore?.removeAll()
+        await queueStore?.removeAll()
         inboxStore?.removeAll()
         PendingIntent.clearPending()
         SharedStore.clearInbox()

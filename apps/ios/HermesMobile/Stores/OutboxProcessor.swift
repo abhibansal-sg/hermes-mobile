@@ -155,8 +155,23 @@ final class OutboxProcessor {
             } else {
                 resume = .submitting
             }
+            let destinationID: String?
+            if resume == .creatingDestination {
+                destinationID = nil
+            } else {
+                guard let resolved = job.destinationSessionID
+                    ?? job.storedSessionID
+                    ?? dependencies.activeStoredSessionID() else {
+                    throw OutboxProcessorError.destinationUnavailable
+                }
+                destinationID = resolved
+            }
             job = try await repository.transitionJob(
-                id: job.jobID, from: .retryWait, to: resume, owner: owner
+                id: job.jobID,
+                from: .retryWait,
+                to: resume,
+                owner: owner,
+                destinationSessionID: destinationID
             )
         }
 
