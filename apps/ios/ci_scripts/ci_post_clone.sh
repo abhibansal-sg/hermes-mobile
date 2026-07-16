@@ -6,9 +6,9 @@
 # directory as the .xcodeproj) and be executable.
 #
 # Responsibilities:
-#   1. Install xcodegen (via Homebrew — available on all Xcode Cloud VMs)
-#   2. Regenerate HermesMobile.xcodeproj from project.yml (source of truth)
-#   3. Resolve Swift Package Manager dependencies
+#   1. Regenerate HermesMobile.xcodeproj when xcodegen is preinstalled, or
+#      validate the checked-in project as the deterministic fallback
+#   2. Resolve Swift Package Manager dependencies
 #
 # Design principles:
 #   - set -euo pipefail: any unexpected failure aborts the build fast
@@ -35,17 +35,19 @@ log "Xcode Cloud build number: ${CI_BUILD_NUMBER:-<not set>}"
 log "Workflow   : ${CI_WORKFLOW:-<not set>}"
 
 # --------------------------------------------------------------------------
-# 1. Install xcodegen via Homebrew
-#    Xcode Cloud VMs ship with Homebrew pre-installed; the install is a
-#    no-op if the formula is already cached.
+# 1. Select the project source
+#    Release builds must not depend on a Homebrew install succeeding. Xcode
+#    Cloud images sometimes contain a broken Cellar, so use xcodegen only when
+#    it is already available; otherwise archive the checked-in project that CI
+#    and the release controller validated before triggering this workflow.
 # --------------------------------------------------------------------------
 log "Checking for xcodegen..."
 if command -v xcodegen &>/dev/null; then
     log "xcodegen already present: $(xcodegen --version 2>&1 | head -1)"
+    USE_XCODEGEN=1
 else
-    log "Installing xcodegen via Homebrew..."
-    brew install xcodegen
-    log "Installed: $(xcodegen --version 2>&1 | head -1)"
+    log "xcodegen not preinstalled; using checked-in HermesMobile.xcodeproj"
+    USE_XCODEGEN=0
 fi
 
 # --------------------------------------------------------------------------
@@ -53,19 +55,25 @@ fi
 #    project.yml lives at apps/ios/project.yml.
 #    xcodegen must be run from the directory containing project.yml.
 # --------------------------------------------------------------------------
-log "Regenerating HermesMobile.xcodeproj from project.yml..."
 cd "$IOS_DIR"
 
-if [ ! -f "project.yml" ]; then
-    log "ERROR: project.yml not found at $IOS_DIR/project.yml"
+if [ "$USE_XCODEGEN" = "1" ]; then
+    log "Regenerating HermesMobile.xcodeproj from project.yml..."
+    if [ ! -f "project.yml" ]; then
+        log "ERROR: project.yml not found at $IOS_DIR/project.yml"
+        exit 1
+    fi
+    xcodegen generate --spec project.yml
+    log "xcodegen generate succeeded."
+elif [ ! -f "HermesMobile.xcodeproj/project.pbxproj" ]; then
+    log "ERROR: checked-in HermesMobile.xcodeproj is missing"
     exit 1
+else
+    log "Checked-in HermesMobile.xcodeproj is present."
 fi
 
-xcodegen generate --spec project.yml
-log "xcodegen generate succeeded."
-
 # --------------------------------------------------------------------------
-# 3. Resolve SPM dependencies
+# 2. Resolve SPM dependencies
 #    xcodebuild -resolvePackageDependencies pre-fetches all remote SPM
 #    packages (GRDB.swift etc.) so the build action starts with a warm cache.
 #    The DebugBridge is a local path package — no network needed for it.
