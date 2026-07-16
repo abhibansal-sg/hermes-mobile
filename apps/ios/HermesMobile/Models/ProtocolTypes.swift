@@ -135,6 +135,15 @@ struct ProfileSummary: Decodable, Identifiable, Sendable, Equatable {
     let isDefault: Bool
     /// Optional human description for a switcher subtitle; absent ⇒ `nil`.
     let description: String?
+    /// Stable opaque profile identity when the gateway supports authority v1.
+    let profileID: String?
+
+    init(name: String, isDefault: Bool, description: String?, profileID: String? = nil) {
+        self.name = name
+        self.isDefault = isDefault
+        self.description = description
+        self.profileID = profileID
+    }
 
     var id: String { name }
 }

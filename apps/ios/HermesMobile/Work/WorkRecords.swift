@@ -2,6 +2,25 @@ import Foundation
 import GRDB
 import Observation
 
+/// Verified authority identity received over an authenticated gateway path.
+/// URLs and profile names are locators/display labels and never populate this
+/// type by inference.
+struct AuthorityScopeV1: Codable, Sendable, Equatable, Hashable {
+    let gatewayID: String
+    let profileID: String
+    let authorityEpoch: String
+
+    init(gatewayID: String, profileID: String, authorityEpoch: String) throws {
+        guard gatewayID.hasPrefix("gw_"), profileID.hasPrefix("pf_"),
+              authorityEpoch.hasPrefix("ae_") else {
+            throw WorkRepositoryError.invalidScope
+        }
+        self.gatewayID = gatewayID
+        self.profileID = profileID
+        self.authorityEpoch = authorityEpoch
+    }
+}
+
 /// The already-normalized Phase-1 durable-work partition.
 ///
 /// This type deliberately does not parse URLs or profile names. The app builds it
@@ -10,6 +29,8 @@ import Observation
 struct WorkScope: Codable, Equatable, Hashable, Sendable {
     let serverID: String
     let profileID: String
+    let gatewayID: String?
+    let authorityEpoch: String?
 
     init(serverID: String, profileID: String) throws {
         guard !serverID.isEmpty, !profileID.isEmpty else {
@@ -17,7 +38,26 @@ struct WorkScope: Codable, Equatable, Hashable, Sendable {
         }
         self.serverID = serverID
         self.profileID = profileID
+        gatewayID = nil
+        authorityEpoch = nil
     }
+
+    init(serverID: String, authority: AuthorityScopeV1) throws {
+        guard !serverID.isEmpty else { throw WorkRepositoryError.invalidScope }
+        self.serverID = serverID
+        profileID = authority.profileID
+        gatewayID = authority.gatewayID
+        authorityEpoch = authority.authorityEpoch
+    }
+
+    var isAuthorityVerified: Bool { gatewayID != nil && authorityEpoch != nil }
+}
+
+enum WorkAuthorityState: String, Codable, Sendable {
+    case unbound
+    case legacyUnverified = "legacy_unverified"
+    case verified
+    case quarantined
 }
 
 enum WorkJobKind: String, Codable, CaseIterable, Sendable {
@@ -61,6 +101,9 @@ struct WorkDraft: Codable, FetchableRecord, PersistableRecord, Equatable, Sendab
     var draftID: String
     var serverID: String
     var profileID: String
+    var gatewayID: String? = nil
+    var authorityEpoch: String? = nil
+    var authorityState: WorkAuthorityState = .legacyUnverified
     var contextKey: String
     var storedSessionID: String?
     var text: String
@@ -74,6 +117,9 @@ struct WorkDraft: Codable, FetchableRecord, PersistableRecord, Equatable, Sendab
         case draftID = "draft_id"
         case serverID = "server_id"
         case profileID = "profile_id"
+        case gatewayID = "gateway_id"
+        case authorityEpoch = "authority_epoch"
+        case authorityState = "authority_state"
         case contextKey = "context_key"
         case storedSessionID = "stored_session_id"
         case text, cwd
@@ -81,6 +127,18 @@ struct WorkDraft: Codable, FetchableRecord, PersistableRecord, Equatable, Sendab
         case revision
         case createdAt = "created_at"
         case updatedAt = "updated_at"
+    }
+
+    var scope: WorkScope? {
+        if let gatewayID, let authorityEpoch,
+           let authority = try? AuthorityScopeV1(
+               gatewayID: gatewayID,
+               profileID: profileID,
+               authorityEpoch: authorityEpoch
+           ) {
+            return try? WorkScope(serverID: serverID, authority: authority)
+        }
+        return try? WorkScope(serverID: serverID, profileID: profileID)
     }
 }
 
@@ -97,6 +155,9 @@ struct WorkJob: Codable, FetchableRecord, PersistableRecord, Equatable, Sendable
     var clientMessageID: String
     var serverID: String?
     var profileID: String?
+    var gatewayID: String?
+    var authorityEpoch: String?
+    var authorityState: WorkAuthorityState
     var state: WorkJobState
     var intentKind: WorkIntentKind?
     var text: String?
@@ -121,6 +182,14 @@ struct WorkJob: Codable, FetchableRecord, PersistableRecord, Equatable, Sendable
     var id: String { jobID }
     var scope: WorkScope? {
         guard let serverID, let profileID else { return nil }
+        if let gatewayID, let authorityEpoch,
+           let authority = try? AuthorityScopeV1(
+               gatewayID: gatewayID,
+               profileID: profileID,
+               authorityEpoch: authorityEpoch
+           ) {
+            return try? WorkScope(serverID: serverID, authority: authority)
+        }
         return try? WorkScope(serverID: serverID, profileID: profileID)
     }
 
@@ -148,6 +217,9 @@ struct WorkJob: Codable, FetchableRecord, PersistableRecord, Equatable, Sendable
         case clientMessageID = "client_message_id"
         case serverID = "server_id"
         case profileID = "profile_id"
+        case gatewayID = "gateway_id"
+        case authorityEpoch = "authority_epoch"
+        case authorityState = "authority_state"
         case state
         case intentKind = "intent_kind"
         case text

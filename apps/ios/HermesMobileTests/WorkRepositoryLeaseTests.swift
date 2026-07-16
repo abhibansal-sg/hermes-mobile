@@ -2,6 +2,40 @@ import Foundation
 import XCTest
 
 final class WorkRepositoryLeaseTests: XCTestCase {
+    func testQuarantinedLegacyWorkCannotBeClaimed() async throws {
+        let test = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: test.directory) }
+        let repository = try WorkRepository(configuration: test.configuration)
+        let legacy = try workTestScope(serverID: "https://gateway.test", profileID: "default")
+        let authority = try AuthorityScopeV1(
+            gatewayID: "gw_AAAAAAAAAAAAAAAAAAAAAA",
+            profileID: "pf_BBBBBBBBBBBBBBBBBBBBBB",
+            authorityEpoch: "ae_CCCCCCCCCCCCCCCCCCCCCC"
+        )
+        let verified = try WorkScope(
+            serverID: "https://gateway.test",
+            authority: authority
+        )
+        let legacyJob = try await repository.enqueue(
+            WorkJobInput(kind: .prompt, scope: legacy, text: "old authority")
+        )
+        let verifiedJob = try await repository.enqueue(
+            WorkJobInput(kind: .prompt, scope: verified, text: "current authority")
+        )
+
+        let quarantinedCount = try await repository.quarantineLegacyWork(
+            serverID: legacy.serverID
+        )
+        XCTAssertEqual(quarantinedCount, 1)
+        let quarantinedJob = try await repository.job(id: legacyJob.jobID)
+        XCTAssertEqual(quarantinedJob?.authorityState, .quarantined)
+        let claimed = try await repository.claimNextJob(
+            owner: "worker", now: Date(), leaseDuration: 30
+        )
+        XCTAssertEqual(claimed?.jobID, verifiedJob.jobID)
+        XCTAssertEqual(claimed?.authorityState, .verified)
+    }
+
     func testClaimIsAtomicAndDeterministic() async throws {
         let test = try makeWorkRepositoryTestConfiguration()
         defer { try? FileManager.default.removeItem(at: test.directory) }

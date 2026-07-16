@@ -135,6 +135,33 @@ enum WorkSchema {
                 table.add(column: "revision", .integer).notNull().defaults(to: 1)
             }
         }
+        migrator.registerMigration("work-v3-authority-scope") { db in
+            try db.alter(table: "drafts") { table in
+                table.add(column: "gateway_id", .text)
+                table.add(column: "authority_epoch", .text)
+                table.add(column: "authority_state", .text)
+                    .notNull().defaults(to: WorkAuthorityState.legacyUnverified.rawValue)
+            }
+            try db.alter(table: "work_jobs") { table in
+                table.add(column: "gateway_id", .text)
+                table.add(column: "authority_epoch", .text)
+                table.add(column: "authority_state", .text)
+                    .notNull().defaults(to: WorkAuthorityState.legacyUnverified.rawValue)
+            }
+            try db.alter(table: "transfers") { table in
+                table.add(column: "gateway_id", .text)
+                table.add(column: "authority_epoch", .text)
+                table.add(column: "authority_state", .text)
+                    .notNull().defaults(to: WorkAuthorityState.legacyUnverified.rawValue)
+            }
+            try db.execute(
+                sql: """
+                    UPDATE work_jobs SET authority_state = ?
+                    WHERE server_id IS NULL AND profile_id IS NULL
+                    """,
+                arguments: [WorkAuthorityState.unbound.rawValue]
+            )
+        }
         return migrator
     }
 }

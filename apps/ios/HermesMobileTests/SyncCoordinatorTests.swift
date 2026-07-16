@@ -21,4 +21,12 @@ final class SyncCoordinatorTests: XCTestCase {
         XCTAssertTrue(chain.reset); XCTAssertEqual(chain.attention.map(\.id), ["a"])
         XCTAssertEqual(chain.activeTurns.map(\.id), ["t"]); XCTAssertEqual(chain.transcriptHeads["s"], 12)
     }
+
+    func testPageChainRejectsAuthorityEpochChange() throws {
+        let first = try decode(#"{"revision":2,"cursor":"start","next_cursor":"next","has_more":true,"gateway_id":"gw_AAAAAAAAAAAAAAAAAAAAAA","journal_epoch":"je_BBBBBBBBBBBBBBBBBBBBBB","profile_authorities":[{"profile_id":"pf_CCCCCCCCCCCCCCCCCCCCCC","profile_name":"default","authority_epoch":"ae_DDDDDDDDDDDDDDDDDDDDDD"}]}"#)
+        let changed = try decode(#"{"revision":2,"cursor":"next","has_more":false,"gateway_id":"gw_AAAAAAAAAAAAAAAAAAAAAA","journal_epoch":"je_BBBBBBBBBBBBBBBBBBBBBB","profile_authorities":[{"profile_id":"pf_CCCCCCCCCCCCCCCCCCCCCC","profile_name":"default","authority_epoch":"ae_EEEEEEEEEEEEEEEEEEEEEE"}]}"#)
+        XCTAssertThrowsError(try ManifestChain(validating: [first, changed])) { error in
+            XCTAssertEqual(error as? ManifestValidationError, .authorityChanged)
+        }
+    }
 }

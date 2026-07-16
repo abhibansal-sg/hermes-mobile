@@ -3,6 +3,10 @@ import Foundation
 /// Frozen hermes-mobile sync-manifest wire envelope. Pages are accumulated and
 /// validated in memory before they are handed to the cache transaction.
 struct SyncManifestPage: Decodable, Sendable, Equatable {
+    let schemaVersion: Int?
+    let gatewayID: String?
+    let journalEpoch: String?
+    let profileAuthorities: [ManifestProfileAuthority]
     let revision: Int64
     let cursor: String
     let nextCursor: String?
@@ -18,6 +22,7 @@ struct SyncManifestPage: Decodable, Sendable, Equatable {
     let serverTime: Double?
 
     enum CodingKeys: String, CodingKey {
+        case schemaVersion, gatewayID, journalEpoch, profileAuthorities
         case revision, cursor, nextCursor, hasMore, reset, sessions, tombstones
         case attention, activeTurns, transcriptHeads, deviceRegistered, capabilities
         case serverTime = "server_time"
@@ -25,6 +30,13 @@ struct SyncManifestPage: Decodable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion)
+        gatewayID = try c.decodeIfPresent(String.self, forKey: .gatewayID)
+        journalEpoch = try c.decodeIfPresent(String.self, forKey: .journalEpoch)
+        profileAuthorities = try c.decodeIfPresent(
+            [ManifestProfileAuthority].self,
+            forKey: .profileAuthorities
+        ) ?? []
         revision = try c.decode(Int64.self, forKey: .revision)
         cursor = try c.decode(String.self, forKey: .cursor)
         nextCursor = try c.decodeIfPresent(String.self, forKey: .nextCursor)
@@ -40,6 +52,12 @@ struct SyncManifestPage: Decodable, Sendable, Equatable {
         let raw = try c.decodeIfPresent([ManifestTombstone].self, forKey: .tombstones) ?? []
         tombstones = raw.map(\.id)
     }
+}
+
+struct ManifestProfileAuthority: Codable, Sendable, Equatable, Hashable {
+    let profileID: String
+    let profileName: String
+    let authorityEpoch: String
 }
 
 private struct ManifestTombstone: Decodable {
@@ -70,6 +88,9 @@ struct ManifestActiveTurn: Codable, Sendable, Equatable, Identifiable {
 }
 
 struct ManifestChain: Sendable, Equatable {
+    let gatewayID: String?
+    let journalEpoch: String?
+    let profileAuthorities: [ManifestProfileAuthority]
     let revision: Int64
     let cursor: String
     let reset: Bool
@@ -87,11 +108,19 @@ struct ManifestChain: Sendable, Equatable {
         var expected: String? = nil
         for (index, page) in pages.enumerated() {
             guard page.revision == first.revision else { throw ManifestValidationError.revisionChanged }
+            guard page.gatewayID == first.gatewayID,
+                  page.journalEpoch == first.journalEpoch,
+                  page.profileAuthorities == first.profileAuthorities else {
+                throw ManifestValidationError.authorityChanged
+            }
             if index > 0, page.cursor != expected { throw ManifestValidationError.brokenCursorChain }
             expected = page.nextCursor
             guard page.hasMore == (page.nextCursor != nil) else { throw ManifestValidationError.invalidPagination }
         }
         guard pages.last?.hasMore == false else { throw ManifestValidationError.incompleteChain }
+        gatewayID = first.gatewayID
+        journalEpoch = first.journalEpoch
+        profileAuthorities = first.profileAuthorities
         revision = first.revision
         cursor = pages.last!.cursor
         reset = first.reset
@@ -106,7 +135,14 @@ struct ManifestChain: Sendable, Equatable {
     }
 }
 
-enum ManifestValidationError: Error { case emptyChain, revisionChanged, brokenCursorChain, invalidPagination, incompleteChain }
+enum ManifestValidationError: Error, Equatable {
+    case emptyChain
+    case revisionChanged
+    case authorityChanged
+    case brokenCursorChain
+    case invalidPagination
+    case incompleteChain
+}
 
 enum ManifestFreshness: Sendable, Equatable { case cached, fresh, partial }
 

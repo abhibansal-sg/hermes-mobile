@@ -340,11 +340,18 @@ actor WorkRepository {
             try db.execute(
                 sql: """
                     UPDATE work_jobs
-                    SET server_id = ?, profile_id = ?, state = 'queued', updated_at = ?
+                    SET server_id = ?, profile_id = ?, gateway_id = ?, authority_epoch = ?,
+                        authority_state = ?, state = 'queued', updated_at = ?
                     WHERE kind = 'share' AND state = 'waiting_for_scope'
                       AND server_id IS NULL AND profile_id IS NULL
                     """,
-                arguments: [scope.serverID, scope.profileID, now.timeIntervalSince1970]
+                arguments: [
+                    scope.serverID, scope.profileID, scope.gatewayID, scope.authorityEpoch,
+                    scope.isAuthorityVerified
+                        ? WorkAuthorityState.verified.rawValue
+                        : WorkAuthorityState.legacyUnverified.rawValue,
+                    now.timeIntervalSince1970,
+                ]
             )
         }
         await publishObservation()
@@ -413,6 +420,34 @@ actor WorkRepository {
         }
     }
 
+    /// Fences locator/name-scoped work after an authenticated v2 gateway is
+    /// observed. Quarantined jobs are never claimable; release requires a
+    /// separate user-confirmed rebind flow with a new operation fingerprint.
+    @discardableResult
+    func quarantineLegacyWork(serverID: String, now: Date = Date()) async throws -> Int {
+        guard !serverID.isEmpty else { throw WorkRepositoryError.invalidScope }
+        let changed = try await database.write { db -> Int in
+            try db.execute(
+                sql: """
+                    UPDATE work_jobs
+                    SET authority_state = ?, lease_owner = NULL, lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE server_id = ? AND authority_state = ?
+                      AND state NOT IN ('completed', 'cancelled', 'expired')
+                    """,
+                arguments: [
+                    WorkAuthorityState.quarantined.rawValue,
+                    now.timeIntervalSince1970,
+                    serverID,
+                    WorkAuthorityState.legacyUnverified.rawValue,
+                ]
+            )
+            return db.changesCount
+        }
+        await publishObservation()
+        return changed
+    }
+
     /// Binds shortcut work created by the App Intents process once the main app
     /// has a stable Phase-1 scope. Existing bindings are immutable.
     func bindPendingAppIntents(to scope: WorkScope, now: Date = Date()) async throws {
@@ -421,11 +456,16 @@ actor WorkRepository {
             try db.execute(
                 sql: """
                     UPDATE work_jobs
-                    SET server_id = ?, profile_id = ?, state = ?, updated_at = ?
+                    SET server_id = ?, profile_id = ?, gateway_id = ?, authority_epoch = ?,
+                        authority_state = ?, state = ?, updated_at = ?
                     WHERE kind = ? AND state = ? AND server_id IS NULL AND profile_id IS NULL
                     """,
                 arguments: [
-                    scope.serverID, scope.profileID, WorkJobState.queued.rawValue,
+                    scope.serverID, scope.profileID, scope.gatewayID, scope.authorityEpoch,
+                    scope.isAuthorityVerified
+                        ? WorkAuthorityState.verified.rawValue
+                        : WorkAuthorityState.legacyUnverified.rawValue,
+                    WorkJobState.queued.rawValue,
                     now.timeIntervalSince1970, WorkJobKind.appIntent.rawValue,
                     WorkJobState.waitingForScope.rawValue,
                 ]
@@ -571,6 +611,7 @@ actor WorkRepository {
                           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
                           AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
                           AND (expires_at IS NULL OR expires_at > ?)
+                          AND authority_state != 'quarantined'
                           \(scopeSQL)
                           \(affinitySQL)
                           \(outboxSQL)
@@ -909,6 +950,9 @@ actor WorkRepository {
                 existing.text = text
                 existing.cwd = cwd
                 existing.modelSelectionJSON = modelSelectionJSON
+                existing.gatewayID = scope.gatewayID
+                existing.authorityEpoch = scope.authorityEpoch
+                existing.authorityState = scope.isAuthorityVerified ? .verified : .legacyUnverified
                 existing.revision += 1
                 existing.updatedAt = timestamp
                 try existing.update(db)
@@ -918,6 +962,9 @@ actor WorkRepository {
                 draftID: UUID().uuidString.lowercased(),
                 serverID: scope.serverID,
                 profileID: scope.profileID,
+                gatewayID: scope.gatewayID,
+                authorityEpoch: scope.authorityEpoch,
+                authorityState: scope.isAuthorityVerified ? .verified : .legacyUnverified,
                 contextKey: contextKey,
                 storedSessionID: storedSessionID,
                 text: text,
@@ -993,13 +1040,19 @@ actor WorkRepository {
                     existing.text = text
                     existing.cwd = cwd
                     existing.modelSelectionJSON = modelSelectionJSON
+                    existing.gatewayID = scope.gatewayID
+                    existing.authorityEpoch = scope.authorityEpoch
+                    existing.authorityState = scope.isAuthorityVerified ? .verified : .legacyUnverified
                     existing.revision += 1
                     existing.updatedAt = timestamp
                     try existing.update(db)
                     draft = existing
                 } else {
                     draft = WorkDraft(draftID: UUID().uuidString.lowercased(), serverID: scope.serverID,
-                        profileID: scope.profileID, contextKey: contextKey, storedSessionID: storedSessionID,
+                        profileID: scope.profileID, gatewayID: scope.gatewayID,
+                        authorityEpoch: scope.authorityEpoch,
+                        authorityState: scope.isAuthorityVerified ? .verified : .legacyUnverified,
+                        contextKey: contextKey, storedSessionID: storedSessionID,
                         text: text, cwd: cwd, modelSelectionJSON: modelSelectionJSON, revision: 1,
                         createdAt: timestamp, updatedAt: timestamp)
                     try draft.insert(db)
@@ -1037,7 +1090,7 @@ actor WorkRepository {
             guard let draft = try WorkDraft.fetchOne(db, key: draftID) else { throw WorkRepositoryError.draftNotFound }
             guard draft.revision == acknowledgedRevision else { throw WorkRepositoryError.draftNotFound }
             let links = try WorkDraftAsset.filter(Column("draft_id") == draftID).order(Column("ordinal")).fetchAll(db)
-            let input = WorkJobInput(jobID: jobID, kind: .prompt, scope: try WorkScope(serverID: draft.serverID, profileID: draft.profileID), state: .queued, text: draft.text, storedSessionID: draft.storedSessionID, createdAt: now)
+            let input = WorkJobInput(jobID: jobID, kind: .prompt, scope: draft.scope, state: .queued, text: draft.text, storedSessionID: draft.storedSessionID, createdAt: now)
             let job = Self.makeJob(input, preparedAssets: [], now: timestamp)
             try job.insert(db)
             for link in links {
@@ -1157,6 +1210,11 @@ actor WorkRepository {
             clientMessageID: jobID,
             serverID: input.scope?.serverID,
             profileID: input.scope?.profileID,
+            gatewayID: input.scope?.gatewayID,
+            authorityEpoch: input.scope?.authorityEpoch,
+            authorityState: input.scope == nil
+                ? .unbound
+                : (input.scope!.isAuthorityVerified ? .verified : .legacyUnverified),
             state: input.state,
             intentKind: input.intentKind,
             text: input.text,
