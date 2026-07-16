@@ -193,19 +193,6 @@ final class WorkRepositoryLeaseTests: XCTestCase {
         XCTAssertEqual(jobs.filter { $0.state == .expired }.count, 20)
         XCTAssertEqual(jobs.last?.jobID, replacement.jobID)
     }
-}
-
-private func XCTAssertThrowsErrorAsync(
-    _ expression: () async throws -> Void,
-    file: StaticString = #filePath,
-    line: UInt = #line
-) async {
-    do {
-        try await expression()
-        XCTFail("Expected error", file: file, line: line)
-    } catch {
-        // Expected.
-    }
 
     func testConcurrentShareAdmissionEnforcesTwentyJobLimit() async throws {
         let (configuration, directory) = try makeWorkRepositoryTestConfiguration()
@@ -301,5 +288,18 @@ private func XCTAssertThrowsErrorAsync(
         XCTAssertNil(persisted)
         XCTAssertFalse(assetExists)
         XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
+    }
+}
+
+private func XCTAssertThrowsErrorAsync(
+    _ expression: () async throws -> Void,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        try await expression()
+        XCTFail("Expected error", file: file, line: line)
+    } catch {
+        // Expected.
     }
 }
