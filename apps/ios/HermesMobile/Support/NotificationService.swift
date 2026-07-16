@@ -764,18 +764,14 @@ enum NotificationService {
 
     // MARK: - Category registration (A1)
 
-    private static var didRegisterCategories = false
-
     /// Register the actionable-push categories with the notification center.
     ///
     /// Idempotent and cheap; called from `requestAuthorizationIfNeeded()` (so the
     /// categories exist before any push lands) and again at launch via
     /// ``setActionHandler(_:)``. `setNotificationCategories` REPLACES the whole
     /// set, so we register all categories in one call.
-    static func registerCategories() {
-        guard !didRegisterCategories else { return }
-        didRegisterCategories = true
-        UNUserNotificationCenter.current().setNotificationCategories(
+    static func registerCategories(center: UNUserNotificationCenter = .current()) {
+        center.setNotificationCategories(
             remoteNotificationCategoriesForTesting()
         )
     }

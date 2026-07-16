@@ -126,21 +126,6 @@ struct HermesMobileApp: App {
                     startGstackDebugBridge(environment: environment)
                     #endif
                     environment.appLock.authenticateAtLaunch()
-                    // Route notification taps (local + remote APNs) into the store
-                    // graph. Registered before bootstrap so a cold-launch tap —
-                    // which iOS delivers right after launch — is honored once the
-                    // session list is refreshed inside the router.
-                    appDelegate.notificationCoordinator.attachTapHandler { tap in
-                        HermesURLRouter.routePushTap(
-                            tap,
-                            sessions: environment.sessionStore,
-                            inbox: environment.inboxStore,
-                            connection: environment.connectionStore
-                        )
-                    }
-                    appDelegate.notificationCoordinator.attachActionCompletionHandler {
-                        Task { await environment.inboxStore.refresh() }
-                    }
                     // The notification-action backend is already installed by
                     // AppDelegate from persisted URL/Keychain state. Do not move
                     // it back here: this task can run after a killed-launch action.
@@ -158,6 +143,21 @@ struct HermesMobileApp: App {
                     await environment.inboxStore.hydrateCachedGateway()
                     await environment.connectionStore.bootstrap()
                     await environment.inboxStore.refresh()
+                    // A notification response may have arrived while the process
+                    // was being created. Keep it buffered until the complete
+                    // AppEnvironment graph has hydrated; routing earlier can
+                    // present against an empty session/inbox store.
+                    appDelegate.notificationCoordinator.attachTapHandler { tap in
+                        HermesURLRouter.routePushTap(
+                            tap,
+                            sessions: environment.sessionStore,
+                            inbox: environment.inboxStore,
+                            connection: environment.connectionStore
+                        )
+                    }
+                    appDelegate.notificationCoordinator.attachActionCompletionHandler {
+                        Task { await environment.inboxStore.refresh() }
+                    }
                     #if DEBUG
                     // Inc-3b UITest seam: HERMES_UITEST_DEEPLINK fires a deep link
                     // immediately after bootstrap, exactly as if onOpenURL had been
