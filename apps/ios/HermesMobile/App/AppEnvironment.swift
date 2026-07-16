@@ -114,10 +114,10 @@ final class AppEnvironment {
                 uploadAsset: { [weak connectionStore, weak workRepository] job, snapshot in
                     guard let connectionStore,
                           let rest = connectionStore.rest,
-                          let client = connectionStore.client,
                           let workRepository else {
                         throw AttachmentError.notConfigured
                     }
+                    let client = connectionStore.client
                     let data = try await workRepository.assetData(snapshot.asset)
                     let upload = try await rest.uploadDurable(
                         data: data,
