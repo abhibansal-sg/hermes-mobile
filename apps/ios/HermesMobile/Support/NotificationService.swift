@@ -101,6 +101,7 @@ enum NotificationService {
         let gatewayScope: String
         let sessionId: String
         let storedSessionId: String?
+        let requestId: String?
 
         var namespaceComponent: String { gatewayScope }
     }
@@ -191,7 +192,12 @@ enum NotificationService {
             eventId: eventId,
             gatewayScope: gatewayScope,
             sessionId: sessionId,
-            storedSessionId: nonEmpty(custom["stored_session_id"] as? String)
+            storedSessionId: nonEmpty(custom["stored_session_id"] as? String),
+            requestId: nonEmpty(
+                (custom["request_id"] as? String)
+                    ?? (custom["approval_id"] as? String)
+                    ?? (custom["turn_id"] as? String)
+            )
         )
     }
 
@@ -842,6 +848,9 @@ enum NotificationService {
         ]
         if let storedSessionId = alert.storedSessionId {
             info["stored_session_id"] = storedSessionId
+        }
+        if let requestId = alert.requestId {
+            info["request_id"] = requestId
         }
         content.userInfo = info
         let identifier = "hermes." + NotificationDeliveryLedger.digest(

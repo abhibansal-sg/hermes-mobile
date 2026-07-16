@@ -513,7 +513,16 @@ def send_event_background(
 ) -> None:
     """Fire-and-forget a push event to the relay. Never blocks the caller."""
     relay_kind = map_push_kind(kind) if kind not in RELAY_PUSH_KINDS else kind
-    if _is_duplicate(f"{relay_kind}:{session_id or ''}:{(body or '')[:80]}"):
+    # The server-issued event identity is the only safe relay dedupe key. Body
+    # text is not identity: two turns can legitimately finish with the same
+    # text, while direct APNs and relay must make the same authority decision.
+    event_id = (payload or {}).get("event_id") if isinstance(payload, dict) else None
+    dedupe_key = (
+        f"{relay_kind}:{session_id or ''}:event:{event_id}"
+        if event_id
+        else f"{relay_kind}:{session_id or ''}:{(body or '')[:80]}"
+    )
+    if _is_duplicate(dedupe_key):
         return
     threading.Thread(
         target=_send_sync,
