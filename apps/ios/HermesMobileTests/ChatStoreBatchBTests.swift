@@ -612,7 +612,8 @@ final class ChatStoreBatchBTests: XCTestCase {
         await settle()
         try await cache.saveTranscript(
             sessionId: "stored-B",
-            messages: [storedMessage(role: "assistant", text: "DISK ADVANCED B")]
+            messages: [storedMessage(role: "assistant", text: "DISK ADVANCED B")],
+            scope: CacheScope(serverId: "unit-test-gateway", profileId: DefaultsKeys.allProfilesScope)
         )
 
         // Switch away so the next B tap is a real session switch, not a no-op.

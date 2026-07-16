@@ -562,14 +562,15 @@ final class CacheScopePartitionTests: XCTestCase {
 
         try await store.saveSessionList([makeSession(id: "a1")], scope: scopeA)
         try await store.saveSessionList([makeSession(id: "b1")], scope: scopeB)
-        try await store.saveTranscript(sessionId: "b1", messages: [makeStoredMessage()])
-        let hadB1 = try await store.hasTranscript("b1")
+        let identityB = testIdentity("b1", scope: scopeB)
+        try await store.saveTranscript(identity: identityB, messages: [makeStoredMessage()])
+        let hadB1 = try await store.hasTranscript(identityB)
         XCTAssertTrue(hadB1)
 
         try await store.clearSessionsForOtherServers(keepingServerId: serverA)
 
         // b1's session row is gone, so its transcript rows cascaded away too.
-        let hasB1 = try await store.hasTranscript("b1")
+        let hasB1 = try await store.hasTranscript(identityB)
         XCTAssertFalse(hasB1, "FK cascade must drop the other server's transcript rows")
     }
 
@@ -612,11 +613,10 @@ final class CacheScopePartitionTests: XCTestCase {
 
 final class CacheV2MigrationTests: XCTestCase {
 
-    func testV4StampsFingerprintV4() async throws {
+    func testMigrationStampsCurrentFingerprint() async throws {
         let store = try makeInMemoryStore()
         let version = try await store.readMeta(SyncMetaRecord.Key.schemaVersion)
-        XCTAssertEqual(version, "v4")
-        XCTAssertEqual(CacheSchema.currentFingerprint, "v4")
+        XCTAssertEqual(version, CacheSchema.currentFingerprint)
     }
 
     func testV2ScopeColumnsExistAndAreQueryable() async throws {

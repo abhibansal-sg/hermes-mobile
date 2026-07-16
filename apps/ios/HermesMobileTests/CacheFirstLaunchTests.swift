@@ -55,6 +55,9 @@ final class CacheFirstLaunchTests: XCTestCase {
         let chat = ChatStore()
         let sessions = SessionStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        // Prefetch resolves its active cache scope from ConnectionStore. Bind
+        // the same server identity used by this test file's cache fixtures.
+        connection.serverURLString = serverURL
         let attachments = AttachmentStore()
         chat.attach(connection: connection, sessions: sessions, attachments: attachments)
         sessions.attach(connection: connection, chat: chat)
