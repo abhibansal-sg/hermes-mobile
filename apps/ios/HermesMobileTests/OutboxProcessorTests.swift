@@ -108,6 +108,52 @@ final class OutboxProcessorTests: XCTestCase {
         XCTAssertEqual(persisted?.state, .completed)
     }
 
+    func testAskIntentCreatesOneStableDestinationThenProcessesLocalNavigation() async throws {
+        let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let ask = try await harness.repository.enqueueAppIntent(
+            kind: .askHermes, text: "durable ask", scope: harness.scope
+        )
+        let navigation = try await harness.repository.enqueueAppIntent(
+            kind: .openSessions, scope: harness.scope
+        )
+        var createCount = 0
+        var localCount = 0
+        let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
+            currentScope: { harness.scope }, activeStoredSessionID: { nil },
+            canProcessPrompt: { true },
+            createDestination: { _ in
+                createCount += 1
+                return OutboxDestination(runtimeSessionID: "runtime-intent", storedSessionID: "stored-intent")
+            },
+            resolveRuntime: { stored in stored == "stored-intent" ? "runtime-intent" : nil },
+            uploadAsset: { _, _ in throw Ambiguous() },
+            willSubmit: { _, _ in },
+            submit: { submitted, _, _ in
+                OutboxSubmitResult(
+                    status: "streaming", accepted: true,
+                    clientMessageID: submitted.clientMessageID
+                )
+            },
+            processLocalAppIntent: { job in
+                if job.intentKind == .openSessions {
+                    localCount += 1
+                    return true
+                }
+                return false
+            }
+        ))
+
+        processor.wake(); await processor.waitUntilIdleForTesting()
+
+        let completedAsk = try await harness.repository.job(id: ask.jobID)
+        let completedNavigation = try await harness.repository.job(id: navigation.jobID)
+        XCTAssertEqual(createCount, 1)
+        XCTAssertEqual(localCount, 1)
+        XCTAssertEqual(completedAsk?.destinationSessionID, "stored-intent")
+        XCTAssertEqual(completedAsk?.state, .completed)
+        XCTAssertEqual(completedNavigation?.state, .completed)
+    }
+
     func testPromptRemainsVisibleForInProgressAndIndeterminate() async throws {
         for status in ["in_progress", "indeterminate"] {
             let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
