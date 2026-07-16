@@ -22,19 +22,23 @@ Usage::
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from utils import atomic_yaml_write
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_OPAQUE_PROFILE_ID_RE = re.compile(r"^pf_[A-Za-z0-9_-]{22}$")
 
 # Directories bootstrapped inside every new profile
 _PROFILE_DIRS = [
@@ -650,6 +654,9 @@ class ProfileInfo:
     # surfaces a "review" badge in this case so the user can edit or
     # accept.
     description_auto: bool = False
+    # Stable opaque identity. Unlike ``name``, this survives profile rename.
+    # ``None`` means legacy/corrupt metadata could not be initialized safely.
+    profile_id: Optional[str] = None
 
 
 def _read_distribution_meta(profile_dir: Path) -> tuple:
@@ -812,6 +819,79 @@ def _profile_yaml_path(profile_dir: Path) -> Path:
     return profile_dir / "profile.yaml"
 
 
+def _new_profile_id() -> str:
+    return "pf_" + secrets.token_urlsafe(16)
+
+
+@contextmanager
+def _profile_identity_lock(profile_dir: Path):
+    """Serialize lazy profile-id creation across Hermes processes."""
+    lock_path = profile_dir / ".profile-identity.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if lock_path.stat().st_size == 0:
+                handle.write(b" ")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def ensure_profile_id(profile_dir: Path, *, rekey: bool = False) -> str:
+    """Return the profile's stable opaque ID, creating it atomically.
+
+    ``rekey`` is reserved for create/clone/import-as-new flows. It must never
+    be used by rename because ``profile.yaml`` moves with the directory.
+    """
+    if not profile_dir.is_dir():
+        raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
+    with _profile_identity_lock(profile_dir):
+        path = _profile_yaml_path(profile_dir)
+        existing: dict = {}
+        if path.is_file():
+            import yaml
+
+            with path.open("r", encoding="utf-8") as handle:
+                loaded = yaml.safe_load(handle) or {}
+            if not isinstance(loaded, dict):
+                raise ValueError(f"invalid profile metadata: {path}")
+            existing = loaded
+        current = existing.get("profile_id")
+        if not rekey and isinstance(current, str) and _OPAQUE_PROFILE_ID_RE.fullmatch(current):
+            return current
+        if not rekey and current not in (None, ""):
+            raise ValueError(f"invalid profile_id in {path}")
+        profile_id = _new_profile_id()
+        existing["profile_id"] = profile_id
+        atomic_yaml_write(path, existing, sort_keys=False)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return profile_id
+
+
 def read_profile_meta(profile_dir: Path) -> dict:
     """Read ``<profile_dir>/profile.yaml`` and return a dict.
 
@@ -822,18 +902,22 @@ def read_profile_meta(profile_dir: Path) -> dict:
     """
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
-        return {"description": "", "description_auto": False}
+        return {"description": "", "description_auto": False, "profile_id": None}
     try:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
     except Exception:
-        return {"description": "", "description_auto": False}
+        return {"description": "", "description_auto": False, "profile_id": None}
     if not isinstance(data, dict):
-        return {"description": "", "description_auto": False}
+        return {"description": "", "description_auto": False, "profile_id": None}
     return {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
+        "profile_id": data.get("profile_id")
+        if isinstance(data.get("profile_id"), str)
+        and _OPAQUE_PROFILE_ID_RE.fullmatch(data["profile_id"])
+        else None,
     }
 
 
@@ -842,6 +926,7 @@ def write_profile_meta(
     *,
     description: Optional[str] = None,
     description_auto: Optional[bool] = None,
+    profile_id: Optional[str] = None,
 ) -> None:
     """Update ``<profile_dir>/profile.yaml`` in place.
 
@@ -866,8 +951,18 @@ def write_profile_meta(
         existing["description"] = description.strip()
     if description_auto is not None:
         existing["description_auto"] = bool(description_auto)
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(existing, f, sort_keys=False, default_flow_style=False)
+    if profile_id is not None:
+        if not _OPAQUE_PROFILE_ID_RE.fullmatch(profile_id):
+            raise ValueError("invalid profile_id")
+        existing["profile_id"] = profile_id
+    atomic_yaml_write(path, existing, sort_keys=False)
+
+
+def _safe_profile_id(profile_dir: Path) -> Optional[str]:
+    try:
+        return ensure_profile_id(profile_dir)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -899,6 +994,7 @@ def list_profiles() -> List[ProfileInfo]:
             distribution_source=dist_source,
             description=meta.get("description", ""),
             description_auto=meta.get("description_auto", False),
+            profile_id=_safe_profile_id(default_home),
         ))
 
     # Named profiles
@@ -941,6 +1037,7 @@ def list_profiles() -> List[ProfileInfo]:
                 distribution_source=dist_source,
                 description=meta.get("description", ""),
                 description_auto=meta.get("description_auto", False),
+                profile_id=_safe_profile_id(entry),
             ))
 
     return profiles
@@ -1155,6 +1252,10 @@ def create_profile(
     # explicit runtime/history stripping above.
     if not clone_all:
         _migrate_profile_config_if_outdated(profile_dir)
+
+    # A clone/import is a new logical profile even when profile.yaml was copied
+    # by --clone-all. Rekey before any API can observe the new directory.
+    ensure_profile_id(profile_dir, rekey=True)
 
     # Persist description if the caller provided one. Done last so a
     # partial-create failure doesn't strand a description file in an

@@ -12821,6 +12821,7 @@ def _profile_attr(info, name: str, default: Any = None) -> Any:
 def _profile_to_dict(info) -> Dict[str, Any]:
     return {
         "name": _profile_attr(info, "name", ""),
+        "profile_id": _profile_attr(info, "profile_id"),
         "path": str(_profile_attr(info, "path", "")),
         "is_default": bool(_profile_attr(info, "is_default", False)),
         "model": _profile_attr(info, "model"),
@@ -12850,6 +12851,7 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
         model, provider = _safe(lambda: profiles_mod._read_config_model(default_home), (None, None))
         profiles.append({
             "name": "default",
+            "profile_id": _safe(lambda: profiles_mod.ensure_profile_id(default_home), None),
             "path": str(default_home),
             "is_default": True,
             "model": model,
@@ -12873,6 +12875,7 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
             model, provider = _safe(lambda entry=entry: profiles_mod._read_config_model(entry), (None, None))
             profiles.append({
                 "name": entry.name,
+                "profile_id": _safe(lambda entry=entry: profiles_mod.ensure_profile_id(entry), None),
                 "path": str(entry),
                 "is_default": False,
                 "model": model,

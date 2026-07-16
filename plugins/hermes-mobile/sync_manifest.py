@@ -8,6 +8,7 @@ tombstones, and opaque cursors needed for reliable reconciliation.
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import secrets
 import sqlite3
@@ -74,7 +75,7 @@ def _connect() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
     conn.executescript("""
-      CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
       INSERT OR IGNORE INTO meta(key,value) VALUES('revision',0);
       CREATE TABLE IF NOT EXISTS snapshots(
         scope TEXT NOT NULL, visibility TEXT NOT NULL, entity_key TEXT NOT NULL,
@@ -96,6 +97,15 @@ def _connect() -> sqlite3.Connection:
         scope TEXT NOT NULL, visibility TEXT NOT NULL, payload TEXT NOT NULL,
         revision INTEGER NOT NULL, PRIMARY KEY(scope,visibility));
     """)
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key,value) VALUES('journal_epoch',?)",
+        ("je_" + secrets.token_urlsafe(16),),
+    )
+    cursor_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(cursors)").fetchall()
+    }
+    if "journal_epoch" not in cursor_columns:
+        conn.execute("ALTER TABLE cursors ADD COLUMN journal_epoch TEXT")
     try:
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
         for suffix in ("-wal", "-shm"):
@@ -105,6 +115,16 @@ def _connect() -> sqlite3.Connection:
     except OSError:
         pass
     return conn
+
+
+def _journal_epoch(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='journal_epoch'"
+    ).fetchone()
+    value = str(row[0]) if row is not None else ""
+    if not value.startswith("je_"):
+        raise ManifestError(503, "journal_identity_invalid", "Manifest journal identity is invalid")
+    return value
 
 
 def _profile_for_home(home: Path) -> str:
@@ -134,6 +154,52 @@ def _homes(scope: str) -> Iterable[tuple[str, Path]]:
         for candidate in sorted(profiles.iterdir()):
             if candidate not in yielded and (candidate / "state.db").exists():
                 yield candidate.name, candidate
+
+
+def _authority_module():
+    """Load the sibling identity module in package and direct-test modes."""
+    if __package__:
+        from importlib import import_module
+
+        return import_module(f"{__package__}.authority_identity")
+    path = Path(__file__).with_name("authority_identity.py")
+    name = f"hermes_mobile_authority_identity_{id(path)}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise ImportError("cannot load authority identity module")
+    module = importlib.util.module_from_spec(spec)
+    import sys
+
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def authority_payload(scope: str) -> dict | None:
+    """Return established authority descriptors without upgrading capability.
+
+    The existing v1 manifest remains available for legacy installs. Identity
+    fields are additive diagnostics until the v2 cursor/reset contract lands;
+    failures therefore omit them rather than making the v1 fallback unusable.
+    """
+    try:
+        homes = tuple(_homes(scope))
+        if not homes:
+            return None
+        identity = _authority_module()
+        current = get_hermes_home()
+        if len(homes) == 1 and homes[0][1] == current:
+            context = identity.ensure_profile_authority(homes[0][0], homes[0][1])
+        else:
+            # Establish only the active writable profile. Aggregate reads for
+            # every other profile remain read-only and fail closed when absent.
+            current_name = _profile_for_home(current)
+            if any(home == current for _, home in homes):
+                identity.ensure_profile_authority(current_name, current)
+            context = identity.read_profile_authorities(homes)
+        return identity.context_payload(context)
+    except Exception:
+        return None
 
 
 def _session_rows(scope: str, active_keys: set[tuple[str, str]]) -> tuple[list[dict], list[dict]]:
@@ -278,20 +344,21 @@ def _filtered(scope: str, visibility_check: Callable[[str], bool]) -> tuple[list
 
 def _new_cursor(conn: sqlite3.Connection, **values: Any) -> str:
     now = time.time()
+    journal_epoch = _journal_epoch(conn)
     existing = conn.execute(
         "SELECT token FROM cursors WHERE scope=? AND visibility=? AND base_revision=? "
         "AND target_revision=? AND position=? AND is_full=? AND snapshot IS ? "
-        "AND expires_at>=? ORDER BY created_at LIMIT 1",
+        "AND journal_epoch=? AND expires_at>=? ORDER BY created_at LIMIT 1",
         (values["scope"], values["visibility"], values["base_revision"],
          values["target_revision"], values["position"], int(values["is_full"]),
-         values.get("snapshot"), now),
+         values.get("snapshot"), journal_epoch, now),
     ).fetchone()
     if existing is not None:
         return str(existing["token"])
     token = "m1." + secrets.token_urlsafe(32)
     conn.execute(
-        "INSERT INTO cursors(token,scope,visibility,base_revision,target_revision,position,is_full,snapshot,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (token, values["scope"], values["visibility"], values["base_revision"], values["target_revision"], values["position"], int(values["is_full"]), values.get("snapshot"), now, now + CURSOR_RETENTION_SECONDS),
+        "INSERT INTO cursors(token,scope,visibility,base_revision,target_revision,position,is_full,snapshot,created_at,expires_at,journal_epoch) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (token, values["scope"], values["visibility"], values["base_revision"], values["target_revision"], values["position"], int(values["is_full"]), values.get("snapshot"), now, now + CURSOR_RETENTION_SECONDS, journal_epoch),
     )
     return token
 
@@ -304,6 +371,8 @@ def _error_cursor(conn: sqlite3.Connection, token: str, scope: str, visibility: 
         raise ManifestError(400, "invalid_cursor", "Invalid manifest cursor")
     if row["scope"] != scope or row["visibility"] != visibility:
         raise ManifestError(409, "cursor_scope_mismatch", "Manifest cursor belongs to another scope or owner")
+    if row["journal_epoch"] != _journal_epoch(conn):
+        raise ManifestError(410, "journal_rebuilt", "Manifest journal was rebuilt", reset=True)
     current_revision = int(conn.execute("SELECT value FROM meta WHERE key='revision'").fetchone()[0])
     if row["expires_at"] < time.time() and current_revision - int(row["base_revision"]) >= MIN_REVISIONS_RETAINED:
         raise ManifestError(410, "cursor_expired", "Manifest cursor is no longer retained", reset=True)
@@ -402,6 +471,7 @@ def build_manifest(
                     "tokens_today": None, "estimated_cost_today": None,
                 },
                 "push": {"device_registered": bool(device_registered)},
+                "authority": authority_payload(scope),
             }
             return _page(conn, frozen, 0, scope, visibility, base, is_full)
         except Exception:
@@ -426,12 +496,15 @@ def _page(conn: sqlite3.Connection, frozen: dict, position: int, scope: str, vis
     heads = frozen["heads"] if complete and not items else [h for h in frozen["heads"] if (h["profile"], h["session_id"]) in page_keys]
     result = {
         "server_time": frozen["server_time"], "revision": frozen["revision"], "scope": scope,
+        "journal_epoch": _journal_epoch(conn),
         "is_full_sync": is_full, "complete": complete, "next_cursor": next_cursor,
         "capabilities_version": CAPABILITIES_VERSION,
         "sessions": {"upserts": upserts, "tombstones": tombstones},
         "pending_attention": frozen["attention"], "active_turns": frozen["active"],
         "transcript_heads": heads, "widget_summary": frozen["widget"], "push_registry": frozen["push"],
     }
+    if frozen.get("authority"):
+        result.update(frozen["authority"])
     conn.execute("COMMIT")
     return result
 

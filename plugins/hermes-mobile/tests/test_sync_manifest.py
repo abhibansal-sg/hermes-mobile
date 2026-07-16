@@ -76,6 +76,34 @@ def test_cold_seed_no_change_delta_and_restart_persistence(sync, monkeypatch):
     assert third["sessions"]["tombstones"][0]["reason"] == "deleted"
 
 
+def test_journal_epoch_is_stable_and_binds_cursors(sync, monkeypatch):
+    _install_universe(monkeypatch, sync, [_row("a")])
+    seed = sync.build_manifest(
+        scope="all", cursor=None, visibility="shared",
+        visibility_check=lambda _: True, device_registered=False,
+    )
+    assert seed["journal_epoch"].startswith("je_")
+    again = sync.build_manifest(
+        scope="all", cursor=seed["next_cursor"], visibility="shared",
+        visibility_check=lambda _: True, device_registered=False,
+    )
+    assert again["journal_epoch"] == seed["journal_epoch"]
+
+    conn = sync._connect()
+    conn.execute(
+        "UPDATE meta SET value=? WHERE key='journal_epoch'",
+        ("je_" + "Z" * 22,),
+    )
+    conn.close()
+    with pytest.raises(sync.ManifestError) as rebuilt:
+        sync.build_manifest(
+            scope="all", cursor=seed["next_cursor"], visibility="shared",
+            visibility_check=lambda _: True, device_registered=False,
+        )
+    assert rebuilt.value.code == "journal_rebuilt"
+    assert rebuilt.value.reset
+
+
 def stat_mode(path: Path) -> int:
     return os.stat(path).st_mode & 0o777
 

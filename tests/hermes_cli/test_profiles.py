@@ -170,6 +170,18 @@ class TestCreateProfile:
                         "plans", "workspace", "cron"]:
             assert (profile_dir / subdir).is_dir(), f"Missing subdir: {subdir}"
 
+    def test_new_and_cloned_profiles_receive_distinct_stable_ids(self, profile_env):
+        source = create_profile("source", no_alias=True)
+        source_id = profiles.ensure_profile_id(source)
+        cloned = create_profile(
+            "cloned", clone_from="source", clone_all=True, no_alias=True
+        )
+        cloned_id = profiles.ensure_profile_id(cloned)
+        assert source_id.startswith("pf_")
+        assert cloned_id.startswith("pf_")
+        assert cloned_id != source_id
+        assert profiles.ensure_profile_id(source) == source_id
+
     def test_seeds_placeholder_env_file(self, profile_env):
         """Fresh profiles get their own .env (owner-only) so channel/env
         writes are profile-scoped from day one instead of falling through
@@ -1069,6 +1081,13 @@ class TestRenameProfile:
         assert not old_dir.is_dir()
         assert new_dir.is_dir()
         assert new_dir == tmp_path / ".hermes" / "profiles" / "newname"
+
+    def test_rename_preserves_profile_id(self, profile_env):
+        old_dir = create_profile("oldname", no_alias=True)
+        profile_id = profiles.ensure_profile_id(old_dir)
+        with patch("hermes_cli.profiles.check_alias_collision", return_value="skip"):
+            new_dir = rename_profile("oldname", "newname")
+        assert profiles.ensure_profile_id(new_dir) == profile_id
 
     def test_renames_root_honcho_host_without_changing_ai_peer(self, profile_env):
         tmp_path = profile_env

@@ -19,10 +19,12 @@ import json
 import logging
 import random
 import re
+import secrets
 import sqlite3
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -30,6 +32,21 @@ from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
+
+_PROFILE_AUTHORITY_ID_RE = re.compile(r"^pf_[A-Za-z0-9_-]{22}$")
+_AUTHORITY_EPOCH_RE = re.compile(r"^ae_[A-Za-z0-9_-]{22}$")
+
+
+@dataclass(frozen=True, slots=True)
+class StateAuthorityIdentity:
+    """Opaque identity for one profile's authoritative state database."""
+
+    profile_id: str
+    authority_epoch: str
+
+
+class StateAuthorityIdentityError(RuntimeError):
+    """Raised when persisted authority metadata is partial or mismatched."""
 
 
 def workspace_key(row: Dict[str, Any]) -> Optional[str]:
@@ -6402,6 +6419,115 @@ class SessionDB:
         return count
 
     # ── Meta key/value (for scheduler bookkeeping) ──
+
+    @staticmethod
+    def _authority_identity_from_rows(
+        profile_value: Optional[str],
+        epoch_value: Optional[str],
+    ) -> Optional[StateAuthorityIdentity]:
+        if profile_value is None and epoch_value is None:
+            return None
+        if profile_value is None or epoch_value is None:
+            raise StateAuthorityIdentityError("partial state authority identity")
+        if not _PROFILE_AUTHORITY_ID_RE.fullmatch(profile_value):
+            raise StateAuthorityIdentityError("invalid persisted profile_id")
+        if not _AUTHORITY_EPOCH_RE.fullmatch(epoch_value):
+            raise StateAuthorityIdentityError("invalid persisted authority_epoch")
+        return StateAuthorityIdentity(profile_value, epoch_value)
+
+    def read_authority_identity(self) -> Optional[StateAuthorityIdentity]:
+        """Read authority identity without creating or changing metadata."""
+        with self._lock:
+            rows = {
+                str(row["key"]): str(row["value"])
+                for row in self._conn.execute(
+                    "SELECT key, value FROM state_meta "
+                    "WHERE key IN ('profile_id', 'authority_epoch')"
+                ).fetchall()
+            }
+        return self._authority_identity_from_rows(
+            rows.get("profile_id"), rows.get("authority_epoch")
+        )
+
+    def get_or_create_authority_identity(
+        self,
+        *,
+        expected_profile_id: str,
+    ) -> StateAuthorityIdentity:
+        """Atomically establish identity for a writable state database.
+
+        A copied/restored database whose stored profile does not match the
+        caller fails closed. Callers must use an explicit restore/rekey flow;
+        ordinary startup never rewrites that evidence silently.
+        """
+        if self.read_only:
+            raise StateAuthorityIdentityError(
+                "cannot create authority identity on a read-only database"
+            )
+        if not _PROFILE_AUTHORITY_ID_RE.fullmatch(expected_profile_id):
+            raise StateAuthorityIdentityError("invalid expected profile_id")
+
+        def _do(conn: sqlite3.Connection) -> StateAuthorityIdentity:
+            rows = {
+                str(row["key"]): str(row["value"])
+                for row in conn.execute(
+                    "SELECT key, value FROM state_meta "
+                    "WHERE key IN ('profile_id', 'authority_epoch')"
+                ).fetchall()
+            }
+            stored_profile = rows.get("profile_id")
+            stored_epoch = rows.get("authority_epoch")
+            if stored_profile is not None and stored_profile != expected_profile_id:
+                raise StateAuthorityIdentityError(
+                    "state database belongs to another profile_id"
+                )
+            if stored_profile is None and stored_epoch is not None:
+                raise StateAuthorityIdentityError("partial state authority identity")
+            if stored_profile is not None and not _PROFILE_AUTHORITY_ID_RE.fullmatch(stored_profile):
+                raise StateAuthorityIdentityError("invalid persisted profile_id")
+            if stored_epoch is not None and not _AUTHORITY_EPOCH_RE.fullmatch(stored_epoch):
+                raise StateAuthorityIdentityError("invalid persisted authority_epoch")
+
+            profile_id = stored_profile or expected_profile_id
+            authority_epoch = stored_epoch or ("ae_" + secrets.token_urlsafe(16))
+            conn.executemany(
+                "INSERT INTO state_meta(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (
+                    ("profile_id", profile_id),
+                    ("authority_epoch", authority_epoch),
+                ),
+            )
+            return StateAuthorityIdentity(profile_id, authority_epoch)
+
+        return self._execute_write(_do)
+
+    def rotate_authority_epoch(
+        self,
+        *,
+        expected_profile_id: str,
+    ) -> StateAuthorityIdentity:
+        """Explicitly begin a new authority lifetime for this profile DB."""
+        current = self.get_or_create_authority_identity(
+            expected_profile_id=expected_profile_id
+        )
+        new_epoch = "ae_" + secrets.token_urlsafe(16)
+
+        def _do(conn: sqlite3.Connection) -> StateAuthorityIdentity:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key='profile_id'"
+            ).fetchone()
+            if row is None or str(row[0]) != current.profile_id:
+                raise StateAuthorityIdentityError(
+                    "state profile identity changed during epoch rotation"
+                )
+            conn.execute(
+                "UPDATE state_meta SET value=? WHERE key='authority_epoch'",
+                (new_epoch,),
+            )
+            return StateAuthorityIdentity(current.profile_id, new_epoch)
+
+        return self._execute_write(_do)
 
     def get_meta(self, key: str) -> Optional[str]:
         """Read a value from the state_meta key/value store."""
