@@ -327,14 +327,25 @@ def enrich_correlated_event(event: str, sid: str, payload: dict | None) -> dict 
     event_id = "evt_" + hashlib.sha256(
         correlation_source.encode("utf-8")
     ).hexdigest()[:32]
-    data["event_id"] = event_id
-    data["gateway_scope"] = _gateway_scope()
+    # Preserve the identity stamped by the pre-emit seam.  The worker may be
+    # called directly, but must not recalculate a different ID for an already
+    # correlated live frame.
+    data.setdefault("event_id", event_id)
+    data.setdefault("gateway_scope", _gateway_scope())
     if turn_id:
         data.setdefault("turn_id", turn_id)
     if event == "approval.request":
         # The approval itself must have a server identity. iOS may display an
         # id-less legacy prompt, but it must never synthesize a UUID for dedupe.
         data.setdefault("approval_id", identity)
+    elif event == "clarify.request":
+        # Keep the request identity explicit in every transport, including
+        # legacy emitters that omitted request_id at intake.
+        data.setdefault("request_id", identity)
+    elif event == "message.complete":
+        # A completion is correlated to its turn even when the caller invokes
+        # the push worker directly and bypasses the pre-emit transform.
+        data.setdefault("turn_id", identity)
     return data
 
 
@@ -1527,7 +1538,7 @@ def _push_route_context(sid: str, data: dict) -> dict:
     stored = (_gw_sessions().get(sid) or {}).get("session_key")
     if stored:
         context["stored_session_id"] = stored
-    for key in ("event_id", "gateway_scope", "turn_id"):
+    for key in ("event_id", "gateway_scope", "turn_id", "request_id", "approval_id"):
         if data.get(key):
             context[key] = data[key]
     return context
@@ -1691,7 +1702,9 @@ def _live_activity_hook(
             return
 
         session = _gw_sessions().get(sid)
-        data = payload or {}
+        # Keep the worker safe for direct callers as well as the normal
+        # pre_emit_event path.  This is idempotent for already enriched data.
+        data = enrich_correlated_event(event, sid, payload) or {}
         is_end = event in ("message.complete", "session.interrupt")
         now = event_time or time.time()
 
@@ -1862,7 +1875,9 @@ def _process_push_event(
         if event not in _PUSH_ALERT_EVENTS:
             return
 
-        data = payload or {}
+        # Keep the worker safe for direct callers as well as the normal
+        # pre_emit_event path. This is idempotent for already enriched data.
+        data = enrich_correlated_event(event, sid, payload) or {}
         if event == "approval.request":
             title = _push_safe_text(data.get("title"), "Approval required", max_chars=80)
             body = _push_safe_text(

@@ -1363,7 +1363,10 @@ final class ChatStore {
                 eventId: eventId,
                 gatewayScope: gatewayScope,
                 sessionId: sessionId,
-                storedSessionId: event.storedSessionId
+                storedSessionId: event.storedSessionId,
+                requestId: event.payload["request_id"]?.stringValue
+                    ?? event.payload["approval_id"]?.stringValue
+                    ?? event.payload["turn_id"]?.stringValue
             )
         } else {
             correlated = nil
