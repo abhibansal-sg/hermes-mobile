@@ -33,6 +33,7 @@ final class ChatStoreBatchBTests: XCTestCase {
         chat.attach(connection: connection, sessions: sessions, attachments: attachments)
         sessions.attach(connection: connection, chat: chat)
         if let cache {
+            connection.serverURLString = "unit-test-gateway"
             chat.attachCache(cache)
             sessions.attachCache(cache)
         }
@@ -611,9 +612,11 @@ final class ChatStoreBatchBTests: XCTestCase {
         // but MUST NOT use this fresh disk proof to skip the authoritative fetch.
         await settle()
         try await cache.saveTranscript(
-            sessionId: "stored-B",
+            identity: CacheIdentity(
+                serverId: "unit-test-gateway", profileId: "default", sessionId: "stored-B"
+            ),
             messages: [storedMessage(role: "assistant", text: "DISK ADVANCED B")],
-            scope: CacheScope(serverId: "unit-test-gateway", profileId: DefaultsKeys.allProfilesScope)
+            scope: CacheScope(serverId: "unit-test-gateway", profileId: "default")
         )
 
         // Switch away so the next B tap is a real session switch, not a no-op.
