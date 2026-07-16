@@ -113,8 +113,9 @@ enum WidgetSnapshotWriter {
         if persistAtomically(snapshot) { lastWritten = snapshot }
     }
 
-    /// True when any user-visible field differs (ignoring `updatedAt`), so we
-    /// only touch WidgetKit when the widgets would actually render differently.
+    // MARK: - Merge
+
+    /// Loads the latest disk snapshot, migrating the legacy defaults payload once.
     private static func loadLatest(now: Date) -> SharedStore.WidgetSnapshot? {
         if let current = SharedStore.readSnapshot() { return current }
         guard let data = SharedStore.defaults?.data(forKey: SharedStore.snapshotKey),
