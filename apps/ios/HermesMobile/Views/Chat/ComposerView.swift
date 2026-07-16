@@ -1039,7 +1039,7 @@ struct ComposerView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(theme.mutedFg)
-            .accessibilityLabel("\(queueStore.pendingCount) pending prompts")
+            .accessibilityLabel("\(queueStore.pendingCount) pending work items")
             Spacer(minLength: 0)
         }
     }
@@ -1715,7 +1715,10 @@ private struct QueueSheet: View {
                         ForEach(queueStore.items) { item in
                             QueuedPromptRow(
                                 text: item.text,
+                                kind: item.kind,
+                                createdAt: item.createdAt,
                                 status: item.displayState.title,
+                                errorMessage: item.errorMessage,
                                 editable: item.isEditable,
                                 canRetry: item.canRetry,
                                 onCommit: { newText in
@@ -1771,7 +1774,10 @@ private struct QueueSheet: View {
 /// One editable queued-prompt row. Edits commit on submit / focus loss.
 private struct QueuedPromptRow: View {
     @State var text: String
+    let kind: WorkJobKind
+    let createdAt: Date
     let status: String
+    let errorMessage: String?
     let editable: Bool
     let canRetry: Bool
     let onCommit: (String) -> Void
@@ -1781,24 +1787,34 @@ private struct QueuedPromptRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            TextField("Queued prompt", text: $text, axis: .vertical)
-                .lineLimit(1...4)
-                .focused($focused)
-                .disabled(!editable)
-                .onSubmit { onCommit(text) }
+            if kind == .share {
+                Label("Shared item", systemImage: "square.and.arrow.up")
+                    .font(.caption.weight(.semibold))
+                Text(text).lineLimit(4)
+            } else {
+                TextField("Queued prompt", text: $text, axis: .vertical)
+                    .lineLimit(1...4)
+                    .focused($focused)
+                    .disabled(!editable)
+                    .onSubmit { onCommit(text) }
+            }
             HStack {
                 Text(status).font(.caption).foregroundStyle(.secondary)
+                Text(createdAt, style: .relative).font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 if canRetry {
                     Button("Retry", action: onRetry).font(.caption.weight(.semibold))
                 }
+            }
+            if let errorMessage, !errorMessage.isEmpty {
+                Text(errorMessage).font(.caption).foregroundStyle(.red)
             }
         }
             // Commit on focus LOSS too (release audit P1): the doc promised
             // it, but only `.onSubmit` was wired — tapping away (keyboard
             // dismiss, sheet drag) silently discarded the edit.
             .onChange(of: focused) { _, isFocused in
-                if !isFocused { onCommit(text) }
+                if editable && !isFocused { onCommit(text) }
             }
             .submitLabel(.done)
     }

@@ -40,13 +40,15 @@ enum SharedInboxWriter {
         let assets = content.images.map {
             WorkAssetInput(data: $0, mimeType: "image/jpeg", fileExtension: "jpg")
         }
-        return try await repository.enqueue(WorkJobInput(
-            kind: .share,
-            scope: nil,
-            text: content.text,
-            sourceURL: content.url,
-            comment: (trimmedComment?.isEmpty ?? true) ? nil : trimmedComment,
-            expiresAt: Date().addingTimeInterval(14 * 24 * 60 * 60)
-        ), assets: assets)
+        return try await repository.enqueueShare(
+            WorkJobInput(
+                kind: .share,
+                scope: nil,
+                text: content.text,
+                sourceURL: content.url,
+                comment: (trimmedComment?.isEmpty ?? true) ? nil : trimmedComment
+            ),
+            assets: assets
+        )
     }
 }
