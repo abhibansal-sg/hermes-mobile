@@ -12,6 +12,7 @@ enum WorkRepositoryError: Error, LocalizedError, Equatable {
     case assetNotFound
     case invalidTransition(from: WorkJobState, to: WorkJobState)
     case leaseLost
+    case appIntentQueueFull
     case shareQueueFull(limit: Int)
     case shareStorageFull(limitBytes: Int)
 
@@ -35,6 +36,8 @@ enum WorkRepositoryError: Error, LocalizedError, Equatable {
             "Invalid work transition from \(from.rawValue) to \(to.rawValue)."
         case .leaseLost:
             "Another worker owns this work item."
+        case .appIntentQueueFull:
+            "Hermes already has 20 pending shortcut requests. Open the app to finish or remove one."
         case .shareQueueFull(let limit):
             "Hermes can hold up to \(limit) pending shares. Retry or delete one first."
         case .shareStorageFull(let limitBytes):
@@ -86,6 +89,8 @@ struct WorkRepositoryConfiguration: Sendable {
 /// SQLite work away from `MainActor`.
 actor WorkRepository {
     private static let protection: FileProtectionType = .completeUntilFirstUserAuthentication
+    static let appIntentJobLimit = 20
+    static let appIntentLifetime: TimeInterval = 24 * 60 * 60
     static let shareJobLimit = 20
     static let shareByteLimit = 100 * 1_048_576
     static let shareLifetime: TimeInterval = 14 * 24 * 60 * 60
@@ -152,6 +157,70 @@ actor WorkRepository {
     }
 
     // MARK: - Job CRUD
+
+    /// Atomically expires stale shortcut work, enforces the bounded queue, and
+    /// inserts one independent App Intent invocation. App Intent processes are
+    /// separate writers, so the count and insert must share the same SQLite
+    /// transaction rather than relying on an in-memory preflight.
+    @discardableResult
+    func enqueueAppIntent(
+        kind: WorkIntentKind,
+        text: String? = nil,
+        scope: WorkScope? = nil,
+        legacyImportKey: String? = nil,
+        now: Date = Date()
+    ) async throws -> WorkJob {
+        try ensureProtectedDataAvailable()
+        let normalizedText: String?
+        if kind == .askHermes {
+            let trimmed = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { throw WorkRepositoryError.jobNotFound }
+            normalizedText = trimmed
+        } else {
+            normalizedText = nil
+        }
+        let timestamp = now.timeIntervalSince1970
+        let input = WorkJobInput(
+            kind: .appIntent,
+            scope: scope,
+            intentKind: kind,
+            text: normalizedText,
+            expiresAt: now.addingTimeInterval(Self.appIntentLifetime),
+            legacyImportKey: legacyImportKey,
+            createdAt: now
+        )
+        let job = Self.makeJob(input, preparedAssets: [], now: timestamp)
+
+        let persisted = try await database.write { db -> WorkJob in
+            if let legacyImportKey,
+               let existing = try WorkJob
+                .filter(Column("legacy_import_key") == legacyImportKey)
+                .fetchOne(db) {
+                return existing
+            }
+            try Self.expireAppIntents(db, at: timestamp)
+            let activeCount = try Int.fetchOne(
+                db,
+                sql: """
+                    SELECT COUNT(*) FROM work_jobs
+                    WHERE kind = ? AND state NOT IN (?, ?, ?)
+                    """,
+                arguments: [
+                    WorkJobKind.appIntent.rawValue,
+                    WorkJobState.completed.rawValue,
+                    WorkJobState.cancelled.rawValue,
+                    WorkJobState.expired.rawValue,
+                ]
+            ) ?? 0
+            guard activeCount < Self.appIntentJobLimit else {
+                throw WorkRepositoryError.appIntentQueueFull
+            }
+            try job.insert(db)
+            return job
+        }
+        await publishObservation()
+        return persisted
+    }
 
     @discardableResult
     func enqueue(_ input: WorkJobInput, assets: [WorkAssetInput] = []) async throws -> WorkJob {
@@ -317,6 +386,84 @@ actor WorkRepository {
         }
     }
 
+    /// Binds shortcut work created by the App Intents process once the main app
+    /// has a stable Phase-1 scope. Existing bindings are immutable.
+    func bindPendingAppIntents(to scope: WorkScope, now: Date = Date()) async throws {
+        try ensureProtectedDataAvailable()
+        try await database.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE work_jobs
+                    SET server_id = ?, profile_id = ?, state = ?, updated_at = ?
+                    WHERE kind = ? AND state = ? AND server_id IS NULL AND profile_id IS NULL
+                    """,
+                arguments: [
+                    scope.serverID, scope.profileID, WorkJobState.queued.rawValue,
+                    now.timeIntervalSince1970, WorkJobKind.appIntent.rawValue,
+                    WorkJobState.waitingForScope.rawValue,
+                ]
+            )
+        }
+        await publishObservation()
+    }
+
+    /// Returns non-terminal App Intents in deterministic FIFO order after
+    /// transactionally expiring stale entries.
+    func pendingAppIntents(now: Date = Date()) async throws -> [WorkJob] {
+        try ensureProtectedDataAvailable()
+        let timestamp = now.timeIntervalSince1970
+        let jobs = try await database.write { db -> [WorkJob] in
+            try Self.expireAppIntents(db, at: timestamp)
+            return try WorkJob.fetchAll(
+                db,
+                sql: """
+                    SELECT * FROM work_jobs
+                    WHERE kind = ? AND state NOT IN (?, ?, ?)
+                    ORDER BY created_at ASC, job_id ASC
+                    """,
+                arguments: [
+                    WorkJobKind.appIntent.rawValue,
+                    WorkJobState.completed.rawValue,
+                    WorkJobState.cancelled.rawValue,
+                    WorkJobState.expired.rawValue,
+                ]
+            )
+        }
+        await publishObservation()
+        return jobs
+    }
+
+    /// Navigation-only shortcut work completes after its local transaction and
+    /// never enters the network outbox state machine.
+    func completeNavigationAppIntent(id: String, now: Date = Date()) async throws {
+        try ensureProtectedDataAvailable()
+        let changed = try await database.write { db -> Int in
+            try db.execute(
+                sql: """
+                    UPDATE work_jobs
+                    SET state = ?, updated_at = ?, completed_at = ?,
+                        lease_owner = NULL, lease_expires_at = NULL
+                    WHERE job_id = ? AND kind = ? AND intent_kind IN (?, ?)
+                      AND state IN (?, ?)
+                    """,
+                arguments: [
+                    WorkJobState.completed.rawValue,
+                    now.timeIntervalSince1970,
+                    now.timeIntervalSince1970,
+                    id,
+                    WorkJobKind.appIntent.rawValue,
+                    WorkIntentKind.openSessions.rawValue,
+                    WorkIntentKind.newSession.rawValue,
+                    WorkJobState.waitingForScope.rawValue,
+                    WorkJobState.queued.rawValue,
+                ]
+            )
+            return db.changesCount
+        }
+        guard changed == 1 else { throw WorkRepositoryError.jobNotFound }
+        await publishObservation()
+    }
+
     func databasePragmas() throws -> WorkDatabasePragmas {
         try database.read { db in
             WorkDatabasePragmas(
@@ -333,6 +480,7 @@ actor WorkRepository {
         scope: WorkScope? = nil,
         activeStoredSessionID: String? = nil,
         enforceSessionAffinity: Bool = false,
+        outboxOnly: Bool = false,
         owner: String,
         now: Date,
         leaseDuration: TimeInterval
@@ -368,6 +516,16 @@ actor WorkRepository {
                     """
             }
         }
+        let outboxSQL = outboxOnly
+            ? " AND (kind = ? OR kind = ? OR kind = ?)"
+            : ""
+        if outboxOnly {
+            arguments += [
+                WorkJobKind.prompt.rawValue,
+                WorkJobKind.share.rawValue,
+                WorkJobKind.appIntent.rawValue,
+            ]
+        }
 
         return try database.write { db in
             try WorkJob.fetchOne(
@@ -388,6 +546,7 @@ actor WorkRepository {
                           AND (expires_at IS NULL OR expires_at > ?)
                           \(scopeSQL)
                           \(affinitySQL)
+                          \(outboxSQL)
                         ORDER BY created_at ASC, job_id ASC
                         LIMIT 1
                     )
@@ -911,6 +1070,28 @@ actor WorkRepository {
         .cancelled: [],
         .expired: [],
     ]
+
+    private static func expireAppIntents(_ db: Database, at timestamp: Double) throws {
+        try db.execute(
+            sql: """
+                UPDATE work_jobs
+                SET state = ?, updated_at = ?, lease_owner = NULL, lease_expires_at = NULL
+                WHERE kind = ?
+                  AND state NOT IN (?, ?, ?)
+                  AND expires_at IS NOT NULL
+                  AND expires_at <= ?
+                """,
+            arguments: [
+                WorkJobState.expired.rawValue,
+                timestamp,
+                WorkJobKind.appIntent.rawValue,
+                WorkJobState.completed.rawValue,
+                WorkJobState.cancelled.rawValue,
+                WorkJobState.expired.rawValue,
+                timestamp,
+            ]
+        )
+    }
 
     private static func makeJob(
         _ input: WorkJobInput,

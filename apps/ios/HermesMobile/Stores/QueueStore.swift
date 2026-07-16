@@ -99,7 +99,11 @@ final class QueueStore {
 
     var items: [QueuedPrompt] {
         observation.snapshot.jobs
-            .filter { $0.kind == .prompt || $0.kind == .share }
+            .filter {
+                $0.kind == .prompt
+                    || $0.kind == .share
+                    || ($0.kind == .appIntent && $0.intentKind == .askHermes)
+            }
             .map(QueuedPrompt.init(job:))
     }
 

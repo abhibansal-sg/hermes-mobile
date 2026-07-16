@@ -48,6 +48,7 @@ final class OutboxProcessor {
         var uploadAsset: (WorkJob, WorkJobAssetSnapshot) async throws -> OutboxUploadedAsset
         var willSubmit: (WorkJob, [String]) -> Void
         var submit: (WorkJob, String, [String]) async throws -> OutboxSubmitResult
+        var processLocalAppIntent: (WorkJob) async -> Bool = { _ in false }
     }
 
     static let leaseDuration: TimeInterval = 120
@@ -102,6 +103,7 @@ final class OutboxProcessor {
                     scope: scope,
                     activeStoredSessionID: activeStoredID,
                     enforceSessionAffinity: true,
+                    outboxOnly: true,
                     owner: owner,
                     now: Date(),
                     leaseDuration: Self.leaseDuration
@@ -119,6 +121,21 @@ final class OutboxProcessor {
                     try await repository.releaseLease(id: job.jobID, owner: owner)
                 } catch { return }
                 continue
+            }
+
+            if job.kind == .appIntent,
+               job.intentKind == .openSessions || job.intentKind == .newSession {
+                if await dependencies.processLocalAppIntent(job) {
+                    do {
+                        try await repository.completeNavigationAppIntent(id: job.jobID)
+                    } catch {
+                        try? await repository.releaseLease(id: job.jobID, owner: owner)
+                        return
+                    }
+                    continue
+                }
+                try? await repository.releaseLease(id: job.jobID, owner: owner)
+                return
             }
 
             guard dependencies.canProcessPrompt() else {
@@ -324,7 +341,9 @@ final class OutboxProcessor {
     }
 
     private static func requiresNewDestination(_ job: WorkJob) -> Bool {
-        job.kind == .share || job.intentKind == .newSession
+        job.kind == .share
+            || job.intentKind == .newSession
+            || (job.kind == .appIntent && job.intentKind == .askHermes)
     }
 }
 
