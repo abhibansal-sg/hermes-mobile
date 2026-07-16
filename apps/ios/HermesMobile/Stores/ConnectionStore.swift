@@ -1856,9 +1856,16 @@ final class ConnectionStore {
                     // reconnect banner.
                     self.chatStore.handleConnectionDrop(stampWarning: false)
                     self.sessionStore.clearAllTurnsInProgress()
-                    guard await self.recoverActiveSession(generation: generation),
-                          !Task.isCancelled,
+                    let recovered = await self.recoverActiveSession(generation: generation)
+                    guard !Task.isCancelled,
                           self.isActiveGeneration(generation) else { return }
+                    // A live socket without a resumed runtime is not a recovered
+                    // chat. Keep the same reconnect loop alive so a transient
+                    // `session.resume` failure retries instead of publishing a
+                    // false `.connected` state that only an app restart resets.
+                    guard recovered else {
+                        throw GatewayError.timeout(method: "session.resume")
+                    }
                     self.enterDraftIfNoActiveSession()
                     guard self.isActiveGeneration(generation) else { return }
                     self.phase = .connected
