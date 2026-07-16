@@ -89,9 +89,15 @@ actor AttachmentBlobCache {
         var mutableDirectory = self.directory
         try? mutableDirectory.setResourceValues(values)
 
-        let queue = try DatabaseQueue(path: self.directory.appendingPathComponent("metadata.sqlite").path)
-        try queue.write { db in
+        var configuration = Configuration()
+        configuration.prepareDatabase { db in
             try db.execute(sql: "PRAGMA journal_mode = WAL")
+        }
+        let queue = try DatabaseQueue(
+            path: self.directory.appendingPathComponent("metadata.sqlite").path,
+            configuration: configuration
+        )
+        try queue.write { db in
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS attachment_blob (
                     cacheKey TEXT PRIMARY KEY NOT NULL,

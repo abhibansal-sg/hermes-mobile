@@ -66,6 +66,10 @@ struct RestClient: Sendable {
     let baseURL: URL
     let token: String
     let session: URLSession
+    /// The injected-session initializer is used by tests to keep uploads on the
+    /// same URLProtocol-backed transport as the other REST calls. Production
+    /// clients always use the durable background transfer path below.
+    private let usesInjectedUploadSession: Bool
     /// Path family for the MOBILE endpoint group (see ``APIPathStyle``).
     /// Defaults to `.legacy` so an un-migrated construction site keeps today's
     /// behavior; ``ConnectionStore`` passes the probed style.
@@ -76,13 +80,16 @@ struct RestClient: Sendable {
     ///   - token: The session token sent as `X-Hermes-Session-Token`.
     ///   - pathStyle: Path family for the mobile endpoint group.
     init(baseURL: URL, token: String, pathStyle: APIPathStyle = .legacy) {
-        self.baseURL = baseURL
-        self.token = token
-        self.pathStyle = pathStyle
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = Self.timeout
         config.waitsForConnectivity = false
-        self.session = URLSession(configuration: config)
+        self.init(
+            baseURL: baseURL,
+            token: token,
+            session: URLSession(configuration: config),
+            pathStyle: pathStyle,
+            usesInjectedUploadSession: false
+        )
     }
 
     /// Testing-only initialiser: accepts a pre-built ``URLSession`` so tests
@@ -94,15 +101,38 @@ struct RestClient: Sendable {
         session: URLSession,
         pathStyle: APIPathStyle = .legacy
     ) {
+        self.init(
+            baseURL: baseURL,
+            token: token,
+            session: session,
+            pathStyle: pathStyle,
+            usesInjectedUploadSession: true
+        )
+    }
+
+    private init(
+        baseURL: URL,
+        token: String,
+        session: URLSession,
+        pathStyle: APIPathStyle,
+        usesInjectedUploadSession: Bool
+    ) {
         self.baseURL = baseURL
         self.token = token
         self.session = session
         self.pathStyle = pathStyle
+        self.usesInjectedUploadSession = usesInjectedUploadSession
     }
 
     /// A copy of this client speaking the given path family (same session).
     func withPathStyle(_ style: APIPathStyle) -> RestClient {
-        RestClient(baseURL: baseURL, token: token, session: session, pathStyle: style)
+        RestClient(
+            baseURL: baseURL,
+            token: token,
+            session: session,
+            pathStyle: style,
+            usesInjectedUploadSession: usesInjectedUploadSession
+        )
     }
 
     /// Prefix for the MOBILE endpoint group under this client's path family.
@@ -461,6 +491,36 @@ struct RestClient: Sendable {
     ) async throws -> DurableUploadResult {
         let request = makeRequest(path: "\(mobileAPIPrefix)/upload", method: "POST")
         guard let url = request.url else { throw RestError.network("Invalid upload URL") }
+
+        if usesInjectedUploadSession {
+            let boundary = "Boundary-\(UUID().uuidString)"
+            var request = request
+            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+            let body = multipartBody(
+                data: data, filename: filename, mimeType: mimeType, boundary: boundary
+            )
+            let response: URLResponse
+            let responseData: Data
+            do {
+                (responseData, response) = try await session.upload(for: request, from: body)
+            } catch {
+                throw RestError.network(error.localizedDescription)
+            }
+            guard let http = response as? HTTPURLResponse else {
+                throw RestError.network("Non-HTTP response")
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                let responseBody = String(data: responseData, encoding: .utf8) ?? ""
+                throw RestError.badStatus(
+                    http.statusCode, body: String(responseBody.prefix(512))
+                )
+            }
+            return DurableUploadResult(
+                upload: try decode(UploadResult.self, from: responseData, context: "upload"),
+                transferID: "injected-session-upload"
+            )
+        }
+
         let transfer = try await TransferManager.shared.uploadMultipart(
             data: data,
             filename: filename,
