@@ -82,6 +82,9 @@ struct RootView: View {
     var body: some View {
         content
             .environment(drawerState)
+            .onReceive(NotificationCenter.default.publisher(for: .hermesOpenSessionsIntent)) { _ in
+                drawerState.open()
+            }
             .onChange(of: inbox.presentationRequestToken) { _, _ in
                 // Route the request to the right surface for the current shell.
                 // On regular width with the inspector mounted, satisfy it there

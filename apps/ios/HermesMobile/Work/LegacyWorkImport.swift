@@ -96,14 +96,12 @@ extension WorkRepository {
         let key = "pending-intent:v1:\(hash)"
         if try !containsLegacyImport(key) {
             do {
-                _ = try await enqueue(WorkJobInput(
-                    kind: .appIntent,
-                    scope: source.scope,
-                    intentKind: intentKind,
+                _ = try await enqueueAppIntent(
+                    kind: intentKind,
                     text: text,
-                    expiresAt: Date().addingTimeInterval(24 * 60 * 60),
+                    scope: source.scope,
                     legacyImportKey: key
-                ))
+                )
             } catch let error as DatabaseError where error.resultCode == .SQLITE_CONSTRAINT {
                 guard try containsLegacyImport(key) else { throw error }
             }

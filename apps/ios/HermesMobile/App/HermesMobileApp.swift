@@ -205,11 +205,14 @@ struct HermesMobileApp: App {
                     // On foreground: apply parked App Intents, surface/drain the
                     // share inbox, and refresh the widgets' usage figures.
                     if newPhase == .active {
-                        PendingIntentRouter.drain(
-                            connection: environment.connectionStore,
-                            sessions: environment.sessionStore,
-                            chat: environment.chatStore
-                        )
+                        Task {
+                            await PendingIntentRouter.drainDurable(
+                                repository: environment.workRepository,
+                                scope: environment.sessionStore.durableWorkScope,
+                                sessions: environment.sessionStore,
+                                queue: environment.queueStore
+                            )
+                        }
                         SharedStore.notifyInboxDidChange()
                         attemptSharedInboxDrain()
                         PushRegistrar.shared.ensureRegisteredForPairedGateway()

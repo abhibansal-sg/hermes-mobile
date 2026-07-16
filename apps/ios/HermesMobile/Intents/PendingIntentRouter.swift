@@ -1,13 +1,14 @@
 import Foundation
 
-/// Applies a parked ``PendingIntent`` against the live store graph.
+extension Notification.Name {
+    static let hermesOpenSessionsIntent = Notification.Name("HermesOpenSessionsIntent")
+}
+
+/// Applies durable and one-release legacy App Intent work to the live stores.
 ///
-/// This is the app-side half of the App Intents handoff. The intent ran in its
-/// own context, parked a request in `UserDefaults`, and foregrounded the app;
-/// the app then calls ``drain(connection:sessions:chat:)`` once the scene is
-/// active. Keeping the apply logic here (rather than in `HermesMobileApp`) means
-/// the App Intents module owns its whole contract end to end, and the wiring in
-/// `HermesMobileApp` is a single call.
+/// Current invocations drain through ``drainDurable(repository:scope:sessions:queue:defaults:)``.
+/// ``drain(connection:sessions:chat:defaults:)`` remains only for the previous
+/// version's single-slot `UserDefaults` handoff.
 ///
 /// All work is `@MainActor`: it drives the same `@Observable` stores the UI
 /// binds to, so the navigation/transcript changes are observed immediately.
@@ -38,6 +39,46 @@ enum PendingIntentRouter {
         apply(intent, connection: connection, sessions: sessions, chat: chat, defaults: defaults)
     }
 
+    /// Drains the durable App Intent queue on foreground. Navigation-only jobs
+    /// complete locally and in FIFO order. Ask Hermes stays durable and wakes the
+    /// common outbox, which owns destination creation and idempotent submission.
+    static func drainDurable(
+        repository: WorkRepository,
+        scope: WorkScope?,
+        sessions: SessionStore,
+        queue: QueueStore,
+        defaults: UserDefaults = .standard
+    ) async {
+        // One-release bridge for requests written by the previous app version.
+        try? await repository.importLegacyWork(
+            from: LegacyWorkImportSource(appDefaults: defaults, scope: scope)
+        )
+        if let scope {
+            try? await repository.bindPendingAppIntents(to: scope)
+        }
+        guard let jobs = try? await repository.pendingAppIntents() else { return }
+
+        for job in jobs {
+            switch job.intentKind {
+            case .openSessions:
+                await sessions.closeActive()
+                NotificationCenter.default.post(name: .hermesOpenSessionsIntent, object: nil)
+                try? await repository.completeNavigationAppIntent(id: job.jobID)
+            case .newSession:
+                sessions.startDraft()
+                try? await repository.completeNavigationAppIntent(id: job.jobID)
+            case .askHermes:
+                // The oldest network job is the FIFO barrier. Do not apply later
+                // navigation until this prompt has left the pending queue.
+                queue.wake()
+                return
+            case nil:
+                return
+            }
+        }
+        await queue.refresh()
+    }
+
     /// Apply a specific request. Exposed (vs. only `drain`) so a future
     /// custom-URL-scheme or Handoff path can reuse the same activation logic.
     static func apply(
@@ -51,6 +92,7 @@ enum PendingIntentRouter {
         case .openSessions:
             // Pure navigation: drop any active session so the list takes over.
             Task { await sessions.closeActive() }
+            NotificationCenter.default.post(name: .hermesOpenSessionsIntent, object: nil)
 
         case .newSession:
             // LOCAL-DRAFT PARITY (User decision 3): "New session" must behave like

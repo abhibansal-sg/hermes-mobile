@@ -2,16 +2,10 @@ import Foundation
 
 /// A request handed from an App Intent (or Siri shortcut) to the running app.
 ///
-/// App Intents run in a *separate* execution context from the SwiftUI app and
-/// must stay lightweight — they do not open their own gateway connection. Instead
-/// each intent records what the user asked for in `UserDefaults` and then brings
-/// the app to the foreground. The app drains the pending request on the next
-/// `scenePhase == .active` transition (see ``PendingIntentRouter``).
-///
-/// The encoding is intentionally a tiny, stable JSON blob (not `Codable` of a
-/// richer type) so the App Intents extension and the app agree on a shape that
-/// can never fail to decode across versions: a `kind` discriminator plus an
-/// optional `prompt`.
+/// App Intents run in a separate process and never open a gateway connection.
+/// Current invocations enqueue independent rows in ``WorkRepository`` before
+/// foregrounding the app. The property-list encoding below is retained only as
+/// a one-release migration bridge for requests written by the previous version.
 enum PendingIntent: Equatable, Sendable {
     /// Open the app to a brand-new session with `prompt` prefilled and sent.
     case ask(prompt: String)
@@ -20,7 +14,36 @@ enum PendingIntent: Equatable, Sendable {
     /// Open the app and immediately create a new, empty session.
     case newSession
 
-    // MARK: - UserDefaults contract
+    var workKind: WorkIntentKind {
+        switch self {
+        case .ask: .askHermes
+        case .openSessions: .openSessions
+        case .newSession: .newSession
+        }
+    }
+
+    var promptText: String? {
+        if case .ask(let prompt) = self { return prompt }
+        return nil
+    }
+
+    /// Durable handoff used by the App Intents process. Every invocation gets a
+    /// separate stable job/client id; no networking occurs in the extension.
+    @discardableResult
+    func enqueue(
+        in repository: WorkRepository,
+        scope: WorkScope? = nil,
+        now: Date = Date()
+    ) async throws -> WorkJob {
+        try await repository.enqueueAppIntent(
+            kind: workKind,
+            text: promptText,
+            scope: scope,
+            now: now
+        )
+    }
+
+    // MARK: - Legacy UserDefaults contract
 
     private static let kindKey = "kind"
     private static let promptKey = "prompt"
@@ -65,11 +88,10 @@ enum PendingIntent: Equatable, Sendable {
 
     // MARK: - Persistence
 
-    /// Park this request in `defaults`, overwriting any earlier pending request.
+    /// Park a request in the previous version's single-slot handoff.
     ///
-    /// "Last write wins": if the user fires two shortcuts back to back before the
-    /// app foregrounds, only the most recent is honored — which matches the user's
-    /// intent (they re-asked) and keeps the drain a single step.
+    /// New App Intent code must use ``enqueue(in:scope:now:)``. This overwrite-only
+    /// API remains solely for retrying/migrating requests created by the old app.
     func park(in defaults: UserDefaults = .standard) {
         defaults.set(storageValue, forKey: DefaultsKeys.pendingIntentPrompt)
     }
