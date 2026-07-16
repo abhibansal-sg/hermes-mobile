@@ -36,7 +36,7 @@ final class PendingAttentionClientTests: XCTestCase {
 
     func testDecodesSnapshotAndSendsOpaqueCursor() async throws {
         StubURLProtocol.handler = { request in
-            XCTAssertEqual(request.url?.path, "/api/plugins/hermes-mobile/pending-attention")
+            XCTAssertEqual(request.url?.path, "/api/plugins/hermes-mobile/attention/pending")
             XCTAssertEqual(URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
                 .queryItems?.first?.value, "pa1.instance.7.scope.signature")
             let json = """
