@@ -1055,6 +1055,44 @@ struct ProjectsStoreTests {
         #expect(sessionStore.sessions.map(\.id) == ["untouched"],
             "a failed project-scoped fetch must never mutate the global drawer Recents list")
     }
+
+    // MARK: - ABH-470 background outcome seam
+
+    @Test("refreshOutcome reports real success")
+    func refreshOutcome_reportsSuccess() async {
+        let store = SessionStore()
+        store.sessionsFetch = { ([], 0) }
+
+        #expect(await store.refreshOutcome() == .success)
+    }
+
+    @Test("refreshOutcome classifies retryable failures without localized matching")
+    func refreshOutcome_reportsRetryableFailure() async {
+        let store = SessionStore()
+        struct Retryable: Error {}
+        store.sessionsFetch = { throw Retryable() }
+
+        #expect(await store.refreshOutcome() == .retryableFailure)
+    }
+
+    @Test("refreshOutcome classifies typed authentication failures")
+    func refreshOutcome_reportsAuthFailure() async {
+        let store = SessionStore()
+        store.sessionsFetch = { throw RestError.badStatus(401, body: "any localized text") }
+
+        #expect(await store.refreshOutcome() == .authFailure)
+    }
+
+    @Test("refreshOutcome propagates cancellation and timeout")
+    func refreshOutcome_reportsCancellationAndTimeout() async {
+        let cancelled = SessionStore()
+        cancelled.sessionsFetch = { throw CancellationError() }
+        #expect(await cancelled.refreshOutcome() == .timeout)
+
+        let timedOut = SessionStore()
+        timedOut.sessionsFetch = { throw URLError(.timedOut) }
+        #expect(await timedOut.refreshOutcome() == .timeout)
+    }
 }
 
 /// Minimal stub for ProjectsStoreTests: id + optional cwd, everything else nil.

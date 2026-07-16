@@ -331,9 +331,9 @@ final class AppEnvironment {
             },
             sync: { [weak sessionStore] _ in
                 guard let sessionStore else { return .retryableFailure }
-                await sessionStore.refresh()
+                let outcome = await sessionStore.refreshOutcome()
                 try Task.checkCancellation()
-                return .success
+                return outcome
             },
             maintenance: { [weak workRepository, weak queueStore] in
                 guard let workRepository else { return }
