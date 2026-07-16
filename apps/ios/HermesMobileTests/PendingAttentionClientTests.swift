@@ -4,7 +4,7 @@ import GRDB
 
 final class PendingAttentionClientTests: XCTestCase {
     private final class StubURLProtocol: URLProtocol, @unchecked Sendable {
-        static var handler: ((URLRequest) throws -> (Int, Data))?
+        nonisolated(unsafe) static var handler: ((URLRequest) throws -> (Int, Data))?
         override class func canInit(with request: URLRequest) -> Bool { true }
         override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
         override func startLoading() {

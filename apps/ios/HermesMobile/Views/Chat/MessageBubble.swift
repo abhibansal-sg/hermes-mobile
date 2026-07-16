@@ -378,7 +378,7 @@ struct MessageBubble: View {
     /// bound (STR-1098) and still clamp to narrow iPad split-view columns.
     private var maxBubbleWidth: CGFloat {
         guard availableWidth > 0 else { return 320 }
-        Self.userBubbleMaxWidth(
+        return Self.userBubbleMaxWidth(
             availableWidth: availableWidth,
             horizontalSizeClass: horizontalSizeClass)
     }

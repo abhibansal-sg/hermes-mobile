@@ -407,13 +407,6 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         notificationCoordinator.install()
         let resolver = PersistedNotificationEndpointResolver()
         notificationCoordinator.attachActionEndpointProvider { resolver.resolve() }
-        return true
-    }
-
-    func application(
-        _ application: UIApplication,
-        didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
-    ) -> Bool {
         // Registration is synchronous and must precede the first submission.
         let coordinator = BackgroundRefreshCoordinator.shared
         if coordinator.registerAtLaunch() { coordinator.scheduleNext() }
