@@ -39,7 +39,7 @@ final class BackgroundRefreshCoordinatorTests: XCTestCase {
         _ = coordinator.registerAtLaunch()
         let task = TaskSpy()
         scheduler.handler?(task)
-        await settle()
+        await waitUntil { received != nil && task.completions == [true] }
         XCTAssertEqual(received, expected)
         XCTAssertEqual(task.completions, [true])
     }
@@ -65,7 +65,9 @@ final class BackgroundRefreshCoordinatorTests: XCTestCase {
             let coordinator = makeCoordinator(scheduler: scheduler)
             _ = coordinator.registerAtLaunch()
             let task = TaskSpy(); scheduler.handler?(task)
-            await settle()
+            await waitUntil {
+                task.completions == [true] && scheduler.events.last == "submit:ai.hermes.app.refresh"
+            }
             XCTAssertEqual(task.completions, [true])
             XCTAssertEqual(scheduler.events.last, "submit:ai.hermes.app.refresh")
         }
@@ -191,6 +193,18 @@ final class BackgroundRefreshCoordinatorTests: XCTestCase {
 
     private func pairing(scope: String = "all") -> BackgroundManifestScope { Self.pairing(scope: scope) }
     private func settle() async { await Task.yield(); await Task.yield(); try? await Task.sleep(for: .milliseconds(10)) }
+
+    private func waitUntil(
+        timeout: Duration = .seconds(1),
+        condition: @escaping @MainActor () -> Bool
+    ) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while !condition() && clock.now < deadline {
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+    }
 }
 
 @MainActor

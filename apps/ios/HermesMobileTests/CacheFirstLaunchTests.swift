@@ -72,6 +72,10 @@ final class CacheFirstLaunchTests: XCTestCase {
 
     private let serverURL = "https://test.example:9443"
 
+    private func cacheIdentity(_ sessionId: String) -> CacheIdentity {
+        CacheIdentity(serverId: serverURL, profileId: "default", sessionId: sessionId)
+    }
+
     // MARK: - Cache-first launch (kills the empty drawer / Welcome-when-offline)
 
     func testPaintFromCacheRendersDrawerWithoutNetwork() async throws {
@@ -283,7 +287,8 @@ final class CacheFirstLaunchTests: XCTestCase {
     // MARK: - Prefetch (happy path + cancellation + skip-fresh)
 
     func testPrefetchWarmsUncachedRecentSessions() async throws {
-        let (_, sessions, _) = makeGraph()
+        let (connection, sessions, _) = makeGraph()
+        connection.serverURLString = serverURL
         let cache = try makeInMemoryCache()
         sessions.attachCache(cache)
         let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
@@ -304,13 +309,14 @@ final class CacheFirstLaunchTests: XCTestCase {
 
         let got = await fetched.value
         XCTAssertEqual(got, ["p1", "p2"])
-        let hasP1 = try await cache.hasTranscript("p1")
-        let hasP2 = try await cache.hasTranscript("p2")
+        let hasP1 = try await cache.hasTranscript(cacheIdentity("p1"))
+        let hasP2 = try await cache.hasTranscript(cacheIdentity("p2"))
         XCTAssertTrue(hasP1 && hasP2, "prefetch wrote both transcripts through to disk")
     }
 
     func testPrefetchSkipsActiveSessionAndFreshCache() async throws {
-        let (_, sessions, _) = makeGraph()
+        let (connection, sessions, _) = makeGraph()
+        connection.serverURLString = serverURL
         let cache = try makeInMemoryCache()
         sessions.attachCache(cache)
         let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
@@ -322,7 +328,9 @@ final class CacheFirstLaunchTests: XCTestCase {
         ]
         try await cache.saveSessionList(rows, scope: scope)
         // `fresh` already has a current transcript on disk → must be skipped.
-        try await cache.saveTranscript(sessionId: "fresh", messages: [stubStored("cached")])
+        try await cache.saveTranscript(
+            identity: cacheIdentity("fresh"), messages: [stubStored("cached")]
+        )
         sessions.sessions = rows
         sessions.activeStoredId = "open"  // the open session owns its own fetch
 
@@ -341,7 +349,8 @@ final class CacheFirstLaunchTests: XCTestCase {
     }
 
     func testPrefetchDefaultFetchUsesDeltaCursorForCachedStaleSession() async throws {
-        let (_, sessions, _) = makeGraph()
+        let (connection, sessions, _) = makeGraph()
+        connection.serverURLString = serverURL
         let cache = try makeInMemoryCache()
         sessions.attachCache(cache)
         let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
@@ -350,7 +359,7 @@ final class CacheFirstLaunchTests: XCTestCase {
         let rows = [makeSummary(id: "unchanged", lastActive: nil)]
         try await cache.saveSessionList(rows, scope: scope)
         try await cache.saveTranscript(
-            sessionId: "unchanged",
+            identity: cacheIdentity("unchanged"),
             messages: [stubStored("cached-1", wireId: 101), stubStored("cached-2", wireId: 102)],
             wireIds: [101, 102]
         )
@@ -375,20 +384,21 @@ final class CacheFirstLaunchTests: XCTestCase {
                       "unchanged cached prefetch should pay only the delta cursor check")
         XCTAssertFalse(PrefetchDeltaStubProtocol.sawFullMessages,
                        "unchanged cached prefetch must not re-download the full transcript")
-        let cached = try await cache.loadTranscript("unchanged") ?? []
+        let cached = try await cache.loadTranscript(cacheIdentity("unchanged")) ?? []
         XCTAssertEqual(cached.map(\.text), ["cached-1", "cached-2"],
                        "empty delta leaves the cached transcript hydrated")
     }
 
     func testPrefetchDefaultFetchMergesChangedSessionDelta() async throws {
-        let (_, sessions, _) = makeGraph()
+        let (connection, sessions, _) = makeGraph()
+        connection.serverURLString = serverURL
         let cache = try makeInMemoryCache()
         sessions.attachCache(cache)
         let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
         let rows = [makeSummary(id: "changed", lastActive: nil)]
         try await cache.saveSessionList(rows, scope: scope)
         try await cache.saveTranscript(
-            sessionId: "changed",
+            identity: cacheIdentity("changed"),
             messages: [stubStored("cached-1", wireId: 201), stubStored("cached-2", wireId: 202)],
             wireIds: [201, 202]
         )
@@ -410,13 +420,13 @@ final class CacheFirstLaunchTests: XCTestCase {
         // and merged into the on-disk cache. Poll the actual persisted merge instead,
         // or this races the write and flakes under CI scheduling load (STR-1481).
         try await Self.poll {
-            (((try? await cache.loadTranscript("changed")) ?? []).count) == 3
+            (((try? await cache.loadTranscript(self.cacheIdentity("changed"))) ?? []).count) == 3
         }
 
-        let cached = try await cache.loadTranscript("changed") ?? []
+        let cached = try await cache.loadTranscript(cacheIdentity("changed")) ?? []
         XCTAssertEqual(cached.map(\.text), ["cached-1", "cached-2", "tail-3"],
                        "changed prefetch hydrates by appending the delta tail")
-        let cursor = try await cache.maxMessageId(for: "changed")
+        let cursor = try await cache.maxMessageId(for: cacheIdentity("changed"))
         XCTAssertEqual(cursor, 203,
                        "merged changed prefetch advances the durable cursor")
         XCTAssertFalse(PrefetchDeltaStubProtocol.sawFullMessages,
@@ -424,7 +434,8 @@ final class CacheFirstLaunchTests: XCTestCase {
     }
 
     func testCancelPrefetchStopsTheSweep() async throws {
-        let (_, sessions, _) = makeGraph()
+        let (connection, sessions, _) = makeGraph()
+        connection.serverURLString = serverURL
         let cache = try makeInMemoryCache()
         sessions.attachCache(cache)
         let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)

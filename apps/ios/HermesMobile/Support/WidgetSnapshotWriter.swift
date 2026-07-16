@@ -106,11 +106,11 @@ enum WidgetSnapshotWriter {
         write(patch)
     }
 
+    /// Forces the authoritative in-memory/disk snapshot through the atomic file
+    /// writer before suspension. No network fetch or WidgetKit keepalive occurs.
     static func flush() {
         guard let snapshot = lastWritten ?? SharedStore.readSnapshot() else { return }
-        if persistAtomically(snapshot) {
-            lastWritten = snapshot
-        }
+        if persistAtomically(snapshot) { lastWritten = snapshot }
     }
 
     // MARK: - Merge

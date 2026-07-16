@@ -24,7 +24,7 @@ enum CacheSchema {
     /// normal GRDB path on a live DB; the fingerprint bump means any DB so old
     /// it cannot ALTER cleanly takes the nuke-and-rebuild escape hatch instead —
     /// always safe (the cache is 100% reconstructible from the gateway).
-    static let currentFingerprint = "v4"
+    static let currentFingerprint = "v5"
 
     // MARK: - Migrator
 
@@ -252,6 +252,66 @@ enum CacheSchema {
                 t.primaryKey(["serverId", "profileId"])
             }
             try SyncMetaRecord(key: SyncMetaRecord.Key.schemaVersion, value: currentFingerprint).save(db)
+        }
+
+        // v5 — repair the transcript FK after the v3 shadow-table rename. Some
+        // SQLite builds preserve the temporary parent name in the child schema,
+        // leaving deletes pointed at the removed `session_cache_v3` table.
+        migrator.registerMigration("v5-cache-seams") { db in
+            let parents = try String.fetchAll(
+                db,
+                sql: "SELECT \"table\" FROM pragma_foreign_key_list('message_row_cache')"
+            )
+            if Set(parents) != [SessionCacheRecord.databaseTableName] {
+                try db.create(table: "message_row_cache_v5") { t in
+                    t.column("serverId", .text).notNull()
+                    t.column("profileId", .text).notNull()
+                    t.column("sessionId", .text).notNull()
+                    t.column("ordinal", .integer).notNull()
+                    t.column("wireId", .integer)
+                    t.column("role", .text).notNull()
+                    t.column("timestamp", .double)
+                    t.column("rowJSON", .blob).notNull()
+                    t.primaryKey(["serverId", "profileId", "sessionId", "ordinal"])
+                    t.foreignKey(
+                        ["serverId", "profileId", "sessionId"],
+                        references: SessionCacheRecord.databaseTableName,
+                        columns: ["serverId", "profileId", "id"],
+                        onDelete: .cascade
+                    )
+                }
+                try db.execute(sql: """
+                    INSERT INTO message_row_cache_v5
+                    SELECT serverId,profileId,sessionId,ordinal,wireId,role,timestamp,rowJSON
+                    FROM message_row_cache
+                    """)
+                let before = try Int.fetchOne(db, sql: "SELECT count(*) FROM message_row_cache") ?? 0
+                let after = try Int.fetchOne(db, sql: "SELECT count(*) FROM message_row_cache_v5") ?? 0
+                guard before == after else {
+                    throw DatabaseError(
+                        resultCode: .SQLITE_CONSTRAINT,
+                        message: "v5 transcript FK repair count mismatch"
+                    )
+                }
+                try db.drop(table: "message_row_cache")
+                try db.rename(table: "message_row_cache_v5", to: "message_row_cache")
+                try db.create(
+                    index: "message_row_cache_identity_wireId",
+                    on: "message_row_cache",
+                    columns: ["serverId", "profileId", "sessionId", "wireId"]
+                )
+            }
+            let violations = try Row.fetchAll(db, sql: "PRAGMA foreign_key_check")
+            guard violations.isEmpty else {
+                throw DatabaseError(
+                    resultCode: .SQLITE_CONSTRAINT_FOREIGNKEY,
+                    message: "v5 foreign-key verification failed"
+                )
+            }
+            try SyncMetaRecord(
+                key: SyncMetaRecord.Key.schemaVersion,
+                value: currentFingerprint
+            ).save(db)
         }
 
         return migrator

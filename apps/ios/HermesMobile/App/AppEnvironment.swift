@@ -28,6 +28,7 @@ final class AppEnvironment {
     let appLock: AppLock
     let themeStore: ThemeStore
     let projectsStore: ProjectsStore
+    let stateFlushCoordinator: StateFlushCoordinator
     private let syncCoordinator: ManifestInvalidationCoordinator
 
     init() {
@@ -348,6 +349,33 @@ final class AppEnvironment {
             }
         )
 
+        let stateFlushCoordinator = StateFlushCoordinator(dependencies: .init(
+            flushDraft: { [weak sessionStore] in
+                await sessionStore?.flushComposerDraftDurably()
+            },
+            suspendOutbox: { [weak queueStore] in
+                await queueStore?.suspendForBackground()
+            },
+            flushSyncCursor: { [weak sessionStore] in
+                sessionStore?.flushSessionListDeltaCursors()
+            },
+            flushWidgetSnapshot: { [weak connectionStore] in
+                var patch = WidgetSnapshotWriter.Patch()
+                if case .connected = connectionStore?.phase {
+                    patch.connectionState = .set(.connected)
+                } else {
+                    patch.connectionState = .set(.offline)
+                    patch.isStale = .set(true)
+                }
+                WidgetSnapshotWriter.write(patch)
+                WidgetSnapshotWriter.flush()
+            },
+            flushPendingNavigation: { [weak workRepository] in
+                PendingIntent.flushPendingStorage()
+                try? await workRepository?.flushForBackground()
+            }
+        ))
+
         self.sessionStore = sessionStore
         self.chatStore = chatStore
         self.attachmentStore = attachmentStore
@@ -361,6 +389,7 @@ final class AppEnvironment {
         self.themeStore = themeStore
         self.connectionStore = connectionStore
         self.projectsStore = projectsStore
+        self.stateFlushCoordinator = stateFlushCoordinator
 
         // Do not publish process-local defaults before bootstrap. The shared
         // disk snapshot remains authoritative until committed server state is

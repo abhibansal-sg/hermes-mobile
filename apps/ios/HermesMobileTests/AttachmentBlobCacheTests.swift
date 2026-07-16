@@ -33,13 +33,17 @@ final class AttachmentBlobCacheTests: XCTestCase {
     func testWriteEvictsLRUAndStaysAtOrBelowCap() async throws {
         let clock = TestClock(Date(timeIntervalSince1970: 1_000))
         let first = png(color: .red), second = png(color: .blue)
-        let cache = try AttachmentBlobCache(directory: directory(), capacity: Int64(first.count + 1),
+        // PNG compression size varies by renderer/runtime. Give the cache room
+        // for either single blob, but not both, so the assertion tests LRU
+        // behavior instead of depending on red encoding larger than blue.
+        let singleBlobCapacity = Int64(max(first.count, second.count))
+        let cache = try AttachmentBlobCache(directory: directory(), capacity: singleBlobCapacity,
                                             clock: clock.now)
         await cache.store(first, for: key("v1"))
         clock.advance(61)
         await cache.store(second, for: key("v2", path: "/other.png"))
         let stats = await cache.statistics()
-        XCTAssertLessThanOrEqual(stats.byteCount, Int64(first.count + 1))
+        XCTAssertLessThanOrEqual(stats.byteCount, singleBlobCapacity)
         let containsFirst = await cache.contains(key("v1"))
         let containsSecond = await cache.contains(key("v2", path: "/other.png"))
         XCTAssertFalse(containsFirst)
