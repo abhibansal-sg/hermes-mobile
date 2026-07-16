@@ -303,7 +303,9 @@ struct RootView: View {
     @ViewBuilder
     private var mainUI: some View {
         VStack(spacing: 0) {
-            FreshnessBanner(presentation: freshnessPresentation)
+            if freshnessPresentation.showsBanner {
+                FreshnessBanner(presentation: freshnessPresentation)
+            }
             if effectiveHorizontalSizeClass == .regular {
                 SplitLayout(
                     showingInspector: $showingInspector,
@@ -382,6 +384,7 @@ struct FreshnessPresentation: Equatable, Sendable {
     let text: String
     let accessibilityLabel: String
 
+    var showsBanner: Bool { kind != .fresh }
     var allowsRemoteMutations: Bool { kind == .fresh }
     var mutationUnavailableExplanation: String {
         "Available after synchronization establishes a fresh connection."
