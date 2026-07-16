@@ -108,6 +108,54 @@ final class OutboxProcessorTests: XCTestCase {
         XCTAssertEqual(persisted?.state, .completed)
     }
 
+    func testShareRetryReusesDestinationUploadedAssetAndClientID() async throws {
+        let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let job = try await harness.repository.enqueueShare(
+            WorkJobInput(kind: .share, scope: harness.scope, text: "photo"),
+            assets: [WorkAssetInput(data: Data("jpeg".utf8), mimeType: "image/jpeg", fileExtension: "jpg")]
+        )
+        var createCount = 0
+        var uploadCount = 0
+        var submittedIDs: [String] = []
+        var failOnce = true
+        let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
+            currentScope: { harness.scope },
+            activeStoredSessionID: { nil },
+            canProcessPrompt: { true },
+            createDestination: { _ in
+                createCount += 1
+                return OutboxDestination(runtimeSessionID: "runtime-share", storedSessionID: "stored-share")
+            },
+            resolveRuntime: { stored in stored == "stored-share" ? "runtime-share" : nil },
+            uploadAsset: { _, _ in
+                uploadCount += 1
+                return OutboxUploadedAsset(transferID: "transfer-share", remotePath: "/remote/share.jpg")
+            },
+            willSubmit: { _, _ in },
+            submit: { submitted, _, _ in
+                submittedIDs.append(submitted.clientMessageID)
+                if failOnce { failOnce = false; throw Ambiguous() }
+                return OutboxSubmitResult(
+                    status: "streaming",
+                    accepted: true,
+                    clientMessageID: submitted.clientMessageID
+                )
+            }
+        ))
+
+        processor.wake(); await processor.waitUntilIdleForTesting()
+        var persisted = try await harness.repository.job(id: job.jobID)
+        XCTAssertEqual(persisted?.destinationSessionID, "stored-share")
+        XCTAssertEqual(persisted?.state, .submitting)
+
+        processor.wake(); await processor.waitUntilIdleForTesting()
+        persisted = try await harness.repository.job(id: job.jobID)
+        XCTAssertEqual(persisted?.state, .completed)
+        XCTAssertEqual(createCount, 1)
+        XCTAssertEqual(uploadCount, 1)
+        XCTAssertEqual(submittedIDs, [job.clientMessageID, job.clientMessageID])
+    }
+
     func testPromptRemainsVisibleForInProgressAndIndeterminate() async throws {
         for status in ["in_progress", "indeterminate"] {
             let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }

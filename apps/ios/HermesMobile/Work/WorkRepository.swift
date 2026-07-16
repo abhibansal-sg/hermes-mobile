@@ -12,6 +12,8 @@ enum WorkRepositoryError: Error, LocalizedError, Equatable {
     case assetNotFound
     case invalidTransition(from: WorkJobState, to: WorkJobState)
     case leaseLost
+    case shareQueueFull(limit: Int)
+    case shareStorageFull(limitBytes: Int)
 
     var errorDescription: String? {
         switch self {
@@ -33,6 +35,10 @@ enum WorkRepositoryError: Error, LocalizedError, Equatable {
             "Invalid work transition from \(from.rawValue) to \(to.rawValue)."
         case .leaseLost:
             "Another worker owns this work item."
+        case .shareQueueFull(let limit):
+            "Hermes can hold up to \(limit) pending shares. Retry or delete one first."
+        case .shareStorageFull(let limitBytes):
+            "Pending shares have reached the \(limitBytes / 1_048_576) MiB local limit."
         }
     }
 }
@@ -80,6 +86,10 @@ struct WorkRepositoryConfiguration: Sendable {
 /// SQLite work away from `MainActor`.
 actor WorkRepository {
     private static let protection: FileProtectionType = .completeUntilFirstUserAuthentication
+    static let shareJobLimit = 20
+    static let shareByteLimit = 100 * 1_048_576
+    static let shareLifetime: TimeInterval = 14 * 24 * 60 * 60
+    static let orphanAssetGrace: TimeInterval = 5 * 60
 
     let database: DatabasePool
     private let configuration: WorkRepositoryConfiguration
@@ -174,6 +184,121 @@ actor WorkRepository {
         return job
     }
 
+    /// Atomically accepts one share after enforcing count, byte, and age policy.
+    @discardableResult
+    func enqueueShare(
+        _ source: WorkJobInput,
+        assets: [WorkAssetInput] = [],
+        now: Date = Date()
+    ) async throws -> WorkJob {
+        guard source.kind == .share else { throw WorkRepositoryError.jobNotFound }
+        let incomingBytes = assets.reduce(0) { $0 + $1.data.count }
+        guard incomingBytes <= Self.shareByteLimit else {
+            throw WorkRepositoryError.shareStorageFull(limitBytes: Self.shareByteLimit)
+        }
+        try ensureProtectedDataAvailable()
+        let preparedAssets = try prepareAssets(assets)
+        var input = source
+        input.expiresAt = now.addingTimeInterval(Self.shareLifetime)
+        input.createdAt = input.createdAt ?? now
+        let job = Self.makeJob(
+            input,
+            preparedAssets: preparedAssets,
+            now: input.createdAt!.timeIntervalSince1970
+        )
+        let timestamp = now.timeIntervalSince1970
+
+        do {
+            let expiredPaths = try await database.write { db -> [String] in
+                let paths = try Self.deleteExpiredShareRows(db, now: timestamp)
+                let activeCount = try Int.fetchOne(
+                    db,
+                    sql: """
+                        SELECT COUNT(*) FROM work_jobs
+                        WHERE kind = 'share'
+                          AND state NOT IN ('completed', 'cancelled', 'expired')
+                          AND (expires_at IS NULL OR expires_at > ?)
+                        """,
+                    arguments: [timestamp]
+                ) ?? 0
+                guard activeCount < Self.shareJobLimit else {
+                    throw WorkRepositoryError.shareQueueFull(limit: Self.shareJobLimit)
+                }
+                let activeBytes = try Int.fetchOne(
+                    db,
+                    sql: """
+                        SELECT COALESCE(SUM(byte_count), 0)
+                        FROM work_assets
+                        WHERE asset_id IN (
+                            SELECT DISTINCT job_assets.asset_id
+                            FROM job_assets
+                            JOIN work_jobs USING (job_id)
+                            WHERE work_jobs.kind = 'share'
+                              AND (work_jobs.expires_at IS NULL OR work_jobs.expires_at > ?)
+                        )
+                        """,
+                    arguments: [timestamp]
+                ) ?? 0
+                guard activeBytes + incomingBytes <= Self.shareByteLimit else {
+                    throw WorkRepositoryError.shareStorageFull(limitBytes: Self.shareByteLimit)
+                }
+                try job.insert(db)
+                for (ordinal, prepared) in preparedAssets.enumerated() {
+                    try prepared.record.insert(db)
+                    try WorkJobAsset(
+                        jobID: job.jobID,
+                        assetID: prepared.record.assetID,
+                        ordinal: ordinal,
+                        transferID: nil,
+                        remotePath: nil,
+                        state: "local"
+                    ).insert(db)
+                }
+                return paths
+            }
+            removeAssetFiles(expiredPaths)
+        } catch {
+            removePreparedFiles(preparedAssets)
+            throw error
+        }
+        await publishObservation()
+        return job
+    }
+
+    /// Binds every unpaired share exactly once after setup establishes identity.
+    func bindPendingShares(to scope: WorkScope, now: Date = Date()) async throws {
+        try await database.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE work_jobs
+                    SET server_id = ?, profile_id = ?, state = 'queued', updated_at = ?
+                    WHERE kind = 'share' AND state = 'waiting_for_scope'
+                      AND server_id IS NULL AND profile_id IS NULL
+                    """,
+                arguments: [scope.serverID, scope.profileID, now.timeIntervalSince1970]
+            )
+        }
+        await publishObservation()
+    }
+
+    /// Expires stale shares and removes database/file orphans without touching live references.
+    @discardableResult
+    func cleanupShareWork(now: Date = Date()) async throws -> Int {
+        try ensureProtectedDataAvailable()
+        let timestamp = now.timeIntervalSince1970
+        let result = try await database.write { db -> (Int, [String]) in
+            let before = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM work_jobs WHERE kind = 'share'") ?? 0
+            var paths = try Self.deleteExpiredShareRows(db, now: timestamp)
+            paths.append(contentsOf: try Self.deleteUnreferencedAssetRows(db))
+            let after = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM work_jobs WHERE kind = 'share'") ?? 0
+            return (before - after, Array(Set(paths)))
+        }
+        removeAssetFiles(result.1)
+        try removeOrphanAssetFiles(now: now)
+        await publishObservation()
+        return result.0
+    }
+
     func job(id: String) throws -> WorkJob? {
         try database.read { db in
             try WorkJob.fetchOne(db, key: id)
@@ -226,10 +351,21 @@ actor WorkRepository {
         var affinitySQL = ""
         if enforceSessionAffinity {
             if let activeStoredSessionID {
-                affinitySQL = " AND (COALESCE(destination_session_id, stored_session_id) IS NULL OR COALESCE(destination_session_id, stored_session_id) = ?)"
+                affinitySQL = """
+                     AND (
+                        kind != 'prompt' OR intent_kind = 'new_session'
+                        OR COALESCE(destination_session_id, stored_session_id) IS NULL
+                        OR COALESCE(destination_session_id, stored_session_id) = ?
+                     )
+                    """
                 arguments += [activeStoredSessionID]
             } else {
-                affinitySQL = " AND COALESCE(destination_session_id, stored_session_id) IS NULL"
+                affinitySQL = """
+                     AND (
+                        kind != 'prompt' OR intent_kind = 'new_session'
+                        OR COALESCE(destination_session_id, stored_session_id) IS NULL
+                     )
+                    """
             }
         }
 
@@ -882,6 +1018,37 @@ actor WorkRepository {
             guard let url = try? assetURL(relativePath: path) else { continue }
             try? FileManager.default.removeItem(at: url)
         }
+    }
+
+    private func removeOrphanAssetFiles(now: Date) throws {
+        let referenced = try database.read { db in
+            Set(try String.fetchAll(db, sql: "SELECT relative_path FROM work_assets"))
+        }
+        let urls = try FileManager.default.contentsOfDirectory(
+            at: configuration.assetsDirectoryURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )
+        for url in urls {
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .contentModificationDateKey])
+            guard values?.isRegularFile == true,
+                  let modifiedAt = values?.contentModificationDate,
+                  modifiedAt <= now.addingTimeInterval(-Self.orphanAssetGrace),
+                  !referenced.contains(url.lastPathComponent) else { continue }
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private static func deleteExpiredShareRows(_ db: Database, now: Double) throws -> [String] {
+        try db.execute(
+            sql: """
+                DELETE FROM work_jobs
+                WHERE kind = 'share' AND expires_at IS NOT NULL AND expires_at <= ?
+                  AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+                """,
+            arguments: [now, now]
+        )
+        return try deleteUnreferencedAssetRows(db)
     }
 
     private static func deleteUnreferencedAssetRows(_ db: Database) throws -> [String] {

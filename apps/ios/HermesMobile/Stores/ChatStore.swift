@@ -2397,7 +2397,7 @@ final class ChatStore {
     func prepareOutboxSubmission(job: WorkJob, remotePaths: [String]) {
         presentOutboxEcho(
             clientMessageID: job.clientMessageID,
-            text: job.text ?? "",
+            text: job.submissionText,
             remotePaths: remotePaths
         )
     }
@@ -2419,7 +2419,7 @@ final class ChatStore {
                 "prompt.submit",
                 params: .object([
                     "session_id": .string(runtimeSessionID),
-                    "text": .string(job.text ?? ""),
+                    "text": .string(job.submissionText),
                     "client_message_id": .string(job.clientMessageID),
                 ])
             )

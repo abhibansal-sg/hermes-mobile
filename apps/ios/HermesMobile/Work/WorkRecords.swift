@@ -124,6 +124,24 @@ struct WorkJob: Codable, FetchableRecord, PersistableRecord, Equatable, Sendable
         return try? WorkScope(serverID: serverID, profileID: profileID)
     }
 
+    /// The immutable prompt body submitted for this durable item.
+    var submissionText: String {
+        guard kind == .share else { return text ?? "" }
+        var lines: [String] = []
+        let trimmedComment = comment?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedText = text?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedURL = sourceURL?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmedComment, !trimmedComment.isEmpty {
+            lines.append("Shared from iPhone: \(trimmedComment)")
+        } else {
+            lines.append("Shared from iPhone:")
+        }
+        if let trimmedText, !trimmedText.isEmpty { lines.append(trimmedText) }
+        if let trimmedURL, !trimmedURL.isEmpty { lines.append(trimmedURL) }
+        if lines.count == 1 { lines.append("Please look at the attached item.") }
+        return lines.joined(separator: "\n")
+    }
+
     enum CodingKeys: String, CodingKey {
         case jobID = "job_id"
         case kind
