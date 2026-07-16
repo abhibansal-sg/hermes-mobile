@@ -1,6 +1,6 @@
 # Hermes Mobile — A0 Authority and Scope Identity Contract
 
-**Status:** Frozen architecture contract; implementation and conformance tests pending
+**Status:** Frozen contract; identity substrate implemented; production v2 activation pending
 
 **Date:** 2026-07-17
 
@@ -545,3 +545,37 @@ Static premise checks confirmed:
 
 Markdown parsing, balanced-fence validation, and `git diff --check` are required
 before the proof commit.
+
+## 13. Implementation progress
+
+The first two independently reversible implementation slices now exist on the
+contract branch:
+
+- `c060e6b9d` adds stable profile IDs, public transactional `SessionDB`
+  authority APIs, the installation registry, manifest journal epochs, cursor
+  journal fencing, profile API identity, and server/plugin conformance tests.
+- `cb34a53d4` adds additive iOS authority wire models, WorkRepository v3 scope
+  columns, verified and legacy authority states, explicit legacy quarantine,
+  and claim-time exclusion of quarantined work.
+
+Verification at those commits:
+
+```text
+180 Python profile/SessionDB/plugin/manifest tests passed
+ruff and py_compile passed
+WorkRepositoryTests build-for-testing passed
+WorkRepositoryMacTests passed
+HermesMobile + HermesMobileTests build-for-testing passed
+```
+
+The normal device-hosted `WorkRepositoryTests` runner could not launch on the
+local Mac because its provisioning profile does not include that Mac device.
+The same target compiled successfully; this is recorded as an environment
+limitation, not test success.
+
+ABH-474 remains **In Progress**. Production v2 activation is still fail-closed
+until A1 freezes the real cross-language manifest shape, `SyncCoordinator` is
+wired into the production graph, the authenticated locator binding persists a
+verified `gateway_id`, and capability advertisement no longer depends on the
+plugin's existing private SessionDB/runtime reads. Legacy URL/name work is not
+silently rebound by the new code.
