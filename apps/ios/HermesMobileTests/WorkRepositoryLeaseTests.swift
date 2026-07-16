@@ -119,6 +119,80 @@ final class WorkRepositoryLeaseTests: XCTestCase {
         let existsAfterDraftDelete = try await repository.assetFileExists(relativePath: asset.relativePath)
         XCTAssertFalse(existsAfterDraftDelete)
     }
+
+    func testAppIntentInvocationsKeepStableFIFOIdentity() async throws {
+        let test = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: test.directory) }
+        let repository = try WorkRepository(configuration: test.configuration)
+        let start = Date(timeIntervalSince1970: 1_000)
+        var inserted: [WorkJob] = []
+        for index in 0..<5 {
+            inserted.append(try await repository.enqueueAppIntent(
+                kind: .askHermes,
+                text: "prompt-\(index)",
+                now: start.addingTimeInterval(Double(index))
+            ))
+        }
+
+        let jobs = try await repository.jobs().filter { $0.kind == .appIntent }
+        XCTAssertEqual(jobs.map(\.jobID), inserted.map(\.jobID))
+        XCTAssertEqual(jobs.map(\.text), (0..<5).map { "prompt-\($0)" })
+        XCTAssertEqual(Set(jobs.map(\.clientMessageID)).count, 5)
+    }
+
+    func testAppIntentCapacityIsAtomicAcrossWriters() async throws {
+        let test = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: test.directory) }
+        let first = try WorkRepository(configuration: test.configuration)
+        let second = try WorkRepository(configuration: test.configuration)
+
+        let results = await withTaskGroup(of: Result<WorkJob, Error>.self) { group in
+            for index in 0..<21 {
+                let writer = index.isMultiple(of: 2) ? first : second
+                group.addTask {
+                    do {
+                        return .success(try await writer.enqueueAppIntent(
+                            kind: .askHermes, text: "writer-\(index)"
+                        ))
+                    } catch {
+                        return .failure(error)
+                    }
+                }
+            }
+            var values: [Result<WorkJob, Error>] = []
+            for await value in group { values.append(value) }
+            return values
+        }
+
+        let successes = results.filter { if case .success = $0 { return true }; return false }
+        let failures = results.compactMap { result -> WorkRepositoryError? in
+            guard case .failure(let error) = result else { return nil }
+            return error as? WorkRepositoryError
+        }
+        XCTAssertEqual(successes.count, 20)
+        XCTAssertEqual(failures, [.appIntentQueueFull])
+    }
+
+    func testExpiredAppIntentsFreeCapacityTransactionally() async throws {
+        let test = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: test.directory) }
+        let repository = try WorkRepository(configuration: test.configuration)
+        let start = Date(timeIntervalSince1970: 2_000)
+        for index in 0..<20 {
+            _ = try await repository.enqueueAppIntent(
+                kind: .openSessions,
+                now: start.addingTimeInterval(Double(index))
+            )
+        }
+        let replacement = try await repository.enqueueAppIntent(
+            kind: .newSession,
+            now: start.addingTimeInterval(WorkRepository.appIntentLifetime + 20)
+        )
+
+        let jobs = try await repository.jobs().filter { $0.kind == .appIntent }
+        XCTAssertEqual(jobs.filter { $0.state == .expired }.count, 20)
+        XCTAssertEqual(jobs.last?.jobID, replacement.jobID)
+    }
 }
 
 private func XCTAssertThrowsErrorAsync(

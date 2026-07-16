@@ -39,7 +39,7 @@ struct AskHermesIntent: AppIntent {
         guard !trimmed.isEmpty else {
             throw AppIntentError.emptyPrompt
         }
-        PendingIntent.ask(prompt: trimmed).park()
+        try await enqueueDurableIntent(.ask(prompt: trimmed))
         return .result()
     }
 }
@@ -57,7 +57,7 @@ struct OpenSessionsIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        PendingIntent.openSessions.park()
+        try await enqueueDurableIntent(.openSessions)
         return .result()
     }
 }
@@ -80,9 +80,15 @@ struct NewSessionIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        PendingIntent.newSession.park()
+        try await enqueueDurableIntent(.newSession)
         return .result()
     }
+}
+
+@MainActor
+private func enqueueDurableIntent(_ intent: PendingIntent) async throws {
+    let repository = try WorkRepository(configuration: .appGroup())
+    try await intent.enqueue(in: repository)
 }
 
 // MARK: - Errors
