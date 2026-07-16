@@ -621,6 +621,29 @@ actor WorkRepository {
         await publishObservation()
     }
 
+    /// Serializes behind all prior repository writes and releases only this
+    /// process's leases, leaving each durable stage recoverable after suspension.
+    func flushForBackground(
+        releasingLeasesOwnedBy owner: String? = nil,
+        now: Date = Date()
+    ) async throws {
+        try await database.write { db in
+            if let owner {
+                try db.execute(
+                    sql: """
+                        UPDATE work_jobs
+                        SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                        WHERE lease_owner = ?
+                        """,
+                    arguments: [now.timeIntervalSince1970, owner]
+                )
+            } else {
+                _ = try Int.fetchOne(db, sql: "SELECT 1")
+            }
+        }
+        if owner != nil { await publishObservation() }
+    }
+
     func bindScope(jobID: String, scope: WorkScope, now: Date = Date()) async throws -> WorkJob {
         let result = try await database.write { db -> WorkJob in
             guard var job = try WorkJob.fetchOne(db, key: jobID) else {

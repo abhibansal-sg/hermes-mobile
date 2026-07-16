@@ -80,6 +80,10 @@ enum DefaultsKeys {
     /// dormant single-profile path is unaffected by any stale value.
     static let activeProfile = "hermes.activeProfile"
 
+    /// Encoded session-list delta cursors, partitioned by their full fetch scope.
+    /// Owned and restored by ``SessionStore``.
+    static let sessionListDeltaCursors = "hermes.sessionListDeltaCursors"
+
     /// Sentinel value of ``activeProfile`` meaning the cross-profile aggregate
     /// view (matches the server's `profile="all"` wire value).
     static let allProfilesScope = "all"
