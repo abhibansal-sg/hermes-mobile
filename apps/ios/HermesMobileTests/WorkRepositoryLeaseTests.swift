@@ -193,6 +193,102 @@ final class WorkRepositoryLeaseTests: XCTestCase {
         XCTAssertEqual(jobs.filter { $0.state == .expired }.count, 20)
         XCTAssertEqual(jobs.last?.jobID, replacement.jobID)
     }
+
+    func testConcurrentShareAdmissionEnforcesTwentyJobLimit() async throws {
+        let (configuration, directory) = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = try WorkRepository(configuration: configuration)
+        let second = try WorkRepository(configuration: configuration)
+        let now = Date(timeIntervalSince1970: 5_000)
+        for index in 0..<19 {
+            _ = try await first.enqueueShare(
+                WorkJobInput(kind: .share, scope: nil, text: "share-\(index)"),
+                now: now
+            )
+        }
+
+        let results = await withTaskGroup(of: Result<WorkJob, WorkRepositoryError>.self) { group in
+            for (repository, text) in [(first, "twenty"), (second, "twenty-one")] {
+                group.addTask {
+                    do {
+                        return .success(try await repository.enqueueShare(
+                            WorkJobInput(kind: .share, scope: nil, text: text),
+                            now: now
+                        ))
+                    } catch let error as WorkRepositoryError {
+                        return .failure(error)
+                    } catch {
+                        return .failure(.jobNotFound)
+                    }
+                }
+            }
+            return await group.reduce(into: []) { $0.append($1) }
+        }
+
+        XCTAssertEqual(results.filter { if case .success = $0 { true } else { false } }.count, 1)
+        XCTAssertEqual(
+            results.filter {
+                if case .failure(.shareQueueFull(let limit)) = $0 { return limit == 20 }
+                return false
+            }.count,
+            1
+        )
+    }
+
+    func testOversizedShareIsRejectedBeforeWritingAssets() async throws {
+        let (configuration, directory) = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = try WorkRepository(configuration: configuration)
+        let oversized = Data(count: WorkRepository.shareByteLimit + 1)
+
+        do {
+            _ = try await repository.enqueueShare(
+                WorkJobInput(kind: .share, scope: nil, text: "too large"),
+                assets: [WorkAssetInput(data: oversized, mimeType: "image/jpeg", fileExtension: "jpg")]
+            )
+            XCTFail("oversized share must be rejected")
+        } catch {
+            XCTAssertEqual(
+                error as? WorkRepositoryError,
+                .shareStorageFull(limitBytes: WorkRepository.shareByteLimit)
+            )
+        }
+        let files = try FileManager.default.contentsOfDirectory(
+            at: configuration.assetsDirectoryURL,
+            includingPropertiesForKeys: nil
+        )
+        XCTAssertTrue(files.isEmpty)
+    }
+
+    func testShareExpiryDeletesOnlyUnreferencedAssetsAndScansOrphans() async throws {
+        let (configuration, directory) = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = try WorkRepository(configuration: configuration)
+        let created = Date()
+        let share = try await repository.enqueueShare(
+            WorkJobInput(kind: .share, scope: nil, text: "expires"),
+            assets: [WorkAssetInput(data: Data("asset".utf8), mimeType: "image/jpeg", fileExtension: "jpg")],
+            now: created
+        )
+        let asset = try await repository.assets(jobID: share.jobID)[0]
+        let orphan = configuration.assetsDirectoryURL.appendingPathComponent("orphan.jpg")
+        try Data("orphan".utf8).write(to: orphan)
+        try FileManager.default.setAttributes(
+            [.modificationDate: created.addingTimeInterval(-WorkRepository.orphanAssetGrace - 1)],
+            ofItemAtPath: orphan.path
+        )
+
+        let expired = try await repository.cleanupShareWork(
+            now: created.addingTimeInterval(WorkRepository.shareLifetime + 1)
+        )
+        let persisted = try await repository.job(id: share.jobID)
+        let assetExists = try await repository.assetFileExists(relativePath: asset.relativePath)
+
+        XCTAssertEqual(expired, 1)
+        XCTAssertNil(persisted)
+        XCTAssertFalse(assetExists)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
+    }
 }
 
 private func XCTAssertThrowsErrorAsync(

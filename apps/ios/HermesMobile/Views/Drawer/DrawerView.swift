@@ -76,6 +76,7 @@ struct DrawerView: View {
 
     @Environment(ConnectionStore.self) private var connection
     @Environment(SessionStore.self) private var sessions
+    @Environment(QueueStore.self) private var queueStore
     @Environment(InboxStore.self) private var inbox
     @Environment(AppLock.self) private var appLock
     @Environment(ThemeStore.self) private var themeStore
@@ -133,10 +134,14 @@ struct DrawerView: View {
     /// control below the header drives this; the list body switches between
     /// the sessions list (the existing drawer) and the read-only projects list.
     @State private var selectedTab: DrawerTab = .sessions
-    /// Share-extension items currently parked in the app-group inbox. This is a
-    /// visibility badge only; ``SharedInboxDrainer`` still uses the app-group
-    /// inbox as the single source of truth for delivery/idempotency.
-    @State private var sharedInboxPendingCount = SharedStore.pendingInboxCount()
+    /// Durable share jobs currently visible in the common work repository.
+    private var sharedInboxPendingCount: Int {
+        queueStore.items.filter {
+            $0.kind == .share
+                && $0.displayState != .sent
+                && $0.displayState != .cancelled
+        }.count
+    }
 
     /// The current display name (Settings field, F2) used for the avatar
     /// initials. `nil`/blank → a neutral person glyph.
@@ -205,10 +210,7 @@ struct DrawerView: View {
         // SwiftUI does not reliably inherit custom environment values across
         // presentation/column boundaries.
         .hermesThemed(themeStore)
-        .onAppear { refreshSharedInboxPendingCount() }
-        .onReceive(NotificationCenter.default.publisher(for: SharedStore.inboxDidChangeNotification)) { _ in
-            refreshSharedInboxPendingCount()
-        }
+
         // Archived Chats sheet (pull-to-reveal entry point).
         .sheet(isPresented: $showingArchivedChats) {
             NavigationStack {
@@ -684,9 +686,6 @@ struct DrawerView: View {
             : "No shared items pending"
     }
 
-    private func refreshSharedInboxPendingCount() {
-        sharedInboxPendingCount = SharedStore.pendingInboxCount()
-    }
 
     // MARK: - Search
 
