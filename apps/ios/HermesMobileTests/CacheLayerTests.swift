@@ -670,9 +670,9 @@ final class CacheV2MigrationTests: XCTestCase {
 
 final class CacheV3CompositeIdentityTests: XCTestCase {
     func testAttachmentKeyRetainsCompositeIdentity() {
-        let a = AttachmentBlobCache.Key(serverId: "server-a", profileId: "work", sessionId: "same", path: "x.png", size: 10)
-        let b = AttachmentBlobCache.Key(serverId: "server-b", profileId: "work", sessionId: "same", path: "x.png", size: 10)
-        let c = AttachmentBlobCache.Key(serverId: "server-a", profileId: "home", sessionId: "same", path: "x.png", size: 10)
+        let a = AttachmentBlobCache.Key(serverId: "server-a", profileId: "work", sessionId: "same", path: "x.png", contentVersion: "10")
+        let b = AttachmentBlobCache.Key(serverId: "server-b", profileId: "work", sessionId: "same", path: "x.png", contentVersion: "10")
+        let c = AttachmentBlobCache.Key(serverId: "server-a", profileId: "home", sessionId: "same", path: "x.png", contentVersion: "10")
         XCTAssertNotEqual(a, b)
         XCTAssertNotEqual(a, c)
     }
@@ -686,10 +686,14 @@ final class CacheV3CompositeIdentityTests: XCTestCase {
         let ia = testIdentity("same", scope: a), ib = testIdentity("same", scope: b)
         try await store.saveTranscript(identity: ia, messages: [makeStoredMessage(role: "user")])
         try await store.saveTranscript(identity: ib, messages: [makeStoredMessage(role: "assistant")])
-        XCTAssertEqual(try await store.loadSessionList(scope: a).first?.title, "A")
-        XCTAssertEqual(try await store.loadSessionList(scope: b).first?.title, "B")
-        XCTAssertEqual(try await store.loadTranscript(ia)?.first?.role, "user")
-        XCTAssertEqual(try await store.loadTranscript(ib)?.first?.role, "assistant")
+        let sessionsA = try await store.loadSessionList(scope: a)
+        let sessionsB = try await store.loadSessionList(scope: b)
+        let transcriptA = try await store.loadTranscript(ia)
+        let transcriptB = try await store.loadTranscript(ib)
+        XCTAssertEqual(sessionsA.first?.title, "A")
+        XCTAssertEqual(sessionsB.first?.title, "B")
+        XCTAssertEqual(transcriptA?.first?.role, "user")
+        XCTAssertEqual(transcriptB?.first?.role, "assistant")
     }
 
     func testAggregateReadsActualProfilesWithoutOwningRows() async throws {
@@ -699,8 +703,12 @@ final class CacheV3CompositeIdentityTests: XCTestCase {
             SessionSummary(id: "a", title: "A", preview: nil, startedAt: nil, messageCount: 1, source: nil, lastActive: 2, cwd: nil, profile: "work"),
             SessionSummary(id: "b", title: "B", preview: nil, startedAt: nil, messageCount: 1, source: nil, lastActive: 1, cwd: nil, profile: "home")
         ], scope: aggregate)
-        XCTAssertEqual(Set(try await store.loadSessionList(scope: aggregate).map(\.id)), ["a", "b"])
-        XCTAssertEqual(try await store.loadSessionList(scope: CacheScope(serverId: "server", profileId: "work")).map(\.id), ["a"])
+        let aggregateSessions = try await store.loadSessionList(scope: aggregate)
+        let workSessions = try await store.loadSessionList(
+            scope: CacheScope(serverId: "server", profileId: "work")
+        )
+        XCTAssertEqual(Set(aggregateSessions.map(\.id)), ["a", "b"])
+        XCTAssertEqual(workSessions.map(\.id), ["a"])
     }
 
     func testV3SchemaUsesCompositeKeysAndForeignKey() throws {

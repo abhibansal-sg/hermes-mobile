@@ -31,12 +31,20 @@ final class OfflineSearchTests: XCTestCase {
         try await cache.saveSessionList([session("same")], scope: b)
         try await cache.saveTranscript(sessionId: "same", messages: [message("tool", "needle work")], scope: b)
 
-        XCTAssertEqual(try await cache.searchTranscript(query: "cafe", scope: a).hits.count, 1)
-        XCTAssertEqual(try await cache.searchTranscript(query: "東京", scope: a).hits.count, 1)
-        XCTAssertEqual(try await cache.searchTranscript(query: "needle", scope: a, roles: ["user"]).hits.count, 0)
-        XCTAssertEqual(try await cache.searchTranscript(query: "needle", scope: a).hits.map(\.role), ["assistant"])
-        XCTAssertEqual(try await cache.searchTranscript(query: "needle", scope: b).hits.map(\.role), ["tool"])
-        XCTAssertEqual(try await cache.searchTranscript(query: "needle", scope: CacheScope(serverId: "gateway-b", profileId: "work")).hits.count, 0)
+        let cafe = try await cache.searchTranscript(query: "cafe", scope: a)
+        let japanese = try await cache.searchTranscript(query: "東京", scope: a)
+        let userNeedle = try await cache.searchTranscript(query: "needle", scope: a, roles: ["user"])
+        let defaultNeedle = try await cache.searchTranscript(query: "needle", scope: a)
+        let workNeedle = try await cache.searchTranscript(query: "needle", scope: b)
+        let otherGateway = try await cache.searchTranscript(
+            query: "needle", scope: CacheScope(serverId: "gateway-b", profileId: "work")
+        )
+        XCTAssertEqual(cafe.hits.count, 1)
+        XCTAssertEqual(japanese.hits.count, 1)
+        XCTAssertEqual(userNeedle.hits.count, 0)
+        XCTAssertEqual(defaultNeedle.hits.map(\.role), ["assistant"])
+        XCTAssertEqual(workNeedle.hits.map(\.role), ["tool"])
+        XCTAssertEqual(otherGateway.hits.count, 0)
     }
 
     func testReplaceAppendTombstoneAndExactOfflineLoad() async throws {
@@ -45,13 +53,16 @@ final class OfflineSearchTests: XCTestCase {
         try await cache.saveSessionList([session("s")], scope: scope)
         try await cache.saveTranscript(sessionId: "s", messages: [message("user", "old", wireId: 1)], scope: scope)
         try await cache.saveTranscript(sessionId: "s", messages: [message("user", "new", wireId: 2)], scope: scope)
-        XCTAssertTrue(try await cache.searchTranscript(query: "old", scope: scope).hits.isEmpty)
+        let oldHits = try await cache.searchTranscript(query: "old", scope: scope)
+        XCTAssertTrue(oldHits.hits.isEmpty)
         try await cache.appendTranscript(sessionId: "s", messages: [message("assistant", "later", wireId: 3)], scope: scope)
-        XCTAssertEqual(try await cache.searchTranscript(query: "later", scope: scope).hits.first?.wireId, 3)
+        let laterHits = try await cache.searchTranscript(query: "later", scope: scope)
+        XCTAssertEqual(laterHits.hits.first?.wireId, 3)
         let loaded = try await cache.loadTranscript(scope: scope, sessionId: "s")
         XCTAssertEqual(loaded?.count, 2)
         try await cache.removeSession(scope: scope, sessionId: "s")
-        XCTAssertTrue(try await cache.searchTranscript(query: "later", scope: scope).hits.isEmpty)
+        let removedHits = try await cache.searchTranscript(query: "later", scope: scope)
+        XCTAssertTrue(removedHits.hits.isEmpty)
     }
 
     func testBackfillProgressPartialResumeAndGatewayPurge() async throws {
@@ -59,10 +70,15 @@ final class OfflineSearchTests: XCTestCase {
         let scope = CacheScope(serverId: "gateway", profileId: "default")
         try await cache.saveSessionList([session("s")], scope: scope)
         try await cache.saveTranscript(sessionId: "s", messages: [message("user", "durable week")], scope: scope)
-        XCTAssertTrue(try await cache.searchTranscript(query: "durable", scope: scope).partial)
-        XCTAssertTrue(try await cache.backfillSearchIndex(scope: scope, batchSize: 1))
-        XCTAssertFalse(try await cache.searchTranscript(query: "durable", scope: scope).partial)
-        XCTAssertEqual(try await cache.purgeGateway(serverId: "gateway"), 1)
-        XCTAssertTrue(try await cache.searchTranscript(query: "durable", scope: scope).hits.isEmpty)
+        let partial = try await cache.searchTranscript(query: "durable", scope: scope)
+        let completed = try await cache.backfillSearchIndex(scope: scope, batchSize: 1)
+        let complete = try await cache.searchTranscript(query: "durable", scope: scope)
+        let purged = try await cache.purgeGateway(serverId: "gateway")
+        let removed = try await cache.searchTranscript(query: "durable", scope: scope)
+        XCTAssertTrue(partial.partial)
+        XCTAssertTrue(completed)
+        XCTAssertFalse(complete.partial)
+        XCTAssertEqual(purged, 1)
+        XCTAssertTrue(removed.hits.isEmpty)
     }
 }
