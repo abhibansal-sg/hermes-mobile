@@ -163,7 +163,8 @@ final class NotificationAuthorityTests: XCTestCase {
             eventId: "evt-stable-1",
             gatewayScope: "gateway-a",
             sessionId: "runtime-1",
-            storedSessionId: "stored-1"
+            storedSessionId: "stored-1",
+            requestId: "approval-1"
         )
     }
 

@@ -171,6 +171,22 @@ def test_approval_identity_is_server_supplied_without_random_fallback(monkeypatc
     )["event_id"]
 
 
+@pytest.mark.parametrize(
+    ("event", "payload", "identity_key"),
+    [
+        ("approval.request", {"command": "same"}, "approval_id"),
+        ("clarify.request", {"question": "same"}, "request_id"),
+        ("message.complete", {"text": "same"}, "turn_id"),
+    ],
+)
+def test_correlated_events_have_stable_transport_identity(event, payload, identity_key):
+    enriched = pn.enrich_correlated_event(event, "runtime-1", payload)
+    assert enriched["event_id"].startswith("evt_")
+    assert enriched["gateway_scope"].startswith("gw_")
+    assert enriched[identity_key]
+    assert pn.enrich_correlated_event(event, "runtime-1", dict(payload)) == enriched
+
+
 def test_build_push_headers_custom_priority_and_expiration():
     headers = pn.build_push_headers(
         provider_jwt="JWT", topic="t", priority=5, expiration=1234

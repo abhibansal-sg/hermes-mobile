@@ -575,8 +575,11 @@ def test_push_hook_clarify_category(monkeypatch, push_engine):
     assert calls[0]["body"] == "Which file?"
     assert calls[0]["payload"] == {
         "session_id": "sid_c",
+        "request_id": "rid-123",
         "approval_id": "rid-123",
         "response_action": "reply",
+        "event_id": calls[0]["payload"]["event_id"],
+        "gateway_scope": calls[0]["payload"]["gateway_scope"],
     }
 
 

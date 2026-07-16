@@ -164,6 +164,7 @@ final class NotificationActionTests: XCTestCase {
             "gateway_scope": "gw-1",
             "session_id": "runtime-1",
             "stored_session_id": "stored-1",
+            "request_id": "request-1",
         ]]
         let alert = try XCTUnwrap(NotificationService.decodeCorrelatedAlert(from: userInfo))
         XCTAssertEqual(alert.kind, .clarify)
@@ -171,6 +172,7 @@ final class NotificationActionTests: XCTestCase {
         XCTAssertEqual(alert.gatewayScope, "gw-1")
         XCTAssertEqual(alert.sessionId, "runtime-1")
         XCTAssertEqual(alert.storedSessionId, "stored-1")
+        XCTAssertEqual(alert.requestId, "request-1")
     }
 
     func testDecodeCorrelatedAlertRejectsMissingServerIdentity() {

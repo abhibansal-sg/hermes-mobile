@@ -48,6 +48,7 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
     }
 
     private var pending: [Event] = []
+    private var didInstall = false
     private var tapHandler: (@MainActor @Sendable (NotificationService.Tap) -> Void)?
     private var endpointProvider:
         (@MainActor @Sendable () -> NotificationService.ActionEndpoint?)?
@@ -57,8 +58,10 @@ final class NotificationLaunchCoordinator: NSObject, UNUserNotificationCenterDel
     private var completedActionRequestIDs: Set<String> = []
 
     func install(center: UNUserNotificationCenter = .current()) {
+        guard !didInstall else { return }
+        didInstall = true
         center.delegate = self
-        NotificationService.registerCategories()
+        NotificationService.registerCategories(center: center)
     }
 
     func attachTapHandler(
