@@ -274,6 +274,7 @@ struct HermesMobileApp: App {
                     // session list refreshes without user interaction in the foreground.
                     environment.sessionStore.handleScenePhaseActive(newPhase == .active)
                     if newPhase == .active {
+                        environment.queueStore.resumeFromBackground()
                         Task { await AttachmentBlobCache.shared.respondToLowAvailableCapacity() }
                     }
                     // On foreground: apply parked App Intents, surface/drain the
