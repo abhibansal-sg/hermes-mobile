@@ -13,7 +13,7 @@ extension RestClient {
             components.queryItems = [URLQueryItem(name: "cursor", value: cursor)]
         }
         let suffix = components.percentEncodedQuery.map { "?\($0)" } ?? ""
-        let data = try await get(path: "\(mobileAPIPrefix)/pending-attention\(suffix)")
+        let data = try await get(path: "\(mobileAPIPrefix)/attention/pending\(suffix)")
         return try decode(PendingAttentionEnvelope.self, from: data, context: "pendingAttention")
     }
 }
