@@ -265,10 +265,12 @@ ScopeKeyV1
 
 Credentials and bearer tokens are not part of cache identity. Profiles are
 independent authority islands: replacing one profile database changes only that
-profile's epoch. Until Hermes exposes stable profile IDs, the compatibility
-identity is the literal profile name bound to one `authority_epoch`;
-rename/delete/recreate creates a new partition. URL aliases are never merged
-automatically.
+profile's epoch. A0 freezes the exact lifetimes, persistence, restore behavior,
+legacy migration, and conformance tests in
+`LOCAL-FIRST-A0-AUTHORITY-EPOCH-CONTRACT.md`. The stable profile ID survives a
+rename; cloning/importing as new or deleting/recreating produces a new profile
+ID. URL and profile name remain locator/display data and are never merged as
+authority automatically.
 
 ### 6.2 Compact turn projection
 
@@ -645,7 +647,11 @@ single immutable revision across all pages:
   "schema_version": 2,
   "gateway_id": "gw_opaque",
   "profile_authorities": [
-    {"profile_id": "profile_opaque", "authority_epoch": "epoch_opaque"}
+    {
+      "profile_id": "profile_opaque",
+      "profile_name": "default",
+      "authority_epoch": "epoch_opaque"
+    }
   ],
   "journal_epoch": "journal_opaque",
   "complete": false,
@@ -1171,11 +1177,22 @@ allowed only where the contract cannot be proven otherwise.
 **Purpose:** establish the identity domain required by every later cursor,
 projection, receipt, asset, and pending mutation.
 
-**Changes:** add a server-issued gateway installation ID, one database-backed
-authority epoch per concrete profile database, stable profile ID or the explicit
-epoch-bound compatibility identity, and a non-destructive iOS scope migration.
-Existing URL/name-scoped pending work is quarantined until explicitly bound to a
-verified profile epoch; it is never sent speculatively.
+**Frozen contract:** `LOCAL-FIRST-A0-AUTHORITY-EPOCH-CONTRACT.md`.
+
+**Changes:** add an installation-root gateway ID, one stable metadata-backed
+profile ID, one `state_meta`-backed authority epoch per concrete profile
+database, a plugin manifest journal epoch, and a non-destructive iOS scope
+migration. The narrow generic SessionDB surface exposes read/get-or-create
+authority identity without private `_conn` access. Existing URL/name-scoped
+cache becomes a labelled legacy/recovered partition. Its pending work is
+quarantined until explicitly bound to an authenticated concrete authority and
+is never sent speculatively. Aggregate `all` is a query selector and is invalid
+for WorkRepository mutation scope.
+
+**Exit gate:** persistence, rename/clone/delete/recreate behavior, profile-A-only
+database replacement, journal-only rebuild, cursor binding, legacy quarantine,
+and concurrent first-start conformance tests pass. The design proof alone does
+not complete A0 implementation.
 
 **Non-goals:** no manifest activation, transcript projection, or automatic cache
 alias merge.
