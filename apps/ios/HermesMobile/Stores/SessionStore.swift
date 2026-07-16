@@ -237,13 +237,18 @@ final class SessionStore {
 
     /// Identity of one server-side Recents list universe. Cursor state is never
     /// shared across gateways, path families, profile rails, or source filters.
-    private struct SessionListDeltaScope: Hashable {
+    private struct SessionListDeltaScope: Hashable, Codable {
         let serverURL: String
         let pathStyle: String
         let activeProfile: String
         let rail: String
         let excludedSources: String
         let source: String
+    }
+
+    private struct PersistedSessionListCursor: Codable {
+        let scope: SessionListDeltaScope
+        let cursor: String
     }
 
     /// Opaque plugin session-list cursors partitioned by list universe.
@@ -283,6 +288,25 @@ final class SessionStore {
     private func resetSessionListDeltaState() {
         sessionListDeltaCursors.removeAll()
         pendingSessionListTombstones.removeAll()
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.sessionListDeltaCursors)
+    }
+
+    func flushSessionListDeltaCursors(defaults: UserDefaults = .standard) {
+        let persisted = sessionListDeltaCursors
+            .map { PersistedSessionListCursor(scope: $0.key, cursor: $0.value) }
+            .sorted {
+                let left = [$0.scope.serverURL, $0.scope.pathStyle, $0.scope.activeProfile,
+                            $0.scope.rail, $0.scope.excludedSources, $0.scope.source].joined(separator: "|")
+                let right = [$1.scope.serverURL, $1.scope.pathStyle, $1.scope.activeProfile,
+                             $1.scope.rail, $1.scope.excludedSources, $1.scope.source].joined(separator: "|")
+                return left < right
+            }
+        if persisted.isEmpty {
+            defaults.removeObject(forKey: DefaultsKeys.sessionListDeltaCursors)
+        } else if let data = try? JSONEncoder().encode(persisted) {
+            defaults.set(data, forKey: DefaultsKeys.sessionListDeltaCursors)
+        }
+        _ = defaults.synchronize()
     }
     /// Runtime `session_id` for the session bound to the current connection.
     var activeRuntimeId: String?
@@ -303,6 +327,17 @@ final class SessionStore {
     private var workRepository: WorkRepository?
     private weak var draftAttachments: AttachmentStore?
     private var draftSaveTasks: [String: Task<Void, Never>] = [:]
+
+    private struct ComposerDraftPersistenceSnapshot: Sendable {
+        let repository: WorkRepository
+        let scope: WorkScope
+        let contextKey: String
+        let storedSessionID: String?
+        let text: String
+        let cwd: String?
+        let modelSelectionJSON: String?
+        let assets: [WorkAssetInput]
+    }
 
     /// Bumped whenever a composer draft is mutated outside the focused field's
     /// direct binding. ComposerView observes this to pull externally-recalled
@@ -377,6 +412,14 @@ final class SessionStore {
         persistComposerDraft(for: key)
     }
 
+    func flushComposerDraftDurably() async {
+        let key = activeComposerDraftKey
+        draftSaveTasks[key]?.cancel()
+        draftSaveTasks[key] = nil
+        guard let snapshot = composerDraftPersistenceSnapshot(for: key) else { return }
+        await Self.saveComposerDraft(snapshot)
+    }
+
     var durableWorkScope: WorkScope? {
         guard let currentCacheScope else { return nil }
         return try? WorkScope(cacheScope: currentCacheScope)
@@ -392,7 +435,14 @@ final class SessionStore {
     }
 
     private func persistComposerDraft(for key: String) {
-        guard let repository = workRepository, let scope = durableWorkScope else { return }
+        guard let snapshot = composerDraftPersistenceSnapshot(for: key) else { return }
+        Task { await Self.saveComposerDraft(snapshot) }
+    }
+
+    private func composerDraftPersistenceSnapshot(
+        for key: String
+    ) -> ComposerDraftPersistenceSnapshot? {
+        guard let repository = workRepository, let scope = durableWorkScope else { return nil }
         let text = composerDrafts[key] ?? ""
         let storedID = key == Self.composerDraftFallbackKey ? nil : key
         let cwd = key == activeComposerDraftKey ? draftCwd : nil
@@ -405,7 +455,30 @@ final class SessionStore {
             modelJSON = nil
         }
         let assets = key == activeComposerDraftKey ? (draftAttachments?.draftAssetInputs() ?? []) : []
-        Task { try? await repository.saveDraft(scope: scope, contextKey: key, storedSessionID: storedID, text: text, cwd: cwd, modelSelectionJSON: modelJSON, assets: assets) }
+        return ComposerDraftPersistenceSnapshot(
+            repository: repository,
+            scope: scope,
+            contextKey: key,
+            storedSessionID: storedID,
+            text: text,
+            cwd: cwd,
+            modelSelectionJSON: modelJSON,
+            assets: assets
+        )
+    }
+
+    private nonisolated static func saveComposerDraft(
+        _ snapshot: ComposerDraftPersistenceSnapshot
+    ) async {
+        try? await snapshot.repository.saveDraft(
+            scope: snapshot.scope,
+            contextKey: snapshot.contextKey,
+            storedSessionID: snapshot.storedSessionID,
+            text: snapshot.text,
+            cwd: snapshot.cwd,
+            modelSelectionJSON: snapshot.modelSelectionJSON,
+            assets: snapshot.assets
+        )
     }
 
     /// Clear prompt-history cursor/snapshot state without changing the user's
@@ -1114,8 +1187,7 @@ final class SessionStore {
     /// connection it was started under. At most one sweep runs at a time.
     private var prefetchTask: Task<Void, Never>?
 
-    init() {
-        let defaults = UserDefaults.standard
+    init(defaults: UserDefaults = .standard) {
         if let stored = defaults.array(forKey: DefaultsKeys.pinnedSessions) as? [String] {
             pinnedIds = Set(stored)
         }
@@ -1131,6 +1203,13 @@ final class SessionStore {
         // desktop's default "All profiles" view. Inert until the switcher is shown.
         activeProfile = defaults.string(forKey: DefaultsKeys.activeProfile)
             ?? DefaultsKeys.allProfilesScope
+        if let data = defaults.data(forKey: DefaultsKeys.sessionListDeltaCursors),
+           let persisted = try? JSONDecoder().decode([PersistedSessionListCursor].self, from: data) {
+            sessionListDeltaCursors = Dictionary(
+                persisted.map { ($0.scope, $0.cursor) },
+                uniquingKeysWith: { _, latest in latest }
+            )
+        }
         // STR-1022: profile-group collapse decisions are derived (see
         // ``isProfileGroupCollapsed(_:)``); these two sets hold only the user's
         // explicit overrides and are persisted so choices survive restarts.
@@ -1968,8 +2047,16 @@ final class SessionStore {
     /// tag (a named scope then filters client-side via ``visibleSessions``).
     /// Otherwise — the dormant single-profile case AND the default-profile scope —
     /// it uses the existing `GET /api/sessions` path, byte-for-byte unchanged.
+    /// Foreground refresh remains non-throwing and keeps its existing API.
     func refresh() async {
+        _ = await refreshOutcome()
+    }
+
+    /// The same authoritative cache/REST/WS pipeline with a typed result for
+    /// background policy. This must remain the sole refresh implementation.
+    func refreshOutcome() async -> BackgroundRefreshOutcome {
         let myConnectionWorkGeneration = connectionWorkGeneration
+        var fallbackOutcome: BackgroundRefreshOutcome?
         isLoading = true
         defer { isLoading = false }
 
@@ -1993,7 +2080,7 @@ final class SessionStore {
         if let cacheStore, let scope = currentCacheScope,
            let previous = lastColdReadServerId, previous != scope.serverId {
             _ = try? await cacheStore.clearSessionsForOtherServers(keepingServerId: scope.serverId)
-            guard connectionWorkGeneration == myConnectionWorkGeneration else { return }
+            guard connectionWorkGeneration == myConnectionWorkGeneration else { return .timeout }
             // A different server's list is showing — drop the stale in-memory rows
             // and re-arm the cold paint so the new server repaints from its own
             // (now sole) cached rows rather than leaving the prior server's list
@@ -2007,7 +2094,7 @@ final class SessionStore {
         }
 
         await paintFromCache()
-        guard connectionWorkGeneration == myConnectionWorkGeneration else { return }
+        guard connectionWorkGeneration == myConnectionWorkGeneration else { return .timeout }
         if let cacheStore, let scope = currentCacheScope {
             // Bounded, resumable batches. Yield between transactions so cache
             // paint and interaction are never held behind historical indexing.
@@ -2027,7 +2114,7 @@ final class SessionStore {
         if let fetch = sessionsFetch {
             do {
                 let (fetched, total) = try await fetch()
-                guard refreshToken == myToken else { return }
+                guard refreshToken == myToken else { return .timeout }
                 mergeSessionPage(fetched, total: total)
                 persistSessionListToCache()  // P3 write-through (fire-and-forget)
                 lastError = nil
@@ -2039,10 +2126,11 @@ final class SessionStore {
 
                 SpotlightIndexer.index(sessions: sessions)
             } catch {
-                guard refreshToken == myToken else { return }
+                guard refreshToken == myToken else { return .timeout }
                 lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                return Self.backgroundRefreshOutcome(for: error)
             }
-            return
+            return .success
         }
 
         // Multi-profile aggregate rail (F4b): only when the capability is
@@ -2064,15 +2152,17 @@ final class SessionStore {
                     profile: DefaultsKeys.allProfilesScope, limit: fetchLimit,
                     excludeSource: Self.recentsExcludeSources
                 )
-                guard refreshToken == myToken else { return }
+                guard refreshToken == myToken else { return .timeout }
                 mergeSessionPage(result.sessions, total: result.total)
                 persistSessionListToCache()  // P3 write-through (fire-and-forget)
                 lastError = nil
                 ensureInitialFill()
                 SpotlightIndexer.index(sessions: sessions)
-                return
+                return .success
             } catch {
-                guard refreshToken == myToken else { return }
+                guard refreshToken == myToken else { return .timeout }
+                let outcome = Self.backgroundRefreshOutcome(for: error)
+                if outcome == .authFailure { fallbackOutcome = outcome }
                 // Fall through to the single-profile fetch below (defensive — a
                 // transient aggregate failure still shows the recents list).
             }
@@ -2112,7 +2202,7 @@ final class SessionStore {
                     guard refreshToken == myToken,
                           sessionListDeltaScope(
                               excludeSource: Self.recentsExcludeSources
-                          ) == deltaScope else { return }
+                          ) == deltaScope else { return .timeout }
 
                     if let delta {
                         sessionListDeltaCursors[deltaScope] = delta.cursor
@@ -2133,7 +2223,7 @@ final class SessionStore {
                         }
                         lastError = nil
                         ensureInitialFill()
-                        return
+                        return .success
                     }
 
                     // A missing/old/malformed plugin endpoint must retry from a
@@ -2141,16 +2231,16 @@ final class SessionStore {
                     sessionListDeltaCursors[deltaScope] = nil
                 }
 
-                guard let rest else { return }
+                guard let rest else { return .retryableFailure }
                 let result = try await rest.sessionsWithTotal(
                     limit: fetchLimit, minMessages: 1,
                     excludeSource: Self.recentsExcludeSources
                 )
-                guard refreshToken == myToken else { return }
+                guard refreshToken == myToken else { return .timeout }
                 if let deltaScope {
                     guard sessionListDeltaScope(
                         excludeSource: Self.recentsExcludeSources
-                    ) == deltaScope else { return }
+                    ) == deltaScope else { return .timeout }
                 }
                 mergeSessionPage(result.sessions, total: result.total)
                 if let deltaScope {
@@ -2176,25 +2266,27 @@ final class SessionStore {
 
                 // Republish the session list into Spotlight (fire-and-forget).
                 SpotlightIndexer.index(sessions: sessions)
-                return
+                return .success
             } catch {
-                guard refreshToken == myToken else { return }
+                guard refreshToken == myToken else { return .timeout }
+                let outcome = Self.backgroundRefreshOutcome(for: error)
+                if outcome == .authFailure { fallbackOutcome = outcome }
                 if let deltaScope {
                     guard sessionListDeltaScope(
                         excludeSource: Self.recentsExcludeSources
-                    ) == deltaScope else { return }
+                    ) == deltaScope else { return .timeout }
                 }
                 // Fall through to the WS RPC below.
             }
         }
 
-        guard let client else { return }
+        guard let client else { return fallbackOutcome ?? .retryableFailure }
         do {
             let raw = try await client.requestRaw(
                 "session.list",
                 params: .object(["limit": .number(100)])
             )
-            guard refreshToken == myToken else { return }
+            guard refreshToken == myToken else { return .timeout }
             let fetched = Self.parseSessions(from: raw)
             // WS RPC shape has no total; preserve whatever was last known.
             mergeSessionPage(fetched, total: nil)
@@ -2202,10 +2294,20 @@ final class SessionStore {
             lastError = nil
             // Republish the session list into Spotlight (fire-and-forget).
             SpotlightIndexer.index(sessions: sessions)
+            return .success
         } catch {
-            guard refreshToken == myToken else { return }
+            guard refreshToken == myToken else { return .timeout }
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return fallbackOutcome ?? Self.backgroundRefreshOutcome(for: error)
         }
+    }
+
+    private static func backgroundRefreshOutcome(for error: Error) -> BackgroundRefreshOutcome {
+        if error is CancellationError || Task.isCancelled { return .timeout }
+        if ConnectionStore.isAuthFailure(error) { return .authFailure }
+        if let urlError = error as? URLError, urlError.code == .timedOut { return .timeout }
+        if case GatewayError.timeout = error { return .timeout }
+        return .retryableFailure
     }
 
     private func resolvedSessionListDeltaFetch(

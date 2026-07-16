@@ -28,6 +28,7 @@ final class AppEnvironment {
     let appLock: AppLock
     let themeStore: ThemeStore
     let projectsStore: ProjectsStore
+    let stateFlushCoordinator: StateFlushCoordinator
     private let syncCoordinator: ManifestInvalidationCoordinator
 
     init() {
@@ -192,7 +193,8 @@ final class AppEnvironment {
         // which makes every store fall back to the network-only path verbatim —
         // the cache is a pure accelerator, never a correctness dependency, so a
         // dead cache degrades to today's behavior rather than breaking the app.
-        if let cacheStore = try? CacheStore() {
+        let cacheStore = try? CacheStore()
+        if let cacheStore {
             sessionStore.attachCache(cacheStore)
             chatStore.attachCache(cacheStore)
             inboxStore.attachCache(cacheStore)
@@ -329,11 +331,50 @@ final class AppEnvironment {
                 return BackgroundManifestScope(gatewayURL: url, scope: profile, token: token)
             },
             sync: { [weak sessionStore] _ in
-                // This is the existing foreground cache/cursor writer. The manifest
-                // issue replaces this closure with its atomic manifest operation.
-                await sessionStore?.refresh()
+                guard let sessionStore else { return .retryableFailure }
+                let outcome = await sessionStore.refreshOutcome()
+                try Task.checkCancellation()
+                return outcome
+            },
+            maintenance: { [weak workRepository, weak queueStore] in
+                guard let workRepository else { return }
+                try await workRepository.cleanupShareWork()
+                try await workRepository.cleanupFinishedWork()
+                if let cacheStore {
+                    _ = try await cacheStore.evictStaleTranscripts()
+                }
+                await AttachmentBlobCache.shared.respondToLowAvailableCapacity()
+                await queueStore?.refresh()
+                WidgetSnapshotWriter.flush()
             }
         )
+
+        let stateFlushCoordinator = StateFlushCoordinator(dependencies: .init(
+            flushDraft: { [weak sessionStore] in
+                await sessionStore?.flushComposerDraftDurably()
+            },
+            suspendOutbox: { [weak queueStore] in
+                await queueStore?.suspendForBackground()
+            },
+            flushSyncCursor: { [weak sessionStore] in
+                sessionStore?.flushSessionListDeltaCursors()
+            },
+            flushWidgetSnapshot: { [weak connectionStore] in
+                var patch = WidgetSnapshotWriter.Patch()
+                if case .connected = connectionStore?.phase {
+                    patch.connectionState = .set(.connected)
+                } else {
+                    patch.connectionState = .set(.offline)
+                    patch.isStale = .set(true)
+                }
+                WidgetSnapshotWriter.write(patch)
+                WidgetSnapshotWriter.flush()
+            },
+            flushPendingNavigation: { [weak workRepository] in
+                PendingIntent.flushPendingStorage()
+                try? await workRepository?.flushForBackground()
+            }
+        ))
 
         self.sessionStore = sessionStore
         self.chatStore = chatStore
@@ -348,6 +389,7 @@ final class AppEnvironment {
         self.themeStore = themeStore
         self.connectionStore = connectionStore
         self.projectsStore = projectsStore
+        self.stateFlushCoordinator = stateFlushCoordinator
 
         // Do not publish process-local defaults before bootstrap. The shared
         // disk snapshot remains authoritative until committed server state is

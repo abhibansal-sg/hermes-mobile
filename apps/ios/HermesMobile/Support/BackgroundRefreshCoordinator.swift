@@ -7,6 +7,14 @@ struct BackgroundManifestScope: Equatable, Sendable {
     let token: String
 }
 
+enum BackgroundRefreshOutcome: Sendable, Equatable {
+    case success
+    case noChange
+    case retryableFailure
+    case authFailure
+    case timeout
+}
+
 @MainActor
 protocol AppRefreshTaskHandle: AnyObject {
     var expirationHandler: (() -> Void)? { get set }
@@ -46,38 +54,47 @@ private final class SystemAppRefreshTask: AppRefreshTaskHandle {
     func setTaskCompleted(success: Bool) { task.setTaskCompleted(success: success) }
 }
 
-/// Owns only iOS scheduling/lifetime policy. The injected operation is the same
-/// atomic manifest sync used by foreground and silent-push triggers; this type
-/// deliberately has no page, cursor, database, or widget implementation of its own.
+/// Owns iOS scheduling and execution policy for the paired-gateway maintenance
+/// cycle. The injected sync remains the same atomic operation used by foreground
+/// and silent-push triggers; this type adds only budget, reschedule, and cleanup
+/// policy and never starts work when pairing credentials are incomplete.
 @MainActor
 final class BackgroundRefreshCoordinator {
     static let identifier = "ai.hermes.app.refresh"
     static let shared = BackgroundRefreshCoordinator(scheduler: SystemAppRefreshScheduler())
 
     private let scheduler: AppRefreshScheduling
+    private let runtimeBudget: Duration
     private var loadPairing: () -> BackgroundManifestScope?
-    private var sync: (BackgroundManifestScope) async throws -> Void
-    private var inFlight: Task<Void, Error>?
+    private var sync: (BackgroundManifestScope) async throws -> BackgroundRefreshOutcome
+    private var maintenance: () async throws -> Void
+    private var inFlight: Task<BackgroundRefreshOutcome, Never>?
     private(set) var registered = false
 
     init(
         scheduler: AppRefreshScheduling,
+        runtimeBudget: Duration = .seconds(25 * 60),
         loadPairing: @escaping () -> BackgroundManifestScope? = { nil },
-        sync: @escaping (BackgroundManifestScope) async throws -> Void = { _ in
+        sync: @escaping (BackgroundManifestScope) async throws -> BackgroundRefreshOutcome = { _ in
             throw CancellationError()
-        }
+        },
+        maintenance: @escaping () async throws -> Void = {}
     ) {
         self.scheduler = scheduler
+        self.runtimeBudget = runtimeBudget
         self.loadPairing = loadPairing
         self.sync = sync
+        self.maintenance = maintenance
     }
 
     func configure(
         loadPairing: @escaping () -> BackgroundManifestScope?,
-        sync: @escaping (BackgroundManifestScope) async throws -> Void
+        sync: @escaping (BackgroundManifestScope) async throws -> BackgroundRefreshOutcome,
+        maintenance: @escaping () async throws -> Void
     ) {
         self.loadPairing = loadPairing
         self.sync = sync
+        self.maintenance = maintenance
     }
 
     @discardableResult
@@ -89,22 +106,48 @@ final class BackgroundRefreshCoordinator {
         return registered
     }
 
-    /// Requests an opportunity, never an execution time guarantee.
-    func scheduleNext() {
+    /// Requests an opportunity, never an execution-time guarantee.
+    func scheduleNext(after delay: TimeInterval = 15 * 60) {
         guard registered, loadPairing() != nil else { return }
         try? scheduler.submit(
             identifier: Self.identifier,
-            earliestBeginDate: Date().addingTimeInterval(15 * 60)
+            earliestBeginDate: Date().addingTimeInterval(delay)
         )
     }
 
-    func syncNowIfPaired() async throws {
-        guard let pairing = loadPairing() else { return }
-        if let inFlight { return try await inFlight.value }
-        let operation = Task { try await sync(pairing) }
+    /// Coalesces all background triggers into one paired sync + maintenance cycle.
+    func syncNowIfPaired() async -> BackgroundRefreshOutcome {
+        guard let pairing = loadPairing() else { return .noChange }
+        if let inFlight { return await inFlight.value }
+
+        let sync = self.sync
+        let maintenance = self.maintenance
+        let operation = Task<BackgroundRefreshOutcome, Never> {
+            do {
+                let outcome = try await sync(pairing)
+                try Task.checkCancellation()
+                if outcome == .success || outcome == .noChange {
+                    try await maintenance()
+                    try Task.checkCancellation()
+                }
+                return outcome
+            } catch is CancellationError {
+                return .timeout
+            } catch {
+                return .retryableFailure
+            }
+        }
         inFlight = operation
-        defer { inFlight = nil }
-        try await operation.value
+        let budgetTask = Task {
+            do {
+                try await Task.sleep(for: runtimeBudget)
+                operation.cancel()
+            } catch {}
+        }
+        let outcome = await operation.value
+        budgetTask.cancel()
+        inFlight = nil
+        return outcome
     }
 
     private func handle(_ task: AppRefreshTaskHandle) {
@@ -115,13 +158,20 @@ final class BackgroundRefreshCoordinator {
                 completion.finish(true)
                 return
             }
-            do {
-                try await self.syncNowIfPaired()
-                guard !Task.isCancelled else { throw CancellationError() }
+            let outcome = await self.syncNowIfPaired()
+            guard !Task.isCancelled else {
+                completion.finish(false)
+                return
+            }
+            switch outcome {
+            case .success, .noChange:
                 self.scheduleNext()
                 completion.finish(true)
-            } catch {
-                self.scheduleNext()
+            case .retryableFailure, .timeout:
+                self.scheduleNext(after: 5 * 60)
+                completion.finish(false)
+            case .authFailure:
+                // A foreground pairing change is the only safe retry trigger.
                 completion.finish(false)
             }
         }

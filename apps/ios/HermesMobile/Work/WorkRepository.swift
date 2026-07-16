@@ -368,6 +368,33 @@ actor WorkRepository {
         return result.0
     }
 
+    /// Prunes terminal work only after its retry/audit retention window has elapsed.
+    @discardableResult
+    func cleanupFinishedWork(
+        now: Date = Date(),
+        retention: TimeInterval = 14 * 24 * 60 * 60
+    ) async throws -> Int {
+        try ensureProtectedDataAvailable()
+        let cutoff = now.timeIntervalSince1970 - retention
+        let result = try await database.write { db -> (Int, [String]) in
+            let before = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM work_jobs") ?? 0
+            try db.execute(
+                sql: """
+                    DELETE FROM work_jobs
+                    WHERE state IN ('completed','cancelled','expired')
+                      AND updated_at <= ?
+                    """,
+                arguments: [cutoff]
+            )
+            let paths = try Self.deleteUnreferencedAssetRows(db)
+            let after = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM work_jobs") ?? 0
+            return (before - after, paths)
+        }
+        removeAssetFiles(result.1)
+        await publishObservation()
+        return result.0
+    }
+
     func job(id: String) throws -> WorkJob? {
         try database.read { db in
             try WorkJob.fetchOne(db, key: id)
@@ -619,6 +646,29 @@ actor WorkRepository {
         }
         guard changed == 1 else { throw WorkRepositoryError.leaseLost }
         await publishObservation()
+    }
+
+    /// Serializes behind all prior repository writes and releases only this
+    /// process's leases, leaving each durable stage recoverable after suspension.
+    func flushForBackground(
+        releasingLeasesOwnedBy owner: String? = nil,
+        now: Date = Date()
+    ) async throws {
+        try await database.write { db in
+            if let owner {
+                try db.execute(
+                    sql: """
+                        UPDATE work_jobs
+                        SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                        WHERE lease_owner = ?
+                        """,
+                    arguments: [now.timeIntervalSince1970, owner]
+                )
+            } else {
+                _ = try Int.fetchOne(db, sql: "SELECT 1")
+            }
+        }
+        if owner != nil { await publishObservation() }
     }
 
     func bindScope(jobID: String, scope: WorkScope, now: Date = Date()) async throws -> WorkJob {
