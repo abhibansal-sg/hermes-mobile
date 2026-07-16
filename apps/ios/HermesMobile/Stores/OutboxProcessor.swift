@@ -148,7 +148,7 @@ final class OutboxProcessor {
             let assets = try await repository.jobAssets(jobID: job.jobID)
             let resume: WorkJobState
             if job.destinationSessionID == nil && job.storedSessionID == nil
-                && job.intentKind == .newSession {
+                && Self.requiresNewDestination(job) {
                 resume = .creatingDestination
             } else if assets.contains(where: { $0.link.state != "uploaded" }) {
                 resume = .uploading
@@ -177,7 +177,7 @@ final class OutboxProcessor {
 
         if job.state == .queued {
             if job.destinationSessionID == nil && job.storedSessionID == nil
-                && job.intentKind == .newSession {
+                && Self.requiresNewDestination(job) {
                 job = try await repository.transitionJob(
                     id: job.jobID, from: .queued, to: .creatingDestination, owner: owner
                 )
@@ -321,6 +321,10 @@ final class OutboxProcessor {
             // claimant. Never delete on an error path.
             _ = fallbackState
         }
+    }
+
+    private static func requiresNewDestination(_ job: WorkJob) -> Bool {
+        job.kind == .share || job.intentKind == .newSession
     }
 }
 

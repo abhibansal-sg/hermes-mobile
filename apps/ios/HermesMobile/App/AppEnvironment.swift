@@ -159,7 +159,12 @@ final class AppEnvironment {
             try? await workRepository.importLegacyWork(
                 from: LegacyWorkImportSource(scope: sessionStore.durableWorkScope)
             )
+            _ = try? await workRepository.cleanupShareWork()
+            if let scope = sessionStore.durableWorkScope {
+                try? await workRepository.bindPendingShares(to: scope)
+            }
             await queueStore.refresh()
+            queueStore.wake()
         }
         // ABH-351: ProjectsStore needs REST access (the /projects route) —
         // injected after ConnectionStore is built, same pattern as the others.
