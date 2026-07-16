@@ -1198,7 +1198,7 @@ final class ConnectionStore {
                 // the outer race intact (this branch finishes only when BOTH are
                 // done) while letting the chip resolve in parallel. (ABH-84 QA.)
                 group.addTask { [weak self] in
-                    guard let self, self.isActiveGeneration(generation) else { return }
+                    guard let self, await self.isActiveGeneration(generation) else { return }
                     async let sessions: Void = self.runHydrationRefresh(generation: generation)
                     async let model: Void = self.refreshActiveModel(generation: generation)
                     _ = await (sessions, model)
@@ -1447,7 +1447,7 @@ final class ConnectionStore {
         PendingIntent.clearPending()
         SharedStore.clearInbox()
         SharedStore.clearSnapshot()
-        AttachmentBlobCache.shared.clearAll()
+        await AttachmentBlobCache.shared.clearAll()
         LiveActivityManager.shared.end()
         defaults.removeObject(forKey: DefaultsKeys.serverURL)
         defaults.removeObject(forKey: DefaultsKeys.connectionOffline)

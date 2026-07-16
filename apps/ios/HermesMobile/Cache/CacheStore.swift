@@ -555,11 +555,11 @@ actor CacheStore {
             // canonical transcript write. Virtual tables have no FK cascade.
             try db.execute(
                 sql: "DELETE FROM transcript_fts WHERE serverId = ? AND profileId = ? AND sessionId = ?",
-                arguments: [scope.serverId, scope.profileId, sessionId]
+                arguments: [scope.serverId, scope.profileId, identity.sessionId]
             )
             try db.execute(
                 sql: "DELETE FROM offline_message_cache WHERE serverId = ? AND profileId = ? AND sessionId = ?",
-                arguments: [scope.serverId, scope.profileId, sessionId]
+                arguments: [scope.serverId, scope.profileId, identity.sessionId]
             )
 
             // Delete existing rows for this session
@@ -590,7 +590,7 @@ actor CacheStore {
                         (serverId, profileId, sessionId, ordinal, wireId, role, timestamp, rowJSON)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
-                    arguments: [scope.serverId, scope.profileId, sessionId, ordinal,
+                    arguments: [scope.serverId, scope.profileId, identity.sessionId, ordinal,
                                 wireId, row.role, row.timestamp, row.rowJSON]
                 )
                 if let text = Self.searchableText(message), !text.isEmpty {
@@ -600,7 +600,7 @@ actor CacheStore {
                             (serverId, profileId, sessionId, messageKey, wireId, ordinal, role, content)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                             """,
-                        arguments: [scope.serverId, scope.profileId, sessionId,
+                        arguments: [scope.serverId, scope.profileId, identity.sessionId,
                                     wireId.map(String.init) ?? "o:\(ordinal)", wireId,
                                     ordinal, message.role, text]
                     )
@@ -616,6 +616,19 @@ actor CacheStore {
             updated.maxMessageId = maxWireId ?? sessionRecord.maxMessageId
             try updated.save(db)
         }
+    }
+
+    /// Compatibility entry point for scoped offline-search callers. The
+    /// canonical write remains identity-qualified.
+    func saveTranscript(
+        sessionId: String, messages: [StoredMessage], scope: CacheScope
+    ) throws {
+        let identity = CacheIdentity(
+            serverId: scope.serverId,
+            profileId: scope.profileId,
+            sessionId: sessionId
+        )
+        try saveTranscript(identity: identity, messages: messages, scope: scope)
     }
 
     /// Append rows while preserving their scoped ordinal identity. The read and
