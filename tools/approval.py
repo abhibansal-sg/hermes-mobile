@@ -1507,11 +1507,21 @@ class _ApprovalEntry:
         self,
         data: dict,
         *,
-        request_id: str,
-        created_at: float,
-        expires_at: float,
-        revision: int,
+        request_id: Optional[str] = None,
+        created_at: Optional[float] = None,
+        expires_at: Optional[float] = None,
+        revision: Optional[int] = None,
     ):
+        # Keep the long-standing one-argument constructor usable for internal
+        # tests and plugin code that creates an entry only to exercise the
+        # resolver. The real gateway wait path supplies all four values under
+        # ``_lock``, so reconciliation records retain their monotonic revision
+        # contract. Direct entries use revision 0 to mark that they did not
+        # come from that reconciliation path.
+        if created_at is None:
+            created_at = time.time()
+        if expires_at is None:
+            expires_at = created_at + max(_get_approval_timeout(), 0)
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
@@ -1519,10 +1529,10 @@ class _ApprovalEntry:
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
-        self.request_id = request_id
+        self.request_id = request_id or secrets.token_hex(16)
         self.created_at = created_at
         self.expires_at = expires_at
-        self.revision = revision
+        self.revision = 0 if revision is None else revision
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
