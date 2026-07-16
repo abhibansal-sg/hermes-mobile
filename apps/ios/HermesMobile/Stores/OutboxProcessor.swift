@@ -350,7 +350,8 @@ final class OutboxProcessor {
     }
 
     private static func requiresNewDestination(_ job: WorkJob) -> Bool {
-        job.intentKind == .newSession
+        job.kind == .share
+            || job.intentKind == .newSession
             || (job.kind == .appIntent && job.intentKind == .askHermes)
     }
 }

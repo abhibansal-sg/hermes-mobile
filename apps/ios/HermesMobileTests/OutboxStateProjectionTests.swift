@@ -86,4 +86,32 @@ final class OutboxStateProjectionTests: XCTestCase {
         persisted = try await repository.job(id: job.jobID)
         XCTAssertNil(persisted)
     }
+
+    func testFailedShareIsVisibleRetryableAndUsesComposedBody() async throws {
+        let (queue, repository, scope, directory) = try makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let job = try await repository.enqueueShare(WorkJobInput(
+            kind: .share,
+            scope: scope,
+            state: .failed,
+            text: "article",
+            sourceURL: "https://example.com",
+            comment: "review this"
+        ))
+
+        let item = try XCTUnwrap(queue.items.first)
+        XCTAssertEqual(item.kind, .share)
+        XCTAssertEqual(item.displayState, .failed)
+        XCTAssertTrue(item.canRetry)
+        XCTAssertFalse(item.isEditable)
+        XCTAssertEqual(
+            item.text,
+            "Shared from iPhone: review this\narticle\nhttps://example.com"
+        )
+
+        await queue.retry(id: item.id)
+        let persisted = try await repository.job(id: job.jobID)
+        XCTAssertEqual(persisted?.state, .queued)
+        XCTAssertEqual(persisted?.clientMessageID, job.clientMessageID)
+    }
 }

@@ -376,11 +376,10 @@ struct HermesMobileApp: App {
     @MainActor
     private func attemptSharedInboxDrain() {
         SharedInboxDrainer.drain(
-            connection: environment.connectionStore,
-            sessions: environment.sessionStore,
-            chat: environment.chatStore,
-            attachments: environment.attachmentStore,
-            onDrained: { count in
+            repository: environment.workRepository,
+            scope: environment.sessionStore.durableWorkScope,
+            queue: environment.queueStore,
+            onQueued: { count in
                 presentSharedInboxToast(processed: count)
             }
         )
@@ -390,7 +389,7 @@ struct HermesMobileApp: App {
     private func presentSharedInboxToast(processed count: Int) {
         guard count > 0 else { return }
         sharedInboxToastDismissTask?.cancel()
-        sharedInboxToast = "Queued \(count) shared item(s)"
+        sharedInboxToast = "\(count) shared item(s) pending"
         sharedInboxToastDismissTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(4))
             guard !Task.isCancelled else { return }

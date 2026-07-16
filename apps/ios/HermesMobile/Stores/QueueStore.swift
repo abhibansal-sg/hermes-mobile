@@ -35,6 +35,7 @@ final class QueueStore {
 
         let id: UUID
         let jobID: String
+        let kind: WorkJobKind
         let clientMessageID: String
         var text: String
         let createdAt: Date
@@ -44,15 +45,16 @@ final class QueueStore {
         let errorMessage: String?
         let isClaimed: Bool
 
-        var isEditable: Bool { state == .queued && !isClaimed }
+        var isEditable: Bool { kind == .prompt && state == .queued && !isClaimed }
         var canRetry: Bool { state == .failed }
         var canDelete: Bool { state == .failed || state.isTerminal || !isClaimed }
 
         init(job: WorkJob) {
             id = UUID(uuidString: job.jobID) ?? UUID()
             jobID = job.jobID
+            kind = job.kind
             clientMessageID = job.clientMessageID
-            text = job.text ?? ""
+            text = job.submissionText
             createdAt = Date(timeIntervalSince1970: job.createdAt)
             storedSessionId = job.destinationSessionID ?? job.storedSessionID
             state = job.state
@@ -99,6 +101,7 @@ final class QueueStore {
         observation.snapshot.jobs
             .filter {
                 $0.kind == .prompt
+                    || $0.kind == .share
                     || ($0.kind == .appIntent && $0.intentKind == .askHermes)
             }
             .map(QueuedPrompt.init(job:))

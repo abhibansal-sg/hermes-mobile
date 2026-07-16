@@ -4,8 +4,7 @@ import UIKit
 
 /// Pulls text, URLs and images out of the `NSExtensionItem`s that the system
 /// hands a share extension and packages them into a single
-/// ``LoadedShareContent`` value, ready to be queued as a
-/// ``SharedStore/SharedInboxItem``.
+/// ``LoadedShareContent`` value, ready for an atomic `WorkRepository` insert.
 ///
 /// All `NSItemProvider` loading is funnelled through `async` wrappers so the
 /// `ShareViewController` can `await` a fully resolved payload before showing
