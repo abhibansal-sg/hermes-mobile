@@ -192,7 +192,8 @@ final class AppEnvironment {
         // which makes every store fall back to the network-only path verbatim —
         // the cache is a pure accelerator, never a correctness dependency, so a
         // dead cache degrades to today's behavior rather than breaking the app.
-        if let cacheStore = try? CacheStore() {
+        let cacheStore = try? CacheStore()
+        if let cacheStore {
             sessionStore.attachCache(cacheStore)
             chatStore.attachCache(cacheStore)
             inboxStore.attachCache(cacheStore)
@@ -329,9 +330,21 @@ final class AppEnvironment {
                 return BackgroundManifestScope(gatewayURL: url, scope: profile, token: token)
             },
             sync: { [weak sessionStore] _ in
-                // This is the existing foreground cache/cursor writer. The manifest
-                // issue replaces this closure with its atomic manifest operation.
-                await sessionStore?.refresh()
+                guard let sessionStore else { return .retryableFailure }
+                await sessionStore.refresh()
+                try Task.checkCancellation()
+                return .success
+            },
+            maintenance: { [weak workRepository, weak queueStore] in
+                guard let workRepository else { return }
+                try await workRepository.cleanupShareWork()
+                try await workRepository.cleanupFinishedWork()
+                if let cacheStore {
+                    _ = try await cacheStore.evictStaleTranscripts()
+                }
+                await AttachmentBlobCache.shared.respondToLowAvailableCapacity()
+                await queueStore?.refresh()
+                WidgetSnapshotWriter.flush()
             }
         )
 
