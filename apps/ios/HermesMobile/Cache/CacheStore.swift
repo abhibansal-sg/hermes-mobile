@@ -107,13 +107,9 @@ actor CacheStore {
     /// rows never bleed into another server's list.
     func loadSessionList(scope: CacheScope) throws -> [SessionSummary] {
         try db.read { db in
-            var request = SessionCacheRecord
+            let request = SessionCacheRecord
                 .filter(Column("serverId") == scope.serverId)
-            if scope.profileId == CacheScope.allProfilesKey {
-                request = request.filter(Column("profileId") != CacheScope.legacy.profileId)
-            } else {
-                request = request.filter(Column("profileId") == scope.profileId)
-            }
+                .filter(Column("profileId") == scope.profileId)
             let records = try request.order(Column("lastActive").desc).fetchAll(db)
             return try records.map { try $0.decodeSummary() }
         }
@@ -393,11 +389,11 @@ actor CacheStore {
                     .deleteAll(db)
             }
             for summary in chain.sessions where !chain.tombstones.contains(summary.id) {
-                let existing = try SessionCacheRecord.fetchOne(db, key: summary.id)
-                // The legacy cache table's id-only PK predates scoped manifests.
-                // Keep another profile's same-id row untouched; the authoritative
-                // scoped session array is persisted in the manifest payload below.
-                if let existing, (existing.serverId != scope.serverId || existing.profileId != scope.profileId) { continue }
+                let existing = try SessionCacheRecord
+                    .filter(Column("serverId") == scope.serverId)
+                    .filter(Column("profileId") == scope.profileId)
+                    .filter(Column("id") == summary.id)
+                    .fetchOne(db)
                 let record = try SessionCacheRecord.make(from: summary, scope: scope, isPinned: existing?.isPinned ?? false, lastAccessedAt: existing?.lastAccessedAt ?? 0, transcriptCachedAt: existing?.transcriptCachedAt, maxMessageId: existing?.maxMessageId)
                 try record.save(db)
             }

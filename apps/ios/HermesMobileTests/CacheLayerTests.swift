@@ -111,6 +111,24 @@ final class CacheMigrationTests: XCTestCase {
         XCTAssertNoThrow(try CacheSchema.makeV1Migrator().migrate(queue))
         XCTAssertNoThrow(try CacheSchema.makeV1Migrator().migrate(queue))
     }
+
+    func testMessageRowCacheForeignKeyUsesFinalSessionTable() throws {
+        var config = Configuration()
+        config.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+        }
+        let queue = try DatabaseQueue(configuration: config)
+
+        try CacheSchema.makeMigrator().migrate(queue)
+
+        let parents = try queue.read { db in
+            try String.fetchAll(
+                db,
+                sql: "SELECT \"table\" FROM pragma_foreign_key_list('message_row_cache')"
+            )
+        }
+        XCTAssertEqual(Set(parents), [SessionCacheRecord.databaseTableName])
+    }
 }
 
 // MARK: - Round-Trip Persistence Tests
