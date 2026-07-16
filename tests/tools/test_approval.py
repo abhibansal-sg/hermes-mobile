@@ -2445,6 +2445,19 @@ def test_pending_snapshot_revisions_are_monotonic_under_lock():
     assert second > first
 
 
+def test_approval_entry_keeps_legacy_resolver_constructor(monkeypatch):
+    """Direct resolver entries need not manufacture reconciliation metadata."""
+    from tools import approval as mod
+
+    monkeypatch.setattr(mod, "_get_approval_timeout", lambda: 30)
+    entry = mod._ApprovalEntry({"description": "legacy resolver test"})
+
+    assert len(entry.request_id) == 32
+    assert entry.created_at < entry.expires_at
+    assert entry.expires_at - entry.created_at == 30
+    assert entry.revision == 0
+
+
 class TestTirithImportErrorFailOpenPolicy:
     """Regression guard for #20733.
 

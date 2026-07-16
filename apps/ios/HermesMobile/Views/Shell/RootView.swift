@@ -396,6 +396,7 @@ struct FreshnessPresentation: Equatable, Sendable {
         case .hydrating, .reconnecting:
             return .init(kind: .syncing, text: "Syncing", accessibilityLabel: "Synchronizing cached content")
         case .offline(let reason):
+            let reason = reason ?? ""
             if reason.localizedCaseInsensitiveContains("sync") && reason.localizedCaseInsensitiveContains("fail") {
                 return .init(kind: .failedCached, text: "Sync failed · Cached data shown", accessibilityLabel: "Synchronization failed. Cached data is shown")
             }

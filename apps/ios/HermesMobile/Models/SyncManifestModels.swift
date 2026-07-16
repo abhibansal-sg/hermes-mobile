@@ -28,7 +28,7 @@ struct SyncManifestPage: Decodable, Sendable, Equatable {
         revision = try c.decode(Int64.self, forKey: .revision)
         cursor = try c.decode(String.self, forKey: .cursor)
         nextCursor = try c.decodeIfPresent(String.self, forKey: .nextCursor)
-        hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? nextCursor != nil
+        hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (nextCursor != nil)
         reset = try c.decodeIfPresent(Bool.self, forKey: .reset) ?? false
         sessions = try c.decodeIfPresent([SessionSummary].self, forKey: .sessions) ?? []
         attention = try c.decodeIfPresent([ManifestAttentionItem].self, forKey: .attention) ?? []

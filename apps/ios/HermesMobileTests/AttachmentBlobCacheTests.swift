@@ -85,10 +85,10 @@ final class AttachmentBlobCacheTests: XCTestCase {
     func testConcurrentReadsAndWritesRemainConsistent() async throws {
         let cache = try AttachmentBlobCache(directory: directory(), capacity: 20_000_000)
         let bytes = png(width: 400, height: 200)
+        let items = (0..<30).map { key("v\($0)", path: "/\($0).png") }
         await withTaskGroup(of: Void.self) { group in
-            for index in 0..<30 {
+            for item in items {
                 group.addTask {
-                    let item = self.key("v\(index)", path: "/\(index).png")
                     await cache.store(bytes, for: item)
                     _ = await cache.image(for: item, maxPixelSize: CGSize(width: 50, height: 50))
                 }

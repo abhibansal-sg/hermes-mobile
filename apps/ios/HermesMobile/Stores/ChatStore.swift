@@ -3841,7 +3841,7 @@ final class ChatStore {
             ) {
                 return page.messages
             }
-            return try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId, identity: sessions?.cacheIdentity(sessionId))
+            return try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId, identity: self.sessions?.cacheIdentity(sessionId))
         }
     }
 
