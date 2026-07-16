@@ -249,6 +249,34 @@ final class OutboxProcessorTests: XCTestCase {
         }
     }
 
+    /// A stock/older gateway accepts `prompt.submit` but returns only the legacy
+    /// `{status: "streaming"}` payload. A completed RPC is authoritative: the
+    /// absence of the optional receipt extension must not strand a delivered
+    /// prompt in the outbox as indeterminate.
+    func testLegacyAcceptedDispositionWithoutReceiptFieldsCompletes() async throws {
+        let harness = try makeHarness()
+        defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let job = try await harness.repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: harness.scope, text: "legacy", storedSessionID: "stored-A"
+        ))
+        let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
+            currentScope: { harness.scope }, activeStoredSessionID: { "stored-A" },
+            canProcessPrompt: { true }, createDestination: { _ in throw Ambiguous() },
+            resolveRuntime: { _ in "runtime-A" }, uploadAsset: { _, _ in throw Ambiguous() },
+            willSubmit: { _, _ in },
+            submit: { _, _, _ in
+                OutboxSubmitResult(json: .object(["status": .string("streaming")]))
+            }
+        ))
+
+        processor.wake()
+        await processor.waitUntilIdleForTesting()
+
+        let persisted = try await harness.repository.job(id: job.jobID)
+        XCTAssertEqual(persisted?.state, .completed,
+                       "a successful legacy submit response must not remain Pending")
+    }
+
     func testAttachmentRetryResumesAfterLastUploadedAsset() async throws {
         let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
         let job = try await harness.repository.enqueue(

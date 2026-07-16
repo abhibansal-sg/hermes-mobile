@@ -419,6 +419,9 @@ final class ConnectionStoreReconnectTests: XCTestCase {
 
         connection.connectRPC = { _, _, _ in }
         sessions.activeStoredId = "already-active-session"
+        sessions.resumeRPC = { stored, _ in
+            self.stagedResumeResult(sessionId: "runtime-after-reconnect", resumed: stored)
+        }
 
         connection._seedAndStartReconnect(
             serverURL: "http://localhost:9123",
@@ -430,6 +433,40 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertEqual(sessions.activeStoredId, "already-active-session",
                        "an already-active session must survive a reconnect-success draft-entry call")
         XCTAssertFalse(sessions.isDraft)
+    }
+
+    /// A live socket is not enough: the selected durable session must also have
+    /// a runtime attachment. If `session.resume` fails transiently, reconnect
+    /// must keep retrying instead of publishing `.connected` with a nil runtime
+    /// and leaving restart as the only recovery path.
+    func testReconnectRetriesWhenSessionResumeFailsTransiently() async {
+        let (connection, sessions, _) = makeStore()
+        let storedID = "stored-resume-retry"
+        let runtimeID = "runtime-after-resume-retry"
+        var connectCount = 0
+        var resumeCount = 0
+
+        connection.reconnectBackoffOverride = 0
+        connection.connectRPC = { _, _, _ in connectCount += 1 }
+        sessions.activeStoredId = storedID
+        sessions.resumeRPC = { stored, _ in
+            resumeCount += 1
+            XCTAssertEqual(stored, storedID)
+            if resumeCount == 1 { throw URLError(.timedOut) }
+            return self.stagedResumeResult(sessionId: runtimeID, resumed: stored)
+        }
+
+        connection._seedAndStartReconnect(
+            serverURL: "http://localhost:9123",
+            token: "test-stable-token"
+        )
+        await connection.waitForReconnectForTesting()
+
+        XCTAssertEqual(resumeCount, 2,
+                       "a transient resume failure must remain inside the reconnect loop")
+        XCTAssertEqual(connectCount, 2)
+        XCTAssertEqual(sessions.activeRuntimeId, runtimeID)
+        XCTAssertEqual(connection.phase, .connected)
     }
 
     /// A transient failure on attempt 0 followed by success on attempt 1
