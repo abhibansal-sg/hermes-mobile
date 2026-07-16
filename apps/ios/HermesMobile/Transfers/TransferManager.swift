@@ -130,7 +130,7 @@ final class TransferManager: NSObject, @unchecked Sendable {
 
     func cancel(id: String) async {
         guard let record = try? await repository.record(id: id),
-              let identifier = record?.taskIdentifier else { return }
+              let identifier = record.taskIdentifier else { return }
         let tasks = await allTasks()
         tasks.first { $0.taskIdentifier == identifier }?.cancel()
     }
@@ -168,8 +168,7 @@ final class TransferManager: NSObject, @unchecked Sendable {
     }
 
     private func processCompletion(task: URLSessionTask, error: Error?) async {
-        guard let fetched = try? await repository.record(taskIdentifier: task.taskIdentifier),
-              var record = fetched else { return }
+        guard var record = try? await repository.record(taskIdentifier: task.taskIdentifier) else { return }
         let status = (task.response as? HTTPURLResponse)?.statusCode
         record.httpStatus = status
         record.responseBody = lock.withLock { responseBodies.removeValue(forKey: task.taskIdentifier) }
@@ -214,8 +213,8 @@ final class TransferManager: NSObject, @unchecked Sendable {
             record.state = .completed
         }
         try? await repository.update(record)
-        if record.state == .completed, let owner = try? await repository.claimOwnerWake(transferId: record.id),
-           let owner {
+        if record.state == .completed,
+           let owner = try? await repository.claimOwnerWake(transferId: record.id) {
             let waker = lock.withLock { ownerWaker }
             await waker?(owner, record.id)
         }
