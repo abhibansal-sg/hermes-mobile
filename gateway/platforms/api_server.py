@@ -1852,7 +1852,20 @@ class APIServerAdapter(BasePlatformAdapter):
         if db is None:
             return []
         try:
-            return db.get_messages_as_conversation(session_id)
+            history = db.get_messages_as_conversation(session_id)
+            # Display-lineage markers are private persistence metadata.  The
+            # in-process CLI/TUI replay path retains them so compaction can
+            # preserve canonical display origins, but the public API session
+            # surface must not leak them into model-facing conversation
+            # history (or make an otherwise identical prompt prefix differ).
+            return [
+                {
+                    key: value
+                    for key, value in message.items()
+                    if not key.startswith("_display_")
+                }
+                for message in history
+            ]
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
