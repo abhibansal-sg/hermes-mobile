@@ -161,13 +161,47 @@ final class PrivacyShieldAppLockTests: XCTestCase {
         XCTAssertFalse(lock.isLocked)
     }
 
+    // GitHub #207: even with App Lock enabled, `.inactive` must not raise the
+    // opaque snapshot shield (the live app stays visible during Control Center /
+    // notification shade), while `.background` still raises it before the
+    // app-switcher snapshot and a post-grace `.active` still re-locks.
+    func testEnabledInactiveKeepsAppVisibleWhileBackgroundStillShieldsAndRelocks() async {
+        UserDefaults.standard.set(true, forKey: defaultsKey)
+        var instant = Date(timeIntervalSince1970: 3_000)
+        let authenticator = AuthenticationSpy()
+        let lock = AppLock(authenticator: authenticator, now: { instant })
+
+        lock.authenticateAtLaunch()
+        await waitUntil { !lock.isLocked }
+
+        lock.handleScenePhase(.inactive)
+        XCTAssertFalse(lock.isPrivacyShieldVisible, "#207: .inactive must keep the live app visible")
+        XCTAssertFalse(lock.isLocked)
+
+        lock.handleScenePhase(.background)
+        XCTAssertTrue(lock.isPrivacyShieldVisible, "app-switcher snapshot must be shielded")
+
+        await authenticator.suspendNextEvaluation()
+        instant.addTimeInterval(AppLock.foregroundGracePeriod)
+        lock.handleScenePhase(.active)
+
+        XCTAssertFalse(lock.isPrivacyShieldVisible)
+        XCTAssertTrue(lock.isLocked, "App Lock re-lock challenge must be preserved")
+        await authenticator.resolveSuspendedEvaluation()
+        await waitUntil { !lock.isLocked }
+    }
+
     private func waitUntil(
         _ predicate: @escaping @MainActor () -> Bool,
         file: StaticString = #filePath,
         line: UInt = #line
     ) async {
-        for _ in 0..<100 where !predicate() {
-            await Task.yield()
+        // A bare `Task.yield()` loop does not reliably drain a cross-actor
+        // continuation resume (the suspended biometric evaluation hopping back to
+        // the MainActor), so poll on a short real-time sleep instead — deterministic
+        // without weakening the assertion.
+        for _ in 0..<200 where !predicate() {
+            try? await Task.sleep(for: .milliseconds(5))
         }
         XCTAssertTrue(predicate(), file: file, line: line)
     }
@@ -182,7 +216,15 @@ private actor AuthenticationSpy: BiometricAuthenticating {
         shouldSuspend = true
     }
 
-    func resolveSuspendedEvaluation() {
+    func resolveSuspendedEvaluation() async {
+        // `authenticate()` calls `evaluate` from a detached Task, so the suspended
+        // continuation may not be stored yet when the test asks to resolve. Await
+        // it (each yield releases actor isolation so the pending `evaluate` can run
+        // and store the continuation) to remove the pre-existing resume-vs-suspend
+        // race that otherwise leaves the lock stuck locked.
+        while continuation == nil {
+            await Task.yield()
+        }
         continuation?.resume(returning: .success)
         continuation = nil
     }

@@ -152,13 +152,24 @@ final class AppLock {
     /// ``foregroundGracePeriod`` has elapsed since then.
     func handleScenePhase(_ scenePhase: ScenePhase) {
         switch scenePhase {
-        case .background, .inactive:
+        case .background:
+            // iOS captures the app-switcher snapshot on the way to `.background`,
+            // so raise the opaque shield first — content-free before the snapshot.
             // This assignment deliberately precedes the App Lock preference
             // check. Snapshot privacy applies even when authentication is off.
             isPrivacyShieldVisible = true
             guard isEnabled else { return }
-            // Record only the first transition out of active; a later `.inactive`
+            // Record only the first transition out of active; a later transition
             // while already backgrounded must not reset the clock.
+            if backgroundedAt == nil {
+                backgroundedAt = now()
+            }
+        case .inactive:
+            // Transient interruptions that keep the live app visible (partial home
+            // swipe, Control Center, notification shade) must NOT raise the shield;
+            // only start the re-lock clock. Leaving the visible surface untouched
+            // here is the GitHub #207 fix.
+            guard isEnabled else { return }
             if backgroundedAt == nil {
                 backgroundedAt = now()
             }
