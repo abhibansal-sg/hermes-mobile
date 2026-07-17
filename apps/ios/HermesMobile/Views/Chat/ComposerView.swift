@@ -259,7 +259,7 @@ struct ComposerView: View {
         .animation(.easeInOut(duration: 0.16), value: showSlashCommandPicker)
         .animation(.easeInOut(duration: 0.18), value: isCapturing)
         .animation(.easeInOut(duration: 0.18), value: voice.isEnabled)
-        .animation(.easeInOut(duration: 0.18), value: queueStore.items.count)
+        .animation(.easeInOut(duration: 0.18), value: queueStore.activeItems.count)
         .animation(.easeInOut(duration: 0.18), value: steerNote)
         .animation(.easeInOut(duration: 0.18), value: yoloStatusNote)
         .animation(.snappy(duration: 0.16), value: holdActive)
@@ -1704,7 +1704,7 @@ private struct QueueSheet: View {
     var body: some View {
         NavigationStack {
             Group {
-                if queueStore.items.isEmpty {
+                if queueStore.activeItems.isEmpty {
                     ContentUnavailableView(
                         "Queue empty",
                         systemImage: "text.badge.plus",
@@ -1712,7 +1712,7 @@ private struct QueueSheet: View {
                     )
                 } else {
                     List {
-                        ForEach(queueStore.items) { item in
+                        ForEach(queueStore.activeItems) { item in
                             QueuedPromptRow(
                                 text: item.text,
                                 kind: item.kind,
@@ -1731,14 +1731,14 @@ private struct QueueSheet: View {
                         }
                         .onDelete { offsets in
                             for index in offsets {
-                                let id = queueStore.items[index].id
+                                let id = queueStore.activeItems[index].id
                                 Task { await queueStore.remove(id: id) }
                             }
                         }
                         // Drag-to-reorder: tapping the EditButton (leading toolbar)
                         // shows grab handles; releasing persists the new order.
                         .onMove { source, destination in
-                            Task { await queueStore.move(fromOffsets: source, toOffset: destination) }
+                            Task { await queueStore.moveActive(fromOffsets: source, toOffset: destination) }
                         }
                     }
                     .scrollContentBackground(.hidden)
@@ -1763,7 +1763,7 @@ private struct QueueSheet: View {
                     } label: {
                         Label("Send next now", systemImage: "paperplane.fill")
                     }
-                    .disabled(queueStore.items.isEmpty || chatStore.isStreaming)
+                    .disabled(queueStore.activeItems.isEmpty || chatStore.isStreaming)
                 }
             }
         }

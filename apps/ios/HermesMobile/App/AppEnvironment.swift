@@ -48,7 +48,8 @@ final class AppEnvironment {
         let queueStore = QueueStore(
             repository: workRepository,
             observation: workObservation,
-            scopeProvider: { [weak sessionStore] in sessionStore?.durableWorkScope }
+            scopeProvider: { [weak sessionStore] in sessionStore?.durableWorkScope },
+            activeSessionProvider: { [weak sessionStore] in sessionStore?.activeStoredId }
         )
         let voiceRecorder = VoiceRecorder()
         let speechPlayer = SpeechPlayer()
