@@ -159,13 +159,16 @@ final class SyncCoordinator {
                 throw error
             }
             guard let stagedSnapshotID else { throw ManifestBindingError.invalidStage }
-            try Task.checkCancellation()
-            if let cancellationCheckpoint {
-                await cancellationCheckpoint(.beforeCommit)
-            }
-            try Task.checkCancellation()
             let result: ManifestCommitResult
             do {
+                // Cancellation after staging is still an aborted snapshot. Keep
+                // the checkpoint and commit inside the cleanup boundary so no
+                // staged page chain can survive a cancelled recovery.
+                try Task.checkCancellation()
+                if let cancellationCheckpoint {
+                    await cancellationCheckpoint(.beforeCommit)
+                }
+                try Task.checkCancellation()
                 result = try await cache.commitStagedManifest(
                     snapshotID: stagedSnapshotID,
                     locator: scope.serverId,

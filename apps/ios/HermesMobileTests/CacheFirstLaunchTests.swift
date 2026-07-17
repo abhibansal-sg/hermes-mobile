@@ -609,6 +609,10 @@ final class CacheFirstLaunchTests: XCTestCase {
         sessions.attachCache(cache)
         let work = makeSummary(id: "work-session", lastActive: 200, profile: "work")
         sessions.sessions = [work]
+        try await cache.saveSessionList(
+            [work],
+            scope: CacheScope(serverId: serverURL, profileId: "work")
+        )
 
         let observed = TestActorBox<String>("")
         sessions.prefetchFetchWithProfile = { @Sendable id, profile in
