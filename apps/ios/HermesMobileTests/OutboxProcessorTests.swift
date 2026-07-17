@@ -30,6 +30,51 @@ final class OutboxProcessorTests: XCTestCase {
 
     private struct Ambiguous: Error {}
 
+    func testUnavailableTransportLeavesPromptUnclaimedButProcessesNavigationIntent() async throws {
+        let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let prompt = try await harness.repository.enqueue(WorkJobInput(
+            kind: .prompt,
+            scope: harness.scope,
+            text: "wait for transport",
+            storedSessionID: "stored-A"
+        ))
+        let navigation = try await harness.repository.enqueueAppIntent(
+            kind: .openSessions,
+            scope: harness.scope
+        )
+        var localNavigationCount = 0
+        let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
+            currentScope: { harness.scope },
+            activeStoredSessionID: { "stored-A" },
+            canProcessPrompt: { false },
+            createDestination: { _ in XCTFail("transport work must not be claimed"); throw Ambiguous() },
+            resolveRuntime: { _ in XCTFail("transport work must not be resolved"); return nil },
+            uploadAsset: { _, _ in XCTFail("transport work must not upload"); throw Ambiguous() },
+            willSubmit: { _, _ in XCTFail("transport work must not submit") },
+            submit: { _, _, _ in XCTFail("transport work must not submit"); throw Ambiguous() },
+            processLocalAppIntent: { job in
+                if job.intentKind == .openSessions {
+                    localNavigationCount += 1
+                    return true
+                }
+                return false
+            }
+        ))
+
+        processor.wake()
+        await processor.waitUntilIdleForTesting()
+
+        let persistedPrompt = try await harness.repository.job(id: prompt.jobID)
+        let persistedNavigation = try await harness.repository.job(id: navigation.jobID)
+        XCTAssertEqual(persistedPrompt?.state, .queued)
+        XCTAssertEqual(persistedPrompt?.attemptCount, 0,
+                       "a prompt remains durable and unclaimed until readiness")
+        XCTAssertNil(persistedPrompt?.leaseOwner)
+        XCTAssertEqual(localNavigationCount, 1)
+        XCTAssertEqual(persistedNavigation?.state, .completed,
+                       "navigation intents remain local and actionable offline")
+    }
+
     func testAuthoritativeReceiptWaitsForMatchingProjectionCommit() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("OutboxAcceptedProjection-\(UUID().uuidString)", isDirectory: true)

@@ -264,6 +264,131 @@ final class CacheFirstLaunchTests: XCTestCase {
         XCTAssertNotEqual(defaultIdentity.profileId, restored?.profileId)
     }
 
+    func testManifestCachePaintFiltersNamedProfileBeforeDeduplicatingIDs() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        connection.serverURLString = serverURL
+        sessions.activeProfile = "work"
+
+        let json = #"""
+        {
+          "schema_version":2,"gateway_id":"gw_cache",
+          "profile_authorities":[
+            {"profile_id":"pf_default","profile_name":"default","authority_epoch":"ae_default"},
+            {"profile_id":"pf_work","profile_name":"work","authority_epoch":"ae_work"}
+          ],
+          "journal_epoch":"je_cache","complete":true,"revision":7,
+          "snapshot_id":"ms_cache_7","page_size":500,"scope":"all",
+          "continuation_cursor":null,"resume_cursor":"m2.je_cache.c7",
+          "reset":true,"reset_reason":"full_snapshot","server_time":7,
+          "sessions":{"upserts":[
+            {"id":"shared","title":"default copy","started_at":1,"message_count":3,"profile":"default","profile_id":"pf_default","authority_epoch":"ae_default","entity_revision":1},
+            {"id":"shared","title":"work copy","started_at":2,"message_count":3,"profile":"work","profile_id":"pf_work","authority_epoch":"ae_work","entity_revision":2},
+            {"id":"work-only","title":"work only","started_at":3,"message_count":3,"profile":"work","profile_id":"pf_work","authority_epoch":"ae_work","entity_revision":3}
+          ],"tombstones":[]},
+          "pending_attention":[],
+          "runtime_snapshot":{"runtime_instance_id":"gri_cache","sequence":1,"captured_at":7,"active_turns":[]},
+          "transcript_heads":[],
+          "widget_summary":{"open_session_count":3,"active_turn_count":0,"pending_attention_count":0,"tokens_today":null,"estimated_cost_today":null},
+          "push_registry":{"device_registered":true}
+        }
+        """#
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let page = try decoder.decode(SyncManifestPage.self, from: Data(json.utf8))
+        _ = try await cache.applyManifest(
+            ManifestChain(validating: [page]),
+            scope: CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
+        )
+
+        await sessions.paintFromCache()
+
+        XCTAssertEqual(sessions.sessions.map(\.id), ["shared", "work-only"])
+        XCTAssertEqual(sessions.sessions.first?.title, "work copy")
+    }
+
+    func testProfileSwitchFencesInFlightRefreshPublicationAndCacheScope() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        connection.serverURLString = serverURL
+        sessions.sessions = [makeSummary(id: "existing")]
+
+        let gate = ResumeGate()
+        sessions.sessionsFetch = {
+            await gate.suspend()
+            return ([self.makeSummary(id: "old-profile")], 1)
+        }
+        let refreshTask = Task { await sessions.refresh() }
+        await gate.waitUntilEntered()
+
+        sessions.activeProfile = "work"
+        gate.release()
+        await refreshTask.value
+
+        XCTAssertEqual(sessions.sessions.map(\.id), ["existing"])
+        let workRows = try await cache.loadSessionList(
+            scope: CacheScope(serverId: serverURL, profileId: "work")
+        )
+        XCTAssertNil(workRows.first(where: { $0.id == "old-profile" }))
+    }
+
+    func testCachedRowUsesSummaryProfileWhenNetworkProfileThreadingIsUnavailable() async throws {
+        let (connection, sessions, chat) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        chat.attachCache(cache)
+        connection.serverURLString = serverURL
+        sessions.profileThreadingAvailableForTesting = false
+
+        let row = makeSummary(id: "work-row", lastActive: 100, profile: "work")
+        sessions.sessions = [row]
+        let workIdentity = CacheIdentity(serverId: serverURL, profileId: "work", sessionId: row.id)
+        try await cache.saveSessionList([row], scope: CacheScope(serverId: serverURL, profileId: "all"))
+        try await cache.saveTranscript(identity: workIdentity, messages: [stubStored("cached work")])
+        sessions.transcriptFetchWithProfile = { _, profile in
+            XCTAssertNil(profile, "network profile params remain capability-gated")
+            throw GatewayError.notConnected
+        }
+
+        sessions.open(row, bindRuntime: false)
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(chat.messages.last?.text, "cached work")
+    }
+
+    func testTranscriptPublishAndCacheWriteAreFencedByTransportReplacement() async throws {
+        let (connection, sessions, chat) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        chat.attachCache(cache)
+        connection.serverURLString = serverURL
+        connection._seedConnectedForTesting(serverURL: serverURL, token: "token")
+
+        let gate = ResumeGate()
+        let row = makeSummary(id: "transport-row", lastActive: 100)
+        sessions.sessions = [row]
+        sessions.transcriptFetchWithProfile = { _, _ in
+            await gate.suspend()
+            return [stubStored("stale transport response")]
+        }
+        sessions.open(row, bindRuntime: false)
+        await gate.waitUntilEntered()
+
+        // Replacing the same gateway transport invalidates the old transcript
+        // task without changing the user's selected stored session.
+        connection._seedConnectedForTesting(serverURL: serverURL, token: "token")
+        gate.release()
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertNil(chat.messages.last?.text)
+        let hasStaleTranscript = try await cache.hasTranscript(
+            CacheIdentity(serverId: serverURL, profileId: "default", sessionId: row.id)
+        )
+        XCTAssertFalse(hasStaleTranscript)
+    }
+
     func testSupersededOpenCannotPersistOlderLastOpenedSelection() async throws {
         let (connection, sessions, _) = makeGraph()
         let cache = try makeInMemoryCache()
