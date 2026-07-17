@@ -154,6 +154,61 @@ def test_receipt_and_sessiondb_bind_same_authoritative_turn_id(
         state_db.close()
 
 
+def test_prompt_receipt_fingerprints_and_atomically_associates_stable_assets(
+    tmp_path, monkeypatch, receipts, isolated_gateway
+):
+    provider = receipts.SQLitePromptReceiptProvider(owner_id="process-a")
+    provider.register_asset(
+        profile_home=tmp_path,
+        asset_id="asset_0123456789abcdef",
+        content_version="sha256:abc",
+        path=str(tmp_path / "asset.jpg"),
+        media_type="image/jpeg",
+        byte_count=3,
+        owner_device_id="device-a",
+    )
+    monkeypatch.setattr(server, "PROMPT_RECEIPT_PROVIDERS", [provider])
+    server._sessions["runtime-sid"] = _session(tmp_path)
+    message_id = uuid.uuid4()
+    reference = {
+        "asset_id": "asset_0123456789abcdef",
+        "content_version": "sha256:abc",
+        "role": "input",
+    }
+    try:
+        response = server._methods["prompt.submit"](
+            "r1", _params(message_id, asset_references=[reference])
+        )
+        assert response["result"]["accepted"] is True
+        turn_id = response["result"]["turn_id"]
+        with sqlite3.connect(provider.database_path(tmp_path)) as conn:
+            association = conn.execute(
+                "SELECT operation_id, asset_id, content_version, session_id, "
+                "turn_id, role FROM stable_asset_associations"
+            ).fetchone()
+        assert association == (
+            str(message_id),
+            reference["asset_id"],
+            reference["content_version"],
+            "stored-session",
+            turn_id,
+            "input",
+        )
+
+        server._sessions["runtime-sid"]["running"] = False
+        server._sessions["runtime-sid"]["inflight_turn"] = None
+        conflict = server._methods["prompt.submit"](
+            "r2",
+            _params(
+                message_id,
+                asset_references=[{**reference, "content_version": "sha256:changed"}],
+            ),
+        )
+        assert conflict["error"]["code"] == 4091
+    finally:
+        server._sessions.pop("runtime-sid", None)
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -246,6 +301,44 @@ def test_abandoned_reservation_is_indeterminate_after_restart(tmp_path, receipts
     restarted = receipts.SQLitePromptReceiptProvider(owner_id="process-b")
     assert restarted.reserve(**request)["state"] == "indeterminate"
     assert restarted.reserve(**request)["state"] == "indeterminate"
+
+
+def test_indeterminate_asset_reservation_remains_a_gc_root(tmp_path, receipts):
+    asset_path = tmp_path / "asset.jpg"
+    asset_path.write_bytes(b"abc")
+    first = receipts.SQLitePromptReceiptProvider(owner_id="process-a")
+    first.register_asset(
+        profile_home=tmp_path,
+        asset_id="asset_pending",
+        content_version="sha256:abc",
+        path=str(asset_path),
+        media_type="image/jpeg",
+        byte_count=3,
+        owner_device_id=None,
+    )
+    request = dict(
+        profile_home=tmp_path,
+        client_message_id=str(uuid.uuid4()),
+        session_id="runtime-sid",
+        text="hello",
+        truncate_before_user_ordinal=None,
+        asset_references=[
+            {
+                "asset_id": "asset_pending",
+                "content_version": "sha256:abc",
+                "role": "input",
+            }
+        ],
+    )
+    assert first.reserve(**request)["state"] == "claimed"
+    restarted = receipts.SQLitePromptReceiptProvider(owner_id="process-b")
+    assert restarted.reserve(**request)["state"] == "indeterminate"
+    assert restarted.is_referenced_path(
+        profile_home=tmp_path, path=str(asset_path)
+    )
+    assert not restarted.mark_unreferenced_asset_deleted(
+        profile_home=tmp_path, path=str(asset_path)
+    )
 
 
 def test_receipts_are_profile_home_isolated(tmp_path, receipts):

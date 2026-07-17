@@ -3,7 +3,7 @@
 **Status:** Product direction confirmed; implementation underway behind versioned capability gates
 **Date:** 2026-07-17
 **Scope:** iOS app and external `hermes-mobile` gateway plugin
-**Implementation state:** Authority identity, manifest v2, display lineage, durable turn ledger, compact GRDB projection, capability-gated iOS reads, and bounded historical backfill are implemented; detail, stable assets, generalized mutations, and rollout evidence remain
+**Implementation state:** Authority identity, manifest v2, display lineage, durable turn ledger, compact GRDB projection, capability-gated iOS reads, bounded historical backfill, and stable upload/receipt asset identity are implemented; memory-only detail, permanent asset rendering/cache migration, generalized mutations, and rollout evidence remain
 
 ## 1. Outcome
 
@@ -1385,6 +1385,12 @@ Create opaque immutable asset/content versions and upload records. Stop returnin
 server paths as transcript identity. Include a real Python-to-Swift upload
 descriptor fixture.
 
+**Implemented:** uploads retain the legacy `path` field for old clients and now
+also return an opaque `asset_id`, immutable SHA-256 content version,
+authenticated download route, and thumbnail route. Registry rows live beside
+the plugin receipt store; asset bytes are never addressed by their absolute
+path on the new API.
+
 #### C1b. Add durable prompt/asset association convergence
 
 Keep the local source until prompt/asset association is acknowledged. Ensure
@@ -1394,11 +1400,24 @@ before core submission; pending/indeterminate references are GC roots; the
 public authoritative turn ledger converges them to committed associations after
 SessionDB commit. `/associate` is recovery-only.
 
+**Implemented for prompt submissions:** WorkRepository persists the remote
+asset/version beside the background transfer. `prompt.submit` includes ordered
+asset references in its idempotency fingerprint. The plugin writes pending GC
+roots in the receipt reservation transaction and converts them to accepted turn
+associations in the receipt-completion transaction; an abandoned reservation
+remains indeterminate and cannot be garbage-collected automatically.
+
 #### C2. Add authenticated asset reads, thumbnails, and GC
 
 Add scoped historical authorization, ETag/`If-Range` download, deterministic
 thumbnail bounds, reference-aware GC, tombstones, grace period, and
 administrative unavailability. This unit does not change iOS rendering.
+
+**Implemented for uploaded input assets:** reads recheck device/session
+authorization, support ETag, `If-Range`, and bounded byte ranges; thumbnails are
+generated at a 512-pixel bound; pruning skips pending and accepted references
+and tombstones unreferenced registry entries before deleting bytes. Generated
+artifact import and administrative purge remain gated.
 
 #### C3. Adopt asset descriptors in iOS
 

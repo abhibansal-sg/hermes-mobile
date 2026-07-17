@@ -1392,12 +1392,20 @@ def _begin_prompt_receipt(rid: Any, params: dict) -> tuple[dict | None, dict | N
 
     provider = PROMPT_RECEIPT_PROVIDERS[0]
     try:
+        reserve_kwargs = {
+            "profile_home": _prompt_receipt_home(params),
+            "client_message_id": canonical_id,
+            "session_id": params.get("session_id", ""),
+            "text": params.get("text", ""),
+            "truncate_before_user_ordinal": truncate,
+        }
+        # Asset references are optional provider metadata. Preserve exact
+        # compatibility with older providers whose reserve signature predates
+        # stable assets instead of forcing a new core interface version.
+        if "asset_references" in inspect.signature(provider.reserve).parameters:
+            reserve_kwargs["asset_references"] = params.get("asset_references")
         outcome = provider.reserve(
-            profile_home=_prompt_receipt_home(params),
-            client_message_id=canonical_id,
-            session_id=params.get("session_id", ""),
-            text=params.get("text", ""),
-            truncate_before_user_ordinal=truncate,
+            **reserve_kwargs,
         )
     except Exception as exc:
         logger.warning("prompt receipt reservation failed: %s", exc)
@@ -9277,6 +9285,13 @@ def _(rid, params: dict) -> dict:
     if err:
         _release_prompt_receipt(receipt)
         return err
+    if receipt is not None and isinstance(receipt.get("reservation"), dict):
+        # Providers may bind auxiliary accepted metadata (for example stable
+        # assets) to the durable stored session without exposing runtime
+        # connection identity as the long-lived association key.
+        receipt["reservation"]["session_id"] = str(
+            session.get("session_key") or sid
+        )
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
     # or fallback moved the session transport to stdio.

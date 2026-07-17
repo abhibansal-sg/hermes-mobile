@@ -8,6 +8,34 @@ struct OutboxDestination: Equatable, Sendable {
 struct OutboxUploadedAsset: Equatable, Sendable {
     let transferID: String
     let remotePath: String
+    let assetID: String?
+    let contentVersion: String?
+
+    init(
+        transferID: String,
+        remotePath: String,
+        assetID: String? = nil,
+        contentVersion: String? = nil
+    ) {
+        self.transferID = transferID
+        self.remotePath = remotePath
+        self.assetID = assetID
+        self.contentVersion = contentVersion
+    }
+}
+
+struct StablePromptAssetReference: Equatable, Sendable {
+    let assetID: String
+    let contentVersion: String
+    let role: String
+
+    var json: JSONValue {
+        .object([
+            "asset_id": .string(assetID),
+            "content_version": .string(contentVersion),
+            "role": .string(role),
+        ])
+    }
 }
 
 struct OutboxSubmitResult: Equatable, Sendable {
@@ -300,7 +328,9 @@ final class OutboxProcessor {
                     owner: owner,
                     state: "uploaded",
                     transferID: uploaded.transferID,
-                    remotePath: uploaded.remotePath
+                    remotePath: uploaded.remotePath,
+                    remoteAssetID: uploaded.assetID,
+                    remoteContentVersion: uploaded.contentVersion
                 )
             }
             job = try await repository.transitionJob(

@@ -173,6 +173,12 @@ enum WorkSchema {
                 WHERE authoritative_turn_id IS NOT NULL
                 """)
         }
+        migrator.registerMigration("work-v5-stable-asset-receipt") { db in
+            try db.alter(table: "job_assets") { table in
+                table.add(column: "remote_asset_id", .text)
+                table.add(column: "remote_content_version", .text)
+            }
+        }
         return migrator
     }
 }

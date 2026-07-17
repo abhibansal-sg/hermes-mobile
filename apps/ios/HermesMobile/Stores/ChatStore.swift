@@ -2434,7 +2434,8 @@ final class ChatStore {
     func submitOutboxPrompt(
         job: WorkJob,
         runtimeSessionID: String,
-        remotePaths: [String]
+        remotePaths: [String],
+        assetReferences: [StablePromptAssetReference] = []
     ) async throws -> OutboxSubmitResult {
         guard let client else { throw GatewayError.notConnected }
         prepareOutboxSubmission(job: job, remotePaths: remotePaths)
@@ -2450,6 +2451,7 @@ final class ChatStore {
                     "session_id": .string(runtimeSessionID),
                     "text": .string(job.submissionText),
                     "client_message_id": .string(job.clientMessageID),
+                    "asset_references": .array(assetReferences.map(\.json)),
                 ])
             )
             let receipt = OutboxSubmitResult(json: result)

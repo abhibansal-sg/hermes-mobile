@@ -277,6 +277,8 @@ struct WorkJobAsset: Codable, FetchableRecord, PersistableRecord, Equatable, Sen
     var ordinal: Int
     var transferID: String?
     var remotePath: String?
+    var remoteAssetID: String? = nil
+    var remoteContentVersion: String? = nil
     var state: String
 
     enum CodingKeys: String, CodingKey {
@@ -285,6 +287,8 @@ struct WorkJobAsset: Codable, FetchableRecord, PersistableRecord, Equatable, Sen
         case ordinal
         case transferID = "transfer_id"
         case remotePath = "remote_path"
+        case remoteAssetID = "remote_asset_id"
+        case remoteContentVersion = "remote_content_version"
         case state
     }
 }

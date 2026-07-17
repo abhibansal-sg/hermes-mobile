@@ -182,13 +182,30 @@ async def mobile_capabilities(request: Request):
         turn_projection = int(all(hasattr(SessionDB, name) for name in turn_methods))
     except Exception:
         turn_projection = 0
+    try:
+        receipt_provider = _plugin_module("prompt_receipts").PROVIDER
+        stable_assets = int(
+            all(
+                hasattr(receipt_provider, name)
+                for name in (
+                    "register_asset",
+                    "asset",
+                    "asset_sessions",
+                    "set_asset_thumbnail",
+                    "is_referenced_path",
+                    "mark_unreferenced_asset_deleted",
+                )
+            )
+        )
+    except Exception:
+        stable_assets = 0
 
     return {
         "schema_version": 1,
         "sync_manifest": 2,
         "turn_projection": turn_projection,
         "turn_detail": 0,
-        "stable_assets": 0,
+        "stable_assets": stable_assets,
         "conditional_mutations": 0,
     }
 
@@ -407,6 +424,14 @@ def _resolve_uploaded_attachment(name: str) -> Path:
 def _prune_uploads() -> None:
     """Best-effort cleanup so the uploads dir can't grow unbounded."""
     try:
+        from hermes_constants import get_hermes_home
+
+        asset_provider = _plugin_module("prompt_receipts").PROVIDER
+        profile_home = get_hermes_home()
+    except Exception:
+        asset_provider = None
+        profile_home = None
+    try:
         entries = sorted(
             (p for p in _UPLOAD_DIR.iterdir() if p.is_file()),
             key=lambda p: p.stat().st_mtime,
@@ -419,8 +444,23 @@ def _prune_uploads() -> None:
         try:
             too_old = (now - path.stat().st_mtime) > _UPLOAD_MAX_AGE_SECONDS
             if index < excess or too_old:
+                if asset_provider is not None and asset_provider.is_referenced_path(
+                    profile_home=profile_home,
+                    path=str(path),
+                ):
+                    continue
+                if asset_provider is not None:
+                    asset_provider.mark_unreferenced_asset_deleted(
+                        profile_home=profile_home,
+                        path=str(path),
+                    )
+                    if asset_provider.is_referenced_path(
+                        profile_home=profile_home,
+                        path=str(path),
+                    ):
+                        continue
                 path.unlink()
-        except OSError:
+        except Exception:
             continue
 
 
@@ -474,12 +514,37 @@ async def upload_attachment(request: Request):
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not store upload: {exc}")
 
+    asset_id = f"asset_{secrets.token_hex(16)}"
+    content_version = _sha256_content_version(data)
+    media_type = mimetypes.guess_type(dest.name)[0] or "application/octet-stream"
+    try:
+        from hermes_constants import get_hermes_home
+
+        _plugin_module("prompt_receipts").PROVIDER.register_asset(
+            profile_home=get_hermes_home(),
+            asset_id=asset_id,
+            content_version=content_version,
+            path=str(dest),
+            media_type=media_type,
+            byte_count=len(data),
+            owner_device_id=_request_device_id(request),
+        )
+    except Exception as exc:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        _log.warning("stable asset registration failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Asset registry unavailable")
     _prune_uploads()
     return {
         "path": str(dest),
+        "asset_id": asset_id,
         "size": len(data),
-        "mime": mimetypes.guess_type(dest.name)[0] or "application/octet-stream",
-        "content_version": _sha256_content_version(data),
+        "mime": media_type,
+        "content_version": content_version,
+        "download_path": f"/assets/{asset_id}",
+        "thumbnail_path": f"/assets/{asset_id}/thumbnail",
     }
 
 
@@ -533,6 +598,110 @@ async def fetch_uploaded_attachment(name: str, request: Request):
 
     media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     return Response(content=data, media_type=media_type, headers=headers)
+
+
+def _asset_for_request(asset_id: str, request: Request) -> tuple[Any, dict[str, Any]]:
+    if not asset_id.startswith("asset_") or len(asset_id) > 128:
+        raise HTTPException(status_code=400, detail="Invalid asset id")
+    from hermes_constants import get_hermes_home
+
+    provider = _plugin_module("prompt_receipts").PROVIDER
+    profile_home = get_hermes_home()
+    asset = provider.asset(profile_home=profile_home, asset_id=asset_id)
+    if asset is None or asset.get("server_state") != "available":
+        raise HTTPException(status_code=404, detail="Asset unavailable")
+    device_id = _request_device_id(request)
+    if device_id and asset.get("owner_device_id") != device_id:
+        sessions = provider.asset_sessions(profile_home=profile_home, asset_id=asset_id)
+        # Hermes profiles are single-user authority partitions. A paired device
+        # with chat scope may read an asset only after the plugin has a durable
+        # committed association in this profile; an unassociated upload remains
+        # private to the device that created it.
+        if not sessions or not _device_has_scope(request, "chat"):
+            raise HTTPException(status_code=403, detail="Device token does not own asset")
+    return provider, asset
+
+
+def _asset_response(path: Path, asset: dict[str, Any], request: Request) -> Response:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        raise HTTPException(status_code=404, detail="Asset bytes unavailable")
+    version = str(asset["content_version"])
+    etag = f'"{version}"'
+    if request.headers.get("if-none-match", "").removeprefix("W/") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    headers = {
+        "ETag": etag,
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(len(data)),
+        "Content-Disposition": f'inline; filename="{path.name}"',
+    }
+    range_header = request.headers.get("range")
+    if range_header:
+        if_range = request.headers.get("if-range")
+        if if_range and if_range != etag:
+            range_header = None
+        else:
+            match = _re.fullmatch(r"bytes=(\d+)-(\d*)", range_header.strip())
+            if not match:
+                return Response(status_code=416, headers={"Content-Range": f"bytes */{len(data)}"})
+            start = int(match.group(1))
+            end = int(match.group(2)) if match.group(2) else len(data) - 1
+            if start >= len(data) or end < start:
+                return Response(status_code=416, headers={"Content-Range": f"bytes */{len(data)}"})
+            end = min(end, len(data) - 1)
+            partial = data[start : end + 1]
+            headers["Content-Range"] = f"bytes {start}-{end}/{len(data)}"
+            headers["Content-Length"] = str(len(partial))
+            return Response(
+                content=partial,
+                status_code=206,
+                media_type=str(asset["media_type"]),
+                headers=headers,
+            )
+    return Response(content=data, media_type=str(asset["media_type"]), headers=headers)
+
+
+@router.get("/assets/{asset_id}")
+async def fetch_stable_asset(asset_id: str, request: Request):
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    _provider, asset = _asset_for_request(asset_id, request)
+    return _asset_response(Path(str(asset["path"])), asset, request)
+
+
+@router.get("/assets/{asset_id}/thumbnail")
+async def fetch_stable_asset_thumbnail(asset_id: str, request: Request):
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    provider, asset = _asset_for_request(asset_id, request)
+    thumbnail_path = Path(str(asset.get("thumbnail_path") or ""))
+    if not thumbnail_path.is_file():
+        try:
+            from PIL import Image
+            from hermes_constants import get_hermes_home
+
+            thumbnail_dir = get_hermes_home() / "mobile" / "asset-thumbnails"
+            thumbnail_dir.mkdir(parents=True, exist_ok=True)
+            thumbnail_path = thumbnail_dir / f"{asset_id}.jpg"
+            with Image.open(str(asset["path"])) as image:
+                image.thumbnail((512, 512))
+                if image.mode not in {"RGB", "L"}:
+                    image = image.convert("RGB")
+                image.save(thumbnail_path, format="JPEG", quality=75, optimize=True)
+            provider.set_asset_thumbnail(
+                profile_home=get_hermes_home(),
+                asset_id=asset_id,
+                thumbnail_path=str(thumbnail_path),
+            )
+        except Exception as exc:
+            _log.warning("asset thumbnail generation failed: %s", exc)
+            raise HTTPException(status_code=503, detail="Thumbnail unavailable")
+    thumb_asset = dict(asset)
+    thumb_asset["content_version"] = f"thumb-v1:{asset['content_version']}"
+    thumb_asset["media_type"] = "image/jpeg"
+    return _asset_response(thumbnail_path, thumb_asset, request)
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ def test_capabilities_advertise_only_implemented_versioned_contracts():
         "sync_manifest": 2,
         "turn_projection": 1,
         "turn_detail": 0,
-        "stable_assets": 0,
+        "stable_assets": 1,
         "conditional_mutations": 0,
     }
 

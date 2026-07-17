@@ -1008,7 +1008,9 @@ actor WorkRepository {
         owner: String,
         state: String,
         transferID: String? = nil,
-        remotePath: String? = nil
+        remotePath: String? = nil,
+        remoteAssetID: String? = nil,
+        remoteContentVersion: String? = nil
     ) async throws {
         guard ["local", "transferring", "uploaded", "failed"].contains(state) else {
             throw WorkRepositoryError.assetNotFound
@@ -1024,6 +1026,8 @@ actor WorkRepository {
             link.state = state
             if let transferID { link.transferID = transferID }
             if let remotePath { link.remotePath = remotePath }
+            if let remoteAssetID { link.remoteAssetID = remoteAssetID }
+            if let remoteContentVersion { link.remoteContentVersion = remoteContentVersion }
             try link.update(db)
         }
         await publishObservation()

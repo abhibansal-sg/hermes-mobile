@@ -57,9 +57,19 @@ def test_upload_attachment_succeeds_under_cap(
     assert body["size"] == 3
     assert body["mime"] == "image/png"
     assert body["content_version"] == f"sha256:{hashlib.sha256(b'abc').hexdigest()}"
+    assert body["asset_id"].startswith("asset_")
+    assert body["download_path"] == f"/assets/{body['asset_id']}"
     stored = Path(body["path"])
     assert stored.parent == upload_dir
     assert stored.read_bytes() == b"abc"
+
+    fetched = client.get(
+        f"/api/plugins/hermes-mobile/assets/{body['asset_id']}",
+        headers={"Range": "bytes=1-2", "If-Range": f'"{body["content_version"]}"'},
+    )
+    assert fetched.status_code == 206
+    assert fetched.content == b"bc"
+    assert fetched.headers["content-range"] == "bytes 1-2/3"
 
 
 def test_upload_attachment_rejects_over_cap_without_storing(

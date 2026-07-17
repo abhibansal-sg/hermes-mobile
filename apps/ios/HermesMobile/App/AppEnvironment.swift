@@ -141,18 +141,35 @@ final class AppEnvironment {
                     )
                     return OutboxUploadedAsset(
                         transferID: upload.transferID,
-                        remotePath: upload.upload.path
+                        remotePath: upload.upload.path,
+                        assetID: upload.upload.assetID,
+                        contentVersion: upload.upload.contentVersion
                     )
                 },
                 willSubmit: { [weak chatStore] job, paths in
                     chatStore?.prepareOutboxSubmission(job: job, remotePaths: paths)
                 },
-                submit: { [weak chatStore] job, runtimeID, paths in
-                    guard let chatStore else { throw GatewayError.notConnected }
+                submit: { [weak chatStore, weak workRepository] job, runtimeID, paths in
+                    guard let chatStore, let workRepository else {
+                        throw GatewayError.notConnected
+                    }
+                    let assetReferences = try await workRepository.jobAssets(jobID: job.jobID)
+                        .compactMap { snapshot -> StablePromptAssetReference? in
+                            guard let assetID = snapshot.link.remoteAssetID,
+                                  let contentVersion = snapshot.link.remoteContentVersion else {
+                                return nil
+                            }
+                            return StablePromptAssetReference(
+                                assetID: assetID,
+                                contentVersion: contentVersion,
+                                role: "input"
+                            )
+                        }
                     return try await chatStore.submitOutboxPrompt(
                         job: job,
                         runtimeSessionID: runtimeID,
-                        remotePaths: paths
+                        remotePaths: paths,
+                        assetReferences: assetReferences
                     )
                 },
                 processLocalAppIntent: { [weak sessionStore] job in
