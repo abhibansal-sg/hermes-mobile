@@ -2442,9 +2442,22 @@ final class ConnectionStore {
         // offline (another client switched it) (F0).
         await refreshActiveModel(generation: generation)
         guard isActiveGeneration(generation) else { return false }
-        if sessionStore.activeStoredId != nil {
-            await sessionStore.resumeActiveAfterReconnect()
+        // A failed resume for the still-selected session means this reconnect
+        // did not recover a usable chat and must retry. A nil result after the
+        // selection changed is supersession instead: follow the latest intent
+        // (coalesced with any readiness-released `open()` task) rather than
+        // treating the old A failure as B's failure.
+        var selectedId = sessionStore.activeStoredId
+        while let expectedStoredId = selectedId {
+            let resumedRuntime = await sessionStore.resumeActiveAfterReconnect()
             guard isActiveGeneration(generation) else { return false }
+            if resumedRuntime != nil { break }
+
+            let latestStoredId = sessionStore.activeStoredId
+            guard latestStoredId != expectedStoredId else { return false }
+            selectedId = latestStoredId
+        }
+        if sessionStore.activeStoredId != nil {
             await chatStore.backfill()
             guard isActiveGeneration(generation) else { return false }
             // Flush the offline outbox now the transcript is current — but only
