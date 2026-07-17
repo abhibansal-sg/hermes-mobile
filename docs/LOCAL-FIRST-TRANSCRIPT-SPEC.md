@@ -1369,6 +1369,13 @@ memory budgets in §6.6. Include the real Python-to-Swift detail fixture here.
 
 **Size:** 2–3 days.
 
+**Partial implementation:** safe per-operation headers now page by immutable
+display revision and deterministic group ID, are decoded by the shipping Swift
+model, and explicitly report `detail_available=false`. Raw argument/result
+detail and the `turn_detail` capability remain disabled until the generic
+bounded observer/read seam can provide redacted chunks without private
+transport or database access. This fail-closed state is intentional.
+
 #### B7. Apply compact transcript presentation
 
 Default to user message + collapsed work envelope + final response. Reuse the

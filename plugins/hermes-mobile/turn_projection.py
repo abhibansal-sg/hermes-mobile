@@ -437,6 +437,97 @@ def _group_operations(turn_id: str, operations: list[dict[str, Any]]) -> list[di
     return groups
 
 
+def build_operation_header_page(
+    db: Any,
+    *,
+    session_id: str,
+    turn_id: str,
+    group_id: str,
+    cursor: Optional[str] = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Return one bounded page of safe headers for a deterministic group."""
+    safe_limit = max(1, min(int(limit), 100))
+    status = db.get_turn_ledger_status(session_id)
+    operations = db.get_turn_operations(
+        session_id,
+        turn_id,
+        limit=MAX_OPERATIONS_PER_TURN + 1,
+    )
+    if len(operations) > MAX_OPERATIONS_PER_TURN:
+        raise TurnProjectionError("turn operation count exceeds detail bound")
+    selected: list[dict[str, Any]] = []
+    current_group_id = None
+    current_category = None
+    for operation in operations:
+        category = str(operation["category"])
+        if current_group_id is None or current_category != category:
+            digest = hashlib.sha256(
+                f"{turn_id}\0{category}\0{operation['operation_id']}".encode("utf-8")
+            ).hexdigest()[:24]
+            current_group_id = f"group_{digest}"
+            current_category = category
+        if current_group_id == group_id:
+            selected.append(operation)
+    offset = 0
+    if cursor:
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+            if (
+                payload.get("v") != 1
+                or payload.get("s") != session_id
+                or payload.get("t") != turn_id
+                or payload.get("g") != group_id
+                or int(payload.get("r")) != int(status["display_revision"])
+            ):
+                raise ValueError
+            offset = int(payload["o"])
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise TurnProjectionError("invalid operation cursor") from exc
+    page = selected[offset : offset + safe_limit]
+    next_cursor = None
+    next_offset = offset + len(page)
+    if next_offset < len(selected):
+        raw = json.dumps(
+            {
+                "v": 1,
+                "s": session_id,
+                "t": turn_id,
+                "g": group_id,
+                "r": int(status["display_revision"]),
+                "o": next_offset,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        next_cursor = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return {
+        "schema_version": 1,
+        "stored_session_id": session_id,
+        "turn_id": turn_id,
+        "group_id": group_id,
+        "source_head_id": int(status["display_revision"]),
+        "operations": [
+            {
+                "operation_id": str(item["operation_id"]),
+                "group_id": group_id,
+                "ordinal": int(item["ordinal"]),
+                "kind": str(item["category"]),
+                "safe_label": str(item["safe_label"]),
+                "state": str(item["state"]),
+                "started_at": item.get("started_at"),
+                "completed_at": item.get("completed_at"),
+                # Raw detail stays disabled until the upstream observer seam
+                # can prove bounded, redacted retrieval without private access.
+                "detail_available": False,
+            }
+            for item in page
+        ],
+        "next_cursor": next_cursor,
+    }
+
+
 def _project_turn(
     db: Any,
     session_id: str,

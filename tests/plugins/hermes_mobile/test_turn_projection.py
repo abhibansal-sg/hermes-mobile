@@ -187,6 +187,28 @@ def test_adjacent_safe_operations_group_without_persisting_payloads(tmp_path):
     ]
     assert all("args" not in item and "result" not in item for item in groups)
 
+    page = projection.build_operation_header_page(
+        db,
+        session_id="s1",
+        turn_id="turn_1",
+        group_id=groups[0]["group_id"],
+        limit=1,
+    )
+    assert len(page["operations"]) == 1
+    assert page["next_cursor"] is not None
+    assert page["operations"][0]["detail_available"] is False
+    assert "args" not in page["operations"][0]
+    second = projection.build_operation_header_page(
+        db,
+        session_id="s1",
+        turn_id="turn_1",
+        group_id=groups[0]["group_id"],
+        cursor=page["next_cursor"],
+        limit=1,
+    )
+    assert len(second["operations"]) == 1
+    assert second["next_cursor"] is None
+
 
 def test_historical_backfill_is_bounded_restartable_and_safe(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))

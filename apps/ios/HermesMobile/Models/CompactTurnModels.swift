@@ -89,3 +89,27 @@ struct CompactTurnProjectionStateV1: Sendable, Equatable {
     let hasOlder: Bool
     let coverageComplete: Bool
 }
+
+struct TurnOperationHeaderPageV1: Decodable, Sendable, Equatable {
+    let schemaVersion: Int
+    let storedSessionID: String
+    let turnID: String
+    let groupID: String
+    let sourceHeadID: Int64
+    let operations: [TurnOperationHeaderV1]
+    let nextCursor: String?
+}
+
+struct TurnOperationHeaderV1: Decodable, Sendable, Equatable, Identifiable {
+    let operationID: String
+    let groupID: String
+    let ordinal: Int
+    let kind: String
+    let safeLabel: String
+    let state: String
+    let startedAt: Double?
+    let completedAt: Double?
+    let detailAvailable: Bool
+
+    var id: String { operationID }
+}

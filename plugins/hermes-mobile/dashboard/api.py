@@ -2207,6 +2207,45 @@ async def session_turns(
             pass
 
 
+@router.get("/sessions/{session_id}/turns/{turn_id}/operations")
+async def session_turn_operations(
+    session_id: str,
+    turn_id: str,
+    request: Request,
+    group_id: str = Query(..., min_length=1, max_length=128),
+    profile: str = "default",
+    cursor: str | None = Query(None, max_length=1024),
+    limit: int = Query(50, ge=1, le=100),
+):
+    """Return bounded safe operation headers; never raw tool payloads."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if _is_device_auth(request) and not _device_has_scope(request, "chat"):
+        raise HTTPException(status_code=403, detail="Device token lacks chat scope")
+    if not _device_owns_stored_session(request, profile, session_id):
+        raise HTTPException(status_code=403, detail="Device token does not own session")
+    from hermes_state import DEFAULT_DB_PATH, SessionDB
+
+    if not DEFAULT_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="state.db unavailable")
+    db = None
+    try:
+        db = SessionDB(read_only=True)
+        return _plugin_module("turn_projection").build_operation_header_page(
+            db,
+            session_id=session_id,
+            turn_id=turn_id,
+            group_id=group_id,
+            cursor=cursor,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        if db is not None:
+            db.close()
+
+
 @router.get("/sessions/{session_id}/messages/around")
 async def session_messages_around(
     session_id: str,

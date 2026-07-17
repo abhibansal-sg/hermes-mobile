@@ -61,4 +61,53 @@ extension RestClient {
         }
         return page
     }
+
+    func turnOperationHeaders(
+        storedSessionID: String,
+        turnID: String,
+        groupID: String,
+        profile: String,
+        cursor: String? = nil,
+        limit: Int = 50
+    ) async throws -> TurnOperationHeaderPageV1 {
+        guard pathStyle == .plugin,
+              !storedSessionID.isEmpty,
+              !turnID.isEmpty,
+              !groupID.isEmpty,
+              !profile.isEmpty,
+              (1...100).contains(limit) else {
+            throw RestError.decoding("turnOperationHeadersV1: invalid request contract")
+        }
+        var items = [
+            URLQueryItem(name: "profile", value: profile),
+            URLQueryItem(name: "group_id", value: groupID),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+        if let cursor, !cursor.isEmpty {
+            items.append(URLQueryItem(name: "cursor", value: cursor))
+        }
+        var components = URLComponents()
+        components.queryItems = items
+        let session = storedSessionID.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? storedSessionID
+        let turn = turnID.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? turnID
+        let data = try await get(
+            path: "\(mobileAPIPrefix)/sessions/\(session)/turns/\(turn)/operations?\(components.percentEncodedQuery ?? "")"
+        )
+        let page = try decode(
+            TurnOperationHeaderPageV1.self,
+            from: data,
+            context: "turnOperationHeadersV1"
+        )
+        guard page.schemaVersion == 1,
+              page.storedSessionID == storedSessionID,
+              page.turnID == turnID,
+              page.groupID == groupID else {
+            throw RestError.decoding("turnOperationHeadersV1: incompatible response")
+        }
+        return page
+    }
 }
