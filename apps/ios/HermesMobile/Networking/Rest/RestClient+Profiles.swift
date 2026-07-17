@@ -210,6 +210,25 @@ extension RestClient {
         ).title) ?? title
     }
 
+    /// Profile-scoped archive mutation for aggregate rails. The gateway accepts
+    /// the profile discriminator in the PATCH body alongside `archived`.
+    func setSessionArchived(id: String, archived: Bool, profile: String?) async throws {
+        guard let profile, !profile.isEmpty else {
+            return try await setSessionArchived(id: id, archived: archived)
+        }
+        let encodedId = id.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? id
+        let body: JSONValue = .object([
+            "archived": .bool(archived),
+            "profile": .string(profile),
+        ])
+        var request = makeRequest(path: "/api/sessions/\(encodedId)", method: "PATCH")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encodeBody(body, context: "patch")
+        _ = try await perform(request)
+    }
+
     // MARK: - Helpers
 
     /// Build a single `profile=…` query fragment, percent-encoding the name so a

@@ -232,6 +232,7 @@ targets:
       - HermesMobile/Work
       - HermesMobile/Models/JSONValue.swift
       - HermesMobile/Stores/OutboxProcessor.swift
+      - HermesMobile/Support/ReliabilityDiagnostics.swift
     dependencies:
       - package: GRDB
         product: GRDB
