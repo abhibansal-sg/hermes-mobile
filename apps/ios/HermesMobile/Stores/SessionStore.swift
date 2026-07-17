@@ -473,6 +473,11 @@ final class SessionStore {
         return selectedProfileID(for: summary) == activeStoredProfile
     }
 
+    var activeScopedIdentity: String? {
+        guard let activeStoredId else { return nil }
+        return "\(activeStoredProfile ?? Self.defaultProfileName)\u{1F}\(activeStoredId)"
+    }
+
     /// Draft identity for a stored session id, using the exact fallback ChatView
     /// uses for the brand-new local chat.
     static func composerDraftKey(storedSessionId: String?) -> String {
@@ -1394,7 +1399,7 @@ final class SessionStore {
         }.filter(Self.isHumanRecentsSession)
 
         sessions = projectedSessions
-        seenServerSessionIds = Set(projectedSessions.map(\.id))
+        seenServerSessionIds = Set(projectedSessions.map(sessionListIdentity))
         loadedCount = projectedSessions.count
         loadedOffset = projectedSessions.count
         totalSessions = projectedSessions.count
@@ -1714,13 +1719,17 @@ final class SessionStore {
     /// drawer never publishes two SwiftUI rows with the same identity.
     static func filterCachedSessions(
         _ rows: [SessionSummary],
-        activeProfile: String
+        activeProfile: String,
+        untaggedProfile: String? = nil
     ) -> [SessionSummary] {
         let requested = activeProfile.trimmingCharacters(in: .whitespacesAndNewlines)
         let allProfiles = requested.isEmpty || requested == CacheScope.allProfilesKey
         var seenScopedIDs: Set<String> = []
         return rows.filter { row in
-            let rowProfile = normalizedProfileID(row.profile)
+            let explicit = row.profile?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let rowProfile = explicit.isEmpty
+                ? (untaggedProfile ?? Self.defaultProfileName)
+                : explicit
             guard allProfiles || rowProfile == requested else {
                 return false
             }
@@ -2191,7 +2200,10 @@ final class SessionStore {
             } else {
                 cached = Self.filterCachedSessions(
                     try await cacheStore.loadSessionList(scope: scope),
-                    activeProfile: activeProfile
+                    activeProfile: activeProfile,
+                    untaggedProfile: scope.profileId == CacheScope.allProfilesKey
+                        ? nil
+                        : scope.profileId
                 )
             }
             cacheReadSucceeded = true
@@ -2233,7 +2245,7 @@ final class SessionStore {
                     // ABH-373: seed all-seen ids from the RAW cached page
                     // (before the machinery filter) so the cursor math on
                     // subsequent grow-limit appends is accurate.
-                    seenServerSessionIds = Set(cached.map(\.id))
+                    seenServerSessionIds = Set(cached.map(sessionListIdentity))
                     loadedCount = cached.count
                     if let lastOpened = try? await cacheStore.loadLastOpenedSession(scope: scope),
                        currentCacheScope == scope,
@@ -2879,6 +2891,10 @@ final class SessionStore {
     /// `sessions` array rather than replacing it. Deduplication is by `id`.
     /// Working-set survivor logic is skipped on appended pages (the first-page
     /// already carries those survivors). `loadedCount` is advanced accordingly.
+    private func sessionListIdentity(_ row: SessionSummary) -> String {
+        usesAggregateRail ? row.scopedIdentity : row.id
+    }
+
     private func mergeSessionPage(_ page: [SessionSummary], total: Int?, isAppend: Bool = false) {
         // ABH-373: Gate machinery at INGRESS. Every path that writes into
         // `sessions` — fetch, WS-triggered refresh, background refresh, load-more
@@ -2908,7 +2924,7 @@ final class SessionStore {
         //    local-only, never delivered by the server), which is exactly why it
         //    must never be used for row inclusion.
         let rawCount = page.count
-        let pageIds = page.map(\.id)
+        let pageIds = page.map(sessionListIdentity)
         let incoming = page.filter(Self.isHumanRecentsSession)
         // Update the total count when the server provides it.
         if let total { totalSessions = total }
@@ -2924,8 +2940,8 @@ final class SessionStore {
             // duplicate Identifiable id in `sessions` → SwiftUI ForEach undefined
             // behavior. Dedupe against the rendered set guarantees each id is
             // present exactly once.
-            let existingIds = Set(sessions.map(\.id))
-            let newRows = incoming.filter { !existingIds.contains($0.id) }
+            let existingIds = Set(sessions.map(sessionListIdentity))
+            let newRows = incoming.filter { !existingIds.contains(sessionListIdentity($0)) }
             // ABH-373: the CURSOR advance dedupe stays against `seenServerSessionIds`
             // (all server rows ever consumed, including filtered machinery). A
             // grow-limit page returns the full expanded window, so rows from earlier
@@ -2944,14 +2960,16 @@ final class SessionStore {
         sessionListUniverseRevision &+= 1
 
         // First-page (replace) path — original ABH-86 merge semantics.
-        let incomingIds = Set(incoming.map(\.id))
+        let incomingIds = Set(incoming.map(sessionListIdentity))
 
         // Working-set: active session + live/working + pinned. These survive
         // even if the server's current page window omits them.
         let workingIds = workingSetSessionIds()
 
         // Survivors: current rows absent from the incoming page but in the working set.
-        let survivors = sessions.filter { !incomingIds.contains($0.id) && workingIds.contains($0.id) }
+        let survivors = sessions.filter {
+            !incomingIds.contains(sessionListIdentity($0)) && workingIds.contains($0.id)
+        }
 
         // ABH-86: carry a HIGHER local `lastActive` forward over the incoming
         // server value. `noteActivity` optimistically bumps a session to NOW on a
@@ -2962,7 +2980,7 @@ final class SessionStore {
         // so `max(local, server)` keeps the optimistic position until the server
         // genuinely catches up, then converges to the authoritative value.
         let priorLastActive: [String: Double] = sessions.reduce(into: [:]) { acc, s in
-            if let la = s.lastActive { acc[s.id] = la }
+            if let la = s.lastActive { acc[sessionListIdentity(s)] = la }
         }
         // ABH-178 — gate the carry-forward on an EXPLICIT per-turn flag
         // (turnsInProgress) instead of the 10s liveWindow time-proxy. The
@@ -2978,7 +2996,7 @@ final class SessionStore {
         // NOTE: `lastActivityAt` / `liveWindow` are PRESERVED for the live-dot
         // (the pulsing row indicator) — only this carry-forward gate has changed.
         let reconciled = incoming.map { row -> SessionSummary in
-            guard let prior = priorLastActive[row.id],
+            guard let prior = priorLastActive[sessionListIdentity(row)],
                   turnsInProgress.contains(row.id),
                   prior > (row.lastActive ?? -.greatestFiniteMagnitude) else { return row }
             var bumped = row
@@ -4081,8 +4099,8 @@ final class SessionStore {
         //     then evict it server-side so the delete doesn't trip the live
         //     guard. Best-effort: the server auto-evicts even if these are
         //     skipped, so neither blocks the delete attempt.
-        let isActive = summary.id == activeStoredId || summary.id == activeRuntimeId
-        if isActive {
+        let wasActive = isActive(summary) || summary.id == activeRuntimeId
+        if wasActive {
             guard let send = resolvedRPCSend else { return }
             // RIDER: stop the actively-streaming runtime before tearing it down.
             await resolvedInterruptActive()
@@ -4119,11 +4137,11 @@ final class SessionStore {
                     .object(["session_id": .string(summary.id)])
                 )
             }
-            sessions.removeAll { $0.id == summary.id }
+            sessions.removeAll { $0.scopedIdentity == summary.scopedIdentity }
             if pinnedIds.remove(summary.id) != nil { persistPins() }
             // `clearActive()` already ran above for the active case; this covers
             // the rare drift where only the runtime id matched.
-            if summary.id == activeStoredId || summary.id == activeRuntimeId {
+            if wasActive {
                 clearActive()
             }
             lastError = nil

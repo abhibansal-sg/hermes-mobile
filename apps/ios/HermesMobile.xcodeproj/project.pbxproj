@@ -137,6 +137,7 @@
 		539350B019B2A6C43C29AA0D /* LegacyWorkImport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 82E8A9A59C0ADDFBC04FFB86 /* LegacyWorkImport.swift */; };
 		53F9E9B3817E1304616E05F5 /* ModelVisibility.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9B3A5A512228E30192F9A46 /* ModelVisibility.swift */; };
 		53F9E9B3817E1304616E05F6 /* ReliabilityDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9B3A5A512228E30192F9A47 /* ReliabilityDiagnostics.swift */; };
+		53F9E9B3817E1304616E05F7 /* ReliabilityDiagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9B3A5A512228E30192F9A47 /* ReliabilityDiagnostics.swift */; };
 		54686750D0C4FE410E9243C9 /* WorkRepositoryMigrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A172531C6FF34F26EAC2250 /* WorkRepositoryMigrationTests.swift */; };
 		55B47C00B82831A1B8D9B415 /* TransferRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50CD5E2BEB3ECDDEC0B841B0 /* TransferRepository.swift */; };
 		5675C935E246127C3E340670 /* HelpLinks.swift in Sources */ = {isa = PBXBuildFile; fileRef = F46748EDF1C6701ACB8E5CA1 /* HelpLinks.swift */; };
@@ -1819,6 +1820,7 @@
 				EAB0A46D600694DF0FB0A3B1 /* LegacyWorkImportTests.swift in Sources */,
 				9888CC47CB9394490D908EFC /* OutboxCrashBoundaryTests.swift in Sources */,
 				6FEC2FE6E13B4990022D66F6 /* OutboxProcessor.swift in Sources */,
+				53F9E9B3817E1304616E05F7 /* ReliabilityDiagnostics.swift in Sources */,
 				9E10281C71D95692B4FF522D /* OutboxProcessorTests.swift in Sources */,
 				E26B78AD7AF3E37EC271EABC /* SharedStore.swift in Sources */,
 				56BC37EF262F7A7027F0A443 /* WorkRecords.swift in Sources */,

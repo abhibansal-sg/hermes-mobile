@@ -2454,15 +2454,15 @@ final class ConnectionStore {
         // selection changed is supersession instead: follow the latest intent
         // (coalesced with any readiness-released `open()` task) rather than
         // treating the old A failure as B's failure.
-        var selectedId = sessionStore.activeStoredId
-        while let expectedStoredId = selectedId {
+        var selectedIdentity = sessionStore.activeScopedIdentity
+        while let expectedIdentity = selectedIdentity {
             let resumedRuntime = await sessionStore.resumeActiveAfterReconnect()
             guard isActiveGeneration(generation) else { return false }
             if resumedRuntime != nil { break }
 
-            let latestStoredId = sessionStore.activeStoredId
-            guard latestStoredId != expectedStoredId else { return false }
-            selectedId = latestStoredId
+            let latestIdentity = sessionStore.activeScopedIdentity
+            guard latestIdentity != expectedIdentity else { return false }
+            selectedIdentity = latestIdentity
         }
         if sessionStore.activeStoredId != nil {
             await chatStore.backfill()
