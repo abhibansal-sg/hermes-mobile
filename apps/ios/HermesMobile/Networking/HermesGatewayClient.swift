@@ -31,6 +31,25 @@ extension GatewayWebSocketTask {
     func sendPing() async throws {}
 }
 
+/// Serializes completion of the callback-based URLSession ping bridge.
+///
+/// URLSession can race a ping completion with task cancellation when the app
+/// returns from the background. Only the first callback may resume the checked
+/// continuation; a second resume is a process-terminating Swift trap.
+final class GatewayPingCompletionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !completed else { return false }
+        completed = true
+        return true
+    }
+}
+
 extension URLSessionWebSocketTask: GatewayWebSocketTask {
     func sendPing() async throws {
         // MUST use withTaskCancellationHandler: when `probeLiveness` times out
@@ -42,7 +61,10 @@ extension URLSessionWebSocketTask: GatewayWebSocketTask {
         // continuation resolves and `probeLiveness` returns within ~livenessPingTimeout.
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let completionGate = GatewayPingCompletionGate()
                 self.sendPing { error in
+                    guard completionGate.claim() else { return }
+
                     if let error {
                         continuation.resume(throwing: error)
                     } else {

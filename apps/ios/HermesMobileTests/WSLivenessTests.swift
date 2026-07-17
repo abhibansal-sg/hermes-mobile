@@ -4,7 +4,7 @@ import XCTest
 /// ABH-177 + ABH-182 Inc-1/Inc-3 — WS liveness ping, orphaned-LA reconcile,
 /// and stale-window tightening.
 ///
-/// Seven deterministic tests (no device, no live gateway):
+/// Deterministic tests (no device, no live gateway):
 ///
 /// (a) Dead ping → `probeLiveness` returns `false` and state transitions to `.failed`.
 /// (b) Healthy ping → `probeLiveness` returns `true` and state stays `.open`.
@@ -18,10 +18,29 @@ import XCTest
 ///     wiring in `ConnectionStore` is correct end-to-end (Must-Fix #2b).
 /// (g) STALE WINDOW: pins `LiveActivityManager.staleAfter` to 5 min and verifies
 ///     the rolling-window safety invariant (ABH-182 Inc-3).
+/// (h) PING COMPLETION: concurrent duplicate URLSession callbacks may claim the
+///     checked continuation exactly once (build 118 background-resume crash).
 @MainActor
 final class WSLivenessTests: XCTestCase {
 
     // MARK: - Mock transports
+
+    private final class ThreadSafeCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage = 0
+
+        func increment() {
+            lock.lock()
+            storage += 1
+            lock.unlock()
+        }
+
+        var value: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+    }
 
     /// Opens normally (delivers `gateway.ready`) and lets `sendPing` succeed
     /// promptly. Used for the "socket alive" path.
@@ -227,6 +246,25 @@ final class WSLivenessTests: XCTestCase {
     /// (no backoff) on the simulator.
     private func settle() async {
         try? await Task.sleep(for: .milliseconds(600))
+    }
+
+    // MARK: - (h) Duplicate ping callbacks resume the continuation once
+
+    /// Build 118 crashed after background → foreground because URLSession raced
+    /// ping cancellation with its completion callback and attempted to resume the
+    /// same checked continuation twice. Exercise the gate concurrently so both
+    /// serialized and cross-thread duplicate callbacks remain harmless.
+    func testPingCompletionGateAllowsExactlyOneClaim() {
+        let gate = GatewayPingCompletionGate()
+        let claimCount = ThreadSafeCounter()
+
+        DispatchQueue.concurrentPerform(iterations: 100) { _ in
+            guard gate.claim() else { return }
+            claimCount.increment()
+        }
+
+        XCTAssertEqual(claimCount.value, 1)
+        XCTAssertFalse(gate.claim(), "the continuation must remain completed")
     }
 
     // MARK: - (a) Dead ping → state transitions to .failed
