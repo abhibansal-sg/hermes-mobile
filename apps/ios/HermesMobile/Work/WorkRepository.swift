@@ -508,6 +508,7 @@ actor WorkRepository {
         activeStoredSessionID: String? = nil,
         enforceSessionAffinity: Bool = false,
         outboxOnly: Bool = false,
+        allowTransportJobs: Bool = true,
         owner: String,
         now: Date,
         leaseDuration: TimeInterval
@@ -553,6 +554,19 @@ actor WorkRepository {
                 WorkJobKind.appIntent.rawValue,
             ]
         }
+        let transportSQL: String
+        if allowTransportJobs {
+            transportSQL = ""
+        } else {
+            // Keep local navigation intents claimable while the WebSocket is
+            // unavailable, but leave every transport-backed job untouched.
+            transportSQL = " AND (kind = ? AND intent_kind IN (?, ?))"
+            arguments += [
+                WorkJobKind.appIntent.rawValue,
+                WorkIntentKind.openSessions.rawValue,
+                WorkIntentKind.newSession.rawValue,
+            ]
+        }
 
         return try database.write { db in
             try WorkJob.fetchOne(
@@ -574,6 +588,7 @@ actor WorkRepository {
                           \(scopeSQL)
                           \(affinitySQL)
                           \(outboxSQL)
+                          \(transportSQL)
                         ORDER BY created_at ASC, job_id ASC
                         LIMIT 1
                     )

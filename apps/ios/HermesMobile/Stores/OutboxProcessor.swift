@@ -119,6 +119,7 @@ final class OutboxProcessor {
         guard let scope = dependencies.currentScope() else { return }
         while !Task.isCancelled {
             let activeStoredID = dependencies.activeStoredSessionID()
+            let canProcessPrompt = dependencies.canProcessPrompt()
             let job: WorkJob
             do {
                 guard let claimed = try await repository.claimNextJob(
@@ -126,6 +127,7 @@ final class OutboxProcessor {
                     activeStoredSessionID: activeStoredID,
                     enforceSessionAffinity: true,
                     outboxOnly: true,
+                    allowTransportJobs: canProcessPrompt,
                     owner: owner,
                     now: Date(),
                     leaseDuration: Self.leaseDuration

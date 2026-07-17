@@ -250,6 +250,87 @@ final class CacheFirstLaunchTests: XCTestCase {
         XCTAssertNotEqual(defaultIdentity.profileId, restored?.profileId)
     }
 
+    func testProfileSwitchFencesInFlightRefreshPublicationAndCacheScope() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        connection.serverURLString = serverURL
+        sessions.sessions = [makeSummary(id: "existing")]
+
+        let gate = ResumeGate()
+        sessions.sessionsFetch = {
+            await gate.suspend()
+            return ([self.makeSummary(id: "old-profile")], 1)
+        }
+        let refreshTask = Task { await sessions.refresh() }
+        await gate.waitUntilEntered()
+
+        sessions.activeProfile = "work"
+        gate.release()
+        await refreshTask.value
+
+        XCTAssertEqual(sessions.sessions.map(\.id), ["existing"])
+        let workRows = try await cache.loadSessionList(
+            scope: CacheScope(serverId: serverURL, profileId: "work")
+        )
+        XCTAssertNil(workRows.first(where: { $0.id == "old-profile" }))
+    }
+
+    func testCachedRowUsesSummaryProfileWhenNetworkProfileThreadingIsUnavailable() async throws {
+        let (connection, sessions, chat) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        chat.attachCache(cache)
+        connection.serverURLString = serverURL
+        sessions.profileThreadingAvailableForTesting = false
+
+        let row = makeSummary(id: "work-row", lastActive: 100, profile: "work")
+        sessions.sessions = [row]
+        let workIdentity = CacheIdentity(serverId: serverURL, profileId: "work", sessionId: row.id)
+        try await cache.saveSessionList([row], scope: CacheScope(serverId: serverURL, profileId: "all"))
+        try await cache.saveTranscript(identity: workIdentity, messages: [stubStored("cached work")])
+        sessions.transcriptFetchWithProfile = { _, profile in
+            XCTAssertNil(profile, "network profile params remain capability-gated")
+            throw GatewayError.notConnected
+        }
+
+        sessions.open(row, bindRuntime: false)
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(chat.messages.last?.text, "cached work")
+    }
+
+    func testTranscriptPublishAndCacheWriteAreFencedByTransportReplacement() async throws {
+        let (connection, sessions, chat) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        chat.attachCache(cache)
+        connection.serverURLString = serverURL
+        connection._seedConnectedForTesting(serverURL: serverURL, token: "token")
+
+        let gate = ResumeGate()
+        let row = makeSummary(id: "transport-row", lastActive: 100)
+        sessions.sessions = [row]
+        sessions.transcriptFetchWithProfile = { _, _ in
+            await gate.suspend()
+            return [stubStored("stale transport response")]
+        }
+        sessions.open(row, bindRuntime: false)
+        await gate.waitUntilEntered()
+
+        // Replacing the same gateway transport invalidates the old transcript
+        // task without changing the user's selected stored session.
+        connection._seedConnectedForTesting(serverURL: serverURL, token: "token")
+        gate.release()
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertNil(chat.messages.last?.text)
+        let hasStaleTranscript = try await cache.hasTranscript(
+            CacheIdentity(serverId: serverURL, profileId: "default", sessionId: row.id)
+        )
+        XCTAssertFalse(hasStaleTranscript)
+    }
+
     func testSupersededOpenCannotPersistOlderLastOpenedSelection() async throws {
         let (connection, sessions, _) = makeGraph()
         let cache = try makeInMemoryCache()
