@@ -26,11 +26,7 @@ enum SharedInboxDrainer {
                     try await repository.bindPendingShares(to: scope)
                 }
                 await queue.refresh()
-                let count = queue.items.filter {
-                    $0.kind == .share
-                        && $0.displayState != .sent
-                        && $0.displayState != .cancelled
-                }.count
+                let count = queue.pendingShareCount
                 queue.wake()
                 if count > 0 { onQueued?(count) }
             } catch {
