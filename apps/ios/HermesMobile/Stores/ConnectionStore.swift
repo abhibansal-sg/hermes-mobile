@@ -1423,6 +1423,7 @@ final class ConnectionStore {
                 returningTo: nil, clearSpotlight: true, generation: generation
             )
             guard isCurrentGeneration(generation) else { return }
+            sessionStore.removeForgottenGatewayState()
             phase = .needsSetup
             return
         }
@@ -1440,6 +1441,7 @@ final class ConnectionStore {
         guard isCurrentGeneration(generation) else { return }
         await stopLiveWork(returningTo: nil, clearSpotlight: true, generation: generation)
         guard isCurrentGeneration(generation) else { return }
+        sessionStore.removeForgottenGatewayState()
         try? await cacheStore?.purgeGateway(serverId: server)
         guard isCurrentGeneration(generation) else { return }
         await queueStore?.removeAll()

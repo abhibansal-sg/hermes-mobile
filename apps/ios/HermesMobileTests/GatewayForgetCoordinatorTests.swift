@@ -3,7 +3,7 @@ import XCTest
 
 @MainActor
 final class GatewayForgetCoordinatorTests: XCTestCase {
-    private func makeStore() throws -> (ConnectionStore, QueueStore, InboxStore, URL) {
+    private func makeStore() throws -> (ConnectionStore, SessionStore, ChatStore, QueueStore, InboxStore, URL) {
         let sessions = SessionStore()
         let chat = ChatStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
@@ -19,7 +19,7 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
         let inbox = InboxStore()
         connection.queueStore = queue
         connection.inboxStore = inbox
-        return (connection, queue, inbox, test.directory)
+        return (connection, sessions, chat, queue, inbox, test.directory)
     }
 
     func testRemoteFailureCannotBlockLocalForgetAndLeavesMinimalTombstone() async throws {
@@ -33,7 +33,7 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
             defaults.removeObject(forKey: DefaultsKeys.gatewayCleanupTombstone)
             defaults.removeObject(forKey: DefaultsKeys.pendingIntentPrompt)
         }
-        let (connection, queue, _, directory) = try makeStore()
+        let (connection, _, _, queue, _, directory) = try makeStore()
         defer { try? FileManager.default.removeItem(at: directory) }
         _ = await queue.enqueue("private queued prompt")
 
@@ -64,7 +64,7 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
             DefaultsKeys.setDeviceId(nil, server: other)
             KeychainService.deleteToken(server: server)
         }
-        let (connection, _, _, directory) = try makeStore()
+        let (connection, _, _, _, _, directory) = try makeStore()
         defer { try? FileManager.default.removeItem(at: directory) }
         await connection.forgetGateway()
         await connection.forgetGateway()
@@ -73,6 +73,42 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
         XCTAssertEqual(connection.phase, .needsSetup)
         XCTAssertFalse(connection.hasConnected)
         XCTAssertNil(connection.reconnectTask)
+    }
+
+    func testForgetClearsPublishedDrawerAndTranscriptBeforeRepairing() async throws {
+        let defaults = UserDefaults.standard
+        let server = "https://forgotten-memory.example"
+        defaults.set(server, forKey: DefaultsKeys.serverURL)
+        let (connection, sessions, chat, _, _, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        sessions.sessions = [SessionSummary(
+            id: "private-session",
+            title: "Private chat",
+            preview: "cached preview",
+            startedAt: 1,
+            messageCount: 1,
+            source: "ios",
+            lastActive: 2,
+            cwd: nil
+        )]
+        sessions.activeStoredId = "private-session"
+        sessions.activeRuntimeId = "runtime-private"
+        chat.seed(from: [StoredMessage(json: .object([
+            "role": .string("assistant"),
+            "content": .string("private cached transcript"),
+        ]))!])
+        XCTAssertFalse(sessions.sessions.isEmpty)
+        XCTAssertFalse(chat.messages.isEmpty)
+
+        await connection.forgetGateway()
+
+        XCTAssertTrue(sessions.sessions.isEmpty)
+        XCTAssertNil(sessions.activeStoredId)
+        XCTAssertNil(sessions.activeRuntimeId)
+        XCTAssertTrue(chat.messages.isEmpty)
+        XCTAssertEqual(sessions.manifestRevision, 0)
+        XCTAssertEqual(connection.phase, .needsSetup)
     }
 }
 
