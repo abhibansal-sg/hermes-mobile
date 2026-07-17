@@ -972,6 +972,36 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         await connection.waitForReconnectForTesting()
     }
 
+    func testTransportDropInvalidatesRuntimeButRetainsLatestStoredSelection() async {
+        let (connection, sessions, _) = makeStore()
+        let gate = SuspensionGate()
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        sessions.activeStoredId = "A"
+        sessions.resumeRPC = { requested, _ in
+            XCTAssertEqual(requested, "A")
+            return self.stagedResumeResult(sessionId: "runtime-A", resumed: "A")
+        }
+        let resumed = await sessions.resumeActiveAfterReconnect()
+        XCTAssertEqual(resumed, "runtime-A")
+        XCTAssertEqual(sessions.activeRuntimeId, "runtime-A")
+
+        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection._handleGatewayStateForTesting(.failed("background socket dropped"))
+        await gate.waitUntilEntered()
+
+        XCTAssertEqual(sessions.activeStoredId, "A",
+                       "the durable drawer selection survives transient reconnect")
+        XCTAssertNil(sessions.activeRuntimeId,
+                     "a runtime from the dropped transport epoch may not be reused")
+        XCTAssertNil(sessions.sessionActionError,
+                     "transport loss is not a user-visible session-open failure")
+
+        await gate.release()
+        await connection.waitForReconnectForTesting()
+    }
+
     // MARK: - ABH-448 connection-generation fencing
 
     func testLateOpenAndClosedFromForgottenGenerationCannotRestoreConnection() async {

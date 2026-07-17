@@ -635,6 +635,7 @@ final class ConnectionStore {
     private func advanceConnectionGeneration() -> UInt64 {
         connectionGeneration &+= 1
         setTransportReadiness(.unconfigured, resolveWaiters: true)
+        sessionStore.transportDidBecomeUnavailable()
         sessionStore.invalidateConnectionWork()
         return connectionGeneration
     }
@@ -708,6 +709,9 @@ final class ConnectionStore {
         switch transportReadiness {
         case .ready(let epoch), .connecting(let epoch), .unavailable(let epoch):
             setTransportReadiness(.unavailable(epoch: epoch))
+            // The stored selection survives grace/reconnect, but its runtime id
+            // was minted by the dropped socket and is no longer admissible.
+            sessionStore.transportDidBecomeUnavailable()
         case .unconfigured, .reauthRequired:
             break
         }
@@ -1237,12 +1241,14 @@ final class ConnectionStore {
         // this is the first point at which operational RPC admission is allowed.
         acceptCurrentTransport()
 
-        if !previousServerURL.isEmpty, previousServerURL != trimmedURL {
+        let switchedServers = !previousServerURL.isEmpty && previousServerURL != trimmedURL
+        if switchedServers {
             // ABH-410 follow-up: when a verified re-pair switches servers, purge
             // the previous server's indexed session titles from Spotlight before
             // the new URL becomes the cache/index identity.
             Self.log.notice("Server switch clearing Hermes Spotlight session index")
             Self.clearSpotlightSessionIndexForPrivacy()
+            sessionStore.invalidateGatewayScopeWork()
         }
 
         // Persist only after a verified connection.
@@ -1271,6 +1277,15 @@ final class ConnectionStore {
         // A verified connection clears any prior re-pair flag and failure tally.
         reauthRequired = false
         consecutiveReconnectFailures = 0
+        // A cold cache restore intentionally selected/painted without issuing
+        // RPC. Now that `gateway.ready` accepted this epoch, bind that latest
+        // durable selection in the background; its token/epoch guards make a
+        // newer drawer tap win while hydration continues independently.
+        if !switchedServers, sessionStore.activeStoredId != nil {
+            Task { [weak self] in
+                await self?.sessionStore.resumeActiveAfterReconnect()
+            }
+        }
         // ABH-82: enter the branded loading screen rather than flashing the empty
         // shell. The hydration coordinator below flips this to `.connected` once
         // the gateway state has been pulled (or the timeout fires first).

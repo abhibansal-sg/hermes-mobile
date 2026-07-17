@@ -62,11 +62,11 @@ final class CacheFirstLaunchTests: XCTestCase {
     }
 
     private func makeSummary(
-        id: String, lastActive: Double? = 100, source: String? = nil
+        id: String, lastActive: Double? = 100, source: String? = nil, profile: String? = nil
     ) -> SessionSummary {
         SessionSummary(
             id: id, title: "T-\(id)", preview: nil, startedAt: 1_000,
-            messageCount: 3, source: source, lastActive: lastActive, cwd: nil
+            messageCount: 3, source: source, lastActive: lastActive, cwd: nil, profile: profile
         )
     }
 
@@ -126,6 +126,23 @@ final class CacheFirstLaunchTests: XCTestCase {
         XCTAssertTrue(sessions.sessions.isEmpty)
     }
 
+    func testCachePaintRetriesAfterPreBootstrapCallGetsNoScope() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+
+        // This must not consume the cold-read latch: bootstrap has not yet
+        // supplied a server identity, so no cache partition is valid.
+        await sessions.paintFromCache()
+
+        connection.serverURLString = serverURL
+        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
+        try await cache.saveSessionList([makeSummary(id: "after-bind")], scope: scope)
+        await sessions.paintFromCache()
+
+        XCTAssertEqual(sessions.sessions.map(\.id), ["after-bind"])
+    }
+
     func testHydratingUsesCachedShellButEmptyScopeUsesLoader() {
         XCTAssertTrue(RootContentPolicy.showsCachedShell(
             phase: .hydrating, hasCachedContent: true
@@ -177,6 +194,100 @@ final class CacheFirstLaunchTests: XCTestCase {
 
         XCTAssertEqual(sessions.activeStoredId, "remembered")
         XCTAssertEqual(chat.messages.last?.text, "from disk")
+    }
+
+    func testCacheRestoreSelectsAndPaintsWithoutStartingResume() async throws {
+        let (connection, sessions, chat) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        chat.attachCache(cache)
+        connection.serverURLString = serverURL
+        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
+        let identity = CacheIdentity(serverId: serverURL, profileId: "default", sessionId: "remembered")
+        try await cache.saveSessionList([makeSummary(id: "remembered")], scope: scope)
+        try await cache.saveTranscript(identity: identity, messages: [stubStored("offline")])
+        try await cache.saveLastOpenedSession(identity, manifestScope: scope)
+
+        let resumeCalls = TestActorBox<Int>(0)
+        sessions.resumeRPC = { _, _ in
+            await resumeCalls.increment()
+            throw GatewayError.notConnected
+        }
+
+        await sessions.paintFromCache()
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(sessions.activeStoredId, "remembered")
+        XCTAssertEqual(chat.messages.last?.text, "offline")
+        let calls = await resumeCalls.value
+        XCTAssertEqual(calls, 0,
+                       "cold cache restoration is local paint only; no RPC may start before readiness")
+        XCTAssertNil(sessions.sessionActionError)
+    }
+
+    func testAllProfilesRestoreRequiresExactSavedProfile() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        connection.serverURLString = serverURL
+        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
+        let defaultIdentity = CacheIdentity(serverId: serverURL, profileId: "default", sessionId: "shared")
+        let workIdentity = CacheIdentity(serverId: serverURL, profileId: "work", sessionId: "shared")
+        try await cache.saveSessionList([
+            makeSummary(id: "shared", lastActive: 200, profile: "default"),
+            makeSummary(id: "shared", lastActive: 100, profile: "work"),
+        ], scope: scope)
+        try await cache.saveLastOpenedSession(workIdentity, manifestScope: scope)
+
+        await sessions.paintFromCache()
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(sessions.activeStoredId, "shared")
+        // Exact-profile selection is observable through the persisted identity:
+        // opening the default duplicate would overwrite this with default.
+        let restored = try await cache.loadLastOpenedSession(scope: scope)
+        XCTAssertEqual(restored?.profileId, "work")
+        XCTAssertNotEqual(defaultIdentity.profileId, restored?.profileId)
+    }
+
+    func testSupersededOpenCannotPersistOlderLastOpenedSelection() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        connection.serverURLString = serverURL
+        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
+
+        sessions.open(makeSummary(id: "A"), bindRuntime: false)
+        sessions.open(makeSummary(id: "B"), bindRuntime: false)
+        await sessions.waitForPendingOpenForTesting()
+
+        let last = try await cache.loadLastOpenedSession(scope: scope)
+        XCTAssertEqual(last?.sessionId, "B")
+    }
+
+    func testLateResumeForOlderSelectionCannotReplaceNewestRuntime() async {
+        let (_, sessions, _) = makeGraph()
+        let gate = ResumeGate()
+        sessions.resumeRPC = { stored, _ in
+            if stored == "A" { await gate.suspend() }
+            return JSONValue.object([
+                "session_id": .string("runtime-\(stored)"),
+                "resumed": .string(stored),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+
+        sessions.open(makeSummary(id: "A"))
+        await gate.waitUntilEntered()
+        sessions.open(makeSummary(id: "B"))
+        await sessions.waitForPendingOpenForTesting()
+        XCTAssertEqual(sessions.activeStoredId, "B")
+        XCTAssertEqual(sessions.activeRuntimeId, "runtime-B")
+
+        await gate.release()
+        for _ in 0..<4 { await Task.yield() }
+        XCTAssertEqual(sessions.activeStoredId, "B")
+        XCTAssertEqual(sessions.activeRuntimeId, "runtime-B",
+                       "a late A resume must be fenced by B's selection token")
     }
 
     // MARK: - RootView gate (paired+offline → mainUI, not Welcome)
@@ -312,6 +423,28 @@ final class CacheFirstLaunchTests: XCTestCase {
         let hasP1 = try await cache.hasTranscript(cacheIdentity("p1"))
         let hasP2 = try await cache.hasTranscript(cacheIdentity("p2"))
         XCTAssertTrue(hasP1 && hasP2, "prefetch wrote both transcripts through to disk")
+    }
+
+    func testPrefetchCarriesOwningProfileToFetchAndCacheIdentity() async throws {
+        let (connection, sessions, _) = makeGraph()
+        connection.serverURLString = serverURL
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        let work = makeSummary(id: "work-session", lastActive: 200, profile: "work")
+        sessions.sessions = [work]
+
+        let observed = TestActorBox<String>("")
+        sessions.prefetchFetchWithProfile = { @Sendable id, profile in
+            await observed.set("\(id):\(profile)")
+            return [stubStored("work transcript")]
+        }
+
+        sessions.prefetchRecentTranscripts()
+        try await Self.poll { await observed.value == "work-session:work" }
+
+        XCTAssertTrue(try await cache.hasTranscript(
+            CacheIdentity(serverId: serverURL, profileId: "work", sessionId: "work-session")
+        ))
     }
 
     func testPrefetchSkipsActiveSessionAndFreshCache() async throws {
@@ -507,6 +640,25 @@ private extension TestActorBox where T == Set<String> {
 
 private extension TestActorBox where T == Int {
     func increment() { value += 1 }
+}
+
+private actor ResumeGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var entered = false
+
+    func suspend() async {
+        entered = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilEntered() async {
+        while !entered { await Task.yield() }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
 }
 
 private final class PrefetchDeltaStubProtocol: URLProtocol, @unchecked Sendable {

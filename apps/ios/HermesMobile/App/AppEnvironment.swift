@@ -102,7 +102,10 @@ final class AppEnvironment {
                 activeStoredSessionID: { [weak sessionStore] in sessionStore?.activeStoredId },
                 canProcessPrompt: { [weak connectionStore, weak chatStore] in
                     guard let connectionStore, let chatStore else { return false }
-                    guard case .connected = connectionStore.phase else { return false }
+                    // Presentation grace intentionally retains `.connected` so
+                    // cached chat stays calm. Durable prompts may drain only
+                    // after the live socket completed `gateway.ready`.
+                    guard connectionStore.isTransportReady else { return false }
                     return !chatStore.isStreaming && !chatStore.localTurnInFlight
                 },
                 createDestination: { [weak sessionStore] _ in
