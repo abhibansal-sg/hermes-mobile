@@ -1144,19 +1144,25 @@ final class SessionStore {
 
     /// Mark a turn started for `storedId`. Called by `ConnectionStore` on
     /// `message.start`. A `nil`/empty id is a no-op.
-    func markTurnStarted(storedId: String?) {
+    func markTurnStarted(storedId: String?, runtimeId: String? = nil) {
         guard let id = storedId, !id.isEmpty else { return }
-        guard let identity = scopedSessionIdentity(forStoredID: id) else { return }
+        guard let identity = scopedSessionIdentity(
+            forStoredID: id,
+            runtimeID: runtimeId
+        ) else { return }
         turnsInProgress.insert(identity)
     }
 
     /// Mark a turn completed (or failed/cancelled) for `storedId`. Called by
     /// `ConnectionStore` on `message.complete`, the gateway `error` terminal,
     /// and every turn-abort path. A `nil`/empty id is a no-op.
-    func markTurnCompleted(storedId: String?) {
+    func markTurnCompleted(storedId: String?, runtimeId: String? = nil) {
         guard let id = storedId, !id.isEmpty else { return }
-        turnsInProgress.remove(id)
-        turnsInProgress = turnsInProgress.filter { !$0.hasSuffix("\u{1F}\(id)") }
+        guard let identity = scopedSessionIdentity(
+            forStoredID: id,
+            runtimeID: runtimeId
+        ) else { return }
+        turnsInProgress.remove(identity)
     }
 
     /// Clear ALL in-progress turn flags. Belt-and-suspenders: called on
@@ -1219,6 +1225,7 @@ final class SessionStore {
     private struct RuntimeBindingKey: Hashable {
         let openToken: UUID
         let storedId: String
+        let profileId: String?
         let transportEpoch: UInt64
     }
 
@@ -1247,12 +1254,14 @@ final class SessionStore {
     private func isCurrentRuntimeBinding(
         token: UUID,
         storedId: String,
+        profileId: String?,
         connectionWorkGeneration: UInt64,
         transportEpoch: UInt64,
         usingResumeTestSeam: Bool
     ) -> Bool {
         guard openToken == token,
               activeStoredId == storedId,
+              activeStoredProfile == profileId,
               self.connectionWorkGeneration == connectionWorkGeneration else { return false }
         guard let connection else { return true }
         guard connection.transportEpoch == transportEpoch else { return false }
@@ -1262,6 +1271,7 @@ final class SessionStore {
 
     private func coalescedSessionResume(
         storedId: String,
+        profileId: String?,
         params: [String: JSONValue],
         token: UUID,
         transportEpoch: UInt64
@@ -1269,6 +1279,7 @@ final class SessionStore {
         let key = RuntimeBindingKey(
             openToken: token,
             storedId: storedId,
+            profileId: profileId,
             transportEpoch: transportEpoch
         )
         if runtimeBindingKey == key, let runtimeBindingTask {
@@ -2959,10 +2970,18 @@ final class SessionStore {
         })
     }
 
-    private func scopedSessionIdentity(forStoredID id: String) -> String? {
+    private func scopedSessionIdentity(
+        forStoredID id: String,
+        runtimeID: String? = nil
+    ) -> String? {
         guard usesAggregateRail else { return id }
-        if activeStoredId == id, let activeScopedIdentity { return activeScopedIdentity }
         let matches = sessions.filter { $0.id == id }
+        if activeStoredId == id,
+           runtimeID != nil,
+           runtimeID == activeRuntimeId,
+           let activeScopedIdentity {
+            return activeScopedIdentity
+        }
         guard matches.count == 1, let row = matches.first else { return nil }
         return sessionListIdentity(row)
     }
@@ -3645,6 +3664,7 @@ final class SessionStore {
                 }
                 let result = try await self.coalescedSessionResume(
                     storedId: summary.id,
+                    profileId: cacheProfile,
                     params: resumeParams,
                     token: token,
                     transportEpoch: bindingEpoch
@@ -3652,6 +3672,7 @@ final class SessionStore {
                 guard self.isCurrentRuntimeBinding(
                     token: token,
                     storedId: summary.id,
+                    profileId: cacheProfile,
                     connectionWorkGeneration: connectionWorkGeneration,
                     transportEpoch: bindingEpoch,
                     usingResumeTestSeam: usingResumeTestSeam
@@ -3684,16 +3705,17 @@ final class SessionStore {
                 if let info = result.info { self.connection?.applyRuntimeInfo(info) }
                 // Compression-chain projection: the gateway may resume a
                 // newer continuation of this conversation — follow it.
-                if let chainTip = result.storedSessionId, chainTip != summary.id {
+                let boundStoredId = result.storedSessionId ?? summary.id
+                if boundStoredId != summary.id {
                     // Re-stamp prompts queued under the parent id to the
                     // continuation BEFORE the swap, so drain's affinity guard
                     // doesn't skip them forever once activeStoredId moves.
-                    self.onStoredIdMigrated?(summary.id, chainTip)
-                    self.activeStoredId = chainTip
+                    self.onStoredIdMigrated?(summary.id, boundStoredId)
+                    self.activeStoredId = boundStoredId
                     // Same token: the chain-tip seed's REST await is just as
                     // outrunnable by a newer open() as the fast path (R1 #43).
                     await self.seedTranscript(
-                        storedId: chainTip,
+                        storedId: boundStoredId,
                         networkProfile: networkProfile,
                         cacheProfile: cacheProfile,
                         token: token,
@@ -3723,7 +3745,8 @@ final class SessionStore {
                 await seedTask.value
                 guard self.isCurrentRuntimeBinding(
                     token: token,
-                    storedId: summary.id,
+                    storedId: boundStoredId,
+                    profileId: self.activeStoredProfile,
                     connectionWorkGeneration: connectionWorkGeneration,
                     transportEpoch: bindingEpoch,
                     usingResumeTestSeam: usingResumeTestSeam
@@ -3748,6 +3771,7 @@ final class SessionStore {
                 guard self.isCurrentRuntimeBinding(
                     token: token,
                     storedId: summary.id,
+                    profileId: cacheProfile,
                     connectionWorkGeneration: connectionWorkGeneration,
                     transportEpoch: bindingEpoch,
                     usingResumeTestSeam: usingResumeTestSeam
@@ -4104,6 +4128,7 @@ final class SessionStore {
         let myConnectionWorkGeneration = connectionWorkGeneration
         let token = openToken
         guard let storedId = activeStoredId, client != nil || resumeRPC != nil else { return nil }
+        let bindingProfile = activeStoredProfile
         let usingResumeTestSeam = resumeRPC != nil
         guard let bindingEpoch = await currentBindingEpoch(
             usingResumeTestSeam: usingResumeTestSeam
@@ -4115,6 +4140,7 @@ final class SessionStore {
             applyProfileScope(to: &resumeParams, selectedProfile: activeStoredProfile)
             let result = try await coalescedSessionResume(
                 storedId: storedId,
+                profileId: bindingProfile,
                 params: resumeParams,
                 token: token,
                 transportEpoch: bindingEpoch
@@ -4129,6 +4155,7 @@ final class SessionStore {
             guard isCurrentRuntimeBinding(
                 token: token,
                 storedId: storedId,
+                profileId: bindingProfile,
                 connectionWorkGeneration: myConnectionWorkGeneration,
                 transportEpoch: bindingEpoch,
                 usingResumeTestSeam: usingResumeTestSeam
@@ -4181,6 +4208,7 @@ final class SessionStore {
             guard isCurrentRuntimeBinding(
                 token: token,
                 storedId: storedId,
+                profileId: bindingProfile,
                 connectionWorkGeneration: myConnectionWorkGeneration,
                 transportEpoch: bindingEpoch,
                 usingResumeTestSeam: usingResumeTestSeam

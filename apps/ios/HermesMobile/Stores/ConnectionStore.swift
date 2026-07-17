@@ -1788,11 +1788,17 @@ final class ConnectionStore {
                 // mergeSessionPage's carry-forward gate is gated on a real
                 // lifecycle event, not the 10s liveWindow time-proxy.
                 if event.type == .messageStart {
-                    sessionStore.markTurnStarted(storedId: activityStoredId)
+                    sessionStore.markTurnStarted(
+                        storedId: activityStoredId,
+                        runtimeId: event.sessionId
+                    )
                 } else {
                     // .messageComplete — turn finished; server lastActive is now
                     // authoritative, so the carry-forward can release.
-                    sessionStore.markTurnCompleted(storedId: activityStoredId)
+                    sessionStore.markTurnCompleted(
+                        storedId: activityStoredId,
+                        runtimeId: event.sessionId
+                    )
                 }
                 scheduleSessionRefresh(generation: generation)
             case .error:
@@ -1802,7 +1808,10 @@ final class ConnectionStore {
                 let errorStoredId = event.storedSessionId
                     ?? (event.sessionId == sessionStore.activeRuntimeId
                         ? sessionStore.activeStoredId : nil)
-                sessionStore.markTurnCompleted(storedId: errorStoredId)
+                sessionStore.markTurnCompleted(
+                    storedId: errorStoredId,
+                    runtimeId: event.sessionId
+                )
             default:
                 break
             }
