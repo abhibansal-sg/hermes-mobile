@@ -131,6 +131,39 @@ final class StreamingSegmentCacheTests: XCTestCase {
         assertStreamRenderEquivalent("look ![alt](https://ex.com/i.png) here\n\nnext para")
     }
 
+    /// Review-finding refutation (sprint/build125 review): the claim was that a
+    /// blank-line-separated ordered list that reuses the `1.` marker relying on
+    /// CommonMark auto-increment (`1. first\n\n1. second\n\n1. third`) renders as
+    /// `1.`,`1.`,`2.` under the streaming split vs `1.`,`2.`,`3.` monolithic. It
+    /// does not: `MessageBubble.listItem` emits the LITERAL source marker (no
+    /// renumbering), and the monolithic `markdownBlocks` already splits each
+    /// blank-line-separated item into its own single-item `listItems` block. Both
+    /// the settled-prefix path and the full parse yield `1.`,`1.`,`1.` — identical.
+    func testRepeatedOrdinalOrderedListStreamsEquivalently() {
+        assertStreamRenderEquivalent("1. first\n\n1. second\n\n1. third")
+    }
+
+    /// A genuinely-numbered ordered list with blank lines between items keeps its
+    /// literal ordinals under both paths.
+    func testBlankSeparatedOrderedListStreamsEquivalently() {
+        assertStreamRenderEquivalent("1. first\n\n2. second\n\n3. third")
+    }
+
+    /// A loose (blank-line-separated) unordered list: the review claimed the split
+    /// changes inter-item spacing. It cannot — the monolithic parse already emits
+    /// separate single-item list blocks at each blank line, and all leaf blocks
+    /// flatten into the one segment VStack, so spacing is invariant.
+    func testLooseUnorderedListStreamsEquivalently() {
+        assertStreamRenderEquivalent("- one\n\n- two\n\n- three")
+    }
+
+    /// A tight ordered list (no internal blank lines) is never bisected — the
+    /// settle boundary only falls at a blank line, which a tight list lacks until
+    /// its trailing blank, at which point the whole list settles as one block.
+    func testTightOrderedListStreamsEquivalently() {
+        assertStreamRenderEquivalent("1. a\n2. b\n3. c\n\ntrailing prose")
+    }
+
     func testConsecutiveBlankLinesStreamEquivalently() {
         assertStreamRenderEquivalent("one\n\n\n\ntwo\n\n\nthree")
     }
