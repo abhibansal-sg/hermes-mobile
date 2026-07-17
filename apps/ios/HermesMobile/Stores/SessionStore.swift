@@ -2094,7 +2094,14 @@ final class SessionStore {
         // A pre-bootstrap call has no safe partition to latch. Wait until the
         // saved gateway has established a real cache identity instead.
         guard let scope = currentCacheScope else { return }
-        guard coldReadCacheScope != scope else { return }
+        // The scope latch normally collapses repeat calls to a single disk read.
+        // EXCEPTION: if the in-memory list has since regressed to empty (a
+        // cancelled/failed refresh cleared it, or a foreground recovery finds it
+        // emptied), re-arm and re-paint from cache — otherwise the drawer stays
+        // stuck empty until a network refresh lands. The read below re-checks
+        // `sessions.isEmpty` after the await, so a concurrent populate is never
+        // clobbered. (#208)
+        guard coldReadCacheScope != scope || sessions.isEmpty else { return }
         guard sessions.isEmpty else {
             coldReadCacheScope = scope
             lastColdReadServerId = scope.serverId
@@ -2470,8 +2477,7 @@ final class SessionStore {
             } catch {
                 guard refreshToken == myToken,
                       currentCacheScope == myCacheScope else { return .timeout }
-                lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                return Self.backgroundRefreshOutcome(for: error)
+                return recordRefreshFailure(error)
             }
             return .success
         }
@@ -2647,17 +2653,41 @@ final class SessionStore {
         } catch {
             guard refreshToken == myToken,
                   currentCacheScope == myCacheScope else { return .timeout }
-            lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            return fallbackOutcome ?? Self.backgroundRefreshOutcome(for: error)
+            return recordRefreshFailure(error, fallback: fallbackOutcome)
         }
     }
 
+    /// Cancellation is control flow, never a user-facing failure: a reconnect,
+    /// scope switch, or superseded task all cancel an in-flight refresh. Covers
+    /// the three shapes it arrives in — a thrown `CancellationError`, cooperative
+    /// `Task.isCancelled`, and a `URLError.cancelled` from a torn-down session. (#208)
+    static func isRefreshCancellation(_ error: Error) -> Bool {
+        if error is CancellationError || Task.isCancelled { return true }
+        if let urlError = error as? URLError, urlError.code == .cancelled { return true }
+        return false
+    }
+
     private static func backgroundRefreshOutcome(for error: Error) -> BackgroundRefreshOutcome {
-        if error is CancellationError || Task.isCancelled { return .timeout }
+        if isRefreshCancellation(error) { return .timeout }
         if ConnectionStore.isAuthFailure(error) { return .authFailure }
         if let urlError = error as? URLError, urlError.code == .timedOut { return .timeout }
         if case GatewayError.timeout = error { return .timeout }
         return .retryableFailure
+    }
+
+    /// Single write seam for a failed refresh/fill fetch. Classifies the error and
+    /// writes ``lastError`` ONLY for a genuine failure — a cancellation never
+    /// reaches it, so a cancelled refresh can never paint a false error row over
+    /// retained cached rows. Returns the classified background-policy outcome
+    /// (honouring an earlier `fallback`, e.g. a prior auth failure). (#208)
+    @discardableResult
+    private func recordRefreshFailure(
+        _ error: Error,
+        fallback: BackgroundRefreshOutcome? = nil
+    ) -> BackgroundRefreshOutcome {
+        if Self.isRefreshCancellation(error) { return fallback ?? .timeout }
+        lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        return fallback ?? Self.backgroundRefreshOutcome(for: error)
     }
 
     private func resolvedSessionListDeltaFetch(
@@ -3101,7 +3131,7 @@ final class SessionStore {
                 if loadedCount == loadedBefore { break }
             } catch {
                 guard refreshToken == myToken else { return }
-                lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                recordRefreshFailure(error)
                 return
             }
 
@@ -3228,7 +3258,9 @@ final class SessionStore {
                 // error and stop, leaving `initialFillDone == false` so the next
                 // refresh() re-kicks the fill (the old code latched done here, so a
                 // single transient error abandoned the fill permanently).
-                lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                // Cancellation routes through the shared seam so a torn-down fill
+                // never surfaces a false error row (#208).
+                recordRefreshFailure(error)
                 return
             }
 
