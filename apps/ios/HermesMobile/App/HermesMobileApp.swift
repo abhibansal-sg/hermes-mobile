@@ -39,6 +39,7 @@ final class StateFlushCoordinator {
 
     func enterBackground() {
         guard flushTask == nil, identifier == .invalid else { return }
+        ReliabilityDiagnostics.shared.backgroundFlushStarted()
         identifier = backgroundTasks.begin("Hermes state flush") { [weak self] in
             Task { @MainActor in self?.expire() }
         }
@@ -72,6 +73,7 @@ final class StateFlushCoordinator {
         identifier = .invalid
         flushTask = nil
         backgroundTasks.end(completed)
+        ReliabilityDiagnostics.shared.backgroundFlushFinished()
     }
 }
 

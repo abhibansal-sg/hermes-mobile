@@ -695,6 +695,7 @@ final class ConnectionStore {
         // accepted until `gateway.ready` has completed. Failed retries therefore
         // never create a runtime epoch that callers could bind to.
         let candidateEpoch = transportEpoch &+ 1
+        ReliabilityDiagnostics.shared.websocketConnect(epoch: candidateEpoch)
         setTransportReadiness(.connecting(epoch: candidateEpoch))
     }
 
@@ -702,12 +703,14 @@ final class ConnectionStore {
         guard case .connecting(let epoch) = transportReadiness,
               epoch == transportEpoch &+ 1 else { return }
         transportEpoch = epoch
+        ReliabilityDiagnostics.shared.websocketReady(epoch: epoch)
         setTransportReadiness(.ready(epoch: epoch), resolveWaiters: true)
     }
 
     private func markTransportUnavailable() {
         switch transportReadiness {
         case .ready(let epoch), .connecting(let epoch), .unavailable(let epoch):
+            ReliabilityDiagnostics.shared.websocketClose(epoch: epoch)
             setTransportReadiness(.unavailable(epoch: epoch))
             // The stored selection survives grace/reconnect, but its runtime id
             // was minted by the dropped socket and is no longer admissible.
@@ -1917,6 +1920,7 @@ final class ConnectionStore {
     private func startGraceWindow(duration: Duration, generation: UInt64) {
         guard isActiveGeneration(generation) else { return }
         isInGrace = true
+        ReliabilityDiagnostics.shared.graceStarted(duration: duration)
         startReconnectLoop(generation: generation)
         graceTask = Task { [weak self] in
             try? await Task.sleep(for: duration)
@@ -1935,6 +1939,7 @@ final class ConnectionStore {
         guard isInGrace, isActiveGeneration(generation) else { return }
         isInGrace = false
         graceTask = nil
+        ReliabilityDiagnostics.shared.graceExpired(attempt: currentReconnectAttempt)
         chatStore.handleConnectionDrop()
         sessionStore.clearAllTurnsInProgress()
         phase = .reconnecting(attempt: currentReconnectAttempt)
@@ -1964,6 +1969,7 @@ final class ConnectionStore {
             while !Task.isCancelled {
                 guard self.isActiveGeneration(generation) else { return }
                 self.currentReconnectAttempt = attempt
+                ReliabilityDiagnostics.shared.reconnectAttempt(number: attempt)
                 // STR-973A: while grace is holding, keep `phase` at
                 // `.connected` — `escalateGraceExpiry()` is the only path
                 // allowed to surface `.reconnecting` during grace.
@@ -2027,6 +2033,7 @@ final class ConnectionStore {
                     // must end first: resolving a waiter while `isInGrace` is
                     // still true would hand callers a false admission signal.
                     self.acceptCurrentTransport()
+                    ReliabilityDiagnostics.shared.reconnectHeal(epoch: self.transportEpoch)
                     // A quick heal (attempt-0 success, typically still inside
                     // grace): silently finalize any stream the drop left
                     // stranded — REQUIRED for `backfill()`'s `guard
@@ -2569,6 +2576,7 @@ final class ConnectionStore {
                 #endif
                 guard self.isActiveGeneration(generation) else { return }
                 guard alive else {
+                    ReliabilityDiagnostics.shared.foregroundLiveness(alive: false)
                     self.markTransportUnavailable()
                     // ABH-177: the real `probeLiveness` path calls `handleSocketFailure`
                     // which sets transport state to `.failed`; the existing state observer
@@ -2595,6 +2603,7 @@ final class ConnectionStore {
                     self.startGraceWindow(duration: grace, generation: generation)
                     return
                 }
+                ReliabilityDiagnostics.shared.foregroundLiveness(alive: true)
                 // ABH-182 Inc-1: on a healthy foreground, reconcile the LA so
                 // any orphaned activity (e.g. from a previous backgrounded turn
                 // whose message.complete was missed) is dismissed.

@@ -174,6 +174,7 @@ final class OutboxProcessor {
                     leaseDuration: Self.leaseDuration
                 ) else { return }
                 job = claimed
+                ReliabilityDiagnostics.shared.outboxClaim(identifier: job.jobID)
             } catch {
                 return
             }
@@ -204,6 +205,7 @@ final class OutboxProcessor {
             }
 
             guard dependencies.canProcessPrompt() else {
+                ReliabilityDiagnostics.shared.outboxWait()
                 try? await repository.releaseLease(id: job.jobID, owner: owner)
                 return
             }
@@ -347,12 +349,14 @@ final class OutboxProcessor {
         }
         let remotePaths = try await repository.jobAssets(jobID: job.jobID).compactMap(\.link.remotePath)
         dependencies.willSubmit(job, remotePaths)
+        ReliabilityDiagnostics.shared.outboxSubmit(identifier: job.jobID)
         let result: OutboxSubmitResult
         do {
             result = try await dependencies.submit(job, runtimeID, remotePaths)
         } catch {
             // The request may have reached the gateway. Keep `submitting` and
             // release the lease; the next wake retries the same client id.
+            ReliabilityDiagnostics.shared.outboxAmbiguous(identifier: job.jobID)
             try await repository.retainPendingJob(
                 id: job.jobID,
                 owner: owner,

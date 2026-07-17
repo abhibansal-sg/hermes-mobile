@@ -54,7 +54,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from typing import Annotated
 
-from hermes_cli.debug import build_debug_share
+from hermes_cli.debug import build_debug_share, upload_to_pastebin
 from hermes_cli.web_git import file_diff_vs_head
 
 _log = logging.getLogger(__name__)
@@ -62,6 +62,88 @@ _log = logging.getLogger(__name__)
 router = APIRouter()
 
 _DEBUG_SHARE_ROUTE_BUDGET_S = 15
+
+_MOBILE_RELIABILITY_KINDS = {
+    "websocket_connect", "websocket_ready", "websocket_close",
+    "reconnect_attempt", "reconnect_heal", "grace_start", "grace_expiry",
+    "epoch_rejection", "session_select", "session_bind", "session_supersession",
+    "cache_paint_start", "cache_paint_finish", "cache_paint_failure",
+    "outbox_wait", "outbox_claim", "outbox_submit", "outbox_ambiguous",
+    "background_flush", "foreground_liveness",
+}
+_MOBILE_RELIABILITY_OUTCOMES = {
+    "started", "ready", "closed", "waiting", "attempted", "healed",
+    "expired", "rejected", "selected", "bound", "superseded", "finished",
+    "failed", "claimed", "submitted", "ambiguous", "alive", "dead",
+}
+
+
+def _validated_mobile_reliability_trace(candidate: object) -> Optional[str]:
+    """Keep only the closed, redacted iOS reliability schema for upload."""
+    if not isinstance(candidate, str) or len(candidate) > 100_000:
+        return None
+    try:
+        envelope = _json.loads(candidate)
+    except Exception:
+        return None
+    if not isinstance(envelope, dict) or envelope.get("version") != 1:
+        return None
+    events = envelope.get("events")
+    if not isinstance(events, list):
+        return None
+
+    safe_events = []
+    for event in events[-100:]:
+        if not isinstance(event, dict) or event.get("kind") not in _MOBILE_RELIABILITY_KINDS:
+            continue
+        safe = {
+            "sequence": event.get("sequence"),
+            "timestamp": event.get("timestamp"),
+            "kind": event["kind"],
+            "idHash": event.get("idHash"),
+            "epoch": event.get("epoch"),
+            "count": event.get("count"),
+            "durationMilliseconds": event.get("durationMilliseconds"),
+            "outcome": event.get("outcome"),
+        }
+        if not isinstance(safe["sequence"], int) or safe["sequence"] < 0:
+            continue
+        if not isinstance(safe["timestamp"], str) or not _re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z",
+            safe["timestamp"],
+        ):
+            continue
+        if safe["idHash"] is not None and (
+            not isinstance(safe["idHash"], str)
+            or not _re.fullmatch(r"[0-9a-f]{16}", safe["idHash"])
+        ):
+            continue
+        for numeric_key in ("epoch", "count", "durationMilliseconds"):
+            value = safe[numeric_key]
+            if value is not None and (not isinstance(value, int) or value < 0):
+                break
+        else:
+            if safe["outcome"] is None or safe["outcome"] in _MOBILE_RELIABILITY_OUTCOMES:
+                safe_events.append(safe)
+
+    return _json.dumps(
+        {"version": 1, "capacity": 100, "events": safe_events},
+        separators=(",", ":"),
+    )
+
+
+def _build_mobile_debug_share(client_reliability_trace: Optional[str]):
+    """Compose the mobile artifact without widening Hermes core APIs."""
+    result = build_debug_share(log_lines=200, redact=True)
+    if client_reliability_trace:
+        try:
+            result.urls["iOS reliability trace"] = upload_to_pastebin(
+                client_reliability_trace,
+                expiry_days=1,
+            )
+        except Exception as exc:
+            result.failures.append(f"iOS reliability trace: {exc}")
+    return result
 
 # Directory of the plugin package (parent of dashboard/).
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
@@ -966,12 +1048,22 @@ async def debug_share_report(request: Request):
     if not _device_has_scope(request, "approve"):
         raise HTTPException(status_code=403, detail="Device token lacks approve scope")
 
+    # The phone trace is generated from a closed, redacted event vocabulary.
+    # Keep the existing export surface and bound the optional field so a
+    # malformed client cannot turn diagnostics into an unbounded upload.
+    client_reliability_trace = None
+    try:
+        body = await request.json()
+        candidate = body.get("reliability_trace") if isinstance(body, dict) else None
+        client_reliability_trace = _validated_mobile_reliability_trace(candidate)
+    except Exception:
+        pass
+
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(
-                build_debug_share,
-                log_lines=200,
-                redact=True,
+                _build_mobile_debug_share,
+                client_reliability_trace,
             ),
             timeout=_DEBUG_SHARE_ROUTE_BUDGET_S,
         )
