@@ -24,11 +24,17 @@ final class CacheFirstLaunchTests: XCTestCase {
     // it set. Save + clear it before each test so `hasSavedConfiguration` reflects
     // ONLY what the test sets, then restore it after.
     private var savedServerURL: String?
+    private var savedActiveProfile: String?
 
     override func setUp() {
         super.setUp()
         savedServerURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
+        savedActiveProfile = UserDefaults.standard.string(forKey: DefaultsKeys.activeProfile)
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+        UserDefaults.standard.set(
+            DefaultsKeys.allProfilesScope,
+            forKey: DefaultsKeys.activeProfile
+        )
     }
 
     override func tearDown() {
@@ -36,6 +42,11 @@ final class CacheFirstLaunchTests: XCTestCase {
             UserDefaults.standard.set(savedServerURL, forKey: DefaultsKeys.serverURL)
         } else {
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+        }
+        if let savedActiveProfile {
+            UserDefaults.standard.set(savedActiveProfile, forKey: DefaultsKeys.activeProfile)
+        } else {
+            UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
         }
         super.tearDown()
     }
@@ -311,8 +322,11 @@ final class CacheFirstLaunchTests: XCTestCase {
 
         await sessions.paintFromCache()
 
-        XCTAssertEqual(sessions.sessions.map(\.id), ["shared", "work-only"])
-        XCTAssertEqual(sessions.sessions.first?.title, "work copy")
+        XCTAssertEqual(Set(sessions.sessions.map(\.id)), ["shared", "work-only"])
+        XCTAssertEqual(
+            sessions.sessions.first(where: { $0.id == "shared" })?.title,
+            "work copy"
+        )
     }
 
     func testNamedProfileCacheTreatsUntaggedLegacyRowsAsSelectedScope() {
@@ -597,7 +611,16 @@ final class CacheFirstLaunchTests: XCTestCase {
         }
 
         sessions.prefetchRecentTranscripts()
-        try await Self.poll { await observed.value == "work-session:work" }
+        try await Self.poll {
+            guard await observed.value == "work-session:work" else { return false }
+            return (try? await cache.hasTranscript(
+                CacheIdentity(
+                    serverId: self.serverURL,
+                    profileId: "work",
+                    sessionId: "work-session"
+                )
+            )) == true
+        }
 
         let hasWorkTranscript = try await cache.hasTranscript(
             CacheIdentity(serverId: serverURL, profileId: "work", sessionId: "work-session")

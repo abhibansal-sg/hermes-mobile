@@ -130,7 +130,7 @@ final class BackgroundRefreshCoordinatorTests: XCTestCase {
             let coordinator = makeCoordinator(scheduler: scheduler) { _ in outcome }
             _ = coordinator.registerAtLaunch()
             let task = TaskSpy(); scheduler.handler?(task)
-            await settle()
+            await waitUntil { task.completions == [false] }
             XCTAssertEqual(scheduler.events.filter { $0.hasPrefix("submit:") }.count, expectedSubmissions)
             XCTAssertEqual(task.completions, [false])
         }
@@ -149,7 +149,10 @@ final class BackgroundRefreshCoordinatorTests: XCTestCase {
         )
         _ = coordinator.registerAtLaunch()
         let task = TaskSpy(); scheduler.handler?(task)
-        try? await Task.sleep(for: .milliseconds(30))
+        await waitUntil {
+            task.completions == [false]
+                && scheduler.events.filter { $0.hasPrefix("submit:") }.count == 1
+        }
         XCTAssertEqual(task.completions, [false])
         XCTAssertEqual(scheduler.events.filter { $0.hasPrefix("submit:") }.count, 1)
     }
