@@ -30,6 +30,8 @@ final class AppEnvironment {
     let projectsStore: ProjectsStore
     let stateFlushCoordinator: StateFlushCoordinator
     private let syncCoordinator: ManifestInvalidationCoordinator
+    private let manifestSyncOperation: @MainActor @Sendable (String) async -> BackgroundRefreshOutcome
+    private var manifestSyncTask: Task<BackgroundRefreshOutcome, Never>?
 
     init() {
         let sessionStore = SessionStore()
@@ -298,24 +300,92 @@ final class AppEnvironment {
         }
         // ConnectionStore drains the offline outbox after reconnect backfill.
         connectionStore.queueStore = queueStore
-        // Silent pushes are invalidation hints only. Route them through the same
-        // authoritative refresh used by foreground recovery, then project the
-        // widget after that refresh has completed.
-        let syncCoordinator = ManifestInvalidationCoordinator { [weak sessionStore, weak connectionStore] _ in
-            guard let sessionStore, let connectionStore else { throw CancellationError() }
-            try Task.checkCancellation()
-            await sessionStore.refresh()
-            try Task.checkCancellation()
-            await MainActor.run {
+        // One atomic manifest operation is shared by silent push and BG refresh.
+        // Foreground/reconnect call the same invalidation coordinator below. A
+        // schema-v1/legacy plugin falls back inside SyncCoordinator without ever
+        // claiming v2 freshness.
+        let manifestWorkRepository = workRepository
+        let performManifestSync: @MainActor @Sendable (String) async -> BackgroundRefreshOutcome = {
+            [weak sessionStore, weak connectionStore, weak inboxStore] _ in
+            guard let sessionStore, let connectionStore, let cacheStore,
+                  let rest = connectionStore.rest,
+                  !connectionStore.serverURLString.isEmpty else {
+                return .retryableFailure
+            }
+            let locator = connectionStore.serverURLString
+            let coordinator = SyncCoordinator(
+                cache: cacheStore,
+                scope: CacheScope(serverId: locator, profileId: sessionStore.activeProfile),
+                manifestScope: "all",
+                client: rest,
+                legacyFallback: { [weak sessionStore] in
+                    await sessionStore?.refresh()
+                },
+                registerPush: {
+                    await MainActor.run { PushRegistrar.shared.enableIfAllowed() }
+                },
+                authorityTransition: { binding, transition in
+                    // Locator/name-scoped work cannot be silently promoted to a
+                    // verified authority. Old verified partitions are fenced
+                    // independently so sibling profiles keep processing.
+                    _ = try? await manifestWorkRepository.quarantineLegacyWork(
+                        serverID: locator
+                    )
+                    // Older app builds persisted the user-entered locator while
+                    // v2 keys the binding by its canonical spelling. Fence both
+                    // forms during migration; they may differ by case, a trailing
+                    // slash, or a default port.
+                    _ = try? await manifestWorkRepository.quarantineLegacyWork(
+                        serverID: binding.normalizedLocator
+                    )
+                    for replacement in transition.replacedProfiles {
+                        _ = try? await manifestWorkRepository.quarantineAuthority(
+                            gatewayID: replacement.gatewayID,
+                            profileID: replacement.profileID,
+                            authorityEpoch: replacement.authorityEpoch
+                        )
+                    }
+                }
+            )
+            let outcome = await coordinator.synchronizeNow()
+            switch outcome {
+            case .applied, .noChange:
+                guard let binding = try? await cacheStore.loadLocatorBinding(locator: locator),
+                      coordinator.projection.gatewayID == binding.gatewayID else {
+                    return .retryableFailure
+                }
+                sessionStore.applyCommittedManifest(coordinator.projection, binding: binding)
+                await inboxStore?.refresh()
                 let connected: Bool
                 if case .connected = connectionStore.phase { connected = true } else { connected = false }
                 var patch = WidgetSnapshotWriter.Patch()
                 patch.connectionState = .set(connected ? .connected : .offline)
-                patch.activeTurnCount = .set(sessionStore.activeStoredId == nil ? 0 : 1)
+                patch.activeTurnCount = .set(coordinator.projection.activeTurns.count)
+                patch.pendingAttentionCount = .set(coordinator.projection.attention.count)
+                patch.serverRevision = .set(String(coordinator.projection.revision))
+                patch.fetchedAt = .set(coordinator.projection.lastSyncedAt ?? Date())
+                patch.isStale = .set(false)
                 WidgetSnapshotWriter.write(patch)
+                return outcome == .applied ? .success : .noChange
+            case .unsupported:
+                return .success
+            case .failed:
+                return .retryableFailure
             }
-            return true
         }
+
+        // Silent pushes are invalidation hints only. Route them through the same
+        // transaction as foreground/background recovery and publish widgets only
+        // after that commit has completed.
+        let syncCoordinator = ManifestInvalidationCoordinator { invalidation in
+            let outcome = await performManifestSync(invalidation.scope)
+            switch outcome {
+            case .success: return true
+            case .noChange: return false
+            case .retryableFailure, .authFailure, .timeout: throw CancellationError()
+            }
+        }
+        self.manifestSyncOperation = performManifestSync
         self.syncCoordinator = syncCoordinator
         Task { await SilentSyncBridge.shared.attach(syncCoordinator) }
 
@@ -330,9 +400,8 @@ final class AppEnvironment {
                 let profile = defaults.string(forKey: DefaultsKeys.activeProfile) ?? DefaultsKeys.allProfilesScope
                 return BackgroundManifestScope(gatewayURL: url, scope: profile, token: token)
             },
-            sync: { [weak sessionStore] _ in
-                guard let sessionStore else { return .retryableFailure }
-                let outcome = await sessionStore.refreshOutcome()
+            sync: { scope in
+                let outcome = await performManifestSync(scope.scope)
                 try Task.checkCancellation()
                 return outcome
             },
@@ -398,6 +467,19 @@ final class AppEnvironment {
     }
 
     // MARK: - Widget snapshot
+
+    /// Coalesced foreground/reconnect entry point for the same manifest
+    /// transaction used by push and BG refresh. Cached UI remains interactive;
+    /// failures leave the prior committed projection untouched.
+    func refreshManifest(scope: String = "all") {
+        guard manifestSyncTask == nil else { return }
+        let operation = manifestSyncOperation
+        manifestSyncTask = Task { @MainActor [weak self] in
+            let outcome = await operation(scope)
+            self?.manifestSyncTask = nil
+            return outcome
+        }
+    }
 
     /// Assemble + publish the current widget snapshot. Reads only `@MainActor`
     /// store state the app already holds; `WidgetSnapshotWriter` debounces

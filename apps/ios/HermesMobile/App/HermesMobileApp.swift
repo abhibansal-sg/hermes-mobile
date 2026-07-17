@@ -260,6 +260,7 @@ struct HermesMobileApp: App {
                     // notification permission and an APNs token. If the user has
                     // explicitly disabled Notifications, this remains a no-op.
                     PushRegistrar.shared.ensureRegisteredForPairedGateway()
+                    environment.refreshManifest()
                     // First-launch usage figures for the widgets, once connected.
                     environment.refreshUsageSnapshot()
                 }
@@ -291,6 +292,7 @@ struct HermesMobileApp: App {
                         SharedStore.notifyInboxDidChange()
                         attemptSharedInboxDrain()
                         PushRegistrar.shared.ensureRegisteredForPairedGateway()
+                        environment.refreshManifest()
                         environment.refreshUsageSnapshot()
                         Task { await environment.inboxStore.refresh() }
                     }
@@ -305,6 +307,7 @@ struct HermesMobileApp: App {
                         drain: { attemptSharedInboxDrain() }
                     )
                     if case .connected = newPhase {
+                        environment.refreshManifest()
                         Task { await environment.inboxStore.refresh() }
                     }
                 }

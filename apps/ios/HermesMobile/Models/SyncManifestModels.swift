@@ -2,7 +2,66 @@ import Foundation
 
 struct SyncManifestHTTPPage: Sendable, Equatable {
     let page: SyncManifestPage
+    let encodedData: Data
     let encodedByteCount: Int
+}
+
+struct GatewayLocatorBindingV1: Codable, Sendable, Equatable {
+    let normalizedLocator: String
+    let gatewayID: String
+    let profileAuthorities: [ManifestProfileAuthority]
+    let verifiedAt: Date
+
+    static func normalize(locator raw: String) throws -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, var components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            throw ManifestBindingError.invalidLocator
+        }
+        components.scheme = scheme
+        components.host = host
+        components.fragment = nil
+        components.query = nil
+        var path = components.path
+        while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+        components.path = path == "/" ? "" : path
+        guard let normalized = components.string, !normalized.isEmpty else {
+            throw ManifestBindingError.invalidLocator
+        }
+        return normalized
+    }
+}
+
+enum ManifestBindingError: Error, Equatable {
+    case invalidLocator
+    case invalidStage
+    case authorityTransition
+}
+
+struct ManifestAuthorityReplacement: Sendable, Equatable, Hashable {
+    let gatewayID: String
+    let profileID: String
+    let authorityEpoch: String
+}
+
+struct ManifestAuthorityTransition: Sendable, Equatable {
+    let replacedGatewayID: String?
+    let replacedProfiles: Set<ManifestAuthorityReplacement>
+
+    static let none = ManifestAuthorityTransition(
+        replacedGatewayID: nil,
+        replacedProfiles: []
+    )
+
+    var changed: Bool { replacedGatewayID != nil || !replacedProfiles.isEmpty }
+}
+
+struct ManifestCommitResult: Sendable, Equatable {
+    let projection: ManifestProjection
+    let binding: GatewayLocatorBindingV1
+    let transition: ManifestAuthorityTransition
 }
 
 /// Exact schema-v2 hermes-mobile manifest envelope.

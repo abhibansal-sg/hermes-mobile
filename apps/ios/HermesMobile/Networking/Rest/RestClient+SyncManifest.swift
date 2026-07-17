@@ -33,6 +33,10 @@ extension RestClient {
         guard page.schemaVersion == 2 else {
             throw RestError.decoding("syncManifestV2: unsupported schema")
         }
-        return SyncManifestHTTPPage(page: page, encodedByteCount: data.count)
+        return SyncManifestHTTPPage(
+            page: page,
+            encodedData: data,
+            encodedByteCount: data.count
+        )
     }
 }

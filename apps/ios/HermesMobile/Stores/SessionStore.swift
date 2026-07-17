@@ -422,6 +422,24 @@ final class SessionStore {
 
     var durableWorkScope: WorkScope? {
         guard let currentCacheScope else { return nil }
+        if let binding = verifiedAuthorityBinding {
+            let profileName = activeProfile == CacheScope.allProfilesKey
+                ? (activeSummary?.profile ?? "default")
+                : activeProfile
+            if let manifestAuthority = binding.profileAuthorities.first(where: {
+                $0.profileName == profileName
+            }),
+               let authority = try? AuthorityScopeV1(
+                   gatewayID: binding.gatewayID,
+                   profileID: manifestAuthority.profileID,
+                   authorityEpoch: manifestAuthority.authorityEpoch
+               ) {
+                return try? WorkScope(
+                    serverID: binding.normalizedLocator,
+                    authority: authority
+                )
+            }
+        }
         return try? WorkScope(cacheScope: currentCacheScope)
     }
 
@@ -1109,6 +1127,7 @@ final class SessionStore {
     private(set) var manifestFreshness: ManifestFreshness = .cached
     private(set) var manifestLastSyncedAt: Date?
     private(set) var manifestRevision: Int64 = 0
+    private(set) var verifiedAuthorityBinding: GatewayLocatorBindingV1?
 
     /// Latches `true` after the first `refresh()` has run the cold-launch cache
     /// read. The read only fires when `sessions` is still empty (cold launch),
@@ -1121,6 +1140,52 @@ final class SessionStore {
     /// and the cache stays a purely-additive accelerator behind `sessions`.
     func attachCache(_ cache: CacheStore) {
         self.cacheStore = cache
+    }
+
+    /// Publishes one already-committed manifest snapshot into the observable
+    /// drawer/live-state model. The database transaction is the authority
+    /// boundary; this method performs one main-actor publication afterward and
+    /// never writes reconstructible state itself.
+    func applyCommittedManifest(
+        _ projection: ManifestProjection,
+        binding: GatewayLocatorBindingV1
+    ) {
+        verifiedAuthorityBinding = binding
+        manifestFreshness = projection.freshness
+        manifestLastSyncedAt = projection.lastSyncedAt
+        manifestRevision = projection.revision
+
+        let selectedProfileIDs: Set<String>
+        if activeProfile == CacheScope.allProfilesKey {
+            selectedProfileIDs = Set(projection.profileAuthorities.map(\.profileID))
+        } else {
+            selectedProfileIDs = Set(
+                projection.profileAuthorities
+                    .filter { $0.profileName == activeProfile || $0.profileID == activeProfile }
+                    .map(\.profileID)
+            )
+        }
+        let authorityNames = Set(
+            projection.profileAuthorities
+                .filter { selectedProfileIDs.contains($0.profileID) }
+                .map(\.profileName)
+        )
+        let projectedSessions = projection.sessions.filter { summary in
+            guard activeProfile != CacheScope.allProfilesKey else { return true }
+            let name = summary.profile ?? "default"
+            return authorityNames.contains(name)
+        }.filter(Self.isHumanRecentsSession)
+
+        sessions = projectedSessions
+        seenServerSessionIds = Set(projectedSessions.map(\.id))
+        loadedCount = projectedSessions.count
+        loadedOffset = projectedSessions.count
+        totalSessions = projectedSessions.count
+        turnsInProgress = Set(
+            projection.activeTurns.compactMap { turn in
+                selectedProfileIDs.contains(turn.profileID) ? turn.storedSessionID : nil
+            }
+        )
     }
 
     /// The active cache partition key (P4): (serverId, profileId).
@@ -1824,12 +1889,36 @@ final class SessionStore {
         didColdReadCache = true
         if sessions.isEmpty, let cacheStore, let scope = currentCacheScope {
             lastColdReadServerId = scope.serverId
+            if let binding = try? await cacheStore.loadLocatorBinding(locator: scope.serverId) {
+                verifiedAuthorityBinding = binding
+            }
+            var manifestSessions: [SessionSummary]?
             if let manifest = try? await cacheStore.loadManifestProjection(scope: scope) {
                 manifestFreshness = manifest.freshness
                 manifestLastSyncedAt = manifest.lastSyncedAt
                 manifestRevision = manifest.revision
+                if manifest.revision > 0 {
+                    manifestSessions = manifest.sessions
+                    let selectedProfileIDs: Set<String>
+                    if activeProfile == CacheScope.allProfilesKey {
+                        selectedProfileIDs = Set(manifest.profileAuthorities.map(\.profileID))
+                    } else {
+                        selectedProfileIDs = Set(manifest.profileAuthorities.filter {
+                            $0.profileName == activeProfile || $0.profileID == activeProfile
+                        }.map(\.profileID))
+                    }
+                    turnsInProgress = Set(manifest.activeTurns.compactMap { turn in
+                        selectedProfileIDs.contains(turn.profileID) ? turn.storedSessionID : nil
+                    })
+                }
             }
-            if let cached = try? await cacheStore.loadSessionList(scope: scope), !cached.isEmpty {
+            let cached: [SessionSummary]
+            if let manifestSessions {
+                cached = manifestSessions
+            } else {
+                cached = (try? await cacheStore.loadSessionList(scope: scope)) ?? []
+            }
+            if !cached.isEmpty {
                 // Re-check emptiness after the await: a concurrent network
                 // refresh may have populated the list while we were reading
                 // disk — never overwrite fresher server data with the cache.
@@ -2069,22 +2158,13 @@ final class SessionStore {
         // unchanged and `mergeSessionPage` reconciles server authority over the
         // cached rows. No cache (tests/previews) ⇒ this is a no-op and the path
         // is byte-identical to today.
-        // P4 SERVER-switch policy: if the active server changed since the last
-        // cold read (a new gateway), CLEAR the other servers' cached rows
-        // (transcripts cascade via FK) and repopulate the active server from the
-        // network below. A PROFILE switch (same server, different profileId) does
-        // NOT clear — both profiles coexist; `selectProfile` re-arms the cold read
-        // and the scoped read below simply re-filters to the new profile's rows.
-        // Architected as the SOLE clear site: dropping the server-clear later
-        // (full coexist-all-servers) is deleting this one call — no migration.
-        if let cacheStore, let scope = currentCacheScope,
+        // Gateway partitions coexist durably. A locator switch clears only the
+        // currently published drawer state and re-arms cache paint; deleting the
+        // prior partition here would destroy the recovered-local-copy contract.
+        if let scope = currentCacheScope,
            let previous = lastColdReadServerId, previous != scope.serverId {
-            _ = try? await cacheStore.clearSessionsForOtherServers(keepingServerId: scope.serverId)
-            guard connectionWorkGeneration == myConnectionWorkGeneration else { return .timeout }
-            // A different server's list is showing — drop the stale in-memory rows
-            // and re-arm the cold paint so the new server repaints from its own
-            // (now sole) cached rows rather than leaving the prior server's list
-            // on screen while the network refetches.
+            // A different gateway's list is showing — drop only the stale
+            // in-memory publication and repaint from the selected partition.
             sessions = []
             loadedCount = 0
             loadedOffset = 0

@@ -448,6 +448,49 @@ actor WorkRepository {
         return changed
     }
 
+    /// Quarantines unfinished work bound to an authority partition that the
+    /// authenticated manifest has replaced. It is deliberately scoped by all
+    /// three verified identifiers: a profile epoch change must not stop jobs for
+    /// sibling profiles, while a gateway replacement calls this once per old
+    /// profile binding. Quarantine is one-way until a future user-confirmed
+    /// recovery flow creates a new operation identity.
+    @discardableResult
+    func quarantineAuthority(
+        gatewayID: String,
+        profileID: String,
+        authorityEpoch: String,
+        now: Date = Date()
+    ) async throws -> Int {
+        let authority = try AuthorityScopeV1(
+            gatewayID: gatewayID,
+            profileID: profileID,
+            authorityEpoch: authorityEpoch
+        )
+        let changed = try await database.write { db -> Int in
+            try db.execute(
+                sql: """
+                    UPDATE work_jobs
+                    SET authority_state = ?, lease_owner = NULL, lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE gateway_id = ? AND profile_id = ? AND authority_epoch = ?
+                      AND authority_state = ?
+                      AND state NOT IN ('completed', 'cancelled', 'expired')
+                    """,
+                arguments: [
+                    WorkAuthorityState.quarantined.rawValue,
+                    now.timeIntervalSince1970,
+                    authority.gatewayID,
+                    authority.profileID,
+                    authority.authorityEpoch,
+                    WorkAuthorityState.verified.rawValue,
+                ]
+            )
+            return db.changesCount
+        }
+        await publishObservation()
+        return changed
+    }
+
     /// Binds shortcut work created by the App Intents process once the main app
     /// has a stable Phase-1 scope. Existing bindings are immutable.
     func bindPendingAppIntents(to scope: WorkScope, now: Date = Date()) async throws {

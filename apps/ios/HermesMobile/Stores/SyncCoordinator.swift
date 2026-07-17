@@ -1,5 +1,12 @@
 import Foundation
 
+enum SyncRecoveryOutcome: Sendable, Equatable {
+    case applied
+    case noChange
+    case unsupported
+    case failed
+}
+
 @MainActor
 @Observable
 final class SyncCoordinator {
@@ -13,22 +20,47 @@ final class SyncCoordinator {
     private let legacyFallback: @Sendable () async -> Void
     private let transcriptDelta: @Sendable (String) async -> Void
     private let registerPush: @Sendable () async -> Void
+    private let authorityTransition: @Sendable (GatewayLocatorBindingV1, ManifestAuthorityTransition) async -> Void
     private var inFlight: Task<Void, Never>?
     private var pendingRevision: Int64?
 
     init(cache: CacheStore, scope: CacheScope, manifestScope: String, client: RestClient,
          legacyFallback: @escaping @Sendable () async -> Void = {},
          transcriptDelta: @escaping @Sendable (String) async -> Void = { _ in },
-         registerPush: @escaping @Sendable () async -> Void = {}) {
+         registerPush: @escaping @Sendable () async -> Void = {},
+         authorityTransition: @escaping @Sendable (
+             GatewayLocatorBindingV1,
+             ManifestAuthorityTransition
+         ) async -> Void = { _, _ in }) {
         self.cache = cache; self.scope = scope; self.manifestScope = manifestScope; self.client = client
         self.legacyFallback = legacyFallback; self.transcriptDelta = transcriptDelta; self.registerPush = registerPush
+        self.authorityTransition = authorityTransition
     }
 
     /// Synchronous-with-respect-to-network first paint: disk is awaited before
     /// the detached recovery request is launched.
     func start() async {
-        if let cached = try? await cache.loadManifestProjection(scope: scope) { projection = cached }
+        if let cached = try? await cache.loadManifestProjection(
+            locator: scope.serverId,
+            manifestScope: manifestScope
+        ) {
+            projection = cached
+        }
         trigger(.launch)
+    }
+
+    /// Awaitable entry point used by foreground, silent-push, and BG refresh
+    /// orchestration. A fresh coordinator may be created from the current
+    /// authenticated REST client; durable resume state still comes from GRDB.
+    @discardableResult
+    func synchronizeNow() async -> SyncRecoveryOutcome {
+        if let cached = try? await cache.loadManifestProjection(
+            locator: scope.serverId,
+            manifestScope: manifestScope
+        ) {
+            projection = cached
+        }
+        return await recover()
     }
 
     func trigger(_ trigger: Trigger, invalidationRevision: Int64? = nil) {
@@ -37,7 +69,7 @@ final class SyncCoordinator {
             return
         }
         inFlight = Task { [weak self] in
-            await self?.recover()
+            _ = await self?.recover()
             guard let self else { return }
             self.inFlight = nil
             if let pending = self.pendingRevision, pending > self.projection.revision {
@@ -47,53 +79,95 @@ final class SyncCoordinator {
         }
     }
 
-    private func recover() async {
+    private func recover() async -> SyncRecoveryOutcome {
         do {
-            var pages: [SyncManifestPage] = []
             var continuationCursor: String?
             var resumeCursor = projection.cursor
             var seenCursors: Set<String> = []
             var encodedBytes = 0
             var entityCount = 0
+            var pageIndex = 0
+            var stagedSnapshotID: String?
+            var finalDeviceRegistered: Bool?
             let deadline = ContinuousClock.now.advanced(by: .seconds(30))
-            repeat {
-                try Task.checkCancellation()
-                guard pages.count < 100,
-                      encodedBytes <= 16 * 1024 * 1024,
-                      entityCount <= 50_000,
-                      ContinuousClock.now < deadline else {
-                    throw ManifestFetchLimitError.limitExceeded
+            do {
+                repeat {
+                    try Task.checkCancellation()
+                    guard pageIndex < 100,
+                          encodedBytes <= 16 * 1024 * 1024,
+                          entityCount <= 50_000,
+                          ContinuousClock.now < deadline else {
+                        throw ManifestFetchLimitError.limitExceeded
+                    }
+                    let response = try await client.syncManifest(
+                        scope: manifestScope,
+                        resumeCursor: continuationCursor == nil ? resumeCursor : nil,
+                        continuationCursor: continuationCursor,
+                        limit: 500
+                    )
+                    let page = response.page
+                    if let stagedSnapshotID {
+                        guard stagedSnapshotID == page.snapshotID else {
+                            throw ManifestFetchLimitError.snapshotChanged
+                        }
+                    } else {
+                        stagedSnapshotID = page.snapshotID
+                    }
+                    try await cache.stageManifestPage(
+                        response,
+                        locator: scope.serverId,
+                        pageIndex: pageIndex
+                    )
+                    pageIndex += 1
+                    encodedBytes += response.encodedByteCount
+                    entityCount += page.sessions.upserts.count + page.sessions.tombstones.count
+                    guard encodedBytes <= 16 * 1024 * 1024, entityCount <= 50_000 else {
+                        throw ManifestFetchLimitError.limitExceeded
+                    }
+                    if page.complete {
+                        finalDeviceRegistered = page.pushRegistry?.deviceRegistered
+                        break
+                    }
+                    guard let next = page.continuationCursor,
+                          seenCursors.insert(next).inserted else {
+                        throw ManifestFetchLimitError.cursorCycle
+                    }
+                    continuationCursor = next
+                    resumeCursor = nil
+                } while true
+            } catch {
+                if let stagedSnapshotID {
+                    try? await cache.discardStagedManifest(snapshotID: stagedSnapshotID)
                 }
-                let response = try await client.syncManifest(
-                    scope: manifestScope,
-                    resumeCursor: continuationCursor == nil ? resumeCursor : nil,
-                    continuationCursor: continuationCursor,
-                    limit: 500
+                throw error
+            }
+            guard let stagedSnapshotID else { throw ManifestBindingError.invalidStage }
+            let result: ManifestCommitResult
+            do {
+                result = try await cache.commitStagedManifest(
+                    snapshotID: stagedSnapshotID,
+                    locator: scope.serverId,
+                    expectedPageCount: pageIndex
                 )
-                let page = response.page
-                pages.append(page)
-                encodedBytes += response.encodedByteCount
-                entityCount += page.sessions.upserts.count + page.sessions.tombstones.count
-                guard encodedBytes <= 16 * 1024 * 1024, entityCount <= 50_000 else {
-                    throw ManifestFetchLimitError.limitExceeded
-                }
-                if page.complete { break }
-                guard let next = page.continuationCursor,
-                      seenCursors.insert(next).inserted else {
-                    throw ManifestFetchLimitError.cursorCycle
-                }
-                continuationCursor = next
-                resumeCursor = nil
-            } while true
-            let chain = try ManifestChain(validating: pages)
-            let committed = try await cache.applyManifest(chain, scope: scope)
-            guard committed.revision >= projection.revision else { return }
-            let priorHeads = projection.transcriptHeads
+            } catch {
+                try? await cache.discardStagedManifest(snapshotID: stagedSnapshotID)
+                throw error
+            }
+            let committed = result.projection
+            if committed.gatewayID == projection.gatewayID,
+               committed.journalEpoch == projection.journalEpoch,
+               committed.revision < projection.revision {
+                return .noChange
+            }
+            let priorProjection = projection
+            let priorHeads = priorProjection.transcriptHeads
             projection = committed // exactly one observable assignment
+            await authorityTransition(result.binding, result.transition)
             for (id, head) in committed.transcriptHeads where priorHeads[id] != head {
                 Task { await transcriptDelta(id) }
             }
-            if chain.deviceRegistered == false { await registerPush() }
+            if finalDeviceRegistered == false { await registerPush() }
+            return committed != priorProjection ? .applied : .noChange
         } catch RestError.badStatus(let code, _) where code == 404 || code == 405 {
             await legacyFallback()
             projection = ManifestProjection(
@@ -110,8 +184,10 @@ final class SyncCoordinator {
                 freshness: .partial,
                 lastSyncedAt: projection.lastSyncedAt
             )
+            return .unsupported
         } catch {
             // Atomic cache and the last published projection remain untouched.
+            return .failed
         }
     }
 }
@@ -119,4 +195,5 @@ final class SyncCoordinator {
 private enum ManifestFetchLimitError: Error {
     case limitExceeded
     case cursorCycle
+    case snapshotChanged
 }

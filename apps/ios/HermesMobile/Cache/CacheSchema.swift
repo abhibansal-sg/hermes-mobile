@@ -24,7 +24,7 @@ enum CacheSchema {
     /// normal GRDB path on a live DB; the fingerprint bump means any DB so old
     /// it cannot ALTER cleanly takes the nuke-and-rebuild escape hatch instead —
     /// always safe (the cache is 100% reconstructible from the gateway).
-    static let currentFingerprint = "v5"
+    static let currentFingerprint = "v6"
 
     // MARK: - Migrator
 
@@ -308,6 +308,90 @@ enum CacheSchema {
                     message: "v5 foreign-key verification failed"
                 )
             }
+            try SyncMetaRecord(
+                key: SyncMetaRecord.Key.schemaVersion,
+                value: currentFingerprint
+            ).save(db)
+        }
+
+        // v6 — authority-keyed manifest staging and projection. Existing
+        // URL/name-scoped cache tables are deliberately untouched: they remain
+        // readable legacy/recovered data and are never silently rekeyed into a
+        // verified gateway authority.
+        migrator.registerMigration("v6-authority-manifest") { db in
+            try db.create(table: "gateway_locator_binding_v1", ifNotExists: true) { t in
+                t.primaryKey("normalizedLocator", .text)
+                t.column("gatewayId", .text).notNull()
+                t.column("profileAuthoritiesJSON", .blob).notNull()
+                t.column("verifiedAt", .double).notNull()
+            }
+            try db.create(table: "authority_partition_v1", ifNotExists: true) { t in
+                t.column("gatewayId", .text).notNull()
+                t.column("profileId", .text).notNull()
+                t.column("authorityEpoch", .text).notNull()
+                t.column("profileName", .text).notNull()
+                t.column("state", .text).notNull()
+                t.column("updatedAt", .double).notNull()
+                t.primaryKey(["gatewayId", "profileId", "authorityEpoch"])
+            }
+            try db.create(table: "manifest_session_projection_v2", ifNotExists: true) { t in
+                t.column("gatewayId", .text).notNull()
+                t.column("profileId", .text).notNull()
+                t.column("authorityEpoch", .text).notNull()
+                t.column("sessionId", .text).notNull()
+                t.column("summaryJSON", .blob).notNull()
+                t.column("entityRevision", .integer).notNull()
+                t.column("lastActive", .double)
+                t.primaryKey(["gatewayId", "profileId", "authorityEpoch", "sessionId"])
+            }
+            try db.create(
+                index: "manifest_session_projection_v2_recency",
+                on: "manifest_session_projection_v2",
+                columns: ["gatewayId", "profileId", "authorityEpoch", "lastActive"],
+                ifNotExists: true
+            )
+            try db.create(table: "projection_tombstone_v1", ifNotExists: true) { t in
+                t.column("gatewayId", .text).notNull()
+                t.column("profileId", .text).notNull()
+                t.column("authorityEpoch", .text).notNull()
+                t.column("entityKind", .text).notNull()
+                t.column("entityId", .text).notNull()
+                t.column("serverRevision", .integer).notNull()
+                t.column("deletedAt", .double).notNull()
+                t.primaryKey([
+                    "gatewayId", "profileId", "authorityEpoch", "entityKind", "entityId"
+                ])
+            }
+            try db.create(table: "manifest_projection_state_v2", ifNotExists: true) { t in
+                t.column("gatewayId", .text).notNull()
+                t.column("manifestScope", .text).notNull()
+                t.column("journalEpoch", .text).notNull()
+                t.column("revision", .integer).notNull()
+                t.column("resumeCursor", .text).notNull()
+                t.column("payloadJSON", .blob).notNull()
+                t.column("updatedAt", .double).notNull()
+                t.primaryKey(["gatewayId", "manifestScope"])
+            }
+            try db.create(table: "manifest_page_stage_v2", ifNotExists: true) { t in
+                t.column("snapshotId", .text).notNull()
+                t.column("pageIndex", .integer).notNull()
+                t.column("normalizedLocator", .text).notNull()
+                t.column("gatewayId", .text).notNull()
+                t.column("journalEpoch", .text).notNull()
+                t.column("revision", .integer).notNull()
+                t.column("manifestScope", .text).notNull()
+                t.column("pageSize", .integer).notNull()
+                t.column("pageJSON", .blob).notNull()
+                t.column("encodedBytes", .integer).notNull()
+                t.column("createdAt", .double).notNull()
+                t.primaryKey(["snapshotId", "pageIndex"])
+            }
+            try db.create(
+                index: "manifest_page_stage_v2_age",
+                on: "manifest_page_stage_v2",
+                columns: ["createdAt"],
+                ifNotExists: true
+            )
             try SyncMetaRecord(
                 key: SyncMetaRecord.Key.schemaVersion,
                 value: currentFingerprint

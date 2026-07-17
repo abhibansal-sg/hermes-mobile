@@ -36,6 +36,48 @@ final class WorkRepositoryLeaseTests: XCTestCase {
         XCTAssertEqual(claimed?.authorityState, .verified)
     }
 
+    func testReplacingOneAuthorityQuarantinesOnlyThatProfileEpoch() async throws {
+        let test = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: test.directory) }
+        let repository = try WorkRepository(configuration: test.configuration)
+        let oldAuthority = try AuthorityScopeV1(
+            gatewayID: "gw_AAAAAAAAAAAAAAAAAAAAAA",
+            profileID: "pf_BBBBBBBBBBBBBBBBBBBBBB",
+            authorityEpoch: "ae_CCCCCCCCCCCCCCCCCCCCCC"
+        )
+        let siblingAuthority = try AuthorityScopeV1(
+            gatewayID: oldAuthority.gatewayID,
+            profileID: "pf_DDDDDDDDDDDDDDDDDDDDDD",
+            authorityEpoch: "ae_EEEEEEEEEEEEEEEEEEEEEE"
+        )
+        let oldScope = try WorkScope(serverID: "https://gateway.test", authority: oldAuthority)
+        let siblingScope = try WorkScope(serverID: "https://gateway.test", authority: siblingAuthority)
+        let oldJob = try await repository.enqueue(
+            WorkJobInput(kind: .prompt, scope: oldScope, text: "old profile")
+        )
+        let siblingJob = try await repository.enqueue(
+            WorkJobInput(kind: .prompt, scope: siblingScope, text: "sibling profile")
+        )
+
+        let count = try await repository.quarantineAuthority(
+            gatewayID: oldAuthority.gatewayID,
+            profileID: oldAuthority.profileID,
+            authorityEpoch: oldAuthority.authorityEpoch
+        )
+
+        XCTAssertEqual(count, 1)
+        let quarantined = try await repository.job(id: oldJob.jobID)
+        let sibling = try await repository.job(id: siblingJob.jobID)
+        let claimed = try await repository.claimNextJob(
+            owner: "worker",
+            now: Date(),
+            leaseDuration: 30
+        )
+        XCTAssertEqual(quarantined?.authorityState, .quarantined)
+        XCTAssertEqual(sibling?.authorityState, .verified)
+        XCTAssertEqual(claimed?.jobID, siblingJob.jobID)
+    }
+
     func testClaimIsAtomicAndDeterministic() async throws {
         let test = try makeWorkRepositoryTestConfiguration()
         defer { try? FileManager.default.removeItem(at: test.directory) }

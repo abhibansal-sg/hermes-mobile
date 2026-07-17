@@ -133,6 +133,30 @@ actor CacheStore {
     /// revisions after relaunch.
     func loadManifestProjection(scope: CacheScope) throws -> ManifestProjection {
         try db.read { db in
+            let locator = (try? GatewayLocatorBindingV1.normalize(locator: scope.serverId))
+                ?? scope.serverId
+            if let binding = try Self.locatorBinding(locator, db: db),
+               let requestedScope = Self.manifestScope(
+                   for: scope.profileId,
+                   authorities: binding.profileAuthorities
+               ) {
+                // Production synchronizes the complete authority map through
+                // `scope=all`. A named-profile cold launch may therefore read
+                // that same indivisible snapshot and let SessionStore apply its
+                // UI filter. A profile-specific snapshot, when present, wins.
+                let candidates = requestedScope == "all"
+                    ? ["all"]
+                    : [requestedScope, "all"]
+                for manifestScope in candidates {
+                    if let projection = try Self.manifestProjection(
+                        gatewayID: binding.gatewayID,
+                        manifestScope: manifestScope,
+                        db: db
+                    ) {
+                        return projection
+                    }
+                }
+            }
             let rows = try SessionCacheRecord
                 .filter(Column("serverId") == scope.serverId)
                 .filter(Column("profileId") == scope.profileId)
@@ -159,6 +183,29 @@ actor CacheStore {
                 lastSyncedAt: payload.serverTime.map(Date.init(timeIntervalSince1970:))
             )
         }
+    }
+
+    func loadManifestProjection(
+        locator: String,
+        manifestScope: String
+    ) throws -> ManifestProjection {
+        let normalized = try GatewayLocatorBindingV1.normalize(locator: locator)
+        return try db.read { db in
+            guard let binding = try Self.locatorBinding(normalized, db: db),
+                  let projection = try Self.manifestProjection(
+                      gatewayID: binding.gatewayID,
+                      manifestScope: manifestScope,
+                      db: db
+                  ) else {
+                return .empty
+            }
+            return projection
+        }
+    }
+
+    func loadLocatorBinding(locator: String) throws -> GatewayLocatorBindingV1? {
+        let normalized = try GatewayLocatorBindingV1.normalize(locator: locator)
+        return try db.read { db in try Self.locatorBinding(normalized, db: db) }
     }
 
     // MARK: - Pending attention
@@ -394,71 +441,519 @@ actor CacheStore {
         }
     }
 
-    /// Applies the fully validated chain in one GRDB transaction. Tombstones
-    /// are unconditional on disk; survivor policy belongs to the in-memory
-    /// working-set overlay and can never repersist a removed row.
+    /// Compatibility entry point for existing tests/callers. Production uses
+    /// staged pages below, but both paths end in the same authority-keyed final
+    /// transaction. The legacy CacheScope is treated only as a locator here.
     func applyManifest(_ chain: ManifestChain, scope: CacheScope) throws -> ManifestProjection {
-        try db.write { db in
-            if let oldRaw = try SyncMetaRecord.fetchOne(db, key: SyncMetaRecord.Key.manifest(scope))?.value,
-               let data = oldRaw.data(using: .utf8),
-               let old = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data),
-               old.gatewayID == chain.gatewayID,
-               old.journalEpoch == chain.journalEpoch,
-               (old.profileAuthorities ?? []) == chain.profileAuthorities,
-               chain.revision <= old.revision {
-                let rows = try SessionCacheRecord.filter(Column("serverId") == scope.serverId).filter(Column("profileId") == scope.profileId).order(Column("lastActive").desc).fetchAll(db)
-                return ManifestProjection(gatewayID: old.gatewayID, journalEpoch: old.journalEpoch, profileAuthorities: old.profileAuthorities ?? [], revision: old.revision, cursor: old.cursor, sessions: old.sessions, attention: old.attention, activeTurns: old.activeTurns, transcriptHeads: old.transcriptHeads, capabilities: old.capabilities, freshness: .fresh)
-            }
+        let locator = (try? GatewayLocatorBindingV1.normalize(locator: scope.serverId))
+            ?? scope.serverId
+        return try db.write { db in
+            try Self.applyManifest(chain, normalizedLocator: locator, db: db).projection
+        }
+    }
 
-            if let oldRaw = try SyncMetaRecord.fetchOne(db, key: SyncMetaRecord.Key.manifest(scope))?.value,
-               let data = oldRaw.data(using: .utf8),
-               let old = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data),
-               old.gatewayID != nil,
-               (old.gatewayID != chain.gatewayID
-                || (old.profileAuthorities ?? []) != chain.profileAuthorities
-                || (old.journalEpoch != chain.journalEpoch
-                    && !(chain.reset && chain.resetReason == "journal_rebuilt"))) {
+    /// Persist one validated wire page into non-observable staging storage.
+    /// Staging never changes the locator binding or current projection.
+    func stageManifestPage(
+        _ response: SyncManifestHTTPPage,
+        locator: String,
+        pageIndex: Int
+    ) throws {
+        let normalized = try GatewayLocatorBindingV1.normalize(locator: locator)
+        guard (0..<100).contains(pageIndex), response.encodedByteCount == response.encodedData.count,
+              response.encodedByteCount <= 16 * 1024 * 1024 else {
+            throw ManifestBindingError.invalidStage
+        }
+        let page = response.page
+        try db.write { db in
+            let now = Date().timeIntervalSince1970
+            try db.execute(
+                sql: "DELETE FROM manifest_page_stage_v2 WHERE createdAt < ?",
+                arguments: [now - 10 * 60]
+            )
+            let existing = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT pageIndex,normalizedLocator,gatewayId,journalEpoch,revision,
+                           manifestScope,pageSize,pageJSON
+                    FROM manifest_page_stage_v2
+                    WHERE snapshotId=? ORDER BY pageIndex
+                    """,
+                arguments: [page.snapshotID]
+            )
+            if let first = existing.first {
+                let stagedLocator: String = first["normalizedLocator"]
+                let stagedGateway: String = first["gatewayId"]
+                let stagedJournal: String = first["journalEpoch"]
+                let stagedRevision: Int64 = first["revision"]
+                let stagedScope: String = first["manifestScope"]
+                let stagedPageSize: Int = first["pageSize"]
+                guard stagedLocator == normalized,
+                      stagedGateway == page.gatewayID,
+                      stagedJournal == page.journalEpoch,
+                      stagedRevision == page.revision,
+                      stagedScope == page.scope,
+                      stagedPageSize == page.pageSize else {
+                    throw ManifestBindingError.invalidStage
+                }
+                if pageIndex < existing.count {
+                    let prior: Data = existing[pageIndex]["pageJSON"]
+                    guard prior == response.encodedData else {
+                        throw ManifestBindingError.invalidStage
+                    }
+                    return
+                }
+                guard pageIndex == existing.count else {
+                    throw ManifestBindingError.invalidStage
+                }
+            } else if pageIndex != 0 {
+                throw ManifestBindingError.invalidStage
+            }
+            let totals = try Row.fetchOne(
+                db,
+                sql: "SELECT count(*) AS n,coalesce(sum(encodedBytes),0) AS bytes FROM manifest_page_stage_v2 WHERE snapshotId=?",
+                arguments: [page.snapshotID]
+            )
+            let count: Int = totals?["n"] ?? 0
+            let bytes: Int = totals?["bytes"] ?? 0
+            guard count < 100, bytes + response.encodedByteCount <= 16 * 1024 * 1024 else {
+                throw ManifestBindingError.invalidStage
+            }
+            try db.execute(
+                sql: """
+                    INSERT INTO manifest_page_stage_v2
+                    (snapshotId,pageIndex,normalizedLocator,gatewayId,journalEpoch,
+                     revision,manifestScope,pageSize,pageJSON,encodedBytes,createdAt)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                arguments: [
+                    page.snapshotID, pageIndex, normalized, page.gatewayID,
+                    page.journalEpoch, page.revision, page.scope, page.pageSize,
+                    response.encodedData, response.encodedByteCount, now,
+                ]
+            )
+        }
+    }
+
+    /// Validate and publish the staged chain in one final GRDB transaction.
+    /// The resume cursor and every projection row become visible together.
+    func commitStagedManifest(
+        snapshotID: String,
+        locator: String,
+        expectedPageCount: Int
+    ) throws -> ManifestCommitResult {
+        let normalized = try GatewayLocatorBindingV1.normalize(locator: locator)
+        guard snapshotID.hasPrefix("ms_"), (1...100).contains(expectedPageCount) else {
+            throw ManifestBindingError.invalidStage
+        }
+        return try db.write { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT pageIndex,normalizedLocator,pageJSON
+                    FROM manifest_page_stage_v2
+                    WHERE snapshotId=? ORDER BY pageIndex
+                    """,
+                arguments: [snapshotID]
+            )
+            guard rows.count == expectedPageCount,
+                  rows.enumerated().allSatisfy({ index, row in
+                      let stagedIndex: Int = row["pageIndex"]
+                      let stagedLocator: String = row["normalizedLocator"]
+                      return stagedIndex == index && stagedLocator == normalized
+                  }) else {
+                throw ManifestBindingError.invalidStage
+            }
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            let pages = try rows.map { row -> SyncManifestPage in
+                let data: Data = row["pageJSON"]
+                return try decoder.decode(SyncManifestPage.self, from: data)
+            }
+            let chain = try ManifestChain(validating: pages)
+            guard chain.snapshotID == snapshotID else {
+                throw ManifestBindingError.invalidStage
+            }
+            let result = try Self.applyManifest(
+                chain,
+                normalizedLocator: normalized,
+                db: db
+            )
+            try db.execute(
+                sql: "DELETE FROM manifest_page_stage_v2 WHERE snapshotId=?",
+                arguments: [snapshotID]
+            )
+            return result
+        }
+    }
+
+    func discardStagedManifest(snapshotID: String) throws {
+        try db.write { db in
+            try db.execute(
+                sql: "DELETE FROM manifest_page_stage_v2 WHERE snapshotId=?",
+                arguments: [snapshotID]
+            )
+        }
+    }
+
+    private static func applyManifest(
+        _ chain: ManifestChain,
+        normalizedLocator: String,
+        db: Database
+    ) throws -> ManifestCommitResult {
+        let now = Date().timeIntervalSince1970
+        let oldBinding = try locatorBinding(normalizedLocator, db: db)
+        var replacedGatewayID: String?
+        var replacedProfiles: Set<ManifestAuthorityReplacement> = []
+
+        if let oldBinding, oldBinding.gatewayID != chain.gatewayID {
+            replacedGatewayID = oldBinding.gatewayID
+            replacedProfiles.formUnion(oldBinding.profileAuthorities.map {
+                ManifestAuthorityReplacement(
+                    gatewayID: oldBinding.gatewayID,
+                    profileID: $0.profileID,
+                    authorityEpoch: $0.authorityEpoch
+                )
+            })
+            try db.execute(
+                sql: "UPDATE authority_partition_v1 SET state='recovered',updatedAt=? WHERE gatewayId=? AND state='current'",
+                arguments: [now, oldBinding.gatewayID]
+            )
+        } else if let oldBinding {
+            let incomingByID = Dictionary(
+                uniqueKeysWithValues: chain.profileAuthorities.map { ($0.profileID, $0) }
+            )
+            let incomingByName = Dictionary(
+                uniqueKeysWithValues: chain.profileAuthorities.map { ($0.profileName, $0) }
+            )
+            for old in oldBinding.profileAuthorities {
+                let sameID = incomingByID[old.profileID]
+                let sameName = incomingByName[old.profileName]
+                if sameID?.authorityEpoch != old.authorityEpoch
+                    || (sameID == nil && sameName?.profileID != old.profileID) {
+                    replacedProfiles.insert(
+                        ManifestAuthorityReplacement(
+                            gatewayID: oldBinding.gatewayID,
+                            profileID: old.profileID,
+                            authorityEpoch: old.authorityEpoch
+                        )
+                    )
+                    try db.execute(
+                        sql: """
+                            UPDATE authority_partition_v1
+                            SET state='recovered',updatedAt=?
+                            WHERE gatewayId=? AND profileId=? AND authorityEpoch=?
+                            """,
+                        arguments: [
+                            now, oldBinding.gatewayID, old.profileID, old.authorityEpoch,
+                        ]
+                    )
+                }
+            }
+        }
+
+        for authority in chain.profileAuthorities {
+            try db.execute(
+                sql: """
+                    INSERT INTO authority_partition_v1
+                    (gatewayId,profileId,authorityEpoch,profileName,state,updatedAt)
+                    VALUES (?,?,?,?, 'current', ?)
+                    ON CONFLICT(gatewayId,profileId,authorityEpoch) DO UPDATE SET
+                      profileName=excluded.profileName,state='current',updatedAt=excluded.updatedAt
+                    """,
+                arguments: [
+                    chain.gatewayID, authority.profileID, authority.authorityEpoch,
+                    authority.profileName, now,
+                ]
+            )
+        }
+
+        let authorityData = try JSONEncoder().encode(chain.profileAuthorities)
+        try db.execute(
+            sql: """
+                INSERT INTO gateway_locator_binding_v1
+                (normalizedLocator,gatewayId,profileAuthoritiesJSON,verifiedAt)
+                VALUES (?,?,?,?)
+                ON CONFLICT(normalizedLocator) DO UPDATE SET
+                  gatewayId=excluded.gatewayId,
+                  profileAuthoritiesJSON=excluded.profileAuthoritiesJSON,
+                  verifiedAt=excluded.verifiedAt
+                """,
+            arguments: [normalizedLocator, chain.gatewayID, authorityData, now]
+        )
+
+        if let existing = try manifestProjection(
+            gatewayID: chain.gatewayID,
+            manifestScope: chain.scope,
+            db: db
+        ), existing.journalEpoch == chain.journalEpoch,
+           existing.profileAuthorities == chain.profileAuthorities,
+           chain.revision <= existing.revision {
+            let binding = GatewayLocatorBindingV1(
+                normalizedLocator: normalizedLocator,
+                gatewayID: chain.gatewayID,
+                profileAuthorities: chain.profileAuthorities,
+                verifiedAt: Date(timeIntervalSince1970: now)
+            )
+            return ManifestCommitResult(
+                projection: ManifestProjection(
+                    gatewayID: existing.gatewayID,
+                    journalEpoch: existing.journalEpoch,
+                    profileAuthorities: existing.profileAuthorities,
+                    revision: existing.revision,
+                    cursor: existing.cursor,
+                    sessions: existing.sessions,
+                    attention: existing.attention,
+                    activeTurns: existing.activeTurns,
+                    transcriptHeads: existing.transcriptHeads,
+                    capabilities: existing.capabilities,
+                    freshness: .fresh,
+                    lastSyncedAt: existing.lastSyncedAt
+                ),
+                binding: binding,
+                transition: ManifestAuthorityTransition(
+                    replacedGatewayID: replacedGatewayID,
+                    replacedProfiles: replacedProfiles
+                )
+            )
+        }
+
+        if let state = try Row.fetchOne(
+            db,
+            sql: "SELECT journalEpoch FROM manifest_projection_state_v2 WHERE gatewayId=? AND manifestScope=?",
+            arguments: [chain.gatewayID, chain.scope]
+        ) {
+            let oldJournal: String = state["journalEpoch"]
+            guard oldJournal == chain.journalEpoch
+                    || (chain.reset && chain.resetReason == "journal_rebuilt") else {
                 throw ManifestCacheError.authorityTransitionRequiresMigration
             }
-
-            if chain.reset {
-                try SessionCacheRecord
-                    .filter(Column("serverId") == scope.serverId)
-                    .filter(Column("profileId") == scope.profileId)
-                    .deleteAll(db)
-            }
-
-            for id in chain.tombstones {
-                try SessionCacheRecord
-                    .filter(Column("id") == id)
-                    .filter(Column("serverId") == scope.serverId)
-                    .filter(Column("profileId") == scope.profileId)
-                    .deleteAll(db)
-            }
-            for summary in chain.sessions where !chain.tombstones.contains(summary.id) {
-                let existing = try SessionCacheRecord
-                    .filter(Column("serverId") == scope.serverId)
-                    .filter(Column("profileId") == scope.profileId)
-                    .filter(Column("id") == summary.id)
-                    .fetchOne(db)
-                let record = try SessionCacheRecord.make(from: summary, scope: scope, isPinned: existing?.isPinned ?? false, lastAccessedAt: existing?.lastAccessedAt ?? 0, transcriptCachedAt: existing?.transcriptCachedAt, maxMessageId: existing?.maxMessageId)
-                try record.save(db)
-            }
-            let previous: [SessionSummary]
-            if chain.reset { previous = [] }
-            else if let raw = try SyncMetaRecord.fetchOne(db, key: SyncMetaRecord.Key.manifest(scope))?.value,
-                    let data = raw.data(using: .utf8), let old = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data) { previous = old.sessions }
-            else { previous = (try? SessionCacheRecord.filter(Column("serverId") == scope.serverId).filter(Column("profileId") == scope.profileId).fetchAll(db).map { try $0.decodeSummary() }) ?? [] }
-            var byID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
-            for id in chain.tombstones { byID.removeValue(forKey: id) }
-            for session in chain.sessions where !chain.tombstones.contains(session.id) { byID[session.id] = session }
-            let projectedSessions = byID.values.sorted { ($0.lastActive ?? 0) > ($1.lastActive ?? 0) }
-            let payload = ManifestCommitPayload(gatewayID: chain.gatewayID, journalEpoch: chain.journalEpoch, profileAuthorities: chain.profileAuthorities, revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities, serverTime: chain.serverTime)
-            let encoded = try JSONEncoder().encode(payload)
-            try SyncMetaRecord(key: SyncMetaRecord.Key.manifest(scope), value: String(decoding: encoded, as: UTF8.self)).save(db)
-            let rows = try SessionCacheRecord.filter(Column("serverId") == scope.serverId).filter(Column("profileId") == scope.profileId).order(Column("lastActive").desc).fetchAll(db)
-            return ManifestProjection(gatewayID: chain.gatewayID, journalEpoch: chain.journalEpoch, profileAuthorities: chain.profileAuthorities, revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities, freshness: .fresh, lastSyncedAt: chain.serverTime.map(Date.init(timeIntervalSince1970:)))
         }
+
+        if chain.reset {
+            for authority in chain.profileAuthorities {
+                try db.execute(
+                    sql: """
+                        DELETE FROM manifest_session_projection_v2
+                        WHERE gatewayId=? AND profileId=? AND authorityEpoch=?
+                        """,
+                    arguments: [
+                        chain.gatewayID, authority.profileID, authority.authorityEpoch,
+                    ]
+                )
+            }
+        }
+
+        for tombstone in chain.tombstoneRecords {
+            try db.execute(
+                sql: """
+                    INSERT INTO projection_tombstone_v1
+                    (gatewayId,profileId,authorityEpoch,entityKind,entityId,serverRevision,deletedAt)
+                    VALUES (?,?,?,'session',?,?,?)
+                    ON CONFLICT(gatewayId,profileId,authorityEpoch,entityKind,entityId)
+                    DO UPDATE SET serverRevision=excluded.serverRevision,deletedAt=excluded.deletedAt
+                    WHERE excluded.serverRevision >= projection_tombstone_v1.serverRevision
+                    """,
+                arguments: [
+                    chain.gatewayID, tombstone.profileID, tombstone.authorityEpoch,
+                    tombstone.sessionID, tombstone.entityRevision, tombstone.deletedAt,
+                ]
+            )
+            try db.execute(
+                sql: """
+                    DELETE FROM manifest_session_projection_v2
+                    WHERE gatewayId=? AND profileId=? AND authorityEpoch=?
+                      AND sessionId=? AND entityRevision<=?
+                    """,
+                arguments: [
+                    chain.gatewayID, tombstone.profileID, tombstone.authorityEpoch,
+                    tombstone.sessionID, tombstone.entityRevision,
+                ]
+            )
+        }
+
+        let encoder = JSONEncoder()
+        for upsert in chain.sessionUpserts {
+            let tombstoneRevision = try Int64.fetchOne(
+                db,
+                sql: """
+                    SELECT serverRevision FROM projection_tombstone_v1
+                    WHERE gatewayId=? AND profileId=? AND authorityEpoch=?
+                      AND entityKind='session' AND entityId=?
+                    """,
+                arguments: [
+                    chain.gatewayID, upsert.profileID, upsert.authorityEpoch,
+                    upsert.summary.id,
+                ]
+            )
+            guard (tombstoneRevision ?? -1) < upsert.entityRevision else { continue }
+            let summaryData = try encoder.encode(upsert.summary)
+            try db.execute(
+                sql: """
+                    INSERT INTO manifest_session_projection_v2
+                    (gatewayId,profileId,authorityEpoch,sessionId,summaryJSON,entityRevision,lastActive)
+                    VALUES (?,?,?,?,?,?,?)
+                    ON CONFLICT(gatewayId,profileId,authorityEpoch,sessionId) DO UPDATE SET
+                      summaryJSON=excluded.summaryJSON,
+                      entityRevision=excluded.entityRevision,
+                      lastActive=excluded.lastActive
+                    WHERE excluded.entityRevision >= manifest_session_projection_v2.entityRevision
+                    """,
+                arguments: [
+                    chain.gatewayID, upsert.profileID, upsert.authorityEpoch,
+                    upsert.summary.id, summaryData, upsert.entityRevision,
+                    upsert.summary.lastActive,
+                ]
+            )
+        }
+
+        var projectedSessions: [SessionSummary] = []
+        for authority in chain.profileAuthorities {
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT summaryJSON FROM manifest_session_projection_v2
+                    WHERE gatewayId=? AND profileId=? AND authorityEpoch=?
+                    ORDER BY lastActive DESC
+                    """,
+                arguments: [
+                    chain.gatewayID, authority.profileID, authority.authorityEpoch,
+                ]
+            )
+            projectedSessions.append(contentsOf: try rows.map { row in
+                let data: Data = row["summaryJSON"]
+                return try JSONDecoder().decode(SessionSummary.self, from: data)
+            })
+        }
+        projectedSessions.sort { ($0.lastActive ?? 0) > ($1.lastActive ?? 0) }
+
+        let payload = ManifestCommitPayload(
+            gatewayID: chain.gatewayID,
+            journalEpoch: chain.journalEpoch,
+            profileAuthorities: chain.profileAuthorities,
+            revision: chain.revision,
+            cursor: chain.cursor,
+            sessions: projectedSessions,
+            attention: chain.attention,
+            activeTurns: chain.activeTurns,
+            transcriptHeads: chain.transcriptHeads,
+            capabilities: chain.capabilities,
+            serverTime: chain.serverTime
+        )
+        let payloadData = try encoder.encode(payload)
+        try db.execute(
+            sql: """
+                INSERT INTO manifest_projection_state_v2
+                (gatewayId,manifestScope,journalEpoch,revision,resumeCursor,payloadJSON,updatedAt)
+                VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(gatewayId,manifestScope) DO UPDATE SET
+                  journalEpoch=excluded.journalEpoch,
+                  revision=excluded.revision,
+                  resumeCursor=excluded.resumeCursor,
+                  payloadJSON=excluded.payloadJSON,
+                  updatedAt=excluded.updatedAt
+                """,
+            arguments: [
+                chain.gatewayID, chain.scope, chain.journalEpoch, chain.revision,
+                chain.cursor, payloadData, now,
+            ]
+        )
+        let binding = GatewayLocatorBindingV1(
+            normalizedLocator: normalizedLocator,
+            gatewayID: chain.gatewayID,
+            profileAuthorities: chain.profileAuthorities,
+            verifiedAt: Date(timeIntervalSince1970: now)
+        )
+        let projection = ManifestProjection(
+            gatewayID: chain.gatewayID,
+            journalEpoch: chain.journalEpoch,
+            profileAuthorities: chain.profileAuthorities,
+            revision: chain.revision,
+            cursor: chain.cursor,
+            sessions: projectedSessions,
+            attention: chain.attention,
+            activeTurns: chain.activeTurns,
+            transcriptHeads: chain.transcriptHeads,
+            capabilities: chain.capabilities,
+            freshness: .fresh,
+            lastSyncedAt: chain.serverTime.map(Date.init(timeIntervalSince1970:))
+        )
+        return ManifestCommitResult(
+            projection: projection,
+            binding: binding,
+            transition: ManifestAuthorityTransition(
+                replacedGatewayID: replacedGatewayID,
+                replacedProfiles: replacedProfiles
+            )
+        )
+    }
+
+    private static func locatorBinding(
+        _ normalizedLocator: String,
+        db: Database
+    ) throws -> GatewayLocatorBindingV1? {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: """
+                SELECT gatewayId,profileAuthoritiesJSON,verifiedAt
+                FROM gateway_locator_binding_v1 WHERE normalizedLocator=?
+                """,
+            arguments: [normalizedLocator]
+        ) else { return nil }
+        let data: Data = row["profileAuthoritiesJSON"]
+        let authorities = try JSONDecoder().decode(
+            [ManifestProfileAuthority].self,
+            from: data
+        )
+        return GatewayLocatorBindingV1(
+            normalizedLocator: normalizedLocator,
+            gatewayID: row["gatewayId"],
+            profileAuthorities: authorities,
+            verifiedAt: Date(timeIntervalSince1970: row["verifiedAt"])
+        )
+    }
+
+    private static func manifestScope(
+        for profileSelector: String,
+        authorities: [ManifestProfileAuthority]
+    ) -> String? {
+        if profileSelector == CacheScope.allProfilesKey { return "all" }
+        if profileSelector.hasPrefix("pf_") { return "profile:\(profileSelector)" }
+        guard let authority = authorities.first(where: {
+            $0.profileName == profileSelector
+        }) else { return nil }
+        return "profile:\(authority.profileID)"
+    }
+
+    private static func manifestProjection(
+        gatewayID: String,
+        manifestScope: String,
+        db: Database
+    ) throws -> ManifestProjection? {
+        guard let row = try Row.fetchOne(
+            db,
+            sql: """
+                SELECT payloadJSON FROM manifest_projection_state_v2
+                WHERE gatewayId=? AND manifestScope=?
+                """,
+            arguments: [gatewayID, manifestScope]
+        ) else { return nil }
+        let data: Data = row["payloadJSON"]
+        let payload = try JSONDecoder().decode(ManifestCommitPayload.self, from: data)
+        return ManifestProjection(
+            gatewayID: payload.gatewayID,
+            journalEpoch: payload.journalEpoch,
+            profileAuthorities: payload.profileAuthorities ?? [],
+            revision: payload.revision,
+            cursor: payload.cursor,
+            sessions: payload.sessions,
+            attention: payload.attention,
+            activeTurns: payload.activeTurns,
+            transcriptHeads: payload.transcriptHeads,
+            capabilities: payload.capabilities,
+            freshness: .cached,
+            lastSyncedAt: payload.serverTime.map(Date.init(timeIntervalSince1970:))
+        )
     }
 
     /// Save (upsert) a batch of SessionSummary values into session_cache under
