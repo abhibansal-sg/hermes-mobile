@@ -586,8 +586,14 @@ final class CacheFirstLaunchTests: XCTestCase {
         }
 
         sessions.prefetchRecentTranscripts()
-        // Drain the sweep deterministically.
-        try await Self.poll { await fetched.value.count == 2 }
+        // Drain through the durable write boundary, not merely the fetch
+        // callback: the callback completes before each GRDB save starts.
+        try await Self.poll {
+            guard await fetched.value.count == 2 else { return false }
+            let hasP1 = (try? await cache.hasTranscript(self.cacheIdentity("p1"))) == true
+            let hasP2 = (try? await cache.hasTranscript(self.cacheIdentity("p2"))) == true
+            return hasP1 && hasP2
+        }
 
         let got = await fetched.value
         XCTAssertEqual(got, ["p1", "p2"])
