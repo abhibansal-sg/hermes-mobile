@@ -25,7 +25,10 @@ final class RestClientLiveTests: XCTestCase {
         let page = await fetchTranscriptPage(rest: rest, sessionId: "s 1", limit: 50, before: 42)
 
         XCTAssertEqual(TranscriptPageStubProtocol.requestedPath, "/api/plugins/hermes-mobile/sessions/s%201/messages")
-        XCTAssertEqual(TranscriptPageStubProtocol.requestedQuery, "limit=50&before=42")
+        XCTAssertEqual(
+            TranscriptPageStubProtocol.requestedQuery,
+            "limit=50&shape=skeleton&before=42"
+        )
         XCTAssertEqual(page?.messages.map(\.wireId), [41])
         XCTAssertEqual(page?.oldestId, 41)
         XCTAssertEqual(page?.hasMoreBefore, true)

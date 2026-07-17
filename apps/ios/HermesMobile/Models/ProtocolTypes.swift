@@ -205,6 +205,22 @@ struct SessionOpenResult: Decodable, Sendable {
     let storedSessionId: String?
     let messageCount: Int?
     let info: SessionRuntimeInfo?
+    /// Root-level live truth returned by current gateway resume/activate paths.
+    /// Older gateways omit these fields, in which case the client falls back to
+    /// `session.status` without inventing an idle state.
+    let running: Bool?
+    let status: String?
+    let inflight: SessionInflightTurn?
+
+    var snapshotRunning: Bool? {
+        if let running { return running }
+        if inflight?.streaming == true { return true }
+        switch status?.lowercased() {
+        case "streaming", "starting", "compacting": return true
+        case "idle": return false
+        default: return nil
+        }
+    }
 
     // NOTE: the RPC decode path uses `.convertFromSnakeCase`
     // (`JSONValue.decoded(as:)`), so wire keys arrive already camelCased —
@@ -215,6 +231,9 @@ struct SessionOpenResult: Decodable, Sendable {
         case resumed
         case messageCount
         case info
+        case running
+        case status
+        case inflight
     }
 
     init(from decoder: Decoder) throws {
@@ -229,7 +248,19 @@ struct SessionOpenResult: Decodable, Sendable {
             ?? c.decodeIfPresent(String.self, forKey: .resumed)
         self.messageCount = try c.decodeIfPresent(Int.self, forKey: .messageCount)
         self.info = try c.decodeIfPresent(SessionRuntimeInfo.self, forKey: .info)
+        self.running = try c.decodeIfPresent(Bool.self, forKey: .running)
+        self.status = try c.decodeIfPresent(String.self, forKey: .status)
+        self.inflight = try c.decodeIfPresent(SessionInflightTurn.self, forKey: .inflight)
     }
+}
+
+/// Bounded in-process turn snapshot returned by `session.resume`/`activate`.
+/// It restores truthful UI after navigation or reconnect; it is never written
+/// to the permanent transcript cache.
+struct SessionInflightTurn: Decodable, Sendable, Equatable {
+    let user: String
+    let assistant: String
+    let streaming: Bool
 }
 
 /// `info` block returned by session.create/resume and session.status.

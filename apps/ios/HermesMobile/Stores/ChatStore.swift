@@ -33,7 +33,7 @@ func fetchTranscriptPage(
         withAllowedCharacters: .urlPathAllowed
     ) ?? sessionId
     var path = "\(rest.pathStyle.mobileAPIPrefix)/sessions/\(encodedId)/messages"
-        + "?limit=\(max(1, limit))"
+        + "?limit=\(max(1, limit))&shape=skeleton"
     if let before, before > 0 {
         path += "&before=\(before)"
     }
@@ -1266,7 +1266,8 @@ final class ChatStore {
     /// (for example, the user re-enters a chat whose turn was started elsewhere or
     /// before navigating away). The REST transcript only contains persisted rows;
     /// it does NOT prove the current runtime is idle. After the open seed has
-    /// landed, ask the gateway for `session.status` and, if it reports `running`,
+    /// landed, consume the resume snapshot when available; older gateways fall
+    /// back to `session.status`. If either reports `running`,
     /// re-create the local in-flight UI state: a streaming assistant placeholder,
     /// the global `isStreaming` flag, the local-turn ownership token (so mutable
     /// actions are disabled), and the Stop target (`activeSessionId`).
@@ -1274,7 +1275,17 @@ final class ChatStore {
     /// This is deliberately idempotent: a live websocket `message.start` that wins
     /// the race simply means the streaming row already exists, and a superseded
     /// open drops out via the runtime-id guard.
-    func reconcileLiveTurnStatus(runtimeId: String) async {
+    func reconcileLiveTurnStatus(
+        runtimeId: String,
+        snapshotRunning: Bool? = nil,
+        inflight: SessionInflightTurn? = nil
+    ) async {
+        guard runtimeId == activeSessionId else { return }
+        if let snapshotRunning {
+            guard snapshotRunning else { return }
+            restoreInflightTurn(inflight)
+            return
+        }
         guard let fetch = resolvedLiveTurnStatusFetch else { return }
         let status = try? await fetch(runtimeId)
         guard runtimeId == activeSessionId else { return }
@@ -1282,8 +1293,23 @@ final class ChatStore {
             applyContextUsage(from: usage)
         }
         guard status?.running == true else { return }
+        restoreInflightTurn(nil)
+    }
+
+    private func restoreInflightTurn(_ inflight: SessionInflightTurn?) {
+        let user = inflight?.user.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !user.isEmpty {
+            let lastUser = messages.last(where: { $0.role == .user })
+            if lastUser?.text != user || messages.last?.role != .user {
+                messages.append(ChatMessage(role: .user, text: user))
+                rebuildUserOrdinals()
+            }
+        }
         beginLocalTurn()
         beginStreamingMessage()
+        if let assistant = inflight?.assistant, !assistant.isEmpty {
+            mutateStreaming { $0.applyFinalText(assistant) }
+        }
     }
 
     /// Injectable seam for `reconcileLiveTurnStatus` tests. The live path uses the

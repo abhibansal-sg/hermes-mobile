@@ -3363,7 +3363,11 @@ final class SessionStore {
                 await seedTask.value
                 guard self.openToken == token,
                       self.activeRuntimeId == result.sessionId else { return }
-                await self.chat?.reconcileLiveTurnStatus(runtimeId: result.sessionId)
+                await self.chat?.reconcileLiveTurnStatus(
+                    runtimeId: result.sessionId,
+                    snapshotRunning: result.snapshotRunning,
+                    inflight: result.inflight
+                )
                 // Runtime bound: flush anything the composer queued during this
                 // resume window. If live re-entry just restored a running turn, the
                 // queue's busy guards now see that state and leave prompts queued.
@@ -3745,6 +3749,15 @@ final class SessionStore {
             confirmActiveProfile(from: result.info)
             // Keep the composer pill session-true on this resume path too.
             if let info = result.info { connection?.applyRuntimeInfo(info) }
+            // Reconnects can land in a quiet long-running tool call. Restore the
+            // server's root-level snapshot before ConnectionStore backfills; the
+            // backfill then correctly defers while this authoritative live turn
+            // is active instead of erasing it as apparently idle.
+            await chat?.reconcileLiveTurnStatus(
+                runtimeId: result.sessionId,
+                snapshotRunning: result.snapshotRunning,
+                inflight: result.inflight
+            )
             lastError = nil
             sessionActionError = nil
             return result.sessionId
