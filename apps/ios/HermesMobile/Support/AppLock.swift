@@ -169,6 +169,13 @@ final class AppLock {
             // swipe, Control Center, notification shade) must NOT raise the shield;
             // only start the re-lock clock. Leaving the visible surface untouched
             // here is the GitHub #207 fix.
+            //
+            // Known tradeoff (#207): ScenePhase cannot distinguish those transient
+            // interruptions from a swipe-up-and-hold app-switcher invocation, which
+            // also resigns to `.inactive` and only reaches `.background` once the
+            // user leaves the app. During that window the switcher card can composite
+            // live content. Re-covering here would reopen the #207 black-flash bug;
+            // closing this exposure needs a non-ScenePhase signal (see #207).
             guard isEnabled else { return }
             if backgroundedAt == nil {
                 backgroundedAt = now()
