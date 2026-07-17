@@ -4968,6 +4968,17 @@ final class SessionStore {
     /// invoke the stored-transcript fetch with the row's owning profile.
     var transcriptFetchWithProfile: ((String, String?) async throws -> [StoredMessage])?
 
+    /// Shape-aware transcript seam (WS-5.1 skeleton cold-open). The third argument
+    /// is the requested payload tier (`"skeleton"` for the fast cold-open paint,
+    /// `"full"` for the background hydrate). Preferred over the legacy seams when
+    /// present so a test can assert BOTH the skeleton request and the full hydrate.
+    var transcriptFetchShaped: ((String, String?, String) async throws -> [StoredMessage])?
+
+    /// Test override for ``skeletonColdOpenEligible`` — forces the cold-open seed
+    /// to request the skeleton tier (and hydrate) regardless of the live gateway
+    /// path style, so the two-phase behavior is deterministically exercisable.
+    var skeletonColdOpenForced: Bool?
+
     /// Profile-aware delete seam for ABH-408. The live path resolves to
     /// `RestClient.deleteSession(id:profile:)`; tests inject this to assert that
     /// All-profiles row deletes target the row's owning profile store.
@@ -5127,7 +5138,14 @@ final class SessionStore {
         signalFirstPaint()
 
         // Phase 2 — authoritative network seed, reconciled in place.
-        guard let fetch = resolvedTranscriptFetch else { return }
+        // WS-5.1: on plugin gateways, seed with the SKELETON tier (conversational
+        // text only; heavy reasoning_content + tool_calls nulled server-side) so
+        // the network seed paints instantly and never blocks behind a full fetch;
+        // a background task then hydrates the heavy fields to full and reconciles
+        // in place. Stock gateways ignore `shape` and keep the single full fetch.
+        let seedShape: String? = skeletonColdOpenEligible ? "skeleton" : nil
+        let seedWasSkeleton = seedShape != nil
+        guard let fetch = resolvedTranscriptFetch(shape: seedShape) else { return }
         do {
             // ARCH37 STEP 3 — skip the redundant network seed only when the SAME
             // DISK copy we just painted is FRESH. A memory snapshot is an instant
@@ -5170,10 +5188,14 @@ final class SessionStore {
             chat.noteTranscriptSeedWindow(stored)
             #if DEBUG
             Self.logOpenLatency(
-                phase: "network-painted", storedId: storedId, since: openClock)
+                phase: seedWasSkeleton ? "network-painted(skeleton)" : "network-painted",
+                storedId: storedId, since: openClock)
             #endif
             // P3 write-through: persist the freshly-fetched transcript so the
             // next open paints it from disk. Fire-and-forget, OFF the UI path.
+            // The skeleton tier writes ALL rows (heavy fields nulled, row count
+            // unchanged) so it is a valid intermediate; the hydrate below
+            // overwrites it with the full payload if it lands.
             if let cacheStore, let identity = capturedIdentity {
                 Task { [weak self] in
                     guard let self,
@@ -5183,6 +5205,24 @@ final class SessionStore {
                               transportEpoch: transportEpoch
                           ) else { return }
                     try? await cacheStore.saveTranscript(identity: identity, messages: stored)
+                }
+            }
+            // WS-5.1: background-hydrate the heavy fields the skeleton tier nulled.
+            // The skeleton is a fully-usable read (conversational text intact), so
+            // hydration is best-effort and never blocks the UI. It reconciles in
+            // place by deterministic wire id — rows do not remount, only their
+            // reasoning/tool-call content enriches (no re-layout jump). This is the
+            // fix for reopened chats losing reasoning/tool-call content (#208).
+            if seedWasSkeleton {
+                Task(priority: .utility) { [weak self] in
+                    await self?.hydrateTranscriptToFull(
+                        storedId: storedId,
+                        networkProfile: networkProfile,
+                        cacheProfile: cacheProfile,
+                        token: token,
+                        workGeneration: workGeneration,
+                        transportEpoch: transportEpoch
+                    )
                 }
             }
         } catch {
@@ -5201,6 +5241,58 @@ final class SessionStore {
                     ?? error.localizedDescription
                 chat.noteTranscriptLoadFailure(description)
             }
+        }
+    }
+
+    /// WS-5.1 — background hydration of the skeleton cold-open seed. Fetches the
+    /// FULL transcript (heavy `reasoning_content` + `tool_calls` restored) and
+    /// reconciles it in place over the skeleton-painted rows, then overwrites the
+    /// intermediate skeleton cache with the full payload so the next open paints
+    /// the complete transcript from disk. Best-effort: the skeleton is a
+    /// fully-usable read, so any failure is swallowed (a later open re-attempts).
+    ///
+    /// Runs at `.utility` priority so it never contends with the open path or a
+    /// live turn; the network `await` and ``normalizeOffMain`` suspend off the
+    /// main actor. The in-place `chat.seed` reconcile is identity-preserving (by
+    /// deterministic wire id), so enriched rows don't remount — no visible jump.
+    /// The same supersession guards as the seed (`token` / `workGeneration` /
+    /// `transportEpoch`) abort a hydration a newer open/reconnect superseded.
+    private func hydrateTranscriptToFull(
+        storedId: String,
+        networkProfile: String?,
+        cacheProfile: String,
+        token: UUID,
+        workGeneration: UInt64,
+        transportEpoch: UInt64
+    ) async {
+        guard isCurrentTranscriptNetworkWork(
+            token: token, workGeneration: workGeneration, transportEpoch: transportEpoch
+        ), let chat else { return }
+        guard let fetch = resolvedTranscriptFetch(shape: nil) else { return }
+        do {
+            let full = try await fetch(storedId, networkProfile)
+            guard isCurrentTranscriptNetworkWork(
+                token: token, workGeneration: workGeneration, transportEpoch: transportEpoch
+            ) else { return }
+            let normalized = await Self.normalizeOffMain(full)
+            guard isCurrentTranscriptNetworkWork(
+                token: token, workGeneration: workGeneration, transportEpoch: transportEpoch
+            ) else { return }
+            rememberWarmOpenSnapshot(normalized, for: storedId)
+            chat.seed(normalized: normalized)
+            chat.noteTranscriptSeedWindow(full)
+            // Overwrite the intermediate skeleton cache with the full payload.
+            if let cacheStore, let identity = cacheIdentity(storedId, profile: cacheProfile) {
+                try? await cacheStore.saveTranscript(identity: identity, messages: full)
+            }
+            #if DEBUG
+            Self.logOpenLatency(
+                phase: "network-hydrated(full)", storedId: storedId,
+                since: ContinuousClock.now)
+            #endif
+        } catch {
+            // Best-effort: skeleton remains the usable read. A later open or
+            // backfill will retry. Surface nothing to the UI.
         }
     }
 
@@ -5223,7 +5315,7 @@ final class SessionStore {
         transportEpoch: UInt64
     ) async {
         guard let chat else { return }
-        guard let storedId, let fetch = resolvedTranscriptFetch else {
+        guard let storedId, let fetch = resolvedTranscriptFetch() else {
             chat.reset()
             return
         }
@@ -5327,9 +5419,29 @@ final class SessionStore {
 
     /// The injected transcript seams, or the default that resolves the live
     /// REST client (mirrors `ChatStore.resolvedBackfillFetch`).
-    private var resolvedTranscriptFetch: ((String, String?) async throws -> [StoredMessage])? {
-        if let transcriptFetchWithProfile { return transcriptFetchWithProfile }
-        if let transcriptFetch { return { sessionId, _ in try await transcriptFetch(sessionId) } }
+    ///
+    /// `shape` (WS-5.1): tiers the requested payload — `"skeleton"` nulls the heavy
+    /// `reasoning_content` + `tool_calls` fields server-side for a faster cold-open
+    /// paint; `nil` (the default) is the shipped FULL fetch. Only the plugin mount
+    /// honors `shape`; a stock gateway ignores the unknown query param and returns
+    /// full, so this stays backward-safe. The shape-aware test seam
+    /// (``transcriptFetchShaped``) is preferred when present; otherwise the legacy
+    /// shape-ignorant seams are used as-is for the default (`nil`) shape only.
+    private func resolvedTranscriptFetch(
+        shape: String? = nil
+    ) -> ((String, String?) async throws -> [StoredMessage])? {
+        if let transcriptFetchShaped {
+            let seam = transcriptFetchShaped
+            return { sessionId, profile in
+                try await seam(sessionId, profile, shape ?? "full")
+            }
+        }
+        // Default (no shape requested): keep the legacy shape-ignorant seams
+        // byte-for-byte so existing tests/default-scope callers are unchanged.
+        if shape == nil {
+            if let transcriptFetchWithProfile { return transcriptFetchWithProfile }
+            if let transcriptFetch { return { sessionId, _ in try await transcriptFetch(sessionId) } }
+        }
         guard let rest = connection?.rest else { return nil }
         // ABH-408: a non-default row opened from the All-profiles rail must use
         // RestClient+Profiles.messages(sessionId:profile:) so the backend reads
@@ -5339,19 +5451,33 @@ final class SessionStore {
         // a profile-aware latest-descendant/messages route.
         return { [cacheStore] sessionId, profile in
             if let profile, !profile.isEmpty {
-                return try await rest.messages(sessionId: sessionId, profile: profile)
+                return try await rest.messages(sessionId: sessionId, profile: profile, shape: shape)
             }
             // ABH-400: plugin gateways fetch only the recent tail window on open;
             // legacy/older plugin builds keep the existing delta-aware full fallback.
             if let page = await fetchTranscriptPage(
                 rest: rest,
                 sessionId: sessionId,
-                limit: ChatStore.transcriptOpenWindowLimit
+                limit: ChatStore.transcriptOpenWindowLimit,
+                shape: shape
             ) {
                 return page.messages
             }
-            return try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId, identity: self.cacheIdentity(sessionId))
+            return try await fetchTranscriptDeltaAware(
+                rest: rest, cacheStore: cacheStore, sessionId: sessionId,
+                identity: self.cacheIdentity(sessionId), shape: shape)
         }
+    }
+
+    /// Whether the cold-open network seed should request the `skeleton` tier and
+    /// then hydrate to full in the background (WS-5.1). True only on the plugin
+    /// mount — the sole route that honors `shape` (the stock endpoint ignores the
+    /// unknown query param and returns full, so a skeleton-then-hydrate there would
+    /// be a redundant double full fetch). Overridable by tests via
+    /// ``skeletonColdOpenForced``.
+    private var skeletonColdOpenEligible: Bool {
+        if let forced = skeletonColdOpenForced { return forced }
+        return connection?.rest?.pathStyle == .plugin
     }
 
     /// The injected ``rpcSend``, or the default that forwards to the live gateway

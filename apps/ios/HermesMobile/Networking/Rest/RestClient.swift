@@ -344,8 +344,17 @@ struct RestClient: Sendable {
     /// The response is either `{"messages": [...]}` or a bare `[...]` array;
     /// both shapes are handled. Entries that fail ``StoredMessage`` parsing
     /// are dropped.
-    func messages(sessionId: String) async throws -> [StoredMessage] {
-        let data = try await get(path: "/api/sessions/\(sessionId)/messages")
+    ///
+    /// `shape` (WS-5.1): `"skeleton"` requests conversational text only (heavy
+    /// `reasoning_content` + `tool_calls` nulled server-side) for a fast cold-open
+    /// paint, then a follow-up full fetch hydrates them. Only the hermes-mobile
+    /// PLUGIN mount honors `shape`; a stock gateway ignores the unknown query param
+    /// and returns the full transcript unchanged, so this stays fully
+    /// backward-safe. `nil` (default) is the shipped full fetch.
+    func messages(sessionId: String, shape: String? = nil) async throws -> [StoredMessage] {
+        var path = "/api/sessions/\(sessionId)/messages"
+        if let shape, !shape.isEmpty { path += "?shape=\(shape)" }
+        let data = try await get(path: path)
 
         let root = try decodeJSONValue(from: data, context: "messages")
 
@@ -702,7 +711,8 @@ func fetchTranscriptDeltaAware(
     rest: RestClient,
     cacheStore: CacheStore?,
     sessionId: String,
-    identity: CacheIdentity?
+    identity: CacheIdentity?,
+    shape: String? = nil
 ) async throws -> [StoredMessage] {
     if let cacheStore, let identity,
        let cursor = try? await cacheStore.deltaCursor(for: identity),
@@ -726,5 +736,6 @@ func fetchTranscriptDeltaAware(
         return delta.messages
     }
     // No cursor / legacy gateway / delta unavailable → full stock fetch (unchanged).
-    return try await rest.messages(sessionId: sessionId)
+    // The cold branch applies `shape` (skeleton tiering) when requested.
+    return try await rest.messages(sessionId: sessionId, shape: shape)
 }

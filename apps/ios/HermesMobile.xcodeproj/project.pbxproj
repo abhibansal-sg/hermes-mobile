@@ -287,6 +287,7 @@
 		BE3A0BBEF190834ABE1FF6B8 /* RenderCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEA27F5DA2514ED03A75B7B7 /* RenderCache.swift */; };
 		BE54165FFE96DDBF320D2CCA /* PanelSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9EC36474D91C79C209F5633 /* PanelSupport.swift */; };
 		C06866C4CFAC3307CA796C50 /* HermesWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = D39251038AB4B700D2241FE4 /* HermesWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		C16216EB98C5D1E7987583C3 /* SkeletonColdOpenTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A66D407946E432C4730C5C4 /* SkeletonColdOpenTests.swift */; };
 		C2516F5A6002A1CB8BCF4CC8 /* PendingIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 255CDADA7A910CD22C7239F1 /* PendingIntent.swift */; };
 		C27649881B75AEFDA9D67195 /* SilentSyncPush.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E5BFB5F47DD010FB7C121ED /* SilentSyncPush.swift */; };
 		C29D5298A9D32EE9A8E0DF9D /* SpeechPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC8A321EED3528AF81D9780 /* SpeechPlayer.swift */; };
@@ -535,6 +536,7 @@
 		491FF6152430BFE797B15F7B /* SessionModelPopover.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionModelPopover.swift; sourceTree = "<group>"; };
 		493CC7559EC337DC66FFB7C0 /* UX1DrawerFeedTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UX1DrawerFeedTests.swift; sourceTree = "<group>"; };
 		4987981420D718F41C87C1FF /* LiveActivityManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityManager.swift; sourceTree = "<group>"; };
+		4A66D407946E432C4730C5C4 /* SkeletonColdOpenTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SkeletonColdOpenTests.swift; sourceTree = "<group>"; };
 		4B5D21A55C5D483D6D317B89 /* ShareViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
 		4C2D6AE4B416C5D426C91E15 /* RenderingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RenderingTests.swift; sourceTree = "<group>"; };
 		4CC8A321EED3528AF81D9780 /* SpeechPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayer.swift; sourceTree = "<group>"; };
@@ -1351,6 +1353,7 @@
 				D8BCB750A3907E26E4FDC7B6 /* SettingsViewTests.swift */,
 				80A3C02FE872630B74393910 /* SharedInboxDrainerTests.swift */,
 				828D97F8379B23D0E46489A3 /* SilentSyncPushTests.swift */,
+				4A66D407946E432C4730C5C4 /* SkeletonColdOpenTests.swift */,
 				95751E039D63A5E88D13F7DD /* SlashCommandTests.swift */,
 				C97414BD0BE36C7EED1127F1 /* SpeechPlayerTests.swift */,
 				39D8214ACA6EF804EE0DBD38 /* StoredMessageTests.swift */,
@@ -2002,6 +2005,7 @@
 				179049A102D1884760E71744 /* SettingsViewTests.swift in Sources */,
 				AC8AE8F89D67323F9D120391 /* SharedInboxDrainerTests.swift in Sources */,
 				CFBE657902C51DE1C9AAE5B7 /* SilentSyncPushTests.swift in Sources */,
+				C16216EB98C5D1E7987583C3 /* SkeletonColdOpenTests.swift in Sources */,
 				B286F2CBD7267C437311AF91 /* SlashCommandTests.swift in Sources */,
 				683EFB986A388E2825D3C5C6 /* SpeechPlayerTests.swift in Sources */,
 				0BF1C756EC4336826742044A /* StoredMessageTests.swift in Sources */,

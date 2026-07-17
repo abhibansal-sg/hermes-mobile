@@ -148,14 +148,15 @@ extension RestClient {
     /// `GET /api/sessions/{id}/messages[?profile=…]` — stored transcript scoped to
     /// a profile when one is active. With `profile == nil`/empty this is the plain
     /// (shipped) request.
-    func messages(sessionId: String, profile: String?) async throws -> [StoredMessage] {
+    func messages(sessionId: String, profile: String?, shape: String? = nil) async throws -> [StoredMessage] {
         guard let profile, !profile.isEmpty else {
-            return try await messages(sessionId: sessionId)
+            return try await messages(sessionId: sessionId, shape: shape)
         }
         let encodedId = sessionId.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? sessionId
-        let path = "/api/sessions/\(encodedId)/messages?" + Self.profileQuery(profile)
+        var path = "/api/sessions/\(encodedId)/messages?" + Self.profileQuery(profile)
+        if let shape, !shape.isEmpty { path += "&shape=\(shape)" }
         let data = try await get(path: path)
 
         let root = try decodeJSONValue(from: data, context: "messages")
