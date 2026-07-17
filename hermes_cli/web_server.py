@@ -14704,7 +14704,11 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
 
     * ``?ticket=<single-use>`` — a browser-minted, single-use, 30s-TTL ticket
       consumed against the dashboard-auth ticket store. This is what the SPA
-      (and native clients) use.
+      and ticket-capable native clients use.
+    * ``?token=<provider-token>`` — a non-interactive machine credential that a
+      registered rich token authenticator recognises. This preserves native
+      clients released before WS-ticket support without ever accepting the
+      dashboard's shared ``_SESSION_TOKEN`` in gated mode.
     * ``?internal=<process-credential>`` — the process-lifetime internal
       credential, used only by WS clients the server spawns itself (the
       embedded-TUI PTY child attaching to ``/api/ws`` and ``/api/pub``). It
@@ -14712,9 +14716,11 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
       injected into the SPA — see ``dashboard_auth.ws_tickets`` for the
       threat model.
 
-    The legacy ``?token=`` path is unconditionally rejected in gated mode
-    (the SPA bundle isn't carrying the token any longer, and a leaked
-    ``_SESSION_TOKEN`` must not grant WS access once the gate is engaged).
+    The legacy shared ``_SESSION_TOKEN`` remains unconditionally rejected in
+    gated mode (the SPA bundle isn't carrying it any longer, and a leaked
+    shared token must not grant WS access once the gate is engaged). Only a
+    token accepted by a registered machine-identity provider can use the
+    compatibility path.
 
     Audit-logs the rejection so operators can debug "WS keeps closing"
     issues from the log.
@@ -14748,27 +14754,38 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 return "internal_invalid", "internal"
 
         ticket = ws.query_params.get("ticket", "")
-        if not ticket:
-            return "no_credential", "none"
+        if ticket:
+            try:
+                info = consume_ticket(ticket)
+                if info.get("provider") == "device" and info.get("user_id"):
+                    ws.state.device = {
+                        "device_id": info.get("device_id") or info["user_id"],
+                        "device_name": info.get("device_name"),
+                        "token_prefix": info.get("token_prefix"),
+                        "scopes": list(info.get("scopes") or []),
+                    }
+                return None, "ticket"
+            except TicketInvalid as exc:
+                audit_log(
+                    AuditEvent.WS_TICKET_REJECTED,
+                    reason=str(exc),
+                    ip=(ws.client.host if ws.client else ""),
+                    path=ws.url.path,
+                )
+                return "ticket_invalid", "ticket"
 
-        try:
-            info = consume_ticket(ticket)
-            if info.get("provider") == "device" and info.get("user_id"):
-                ws.state.device = {
-                    "device_id": info.get("device_id") or info["user_id"],
-                    "device_name": info.get("device_name"),
-                    "token_prefix": info.get("token_prefix"),
-                    "scopes": list(info.get("scopes") or []),
-                }
-            return None, "ticket"
-        except TicketInvalid as exc:
-            audit_log(
-                AuditEvent.WS_TICKET_REJECTED,
-                reason=str(exc),
-                ip=(ws.client.host if ws.client else ""),
-                path=ws.url.path,
-            )
-            return "ticket_invalid", "ticket"
+        # Native clients released before the WS-ticket endpoint present their
+        # provider-issued machine token directly. Do not compare against the
+        # process-wide shared token here: gated mode deliberately rejects it.
+        token = ws.query_params.get("token", "")
+        if token:
+            identity = _ws_token_identity(token)
+            if identity is not None:
+                ws.state.device = identity
+                return None, "device"
+            return "token_mismatch", "token"
+
+        return "no_credential", "none"
 
     token = ws.query_params.get("token", "")
     if not token:

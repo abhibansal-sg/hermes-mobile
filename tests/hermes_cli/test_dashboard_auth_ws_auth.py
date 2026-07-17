@@ -3,7 +3,8 @@
 The dashboard's WS endpoints (``/api/pty``, ``/api/console``, ``/api/ws``,
 ``/api/pub``, ``/api/events``) share an auth gate: ``_ws_auth_ok``. In
 loopback mode it accepts ``?token=<_SESSION_TOKEN>``; in gated mode it accepts
-a single-use ``?ticket=`` minted by ``POST /api/auth/ws-ticket``.
+a single-use ``?ticket=`` minted by ``POST /api/auth/ws-ticket`` or a token
+recognised by a registered non-interactive machine-identity provider.
 
 These tests exercise the helper at the unit level (no actual WS upgrade)
 plus the ticket-mint endpoint under realistic gated-mode setup. We don't
@@ -194,6 +195,7 @@ def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/p
     return SimpleNamespace(
         query_params=_QP(query),
         client=SimpleNamespace(host=client_host),
+        state=SimpleNamespace(),
         url=SimpleNamespace(path=path),
     )
 
@@ -222,7 +224,7 @@ class TestWsAuthOkLoopback:
 
 
 class TestWsAuthOkGated:
-    """Gate ON — ticket path only."""
+    """Gate ON — ticket or registered machine-token paths."""
 
     def test_valid_ticket_accepted(self, gated_app):
         ticket = mint_ticket(user_id="u1", provider="stub")
@@ -251,6 +253,34 @@ class TestWsAuthOkGated:
         _SESSION_TOKEN (e.g. a leaked log line)."""
         ws = _fake_ws(query={"token": web_server._SESSION_TOKEN})
         assert web_server._ws_auth_ok(ws) is False
+
+    def test_registered_machine_token_accepted_in_gated_mode(
+        self, gated_app, monkeypatch
+    ):
+        identity = {
+            "device_id": "dev_test",
+            "device_name": "Native client",
+            "scopes": ["dashboard:read"],
+        }
+        monkeypatch.setattr(
+            web_server,
+            "_ws_token_identity",
+            lambda token: identity if token == "provider-device-token" else None,
+        )
+
+        ws = _fake_ws(query={"token": "provider-device-token"})
+
+        assert web_server._ws_auth_reason(ws) == (None, "device")
+        assert ws.state.device is identity
+
+    def test_unrecognised_machine_token_rejected_in_gated_mode(
+        self, gated_app, monkeypatch
+    ):
+        monkeypatch.setattr(web_server, "_ws_token_identity", lambda _token: None)
+
+        ws = _fake_ws(query={"token": "unknown-machine-token"})
+
+        assert web_server._ws_auth_reason(ws) == ("token_mismatch", "token")
 
     def test_rejection_audit_logs(self, gated_app, tmp_path, monkeypatch):
         # Point the audit log at a tmp dir so we can read what got written.
