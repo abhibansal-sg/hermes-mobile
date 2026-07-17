@@ -762,6 +762,11 @@ actor CacheStore {
                            arguments: [scope.serverId, scope.profileId, sessionId])
             try db.execute(sql: "DELETE FROM offline_message_cache WHERE serverId=? AND profileId=? AND sessionId=?",
                            arguments: [scope.serverId, scope.profileId, sessionId])
+            // Delete the scoped parent last. The canonical transcript rows use
+            // its composite identity as a foreign key, so this removes legacy
+            // message_row_cache rows through SQLite's cascade as well.
+            try db.execute(sql: "DELETE FROM session_cache WHERE serverId=? AND profileId=? AND id=?",
+                           arguments: [scope.serverId, scope.profileId, sessionId])
         }
     }
 
@@ -774,6 +779,7 @@ actor CacheStore {
             for table in ["offline_message_cache", "offline_search_backfill", "session_cache"] {
                 try db.execute(sql: "DELETE FROM \(table) WHERE serverId=?", arguments: [serverId])
             }
+            try db.execute(sql: "DELETE FROM last_opened_session WHERE serverId=?", arguments: [serverId])
             // Optional foundation tables are purged when present; this keeps the
             // primitive forward-compatible without creating speculative schema.
             for table in ["pending_attention_cache", "attention_reconciliation_meta", "attention_cache", "turn_cache", "head_cache", "cursor_cache", "last_opened_cache", "widget_source_state"] {
