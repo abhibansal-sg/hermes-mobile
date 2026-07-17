@@ -24,11 +24,17 @@ final class CacheFirstLaunchTests: XCTestCase {
     // it set. Save + clear it before each test so `hasSavedConfiguration` reflects
     // ONLY what the test sets, then restore it after.
     private var savedServerURL: String?
+    private var savedActiveProfile: String?
 
     override func setUp() {
         super.setUp()
         savedServerURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
+        savedActiveProfile = UserDefaults.standard.string(forKey: DefaultsKeys.activeProfile)
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+        UserDefaults.standard.set(
+            DefaultsKeys.allProfilesScope,
+            forKey: DefaultsKeys.activeProfile
+        )
     }
 
     override func tearDown() {
@@ -36,6 +42,11 @@ final class CacheFirstLaunchTests: XCTestCase {
             UserDefaults.standard.set(savedServerURL, forKey: DefaultsKeys.serverURL)
         } else {
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+        }
+        if let savedActiveProfile {
+            UserDefaults.standard.set(savedActiveProfile, forKey: DefaultsKeys.activeProfile)
+        } else {
+            UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
         }
         super.tearDown()
     }
@@ -284,7 +295,7 @@ final class CacheFirstLaunchTests: XCTestCase {
         await gate.waitUntilEntered()
 
         sessions.activeProfile = "work"
-        gate.release()
+        await gate.release()
         await refreshTask.value
 
         XCTAssertEqual(sessions.sessions.map(\.id), ["existing"])
@@ -339,7 +350,7 @@ final class CacheFirstLaunchTests: XCTestCase {
         // Replacing the same gateway transport invalidates the old transcript
         // task without changing the user's selected stored session.
         connection._seedConnectedForTesting(serverURL: serverURL, token: "token")
-        gate.release()
+        await gate.release()
         await sessions.waitForPendingOpenForTesting()
 
         XCTAssertNil(chat.messages.last?.text)
@@ -514,8 +525,14 @@ final class CacheFirstLaunchTests: XCTestCase {
         }
 
         sessions.prefetchRecentTranscripts()
-        // Drain the sweep deterministically.
-        try await Self.poll { await fetched.value.count == 2 }
+        // Drain through the durable write boundary, not merely the fetch
+        // callback: the callback completes before each GRDB save starts.
+        try await Self.poll {
+            guard await fetched.value.count == 2 else { return false }
+            let hasP1 = (try? await cache.hasTranscript(self.cacheIdentity("p1"))) == true
+            let hasP2 = (try? await cache.hasTranscript(self.cacheIdentity("p2"))) == true
+            return hasP1 && hasP2
+        }
 
         let got = await fetched.value
         XCTAssertEqual(got, ["p1", "p2"])
@@ -539,7 +556,16 @@ final class CacheFirstLaunchTests: XCTestCase {
         }
 
         sessions.prefetchRecentTranscripts()
-        try await Self.poll { await observed.value == "work-session:work" }
+        try await Self.poll {
+            guard await observed.value == "work-session:work" else { return false }
+            return (try? await cache.hasTranscript(
+                CacheIdentity(
+                    serverId: self.serverURL,
+                    profileId: "work",
+                    sessionId: "work-session"
+                )
+            )) == true
+        }
 
         let hasWorkTranscript = try await cache.hasTranscript(
             CacheIdentity(serverId: serverURL, profileId: "work", sessionId: "work-session")
