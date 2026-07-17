@@ -342,7 +342,7 @@ final class CacheFirstLaunchTests: XCTestCase {
         await gate.waitUntilEntered()
 
         sessions.activeProfile = "work"
-        gate.release()
+        await gate.release()
         await refreshTask.value
 
         XCTAssertEqual(sessions.sessions.map(\.id), ["existing"])
@@ -397,7 +397,7 @@ final class CacheFirstLaunchTests: XCTestCase {
         // Replacing the same gateway transport invalidates the old transcript
         // task without changing the user's selected stored session.
         connection._seedConnectedForTesting(serverURL: serverURL, token: "token")
-        gate.release()
+        await gate.release()
         await sessions.waitForPendingOpenForTesting()
 
         XCTAssertNil(chat.messages.last?.text)
