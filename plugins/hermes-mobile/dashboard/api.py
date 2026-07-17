@@ -622,11 +622,41 @@ def _asset_for_request(asset_id: str, request: Request) -> tuple[Any, dict[str, 
     return provider, asset
 
 
-def _asset_response(path: Path, asset: dict[str, Any], request: Request) -> Response:
+def _registered_asset_path(asset: dict[str, Any]) -> Path:
+    """Resolve a registry asset only inside the plugin-owned upload root."""
+    registered = Path(str(asset.get("path") or ""))
+    if not registered.name or registered.is_symlink():
+        raise HTTPException(status_code=404, detail="Asset bytes unavailable")
+    safe_path = _resolve_uploaded_attachment(registered.name)
     try:
-        data = path.read_bytes()
+        if registered.resolve(strict=True) != safe_path.resolve(strict=True):
+            raise HTTPException(status_code=404, detail="Asset bytes unavailable")
     except OSError:
         raise HTTPException(status_code=404, detail="Asset bytes unavailable")
+    return safe_path
+
+
+def _asset_thumbnail_path(asset_id: str) -> Path:
+    if not _re.fullmatch(r"asset_[A-Za-z0-9_-]{1,122}", asset_id):
+        raise HTTPException(status_code=400, detail="Invalid asset id")
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "mobile" / "asset-thumbnails" / f"{asset_id}.jpg"
+
+
+def _read_asset_bytes(path: Path) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError:
+        raise HTTPException(status_code=404, detail="Asset bytes unavailable")
+
+
+def _asset_response(
+    data: bytes,
+    filename: str,
+    asset: dict[str, Any],
+    request: Request,
+) -> Response:
     version = str(asset["content_version"])
     etag = f'"{version}"'
     if request.headers.get("if-none-match", "").removeprefix("W/") == etag:
@@ -635,7 +665,7 @@ def _asset_response(path: Path, asset: dict[str, Any], request: Request) -> Resp
         "ETag": etag,
         "Accept-Ranges": "bytes",
         "Content-Length": str(len(data)),
-        "Content-Disposition": f'inline; filename="{path.name}"',
+        "Content-Disposition": f'inline; filename="{filename}"',
     }
     range_header = request.headers.get("range")
     if range_header:
@@ -668,7 +698,8 @@ async def fetch_stable_asset(asset_id: str, request: Request):
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     _provider, asset = _asset_for_request(asset_id, request)
-    return _asset_response(Path(str(asset["path"])), asset, request)
+    path = _registered_asset_path(asset)
+    return _asset_response(_read_asset_bytes(path), path.name, asset, request)
 
 
 @router.get("/assets/{asset_id}/thumbnail")
@@ -676,16 +707,15 @@ async def fetch_stable_asset_thumbnail(asset_id: str, request: Request):
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     provider, asset = _asset_for_request(asset_id, request)
-    thumbnail_path = Path(str(asset.get("thumbnail_path") or ""))
+    thumbnail_path = _asset_thumbnail_path(asset_id)
     if not thumbnail_path.is_file():
         try:
             from PIL import Image
             from hermes_constants import get_hermes_home
 
-            thumbnail_dir = get_hermes_home() / "mobile" / "asset-thumbnails"
+            thumbnail_dir = thumbnail_path.parent
             thumbnail_dir.mkdir(parents=True, exist_ok=True)
-            thumbnail_path = thumbnail_dir / f"{asset_id}.jpg"
-            with Image.open(str(asset["path"])) as image:
+            with Image.open(_registered_asset_path(asset)) as image:
                 image.thumbnail((512, 512))
                 if image.mode not in {"RGB", "L"}:
                     image = image.convert("RGB")
@@ -701,7 +731,12 @@ async def fetch_stable_asset_thumbnail(asset_id: str, request: Request):
     thumb_asset = dict(asset)
     thumb_asset["content_version"] = f"thumb-v1:{asset['content_version']}"
     thumb_asset["media_type"] = "image/jpeg"
-    return _asset_response(thumbnail_path, thumb_asset, request)
+    return _asset_response(
+        _read_asset_bytes(thumbnail_path),
+        thumbnail_path.name,
+        thumb_asset,
+        request,
+    )
 
 
 # ---------------------------------------------------------------------------

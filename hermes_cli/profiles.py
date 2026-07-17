@@ -819,6 +819,45 @@ def _profile_yaml_path(profile_dir: Path) -> Path:
     return profile_dir / "profile.yaml"
 
 
+def _managed_profile_dir(profile_dir: Path) -> Path:
+    """Return a canonical Hermes-managed profile directory.
+
+    Stable profile identity is security-sensitive metadata.  Callers may pass a
+    ``Path``, but they may not redirect identity reads or writes to an arbitrary
+    directory.  Resolve the requested directory only for comparison, then
+    return a path discovered from the configured Hermes roots rather than the
+    caller-provided object.
+    """
+    try:
+        requested = Path(profile_dir).resolve(strict=True)
+    except OSError as exc:
+        raise FileNotFoundError(
+            f"profile directory does not exist: {profile_dir}"
+        ) from exc
+
+    default_home = _get_default_hermes_home().resolve()
+    if requested == default_home and default_home.is_dir():
+        return default_home
+
+    profiles_root = _get_profiles_root().resolve()
+    try:
+        entries = list(profiles_root.iterdir())
+    except OSError as exc:
+        raise ValueError(
+            f"profile directory is not managed by Hermes: {profile_dir}"
+        ) from exc
+    for entry in entries:
+        try:
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if entry.resolve(strict=True) == requested:
+                validate_profile_name(entry.name)
+                return entry
+        except (OSError, ValueError):
+            continue
+    raise ValueError(f"profile directory is not managed by Hermes: {profile_dir}")
+
+
 def _new_profile_id() -> str:
     return "pf_" + secrets.token_urlsafe(16)
 
@@ -827,13 +866,21 @@ def _new_profile_id() -> str:
 def _profile_identity_lock(profile_dir: Path):
     """Serialize lazy profile-id creation across Hermes processes."""
     lock_path = profile_dir / ".profile-identity.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("a+b")
+    if lock_path.is_symlink():
+        raise ValueError(f"unsafe profile identity lock symlink: {lock_path}")
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise ValueError(f"unsafe profile identity lock: {lock_path}") from exc
+    handle = os.fdopen(fd, "a+b")
     try:
         if os.name == "nt":
             import msvcrt
 
-            if lock_path.stat().st_size == 0:
+            if os.fstat(handle.fileno()).st_size == 0:
                 handle.write(b" ")
                 handle.flush()
             handle.seek(0)
@@ -864,11 +911,12 @@ def ensure_profile_id(profile_dir: Path, *, rekey: bool = False) -> str:
     ``rekey`` is reserved for create/clone/import-as-new flows. It must never
     be used by rename because ``profile.yaml`` moves with the directory.
     """
-    if not profile_dir.is_dir():
-        raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
+    profile_dir = _managed_profile_dir(profile_dir)
     with _profile_identity_lock(profile_dir):
         path = _profile_yaml_path(profile_dir)
         existing: dict = {}
+        if path.is_symlink():
+            raise ValueError(f"unsafe profile metadata symlink: {path}")
         if path.is_file():
             import yaml
 

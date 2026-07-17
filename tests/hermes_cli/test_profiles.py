@@ -182,6 +182,27 @@ class TestCreateProfile:
         assert cloned_id != source_id
         assert profiles.ensure_profile_id(source) == source_id
 
+    def test_profile_identity_rejects_unmanaged_directory(self, profile_env):
+        unmanaged = profile_env / "outside-hermes"
+        unmanaged.mkdir()
+
+        with pytest.raises(ValueError, match="not managed by Hermes"):
+            profiles.ensure_profile_id(unmanaged)
+
+    def test_profile_identity_rejects_metadata_symlink(self, profile_env):
+        profile_dir = create_profile("source", no_alias=True)
+        metadata = profile_dir / "profile.yaml"
+        external = profile_env / "external-profile.yaml"
+        external.write_text("profile_id: pf_AAAAAAAAAAAAAAAAAAAAAA\n")
+        metadata.unlink()
+        try:
+            metadata.symlink_to(external)
+        except OSError:
+            pytest.skip("symlinks are unavailable on this platform")
+
+        with pytest.raises(ValueError, match="metadata symlink"):
+            profiles.ensure_profile_id(profile_dir)
+
     def test_seeds_placeholder_env_file(self, profile_env):
         """Fresh profiles get their own .env (owner-only) so channel/env
         writes are profile-scoped from day one instead of falling through

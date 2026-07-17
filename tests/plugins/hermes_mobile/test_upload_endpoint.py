@@ -86,3 +86,31 @@ def test_upload_attachment_rejects_over_cap_without_storing(
 
     assert resp.status_code == 413
     assert not upload_dir.exists()
+
+
+def test_stable_asset_fetch_rejects_registry_path_outside_upload_root(
+    client, api_module, monkeypatch, tmp_path
+):
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    monkeypatch.setattr(api_module, "_UPLOAD_DIR", upload_dir)
+    outside = tmp_path / "private.png"
+    outside.write_bytes(b"private")
+
+    from hermes_constants import get_hermes_home
+
+    asset_id = "asset_0123456789abcdef0123456789abcdef"
+    api_module._plugin_module("prompt_receipts").PROVIDER.register_asset(
+        profile_home=get_hermes_home(),
+        asset_id=asset_id,
+        content_version="sha256:not-readable",
+        path=str(outside),
+        media_type="image/png",
+        byte_count=outside.stat().st_size,
+        owner_device_id=None,
+    )
+
+    response = client.get(f"/api/plugins/hermes-mobile/assets/{asset_id}")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Asset bytes unavailable"
