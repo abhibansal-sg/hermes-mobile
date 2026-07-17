@@ -744,3 +744,53 @@ final class CacheV3CompositeIdentityTests: XCTestCase {
         }
     }
 }
+
+final class CacheCleanupTests: XCTestCase {
+    func testRemoveSessionDeletesScopedParentAndCascadesTranscriptRows() async throws {
+        let store = try makeInMemoryStore()
+        let scopeA = CacheScope(serverId: "https://server.example", profileId: "profile-a")
+        let scopeB = CacheScope(serverId: "https://server.example", profileId: "profile-b")
+        let sessionID = "same-session"
+
+        try await store.saveSessionList([makeSession(id: sessionID)], scope: scopeA)
+        try await store.saveSessionList([makeSession(id: sessionID)], scope: scopeB)
+        let identityA = testIdentity(sessionID, scope: scopeA)
+        let identityB = testIdentity(sessionID, scope: scopeB)
+        try await store.saveTranscript(identity: identityA, messages: [makeStoredMessage(role: "user")])
+        try await store.saveTranscript(identity: identityB, messages: [makeStoredMessage(role: "assistant")])
+
+        try await store.removeSession(scope: scopeA, sessionId: sessionID)
+
+        let sessionsA = try await store.loadSessionList(scope: scopeA)
+        let transcriptA = try await store.loadTranscript(identityA)
+        let offlineTranscriptA = try await store.loadTranscript(scope: scopeA, sessionId: sessionID)
+        let sessionsB = try await store.loadSessionList(scope: scopeB)
+        let transcriptB = try await store.loadTranscript(identityB)
+        XCTAssertTrue(sessionsA.isEmpty)
+        XCTAssertNil(transcriptA)
+        XCTAssertNil(offlineTranscriptA)
+        XCTAssertEqual(sessionsB.map(\.id), [sessionID])
+        XCTAssertEqual(transcriptB?.first?.role, "assistant")
+    }
+
+    func testPurgeGatewayRemovesLastOpenedAndScopedCache() async throws {
+        let store = try makeInMemoryStore()
+        let scope = CacheScope(serverId: "https://purge.example", profileId: "profile")
+        let identity = testIdentity("session", scope: scope)
+
+        try await store.saveSessionList([makeSession(id: identity.sessionId)], scope: scope)
+        try await store.saveTranscript(identity: identity, messages: [makeStoredMessage()])
+        try await store.saveLastOpenedSession(identity, manifestScope: scope)
+        let savedLastOpened = try await store.loadLastOpenedSession(scope: scope)
+        XCTAssertNotNil(savedLastOpened)
+
+        _ = try await store.purgeGateway(serverId: scope.serverId)
+
+        let purgedLastOpened = try await store.loadLastOpenedSession(scope: scope)
+        let purgedSessions = try await store.loadSessionList(scope: scope)
+        let purgedTranscript = try await store.loadTranscript(identity)
+        XCTAssertNil(purgedLastOpened)
+        XCTAssertTrue(purgedSessions.isEmpty)
+        XCTAssertNil(purgedTranscript)
+    }
+}
