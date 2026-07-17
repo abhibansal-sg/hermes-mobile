@@ -446,7 +446,9 @@ final class WSLivenessTests: XCTestCase {
 
         // Force the `dead` branch by injecting .closed state.
         connection.clientStateOverrideForScenePhase = .closed(reason: nil)
-        // Throw in connectRPC so the reconnect loop stays in .reconnecting.
+        // Use a short cold-open grace, then throw in connectRPC so recovery
+        // escalates visibly after the grace window expires.
+        connection.graceWindowOverride = .milliseconds(50)
         connection.reconnectBackoffOverride = 0
         connection.connectRPC = { _, _, _ in
             throw URLError(.cannotConnectToHost)
@@ -455,18 +457,20 @@ final class WSLivenessTests: XCTestCase {
         connection.handleScenePhase(.active)
         await settle()
 
-        // The `dead` branch must have cleared all in-progress turn flags.
+        // Expiry, not discovery, clears the turn flags — grace keeps the cached
+        // transcript/presentation stable while a quick reconnect is possible.
         XCTAssertTrue(sessions.turnsInProgressIds.isEmpty,
-            "handleScenePhase dead branch must clear turnsInProgress (ABH-178)")
+            "cold-open grace expiry must clear turnsInProgress (ABH-178)")
     }
 
     /// `handleScenePhase(.active)` with `probeLivenessRPC` returning `false`
-    /// (the dead-probe branch, ABH-177) must also clear `turnsInProgress`.
+    /// (the dead-probe branch, ABH-177) must clear `turnsInProgress` only after
+    /// cold-open grace expires.
     ///
     /// In the real path, `probeLiveness()` transitions the client to `.failed` and
-    /// the state observer calls `clearAllTurnsInProgress`. In the injected-hook
-    /// path the observer is never driven, so the explicit `clearAllTurnsInProgress()`
-    /// in the `guard alive else` branch must do it instead.
+    /// the state observer starts reconnect grace. In the injected-hook path the
+    /// observer is never driven, so the same explicit grace path must eventually
+    /// perform the cleanup at expiry.
     @MainActor
     func testDeadProbeBranchClearsTurnsInProgress() async {
         let (connection, sessions, _) = makeConnectionStore()
@@ -489,7 +493,8 @@ final class WSLivenessTests: XCTestCase {
 
         // Inject a dead liveness probe (hook path — state observer never fires).
         connection.probeLivenessRPC = { _ in false }
-        // Throw in connectRPC so the reconnect loop stays in .reconnecting.
+        // Shorten cold-open grace, then keep recovery failing past expiry.
+        connection.graceWindowOverride = .milliseconds(50)
         connection.reconnectBackoffOverride = 0
         connection.connectRPC = { _, _, _ in
             throw URLError(.cannotConnectToHost)
@@ -498,9 +503,9 @@ final class WSLivenessTests: XCTestCase {
         connection.handleScenePhase(.active)
         await settle()
 
-        // The `guard alive else` branch must have cleared all in-progress turn flags.
+        // Grace expiry must have cleared all in-progress turn flags.
         XCTAssertTrue(sessions.turnsInProgressIds.isEmpty,
-            "handleScenePhase dead-probe branch must clear turnsInProgress (ABH-178)")
+            "cold-open grace expiry must clear turnsInProgress (ABH-178)")
 
         // And the reconnect loop must be running — belt-and-suspenders sanity.
         if case .reconnecting = connection.phase { /* expected */ } else {
@@ -508,7 +513,7 @@ final class WSLivenessTests: XCTestCase {
         }
     }
 
-    // MARK: - (f) REAL ROUTING: handleScenePhase dead-probe → phase transitions to .reconnecting
+    // MARK: - (f) REAL ROUTING: foreground dead probe uses cold-open grace
 
     /// The routing test for Must-Fix #2b.
     ///
@@ -516,13 +521,14 @@ final class WSLivenessTests: XCTestCase {
     /// `ConnectionStoreReconnectTests`) to put the store in `.connected` with
     /// `hasConnected=true`, then injects `probeLivenessRPC` returning `false` and
     /// calls `handleScenePhase(.active)`. Verifies that:
-    ///   1. The store exits `.connected` (the dead probe was detected).
-    ///   2. The phase transitions to `.reconnecting(attempt: 0)` (the reconnect
-    ///      loop starts immediately, as expected for a foreground wake).
+    ///   1. Transport readiness is revoked while presentation remains `.connected`
+    ///      during the shorter cold-open grace window.
+    ///   2. After grace expires, the phase transitions to `.reconnecting` while
+    ///      the existing reconnect loop continues retrying.
     ///   3. The hook receives the `livenessPingTimeout` constant (not a magic number).
     ///
     /// No live socket is touched. The `connectRPC` hook throws so the reconnect loop
-    /// stays in `.reconnecting` (no REST or WS activity).
+    /// stays unavailable (no REST or WS activity).
     @MainActor
     func testScenePhaseActiveDeadProbeTransitionsToReconnecting() async {
         let (connection, _, _) = makeConnectionStore()
@@ -552,27 +558,34 @@ final class WSLivenessTests: XCTestCase {
         // Zero-delay backoff (matching the ConnectionStoreReconnectTests pattern) so
         // attempt 0 fires immediately and the phase is in .reconnecting when we check.
         connection.reconnectBackoffOverride = 0
+        connection.graceWindowOverride = .milliseconds(50)
         connection.connectRPC = { _, _, _ in
             throw URLError(.cannotConnectToHost)
         }
 
         // Step 4: fire the foreground event. handleScenePhase sees .connected +
-        // dead probe → reconciles LA → starts reconnect loop → phase leaves .connected.
+        // dead probe → revokes readiness → starts the shorter cold-open grace.
         connection.handleScenePhase(.active)
 
-        // Let the spawned Task (inside handleScenePhase) run and advance the phase.
-        await settle()
+        // Let the spawned Task enter grace, but not reach the 50ms expiry yet.
+        try? await Task.sleep(for: .milliseconds(20))
 
         // The probe hook must have been called with the correct timeout constant.
         XCTAssertEqual(capturedTimeout, HermesGatewayClient.livenessPingTimeout,
             "handleScenePhase must pass livenessPingTimeout to the probe hook")
 
-        // The store must have left .connected (dead socket detected).
-        XCTAssertNotEqual(connection.phase, .connected,
-            "phase must not stay .connected after a dead liveness probe")
+        XCTAssertEqual(connection.phase, .connected,
+            "cold-open grace keeps the UI phase stable during a brief reconnect")
+        XCTAssertTrue(connection.isInGrace)
+        XCTAssertFalse(connection.isTransportReady,
+            "cold-open grace must not treat a dropped socket as operational")
 
-        // The reconnect loop must be running. Attempt number varies with timing;
-        // the key invariant is that the loop is active (not .offline or .needsSetup).
+        // Let the short grace expire while the injected reconnect keeps failing.
+        await settle()
+
+        // The reconnect loop must be running after grace expires. Attempt number
+        // varies with timing; the key invariant is that the loop is active (not
+        // .offline or .needsSetup).
         if case .reconnecting = connection.phase { /* expected */ } else {
             XCTFail("expected .reconnecting after dead probe, got \(connection.phase)")
         }
