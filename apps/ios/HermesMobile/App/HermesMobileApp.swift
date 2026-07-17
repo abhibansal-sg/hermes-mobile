@@ -213,6 +213,12 @@ struct HermesMobileApp: App {
                             pushIsAuthoritative: PushRegistrar.shared.isAlertAuthorityRegistered
                         )
                     }
+                    // Cold-open frame-0 paint (build125 smoothness): kick the
+                    // cached drawer + last-opened transcript paint FIRST, so it is
+                    // not sequenced behind the inbox cache hydrate or any unrelated
+                    // launch await. This is a cheap disk read; bootstrap() re-runs
+                    // the same latched paint, which collapses onto this one.
+                    await environment.connectionStore.paintDrawerCacheFirst()
                     await environment.inboxStore.hydrateCachedGateway()
                     await environment.connectionStore.bootstrap()
                     await environment.inboxStore.refresh()
