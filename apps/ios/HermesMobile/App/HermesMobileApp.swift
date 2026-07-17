@@ -370,8 +370,12 @@ struct HermesMobileApp: App {
                 }
                 // Highest app layer: covers sheets, alerts, toasts, navigation,
                 // attachments, and every connection phase before iOS snapshots
-                // the scene. The content-free privacy cover wins while inactive;
-                // on return, the authentication cover remains when required.
+                // the scene. The content-free privacy cover is raised on
+                // `.background` only (per #207) and takes precedence over the
+                // authentication cover; `.inactive` shows neither. Known #207
+                // tradeoff: the swipe-up-and-hold app-switcher path stays
+                // `.inactive` (never reaching `.background` while the card is
+                // visible), so that card can briefly composite live content.
                 .overlay {
                     if environment.appLock.isPrivacyShieldVisible {
                         PrivacyShieldCover()
