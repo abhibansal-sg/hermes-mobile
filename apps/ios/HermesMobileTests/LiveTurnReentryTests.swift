@@ -297,6 +297,40 @@ final class LiveTurnReentryTests: XCTestCase {
         XCTAssertEqual(chat.interruptTarget, runtimeId)
     }
 
+    func testRepeatResumeSnapshotDoesNotDuplicateInflightPrompt() async {
+        // Regression: reconcileLiveTurnStatus runs once at open and again on every
+        // reconnect-recovery resume for the same running turn. The prompt bubble
+        // must not multiply across repeat reconciles of one inflight turn.
+        let (chat, _) = makeStore()
+        chat.seed(from: [
+            storedMessage(role: "user", text: "previous prompt"),
+            storedMessage(role: "assistant", text: "previous reply"),
+        ])
+        let inflight = SessionInflightTurn(
+            user: "write a long answer",
+            assistant: "partial answer",
+            streaming: true
+        )
+
+        for _ in 0..<3 {
+            await chat.reconcileLiveTurnStatus(
+                runtimeId: runtimeId,
+                snapshotRunning: true,
+                inflight: inflight
+            )
+        }
+
+        XCTAssertEqual(
+            chat.messages.map(\.role),
+            [.user, .assistant, .user, .assistant],
+            "repeat reconciles of the same inflight turn must not append duplicate prompt bubbles"
+        )
+        XCTAssertEqual(chat.messages.filter { $0.role == .user && $0.text == "write a long answer" }.count, 1)
+        XCTAssertTrue(chat.messages.last?.isStreaming == true)
+        XCTAssertTrue(chat.localTurnInFlight)
+        XCTAssertEqual(chat.interruptTarget, runtimeId)
+    }
+
     func testOpenWaitsForSeedThenRestoresLiveStatus() async {
         let chat = ChatStore()
         let sessions = SessionStore()
