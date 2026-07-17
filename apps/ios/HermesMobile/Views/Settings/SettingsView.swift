@@ -1036,7 +1036,7 @@ struct SettingsView: View {
                 case .learning:
                     LearningJourneyView(client: connectionStore.client)
                 case .gateway:
-                    GatewayStatusView(control: control)
+                    GatewayStatusView(control: control, connection: connectionStore)
                 case .artifacts:
                     ArtifactsGalleryView(
                         control: control,
@@ -1180,7 +1180,9 @@ struct SettingsView: View {
         Task {
             defer { debugSharePending = false }
             do {
-                let report = try await rest.debugShareReport()
+                let report = try await rest.debugShareReport(
+                    reliabilityTrace: ReliabilityDiagnostics.shared.redactedJSON
+                )
                 debugShareResult = report
             } catch {
                 debugShareError = "Couldn't generate debug report: \(error.localizedDescription)"
