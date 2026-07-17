@@ -1,4 +1,5 @@
 import XCTest
+import Foundation
 import GRDB
 @testable import HermesMobile
 
@@ -299,4 +300,153 @@ private extension ManifestProjection {
             lastSyncedAt: lastSyncedAt
         )
     }
+}
+
+@MainActor
+final class CacheManifestCancellationTests: XCTestCase {
+    private let scope = CacheScope(serverId: "https://example.test", profileId: "p")
+
+    func testCancellationAfterPageFetchPreservesProjectionAndDiscardsStaging() async throws {
+        try await assertCancellation(at: .afterPageFetch)
+    }
+
+    func testCancellationBeforeStagePreservesProjectionAndDiscardsStaging() async throws {
+        try await assertCancellation(at: .beforeStage)
+    }
+
+    func testCancellationBeforeCommitPreservesProjectionAndDiscardsStaging() async throws {
+        try await assertCancellation(at: .beforeCommit)
+    }
+
+    private func assertCancellation(
+        at cancellationPoint: SyncCoordinator.CancellationCheckpoint
+    ) async throws {
+        let store = try CacheStore(testDB: DatabaseQueue())
+        let prior = try await store.applyManifest(
+            ManifestChain(validating: [try page(revision: 1, cursor: "cursor-1", reset: true)]),
+            scope: scope
+        )
+        let gate = CancellationGate()
+        let client = makeClient()
+        let coordinator = SyncCoordinator(
+            cache: store,
+            scope: scope,
+            manifestScope: "profile:pf_profile",
+            client: client,
+            cancellationCheckpoint: { point in
+                guard point == cancellationPoint else { return }
+                await gate.pause(at: point)
+            }
+        )
+
+        let operation = Task { await coordinator.synchronizeNow() }
+        await gate.waitUntilReached(cancellationPoint)
+        operation.cancel()
+        await gate.release(cancellationPoint)
+        let outcome = await operation.value
+        XCTAssertEqual(outcome, .failed)
+
+        XCTAssertEqual(coordinator.projection.revision, prior.revision)
+        let cached = try await store.loadManifestProjection(scope: scope)
+        XCTAssertEqual(cached.revision, prior.revision)
+
+        do {
+            _ = try await store.commitStagedManifest(
+                snapshotID: "ms_2",
+                locator: scope.serverId,
+                expectedPageCount: 1
+            )
+            XCTFail("cancelled synchronization must discard staging")
+        } catch {
+            XCTAssertEqual(error as? ManifestBindingError, .invalidStage)
+        }
+    }
+
+    private func makeClient() -> RestClient {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CacheManifestStubProtocol.self]
+        return RestClient(
+            baseURL: URL(string: scope.serverId)!,
+            token: "test-token",
+            session: URLSession(configuration: configuration),
+            pathStyle: .plugin
+        )
+    }
+
+    private func page(revision: Int, cursor: String, reset: Bool) throws -> SyncManifestPage {
+        let json = """
+        {
+          "schema_version":2,"gateway_id":"gw_gateway",
+          "profile_authorities":[{"profile_id":"pf_profile","profile_name":"p","authority_epoch":"ae_epoch"}],
+          "journal_epoch":"je_journal","complete":true,"revision":\(revision),
+          "snapshot_id":"ms_\(revision)","page_size":500,"scope":"profile:pf_profile",
+          "continuation_cursor":null,"resume_cursor":"\(cursor)",
+          "reset":\(reset),"reset_reason":\(reset ? "\"full_snapshot\"" : "null"),"server_time":\(revision),
+          "sessions":{"upserts":[],"tombstones":[]},
+          "pending_attention":[],"runtime_snapshot":{"runtime_instance_id":"gri_runtime","sequence":1,"captured_at":1,"active_turns":[]},
+          "transcript_heads":[],"widget_summary":{"open_session_count":0,"active_turn_count":0,"pending_attention_count":0,"tokens_today":null,"estimated_cost_today":null},
+          "push_registry":{"device_registered":true}
+        }
+        """
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(SyncManifestPage.self, from: Data(json.utf8))
+    }
+}
+
+private actor CancellationGate {
+    private var reached: Set<SyncCoordinator.CancellationCheckpoint> = []
+    private var waiters: [SyncCoordinator.CancellationCheckpoint: CheckedContinuation<Void, Never>] = [:]
+
+    func pause(at point: SyncCoordinator.CancellationCheckpoint) async {
+        reached.insert(point)
+        await withCheckedContinuation { continuation in
+            waiters[point] = continuation
+        }
+    }
+
+    func waitUntilReached(_ point: SyncCoordinator.CancellationCheckpoint) async {
+        while !reached.contains(point) {
+            await Task.yield()
+        }
+    }
+
+    func release(_ point: SyncCoordinator.CancellationCheckpoint) {
+        waiters.removeValue(forKey: point)?.resume()
+    }
+}
+
+private final class CacheManifestStubProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let data = Data(Self.pageJSON.utf8)
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: data)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+
+    private static let pageJSON = """
+    {
+      "schema_version":2,"gateway_id":"gw_gateway",
+      "profile_authorities":[{"profile_id":"pf_profile","profile_name":"p","authority_epoch":"ae_epoch"}],
+      "journal_epoch":"je_journal","complete":true,"revision":2,
+      "snapshot_id":"ms_2","page_size":500,"scope":"profile:pf_profile",
+      "continuation_cursor":null,"resume_cursor":"cursor-2",
+      "reset":false,"reset_reason":null,"server_time":2,
+      "sessions":{"upserts":[],"tombstones":[]},
+      "pending_attention":[],"runtime_snapshot":{"runtime_instance_id":"gri_runtime","sequence":1,"captured_at":1,"active_turns":[]},
+      "transcript_heads":[],"widget_summary":{"open_session_count":0,"active_turn_count":0,"pending_attention_count":0,"tokens_today":null,"estimated_cost_today":null},
+      "push_registry":{"device_registered":true}
+    }
+    """
 }

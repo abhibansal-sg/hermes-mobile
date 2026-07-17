@@ -11,6 +11,11 @@ enum SyncRecoveryOutcome: Sendable, Equatable {
 @Observable
 final class SyncCoordinator {
     enum Trigger: Sendable { case launch, foreground, reconnect, pullToRefresh, backgroundPush, backgroundRefresh }
+    enum CancellationCheckpoint: Hashable, Sendable {
+        case afterPageFetch
+        case beforeStage
+        case beforeCommit
+    }
 
     private(set) var projection: ManifestProjection = .empty
     private let cache: CacheStore
@@ -21,6 +26,7 @@ final class SyncCoordinator {
     private let transcriptDelta: @Sendable (String) async -> Void
     private let registerPush: @Sendable () async -> Void
     private let authorityTransition: @Sendable (GatewayLocatorBindingV1, ManifestAuthorityTransition) async -> Void
+    private let cancellationCheckpoint: (@Sendable (CancellationCheckpoint) async -> Void)?
     private var inFlight: Task<Void, Never>?
     private var pendingRevision: Int64?
 
@@ -31,10 +37,11 @@ final class SyncCoordinator {
          authorityTransition: @escaping @Sendable (
              GatewayLocatorBindingV1,
              ManifestAuthorityTransition
-         ) async -> Void = { _, _ in }) {
+         ) async -> Void = { _, _ in },
+         cancellationCheckpoint: (@Sendable (CancellationCheckpoint) async -> Void)? = nil) {
         self.cache = cache; self.scope = scope; self.manifestScope = manifestScope; self.client = client
         self.legacyFallback = legacyFallback; self.transcriptDelta = transcriptDelta; self.registerPush = registerPush
-        self.authorityTransition = authorityTransition
+        self.authorityTransition = authorityTransition; self.cancellationCheckpoint = cancellationCheckpoint
     }
 
     /// Synchronous-with-respect-to-network first paint: disk is awaited before
@@ -105,6 +112,11 @@ final class SyncCoordinator {
                         continuationCursor: continuationCursor,
                         limit: 500
                     )
+                    try Task.checkCancellation()
+                    if let cancellationCheckpoint {
+                        await cancellationCheckpoint(.afterPageFetch)
+                    }
+                    try Task.checkCancellation()
                     let page = response.page
                     if let stagedSnapshotID {
                         guard stagedSnapshotID == page.snapshotID else {
@@ -113,6 +125,11 @@ final class SyncCoordinator {
                     } else {
                         stagedSnapshotID = page.snapshotID
                     }
+                    try Task.checkCancellation()
+                    if let cancellationCheckpoint {
+                        await cancellationCheckpoint(.beforeStage)
+                    }
+                    try Task.checkCancellation()
                     try await cache.stageManifestPage(
                         response,
                         locator: scope.serverId,
@@ -142,6 +159,11 @@ final class SyncCoordinator {
                 throw error
             }
             guard let stagedSnapshotID else { throw ManifestBindingError.invalidStage }
+            try Task.checkCancellation()
+            if let cancellationCheckpoint {
+                await cancellationCheckpoint(.beforeCommit)
+            }
+            try Task.checkCancellation()
             let result: ManifestCommitResult
             do {
                 result = try await cache.commitStagedManifest(
