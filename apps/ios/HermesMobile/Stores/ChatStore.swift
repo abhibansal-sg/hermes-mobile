@@ -1305,18 +1305,34 @@ final class ChatStore {
 
     private func restoreInflightTurn(_ inflight: SessionInflightTurn?) {
         let user = inflight?.user.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !user.isEmpty {
-            let lastUser = messages.last(where: { $0.role == .user })
-            if lastUser?.text != user || messages.last?.role != .user {
-                messages.append(ChatMessage(role: .user, text: user))
-                rebuildUserOrdinals()
-            }
+        if !user.isEmpty, !inflightUserPromptAlreadyRestored(user) {
+            messages.append(ChatMessage(role: .user, text: user))
+            rebuildUserOrdinals()
         }
         beginLocalTurn()
         beginStreamingMessage()
         if let assistant = inflight?.assistant, !assistant.isEmpty {
             mutateStreaming { $0.applyFinalText(assistant) }
         }
+    }
+
+    /// True when `user` is already the prompt row that opened the in-flight
+    /// streaming turn, so a repeat `reconcileLiveTurnStatus` must not re-append a
+    /// duplicate prompt bubble. `reconcileLiveTurnStatus` runs once at open and
+    /// again on every reconnect-recovery resume for the same running turn; the
+    /// prior guard (`lastUser?.text != user || messages.last?.role != .user`) was
+    /// always satisfied once the streaming assistant row trailed the prompt, so
+    /// each repeat call appended another copy of the same inflight prompt.
+    private func inflightUserPromptAlreadyRestored(_ user: String) -> Bool {
+        guard let streamingMessageID,
+              let streamIndex = messages.firstIndex(where: { $0.id == streamingMessageID })
+        else { return false }
+        // Walk back from the streaming assistant row to the prompt that started
+        // it; equality there means this exact inflight turn is already restored.
+        var index = streamIndex - 1
+        while index >= 0, messages[index].role != .user { index -= 1 }
+        guard index >= 0 else { return false }
+        return messages[index].text == user
     }
 
     /// Injectable seam for `reconcileLiveTurnStatus` tests. The live path uses the
