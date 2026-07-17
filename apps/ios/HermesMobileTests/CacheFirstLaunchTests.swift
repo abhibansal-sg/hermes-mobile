@@ -257,6 +257,17 @@ final class CacheFirstLaunchTests: XCTestCase {
         XCTAssertNotEqual(defaultIdentity.profileId, restored?.profileId)
     }
 
+    func testNamedProfileCacheTreatsUntaggedLegacyRowsAsSelectedScope() {
+        let legacy = makeSummary(id: "legacy-work", profile: nil)
+        let filtered = SessionStore.filterCachedSessions(
+            [legacy],
+            activeProfile: "work",
+            untaggedProfile: "work"
+        )
+
+        XCTAssertEqual(filtered.map(\.id), ["legacy-work"])
+    }
+
     func testProfileSwitchFencesInFlightRefreshPublicationAndCacheScope() async throws {
         let (connection, sessions, _) = makeGraph()
         let cache = try makeInMemoryCache()
