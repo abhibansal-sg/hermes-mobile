@@ -541,9 +541,15 @@ struct MessageBubble: View {
     private func assistantText(_ text: String, showsCursor: Bool) -> some View {
         // Memoized segmentation (RenderCache): a flick-scroll re-realizes this
         // row without changing `text`, so the segment scan is an O(1) cache hit
-        // instead of an O(n) re-scan of the whole body. A streaming flush extends
-        // `text` → new key → fresh scan only for the genuinely-new content.
-        let segments = RenderCache.segments(text)
+        // instead of an O(n) re-scan of the whole body.
+        //
+        // D1: the ONE actively-streaming tail (`showsCursor`) takes the
+        // incremental path, which reuses the settled blocks and re-parses only the
+        // in-progress block, so a 40ms flush is O(current block) not O(total).
+        // Settled rows go through the value-keyed full parse (O(1) on a cache hit),
+        // and on stream completion the bubble renders non-streaming through that
+        // same full parse — byte-identical to today.
+        let segments = showsCursor ? RenderCache.streamingSegments(text) : RenderCache.segments(text)
 
         return VStack(alignment: .leading, spacing: Self.segmentSpacing) {
             // POSITIONAL identity (release audit P1): keying on `\.element.id`
