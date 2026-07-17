@@ -86,12 +86,43 @@ struct SyncManifestPage: Decodable, Sendable, Equatable {
     let transcriptHeads: [ManifestTranscriptHead]?
     let widgetSummary: ManifestWidgetSummary?
     let pushRegistry: ManifestPushRegistry?
+
+    // JSONDecoder's snake-case strategy maps `*_id` to `*Id`, while Swift's
+    // API-design spelling uses `*ID`. Bind those transformed keys explicitly.
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case gatewayID = "gatewayId"
+        case profileAuthorities
+        case journalEpoch
+        case complete
+        case revision
+        case snapshotID = "snapshotId"
+        case pageSize
+        case scope
+        case continuationCursor
+        case resumeCursor
+        case reset
+        case resetReason
+        case serverTime
+        case sessions
+        case pendingAttention
+        case runtimeSnapshot
+        case transcriptHeads
+        case widgetSummary
+        case pushRegistry
+    }
 }
 
 struct ManifestProfileAuthority: Codable, Sendable, Equatable, Hashable {
     let profileID: String
     let profileName: String
     let authorityEpoch: String
+
+    private enum CodingKeys: String, CodingKey {
+        case profileID = "profileId"
+        case profileName
+        case authorityEpoch
+    }
 }
 
 struct ManifestSessionDelta: Decodable, Sendable, Equatable {
@@ -114,7 +145,7 @@ struct ManifestSessionUpsert: Decodable, Sendable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case profileID
+        case profileID = "profileId"
         case authorityEpoch
         case entityRevision
     }
@@ -127,6 +158,15 @@ struct ManifestSessionTombstone: Decodable, Sendable, Equatable, Hashable {
     let entityRevision: Int64
     let deletedAt: Double
     let reason: String
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case profileID = "profileId"
+        case authorityEpoch
+        case entityRevision
+        case deletedAt
+        case reason
+    }
 }
 
 struct ManifestAttentionItem: Codable, Sendable, Equatable, Identifiable {
@@ -142,6 +182,18 @@ struct ManifestAttentionItem: Codable, Sendable, Equatable, Identifiable {
 
     var sessionId: String { storedSessionID ?? sessionID }
     var title: String? { safeTitle }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case sessionID = "sessionId"
+        case storedSessionID = "storedSessionId"
+        case profileID = "profileId"
+        case authorityEpoch
+        case kind
+        case safeTitle
+        case status
+        case entityRevision
+    }
 }
 
 struct ManifestActiveTurn: Codable, Sendable, Equatable, Identifiable {
@@ -154,6 +206,15 @@ struct ManifestActiveTurn: Codable, Sendable, Equatable, Identifiable {
 
     var id: String { storedSessionID ?? sessionID }
     var sessionId: String { storedSessionID ?? sessionID }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case storedSessionID = "storedSessionId"
+        case profileID = "profileId"
+        case authorityEpoch
+        case state
+        case startedAt
+    }
 }
 
 struct ManifestRuntimeSnapshot: Codable, Sendable, Equatable {
@@ -161,6 +222,13 @@ struct ManifestRuntimeSnapshot: Codable, Sendable, Equatable {
     let sequence: Int64
     let capturedAt: Double
     let activeTurns: [ManifestActiveTurn]
+
+    private enum CodingKeys: String, CodingKey {
+        case runtimeInstanceID = "runtimeInstanceId"
+        case sequence
+        case capturedAt
+        case activeTurns
+    }
 }
 
 struct ManifestTranscriptHead: Codable, Sendable, Equatable {
@@ -171,6 +239,16 @@ struct ManifestTranscriptHead: Codable, Sendable, Equatable {
     let messageCount: Int
     let lastMessageAt: Double?
     let entityRevision: Int64
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case profileID = "profileId"
+        case authorityEpoch
+        case maxMessageID = "maxMessageId"
+        case messageCount
+        case lastMessageAt
+        case entityRevision
+    }
 }
 
 struct ManifestWidgetSummary: Codable, Sendable, Equatable {
