@@ -37,6 +37,21 @@ func startGstackDebugBridge(environment: AppEnvironment) {
         ChatStoreAccessor.register(environment.chatStore)
         SessionStoreAccessor.register(environment.sessionStore)
         InboxStoreAccessor.register(environment.inboxStore)
+        // Build 120: the trace is already typed/redacted before it crosses the
+        // DEBUG bridge. Keep it read-only and expose the JSON as one accessor so
+        // the bridge does not need a second diagnostics protocol.
+        StateServer.shared.registerAccessor(
+            key: "reliability.events",
+            type: "String",
+            read: { ReliabilityDiagnostics.shared.redactedJSON as Any? },
+            write: { _ in false }
+        )
+        StateServer.shared.registerAccessor(
+            key: "reliability.count",
+            type: "Int",
+            read: { ReliabilityDiagnostics.shared.events.count as Any? },
+            write: { _ in false }
+        )
     }
 }
 #endif

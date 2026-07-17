@@ -2057,9 +2057,23 @@ final class SessionStore {
             return
         }
         guard let cacheStore else { return }
+        let paintStart = ContinuousClock.now
+        var paintedRows = 0
+        var paintFinished = false
+        ReliabilityDiagnostics.shared.cachePaintStarted(identifier: nil)
         coldReadCacheScope = scope
         var cacheReadSucceeded = false
         defer {
+            let duration = paintStart.duration(to: ContinuousClock.now)
+            if paintFinished {
+                ReliabilityDiagnostics.shared.cachePaintFinished(
+                    rowCount: paintedRows, duration: duration
+                )
+            } else {
+                ReliabilityDiagnostics.shared.cachePaintFailed(
+                    rowCount: paintedRows, duration: duration
+                )
+            }
             // A transient GRDB/decode failure must not permanently suppress the
             // next foreground/bootstrap retry for this scope.
             if !cacheReadSucceeded, coldReadCacheScope == scope {
@@ -2078,6 +2092,7 @@ final class SessionStore {
                 activeProfile: activeProfile
             )
             cacheReadSucceeded = true
+            paintedRows = cached.count
             // Profile/server selection can change while the actor read is
             // suspended. Do not publish the old partition into the new shell.
             guard currentCacheScope == scope, coldReadCacheScope == scope else { return }
@@ -2114,6 +2129,7 @@ final class SessionStore {
                     loadedOffset = cached.count
                 }
             }
+            paintFinished = true
         } catch {
             return
         }
@@ -3403,6 +3419,10 @@ final class SessionStore {
         bindRuntime: Bool = true
     ) {
         let wasAlreadyActive = activeStoredId == summary.id
+        if let previous = activeStoredId, previous != summary.id {
+            ReliabilityDiagnostics.shared.sessionSuperseded(identifier: previous)
+        }
+        ReliabilityDiagnostics.shared.sessionSelected(identifier: summary.id)
 
         // Leaving any draft: opening a stored session is no longer a draft.
         isDraft = false
@@ -3569,9 +3589,24 @@ final class SessionStore {
                     connectionWorkGeneration: connectionWorkGeneration,
                     transportEpoch: bindingEpoch,
                     usingResumeTestSeam: usingResumeTestSeam
-                ) else { return }  // superseded or an older transport
+                ) else {
+                    if !usingResumeTestSeam,
+                       self.connection?.transportEpoch != bindingEpoch {
+                        ReliabilityDiagnostics.shared.epochRejected(
+                            expected: bindingEpoch,
+                            received: self.connection?.transportEpoch
+                        )
+                    }
+                    if self.activeStoredId != summary.id || self.openToken != token {
+                        ReliabilityDiagnostics.shared.sessionSuperseded(identifier: summary.id)
+                    }
+                    return
+                }  // superseded or an older transport
                 self.activeRuntimeId = result.sessionId
                 self.activeRuntimeEpoch = bindingEpoch
+                ReliabilityDiagnostics.shared.sessionBound(
+                    identifier: summary.id, epoch: bindingEpoch
+                )
                 // Confirm/seed the active-profile pref from the server's echo: the
                 // WS path silently falls back to the launch profile on an unknown
                 // name, so trust the echo over the requested scope.
@@ -4022,9 +4057,24 @@ final class SessionStore {
                 connectionWorkGeneration: myConnectionWorkGeneration,
                 transportEpoch: bindingEpoch,
                 usingResumeTestSeam: usingResumeTestSeam
-            ) else { return nil }
+            ) else {
+                if !usingResumeTestSeam,
+                   connection?.transportEpoch != bindingEpoch {
+                    ReliabilityDiagnostics.shared.epochRejected(
+                        expected: bindingEpoch,
+                        received: connection?.transportEpoch
+                    )
+                }
+                if activeStoredId != storedId || openToken != token {
+                    ReliabilityDiagnostics.shared.sessionSuperseded(identifier: storedId)
+                }
+                return nil
+            }
             activeRuntimeId = result.sessionId
             activeRuntimeEpoch = bindingEpoch
+            ReliabilityDiagnostics.shared.sessionBound(
+                identifier: storedId, epoch: bindingEpoch
+            )
             // A resume can follow a compression chain tip (parent → continuation);
             // re-stamp queued prompts so affinity-stamped ones aren't skipped forever.
             let newStored = result.storedSessionId ?? storedId
@@ -4803,6 +4853,22 @@ final class SessionStore {
         transportEpoch: UInt64,
         onFirstPaint: (@MainActor () -> Void)? = nil
     ) async {
+        let paintStart = ContinuousClock.now
+        var paintedRows = 0
+        var paintFinished = false
+        ReliabilityDiagnostics.shared.cachePaintStarted(identifier: storedId)
+        defer {
+            let duration = paintStart.duration(to: ContinuousClock.now)
+            if paintFinished {
+                ReliabilityDiagnostics.shared.cachePaintFinished(
+                    rowCount: paintedRows, duration: duration
+                )
+            } else {
+                ReliabilityDiagnostics.shared.cachePaintFailed(
+                    rowCount: paintedRows, duration: duration
+                )
+            }
+        }
         // R40 reveal-on-paint: fire the caller's reveal (drawer close) exactly
         // once, after phase 1 lands the first frame — even on the early-out paths
         // below, so a missing `chat` can never strand the drawer open.
@@ -4815,7 +4881,11 @@ final class SessionStore {
                 workGeneration: workGeneration
             ) { onFirstPaint?() }
         }
-        guard let chat else { signalFirstPaint(); return }
+        guard let chat else {
+            paintFinished = true
+            signalFirstPaint()
+            return
+        }
         // Capture the scoped identity before any await. A server/profile change
         // rotates `openToken`; this captured key ensures an old task cannot
         // persist its response into whichever scope happens to be current later.
@@ -4838,6 +4908,7 @@ final class SessionStore {
         if isCurrentTranscriptSelection(token: token, workGeneration: workGeneration),
            let cached = cachedWarmOpenSnapshot(for: storedId) {
             chat.seed(normalized: Array(cached.suffix(ChatStore.transcriptOpenWindowLimit)))
+            paintedRows = cached.count
             paintedFromCache = true
             #if DEBUG
             Self.logOpenLatency(
@@ -4868,6 +4939,7 @@ final class SessionStore {
                 ) else { return }
                 rememberWarmOpenSnapshot(normalized, for: storedId)
                 chat.seed(normalized: normalized)  // in-place reconcile — FIRST frame
+                paintedRows = cachedWindow.count
                 chat.noteTranscriptSeedWindow(cachedWindow)
                 paintedFromCache = true
                 paintedFromDisk = true
@@ -4879,6 +4951,7 @@ final class SessionStore {
             // skeleton, not a stale prior session's rows, while the network loads.
             chat.reset()
         }
+        paintFinished = true
         #if DEBUG
         Self.logOpenLatency(
             phase: paintedFromCache ? "cache-paint(HIT)" : "cache-miss(reset)",

@@ -6,6 +6,10 @@ import SwiftUI
 /// surface honest in-flight/offline/progress states instead of stale "connected".
 struct GatewayStatusView: View {
     let control: RestClient
+    /// Optional for compatibility with previews/tests that only exercise the
+    /// REST panel. Production passes the app's live connection store so the
+    /// two kinds of gateway truth are shown separately.
+    let connection: ConnectionStore?
 
     @Environment(\.hermesTheme) private var theme
 
@@ -13,8 +17,9 @@ struct GatewayStatusView: View {
     @StateObject private var actionRunner: GatewayActionRunner
     @State private var pendingAction: GatewayRecoveryAction?
 
-    init(control: RestClient) {
+    init(control: RestClient, connection: ConnectionStore? = nil) {
         self.control = control
+        self.connection = connection
         _actionRunner = StateObject(wrappedValue: GatewayActionRunner(control: control))
     }
 
@@ -92,11 +97,24 @@ struct GatewayStatusView: View {
         // PSF-02: use theme.card for every row so the gateway section matches the
         // glass/card idiom of the other panels (PersonalityPicker, ModelPicker).
         Section {
-            LabeledContent("State") {
+            LabeledContent("Gateway process") {
                 let badge = actionRunner.gatewayBadgeState(fallback: status)
                 StatusBadge(state: badge.state, running: badge.running)
             }
             .listRowBackground(theme.card)
+            if let connection {
+                LabeledContent("Phone WebSocket") {
+                    let badge = Self.phoneBadgeState(for: connection.transportReadiness)
+                    StatusBadge(state: badge.state, running: badge.running)
+                }
+                .accessibilityLabel("Phone WebSocket readiness")
+                .accessibilityValue(Self.phoneReadinessDescription(for: connection.transportReadiness))
+                .listRowBackground(theme.card)
+                Text("Gateway process status is from REST. Phone WebSocket is this device's live RPC readiness.")
+                    .font(.caption)
+                    .foregroundStyle(theme.mutedFg)
+                    .listRowBackground(theme.card)
+            }
             if let active = status.activeSessions {
                 LabeledContent("Active sessions", value: "\(active)")
                     .listRowBackground(theme.card)
@@ -306,6 +324,35 @@ struct GatewayStatusView: View {
         case "whatsapp": return "phone.fill"
         case "slack": return "number"
         default: return "antenna.radiowaves.left.and.right"
+        }
+    }
+
+    static func phoneBadgeState(
+        for readiness: ConnectionStore.TransportReadiness
+    ) -> GatewayBadgeSnapshot {
+        switch readiness {
+        case .unconfigured:
+            return GatewayBadgeSnapshot(state: "not configured", running: false)
+        case .connecting:
+            return GatewayBadgeSnapshot(state: "connecting", running: nil)
+        case .ready:
+            return GatewayBadgeSnapshot(state: "ready", running: true)
+        case .unavailable:
+            return GatewayBadgeSnapshot(state: "offline", running: false)
+        case .reauthRequired:
+            return GatewayBadgeSnapshot(state: "reauth required", running: false)
+        }
+    }
+
+    private static func phoneReadinessDescription(
+        for readiness: ConnectionStore.TransportReadiness
+    ) -> String {
+        switch readiness {
+        case .unconfigured: return "Not configured"
+        case .connecting: return "Connecting"
+        case .ready: return "Ready for live WebSocket RPC"
+        case .unavailable: return "Unavailable"
+        case .reauthRequired: return "Reauthentication required"
         }
     }
 
