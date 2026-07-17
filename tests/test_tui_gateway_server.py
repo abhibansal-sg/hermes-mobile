@@ -507,6 +507,48 @@ def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
     assert "result_text" not in events[1][2]
 
 
+def test_tool_callbacks_persist_only_safe_turn_operation_metadata(monkeypatch):
+    calls = []
+
+    class _DB:
+        def start_turn_operation(self, *args, **kwargs):
+            calls.append(("start", args, kwargs))
+
+        def finish_turn_operation(self, *args, **kwargs):
+            calls.append(("finish", args, kwargs))
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(
+        server._sessions,
+        "turn-operation-test",
+        {
+            "inflight_turn": {"turn_id": "turn_1"},
+            "session_key": "stored_1",
+            "tool_progress_mode": "all",
+            "tool_started_at": {},
+        },
+    )
+
+    raw_args = {"command": "printf secret"}
+    raw_result = "secret output"
+    server._on_tool_start(
+        "turn-operation-test", "call_1", "terminal", raw_args
+    )
+    server._on_tool_complete(
+        "turn-operation-test", "call_1", "terminal", raw_args, raw_result
+    )
+
+    assert calls[0][0] == "start"
+    assert calls[0][1] == ("stored_1", "turn_1", "call_1")
+    assert calls[0][2]["category"] == "shell"
+    assert calls[0][2]["safe_label"] == "Ran terminal operations"
+    assert raw_args not in calls[0][1:] and raw_result not in calls[0][1:]
+    assert calls[1][0] == "finish"
+    assert calls[1][1] == ("stored_1", "turn_1", "call_1")
+    assert calls[1][2]["state"] == "completed"
+
+
 def test_tui_tool_output_risk_event_exposes_metadata_without_raw_output(monkeypatch):
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(

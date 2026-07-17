@@ -48,7 +48,7 @@ against the same implementation.
 
 ## Authoritative turn ledger
 
-SessionDB schema v23 adds a public, bounded ledger independent of mutable model
+SessionDB schemas v23-v24 add a public, bounded ledger independent of mutable model
 context:
 
 - `session_turns` owns the opaque turn ID, queued/running/terminal state,
@@ -60,6 +60,12 @@ context:
   content fails closed;
 - a terminal turn rejects new inputs and contradictory terminal outcomes; and
 - bounded turn/input reads never enumerate the raw tool-heavy transcript.
+- `session_turn_operations` persists only safe operation identity, category,
+  label, state, and timing; tool arguments, results, terminal output, and
+  reasoning never enter this projection ledger; and
+- per-session ledger coverage is explicit. A newly created empty session can
+  become complete immediately, while resumed, branched, imported, or otherwise
+  historical sessions remain honestly partial until checkpointed backfill.
 
 The TUI gateway reserves and persists the turn before acknowledging a mobile
 prompt receipt. The receipt, inflight snapshot, lifecycle frames, and terminal
@@ -72,9 +78,16 @@ reconstructible GRDB projection commits the same verified authority scope,
 `client_message_id`, and `turn_id`. Restart recovery is idempotent and the
 optimistic overlay cannot disappear in the cross-database crash window.
 
-## Remaining projection gate
+## Bounded projection reader
 
-The plugin must still build the compact projection through a bounded,
-checkpointed projector and pass historical golden fixtures before advertising
-`turn_projection: 1`. Historical grouping and final-response inference remain
-null/fail-closed when the durable ledger or display lineage cannot prove them.
+The plugin now exposes a schema-v1 compact turn page backed only by the bounded
+turn/input/operation ledgers and stable display-origin lookup. Cursors bind to
+the display revision, equal timestamps cannot skip a turn, terminal content is
+accepted only from the durable terminal display origin, and rewind tombstones
+dominate delayed pages. The iOS cache schema v7 applies those pages atomically
+and reads only the requested compact turn window.
+
+The capability must still remain unadvertised until checkpointed historical
+backfill and real historical golden fixtures prove complete coverage.
+Historical grouping and final-response inference remain null/fail-closed when
+the durable ledger or display lineage cannot prove them.

@@ -1837,8 +1837,8 @@ async def search_sessions(
         raise HTTPException(status_code=503, detail="search failed")
     finally:
         try:
-            if db is not None and getattr(db, "_conn", None) is not None:
-                db._conn.close()
+            if db is not None:
+                db.close()
         except Exception:
             pass
 
@@ -1947,6 +1947,51 @@ async def session_messages_delta(
             "has_more_before": page.has_more_before,
         }
     return result
+
+
+@router.get("/sessions/{session_id}/turns")
+async def session_turns(
+    session_id: str,
+    request: Request,
+    profile: str = "default",
+    before: str | None = None,
+    after_revision: int = Query(0, ge=0),
+    limit: int = Query(30, ge=1, le=100),
+):
+    """Return a bounded compact-turn page from public SessionDB ledgers."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if _is_device_auth(request) and not _device_has_scope(request, "chat"):
+        raise HTTPException(status_code=403, detail="Device token lacks chat scope")
+    if not _device_owns_stored_session(request, profile, session_id):
+        raise HTTPException(status_code=403, detail="Device token does not own session")
+
+    from hermes_state import DEFAULT_DB_PATH, SessionDB
+
+    if not DEFAULT_DB_PATH.exists():
+        raise HTTPException(status_code=503, detail="state.db unavailable")
+    db = None
+    try:
+        db = SessionDB(read_only=True)
+        projection = _plugin_module("turn_projection")
+        return projection.build_turn_page(
+            db,
+            session_id=session_id,
+            before=before,
+            after_revision=after_revision,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        _log.warning("compact turn projection failed for %s: %s", session_id, exc)
+        raise HTTPException(status_code=503, detail="turn projection unavailable") from exc
+    finally:
+        try:
+            if db is not None:
+                db.close()
+        except Exception:
+            pass
 
 
 @router.get("/sessions/{session_id}/messages/around")

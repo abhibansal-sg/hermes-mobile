@@ -24,7 +24,7 @@ enum CacheSchema {
     /// normal GRDB path on a live DB; the fingerprint bump means any DB so old
     /// it cannot ALTER cleanly takes the nuke-and-rebuild escape hatch instead —
     /// always safe (the cache is 100% reconstructible from the gateway).
-    static let currentFingerprint = "v6"
+    static let currentFingerprint = "v7"
 
     // MARK: - Migrator
 
@@ -392,6 +392,112 @@ enum CacheSchema {
                 columns: ["createdAt"],
                 ifNotExists: true
             )
+            try SyncMetaRecord(
+                key: SyncMetaRecord.Key.schemaVersion,
+                value: currentFingerprint
+            ).save(db)
+        }
+
+        // v7 — compact authoritative turn projection. Raw tool/reasoning
+        // payloads have no columns in this schema by construction.
+        migrator.registerMigration("v7-compact-turn-projection") { db in
+            try db.create(table: "turn_projection_v1", ifNotExists: true) { t in
+                t.column("gatewayId", .text).notNull()
+                t.column("profileId", .text).notNull()
+                t.column("authorityEpoch", .text).notNull()
+                t.column("sessionId", .text).notNull()
+                t.column("turnId", .text).notNull()
+                t.column("clientMessageId", .text)
+                t.column("state", .text).notNull()
+                t.column("acceptedAt", .double).notNull()
+                t.column("startedAt", .double)
+                t.column("completedAt", .double)
+                t.column("elapsedMs", .integer)
+                t.column("timingQuality", .text).notNull()
+                t.column("authorityState", .text).notNull()
+                t.column("finalJSON", .blob)
+                t.column("sourceHeadId", .integer).notNull()
+                t.column("projectionVersion", .integer).notNull()
+                t.column("serverRevision", .integer).notNull()
+                t.column("updatedAt", .double).notNull()
+                t.primaryKey([
+                    "gatewayId", "profileId", "authorityEpoch", "sessionId", "turnId"
+                ])
+            }
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX IF NOT EXISTS turn_projection_v1_client_message
+                ON turn_projection_v1(
+                    gatewayId,profileId,authorityEpoch,sessionId,clientMessageId
+                ) WHERE clientMessageId IS NOT NULL
+                """)
+            try db.create(
+                index: "turn_projection_v1_page",
+                on: "turn_projection_v1",
+                columns: [
+                    "gatewayId", "profileId", "authorityEpoch", "sessionId", "acceptedAt"
+                ],
+                ifNotExists: true
+            )
+            try db.create(table: "turn_input_v1", ifNotExists: true) { t in
+                t.column("gatewayId", .text).notNull()
+                t.column("profileId", .text).notNull()
+                t.column("authorityEpoch", .text).notNull()
+                t.column("sessionId", .text).notNull()
+                t.column("turnId", .text).notNull()
+                t.column("inputId", .text).notNull()
+                t.column("clientMessageId", .text)
+                t.column("ordinal", .integer).notNull()
+                t.column("inputKind", .text).notNull()
+                t.column("contentJSON", .blob).notNull()
+                t.column("createdAt", .double).notNull()
+                t.primaryKey([
+                    "gatewayId", "profileId", "authorityEpoch", "sessionId", "turnId", "inputId"
+                ])
+                t.foreignKey(
+                    ["gatewayId", "profileId", "authorityEpoch", "sessionId", "turnId"],
+                    references: "turn_projection_v1",
+                    columns: ["gatewayId", "profileId", "authorityEpoch", "sessionId", "turnId"],
+                    onDelete: .cascade
+                )
+            }
+            try db.create(table: "turn_activity_group_v1", ifNotExists: true) { t in
+                t.column("gatewayId", .text).notNull()
+                t.column("profileId", .text).notNull()
+                t.column("authorityEpoch", .text).notNull()
+                t.column("sessionId", .text).notNull()
+                t.column("turnId", .text).notNull()
+                t.column("groupId", .text).notNull()
+                t.column("ordinal", .integer).notNull()
+                t.column("category", .text).notNull()
+                t.column("displayLabel", .text).notNull()
+                t.column("operationCount", .integer).notNull()
+                t.column("state", .text).notNull()
+                t.column("startedAt", .double)
+                t.column("completedAt", .double)
+                t.column("detailAvailable", .boolean).notNull()
+                t.column("serverRevision", .integer).notNull()
+                t.primaryKey([
+                    "gatewayId", "profileId", "authorityEpoch", "sessionId", "turnId", "groupId"
+                ])
+                t.foreignKey(
+                    ["gatewayId", "profileId", "authorityEpoch", "sessionId", "turnId"],
+                    references: "turn_projection_v1",
+                    columns: ["gatewayId", "profileId", "authorityEpoch", "sessionId", "turnId"],
+                    onDelete: .cascade
+                )
+            }
+            try db.create(table: "turn_projection_state_v1", ifNotExists: true) { t in
+                t.column("gatewayId", .text).notNull()
+                t.column("profileId", .text).notNull()
+                t.column("authorityEpoch", .text).notNull()
+                t.column("sessionId", .text).notNull()
+                t.column("sourceHeadId", .integer).notNull()
+                t.column("previousCursor", .text)
+                t.column("hasOlder", .boolean).notNull()
+                t.column("coverageComplete", .boolean).notNull()
+                t.column("updatedAt", .double).notNull()
+                t.primaryKey(["gatewayId", "profileId", "authorityEpoch", "sessionId"])
+            }
             try SyncMetaRecord(
                 key: SyncMetaRecord.Key.schemaVersion,
                 value: currentFingerprint

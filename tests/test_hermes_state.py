@@ -6375,3 +6375,50 @@ class TestTurnLedger:
             "turn-s1", "turn_7", after_ordinal=page[-1]["ordinal"], limit=2
         )
         assert [item["ordinal"] for item in next_page] == [2, 3]
+
+    def test_turn_operations_persist_only_safe_bounded_headers(self, db):
+        db.create_session("turn-s1", source="tui")
+        db.start_turn("turn-s1", "turn_ops", content="work")
+        for index in range(5):
+            db.start_turn_operation(
+                "turn-s1",
+                "turn_ops",
+                f"call_{index}",
+                tool_name="terminal",
+                category="shell",
+                safe_label="Ran terminal operations",
+                started_at=float(index),
+            )
+            if index < 4:
+                db.finish_turn_operation(
+                    "turn-s1",
+                    "turn_ops",
+                    f"call_{index}",
+                    state="completed",
+                    completed_at=float(index) + 0.5,
+                )
+
+        page = db.get_turn_operations("turn-s1", "turn_ops", limit=2)
+        assert [item["operation_id"] for item in page] == ["call_0", "call_1"]
+        assert set(page[0]) == {
+            "operation_id",
+            "ordinal",
+            "tool_name",
+            "category",
+            "safe_label",
+            "state",
+            "started_at",
+            "completed_at",
+        }
+        db.finish_turn("turn-s1", "turn_ops", state="interrupted", terminal_at=9)
+        all_operations = db.get_turn_operations("turn-s1", "turn_ops")
+        assert all_operations[-1]["state"] == "interrupted"
+        with pytest.raises(ValueError, match="active turn"):
+            db.start_turn_operation(
+                "turn-s1",
+                "turn_ops",
+                "late",
+                tool_name="terminal",
+                category="shell",
+                safe_label="Ran terminal operations",
+            )

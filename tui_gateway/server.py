@@ -2038,6 +2038,8 @@ def _persist_branch_seed(session: dict) -> None:
         if db is None:
             return
         try:
+            if hasattr(db, "mark_turn_ledger_incomplete"):
+                db.mark_turn_ledger_incomplete(key)
             for msg in seed:
                 db.append_message(session_id=key, role=msg.get("role", "user"), content=msg.get("content"))
             session["_branch_seed_persisted"] = True
@@ -4061,6 +4063,35 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
     return f"{text}{suffix}" if text else None
 
 
+def _tool_activity_category(name: str) -> str:
+    normalized = str(name or "").lower()
+    if normalized in {"terminal", "bash", "shell", "python", "process"}:
+        return "shell"
+    if normalized in {"write_file", "patch", "apply_patch", "edit_file"}:
+        return "edit"
+    if normalized in {"read_file", "list_files", "search_files", "grep", "glob"}:
+        return "files"
+    if normalized.startswith("web_") or normalized in {"browser", "web_search"}:
+        return "web"
+    if normalized in {"pytest", "test", "benchmark"}:
+        return "test"
+    if "reason" in normalized or normalized in {"think", "plan"}:
+        return "reasoning"
+    return "other"
+
+
+def _tool_activity_label(category: str) -> str:
+    return {
+        "shell": "Ran terminal operations",
+        "edit": "Updated files",
+        "files": "Inspected files",
+        "web": "Used web resources",
+        "test": "Verified tests",
+        "reasoning": "Reasoned through the task",
+        "other": "Performed operations",
+    }[category]
+
+
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
     session = _sessions.get(sid)
     if session is not None:
@@ -4073,6 +4104,26 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         except Exception:
             pass
         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
+        turn = session.get("inflight_turn") or {}
+        turn_id = str(turn.get("turn_id") or "")
+        session_key = str(session.get("session_key") or "")
+        db = _get_db()
+        if db is not None and turn_id and session_key and hasattr(
+            db, "start_turn_operation"
+        ):
+            try:
+                category = _tool_activity_category(name)
+                db.start_turn_operation(
+                    session_key,
+                    turn_id,
+                    tool_call_id,
+                    tool_name=name,
+                    category=category,
+                    safe_label=_tool_activity_label(category),
+                    started_at=session["tool_started_at"][tool_call_id],
+                )
+            except Exception:
+                logger.warning("turn operation start persistence failed", exc_info=True)
     if _tool_progress_enabled(sid):
         payload = {
             "tool_id": tool_call_id,
@@ -4097,6 +4148,26 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         snapshot = session.setdefault("edit_snapshots", {}).pop(tool_call_id, None)
         started_at = session.setdefault("tool_started_at", {}).pop(tool_call_id, None)
     duration_s = time.time() - started_at if started_at else None
+    if session is not None:
+        turn = session.get("inflight_turn") or {}
+        turn_id = str(turn.get("turn_id") or "")
+        session_key = str(session.get("session_key") or "")
+        db = _get_db()
+        if db is not None and turn_id and session_key and hasattr(
+            db, "finish_turn_operation"
+        ):
+            try:
+                failed = isinstance(result, str) and result.lstrip().lower().startswith(
+                    ("error", "failed")
+                )
+                db.finish_turn_operation(
+                    session_key,
+                    turn_id,
+                    tool_call_id,
+                    state="failed" if failed else "completed",
+                )
+            except Exception:
+                logger.warning("turn operation completion persistence failed", exc_info=True)
     if duration_s is not None:
         payload["duration_s"] = duration_s
     try:
@@ -5598,6 +5669,7 @@ def _finish_inflight_turn(
     *,
     state: str,
     terminal_message_origin_id: int | None = None,
+    input_message_origin_id: int | None = None,
 ) -> None:
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
@@ -5609,6 +5681,16 @@ def _finish_inflight_turn(
         return
     if not hasattr(db, "finish_turn"):
         return
+    input_id = str(turn.get("input_id") or "")
+    if input_message_origin_id is not None and input_id and hasattr(
+        db, "bind_turn_input_origin"
+    ):
+        db.bind_turn_input_origin(
+            session_key,
+            turn_id,
+            input_id,
+            input_message_origin_id,
+        )
     db.finish_turn(
         session_key,
         turn_id,
@@ -10030,7 +10112,18 @@ def _run_prompt_submit(
                 status = "complete"
 
             terminal_origin_id = None
+            input_origin_id = None
             if isinstance(result, dict) and isinstance(result.get("messages"), list):
+                for message in result["messages"][len(history):]:
+                    if not isinstance(message, dict) or message.get("role") != "user":
+                        continue
+                    raw_origin = message.get("_display_origin_id")
+                    if raw_origin is not None:
+                        try:
+                            input_origin_id = int(raw_origin)
+                        except (TypeError, ValueError):
+                            input_origin_id = None
+                    break
                 for message in reversed(result["messages"]):
                     if not isinstance(message, dict):
                         continue
@@ -10052,6 +10145,7 @@ def _run_prompt_submit(
                 session,
                 state=terminal_state,
                 terminal_message_origin_id=terminal_origin_id,
+                input_message_origin_id=input_origin_id,
             )
             turn_id = str((session.get("inflight_turn") or {}).get("turn_id") or "")
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}

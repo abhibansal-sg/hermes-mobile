@@ -5,6 +5,11 @@ enum ManifestCacheError: Error, Equatable {
     case authorityTransitionRequiresMigration
 }
 
+enum CompactTurnCacheError: Error, Equatable {
+    case incompatiblePage
+    case stalePage
+}
+
 // MARK: - CacheStore
 //
 // The single actor that owns the SQLite DatabaseQueue. ALL database access is
@@ -20,6 +25,11 @@ enum ManifestCacheError: Error, Equatable {
 // See CONTRACT-OFFLINE-CACHE.md §1, §2, §3.
 
 actor CacheStore {
+
+    struct CompactTurnCommitIdentity: Sendable, Equatable {
+        let clientMessageID: String
+        let turnID: String
+    }
 
     struct OfflineSearchHit: Sendable, Equatable {
         let scope: CacheScope
@@ -954,6 +964,298 @@ actor CacheStore {
             freshness: .cached,
             lastSyncedAt: payload.serverTime.map(Date.init(timeIntervalSince1970:))
         )
+    }
+
+    /// Apply one bounded turn page atomically. WorkRepository completion is a
+    /// deliberately separate, idempotent step performed by the coordinator
+    /// after this transaction returns.
+    func applyCompactTurnPage(
+        _ page: CompactTurnPageV1,
+        authority: AuthorityScopeV1,
+        now: Date = Date()
+    ) throws -> [CompactTurnCommitIdentity] {
+        guard page.schemaVersion == 1,
+              page.projectionVersion == 1,
+              !page.storedSessionID.isEmpty else {
+            throw CompactTurnCacheError.incompatiblePage
+        }
+        return try db.write { db in
+            let existingHead = try Int64.fetchOne(
+                db,
+                sql: """
+                    SELECT sourceHeadId FROM turn_projection_state_v1
+                    WHERE gatewayId=? AND profileId=? AND authorityEpoch=? AND sessionId=?
+                    """,
+                arguments: [
+                    authority.gatewayID, authority.profileID, authority.authorityEpoch,
+                    page.storedSessionID,
+                ]
+            )
+            if let existingHead, existingHead > page.sourceHeadID {
+                throw CompactTurnCacheError.stalePage
+            }
+            let scopeArguments: [DatabaseValueConvertible] = [
+                authority.gatewayID,
+                authority.profileID,
+                authority.authorityEpoch,
+                page.storedSessionID,
+            ]
+            if page.reset {
+                try db.execute(
+                    sql: """
+                        DELETE FROM turn_projection_v1
+                        WHERE gatewayId=? AND profileId=? AND authorityEpoch=? AND sessionId=?
+                        """,
+                    arguments: StatementArguments(scopeArguments)
+                )
+            }
+
+            for tombstone in page.tombstones {
+                let entityID = "\(page.storedSessionID):\(tombstone.turnID)"
+                try db.execute(
+                    sql: """
+                        INSERT INTO projection_tombstone_v1
+                        (gatewayId,profileId,authorityEpoch,entityKind,entityId,serverRevision,deletedAt)
+                        VALUES (?,?,?,?,?,?,?)
+                        ON CONFLICT(gatewayId,profileId,authorityEpoch,entityKind,entityId)
+                        DO UPDATE SET serverRevision=excluded.serverRevision,
+                                      deletedAt=excluded.deletedAt
+                        WHERE excluded.serverRevision >= projection_tombstone_v1.serverRevision
+                        """,
+                    arguments: [
+                        authority.gatewayID, authority.profileID, authority.authorityEpoch,
+                        "turn", entityID, tombstone.serverRevision, tombstone.deletedAt,
+                    ]
+                )
+                try db.execute(
+                    sql: """
+                        DELETE FROM turn_projection_v1
+                        WHERE gatewayId=? AND profileId=? AND authorityEpoch=?
+                          AND sessionId=? AND turnId=? AND serverRevision<=?
+                        """,
+                    arguments: [
+                        authority.gatewayID, authority.profileID, authority.authorityEpoch,
+                        page.storedSessionID, tombstone.turnID, tombstone.serverRevision,
+                    ]
+                )
+            }
+
+            let encoder = JSONEncoder()
+            var committed: [CompactTurnCommitIdentity] = []
+            for turn in page.turns {
+                let entityID = "\(page.storedSessionID):\(turn.turnID)"
+                let tombstoneRevision = try Int64.fetchOne(
+                    db,
+                    sql: """
+                        SELECT serverRevision FROM projection_tombstone_v1
+                        WHERE gatewayId=? AND profileId=? AND authorityEpoch=?
+                          AND entityKind='turn' AND entityId=?
+                        """,
+                    arguments: [
+                        authority.gatewayID, authority.profileID,
+                        authority.authorityEpoch, entityID,
+                    ]
+                )
+                guard (tombstoneRevision ?? -1) < turn.serverRevision else { continue }
+                let finalJSON = try turn.final.map(encoder.encode)
+                try db.execute(
+                    sql: """
+                        INSERT INTO turn_projection_v1
+                        (gatewayId,profileId,authorityEpoch,sessionId,turnId,clientMessageId,
+                         state,acceptedAt,startedAt,completedAt,elapsedMs,timingQuality,
+                         authorityState,finalJSON,sourceHeadId,projectionVersion,
+                         serverRevision,updatedAt)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(gatewayId,profileId,authorityEpoch,sessionId,turnId)
+                        DO UPDATE SET clientMessageId=excluded.clientMessageId,
+                          state=excluded.state,acceptedAt=excluded.acceptedAt,
+                          startedAt=excluded.startedAt,completedAt=excluded.completedAt,
+                          elapsedMs=excluded.elapsedMs,timingQuality=excluded.timingQuality,
+                          authorityState=excluded.authorityState,finalJSON=excluded.finalJSON,
+                          sourceHeadId=excluded.sourceHeadId,
+                          projectionVersion=excluded.projectionVersion,
+                          serverRevision=excluded.serverRevision,updatedAt=excluded.updatedAt
+                        WHERE excluded.serverRevision >= turn_projection_v1.serverRevision
+                        """,
+                    arguments: [
+                        authority.gatewayID, authority.profileID, authority.authorityEpoch,
+                        page.storedSessionID, turn.turnID, turn.clientMessageID,
+                        turn.state, turn.acceptedAt, turn.startedAt, turn.completedAt,
+                        turn.elapsedMs, turn.timingQuality, turn.authorityState,
+                        finalJSON, page.sourceHeadID, page.projectionVersion,
+                        turn.serverRevision, now.timeIntervalSince1970,
+                    ]
+                )
+                try db.execute(
+                    sql: """
+                        DELETE FROM turn_input_v1
+                        WHERE gatewayId=? AND profileId=? AND authorityEpoch=?
+                          AND sessionId=? AND turnId=?
+                        """,
+                    arguments: StatementArguments(scopeArguments + [turn.turnID])
+                )
+                for input in turn.inputs {
+                    try db.execute(
+                        sql: """
+                            INSERT INTO turn_input_v1
+                            (gatewayId,profileId,authorityEpoch,sessionId,turnId,inputId,
+                             clientMessageId,ordinal,inputKind,contentJSON,createdAt)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                        arguments: StatementArguments(scopeArguments + [
+                            turn.turnID, input.inputID, input.clientMessageID,
+                            input.ordinal, input.inputKind,
+                            try encoder.encode(input.content), input.createdAt,
+                        ])
+                    )
+                }
+                try db.execute(
+                    sql: """
+                        DELETE FROM turn_activity_group_v1
+                        WHERE gatewayId=? AND profileId=? AND authorityEpoch=?
+                          AND sessionId=? AND turnId=?
+                        """,
+                    arguments: StatementArguments(scopeArguments + [turn.turnID])
+                )
+                for group in turn.activityGroups {
+                    try db.execute(
+                        sql: """
+                            INSERT INTO turn_activity_group_v1
+                            (gatewayId,profileId,authorityEpoch,sessionId,turnId,groupId,
+                             ordinal,category,displayLabel,operationCount,state,startedAt,
+                             completedAt,detailAvailable,serverRevision)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                        arguments: StatementArguments(scopeArguments + [
+                            turn.turnID, group.groupID, group.ordinal, group.category,
+                            group.displayLabel, group.operationCount, group.state,
+                            group.startedAt, group.completedAt, group.detailAvailable,
+                            turn.serverRevision,
+                        ])
+                    )
+                }
+                if let clientMessageID = turn.clientMessageID {
+                    committed.append(CompactTurnCommitIdentity(
+                        clientMessageID: clientMessageID,
+                        turnID: turn.turnID
+                    ))
+                }
+            }
+            try db.execute(
+                sql: """
+                    INSERT INTO turn_projection_state_v1
+                    (gatewayId,profileId,authorityEpoch,sessionId,sourceHeadId,
+                     previousCursor,hasOlder,coverageComplete,updatedAt)
+                    VALUES (?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(gatewayId,profileId,authorityEpoch,sessionId)
+                    DO UPDATE SET sourceHeadId=excluded.sourceHeadId,
+                      previousCursor=excluded.previousCursor,hasOlder=excluded.hasOlder,
+                      coverageComplete=excluded.coverageComplete,updatedAt=excluded.updatedAt
+                    WHERE excluded.sourceHeadId >= turn_projection_state_v1.sourceHeadId
+                    """,
+                arguments: StatementArguments(scopeArguments + [
+                    page.sourceHeadID, page.previousCursor, page.hasOlder,
+                    page.coverageComplete, now.timeIntervalSince1970,
+                ])
+            )
+            return committed
+        }
+    }
+
+    /// Read only the newest requested compact turns. This is the normal
+    /// local-first session-open path and never decodes legacy raw rows.
+    func loadCompactTurns(
+        authority: AuthorityScopeV1,
+        storedSessionID: String,
+        limit: Int = 30
+    ) throws -> [CompactTurnV1] {
+        let safeLimit = max(1, min(limit, 100))
+        return try db.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT * FROM (
+                      SELECT * FROM turn_projection_v1
+                      WHERE gatewayId=? AND profileId=? AND authorityEpoch=? AND sessionId=?
+                      ORDER BY acceptedAt DESC, turnId DESC LIMIT ?
+                    ) ORDER BY acceptedAt ASC, turnId ASC
+                    """,
+                arguments: [
+                    authority.gatewayID, authority.profileID, authority.authorityEpoch,
+                    storedSessionID, safeLimit,
+                ]
+            )
+            let decoder = JSONDecoder()
+            return try rows.map { row in
+                let turnID: String = row["turnId"]
+                let inputRows = try Row.fetchAll(
+                    db,
+                    sql: """
+                        SELECT * FROM turn_input_v1
+                        WHERE gatewayId=? AND profileId=? AND authorityEpoch=?
+                          AND sessionId=? AND turnId=? ORDER BY ordinal
+                        """,
+                    arguments: [
+                        authority.gatewayID, authority.profileID, authority.authorityEpoch,
+                        storedSessionID, turnID,
+                    ]
+                )
+                let inputs = try inputRows.map { input -> CompactTurnInputV1 in
+                    let contentData: Data = input["contentJSON"]
+                    return CompactTurnInputV1(
+                        inputID: input["inputId"],
+                        clientMessageID: input["clientMessageId"],
+                        ordinal: input["ordinal"],
+                        inputKind: input["inputKind"],
+                        content: try decoder.decode(JSONValue.self, from: contentData),
+                        createdAt: input["createdAt"]
+                    )
+                }
+                let groupRows = try Row.fetchAll(
+                    db,
+                    sql: """
+                        SELECT * FROM turn_activity_group_v1
+                        WHERE gatewayId=? AND profileId=? AND authorityEpoch=?
+                          AND sessionId=? AND turnId=? ORDER BY ordinal
+                        """,
+                    arguments: [
+                        authority.gatewayID, authority.profileID, authority.authorityEpoch,
+                        storedSessionID, turnID,
+                    ]
+                )
+                let groups = groupRows.map { group in
+                    CompactTurnActivityGroupV1(
+                        groupID: group["groupId"],
+                        ordinal: group["ordinal"],
+                        category: group["category"],
+                        displayLabel: group["displayLabel"],
+                        operationCount: group["operationCount"],
+                        state: group["state"],
+                        startedAt: group["startedAt"],
+                        completedAt: group["completedAt"],
+                        detailAvailable: group["detailAvailable"]
+                    )
+                }
+                let finalData: Data? = row["finalJSON"]
+                return CompactTurnV1(
+                    turnID: turnID,
+                    clientMessageID: row["clientMessageId"],
+                    inputs: inputs,
+                    state: row["state"],
+                    acceptedAt: row["acceptedAt"],
+                    startedAt: row["startedAt"],
+                    completedAt: row["completedAt"],
+                    elapsedMs: row["elapsedMs"],
+                    timingQuality: row["timingQuality"],
+                    authorityState: row["authorityState"],
+                    serverRevision: row["serverRevision"],
+                    final: try finalData.map {
+                        try decoder.decode(CompactTurnFinalV1.self, from: $0)
+                    },
+                    activityGroups: groups
+                )
+            }
+        }
     }
 
     /// Save (upsert) a batch of SessionSummary values into session_cache under

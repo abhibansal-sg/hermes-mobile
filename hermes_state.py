@@ -157,7 +157,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -812,6 +812,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     display_revision INTEGER NOT NULL DEFAULT 0,
     display_generation INTEGER NOT NULL DEFAULT 0,
     display_lineage_complete INTEGER NOT NULL DEFAULT 1,
+    turn_ledger_complete INTEGER NOT NULL DEFAULT 0,
+    turn_ledger_start_origin_id INTEGER,
     archived INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
@@ -877,6 +879,22 @@ CREATE TABLE IF NOT EXISTS session_turn_inputs (
     accepted_at REAL NOT NULL,
     message_origin_id INTEGER,
     PRIMARY KEY (session_id, turn_id, input_id),
+    FOREIGN KEY (session_id, turn_id)
+        REFERENCES session_turns(session_id, turn_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS session_turn_operations (
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    tool_name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    safe_label TEXT NOT NULL,
+    state TEXT NOT NULL,
+    started_at REAL,
+    completed_at REAL,
+    PRIMARY KEY (session_id, turn_id, operation_id),
     FOREIGN KEY (session_id, turn_id)
         REFERENCES session_turns(session_id, turn_id) ON DELETE CASCADE
 );
@@ -955,6 +973,8 @@ CREATE INDEX IF NOT EXISTS idx_session_turns_page
 CREATE UNIQUE INDEX IF NOT EXISTS idx_session_turn_client_message
     ON session_turn_inputs(session_id, client_message_id)
     WHERE client_message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_session_turn_operations_page
+    ON session_turn_operations(session_id, turn_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
@@ -4647,6 +4667,31 @@ class SessionDB:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def get_display_message_by_origin(
+        self, session_id: str, origin_id: int
+    ) -> Optional[Dict[str, Any]]:
+        """Return one canonical display row by stable origin identity."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT m.*, d.origin_id, d.created_generation, "
+                "d.display_revision AS origin_display_revision "
+                "FROM message_display_origins d "
+                "JOIN messages m ON m.id = d.canonical_message_id "
+                "WHERE d.session_id = ? AND d.origin_id = ? "
+                "AND d.state = 'display'",
+                (session_id, int(origin_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["content"] = self._decode_content(item.get("content"))
+        if item.get("tool_calls"):
+            try:
+                item["tool_calls"] = json.loads(item["tool_calls"])
+            except (json.JSONDecodeError, TypeError):
+                item["tool_calls"] = []
+        return item
+
     _TURN_STATES = frozenset(
         {"queued", "running", "completed", "interrupted", "failed"}
     )
@@ -4691,6 +4736,25 @@ class SessionDB:
                 "WHERE session_id = ? AND turn_id = ?",
                 (session_id, turn_id),
             ).fetchone()
+            if existing_turn is None:
+                prior_turn = conn.execute(
+                    "SELECT 1 FROM session_turns WHERE session_id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if prior_turn is None:
+                    origin_row = conn.execute(
+                        "SELECT COUNT(*), COALESCE(MAX(origin_id), 0) "
+                        "FROM message_display_origins "
+                        "WHERE session_id = ? AND state = 'display'",
+                        (session_id,),
+                    ).fetchone()
+                    origin_count = int(origin_row[0] or 0)
+                    max_origin = int(origin_row[1] or 0)
+                    conn.execute(
+                        "UPDATE sessions SET turn_ledger_complete = ?, "
+                        "turn_ledger_start_origin_id = ? WHERE id = ?",
+                        (1 if origin_count == 0 else 0, max_origin, session_id),
+                    )
             existing_input = conn.execute(
                 "SELECT turn_id, input_id, client_message_id, input_kind, content, "
                 "accepted_at FROM session_turn_inputs "
@@ -4907,6 +4971,140 @@ class SessionDB:
                     turn_id,
                 ),
             )
+            operation_terminal_state = (
+                "interrupted" if state == "interrupted" else
+                "failed" if state == "failed" else "completed"
+            )
+            conn.execute(
+                "UPDATE session_turn_operations SET state = ?, completed_at = ? "
+                "WHERE session_id = ? AND turn_id = ? AND state = 'running'",
+                (operation_terminal_state, terminal, session_id, turn_id),
+            )
+
+        self._execute_write(_do)
+
+    def bind_turn_input_origin(
+        self,
+        session_id: str,
+        turn_id: str,
+        input_id: str,
+        message_origin_id: int,
+    ) -> None:
+        """Bind a committed user row to its authoritative turn input once."""
+        def _do(conn):
+            origin = conn.execute(
+                "SELECT 1 FROM message_display_origins d "
+                "JOIN messages m ON m.id = d.canonical_message_id "
+                "WHERE d.session_id = ? AND d.origin_id = ? "
+                "AND d.state = 'display' AND m.role = 'user'",
+                (session_id, int(message_origin_id)),
+            ).fetchone()
+            if origin is None:
+                raise ValueError("turn input origin is not a displayed user message")
+            row = conn.execute(
+                "SELECT message_origin_id FROM session_turn_inputs "
+                "WHERE session_id = ? AND turn_id = ? AND input_id = ?",
+                (session_id, turn_id, input_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"turn input not found: {input_id}")
+            if row[0] is not None and int(row[0]) != int(message_origin_id):
+                raise ValueError("turn input is already bound to another display origin")
+            conn.execute(
+                "UPDATE session_turn_inputs SET message_origin_id = ? "
+                "WHERE session_id = ? AND turn_id = ? AND input_id = ?",
+                (int(message_origin_id), session_id, turn_id, input_id),
+            )
+
+        self._execute_write(_do)
+
+    def start_turn_operation(
+        self,
+        session_id: str,
+        turn_id: str,
+        operation_id: str,
+        *,
+        tool_name: str,
+        category: str,
+        safe_label: str,
+        started_at: Optional[float] = None,
+    ) -> None:
+        """Persist a safe operation header without arguments or results."""
+        if not operation_id or not tool_name or not category or not safe_label:
+            raise ValueError("operation identity and safe metadata are required")
+        started = float(started_at if started_at is not None else time.time())
+
+        def _do(conn):
+            turn = conn.execute(
+                "SELECT state FROM session_turns WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone()
+            if turn is None or turn[0] not in {"queued", "running"}:
+                raise ValueError("operation does not belong to an active turn")
+            existing = conn.execute(
+                "SELECT tool_name, category, safe_label FROM session_turn_operations "
+                "WHERE session_id = ? AND turn_id = ? AND operation_id = ?",
+                (session_id, turn_id, operation_id),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) != (tool_name, category, safe_label):
+                    raise ValueError("operation id was reused with different metadata")
+                return
+            ordinal = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(ordinal), -1) + 1 "
+                    "FROM session_turn_operations WHERE session_id = ? AND turn_id = ?",
+                    (session_id, turn_id),
+                ).fetchone()[0]
+            )
+            conn.execute(
+                "INSERT INTO session_turn_operations "
+                "(session_id, turn_id, operation_id, ordinal, tool_name, category, "
+                "safe_label, state, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)",
+                (
+                    session_id,
+                    turn_id,
+                    operation_id,
+                    ordinal,
+                    tool_name,
+                    category,
+                    safe_label,
+                    started,
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def finish_turn_operation(
+        self,
+        session_id: str,
+        turn_id: str,
+        operation_id: str,
+        *,
+        state: str,
+        completed_at: Optional[float] = None,
+    ) -> None:
+        if state not in {"completed", "failed", "interrupted"}:
+            raise ValueError(f"invalid operation terminal state: {state!r}")
+        completed = float(completed_at if completed_at is not None else time.time())
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT state FROM session_turn_operations "
+                "WHERE session_id = ? AND turn_id = ? AND operation_id = ?",
+                (session_id, turn_id, operation_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"operation not found: {operation_id}")
+            if row[0] != "running":
+                if row[0] != state:
+                    raise ValueError(f"operation already terminal as {row[0]!r}")
+                return
+            conn.execute(
+                "UPDATE session_turn_operations SET state = ?, completed_at = ? "
+                "WHERE session_id = ? AND turn_id = ? AND operation_id = ?",
+                (state, completed, session_id, turn_id, operation_id),
+            )
 
         self._execute_write(_do)
 
@@ -4915,6 +5113,7 @@ class SessionDB:
         session_id: str,
         *,
         before_accepted_at: Optional[float] = None,
+        before_turn_id: Optional[str] = None,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
         """Return a bounded newest-first page of durable turn ledger rows."""
@@ -4922,8 +5121,16 @@ class SessionDB:
         before_clause = ""
         params: list[Any] = [session_id]
         if before_accepted_at is not None:
-            before_clause = " AND accepted_at < ?"
-            params.append(float(before_accepted_at))
+            if before_turn_id:
+                before_clause = (
+                    " AND (accepted_at < ? OR (accepted_at = ? AND turn_id < ?))"
+                )
+                params.extend(
+                    [float(before_accepted_at), float(before_accepted_at), before_turn_id]
+                )
+            else:
+                before_clause = " AND accepted_at < ?"
+                params.append(float(before_accepted_at))
         params.append(bounded_limit)
         with self._lock:
             rows = self._conn.execute(
@@ -4932,6 +5139,81 @@ class SessionDB:
                 tuple(params),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def get_turn_ledger_status(self, session_id: str) -> Dict[str, Any]:
+        """Return bounded-projection coverage without reading raw messages."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT display_revision, display_lineage_complete, "
+                "turn_ledger_complete, turn_ledger_start_origin_id "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"session not found: {session_id}")
+        return {
+            "schema_version": 1,
+            "session_id": session_id,
+            "display_revision": int(row["display_revision"] or 0),
+            "display_lineage_complete": bool(row["display_lineage_complete"]),
+            "coverage_complete": bool(row["turn_ledger_complete"]),
+            "ledger_start_origin_id": row["turn_ledger_start_origin_id"],
+        }
+
+    def get_turn_tombstones(
+        self,
+        session_id: str,
+        *,
+        after_revision: int = 0,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """Return turns whose primary committed user origin was removed."""
+        bounded_limit = max(1, min(int(limit), 5000))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT i.turn_id, d.state, d.display_revision, d.updated_at "
+                "FROM session_turn_inputs i "
+                "JOIN message_display_origins d "
+                "  ON d.session_id = i.session_id "
+                " AND d.origin_id = i.message_origin_id "
+                "WHERE i.session_id = ? AND i.ordinal = 0 "
+                "AND d.state != 'display' AND d.display_revision > ? "
+                "ORDER BY d.display_revision, i.turn_id LIMIT ?",
+                (session_id, int(after_revision), bounded_limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_turn_operations(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        after_ordinal: int = -1,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """Return bounded safe operation headers; never raw tool payloads."""
+        bounded_limit = max(1, min(int(limit), 5000))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT operation_id, ordinal, tool_name, category, safe_label, "
+                "state, started_at, completed_at FROM session_turn_operations "
+                "WHERE session_id = ? AND turn_id = ? AND ordinal > ? "
+                "ORDER BY ordinal LIMIT ?",
+                (session_id, turn_id, int(after_ordinal), bounded_limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_turn_ledger_incomplete(self, session_id: str) -> None:
+        """Fail closed when history is seeded without authoritative turns."""
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET turn_ledger_complete = 0 WHERE id = ?",
+                (session_id,),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(f"session not found: {session_id}")
+
+        self._execute_write(_do)
 
     def get_turn_inputs(
         self,
@@ -7678,7 +7960,12 @@ class SessionDB:
                 ).fetchall()
             except sqlite3.OperationalError:
                 return []
-        return [dict(row) for row in rows]
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["content"] = self._decode_content(item.get("content"))
+            result.append(item)
+        return result
 
     def get_telegram_topic_binding_by_session(
         self,

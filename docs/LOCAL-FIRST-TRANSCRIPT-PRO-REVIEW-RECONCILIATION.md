@@ -116,8 +116,12 @@ complete—not revisit the locked local-first product direction.
   APIs. Already-compacted legacy histories fail closed rather than being
   guessed.
 
-The durable authoritative turn ledger is now implemented in SessionDB schema
-v23 and wired to prompt receipts, steering, queued follow-ups, and terminal
-gateway transitions. The remaining B1/B2 gate is the bounded plugin projector
-and its historical golden-fixture proof; the plugin continues to withhold the
-compact projection capability until that gate passes.
+The durable authoritative turn ledger is now implemented in SessionDB schemas
+v23-v24 and wired to prompt receipts, steering, queued follow-ups, safe
+operation headers, and terminal gateway transitions. The bounded plugin reader
+now serves cursor-stable schema-v1 compact pages without loading the raw
+transcript, and iOS cache schema v7 applies/tombstones those pages atomically
+with SQL-limited reads. Historical sessions expose partial coverage instead of
+fabricating completeness. The remaining B2a gate is checkpointed historical
+backfill plus real compaction/rewind golden fixtures; the plugin continues to
+withhold the compact projection capability until that gate passes.
