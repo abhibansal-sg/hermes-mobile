@@ -233,6 +233,7 @@ final class SessionStore {
     /// selection and its pending open intent, but make the old runtime unusable
     /// the instant that transport disappears.
     func transportDidBecomeUnavailable() {
+        connectionWorkGeneration &+= 1
         activeRuntimeId = nil
         activeRuntimeEpoch = nil
         cancelEnsureRuntime()
@@ -974,6 +975,11 @@ final class SessionStore {
         didSet {
             guard activeProfile != oldValue else { return }
             UserDefaults.standard.set(activeProfile, forKey: DefaultsKeys.activeProfile)
+            // Fence a response before its suspended continuation can publish
+            // rows or schedule a cache write for the old profile.
+            refreshToken &+= 1
+            coldReadCacheScope = nil
+            resetInitialFill()
             resetSessionListDeltaState()
         }
     }
@@ -1518,6 +1524,27 @@ final class SessionStore {
         return rows.filter { $0.profile == name }
     }
 
+    /// Offline rows are filtered by the selected profile even before the live
+    /// capability probe settles. Duplicate stored ids are collapsed so the
+    /// drawer never publishes two SwiftUI rows with the same identity.
+    static func filterCachedSessions(
+        _ rows: [SessionSummary],
+        activeProfile: String
+    ) -> [SessionSummary] {
+        let requested = activeProfile.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allProfiles = requested.isEmpty || requested == CacheScope.allProfilesKey
+        var seenScopedIDs: Set<String> = []
+        return rows.filter { row in
+            let rowProfile = normalizedProfileID(row.profile)
+            guard allProfiles || rowProfile == requested else {
+                return false
+            }
+            // Stored session ids are only unique inside a profile. Preserve
+            // deliberate cross-profile collisions in the aggregate drawer.
+            return seenScopedIDs.insert("\(rowProfile)\u{1F}\(row.id)").inserted
+        }
+    }
+
     /// Pinned sessions (in list order) — rendered in a section above the rest.
     var pinnedSessions: [SessionSummary] {
         visibleSessions.filter { pinnedIds.contains($0.id) }
@@ -1950,7 +1977,10 @@ final class SessionStore {
                 manifestLastSyncedAt = manifest.lastSyncedAt
                 manifestRevision = manifest.revision
             }
-            let cached = try await cacheStore.loadSessionList(scope: scope)
+            let cached = Self.filterCachedSessions(
+                try await cacheStore.loadSessionList(scope: scope),
+                activeProfile: activeProfile
+            )
             cacheReadSucceeded = true
             // Profile/server selection can change while the actor read is
             // suspended. Do not publish the old partition into the new shell.
@@ -2206,6 +2236,7 @@ final class SessionStore {
     /// background policy. This must remain the sole refresh implementation.
     func refreshOutcome() async -> BackgroundRefreshOutcome {
         let myConnectionWorkGeneration = connectionWorkGeneration
+        let myCacheScope = currentCacheScope
         var fallbackOutcome: BackgroundRefreshOutcome?
         isLoading = true
         defer { isLoading = false }
@@ -2244,7 +2275,8 @@ final class SessionStore {
         }
 
         await paintFromCache()
-        guard connectionWorkGeneration == myConnectionWorkGeneration else { return .timeout }
+        guard connectionWorkGeneration == myConnectionWorkGeneration,
+              currentCacheScope == myCacheScope else { return .timeout }
         if let cacheStore, let scope = currentCacheScope {
             // Bounded, resumable batches. Yield between transactions so cache
             // paint and interaction are never held behind historical indexing.
@@ -2264,9 +2296,10 @@ final class SessionStore {
         if let fetch = sessionsFetch {
             do {
                 let (fetched, total) = try await fetch()
-                guard refreshToken == myToken else { return .timeout }
+                guard refreshToken == myToken,
+                      currentCacheScope == myCacheScope else { return .timeout }
                 mergeSessionPage(fetched, total: total)
-                persistSessionListToCache()  // P3 write-through (fire-and-forget)
+                if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
                 lastError = nil
 
                 // Kick the decoupled initial-fill (idempotent; survives a sibling
@@ -2276,7 +2309,8 @@ final class SessionStore {
 
                 SpotlightIndexer.index(sessions: sessions)
             } catch {
-                guard refreshToken == myToken else { return .timeout }
+                guard refreshToken == myToken,
+                      currentCacheScope == myCacheScope else { return .timeout }
                 lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 return Self.backgroundRefreshOutcome(for: error)
             }
@@ -2302,15 +2336,17 @@ final class SessionStore {
                     profile: DefaultsKeys.allProfilesScope, limit: fetchLimit,
                     excludeSource: Self.recentsExcludeSources
                 )
-                guard refreshToken == myToken else { return .timeout }
+                guard refreshToken == myToken,
+                      currentCacheScope == myCacheScope else { return .timeout }
                 mergeSessionPage(result.sessions, total: result.total)
-                persistSessionListToCache()  // P3 write-through (fire-and-forget)
+                if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
                 lastError = nil
                 ensureInitialFill()
                 SpotlightIndexer.index(sessions: sessions)
                 return .success
             } catch {
-                guard refreshToken == myToken else { return .timeout }
+                guard refreshToken == myToken,
+                      currentCacheScope == myCacheScope else { return .timeout }
                 let outcome = Self.backgroundRefreshOutcome(for: error)
                 if outcome == .authFailure { fallbackOutcome = outcome }
                 // Fall through to the single-profile fetch below (defensive — a
@@ -2350,6 +2386,7 @@ final class SessionStore {
                         delta = nil
                     }
                     guard refreshToken == myToken,
+                          currentCacheScope == myCacheScope,
                           sessionListDeltaScope(
                               excludeSource: Self.recentsExcludeSources
                           ) == deltaScope else { return .timeout }
@@ -2368,7 +2405,7 @@ final class SessionStore {
                             didChange = mergeSessionDelta(delta, scope: deltaScope)
                         }
                         if didChange {
-                            persistSessionListToCache()  // P3 write-through
+                            if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
                             SpotlightIndexer.index(sessions: sessions)
                         }
                         lastError = nil
@@ -2386,7 +2423,8 @@ final class SessionStore {
                     limit: fetchLimit, minMessages: 1,
                     excludeSource: Self.recentsExcludeSources
                 )
-                guard refreshToken == myToken else { return .timeout }
+                guard refreshToken == myToken,
+                      currentCacheScope == myCacheScope else { return .timeout }
                 if let deltaScope {
                     guard sessionListDeltaScope(
                         excludeSource: Self.recentsExcludeSources
@@ -2399,7 +2437,7 @@ final class SessionStore {
                         scope: deltaScope
                     )
                 }
-                persistSessionListToCache()  // P3 write-through (fire-and-forget)
+                if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
                 lastError = nil
 
                 // BUG B FIX (re-architected — fill30): ensure at least
@@ -2418,7 +2456,8 @@ final class SessionStore {
                 SpotlightIndexer.index(sessions: sessions)
                 return .success
             } catch {
-                guard refreshToken == myToken else { return .timeout }
+                guard refreshToken == myToken,
+                      currentCacheScope == myCacheScope else { return .timeout }
                 let outcome = Self.backgroundRefreshOutcome(for: error)
                 if outcome == .authFailure { fallbackOutcome = outcome }
                 if let deltaScope {
@@ -2436,17 +2475,19 @@ final class SessionStore {
                 "session.list",
                 params: .object(["limit": .number(100)])
             )
-            guard refreshToken == myToken else { return .timeout }
+            guard refreshToken == myToken,
+                  currentCacheScope == myCacheScope else { return .timeout }
             let fetched = Self.parseSessions(from: raw)
             // WS RPC shape has no total; preserve whatever was last known.
             mergeSessionPage(fetched, total: nil)
-            persistSessionListToCache()  // P3 write-through (fire-and-forget)
+            if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
             lastError = nil
             // Republish the session list into Spotlight (fire-and-forget).
             SpotlightIndexer.index(sessions: sessions)
             return .success
         } catch {
-            guard refreshToken == myToken else { return .timeout }
+            guard refreshToken == myToken,
+                  currentCacheScope == myCacheScope else { return .timeout }
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             return fallbackOutcome ?? Self.backgroundRefreshOutcome(for: error)
         }
@@ -2783,10 +2824,13 @@ final class SessionStore {
     /// `isPinned`/`lastAccessedAt`/transcript cursors on existing rows, so a
     /// partial-page refresh can never evict an unseen session or drop a cached
     /// transcript. No cache (tests/previews) ⇒ this is a no-op.
-    private func persistSessionListToCache() {
-        guard let cacheStore, let scope = currentCacheScope else { return }
+    private func persistSessionListToCache(scope: CacheScope) {
+        guard let cacheStore, currentCacheScope == scope else { return }
         let snapshot = sessions
-        Task { try? await cacheStore.saveSessionList(snapshot, scope: scope) }
+        Task { [weak self] in
+            guard let self, self.currentCacheScope == scope else { return }
+            try? await cacheStore.saveSessionList(snapshot, scope: scope)
+        }
     }
 
     /// Decode the `session.list` result, which is `{ sessions: [...] }`.
@@ -3327,7 +3371,12 @@ final class SessionStore {
             }
             lastOpenPersistenceTask = persistenceTask
         }
-        let rowProfile = profileParam(for: summary)
+        let networkProfile = profileParam(for: summary)
+        // Cache identity comes from the row itself. It must not depend on the
+        // live capability gate used for network profile parameters.
+        let cacheProfile = Self.normalizedProfileID(summary.profile)
+        let transcriptWorkGeneration = connectionWorkGeneration
+        let transcriptTransportEpoch = connection?.transportEpoch ?? 0
         // Fresh user intent to use this session: supersede any in-flight on-demand
         // re-resume (it was for the PREVIOUS session — its result must not bind
         // here) and reset the budget so a session that exhausted its retries
@@ -3377,8 +3426,11 @@ final class SessionStore {
             #endif
             await self.seedTranscriptCacheFirst(
                 storedId: summary.id,
-                profile: rowProfile,
+                networkProfile: networkProfile,
+                cacheProfile: cacheProfile,
                 token: token,
+                workGeneration: transcriptWorkGeneration,
+                transportEpoch: transcriptTransportEpoch,
                 onFirstPaint: wasAlreadyActive ? nil : reveal
             )
         }
@@ -3410,8 +3462,8 @@ final class SessionStore {
                 // the row's owning profile home. Omitted for default/all/dormant
                 // cases — byte-for-byte the shipped resume.
                 var resumeParams: [String: JSONValue] = ["session_id": .string(summary.id)]
-                if let rowProfile {
-                    resumeParams["profile"] = .string(rowProfile)
+                if let networkProfile {
+                    resumeParams["profile"] = .string(networkProfile)
                 }
                 let result: SessionOpenResult
                 if let resumeRPC = self.resumeRPC {
@@ -3451,7 +3503,14 @@ final class SessionStore {
                     self.activeStoredId = chainTip
                     // Same token: the chain-tip seed's REST await is just as
                     // outrunnable by a newer open() as the fast path (R1 #43).
-                    await self.seedTranscript(storedId: chainTip, profile: rowProfile, token: token)
+                    await self.seedTranscript(
+                        storedId: chainTip,
+                        networkProfile: networkProfile,
+                        cacheProfile: cacheProfile,
+                        token: token,
+                        workGeneration: transcriptWorkGeneration,
+                        transportEpoch: transcriptTransportEpoch
+                    )
                     // Surface the chain-tip row in the drawer NOW rather than
                     // on the next 30s heartbeat (release audit P2).
                     Task { [weak self] in await self?.refresh() }
@@ -4605,6 +4664,24 @@ final class SessionStore {
     /// All-profiles row deletes target the row's owning profile store.
     var deleteSessionRequest: ((String, String?) async throws -> Void)?
 
+    private func isCurrentTranscriptSelection(
+        token: UUID,
+        workGeneration: UInt64
+    ) -> Bool {
+        !Task.isCancelled
+            && openToken == token
+            && connectionWorkGeneration == workGeneration
+    }
+
+    private func isCurrentTranscriptNetworkWork(
+        token: UUID,
+        workGeneration: UInt64,
+        transportEpoch: UInt64
+    ) -> Bool {
+        isCurrentTranscriptSelection(token: token, workGeneration: workGeneration)
+            && (connection?.transportEpoch ?? 0) == transportEpoch
+    }
+
     /// CACHE-FIRST session open (WhatsApp bar — kills the white void).
     ///
     /// The cold-open seed for ``open(_:)``. It reads the local cache FIRST and:
@@ -4623,8 +4700,11 @@ final class SessionStore {
     /// a stale seed (R1 #28/#43).
     private func seedTranscriptCacheFirst(
         storedId: String,
-        profile: String?,
+        networkProfile: String?,
+        cacheProfile: String,
         token: UUID,
+        workGeneration: UInt64,
+        transportEpoch: UInt64,
         onFirstPaint: (@MainActor () -> Void)? = nil
     ) async {
         // R40 reveal-on-paint: fire the caller's reveal (drawer close) exactly
@@ -4634,13 +4714,16 @@ final class SessionStore {
         func signalFirstPaint() {
             guard !firstPaintSignalled else { return }
             firstPaintSignalled = true
-            if openToken == token { onFirstPaint?() }
+            if isCurrentTranscriptSelection(
+                token: token,
+                workGeneration: workGeneration
+            ) { onFirstPaint?() }
         }
         guard let chat else { signalFirstPaint(); return }
         // Capture the scoped identity before any await. A server/profile change
         // rotates `openToken`; this captured key ensures an old task cannot
         // persist its response into whichever scope happens to be current later.
-        let capturedIdentity = cacheIdentity(storedId, profile: profile)
+        let capturedIdentity = cacheIdentity(storedId, profile: cacheProfile)
 
         #if DEBUG
         // OPEN→PAINTED LATENCY instrumentation (WhatsApp bar): measure where the
@@ -4656,7 +4739,8 @@ final class SessionStore {
         // reconciles any tail/delta afterward.
         var paintedFromCache = false
         var paintedFromDisk = false
-        if openToken == token, let cached = cachedWarmOpenSnapshot(for: storedId) {
+        if isCurrentTranscriptSelection(token: token, workGeneration: workGeneration),
+           let cached = cachedWarmOpenSnapshot(for: storedId) {
             chat.seed(normalized: Array(cached.suffix(ChatStore.transcriptOpenWindowLimit)))
             paintedFromCache = true
             #if DEBUG
@@ -4673,16 +4757,19 @@ final class SessionStore {
             // never ages out of the eviction horizon.
             guard let identity = capturedIdentity else { return }
             try? await cacheStore.touchSession(identity)
-            if openToken == token,           // not superseded while reading disk
+            if isCurrentTranscriptSelection(token: token, workGeneration: workGeneration),
                (try? await cacheStore.hasTranscript(identity)) == true,
-               openToken == token,
+               isCurrentTranscriptSelection(token: token, workGeneration: workGeneration),
                let cached = try? await cacheStore.loadTranscript(identity),
-               openToken == token {          // re-check after every await
+               isCurrentTranscriptSelection(token: token, workGeneration: workGeneration) {
                 // ARCH37 STEP 2 — normalize the cached rows OFF main, hop to main
                 // only for the in-place reconcile (the FIRST painted frame).
                 let cachedWindow = Array(cached.suffix(ChatStore.transcriptOpenWindowLimit))
                 let normalized = await Self.normalizeOffMain(cachedWindow)
-                guard openToken == token else { return }
+                guard isCurrentTranscriptSelection(
+                    token: token,
+                    workGeneration: workGeneration
+                ) else { return }
                 rememberWarmOpenSnapshot(normalized, for: storedId)
                 chat.seed(normalized: normalized)  // in-place reconcile — FIRST frame
                 chat.noteTranscriptSeedWindow(cachedWindow)
@@ -4690,7 +4777,8 @@ final class SessionStore {
                 paintedFromDisk = true
             }
         }
-        if !paintedFromCache, openToken == token {
+        if !paintedFromCache,
+           isCurrentTranscriptSelection(token: token, workGeneration: workGeneration) {
             // Cache miss (or no cache): empty the transcript so ChatView shows the
             // skeleton, not a stale prior session's rows, while the network loads.
             chat.reset()
@@ -4720,20 +4808,31 @@ final class SessionStore {
                let lastActive = sessions.first(where: { $0.id == storedId })?.lastActive,
                let identity = capturedIdentity,
                (try? await cacheStore.transcriptIsFresh(identity, lastActive: lastActive)) == true {
-                guard openToken == token else { return }
+                guard isCurrentTranscriptSelection(
+                    token: token,
+                    workGeneration: workGeneration
+                ) else { return }
                 #if DEBUG
                 Self.logOpenLatency(
                     phase: "network-seed-skipped(fresh)", storedId: storedId, since: openClock)
                 #endif
                 return
             }
-            let stored = try await fetch(storedId, profile)
-            guard openToken == token else { return }  // superseded (R1 #28/#43)
+            let stored = try await fetch(storedId, networkProfile)
+            guard isCurrentTranscriptNetworkWork(
+                token: token,
+                workGeneration: workGeneration,
+                transportEpoch: transportEpoch
+            ) else { return }
             // ARCH37 STEP 2 — normalize OFF the main actor (the pure `toChatMessages`
             // transform), hop to main only for the in-place reconcile assignment with
             // a fresh openToken re-check (a superseded open's normalize is dropped).
             let normalized = await Self.normalizeOffMain(stored)
-            guard openToken == token else { return }  // superseded during normalize
+            guard isCurrentTranscriptNetworkWork(
+                token: token,
+                workGeneration: workGeneration,
+                transportEpoch: transportEpoch
+            ) else { return }
             rememberWarmOpenSnapshot(normalized, for: storedId)
             chat.seed(normalized: normalized)
             chat.noteTranscriptSeedWindow(stored)
@@ -4745,12 +4844,21 @@ final class SessionStore {
             // next open paints it from disk. Fire-and-forget, OFF the UI path.
             if let cacheStore, let identity = capturedIdentity {
                 Task { [weak self] in
-                    guard let self, self.openToken == token else { return }
+                    guard let self,
+                          self.isCurrentTranscriptNetworkWork(
+                              token: token,
+                              workGeneration: workGeneration,
+                              transportEpoch: transportEpoch
+                          ) else { return }
                     try? await cacheStore.saveTranscript(identity: identity, messages: stored)
                 }
             }
         } catch {
-            guard openToken == token else { return }  // superseded (R1 #28/#43)
+            guard isCurrentTranscriptNetworkWork(
+                token: token,
+                workGeneration: workGeneration,
+                transportEpoch: transportEpoch
+            ) else { return }
             // History fetch failed. If the cache already painted, KEEP it (offline-
             // with-cache is a fully usable read) and stay silent. Only an EMPTY
             // transcript needs the recoverable error state — never an infinite
@@ -4774,13 +4882,20 @@ final class SessionStore {
     /// `token` is the ``openToken`` re-checked AFTER the REST await (R1 #28/#43):
     /// a newer `open()`/`startDraft()` may have activated a different session while
     /// the fetch was in flight, and the stale result must be dropped.
-    private func seedTranscript(storedId: String?, profile: String?, token: UUID) async {
+    private func seedTranscript(
+        storedId: String?,
+        networkProfile: String?,
+        cacheProfile: String,
+        token: UUID,
+        workGeneration: UInt64,
+        transportEpoch: UInt64
+    ) async {
         guard let chat else { return }
         guard let storedId, let fetch = resolvedTranscriptFetch else {
             chat.reset()
             return
         }
-        let capturedIdentity = cacheIdentity(storedId, profile: profile)
+        let capturedIdentity = cacheIdentity(storedId, profile: cacheProfile)
 
         // Cache read-through first (identical to the cold-open phase 1, minus the
         // reset-on-miss: a chain-tip seed reconciles over already-painted content,
@@ -4789,14 +4904,17 @@ final class SessionStore {
         if let cacheStore {
             guard let identity = capturedIdentity else { return }
             try? await cacheStore.touchSession(identity)
-            if openToken == token,
+            if isCurrentTranscriptSelection(token: token, workGeneration: workGeneration),
                (try? await cacheStore.hasTranscript(identity)) == true,
-               openToken == token,
+               isCurrentTranscriptSelection(token: token, workGeneration: workGeneration),
                let cached = try? await cacheStore.loadTranscript(identity),
-               openToken == token {
+               isCurrentTranscriptSelection(token: token, workGeneration: workGeneration) {
                 let cachedWindow = Array(cached.suffix(ChatStore.transcriptOpenWindowLimit))
                 let normalized = await Self.normalizeOffMain(cachedWindow)
-                guard openToken == token else { return }
+                guard isCurrentTranscriptSelection(
+                    token: token,
+                    workGeneration: workGeneration
+                ) else { return }
                 rememberWarmOpenSnapshot(normalized, for: storedId)
                 chat.seed(normalized: normalized)
                 chat.noteTranscriptSeedWindow(cachedWindow)
@@ -4805,21 +4923,38 @@ final class SessionStore {
         }
 
         do {
-            let stored = try await fetch(storedId, profile)
-            guard openToken == token else { return }  // superseded (R1 #28/#43)
+            let stored = try await fetch(storedId, networkProfile)
+            guard isCurrentTranscriptNetworkWork(
+                token: token,
+                workGeneration: workGeneration,
+                transportEpoch: transportEpoch
+            ) else { return }
             let normalized = await Self.normalizeOffMain(stored)
-            guard openToken == token else { return }  // superseded during normalize
+            guard isCurrentTranscriptNetworkWork(
+                token: token,
+                workGeneration: workGeneration,
+                transportEpoch: transportEpoch
+            ) else { return }
             rememberWarmOpenSnapshot(normalized, for: storedId)
             chat.seed(normalized: normalized)
             chat.noteTranscriptSeedWindow(stored)
             if let cacheStore, let identity = capturedIdentity {
                 Task { [weak self] in
-                    guard let self, self.openToken == token else { return }
+                    guard let self,
+                          self.isCurrentTranscriptNetworkWork(
+                              token: token,
+                              workGeneration: workGeneration,
+                              transportEpoch: transportEpoch
+                          ) else { return }
                     try? await cacheStore.saveTranscript(identity: identity, messages: stored)
                 }
             }
         } catch {
-            guard openToken == token else { return }  // superseded (R1 #28/#43)
+            guard isCurrentTranscriptNetworkWork(
+                token: token,
+                workGeneration: workGeneration,
+                transportEpoch: transportEpoch
+            ) else { return }
             // A valid cache paint remains readable when reconciliation fails.
             // Only an empty miss needs the recoverable error presentation.
             if !paintedFromCache { chat.reset() }
