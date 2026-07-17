@@ -1158,7 +1158,13 @@ struct DrawerView: View {
 
     @ViewBuilder
     private func sourceGroupRows(_ group: SessionStore.DrawerSourceGroup) -> some View {
-        if let error = sessions.lastError, group.kind == .chats, group.sessions.isEmpty {
+        // Cache-retention invariant (#208): an error row must NEVER replace
+        // retained cached rows. Render it only when there is genuinely nothing
+        // cached (the whole backing list is empty), not merely when this one
+        // source group filtered to empty. Cancellation no longer writes
+        // `lastError` at the store, so this is the belt to that suspender.
+        if let error = sessions.lastError, group.kind == .chats,
+           group.sessions.isEmpty, sessions.sessions.isEmpty {
             sourceGroupErrorRow(error)
         } else if group.sessions.isEmpty {
             sourceGroupEmptyRow(group)

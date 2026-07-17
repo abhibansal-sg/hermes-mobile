@@ -1101,6 +1101,31 @@ final class ConnectionStore {
         enterDraftIfNoActiveSession()
     }
 
+    /// Cold-open frame-0 paint (build125 smoothness): resolve the returning
+    /// user's saved / dev-env gateway URL and paint the cached drawer + last-opened
+    /// transcript from disk IMMEDIATELY at launch, BEFORE the inbox cache hydrate
+    /// or any network await. `bootstrap()` re-runs this exact paint, but the
+    /// `paintFromCache()` read is latched + idempotent so it collapses onto this
+    /// one — hoisting it here only removes the frame-0 dependency on unrelated
+    /// launch awaits (the inbox hydrate). A fresh install (no saved URL, no dev
+    /// env) is a no-op, byte-identical to today. The resolution below mirrors
+    /// `bootstrap(generation:)` exactly so the painted scope matches the scope
+    /// bootstrap will connect under.
+    func paintDrawerCacheFirst() async {
+        #if DEBUG
+        let env = ProcessInfo.processInfo.environment
+        if !_skipEnvironmentBootstrapForTesting,
+           let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+           !url.isEmpty, !token.isEmpty {
+            await paintCacheFirst(serverURLString: url)
+            return
+        }
+        #endif
+        guard let savedURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL),
+              !savedURL.isEmpty else { return }
+        await paintCacheFirst(serverURLString: savedURL)
+    }
+
     /// Bind the session cache scope to `serverURLString` and paint the drawer from
     /// the local cache (WhatsApp bar — cache-first launch).
     ///

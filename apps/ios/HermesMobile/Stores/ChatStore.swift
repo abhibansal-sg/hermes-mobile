@@ -26,16 +26,23 @@ func fetchTranscriptPage(
     rest: RestClient,
     sessionId: String,
     limit: Int,
-    before: Int? = nil
+    before: Int? = nil,
+    shape: String? = nil
 ) async -> TranscriptPageFetch? {
     guard rest.pathStyle == .plugin else { return nil }
     let encodedId = sessionId.addingPercentEncoding(
         withAllowedCharacters: .urlPathAllowed
     ) ?? sessionId
+    // WS-5.1: `shape` is a PARAMETER now (was hardcoded `skeleton`, which stranded
+    // reopened chats on text-only rows with no hydrate). Default `nil` ⇒ FULL; the
+    // cold-open seed passes `skeleton` and pairs it with a background hydrate.
     var path = "\(rest.pathStyle.mobileAPIPrefix)/sessions/\(encodedId)/messages"
-        + "?limit=\(max(1, limit))&shape=skeleton"
+        + "?limit=\(max(1, limit))"
     if let before, before > 0 {
         path += "&before=\(before)"
+    }
+    if let shape, !shape.isEmpty {
+        path += "&shape=\(shape)"
     }
     do {
         let data = try await rest.get(path: path)

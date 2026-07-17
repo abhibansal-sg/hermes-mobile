@@ -129,6 +129,56 @@ final class CacheFirstLaunchTests: XCTestCase {
                        "second paint is latched — never clobbers a warm list")
     }
 
+    /// Cold-open frame-0 paint (build125): `paintDrawerCacheFirst()` must paint the
+    /// drawer from disk WITHOUT any network step — proving the cache paint precedes
+    /// (and does not depend on) the connection bootstrap. hasConnected stays false
+    /// and the phase never leaves `.connecting`, yet the rows are on screen.
+    func testPaintDrawerCacheFirstPaintsBeforeNetwork() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        connection._skipEnvironmentBootstrapForTesting = true
+
+        let savedURL = "https://frame0-\(UUID().uuidString).example"
+        UserDefaults.standard.set(savedURL, forKey: DefaultsKeys.serverURL)
+        defer { UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL) }
+        let scope = CacheScope(serverId: savedURL, profileId: DefaultsKeys.allProfilesScope)
+        try await cache.saveSessionList(
+            [makeSummary(id: "c1", lastActive: 200), makeSummary(id: "c2", lastActive: 100)],
+            scope: scope)
+
+        XCTAssertTrue(sessions.sessions.isEmpty)
+        XCTAssertFalse(connection.hasConnected)
+
+        await connection.paintDrawerCacheFirst()
+
+        XCTAssertEqual(Set(sessions.sessions.map(\.id)), ["c1", "c2"],
+            "the drawer paints from cache at frame 0, before any network bootstrap")
+        XCTAssertEqual(connection.serverURLString, savedURL,
+            "the cache scope is bound from the saved URL without a network probe")
+        XCTAssertFalse(connection.hasConnected,
+            "frame-0 paint must not perform a network connect")
+        guard case .connecting = connection.phase else {
+            return XCTFail("frame-0 paint must not advance the connection phase")
+        }
+    }
+
+    /// A fresh install (no saved URL, dev env skipped) leaves the frame-0 paint a
+    /// no-op — byte-identical to today's onboarding path.
+    func testPaintDrawerCacheFirstNoOpWithoutSavedURL() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        connection._skipEnvironmentBootstrapForTesting = true
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+
+        await connection.paintDrawerCacheFirst()
+
+        XCTAssertTrue(sessions.sessions.isEmpty,
+            "no saved URL ⇒ nothing to paint")
+        XCTAssertEqual(connection.serverURLString, "")
+    }
+
     func testPaintFromCacheNoOpWithoutCache() async throws {
         // No cache wired (previews/tests) ⇒ byte-identical to the network-only path.
         let (connection, sessions, _) = makeGraph()

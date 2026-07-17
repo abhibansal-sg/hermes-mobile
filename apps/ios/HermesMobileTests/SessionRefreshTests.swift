@@ -1,4 +1,5 @@
 import XCTest
+import Observation
 @testable import HermesMobile
 
 /// Unit tests for ABH-86: desktop-parity session list refresh.
@@ -76,6 +77,61 @@ final class SessionRefreshTests: XCTestCase {
     /// A fresh store wired with no live connection — suitable for fetch-seam tests.
     private func makeStore() -> SessionStore {
         SessionStore()
+    }
+
+    // MARK: - build125: identical first-page refresh produces no array churn (#208)
+
+    /// A periodic first-page refresh that returns byte-identical rows must NOT
+    /// reassign the `sessions` array — under `@Observable` an equal-but-new array
+    /// still relayouts the whole drawer. `withObservationTracking`'s `onChange`
+    /// fires only if `sessions` is actually mutated.
+    func testIdenticalRefreshProducesNoSessionsChurn() async {
+        let store = makeStore()
+        let rows = [
+            makeSummary(id: "A", lastActive: 300, startedAt: 3),
+            makeSummary(id: "B", lastActive: 200, startedAt: 2),
+            makeSummary(id: "C", lastActive: 100, startedAt: 1),
+        ]
+        store.sessionsFetch = { (rows, 3) }
+        await store.refresh()
+        XCTAssertEqual(store.sessions.map(\.id), ["A", "B", "C"])
+
+        let mutated = MutationFlag()
+        withObservationTracking {
+            _ = store.sessions
+        } onChange: {
+            mutated.fire()
+        }
+        // Identical content on the next refresh.
+        await store.refresh()
+
+        XCTAssertFalse(mutated.fired,
+            "an identical-content first-page refresh must not churn the sessions array (#208)")
+        XCTAssertEqual(store.sessions.map(\.id), ["A", "B", "C"])
+    }
+
+    /// Control: a refresh that genuinely changes the row set DOES reassign
+    /// `sessions`, so the no-churn guard never suppresses a real update.
+    func testChangedRefreshStillUpdatesSessions() async {
+        let store = makeStore()
+        store.sessionsFetch = { ([self.makeSummary(id: "A", lastActive: 100)], 1) }
+        await store.refresh()
+        XCTAssertEqual(store.sessions.map(\.id), ["A"])
+
+        let mutated = MutationFlag()
+        withObservationTracking {
+            _ = store.sessions
+        } onChange: {
+            mutated.fire()
+        }
+        store.sessionsFetch = {
+            ([self.makeSummary(id: "A", lastActive: 100),
+              self.makeSummary(id: "B", lastActive: 90)], 2)
+        }
+        await store.refresh()
+
+        XCTAssertTrue(mutated.fired, "a changed refresh must still publish the sessions update")
+        XCTAssertEqual(Set(store.sessions.map(\.id)), ["A", "B"])
     }
 
     // MARK: - 1. Re-sort on bumped lastActive
@@ -1140,4 +1196,15 @@ extension SessionSummary {
             cwd: cwd
         )
     }
+}
+
+/// A Sendable one-shot flag for `withObservationTracking`'s `@Sendable` onChange
+/// closure (Swift 6 forbids mutating a captured `var` there). All access is
+/// effectively on the MainActor in these tests; the lock makes it data-race-safe
+/// regardless.
+private final class MutationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _fired = false
+    var fired: Bool { lock.lock(); defer { lock.unlock() }; return _fired }
+    func fire() { lock.lock(); _fired = true; lock.unlock() }
 }
