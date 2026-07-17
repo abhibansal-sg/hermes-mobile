@@ -466,6 +466,80 @@ final class ProfilesTests: XCTestCase {
         sessions.profileThreadingAvailableForTesting = nil
     }
 
+    func testAggregateTurnCompletionClearsOnlyOwningProfile() {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        sessions.attach(connection: connection, chat: chat)
+        connection.capabilities._seedProfilesCapabilityForTesting(.available)
+        sessions._seedProfilesForTesting([
+            ProfileSummary(name: "work", isDefault: false, description: nil),
+            ProfileSummary(name: "personal", isDefault: false, description: nil),
+        ])
+        sessions.activeProfile = DefaultsKeys.allProfilesScope
+        let work = row("shared", profile: "work")
+        let personal = row("shared", profile: "personal")
+        sessions.sessions = [work, personal]
+
+        sessions.open(work, bindRuntime: false)
+        sessions.activeRuntimeId = "runtime-work"
+        sessions.markTurnStarted(storedId: "shared", runtimeId: "runtime-work")
+        sessions.open(personal, bindRuntime: false)
+        sessions.activeRuntimeId = "runtime-personal"
+        sessions.markTurnStarted(storedId: "shared", runtimeId: "runtime-personal")
+        sessions.open(work, bindRuntime: false)
+        sessions.activeRuntimeId = "runtime-work"
+        sessions.markTurnCompleted(storedId: "shared", runtimeId: "runtime-work")
+
+        XCTAssertEqual(sessions.turnsInProgressIds, ["personal\u{1F}shared"])
+    }
+
+    func testAggregateManifestRestoresProfileScopedTurnIdentity() {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        sessions.attach(connection: connection, chat: chat)
+        // Reproduce startup ordering: the manifest may commit before the async
+        // profiles capability/list probe finishes.
+        sessions.activeProfile = DefaultsKeys.allProfilesScope
+        let authorities = [
+            ManifestProfileAuthority(profileID: "p-work", profileName: "work", authorityEpoch: "a1"),
+            ManifestProfileAuthority(profileID: "p-personal", profileName: "personal", authorityEpoch: "a2"),
+        ]
+        let projection = ManifestProjection(
+            gatewayID: "gateway",
+            journalEpoch: "journal",
+            profileAuthorities: authorities,
+            revision: 7,
+            cursor: "cursor",
+            sessions: [row("shared", profile: "work"), row("shared", profile: "personal")],
+            attention: [],
+            activeTurns: [
+                ManifestActiveTurn(
+                    sessionID: "runtime-work", storedSessionID: "shared",
+                    profileID: "p-work", authorityEpoch: "a1", state: "running", startedAt: 1
+                ),
+                ManifestActiveTurn(
+                    sessionID: "runtime-personal", storedSessionID: "shared",
+                    profileID: "p-personal", authorityEpoch: "a2", state: "running", startedAt: 2
+                ),
+            ],
+            transcriptHeads: [:], capabilities: [], freshness: .fresh
+        )
+        sessions.applyCommittedManifest(
+            projection,
+            binding: GatewayLocatorBindingV1(
+                normalizedLocator: "https://gateway.test", gatewayID: "gateway",
+                profileAuthorities: authorities, verifiedAt: Date()
+            )
+        )
+
+        XCTAssertEqual(
+            sessions.turnsInProgressIds,
+            ["work\u{1F}shared", "personal\u{1F}shared"]
+        )
+    }
+
     func testAllProfilesCompressedOpenThreadsRowProfileToResumeAndChainTipFetch() async {
         let chat = ChatStore()
         let sessions = SessionStore()
@@ -489,6 +563,8 @@ final class ProfilesTests: XCTestCase {
         }
 
         var transcriptCalls: [(sessionId: String, profile: String?)] = []
+        var runtimeBoundCount = 0
+        sessions.onActiveRuntimeBound = { runtimeBoundCount += 1 }
         sessions.transcriptFetchWithProfile = { sessionId, profile in
             transcriptCalls.append((sessionId, profile))
             return []
@@ -501,6 +577,8 @@ final class ProfilesTests: XCTestCase {
         XCTAssertTrue(transcriptCalls.contains { $0.sessionId == "parent-session" && $0.profile == "work" })
         XCTAssertTrue(transcriptCalls.contains { $0.sessionId == "child-session" && $0.profile == "work" },
                       "Compression-chain continuation seed must keep the parent row's profile scope")
+        XCTAssertEqual(runtimeBoundCount, 1,
+                       "The authoritative chain tip must pass the post-resume fence and drain queued work")
         sessions.profileThreadingAvailableForTesting = nil
     }
 
