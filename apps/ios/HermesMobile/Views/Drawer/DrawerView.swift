@@ -136,11 +136,9 @@ struct DrawerView: View {
     @State private var selectedTab: DrawerTab = .sessions
     /// Durable share jobs currently visible in the common work repository.
     private var sharedInboxPendingCount: Int {
-        queueStore.items.filter {
-            $0.kind == .share
-                && $0.displayState != .sent
-                && $0.displayState != .cancelled
-        }.count
+        // Cross-session count: share work is not bound to the active composer, so
+        // it uses the unscoped share projection rather than `activeItems` (#209).
+        queueStore.pendingShareCount
     }
 
     /// The current display name (Settings field, F2) used for the avatar
