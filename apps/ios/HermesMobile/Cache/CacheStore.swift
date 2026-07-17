@@ -1258,6 +1258,32 @@ actor CacheStore {
         }
     }
 
+    func compactTurnProjectionState(
+        authority: AuthorityScopeV1,
+        storedSessionID: String
+    ) throws -> CompactTurnProjectionStateV1? {
+        try db.read { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: """
+                    SELECT sourceHeadId,previousCursor,hasOlder,coverageComplete
+                    FROM turn_projection_state_v1
+                    WHERE gatewayId=? AND profileId=? AND authorityEpoch=? AND sessionId=?
+                    """,
+                arguments: [
+                    authority.gatewayID, authority.profileID, authority.authorityEpoch,
+                    storedSessionID,
+                ]
+            ) else { return nil }
+            return CompactTurnProjectionStateV1(
+                sourceHeadID: row["sourceHeadId"],
+                previousCursor: row["previousCursor"],
+                hasOlder: row["hasOlder"],
+                coverageComplete: row["coverageComplete"]
+            )
+        }
+    }
+
     /// Save (upsert) a batch of SessionSummary values into session_cache under
     /// `scope`. Existing rows are updated; new rows are inserted. Does NOT delete
     /// rows absent from the batch — partial pages must never evict unseen

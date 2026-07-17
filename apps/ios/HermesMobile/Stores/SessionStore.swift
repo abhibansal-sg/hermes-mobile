@@ -4454,6 +4454,10 @@ final class SessionStore {
     /// invoke the stored-transcript fetch with the row's owning profile.
     var transcriptFetchWithProfile: ((String, String?) async throws -> [StoredMessage])?
 
+    /// Capability-gated compact projection fetch. `nil` preserves the legacy
+    /// bounded skeleton path in tests and on older app graphs.
+    var compactTurnFetch: ((String, String) async throws -> CompactTurnSyncResult)?
+
     /// Profile-aware delete seam for ABH-408. The live path resolves to
     /// `RestClient.deleteSession(id:profile:)`; tests inject this to assert that
     /// All-profiles row deletes target the row's owning profile store.
@@ -4506,6 +4510,22 @@ final class SessionStore {
         // reconciles any tail/delta afterward.
         var paintedFromCache = false
         var paintedFromDisk = false
+        var paintedFromCompact = false
+        if openToken == token,
+           let cacheStore,
+           let authority = compactAuthority(profile: profile),
+           let compact = try? await cacheStore.loadCompactTurns(
+               authority: authority,
+               storedSessionID: storedId,
+               limit: ChatStore.transcriptOpenWindowLimit
+           ),
+           !compact.isEmpty,
+           openToken == token {
+            chat.seed(compactTurns: compact)
+            paintedFromCache = true
+            paintedFromDisk = true
+            paintedFromCompact = true
+        }
         if openToken == token, let cached = cachedWarmOpenSnapshot(for: storedId) {
             chat.seed(normalized: Array(cached.suffix(ChatStore.transcriptOpenWindowLimit)))
             paintedFromCache = true
@@ -4557,6 +4577,30 @@ final class SessionStore {
         signalFirstPaint()
 
         // Phase 2 — authoritative network seed, reconciled in place.
+        if let compactTurnFetch {
+            let profileName = resolvedProfileName(profile)
+            do {
+                let compactResult = try await compactTurnFetch(storedId, profileName)
+                guard openToken == token else { return }
+                switch compactResult {
+                case .unsupported:
+                    break
+                case .available(let turns, let projectionPending):
+                    if !turns.isEmpty || !projectionPending {
+                        chat.seed(compactTurns: turns)
+                        return
+                    }
+                    // Historical coverage is still being built. Keep an already
+                    // painted compact tail, otherwise use the bounded legacy path.
+                    if paintedFromCompact { return }
+                }
+            } catch {
+                // A compact cache hit remains fully readable offline. On a miss,
+                // retain the established bounded compatibility fetch below.
+                if paintedFromCompact { return }
+            }
+        }
+
         guard let fetch = resolvedTranscriptFetch else { return }
         do {
             // ARCH37 STEP 3 — skip the redundant network seed only when the SAME
@@ -4728,6 +4772,28 @@ final class SessionStore {
             }
             return try await fetchTranscriptDeltaAware(rest: rest, cacheStore: cacheStore, sessionId: sessionId, identity: self.cacheIdentity(sessionId))
         }
+    }
+
+    private func resolvedProfileName(_ profile: String?) -> String {
+        let explicit = profile?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !explicit.isEmpty { return explicit }
+        if activeProfile != CacheScope.allProfilesKey, !activeProfile.isEmpty {
+            return activeProfile
+        }
+        return activeSummary?.profile ?? "default"
+    }
+
+    private func compactAuthority(profile: String?) -> AuthorityScopeV1? {
+        guard let binding = verifiedAuthorityBinding else { return nil }
+        let profileName = resolvedProfileName(profile)
+        guard let authority = binding.profileAuthorities.first(where: {
+            $0.profileName == profileName || $0.profileID == profileName
+        }) else { return nil }
+        return try? AuthorityScopeV1(
+            gatewayID: binding.gatewayID,
+            profileID: authority.profileID,
+            authorityEpoch: authority.authorityEpoch
+        )
     }
 
     /// The injected ``rpcSend``, or the default that forwards to the live gateway

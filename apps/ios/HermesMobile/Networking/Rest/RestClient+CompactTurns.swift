@@ -1,6 +1,22 @@
 import Foundation
 
 extension RestClient {
+    func mobilePluginCapabilities() async throws -> MobilePluginCapabilitiesV1 {
+        guard pathStyle == .plugin else {
+            throw RestError.decoding("mobileCapabilitiesV1: plugin path required")
+        }
+        let data = try await get(path: "\(mobileAPIPrefix)/capabilities")
+        let capabilities = try decode(
+            MobilePluginCapabilitiesV1.self,
+            from: data,
+            context: "mobileCapabilitiesV1"
+        )
+        guard capabilities.schemaVersion == 1 else {
+            throw RestError.decoding("mobileCapabilitiesV1: incompatible response")
+        }
+        return capabilities
+    }
+
     func compactTurns(
         storedSessionID: String,
         profile: String,

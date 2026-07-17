@@ -87,7 +87,9 @@ accepted only from the durable terminal display origin, and rewind tombstones
 dominate delayed pages. The iOS cache schema v7 applies those pages atomically
 and reads only the requested compact turn window.
 
-The capability must still remain unadvertised until checkpointed historical
-backfill and real historical golden fixtures prove complete coverage.
-Historical grouping and final-response inference remain null/fail-closed when
-the durable ledger or display lineage cannot prove them.
+Capability discovery now advertises the compact reader only when every required
+public SessionDB method is present. Per-session completeness remains an
+independent truth: historical sessions return `projection_pending=true` until
+checkpointed backfill and golden fixtures prove coverage. Historical grouping
+and final-response inference remain null/fail-closed when the durable ledger or
+display lineage cannot prove them.

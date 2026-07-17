@@ -2986,6 +2986,14 @@ final class ChatStore {
         seed(normalized: Self.toChatMessages(stored))
     }
 
+    /// Seed the durable compact read model without reconstructing raw tool or
+    /// reasoning rows. Activity groups become safe collapsed tool summaries;
+    /// only committed user inputs and the authoritative terminal response are
+    /// rendered as message bodies.
+    func seed(compactTurns: [CompactTurnV1]) {
+        seed(normalized: Self.toChatMessages(compactTurns: compactTurns))
+    }
+
     /// Apply an ALREADY-NORMALIZED seed (`toChatMessages` output) onto the
     /// transcript. The pure `toChatMessages` transform may have run OFF the main
     /// actor (ARCH37 Step 2 — the off-main open/backfill path), so this method is the
@@ -3543,6 +3551,107 @@ final class ChatStore {
         let renumbered = filtered.map(renumberRunIDs(in:))
         // 5. unique-but-stable ids (global de-dup safety net, §2.2).
         return withUniqueSeedPartIds(renumbered)
+    }
+
+    nonisolated static func toChatMessages(
+        compactTurns: [CompactTurnV1]
+    ) -> [ChatMessage] {
+        var result: [ChatMessage] = []
+        for turn in compactTurns {
+            for input in turn.inputs.sorted(by: { $0.ordinal < $1.ordinal }) {
+                let text = compactDisplayText(input.content)
+                guard !text.isEmpty else { continue }
+                let key = "compact:\(turn.turnID):input:\(input.inputID)"
+                result.append(ChatMessage(
+                    id: ChatMessage.deterministicID(seedKey: key),
+                    role: .user,
+                    clientMessageID: input.clientMessageID,
+                    text: text,
+                    timestamp: Date(timeIntervalSince1970: input.createdAt)
+                ))
+            }
+
+            let activities = turn.activityGroups.sorted(by: { $0.ordinal < $1.ordinal }).map {
+                group -> ToolActivity in
+                let state: ToolActivity.State
+                switch group.state {
+                case "running": state = .running
+                case "failed": state = .failed
+                default: state = .done
+                }
+                let durationMs: Double?
+                if let start = group.startedAt, let end = group.completedAt {
+                    durationMs = max(0, (end - start) * 1_000)
+                } else {
+                    durationMs = nil
+                }
+                return ToolActivity(
+                    id: group.groupID,
+                    name: group.category,
+                    argsSummary: "",
+                    progressText: group.displayLabel,
+                    resultPreview: "",
+                    state: state,
+                    durationMs: durationMs,
+                    todos: nil,
+                    fullDiff: nil,
+                    resultSummary: group.displayLabel
+                )
+            }
+            let finalText = turn.final.map { compactDisplayText($0.content) } ?? ""
+            var parts: [ChatMessagePart] = []
+            if !activities.isEmpty {
+                parts.append(.tools(
+                    id: "compact:\(turn.turnID):activity",
+                    tools: activities,
+                    collapsed: true,
+                    turnElapsed: turn.elapsedMs.map { TimeInterval($0) / 1_000 }
+                ))
+            }
+            if !finalText.isEmpty {
+                parts.append(.text(id: "compact:\(turn.turnID):final", text: finalText))
+            } else if turn.state == "failed" {
+                parts.append(.warning(id: "compact:\(turn.turnID):failed", text: "Turn failed"))
+            } else if turn.state == "interrupted" {
+                parts.append(.warning(
+                    id: "compact:\(turn.turnID):interrupted",
+                    text: "Turn interrupted"
+                ))
+            }
+            guard !parts.isEmpty || turn.state == "running" || turn.state == "queued" else {
+                continue
+            }
+            let key = "compact:\(turn.turnID):assistant"
+            result.append(ChatMessage(
+                id: ChatMessage.deterministicID(seedKey: key),
+                role: .assistant,
+                parts: parts,
+                isStreaming: turn.state == "running" || turn.state == "queued",
+                reasoningElapsed: turn.elapsedMs.map { TimeInterval($0) / 1_000 },
+                timestamp: Date(timeIntervalSince1970: turn.completedAt ?? turn.acceptedAt)
+            ))
+        }
+        return result
+    }
+
+    private nonisolated static func compactDisplayText(_ value: JSONValue) -> String {
+        switch value {
+        case .string(let text):
+            return text
+        case .array(let parts):
+            return parts.compactMap { part -> String? in
+                if case .string(let text) = part { return text }
+                guard case .object(let object) = part else { return nil }
+                return object["text"]?.stringValue
+                    ?? object["content"]?.stringValue
+            }.joined()
+        case .object(let object):
+            return object["text"]?.stringValue
+                ?? object["content"]?.stringValue
+                ?? ""
+        default:
+            return ""
+        }
     }
 
     /// Renumber `.text`/`.reasoning` run-index ids within a message so they read

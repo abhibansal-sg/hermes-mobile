@@ -153,6 +153,43 @@ def _request_device_id(request: Request) -> Optional[str]:
     return None
 
 
+@router.get("/capabilities")
+async def mobile_capabilities(request: Request):
+    """Return independently versioned plugin contracts.
+
+    A feature is advertised only when its public core prerequisites are
+    present. This lets the same external plugin fail closed on pristine or
+    older hermes-agent installations instead of promising an endpoint that
+    will fail only after the app has migrated local state.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        from hermes_state import SessionDB
+
+        turn_methods = (
+            "get_turn_ledger_status",
+            "get_turns",
+            "get_turn_inputs",
+            "get_turn_operations",
+            "get_turn_tombstones",
+            "get_display_message_by_origin",
+        )
+        turn_projection = int(all(hasattr(SessionDB, name) for name in turn_methods))
+    except Exception:
+        turn_projection = 0
+
+    return {
+        "schema_version": 1,
+        "sync_manifest": 2,
+        "turn_projection": turn_projection,
+        "turn_detail": 0,
+        "stable_assets": 0,
+        "conditional_mutations": 0,
+    }
+
+
 def _device_owns_session(request: Request, session_id: str) -> bool:
     """Return whether this request may act on ``session_id``.
 

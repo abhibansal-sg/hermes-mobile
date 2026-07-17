@@ -201,6 +201,28 @@ final class AppEnvironment {
             chatStore.attachCache(cacheStore)
             inboxStore.attachCache(cacheStore)
             connectionStore.cacheStore = cacheStore
+            let compactTurns = CompactTurnCoordinator(
+                cache: cacheStore,
+                workRepository: workRepository
+            )
+            sessionStore.compactTurnFetch = {
+                [weak connectionStore] storedSessionID, profileName in
+                guard let connectionStore,
+                      let rest = connectionStore.rest,
+                      !connectionStore.serverURLString.isEmpty,
+                      let binding = try? await cacheStore.loadLocatorBinding(
+                          locator: connectionStore.serverURLString
+                      ) else {
+                    return .unsupported
+                }
+                return try await compactTurns.synchronize(
+                    client: rest,
+                    binding: binding,
+                    profileName: profileName,
+                    storedSessionID: storedSessionID,
+                    limit: ChatStore.transcriptOpenWindowLimit
+                )
+            }
         }
         // The inbox accumulates broadcast approval/clarify prompts and answers
         // them against each prompt's own runtime via the gateway client.

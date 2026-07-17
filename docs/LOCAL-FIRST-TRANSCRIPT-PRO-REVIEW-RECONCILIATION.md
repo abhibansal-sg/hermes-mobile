@@ -122,6 +122,8 @@ operation headers, and terminal gateway transitions. The bounded plugin reader
 now serves cursor-stable schema-v1 compact pages without loading the raw
 transcript, and iOS cache schema v7 applies/tombstones those pages atomically
 with SQL-limited reads. Historical sessions expose partial coverage instead of
-fabricating completeness. The remaining B2a gate is checkpointed historical
-backfill plus real compaction/rewind golden fixtures; the plugin continues to
-withhold the compact projection capability until that gate passes.
+fabricating completeness. Capability discovery is prerequisite-sensitive, and
+production iOS opens the compact cache first only after the server advertises
+version 1; accepted Work overlays complete only after the matching compact turn
+commits. The remaining B2a gate is checkpointed historical backfill plus real
+compaction/rewind golden fixtures.

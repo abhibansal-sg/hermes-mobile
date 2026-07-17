@@ -1,5 +1,18 @@
 import Foundation
 
+struct MobilePluginCapabilitiesV1: Decodable, Sendable, Equatable {
+    let schemaVersion: Int
+    let syncManifest: Int
+    let turnProjection: Int
+    let turnDetail: Int
+    let stableAssets: Int
+    let conditionalMutations: Int
+
+    var supportsCompactTurns: Bool {
+        schemaVersion == 1 && turnProjection >= 1
+    }
+}
+
 struct CompactTurnPageV1: Decodable, Sendable, Equatable {
     let schemaVersion: Int
     let projectionVersion: Int
@@ -68,4 +81,11 @@ struct CompactTurnTombstoneV1: Decodable, Sendable, Equatable {
     let state: String
     let serverRevision: Int64
     let deletedAt: Double
+}
+
+struct CompactTurnProjectionStateV1: Sendable, Equatable {
+    let sourceHeadID: Int64
+    let previousCursor: String?
+    let hasOlder: Bool
+    let coverageComplete: Bool
 }

@@ -118,4 +118,21 @@ final class CompactTurnCacheTests: XCTestCase {
         )
         XCTAssertTrue(turns.isEmpty)
     }
+
+    func testCompactAdapterRendersOnlySafeEnvelopeAndCommittedBodies() {
+        let messages = ChatStore.toChatMessages(compactTurns: page(revision: 10).turns)
+
+        XCTAssertEqual(messages.count, 2)
+        XCTAssertEqual(messages[0].role, .user)
+        XCTAssertEqual(messages[0].text, "hello")
+        XCTAssertEqual(messages[0].clientMessageID, "cm_1")
+        XCTAssertEqual(messages[1].role, .assistant)
+        XCTAssertEqual(messages[1].text, "done")
+        XCTAssertTrue(messages[1].thinking.isEmpty)
+        XCTAssertEqual(messages[1].tools.count, 1)
+        XCTAssertEqual(messages[1].tools[0].resultSummary, "Inspected files")
+        XCTAssertTrue(messages[1].tools[0].argsSummary.isEmpty)
+        XCTAssertTrue(messages[1].tools[0].resultPreview.isEmpty)
+        XCTAssertEqual(messages[1].turnElapsed, 2)
+    }
 }
