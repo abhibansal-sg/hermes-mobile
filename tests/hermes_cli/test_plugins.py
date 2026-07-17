@@ -104,6 +104,23 @@ class TestPluginDiscovery:
         assert "hello_plugin" in mgr._plugins
         assert mgr._plugins["hello_plugin"].enabled
 
+    def test_hidden_plugin_directories_are_not_discovered(self, tmp_path, monkeypatch):
+        """Backup/staging directories must not become runtime plugins."""
+        hermes_home = tmp_path / "hermes_test"
+        plugins_dir = hermes_home / "plugins"
+        hidden = _make_plugin_dir(
+            plugins_dir,
+            ".hermes-mobile.pre-git",
+            auto_enable=False,
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mgr = PluginManager()
+        manifests = mgr._scan_directory(plugins_dir, source="user")
+
+        assert hidden.is_dir()
+        assert manifests == []
+
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(

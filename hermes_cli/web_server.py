@@ -16621,7 +16621,11 @@ def _discover_dashboard_plugins() -> list:
         if not plugins_root.is_dir():
             continue
         for child in sorted(plugins_root.iterdir()):
-            if not child.is_dir():
+            # Dot-prefixed directories are staging, backup, or quarantine
+            # implementation details, not installed plugins.  Discovering one
+            # can let a stale backup sort ahead of the canonical directory and
+            # win the manifest-name deduplication below.
+            if child.name.startswith(".") or not child.is_dir():
                 continue
             manifest_file = child / "dashboard" / "manifest.json"
             if not manifest_file.exists():

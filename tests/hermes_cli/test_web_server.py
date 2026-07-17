@@ -6534,6 +6534,30 @@ class TestDashboardPluginManifestExtensions:
         assert entry["tab"]["hidden"] is True
         assert entry["slots"] == ["sidebar", "header-left"]
 
+    def test_hidden_backup_cannot_shadow_installed_dashboard_plugin(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_plugin(tmp_path, ".hermes-mobile.pre-git", {
+            "name": "hermes-mobile",
+            "label": "Stale backup",
+            "api": "api.py",
+        })
+        active_dir = self._write_plugin(tmp_path, "hermes-mobile", {
+            "name": "hermes-mobile",
+            "label": "Hermes Mobile",
+            "api": "api.py",
+        })
+
+        from hermes_cli import web_server
+        web_server._dashboard_plugins_cache = None
+        plugins = web_server._get_dashboard_plugins(force_rescan=True)
+        matching = [p for p in plugins if p["name"] == "hermes-mobile"]
+
+        assert len(matching) == 1
+        assert matching[0]["label"] == "Hermes Mobile"
+        assert matching[0]["_dir"] == str(active_dir)
+
     def test_override_requires_leading_slash(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         self._write_plugin(tmp_path, "bad-override", {

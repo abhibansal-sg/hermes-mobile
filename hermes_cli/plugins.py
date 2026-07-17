@@ -1539,7 +1539,11 @@ class PluginManager:
             return manifests
 
         for child in sorted(path.iterdir()):
-            if not child.is_dir():
+            # Plugin installers and operators use dot-prefixed directories for
+            # atomic staging, backups, and quarantine.  They must never become
+            # discoverable plugins (or category namespaces) merely because
+            # they contain a valid manifest.
+            if child.name.startswith(".") or not child.is_dir():
                 continue
             if depth == 0 and skip_names and child.name in skip_names:
                 continue
