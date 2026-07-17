@@ -1166,7 +1166,8 @@ final class SessionStore {
     /// `message.start`. A `nil`/empty id is a no-op.
     func markTurnStarted(storedId: String?) {
         guard let id = storedId, !id.isEmpty else { return }
-        turnsInProgress.insert(id)
+        guard let identity = scopedSessionIdentity(forStoredID: id) else { return }
+        turnsInProgress.insert(identity)
     }
 
     /// Mark a turn completed (or failed/cancelled) for `storedId`. Called by
@@ -1175,6 +1176,7 @@ final class SessionStore {
     func markTurnCompleted(storedId: String?) {
         guard let id = storedId, !id.isEmpty else { return }
         turnsInProgress.remove(id)
+        turnsInProgress = turnsInProgress.filter { !$0.hasSuffix("\u{1F}\(id)") }
     }
 
     /// Clear ALL in-progress turn flags. Belt-and-suspenders: called on
@@ -2193,9 +2195,15 @@ final class SessionStore {
             }
             let cached: [SessionSummary]
             if let manifestSessions {
+                let untaggedProfile = manifestSessions.allSatisfy {
+                    ($0.profile?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+                } && activeProfile != CacheScope.allProfilesKey
+                    ? activeProfile
+                    : nil
                 cached = Self.filterCachedSessions(
                     manifestSessions,
-                    activeProfile: activeProfile
+                    activeProfile: activeProfile,
+                    untaggedProfile: untaggedProfile
                 )
             } else {
                 cached = Self.filterCachedSessions(
@@ -2964,11 +2972,12 @@ final class SessionStore {
 
         // Working-set: active session + live/working + pinned. These survive
         // even if the server's current page window omits them.
-        let workingIds = workingSetSessionIds()
+        let workingIds = workingSetSessionIdentities()
 
         // Survivors: current rows absent from the incoming page but in the working set.
         let survivors = sessions.filter {
-            !incomingIds.contains(sessionListIdentity($0)) && workingIds.contains($0.id)
+            !incomingIds.contains(sessionListIdentity($0))
+                && workingIds.contains(sessionListIdentity($0))
         }
 
         // ABH-86: carry a HIGHER local `lastActive` forward over the incoming
@@ -2997,7 +3006,7 @@ final class SessionStore {
         // (the pulsing row indicator) — only this carry-forward gate has changed.
         let reconciled = incoming.map { row -> SessionSummary in
             guard let prior = priorLastActive[sessionListIdentity(row)],
-                  turnsInProgress.contains(row.id),
+                  turnsInProgress.contains(sessionListIdentity(row)),
                   prior > (row.lastActive ?? -.greatestFiniteMagnitude) else { return row }
             var bumped = row
             bumped.lastActive = prior
@@ -3034,6 +3043,26 @@ final class SessionStore {
         return workingIds
     }
 
+    private func workingSetSessionIdentities() -> Set<String> {
+        guard usesAggregateRail else { return workingSetSessionIds() }
+        let now = Date()
+        return Set(sessions.compactMap { row in
+            let identity = sessionListIdentity(row)
+            let isWorking = pinnedIds.contains(row.id)
+                || isActive(row)
+                || lastActivityAt[identity].map { now.timeIntervalSince($0) < Self.liveWindow } == true
+            return isWorking ? identity : nil
+        })
+    }
+
+    private func scopedSessionIdentity(forStoredID id: String) -> String? {
+        guard usesAggregateRail else { return id }
+        if activeStoredId == id, let activeScopedIdentity { return activeScopedIdentity }
+        let matches = sessions.filter { $0.id == id }
+        guard matches.count == 1, let row = matches.first else { return nil }
+        return sessionListIdentity(row)
+    }
+
     /// ABH-86: optimistically bump a session's activity to NOW so a live frame
     /// (the user sending into it, or a foreign turn) re-sorts it to the top of the
     /// drawer IMMEDIATELY — without waiting for the server's `lastActive` (which
@@ -3044,7 +3073,8 @@ final class SessionStore {
     /// unknown (the caller's debounced `scheduleSessionRefresh` discovers it).
     func noteActivity(storedId: String?) {
         guard let id = storedId,
-              let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
+              let identity = scopedSessionIdentity(forStoredID: id),
+              let idx = sessions.firstIndex(where: { sessionListIdentity($0) == identity }) else { return }
         let now = Date().timeIntervalSince1970
         if (sessions[idx].lastActive ?? -.greatestFiniteMagnitude) < now {
             sessions[idx].lastActive = now
@@ -3056,7 +3086,7 @@ final class SessionStore {
         // lets it decay to the authoritative server value. Without this unifying
         // stamp the bump would be carried forward FOREVER (device-clock skew →
         // never converges: stale sort + stale timestamp).
-        lastActivityAt[id] = Date()
+        lastActivityAt[identity] = Date()
     }
 
     /// P3 write-through: persist the current `sessions` array into the local
@@ -4623,23 +4653,29 @@ final class SessionStore {
         }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
-            let stored = try await api.renameSession(id: summary.id, title: trimmed)
-            replaceRow(id: summary.id) { current in
-                // Carry `current.profile` through the rebuild (F4b polish) so a
-                // rename doesn't drop the row's profile tag in the aggregate view
-                // before the next rail re-fetch re-tags it.
-                SessionSummary(
-                    id: current.id,
-                    title: stored.isEmpty ? nil : stored,
-                    preview: current.preview,
-                    startedAt: current.startedAt,
-                    messageCount: current.messageCount,
-                    source: current.source,
-                    lastActive: current.lastActive,
-                    cwd: current.cwd,
-                    profile: current.profile
-                )
-            }
+            let stored = try await api.renameSession(
+                id: summary.id,
+                title: trimmed,
+                profile: profileParam(for: summary)
+            )
+            guard let index = sessions.firstIndex(where: {
+                $0.scopedIdentity == summary.scopedIdentity
+            }) else { return }
+            let current = sessions[index]
+            // Carry `current.profile` through the rebuild (F4b polish) so a
+            // rename doesn't drop the row's profile tag in the aggregate view
+            // before the next rail re-fetch re-tags it.
+            sessions[index] = SessionSummary(
+                id: current.id,
+                title: stored.isEmpty ? nil : stored,
+                preview: current.preview,
+                startedAt: current.startedAt,
+                messageCount: current.messageCount,
+                source: current.source,
+                lastActive: current.lastActive,
+                cwd: current.cwd,
+                profile: current.profile
+            )
             lastError = nil
             sessionActionError = nil
         } catch {
@@ -4661,10 +4697,14 @@ final class SessionStore {
             return
         }
         do {
-            try await api.setSessionArchived(id: summary.id, archived: true)
-            sessions.removeAll { $0.id == summary.id }
+            try await api.setSessionArchived(
+                id: summary.id,
+                archived: true,
+                profile: profileParam(for: summary)
+            )
+            sessions.removeAll { $0.scopedIdentity == summary.scopedIdentity }
             if pinnedIds.remove(summary.id) != nil { persistPins() }
-            if summary.id == activeStoredId || summary.id == activeRuntimeId {
+            if isActive(summary) || summary.id == activeRuntimeId {
                 clearActive()
             }
             lastError = nil
@@ -4728,8 +4768,12 @@ final class SessionStore {
             return
         }
         do {
-            try await api.setSessionArchived(id: summary.id, archived: false)
-            archivedSessions.removeAll { $0.id == summary.id }
+            try await api.setSessionArchived(
+                id: summary.id,
+                archived: false,
+                profile: profileParam(for: summary)
+            )
+            archivedSessions.removeAll { $0.scopedIdentity == summary.scopedIdentity }
             lastError = nil
             sessionActionError = nil
             // Re-surface the session in the main list on the next refresh.
@@ -4774,7 +4818,8 @@ final class SessionStore {
     /// frames, or — for our own active runtime turn — `activeStoredId`. A `nil`
     /// or empty id is ignored. Starts the prune task on the first entry.
     func noteActivity(storedSessionId: String?) {
-        guard let id = storedSessionId, !id.isEmpty else { return }
+        guard let id = storedSessionId, !id.isEmpty,
+              let identity = scopedSessionIdentity(forStoredID: id) else { return }
         // FIX 6a — COALESCE the per-delta stamp. `lastActivityAt` is a TRACKED
         // @Observable property and the drawer is ALWAYS mounted behind the chat card
         // (RootView), reading it per visible row via `isLive(_:)`. Writing it on every
@@ -4790,24 +4835,26 @@ final class SessionStore {
         // map is @ObservationIgnored so consulting it never itself triggers a
         // drawer invalidation.
         let now = Date()
-        if let last = lastActivityStampAt[id],
+        if let last = lastActivityStampAt[identity],
            now.timeIntervalSince(last) < Self.liveStampCoalesce {
             return
         }
-        lastActivityStampAt[id] = now
-        lastActivityAt[id] = now
+        lastActivityStampAt[identity] = now
+        lastActivityAt[identity] = now
         startLiveCleanupIfNeeded()
     }
 
     /// Whether `summary`'s row should pulse: its conversation saw broadcast
     /// activity within the last ``liveWindow`` seconds.
     func isLive(_ summary: SessionSummary) -> Bool {
-        isLive(storedSessionId: summary.id)
+        guard let at = lastActivityAt[sessionListIdentity(summary)] else { return false }
+        return Date().timeIntervalSince(at) < Self.liveWindow
     }
 
     /// Whether a stored session id is currently within the live window.
     func isLive(storedSessionId id: String) -> Bool {
-        guard let at = lastActivityAt[id] else { return false }
+        guard let identity = scopedSessionIdentity(forStoredID: id),
+              let at = lastActivityAt[identity] else { return false }
         return Date().timeIntervalSince(at) < Self.liveWindow
     }
 
