@@ -30,6 +30,19 @@ struct DraftModelSelection: Codable, Equatable, Sendable {
 final class ConnectionStore {
     private static let log = Logger(subsystem: "HermesMobile", category: "ConnectionStore")
 
+    /// Operational WebSocket capability for the current transport generation.
+    ///
+    /// This is intentionally separate from ``Phase``. In particular, `.connected`
+    /// is retained during the silent reconnect grace window as presentation policy,
+    /// while this value becomes `.unavailable` immediately when its socket drops.
+    enum TransportReadiness: Equatable {
+        case unconfigured
+        case connecting(epoch: UInt64)
+        case ready(epoch: UInt64)
+        case unavailable(epoch: UInt64)
+        case reauthRequired
+    }
+
     #if DEBUG
     /// Test seam for privacy-sensitive Spotlight purges. `nil` in app runs so the
     /// production path calls ``SpotlightIndexer.clearAll`` directly.
@@ -54,7 +67,15 @@ final class ConnectionStore {
 
     /// Current high-level connection phase.
     var phase: Phase = .connecting {
-        didSet { notifyReadinessWaiters() }
+        didSet {
+            notifyReadinessWaiters()
+            switch phase {
+            case .needsSetup, .offline:
+                resolveAllTransportReadinessWaiters(with: false)
+            case .connecting, .hydrating, .connected, .reconnecting:
+                break
+            }
+        }
     }
     #if DEBUG
     /// JSON-safe mirror of ``phase`` for the gstack debug bridge snapshot
@@ -442,10 +463,9 @@ final class ConnectionStore {
     /// Silent-reconnect grace window for a dead socket found on a cold app
     /// open / foreground (as opposed to a drop witnessed live) — STR-973A.
     /// Shorter than `transientGraceWindow`: a cold-open dead socket is far
-    /// more often a stale-suspend reconnect than a real outage. Reserved for
-    /// the foreground/cold-open detection path; not yet wired into
-    /// `handleScenePhase` in this change (kept out of scope — see issue
-    /// notes). Named so the test can pin it.
+    /// more often a stale-suspend reconnect than a real outage. Used by the
+    /// foreground/cold-open detection path in `handleScenePhase`. Named so the
+    /// test can pin it.
     static let coldOpenGraceWindow: Duration = .seconds(5)
 
     /// Hard ceiling for a cold push tap that arrives before bootstrap/configure
@@ -455,6 +475,21 @@ final class ConnectionStore {
 
     /// The single, long-lived gateway client.
     let client = HermesGatewayClient()
+
+    /// The accepted transport generation. Runtime bindings use this value to
+    /// reject work produced by a prior socket after reconnect.
+    private(set) var transportEpoch: UInt64 = 0
+
+    /// The authoritative operational state for WebSocket RPC admission.
+    private(set) var transportReadiness: TransportReadiness = .unconfigured
+
+    /// `true` only after the current socket has completed `gateway.ready` and
+    /// while no presentation-grace window is masking a dropped transport.
+    var isTransportReady: Bool {
+        guard !isInGrace else { return false }
+        if case .ready = transportReadiness { return true }
+        return false
+    }
 
     /// Which branch-only server features the connected gateway supports (E1).
     /// Probed after a successful configure/connect; views gate on it so one
@@ -593,12 +628,123 @@ final class ConnectionStore {
     /// belonged to the prior gateway.
     private var connectionGeneration: UInt64 = 0
     private var readinessWaiters: [CheckedContinuation<Void, Never>] = []
+    private var transportReadinessWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var transportReadinessTimeouts: [UUID: Task<Void, Never>] = [:]
 
     @discardableResult
     private func advanceConnectionGeneration() -> UInt64 {
         connectionGeneration &+= 1
+        setTransportReadiness(.unconfigured, resolveWaiters: true)
         sessionStore.invalidateConnectionWork()
         return connectionGeneration
+    }
+
+    /// Wait for an operationally-ready WebSocket. A visible `.connected` phase
+    /// during silent grace intentionally does not satisfy this contract.
+    ///
+    /// Waiters survive transient `.unavailable → .connecting` retries. They end
+    /// only on readiness, a terminal setup/auth state, cancellation, timeout, or
+    /// replacement of the owning connection generation.
+    func waitForTransportReady(timeout: Duration) async -> Bool {
+        if isTransportReady { return true }
+        if isTransportTerminal { return false }
+
+        let id = UUID()
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                guard !self.isTransportReady, !self.isTransportTerminal else {
+                    continuation.resume(returning: self.isTransportReady)
+                    return
+                }
+
+                self.transportReadinessWaiters[id] = continuation
+                self.transportReadinessTimeouts[id] = Task { [weak self] in
+                    do {
+                        try await Task.sleep(for: timeout)
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    self?.resolveTransportReadinessWaiter(id: id, with: false)
+                }
+            }
+        }, onCancel: {
+            Task { @MainActor [weak self] in
+                self?.resolveTransportReadinessWaiter(id: id, with: false)
+            }
+        })
+    }
+
+    private var isTransportTerminal: Bool {
+        if reauthRequired { return true }
+        switch phase {
+        case .needsSetup, .offline:
+            return true
+        case .connecting, .hydrating, .connected, .reconnecting:
+            return false
+        }
+    }
+
+    private func beginTransportAttempt() {
+        // Reserve the next epoch for this handshake, but do not publish it as
+        // accepted until `gateway.ready` has completed. Failed retries therefore
+        // never create a runtime epoch that callers could bind to.
+        let candidateEpoch = transportEpoch &+ 1
+        setTransportReadiness(.connecting(epoch: candidateEpoch))
+    }
+
+    private func acceptCurrentTransport() {
+        guard case .connecting(let epoch) = transportReadiness,
+              epoch == transportEpoch &+ 1 else { return }
+        transportEpoch = epoch
+        setTransportReadiness(.ready(epoch: epoch), resolveWaiters: true)
+    }
+
+    private func markTransportUnavailable() {
+        switch transportReadiness {
+        case .ready(let epoch), .connecting(let epoch), .unavailable(let epoch):
+            setTransportReadiness(.unavailable(epoch: epoch))
+        case .unconfigured, .reauthRequired:
+            break
+        }
+    }
+
+    private func requireTransportReauthentication() {
+        setTransportReadiness(.reauthRequired, resolveWaiters: true)
+    }
+
+    private func setTransportReadiness(
+        _ readiness: TransportReadiness,
+        resolveWaiters: Bool = false
+    ) {
+        transportReadiness = readiness
+        if resolveWaiters {
+            let result: Bool
+            if case .ready = readiness {
+                result = true
+            } else {
+                result = false
+            }
+            resolveAllTransportReadinessWaiters(with: result)
+        }
+    }
+
+    private func resolveTransportReadinessWaiter(id: UUID, with result: Bool) {
+        transportReadinessTimeouts.removeValue(forKey: id)?.cancel()
+        transportReadinessWaiters.removeValue(forKey: id)?.resume(returning: result)
+    }
+
+    private func resolveAllTransportReadinessWaiters(with result: Bool) {
+        let waiters = transportReadinessWaiters
+        transportReadinessWaiters.removeAll()
+        let timeouts = transportReadinessTimeouts
+        transportReadinessTimeouts.removeAll()
+        timeouts.values.forEach { $0.cancel() }
+        waiters.values.forEach { $0.resume(returning: result) }
     }
 
     private func isCurrentGeneration(_ generation: UInt64) -> Bool {
@@ -1062,6 +1208,7 @@ final class ConnectionStore {
             // a bootstrap of a now-revoked saved token.
             if Self.isAuthFailure(error) {
                 reauthRequired = true
+                requireTransportReauthentication()
                 phase = .needsSetup
                 return Self.reauthMessage
             }
@@ -1072,6 +1219,7 @@ final class ConnectionStore {
         guard isCurrentGeneration(generation) else { return nil }
 
         do {
+            beginTransportAttempt()
             if let connectRPC {
                 try await connectRPC(url, trimmedToken, connectionMode)
             } else {
@@ -1079,11 +1227,15 @@ final class ConnectionStore {
             }
         } catch {
             guard isCurrentGeneration(generation) else { return nil }
+            markTransportUnavailable()
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             phase = .offline(message)
             return message
         }
         guard isCurrentGeneration(generation) else { return nil }
+        // `HermesGatewayClient.connect` returns only after `gateway.ready`, so
+        // this is the first point at which operational RPC admission is allowed.
+        acceptCurrentTransport()
 
         if !previousServerURL.isEmpty, previousServerURL != trimmedURL {
             // ABH-410 follow-up: when a verified re-pair switches servers, purge
@@ -1712,6 +1864,10 @@ final class ConnectionStore {
             if reconnectTask == nil, phase != .hydrating,
                isActiveGeneration(generation) { phase = .connected }
         case .closed, .failed:
+            // Keep the UI in `.connected` during silent grace, but make the
+            // transport unusable immediately. A live task object is not proof
+            // that this generation may admit RPC.
+            markTransportUnavailable()
             // STR-973A silent reconnect: a drop after we were connected no
             // longer finalizes the stream or shows `.reconnecting` right
             // away. Start the grace window instead — it fires the reconnect
@@ -1831,6 +1987,7 @@ final class ConnectionStore {
                 }
 
                 do {
+                    self.beginTransportAttempt()
                     if let hook = self.connectRPC {
                         try await hook(url, token, self.connectionMode)
                     } else {
@@ -1850,6 +2007,11 @@ final class ConnectionStore {
                     // new grace window while `reconnectTask` is still
                     // non-nil, so ending it this early is safe.
                     self.endGrace()
+                    // The client only returns after its `gateway.ready`
+                    // handshake, so this accepts a fresh transport epoch. Grace
+                    // must end first: resolving a waiter while `isInGrace` is
+                    // still true would hand callers a false admission signal.
+                    self.acceptCurrentTransport()
                     // A quick heal (attempt-0 success, typically still inside
                     // grace): silently finalize any stream the drop left
                     // stranded — REQUIRED for `backfill()`'s `guard
@@ -1877,6 +2039,7 @@ final class ConnectionStore {
                 } catch {
                     guard !Task.isCancelled,
                           self.isActiveGeneration(generation) else { return }
+                    self.markTransportUnavailable()
                     // The WS handshake error is not typed as auth, so once a
                     // string of reconnects keep failing we re-probe REST to tell
                     // an auth *revocation* (→ re-pair) apart from plain
@@ -1891,6 +2054,7 @@ final class ConnectionStore {
                         // grace — end it now and escalate straight to re-pair.
                         self.endGrace()
                         self.reauthRequired = true
+                        self.requireTransportReauthentication()
                         self.phase = .needsSetup
                         self.reconnectTask = nil
                         return
@@ -1974,6 +2138,7 @@ final class ConnectionStore {
             Self.clearSpotlightSessionIndexForPrivacy()
         }
         reauthRequired = true
+        requireTransportReauthentication()
         hasConnected = false
         consecutiveReconnectFailures = 0
         phase = .needsSetup
@@ -2153,6 +2318,9 @@ final class ConnectionStore {
         hasConnected = true
         reauthRequired = false
         phase = .connected
+        beginTransportAttempt()
+        acceptCurrentTransport()
+        markTransportUnavailable()
         startReconnectLoop(generation: generation)
     }
 
@@ -2166,6 +2334,8 @@ final class ConnectionStore {
         hasConnected = true
         reauthRequired = false
         phase = .connected
+        beginTransportAttempt()
+        acceptCurrentTransport()
     }
 
     /// DEBUG-only test seam for a gateway-client state transition. This keeps the
@@ -2316,6 +2486,9 @@ final class ConnectionStore {
             }
 
             if dead {
+                // The presentation phase may still be `.connected`; that is
+                // silent-grace policy, not permission to send JSON-RPC.
+                self.markTransportUnavailable()
                 // iOS killed the socket in the background. If we already have a
                 // reconnect loop running (possibly mid-backoff), RESET it so the
                 // next attempt fires immediately rather than waiting out whatever
@@ -2323,26 +2496,27 @@ final class ConnectionStore {
                 // they expect instant reconnection. Cancelling the existing task
                 // also cancels any pending `Task.sleep` inside it, so
                 // `startReconnectLoop` can begin at attempt 0 with zero delay.
-                if self.reconnectTask != nil {
+                if self.reconnectTask != nil || self.graceTask != nil {
                     self.reconnectTask?.cancel()
                     self.reconnectTask = nil
+                    self.graceTask?.cancel()
+                    self.graceTask = nil
+                    self.isInGrace = false
                 }
-                // iOS killed the socket in the background and the state observer
-                // may not have seen the transition — finalize any in-flight stream
-                // before reconnecting so the recovery backfill isn't no-op'd
-                // (R1 #9/#42).
-                self.chatStore.handleConnectionDrop()
-                // ABH-178: the state observer's clearAllTurnsInProgress() may not
-                // have fired either (same reason as handleConnectionDrop above).
-                // Clear here so the subsequent recoverActiveSession→refresh→
-                // mergeSessionPage doesn't carry a stale lastActive forward.
-                self.sessionStore.clearAllTurnsInProgress()
-                // ABH-182 Inc-1: a dead socket means any in-progress turn is
-                // interrupted; reconcile the LA so an orphaned "Thinking" activity
-                // is dismissed rather than expiring on the lock screen at staleAfter.
-                LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
+                // Do not finalize a turn or stamp a warning here. Cold-open
+                // grace has the same presentation contract as a witnessed live
+                // drop: `escalateGraceExpiry` performs that work only if the
+                // replacement transport still has not healed.
                 guard self.isActiveGeneration(generation) else { return }
-                self.startReconnectLoop(generation: generation)
+                // A foreground/cold-open discovery has a shorter grace window
+                // than a witnessed live drop. It preserves the existing UI
+                // policy while ensuring the readiness contract is already false.
+                #if DEBUG
+                let grace = self.graceWindowOverride ?? Self.coldOpenGraceWindow
+                #else
+                let grace = Self.coldOpenGraceWindow
+                #endif
+                self.startGraceWindow(duration: grace, generation: generation)
             } else if case .connected = self.phase {
                 // ABH-177: verify the socket is still alive with a read-only ping
                 // before attempting the REST backfill. A silent-dead socket that
@@ -2367,23 +2541,30 @@ final class ConnectionStore {
                 #endif
                 guard self.isActiveGeneration(generation) else { return }
                 guard alive else {
+                    self.markTransportUnavailable()
                     // ABH-177: the real `probeLiveness` path calls `handleSocketFailure`
                     // which sets transport state to `.failed`; the existing state observer
                     // then starts the reconnect loop. In tests the injected hook does NOT
                     // call `handleSocketFailure`, so we start the loop explicitly here to
                     // keep the routing correct in both code paths.
                     LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
-                    // ABH-178: in the real path the state observer's .failed transition
-                    // fires clearAllTurnsInProgress(); in the injected-hook test path the
-                    // observer is never driven, so clear explicitly here to guarantee the
-                    // flag can't stay stuck and revive the ABH-157 never-converge bug.
-                    self.sessionStore.clearAllTurnsInProgress()
-                    if self.reconnectTask != nil {
+                    // Keep active-turn state intact during cold-open grace. If
+                    // recovery does not heal in time, `escalateGraceExpiry`
+                    // clears it alongside the visible disconnect treatment.
+                    if self.reconnectTask != nil || self.graceTask != nil {
                         self.reconnectTask?.cancel()
                         self.reconnectTask = nil
+                        self.graceTask?.cancel()
+                        self.graceTask = nil
+                        self.isInGrace = false
                     }
                     guard self.isActiveGeneration(generation) else { return }
-                    self.startReconnectLoop(generation: generation)
+                    #if DEBUG
+                    let grace = self.graceWindowOverride ?? Self.coldOpenGraceWindow
+                    #else
+                    let grace = Self.coldOpenGraceWindow
+                    #endif
+                    self.startGraceWindow(duration: grace, generation: generation)
                     return
                 }
                 // ABH-182 Inc-1: on a healthy foreground, reconcile the LA so

@@ -891,6 +891,87 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertFalse(connection.isInGrace, "grace must be ended, not left dangling, on auth revoke")
     }
 
+    // MARK: - Build 120 transport readiness / epoch contract
+
+    /// A silent reconnect may preserve `.connected` for presentation, but it
+    /// must revoke operational readiness immediately. The waiter must survive
+    /// that transient unavailable state and resolve only after the replacement
+    /// socket has completed its ready handshake (represented by `connectRPC`).
+    func testGraceRevokesTransportReadinessUntilNewEpochIsAccepted() async {
+        let (connection, _, _) = makeStore()
+        let gate = SuspensionGate()
+
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        let priorEpoch = connection.transportEpoch
+        XCTAssertTrue(connection.isTransportReady)
+        XCTAssertEqual(connection.transportReadiness, .ready(epoch: priorEpoch))
+
+        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection._handleGatewayStateForTesting(.failed("background socket dropped"))
+        await gate.waitUntilEntered()
+
+        XCTAssertEqual(connection.phase, .connected,
+                       "grace deliberately preserves the presentation phase")
+        XCTAssertTrue(connection.isInGrace)
+        XCTAssertFalse(connection.isTransportReady,
+                       "presentation grace must never admit transport work")
+        XCTAssertEqual(
+            connection.transportReadiness,
+            .connecting(epoch: priorEpoch + 1),
+            "the reconnect attempt owns a fresh transport epoch"
+        )
+
+        let readinessWaiter = Task { await connection.waitForTransportReady(timeout: .seconds(2)) }
+        await Task.yield()
+        await gate.release()
+
+        let becameReady = await readinessWaiter.value
+        XCTAssertTrue(becameReady)
+        await connection.waitForReconnectForTesting()
+        XCTAssertTrue(connection.isTransportReady)
+        XCTAssertEqual(connection.transportReadiness, .ready(epoch: priorEpoch + 1))
+    }
+
+    /// Timeout, cancellation, and terminal teardown must resolve a readiness
+    /// waiter with `false`; no caller may remain parked after its connection
+    /// generation is deliberately invalidated.
+    func testTransportReadinessWaiterTimeoutsCancelsAndTeardownResolvesFalse() async {
+        let (connection, _, _) = makeStore()
+        let gate = SuspensionGate()
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection._handleGatewayStateForTesting(.failed("background socket dropped"))
+        await gate.waitUntilEntered()
+
+        let timedOutResult = await connection.waitForTransportReady(timeout: .milliseconds(20))
+        XCTAssertFalse(timedOutResult)
+
+        let cancelledWaiter = Task {
+            await connection.waitForTransportReady(timeout: .seconds(30))
+        }
+        await Task.yield()
+        cancelledWaiter.cancel()
+        let cancelledResult = await cancelledWaiter.value
+        XCTAssertFalse(cancelledResult)
+
+        let terminalWaiter = Task {
+            await connection.waitForTransportReady(timeout: .seconds(30))
+        }
+        await Task.yield()
+        await connection.disconnect()
+        let terminalResult = await terminalWaiter.value
+        XCTAssertFalse(terminalResult)
+
+        // The injected hook is intentionally not cancellation-aware; release it
+        // so this deterministic test leaves no parked test task behind.
+        await gate.release()
+        await connection.waitForReconnectForTesting()
+    }
+
     // MARK: - ABH-448 connection-generation fencing
 
     func testLateOpenAndClosedFromForgottenGenerationCannotRestoreConnection() async {
