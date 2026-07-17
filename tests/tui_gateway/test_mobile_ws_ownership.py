@@ -66,3 +66,47 @@ def test_session_branch_rejects_non_owner_before_agent_build(monkeypatch):
 
     assert result["error"]["code"] == 4030
     assert builds == []
+
+
+def test_gateway_runtime_snapshot_is_content_free_and_mutation_safe():
+    session_id = "runtime-snapshot"
+    secret_agent = object()
+    with server._sessions_lock:
+        previous = dict(server._sessions)
+        server._sessions.clear()
+        server._sessions[session_id] = {
+            "session_key": "stored-snapshot",
+            "agent": secret_agent,
+            "transport": object(),
+            "history": [{"role": "user", "content": "must not leak"}],
+            "running": True,
+            "created_at": 10.0,
+            "last_active": 11.0,
+            "turn_started_at": 12.0,
+            "profile_home": "/profiles/default",
+        }
+    try:
+        first = server.gateway_runtime_snapshot()
+        first["sessions"][0]["running"] = False
+        first["sessions"].append({"session_id": "forged"})
+        second = server.gateway_runtime_snapshot()
+    finally:
+        with server._sessions_lock:
+            server._sessions.clear()
+            server._sessions.update(previous)
+
+    assert second["runtime_instance_id"].startswith("gri_")
+    assert second["sequence"] == first["sequence"] + 1
+    assert second["sessions"] == [{
+        "session_id": session_id,
+        "stored_session_id": "stored-snapshot",
+        "running": True,
+        "created_at": 10.0,
+        "last_active": 11.0,
+        "turn_started_at": 12.0,
+        "profile_name": "default",
+    }]
+    serialized = repr(second)
+    assert "must not leak" not in serialized
+    assert "transport" not in serialized
+    assert "agent" not in serialized

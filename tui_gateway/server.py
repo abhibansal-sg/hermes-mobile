@@ -132,6 +132,8 @@ _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
 _pending_prompt_revision = 0
+_runtime_instance_id = "gri_" + uuid.uuid4().hex
+_runtime_snapshot_sequence = 0
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
@@ -2394,6 +2396,59 @@ def attention_session_identities() -> list[dict]:
                     {"session_id": sid, "stored_session_id": stored_session_id}
                 )
         return identities
+
+
+def gateway_runtime_snapshot() -> dict:
+    """Return a mutation-safe, content-free snapshot of live gateway sessions.
+
+    External read models need running/binding truth after reconnect, but they
+    must not inspect ``_sessions`` or retain mutable agents/transports.  The
+    returned records intentionally contain only opaque identities, lifecycle
+    timestamps, and state flags.  ``sequence`` orders snapshots produced by
+    this gateway process; ``runtime_instance_id`` changes on process restart.
+    """
+    global _runtime_snapshot_sequence
+    with _sessions_lock:
+        _runtime_snapshot_sequence += 1
+        sequence = _runtime_snapshot_sequence
+        records = []
+        for session_id, session in _sessions.items():
+            if session.get("_finalized"):
+                continue
+            agent = session.get("agent")
+            stored_session_id = str(
+                getattr(agent, "session_id", None)
+                or session.get("session_key")
+                or ""
+            )
+            profile_home = session.get("profile_home")
+            if profile_home:
+                profile_path = Path(str(profile_home))
+                profile_name = (
+                    profile_path.name
+                    if profile_path.parent.name == "profiles"
+                    else "default"
+                )
+            else:
+                profile_name = "default"
+            records.append(
+                {
+                    "session_id": str(session_id),
+                    "stored_session_id": stored_session_id or None,
+                    "running": bool(session.get("running")),
+                    "created_at": session.get("created_at"),
+                    "last_active": session.get("last_active"),
+                    "turn_started_at": session.get("turn_started_at"),
+                    "profile_name": profile_name,
+                }
+            )
+    records.sort(key=lambda item: item["session_id"])
+    return {
+        "runtime_instance_id": _runtime_instance_id,
+        "sequence": sequence,
+        "captured_at": time.time(),
+        "sessions": records,
+    }
 
 
 def resolve_pending_clarification(

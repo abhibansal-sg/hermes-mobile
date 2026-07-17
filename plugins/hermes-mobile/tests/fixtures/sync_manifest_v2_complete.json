@@ -1,0 +1,72 @@
+{
+  "schema_version": 2,
+  "gateway_id": "gw_9-Cfia51aBCBzvgZ25nqow",
+  "profile_authorities": [
+    {
+      "profile_id": "pf_Y2ldlwUtudq6BKW6rBcqWA",
+      "profile_name": "default",
+      "authority_epoch": "ae_EXGaJgwWqAeuIsdFZkUozQ"
+    }
+  ],
+  "journal_epoch": "je_soA3GNPIQ6zN_Fdt8znXIA",
+  "complete": true,
+  "revision": 1,
+  "snapshot_id": "ms_VhcFEne0tjr0l2o-yNK0cQ",
+  "page_size": 500,
+  "scope": "all",
+  "continuation_cursor": null,
+  "resume_cursor": "m2.je_soA3GNPIQ6zN_Fdt8znXIA.wrP11UZqf-yq1WpIpy6_Up4m_kBCb768JJQ6UejVL1E",
+  "reset": true,
+  "reset_reason": "full_snapshot",
+  "server_time": 1784258786.4618418,
+  "sessions": {
+    "upserts": [
+      {
+        "id": "fixture-session",
+        "profile": "default",
+        "profile_id": "pf_Y2ldlwUtudq6BKW6rBcqWA",
+        "authority_epoch": "ae_EXGaJgwWqAeuIsdFZkUozQ",
+        "entity_revision": 1,
+        "title": "Fixture session",
+        "preview": "fixture hello",
+        "started_at": 1784258785.9248362,
+        "message_count": 1,
+        "source": "cli",
+        "last_active": 100.0,
+        "cwd": "/tmp/project",
+        "archived": false,
+        "is_active": false
+      }
+    ],
+    "tombstones": []
+  },
+  "pending_attention": [],
+  "runtime_snapshot": {
+    "runtime_instance_id": "gri_5ee0ac9a81df465fb7d411419a9ac1ce",
+    "sequence": 1,
+    "captured_at": 1784258786.457831,
+    "active_turns": []
+  },
+  "transcript_heads": [
+    {
+      "session_id": "fixture-session",
+      "profile": "default",
+      "profile_id": "pf_Y2ldlwUtudq6BKW6rBcqWA",
+      "authority_epoch": "ae_EXGaJgwWqAeuIsdFZkUozQ",
+      "max_message_id": 1,
+      "message_count": 1,
+      "last_message_at": 100.0,
+      "entity_revision": 1
+    }
+  ],
+  "widget_summary": {
+    "open_session_count": 1,
+    "active_turn_count": 0,
+    "pending_attention_count": 0,
+    "tokens_today": null,
+    "estimated_cost_today": null
+  },
+  "push_registry": {
+    "device_registered": false
+  }
+}

@@ -6449,6 +6449,42 @@ class SessionDB:
             rows.get("profile_id"), rows.get("authority_epoch")
         )
 
+    def list_active_message_heads(self, *, limit: int = 100_000) -> List[Dict[str, Any]]:
+        """Return bounded per-session active-message head metadata.
+
+        This is a generic read-model primitive for callers that need to detect
+        transcript changes without hydrating message bodies or reaching into
+        the private SQLite connection.  It deliberately exposes no content,
+        tool arguments, results, reasoning, or terminal data.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100_000:
+            raise ValueError("limit must be between 1 and 100000")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT session_id, MAX(id) AS max_message_id, COUNT(*) AS message_count, "
+                "MAX(timestamp) AS last_message_at "
+                "FROM messages WHERE active=1 GROUP BY session_id "
+                "ORDER BY max_message_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "session_id": str(row["session_id"]),
+                "max_message_id": (
+                    int(row["max_message_id"])
+                    if row["max_message_id"] is not None
+                    else None
+                ),
+                "message_count": int(row["message_count"] or 0),
+                "last_message_at": (
+                    float(row["last_message_at"])
+                    if row["last_message_at"] is not None
+                    else None
+                ),
+            }
+            for row in rows
+        ]
+
     def get_or_create_authority_identity(
         self,
         *,

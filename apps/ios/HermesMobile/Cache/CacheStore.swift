@@ -1,6 +1,10 @@
 import Foundation
 import GRDB
 
+enum ManifestCacheError: Error, Equatable {
+    case authorityTransitionRequiresMigration
+}
+
 // MARK: - CacheStore
 //
 // The single actor that owns the SQLite DatabaseQueue. ALL database access is
@@ -37,6 +41,9 @@ actor CacheStore {
     }
 
     struct ManifestCommitPayload: Codable {
+        let gatewayID: String?
+        let journalEpoch: String?
+        let profileAuthorities: [ManifestProfileAuthority]?
         let revision: Int64
         let cursor: String
         let sessions: [SessionSummary]
@@ -137,7 +144,20 @@ actor CacheStore {
                   let payload = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data) else {
                 return ManifestProjection(revision: 0, cursor: nil, sessions: legacySessions, attention: [], activeTurns: [], transcriptHeads: [:], capabilities: [], freshness: .cached)
             }
-            return ManifestProjection(revision: payload.revision, cursor: payload.cursor, sessions: payload.sessions, attention: payload.attention, activeTurns: payload.activeTurns, transcriptHeads: payload.transcriptHeads, capabilities: payload.capabilities, freshness: .cached, lastSyncedAt: payload.serverTime.map(Date.init(timeIntervalSince1970:)))
+            return ManifestProjection(
+                gatewayID: payload.gatewayID,
+                journalEpoch: payload.journalEpoch,
+                profileAuthorities: payload.profileAuthorities ?? [],
+                revision: payload.revision,
+                cursor: payload.cursor,
+                sessions: payload.sessions,
+                attention: payload.attention,
+                activeTurns: payload.activeTurns,
+                transcriptHeads: payload.transcriptHeads,
+                capabilities: payload.capabilities,
+                freshness: .cached,
+                lastSyncedAt: payload.serverTime.map(Date.init(timeIntervalSince1970:))
+            )
         }
     }
 
@@ -382,9 +402,30 @@ actor CacheStore {
             if let oldRaw = try SyncMetaRecord.fetchOne(db, key: SyncMetaRecord.Key.manifest(scope))?.value,
                let data = oldRaw.data(using: .utf8),
                let old = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data),
+               old.gatewayID == chain.gatewayID,
+               old.journalEpoch == chain.journalEpoch,
+               (old.profileAuthorities ?? []) == chain.profileAuthorities,
                chain.revision <= old.revision {
                 let rows = try SessionCacheRecord.filter(Column("serverId") == scope.serverId).filter(Column("profileId") == scope.profileId).order(Column("lastActive").desc).fetchAll(db)
-                return ManifestProjection(revision: old.revision, cursor: old.cursor, sessions: old.sessions, attention: old.attention, activeTurns: old.activeTurns, transcriptHeads: old.transcriptHeads, capabilities: old.capabilities, freshness: .fresh)
+                return ManifestProjection(gatewayID: old.gatewayID, journalEpoch: old.journalEpoch, profileAuthorities: old.profileAuthorities ?? [], revision: old.revision, cursor: old.cursor, sessions: old.sessions, attention: old.attention, activeTurns: old.activeTurns, transcriptHeads: old.transcriptHeads, capabilities: old.capabilities, freshness: .fresh)
+            }
+
+            if let oldRaw = try SyncMetaRecord.fetchOne(db, key: SyncMetaRecord.Key.manifest(scope))?.value,
+               let data = oldRaw.data(using: .utf8),
+               let old = try? JSONDecoder().decode(ManifestCommitPayload.self, from: data),
+               old.gatewayID != nil,
+               (old.gatewayID != chain.gatewayID
+                || (old.profileAuthorities ?? []) != chain.profileAuthorities
+                || (old.journalEpoch != chain.journalEpoch
+                    && !(chain.reset && chain.resetReason == "journal_rebuilt"))) {
+                throw ManifestCacheError.authorityTransitionRequiresMigration
+            }
+
+            if chain.reset {
+                try SessionCacheRecord
+                    .filter(Column("serverId") == scope.serverId)
+                    .filter(Column("profileId") == scope.profileId)
+                    .deleteAll(db)
             }
 
             for id in chain.tombstones {
@@ -412,11 +453,11 @@ actor CacheStore {
             for id in chain.tombstones { byID.removeValue(forKey: id) }
             for session in chain.sessions where !chain.tombstones.contains(session.id) { byID[session.id] = session }
             let projectedSessions = byID.values.sorted { ($0.lastActive ?? 0) > ($1.lastActive ?? 0) }
-            let payload = ManifestCommitPayload(revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities, serverTime: chain.serverTime)
+            let payload = ManifestCommitPayload(gatewayID: chain.gatewayID, journalEpoch: chain.journalEpoch, profileAuthorities: chain.profileAuthorities, revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities, serverTime: chain.serverTime)
             let encoded = try JSONEncoder().encode(payload)
             try SyncMetaRecord(key: SyncMetaRecord.Key.manifest(scope), value: String(decoding: encoded, as: UTF8.self)).save(db)
             let rows = try SessionCacheRecord.filter(Column("serverId") == scope.serverId).filter(Column("profileId") == scope.profileId).order(Column("lastActive").desc).fetchAll(db)
-            return ManifestProjection(revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities, freshness: .fresh, lastSyncedAt: chain.serverTime.map(Date.init(timeIntervalSince1970:)))
+            return ManifestProjection(gatewayID: chain.gatewayID, journalEpoch: chain.journalEpoch, profileAuthorities: chain.profileAuthorities, revision: chain.revision, cursor: chain.cursor, sessions: projectedSessions, attention: chain.attention, activeTurns: chain.activeTurns, transcriptHeads: chain.transcriptHeads, capabilities: chain.capabilities, freshness: .fresh, lastSyncedAt: chain.serverTime.map(Date.init(timeIntervalSince1970:)))
         }
     }
 

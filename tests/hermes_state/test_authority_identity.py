@@ -60,3 +60,26 @@ def test_explicit_epoch_rotation_preserves_profile(tmp_path):
     assert rotated.authority_epoch != first.authority_epoch
     assert db.read_authority_identity() == rotated
     db.close()
+
+
+def test_active_message_heads_are_bounded_and_content_free(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("older", source="cli")
+    db.append_message("older", role="user", content="must not leak", timestamp=10.0)
+    db.create_session("newer", source="cli")
+    db.append_message("newer", role="user", content="also secret", timestamp=20.0)
+
+    heads = db.list_active_message_heads(limit=1)
+    assert heads == [{
+        "session_id": "newer",
+        "max_message_id": heads[0]["max_message_id"],
+        "message_count": 1,
+        "last_message_at": 20.0,
+    }]
+    assert "content" not in heads[0]
+
+    with pytest.raises(ValueError, match="between 1 and 100000"):
+        db.list_active_message_heads(limit=0)
+    with pytest.raises(ValueError, match="between 1 and 100000"):
+        db.list_active_message_heads(limit=100_001)
+    db.close()

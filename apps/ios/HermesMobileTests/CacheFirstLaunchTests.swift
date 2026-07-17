@@ -143,9 +143,23 @@ final class CacheFirstLaunchTests: XCTestCase {
         let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
         let timestamp = Date().addingTimeInterval(-7 * 86_400).timeIntervalSince1970
         let json = """
-        {"revision":42,"cursor":"done","has_more":false,"server_time":\(timestamp)}
+        {
+          "schema_version":2,"gateway_id":"gw_gateway",
+          "profile_authorities":[{"profile_id":"pf_profile","profile_name":"default","authority_epoch":"ae_epoch"}],
+          "journal_epoch":"je_journal","complete":true,"revision":42,
+          "snapshot_id":"ms_42","page_size":500,"scope":"all",
+          "continuation_cursor":null,"resume_cursor":"m2.je_journal.done",
+          "reset":true,"reset_reason":"full_snapshot","server_time":\(timestamp),
+          "sessions":{"upserts":[],"tombstones":[]},"pending_attention":[],
+          "runtime_snapshot":{"runtime_instance_id":"gri_runtime","sequence":1,"captured_at":\(timestamp),"active_turns":[]},
+          "transcript_heads":[],
+          "widget_summary":{"open_session_count":0,"active_turn_count":0,"pending_attention_count":0,"tokens_today":null,"estimated_cost_today":null},
+          "push_registry":{"device_registered":false}
+        }
         """
-        let page = try JSONDecoder().decode(SyncManifestPage.self, from: Data(json.utf8))
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let page = try decoder.decode(SyncManifestPage.self, from: Data(json.utf8))
         _ = try await cache.applyManifest(ManifestChain(validating: [page]), scope: scope)
 
         let restored = try await cache.loadManifestProjection(scope: scope)

@@ -32,7 +32,7 @@ import pytest
 from tests.plugins.hermes_mobile.conftest import load_plugin_module
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-_API_MODULE_NAME = "hermes_dashboard_plugin_hermes-mobile"
+_API_MODULE_NAME = "hermes_mobile_dashboard_api_auth_contract_test"
 
 
 @pytest.fixture
@@ -181,3 +181,39 @@ def test_bearer_token_authenticated_flag_accepted(api):
     """The additive ``token_authenticated`` branch admits bearer-auth requests."""
     req = _make_request(auth_required=True, token_authenticated=True)
     assert api._has_dashboard_api_auth(req) is True
+
+
+def test_stored_session_ownership_is_profile_scoped(api, monkeypatch):
+    """Colliding stored IDs in two profiles must not authorize each other."""
+    from tui_gateway import server
+
+    req = _make_request(
+        auth_required=True,
+        device={"device_id": "device-1", "scopes": ["chat"]},
+    )
+    monkeypatch.setattr(
+        server,
+        "gateway_runtime_snapshot",
+        lambda: {
+            "sessions": [
+                {
+                    "session_id": "runtime-default",
+                    "stored_session_id": "colliding",
+                    "profile_name": "default",
+                },
+                {
+                    "session_id": "runtime-work",
+                    "stored_session_id": "colliding",
+                    "profile_name": "work",
+                },
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        api,
+        "_device_owns_session",
+        lambda _request, runtime_id: runtime_id == "runtime-work",
+    )
+
+    assert api._device_owns_stored_session(req, "default", "colliding") is False
+    assert api._device_owns_stored_session(req, "work", "colliding") is True

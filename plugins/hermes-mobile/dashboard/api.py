@@ -171,25 +171,29 @@ def _device_owns_session(request: Request, session_id: str) -> bool:
     return isinstance(owner, dict) and owner.get("device_id") == device_id
 
 
-def _device_owns_stored_session(request: Request, stored_session_id: str) -> bool:
-    """Resolve persisted identity through live runtime correlations, fail closed.
+def _device_owns_stored_session(
+    request: Request,
+    profile_name: str,
+    stored_session_id: str,
+) -> bool:
+    """Resolve persisted identity through the public runtime snapshot, fail closed.
 
     The device-token index is intentionally keyed by runtime session ID.  A
     manifest row is keyed by stored session ID, so bridge the two only through
-    an unambiguous live ``session_key`` match; never infer ownership from a
-    title, token prefix, or another persisted field.
+    an unambiguous opaque runtime binding; never inspect the private session
+    table or infer ownership from a title, token prefix, or persisted content.
     """
     if _request_device_id(request) is None:
         return True
-    if _device_owns_session(request, stored_session_id):
-        return True
     try:
-        from tui_gateway.server import _sessions, _sessions_lock
-        with _sessions_lock:
-            runtime_ids = [
-                str(runtime_id) for runtime_id, rec in _sessions.items()
-                if rec.get("session_key") == stored_session_id
-            ]
+        from tui_gateway.server import gateway_runtime_snapshot
+
+        runtime_ids = [
+            str(item["session_id"])
+            for item in gateway_runtime_snapshot()["sessions"]
+            if item.get("stored_session_id") == stored_session_id
+            and item.get("profile_name") == profile_name
+        ]
     except Exception:
         return False
     return len(runtime_ids) == 1 and _device_owns_session(request, runtime_ids[0])
@@ -230,7 +234,13 @@ def _manifest_error(exc: Any) -> JSONResponse:
 
 
 @router.get("/sync/manifest")
-async def sync_manifest(request: Request, scope: str = Query(...), cursor: Optional[str] = None):
+async def sync_manifest(
+    request: Request,
+    scope: str = Query(...),
+    resume_cursor: Optional[str] = None,
+    continuation_cursor: Optional[str] = None,
+    limit: int = Query(500, ge=1, le=500),
+):
     """Return one immutable page of the plugin-owned mobile sync manifest."""
     if not _has_dashboard_api_auth(request):
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
@@ -243,11 +253,35 @@ async def sync_manifest(request: Request, scope: str = Query(...), cursor: Optio
     engine = _plugin_module("push_engine")
     try:
         return sync.build_manifest(
-            scope=scope, cursor=cursor, visibility=visibility,
-            visibility_check=lambda session_id: _device_owns_stored_session(request, session_id),
+            scope=scope,
+            resume_cursor=resume_cursor,
+            continuation_cursor=continuation_cursor,
+            limit=limit,
+            visibility=visibility,
+            visibility_check=lambda profile, session_id: _device_owns_stored_session(
+                request, profile, session_id
+            ),
             device_registered=sync.device_is_registered(device_id, engine.registry_entries()),
         )
     except sync.ManifestError as exc:
+        if exc.reset or exc.code == "authority_changed":
+            try:
+                return sync.build_manifest(
+                    scope=scope,
+                    resume_cursor=None,
+                    continuation_cursor=None,
+                    limit=limit,
+                    visibility=visibility,
+                    visibility_check=lambda profile, session_id: _device_owns_stored_session(
+                        request, profile, session_id
+                    ),
+                    device_registered=sync.device_is_registered(
+                        device_id, engine.registry_entries()
+                    ),
+                    full_snapshot_reason=(exc.code if exc.reset else None),
+                )
+            except sync.ManifestError as retry_exc:
+                return _manifest_error(retry_exc)
         return _manifest_error(exc)
     except Exception:
         _log.exception("sync manifest failed")
