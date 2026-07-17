@@ -229,6 +229,27 @@ final class SessionStore {
         cancelEnsureRuntime()
     }
 
+    /// A runtime id belongs to one WebSocket generation only. Keep the durable
+    /// selection and its pending open intent, but make the old runtime unusable
+    /// the instant that transport disappears.
+    func transportDidBecomeUnavailable() {
+        activeRuntimeId = nil
+        activeRuntimeEpoch = nil
+        cancelEnsureRuntime()
+    }
+
+    /// A different gateway is a different cache and runtime namespace. Do not
+    /// carry an old stored-session intent into the newly configured server.
+    func invalidateGatewayScopeWork() {
+        openToken = UUID()
+        openRevealToken = nil
+        cancelEnsureRuntime()
+        activeRuntimeId = nil
+        activeRuntimeEpoch = nil
+        activeStoredId = nil
+        chat?.reset()
+    }
+
     /// Remove every in-memory surface owned by a forgotten gateway.
     ///
     /// Disk/cache deletion is coordinated by ``ConnectionStore.forgetGateway``.
@@ -285,7 +306,7 @@ final class SessionStore {
         manifestLastSyncedAt = nil
         manifestRevision = 0
         verifiedAuthorityBinding = nil
-        didColdReadCache = false
+        coldReadCacheScope = nil
         lastColdReadServerId = nil
 
         clearSearch()
@@ -1210,7 +1231,10 @@ final class SessionStore {
     /// read. The read only fires when `sessions` is still empty (cold launch),
     /// so a warm in-memory list is never overwritten by a (possibly older) disk
     /// snapshot.
-    private var didColdReadCache = false
+    /// The cache scope whose cold read has begun. This is deliberately a scope,
+    /// not a process-wide Boolean: bootstrap can run before a gateway identity
+    /// exists and profile switches must get their own local first paint.
+    private var coldReadCacheScope: CacheScope?
 
     /// Inject the offline cache. Separate from `attach(connection:chat:)` so the
     /// frozen `attach` signature — called by every store-graph test — is untouched
@@ -1282,6 +1306,11 @@ final class SessionStore {
         let actual = profile?.trimmingCharacters(in: .whitespacesAndNewlines)
         let profileId = actual?.isEmpty == false ? actual! : (scope.profileId == CacheScope.allProfilesKey ? "default" : scope.profileId)
         return CacheIdentity(serverId: scope.serverId, profileId: profileId, sessionId: sessionId)
+    }
+
+    private static func normalizedProfileID(_ profile: String?) -> String {
+        let value = profile?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? "default" : value
     }
 
     /// The serverId the cache cold-read was last partitioned by, so a SERVER
@@ -1948,9 +1977,9 @@ final class SessionStore {
     /// drawer hole) so it can be driven directly from `ConnectionStore.bootstrap()`
     /// BEFORE the REST probe.
     ///
-    /// Idempotent and self-gating, preserving the exact `didColdReadCache`
+    /// Idempotent and self-gating, preserving the scoped cold-read
     /// semantics the network merge relies on:
-    ///   - fires at most once per (server) binding — the `didColdReadCache` latch;
+    ///   - fires at most once per cache scope — the scope-aware latch;
     ///   - paints ONLY while `sessions` is still empty, so a warm in-memory list
     ///     (or a network refresh that already populated it) is never clobbered by a
     ///     disk snapshot;
@@ -1962,9 +1991,26 @@ final class SessionStore {
     /// `refresh()` still calls it on every invocation, and `bootstrap()` calls it
     /// once up front — the latch collapses both to a single disk read.
     func paintFromCache() async {
-        guard !didColdReadCache else { return }
-        didColdReadCache = true
-        if sessions.isEmpty, let cacheStore, let scope = currentCacheScope {
+        // A pre-bootstrap call has no safe partition to latch. Wait until the
+        // saved gateway has established a real cache identity instead.
+        guard let scope = currentCacheScope else { return }
+        guard coldReadCacheScope != scope else { return }
+        guard sessions.isEmpty else {
+            coldReadCacheScope = scope
+            lastColdReadServerId = scope.serverId
+            return
+        }
+        guard let cacheStore else { return }
+        coldReadCacheScope = scope
+        var cacheReadSucceeded = false
+        defer {
+            // A transient GRDB/decode failure must not permanently suppress the
+            // next foreground/bootstrap retry for this scope.
+            if !cacheReadSucceeded, coldReadCacheScope == scope {
+                coldReadCacheScope = nil
+            }
+        }
+        do {
             lastColdReadServerId = scope.serverId
             if let binding = try? await cacheStore.loadLocatorBinding(locator: scope.serverId) {
                 verifiedAuthorityBinding = binding
@@ -1993,8 +2039,12 @@ final class SessionStore {
             if let manifestSessions {
                 cached = manifestSessions
             } else {
-                cached = (try? await cacheStore.loadSessionList(scope: scope)) ?? []
+                cached = try await cacheStore.loadSessionList(scope: scope)
             }
+            cacheReadSucceeded = true
+            // Profile/server selection can change while the actor read is
+            // suspended. Do not publish the old partition into the new shell.
+            guard currentCacheScope == scope, coldReadCacheScope == scope else { return }
             if !cached.isEmpty {
                 // Re-check emptiness after the await: a concurrent network
                 // refresh may have populated the list while we were reading
@@ -2014,20 +2064,22 @@ final class SessionStore {
                     seenServerSessionIds = Set(cached.map(\.id))
                     loadedCount = cached.count
                     if let lastOpened = try? await cacheStore.loadLastOpenedSession(scope: scope),
+                       currentCacheScope == scope,
+                       coldReadCacheScope == scope,
                        let summary = sessions.first(where: {
                            $0.id == lastOpened.sessionId
-                               && (lastOpened.profileId == "default" || $0.profile == lastOpened.profileId)
+                               && Self.normalizedProfileID($0.profile) == lastOpened.profileId
                        }) {
-                        open(summary)
+                        // Offline restoration changes only local selection and
+                        // paints cached transcript. Runtime binding is deferred
+                        // until the gateway is operationally ready.
+                        open(summary, bindRuntime: false)
                     }
                     loadedOffset = cached.count
                 }
             }
-        } else if let scope = currentCacheScope {
-            // Even when we skip the disk read (warm list already populated),
-            // record the server we're now bound to so a later server switch
-            // is detected.
-            lastColdReadServerId = scope.serverId
+        } catch {
+            return
         }
     }
 
@@ -2097,7 +2149,7 @@ final class SessionStore {
                     let sessionId = identity.sessionId
                     group.addTask(priority: .utility) {
                         if Task.isCancelled { return }
-                        guard let stored = try? await fetch(sessionId) else { return }
+                        guard let stored = try? await fetch(identity) else { return }
                         if Task.isCancelled { return }
                         try? await cacheStore.saveTranscript(
                             identity: identity, messages: stored)
@@ -2116,6 +2168,15 @@ final class SessionStore {
     /// (default) resolves the live REST client below.
     var prefetchFetch: (@Sendable (String) async throws -> [StoredMessage])?
 
+    /// Profile-aware variant of the prefetch seam. The legacy one-argument
+    /// seam remains for existing tests, while production and new coverage carry
+    /// the exact profile from the cached row all the way to the REST request.
+    var prefetchFetchWithProfile: (@Sendable (String, String) async throws -> [StoredMessage])?
+
+    /// Serializes persisted drawer selection. A newer selection waits for any
+    /// already-started write, then re-checks its token before committing.
+    private var lastOpenPersistenceTask: Task<Void, Never>?
+
     #if DEBUG
     /// DEBUG-only RestClient seam for exercising the live prefetch fetch resolver
     /// with a stubbed URLSession. The production path still resolves through the
@@ -2128,24 +2189,34 @@ final class SessionStore {
     /// `RestClient` (a Sendable value struct — safe to capture across the task-group
     /// boundary). `nil` when unconfigured/offline, which makes the whole sweep a
     /// no-op (purely additive coverage, never a correctness dependency).
-    private var resolvedPrefetchFetch: (@Sendable (String) async throws -> [StoredMessage])? {
-        if let prefetchFetch { return prefetchFetch }
+    private var resolvedPrefetchFetch: (@Sendable (CacheIdentity) async throws -> [StoredMessage])? {
+        if let prefetchFetchWithProfile {
+            return { identity in try await prefetchFetchWithProfile(identity.sessionId, identity.profileId) }
+        }
+        if let prefetchFetch {
+            return { identity in try await prefetchFetch(identity.sessionId) }
+        }
         #if DEBUG
         let resolvedRest = prefetchRestClientForTesting ?? connection?.rest
         #else
         let resolvedRest = connection?.rest
         #endif
         guard let rest = resolvedRest else { return nil }
-        return { [cacheStore] sessionId in
+        return { [cacheStore] identity in
+            let sessionId = identity.sessionId
             // Cursor-bearing cached transcripts take the delta-aware path first so
             // an unchanged background sweep pays only the cheap cursor check. Rows
             // without a cursor keep the ABH-400 page-window prefetch behavior.
             if let cacheStore {
                 do {
-                    guard let scope = await self.currentCacheScope else { return try await rest.messages(sessionId: sessionId) }
-                    let identity = CacheIdentity(serverId: scope.serverId, profileId: scope.profileId == CacheScope.allProfilesKey ? "default" : scope.profileId, sessionId: sessionId)
                     if let cursor = try await cacheStore.deltaCursor(for: identity),
                        cursor.afterId > 0 {
+                        // Profile-scoped rows use the profile endpoint. Its
+                        // current protocol lacks a delta equivalent, so prefer
+                        // correctness over the aggregate-only delta shortcut.
+                        if identity.profileId != "default" {
+                            return try await rest.messages(sessionId: sessionId, profile: identity.profileId)
+                        }
                         return try await fetchTranscriptDeltaAware(
                             rest: rest,
                             cacheStore: cacheStore,
@@ -2158,6 +2229,9 @@ final class SessionStore {
                     // below preserves the previous best-effort prefetch semantics.
                 }
             }
+            if identity.profileId != "default" {
+                return try await rest.messages(sessionId: sessionId, profile: identity.profileId)
+            }
             if let page = await fetchTranscriptPage(
                 rest: rest,
                 sessionId: sessionId,
@@ -2169,7 +2243,7 @@ final class SessionStore {
                 rest: rest,
                 cacheStore: cacheStore,
                 sessionId: sessionId,
-                identity: await self.cacheIdentity(sessionId)
+                identity: identity
             )
         }
     }
@@ -2247,7 +2321,7 @@ final class SessionStore {
             loadedOffset = 0
             seenServerSessionIds = []  // ABH-373
             resetSessionListDeltaState()
-            didColdReadCache = false
+            coldReadCacheScope = nil
         }
 
         await paintFromCache()
@@ -3154,7 +3228,12 @@ final class SessionStore {
         loadedFloor = 0  // ABH review P2: don't carry the prior profile's high-water
                          // window into the new profile's first-page fetch (over-fetch).
         seenServerSessionIds = []  // ABH-373
-        didColdReadCache = false
+        // A profile switch invalidates all in-flight selection work. The
+        // durable selection remains available through cache restoration, but a
+        // late old-profile resume/transcript must not publish here.
+        openToken = UUID()
+        clearActive()
+        coldReadCacheScope = nil
         Task { [weak self] in await self?.refresh() }
     }
 
@@ -3165,6 +3244,9 @@ final class SessionStore {
     /// Monotonic token for the most recent `open()`; background work from a
     /// superseded open (the user tapped another session) checks it and bails.
     private var openToken = UUID()
+    /// The accepted transport generation that created `activeRuntimeId`.
+    /// Runtime ids are ephemeral and cannot be reused after a reconnect.
+    private var activeRuntimeEpoch: UInt64?
     private var openRevealToken: UUID?
     private static let drawerRevealDeadline: Duration = .milliseconds(300)
 
@@ -3233,6 +3315,7 @@ final class SessionStore {
     func waitForPendingOpenForTesting() async {
         await lastOpenSeedTask?.value
         await lastOpenResumeTask?.value
+        await lastOpenPersistenceTask?.value
         // One additional cooperative yield so `@Observable` write propagations
         // that happen synchronously inside the open Tasks' final awaits have
         // settled before the test asserts.
@@ -3255,7 +3338,11 @@ final class SessionStore {
     ///   deadline races first paint so a missed paint signal cannot strand the
     ///   drawer. `nil` (the default, every non-drawer caller) preserves the exact
     ///   prior behavior.
-    func open(_ summary: SessionSummary, revealOnFirstPaint: (@MainActor () -> Void)? = nil) {
+    func open(
+        _ summary: SessionSummary,
+        revealOnFirstPaint: (@MainActor () -> Void)? = nil,
+        bindRuntime: Bool = true
+    ) {
         let wasAlreadyActive = activeStoredId == summary.id
 
         // Leaving any draft: opening a stored session is no longer a draft.
@@ -3307,10 +3394,19 @@ final class SessionStore {
             openRevealToken = nil
         }
         activeRuntimeId = nil          // gates the composer until resume lands
+        activeRuntimeEpoch = nil
         activeStoredId = summary.id
         if let cacheStore, let scope = currentCacheScope,
            let identity = cacheIdentity(summary.id, profile: summary.profile) {
-            Task { try? await cacheStore.saveLastOpenedSession(identity, manifestScope: scope) }
+            let previousPersistence = lastOpenPersistenceTask
+            let persistenceTask = Task { [weak self] in
+                await previousPersistence?.value
+                // A delayed A write may not overwrite a newer B selection. If A
+                // was already inside SQLite, B commits strictly after it.
+                guard let self, self.openToken == token else { return }
+                try? await cacheStore.saveLastOpenedSession(identity, manifestScope: scope)
+            }
+            lastOpenPersistenceTask = persistenceTask
         }
         let rowProfile = profileParam(for: summary)
         // Fresh user intent to use this session: supersede any in-flight on-demand
@@ -3371,10 +3467,25 @@ final class SessionStore {
         lastOpenSeedTask = seedTask
         #endif
 
+        // Cache restoration intentionally stops after local selection/paint.
+        // Connection recovery invokes `resumeActiveAfterReconnect()` once the
+        // ready handshake succeeds.
+        guard bindRuntime else { return }
+
         // Slow path: gateway resume — spins up the agent server-side; only
         // prompt submission depends on it.
         let resumeTask = Task { [weak self] in
             guard let self, self.client != nil || self.resumeRPC != nil else { return }
+            let usingResumeTestSeam = self.resumeRPC != nil
+            let bindingEpoch: UInt64
+            if usingResumeTestSeam {
+                bindingEpoch = self.connection?.transportEpoch ?? 0
+            } else {
+                guard let connection = self.connection,
+                      await connection.waitForTransportReady(timeout: .seconds(120)),
+                      connection.isTransportReady else { return }
+                bindingEpoch = connection.transportEpoch
+            }
             do {
                 // Thread the row's profile scope so an All-profiles tap resumes in
                 // the row's owning profile home. Omitted for default/all/dormant
@@ -3395,8 +3506,13 @@ final class SessionStore {
                 } else {
                     return
                 }
-                guard self.openToken == token else { return }  // superseded
+                guard self.openToken == token,
+                      usingResumeTestSeam || (
+                        self.connection?.isTransportReady == true
+                            && self.connection?.transportEpoch == bindingEpoch
+                      ) else { return }  // superseded or an older transport
                 self.activeRuntimeId = result.sessionId
+                self.activeRuntimeEpoch = bindingEpoch
                 // Confirm/seed the active-profile pref from the server's echo: the
                 // WS path silently falls back to the launch profile on an unknown
                 // name, so trust the echo over the requested scope.
@@ -3439,7 +3555,8 @@ final class SessionStore {
                 // the resume/status gap.
                 await seedTask.value
                 guard self.openToken == token,
-                      self.activeRuntimeId == result.sessionId else { return }
+                      self.activeRuntimeId == result.sessionId,
+                      usingResumeTestSeam || self.activeRuntimeEpoch == self.connection?.transportEpoch else { return }
                 await self.chat?.reconcileLiveTurnStatus(
                     runtimeId: result.sessionId,
                     snapshotRunning: result.snapshotRunning,
@@ -3456,6 +3573,9 @@ final class SessionStore {
                 await self.chat?.seedContextUsageFromStatus(runtimeId: result.sessionId)
             } catch {
                 guard self.openToken == token else { return }
+                // A socket that disappeared between the readiness check and
+                // resume is a reconnect condition, not a user-facing failure.
+                if !usingResumeTestSeam, self.connection?.isTransportReady != true { return }
                 let message = self.errorMessage(from: error)
                 self.lastError = message
                 self.sessionActionError = SessionActionError(action: "Open Session", message: message)
@@ -3479,6 +3599,7 @@ final class SessionStore {
         cancelEnsureRuntime()
         isDraft = true
         activeRuntimeId = nil
+        activeRuntimeEpoch = nil
         activeStoredId = nil
         resetComposerHistoryBrowse()
         chat?.reset()
@@ -3528,6 +3649,7 @@ final class SessionStore {
                 timeout: .seconds(120)
             )
             activeRuntimeId = result.sessionId
+            activeRuntimeEpoch = connection?.transportEpoch
             activeStoredId = result.storedSessionId ?? result.sessionId
             isDraft = false
             confirmActiveProfile(from: result.info)
@@ -3635,6 +3757,7 @@ final class SessionStore {
             let storedId = response["stored_session_id"]?.stringValue ?? runtimeId
             // Activate the new branch.
             activeRuntimeId = runtimeId
+            activeRuntimeEpoch = connection?.transportEpoch
             activeStoredId = storedId
             isDraft = false
             // Branching is reachable while the OLD session's adopted foreign
@@ -3679,7 +3802,10 @@ final class SessionStore {
             isDraft = false
             // Refresh the runtime pointer if the caller has a newer one (it won't
             // normally differ, but keep them consistent without touching the chat).
-            if let runtimeId, !runtimeId.isEmpty { activeRuntimeId = runtimeId }
+            if let runtimeId, !runtimeId.isEmpty {
+                activeRuntimeId = runtimeId
+                activeRuntimeEpoch = connection?.transportEpoch
+            }
             return
         }
         // Drifted elsewhere — resume the target through the standard open path.
@@ -3790,7 +3916,18 @@ final class SessionStore {
     @discardableResult
     func resumeActiveAfterReconnect() async -> String? {
         let myConnectionWorkGeneration = connectionWorkGeneration
+        let token = openToken
         guard let storedId = activeStoredId, client != nil || resumeRPC != nil else { return nil }
+        let usingResumeTestSeam = resumeRPC != nil
+        let bindingEpoch: UInt64
+        if usingResumeTestSeam {
+            bindingEpoch = connection?.transportEpoch ?? 0
+        } else {
+            guard let connection,
+                  await connection.waitForTransportReady(timeout: .seconds(120)),
+                  connection.isTransportReady else { return nil }
+            bindingEpoch = connection.transportEpoch
+        }
         do {
             // Re-resume into the same profile scope so a reconnect keeps the
             // session in its per-profile home. Omitted for the default/all scope.
@@ -3815,9 +3952,15 @@ final class SessionStore {
             // result; otherwise a live send would misroute into the resumed
             // session (the R1 #17 class, on the un-affinity-guarded live path).
             // Mirrors open()'s `openToken` re-check after its own resume await.
-            guard activeStoredId == storedId,
-                  connectionWorkGeneration == myConnectionWorkGeneration else { return nil }
+            guard openToken == token,
+                  activeStoredId == storedId,
+                  connectionWorkGeneration == myConnectionWorkGeneration,
+                  usingResumeTestSeam || (
+                    connection?.isTransportReady == true
+                        && connection?.transportEpoch == bindingEpoch
+                  ) else { return nil }
             activeRuntimeId = result.sessionId
+            activeRuntimeEpoch = bindingEpoch
             // A resume can follow a compression chain tip (parent → continuation);
             // re-stamp queued prompts so affinity-stamped ones aren't skipped forever.
             let newStored = result.storedSessionId ?? storedId
@@ -3839,6 +3982,7 @@ final class SessionStore {
             sessionActionError = nil
             return result.sessionId
         } catch {
+            if !usingResumeTestSeam, connection?.isTransportReady != true { return nil }
             let message = errorMessage(from: error)
             lastError = message
             sessionActionError = SessionActionError(action: "Resume Session", message: message)
@@ -3859,7 +4003,12 @@ final class SessionStore {
     /// attempt budget is exhausted.
     @discardableResult
     func ensureActiveRuntime() async -> String? {
-        if let rid = activeRuntimeId { return rid }
+        if let rid = activeRuntimeId,
+           activeRuntimeEpoch == connection?.transportEpoch,
+           connection?.isTransportReady == true {
+            return rid
+        }
+        if activeRuntimeId != nil { transportDidBecomeUnavailable() }
         if let task = ensureRuntimeTask { return await task.value }
         guard client != nil || resumeRPC != nil, let target = activeStoredId else { return nil }
         // Reset the budget when the target session changes; cap per session.
@@ -4499,6 +4648,7 @@ final class SessionStore {
         cancelEnsureRuntime()
         isDraft = false
         activeRuntimeId = nil
+        activeRuntimeEpoch = nil
         activeStoredId = nil
         chat?.reset()
     }
@@ -4572,6 +4722,10 @@ final class SessionStore {
             if openToken == token { onFirstPaint?() }
         }
         guard let chat else { signalFirstPaint(); return }
+        // Capture the scoped identity before any await. A server/profile change
+        // rotates `openToken`; this captured key ensures an old task cannot
+        // persist its response into whichever scope happens to be current later.
+        let capturedIdentity = cacheIdentity(storedId, profile: profile)
 
         #if DEBUG
         // OPEN→PAINTED LATENCY instrumentation (WhatsApp bar): measure where the
@@ -4618,7 +4772,7 @@ final class SessionStore {
         if !paintedFromCache, let cacheStore {
             // `touchSession` bumps `lastAccessedAt` so an actively-opened session
             // never ages out of the eviction horizon.
-            guard let identity = cacheIdentity(storedId, profile: profile) else { return }
+            guard let identity = capturedIdentity else { return }
             try? await cacheStore.touchSession(identity)
             if openToken == token,           // not superseded while reading disk
                (try? await cacheStore.hasTranscript(identity)) == true,
@@ -4689,7 +4843,7 @@ final class SessionStore {
             // "fresh" is never over-broad.
             if paintedFromDisk, let cacheStore,
                let lastActive = sessions.first(where: { $0.id == storedId })?.lastActive,
-               let identity = cacheIdentity(storedId, profile: profile),
+               let identity = capturedIdentity,
                (try? await cacheStore.transcriptIsFresh(identity, lastActive: lastActive)) == true {
                 guard openToken == token else { return }
                 #if DEBUG
@@ -4714,8 +4868,11 @@ final class SessionStore {
             #endif
             // P3 write-through: persist the freshly-fetched transcript so the
             // next open paints it from disk. Fire-and-forget, OFF the UI path.
-            if let cacheStore {
-                if let identity = cacheIdentity(storedId, profile: profile) { Task { try? await cacheStore.saveTranscript(identity: identity, messages: stored) } }
+            if let cacheStore, let identity = capturedIdentity {
+                Task { [weak self] in
+                    guard let self, self.openToken == token else { return }
+                    try? await cacheStore.saveTranscript(identity: identity, messages: stored)
+                }
             }
         } catch {
             guard openToken == token else { return }  // superseded (R1 #28/#43)
@@ -4748,12 +4905,14 @@ final class SessionStore {
             chat.reset()
             return
         }
+        let capturedIdentity = cacheIdentity(storedId, profile: profile)
 
         // Cache read-through first (identical to the cold-open phase 1, minus the
         // reset-on-miss: a chain-tip seed reconciles over already-painted content,
         // so a miss simply leaves it for the network fetch below).
+        var paintedFromCache = false
         if let cacheStore {
-            guard let identity = cacheIdentity(storedId, profile: profile) else { return }
+            guard let identity = capturedIdentity else { return }
             try? await cacheStore.touchSession(identity)
             if openToken == token,
                (try? await cacheStore.hasTranscript(identity)) == true,
@@ -4766,6 +4925,7 @@ final class SessionStore {
                 rememberWarmOpenSnapshot(normalized, for: storedId)
                 chat.seed(normalized: normalized)
                 chat.noteTranscriptSeedWindow(cachedWindow)
+                paintedFromCache = true
             }
         }
 
@@ -4777,19 +4937,20 @@ final class SessionStore {
             rememberWarmOpenSnapshot(normalized, for: storedId)
             chat.seed(normalized: normalized)
             chat.noteTranscriptSeedWindow(stored)
-            if let cacheStore {
-                if let identity = cacheIdentity(storedId, profile: profile) { Task { try? await cacheStore.saveTranscript(identity: identity, messages: stored) } }
+            if let cacheStore, let identity = capturedIdentity {
+                Task { [weak self] in
+                    guard let self, self.openToken == token else { return }
+                    try? await cacheStore.saveTranscript(identity: identity, messages: stored)
+                }
             }
         } catch {
             guard openToken == token else { return }  // superseded (R1 #28/#43)
-            // History fetch failed: an empty transcript is acceptable as the
-            // interim render, but the failure must be recoverable — surface it
-            // so ChatView shows error + retry instead of an infinite
-            // "Loading conversation…" spinner (R1 #79).
-            chat.reset()
+            // A valid cache paint remains readable when reconciliation fails.
+            // Only an empty miss needs the recoverable error presentation.
+            if !paintedFromCache { chat.reset() }
             let description = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
-            chat.noteTranscriptLoadFailure(description)
+            if !paintedFromCache { chat.noteTranscriptLoadFailure(description) }
         }
     }
 
