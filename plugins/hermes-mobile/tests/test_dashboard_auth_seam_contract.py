@@ -183,6 +183,40 @@ def test_bearer_token_authenticated_flag_accepted(api):
     assert api._has_dashboard_api_auth(req) is True
 
 
+def test_native_device_token_routes_are_exact_and_session_header_enabled(api):
+    registered = {}
+
+    def capture(path, *, allow_session_header=False):
+        registered[path] = allow_session_header
+
+    api._register_mobile_token_routes(capture)
+
+    assert registered["/api/sessions"] is True
+    assert registered["/api/sessions/{session_id}/messages"] is True
+    assert registered["/api/profiles/sessions"] is True
+    assert registered["/api/model/info"] is True
+    assert registered["/api/plugins/hermes-mobile/sync/manifest"] is True
+    assert all(path.startswith("/api/") for path in registered)
+    assert "/api" not in registered
+    assert "/api/{path}" not in registered
+
+
+def test_dashboard_api_mount_registers_mobile_token_provider_once(api):
+    providers = {}
+
+    def get(name):
+        return providers.get(name)
+
+    def register(provider):
+        providers[provider.name] = provider
+
+    api._register_mobile_token_provider(get, register)
+    api._register_mobile_token_provider(get, register)
+
+    assert list(providers) == ["hermes-mobile-device"]
+    assert providers["hermes-mobile-device"].supports_token is True
+
+
 def test_stored_session_ownership_is_profile_scoped(api, monkeypatch):
     """Colliding stored IDs in two profiles must not authorize each other."""
     from tui_gateway import server

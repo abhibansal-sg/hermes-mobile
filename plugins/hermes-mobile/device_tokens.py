@@ -41,6 +41,12 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from hermes_cli.dashboard_auth import (
+    DashboardAuthProvider,
+    LoginStart,
+    Session,
+    TokenPrincipal,
+)
 from utils import atomic_json_write
 
 _log = logging.getLogger(__name__)
@@ -393,6 +399,42 @@ def is_device_active(device_id: Optional[str]) -> bool:
             return False
     with _registry_lock:
         return device_id in _load()
+
+
+class MobileDeviceTokenProvider(DashboardAuthProvider):
+    """Non-interactive provider backed by the device-token registry."""
+
+    name = "hermes-mobile-device"
+    display_name = "Hermes Mobile Device"
+    supports_token = True
+    supports_session = False
+
+    def verify_token(self, *, token: str) -> Optional[TokenPrincipal]:
+        identity = match(token)
+        if identity is None:
+            return None
+        return TokenPrincipal(
+            principal=identity["device_id"],
+            provider=self.name,
+            scopes=tuple(identity.get("scopes") or ()),
+        )
+
+    def start_login(self, *, redirect_uri: str) -> LoginStart:
+        raise NotImplementedError("device tokens do not have a login flow")
+
+    def complete_login(
+        self, *, code: str, state: str, code_verifier: str, redirect_uri: str
+    ) -> Session:
+        raise NotImplementedError("device tokens do not have a login flow")
+
+    def verify_session(self, *, access_token: str) -> Optional[Session]:
+        return None
+
+    def refresh_session(self, *, refresh_token: str) -> Session:
+        raise NotImplementedError("device tokens do not have refresh sessions")
+
+    def revoke_session(self, *, refresh_token: str) -> None:
+        return None
 
 
 # ---------------------------------------------------------------------------

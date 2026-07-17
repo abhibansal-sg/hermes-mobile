@@ -4607,3 +4607,103 @@ async def set_memory_approval(body: _MemoryApprovalBody, request: Request) -> Di
     atomic_yaml_write(config_path, user_config)
 
     return {"enabled": wa.write_approval_enabled(wa.MEMORY)}
+
+
+# Core dashboard routes the shipping iOS client calls with its revocable
+# per-device credential. The list is deliberately exact/template-based: this
+# restores native-client auth without turning every future ``/api/*`` route into
+# a device-token surface by accident.
+_MOBILE_CORE_TOKEN_ROUTE_TEMPLATES = (
+    "/api/status",
+    "/api/sessions",
+    "/api/sessions/search",
+    "/api/sessions/{session_id}",
+    "/api/sessions/{session_id}/messages",
+    "/api/profiles",
+    "/api/profiles/sessions",
+    "/api/model/options",
+    "/api/model/info",
+    "/api/model/set",
+    "/api/config",
+    "/api/analytics/usage",
+    "/api/cron/jobs",
+    "/api/cron/delivery-targets",
+    "/api/cron/jobs/{job_id}",
+    "/api/cron/jobs/{job_id}/{action}",
+    "/api/cron/jobs/{job_id}/outputs",
+    "/api/cron/jobs/{job_id}/outputs/{output_id}",
+    "/api/skills",
+    "/api/skills/toggle",
+    "/api/webhooks",
+    "/api/webhooks/enable",
+    "/api/webhooks/{name}",
+    "/api/webhooks/{name}/enabled",
+    "/api/logs",
+    "/api/audio/speak",
+    "/api/audio/transcribe",
+    "/api/gateway/restart",
+    "/api/gateway/drain",
+    "/api/hermes/update",
+    "/api/actions/{action_id}/status",
+)
+
+
+def _register_mobile_token_routes(register=None) -> None:
+    """Opt the plugin and shipping native-client routes into additive auth.
+
+    Older compatible Hermes forks authenticate device tokens in their existing
+    dashboard gate and do not expose ``register_additive_token_route``. On those
+    hosts this is intentionally a no-op. Newer pristine upstream uses the
+    generic provider seam, where explicit registration is required.
+    """
+    if register is None:
+        try:
+            from hermes_cli.dashboard_auth.token_auth import (
+                register_additive_token_route as register,
+            )
+        except ImportError:
+            return
+
+    paths = set(_MOBILE_CORE_TOKEN_ROUTE_TEMPLATES)
+    prefix = "/api/plugins/hermes-mobile"
+    for route in router.routes:
+        path = getattr(route, "path", "")
+        if isinstance(path, str) and path.startswith("/"):
+            paths.add(f"{prefix}{path}")
+    for path in sorted(paths):
+        register(path, allow_session_header=True)
+
+
+def _register_mobile_token_provider(get=None, register=None) -> None:
+    """Register device-token verification in dashboard-only processes.
+
+    The dashboard imports this API module directly to mount plugin routes; it
+    does not necessarily run the agent-side ``register(ctx)`` entry point that
+    normally installs the provider.  Route opt-in without the provider simply
+    falls through to cookie/shared-token auth and returns 401, so both halves
+    must be installed at this dashboard startup seam.
+    """
+    if get is None or register is None:
+        try:
+            from hermes_cli.dashboard_auth import (
+                get_provider as get,
+                register_provider as register,
+            )
+        except ImportError:
+            return
+
+    device_tokens = _plugin_module("device_tokens")
+    provider_type = device_tokens.MobileDeviceTokenProvider
+    if get(provider_type.name) is not None:
+        return
+    try:
+        register(provider_type())
+    except ValueError:
+        # Another startup path may have won the registration race.  Preserve
+        # fail-closed behavior if the duplicate was not actually this provider.
+        if get(provider_type.name) is None:
+            raise
+
+
+_register_mobile_token_provider()
+_register_mobile_token_routes()
