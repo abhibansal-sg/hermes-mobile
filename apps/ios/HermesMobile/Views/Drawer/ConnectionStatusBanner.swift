@@ -94,16 +94,13 @@ struct ConnectionStatusBanner: View {
         return parts.joined(separator: ": ")
     }
 
-    /// Re-issue `configure` against the saved server + token (Keychain), exactly
-    /// as the retired status pill did, so an offline tap reconnects.
+    /// Leave durable offline mode and resume the normal saved-pairing bootstrap.
+    /// Calling `configure` directly here would reconnect only for this process
+    /// while leaving `connectionOffline` set, so the next launch would appear
+    /// offline again.
     private func retry() {
         Task {
-            guard let url = URL(string: connection.serverURLString),
-                  let host = url.host, !host.isEmpty,
-                  let token = KeychainService.loadToken(server: connection.serverURLString) else {
-                return
-            }
-            _ = await connection.configure(urlString: connection.serverURLString, token: token)
+            await connection.reconnect()
         }
     }
 }
