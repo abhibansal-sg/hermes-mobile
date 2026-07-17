@@ -828,15 +828,13 @@ def _managed_profile_dir(profile_dir: Path) -> Path:
     return a path discovered from the configured Hermes roots rather than the
     caller-provided object.
     """
-    try:
-        requested = Path(profile_dir).resolve(strict=True)
-    except OSError as exc:
-        raise FileNotFoundError(
-            f"profile directory does not exist: {profile_dir}"
-        ) from exc
+    # Keep the caller-provided value lexical: never perform a filesystem
+    # operation through it.  We compare it with paths discovered from the
+    # configured Hermes roots and return only those trusted path objects.
+    requested = os.path.normcase(os.path.abspath(os.fspath(profile_dir)))
 
     default_home = _get_default_hermes_home().resolve()
-    if requested == default_home and default_home.is_dir():
+    if requested == os.path.normcase(os.fspath(default_home)) and default_home.is_dir():
         return default_home
 
     profiles_root = _get_profiles_root().resolve()
@@ -850,7 +848,7 @@ def _managed_profile_dir(profile_dir: Path) -> Path:
         try:
             if entry.is_symlink() or not entry.is_dir():
                 continue
-            if entry.resolve(strict=True) == requested:
+            if os.path.normcase(os.path.abspath(os.fspath(entry))) == requested:
                 validate_profile_name(entry.name)
                 return entry
         except (OSError, ValueError):

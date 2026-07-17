@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import email.utils
 import hashlib
+import io
 import importlib
 import importlib.util
 import json as _json
@@ -622,31 +623,31 @@ def _asset_for_request(asset_id: str, request: Request) -> tuple[Any, dict[str, 
     return provider, asset
 
 
-def _registered_asset_path(asset: dict[str, Any]) -> Path:
-    """Resolve a registry asset only inside the plugin-owned upload root."""
-    registered = Path(str(asset.get("path") or ""))
-    if not registered.name or registered.is_symlink():
+def _registered_asset_bytes(asset: dict[str, Any]) -> tuple[bytes, str]:
+    """Read a registry asset by a validated basename under the upload root."""
+    registered = str(asset.get("path") or "")
+    name = os.path.basename(registered)
+    if not name:
         raise HTTPException(status_code=404, detail="Asset bytes unavailable")
-    safe_path = _resolve_uploaded_attachment(registered.name)
-    try:
-        if registered.resolve(strict=True) != safe_path.resolve(strict=True):
-            raise HTTPException(status_code=404, detail="Asset bytes unavailable")
-    except OSError:
+    safe_path = _resolve_uploaded_attachment(name)
+    registered_normalized = os.path.normcase(os.path.abspath(registered))
+    safe_normalized = os.path.normcase(os.path.abspath(os.fspath(safe_path)))
+    if registered_normalized != safe_normalized:
         raise HTTPException(status_code=404, detail="Asset bytes unavailable")
-    return safe_path
-
-
-def _asset_thumbnail_path(asset_id: str) -> Path:
-    if not _re.fullmatch(r"asset_[A-Za-z0-9_-]{1,122}", asset_id):
-        raise HTTPException(status_code=400, detail="Invalid asset id")
-    from hermes_constants import get_hermes_home
-
-    return get_hermes_home() / "mobile" / "asset-thumbnails" / f"{asset_id}.jpg"
-
-
-def _read_asset_bytes(path: Path) -> bytes:
     try:
-        return path.read_bytes()
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        directory_fd = os.open(_UPLOAD_DIR, os.O_RDONLY)
+        try:
+            file_fd = os.open(name, flags, dir_fd=directory_fd)
+            with os.fdopen(file_fd, "rb") as handle:
+                data = handle.read(_MAX_ATTACHMENT_UPLOAD_BYTES + 1)
+                if len(data) > _MAX_ATTACHMENT_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Asset too large")
+                return data, name
+        finally:
+            os.close(directory_fd)
     except OSError:
         raise HTTPException(status_code=404, detail="Asset bytes unavailable")
 
@@ -698,8 +699,8 @@ async def fetch_stable_asset(asset_id: str, request: Request):
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     _provider, asset = _asset_for_request(asset_id, request)
-    path = _registered_asset_path(asset)
-    return _asset_response(_read_asset_bytes(path), path.name, asset, request)
+    data, filename = _registered_asset_bytes(asset)
+    return _asset_response(data, filename, asset, request)
 
 
 @router.get("/assets/{asset_id}/thumbnail")
@@ -707,23 +708,27 @@ async def fetch_stable_asset_thumbnail(asset_id: str, request: Request):
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     provider, asset = _asset_for_request(asset_id, request)
-    thumbnail_path = _asset_thumbnail_path(asset_id)
-    if not thumbnail_path.is_file():
+    from hermes_constants import get_hermes_home
+
+    thumbnail = provider.asset_thumbnail(
+        profile_home=get_hermes_home(), asset_id=asset_id
+    )
+    if thumbnail is None:
         try:
             from PIL import Image
-            from hermes_constants import get_hermes_home
 
-            thumbnail_dir = thumbnail_path.parent
-            thumbnail_dir.mkdir(parents=True, exist_ok=True)
-            with Image.open(_registered_asset_path(asset)) as image:
+            original, _filename = _registered_asset_bytes(asset)
+            output = io.BytesIO()
+            with Image.open(io.BytesIO(original)) as image:
                 image.thumbnail((512, 512))
                 if image.mode not in {"RGB", "L"}:
                     image = image.convert("RGB")
-                image.save(thumbnail_path, format="JPEG", quality=75, optimize=True)
+                image.save(output, format="JPEG", quality=75, optimize=True)
+            thumbnail = output.getvalue()
             provider.set_asset_thumbnail(
                 profile_home=get_hermes_home(),
                 asset_id=asset_id,
-                thumbnail_path=str(thumbnail_path),
+                thumbnail_bytes=thumbnail,
             )
         except Exception as exc:
             _log.warning("asset thumbnail generation failed: %s", exc)
@@ -732,8 +737,8 @@ async def fetch_stable_asset_thumbnail(asset_id: str, request: Request):
     thumb_asset["content_version"] = f"thumb-v1:{asset['content_version']}"
     thumb_asset["media_type"] = "image/jpeg"
     return _asset_response(
-        _read_asset_bytes(thumbnail_path),
-        thumbnail_path.name,
+        thumbnail,
+        f"{asset_id}.jpg",
         thumb_asset,
         request,
     )

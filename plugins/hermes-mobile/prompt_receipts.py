@@ -97,6 +97,7 @@ class SQLitePromptReceiptProvider:
                 byte_count INTEGER NOT NULL,
                 owner_device_id TEXT,
                 thumbnail_path TEXT,
+                thumbnail_bytes BLOB,
                 server_state TEXT NOT NULL DEFAULT 'available',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -126,6 +127,12 @@ class SQLitePromptReceiptProvider:
             );
             """
         )
+        asset_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(stable_assets)").fetchall()
+        }
+        if "thumbnail_bytes" not in asset_columns:
+            conn.execute("ALTER TABLE stable_assets ADD COLUMN thumbnail_bytes BLOB")
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -446,15 +453,17 @@ class SQLitePromptReceiptProvider:
         *,
         profile_home: str | os.PathLike[str],
         asset_id: str,
-        thumbnail_path: str,
+        thumbnail_bytes: bytes,
     ) -> None:
+        if not thumbnail_bytes or len(thumbnail_bytes) > 2 * 1024 * 1024:
+            raise ValueError("thumbnail bytes exceed the bounded storage contract")
         conn = self._connect(profile_home)
         try:
             conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
-                "UPDATE stable_assets SET thumbnail_path = ?, updated_at = ? "
+                "UPDATE stable_assets SET thumbnail_bytes = ?, updated_at = ? "
                 "WHERE asset_id = ? AND server_state = 'available'",
-                (thumbnail_path, float(self._clock()), asset_id),
+                (sqlite3.Binary(thumbnail_bytes), float(self._clock()), asset_id),
             )
             if cursor.rowcount != 1:
                 raise ValueError("asset unavailable")
@@ -463,6 +472,22 @@ class SQLitePromptReceiptProvider:
             if conn.in_transaction:
                 conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    def asset_thumbnail(
+        self, *, profile_home: str | os.PathLike[str], asset_id: str
+    ) -> bytes | None:
+        conn = self._connect(profile_home)
+        try:
+            row = conn.execute(
+                "SELECT thumbnail_bytes FROM stable_assets "
+                "WHERE asset_id = ? AND server_state = 'available'",
+                (asset_id,),
+            ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            return bytes(row[0])
         finally:
             conn.close()
 

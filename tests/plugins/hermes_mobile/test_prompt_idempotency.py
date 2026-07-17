@@ -209,6 +209,33 @@ def test_prompt_receipt_fingerprints_and_atomically_associates_stable_assets(
         server._sessions.pop("runtime-sid", None)
 
 
+def test_stable_asset_thumbnail_bytes_round_trip(tmp_path, receipts):
+    provider = receipts.SQLitePromptReceiptProvider(owner_id="process-a")
+    provider.register_asset(
+        profile_home=tmp_path,
+        asset_id="asset_thumbnail_round_trip",
+        content_version="sha256:abc",
+        path=str(tmp_path / "asset.jpg"),
+        media_type="image/jpeg",
+        byte_count=3,
+        owner_device_id="device-a",
+    )
+
+    assert provider.asset_thumbnail(
+        profile_home=tmp_path, asset_id="asset_thumbnail_round_trip"
+    ) is None
+
+    provider.set_asset_thumbnail(
+        profile_home=tmp_path,
+        asset_id="asset_thumbnail_round_trip",
+        thumbnail_bytes=b"bounded-jpeg-thumbnail",
+    )
+
+    assert provider.asset_thumbnail(
+        profile_home=tmp_path, asset_id="asset_thumbnail_round_trip"
+    ) == b"bounded-jpeg-thumbnail"
+
+
 @pytest.mark.parametrize(
     "change",
     [
