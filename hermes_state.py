@@ -157,7 +157,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -882,6 +882,10 @@ CREATE TABLE IF NOT EXISTS session_turn_inputs (
     FOREIGN KEY (session_id, turn_id)
         REFERENCES session_turns(session_id, turn_id) ON DELETE CASCADE
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_turn_inputs_display_origin
+ON session_turn_inputs(session_id, message_origin_id)
+WHERE message_origin_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS session_turn_operations (
     session_id TEXT NOT NULL,
@@ -4634,6 +4638,15 @@ class SessionDB:
         for row in reversed(page_rows):
             item = dict(row)
             item["content"] = self._decode_content(item.get("content"))
+            if item.get("tool_calls"):
+                try:
+                    item["tool_calls"] = json.loads(item["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize tool_calls in get_display_messages, "
+                        "falling back to []"
+                    )
+                    item["tool_calls"] = []
             messages.append(item)
         previous_cursor = (
             int(page_rows[-1]["origin_id"])
@@ -5214,6 +5227,185 @@ class SessionDB:
                 raise ValueError(f"session not found: {session_id}")
 
         self._execute_write(_do)
+
+    def import_historical_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        user_origin_id: int,
+        user_content: Any,
+        accepted_at: float,
+        terminal_origin_id: int,
+        terminal_at: float,
+        operations: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Atomically import one proven completed historical display turn.
+
+        This is deliberately narrower than the live turn API. Historical
+        derivation may only commit a turn when a displayed user origin and a
+        displayed terminal assistant origin are both known. ``operations``
+        accepts safe headers only; raw arguments and results have no field in
+        the public contract or durable schema.
+        """
+        if not turn_id:
+            raise ValueError("turn_id is required")
+        if int(user_origin_id) <= 0 or int(terminal_origin_id) <= 0:
+            raise ValueError("historical display origins are required")
+        if len(operations) > 5000:
+            raise ValueError("historical operation count exceeds import bound")
+        normalized_operations: List[Dict[str, Any]] = []
+        allowed_states = {"completed", "failed", "interrupted"}
+        for ordinal, item in enumerate(operations):
+            if not isinstance(item, dict):
+                raise ValueError("historical operation must be an object")
+            operation_id = str(item.get("operation_id") or "").strip()
+            tool_name = str(item.get("tool_name") or "").strip()
+            category = str(item.get("category") or "").strip()
+            safe_label = str(item.get("safe_label") or "").strip()
+            state = str(item.get("state") or "completed")
+            if not operation_id or not tool_name or not category or not safe_label:
+                raise ValueError("historical operation safe metadata is required")
+            if state not in allowed_states:
+                raise ValueError("historical operation state is invalid")
+            normalized_operations.append(
+                {
+                    "operation_id": operation_id[:256],
+                    "tool_name": tool_name[:256],
+                    "category": category[:64],
+                    "safe_label": safe_label[:256],
+                    "state": state,
+                    "started_at": item.get("started_at"),
+                    "completed_at": item.get("completed_at"),
+                    "ordinal": ordinal,
+                }
+            )
+        stored_content = self._encode_content(user_content)
+        accepted = float(accepted_at)
+        terminal = float(terminal_at)
+
+        def _do(conn):
+            origins = conn.execute(
+                "SELECT d.origin_id, m.role FROM message_display_origins d "
+                "JOIN messages m ON m.id = d.canonical_message_id "
+                "WHERE d.session_id = ? AND d.origin_id IN (?, ?) "
+                "AND d.state = 'display'",
+                (session_id, int(user_origin_id), int(terminal_origin_id)),
+            ).fetchall()
+            roles = {int(row[0]): row[1] for row in origins}
+            if roles.get(int(user_origin_id)) != "user":
+                raise ValueError("historical input origin is not a displayed user row")
+            if roles.get(int(terminal_origin_id)) != "assistant":
+                raise ValueError(
+                    "historical terminal origin is not a displayed assistant row"
+                )
+            existing = conn.execute(
+                "SELECT turn_id FROM session_turn_inputs "
+                "WHERE session_id = ? AND message_origin_id = ?",
+                (session_id, int(user_origin_id)),
+            ).fetchone()
+            if existing is not None:
+                return {"turn_id": str(existing[0]), "inserted": False}
+            if conn.execute(
+                "SELECT 1 FROM session_turns WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone() is not None:
+                raise ValueError("historical turn id is already bound")
+            now = time.time()
+            conn.execute(
+                "INSERT INTO session_turns "
+                "(session_id, turn_id, state, accepted_at, terminal_at, "
+                " terminal_message_origin_id, updated_at) "
+                "VALUES (?, ?, 'completed', ?, ?, ?, ?)",
+                (
+                    session_id,
+                    turn_id,
+                    accepted,
+                    terminal,
+                    int(terminal_origin_id),
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO session_turn_inputs "
+                "(session_id, turn_id, input_id, input_kind, ordinal, content, "
+                " accepted_at, message_origin_id) "
+                "VALUES (?, ?, ?, 'prompt', 0, ?, ?, ?)",
+                (
+                    session_id,
+                    turn_id,
+                    f"hist_input_{int(user_origin_id)}",
+                    stored_content,
+                    accepted,
+                    int(user_origin_id),
+                ),
+            )
+            for item in normalized_operations:
+                conn.execute(
+                    "INSERT INTO session_turn_operations "
+                    "(session_id, turn_id, operation_id, ordinal, tool_name, "
+                    " category, safe_label, state, started_at, completed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        turn_id,
+                        item["operation_id"],
+                        item["ordinal"],
+                        item["tool_name"],
+                        item["category"],
+                        item["safe_label"],
+                        item["state"],
+                        item["started_at"],
+                        item["completed_at"],
+                    ),
+                )
+            return {"turn_id": turn_id, "inserted": True}
+
+        return self._execute_write(_do)
+
+    def refresh_turn_ledger_coverage(self, session_id: str) -> Dict[str, Any]:
+        """Mark coverage complete only when every displayed user origin is bound."""
+        def _do(conn):
+            row = conn.execute(
+                "SELECT display_lineage_complete FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"session not found: {session_id}")
+            user_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM message_display_origins d "
+                    "JOIN messages m ON m.id = d.canonical_message_id "
+                    "WHERE d.session_id = ? AND d.state = 'display' "
+                    "AND m.role = 'user'",
+                    (session_id,),
+                ).fetchone()[0]
+            )
+            bound_count = int(
+                conn.execute(
+                    "SELECT COUNT(DISTINCT i.message_origin_id) "
+                    "FROM session_turn_inputs i "
+                    "JOIN message_display_origins d "
+                    "  ON d.session_id = i.session_id "
+                    " AND d.origin_id = i.message_origin_id "
+                    "WHERE i.session_id = ? AND d.state = 'display' "
+                    "AND i.message_origin_id IS NOT NULL",
+                    (session_id,),
+                ).fetchone()[0]
+            )
+            complete = bool(row[0]) and user_count == bound_count
+            conn.execute(
+                "UPDATE sessions SET turn_ledger_complete = ? WHERE id = ?",
+                (int(complete), session_id),
+            )
+            return {
+                "session_id": session_id,
+                "display_user_count": user_count,
+                "bound_user_count": bound_count,
+                "coverage_complete": complete,
+            }
+
+        return self._execute_write(_do)
 
     def get_turn_inputs(
         self,

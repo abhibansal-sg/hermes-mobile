@@ -11,8 +11,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import sqlite3
+import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
+
+from hermes_constants import get_hermes_home
 
 
 SCHEMA_VERSION = 1
@@ -22,10 +27,307 @@ MAX_INPUTS_PER_TURN = 1000
 MAX_TOMBSTONES_PER_PAGE = 1000
 MAX_OPERATIONS_PER_TURN = 1000
 MAX_OPERATIONS_PER_PAGE = 5000
+MAX_BACKFILL_ROWS_PER_STEP = 500
+MAX_BACKFILL_OPERATIONS_PER_TURN = 1000
+
+_backfill_lock = threading.RLock()
 
 
 class TurnProjectionError(ValueError):
     """A cursor or source ledger cannot produce an integrity-safe page."""
+
+
+def _backfill_path() -> Path:
+    path = get_hermes_home() / "mobile" / "turn-projection-backfill.sqlite3"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _open_backfill_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(_backfill_path(), timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        PRAGMA journal_mode=WAL;
+        PRAGMA foreign_keys=ON;
+        CREATE TABLE IF NOT EXISTS backfill_state (
+            session_id TEXT PRIMARY KEY,
+            display_revision INTEGER NOT NULL,
+            before_origin_id INTEGER,
+            pending_final_origin_id INTEGER,
+            pending_final_at REAL,
+            pending_overflow INTEGER NOT NULL DEFAULT 0,
+            scan_complete INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS backfill_operations (
+            session_id TEXT NOT NULL,
+            reverse_ordinal INTEGER NOT NULL,
+            operation_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            safe_label TEXT NOT NULL,
+            state TEXT NOT NULL,
+            started_at REAL,
+            completed_at REAL,
+            PRIMARY KEY (session_id, operation_id)
+        );
+        CREATE TABLE IF NOT EXISTS backfill_results (
+            session_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            completed_at REAL,
+            PRIMARY KEY (session_id, operation_id)
+        );
+        """
+    )
+    return conn
+
+
+def _reset_backfill(conn: sqlite3.Connection, session_id: str, revision: int) -> None:
+    import time
+
+    conn.execute("DELETE FROM backfill_operations WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM backfill_results WHERE session_id = ?", (session_id,))
+    conn.execute(
+        "INSERT INTO backfill_state "
+        "(session_id, display_revision, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(session_id) DO UPDATE SET "
+        "display_revision = excluded.display_revision, before_origin_id = NULL, "
+        "pending_final_origin_id = NULL, pending_final_at = NULL, "
+        "pending_overflow = 0, scan_complete = 0, "
+        "updated_at = excluded.updated_at",
+        (session_id, int(revision), time.time()),
+    )
+
+
+def _clear_pending_boundary(conn: sqlite3.Connection, session_id: str) -> None:
+    conn.execute("DELETE FROM backfill_operations WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM backfill_results WHERE session_id = ?", (session_id,))
+    conn.execute(
+        "UPDATE backfill_state SET pending_final_origin_id = NULL, "
+        "pending_final_at = NULL, pending_overflow = 0 WHERE session_id = ?",
+        (session_id,),
+    )
+
+
+def _has_visible_content(content: Any) -> bool:
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return bool(content)
+    return content is not None
+
+
+def _tool_name(call: Any) -> str:
+    if not isinstance(call, dict):
+        return "operation"
+    function = call.get("function")
+    if isinstance(function, dict) and function.get("name"):
+        return str(function["name"])[:256]
+    return str(call.get("name") or "operation")[:256]
+
+
+def _tool_id(call: Any, *, origin_id: int, index: int) -> str:
+    if isinstance(call, dict) and call.get("id"):
+        return str(call["id"])[:256]
+    digest = hashlib.sha256(f"{origin_id}\0{index}".encode()).hexdigest()[:24]
+    return f"hist_op_{digest}"
+
+
+def _safe_tool_metadata(name: str) -> tuple[str, str]:
+    lowered = name.lower()
+    if any(token in lowered for token in ("terminal", "shell", "exec", "command")):
+        return "shell", "Ran terminal operations"
+    if any(token in lowered for token in ("edit", "write", "patch")):
+        return "edit", "Updated files"
+    if any(token in lowered for token in ("test", "verify", "lint", "build")):
+        return "test", "Verified changes"
+    if any(token in lowered for token in ("browser", "web", "search", "fetch")):
+        return "web", "Used web resources"
+    if any(token in lowered for token in ("file", "read", "list", "directory")):
+        return "files", "Inspected files"
+    return "other", "Performed operations"
+
+
+def _pending_operations(conn: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT operation_id, tool_name, category, safe_label, state, "
+        "started_at, completed_at FROM backfill_operations "
+        "WHERE session_id = ? ORDER BY reverse_ordinal DESC",
+        (session_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def advance_historical_backfill(
+    db: Any,
+    *,
+    session_id: str,
+    max_rows: int = MAX_BACKFILL_ROWS_PER_STEP,
+) -> dict[str, Any]:
+    """Advance one restart-safe historical projection batch.
+
+    Each invocation reads at most ``max_rows`` canonical display rows. The
+    plugin checkpoint contains only cursors, stable origins, result IDs, and
+    safe operation headers. User/final content moves directly from the public
+    display page into the authoritative turn ledger only after a complete
+    boundary is proven.
+    """
+    import time
+
+    bounded_rows = max(1, min(int(max_rows), MAX_BACKFILL_ROWS_PER_STEP))
+    status = db.get_turn_ledger_status(session_id)
+    if status["coverage_complete"] or not status["display_lineage_complete"]:
+        return {"rows_scanned": 0, **status}
+    with _backfill_lock:
+        conn = _open_backfill_db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            state = conn.execute(
+                "SELECT * FROM backfill_state WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            revision = int(status["display_revision"])
+            if state is None or int(state["display_revision"]) != revision:
+                _reset_backfill(conn, session_id, revision)
+                state = conn.execute(
+                    "SELECT * FROM backfill_state WHERE session_id = ?", (session_id,)
+                ).fetchone()
+            if bool(state["scan_complete"]):
+                conn.commit()
+                return {"rows_scanned": 0, **db.refresh_turn_ledger_coverage(session_id)}
+
+            page = db.get_display_messages(
+                session_id,
+                before_origin_id=state["before_origin_id"],
+                limit=bounded_rows,
+            )
+            if int(page["display_revision"]) != revision:
+                _reset_backfill(conn, session_id, int(page["display_revision"]))
+                conn.commit()
+                return {"rows_scanned": 0, "coverage_complete": False, "reset": True}
+
+            for message in reversed(page["messages"]):
+                role = str(message.get("role") or "")
+                origin_id = int(message["origin_id"])
+                timestamp = float(message.get("timestamp") or 0)
+                if role == "tool":
+                    operation_id = str(message.get("tool_call_id") or "").strip()
+                    if operation_id:
+                        conn.execute(
+                            "INSERT INTO backfill_results "
+                            "(session_id, operation_id, completed_at) VALUES (?, ?, ?) "
+                            "ON CONFLICT(session_id, operation_id) DO UPDATE SET "
+                            "completed_at = excluded.completed_at",
+                            (session_id, operation_id[:256], timestamp),
+                        )
+                    continue
+                if role == "assistant":
+                    calls = message.get("tool_calls") or []
+                    if calls:
+                        for index, call in reversed(list(enumerate(calls))):
+                            count = int(
+                                conn.execute(
+                                    "SELECT COUNT(*) FROM backfill_operations "
+                                    "WHERE session_id = ?",
+                                    (session_id,),
+                                ).fetchone()[0]
+                            )
+                            if count >= MAX_BACKFILL_OPERATIONS_PER_TURN:
+                                conn.execute(
+                                    "UPDATE backfill_state SET pending_overflow = 1 "
+                                    "WHERE session_id = ?",
+                                    (session_id,),
+                                )
+                                continue
+                            operation_id = _tool_id(call, origin_id=origin_id, index=index)
+                            name = _tool_name(call)
+                            category, label = _safe_tool_metadata(name)
+                            result = conn.execute(
+                                "SELECT completed_at FROM backfill_results "
+                                "WHERE session_id = ? AND operation_id = ?",
+                                (session_id, operation_id),
+                            ).fetchone()
+                            reverse_ordinal = int(
+                                conn.execute(
+                                    "SELECT COALESCE(MAX(reverse_ordinal), -1) + 1 "
+                                    "FROM backfill_operations WHERE session_id = ?",
+                                    (session_id,),
+                                ).fetchone()[0]
+                            )
+                            conn.execute(
+                                "INSERT OR IGNORE INTO backfill_operations "
+                                "(session_id, reverse_ordinal, operation_id, tool_name, "
+                                " category, safe_label, state, started_at, completed_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                (
+                                    session_id,
+                                    reverse_ordinal,
+                                    operation_id,
+                                    name,
+                                    category,
+                                    label,
+                                    "completed" if result is not None else "interrupted",
+                                    timestamp,
+                                    float(result[0]) if result is not None else None,
+                                ),
+                            )
+                    elif _has_visible_content(message.get("content")):
+                        conn.execute(
+                            "UPDATE backfill_state SET "
+                            "pending_final_origin_id = COALESCE("
+                            "pending_final_origin_id, ?), "
+                            "pending_final_at = COALESCE(pending_final_at, ?) "
+                            "WHERE session_id = ?",
+                            (origin_id, timestamp, session_id),
+                        )
+                    continue
+                if role != "user":
+                    continue
+
+                current = conn.execute(
+                    "SELECT pending_final_origin_id, pending_final_at, "
+                    "pending_overflow FROM backfill_state WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if current["pending_final_origin_id"] is not None and not bool(
+                    current["pending_overflow"]
+                ):
+                    historical_turn_id = f"turn_hist_{origin_id}"
+                    db.import_historical_turn(
+                        session_id,
+                        historical_turn_id,
+                        user_origin_id=origin_id,
+                        user_content=message.get("content"),
+                        accepted_at=timestamp,
+                        terminal_origin_id=int(current["pending_final_origin_id"]),
+                        terminal_at=float(current["pending_final_at"] or timestamp),
+                        operations=_pending_operations(conn, session_id),
+                    )
+                _clear_pending_boundary(conn, session_id)
+
+            scan_complete = not bool(page["has_older"])
+            conn.execute(
+                "UPDATE backfill_state SET before_origin_id = ?, scan_complete = ?, "
+                "updated_at = ? WHERE session_id = ?",
+                (
+                    page["previous_cursor"],
+                    int(scan_complete),
+                    time.time(),
+                    session_id,
+                ),
+            )
+            conn.commit()
+            coverage = db.refresh_turn_ledger_coverage(session_id)
+            return {
+                "rows_scanned": len(page["messages"]),
+                "scan_complete": scan_complete,
+                **coverage,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 @dataclass(frozen=True)

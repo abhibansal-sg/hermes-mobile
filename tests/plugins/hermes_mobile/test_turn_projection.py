@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from hermes_state import SessionDB
@@ -184,3 +186,103 @@ def test_adjacent_safe_operations_group_without_persisting_payloads(tmp_path):
         ("shell", 1),
     ]
     assert all("args" not in item and "result" not in item for item in groups)
+
+
+def test_historical_backfill_is_bounded_restartable_and_safe(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("legacy", source="tui")
+    db.append_message("legacy", "user", "inspect the project", timestamp=1)
+    for index in range(4):
+        call_id = f"call_{index}"
+        db.append_message(
+            "legacy",
+            "assistant",
+            None,
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"secret command"}',
+                    },
+                }
+            ],
+            timestamp=2 + index * 2,
+        )
+        db.append_message(
+            "legacy",
+            "tool",
+            "sensitive raw result",
+            tool_call_id=call_id,
+            timestamp=3 + index * 2,
+        )
+    db.append_message("legacy", "assistant", "done", timestamp=20)
+
+    scanned = []
+    while True:
+        result = projection.advance_historical_backfill(
+            db, session_id="legacy", max_rows=2
+        )
+        scanned.append(result["rows_scanned"])
+        if result.get("scan_complete") or result.get("coverage_complete"):
+            break
+    assert scanned and max(scanned) <= 2
+    assert len(scanned) > 1
+
+    page = projection.build_turn_page(db, session_id="legacy")
+    assert page["coverage_complete"] is True
+    assert page["projection_pending"] is False
+    assert len(page["turns"]) == 1
+    assert page["turns"][0]["final"]["content"] == "done"
+    assert page["turns"][0]["activity_groups"][0]["operation_count"] == 4
+
+    checkpoint = (
+        tmp_path / "home" / "mobile" / "turn-projection-backfill.sqlite3"
+    ).read_bytes()
+    assert b"secret command" not in checkpoint
+    assert b"sensitive raw result" not in checkpoint
+
+
+def test_historical_backfill_resets_checkpoint_when_display_revision_changes(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("legacy", source="tui")
+    db.append_message("legacy", "user", "first", timestamp=1)
+    db.append_message("legacy", "assistant", "first answer", timestamp=2)
+    db.append_message("legacy", "user", "second", timestamp=3)
+    db.append_message("legacy", "assistant", "second answer", timestamp=4)
+
+    first = projection.advance_historical_backfill(
+        db, session_id="legacy", max_rows=1
+    )
+    assert first["rows_scanned"] == 1
+    db.append_message("legacy", "assistant", "newer display row", timestamp=5)
+
+    second = projection.advance_historical_backfill(
+        db, session_id="legacy", max_rows=1
+    )
+    assert second["rows_scanned"] == 1
+    with sqlite3.connect(
+        tmp_path / "home" / "mobile" / "turn-projection-backfill.sqlite3"
+    ) as checkpoint:
+        revision = checkpoint.execute(
+            "SELECT display_revision FROM backfill_state WHERE session_id = 'legacy'"
+        ).fetchone()[0]
+    assert revision == db.get_turn_ledger_status("legacy")["display_revision"]
+
+
+def test_historical_turn_without_proven_terminal_remains_partial(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("legacy", source="tui")
+    db.append_message("legacy", "user", "unfinished", timestamp=1)
+    result = projection.advance_historical_backfill(db, session_id="legacy")
+
+    assert result["scan_complete"] is True
+    page = projection.build_turn_page(db, session_id="legacy")
+    assert page["coverage_complete"] is False
+    assert page["projection_pending"] is True
+    assert page["turns"] == []

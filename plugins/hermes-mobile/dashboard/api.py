@@ -175,6 +175,9 @@ async def mobile_capabilities(request: Request):
             "get_turn_operations",
             "get_turn_tombstones",
             "get_display_message_by_origin",
+            "get_display_messages",
+            "import_historical_turn",
+            "refresh_turn_ledger_coverage",
         )
         turn_projection = int(all(hasattr(SessionDB, name) for name in turn_methods))
     except Exception:
@@ -2009,8 +2012,12 @@ async def session_turns(
         raise HTTPException(status_code=503, detail="state.db unavailable")
     db = None
     try:
-        db = SessionDB(read_only=True)
+        # Historical projection advances through a bounded, restart-safe
+        # checkpoint and therefore needs the public writable ledger API. One
+        # request still scans at most the plugin's fixed source-row budget.
+        db = SessionDB()
         projection = _plugin_module("turn_projection")
+        projection.advance_historical_backfill(db, session_id=session_id)
         return projection.build_turn_page(
             db,
             session_id=session_id,

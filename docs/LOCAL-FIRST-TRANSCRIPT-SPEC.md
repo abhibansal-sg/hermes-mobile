@@ -1,9 +1,9 @@
 # Hermes Mobile — Local-First Transcript and Asset Integrity
 
-**Status:** Product direction confirmed; internal and external architecture reviews reconciled; implementation proof gates remain
+**Status:** Product direction confirmed; implementation underway behind versioned capability gates
 **Date:** 2026-07-17
 **Scope:** iOS app and external `hermes-mobile` gateway plugin
-**Implementation state:** Design only; no build work is authorized by this document
+**Implementation state:** Authority identity, manifest v2, display lineage, durable turn ledger, compact GRDB projection, capability-gated iOS reads, and bounded historical backfill are implemented; detail, stable assets, generalized mutations, and rollout evidence remain
 
 ## 1. Outcome
 
@@ -1312,11 +1312,24 @@ turn lifecycle updates it incrementally. Historical projection runs in fixed
 source-row batches with persisted backfill cursor, coverage metadata, and a hard
 read budget. Use public `SessionDB`/display-lineage APIs only.
 
+**Implemented:** the generic SessionDB turn ledger is the compact authoritative
+index. The external plugin owns a restart-safe backfill checkpoint under
+`HERMES_HOME`, scans at most 500 canonical display rows per advancement, stores
+only safe operation metadata, and leaves ambiguous/no-final or over-limit turns
+explicitly incomplete. A display-revision change discards only the checkpoint
+and restarts derivation; it never deletes authoritative turns or durable mobile
+work.
+
 #### B2b. Add bounded compact turn HTTP reads
 
 Expose tail, older-page, and delta/reset endpoints backed only by B2a's compact
 index. Return explicit incomplete coverage rather than deriving arbitrary
 history during a request. Include the real Python-to-Swift fixture in this unit.
+
+**Implemented:** `/sessions/{stored_session_id}/turns` reads the bounded turn
+ledger only. A request may advance one fixed historical source batch before the
+read, reports `projection_pending` until every displayed user origin is proven,
+and never falls back to full-transcript hydration.
 
 #### B3. Add GRDB compact projection schema
 
