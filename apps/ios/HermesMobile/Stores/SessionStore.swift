@@ -2960,7 +2960,18 @@ final class SessionStore {
 
         // Merge: survivors first (they have the most up-to-date local state),
         // then the incoming page (server authority for everything else).
-        sessions = survivors + reconciled
+        // build125 smoothness (#208): a periodic first-page refresh (the 30s
+        // heartbeat / drawer-open) very often returns byte-identical rows. Under
+        // `@Observable`, reassigning `sessions` with an equal-but-new array still
+        // fires the observation and relayouts the whole LazyVStack. Publish ONLY
+        // when the merged result actually differs — an id-diff over the value-typed
+        // array (`SessionSummary: Equatable`) — so an unchanged refresh causes zero
+        // list churn. Ordering and contents are byte-identical to the prior
+        // unconditional replace when it does differ.
+        let merged = survivors + reconciled
+        if merged != sessions {
+            sessions = merged
+        }
 
         // Reset pagination cursors on a first-page refresh.
         // ABH-373: a first-page replace is a fresh server window — rebuild the
