@@ -97,24 +97,11 @@ struct GatewayStatusView: View {
         // PSF-02: use theme.card for every row so the gateway section matches the
         // glass/card idiom of the other panels (PersonalityPicker, ModelPicker).
         Section {
-            LabeledContent("Gateway process") {
+            LabeledContent("State") {
                 let badge = actionRunner.gatewayBadgeState(fallback: status)
                 StatusBadge(state: badge.state, running: badge.running)
             }
             .listRowBackground(theme.card)
-            if let connection {
-                LabeledContent("Phone WebSocket") {
-                    let badge = Self.phoneBadgeState(for: connection.transportReadiness)
-                    StatusBadge(state: badge.state, running: badge.running)
-                }
-                .accessibilityLabel("Phone WebSocket readiness")
-                .accessibilityValue(Self.phoneReadinessDescription(for: connection.transportReadiness))
-                .listRowBackground(theme.card)
-                Text("Gateway process status is from REST. Phone WebSocket is this device's live RPC readiness.")
-                    .font(.caption)
-                    .foregroundStyle(theme.mutedFg)
-                    .listRowBackground(theme.card)
-            }
             if let active = status.activeSessions {
                 LabeledContent("Active sessions", value: "\(active)")
                     .listRowBackground(theme.card)
@@ -341,18 +328,6 @@ struct GatewayStatusView: View {
             return GatewayBadgeSnapshot(state: "offline", running: false)
         case .reauthRequired:
             return GatewayBadgeSnapshot(state: "reauth required", running: false)
-        }
-    }
-
-    private static func phoneReadinessDescription(
-        for readiness: ConnectionStore.TransportReadiness
-    ) -> String {
-        switch readiness {
-        case .unconfigured: return "Not configured"
-        case .connecting: return "Connecting"
-        case .ready: return "Ready for live WebSocket RPC"
-        case .unavailable: return "Unavailable"
-        case .reauthRequired: return "Reauthentication required"
         }
     }
 
