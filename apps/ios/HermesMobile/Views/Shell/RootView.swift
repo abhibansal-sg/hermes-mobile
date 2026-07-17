@@ -302,33 +302,20 @@ struct RootView: View {
 
     @ViewBuilder
     private var mainUI: some View {
-        VStack(spacing: 0) {
-            if freshnessPresentation.showsBanner {
-                FreshnessBanner(presentation: freshnessPresentation)
-            }
-            if effectiveHorizontalSizeClass == .regular {
-                SplitLayout(
-                    showingInspector: $showingInspector,
-                    inspectorTab: $inspectorTab,
-                    onOpenSettings: openSettings
-                )
-            } else {
-                CompactLayout(onOpenSettings: openSettings)
-            }
+        if effectiveHorizontalSizeClass == .regular {
+            SplitLayout(
+                showingInspector: $showingInspector,
+                inspectorTab: $inspectorTab,
+                onOpenSettings: openSettings
+            )
+        } else {
+            CompactLayout(onOpenSettings: openSettings)
         }
     }
 
     private var hasCachedContent: Bool {
         !sessions.sessions.isEmpty || sessions.activeStoredId != nil
             || !chat.messages.isEmpty || sessions.manifestRevision > 0
-    }
-
-    private var freshnessPresentation: FreshnessPresentation {
-        FreshnessPresentation.resolve(
-            phase: connection.phase,
-            manifestFreshness: sessions.manifestFreshness,
-            lastSyncedAt: sessions.manifestLastSyncedAt
-        )
     }
 
     /// `hermesapp://debug/open-settings` opens the same root-owned Settings
@@ -384,7 +371,6 @@ struct FreshnessPresentation: Equatable, Sendable {
     let text: String
     let accessibilityLabel: String
 
-    var showsBanner: Bool { kind != .fresh }
     var allowsRemoteMutations: Bool { kind == .fresh }
     var mutationUnavailableExplanation: String {
         "Available after synchronization establishes a fresh connection."
@@ -428,20 +414,6 @@ struct FreshnessPresentation: Equatable, Sendable {
         if seconds >= 3_600 { return "\(seconds / 3_600)h ago" }
         if seconds >= 60 { return "\(seconds / 60)m ago" }
         return "just now"
-    }
-}
-
-private struct FreshnessBanner: View {
-    let presentation: FreshnessPresentation
-
-    var body: some View {
-        Text(presentation.text)
-            .font(.caption.weight(.semibold))
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 5)
-            .background(.ultraThinMaterial)
-            .accessibilityLabel(presentation.accessibilityLabel)
-            .accessibilityIdentifier("syncFreshness")
     }
 }
 

@@ -229,6 +229,83 @@ final class SessionStore {
         cancelEnsureRuntime()
     }
 
+    /// Remove every in-memory surface owned by a forgotten gateway.
+    ///
+    /// Disk/cache deletion is coordinated by ``ConnectionStore.forgetGateway``.
+    /// This companion reset is intentionally stronger than an ordinary
+    /// disconnect: it prevents the old drawer and transcript from surviving in
+    /// the long-lived store graph and reappearing during an immediate re-pair.
+    func removeForgottenGatewayState() {
+        invalidateConnectionWork()
+        stopHeartbeat()
+        cancelPrefetch()
+        searchTask?.cancel()
+        searchTask = nil
+        searchLoadMoreTask?.cancel()
+        searchLoadMoreTask = nil
+
+        openToken = UUID()
+        openRevealToken = nil
+        warmOpenSnapshots.removeAll()
+        warmOpenSnapshotOrder.removeAll()
+        #if DEBUG
+        lastOpenSeedTask?.cancel()
+        lastOpenResumeTask?.cancel()
+        #endif
+
+        draftSaveTasks.values.forEach { $0.cancel() }
+        draftSaveTasks.removeAll()
+        composerDrafts.removeAll()
+        composerHistoryBrowses.removeAll()
+        composerDraftRevision &+= 1
+        draftCwd = nil
+        draftAttachments?.removeAll()
+
+        clearActive()
+        sessions.removeAll()
+        archivedSessions.removeAll()
+        automationSessions.removeAll()
+        profiles.removeAll()
+        totalSessions = nil
+        automationSessionsTotal = nil
+        loadedOffset = 0
+        loadedCount = 0
+        loadedFloor = 0
+        seenServerSessionIds.removeAll()
+        pendingSessionListTombstones.removeAll()
+        resetSessionListDeltaState()
+
+        liveCleanupTask?.cancel()
+        liveCleanupTask = nil
+        lastActivityAt.removeAll()
+        lastActivityStampAt.removeAll()
+        turnsInProgress.removeAll()
+
+        manifestFreshness = .cached
+        manifestLastSyncedAt = nil
+        manifestRevision = 0
+        verifiedAuthorityBinding = nil
+        didColdReadCache = false
+        lastColdReadServerId = nil
+
+        clearSearch()
+        pendingSearchScroll = nil
+        pendingMessageJump = nil
+        pendingMessageJumpAttempts = 0
+        pendingMessageJumpSnippet = nil
+        pendingSearchScrollIsSnippet = false
+        lastError = nil
+        sessionActionError = nil
+        isLoading = false
+        isLoadingMore = false
+        isLoadingAutomationSessions = false
+        automationSessionsError = nil
+
+        pinnedIds.removeAll()
+        persistPins()
+        activeProfile = Self.defaultProfileName
+    }
+
     /// Revision of the server-side Recents universe represented by `sessions`.
     /// Unlike `refreshToken`, this does not cancel the dedicated initial fill on
     /// every heartbeat. It changes only when a first-page replacement or cursor
