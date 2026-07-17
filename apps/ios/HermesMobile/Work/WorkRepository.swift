@@ -647,9 +647,12 @@ actor WorkRepository {
                     WHERE job_id = (
                         SELECT job_id
                         FROM work_jobs
-                        WHERE state IN (
-                            'queued', 'creating_destination', 'uploading', 'submitting',
-                            'accepted', 'retry_wait'
+                        WHERE (
+                            state IN (
+                                'queued', 'creating_destination', 'uploading', 'submitting',
+                                'retry_wait'
+                            )
+                            OR (state = 'accepted' AND authoritative_turn_id IS NULL)
                         )
                           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
                           AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
@@ -714,6 +717,91 @@ actor WorkRepository {
         }
         await publishObservation()
         return existing
+    }
+
+    /// Commits the gateway acceptance receipt without making the optimistic
+    /// work disappear. `accepted` is the cross-database
+    /// accepted-awaiting-projection stage: only a later GRDB projection commit
+    /// may complete it.
+    @discardableResult
+    func recordAcceptedReceipt(
+        id: String,
+        owner: String,
+        authoritativeTurnID: String,
+        entityRevision: Int64?,
+        now: Date = Date()
+    ) async throws -> WorkJob {
+        guard !authoritativeTurnID.isEmpty else {
+            throw WorkRepositoryError.invalidTransition(from: .submitting, to: .accepted)
+        }
+        let timestamp = now.timeIntervalSince1970
+        let job = try await database.write { db -> WorkJob in
+            guard var job = try WorkJob.fetchOne(db, key: id) else {
+                throw WorkRepositoryError.jobNotFound
+            }
+            guard job.state == .submitting else {
+                throw WorkRepositoryError.invalidTransition(from: job.state, to: .accepted)
+            }
+            guard job.leaseOwner == owner else { throw WorkRepositoryError.leaseLost }
+            job.state = .accepted
+            job.authoritativeTurnID = authoritativeTurnID
+            job.acceptedEntityRevision = entityRevision
+            job.acceptedAt = timestamp
+            job.updatedAt = timestamp
+            job.nextAttemptAt = nil
+            job.lastErrorCode = nil
+            job.lastErrorMessage = nil
+            try job.update(db)
+            return job
+        }
+        await publishObservation()
+        return job
+    }
+
+    /// Completes an accepted Work overlay only after the reconstructible GRDB
+    /// projection has committed the same scoped client/turn identity.
+    @discardableResult
+    func completeAcceptedProjection(
+        scope: WorkScope,
+        clientMessageID: String,
+        authoritativeTurnID: String,
+        now: Date = Date()
+    ) async throws -> Bool {
+        guard let gatewayID = scope.gatewayID,
+              let authorityEpoch = scope.authorityEpoch else {
+            throw WorkRepositoryError.invalidScope
+        }
+        let timestamp = now.timeIntervalSince1970
+        let changed = try await database.write { db -> Int in
+            try db.execute(
+                sql: """
+                    UPDATE work_jobs
+                    SET state = ?, completed_at = ?, updated_at = ?
+                    WHERE server_id = ? AND profile_id = ?
+                      AND client_message_id = ?
+                      AND authoritative_turn_id = ?
+                      AND state = ?
+                      AND authority_state = ?
+                      AND gateway_id = ? AND authority_epoch = ?
+                    """,
+                arguments: [
+                    WorkJobState.completed.rawValue,
+                    timestamp,
+                    timestamp,
+                    scope.serverID,
+                    scope.profileID,
+                    clientMessageID,
+                    authoritativeTurnID,
+                    WorkJobState.accepted.rawValue,
+                    WorkAuthorityState.verified.rawValue,
+                    gatewayID,
+                    authorityEpoch,
+                ]
+            )
+            return db.changesCount
+        }
+        if changed > 0 { await publishObservation() }
+        return changed == 1
     }
 
     func releaseLease(id: String, owner: String, now: Date = Date()) async throws {
@@ -1285,7 +1373,9 @@ actor WorkRepository {
             createdAt: now,
             updatedAt: now,
             acceptedAt: nil,
-            completedAt: nil
+            completedAt: nil,
+            authoritativeTurnID: nil,
+            acceptedEntityRevision: nil
         )
     }
 

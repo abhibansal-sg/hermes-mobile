@@ -30,6 +30,63 @@ final class OutboxProcessorTests: XCTestCase {
 
     private struct Ambiguous: Error {}
 
+    func testAuthoritativeReceiptWaitsForMatchingProjectionCommit() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OutboxAcceptedProjection-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = try WorkRepository(
+            configuration: WorkRepositoryConfiguration(containerURL: directory)
+        )
+        let authority = try AuthorityScopeV1(
+            gatewayID: "gw_test",
+            profileID: "pf_test",
+            authorityEpoch: "ae_test"
+        )
+        let scope = try WorkScope(serverID: "https://gateway.test", authority: authority)
+        let job = try await repository.enqueue(WorkJobInput(
+            kind: .prompt,
+            scope: scope,
+            text: "once",
+            storedSessionID: "stored-A"
+        ))
+        let processor = OutboxProcessor(repository: repository, dependencies: .init(
+            currentScope: { scope },
+            activeStoredSessionID: { "stored-A" },
+            canProcessPrompt: { true },
+            createDestination: { _ in throw Ambiguous() },
+            resolveRuntime: { _ in "runtime-A" },
+            uploadAsset: { _, _ in throw Ambiguous() },
+            willSubmit: { _, _ in },
+            submit: { submitted, _, _ in
+                OutboxSubmitResult(
+                    status: "streaming",
+                    accepted: true,
+                    clientMessageID: submitted.clientMessageID,
+                    authoritativeTurnID: "turn_authoritative",
+                    acceptedEntityRevision: 42
+                )
+            }
+        ))
+
+        processor.wake()
+        await processor.waitUntilIdleForTesting()
+        var persisted = try await repository.job(id: job.jobID)
+        XCTAssertEqual(persisted?.state, .accepted)
+        XCTAssertEqual(persisted?.authoritativeTurnID, "turn_authoritative")
+        XCTAssertEqual(persisted?.acceptedEntityRevision, 42)
+        XCTAssertNil(persisted?.completedAt)
+
+        let completedProjection = try await repository.completeAcceptedProjection(
+            scope: scope,
+            clientMessageID: job.clientMessageID,
+            authoritativeTurnID: "turn_authoritative"
+        )
+        XCTAssertTrue(completedProjection)
+        persisted = try await repository.job(id: job.jobID)
+        XCTAssertEqual(persisted?.state, .completed)
+        XCTAssertNotNil(persisted?.completedAt)
+    }
+
     func testAmbiguousRetryReusesClientIDAndDoesNotCreateAnotherJob() async throws {
         let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
         let job = try await harness.repository.enqueue(WorkJobInput(

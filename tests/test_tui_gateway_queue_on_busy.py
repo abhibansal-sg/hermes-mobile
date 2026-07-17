@@ -85,6 +85,43 @@ def test_busy_steer_mode_injects_when_accepted(monkeypatch):
     assert session.get("queued_prompt") is None
 
 
+def test_busy_steer_is_recorded_as_input_on_current_turn(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
+    recorded = []
+    monkeypatch.setattr(
+        server,
+        "_persist_turn_input",
+        lambda session, turn_id, **kwargs: recorded.append((turn_id, kwargs)),
+    )
+    agent = types.SimpleNamespace(steer=lambda text: True, interrupt=lambda: None)
+    session = _session(
+        agent=agent,
+        inflight_turn={"turn_id": "turn-current", "client_message_id": "first"},
+    )
+
+    resp = server._handle_busy_submit(
+        "r1",
+        "sid",
+        session,
+        "nudge",
+        "ws-1",
+        client_message_id="second",
+    )
+
+    assert resp["result"]["turn_id"] == "turn-current"
+    assert recorded == [
+        (
+            "turn-current",
+            {
+                "text": "nudge",
+                "client_message_id": "second",
+                "input_kind": "steer",
+                "accepted_at": recorded[0][1]["accepted_at"],
+            },
+        )
+    ]
+
+
 def test_busy_steer_mode_falls_back_to_queue_when_rejected(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
     agent = types.SimpleNamespace(steer=lambda text: False, interrupt=lambda *a, **k: None)
@@ -122,6 +159,7 @@ def test_idempotent_busy_replay_does_not_interrupt_or_queue_twice(monkeypatch):
     provider = _Provider()
     monkeypatch.setattr(server, "PROMPT_RECEIPT_PROVIDERS", [provider])
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    monkeypatch.setattr(server, "_persist_turn_start", lambda *a, **k: None)
     monkeypatch.setattr(server, "current_transport", lambda: None)
     server._sessions["busy-sid"] = session
     params = {
@@ -143,6 +181,36 @@ def test_idempotent_busy_replay_does_not_interrupt_or_queue_twice(monkeypatch):
         assert session["queued_prompt"]["text"] == "next"
     finally:
         server._sessions.pop("busy-sid", None)
+
+
+def test_multiple_client_followups_share_one_queued_turn(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    starts = []
+    inputs = []
+    monkeypatch.setattr(
+        server,
+        "_persist_turn_start",
+        lambda session, turn, state="running": starts.append((dict(turn), state)),
+    )
+    monkeypatch.setattr(
+        server,
+        "_persist_turn_input",
+        lambda session, turn_id, **kwargs: inputs.append((turn_id, kwargs)),
+    )
+    session = _session(agent=types.SimpleNamespace())
+
+    first = server._handle_busy_submit(
+        "r1", "sid", session, "first", "ws-1", client_message_id="client-1"
+    )
+    second = server._handle_busy_submit(
+        "r2", "sid", session, "second", "ws-2", client_message_id="client-2"
+    )
+
+    assert first["result"]["turn_id"] == second["result"]["turn_id"]
+    assert starts[0][1] == "queued"
+    assert inputs[0][0] == first["result"]["turn_id"]
+    assert inputs[0][1]["text"] == "second"
+    assert session["queued_prompt"]["text"] == "first\n\nsecond"
 
 
 # ── _drain_queued_prompt ───────────────────────────────────────────────────

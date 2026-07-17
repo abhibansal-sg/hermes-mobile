@@ -5513,15 +5513,108 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
-def _start_inflight_turn(session: dict, text: Any) -> None:
-    now = time.time()
-    session["inflight_turn"] = {
+def _new_turn_id() -> str:
+    return f"turn_{uuid.uuid4().hex}"
+
+
+def _start_inflight_turn(
+    session: dict,
+    text: Any,
+    *,
+    turn_id: str | None = None,
+    client_message_id: str | None = None,
+    accepted_at: float | None = None,
+    input_kind: str = "prompt",
+) -> dict:
+    now = float(accepted_at if accepted_at is not None else time.time())
+    turn = {
         "assistant": "",
+        "client_message_id": client_message_id,
+        "input_id": client_message_id or f"input_{uuid.uuid4().hex}",
+        "input_kind": input_kind,
         "started_at": now,
         "streaming": True,
+        "turn_id": turn_id or _new_turn_id(),
         "updated_at": now,
         "user": _inflight_text(text),
     }
+    session["inflight_turn"] = turn
+    return turn
+
+
+def _persist_turn_start(
+    session: dict,
+    turn: dict,
+    *,
+    state: str = "running",
+) -> None:
+    db = _get_db()
+    session_key = str(session.get("session_key") or "")
+    turn_id = str(turn.get("turn_id") or "")
+    if db is None or not session_key or not turn_id:
+        return
+    if not hasattr(db, "start_turn"):
+        raise RuntimeError("SessionDB turn ledger is unavailable")
+    db.start_turn(
+        session_key,
+        turn_id,
+        content=turn.get("user") or "",
+        client_message_id=turn.get("client_message_id"),
+        input_kind=str(turn.get("input_kind") or "prompt"),
+        accepted_at=turn.get("started_at"),
+        state=state,
+        input_id=turn.get("input_id"),
+    )
+
+
+def _persist_turn_input(
+    session: dict,
+    turn_id: str,
+    *,
+    text: Any,
+    client_message_id: str | None,
+    input_kind: str,
+    accepted_at: float,
+) -> None:
+    db = _get_db()
+    session_key = str(session.get("session_key") or "")
+    if db is None or not session_key or not turn_id:
+        return
+    if not hasattr(db, "add_turn_input"):
+        raise RuntimeError("SessionDB turn ledger is unavailable")
+    db.add_turn_input(
+        session_key,
+        turn_id,
+        content=_inflight_text(text),
+        client_message_id=client_message_id,
+        input_kind=input_kind,
+        accepted_at=accepted_at,
+        input_id=client_message_id or f"input_{uuid.uuid4().hex}",
+    )
+
+
+def _finish_inflight_turn(
+    session: dict,
+    *,
+    state: str,
+    terminal_message_origin_id: int | None = None,
+) -> None:
+    turn = session.get("inflight_turn")
+    if not isinstance(turn, dict):
+        return
+    turn_id = str(turn.get("turn_id") or "")
+    session_key = str(session.get("session_key") or "")
+    db = _get_db()
+    if db is None or not turn_id or not session_key:
+        return
+    if not hasattr(db, "finish_turn"):
+        return
+    db.finish_turn(
+        session_key,
+        turn_id,
+        state=state,
+        terminal_message_origin_id=terminal_message_origin_id,
+    )
 
 
 def _append_inflight_delta(session: dict, delta: Any) -> None:
@@ -5541,7 +5634,13 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _enqueue_prompt(
+    session: dict,
+    text: Any,
+    transport: Any,
+    *,
+    client_message_id: str | None = None,
+) -> dict:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
@@ -5551,6 +5650,8 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     the client that sent it even if the session transport is rebound meanwhile.
     """
     existing = session.get("queued_prompt")
+    accepted_at = time.time()
+    input_text = text
     if (
         existing
         and isinstance(existing.get("text"), str)
@@ -5558,10 +5659,68 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     ):
         prev = existing["text"]
         text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+    if client_message_id is None:
+        queued = {"text": text, "transport": transport}
+        session["queued_prompt"] = queued
+        return queued
+    if existing:
+        turn_id = str(existing.get("turn_id") or "")
+        if not turn_id:
+            turn = {
+                "client_message_id": None,
+                "input_kind": "queued_follow_up",
+                "input_id": f"input_{uuid.uuid4().hex}",
+                "started_at": accepted_at,
+                "turn_id": _new_turn_id(),
+                "user": _inflight_text(existing.get("text")),
+            }
+            _persist_turn_start(session, turn, state="queued")
+            turn_id = turn["turn_id"]
+        _persist_turn_input(
+            session,
+            turn_id,
+            text=input_text,
+            client_message_id=client_message_id,
+            input_kind="queued_follow_up",
+            accepted_at=accepted_at,
+        )
+        queued = dict(existing)
+        queued.update(
+            {
+                "client_message_id": (
+                    existing.get("client_message_id") or client_message_id
+                ),
+                "input_kind": "queued_follow_up",
+                "started_at": existing.get("started_at") or accepted_at,
+                "text": text,
+                "transport": transport,
+                "turn_id": turn_id,
+            }
+        )
+    else:
+        turn = {
+            "client_message_id": client_message_id,
+            "input_kind": "queued_follow_up",
+            "input_id": client_message_id or f"input_{uuid.uuid4().hex}",
+            "started_at": accepted_at,
+            "turn_id": _new_turn_id(),
+            "user": _inflight_text(text),
+        }
+        _persist_turn_start(session, turn, state="queued")
+        queued = {**turn, "text": text, "transport": transport}
+    session["queued_prompt"] = queued
+    return queued
 
 
-def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:
+def _handle_busy_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    *,
+    client_message_id: str | None = None,
+) -> dict:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
 
@@ -5581,8 +5740,19 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
     if mode == "steer" and agent is not None and hasattr(agent, "steer"):
         try:
             if agent.steer(text):
+                turn = session.get("inflight_turn") or {}
+                turn_id = str(turn.get("turn_id") or "")
+                if turn_id:
+                    _persist_turn_input(
+                        session,
+                        turn_id,
+                        text=text,
+                        client_message_id=client_message_id,
+                        input_kind="steer",
+                        accepted_at=time.time(),
+                    )
                 session["last_active"] = time.time()
-                return _ok(rid, {"status": "steered"})
+                return _ok(rid, {"status": "steered", "turn_id": turn_id})
         except Exception:
             pass  # fall through to queue
     if mode != "queue" and agent is not None and hasattr(agent, "interrupt"):
@@ -5590,9 +5760,17 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
             agent.interrupt()
         except Exception:
             pass
-    _enqueue_prompt(session, text, transport)
+    queued = _enqueue_prompt(
+        session,
+        text,
+        transport,
+        client_message_id=client_message_id,
+    )
     session["last_active"] = time.time()
-    return _ok(rid, {"status": "queued"})
+    result = {"status": "queued"}
+    if queued.get("turn_id"):
+        result["turn_id"] = queued["turn_id"]
+    return _ok(rid, result)
 
 
 def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
@@ -5611,7 +5789,19 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     try:
-        _run_prompt_submit(rid, sid, session, queued["text"])
+        if queued.get("turn_id"):
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                queued["text"],
+                turn_id=queued.get("turn_id"),
+                client_message_id=queued.get("client_message_id"),
+                accepted_at=queued.get("started_at"),
+                input_kind="queued_follow_up",
+            )
+        else:
+            _run_prompt_submit(rid, sid, session, queued["text"])
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -5632,11 +5822,15 @@ def _inflight_snapshot(session: dict) -> dict | None:
     streaming = bool(turn.get("streaming"))
     if not user and not assistant and not streaming:
         return None
-    return {
+    snapshot = {
         "assistant": assistant,
         "streaming": streaming,
         "user": user,
     }
+    if turn.get("client_message_id"):
+        snapshot["client_message_id"] = turn["client_message_id"]
+        snapshot["turn_id"] = turn.get("turn_id")
+    return snapshot
 
 
 # ── Methods: session ─────────────────────────────────────────────────
@@ -8947,7 +9141,29 @@ def _(rid, params: dict) -> dict:
         accepted = agent.steer(text)
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
-    return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
+    turn_id = ""
+    if accepted:
+        turn_id = str((session.get("inflight_turn") or {}).get("turn_id") or "")
+        if turn_id:
+            try:
+                _persist_turn_input(
+                    session,
+                    turn_id,
+                    text=text,
+                    client_message_id=None,
+                    input_kind="steer",
+                    accepted_at=time.time(),
+                )
+            except Exception as exc:
+                return _err(rid, 5038, f"turn ledger unavailable: {exc}")
+    return _ok(
+        rid,
+        {
+            "status": "queued" if accepted else "rejected",
+            "text": text,
+            "turn_id": turn_id,
+        },
+    )
 
 
 @method("terminal.resize")
@@ -8971,6 +9187,10 @@ def _(rid, params: dict) -> dict:
         return receipt_response
     if receipt is not None:
         truncate_user_ordinal = receipt["truncate_before_user_ordinal"]
+    # Preserve the legacy no-op contract when no receipt provider is active:
+    # merely including an unknown ``client_message_id`` field cannot change the
+    # response shape or turn behavior.
+    client_message_id = receipt.get("client_message_id") if receipt else None
     session, err = _sess_nowait(params, rid)
     if err:
         _release_prompt_receipt(receipt)
@@ -8987,7 +9207,12 @@ def _(rid, params: dict) -> dict:
             # _handle_busy_submit for why the old "session busy" rejection
             # dropped messages when teardown outlived the client's retry window.
             response = _handle_busy_submit(
-                rid, sid, session, text, t or session.get("transport")
+                rid,
+                sid,
+                session,
+                text,
+                t or session.get("transport"),
+                client_message_id=client_message_id,
             )
             return _complete_prompt_receipt(rid, receipt, response)
         # A watch session's run lives in the PARENT turn, so its own running
@@ -9020,19 +9245,52 @@ def _(rid, params: dict) -> dict:
             if (db := _get_db()) is not None:
                 try:
                     session_key = session["session_key"]
-                    db.replace_messages(
-                        session_key,
-                        truncated,
-                        active_only=db.has_archived_messages(session_key),
-                    )
+                    if hasattr(db, "has_archived_messages") and db.has_archived_messages(
+                        session_key
+                    ):
+                        db.replace_messages(session_key, truncated, active_only=True)
+                    else:
+                        db.replace_messages(session_key, truncated)
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
-        _start_inflight_turn(session, text)
+        inflight_turn = _start_inflight_turn(
+            session,
+            text,
+            client_message_id=client_message_id,
+            input_kind=(
+                "interrupt_replace"
+                if truncate_user_ordinal is not None
+                else "prompt"
+            ),
+        )
 
-    response = _complete_prompt_receipt(rid, receipt, _ok(rid, {"status": "streaming"}))
+    # Persist the DB row and turn reservation before acknowledging acceptance.
+    # The prompt receipt and durable turn ledger therefore return the same
+    # authoritative turn id, including after a client retry.
+    _ensure_session_db_row(session)
+    try:
+        _persist_turn_start(session, inflight_turn)
+    except Exception as exc:
+        if client_message_id:
+            _release_prompt_receipt(receipt)
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
+            logger.warning("turn ledger start failed: %s", exc)
+            return _err(rid, 5038, "turn ledger unavailable")
+        logger.debug("legacy turn ledger start skipped: %s", exc)
+
+    accepted_result = {"status": "streaming"}
+    if client_message_id:
+        accepted_result["turn_id"] = inflight_turn["turn_id"]
+    response = _complete_prompt_receipt(
+        rid,
+        receipt,
+        _ok(rid, accepted_result),
+    )
     if "error" in response:
         # No agent turn has started yet.  Release the in-memory claim so a
         # receipt-store outage cannot leave the session permanently busy.
@@ -9041,8 +9299,6 @@ def _(rid, params: dict) -> dict:
             _clear_inflight_turn(session)
         return response
 
-    # Persist the DB row lazily, now that the user has actually sent a message.
-    _ensure_session_db_row(session)
     # A branch becomes real here: copy its parent's transcript into the row so it
     # resumes with full context (the agent won't persist the seed itself).
     _persist_branch_seed(session)
@@ -9062,11 +9318,19 @@ def _(rid, params: dict) -> dict:
             )
             with session["history_lock"]:
                 session["running"] = False
+                try:
+                    _finish_inflight_turn(session, state="failed")
+                except Exception:
+                    logger.warning("turn ledger finish failed", exc_info=True)
                 _clear_inflight_turn(session)
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
                 session["running"] = False
+                try:
+                    _finish_inflight_turn(session, state="interrupted")
+                except Exception:
+                    logger.warning("turn ledger finish failed", exc_info=True)
                 _clear_inflight_turn(session)
                 return
         _run_prompt_submit(rid, sid, session, text)
@@ -9473,21 +9737,52 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    turn_id: str | None = None,
+    client_message_id: str | None = None,
+    accepted_at: float | None = None,
+    input_kind: str = "prompt",
+) -> None:
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
         images = list(session.get("attached_images", []))
         session["attached_images"] = []
         if not isinstance(session.get("inflight_turn"), dict):
-            _start_inflight_turn(session, text)
+            turn = _start_inflight_turn(
+                session,
+                text,
+                turn_id=turn_id,
+                client_message_id=client_message_id,
+                accepted_at=accepted_at,
+                input_kind=input_kind,
+            )
+            _persist_turn_start(session, turn)
+        elif turn_id:
+            # A queued turn was accepted durably before it began running.
+            db = _get_db()
+            if db is not None:
+                db.mark_turn_running(
+                    str(session.get("session_key") or ""),
+                    turn_id,
+                    started_at=time.time(),
+                )
     agent = session["agent"]
     if hasattr(agent, "clear_interrupt"):
         try:
             agent.clear_interrupt()
         except Exception:
             pass
-    _emit("message.start", sid)
+    active_turn = session.get("inflight_turn") or {}
+    start_payload = None
+    if active_turn.get("client_message_id"):
+        start_payload = {"turn_id": str(active_turn.get("turn_id") or "")}
+    _emit("message.start", sid, start_payload)
 
     def run():
         approval_token = None
@@ -9734,7 +10029,34 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 raw = str(result)
                 status = "complete"
 
+            terminal_origin_id = None
+            if isinstance(result, dict) and isinstance(result.get("messages"), list):
+                for message in reversed(result["messages"]):
+                    if not isinstance(message, dict):
+                        continue
+                    if message.get("role") != "assistant" or message.get("tool_calls"):
+                        continue
+                    raw_origin = message.get("_display_origin_id")
+                    if raw_origin is not None:
+                        try:
+                            terminal_origin_id = int(raw_origin)
+                        except (TypeError, ValueError):
+                            terminal_origin_id = None
+                    break
+            terminal_state = {
+                "complete": "completed",
+                "interrupted": "interrupted",
+                "error": "failed",
+            }[status]
+            _finish_inflight_turn(
+                session,
+                state=terminal_state,
+                terminal_message_origin_id=terminal_origin_id,
+            )
+            turn_id = str((session.get("inflight_turn") or {}).get("turn_id") or "")
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if (session.get("inflight_turn") or {}).get("client_message_id"):
+                payload["turn_id"] = turn_id
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -9884,6 +10206,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
+            try:
+                _finish_inflight_turn(session, state="failed")
+            except Exception:
+                logger.warning("turn ledger finish failed", exc_info=True)
             _emit("error", sid, {"message": str(e)})
         finally:
             try:

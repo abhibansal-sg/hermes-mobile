@@ -178,6 +178,8 @@ struct WorkJob: Codable, FetchableRecord, PersistableRecord, Equatable, Sendable
     var updatedAt: Double
     var acceptedAt: Double?
     var completedAt: Double?
+    var authoritativeTurnID: String?
+    var acceptedEntityRevision: Int64?
 
     var id: String { jobID }
     var scope: WorkScope? {
@@ -240,6 +242,8 @@ struct WorkJob: Codable, FetchableRecord, PersistableRecord, Equatable, Sendable
         case updatedAt = "updated_at"
         case acceptedAt = "accepted_at"
         case completedAt = "completed_at"
+        case authoritativeTurnID = "authoritative_turn_id"
+        case acceptedEntityRevision = "accepted_entity_revision"
     }
 }
 

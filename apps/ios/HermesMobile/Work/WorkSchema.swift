@@ -162,6 +162,17 @@ enum WorkSchema {
                 arguments: [WorkAuthorityState.unbound.rawValue]
             )
         }
+        migrator.registerMigration("work-v4-authoritative-receipt") { db in
+            try db.alter(table: "work_jobs") { table in
+                table.add(column: "authoritative_turn_id", .text)
+                table.add(column: "accepted_entity_revision", .integer)
+            }
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS work_jobs_authoritative_turn
+                ON work_jobs(gateway_id, profile_id, authority_epoch, authoritative_turn_id)
+                WHERE authoritative_turn_id IS NOT NULL
+                """)
+        }
         return migrator
     }
 }

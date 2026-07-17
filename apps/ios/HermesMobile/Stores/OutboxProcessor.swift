@@ -14,6 +14,8 @@ struct OutboxSubmitResult: Equatable, Sendable {
     let status: String
     let accepted: Bool
     let clientMessageID: String?
+    let authoritativeTurnID: String?
+    let acceptedEntityRevision: Int64?
     let deduplicated: Bool
 
     init(json: JSONValue) {
@@ -26,13 +28,24 @@ struct OutboxSubmitResult: Equatable, Sendable {
         accepted = json["accepted"]?.boolValue
             ?? ["streaming", "queued", "steered"].contains(responseStatus)
         clientMessageID = json["client_message_id"]?.stringValue
+        authoritativeTurnID = json["turn_id"]?.stringValue
+        acceptedEntityRevision = json["entity_revision"]?.intValue.map(Int64.init)
         deduplicated = json["deduplicated"]?.boolValue ?? false
     }
 
-    init(status: String, accepted: Bool, clientMessageID: String? = nil, deduplicated: Bool = false) {
+    init(
+        status: String,
+        accepted: Bool,
+        clientMessageID: String? = nil,
+        authoritativeTurnID: String? = nil,
+        acceptedEntityRevision: Int64? = nil,
+        deduplicated: Bool = false
+    ) {
         self.status = status
         self.accepted = accepted
         self.clientMessageID = clientMessageID
+        self.authoritativeTurnID = authoritativeTurnID
+        self.acceptedEntityRevision = acceptedEntityRevision
         self.deduplicated = deduplicated
     }
 }
@@ -183,6 +196,17 @@ final class OutboxProcessor {
     private func process(_ claimed: WorkJob) async throws -> Bool {
         var job = claimed
 
+        // Pre-v4 crash recovery: old builds could stop between accepted and
+        // completed without an authoritative turn receipt. New v4 accepted
+        // rows carry a turn id and are not claimable until GRDB confirms them.
+        if job.state == .accepted, job.authoritativeTurnID == nil {
+            _ = try await repository.transitionJob(
+                id: job.jobID, from: .accepted, to: .completed, owner: owner
+            )
+            try await repository.releaseLease(id: job.jobID, owner: owner)
+            return true
+        }
+
         if job.state == .retryWait {
             let assets = try await repository.jobAssets(jobID: job.jobID)
             let resume: WorkJobState
@@ -309,12 +333,26 @@ final class OutboxProcessor {
         if result.accepted,
            Self.acceptedDispositions.contains(result.status),
            result.clientMessageID == nil || result.clientMessageID == job.clientMessageID {
-            _ = try await repository.transitionJob(
-                id: job.jobID, from: .submitting, to: .accepted, owner: owner
-            )
-            _ = try await repository.transitionJob(
-                id: job.jobID, from: .accepted, to: .completed, owner: owner
-            )
+            if let authoritativeTurnID = result.authoritativeTurnID,
+               !authoritativeTurnID.isEmpty {
+                _ = try await repository.recordAcceptedReceipt(
+                    id: job.jobID,
+                    owner: owner,
+                    authoritativeTurnID: authoritativeTurnID,
+                    entityRevision: result.acceptedEntityRevision
+                )
+            } else {
+                // Compatibility path for an older gateway that does not
+                // advertise authoritative turn receipts. Exact convergence is
+                // unavailable, so retain the legacy accepted→completed
+                // behavior rather than stranding work forever.
+                _ = try await repository.transitionJob(
+                    id: job.jobID, from: .submitting, to: .accepted, owner: owner
+                )
+                _ = try await repository.transitionJob(
+                    id: job.jobID, from: .accepted, to: .completed, owner: owner
+                )
+            }
             try await repository.releaseLease(id: job.jobID, owner: owner)
             return true
         }

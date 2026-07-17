@@ -8,6 +8,7 @@ import uuid
 
 import pytest
 
+from hermes_state import SessionDB
 from tests.plugins.hermes_mobile.conftest import load_plugin_module
 from tui_gateway import server
 
@@ -48,6 +49,7 @@ def isolated_gateway(monkeypatch):
 
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_persist_turn_start", lambda *a, **k: None)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda *a, **k: None)
     monkeypatch.setattr(server.threading, "Thread", _Thread)
     monkeypatch.setattr(server, "current_transport", lambda: None)
@@ -74,8 +76,10 @@ def test_replay_returns_original_disposition_without_second_execution(
     message_id = uuid.uuid4()
     try:
         first = server._methods["prompt.submit"]("r1", _params(message_id))
+        assert first["result"]["turn_id"].startswith("turn_")
         assert first["result"] == {
             "status": "streaming",
+            "turn_id": first["result"]["turn_id"],
             "accepted": True,
             "client_message_id": str(message_id),
             "deduplicated": False,
@@ -102,6 +106,52 @@ def test_replay_returns_original_disposition_without_second_execution(
             assert conn.execute("SELECT count(*) FROM prompt_receipts").fetchone()[0] == 1
     finally:
         server._sessions.pop("runtime-sid", None)
+
+
+def test_receipt_and_sessiondb_bind_same_authoritative_turn_id(
+    tmp_path, monkeypatch, receipts, isolated_gateway
+):
+    provider = receipts.SQLitePromptReceiptProvider(owner_id="process-a")
+    monkeypatch.setattr(server, "PROMPT_RECEIPT_PROVIDERS", [provider])
+    state_db = SessionDB(db_path=tmp_path / "state.db")
+    state_db.create_session("stored-session", source="tui")
+    monkeypatch.setattr(server, "_get_db", lambda: state_db)
+    # Exercise the real ledger method; only the lazy row creator remains a no-op
+    # because the authoritative row was created explicitly above.
+    monkeypatch.setattr(
+        server,
+        "_persist_turn_start",
+        lambda session, turn, state="running": state_db.start_turn(
+            session["session_key"],
+            turn["turn_id"],
+            content=turn["user"],
+            client_message_id=turn["client_message_id"],
+            input_kind=turn["input_kind"],
+            accepted_at=turn["started_at"],
+            state=state,
+            input_id=turn["input_id"],
+        ),
+    )
+    session = _session(tmp_path)
+    server._sessions["runtime-sid"] = session
+    message_id = uuid.uuid4()
+    try:
+        first = server._methods["prompt.submit"]("r1", _params(message_id))
+        turn_id = first["result"]["turn_id"]
+        assert state_db.get_turns("stored-session")[0]["turn_id"] == turn_id
+        assert state_db.get_turn_inputs("stored-session", turn_id)[0][
+            "client_message_id"
+        ] == str(message_id)
+
+        session["running"] = False
+        session["inflight_turn"] = None
+        replay = server._methods["prompt.submit"]("r2", _params(message_id))
+        assert replay["result"]["turn_id"] == turn_id
+        assert replay["result"]["deduplicated"] is True
+        assert len(state_db.get_turns("stored-session")) == 1
+    finally:
+        server._sessions.pop("runtime-sid", None)
+        state_db.close()
 
 
 @pytest.mark.parametrize(

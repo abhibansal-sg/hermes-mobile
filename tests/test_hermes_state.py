@@ -6226,3 +6226,152 @@ class TestDisplayLineage:
             assert reopened.get_display_messages("legacy", limit=20)["messages"] == []
         finally:
             reopened.close()
+
+
+class TestTurnLedger:
+    def test_turn_preserves_multiple_committed_inputs_and_terminal_origin(self, db):
+        db.create_session("turn-s1", source="tui")
+        user_origin = db.append_message("turn-s1", "user", "initial prompt")
+        turn = db.start_turn(
+            "turn-s1",
+            "turn_01",
+            content="initial prompt",
+            client_message_id="client-01",
+            input_kind="prompt",
+            accepted_at=10.0,
+        )
+        assert turn["state"] == "running"
+        db.add_turn_input(
+            "turn-s1",
+            "turn_01",
+            content="steer this way",
+            client_message_id="client-02",
+            input_kind="steer",
+            accepted_at=11.0,
+        )
+        final_origin = db.append_message("turn-s1", "assistant", "final answer")
+        db.finish_turn(
+            "turn-s1",
+            "turn_01",
+            state="completed",
+            terminal_at=15.0,
+            terminal_message_origin_id=final_origin,
+        )
+
+        ledger = db.get_turns("turn-s1")
+        assert ledger[0]["turn_id"] == "turn_01"
+        assert ledger[0]["state"] == "completed"
+        assert ledger[0]["terminal_message_origin_id"] == final_origin
+        assert [item["input_kind"] for item in db.get_turn_inputs("turn-s1", "turn_01")] == [
+            "prompt",
+            "steer",
+        ]
+        assert user_origin != final_origin
+
+    def test_queued_turn_transitions_to_running_and_terminal_once(self, db):
+        db.create_session("turn-s1", source="tui")
+        db.start_turn(
+            "turn-s1",
+            "turn_queued",
+            content="next",
+            input_kind="queued_follow_up",
+            state="queued",
+            accepted_at=20.0,
+        )
+        db.mark_turn_running("turn-s1", "turn_queued", started_at=21.0)
+        db.finish_turn(
+            "turn-s1", "turn_queued", state="interrupted", terminal_at=22.0
+        )
+        # Same terminal replay is idempotent; a contradictory outcome is not.
+        db.finish_turn(
+            "turn-s1", "turn_queued", state="interrupted", terminal_at=23.0
+        )
+        with pytest.raises(ValueError, match="already terminal"):
+            db.finish_turn("turn-s1", "turn_queued", state="completed")
+
+        row = db.get_turns("turn-s1")[0]
+        assert row["state"] == "interrupted"
+        assert row["started_at"] == 21.0
+        assert row["terminal_at"] == 22.0
+
+    def test_client_message_id_cannot_move_between_turns(self, db):
+        db.create_session("turn-s1", source="tui")
+        db.start_turn(
+            "turn-s1",
+            "turn_a",
+            content="one",
+            client_message_id="client-stable",
+        )
+        with pytest.raises(ValueError, match="different turn input"):
+            db.start_turn(
+                "turn-s1",
+                "turn_b",
+                content="two",
+                client_message_id="client-stable",
+            )
+
+    def test_turn_input_replay_is_exact_and_terminal_turn_rejects_new_input(self, db):
+        db.create_session("turn-s1", source="tui")
+        first = db.start_turn(
+            "turn-s1",
+            "turn_a",
+            content="one",
+            input_id="input-stable",
+            accepted_at=10.0,
+        )
+        replay = db.start_turn(
+            "turn-s1",
+            "turn_a",
+            content="one",
+            input_id="input-stable",
+            accepted_at=99.0,
+        )
+        assert replay == first
+        with pytest.raises(ValueError, match="reused with different content"):
+            db.start_turn(
+                "turn-s1",
+                "turn_a",
+                content="changed",
+                input_id="input-stable",
+            )
+
+        db.finish_turn("turn-s1", "turn_a", state="completed")
+        # The exact receipt replay remains idempotent after termination, while
+        # a genuinely new input cannot be appended to historical authority.
+        assert db.start_turn(
+            "turn-s1", "turn_a", content="one", input_id="input-stable"
+        )["state"] == "completed"
+        with pytest.raises(ValueError, match="already terminal"):
+            db.add_turn_input(
+                "turn-s1",
+                "turn_a",
+                content="late steer",
+                input_kind="steer",
+                input_id="late-steer",
+            )
+
+    def test_turn_and_input_reads_are_hard_bounded(self, db):
+        db.create_session("turn-s1", source="tui")
+        for index in range(8):
+            db.start_turn(
+                "turn-s1",
+                f"turn_{index}",
+                content=f"prompt {index}",
+                accepted_at=float(index),
+            )
+        assert len(db.get_turns("turn-s1", limit=3)) == 3
+
+        for index in range(6):
+            db.add_turn_input(
+                "turn-s1",
+                "turn_7",
+                content=f"steer {index}",
+                input_kind="steer",
+                input_id=f"steer-{index}",
+            )
+        page = db.get_turn_inputs("turn-s1", "turn_7", limit=2)
+        assert [item["ordinal"] for item in page] == [0, 1]
+        next_page = db.get_turn_inputs(
+            "turn-s1", "turn_7", after_ordinal=page[-1]["ordinal"], limit=2
+        )
+        assert [item["ordinal"] for item in next_page] == [2, 3]

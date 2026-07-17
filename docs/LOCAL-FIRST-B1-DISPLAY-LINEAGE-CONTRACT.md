@@ -1,7 +1,8 @@
-# B1 Display-Lineage Contract
+# B1 Display-Lineage and Turn-Ledger Contract
 
-**Status:** Implemented generic SessionDB prerequisite; turn-ledger proof remains
-the next B1 gate.
+**Status:** Implemented generic SessionDB display lineage and authoritative
+turn-ledger prerequisites. Compact projection publication remains gated on the
+bounded projector and historical golden fixtures.
 
 ## Contract
 
@@ -45,10 +46,35 @@ The SessionDB behavior tests cover:
 Gateway, ACP, compression, transcript-delta, and SessionDB regressions run
 against the same implementation.
 
-## Remaining B1 gate
+## Authoritative turn ledger
 
-This prerequisite deliberately does not invent turn boundaries. B1 remains
-closed until the generic durable turn ledger proves prompt, steering,
-interrupt-and-replace, queued follow-up, terminal-message identity, and exact
-turn timing. The plugin must not advertise `turn_projection: 1` before that
-second proof passes.
+SessionDB schema v23 adds a public, bounded ledger independent of mutable model
+context:
+
+- `session_turns` owns the opaque turn ID, queued/running/terminal state,
+  acceptance/start/terminal timestamps, and nullable terminal display origin;
+- `session_turn_inputs` preserves every committed prompt, steering input,
+  interrupt-and-replace prompt, and queued follow-up in stable ordinal order;
+- a `client_message_id` can identify only one scoped turn input;
+- exact receipt replay is idempotent, while an input ID reused with different
+  content fails closed;
+- a terminal turn rejects new inputs and contradictory terminal outcomes; and
+- bounded turn/input reads never enumerate the raw tool-heavy transcript.
+
+The TUI gateway reserves and persists the turn before acknowledging a mobile
+prompt receipt. The receipt, inflight snapshot, lifecycle frames, and terminal
+ledger transition carry the same authoritative `turn_id`. Legacy requests
+without the receipt capability preserve their prior response shape.
+
+The iOS Work database now retains a receipt-bearing job in the durable
+`accepted` (accepted-awaiting-projection) state. It can complete only after the
+reconstructible GRDB projection commits the same verified authority scope,
+`client_message_id`, and `turn_id`. Restart recovery is idempotent and the
+optimistic overlay cannot disappear in the cross-database crash window.
+
+## Remaining projection gate
+
+The plugin must still build the compact projection through a bounded,
+checkpointed projector and pass historical golden fixtures before advertising
+`turn_projection: 1`. Historical grouping and final-response inference remain
+null/fail-closed when the durable ledger or display lineage cannot prove them.

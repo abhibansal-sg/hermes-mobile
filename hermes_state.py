@@ -157,7 +157,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -853,6 +853,34 @@ CREATE TABLE IF NOT EXISTS message_display_origins (
     PRIMARY KEY (session_id, origin_id)
 );
 
+CREATE TABLE IF NOT EXISTS session_turns (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    primary_client_message_id TEXT,
+    state TEXT NOT NULL,
+    accepted_at REAL NOT NULL,
+    started_at REAL,
+    terminal_at REAL,
+    terminal_message_origin_id INTEGER,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (session_id, turn_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_turn_inputs (
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    input_id TEXT NOT NULL,
+    client_message_id TEXT,
+    input_kind TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    content TEXT,
+    accepted_at REAL NOT NULL,
+    message_origin_id INTEGER,
+    PRIMARY KEY (session_id, turn_id, input_id),
+    FOREIGN KEY (session_id, turn_id)
+        REFERENCES session_turns(session_id, turn_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     model TEXT NOT NULL,
@@ -922,6 +950,11 @@ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_display_origins_page
     ON message_display_origins(session_id, state, origin_id DESC);
+CREATE INDEX IF NOT EXISTS idx_session_turns_page
+    ON session_turns(session_id, accepted_at DESC, turn_id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_turn_client_message
+    ON session_turn_inputs(session_id, client_message_id)
+    WHERE client_message_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
@@ -4613,6 +4646,316 @@ class SessionDB:
                 (session_id, int(after_revision), bounded_limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    _TURN_STATES = frozenset(
+        {"queued", "running", "completed", "interrupted", "failed"}
+    )
+    _TURN_INPUT_KINDS = frozenset(
+        {"prompt", "steer", "queued_follow_up", "interrupt_replace", "other"}
+    )
+
+    def start_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        content: Any,
+        client_message_id: Optional[str] = None,
+        input_kind: str = "prompt",
+        accepted_at: Optional[float] = None,
+        state: str = "running",
+        input_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create an authoritative turn and its first committed user input.
+
+        The operation is idempotent for the same ``turn_id`` and input id. A
+        reused client-message id pointing at another turn fails closed.
+        """
+        if not turn_id:
+            raise ValueError("turn_id is required")
+        if state not in {"queued", "running"}:
+            raise ValueError(f"invalid initial turn state: {state!r}")
+        if input_kind not in self._TURN_INPUT_KINDS:
+            raise ValueError(f"invalid turn input kind: {input_kind!r}")
+        accepted = float(accepted_at if accepted_at is not None else time.time())
+        stable_input_id = input_id or client_message_id or f"input_{secrets.token_hex(16)}"
+        stored_content = self._encode_content(content)
+
+        def _do(conn):
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone() is None:
+                raise ValueError(f"session not found: {session_id}")
+            existing_turn = conn.execute(
+                "SELECT state, accepted_at FROM session_turns "
+                "WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone()
+            existing_input = conn.execute(
+                "SELECT turn_id, input_id, client_message_id, input_kind, content, "
+                "accepted_at FROM session_turn_inputs "
+                "WHERE session_id = ? AND turn_id = ? AND input_id = ?",
+                (session_id, turn_id, stable_input_id),
+            ).fetchone()
+            existing_client = None
+            if client_message_id:
+                existing_client = conn.execute(
+                    "SELECT turn_id, input_id, client_message_id, input_kind, content, "
+                    "accepted_at FROM session_turn_inputs WHERE session_id = ? "
+                    "AND client_message_id = ?",
+                    (session_id, client_message_id),
+                ).fetchone()
+            if existing_input is not None and existing_client is not None:
+                if tuple(existing_input[:2]) != tuple(existing_client[:2]):
+                    raise ValueError(
+                        "client_message_id already belongs to a different turn input"
+                    )
+            replay = existing_input or existing_client
+            if replay is not None:
+                if replay[0] != turn_id:
+                    raise ValueError(
+                        "client_message_id already belongs to a different turn input"
+                    )
+                if (
+                    replay[1] != stable_input_id
+                    or replay[2] != client_message_id
+                    or replay[3] != input_kind
+                    or replay[4] != stored_content
+                ):
+                    raise ValueError("turn input id was reused with different content")
+                return {
+                    "turn_id": turn_id,
+                    "input_id": stable_input_id,
+                    "client_message_id": client_message_id,
+                    "state": existing_turn[0] if existing_turn else state,
+                    "accepted_at": float(replay[5]),
+                }
+            if existing_turn is not None and existing_turn[0] in {
+                "completed",
+                "interrupted",
+                "failed",
+            }:
+                raise ValueError(f"turn is already terminal: {turn_id}")
+            conn.execute(
+                "INSERT INTO session_turns "
+                "(session_id, turn_id, primary_client_message_id, state, "
+                " accepted_at, started_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id, turn_id) DO UPDATE SET "
+                "primary_client_message_id = COALESCE("
+                "  session_turns.primary_client_message_id, "
+                "  excluded.primary_client_message_id), "
+                "state = CASE "
+                "  WHEN session_turns.state = 'queued' AND excluded.state = 'running' "
+                "  THEN 'running' ELSE session_turns.state END, "
+                "started_at = CASE "
+                "  WHEN session_turns.started_at IS NULL AND excluded.state = 'running' "
+                "  THEN excluded.started_at ELSE session_turns.started_at END, "
+                "updated_at = excluded.updated_at",
+                (
+                    session_id,
+                    turn_id,
+                    client_message_id,
+                    state,
+                    accepted,
+                    accepted if state == "running" else None,
+                    time.time(),
+                ),
+            )
+            ordinal_row = conn.execute(
+                "SELECT COALESCE(MAX(ordinal), -1) + 1 "
+                "FROM session_turn_inputs WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone()
+            ordinal = int(ordinal_row[0])
+            conn.execute(
+                "INSERT INTO session_turn_inputs "
+                "(session_id, turn_id, input_id, client_message_id, input_kind, "
+                " ordinal, content, accepted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    turn_id,
+                    stable_input_id,
+                    client_message_id,
+                    input_kind,
+                    ordinal,
+                    stored_content,
+                    accepted,
+                ),
+            )
+            current_state = "running" if (
+                existing_turn is not None
+                and existing_turn[0] == "queued"
+                and state == "running"
+            ) else (existing_turn[0] if existing_turn else state)
+            return {
+                "turn_id": turn_id,
+                "input_id": stable_input_id,
+                "client_message_id": client_message_id,
+                "state": current_state,
+                "accepted_at": accepted,
+            }
+
+        return self._execute_write(_do)
+
+    def add_turn_input(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        content: Any,
+        input_kind: str,
+        client_message_id: Optional[str] = None,
+        accepted_at: Optional[float] = None,
+        input_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Append a committed steer/follow-up input to an existing turn."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT state, accepted_at FROM session_turns "
+                "WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"turn not found: {turn_id}")
+        if row["state"] in {"completed", "interrupted", "failed"}:
+            raise ValueError(f"turn is already terminal: {turn_id}")
+        # ``start_turn`` owns idempotency and ordinal allocation. Its upsert
+        # preserves the existing acceptance timestamp and state.
+        return self.start_turn(
+            session_id,
+            turn_id,
+            content=content,
+            client_message_id=client_message_id,
+            input_kind=input_kind,
+            accepted_at=accepted_at,
+            state=row["state"],
+            input_id=input_id,
+        )
+
+    def mark_turn_running(
+        self, session_id: str, turn_id: str, *, started_at: Optional[float] = None
+    ) -> None:
+        started = float(started_at if started_at is not None else time.time())
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE session_turns SET state = 'running', "
+                "started_at = COALESCE(started_at, ?), updated_at = ? "
+                "WHERE session_id = ? AND turn_id = ? AND state = 'queued'",
+                (started, time.time(), session_id, turn_id),
+            )
+            if cursor.rowcount == 0:
+                row = conn.execute(
+                    "SELECT state FROM session_turns WHERE session_id = ? AND turn_id = ?",
+                    (session_id, turn_id),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"turn not found: {turn_id}")
+                if row[0] != "running":
+                    raise ValueError(f"turn is already terminal: {turn_id}")
+
+        self._execute_write(_do)
+
+    def finish_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        state: str,
+        terminal_at: Optional[float] = None,
+        terminal_message_origin_id: Optional[int] = None,
+    ) -> None:
+        """Commit one terminal state transition exactly once."""
+        if state not in {"completed", "interrupted", "failed"}:
+            raise ValueError(f"invalid terminal turn state: {state!r}")
+        terminal = float(terminal_at if terminal_at is not None else time.time())
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT state, terminal_at, terminal_message_origin_id "
+                "FROM session_turns WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone()
+            if existing is None:
+                raise ValueError(f"turn not found: {turn_id}")
+            if existing[0] in {"completed", "interrupted", "failed"}:
+                if existing[0] != state:
+                    raise ValueError(
+                        f"turn already terminal as {existing[0]!r}: {turn_id}"
+                    )
+                return
+            if terminal_message_origin_id is not None:
+                origin = conn.execute(
+                    "SELECT 1 FROM message_display_origins "
+                    "WHERE session_id = ? AND origin_id = ? AND state = 'display'",
+                    (session_id, int(terminal_message_origin_id)),
+                ).fetchone()
+                if origin is None:
+                    raise ValueError("terminal message origin does not belong to session")
+            conn.execute(
+                "UPDATE session_turns SET state = ?, terminal_at = ?, "
+                "terminal_message_origin_id = ?, updated_at = ? "
+                "WHERE session_id = ? AND turn_id = ?",
+                (
+                    state,
+                    terminal,
+                    terminal_message_origin_id,
+                    time.time(),
+                    session_id,
+                    turn_id,
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def get_turns(
+        self,
+        session_id: str,
+        *,
+        before_accepted_at: Optional[float] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Return a bounded newest-first page of durable turn ledger rows."""
+        bounded_limit = max(1, min(int(limit), 500))
+        before_clause = ""
+        params: list[Any] = [session_id]
+        if before_accepted_at is not None:
+            before_clause = " AND accepted_at < ?"
+            params.append(float(before_accepted_at))
+        params.append(bounded_limit)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM session_turns WHERE session_id = ?"
+                f"{before_clause} ORDER BY accepted_at DESC, turn_id DESC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_turn_inputs(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        after_ordinal: int = -1,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Return a bounded input page for one authoritative turn."""
+        bounded_limit = max(1, min(int(limit), 1000))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM session_turn_inputs "
+                "WHERE session_id = ? AND turn_id = ? AND ordinal > ? "
+                "ORDER BY ordinal LIMIT ?",
+                (session_id, turn_id, int(after_ordinal), bounded_limit),
+            ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["content"] = self._decode_content(item.get("content"))
+            result.append(item)
+        return result
 
     def get_messages_around(
         self,

@@ -116,6 +116,8 @@ complete—not revisit the locked local-first product direction.
   APIs. Already-compacted legacy histories fail closed rather than being
   guessed.
 
-The remaining B1 blocker is the durable authoritative turn ledger and its real
-prompt/steer/queued/interrupt/terminal fixtures. Compact projection capability
-remains disabled until that proof passes.
+The durable authoritative turn ledger is now implemented in SessionDB schema
+v23 and wired to prompt receipts, steering, queued follow-ups, and terminal
+gateway transitions. The remaining B1/B2 gate is the bounded plugin projector
+and its historical golden-fixture proof; the plugin continues to withhold the
+compact projection capability until that gate passes.
