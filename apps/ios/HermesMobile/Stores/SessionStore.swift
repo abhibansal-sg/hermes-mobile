@@ -251,6 +251,7 @@ final class SessionStore {
         activeRuntimeId = nil
         activeRuntimeEpoch = nil
         activeStoredId = nil
+        activeStoredProfile = nil
         chat?.reset()
     }
 
@@ -418,6 +419,9 @@ final class SessionStore {
     @Snapshotable
     #endif
     var activeStoredId: String?
+    /// Profile component of the durable selection identity. Stored session ids
+    /// are not globally unique across an aggregate multi-profile drawer.
+    private(set) var activeStoredProfile: String?
     /// Key used for the local, not-yet-materialized chat draft. This intentionally
     /// matches ChatView's transcript `.id` fallback so the stable overlay composer
     /// and transcript agree on the draft-chat identity.
@@ -456,7 +460,17 @@ final class SessionStore {
     /// not yet in `sessions` (a brand-new create the list hasn't refreshed onto).
     var activeSummary: SessionSummary? {
         guard let id = activeStoredId else { return nil }
-        return sessions.first { $0.id == id }
+        return sessions.first {
+            $0.id == id
+                && (activeStoredProfile == nil
+                    || selectedProfileID(for: $0) == activeStoredProfile)
+        }
+    }
+
+    func isActive(_ summary: SessionSummary) -> Bool {
+        guard summary.id == activeStoredId else { return false }
+        guard let activeStoredProfile else { return true }
+        return selectedProfileID(for: summary) == activeStoredProfile
     }
 
     /// Draft identity for a stored session id, using the exact fallback ChatView
@@ -1413,6 +1427,14 @@ final class SessionStore {
     private static func normalizedProfileID(_ profile: String?) -> String {
         let value = profile?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return value.isEmpty ? "default" : value
+    }
+
+    private func selectedProfileID(for summary: SessionSummary) -> String {
+        let explicit = summary.profile?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !explicit.isEmpty { return explicit }
+        let scope = activeProfile.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !scope.isEmpty, scope != CacheScope.allProfilesKey { return scope }
+        return Self.defaultProfileName
     }
 
     /// The serverId the cache cold-read was last partitioned by, so a SERVER
@@ -3508,11 +3530,12 @@ final class SessionStore {
         revealOnFirstPaint: (@MainActor () -> Void)? = nil,
         bindRuntime: Bool = true
     ) {
-        let wasAlreadyActive = activeStoredId == summary.id
-        if let previous = activeStoredId, previous != summary.id {
-            ReliabilityDiagnostics.shared.sessionSuperseded(identifier: previous)
+        let wasAlreadyActive = isActive(summary)
+        if let previous = activeSummary,
+           previous.scopedIdentity != summary.scopedIdentity {
+            ReliabilityDiagnostics.shared.sessionSuperseded(identifier: previous.scopedIdentity)
         }
-        ReliabilityDiagnostics.shared.sessionSelected(identifier: summary.id)
+        ReliabilityDiagnostics.shared.sessionSelected(identifier: summary.scopedIdentity)
 
         // Leaving any draft: opening a stored session is no longer a draft.
         isDraft = false
@@ -3543,7 +3566,7 @@ final class SessionStore {
         // if it differs from active, the stale clear is correct and the result's
         // jump is re-set by `open(searchResult:)` AFTER clearSearch but BEFORE
         // open — re-ordered below to set after the switch clear.
-        if activeStoredId != summary.id {
+        if !wasAlreadyActive {
             pendingMessageJump = nil
             pendingMessageJumpAttempts = 0
             pendingMessageJumpSnippet = nil
@@ -3565,6 +3588,7 @@ final class SessionStore {
         }
         activeRuntimeId = nil          // gates the composer until resume lands
         activeRuntimeEpoch = nil
+        activeStoredProfile = selectedProfileID(for: summary)
         activeStoredId = summary.id
         if let cacheStore, let scope = currentCacheScope,
            let identity = cacheIdentity(summary.id, profile: summary.profile) {
@@ -3581,7 +3605,7 @@ final class SessionStore {
         let networkProfile = profileParam(for: summary)
         // Cache identity comes from the row itself. It must not depend on the
         // live capability gate used for network profile parameters.
-        let cacheProfile = Self.normalizedProfileID(summary.profile)
+        let cacheProfile = selectedProfileID(for: summary)
         let transcriptWorkGeneration = connectionWorkGeneration
         let transcriptTransportEpoch = connection?.transportEpoch ?? 0
         // Fresh user intent to use this session: supersede any in-flight on-demand
@@ -3695,7 +3719,7 @@ final class SessionStore {
                 self.activeRuntimeId = result.sessionId
                 self.activeRuntimeEpoch = bindingEpoch
                 ReliabilityDiagnostics.shared.sessionBound(
-                    identifier: summary.id, epoch: bindingEpoch
+                    identifier: summary.scopedIdentity, epoch: bindingEpoch
                 )
                 // Confirm/seed the active-profile pref from the server's echo: the
                 // WS path silently falls back to the launch profile on an unknown
@@ -3802,6 +3826,7 @@ final class SessionStore {
         activeRuntimeId = nil
         activeRuntimeEpoch = nil
         activeStoredId = nil
+        activeStoredProfile = nil
         resetComposerHistoryBrowse()
         chat?.reset()
         chat?.seed(from: [])  // empty IS the (draft) transcript
@@ -3852,6 +3877,12 @@ final class SessionStore {
             activeRuntimeId = result.sessionId
             activeRuntimeEpoch = connection?.transportEpoch
             activeStoredId = result.storedSessionId ?? result.sessionId
+            let echoedProfile = result.info?.profileName
+            activeStoredProfile = Self.normalizedProfileID(
+                echoedProfile ?? (activeProfile == CacheScope.allProfilesKey
+                    ? Self.defaultProfileName
+                    : activeProfile)
+            )
             isDraft = false
             confirmActiveProfile(from: result.info)
             // Seed the pill from the create echo (the fresh session's actual
@@ -3935,6 +3966,7 @@ final class SessionStore {
     func branchSession(seed: [JSONValue], cwd: String?) async throws
         -> (runtimeId: String, storedId: String) {
         guard let client else { throw GatewayError.notConnected }
+        let branchProfile = activeStoredProfile ?? Self.normalizedProfileID(activeProfile)
         isLoading = true
         defer { isLoading = false }
         var params: [String: JSONValue] = [
@@ -3943,7 +3975,7 @@ final class SessionStore {
         ]
         if let cwd, !cwd.isEmpty { params["cwd"] = .string(cwd) }
         // Branch into the active profile scope (same conditional spot as `cwd`).
-        applyProfileScope(to: &params)
+        applyProfileScope(to: &params, selectedProfile: activeStoredProfile)
         do {
             // Use the raw result so we can read the coerced `messages` echo
             // alongside the ids (the typed `SessionOpenResult` drops `messages`).
@@ -3960,6 +3992,7 @@ final class SessionStore {
             activeRuntimeId = runtimeId
             activeRuntimeEpoch = connection?.transportEpoch
             activeStoredId = storedId
+            activeStoredProfile = branchProfile
             isDraft = false
             // Branching is reachable while the OLD session's adopted foreign
             // mirror is still live ("does not interrupt the current turn"),
@@ -4127,7 +4160,7 @@ final class SessionStore {
             // Re-resume into the same profile scope so a reconnect keeps the
             // session in its per-profile home. Omitted for the default/all scope.
             var resumeParams: [String: JSONValue] = ["session_id": .string(storedId)]
-            applyProfileScope(to: &resumeParams)
+            applyProfileScope(to: &resumeParams, selectedProfile: activeStoredProfile)
             let result = try await coalescedSessionResume(
                 storedId: storedId,
                 params: resumeParams,
@@ -4163,13 +4196,17 @@ final class SessionStore {
             activeRuntimeId = result.sessionId
             activeRuntimeEpoch = bindingEpoch
             ReliabilityDiagnostics.shared.sessionBound(
-                identifier: storedId, epoch: bindingEpoch
+                identifier: "\(activeStoredProfile ?? "default")\u{1F}\(storedId)",
+                epoch: bindingEpoch
             )
             // A resume can follow a compression chain tip (parent → continuation);
             // re-stamp queued prompts so affinity-stamped ones aren't skipped forever.
             let newStored = result.storedSessionId ?? storedId
             if newStored != storedId { onStoredIdMigrated?(storedId, newStored) }
             activeStoredId = newStored
+            if let echoedProfile = result.info?.profileName {
+                activeStoredProfile = Self.normalizedProfileID(echoedProfile)
+            }
             confirmActiveProfile(from: result.info)
             // Keep the composer pill session-true on this resume path too.
             if let info = result.info { connection?.applyRuntimeInfo(info) }
@@ -4785,8 +4822,14 @@ final class SessionStore {
     /// is available. For the default/all scope — and every dormant / stock-gateway
     /// case — this is a no-op, so the WS create/resume payload is byte-for-byte the
     /// shipped single-profile shape. The single gate for create/resume threading.
-    private func applyProfileScope(to params: inout [String: JSONValue]) {
-        if let name = Self.profileParam(scope: activeProfile, multiAvailable: isMultiProfileAvailable) {
+    private func applyProfileScope(
+        to params: inout [String: JSONValue],
+        selectedProfile: String? = nil
+    ) {
+        if let name = Self.profileParam(
+            scope: selectedProfile ?? activeProfile,
+            multiAvailable: isMultiProfileAvailable
+        ) {
             params["profile"] = .string(name)
         }
     }
@@ -4864,6 +4907,7 @@ final class SessionStore {
         activeRuntimeId = nil
         activeRuntimeEpoch = nil
         activeStoredId = nil
+        activeStoredProfile = nil
         chat?.reset()
     }
 

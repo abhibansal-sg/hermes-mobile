@@ -75,6 +75,40 @@ final class OutboxProcessorTests: XCTestCase {
                        "navigation intents remain local and actionable offline")
     }
 
+    func testTransportDropDuringClaimDoesNotConsumePromptRetry() async throws {
+        let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let prompt = try await harness.repository.enqueue(WorkJobInput(
+            kind: .prompt,
+            scope: harness.scope,
+            text: "race transport admission",
+            storedSessionID: "stored-A"
+        ))
+        var readinessChecks = 0
+        let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
+            currentScope: { harness.scope },
+            activeStoredSessionID: { "stored-A" },
+            canProcessPrompt: {
+                readinessChecks += 1
+                return readinessChecks == 1
+            },
+            createDestination: { _ in XCTFail("readiness-raced prompt must not process"); throw Ambiguous() },
+            resolveRuntime: { _ in XCTFail("readiness-raced prompt must not resolve"); return nil },
+            uploadAsset: { _, _ in XCTFail("readiness-raced prompt must not upload"); throw Ambiguous() },
+            willSubmit: { _, _ in XCTFail("readiness-raced prompt must not submit") },
+            submit: { _, _, _ in XCTFail("readiness-raced prompt must not submit"); throw Ambiguous() },
+            processLocalAppIntent: { _ in false }
+        ))
+
+        processor.wake()
+        await processor.waitUntilIdleForTesting()
+
+        let persisted = try await harness.repository.job(id: prompt.jobID)
+        XCTAssertEqual(readinessChecks, 2)
+        XCTAssertEqual(persisted?.state, .queued)
+        XCTAssertEqual(persisted?.attemptCount, 0)
+        XCTAssertNil(persisted?.leaseOwner)
+    }
+
     func testAuthoritativeReceiptWaitsForMatchingProjectionCommit() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("OutboxAcceptedProjection-\(UUID().uuidString)", isDirectory: true)
