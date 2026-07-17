@@ -1,8 +1,8 @@
 # Hermes Mobile Build 120 — Connection and Cache Recovery Integrity
 
-**Status:** Draft for user confirmation  
-**Target:** TestFlight build 120  
-**Tracking:** Linear ABH-503, draft PR #206  
+**Status:** Implementation and verification in progress
+**Target:** TestFlight build 120
+**Tracking:** Linear ABH-504 (related: ABH-503), draft PR #206
 **Reviewed by:** GPT-5.6 Luna architecture pass, two GPT-5.6 Terra execution passes
 
 ## Context
