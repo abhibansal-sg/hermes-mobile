@@ -227,6 +227,7 @@ final class SessionStore {
         refreshToken &+= 1
         resetInitialFill()
         cancelEnsureRuntime()
+        cancelRuntimeBinding()
     }
 
     /// A runtime id belongs to one WebSocket generation only. Keep the durable
@@ -237,6 +238,7 @@ final class SessionStore {
         activeRuntimeId = nil
         activeRuntimeEpoch = nil
         cancelEnsureRuntime()
+        cancelRuntimeBinding()
     }
 
     /// A different gateway is a different cache and runtime namespace. Do not
@@ -245,6 +247,7 @@ final class SessionStore {
         openToken = UUID()
         openRevealToken = nil
         cancelEnsureRuntime()
+        cancelRuntimeBinding()
         activeRuntimeId = nil
         activeRuntimeEpoch = nil
         activeStoredId = nil
@@ -268,6 +271,7 @@ final class SessionStore {
 
         openToken = UUID()
         openRevealToken = nil
+        cancelRuntimeBinding()
         warmOpenSnapshots.removeAll()
         warmOpenSnapshotOrder.removeAll()
         #if DEBUG
@@ -1206,6 +1210,98 @@ final class SessionStore {
     /// request; tests stage a `SessionOpenResult` or failure so `open()` and
     /// ``resumeActiveAfterReconnect()`` are exercisable without a network.
     var resumeRPC: ((_ storedId: String, _ params: [String: JSONValue]) async throws -> SessionOpenResult)?
+
+    /// Identity of the one raw `session.resume` permitted for a selected session
+    /// on a particular accepted transport. Both `open()` and reconnect recovery
+    /// reach this same RPC, so keeping the key here prevents readiness from
+    /// releasing an open task and recovery at the same time into duplicate work.
+    private struct RuntimeBindingKey: Hashable {
+        let openToken: UUID
+        let storedId: String
+        let transportEpoch: UInt64
+    }
+
+    private var runtimeBindingKey: RuntimeBindingKey?
+    private var runtimeBindingTask: Task<SessionOpenResult, Error>?
+
+    private func cancelRuntimeBinding() {
+        runtimeBindingTask?.cancel()
+        runtimeBindingTask = nil
+        runtimeBindingKey = nil
+    }
+
+    /// Test seams historically run without a configured `ConnectionStore`. Once
+    /// a test has a real accepted epoch, though, they must obey the same fencing
+    /// as the production client so a late epoch-N failure cannot publish in N+1.
+    private func currentBindingEpoch(usingResumeTestSeam: Bool) async -> UInt64? {
+        guard let connection else { return 0 }
+        if usingResumeTestSeam, connection.transportEpoch == 0 {
+            return 0
+        }
+        guard await connection.waitForTransportReady(timeout: .seconds(120)),
+              connection.isTransportReady else { return nil }
+        return connection.transportEpoch
+    }
+
+    private func isCurrentRuntimeBinding(
+        token: UUID,
+        storedId: String,
+        connectionWorkGeneration: UInt64,
+        transportEpoch: UInt64,
+        usingResumeTestSeam: Bool
+    ) -> Bool {
+        guard openToken == token,
+              activeStoredId == storedId,
+              self.connectionWorkGeneration == connectionWorkGeneration else { return false }
+        guard let connection else { return true }
+        guard connection.transportEpoch == transportEpoch else { return false }
+        // Epoch zero is the deliberately transport-free unit-test case above.
+        return usingResumeTestSeam && transportEpoch == 0 || connection.isTransportReady
+    }
+
+    private func coalescedSessionResume(
+        storedId: String,
+        params: [String: JSONValue],
+        token: UUID,
+        transportEpoch: UInt64
+    ) async throws -> SessionOpenResult {
+        let key = RuntimeBindingKey(
+            openToken: token,
+            storedId: storedId,
+            transportEpoch: transportEpoch
+        )
+        if runtimeBindingKey == key, let runtimeBindingTask {
+            return try await runtimeBindingTask.value
+        }
+
+        let resumeRPC = self.resumeRPC
+        let client = self.client
+        let task = Task<SessionOpenResult, Error> {
+            if let resumeRPC {
+                return try await resumeRPC(storedId, params)
+            }
+            guard let client else { throw GatewayError.notConnected }
+            return try await client.request(
+                "session.resume",
+                params: .object(params),
+                timeout: .seconds(120)
+            )
+        }
+        runtimeBindingKey = key
+        runtimeBindingTask = task
+        do {
+            return try await task.value
+        } catch {
+            // Retain a successful task for this selection/epoch: a sibling
+            // recovery caller can still consume that one result. Failures must
+            // be released so reconnect can retry the selected session.
+            if runtimeBindingKey == key {
+                runtimeBindingTask = nil
+                runtimeBindingKey = nil
+            }
+            throw error
+        }
+    }
 
     /// Supersede any in-flight on-demand re-resume (``ensureActiveRuntime()``) so a
     /// stale result can't bind a runtime into a session the user has navigated away
@@ -3441,6 +3537,7 @@ final class SessionStore {
         // CHEAP and drive the drawer selection highlight + gate the composer + resolve
         // the seed's stored id, so they MUST land synchronously on the tap tick.
         let token = UUID()
+        cancelRuntimeBinding()
         openToken = token
         let reveal = revealOnFirstPaint.map { makeOpenReveal(token: token, callback: $0) }
         if revealOnFirstPaint == nil {
@@ -3538,15 +3635,10 @@ final class SessionStore {
         let resumeTask = Task { [weak self] in
             guard let self, self.client != nil || self.resumeRPC != nil else { return }
             let usingResumeTestSeam = self.resumeRPC != nil
-            let bindingEpoch: UInt64
-            if usingResumeTestSeam {
-                bindingEpoch = self.connection?.transportEpoch ?? 0
-            } else {
-                guard let connection = self.connection,
-                      await connection.waitForTransportReady(timeout: .seconds(120)),
-                      connection.isTransportReady else { return }
-                bindingEpoch = connection.transportEpoch
-            }
+            let connectionWorkGeneration = self.connectionWorkGeneration
+            guard let bindingEpoch = await self.currentBindingEpoch(
+                usingResumeTestSeam: usingResumeTestSeam
+            ) else { return }
             do {
                 // Thread the row's profile scope so an All-profiles tap resumes in
                 // the row's owning profile home. Omitted for default/all/dormant
@@ -3555,23 +3647,19 @@ final class SessionStore {
                 if let networkProfile {
                     resumeParams["profile"] = .string(networkProfile)
                 }
-                let result: SessionOpenResult
-                if let resumeRPC = self.resumeRPC {
-                    result = try await resumeRPC(summary.id, resumeParams)
-                } else if let client = self.client {
-                    result = try await client.request(
-                        "session.resume",
-                        params: .object(resumeParams),
-                        timeout: .seconds(120)
-                    )
-                } else {
-                    return
-                }
-                guard self.openToken == token,
-                      usingResumeTestSeam || (
-                        self.connection?.isTransportReady == true
-                            && self.connection?.transportEpoch == bindingEpoch
-                      ) else { return }  // superseded or an older transport
+                let result = try await self.coalescedSessionResume(
+                    storedId: summary.id,
+                    params: resumeParams,
+                    token: token,
+                    transportEpoch: bindingEpoch
+                )
+                guard self.isCurrentRuntimeBinding(
+                    token: token,
+                    storedId: summary.id,
+                    connectionWorkGeneration: connectionWorkGeneration,
+                    transportEpoch: bindingEpoch,
+                    usingResumeTestSeam: usingResumeTestSeam
+                ) else { return }  // superseded or an older transport
                 self.activeRuntimeId = result.sessionId
                 self.activeRuntimeEpoch = bindingEpoch
                 // Confirm/seed the active-profile pref from the server's echo: the
@@ -3622,9 +3710,13 @@ final class SessionStore {
                 // queued prompt could slip into an already-running server turn during
                 // the resume/status gap.
                 await seedTask.value
-                guard self.openToken == token,
-                      self.activeRuntimeId == result.sessionId,
-                      usingResumeTestSeam || self.activeRuntimeEpoch == self.connection?.transportEpoch else { return }
+                guard self.isCurrentRuntimeBinding(
+                    token: token,
+                    storedId: summary.id,
+                    connectionWorkGeneration: connectionWorkGeneration,
+                    transportEpoch: bindingEpoch,
+                    usingResumeTestSeam: usingResumeTestSeam
+                ), self.activeRuntimeId == result.sessionId else { return }
                 await self.chat?.reconcileLiveTurnStatus(
                     runtimeId: result.sessionId,
                     snapshotRunning: result.snapshotRunning,
@@ -3640,10 +3732,15 @@ final class SessionStore {
                 // open inside ChatStore via the runtime-id check.
                 await self.chat?.seedContextUsageFromStatus(runtimeId: result.sessionId)
             } catch {
-                guard self.openToken == token else { return }
-                // A socket that disappeared between the readiness check and
-                // resume is a reconnect condition, not a user-facing failure.
-                if !usingResumeTestSeam, self.connection?.isTransportReady != true { return }
+                // A stale token/generation or a replaced epoch is a superseded
+                // binding, not an actionable open failure.
+                guard self.isCurrentRuntimeBinding(
+                    token: token,
+                    storedId: summary.id,
+                    connectionWorkGeneration: connectionWorkGeneration,
+                    transportEpoch: bindingEpoch,
+                    usingResumeTestSeam: usingResumeTestSeam
+                ) else { return }
                 let message = self.errorMessage(from: error)
                 self.lastError = message
                 self.sessionActionError = SessionActionError(action: "Open Session", message: message)
@@ -3665,6 +3762,7 @@ final class SessionStore {
         openToken = UUID()
         openRevealToken = nil
         cancelEnsureRuntime()
+        cancelRuntimeBinding()
         isDraft = true
         activeRuntimeId = nil
         activeRuntimeEpoch = nil
@@ -3987,32 +4085,20 @@ final class SessionStore {
         let token = openToken
         guard let storedId = activeStoredId, client != nil || resumeRPC != nil else { return nil }
         let usingResumeTestSeam = resumeRPC != nil
-        let bindingEpoch: UInt64
-        if usingResumeTestSeam {
-            bindingEpoch = connection?.transportEpoch ?? 0
-        } else {
-            guard let connection,
-                  await connection.waitForTransportReady(timeout: .seconds(120)),
-                  connection.isTransportReady else { return nil }
-            bindingEpoch = connection.transportEpoch
-        }
+        guard let bindingEpoch = await currentBindingEpoch(
+            usingResumeTestSeam: usingResumeTestSeam
+        ) else { return nil }
         do {
             // Re-resume into the same profile scope so a reconnect keeps the
             // session in its per-profile home. Omitted for the default/all scope.
             var resumeParams: [String: JSONValue] = ["session_id": .string(storedId)]
             applyProfileScope(to: &resumeParams)
-            let result: SessionOpenResult
-            if let resumeRPC {
-                result = try await resumeRPC(storedId, resumeParams)
-            } else if let client {
-                result = try await client.request(
-                    "session.resume",
-                    params: .object(resumeParams),
-                    timeout: .seconds(120)
-                )
-            } else {
-                return nil
-            }
+            let result = try await coalescedSessionResume(
+                storedId: storedId,
+                params: resumeParams,
+                token: token,
+                transportEpoch: bindingEpoch
+            )
             // SUPERSESSION GUARD: the active session may have changed across the
             // (up to 120 s) resume await — the user tapped another drawer row
             // (`open`), started a draft, or cleared the active session. Do NOT
@@ -4020,13 +4106,13 @@ final class SessionStore {
             // result; otherwise a live send would misroute into the resumed
             // session (the R1 #17 class, on the un-affinity-guarded live path).
             // Mirrors open()'s `openToken` re-check after its own resume await.
-            guard openToken == token,
-                  activeStoredId == storedId,
-                  connectionWorkGeneration == myConnectionWorkGeneration,
-                  usingResumeTestSeam || (
-                    connection?.isTransportReady == true
-                        && connection?.transportEpoch == bindingEpoch
-                  ) else { return nil }
+            guard isCurrentRuntimeBinding(
+                token: token,
+                storedId: storedId,
+                connectionWorkGeneration: myConnectionWorkGeneration,
+                transportEpoch: bindingEpoch,
+                usingResumeTestSeam: usingResumeTestSeam
+            ) else { return nil }
             activeRuntimeId = result.sessionId
             activeRuntimeEpoch = bindingEpoch
             // A resume can follow a compression chain tip (parent → continuation);
@@ -4050,7 +4136,16 @@ final class SessionStore {
             sessionActionError = nil
             return result.sessionId
         } catch {
-            if !usingResumeTestSeam, connection?.isTransportReady != true { return nil }
+            // The error belongs to an obsolete token/generation/epoch when the
+            // transport changed while the RPC was suspended. Never surface it
+            // into the current session's error channel.
+            guard isCurrentRuntimeBinding(
+                token: token,
+                storedId: storedId,
+                connectionWorkGeneration: myConnectionWorkGeneration,
+                transportEpoch: bindingEpoch,
+                usingResumeTestSeam: usingResumeTestSeam
+            ) else { return nil }
             let message = errorMessage(from: error)
             lastError = message
             sessionActionError = SessionActionError(action: "Resume Session", message: message)
@@ -4714,6 +4809,7 @@ final class SessionStore {
         // Supersede any in-flight on-demand re-resume so it can't re-bind a runtime
         // into a session we're detaching from.
         cancelEnsureRuntime()
+        cancelRuntimeBinding()
         isDraft = false
         activeRuntimeId = nil
         activeRuntimeEpoch = nil

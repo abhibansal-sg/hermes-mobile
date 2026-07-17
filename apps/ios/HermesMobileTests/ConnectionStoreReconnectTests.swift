@@ -49,6 +49,18 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         }
     }
 
+    private actor ResumeCallLog {
+        private var values: [String] = []
+
+        func append(_ value: String) {
+            values.append(value)
+        }
+
+        func calls(for storedId: String) -> Int {
+            values.filter { $0 == storedId }.count
+        }
+    }
+
     // MARK: - Helpers
 
     /// Build a wired store graph (ConnectionStore + SessionStore + ChatStore).
@@ -1000,6 +1012,68 @@ final class ConnectionStoreReconnectTests: XCTestCase {
 
         await gate.release()
         await connection.waitForReconnectForTesting()
+    }
+
+    func testLateEpochFailureIsIgnoredAfterReplacementTransportBecomesReady() async {
+        let (connection, sessions, _) = makeStore()
+        let gate = SuspensionGate()
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        let epochN = connection.transportEpoch
+        sessions.activeStoredId = "A"
+        sessions.resumeRPC = { _, _ in
+            await gate.suspend()
+            throw URLError(.networkConnectionLost)
+        }
+
+        let resume = Task { await sessions.resumeActiveAfterReconnect() }
+        await gate.waitUntilEntered()
+
+        // The failed RPC belongs to epoch N. A replacement ready epoch must
+        // fence its catch path before it can set an alert on the current UI.
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        XCTAssertEqual(connection.transportEpoch, epochN + 1)
+        await gate.release()
+        let resumed = await resume.value
+        XCTAssertNil(resumed)
+
+        XCTAssertNil(sessions.sessionActionError)
+        XCTAssertNil(sessions.lastError)
+        XCTAssertNil(sessions.activeRuntimeId)
+    }
+
+    func testOpenDuringReconnectAndRecoveryIssueOneResumeForLatestSelection() async {
+        let (connection, sessions, _) = makeStore()
+        let reconnectGate = SuspensionGate()
+        let calls = ResumeCallLog()
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        sessions.activeStoredId = "A"
+        sessions.resumeRPC = { stored, _ in
+            await calls.append(stored)
+            return self.stagedResumeResult(sessionId: "runtime-\(stored)", resumed: stored)
+        }
+        connection.connectRPC = { _, _, _ in await reconnectGate.suspend() }
+
+        connection._handleGatewayStateForTesting(.failed("background socket dropped"))
+        await reconnectGate.waitUntilEntered()
+        sessions.open(self.sessionSummary("B"))
+
+        await reconnectGate.release()
+        await connection.waitForReconnectForTesting()
+        await sessions.waitForPendingOpenForTesting()
+
+        let aCalls = await calls.calls(for: "A")
+        let bCalls = await calls.calls(for: "B")
+        XCTAssertEqual(aCalls, 0)
+        XCTAssertEqual(bCalls, 1,
+                       "readiness-released open(B) and recovery must share one resume")
+        XCTAssertEqual(sessions.activeStoredId, "B")
+        XCTAssertEqual(sessions.activeRuntimeId, "runtime-B")
     }
 
     // MARK: - ABH-448 connection-generation fencing
