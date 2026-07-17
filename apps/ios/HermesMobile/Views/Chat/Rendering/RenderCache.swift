@@ -339,6 +339,19 @@ enum RenderCache {
         }
     }
 
+    /// Runtime scroll-indicator flag, available in RELEASE builds (D2).
+    ///
+    /// The iOS-26 scroll indicator renders as a gradient-stroked capsule; on the
+    /// transcript ScrollView and every code block's horizontal ScrollView it
+    /// re-rasterizes its gradient stroke per scroll frame (round-2 conic hunt).
+    /// Promoting this from the DEBUG-only experiment set to a runtime flag lets a
+    /// profiler pass flip it in a release build later WITHOUT shipping a code
+    /// change. It is DEFAULT OFF — with `HERMES_EXP_NO_SCROLL_INDICATORS` unset
+    /// the app is byte-for-byte visually identical to today (indicators shown).
+    ///   HERMES_EXP_NO_SCROLL_INDICATORS=1 → `.scrollIndicators(.hidden)` on the
+    ///   transcript + code blocks.
+    static let expNoScrollIndicators = ProcessInfo.processInfo.environment["HERMES_EXP_NO_SCROLL_INDICATORS"] == "1"
+
     #if DEBUG
     /// Round-2 scroll-cost differential experiment flags (DEBUG only). Each is a
     /// launch-env opt-in so a single suspected scroll cost can be stripped and the
@@ -381,17 +394,6 @@ enum RenderCache {
     static let expNoCodeCardChrome = ProcessInfo.processInfo.environment["HERMES_EXP_NO_CODECARD_CHROME"] == "1"
     static let expNoBubbleBg = ProcessInfo.processInfo.environment["HERMES_EXP_NO_BUBBLE_BG"] == "1"
     static let expNoRowShadow = ProcessInfo.processInfo.environment["HERMES_EXP_NO_ROW_SHADOW"] == "1"
-    /// Conic-stroke hunt, third cut. The render leaf is a `Stroke<StrokeablePath>`
-    /// filled with a SwiftUI-internal angular/radial gradient (`RadialGradient
-    /// ._Paint` → `_setAngularGradientCenter`) — NO such gradient exists in app
-    /// source, so it is SYSTEM-DRAWN. iOS 26 renders the SCROLL INDICATOR as a
-    /// gradient-stroked capsule; the transcript ScrollView + every code block's
-    /// horizontal ScrollView show indicators, each re-rasterizing its gradient
-    /// stroke per scroll frame. This flag hides scroll indicators to attribute it:
-    ///   HERMES_EXP_NO_SCROLL_INDICATORS=1 → `.scrollIndicators(.hidden)` on the
-    ///   transcript + code blocks; conic collapse confirms the indicator is the hog.
-    static let expNoScrollIndicators = ProcessInfo.processInfo.environment["HERMES_EXP_NO_SCROLL_INDICATORS"] == "1"
-
     /// Test/diagnostic hook: drop all cached entries.
     static func resetForTesting() {
         segmentCache.removeAll(); segmentOrder.removeAll()
@@ -439,19 +441,17 @@ extension View {
         #endif
     }
 
-    /// DEBUG conic-hunt: optionally hide scroll indicators on a ScrollView to
-    /// measure the iOS-26 gradient-stroked indicator's per-frame render cost.
+    /// Runtime conic-hunt flag (D2): optionally hide scroll indicators on a
+    /// ScrollView to measure the iOS-26 gradient-stroked indicator's per-frame
+    /// render cost. Available in release builds; DEFAULT OFF, so with the env var
+    /// unset this is a no-op and the indicators render exactly as today.
     @ViewBuilder
     func perfScrollIndicators() -> some View {
-        #if DEBUG
         if RenderCache.expNoScrollIndicators {
             self.scrollIndicators(.hidden)
         } else {
             self
         }
-        #else
-        self
-        #endif
     }
 
     /// DEBUG A/B: optionally `.drawingGroup()`-rasterize the code card so its
