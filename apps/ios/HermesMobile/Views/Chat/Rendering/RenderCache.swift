@@ -140,6 +140,184 @@ enum RenderCache {
         return value
     }
 
+    // MARK: - Streaming incremental segmentation (D1)
+
+    /// Single-slot incremental state for the ONE actively-streaming assistant
+    /// tail. `segments(_:)` is keyed on the whole text value, so during a stream
+    /// every 40ms flush extends `text` → a fresh key → a full O(total) re-scan of
+    /// the growing body (the exact cost D1 removes). This path instead keeps the
+    /// segments of the *settled* prefix (everything before the current in-progress
+    /// block) and, on each flush, re-parses only the in-progress tail, so per-flush
+    /// parse cost is O(current block), not O(total).
+    ///
+    /// **Fidelity.** The settled boundary only ever falls at a point where
+    /// splitting is render-equivalent to the monolithic parse: at a fenced-code
+    /// transition (a code block never spans a fence, so the split is *exact*), or —
+    /// only when no LaTeX delimiter (`$` / `\`) has appeared — at a blank line.
+    /// A blank-line split of a prose run yields adjacent `.prose` segments whose
+    /// downstream GFM blocks (`chatProseEntries` → `markdownBlocks`) flatten into
+    /// the identical sibling list the single prose segment would produce (blocks
+    /// never straddle a blank line). When math delimiters are present the prose run
+    /// is left whole in the tail, so multi-line `$$…$$` / `\[…\]` can never be
+    /// bisected. On stream completion the bubble is rendered non-streaming through
+    /// the plain `segments(_:)` full parse, so the settled output is byte-identical
+    /// to today — this path only accelerates the in-progress frames.
+    private static var streamPrevText = ""
+    private static var streamResult: [MessageSegmenter.Segment] = []
+    private static var streamSettledSegments: [MessageSegmenter.Segment] = []
+    private static var streamSettledLen = 0
+    private static var streamInCode = false
+    private static var streamMathSeen = false
+
+    #if DEBUG
+    /// D1 instrumentation: characters handed to `MessageSegmenter.segments` for
+    /// the in-progress tail on the most recent streaming flush (the per-flush
+    /// parse cost the test bounds), and how many times the slot fell back to a
+    /// full reset parse. `streamSettledCount` is the settled-segment count reused
+    /// without re-parsing.
+    static var streamingTailParseChars = 0
+    static var streamingResetCount = 0
+    static var streamingSettledCount = 0
+    #endif
+
+    /// Incremental segmentation for the actively-streaming tail. Render-equivalent
+    /// to `segments(_:)` at every flush; falls back to a full parse when `text` is
+    /// not an extension of the previous streamed value (new turn / rewrite).
+    static func streamingSegments(_ text: String) -> [MessageSegmenter.Segment] {
+        guard !text.isEmpty else {
+            resetStreaming()
+            return []
+        }
+
+        // Exact repeat (a scroll re-realization of the same streaming frame) — the
+        // memoized result, no re-parse.
+        if text == streamPrevText {
+            #if DEBUG
+            streamingTailParseChars = 0
+            #endif
+            return streamResult
+        }
+
+        // A non-extension (new streaming turn, or an `applyFinalText` rewrite) —
+        // drop the settled prefix and rebuild from scratch.
+        if streamPrevText.isEmpty || !text.hasPrefix(streamPrevText) {
+            resetStreaming()
+            #if DEBUG
+            streamingResetCount += 1
+            #endif
+        }
+
+        // Advance the settled boundary over any newly-complete blocks in the
+        // unsettled region, parsing each settled block exactly once.
+        let settledIndex = text.index(text.startIndex, offsetBy: streamSettledLen)
+        var unsettled = text[settledIndex...]
+
+        let advance = advanceSettledBoundary(in: unsettled, inCode: streamInCode, mathSeen: streamMathSeen)
+        if advance.settledCount > 0 {
+            let boundary = unsettled.index(unsettled.startIndex, offsetBy: advance.settledCount)
+            let newlySettled = String(unsettled[..<boundary])
+            streamSettledSegments.append(contentsOf: MessageSegmenter.segments(newlySettled))
+            streamSettledLen += advance.settledCount
+            streamInCode = advance.inCode
+            streamMathSeen = advance.mathSeen
+            unsettled = unsettled[boundary...]
+        }
+
+        let tail = String(unsettled)
+        let tailSegments = MessageSegmenter.segments(tail)
+        var result = streamSettledSegments
+        result.append(contentsOf: tailSegments)
+
+        streamPrevText = text
+        streamResult = result
+        #if DEBUG
+        streamingTailParseChars = tail.count
+        streamingSettledCount = streamSettledSegments.count
+        #endif
+        return result
+    }
+
+    private static func resetStreaming() {
+        streamPrevText = ""
+        streamResult = []
+        streamSettledSegments = []
+        streamSettledLen = 0
+        streamInCode = false
+        streamMathSeen = false
+    }
+
+    /// Scan the complete lines of `unsettled` (the final newline-less line is the
+    /// in-progress tail and never settles) and return the number of characters up
+    /// to the last render-safe boundary, plus the fold state there. A boundary is
+    /// safe at a fenced-code transition (always) or at a blank line while not in
+    /// code and no math delimiter has yet appeared.
+    private static func advanceSettledBoundary(
+        in unsettled: Substring,
+        inCode: Bool,
+        mathSeen: Bool
+    ) -> (settledCount: Int, inCode: Bool, mathSeen: Bool) {
+        var localInCode = inCode
+        var localMathSeen = mathSeen
+        var boundaryCount = 0
+        var boundaryInCode = inCode
+        var boundaryMathSeen = mathSeen
+
+        var lineStart = unsettled.startIndex
+        var consumed = 0            // characters consumed up to `lineStart`
+        while let newline = unsettled[lineStart...].firstIndex(of: "\n") {
+            let line = unsettled[lineStart..<newline]
+            let afterNewline = unsettled.index(after: newline)
+            let lineWithBreak = unsettled.distance(from: lineStart, to: afterNewline)
+
+            let hadMath = localMathSeen
+            if lineHasMathDelimiter(line) { localMathSeen = true }
+
+            if isFenceLine(line) {
+                if localInCode {
+                    // Closing fence: the code block completes after this line.
+                    localInCode = false
+                    boundaryCount = consumed + lineWithBreak
+                    boundaryInCode = false
+                    boundaryMathSeen = localMathSeen
+                } else {
+                    // Opening fence: settle the prose up to (not including) it.
+                    boundaryCount = consumed
+                    boundaryInCode = false
+                    boundaryMathSeen = hadMath
+                    localInCode = true
+                }
+            } else if !localInCode,
+                      line.trimmingCharacters(in: .whitespaces).isEmpty,
+                      !localMathSeen {
+                boundaryCount = consumed + lineWithBreak
+                boundaryInCode = false
+                boundaryMathSeen = false
+            }
+
+            consumed += lineWithBreak
+            lineStart = afterNewline
+        }
+
+        return (boundaryCount, boundaryInCode, boundaryMathSeen)
+    }
+
+    /// A fence line, recognised exactly as `MessageSegmenter` does (``` after
+    /// optional leading whitespace).
+    private static func isFenceLine(_ line: Substring) -> Bool {
+        var index = line.startIndex
+        while index < line.endIndex, line[index] == " " || line[index] == "\t" {
+            index = line.index(after: index)
+        }
+        return line[index...].hasPrefix("```")
+    }
+
+    /// True when the line carries a LaTeX math delimiter opener (`$` or a
+    /// backslash escape). Conservative: any such char disables blank-line settling
+    /// so a multi-line math region can never be bisected.
+    private static func lineHasMathDelimiter(_ line: Substring) -> Bool {
+        line.contains("$") || line.contains("\\")
+    }
+
     // MARK: - Bounded store
 
     /// Insert `value` for `key`, evicting the oldest entries past `limit` (FIFO).
@@ -220,6 +398,10 @@ enum RenderCache {
         proseCache.removeAll(); proseOrder.removeAll()
         markdownBlockCache.removeAll(); markdownBlockOrder.removeAll()
         highlightCache.removeAll(); highlightOrder.removeAll()
+        resetStreaming()
+        streamingTailParseChars = 0
+        streamingResetCount = 0
+        streamingSettledCount = 0
     }
     #endif
 }
