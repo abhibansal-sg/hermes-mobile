@@ -100,3 +100,22 @@ The prior draft's implementation verdict remains **NO-GO**. The revised
 governing spec incorporates every accepted correction. Its next review should
 therefore judge whether the newly explicit proof gates and contracts are
 complete—not revisit the locked local-first product direction.
+
+## 5. Implementation record
+
+- A0/A1 now provide stable gateway/profile authority identity, authority epoch,
+  journal identity, distinct continuation/resume cursors, and the real
+  Python-to-Swift manifest contract.
+- A2 now stages and atomically applies authority-keyed manifest pages with hard
+  caps, durable tombstones, same-authority reset, authority replacement, and
+  WorkRepository quarantine.
+- A3/A4 now restore skeleton payload shaping and snapshot-derived running state.
+- The first B1 prerequisite is implemented in SessionDB schema v22. See
+  `LOCAL-FIRST-B1-DISPLAY-LINEAGE-CONTRACT.md`. Stable display origins now
+  survive compaction, rewind, restore, and replacement through bounded public
+  APIs. Already-compacted legacy histories fail closed rather than being
+  guessed.
+
+The remaining B1 blocker is the durable authoritative turn ledger and its real
+prompt/steer/queued/interrupt/terminal fixtures. Compact projection capability
+remains disabled until that proof passes.

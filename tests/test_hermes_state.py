@@ -6070,3 +6070,159 @@ class TestGetMessagesPagination:
         self._seed(db, n=5)
         rows = db.get_messages("s1", offset=3)
         assert [m["content"] for m in rows] == ["msg-3", "msg-4"]
+
+
+class TestDisplayLineage:
+    """Behavior contract for stable, bounded display-history projection."""
+
+    @staticmethod
+    def _seed_two_turns(db, session_id="display-s1"):
+        db.create_session(session_id, source="cli")
+        ids = []
+        for role, content in (
+            ("user", "first question"),
+            ("assistant", "first answer"),
+            ("user", "second question"),
+            ("assistant", "second answer"),
+        ):
+            ids.append(db.append_message(session_id, role, content))
+        return ids
+
+    def test_display_page_is_bounded_and_cursor_pages_origins(self, db):
+        ids = self._seed_two_turns(db)
+        newest = db.get_display_messages("display-s1", limit=2)
+        assert newest["complete"] is True
+        assert [m["content"] for m in newest["messages"]] == [
+            "second question",
+            "second answer",
+        ]
+        assert newest["has_older"] is True
+        assert newest["previous_cursor"] == ids[2]
+
+        older = db.get_display_messages(
+            "display-s1",
+            before_origin_id=newest["previous_cursor"],
+            limit=2,
+        )
+        assert [m["content"] for m in older["messages"]] == [
+            "first question",
+            "first answer",
+        ]
+        assert older["has_older"] is False
+
+    def test_two_compaction_generations_keep_each_origin_once(self, db):
+        self._seed_two_turns(db)
+        live = db.get_messages_as_conversation("display-s1")
+        db.archive_and_compact(
+            "display-s1",
+            [
+                {
+                    "role": "assistant",
+                    "content": "summary one",
+                    "_compressed_summary": True,
+                },
+                live[-2],
+                live[-1],
+            ],
+        )
+        second_live = db.get_messages_as_conversation("display-s1")
+        db.archive_and_compact(
+            "display-s1",
+            [
+                {
+                    "role": "user",
+                    "content": "summary two",
+                    "_compressed_summary": True,
+                },
+                second_live[-2],
+                second_live[-1],
+            ],
+        )
+
+        status = db.get_display_lineage_status("display-s1")
+        page = db.get_display_messages("display-s1", limit=20)
+        assert status["display_generation"] == 2
+        assert status["complete"] is True
+        assert [m["content"] for m in page["messages"]] == [
+            "first question",
+            "first answer",
+            "second question",
+            "second answer",
+        ]
+        assert len({m["origin_id"] for m in page["messages"]}) == 4
+
+    def test_rewind_after_compaction_tombstones_origins_and_restore_reverts(self, db):
+        self._seed_two_turns(db)
+        live = db.get_messages_as_conversation("display-s1")
+        db.archive_and_compact("display-s1", live[-2:])
+        active_rows = db.get_messages("display-s1")
+        target_id = next(
+            row["id"]
+            for row in active_rows
+            if row["role"] == "user" and row["content"] == "second question"
+        )
+
+        before_revision = db.get_display_lineage_status("display-s1")[
+            "display_revision"
+        ]
+        db.rewind_to_message("display-s1", target_id)
+        after = db.get_display_messages("display-s1", limit=20)
+        assert [m["content"] for m in after["messages"]] == [
+            "first question",
+            "first answer",
+        ]
+        tombstones = db.get_display_tombstones(
+            "display-s1", after_revision=before_revision
+        )
+        assert len(tombstones) == 2
+
+        db.restore_rewound("display-s1", target_id)
+        restored = db.get_display_messages("display-s1", limit=20)
+        assert [m["content"] for m in restored["messages"]] == [
+            "first question",
+            "first answer",
+            "second question",
+            "second answer",
+        ]
+
+    def test_replace_emits_tombstones_without_duplicate_retained_rows(self, db):
+        self._seed_two_turns(db)
+        history = db.get_messages_as_conversation("display-s1")
+        before_revision = db.get_display_lineage_status("display-s1")[
+            "display_revision"
+        ]
+        db.replace_messages("display-s1", history[:2])
+
+        page = db.get_display_messages("display-s1", limit=20)
+        assert [m["content"] for m in page["messages"]] == [
+            "first question",
+            "first answer",
+        ]
+        assert len({m["origin_id"] for m in page["messages"]}) == 2
+        tombstones = db.get_display_tombstones(
+            "display-s1", after_revision=before_revision
+        )
+        assert len(tombstones) == 2
+
+    def test_legacy_compacted_rows_fail_closed_instead_of_guessing(self, tmp_path):
+        path = tmp_path / "legacy-compacted.db"
+        db = SessionDB(db_path=path)
+        self._seed_two_turns(db, session_id="legacy")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE messages SET compacted = 1, display_origin_id = NULL, "
+                "display_class = 'display' WHERE session_id = 'legacy'"
+            )
+            db._conn.execute(
+                "DELETE FROM message_display_origins WHERE session_id = 'legacy'"
+            )
+            db._conn.execute("UPDATE schema_version SET version = 21")
+            db._conn.commit()
+        db.close()
+
+        reopened = SessionDB(db_path=path)
+        try:
+            assert reopened.get_display_lineage_status("legacy")["complete"] is False
+            assert reopened.get_display_messages("legacy", limit=20)["messages"] == []
+        finally:
+            reopened.close()

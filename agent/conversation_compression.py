@@ -453,6 +453,7 @@ def _ensure_compressed_has_user_turn(original_messages: list, compressed: list) 
             "This marker exists because the compacted transcript contained "
             "no preserved user turn."
         ),
+        "_display_class": "synthetic_no_display",
     })
 
 
@@ -809,7 +810,11 @@ def compress_context(
 
         todo_snapshot = agent._todo_store.format_for_injection()
         if todo_snapshot:
-            compressed.append({"role": "user", "content": todo_snapshot})
+            compressed.append({
+                "role": "user",
+                "content": todo_snapshot,
+                "_display_class": "synthetic_no_display",
+            })
         _ensure_compressed_has_user_turn(messages, compressed)
 
         agent._invalidate_system_prompt()

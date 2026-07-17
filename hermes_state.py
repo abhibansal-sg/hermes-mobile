@@ -157,7 +157,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -809,6 +809,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     compression_failure_error TEXT,
     compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
     rewind_count INTEGER NOT NULL DEFAULT 0,
+    display_revision INTEGER NOT NULL DEFAULT 0,
+    display_generation INTEGER NOT NULL DEFAULT 0,
+    display_lineage_complete INTEGER NOT NULL DEFAULT 1,
     archived INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
@@ -833,7 +836,21 @@ CREATE TABLE IF NOT EXISTS messages (
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
-    compacted INTEGER NOT NULL DEFAULT 0
+    compacted INTEGER NOT NULL DEFAULT 0,
+    display_origin_id INTEGER,
+    display_generation INTEGER NOT NULL DEFAULT 0,
+    display_class TEXT NOT NULL DEFAULT 'display'
+);
+
+CREATE TABLE IF NOT EXISTS message_display_origins (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    origin_id INTEGER NOT NULL,
+    canonical_message_id INTEGER,
+    state TEXT NOT NULL DEFAULT 'display',
+    created_generation INTEGER NOT NULL DEFAULT 0,
+    display_revision INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (session_id, origin_id)
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
@@ -903,6 +920,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_display_origins_page
+    ON message_display_origins(session_id, state, origin_id DESC);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
@@ -1465,6 +1484,73 @@ class SessionDB:
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
 
+    def _backfill_display_lineage(self, cursor: sqlite3.Cursor) -> None:
+        """Backfill exact display origins only where legacy rows are unambiguous.
+
+        A session that has ever been compacted cannot be reconstructed from the
+        legacy ``active``/``compacted`` flags: retained rows and synthetic
+        summary rows were reinserted with fresh ids and no source identity.
+        Those sessions fail closed with ``display_lineage_complete = 0``.  An
+        uncompacted legacy session is exact: every stored row is its own origin,
+        and inactive rows are rewind tombstones rather than compacted copies.
+
+        The migration is deliberately idempotent.  New writes populate
+        ``message_display_origins`` transactionally, so only sessions with rows
+        and no ledger entries are candidates here.
+        """
+        try:
+            session_rows = cursor.execute(
+                "SELECT s.id, "
+                "EXISTS(SELECT 1 FROM messages m "
+                "       WHERE m.session_id = s.id AND m.compacted = 1) AS ambiguous "
+                "FROM sessions s "
+                "WHERE EXISTS(SELECT 1 FROM messages m WHERE m.session_id = s.id) "
+                "AND NOT EXISTS(SELECT 1 FROM message_display_origins d "
+                "               WHERE d.session_id = s.id)"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+
+        now = time.time()
+        for row in session_rows:
+            session_id = row["id"] if hasattr(row, "keys") else row[0]
+            ambiguous = bool(row["ambiguous"] if hasattr(row, "keys") else row[1])
+            if ambiguous:
+                cursor.execute(
+                    "UPDATE sessions SET display_lineage_complete = 0 WHERE id = ?",
+                    (session_id,),
+                )
+                cursor.execute(
+                    "UPDATE messages SET display_class = 'unknown' "
+                    "WHERE session_id = ? AND display_origin_id IS NULL",
+                    (session_id,),
+                )
+                continue
+
+            baseline_revision = 1
+            cursor.execute(
+                "UPDATE messages SET display_origin_id = id, "
+                "display_generation = 0, "
+                "display_class = CASE WHEN active = 1 "
+                "  THEN 'display' ELSE 'rewound_no_display' END "
+                "WHERE session_id = ?",
+                (session_id,),
+            )
+            cursor.execute(
+                "INSERT OR IGNORE INTO message_display_origins "
+                "(session_id, origin_id, canonical_message_id, state, "
+                " created_generation, display_revision, updated_at) "
+                "SELECT session_id, id, id, "
+                "CASE WHEN active = 1 THEN 'display' ELSE 'rewound_no_display' END, "
+                "0, ?, ? FROM messages WHERE session_id = ?",
+                (baseline_revision, now, session_id),
+            )
+            cursor.execute(
+                "UPDATE sessions SET display_revision = ?, "
+                "display_generation = 0, display_lineage_complete = 1 WHERE id = ?",
+                (baseline_revision, session_id),
+            )
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -1522,6 +1608,20 @@ class SessionDB:
             )
         except sqlite3.OperationalError:
             pass
+
+        # v22 display-lineage backfill.  This intentionally runs after column
+        # reconciliation and the legacy active=NULL repair so classification is
+        # based on the final row state.  Gate it on the pre-upgrade schema
+        # version: rescanning a large current database at every process start
+        # would turn a one-time migration into an unbounded launch cost.
+        pre_lineage_version_row = cursor.execute(
+            "SELECT version FROM schema_version LIMIT 1"
+        ).fetchone()
+        pre_lineage_version = (
+            int(pre_lineage_version_row[0]) if pre_lineage_version_row else 0
+        )
+        if pre_lineage_version < 22:
+            self._backfill_display_lineage(cursor)
 
         fts5_available = self._sqlite_supports_fts5(cursor)
         fts_migrations_complete = True
@@ -3819,6 +3919,10 @@ class SessionDB:
         observed: bool = False,
         effect_disposition: Optional[str] = None,
         timestamp: Any = None,
+        display_origin_id: Optional[int] = None,
+        display_session_id: Optional[str] = None,
+        display_class: Optional[str] = None,
+        display_generation: Optional[int] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -3866,12 +3970,41 @@ class SessionDB:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
         def _do(conn):
+            session_row = conn.execute(
+                "SELECT display_revision, display_generation "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            current_revision = int(session_row[0] or 0) if session_row else 0
+            current_generation = int(session_row[1] or 0) if session_row else 0
+            row_generation = (
+                int(display_generation)
+                if display_generation is not None
+                else current_generation
+            )
+            row_class = display_class or "display"
+            if row_class not in {
+                "display",
+                "synthetic_no_display",
+                "rewound_no_display",
+                "unknown",
+            }:
+                raise ValueError(f"unsupported display_class: {row_class!r}")
+            preserved_origin = (
+                int(display_origin_id)
+                if display_origin_id is not None and display_session_id == session_id
+                else None
+            )
+            if row_class == "synthetic_no_display":
+                preserved_origin = None
+
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active,
+                   display_origin_id, display_generation, display_class)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -3891,9 +4024,44 @@ class SessionDB:
                     platform_message_id,
                     1 if observed else 0,
                     1,
+                    preserved_origin,
+                    row_generation,
+                    row_class,
                 ),
             )
             msg_id = cursor.lastrowid
+
+            if row_class != "synthetic_no_display":
+                origin_id = preserved_origin or msg_id
+                next_revision = current_revision + 1
+                conn.execute(
+                    "UPDATE messages SET display_origin_id = ? WHERE id = ?",
+                    (origin_id, msg_id),
+                )
+                conn.execute(
+                    "INSERT INTO message_display_origins "
+                    "(session_id, origin_id, canonical_message_id, state, "
+                    " created_generation, display_revision, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(session_id, origin_id) DO UPDATE SET "
+                    "canonical_message_id = excluded.canonical_message_id, "
+                    "state = excluded.state, "
+                    "display_revision = excluded.display_revision, "
+                    "updated_at = excluded.updated_at",
+                    (
+                        session_id,
+                        origin_id,
+                        msg_id,
+                        row_class,
+                        row_generation,
+                        next_revision,
+                        time.time(),
+                    ),
+                )
+                conn.execute(
+                    "UPDATE sessions SET display_revision = ? WHERE id = ?",
+                    (next_revision, session_id),
+                )
 
             # Update counters
             if num_tool_calls > 0:
@@ -3911,7 +4079,60 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    @staticmethod
+    def _display_lineage_from_message(
+        message: Dict[str, Any], session_id: str
+    ) -> tuple[Optional[int], Optional[int], str]:
+        """Return trusted same-session lineage carried by a message dict.
+
+        Conversation reloads expose underscore-prefixed internal metadata so
+        compaction can copy it without putting it on a provider wire.  Raw
+        SessionDB rows expose the equivalent column names.  Cross-session
+        copies (fork/branch/import) intentionally receive new origins.
+        """
+        source_session = message.get("_display_session_id") or message.get("session_id")
+        raw_origin = message.get("_display_origin_id")
+        if raw_origin is None:
+            raw_origin = message.get("display_origin_id")
+        raw_generation = message.get("_display_generation")
+        if raw_generation is None:
+            raw_generation = message.get("display_generation")
+        row_class = (
+            message.get("_display_class")
+            or message.get("display_class")
+            or "display"
+        )
+        if message.get("_compressed_summary"):
+            row_class = "synthetic_no_display"
+        if row_class not in {
+            "display",
+            "synthetic_no_display",
+            "rewound_no_display",
+            "unknown",
+        }:
+            row_class = "unknown"
+        if row_class == "synthetic_no_display":
+            return None, None, row_class
+        if source_session != session_id:
+            return None, None, "display"
+        try:
+            origin_id = int(raw_origin) if raw_origin is not None else None
+        except (TypeError, ValueError):
+            origin_id = None
+        try:
+            generation = int(raw_generation) if raw_generation is not None else None
+        except (TypeError, ValueError):
+            generation = None
+        return origin_id, generation, row_class
+
+    def _insert_message_rows(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        lineage_mode: str = "replace",
+    ) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
@@ -3920,12 +4141,27 @@ class SessionDB:
         ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
         — the caller owns that, since the two flows reconcile counts differently.
         """
+        if lineage_mode not in {"replace", "compaction"}:
+            raise ValueError(f"unsupported lineage_mode: {lineage_mode!r}")
+        session_row = conn.execute(
+            "SELECT display_revision, display_generation FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        display_revision = int(session_row[0] or 0) if session_row else 0
+        current_generation = int(session_row[1] or 0) if session_row else 0
         now_ts = time.time()
         inserted = 0
         tool_calls_total = 0
         for msg in messages:
             role = msg.get("role", "unknown")
             tool_calls = msg.get("tool_calls")
+            origin_id, carried_generation, row_class = self._display_lineage_from_message(
+                msg, session_id
+            )
+            # The physical row belongs to the session's current context
+            # generation.  ``created_generation`` in the origin ledger remains
+            # the stable logical origin generation across compaction copies.
+            row_generation = current_generation
             message_timestamp = now_ts
             if msg.get("timestamp") is not None:
                 try:
@@ -3963,8 +4199,9 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active,
+                   display_origin_id, display_generation, display_class)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -3984,14 +4221,57 @@ class SessionDB:
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
                     1,
+                    origin_id,
+                    row_generation,
+                    row_class,
                 ),
             )
+            message_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            if row_class != "synthetic_no_display":
+                is_new_origin = origin_id is None
+                if is_new_origin:
+                    origin_id = message_id
+                    display_revision += 1
+                    conn.execute(
+                        "UPDATE messages SET display_origin_id = ? WHERE id = ?",
+                        (origin_id, message_id),
+                    )
+                if is_new_origin or lineage_mode == "replace":
+                    conn.execute(
+                        "INSERT INTO message_display_origins "
+                        "(session_id, origin_id, canonical_message_id, state, "
+                        " created_generation, display_revision, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(session_id, origin_id) DO UPDATE SET "
+                        "canonical_message_id = excluded.canonical_message_id, "
+                        "state = excluded.state, "
+                        "display_revision = MAX(message_display_origins.display_revision, "
+                        "                       excluded.display_revision), "
+                        "updated_at = excluded.updated_at",
+                        (
+                            session_id,
+                            origin_id,
+                            message_id,
+                            row_class,
+                            (
+                                carried_generation
+                                if carried_generation is not None
+                                else row_generation
+                            ),
+                            display_revision,
+                            time.time(),
+                        ),
+                    )
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
+        conn.execute(
+            "UPDATE sessions SET display_revision = ? WHERE id = ?",
+            (display_revision, session_id),
+        )
         return inserted, tool_calls_total
 
     def replace_messages(
@@ -4024,6 +4304,13 @@ class SessionDB:
         active_clause = " AND active = 1" if active_only else ""
 
         def _do(conn):
+            previous_rows = conn.execute(
+                "SELECT DISTINCT display_origin_id FROM messages "
+                f"WHERE session_id = ?{active_clause} "
+                "AND display_origin_id IS NOT NULL",
+                (session_id,),
+            ).fetchall()
+            previous_origins = {int(row[0]) for row in previous_rows}
             conn.execute(
                 f"DELETE FROM messages WHERE session_id = ?{active_clause}",
                 (session_id,),
@@ -4033,11 +4320,64 @@ class SessionDB:
                 (session_id,),
             )
             total_messages, total_tool_calls = self._insert_message_rows(
-                conn, session_id, messages
+                conn, session_id, messages, lineage_mode="replace"
             )
+            current_rows = conn.execute(
+                "SELECT DISTINCT display_origin_id FROM messages "
+                "WHERE session_id = ? AND active = 1 "
+                "AND display_origin_id IS NOT NULL",
+                (session_id,),
+            ).fetchall()
+            current_origins = {int(row[0]) for row in current_rows}
+            omitted_origins = previous_origins - current_origins
+            revision_row = conn.execute(
+                "SELECT display_revision FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            next_revision = int(revision_row[0] or 0) + 1
+            if omitted_origins:
+                placeholders = ",".join("?" for _ in omitted_origins)
+                origin_params = tuple(sorted(omitted_origins))
+                conn.execute(
+                    f"UPDATE message_display_origins "
+                    f"SET state = 'rewound_no_display', "
+                    f"canonical_message_id = CASE "
+                    f"  WHEN canonical_message_id IN "
+                    f"       (SELECT id FROM messages WHERE session_id = ?) "
+                    f"  THEN canonical_message_id ELSE NULL END, "
+                    f"display_revision = ?, updated_at = ? "
+                    f"WHERE session_id = ? AND origin_id IN ({placeholders})",
+                    (
+                        session_id,
+                        next_revision,
+                        time.time(),
+                        session_id,
+                        *origin_params,
+                    ),
+                )
+                conn.execute(
+                    f"UPDATE messages SET display_class = 'rewound_no_display' "
+                    f"WHERE session_id = ? AND display_origin_id IN ({placeholders})",
+                    (session_id, *origin_params),
+                )
+            if current_origins:
+                placeholders = ",".join("?" for _ in current_origins)
+                origin_params = tuple(sorted(current_origins))
+                conn.execute(
+                    f"UPDATE message_display_origins "
+                    f"SET state = 'display', display_revision = ?, updated_at = ? "
+                    f"WHERE session_id = ? AND origin_id IN ({placeholders})",
+                    (next_revision, time.time(), session_id, *origin_params),
+                )
+                conn.execute(
+                    f"UPDATE messages SET display_class = 'display' "
+                    f"WHERE session_id = ? AND display_origin_id IN ({placeholders})",
+                    (session_id, *origin_params),
+                )
             conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (total_messages, total_tool_calls, session_id),
+                "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                "display_revision = ? WHERE id = ?",
+                (total_messages, total_tool_calls, next_revision, session_id),
             )
 
         self._execute_write(_do)
@@ -4084,6 +4424,15 @@ class SessionDB:
         """
 
         def _do(conn):
+            generation_row = conn.execute(
+                "SELECT display_generation FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            next_generation = int(generation_row[0] or 0) + 1
+            conn.execute(
+                "UPDATE sessions SET display_generation = ? WHERE id = ?",
+                (next_generation, session_id),
+            )
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it
@@ -4096,7 +4445,10 @@ class SessionDB:
                 (session_id,),
             )
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, compacted_messages
+                conn,
+                session_id,
+                compacted_messages,
+                lineage_mode="compaction",
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
@@ -4158,6 +4510,109 @@ class SessionDB:
                     msg["tool_calls"] = []
             result.append(msg)
         return result
+
+    def get_display_lineage_status(self, session_id: str) -> Dict[str, Any]:
+        """Return the public display-lineage checkpoint for ``session_id``.
+
+        ``complete`` is false for legacy sessions whose pre-v22 compaction
+        generations cannot be classified without guessing.  Consumers must
+        fail closed and avoid advertising an exact display projection then.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT display_revision, display_generation, "
+                "display_lineage_complete FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"session not found: {session_id}")
+        return {
+            "schema_version": 1,
+            "session_id": session_id,
+            "display_revision": int(row["display_revision"] or 0),
+            "display_generation": int(row["display_generation"] or 0),
+            "complete": bool(row["display_lineage_complete"]),
+        }
+
+    def get_display_messages(
+        self,
+        session_id: str,
+        *,
+        before_origin_id: Optional[int] = None,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Read one bounded page of canonical display-origin rows.
+
+        The ledger contains one entry per logical source row.  Compaction
+        copies never create duplicates, while rewound/replaced origins are
+        excluded and available through :meth:`get_display_tombstones`.
+        Results are chronological within the page; ``previous_cursor`` pages
+        toward older origins.
+        """
+        bounded_limit = max(1, min(int(limit), 1000))
+        status = self.get_display_lineage_status(session_id)
+        if not status["complete"]:
+            return {
+                **status,
+                "messages": [],
+                "previous_cursor": None,
+                "has_older": False,
+            }
+        before_clause = ""
+        params: list[Any] = [session_id]
+        if before_origin_id is not None:
+            before_clause = " AND d.origin_id < ?"
+            params.append(int(before_origin_id))
+        params.append(bounded_limit + 1)
+        sql = (
+            "SELECT m.*, d.origin_id, d.created_generation, "
+            "d.display_revision AS origin_display_revision "
+            "FROM message_display_origins d "
+            "JOIN messages m ON m.id = d.canonical_message_id "
+            "WHERE d.session_id = ? AND d.state = 'display'"
+            f"{before_clause} "
+            "ORDER BY d.origin_id DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        has_older = len(rows) > bounded_limit
+        page_rows = rows[:bounded_limit]
+        messages: List[Dict[str, Any]] = []
+        for row in reversed(page_rows):
+            item = dict(row)
+            item["content"] = self._decode_content(item.get("content"))
+            messages.append(item)
+        previous_cursor = (
+            int(page_rows[-1]["origin_id"])
+            if has_older and page_rows
+            else None
+        )
+        return {
+            **status,
+            "messages": messages,
+            "previous_cursor": previous_cursor,
+            "has_older": has_older,
+        }
+
+    def get_display_tombstones(
+        self,
+        session_id: str,
+        *,
+        after_revision: int = 0,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        """Return bounded rewound/replaced display-origin tombstones."""
+        bounded_limit = max(1, min(int(limit), 5000))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT origin_id, state, display_revision, updated_at "
+                "FROM message_display_origins "
+                "WHERE session_id = ? AND state != 'display' "
+                "AND display_revision > ? "
+                "ORDER BY display_revision, origin_id LIMIT ?",
+                (session_id, int(after_revision), bounded_limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_messages_around(
         self,
@@ -4471,6 +4926,7 @@ class SessionDB:
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp "
+                ", display_origin_id, display_generation, display_class, session_id "
                 f"FROM messages WHERE session_id IN ({placeholders})"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
                 # append_message stamps rows with time.time(), which is not
@@ -4490,6 +4946,11 @@ class SessionDB:
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
+            if row["display_origin_id"] is not None:
+                msg["_display_origin_id"] = int(row["display_origin_id"])
+                msg["_display_generation"] = int(row["display_generation"] or 0)
+                msg["_display_class"] = row["display_class"] or "display"
+                msg["_display_session_id"] = row["session_id"]
             if row["timestamp"]:
                 msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:
@@ -4650,16 +5111,41 @@ class SessionDB:
 
         def _do(conn):
             cursor = conn.execute(
-                "SELECT id FROM messages "
+                "SELECT id, display_origin_id FROM messages "
                 "WHERE session_id = ? AND id >= ? AND active = 1",
                 (session_id, target_message_id),
             )
-            ids = [r[0] for r in cursor.fetchall()]
+            selected_rows = cursor.fetchall()
+            ids = [r[0] for r in selected_rows]
+            origins = sorted({int(r[1]) for r in selected_rows if r[1] is not None})
             if ids:
                 placeholders = ",".join("?" for _ in ids)
                 conn.execute(
                     f"UPDATE messages SET active = 0 WHERE id IN ({placeholders})",
                     ids,
+                )
+            if origins:
+                revision_row = conn.execute(
+                    "SELECT display_revision FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                next_revision = int(revision_row[0] or 0) + 1
+                placeholders = ",".join("?" for _ in origins)
+                conn.execute(
+                    f"UPDATE message_display_origins "
+                    f"SET state = 'rewound_no_display', display_revision = ?, "
+                    f"updated_at = ? WHERE session_id = ? "
+                    f"AND origin_id IN ({placeholders})",
+                    (next_revision, time.time(), session_id, *origins),
+                )
+                conn.execute(
+                    f"UPDATE messages SET display_class = 'rewound_no_display' "
+                    f"WHERE session_id = ? AND display_origin_id IN ({placeholders})",
+                    (session_id, *origins),
+                )
+                conn.execute(
+                    "UPDATE sessions SET display_revision = ? WHERE id = ?",
+                    (next_revision, session_id),
                 )
             conn.execute(
                 "UPDATE sessions SET rewind_count = COALESCE(rewind_count, 0) + 1 "
@@ -4693,16 +5179,41 @@ class SessionDB:
         """
         def _do(conn):
             cursor = conn.execute(
-                "SELECT id FROM messages "
-                "WHERE session_id = ? AND id >= ? AND active = 0",
+                "SELECT id, display_origin_id FROM messages "
+                "WHERE session_id = ? AND id >= ? AND active = 0 "
+                "AND compacted = 0",
                 (session_id, since_message_id),
             )
-            ids = [r[0] for r in cursor.fetchall()]
+            selected_rows = cursor.fetchall()
+            ids = [r[0] for r in selected_rows]
+            origins = sorted({int(r[1]) for r in selected_rows if r[1] is not None})
             if ids:
                 placeholders = ",".join("?" for _ in ids)
                 conn.execute(
                     f"UPDATE messages SET active = 1 WHERE id IN ({placeholders})",
                     ids,
+                )
+            if origins:
+                revision_row = conn.execute(
+                    "SELECT display_revision FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                next_revision = int(revision_row[0] or 0) + 1
+                placeholders = ",".join("?" for _ in origins)
+                conn.execute(
+                    f"UPDATE message_display_origins "
+                    f"SET state = 'display', display_revision = ?, updated_at = ? "
+                    f"WHERE session_id = ? AND origin_id IN ({placeholders})",
+                    (next_revision, time.time(), session_id, *origins),
+                )
+                conn.execute(
+                    f"UPDATE messages SET display_class = 'display' "
+                    f"WHERE session_id = ? AND display_origin_id IN ({placeholders})",
+                    (session_id, *origins),
+                )
+                conn.execute(
+                    "UPDATE sessions SET display_revision = ? WHERE id = ?",
+                    (next_revision, session_id),
                 )
             return len(ids)
 

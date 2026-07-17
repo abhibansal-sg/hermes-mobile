@@ -9019,7 +9019,12 @@ def _(rid, params: dict) -> dict:
             session["history_version"] = int(session.get("history_version", 0)) + 1
             if (db := _get_db()) is not None:
                 try:
-                    db.replace_messages(session["session_key"], truncated)
+                    session_key = session["session_key"]
+                    db.replace_messages(
+                        session_key,
+                        truncated,
+                        active_only=db.has_archived_messages(session_key),
+                    )
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
         session["running"] = True

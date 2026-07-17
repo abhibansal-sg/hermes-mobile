@@ -2428,6 +2428,10 @@ class SessionStore:
                     ),
                     observed=bool(message.get("observed")),
                     timestamp=message.get("timestamp"),
+                    display_origin_id=message.get("_display_origin_id"),
+                    display_session_id=message.get("_display_session_id"),
+                    display_class=message.get("_display_class"),
+                    display_generation=message.get("_display_generation"),
                 )
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
@@ -2467,7 +2471,11 @@ class SessionStore:
         if not self._db:
             return True
         try:
-            self._db.replace_messages(session_id, messages)
+            self._db.replace_messages(
+                session_id,
+                messages,
+                active_only=self._db.has_archived_messages(session_id),
+            )
             return True
         except Exception as e:
             logger.debug("Failed to rewrite transcript in DB: %s", e)

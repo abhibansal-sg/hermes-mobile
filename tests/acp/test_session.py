@@ -668,6 +668,10 @@ class TestPersistence:
         assert restored is not None
         msg = restored.history[0]
         assert isinstance(msg.pop("timestamp", None), (int, float))
+        assert isinstance(msg.pop("_display_origin_id", None), int)
+        assert msg.pop("_display_generation", None) == 0
+        assert msg.pop("_display_class", None) == "display"
+        assert msg.pop("_display_session_id", None) == state.session_id
         assert restored.history == [{
             "role": "assistant",
             "content": "hello",

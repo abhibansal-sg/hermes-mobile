@@ -1954,7 +1954,12 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                self._session_db.append_message(
+                persisted_display_class = (
+                    "synthetic_no_display"
+                    if msg.get("_compressed_summary")
+                    else msg.get("_display_class") or "display"
+                )
+                persisted_row_id = self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
                     content=content,
@@ -1968,7 +1973,17 @@ class AIAgent:
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
                     timestamp=_row_timestamp,
+                    display_origin_id=msg.get("_display_origin_id"),
+                    display_session_id=msg.get("_display_session_id"),
+                    display_class=persisted_display_class,
+                    display_generation=msg.get("_display_generation"),
                 )
+                if persisted_display_class == "synthetic_no_display":
+                    msg.pop("_display_origin_id", None)
+                else:
+                    msg["_display_origin_id"] = persisted_row_id
+                msg["_display_session_id"] = self.session_id
+                msg["_display_class"] = persisted_display_class
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
