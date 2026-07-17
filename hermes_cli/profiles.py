@@ -902,23 +902,23 @@ def read_profile_meta(profile_dir: Path) -> dict:
     """
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
-        return {"description": "", "description_auto": False, "profile_id": None}
+        return {"description": "", "description_auto": False}
     try:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
     except Exception:
-        return {"description": "", "description_auto": False, "profile_id": None}
+        return {"description": "", "description_auto": False}
     if not isinstance(data, dict):
-        return {"description": "", "description_auto": False, "profile_id": None}
-    return {
+        return {"description": "", "description_auto": False}
+    meta = {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
-        "profile_id": data.get("profile_id")
-        if isinstance(data.get("profile_id"), str)
-        and _OPAQUE_PROFILE_ID_RE.fullmatch(data["profile_id"])
-        else None,
     }
+    profile_id = data.get("profile_id")
+    if isinstance(profile_id, str) and _OPAQUE_PROFILE_ID_RE.fullmatch(profile_id):
+        meta["profile_id"] = profile_id
+    return meta
 
 
 def write_profile_meta(
