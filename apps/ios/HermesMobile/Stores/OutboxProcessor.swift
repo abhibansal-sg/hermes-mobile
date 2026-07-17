@@ -165,7 +165,10 @@ final class OutboxProcessor {
 
             guard dependencies.canProcessPrompt() else {
                 ReliabilityDiagnostics.shared.outboxWait()
-                try? await repository.releaseLease(id: job.jobID, owner: owner)
+                try? await repository.rollbackReadinessRacedLease(
+                    id: job.jobID,
+                    owner: owner
+                )
                 return
             }
 

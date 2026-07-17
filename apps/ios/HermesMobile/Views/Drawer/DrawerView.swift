@@ -987,7 +987,7 @@ struct DrawerView: View {
     private var pinnedSection: some View {
         if !sessions.drawerPinnedSessions.isEmpty {
             Section {
-                ForEach(sessions.drawerPinnedSessions) { summary in
+                ForEach(sessions.drawerPinnedSessions, id: \.scopedIdentity) { summary in
                     sessionRow(summary, pinned: true)
                 }
             } header: {
@@ -1096,7 +1096,7 @@ struct DrawerView: View {
             // or workspace fold), then an expand affordance. `group.sessions` is
             // already newest-first (sortedByActivity in drawerProfileGroups).
             let previewCount = SessionStore.drawerCollapsedProfilePreviewCount
-            ForEach(group.sessions.prefix(previewCount)) { summary in
+            ForEach(group.sessions.prefix(previewCount), id: \.scopedIdentity) { summary in
                 sessionRow(summary, pinned: false)
                     .onAppear { maybePrefetchMore(rowId: summary.id) }
             }
@@ -1149,7 +1149,7 @@ struct DrawerView: View {
         if group.kind == .chats && sessions.groupByWorkspace {
             groupedSourceRows(group)
         } else {
-            ForEach(group.sessions) { summary in
+            ForEach(group.sessions, id: \.scopedIdentity) { summary in
                 sessionRow(summary, pinned: false)
                     .onAppear { maybePrefetchMore(rowId: summary.id) }
             }
@@ -1165,7 +1165,7 @@ struct DrawerView: View {
         } else if group.kind == .chats && sessions.groupByWorkspace {
             groupedSourceRows(group)
         } else {
-            ForEach(group.sessions) { summary in
+            ForEach(group.sessions, id: \.scopedIdentity) { summary in
                 sessionRow(summary, pinned: false)
                     .onAppear { maybePrefetchMore(rowId: summary.id) }
             }
@@ -1191,7 +1191,7 @@ struct DrawerView: View {
                 }
             }
             if !isCollapsed {
-                ForEach(workspace.sessions) { summary in
+                ForEach(workspace.sessions, id: \.scopedIdentity) { summary in
                     sessionRow(summary, pinned: false)
                         .onAppear { maybePrefetchMore(rowId: summary.id) }
                 }
@@ -1435,7 +1435,7 @@ struct DrawerView: View {
                 }
             }
             if !isCollapsed {
-                ForEach(group.sessions) { summary in
+                ForEach(group.sessions, id: \.scopedIdentity) { summary in
                     sessionRow(summary, pinned: false)
                         // Grouped layout gets the same near-bottom prefetch as
                         // the flat list (resolved by id against the flat
@@ -1606,7 +1606,7 @@ struct DrawerView: View {
                 DrawerSessionRow(
                     summary: summary,
                     isPinned: pinned,
-                    isSelected: summary.id == sessions.activeStoredId,
+                    isSelected: sessions.isActive(summary),
                     isLive: sessions.isLive(summary)
                 )
             }
@@ -2484,7 +2484,7 @@ struct ProjectDetailView: View {
                 // Designed empty state: no sessions yet. Helpful, not blank.
                 emptyStateRow
             } else {
-                ForEach(projectSessions) { summary in
+                ForEach(projectSessions, id: \.scopedIdentity) { summary in
                     sessionRow(summary)
                 }
             }
@@ -2514,7 +2514,7 @@ struct ProjectDetailView: View {
         } label: {
             DrawerSessionRow(
                 summary: summary,
-                isSelected: summary.id == sessions.activeStoredId,
+                isSelected: sessions.isActive(summary),
                 isLive: sessions.isLive(summary)
             )
         }

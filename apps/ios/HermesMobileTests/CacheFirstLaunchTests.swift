@@ -243,6 +243,13 @@ final class CacheFirstLaunchTests: XCTestCase {
         await sessions.waitForPendingOpenForTesting()
 
         XCTAssertEqual(sessions.activeStoredId, "shared")
+        XCTAssertEqual(sessions.activeStoredProfile, "work")
+        XCTAssertTrue(sessions.isActive(makeSummary(id: "shared", profile: "work")))
+        XCTAssertFalse(sessions.isActive(makeSummary(id: "shared", profile: "default")))
+        XCTAssertNotEqual(
+            makeSummary(id: "shared", profile: "work").scopedIdentity,
+            makeSummary(id: "shared", profile: "default").scopedIdentity
+        )
         // Exact-profile selection is observable through the persisted identity:
         // opening the default duplicate would overwrite this with default.
         let restored = try await cache.loadLastOpenedSession(scope: scope)
@@ -523,9 +530,10 @@ final class CacheFirstLaunchTests: XCTestCase {
         sessions.prefetchRecentTranscripts()
         try await Self.poll { await observed.value == "work-session:work" }
 
-        XCTAssertTrue(try await cache.hasTranscript(
+        let hasWorkTranscript = try await cache.hasTranscript(
             CacheIdentity(serverId: serverURL, profileId: "work", sessionId: "work-session")
-        ))
+        )
+        XCTAssertTrue(hasWorkTranscript)
     }
 
     func testPrefetchSkipsActiveSessionAndFreshCache() async throws {

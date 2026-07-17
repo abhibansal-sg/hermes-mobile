@@ -40,6 +40,13 @@ struct SessionSummary: Decodable, Identifiable, Sendable, Equatable {
     /// rebuild, the test fixture helper) compile without passing it.
     var profile: String? = nil
 
+    /// Drawer/list identity is scoped because stored session ids may collide
+    /// across profiles on the same gateway.
+    var scopedIdentity: String {
+        let value = profile?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return "\(value.isEmpty ? "default" : value)\u{1F}\(id)"
+    }
+
     /// Stable group key for workspace grouping: the trimmed ``cwd``, or the
     /// sentinel `"__no_workspace__"` when blank/absent — replicating the
     /// desktop sidebar's `workspaceGroupsFor` (apps/desktop/.../sidebar/index.tsx).
