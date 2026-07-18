@@ -1,5 +1,6 @@
 import SwiftUI
 import OSLog
+import Network  // NWPathMonitor — S3 self-reconnect when the network returns
 #if canImport(UIKit)
 import UIKit  // UIDevice.current.name — the auto-upgrade device-name hint (W3A-A)
 #endif
@@ -847,6 +848,25 @@ final class ConnectionStore {
     /// written — never cleared — so `await value` resolves once and only once.
     var lastReconnectTask: Task<Void, Never>?
     func waitForReconnectForTesting() async { await lastReconnectTask?.value }
+
+    /// Injectable path monitor (tests). When non-nil, `startPathMonitor()` wires
+    /// this fake instead of building a live `NWPathMonitor` adapter, so path
+    /// transitions can be emitted deterministically without real hardware.
+    /// Pattern mirrors `connectRPC`/`probeLivenessRPC`. `nil` in production.
+    var _pathMonitorForTesting: NetworkPathMonitoring?
+
+    /// Injectable network-reconnect debounce (tests). When non-nil, the
+    /// path-satisfied trigger uses this instead of `networkReconnectDebounce` so
+    /// flapping/single-attempt tests don't wait a real second.
+    var networkReconnectDebounceOverride: Duration?
+
+    /// Test seam: wire + start the path monitor without going through a full
+    /// `configure()` (used by the already-connected no-op test, which seeds the
+    /// connected state directly).
+    func _startPathMonitorForTesting() { startPathMonitor() }
+
+    /// Test observability: whether a path monitor is currently armed.
+    var _pathMonitorIsRunningForTesting: Bool { pathMonitor != nil }
     #endif
 
     /// Tasks that live as long as the client: the event router and the
@@ -902,6 +922,27 @@ final class ConnectionStore {
     /// phase immediately at expiry, rather than waiting for the loop's next
     /// iteration (which could be a full backoff delay away).
     private var currentReconnectAttempt = 0
+
+    // MARK: - Network path monitoring (S3 — self-reconnect)
+
+    /// The single network-path monitor owned by this store (S3). Started in
+    /// `configure()` — so even a cold-launch-offline configure whose REST probe
+    /// fails (`phase = .offline`, `hasConnected == false`) leaves a live monitor
+    /// armed — and torn down in `stopLiveWork()` (disconnect / forget / explicit
+    /// offline). When the path transitions to `.satisfied` while we are stalled
+    /// (`.offline` or `.reconnecting`), it kicks the EXISTING reconnect entry
+    /// point (`startReconnectLoop`, or `bootstrap()` for the cold case) behind a
+    /// debounce — it never invents a new connect path.
+    private var pathMonitor: NetworkPathMonitoring?
+    /// Debounced trailing-edge trigger for a path-satisfied reconnect. Cancelled
+    /// and replaced on every fresh `.satisfied`, so a rapidly flapping path
+    /// (satisfied/unsatisfied/satisfied…) collapses to a SINGLE reconnect attempt.
+    private var networkReconnectDebounceTask: Task<Void, Never>?
+    /// Debounce window between a `.satisfied` path event and the reconnect kick.
+    /// Short enough to feel instant, long enough to absorb interface flapping
+    /// (Wi-Fi↔cellular handoff, VPN re-handshake) into one attempt.
+    private static let networkReconnectDebounce: Duration = .seconds(1)
+
     /// The in-flight post-connect hydration coordinator, if any (ABH-82). Owns
     /// the `.hydrating → .connected` transition and the timeout fallback;
     /// cancelled on disconnect so a teardown mid-hydration can't later flip the
@@ -1212,6 +1253,14 @@ final class ConnectionStore {
         sessionStore.resetInitialFill()
 
         phase = .connecting
+
+        // S3: arm the network-path monitor BEFORE the REST probe. A cold-launch-
+        // offline configure fails at the probe below and returns terminal
+        // `.offline` with `hasConnected == false`; arming here (not after a
+        // verified connect) is what lets a later path-satisfied event lift that
+        // terminal state and reconnect by itself. Idempotent — a single instance
+        // survives re-configures.
+        startPathMonitor()
 
         // Probe REST first to fail fast with a clear message before opening WS.
         let previousToken = KeychainService.loadToken(server: trimmedURL)
@@ -1543,6 +1592,11 @@ final class ConnectionStore {
         generation ownedGeneration: UInt64? = nil
     ) async {
         let generation = ownedGeneration ?? advanceConnectionGeneration()
+        // S3: tear down the path monitor on every deliberate stop — disconnect
+        // (→ needsSetup, no saved config to retry), forget (unpair), and explicit
+        // goOffline (a user-chosen offline must NOT silently self-reconnect). A
+        // later `configure()`/`bootstrap()` re-arms it.
+        stopPathMonitor()
         reconnectTask?.cancel()
         reconnectTask = nil
         // Cancel any in-flight hydration so a teardown mid-load can't later flip
@@ -1990,6 +2044,121 @@ final class ConnectionStore {
         graceTask?.cancel()
         graceTask = nil
         isInGrace = false
+    }
+
+    // MARK: - Network path monitoring (S3)
+
+    /// Arm the single network-path monitor. Idempotent: a monitor already
+    /// running is left untouched so re-configures don't churn it. In DEBUG a
+    /// test can inject a fake via `_pathMonitorForTesting`.
+    private func startPathMonitor() {
+        guard pathMonitor == nil else { return }
+        let monitor: NetworkPathMonitoring
+        #if DEBUG
+        if let injected = _pathMonitorForTesting {
+            monitor = injected
+        } else if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            // Under XCTest with no injected fake, do NOT arm a live NWPathMonitor:
+            // the simulator's real `.satisfied` path would fire spurious
+            // reconnects into unrelated tests that assert on a stalled `.offline`/
+            // `.reconnecting` state. S3 tests inject `_pathMonitorForTesting`.
+            return
+        } else {
+            monitor = NWPathMonitorAdapter()
+        }
+        #else
+        monitor = NWPathMonitorAdapter()
+        #endif
+        monitor.onPathUpdate = { [weak self] status in
+            self?.handleNetworkPath(status)
+        }
+        pathMonitor = monitor
+        monitor.start()
+    }
+
+    /// Disarm the monitor and drop any pending debounced kick.
+    private func stopPathMonitor() {
+        networkReconnectDebounceTask?.cancel()
+        networkReconnectDebounceTask = nil
+        pathMonitor?.onPathUpdate = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
+    }
+
+    /// A path update arrived (main actor). Only a `.satisfied` path can heal a
+    /// stalled connection, and only while we are actually stalled — `.offline`
+    /// (including the terminal cold-launch-offline state) or `.reconnecting`.
+    ///
+    /// `.requiresConnection`/`.unsatisfied` are treated as "still down" and
+    /// ignored; the next `.satisfied` fires the trigger. Constrained paths (Low
+    /// Data Mode) still report `.satisfied` — we deliberately do NOT special-case
+    /// `path.isConstrained` here, so behavior is unchanged on constrained links
+    /// (noted per spec).
+    private func handleNetworkPath(_ status: NetworkPathStatus) {
+        guard status == .satisfied else { return }
+        switch phase {
+        case .offline, .reconnecting:
+            break
+        case .needsSetup, .connecting, .hydrating, .connected:
+            // Live, hydrating, or unpaired — nothing to self-heal.
+            return
+        }
+        // A user-chosen offline (goOffline) must never be silently overridden by
+        // a returning network. (stopLiveWork also tears the monitor down in that
+        // case, so this is belt-and-suspenders against an in-flight event.)
+        if UserDefaults.standard.bool(forKey: DefaultsKeys.connectionOffline) { return }
+        scheduleNetworkReconnect()
+    }
+
+    /// Debounce the reconnect kick on the trailing edge so a flapping path
+    /// collapses to a single attempt.
+    private func scheduleNetworkReconnect() {
+        networkReconnectDebounceTask?.cancel()
+        #if DEBUG
+        let delay = networkReconnectDebounceOverride ?? Self.networkReconnectDebounce
+        #else
+        let delay = Self.networkReconnectDebounce
+        #endif
+        networkReconnectDebounceTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, !Task.isCancelled else { return }
+            self.networkReconnectDebounceTask = nil
+            self.fireNetworkReconnect()
+        }
+    }
+
+    /// Trailing-edge of the debounce: re-check state and route into the EXISTING
+    /// reconnect seam. Never a new connect path.
+    private func fireNetworkReconnect() {
+        // Re-check at fire time — the window may have healed us, or the user may
+        // have just chosen offline.
+        if UserDefaults.standard.bool(forKey: DefaultsKeys.connectionOffline) { return }
+        switch phase {
+        case .offline:
+            if hasConnected {
+                // We reached the gateway at least once this launch, so the saved
+                // URL + in-memory token are live: the reconnect loop can resume
+                // (its own backoff still applies to subsequent failures).
+                startReconnectLoop(generation: connectionGeneration)
+            } else {
+                // Cold-launch-offline: `configure()`'s REST probe never succeeded,
+                // so there is no in-memory token to resume. Re-run bootstrap — it
+                // re-reads the saved config, reloads the Keychain token, and
+                // re-probes REST — which is what lifts the TERMINAL `.offline`
+                // state (S3 cold-launch case).
+                Task { [weak self] in await self?.bootstrap() }
+            }
+        case .reconnecting:
+            // A reconnect loop is already running but may be parked deep in
+            // backoff. Reset it so the next attempt fires immediately now that
+            // the path is back — same kick `handleScenePhase` performs on
+            // foreground. The loop keeps its backoff schedule on further failures.
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            startReconnectLoop(generation: connectionGeneration)
+        case .needsSetup, .connecting, .hydrating, .connected:
+            return
+        }
     }
 
     // MARK: - Reconnect
@@ -2726,5 +2895,69 @@ final class ConnectionStore {
 
         let trimmed = name.trimmingCharacters(in: CharacterSet(charactersIn: "-").union(.whitespaces))
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+// MARK: - Network path monitoring seam (S3)
+
+/// The minimal path-reachability signal the S3 self-reconnect trigger consumes.
+/// A deliberately reduced projection of `NWPath.Status` so the store's trigger
+/// logic (and its tests) never depend on the `Network` framework's concrete
+/// types.
+enum NetworkPathStatus: Equatable, Sendable {
+    /// A usable path exists (the only status that kicks a reconnect).
+    case satisfied
+    /// No usable path.
+    case unsatisfied
+    /// A path may become satisfied after a connection step (e.g. captive portal
+    /// / VPN handshake). Treated as "still down" until it flips to `.satisfied`.
+    case requiresConnection
+}
+
+/// Protocol-wrapped `NWPathMonitor` so tests can inject deterministic path
+/// transitions without real hardware (the production impl is
+/// ``NWPathMonitorAdapter``). Main-actor bound because its single consumer,
+/// `ConnectionStore`, is `@MainActor` and mutates connection state on every
+/// update.
+@MainActor
+protocol NetworkPathMonitoring: AnyObject {
+    /// Invoked on the main actor for each path update after `start()`.
+    var onPathUpdate: ((NetworkPathStatus) -> Void)? { get set }
+    /// Begin delivering updates. Idempotent per instance.
+    func start()
+    /// Stop delivering updates and release the underlying monitor.
+    func cancel()
+}
+
+/// Production ``NetworkPathMonitoring`` backed by `NWPathMonitor`. `NWPathMonitor`
+/// delivers updates on a background dispatch queue, so each update hops to the
+/// main actor before touching `onPathUpdate`.
+@MainActor
+final class NWPathMonitorAdapter: NetworkPathMonitoring {
+    var onPathUpdate: ((NetworkPathStatus) -> Void)?
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "ai.hermes.app.networkpath")
+    private var started = false
+
+    func start() {
+        guard !started else { return }
+        started = true
+        monitor.pathUpdateHandler = { [weak self] path in
+            let status: NetworkPathStatus
+            switch path.status {
+            case .satisfied: status = .satisfied
+            case .unsatisfied: status = .unsatisfied
+            case .requiresConnection: status = .requiresConnection
+            @unknown default: status = .unsatisfied
+            }
+            Task { @MainActor [weak self] in
+                self?.onPathUpdate?(status)
+            }
+        }
+        monitor.start(queue: queue)
+    }
+
+    func cancel() {
+        monitor.cancel()
     }
 }
