@@ -93,6 +93,19 @@ struct MessageBubble: View {
     /// sites compiling unchanged.
     let appearance: BubbleAppearance
 
+    /// WhatsApp-style delivery state of this user bubble's durable outbox row
+    /// (C1), correlated by `message.clientMessageID`. `.failed` shows the red
+    /// error badge with Resend/Delete; `.inTransit`/`.none` show no extra
+    /// affordance. A `Sendable`/`Equatable` value so the `nonisolated ==` can
+    /// compare it and re-render the badge when the row transitions.
+    let delivery: QueueStore.SendDelivery
+    /// Invoked when the user taps "Resend" on a failed bubble — re-drives the
+    /// existing outbox row. `nil` hides the action (previews / non-user rows).
+    let onResend: (() -> Void)?
+    /// Invoked when the user taps "Delete" on a failed bubble — cancels the row
+    /// and removes the local echo. `nil` hides the action.
+    let onDeleteFailedSend: (() -> Void)?
+
     /// Explicit memberwise init so every comparison input can be an immutable
     /// `Sendable` `let` (required for the `nonisolated ==` under Swift 6 strict
     /// concurrency — a `View` is main-actor-isolated, so `Equatable.==` may only
@@ -108,7 +121,10 @@ struct MessageBubble: View {
         menuActionsEnabled: Bool = true,
         assistantTurnActionsEnabled: Bool = true,
         liveTurnStartedAt: Date? = nil,
-        appearance: BubbleAppearance = BubbleAppearance()
+        appearance: BubbleAppearance = BubbleAppearance(),
+        delivery: QueueStore.SendDelivery = .none,
+        onResend: (() -> Void)? = nil,
+        onDeleteFailedSend: (() -> Void)? = nil
     ) {
         self.message = message
         self.onEdit = onEdit
@@ -122,6 +138,15 @@ struct MessageBubble: View {
         self.assistantTurnActionsEnabled = assistantTurnActionsEnabled
         self.liveTurnStartedAt = liveTurnStartedAt
         self.appearance = appearance
+        self.delivery = delivery
+        self.onResend = onResend
+        self.onDeleteFailedSend = onDeleteFailedSend
+    }
+
+    /// Whether this bubble's send is stuck/failed and should show the badge.
+    private var isFailedSend: Bool {
+        if case .failed = delivery { return true }
+        return false
     }
 
     var body: some View {
@@ -286,11 +311,17 @@ struct MessageBubble: View {
     /// Whether the long user message is expanded (ephemeral, per-message-instance).
     @State private var userBubbleExpanded = false
 
+    /// Whether the failed-send confirmation menu (Resend / Delete) is showing.
+    @State private var showDeliveryActions = false
+
     private var userBubble: some View {
         let attachmentInput = Self.sentImageAttachments(in: message.text)
         let displayText = attachmentInput.displayText
-        return HStack {
+        return HStack(alignment: .center, spacing: 6) {
             Spacer(minLength: 0)
+            if isFailedSend {
+                deliveryFailureBadge
+            }
             VStack(alignment: .trailing, spacing: 0) {
                 ForEach(attachmentInput.attachments) { attachment in
                     SentImageThumbnailView(
@@ -341,6 +372,39 @@ struct MessageBubble: View {
             }
             .modifier(PerfUserBubbleChrome())
             .frame(maxWidth: maxBubbleWidth, alignment: .trailing)
+        }
+    }
+
+    /// The WhatsApp-style failed-send affordance (C1): a small red-circle
+    /// exclamation to the left of the bubble. Tapping opens a confirmation menu
+    /// with exactly two actions — Resend and Delete. Uses the existing error
+    /// iconography (`exclamationmark.circle.fill`, `theme.destructive`) so it
+    /// matches the app's design language with no new visual vocabulary.
+    private var deliveryFailureBadge: some View {
+        Button {
+            showDeliveryActions = true
+        } label: {
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.title3)
+                .foregroundStyle(theme.destructive)
+                .symbolRenderingMode(.hierarchical)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Message not sent")
+        .accessibilityHint("Double-tap for resend and delete options")
+        .accessibilityIdentifier("messageDeliveryFailedBadge")
+        .confirmationDialog(
+            "Message not sent",
+            isPresented: $showDeliveryActions,
+            titleVisibility: .visible
+        ) {
+            if let onResend {
+                Button("Resend") { onResend() }
+            }
+            if let onDeleteFailedSend {
+                Button("Delete", role: .destructive) { onDeleteFailedSend() }
+            }
+            Button("Cancel", role: .cancel) {}
         }
     }
 
@@ -2175,6 +2239,10 @@ extension MessageBubble: Equatable {
             && lhs.showsUndoLastTurnAction == rhs.showsUndoLastTurnAction
             && lhs.liveTurnStartedAt == rhs.liveTurnStartedAt
             && lhs.appearance == rhs.appearance
+            // Delivery state drives the send-failed badge (C1); a transition
+            // (in-transit → failed → delivered) must re-render past the A1
+            // short-circuit.
+            && lhs.delivery == rhs.delivery
     }
 }
 
