@@ -52,7 +52,7 @@ no gateway dependency, no I/O.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .bus import TOPIC_GATEWAY_EVENTS, TOPIC_RELAY_FRAMES, EventBus
@@ -91,6 +91,10 @@ class _Ctx:
     current_turn: Optional[str] = None
     text_item: Optional[str] = None
     reasoning_item: Optional[str] = None
+    # For id-LESS tools only: name -> the synthesized item_id assigned at
+    # tool.start, so the matching tool.complete lands on the SAME card. Tools
+    # that carry a real ``tool_id`` never touch this map (they correlate on it).
+    open_tools_by_name: dict[str, str] = field(default_factory=dict)
 
 
 class Reframer:
@@ -348,6 +352,31 @@ class Reframer:
         ]
 
     # -- tools -----------------------------------------------------------
+    def _tool_item_id(
+        self, ctx: _Ctx, sid: str, name: str, payload: dict, etype: str
+    ) -> str:
+        """Resolve the correlating ``item_id`` for a tool.start/complete.
+
+        When the gateway supplies a ``tool_id`` it is reused verbatim as the
+        item id, so start and complete correlate on it directly. When it is
+        ABSENT (an edge the generic forward-compat path must still survive),
+        synthesizing a fresh id on BOTH the start and the complete would split
+        one tool across two cards — an orphaned in-progress card that never
+        completes. Instead, correlate id-less events by tool ``name``: the start
+        records its synthesized id under the name; the matching complete pops and
+        reuses it. A complete with no prior start still gets a fresh id.
+        """
+        raw_tool_id = str(payload.get("tool_id") or "")
+        if raw_tool_id:
+            return raw_tool_id
+        if etype == RawEvent.TOOL_START:
+            item_id = self._new_item_id(sid)
+            ctx.open_tools_by_name[name] = item_id
+            return item_id
+        # TOOL_COMPLETE with no tool_id: reuse the start's synthesized id if we
+        # opened one for this name, else mint a fresh id (complete-without-start).
+        return ctx.open_tools_by_name.pop(name, None) or self._new_item_id(sid)
+
     def _reframe_tool(self, event: GatewayEvent) -> list[Frame]:
         """tool.start/complete -> generic toolCall (or a special render type).
 
@@ -356,14 +385,14 @@ class Reframer:
         """
         sid = event.session_id or ""
         state = self._store.get(sid)
+        ctx = self._ctx_for(sid)
         payload = event.payload
         name = str(payload.get("name") or "")
-        tool_id = str(payload.get("tool_id") or "") or self._new_item_id(sid)
+        tool_id = self._tool_item_id(ctx, sid, name, payload, event.type)
         itype = self._tool_item_type(name, payload)
 
         if event.type == RawEvent.TOOL_START:
             frames = self._ensure_turn(sid)
-            ctx = self._ctx_for(sid)
             body: dict[str, Any] = {"name": name}
             for key in ("context", "args_text", "args"):
                 if payload.get(key) is not None:
@@ -382,7 +411,6 @@ class Reframer:
         # TOOL_COMPLETE — authoritative tool result. May arrive with no prior
         # tool.start (progress disabled but an inline_diff forced the emit).
         frames = self._ensure_turn(sid)
-        ctx = self._ctx_for(sid)
         existing = state.items.get(tool_id)
         ord_ = existing.ord if existing is not None else state.allocate_ord()
         body = {"name": name}

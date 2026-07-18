@@ -263,6 +263,55 @@ def test_unknown_tool_name_is_generic_tool_call():
     assert completed.body["item_id"] == "z9"
 
 
+def test_idless_tool_start_and_complete_correlate_by_name():
+    """An id-LESS tool.start/complete pair must land on ONE card. Synthesizing a
+    fresh id on both would orphan an in-progress card that never completes."""
+    rf = _rf()
+    frames = _drive(
+        rf,
+        [
+            _ev("message.start"),
+            _ev("tool.start", name="mystery_tool", context="working"),   # NO tool_id
+            _ev("tool.complete", name="mystery_tool", result="ok"),      # NO tool_id
+        ],
+    )
+    started = _first(frames, FrameKind.ITEM_STARTED)
+    completed = _first(frames, FrameKind.ITEM_COMPLETED)
+    assert started.body["item_id"] == completed.body["item_id"]  # same card
+    assert started.body["status"] == ItemStatus.IN_PROGRESS
+    assert completed.body["status"] == ItemStatus.COMPLETED
+    # the completion reused the started item's ord (no duplicate slot).
+    assert started.body["ord"] == completed.body["ord"]
+
+
+def test_idless_tools_distinct_names_do_not_crosstalk():
+    rf = _rf()
+    frames = _drive(
+        rf,
+        [
+            _ev("tool.start", name="alpha"),
+            _ev("tool.start", name="beta"),
+            _ev("tool.complete", name="beta", result="b"),
+            _ev("tool.complete", name="alpha", result="a"),
+        ],
+    )
+    ids = {f.body["body"]["name"]: f.body["item_id"]
+           for f in frames if f.kind == FrameKind.ITEM_COMPLETED}
+    starts = {f.body["body"]["name"]: f.body["item_id"]
+              for f in frames if f.kind == FrameKind.ITEM_STARTED}
+    assert ids["alpha"] == starts["alpha"]
+    assert ids["beta"] == starts["beta"]
+    assert ids["alpha"] != ids["beta"]
+
+
+def test_idless_tool_complete_without_start_gets_fresh_id():
+    rf = _rf()
+    frames = _drive(rf, [_ev("tool.complete", name="lonely", result="done")])
+    completed = _first(frames, FrameKind.ITEM_COMPLETED)
+    assert completed.body["item_id"]  # a non-empty synthesized id
+    assert completed.body["status"] == ItemStatus.COMPLETED
+
+
 def test_tool_complete_without_start_still_completes():
     rf = _rf()
     frames = _drive(rf, [_ev("tool.complete", tool_id="solo", name="write_file", result="wrote")])

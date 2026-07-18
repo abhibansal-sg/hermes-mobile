@@ -141,6 +141,16 @@ class SessionStore:
     def snapshot(self, sid: str, cursor: Any = None) -> dict[str, Any]:
         return self.get(sid).snapshot(cursor=cursor)
 
+    def session_ids(self) -> list[str]:
+        """Every session id the store currently holds accumulated items for.
+
+        Used by the DownstreamServer to snapshot a phone across a reconnect
+        (fresh per-connection seq space), where the connection's own
+        ``seen_sids`` is still empty because no frame has streamed on the new
+        socket yet.
+        """
+        return list(self._states.keys())
+
     def drop(self, sid: str) -> bool:
         return self._states.pop(sid, None) is not None
 

@@ -104,7 +104,12 @@ class PhoneConnection:
         # Sessions this connection has streamed at least one frame for — the
         # set a FALLBACK resync rebuilds snapshots for.
         self.seen_sids: set[str] = set()
-        # Sessions this phone currently holds foregrounded (gates Notifier §6).
+        # The session this phone currently holds foregrounded (gates Notifier §6).
+        # A mobile client shows ONE chat at a time, so this is set-REPLACE, never
+        # accumulate: navigating to another chat clears the previous one and an
+        # explicit ``foreground{session_id:null}`` (app backgrounded) clears it
+        # entirely. Kept as a set so :meth:`DownstreamServer.session_has_live_phone`
+        # stays a simple membership test.
         self.foreground_sessions: set[str] = set()
 
     # -- introspection (tests / diagnostics) -----------------------------
@@ -120,6 +125,18 @@ class PhoneConnection:
         """Allocate the next monotonic per-connection seq."""
         self._head_seq += 1
         return self._head_seq
+
+    def set_foreground(self, sid: Optional[str]) -> None:
+        """Declare the single session this phone now holds foregrounded (§6).
+
+        REPLACE semantics (a mobile phone views one chat at a time): opening or
+        driving a new chat clears the previous one, so a session the user has
+        navigated away from stops suppressing its own completion/error pushes.
+        ``None`` (app backgrounded / chat closed) clears the foreground set,
+        re-enabling pushes for everything. NOTE: a pure background REST
+        ``history`` sync must NOT call this — reading is not foregrounding.
+        """
+        self.foreground_sessions = {sid} if sid else set()
 
     async def send_frame(self, frame: Frame) -> int:
         """Stamp seq, append to the ring, and write the frame to the socket.
@@ -153,8 +170,21 @@ class PhoneConnection:
         FALLBACK -> build a per-session ``snapshot`` from ``store`` and send it,
         then resume live. CURRENT -> nothing to replay.
         """
+        if last_seq > self._head_seq:
+            # ``last_seq`` is HIGHER than anything this connection has ever sent.
+            # seq is per-connection, so this can only be a leftover watermark from
+            # a PRIOR connection (a reconnect on a fresh socket): this connection's
+            # ring cannot replay a foreign seq space, and the CURRENT short-circuit
+            # below would wrongly return with no catch-up at all, stranding the
+            # phone on stale content until it manually REST-refetches. Hand it a
+            # snapshot of every known session instead, which it reconciles by
+            # item_id and then resumes live on THIS connection's seq spine.
+            # ``seen_sids`` is still empty on a just-opened socket, so snapshot the
+            # whole store, not just this connection's (as-yet-empty) seen set.
+            await self._send_snapshots(store, sids=store.session_ids())
+            return
         if last_seq >= self._head_seq:
-            return  # CURRENT: phone is at or ahead of head; attach live only.
+            return  # CURRENT: phone is at head on THIS connection; attach live.
 
         decision = self._ring.decide(self.conn_id, last_seq)
         if decision.is_replay:
@@ -169,8 +199,18 @@ class PhoneConnection:
         # sequenced downstream frame the phone will ack.
         await self._send_snapshots(store)
 
-    async def _send_snapshots(self, store: SessionStore) -> None:
-        for sid in sorted(self.seen_sids):
+    async def _send_snapshots(
+        self, store: SessionStore, sids: Optional[list[str]] = None
+    ) -> None:
+        """Send a fresh per-session ``snapshot`` for each of ``sids``.
+
+        Defaults to this connection's ``seen_sids`` (an intra-connection ring
+        miss). A caller recovering a reconnect passes an explicit list (e.g.
+        ``store.session_ids()``), because a just-opened socket has not streamed a
+        frame yet and its ``seen_sids`` is empty.
+        """
+        target = sids if sids is not None else sorted(self.seen_sids)
+        for sid in target:
             body = store.snapshot(sid, cursor=self._head_seq)
             await self.send_frame(Frame(sid=sid, kind=FrameKind.SNAPSHOT, body=body))
 
@@ -300,11 +340,40 @@ class DownstreamServer:
             )
 
     async def _fanout_loop(self) -> None:
-        """Read ``TOPIC_RELAY_FRAMES`` and mirror every frame to every phone."""
+        """Read ``TOPIC_RELAY_FRAMES`` and mirror every frame to every phone.
+
+        Guards the SILENT-LOSS hole: the per-subscriber bus queue is bounded and
+        drops the OLDEST message on overflow (bus.py), and ``seq`` is stamped
+        per-connection HERE — downstream of that drop. So a dropped authoritative
+        ``item.completed`` would leave the phone with a perfectly CONTIGUOUS seq
+        stream (no gap to trigger a resync) yet stale content. We can't recover
+        the dropped Frame, but the Reframer already folded it into the shared
+        SessionStore BEFORE publishing (upstream of the drop), so the store still
+        holds the authoritative item. Detect the drop via the subscription's
+        drop counter and heal every connection with a fresh snapshot.
+        """
         assert self._sub is not None
+        seen_dropped = self._sub.dropped
         while not self._stop.is_set():
             frame = await self._sub.get()
             await self._dispatch(frame)
+            if self._sub.dropped != seen_dropped:
+                seen_dropped = self._sub.dropped
+                await self._heal_after_drop()
+
+    async def _heal_after_drop(self) -> None:
+        """A bus overflow silently dropped frame(s) before they were seq-stamped.
+
+        Hand every connection a fresh snapshot for each session it has seen; the
+        phone reconciles by ``item_id`` and recovers any lost authoritative
+        ``item.completed``. Snapshots are themselves sequenced frames on each
+        connection's spine, so the recovery is reliable end-to-end.
+        """
+        for conn in list(self._conns.values()):
+            try:
+                await conn._send_snapshots(self._store)
+            except Exception:  # a broken socket must not stall the heal for others
+                _log.debug("post-drop heal to %s failed", conn.conn_id, exc_info=True)
 
     async def _dispatch(self, frame: Frame) -> None:
         """Fan one Reframer frame out to every connection (per-connection seq)."""
@@ -355,6 +424,12 @@ class DownstreamServer:
         if method == UpstreamMethod.RESYNC:
             await conn.replay(int(p.get("last_seq", 0)), self._store)
             return None
+        if method == UpstreamMethod.FOREGROUND:
+            # Phone declares which chat it is looking at (or null when the app is
+            # backgrounded / the chat is closed). This is the authoritative §6
+            # signal; the passive OPEN/SUBMIT/RESUME tracking is only a fallback.
+            conn.set_foreground(p.get("session_id"))
+            return None
 
         # -- reads -----------------------------------------------------------
         if method == UpstreamMethod.LIST:
@@ -362,7 +437,11 @@ class DownstreamServer:
 
         if method in (UpstreamMethod.OPEN, UpstreamMethod.HISTORY):
             sid = p["session_id"]
-            conn.foreground_sessions.add(sid)  # phone is now watching it (§6)
+            # OPEN = user brought this chat on screen -> foreground it (§6).
+            # HISTORY = background store sync -> must NOT foreground, else a mere
+            # sync would permanently gag that session's completion/error pushes.
+            if method == UpstreamMethod.OPEN:
+                conn.set_foreground(sid)
             return {"session_id": sid, "messages": await self._gateway.rest_history(sid)}
 
         # -- drive (become owner) --------------------------------------------
@@ -383,13 +462,13 @@ class DownstreamServer:
                     provider=p.get("provider"),
                 )
                 await self._gateway.prompt_submit(sid, text)
-            conn.foreground_sessions.add(sid)
+            conn.set_foreground(sid)  # driving a chat brings it on screen (§6)
             return {"session_id": sid}
 
         if method == UpstreamMethod.RESUME:
             sid = p["session_id"]
             result = await self._gateway.session_resume(sid)
-            conn.foreground_sessions.add(sid)
+            conn.set_foreground(sid)  # resuming brings it on screen (§6)
             return {"session_id": sid, "result": result}
 
         # -- interactive gates + stop (pass-through) -------------------------

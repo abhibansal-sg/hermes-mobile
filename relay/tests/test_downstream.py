@@ -14,12 +14,14 @@ Coverage the lane brief calls out:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from hermes_relay import plugin_bridge
+from hermes_relay.bus import TOPIC_RELAY_FRAMES
 from hermes_relay.downstream import (
     DownstreamConfig,
     DownstreamServer,
@@ -381,3 +383,185 @@ async def test_session_has_live_phone_reflects_foreground():
     assert srv.session_has_live_phone("s1") is True
     srv.unregister(conn)
     assert srv.session_has_live_phone("s1") is False
+
+
+# ---------------------------------------------------------------------------
+# F2 — cross-reconnect resync must snapshot, not silently no-op
+# ---------------------------------------------------------------------------
+
+
+def _completed_item_store(sid="s1", item_id="m1", text="final answer"):
+    store = SessionStore()
+    store.apply(
+        Frame.with_item(
+            sid,
+            FrameKind.ITEM_COMPLETED,
+            Item(item_id, ItemType.AGENT_MESSAGE, ItemStatus.COMPLETED, 0, body={"text": text}),
+            turn="t1",
+        )
+    )
+    return store
+
+
+async def test_resync_on_fresh_reconnect_sends_snapshot():
+    """A phone reconnecting on a NEW socket presents a last_seq from the PRIOR
+    connection's seq space. The fresh connection's head is 0 (< last_seq), which
+    used to hit the CURRENT short-circuit and return NOTHING — stranding the
+    phone on stale content. It must instead get a snapshot of known sessions."""
+    store = _completed_item_store()
+    conn = _conn()  # brand-new connection: head 0, empty ring, empty seen_sids
+    await conn.replay(7, store)  # last_seq 7 is from a previous connection
+    snaps = [f for f in conn._ws.frames if f["kind"] == FrameKind.SNAPSHOT]
+    assert len(snaps) == 1
+    assert snaps[0]["sid"] == "s1"
+    assert snaps[0]["body"]["items"][0]["item_id"] == "m1"
+    assert snaps[0]["body"]["items"][0]["body"]["text"] == "final answer"
+    # the snapshot is itself sequenced on the NEW connection's spine.
+    assert snaps[0]["seq"] == 1
+    assert conn.head_seq == 1
+
+
+async def test_resync_brand_new_connection_last_seq_zero_is_noop():
+    """A truly fresh phone (last_seq 0, head 0) has nothing to catch up on — it
+    bootstraps via list/history, so resync stays a no-op (no empty snapshots)."""
+    conn = _conn()
+    await conn.replay(0, _completed_item_store())
+    assert conn._ws.sent == []
+
+
+# ---------------------------------------------------------------------------
+# F1 — a bus-dropped authoritative frame is healed by a snapshot
+# ---------------------------------------------------------------------------
+
+
+class _DropSub:
+    """A fake bus subscription that reports a drop after a chosen frame.
+
+    Models bus.py's drop-oldest overflow: ``dropped`` bumps while the fanout
+    loop is parked, so the loop must notice it on the next iteration and heal.
+    """
+
+    def __init__(self, frames, drop_after_index):
+        self._frames = list(frames)
+        self._drop_after = drop_after_index
+        self._i = 0
+        self.dropped = 0
+
+    async def get(self):
+        if self._i >= len(self._frames):
+            await asyncio.Event().wait()  # park forever until cancelled
+        frame = self._frames[self._i]
+        if self._i == self._drop_after:
+            self.dropped += 1  # a frame was silently dropped before this one
+        self._i += 1
+        return frame
+
+
+async def test_bus_drop_heals_connection_with_snapshot():
+    srv, _ = _server()
+    await srv.start()
+    # The Reframer folds the authoritative item into the SHARED store BEFORE the
+    # bus (upstream of any drop), so the store still holds it after a drop.
+    srv._store.apply(
+        Frame.with_item(
+            "s1",
+            FrameKind.ITEM_COMPLETED,
+            Item("m1", ItemType.AGENT_MESSAGE, ItemStatus.COMPLETED, 0, body={"text": "authoritative"}),
+            turn="t1",
+        )
+    )
+    conn = srv.register(FakeWS())
+    # Frame 0 streams normally (populating seen_sids for s1); the bus drops a
+    # frame right before frame 1, which the loop detects and heals.
+    srv._sub = _DropSub([_status("delta-a"), _status("delta-b")], drop_after_index=1)
+    task = asyncio.create_task(srv._fanout_loop())
+    for _ in range(200):
+        await asyncio.sleep(0)
+        if any(f["kind"] == FrameKind.SNAPSHOT for f in conn._ws.frames):
+            break
+    srv._stop.set()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    snaps = [f for f in conn._ws.frames if f["kind"] == FrameKind.SNAPSHOT]
+    assert len(snaps) == 1  # exactly one heal for the one drop event
+    assert snaps[0]["sid"] == "s1"
+    assert snaps[0]["body"]["items"][0]["item_id"] == "m1"
+    assert snaps[0]["body"]["items"][0]["body"]["text"] == "authoritative"
+
+
+async def test_no_drop_means_no_heal_snapshot():
+    srv, _ = _server()
+    await srv.start()
+    srv._store.apply(
+        Frame.with_item(
+            "s1", FrameKind.ITEM_COMPLETED,
+            Item("m1", ItemType.AGENT_MESSAGE, ItemStatus.COMPLETED, 0, body={"text": "x"}), turn="t1",
+        )
+    )
+    conn = srv.register(FakeWS())
+    srv._sub = _DropSub([_status("a"), _status("b")], drop_after_index=-1)  # never drops
+    task = asyncio.create_task(srv._fanout_loop())
+    for _ in range(50):
+        await asyncio.sleep(0)
+    srv._stop.set()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert [f["kind"] for f in conn._ws.frames] == [FrameKind.STATUS, FrameKind.STATUS]
+
+
+# ---------------------------------------------------------------------------
+# F3 — foreground gate: history never gags; replace-not-accumulate; explicit method
+# ---------------------------------------------------------------------------
+
+
+async def test_history_read_does_not_foreground_session():
+    srv, _ = _server()
+    await srv.start()
+    conn = srv.register(FakeWS())
+    await srv.handle_upstream(conn, UpstreamRequest(UpstreamMethod.HISTORY, {"session_id": "s1"}))
+    # A background store sync must NOT foreground the session (else it would
+    # permanently suppress that session's completion/error pushes).
+    assert srv.session_has_live_phone("s1") is False
+
+
+async def test_open_replaces_previous_foreground():
+    srv, _ = _server()
+    await srv.start()
+    conn = srv.register(FakeWS())
+    await srv.handle_upstream(conn, UpstreamRequest(UpstreamMethod.OPEN, {"session_id": "s1"}))
+    assert srv.session_has_live_phone("s1") is True
+    # Navigating to another chat clears the first — s1 is no longer gagged.
+    await srv.handle_upstream(conn, UpstreamRequest(UpstreamMethod.OPEN, {"session_id": "s2"}))
+    assert srv.session_has_live_phone("s2") is True
+    assert srv.session_has_live_phone("s1") is False
+
+
+async def test_explicit_foreground_method_sets_and_clears():
+    srv, gw = _server()
+    await srv.start()
+    conn = srv.register(FakeWS())
+    r = await srv.handle_upstream(conn, UpstreamRequest(UpstreamMethod.FOREGROUND, {"session_id": "s1"}))
+    assert r is None  # local, no gateway hop
+    assert srv.session_has_live_phone("s1") is True
+    # null clears (app backgrounded) -> pushes re-enabled.
+    await srv.handle_upstream(conn, UpstreamRequest(UpstreamMethod.FOREGROUND, {"session_id": None}))
+    assert srv.session_has_live_phone("s1") is False
+    gw.session_list.assert_not_awaited()
+
+
+async def test_submit_and_resume_replace_foreground():
+    srv, gw = _server()
+    gw.owns = MagicMock(return_value=True)
+    await srv.start()
+    conn = srv.register(FakeWS())
+    await srv.handle_upstream(conn, UpstreamRequest(UpstreamMethod.OPEN, {"session_id": "s1"}))
+    await srv.handle_upstream(conn, UpstreamRequest(UpstreamMethod.SUBMIT, {"text": "hi", "session_id": "s2"}))
+    assert srv.session_has_live_phone("s1") is False
+    assert srv.session_has_live_phone("s2") is True

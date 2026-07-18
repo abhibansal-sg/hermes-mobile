@@ -125,9 +125,10 @@ class UpstreamMethod:
     INTERRUPT = "interrupt"    # -> session.interrupt (pass-through)
     ACK = "ack"               # local: ring.drop acked frames {through}
     RESYNC = "resync"         # local: ring.decide {last_seq} -> replay or snapshot
+    FOREGROUND = "foreground"  # local: phone declares the session it now holds foregrounded (§6 gate); null clears
 
     ALL = frozenset(
-        {SUBMIT, RESUME, OPEN, LIST, HISTORY, APPROVE, CLARIFY, INTERRUPT, ACK, RESYNC}
+        {SUBMIT, RESUME, OPEN, LIST, HISTORY, APPROVE, CLARIFY, INTERRUPT, ACK, RESYNC, FOREGROUND}
     )
 
 
