@@ -190,4 +190,99 @@ final class WorkingSectionModelTests: XCTestCase {
         ]
         XCTAssertEqual(WorkingSectionModel.currentWorkingItem(in: parts)?.itemID, "t2")
     }
+
+    // MARK: - Step humanizer (approved design §2 — deterministic, no LLM)
+
+    func testStepSummaryPrefersRelaySummary() {
+        let it = ChatItem(itemID: "t1", type: .toolCall, status: .completed, ord: 0,
+                          summary: "Ran alembic upgrade head",
+                          body: ["name": "shell", "args": ["command": "alembic upgrade head"]])
+        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Ran alembic upgrade head")
+    }
+
+    func testStepSummaryHumanizesReadFromArgs() {
+        let it = ChatItem(itemID: "t1", type: .toolCall, status: .completed, ord: 0,
+                          body: ["name": "read_file", "args": ["path": "auth.py"]])
+        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Read auth.py")
+    }
+
+    func testStepSummaryHumanizesGrepFromPattern() {
+        let it = ChatItem(itemID: "t1", type: .toolCall, status: .completed, ord: 0,
+                          body: ["name": "grep", "args": ["pattern": "node_loop"]])
+        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Grepped for node_loop")
+    }
+
+    func testStepSummaryHumanizesRunCommand() {
+        let it = ChatItem(itemID: "t1", type: .toolCall, status: .completed, ord: 0,
+                          body: ["name": "bash", "args": ["command": "alembic upgrade head"]])
+        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Ran alembic upgrade head")
+    }
+
+    func testStepSummaryFileChangeUsesEditVerb() {
+        let it = ChatItem(itemID: "f1", type: .fileChange, status: .completed, ord: 0,
+                          body: ["name": "apply_patch", "args": ["path": "parser.swift"]])
+        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Edited parser.swift")
+    }
+
+    func testStepSummaryFallsBackToPrettyToolName() {
+        let it = ChatItem(itemID: "t1", type: ChatItemType(wire: "quantum_flux"), rawType: "quantum_flux",
+                          status: .completed, ord: 0, body: ["name": "quantum_flux"])
+        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Quantum flux")
+    }
+
+    func testStepSummaryCollapsesAndCapsLongTargets() {
+        let long = String(repeating: "x", count: 200)
+        let it = ChatItem(itemID: "t1", type: .toolCall, status: .completed, ord: 0,
+                          body: .object(["name": .string("read"),
+                                         "args": .object(["path": .string(long)])]))
+        let summary = WorkingSectionModel.stepSummary(for: it)
+        XCTAssertTrue(summary.hasPrefix("Read "))
+        XCTAssertTrue(summary.hasSuffix("…"), "an over-long target is truncated with an ellipsis")
+        XCTAssertLessThanOrEqual(summary.count, 80)
+    }
+
+    func testStepsBuildsReasoningThenToolInWireOrder() {
+        let parts: [ChatMessagePart] = [
+            .reasoning(id: "r1", text: "Reviewed the request\nand split the layers"),
+            item("t1", .toolCall, body: ["name": "read", "args": ["path": "node.py"]]),
+        ]
+        let steps = WorkingSectionModel.steps(from: parts)
+        XCTAssertEqual(steps.count, 2)
+        XCTAssertEqual(steps[0].kind, .reasoning)
+        XCTAssertEqual(steps[0].glyph, "bubble.left")
+        XCTAssertEqual(steps[0].summary, "Reviewed the request")
+        XCTAssertEqual(steps[0].body, "Reviewed the request\nand split the layers")
+        XCTAssertEqual(steps[1].kind, .tool)
+        XCTAssertEqual(steps[1].glyph, "terminal")
+        XCTAssertEqual(steps[1].summary, "Read node.py")
+    }
+
+    func testStepsSkipsEmptyReasoning() {
+        let parts: [ChatMessagePart] = [
+            .reasoning(id: "r1", text: "   "),
+            item("t1", .toolCall, body: ["name": "read", "args": ["path": "x.py"]]),
+        ]
+        let steps = WorkingSectionModel.steps(from: parts)
+        XCTAssertEqual(steps.count, 1, "an empty/whitespace reasoning part produces no step")
+        XCTAssertEqual(steps[0].kind, .tool)
+    }
+
+    func testStepCarriesFailureAndOutputForSheet() {
+        let it = ChatItem(itemID: "t1", type: .toolCall, status: .failed, ord: 0,
+                          body: ["name": "bash", "args": ["command": "make"], "result": "error: boom"])
+        let steps = WorkingSectionModel.steps(from: [.item(id: "t1", item: it)])
+        XCTAssertEqual(steps.count, 1)
+        XCTAssertTrue(steps[0].isFailure)
+        XCTAssertEqual(steps[0].command, "make")
+        XCTAssertEqual(steps[0].commandLanguage, "bash")
+        XCTAssertEqual(steps[0].output, "error: boom")
+    }
+
+    func testGlyphMapping() {
+        XCTAssertEqual(WorkingSectionModel.glyph(for: .toolCall), "terminal")
+        XCTAssertEqual(WorkingSectionModel.glyph(for: .fileChange), "pencil")
+        XCTAssertEqual(WorkingSectionModel.glyph(for: .browser), "safari")
+        XCTAssertEqual(WorkingSectionModel.glyph(for: .image), "photo")
+        XCTAssertEqual(WorkingSectionModel.glyph(for: .reasoning), "bubble.left")
+    }
 }
