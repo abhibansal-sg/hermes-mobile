@@ -1042,13 +1042,13 @@ final class ConnectionStore {
     }
 
     private func bootstrap(generation: UInt64) async {
-        if UserDefaults.standard.string(forKey: DefaultsKeys.serverURL) == nil,
-           UserDefaults.standard.data(forKey: DefaultsKeys.gatewayCleanupTombstone) != nil {
-            // A prior Forget may have been terminated after credentials were
-            // removed but before every idempotent local owner ran. Resume it.
-            await forgetGateway()
-            return
-        }
+        // Reconcile any pending gateway-forget tombstone against the CURRENT
+        // pairing BEFORE the cache-first paint path runs. A stale tombstone left
+        // by a forget whose remote revoke failed must NOT suppress the cache of a
+        // server the user has since RE-PAIRED under a new device — cached content
+        // for a currently-paired server always paints (LANE A). If this resumes a
+        // genuinely-interrupted forget, it returns `true` and bootstrap aborts.
+        if await reconcilePendingForgetTombstone() { return }
         if UserDefaults.standard.bool(forKey: DefaultsKeys.connectionOffline) {
             if let savedURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL), !savedURL.isEmpty {
                 await paintCacheFirst(serverURLString: savedURL)
@@ -1344,6 +1344,23 @@ final class ConnectionStore {
             DefaultsKeys.setDeviceId(issuedDeviceId, server: trimmedURL)
         } else if !isSavedTokenReuse {
             DefaultsKeys.setDeviceId(nil, server: trimmedURL)
+        }
+
+        // Re-pairing supersedes forget: a verified connection to a server that
+        // still carries a stale cleanup tombstone from a PRIOR device's forget
+        // must void that tombstone's cache-suppression now, so a later cold-open
+        // never paints an empty shell over this server's populated cache. The
+        // owed remote revoke of the old device (if any) is preserved. When the
+        // tombstone's device equals the just-configured pairing, forget semantics
+        // are kept (`.keep`) exactly as the launch reconciler decides.
+        if let tombstone = Self.pendingCleanupTombstone(),
+           tombstone.server.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedURL {
+            let decision = GatewayForgetCoordinator.evaluate(
+                tombstone: tombstone,
+                currentDeviceId: DefaultsKeys.deviceId(server: trimmedURL),
+                hasLivePairing: true
+            )
+            Self.applyTombstoneDecision(decision, for: tombstone, defaults: .standard)
         }
 
         startLongLivedTasks()
@@ -1645,6 +1662,98 @@ final class ConnectionStore {
         await client.disconnect()
         guard isCurrentGeneration(generation) else { return }
         if let finalPhase { phase = finalPhase }
+    }
+
+    // MARK: - Forget tombstone reconciliation
+
+    /// Read the pending gateway-forget cleanup tombstone, if any.
+    static func pendingCleanupTombstone(
+        _ defaults: UserDefaults = .standard
+    ) -> GatewayCleanupTombstone? {
+        defaults.data(forKey: DefaultsKeys.gatewayCleanupTombstone)
+            .flatMap { try? JSONDecoder().decode(GatewayCleanupTombstone.self, from: $0) }
+    }
+
+    /// Whether a live credential currently exists for `server` — either it is the
+    /// persisted/configured server URL, or a Keychain token is present for it.
+    static func hasLivePairing(
+        for server: String,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        let target = server.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let saved = defaults.string(forKey: DefaultsKeys.serverURL),
+           saved.trimmingCharacters(in: .whitespacesAndNewlines) == target,
+           !target.isEmpty {
+            return true
+        }
+        return KeychainService.loadToken(server: server) != nil
+    }
+
+    /// Apply a ``GatewayForgetCoordinator.Decision`` to the persisted tombstone.
+    static func applyTombstoneDecision(
+        _ decision: GatewayForgetCoordinator.Decision,
+        for tombstone: GatewayCleanupTombstone,
+        defaults: UserDefaults = .standard
+    ) {
+        switch decision.rewrite {
+        case .keep:
+            break
+        case .remove:
+            defaults.removeObject(forKey: DefaultsKeys.gatewayCleanupTombstone)
+        case .supersede:
+            // Retry-only form: cache-suppression is void, the remote revoke of the
+            // OLD device stays owed (background, best-effort, never gating paint).
+            let superseded = GatewayCleanupTombstone(
+                server: tombstone.server,
+                deviceId: tombstone.deviceId,
+                remoteRetryNeeded: tombstone.remoteRetryNeeded,
+                supersededByRepair: true
+            )
+            if let data = try? JSONEncoder().encode(superseded) {
+                defaults.set(data, forKey: DefaultsKeys.gatewayCleanupTombstone)
+            }
+        }
+    }
+
+    /// Reconcile a pending forget tombstone at launch against the current pairing.
+    ///
+    /// Returns `true` when it resumed a genuinely-interrupted local forget (the
+    /// caller must abort the rest of bootstrap). Returns `false` — the common
+    /// case — when there is no tombstone, or when a re-pair under a new device has
+    /// superseded it (the stale cache-suppression is voided, only the owed remote
+    /// revoke is preserved, and the normal cache-first launch proceeds so the
+    /// re-paired server's cache paints).
+    func reconcilePendingForgetTombstone(
+        defaults: UserDefaults = .standard
+    ) async -> Bool {
+        guard let tombstone = Self.pendingCleanupTombstone(defaults) else { return false }
+        let decision = GatewayForgetCoordinator.evaluate(
+            tombstone: tombstone,
+            currentDeviceId: DefaultsKeys.deviceId(server: tombstone.server, defaults),
+            hasLivePairing: Self.hasLivePairing(for: tombstone.server, defaults: defaults)
+        )
+        guard decision.suppressesCache else {
+            // Re-pairing supersedes forget. Void the cache-suppression and keep
+            // only the owed remote revoke of the old device.
+            Self.applyTombstoneDecision(decision, for: tombstone, defaults: defaults)
+            // If the interrupted forget cleared the persisted URL but a live token
+            // for the re-paired server remains, restore the URL so the cache-first
+            // paint below binds the correct scope.
+            if defaults.string(forKey: DefaultsKeys.serverURL) == nil,
+               KeychainService.loadToken(server: tombstone.server) != nil {
+                defaults.set(tombstone.server, forKey: DefaultsKeys.serverURL)
+            }
+            return false
+        }
+        // Forget semantics preserved (deviceId == current pairing, or no live
+        // pairing). Resume the interrupted LOCAL cleanup only when no live
+        // credential URL remains — otherwise there is nothing left to resume and
+        // the normal launch path handles the still-configured server.
+        if defaults.string(forKey: DefaultsKeys.serverURL) == nil {
+            await forgetGateway()
+            return true
+        }
+        return false
     }
 
     /// Authenticated caller-only privacy transaction. Local erasure always wins;
