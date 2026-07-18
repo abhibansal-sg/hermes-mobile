@@ -196,7 +196,9 @@ final class RelaySessionCoordinator {
     /// Resume + own an idle/terminal session, then adopt it as active.
     @discardableResult
     func resume(_ sessionID: String) async throws -> JSONValue {
-        let result = try await requireClient().resumeSession(sessionID)
+        let client = try requireClient()
+        resetItemStoreForSessionSwitch(to: sessionID)
+        let result = try await client.resumeSession(sessionID)
         activeSessionID = sessionID
         return result
     }
@@ -204,9 +206,31 @@ final class RelaySessionCoordinator {
     /// Open/read a session; its `snapshot` streams into the transcript.
     @discardableResult
     func open(_ sessionID: String) async throws -> JSONValue {
-        let result = try await requireClient().open(sessionID)
+        let client = try requireClient()
+        resetItemStoreForSessionSwitch(to: sessionID)
+        let result = try await client.open(sessionID)
         activeSessionID = sessionID
         return result
+    }
+
+    /// Clear the render-lane item store when the projected session is about to
+    /// CHANGE, so the incoming session's `snapshot` reconciles onto a clean
+    /// baseline instead of folding on top of the previous session's items.
+    ///
+    /// `RelayItemStore.reconcile(snapshot:)` is deliberately additive — items
+    /// absent from a snapshot are RETAINED (the snapshot is a resumed baseline,
+    /// not a delete list). That is correct for a `resync` of the SAME session,
+    /// but on a session SWITCH it would leak session A's transcript under
+    /// session B's snapshot, so `applyRelayItems` would render both. Resetting
+    /// here (and immediately re-projecting the emptied set) makes the switch
+    /// clean and is a no-op re-open/re-resume of the already-active session,
+    /// whose live items must survive a `resync`. Called BEFORE the open/resume
+    /// RPC awaits so any snapshot frames the pump delivers during the await land
+    /// on the fresh store.
+    private func resetItemStoreForSessionSwitch(to sessionID: String) {
+        guard sessionID != activeSessionID else { return }
+        store = RelayItemStore()
+        chatStore.applyRelayItems(store.items)
     }
 
     func list() async throws -> JSONValue { try await requireClient().list() }
