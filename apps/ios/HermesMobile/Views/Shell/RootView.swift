@@ -1153,6 +1153,26 @@ enum DrawerGestureArbitration {
     static func shouldLockTranscriptScroll(horizontalDominant: Bool?) -> Bool {
         horizontalDominant == true
     }
+
+    /// The signed, clamped live drag translation for the chat card, given the
+    /// drawer's open-state captured at the instant this gesture LATCHED as the
+    /// drawer driver (`openAtStart`), and the anchor-corrected effective finger
+    /// travel (`effectiveTranslation`).
+    ///
+    /// - An OPEN-at-start drawer only tracks LEFTWARD (closing) travel → `min(0, …)`
+    ///   (a rightward pull past fully-open is clamped to 0 — the card is already
+    ///   at `+drawerWidth`).
+    /// - A CLOSED-at-start drawer only tracks RIGHTWARD (opening) travel →
+    ///   `max(0, …)`.
+    ///
+    /// Consuming the LATCHED start-state — not the live `drawer.isOpen` — is the
+    /// fix for the "follows the finger, steps back, tries again" jitter (drawer
+    /// session-switch symptom 2): an asynchronous `isOpen` flip landing mid-drag
+    /// (e.g. a programmatic close from selection, ⌘F, or the open-sessions intent)
+    /// can no longer swap the open/close branch under the user's finger.
+    static func latchedDragTranslation(openAtStart: Bool, effectiveTranslation: CGFloat) -> CGFloat {
+        openAtStart ? min(0, effectiveTranslation) : max(0, effectiveTranslation)
+    }
 }
 
 @MainActor
@@ -1318,6 +1338,15 @@ private struct CompactLayout: View {
     /// instant we took over: the visible "snap to the right" on open (and its
     /// mirror jump on close). Reset to 0 on `onEnded`.
     @State private var dragAnchor: CGFloat = 0
+
+    /// The drawer's open-state captured at the instant THIS gesture latched as the
+    /// drawer driver. The in-flight drag (offset base + open/close branch) reads
+    /// THIS, never the live `drawer.isOpen`, so an asynchronous `isOpen` flip
+    /// landing mid-drag — a programmatic close from a session selection, ⌘F, or the
+    /// open-sessions intent — cannot swap the branch under the user's finger. That
+    /// swap was the "follows the finger, steps back, tries again" jitter (drawer
+    /// session-switch symptom 2). Reset to `false` on `onEnded`.
+    @State private var gestureOpenAtStart = false
 
     /// Fraction of the screen width the chat card is pushed by when open (≈78%,
     /// observed reference). The drawer beneath occupies this leading band.
@@ -1676,8 +1705,14 @@ private struct CompactLayout: View {
     /// `+drawerWidth` (the card pushed right to reveal the drawer). A live drag
     /// interpolates between the two, clamped to `0...drawerWidth`.
     private func currentOffset(drawerWidth: CGFloat) -> CGFloat {
-        let base: CGFloat = drawer.isOpen ? drawerWidth : 0
-        guard let translation = dragTranslation else { return base }
+        // At rest (no active drag) the base tracks the live `drawer.isOpen`. DURING
+        // a drag it tracks `gestureOpenAtStart` — the state latched when the gesture
+        // took over — so an async `isOpen` flip mid-drag can't teleport the card by
+        // ±drawerWidth (the "step back" jitter, symptom 2).
+        guard let translation = dragTranslation else {
+            return drawer.isOpen ? drawerWidth : 0
+        }
+        let base: CGFloat = gestureOpenAtStart ? drawerWidth : 0
         return min(drawerWidth, max(0, base + translation))
     }
 
@@ -1724,18 +1759,22 @@ private struct CompactLayout: View {
                     // CURRENT position (offset 0 this frame), not from touch-down —
                     // kills the pre-latch dead-zone step ("snaps to the right").
                     dragAnchor = dx
+                    // Latch the open-state THIS gesture operates against, so an
+                    // async `isOpen` flip mid-drag can't swap the open/close branch
+                    // under the finger (symptom 2).
+                    gestureOpenAtStart = drawer.isOpen
                 }
                 guard horizontalDominant == true else { return }
 
                 // Displacement measured from the anchor: the card is glued to the
-                // finger from the moment we took over, with no opening step.
+                // finger from the moment we took over, with no opening step. The
+                // open/close branch reads the LATCHED `gestureOpenAtStart`, not the
+                // live `drawer.isOpen`.
                 let eff = dx - dragAnchor
-                if drawer.isOpen {
-                    // Track leftward (closing) drags from the displaced card.
-                    dragTranslation = min(0, eff)
-                } else {
-                    dragTranslation = max(0, eff)
-                }
+                dragTranslation = DrawerGestureArbitration.latchedDragTranslation(
+                    openAtStart: gestureOpenAtStart,
+                    effectiveTranslation: eff
+                )
             }
             .onEnded { value in
                 let anchor = dragAnchor
@@ -1750,6 +1789,7 @@ private struct CompactLayout: View {
                     horizontalDominant = nil
                     drawerScrollLocked = false
                     dragAnchor = 0
+                    gestureOpenAtStart = false
                 }
                 // A drag this gesture never drove still animates its (zero) drag
                 // contribution away, so there is never a raw final-frame jump.
@@ -1766,8 +1806,10 @@ private struct CompactLayout: View {
 
                 // Committed target. A FAILED threshold settles BACK to the current
                 // state — the case the old modifier left UN-animated (it keyed on a
-                // `drawer.isOpen` change that never happened).
-                let wasOpen = drawer.isOpen
+                // `drawer.isOpen` change that never happened). `wasOpen` is the
+                // LATCHED start-state the drag operated against (not live
+                // `drawer.isOpen`), so an async flip mid-drag can't invert the commit.
+                let wasOpen = gestureOpenAtStart
                 let commitOpen: Bool
                 if wasOpen {
                     commitOpen = !(dragged < -drawerWidth * 0.3 || predicted < -drawerWidth * 0.5)

@@ -1811,18 +1811,28 @@ struct DrawerView: View {
     /// Open an existing session and dismiss the drawer (compact). Activation is
     /// instant (transcript + resume continue in the background).
     ///
-    /// R40 — REVEAL-ON-PAINT (supersedes FIX 4). Keep the drawer OPEN through the
-    /// tap and hand `open(_:)` the close as `revealOnFirstPaint`: the store fires
-    /// it the instant the new transcript's first frame is painted (cache hit ≈ one
-    /// frame; miss = the skeleton), so the rigid close-slide uncovers SETTLED
-    /// content. The prior FIX-4 order closed on frame 0 while the async cache paint
-    /// landed a frame later — mid-slide — which the user saw as "the transcript
-    /// moves on its own beat before the chat-view layer." The switch-hitch FIX 4
-    /// targeted is still avoided: `open()` keeps deferring its heavy teardown, and
-    /// nothing heavy runs on the close-spring's frame 0 (the slide now even starts
-    /// a frame later, fully clear of the activation work).
+    /// DRAWER-SESSION-SWITCH — close on the SELECTION tick, synchronously, rather
+    /// than through the deferred `revealOnFirstPaint` (R40) callback. The R40 order
+    /// kept the drawer open and let ``SessionStore/open(_:revealOnFirstPaint:)``
+    /// fire the close at the new transcript's first paint (or a 300 ms deadline).
+    /// That deferral had two field-reported failure modes:
+    ///  1. STARVATION — each tap re-armed the per-open reveal/deadline against a
+    ///     fresh `openToken`, so a burst of taps (faster than the deadline) never
+    ///     let any single reveal survive to fire: the drawer stayed visually open
+    ///     while selections changed underneath ("keep tapping other sessions and
+    ///     they open while the drawer stays open").
+    ///  2. MID-DRAG FLIP — the reveal could fire `drawer.close()` ASYNCHRONOUSLY
+    ///     while the user was mid-swipe, flipping `drawer.isOpen` under an in-flight
+    ///     open-drag → the "follows the finger, steps back, tries again" jitter.
+    /// Closing synchronously here makes the SELECTION the single source of truth:
+    /// the drawer always closes, immediately, on the same tick the row is tapped —
+    /// never starved, never mid-drag. This matches the already-reliable
+    /// search-result path (`sessions.open(searchResult:)` + `onNavigate()`) and the
+    /// iPad no-op (`onNavigate` defaults to `{}`). The close still animates with the
+    /// standard drawer spring (``DrawerState/close()``), preserving the feel.
     private func open(_ summary: SessionSummary) {
-        sessions.open(summary) { onNavigate() }
+        sessions.open(summary)
+        onNavigate()
     }
 
     /// Start a fresh local draft chat (B3 API) and dismiss the drawer. Draft
@@ -2514,7 +2524,11 @@ struct ProjectDetailView: View {
     private func sessionRow(_ summary: SessionSummary) -> some View {
         Button {
             rowTapFeedbackTrigger = UUID()
-            sessions.open(summary) { onNavigate() }
+            // Close on the selection tick — see DrawerView.open(_:) for why the
+            // deferred revealOnFirstPaint close is not used (starvation +
+            // mid-drag flip). Consistent with the main drawer row.
+            sessions.open(summary)
+            onNavigate()
         } label: {
             DrawerSessionRow(
                 summary: summary,
