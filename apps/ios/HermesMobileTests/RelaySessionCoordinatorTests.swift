@@ -514,3 +514,176 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         XCTAssertLessThanOrEqual(big, .milliseconds(8250))
     }
 }
+
+/// LANE 4 — deep-link resume-to-send over the Wave-2 relay coordinator.
+///
+/// Repro (convergence device-QA finding): in relay-only mode the notification
+/// deep link `hermesapp://session/<id>` opened the transcript (history streamed
+/// via the relay), but the resume-to-send raised "Not connected to the Hermes
+/// gateway" because `SessionStore.open`'s `session.resume` and `ChatStore.send`'s
+/// `prompt.submit` both drove the gateway-direct RPC socket, which is idle when
+/// only the relay transport is up.
+///
+/// These tests prove the router's session-open-and-send path now routes through
+/// the relay coordinator when `transportPath == .relay`, and that the default
+/// gateway-direct path is untouched (no relay op is emitted with the flag OFF).
+/// No live network — the coordinator's `RelayClient` runs over the same in-process
+/// fake relay `RelaySessionCoordinatorTests` uses.
+@MainActor
+final class RelayDeepLinkResumeTests: XCTestCase {
+
+    private typealias MockRelayTransport = RelaySessionCoordinatorTests.MockRelayTransport
+
+    private let relayURL = URL(string: "ws://127.0.0.1:9999/relay")!
+
+    private struct Stores {
+        let connection: ConnectionStore
+        let sessions: SessionStore
+        let chat: ChatStore
+        let inbox: InboxStore
+        let transport: MockRelayTransport
+        let coordinator: RelaySessionCoordinator
+    }
+
+    /// An RPC-answering fake relay: every upstream request gets a result. `submit`
+    /// echoes a `session_id` so the coordinator adopts it, exactly like the real
+    /// relay's submit reply.
+    private func makeTransport() -> MockRelayTransport {
+        MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id else { return }
+            if upstream.method == "submit" {
+                let sid = (upstream.params["session_id"] as? String) ?? "abc123"
+                relay.deliverResult(id: id, result: .object(["session_id": .string(sid)]))
+            } else {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+            }
+        })
+    }
+
+    private func makeStores(relay: Bool) async throws -> Stores {
+        UserDefaults.standard.set(
+            (relay ? TransportPath.relay : TransportPath.gatewayDirect).rawValue,
+            forKey: DefaultsKeys.transportPath
+        )
+
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let attachments = AttachmentStore()
+        let inbox = InboxStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        sessions.attach(connection: connection, chat: chat)
+        inbox.attach(connection: connection)
+
+        let transport = makeTransport()
+        let coordinator = RelaySessionCoordinator(
+            chatStore: chat,
+            clientFactory: { RelayClient { _ in transport } }
+        )
+        try await coordinator.start(url: relayURL)
+        connection.relayCoordinatorFactory = { coordinator }
+        _ = connection.ensureRelayCoordinator()
+
+        return Stores(
+            connection: connection, sessions: sessions, chat: chat,
+            inbox: inbox, transport: transport, coordinator: coordinator
+        )
+    }
+
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.transportPath)
+        super.tearDown()
+    }
+
+    private func summary(id: String) -> SessionSummary {
+        SessionSummary(
+            id: id, title: "Session \(id)", preview: nil, startedAt: nil,
+            messageCount: nil, source: nil, lastActive: nil, cwd: nil
+        )
+    }
+
+    private func waitUntil(
+        _ condition: @escaping () -> Bool, timeout: TimeInterval = 2.0
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() && Date() < deadline {
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+
+    // MARK: - Relay-active deep-link open + send
+
+    func testRelayDeepLinkOpenResumesOverRelayNotGateway() async throws {
+        let s = try await makeStores(relay: true)
+        s.sessions.sessions = [summary(id: "abc123")]
+
+        HermesURLRouter.route(
+            URL(string: "hermesapp://session/abc123")!,
+            connection: s.connection, sessions: s.sessions,
+            chat: s.chat, inbox: s.inbox
+        )
+
+        // The session activates synchronously; the relay resume binds the runtime
+        // on its Task hop.
+        XCTAssertEqual(s.sessions.activeStoredId, "abc123")
+        await waitUntil { s.sessions.activeRuntimeId == "abc123" }
+        XCTAssertEqual(s.sessions.activeRuntimeId, "abc123",
+                       "relay resume must bind the runtime so the composer unlocks")
+
+        // The gateway-direct "Not connected to the Hermes gateway" must NOT surface.
+        XCTAssertNil(s.sessions.lastError)
+        XCTAssertNil(s.sessions.sessionActionError)
+
+        // The resume travelled over the relay transport, not the gateway socket.
+        let methods = s.transport.upstreams().map(\.method)
+        XCTAssertTrue(methods.contains("resume"),
+                      "the deep-link open must resume via the relay coordinator")
+        let resume = s.transport.upstreams().first { $0.method == "resume" }
+        XCTAssertEqual(resume?.params["session_id"] as? String, "abc123")
+    }
+
+    func testRelaySendAfterDeepLinkOpenSubmitsOverRelay() async throws {
+        let s = try await makeStores(relay: true)
+        s.sessions.sessions = [summary(id: "abc123")]
+
+        HermesURLRouter.route(
+            URL(string: "hermesapp://session/abc123")!,
+            connection: s.connection, sessions: s.sessions,
+            chat: s.chat, inbox: s.inbox
+        )
+        await waitUntil { s.sessions.activeRuntimeId == "abc123" }
+
+        let ok = await s.chat.send(text: "resume and send me")
+        XCTAssertTrue(ok, "a relay-active send must succeed via the relay coordinator")
+        XCTAssertNil(s.chat.lastError)
+
+        let submit = s.transport.upstreams().first { $0.method == "submit" }
+        XCTAssertNotNil(submit, "the send must route prompt.submit over the relay")
+        XCTAssertEqual(submit?.params["prompt"] as? String, "resume and send me")
+        XCTAssertEqual(submit?.params["session_id"] as? String, "abc123")
+    }
+
+    // MARK: - Gateway-direct unchanged (flag OFF)
+
+    func testGatewayDirectDeepLinkNeverTouchesRelay() async throws {
+        let s = try await makeStores(relay: false)
+        s.sessions.sessions = [summary(id: "abc123")]
+
+        HermesURLRouter.route(
+            URL(string: "hermesapp://session/abc123")!,
+            connection: s.connection, sessions: s.sessions,
+            chat: s.chat, inbox: s.inbox
+        )
+
+        // Activation is synchronous (unchanged gateway-direct behaviour); give any
+        // stray relay Task a budgeted chance to (incorrectly) fire before asserting.
+        XCTAssertEqual(s.sessions.activeStoredId, "abc123")
+        await waitUntil { !s.transport.upstreams().isEmpty }
+
+        XCTAssertFalse(
+            s.transport.upstreams().contains { $0.method == "resume" || $0.method == "submit" },
+            "with the flag OFF the deep-link open must NOT drive the relay coordinator"
+        )
+    }
+}
