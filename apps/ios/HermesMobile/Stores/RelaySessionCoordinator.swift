@@ -89,6 +89,16 @@ final class RelaySessionCoordinator {
     }
 
     private(set) var phase: Phase = .idle
+    /// Fired each time the relay connection crosses INTO `.open` — the initial
+    /// connect and every reconnect after a drop/flap. This is the relay analogue
+    /// of the gateway's `gateway.ready`: ``ConnectionStore`` wires it to
+    /// `queueStore.wake()` so a prompt the user queued while the relay was
+    /// mid-connect drains the moment the socket is live again, over the relay,
+    /// mirroring the gateway-direct reconnect drain. `nil` in unit tests that do
+    /// not exercise the outbox. Reconnect POLICY stays external (§4) — this hook
+    /// only reacts to a connection that has already come up.
+    var onReady: (() -> Void)?
+
     /// The session whose item stream is currently projected into ``ChatStore``.
     private(set) var activeSessionID: String?
     /// The render-lane reconciled item set (mirrors the client store; the source
@@ -185,6 +195,7 @@ final class RelaySessionCoordinator {
     }
 
     private func applyState(_ state: RelayConnectionState) {
+        let wasOpen = (phase == .open)
         switch state {
         case .idle:          phase = .idle
         case .connecting:    phase = .connecting
@@ -192,6 +203,14 @@ final class RelaySessionCoordinator {
         case .closed(let r): phase = .closed(reason: r)
         case .failed(let m): phase = .failed(m)
         }
+        // Crossing INTO `.open` is the relay's readiness edge — kick the outbox so
+        // a prompt queued while disconnected drains now, over the relay. Both the
+        // initial connect and a reconnect surface here as a buffered
+        // `.connecting` → `.open` pair (the socket yields both; `start`/`reconnect`
+        // set `phase` before this observer drains them), so this fires exactly once
+        // per connect. Edge-triggered — a redundant same-state yield does not
+        // re-fire, and `wake()` coalesces regardless.
+        if phase == .open, !wasOpen { onReady?() }
     }
 
     // MARK: Upstream session ops (§5)
