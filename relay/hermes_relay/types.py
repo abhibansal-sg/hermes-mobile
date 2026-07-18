@@ -78,6 +78,7 @@ class ItemType:
     AGENT_MESSAGE = "agentMessage"
     REASONING = "reasoning"
     TOOL_CALL = "toolCall"  # GENERIC — any tool.start/complete keyed by name
+    TASK_LIST = "taskList"  # the agent's structured task/todo list (id,text,status)
     FILE_CHANGE = "fileChange"
     IMAGE = "image"
     BROWSER = "browser"
@@ -90,6 +91,7 @@ class ItemType:
             AGENT_MESSAGE,
             REASONING,
             TOOL_CALL,
+            TASK_LIST,
             FILE_CHANGE,
             IMAGE,
             BROWSER,

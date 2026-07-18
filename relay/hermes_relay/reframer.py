@@ -25,6 +25,9 @@ The raw -> item mapping (grounded in the R0 fixture AND the gateway's own
 | ``tool.complete`` (``.tool_id,     | ``item.completed`` toolCall — OR ``fileChange``   |
 |   .name,.args,.result,             |   when ``inline_diff`` present; ``browser`` for   |
 |   .duration_s,.inline_diff``)      |   ``browser_*``; ``image`` for image tools        |
+| ``tool.*`` with ``name=="todo"``   | dedicated ``taskList`` item on a STABLE id —      |
+|   (``.todos`` full list on complete)|  started (snapshot) / delta (update) / completed  |
+|                                     |  (all tasks done); NOT a generic toolCall         |
 | ``error`` (``.message``)           | ``item.completed`` error (status=failed)          |
 | ``status.update`` (``.kind,.text``)| ``status`` frame (non-item chatter)               |
 | ``session.title``/``title``        | ``title`` frame                                   |
@@ -71,6 +74,19 @@ from .types import (
 # a generic toolCall. Kept as data so the mapping stays declarative.
 _BROWSER_PREFIX = "browser_"
 _IMAGE_TOOLS = frozenset({"image_generate", "image_edit"})
+
+# The agent's task/todo list rides on the generic ``todo`` tool (tool.start /
+# tool.complete, name == "todo"): the gateway lifts the authoritative full list
+# to a top-level ``todos`` key on tool.complete. Instead of letting it fall
+# through to a generic toolCall, the reframer gives it a DEDICATED ``taskList``
+# item on a STABLE per-session id (protocol §2), so the phone renders one living
+# task card that is snapshotted on first sight and updated in place thereafter.
+_TASK_TOOL = "todo"
+# Terminal task statuses — a list whose every task is one of these is "done"
+# (drives the ``taskList`` item.completed frame + the task-list-complete push).
+_TASK_DONE_STATUSES = frozenset({"completed", "cancelled"})
+# Canonical task status order for the counts summary.
+_TASK_STATUSES = ("pending", "in_progress", "completed", "cancelled")
 
 # Top-level events that are gateway/session metadata, not turn content. They
 # produce no downstream frame (they are neither ordered items nor phone chatter).
@@ -388,6 +404,10 @@ class Reframer:
         ctx = self._ctx_for(sid)
         payload = event.payload
         name = str(payload.get("name") or "")
+        # The task/todo list gets a dedicated taskList item on a stable id — not
+        # a generic per-call toolCall card (protocol §2).
+        if name == _TASK_TOOL:
+            return self._reframe_tasks(event)
         tool_id = self._tool_item_id(ctx, sid, name, payload, event.type)
         itype = self._tool_item_type(name, payload)
 
@@ -427,6 +447,95 @@ class Reframer:
             body=body,
         )
         frames.append(Frame.with_item(sid, FrameKind.ITEM_COMPLETED, item, ctx.current_turn))
+        return frames
+
+    # -- tasks / todos (dedicated taskList item) -------------------------
+    def _tasks_item_id(self, sid: str) -> str:
+        """The STABLE per-session id every task-list update lands on.
+
+        Unlike a per-call toolCall (a fresh id each invocation), the task list is
+        ONE living card: the first ``todo`` call is its snapshot and every later
+        call updates the SAME id in place (protocol §2 "snapshot + subsequent
+        updates keyed by a stable id").
+        """
+        return f"{sid}:tasks"
+
+    def _reframe_tasks(self, event: GatewayEvent) -> list[Frame]:
+        """``todo`` tool.start/complete -> a stable ``taskList`` item lifecycle.
+
+        The gateway lifts the AUTHORITATIVE full list to a top-level ``todos``
+        key on ``tool.complete``; ``tool.start`` may only carry a PARTIAL merge
+        update in ``args.todos``. So the completed payload is authoritative
+        (protocol §2/§4 completed-is-authoritative) and the start is a best-effort
+        preview only. Lifecycle on the stable id:
+
+        * first sight             -> ``item.started`` (in_progress snapshot)
+        * subsequent, not all done -> ``item.delta`` (full authoritative list —
+          a REPLACE, folded into the store so a resync snapshot stays current)
+        * every task done/cancelled -> ``item.completed`` (authoritative, and the
+          signal the Notifier turns into the task-list-complete push, §6)
+        """
+        sid = event.session_id or ""
+        state = self._store.get(sid)
+        ctx = self._ctx_for(sid)
+        frames = self._ensure_turn(sid)
+        payload = event.payload
+        item_id = self._tasks_item_id(sid)
+        existing = state.items.get(item_id)
+        ord_ = existing.ord if existing is not None else state.allocate_ord()
+
+        if event.type == RawEvent.TOOL_START:
+            # A partial (merge) preview. Only materialize the card the first time
+            # so the phone shows a pending list immediately; once a card exists,
+            # keep the authoritative list intact and wait for the complete.
+            if existing is not None:
+                return frames
+            tasks = _normalize_tasks(_start_tasks(payload))
+            item = Item(
+                item_id=item_id,
+                type=ItemType.TASK_LIST,
+                status=ItemStatus.IN_PROGRESS,
+                ord=ord_,
+                summary=_tasks_summary(tasks),
+                body=_tasks_body(tasks, payload.get("summary")),
+            )
+            frames.append(Frame.with_item(sid, FrameKind.ITEM_STARTED, item, ctx.current_turn))
+            return frames
+
+        # TOOL_COMPLETE — the authoritative full list.
+        tasks = _normalize_tasks(payload.get("todos"))
+        body = _tasks_body(tasks, payload.get("summary"))
+        summary = _tasks_summary(tasks)
+
+        if _tasks_all_complete(tasks):
+            item = Item(
+                item_id=item_id,
+                type=ItemType.TASK_LIST,
+                status=ItemStatus.COMPLETED,
+                ord=ord_,
+                summary=summary,
+                body=body,
+            )
+            frames.append(Frame.with_item(sid, FrameKind.ITEM_COMPLETED, item, ctx.current_turn))
+        elif existing is None or existing.status != ItemStatus.IN_PROGRESS:
+            # First sight (progress disabled -> only a complete arrives), OR a
+            # previously-completed list reopened with new work: (re)materialize
+            # the card in_progress via item.started (wholesale replace in store).
+            item = Item(
+                item_id=item_id,
+                type=ItemType.TASK_LIST,
+                status=ItemStatus.IN_PROGRESS,
+                ord=ord_,
+                summary=summary,
+                body=body,
+            )
+            frames.append(Frame.with_item(sid, FrameKind.ITEM_STARTED, item, ctx.current_turn))
+        else:
+            # Living in-progress card: a full-list REPLACE delta. The patch keys
+            # (``tasks``/``counts``) shallow-overwrite the item body in the store
+            # (session_state._merge_patch), so a mid-stream snapshot stays
+            # authoritative; the phone repaints the list from ``body.tasks``.
+            frames.append(Frame.item_delta(sid, item_id, body, ctx.current_turn))
         return frames
 
     # -- error -----------------------------------------------------------
@@ -547,6 +656,81 @@ def _tool_summary(name: str, payload: dict[str, Any]) -> str:
 def _usage_summary(usage: dict[str, Any]) -> str:
     total = usage.get("total")
     return f"{total} tokens" if isinstance(total, int) else "usage"
+
+
+def _start_tasks(payload: dict[str, Any]) -> Any:
+    """The partial task list on a ``todo`` tool.start (``args.todos``), if any."""
+    args = payload.get("args")
+    if isinstance(args, dict):
+        return args.get("todos")
+    return None
+
+
+def _normalize_tasks(raw: Any) -> list[dict[str, Any]]:
+    """Normalize the gateway's ``{id,content,status}`` todos to ``{id,text,status}``.
+
+    Tolerant of shape drift: non-list -> empty; non-dict entries dropped; a
+    missing text falls back to ``content`` (the gateway's field name); status
+    defaults to ``pending``. The phone renders from this stable trio.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        text = entry.get("text")
+        if not isinstance(text, str) or not text:
+            text = entry.get("content")
+        out.append(
+            {
+                "id": str(entry.get("id", "")),
+                "text": str(text or ""),
+                "status": str(entry.get("status") or "pending"),
+            }
+        )
+    return out
+
+
+def _tasks_counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
+    """Per-status tallies + total for the task-list card badge."""
+    counts = {"total": len(tasks)}
+    for status in _TASK_STATUSES:
+        counts[status] = 0
+    for task in tasks:
+        status = task.get("status")
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def _tasks_all_complete(tasks: list[dict[str, Any]]) -> bool:
+    """True iff the list is non-empty and every task is done/cancelled."""
+    return bool(tasks) and all(t.get("status") in _TASK_DONE_STATUSES for t in tasks)
+
+
+def _tasks_summary(tasks: list[dict[str, Any]]) -> str:
+    """Card summary like ``Tasks 2/5`` (done/total)."""
+    counts = _tasks_counts(tasks)
+    done = counts["completed"] + counts["cancelled"]
+    return f"Tasks {done}/{counts['total']}"
+
+
+def _tasks_body(tasks: list[dict[str, Any]], tool_summary: Any = None) -> dict[str, Any]:
+    """The ``taskList`` item body: the full list + per-status counts.
+
+    ``all_complete`` is a convenience flag the Notifier reads without re-deriving
+    it; the gateway's own ``summary`` (if present) is preserved under
+    ``tool_summary`` for parity with the desktop card.
+    """
+    body: dict[str, Any] = {
+        "tasks": tasks,
+        "counts": _tasks_counts(tasks),
+        "all_complete": _tasks_all_complete(tasks),
+    }
+    if isinstance(tool_summary, dict):
+        body["tool_summary"] = tool_summary
+    return body
 
 
 def _is_error_result(payload: dict[str, Any]) -> bool:
