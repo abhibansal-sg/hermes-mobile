@@ -21,15 +21,19 @@ the two long-lived tasks; the Reframer and Notifier are pumps over the bus.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from .bus import EventBus
+from .bus import TOPIC_GATEWAY_EVENTS, TOPIC_RELAY_FRAMES, EventBus
 from .downstream import DownstreamConfig, DownstreamServer
 from .gateway_client import GatewayClient, GatewayConfig
 from .notifier import Notifier, NotifierConfig
 from .reframer import Reframer
 from .session_state import SessionStore
+
+_log = logging.getLogger("hermes_relay.app")
 
 
 @dataclass
@@ -48,6 +52,8 @@ class RelayApp:
         self._cfg = config
         self.bus = EventBus()
         self.store = SessionStore()
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._closing = False
 
         self.gateway = GatewayClient(config.gateway, self.bus)
         self.reframer = Reframer(self.bus, self.store)
@@ -69,10 +75,83 @@ class RelayApp:
         ``notifier.run()`` (push observer). A failure in any long-lived task
         should tear the group down for a clean restart.
         """
-        raise NotImplementedError
+        self._closing = False
+        # Build the reused replay ring before any frame can be fanned out.
+        await self.downstream.start()
+
+        # Start the three bus consumers FIRST. Subscriptions only receive
+        # messages published after subscribe() (see bus.py), so the reframer,
+        # notifier and downstream must be on their topics before the gateway
+        # begins publishing — otherwise the opening events of a live session
+        # would be dropped on the floor.
+        self._tasks = {
+            "reframer": asyncio.create_task(self.reframer.run(), name="relay.reframer"),
+            "notifier": asyncio.create_task(self.notifier.run(), name="relay.notifier"),
+            "downstream": asyncio.create_task(
+                self.downstream.serve(), name="relay.downstream"
+            ),
+        }
+
+        # Deterministic startup barrier: yield until the consumers have actually
+        # registered their subscriptions (reframer -> gateway.events;
+        # downstream + notifier -> relay.frames). Bounded so a consumer that
+        # dies before subscribing can never spin us forever.
+        for _ in range(10_000):
+            if (
+                self.bus.subscriber_count(TOPIC_GATEWAY_EVENTS) >= 1
+                and self.bus.subscriber_count(TOPIC_RELAY_FRAMES) >= 2
+            ):
+                break
+            if any(t.done() for t in self._tasks.values()):
+                break  # a consumer failed during startup; fall through to reap
+            await asyncio.sleep(0)
+
+        # Only now attach the upstream producer.
+        self._tasks["gateway"] = asyncio.create_task(
+            self.gateway.run(), name="relay.gateway"
+        )
+
+        # Supervise: the first task to exit (cleanly or by raising) tears the
+        # whole group down so the outer process can restart from a clean slate.
+        try:
+            done, _pending = await asyncio.wait(
+                self._tasks.values(), return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            await self.close()
+
+        # Surface the first real failure so the supervisor above sees it.
+        for task in done:
+            if task.cancelled():
+                continue
+            exc = task.exception()
+            if exc is not None:
+                raise exc
 
     async def close(self) -> None:
-        raise NotImplementedError
+        """Idempotent teardown: stop the long-lived lanes, cancel the pumps."""
+        if self._closing and not self._tasks:
+            return
+        self._closing = True
+
+        # Stop the producer and the phone-facing server via their own graceful
+        # paths (unblocks gateway.run() and downstream.serve()).
+        for name, closer in (
+            ("gateway", self.gateway.close),
+            ("downstream", self.downstream.close),
+        ):
+            try:
+                await closer()
+            except Exception:  # pragma: no cover - defensive teardown
+                _log.debug("error closing %s", name, exc_info=True)
+
+        # Cancel every supervised task (the reframer/notifier pumps park on
+        # bus.get() forever, so they need an explicit cancel).
+        for task in self._tasks.values():
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        self._tasks = {}
 
 
 def build_default_config(
