@@ -223,6 +223,7 @@ final class LiveTurnReentryTests: XCTestCase {
         XCTAssertTrue(MessageBubble.shouldShowAssistantActionRow(
             messageIsStreaming: false,
             hasRenderedText: true,
+            hasTurnActions: true,
             assistantTurnActionsEnabled: !chat.isStreaming
         ))
 
@@ -243,6 +244,7 @@ final class LiveTurnReentryTests: XCTestCase {
         XCTAssertFalse(MessageBubble.shouldShowAssistantActionRow(
             messageIsStreaming: false,
             hasRenderedText: true,
+            hasTurnActions: true,
             assistantTurnActionsEnabled: !chat.isStreaming
         ), "completed-turn rows are suppressed while the live runtime is still working")
     }
@@ -263,8 +265,57 @@ final class LiveTurnReentryTests: XCTestCase {
         XCTAssertTrue(MessageBubble.shouldShowAssistantActionRow(
             messageIsStreaming: false,
             hasRenderedText: true,
+            hasTurnActions: true,
             assistantTurnActionsEnabled: !chat.isStreaming
         ))
+    }
+
+    /// Regression (Lane B): a SETTLED assistant turn with NO rendered `.text` part
+    /// — a tool-only / reasoning-only / error-only turn — must STILL expose the
+    /// turn-level actions (retry / undo / branch). The old always-attached
+    /// whole-bubble context menu guaranteed this; after the text-selection fix
+    /// moved actions into the gated inline row, a text-less turn would otherwise
+    /// show no affordance at all. The row must appear whenever there is prose to
+    /// act on OR at least one turn-level action, and be suppressed only while
+    /// streaming or when the chat-level gate is closed.
+    func testActionRowStaysReachableOnTextlessSettledTurn() {
+        // Text-less settled turn, but retry/undo/branch exist → row shows.
+        XCTAssertTrue(MessageBubble.shouldShowAssistantActionRow(
+            messageIsStreaming: false,
+            hasRenderedText: false,
+            hasTurnActions: true,
+            assistantTurnActionsEnabled: true
+        ), "a tool-only / error-only settled turn must keep its retry/undo/branch affordance")
+
+        // Text-less settled turn with NO turn-level actions → nothing to show.
+        XCTAssertFalse(MessageBubble.shouldShowAssistantActionRow(
+            messageIsStreaming: false,
+            hasRenderedText: false,
+            hasTurnActions: false,
+            assistantTurnActionsEnabled: true
+        ), "with neither prose nor turn actions the row is empty and must stay hidden")
+
+        // Rendered prose alone still shows the row even without turn actions.
+        XCTAssertTrue(MessageBubble.shouldShowAssistantActionRow(
+            messageIsStreaming: false,
+            hasRenderedText: true,
+            hasTurnActions: false,
+            assistantTurnActionsEnabled: true
+        ), "a normal prose turn shows copy/share even when retry/undo/branch are absent")
+
+        // Streaming and the closed chat-level gate both suppress the row regardless.
+        XCTAssertFalse(MessageBubble.shouldShowAssistantActionRow(
+            messageIsStreaming: true,
+            hasRenderedText: true,
+            hasTurnActions: true,
+            assistantTurnActionsEnabled: true
+        ), "a streaming turn never shows the end-of-turn row")
+        XCTAssertFalse(MessageBubble.shouldShowAssistantActionRow(
+            messageIsStreaming: false,
+            hasRenderedText: true,
+            hasTurnActions: true,
+            assistantTurnActionsEnabled: false
+        ), "the closed chat-level gate suppresses the row while the runtime works")
     }
 
     func testResumeSnapshotRestoresPartialTurnWithoutStatusRoundTrip() async {
