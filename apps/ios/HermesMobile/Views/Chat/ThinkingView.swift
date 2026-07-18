@@ -65,12 +65,15 @@ struct ThinkingView: View {
     }
 
     /// Binding the DisclosureGroup drives: reads the user's choice when set, else
-    /// the streaming default; a write is always an explicit user toggle, so it
-    /// latches `userExpanded` and the default no longer applies.
+    /// the streaming default. A write only latches `userExpanded` when it CROSSES
+    /// the current default (a deliberate tap) — an echo write equal to the default
+    /// (which SwiftUI emits while animating a binding-driven group, notably on the
+    /// streaming→settled transition) clears the override instead, so a settled
+    /// section always auto-collapses rather than getting pinned open.
     private var isExpanded: Binding<Bool> {
         Binding(
-            get: { userExpanded ?? autoExpanded },
-            set: { userExpanded = $0 }
+            get: { ThinkingDisplay.expansionResolved(userOverride: userExpanded, streaming: autoExpanded) },
+            set: { userExpanded = ThinkingDisplay.expansionOverride(forWrite: $0, streaming: autoExpanded) }
         )
     }
 
