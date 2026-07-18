@@ -214,6 +214,18 @@ enum CacheSchema {
                 try db.execute(sql: "CREATE TABLE \(name) (serverId TEXT NOT NULL, profileId TEXT NOT NULL, \(tail))")
             }
             try db.execute(sql: "CREATE TABLE last_opened_session (serverId TEXT NOT NULL, manifestScope TEXT NOT NULL, profileId TEXT NOT NULL, sessionId TEXT NOT NULL, PRIMARY KEY(serverId,manifestScope))")
+            // Some SQLite builds (notably Apple's system SQLite, which GRDB links
+            // on-device) do NOT rewrite a child table's foreign-key reference when
+            // its parent is renamed. After the `session_cache_v3 -> session_cache`
+            // rename above, the transcript FK can therefore still point at the
+            // now-removed `session_cache_v3`, and `foreign_key_check` reports every
+            // transcript row as a violation — so a POPULATED database (real chats)
+            // throws here and this migration rolls back on every launch, stranding
+            // the DB one step short and leaving `CacheStore()` unbuildable. Fold the
+            // FK repair in BEFORE verifying so the chain advances past v3 without
+            // data loss. This is a no-op on builds that did rewrite the reference
+            // (and on the empty-table fresh-install path, where the FK never binds).
+            try repairTranscriptForeignKeyIfNeeded(db)
             let violations = try Row.fetchAll(db, sql: "PRAGMA foreign_key_check")
             guard violations.isEmpty else { throw DatabaseError(resultCode: .SQLITE_CONSTRAINT_FOREIGNKEY, message: "v3 foreign-key verification failed") }
             try SyncMetaRecord(key: SyncMetaRecord.Key.schemaVersion, value: currentFingerprint).save(db)
@@ -258,49 +270,13 @@ enum CacheSchema {
         // SQLite builds preserve the temporary parent name in the child schema,
         // leaving deletes pointed at the removed `session_cache_v3` table.
         migrator.registerMigration("v5-cache-seams") { db in
-            let parents = try String.fetchAll(
-                db,
-                sql: "SELECT \"table\" FROM pragma_foreign_key_list('message_row_cache')"
-            )
-            if Set(parents) != [SessionCacheRecord.databaseTableName] {
-                try db.create(table: "message_row_cache_v5") { t in
-                    t.column("serverId", .text).notNull()
-                    t.column("profileId", .text).notNull()
-                    t.column("sessionId", .text).notNull()
-                    t.column("ordinal", .integer).notNull()
-                    t.column("wireId", .integer)
-                    t.column("role", .text).notNull()
-                    t.column("timestamp", .double)
-                    t.column("rowJSON", .blob).notNull()
-                    t.primaryKey(["serverId", "profileId", "sessionId", "ordinal"])
-                    t.foreignKey(
-                        ["serverId", "profileId", "sessionId"],
-                        references: SessionCacheRecord.databaseTableName,
-                        columns: ["serverId", "profileId", "id"],
-                        onDelete: .cascade
-                    )
-                }
-                try db.execute(sql: """
-                    INSERT INTO message_row_cache_v5
-                    SELECT serverId,profileId,sessionId,ordinal,wireId,role,timestamp,rowJSON
-                    FROM message_row_cache
-                    """)
-                let before = try Int.fetchOne(db, sql: "SELECT count(*) FROM message_row_cache") ?? 0
-                let after = try Int.fetchOne(db, sql: "SELECT count(*) FROM message_row_cache_v5") ?? 0
-                guard before == after else {
-                    throw DatabaseError(
-                        resultCode: .SQLITE_CONSTRAINT,
-                        message: "v5 transcript FK repair count mismatch"
-                    )
-                }
-                try db.drop(table: "message_row_cache")
-                try db.rename(table: "message_row_cache_v5", to: "message_row_cache")
-                try db.create(
-                    index: "message_row_cache_identity_wireId",
-                    on: "message_row_cache",
-                    columns: ["serverId", "profileId", "sessionId", "wireId"]
-                )
-            }
+            // Repairs devices that recorded v3 with a still-dangling transcript FK
+            // (the empty-table fresh-install path: v3's `foreign_key_check` found no
+            // rows to flag, so v3 committed even though the reference points at the
+            // removed `session_cache_v3`). Those devices never re-run v3, so the
+            // repair must live in this later migration too. Shares the exact repair
+            // used inside v3 so the two paths can never diverge.
+            try repairTranscriptForeignKeyIfNeeded(db)
             let violations = try Row.fetchAll(db, sql: "PRAGMA foreign_key_check")
             guard violations.isEmpty else {
                 throw DatabaseError(
@@ -315,6 +291,111 @@ enum CacheSchema {
         }
 
         return migrator
+    }
+
+    // MARK: - Transcript foreign-key repair (shared by v3 + v5)
+
+    /// Rebuild `message_row_cache` with a correct composite foreign key to
+    /// `session_cache` IF its stored schema still references the transient
+    /// `session_cache_v3` parent produced during the v3 shadow-table swap.
+    ///
+    /// Root cause: SQLite builds that do not rewrite child foreign-key references
+    /// on `ALTER TABLE ... RENAME` (Apple's system SQLite among them) leave the
+    /// transcript FK pointing at the dropped `session_cache_v3`. `foreign_key_check`
+    /// then flags every transcript row, so v3 threw and rolled back forever on any
+    /// populated database.
+    ///
+    /// The repair is data-preserving: it copies every row into a fresh table that
+    /// carries the correct FK, asserts the row count is identical, then atomically
+    /// swaps it in. Renaming the CHILD table never disturbs its own FK's parent
+    /// reference (`session_cache`, which exists), so the swap cannot re-introduce a
+    /// dangling reference. It is a no-op — and cheap — when the FK is already
+    /// correct (the common healthy path). Returns true iff a rebuild was performed.
+    @discardableResult
+    static func repairTranscriptForeignKeyIfNeeded(_ db: Database) throws -> Bool {
+        // No transcript table yet (should not happen post-v3) ⇒ nothing to repair.
+        guard try db.tableExists(MessageRowRecord.databaseTableName) else { return false }
+        let parents = try String.fetchAll(
+            db,
+            sql: "SELECT \"table\" FROM pragma_foreign_key_list('message_row_cache')"
+        )
+        // Already references the real parent (and only it) ⇒ healthy, no rebuild.
+        guard Set(parents) != [SessionCacheRecord.databaseTableName] else { return false }
+
+        try db.create(table: "message_row_cache_fkfix") { t in
+            t.column("serverId", .text).notNull()
+            t.column("profileId", .text).notNull()
+            t.column("sessionId", .text).notNull()
+            t.column("ordinal", .integer).notNull()
+            t.column("wireId", .integer)
+            t.column("role", .text).notNull()
+            t.column("timestamp", .double)
+            t.column("rowJSON", .blob).notNull()
+            t.primaryKey(["serverId", "profileId", "sessionId", "ordinal"])
+            t.foreignKey(
+                ["serverId", "profileId", "sessionId"],
+                references: SessionCacheRecord.databaseTableName,
+                columns: ["serverId", "profileId", "id"],
+                onDelete: .cascade
+            )
+        }
+        try db.execute(sql: """
+            INSERT INTO message_row_cache_fkfix
+            SELECT serverId,profileId,sessionId,ordinal,wireId,role,timestamp,rowJSON
+            FROM message_row_cache
+            """)
+        let before = try Int.fetchOne(db, sql: "SELECT count(*) FROM message_row_cache") ?? 0
+        let after = try Int.fetchOne(db, sql: "SELECT count(*) FROM message_row_cache_fkfix") ?? 0
+        guard before == after else {
+            throw DatabaseError(
+                resultCode: .SQLITE_CONSTRAINT,
+                message: "transcript FK repair count mismatch (\(before) != \(after))"
+            )
+        }
+        try db.drop(table: "message_row_cache")
+        try db.rename(table: "message_row_cache_fkfix", to: "message_row_cache")
+        // The transcript-cursor index rides on the table it indexes, so the drop
+        // above removed it; recreate it on the rebuilt table.
+        try db.create(
+            index: "message_row_cache_identity_wireId",
+            on: "message_row_cache",
+            columns: ["serverId", "profileId", "sessionId", "wireId"],
+            ifNotExists: true
+        )
+        return true
+    }
+
+    // MARK: - Resilient migrate (defense in depth)
+
+    /// Run the full migration chain, NEVER erasing the database on failure. The
+    /// offline cache holds the owner's real chats and is only reconstructible from
+    /// a live gateway they may not currently be able to reach, so wiping is not an
+    /// acceptable recovery — `eraseDatabaseOnSchemaChange` stays false everywhere.
+    ///
+    /// If the chain throws, attempt the one known in-place, data-preserving repair
+    /// (the dangling transcript FK left by the v3 shadow rename) and retry the
+    /// chain EXACTLY once. If it still fails, the error is rethrown so the caller
+    /// can surface a diagnostic — the database is left intact, untouched, and
+    /// fully recoverable by a future build rather than silently destroyed.
+    static func migrateResiliently(_ writer: some DatabaseWriter) throws {
+        let migrator = makeMigrator()
+        do {
+            try migrator.migrate(writer)
+            return
+        } catch let firstError {
+            // Bounded recovery: repair the transcript FK in place, then retry.
+            do {
+                try writer.write { db in
+                    try db.execute(sql: "PRAGMA defer_foreign_keys = ON")
+                    try repairTranscriptForeignKeyIfNeeded(db)
+                }
+            } catch {
+                // The repair itself failed — surface the ORIGINAL migration cause,
+                // never wipe. A nil cache degrades to the network-only path.
+                throw firstError
+            }
+            try migrator.migrate(writer)
+        }
     }
 
     // MARK: - Drop-and-rebuild escape hatch
