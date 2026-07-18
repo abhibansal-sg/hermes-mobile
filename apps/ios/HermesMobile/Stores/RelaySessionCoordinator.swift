@@ -45,6 +45,25 @@ extension DefaultsKeys {
         let raw = defaults.string(forKey: transportPath) ?? ""
         return TransportPath(rawValue: raw) ?? .gatewayDirect
     }
+
+    /// `String` — an explicit relay WS URL the user enters in Settings. On a
+    /// physical device the simulator's `HERMES_RELAY_URL` launch env var is
+    /// unavailable, so the device reads THIS UserDefaults value instead (the env
+    /// var stays a DEBUG-only override that still wins for the simulator E2E).
+    /// When non-empty it overrides the gateway-derived `/relay` URL, letting the
+    /// phone dial a relay that is NOT co-located with the gateway (e.g. a Mac on
+    /// the tailnet). Empty/absent ⇒ derive from the gateway base URL. Owned by
+    /// ``ConnectionStore`` (reader) + ``SettingsView`` (writer).
+    static let relayURLOverride = "hermes.relayURLOverride"
+
+    /// The trimmed relay-URL override, or `nil` when unset/blank (derive from the
+    /// gateway instead).
+    static func relayURLOverrideValue(_ defaults: UserDefaults = .standard) -> String? {
+        let raw = defaults.string(forKey: relayURLOverride)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let raw, !raw.isEmpty else { return nil }
+        return raw
+    }
 }
 
 // MARK: - Coordinator

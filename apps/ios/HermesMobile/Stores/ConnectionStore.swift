@@ -514,10 +514,14 @@ final class ConnectionStore {
         return DefaultsKeys.transportPathValue()
     }
 
-    /// The relay WS URL to dial when ``transportPath`` is `.relay`. In DEBUG the
-    /// `HERMES_RELAY_URL` env var wins (the E2E points the app at the isolated
-    /// relay); otherwise it is derived from the gateway base URL (http→ws,
-    /// https→wss) with the ratified `/relay` path (§1).
+    /// The relay WS URL to dial when ``transportPath`` is `.relay`. Precedence:
+    /// (1) in DEBUG the `HERMES_RELAY_URL` env var wins (the simulator E2E points
+    /// the app at the isolated relay without a Settings round-trip); (2) an
+    /// explicit relay URL the user typed in Settings (`DefaultsKeys.relayURLOverride`)
+    /// — the on-device equivalent of the env var, so the phone can dial a relay
+    /// that is not co-located with the gateway (e.g. a Mac on the tailnet); (3)
+    /// otherwise derive from the gateway base URL (http→ws, https→wss) with the
+    /// ratified `/relay` path (§1).
     func relayURL(forGateway gatewayURL: URL) -> URL? {
         #if DEBUG
         if let raw = ProcessInfo.processInfo.environment["HERMES_RELAY_URL"],
@@ -525,6 +529,10 @@ final class ConnectionStore {
             return override
         }
         #endif
+        if let raw = DefaultsKeys.relayURLOverrideValue(),
+           let override = URL(string: raw) {
+            return override
+        }
         var components = URLComponents(url: gatewayURL, resolvingAgainstBaseURL: false)
         components?.scheme = gatewayURL.scheme == "https" ? "wss" : "ws"
         components?.path = "/relay"
