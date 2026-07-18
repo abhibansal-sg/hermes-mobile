@@ -1,7 +1,6 @@
 import Foundation
 #if DEBUG
 import os
-import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-G)
 
 /// DEBUG-only logger for SessionStore open→painted latency instrumentation
 /// (WhatsApp bar). Absent in Release.
@@ -414,7 +413,6 @@ final class SessionStore {
     var activeRuntimeId: String?
     /// Persistent `stored_session_id` for the active session (survives reconnects).
     #if DEBUG
-    @Snapshotable
     #endif
     var activeStoredId: String?
     /// Profile component of the durable selection identity. Stored session ids
@@ -654,7 +652,6 @@ final class SessionStore {
     }
     /// True while a list/open/create RPC is in flight.
     #if DEBUG
-    @Snapshotable
     #endif
     var isLoading: Bool = false
     /// Last human-readable error from a session operation, for the UI to surface.
@@ -670,7 +667,6 @@ final class SessionStore {
     /// to this value (`DrawerView`); ``lastError`` is still written too for the
     /// other call sites that read it. `nil` = nothing to show / silent success.
     #if DEBUG
-    @Snapshotable
     #endif
     var sessionActionError: SessionActionError?
 
@@ -992,7 +988,6 @@ final class SessionStore {
     /// stale value on a stock / pre-multi-profile gateway is inert and the dormant
     /// single-profile path is byte-for-byte unchanged.
     #if DEBUG
-    @Snapshotable
     #endif
     var activeProfile: String {
         didSet {

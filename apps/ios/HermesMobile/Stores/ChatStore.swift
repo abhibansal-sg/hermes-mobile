@@ -3,7 +3,6 @@ import SwiftUI  // A2: withTransaction(Transaction(animation: nil)) on the final
 import UIKit
 import os
 #if DEBUG
-import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-G)
 #endif
 
 struct TranscriptPageFetch: Sendable {
@@ -159,7 +158,6 @@ final class ChatStore {
     var messages: [ChatMessage] = []
     /// True while the agent is producing a streaming turn.
     #if DEBUG
-    @Snapshotable
     #endif
     var isStreaming: Bool = false
     /// An approval the user must answer, or `nil`.
@@ -180,7 +178,6 @@ final class ChatStore {
     /// reset on a fresh turn / open / reset. The view renders ``subagentRoots``
     /// + ``subagentChildren(of:)`` so it never touches the assembly map.
     #if DEBUG
-    @Snapshotable
     #endif
     private(set) var subagentNodeCount: Int = 0
 
@@ -189,14 +186,12 @@ final class ChatStore {
     /// secure prompt (`"sudo"` / `"secret"` / `"none"`) so the gate can assert a
     /// prompt is up WITHOUT ever reading the entered value (which is never held in
     /// the store at all — see ``PendingSecurePrompt``). Bridge-exposed as a String.
-    @Snapshotable
     var activeSecurePromptKind: String {
         pendingSecurePrompt?.kind.rawValue ?? "none"
     }
     #endif
     /// Last user-facing error (busy, send failure, …), or `nil`.
     #if DEBUG
-    @Snapshotable
     #endif
     var lastError: String?
 
@@ -236,20 +231,17 @@ final class ChatStore {
     /// `catch`. Not user-facing chrome — it drives diagnostics and the DEBUG
     /// bridge — so it never clobbers `lastError`.
     #if DEBUG
-    @Snapshotable
     #endif
     private(set) var lastBackfillError: String?
 
     #if DEBUG
     /// DEBUG-only adoption-gate telemetry, bridge-exposed via the UI-G
     /// StateAccessor pattern. Release builds never reference this.
-    @Snapshotable
     private(set) var foreignMirrorTelemetry = ForeignMirrorTelemetry()
 
     /// DEBUG-only label of the most recent `isStreaming` write (F3-H2). Names the
     /// function + reason + the inbound event's ids vs. the active ids, so the gate
     /// can read which path flipped streaming on. Bridge-exposed as a String.
-    @Snapshotable
     private(set) var lastStreamingSetter: String = "(none)"
 
     /// DEBUG-only ordered ring buffer of the last `streamingRingCapacity`
@@ -350,7 +342,6 @@ final class ChatStore {
     /// the turn activity bar. `nil` when no tool is running. Set on `tool.start`
     /// and cleared on that tool's `tool.complete` / turn completion.
     #if DEBUG
-    @Snapshotable
     #endif
     private(set) var activeToolName: String?
     /// `tool_call_id` backing `activeToolName`, so completion of an *earlier*

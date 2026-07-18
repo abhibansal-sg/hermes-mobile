@@ -4,7 +4,6 @@ import OSLog
 import UIKit  // UIDevice.current.name — the auto-upgrade device-name hint (W3A-A)
 #endif
 #if DEBUG
-import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-G)
 #endif
 
 /// A model pick made on a DRAFT chat (no gateway session yet) — pends until
@@ -82,7 +81,7 @@ final class ConnectionStore {
     /// (task UI-G). `phase` is a Swift enum and not JSON-serializable, so the
     /// generated StateServer accessor reads this stable String label instead.
     /// Wrapped in `#if DEBUG` so it does not exist in Release.
-    @Snapshotable var phaseLabel: String {
+    var phaseLabel: String {
         switch phase {
         case .needsSetup: return "needsSetup"
         case .connecting: return "connecting"
@@ -101,7 +100,6 @@ final class ConnectionStore {
     #endif
     /// The server base URL string (persisted in UserDefaults).
     #if DEBUG
-    @Snapshotable
     #endif
     var serverURLString: String = ""
 
@@ -152,7 +150,6 @@ final class ConnectionStore {
     /// health and must never gate the composer: the shared token remains live, so
     /// the chat stays usable while the user revokes an unused device and retries.
     #if DEBUG
-    @Snapshotable
     #endif
     var deviceLimitAdvisory: String?
 
