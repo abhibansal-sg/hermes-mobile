@@ -105,13 +105,24 @@ final class AppEnvironment {
             dependencies: .init(
                 currentScope: { [weak sessionStore] in sessionStore?.durableWorkScope },
                 activeStoredSessionID: { [weak sessionStore] in sessionStore?.activeStoredId },
-                canProcessPrompt: { [weak connectionStore, weak chatStore] in
-                    guard let connectionStore, let chatStore else { return false }
+                isTransportReady: { [weak connectionStore] in
+                    guard let connectionStore else { return false }
                     // Presentation grace intentionally retains `.connected` so
                     // cached chat stays calm. Durable prompts may drain only
                     // after the live socket completed `gateway.ready`.
-                    guard connectionStore.isTransportReady else { return false }
-                    return !chatStore.isStreaming && !chatStore.localTurnInFlight
+                    return connectionStore.isTransportReady
+                },
+                busySessionID: { [weak chatStore] in
+                    // Per-session serialization (Lane C fix 1): a turn streaming —
+                    // or a local turn in flight — belongs to the ACTIVE session.
+                    // Report its stored id so the processor holds only that
+                    // session's queued prompts and drains every other session
+                    // now, instead of the old global "any turn streams" block.
+                    guard let chatStore,
+                          chatStore.isStreaming || chatStore.localTurnInFlight else {
+                        return nil
+                    }
+                    return chatStore.activeStoredSessionId
                 },
                 createDestination: { [weak sessionStore] _ in
                     guard let sessionStore else { throw OutboxProcessorError.destinationUnavailable }
