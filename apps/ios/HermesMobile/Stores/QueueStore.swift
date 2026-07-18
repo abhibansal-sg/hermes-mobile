@@ -214,6 +214,19 @@ final class QueueStore {
         if prompt.displayState == .inProgress || prompt.displayState == .indeterminate {
             return false
         }
+        // A leased row actively in flight (.submitting/.uploading with a live
+        // lease owner) is NOT stuck: a drain holds it and the request is in
+        // progress. Its enqueue-relative age can exceed the threshold — e.g. a
+        // message queued while offline that only begins submitting after
+        // reconnect — but surfacing the red "not sent" badge (which wires
+        // Delete) mid-request would cancel a send the gateway is about to
+        // accept. If the attempt errors it moves to .failed/.retryWait (caught
+        // below); if the lease goes stale the row is reclaimed with leaseOwner
+        // cleared and the age check applies again. Mirrors the
+        // in_progress/indeterminate exclusion above.
+        if prompt.isClaimed, prompt.state == .submitting || prompt.state == .uploading {
+            return false
+        }
         switch prompt.state {
         case .failed, .retryWait:
             return true
