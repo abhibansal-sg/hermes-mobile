@@ -114,13 +114,63 @@ final class RelayItemStoreTests: XCTestCase {
 
     func testDuplicateSeqReapplyIsIdempotent() {
         var store = RelayItemStore()
-        let frame = completed("a", .agentMessage, ord: 0, seq: 3, body: ["text": "x"])
+        // Establish a dense watermark (seqs 1–2) so the seq-3 frame under test
+        // arrives IN-ORDER, not as a gap. A lone seq-3 on a fresh store is a gap
+        // (missing 1–2) and — per the §4 watermark contract — deliberately does not
+        // advance `lastSeq`; that is a separate case, covered by the gap tests.
+        store.apply(completed("u", .userMessage, ord: 0, seq: 1, body: ["text": "hi"]))
+        store.apply(started("a", .agentMessage, ord: 1, seq: 2, body: ["text": ""]))
+
+        let frame = completed("a", .agentMessage, ord: 1, seq: 3, body: ["text": "x"])
         store.apply(frame)
         let afterFirst = store
         // Re-applying the exact frame (a replayed duplicate) converges to the same state.
         store.apply(frame)
         XCTAssertEqual(store, afterFirst)
         XCTAssertEqual(store.lastSeq, 3)
+    }
+
+    /// A live GAP must NOT advance the watermark past the hole (§4). The gapped
+    /// frame is applied optimistically, but `lastSeq` stays at the last dense seq
+    /// so a following `resync{last_seq}` replays from the hole. Advancing past the
+    /// gap would strand the skipped middle — a dropped `item.completed` could never
+    /// backfill and its item would be stuck `.inProgress`.
+    func testGapDoesNotAdvanceWatermarkPastTheHole() {
+        var store = RelayItemStore()
+        store.apply(started("msg-1", .agentMessage, ord: 1, seq: 1, body: ["text": ""]))
+        XCTAssertEqual(store.lastSeq, 1)
+
+        // Frames 2–3 are missed; seq 4 lands as a gap and is applied optimistically…
+        let admission = store.apply(completed("tool-1", .toolCall, ord: 2, seq: 4, body: ["name": "grep"]))
+        XCTAssertEqual(admission, .gap(missing: 2..<4))
+        XCTAssertEqual(store.itemsByID["tool-1"]?.toolName, "grep", "gapped payload still applies")
+        XCTAssertEqual(store.lastSeq, 1, "watermark must stay at the last DENSE seq, not jump to 4")
+
+        // …so a resync anchored on lastSeq (1) can replay 2–4 and backfill the hole,
+        // idempotently re-applying the already-seen seq 4.
+        store.apply(delta("msg-1", seq: 2, patch: ["text": "Working…"]))
+        store.apply(completed("msg-1", .agentMessage, ord: 1, seq: 3, body: ["text": "Done."]))
+        store.apply(completed("tool-1", .toolCall, ord: 2, seq: 4, body: ["name": "grep"]))
+        XCTAssertEqual(store.lastSeq, 4, "dense replay heals the watermark")
+        XCTAssertEqual(store.itemsByID["msg-1"]?.textBody, "Done.")
+    }
+
+    /// A dropped `item.completed` recovers via resync: the store must not have
+    /// advanced past the gap, so replaying it lands the authoritative terminal item
+    /// (otherwise the item stays `.inProgress` forever).
+    func testDroppedCompletedRecoversOnDenseReplay() {
+        var store = RelayItemStore()
+        store.apply(started("msg-1", .agentMessage, ord: 0, seq: 1, body: ["text": ""]))
+        store.apply(delta("msg-1", seq: 2, patch: ["text": "partial"]))
+        // seq 3 (the item.completed) is DROPPED; seq 4 (a later item) lands as a gap.
+        store.apply(completed("tool-1", .toolCall, ord: 1, seq: 4, body: ["name": "grep"]))
+        XCTAssertEqual(store.itemsByID["msg-1"]?.status, .inProgress, "still in-progress before backfill")
+        XCTAssertEqual(store.lastSeq, 2, "watermark pinned at last dense seq, not the gapped 4")
+
+        // resync replays 3–4; the dropped completed lands and heals the item.
+        store.apply(completed("msg-1", .agentMessage, ord: 0, seq: 3, body: ["text": "final"]))
+        XCTAssertEqual(store.itemsByID["msg-1"]?.status, .completed)
+        XCTAssertEqual(store.itemsByID["msg-1"]?.textBody, "final")
     }
 
     // MARK: - Snapshot reconciliation (§4)

@@ -330,6 +330,38 @@ final class RelayClientMockTests: XCTestCase {
         await client.disconnect()
     }
 
+    /// A LIVE gap (frames missed without a socket tear) must auto-`resync` from the
+    /// dense watermark — the store leaves `lastSeq` pinned at the last in-order seq,
+    /// so the replay backfills the hole (§4). Without this the discarded gap
+    /// admission would strand a dropped `item.completed` `.inProgress` forever.
+    func testLiveGapTriggersResyncAndBackfills() async {
+        let full = sampleTurn()   // dense 1…5
+        let transport = MockRelayTransport(script: { upstream, relay in
+            guard upstream.method == "resync" else { return }
+            let lastSeq = (upstream.params["last_seq"] as? NSNumber)?.intValue ?? -1
+            XCTAssertEqual(lastSeq, 1, "resync must anchor on the last DENSE seq, not the gapped one")
+            relay.deliverFrames(Array(full[1...4]))   // replay seqs 2…5 in order
+        })
+        let client = RelayClient { _ in transport }
+        await client.connect(url: url)
+
+        transport.deliverFrame(full[0])                    // seq 1 (dense)
+        await waitUntil { await client.lastSeq == 1 }
+        transport.deliverFrame(full[4])                    // seq 5 → live gap (missing 2…4)
+
+        // The gap payload applies optimistically but the watermark stays pinned…
+        await waitUntil { transport.upstreams().contains { $0.method == "resync" } }
+        // …and the replay reconciles gap-free up to the head.
+        await waitUntil { await client.lastSeq == 5 }
+        await assertReconciledToFullTurn(client)
+
+        // Exactly ONE resync fired for the single hole (no per-frame storm).
+        let resyncs = transport.upstreams().filter { $0.method == "resync" }.count
+        XCTAssertEqual(resyncs, 1, "a single hole must trigger exactly one resync")
+
+        await client.disconnect()
+    }
+
     // MARK: - Shared assertion
 
     private func assertReconciledToFullTurn(_ client: RelayClient) async {

@@ -54,6 +54,12 @@ struct RelayItemStore: Sendable, Equatable {
         /// `seq > lastSeq + 1` — one or more frames were missed. The payload is
         /// still applied optimistically; the caller should `resync` to backfill.
         case gap(missing: Range<Int>)
+
+        /// Whether this admission represents a missed run of frames.
+        var isGap: Bool {
+            if case .gap = self { return true }
+            return false
+        }
     }
 
     /// Classify a `seq` against the current watermark without mutating.
@@ -85,7 +91,17 @@ struct RelayItemStore: Sendable, Equatable {
              .status, .title, .unknown:
             break   // non-item frame kinds carry no store mutation
         }
-        if frame.seq > lastSeq { lastSeq = frame.seq }
+        // Watermark advance (§4). A `snapshot` is the authoritative gap-free
+        // baseline, so it always advances the watermark (its own `reconcile` also
+        // honours the snapshot `cursor`). An ordinary frame advances the watermark
+        // ONLY when it is not a `.gap`: a gapped frame is applied optimistically,
+        // but the watermark must stay at the last DENSE seq so a following
+        // `resync{last_seq}` replays from the hole and backfills the skipped
+        // middle. Advancing past a gap would strand the missing frames — including
+        // a possibly-dropped `item.completed`, which would otherwise leave its item
+        // stuck `.inProgress` with no recovery short of a full snapshot.
+        let advancesWatermark = frame.kind == .snapshot || !admission.isGap
+        if advancesWatermark, frame.seq > lastSeq { lastSeq = frame.seq }
         return admission
     }
 

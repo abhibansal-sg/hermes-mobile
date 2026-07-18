@@ -85,6 +85,11 @@ actor RelayClient {
     /// the real watermark and the replay reconciles gap-free.
     private(set) var store = RelayItemStore()
     private var lastAckedSeq = 0
+    /// The dense watermark a live-gap `resync` was last fired from. A gap leaves
+    /// `store.lastSeq` pinned at the last in-order seq, so every subsequent live
+    /// frame classifies as a gap too; this guard fires ONE `resync` per hole
+    /// instead of one per frame, avoiding a resync storm while the backfill lands.
+    private var lastGapResyncSeq = -1
     /// Coalescing threshold: ack once the watermark has advanced this many frames
     /// past the last ack (§4 "periodically" — count-based so tests are deterministic).
     let ackEvery: Int
@@ -353,9 +358,22 @@ actor RelayClient {
         }
 
         if let frame = try? decoder.decode(RelayFrame.self, from: data) {
-            store.apply(frame)
+            let admission = store.apply(frame)
             framesContinuation.yield(frame)
-            Task { await self.maybeAck() }
+            // Reliability spine (§4): a live gap means frames were missed. The
+            // store left `lastSeq` pinned at the last dense seq (it does not
+            // advance past an unfilled gap), so a `resync{last_seq}` now replays
+            // from the hole and backfills the skipped middle — including a
+            // possibly-dropped `item.completed` that would otherwise strand its
+            // item `.inProgress`. A `snapshot` arriving as a gap is itself the
+            // authoritative backfill, so it needs no resync. The per-hole guard
+            // fires exactly one resync until the watermark advances again.
+            if admission.isGap, frame.kind != .snapshot, store.lastSeq > lastGapResyncSeq {
+                lastGapResyncSeq = store.lastSeq
+                Task { await self.resync() }
+            } else {
+                Task { await self.maybeAck() }
+            }
             return
         }
 

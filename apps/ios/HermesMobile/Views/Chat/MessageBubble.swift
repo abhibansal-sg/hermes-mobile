@@ -566,6 +566,7 @@ struct MessageBubble: View {
             if Self.shouldShowAssistantActionRow(
                 messageIsStreaming: message.isStreaming,
                 hasRenderedText: hasRenderedText,
+                hasTurnActions: hasAssistantTurnActions,
                 assistantTurnActionsEnabled: assistantTurnActionsEnabled
             ) {
                 assistantActionRow
@@ -587,16 +588,31 @@ struct MessageBubble: View {
         }
     }
 
+    /// Whether this turn exposes at least one TURN-LEVEL action (retry / undo /
+    /// branch) — the affordances that must stay reachable on a settled turn even
+    /// when it rendered no prose (tool-only / reasoning-only / error-only). These
+    /// are the actions the removed whole-bubble `.contextMenu` always guaranteed;
+    /// without this, a text-less settled turn would show NO action affordance.
+    private var hasAssistantTurnActions: Bool {
+        onRetry != nil || onUndoLastTurn != nil || onBranch != nil
+    }
+
     /// Pure action-row visibility contract for tests: a completed assistant row
-    /// needs rendered prose AND the chat-level turn must be settled. The extra
-    /// chat-level gate prevents live re-entry from showing an end-of-turn row while
-    /// the runtime is still working.
+    /// shows when the chat-level turn is settled AND there is something to act on
+    /// — either rendered prose (copy / share / speak) OR a turn-level action
+    /// (retry / undo / branch). The prose-OR-turn-action rule is what keeps a
+    /// text-less settled turn (tool-only / reasoning-only / error-only) from
+    /// losing every affordance the old always-attached context menu provided.
+    /// The chat-level `assistantTurnActionsEnabled` gate prevents live re-entry
+    /// from showing an end-of-turn row while the runtime is still working.
     nonisolated static func shouldShowAssistantActionRow(
         messageIsStreaming: Bool,
         hasRenderedText: Bool,
+        hasTurnActions: Bool,
         assistantTurnActionsEnabled: Bool
     ) -> Bool {
-        !messageIsStreaming && hasRenderedText && assistantTurnActionsEnabled
+        guard !messageIsStreaming, assistantTurnActionsEnabled else { return false }
+        return hasRenderedText || hasTurnActions
     }
 
     @ViewBuilder
@@ -1331,38 +1347,49 @@ struct MessageBubble: View {
     /// speak (existing `onSpeak`), retry (existing `onRetry`). 16pt glyphs,
     /// `theme.mutedFg`, 20pt spacing, no backgrounds (observed reference). Speak
     /// and retry render only when their hook is supplied (mirrors the context
-    /// menu's existing gating); copy + share are always available.
+    /// menu's existing gating); copy + share render whenever there is rendered
+    /// prose to act on. On a text-less settled turn only the turn-level actions
+    /// (Retry + overflow) render — the affordance the removed context menu
+    /// always guaranteed.
     ///
     /// CC-02: copy button shows a checkmark confirmation (+ haptic) matching
     /// CodeBlockView's copy UX so every copy surface in the transcript is consistent.
     /// CC-07: top padding raised from 4 → 8 for better separation from prose.
     private var assistantActionRow: some View {
         HStack(spacing: 20) {
-            // CC-02: confirm copy with checkmark + color change (mirrors CodeBlockView).
-            Button {
-                copyAssistantMessage()
-            } label: {
-                Image(systemName: didCopyMessage ? "checkmark" : "doc.on.doc")
-                    .font(.body)
-                    .foregroundStyle(didCopyMessage ? theme.statusOK : theme.mutedFg)
-                    .frame(width: 28, height: 28)
-                    .contentShape(Rectangle())
-                    .contentTransition(.symbolEffect(.replace))
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(didCopyMessage ? "Copied to clipboard" : "Copy")
+            // Copy / Share / Speak act on the rendered prose (`message.text` is the
+            // concat of the `.text` parts), so they appear ONLY when there is
+            // rendered text — copying/sharing/speaking an empty body is meaningless.
+            // On a text-less settled turn the row still renders (below) for the
+            // turn-level actions (Retry + overflow), which is the affordance the
+            // removed whole-bubble context menu used to guarantee.
+            if hasRenderedText {
+                // CC-02: confirm copy with checkmark + color change (mirrors CodeBlockView).
+                Button {
+                    copyAssistantMessage()
+                } label: {
+                    Image(systemName: didCopyMessage ? "checkmark" : "doc.on.doc")
+                        .font(.body)
+                        .foregroundStyle(didCopyMessage ? theme.statusOK : theme.mutedFg)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                        .contentTransition(.symbolEffect(.replace))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(didCopyMessage ? "Copied to clipboard" : "Copy")
 
-            ShareLink(item: message.text) {
-                Image(systemName: "square.and.arrow.up")
-                    .font(.body)
-                    .foregroundStyle(theme.mutedFg)
-                    .frame(width: 28, height: 28)
-                    .contentShape(Rectangle())
-            }
-            .accessibilityLabel("Share")
-            if let onSpeak {
-                actionIcon("speaker.wave.2", label: "Speak") {
-                    onSpeak(message)
+                ShareLink(item: message.text) {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.body)
+                        .foregroundStyle(theme.mutedFg)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Share")
+                if let onSpeak {
+                    actionIcon("speaker.wave.2", label: "Speak") {
+                        onSpeak(message)
+                    }
                 }
             }
             if let onRetry {
