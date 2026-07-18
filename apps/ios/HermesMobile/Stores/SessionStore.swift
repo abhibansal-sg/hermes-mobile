@@ -356,6 +356,35 @@ final class SessionStore {
     @ObservationIgnored
     private var sessionListDeltaCursors: [SessionListDeltaScope: String] = [:]
 
+    /// The transport generation the delta rail last FULL-seeded under (A2). Every
+    /// reconnect / foreground-recovery bumps `ConnectionStore.transportEpoch`, so
+    /// comparing it here lets the FIRST session-list refresh on a new transport
+    /// bypass the persisted delta cursor and do a full first-page re-seed +
+    /// fill-to-target before incremental deltas resume — otherwise an
+    /// under-populated drawer (initial hydration cut short by the 8s timeout) can
+    /// never be repaired without a process restart. This single data-driven seam
+    /// keys off the epoch that ALL recovery entry points already advance, so no
+    /// per-path flag and no third recovery path is needed.
+    @ObservationIgnored
+    private var lastReseededTransportGeneration: UInt64?
+
+    /// The current transport generation for the A2 reseed gate. The live path is
+    /// `connection?.transportEpoch`; a test injects `reconnectGenerationProvider`
+    /// to simulate a reconnect deterministically without a live socket.
+    private var currentReconnectGeneration: UInt64? {
+        #if DEBUG
+        if let provider = reconnectGenerationProvider { return provider() }
+        #endif
+        return connection?.transportEpoch
+    }
+
+    #if DEBUG
+    /// Test seam for the A2 reconnect full-reseed gate: overrides the transport
+    /// generation the gate reads. Bumping the returned value between refreshes
+    /// simulates a reconnect (which, in the app, bumps `transportEpoch`).
+    var reconnectGenerationProvider: (() -> UInt64?)?
+    #endif
+
     /// Tombstones deferred while a row belongs to the active/pinned/live working
     /// set. They are re-evaluated on every later delta so advancing the server
     /// cursor cannot leave a protected row behind forever after protection ends.
@@ -2552,8 +2581,22 @@ final class SessionStore {
                 // post-fill heartbeat / gateway.ready replace can't collapse the
                 // drawer back to ~100 rows (fill30): `max(100, loadedFloor, loadedCount)`.
                 let fetchLimit = max(100, loadedFloor, loadedCount)
+                // A2: the transport generation at the start of this refresh. If it
+                // advanced since the delta rail last full-seeded, a reconnect /
+                // foreground-recovery happened and the FIRST refresh on the new
+                // transport must FULL-seed (bypass the persisted cursor) before
+                // incremental deltas resume — see `lastReseededTransportGeneration`.
+                let reseedGeneration = currentReconnectGeneration
                 if let deltaScope {
-                    let previousCursor = sessionListDeltaCursors[deltaScope]
+                    var previousCursor = sessionListDeltaCursors[deltaScope]
+                    if previousCursor != nil,
+                       reseedGeneration != lastReseededTransportGeneration {
+                        // Reconnected/recovered since the last seed: drop the cursor
+                        // so this refresh takes the full first-page seed + fill-to-
+                        // target path, then deltas resume from the new cursor.
+                        previousCursor = nil
+                        sessionListDeltaCursors[deltaScope] = nil
+                    }
                     let delta: SessionListDeltaResult?
                     do {
                         delta = try await resolvedSessionListDeltaFetch(
@@ -2572,6 +2615,10 @@ final class SessionStore {
 
                     if let delta {
                         sessionListDeltaCursors[deltaScope] = delta.cursor
+                        // This refresh is now the seed for the current transport
+                        // generation; subsequent same-generation refreshes resume
+                        // incremental deltas (A2).
+                        lastReseededTransportGeneration = reseedGeneration
                         let didChange: Bool
                         if previousCursor == nil {
                             mergeSessionPage(delta.sessions, total: delta.total)
@@ -2615,6 +2662,10 @@ final class SessionStore {
                         afterAuthoritativePage: result.sessions,
                         scope: deltaScope
                     )
+                    // The stock REST path is itself a full first-page seed; mark the
+                    // current transport generation as seeded so a delta cursor set
+                    // later this generation is not force-bypassed again (A2).
+                    lastReseededTransportGeneration = reseedGeneration
                 }
                 if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
                 lastError = nil

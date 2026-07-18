@@ -469,6 +469,62 @@ final class SessionRefreshTests: XCTestCase {
         XCTAssertEqual(store.sessions.first?.lastActive, 400)
     }
 
+    /// A2: after a reconnect (transport generation advances), the FIRST session-
+    /// list refresh must bypass the persisted delta cursor and do a FULL first-page
+    /// re-seed + fill-to-target, so an under-populated drawer (hydration cut short)
+    /// is repaired without a process restart. Same-generation refreshes still resume
+    /// incremental deltas.
+    func testReconnectForcesFullReseedBeforeDeltasResume() async {
+        let store = makeStore()
+        var generation: UInt64 = 1
+        store.reconnectGenerationProvider = { generation }
+        var seenCursors: [String?] = []
+        let fullPage = (0..<40).map { makeSummary(id: "s\($0)", lastActive: Double(1000 - $0)) }
+        store.sessionListDeltaFetch = { cursor, _ in
+            seenCursors.append(cursor)
+            if cursor == nil {
+                return SessionListDeltaResult(
+                    sessions: fullPage, tombstones: [], cursor: "cur-\(generation)", total: 40)
+            }
+            // A non-nil cursor is an incremental heartbeat: only change-sets, never
+            // the full list — so it can never by itself repair a partial drawer.
+            return SessionListDeltaResult(
+                sessions: [], tombstones: [], cursor: "cur-\(generation)", total: 40)
+        }
+        store.initialFillFetch = { _ in (fullPage, 40) }
+
+        // Cold connect: full seed populates the drawer and sets the cursor.
+        await store.refresh()
+        await store.awaitInitialFillForTesting()
+        XCTAssertGreaterThanOrEqual(store.sessions.count, SessionStore.initialVisibleTarget)
+        XCTAssertEqual(seenCursors, [nil], "the first connect seeds with a nil cursor")
+
+        // A same-generation heartbeat resumes incremental deltas (non-nil cursor).
+        await store.refresh()
+        XCTAssertEqual(seenCursors.last, "cur-1",
+            "a same-generation refresh uses the persisted delta cursor")
+
+        // The drawer regresses to a partial state with the cursor STILL set — the
+        // exact wedge: incremental deltas alone can never refill it.
+        store.sessions = Array(fullPage.prefix(3))
+        store.setPaginationForTesting(loadedCount: 3, loadedOffset: 3, total: 40)
+
+        // Reconnect: the transport generation advances.
+        generation = 2
+        await store.refresh()
+        await store.awaitInitialFillForTesting()
+
+        XCTAssertNil(seenCursors.last!,
+            "the first refresh after a reconnect must FULL-seed with a nil cursor")
+        XCTAssertGreaterThanOrEqual(store.sessions.count, SessionStore.initialVisibleTarget,
+            "after reconnect the drawer is restored to a full list, not left partial")
+
+        // Deltas resume on the new generation's cursor for subsequent refreshes.
+        await store.refresh()
+        XCTAssertEqual(seenCursors.last, "cur-2",
+            "after the reconnect reseed, incremental deltas resume from the new cursor")
+    }
+
     func testCursorDeltaTombstonesDropOnlyNonWorkingSetRows() async {
         let store = makeStore()
         let old = makeSummary(id: "old", lastActive: 10)
