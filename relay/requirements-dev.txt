@@ -1,0 +1,26 @@
+# Dev/venv note — hermes-relay
+#
+# Build all venvs on the external volume (/Volumes/MainData); the internal disk
+# is tight. Python is Homebrew 3.13.
+#
+#   /opt/homebrew/bin/python3.13 -m venv /Volumes/MainData/Developer/hermes-tmp/venvs/relay
+#   source /Volumes/MainData/Developer/hermes-tmp/venvs/relay/bin/activate
+#   pip install -r requirements-dev.txt
+#   # or: pip install -e '.[dev]'   (uses pyproject)
+#
+# Unit tests use stdlib + pytest + unittest.mock only and NEVER touch the
+# network. End-to-end tests run against a STOCK isolated gateway on port 9126+
+# with a temp HERMES_HOME (see r0-relay-spike/launch_gateway.sh) — NEVER the
+# live gateway on 9119.
+#
+# The reused plumbing (replay_ring / push_engine / device_tokens) is imported
+# from plugins/hermes-mobile at runtime via hermes_relay.plugin_bridge; it is
+# NOT installed as a package.
+
+# runtime
+websockets>=12
+httpx>=0.27
+
+# dev/test
+pytest>=8
+pytest-asyncio>=0.23
