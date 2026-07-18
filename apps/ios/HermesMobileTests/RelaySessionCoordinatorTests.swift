@@ -28,6 +28,7 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         private var waiter: CheckedContinuation<URLSessionWebSocketTask.Message, Error>?
         private var sent: [Upstream] = []
         private var cancelled = false
+        private var failed = false
 
         var script: (@Sendable (Upstream, MockRelayTransport) -> Void)?
 
@@ -40,11 +41,27 @@ final class RelaySessionCoordinatorTests: XCTestCase {
                 lock.lock()
                 if cancelled {
                     lock.unlock(); continuation.resume(throwing: URLError(.cancelled))
+                } else if failed {
+                    failed = false; lock.unlock()
+                    continuation.resume(throwing: URLError(.networkConnectionLost))
                 } else if !inbox.isEmpty {
                     let next = inbox.removeFirst(); lock.unlock(); continuation.resume(returning: next)
                 } else {
                     waiter = continuation; lock.unlock()
                 }
+            }
+        }
+
+        /// Simulate an unexpected transport drop: the parked `receive()` throws a
+        /// NON-cancelled error, which the client maps to `.failed` (a real drop,
+        /// distinct from an intentional `cancel` → `.closed`).
+        func fail() {
+            lock.lock()
+            if let parked = waiter {
+                waiter = nil; lock.unlock()
+                parked.resume(throwing: URLError(.networkConnectionLost))
+            } else {
+                failed = true; lock.unlock()
             }
         }
 
@@ -414,5 +431,86 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(interruptFrame?.params["session_id"] as? String, "sess-42")
 
         await coordinator.stop()
+    }
+
+    // MARK: - (4) Auto-reconnect driver: prompt first attempt + resync-on-open
+
+    /// Hands out a scripted transport per `connect`, so a reconnect gets a fresh
+    /// relay instance (mirrors `RelayClientMockTests.TransportQueue`).
+    private final class TransportQueue: @unchecked Sendable {
+        private let transports: [MockRelayTransport]
+        private let lock = NSLock()
+        private var index = 0
+        init(_ transports: [MockRelayTransport]) { self.transports = transports }
+        func next() -> MockRelayTransport {
+            lock.lock(); defer { lock.unlock() }
+            let t = transports[min(index, transports.count - 1)]
+            index += 1
+            return t
+        }
+    }
+
+    /// Records the delays the reconnect driver asks for, returning immediately so
+    /// the test never actually sleeps (the injected clock seam).
+    private actor SleepRecorder {
+        private(set) var recorded: [Duration] = []
+        func record(_ d: Duration) { recorded.append(d) }
+        func durations() -> [Duration] { recorded }
+    }
+
+    /// HEADLINE: an unexpected drop auto-reconnects with NO pre-delay (attempt 0
+    /// is immediate) and sends `resync{last_seq}` immediately on the re-opened
+    /// socket, anchored on the retained watermark — the stream resumes fast.
+    func testAutoReconnectIsPromptAndResyncsFromWatermark() async throws {
+        let recorder = SleepRecorder()
+        let live = MockRelayTransport()
+        let resumed = MockRelayTransport(script: { upstream, _ in
+            _ = upstream   // the resumed relay only needs to record the resync
+        })
+        let queue = TransportQueue([live, resumed])
+        let coordinator = RelaySessionCoordinator(
+            chatStore: ChatStore(),
+            clientFactory: { RelayClient { _ in queue.next() } },
+            backoffSleep: { await recorder.record($0) }
+        )
+        try await coordinator.start(url: url)
+
+        // Stream two dense frames so the resync watermark is 2.
+        live.deliverFrames(Array(sampleTurn().prefix(2)))
+        await waitUntil { coordinator.store.lastSeq == 2 }
+
+        // Drop the live socket (non-cancelled error → `.failed` → auto-reconnect).
+        live.fail()
+
+        // The driver re-dials the resumed transport and sends resync immediately.
+        await waitUntil { resumed.upstreams().contains { $0.method == "resync" } }
+        let resync = resumed.upstreams().first { $0.method == "resync" }
+        XCTAssertEqual((resync?.params["last_seq"] as? NSNumber)?.intValue, 2,
+                       "resync must anchor on the retained watermark")
+
+        // Prompt: the first (attempt 0) reconnect fired with NO backoff sleep.
+        let sleeps = await recorder.durations()
+        XCTAssertTrue(sleeps.isEmpty, "the first reconnect attempt must be immediate (no pre-delay)")
+
+        await coordinator.stop()
+    }
+
+    /// The backoff schedule: attempt 0 immediate, tight early growth, bounded so a
+    /// persistently-dead relay is retried at ~8s — fast off the mark, never
+    /// hammering.
+    func testReconnectBackoffIsImmediateThenTightAndBounded() {
+        XCTAssertEqual(RelaySessionCoordinator.reconnectBackoff(attempt: 0), .zero,
+                       "attempt 0 must be immediate")
+        // base 0.25·2^(n-1) + jitter(0…0.25): attempt 1 ∈ [0.25,0.5]s, 2 ∈ [0.5,0.75]s.
+        let a1 = RelaySessionCoordinator.reconnectBackoff(attempt: 1)
+        let a2 = RelaySessionCoordinator.reconnectBackoff(attempt: 2)
+        XCTAssertGreaterThanOrEqual(a1, .milliseconds(250))
+        XCTAssertLessThanOrEqual(a1, .milliseconds(500))
+        XCTAssertGreaterThanOrEqual(a2, .milliseconds(500))
+        XCTAssertLessThanOrEqual(a2, .milliseconds(750))
+        // Bounded cap: base saturates at 8s.
+        let big = RelaySessionCoordinator.reconnectBackoff(attempt: 20)
+        XCTAssertGreaterThanOrEqual(big, .milliseconds(8000))
+        XCTAssertLessThanOrEqual(big, .milliseconds(8250))
     }
 }
