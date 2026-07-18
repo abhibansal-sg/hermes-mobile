@@ -112,12 +112,57 @@ final class QueueSelfHealTests: XCTestCase {
 
     // MARK: - ensureActiveRuntime guards (no network)
 
+    /// #210 fast-path contract: a runtime bound under the CURRENT ready transport
+    /// (matching epoch) is returned as-is, WITHOUT re-resuming. Rewritten from the
+    /// pre-#210 version that only set `activeRuntimeId` — the fast-path now also
+    /// requires `isTransportReady` + a matching `activeRuntimeEpoch`, so the old
+    /// test fell through to a live resume and hung the suite for 120s.
     func testEnsureActiveRuntimeReturnsExistingRuntimeWithoutResuming() async {
         let (_, sessions) = makeStores()
-        sessions.activeRuntimeId = "rt-live"
+        let connection = sessions.connectionForTesting!
+        // A ready transport (epoch advances to a real, accepted value).
+        connection._seedConnectedForTesting(serverURL: "https://gateway.test", token: "t")
+        // Runtime bound under THAT epoch — the fast-path precondition.
+        sessions._bindActiveRuntimeForTesting(id: "rt-live", epoch: connection.transportEpoch)
         sessions.activeStoredId = storedParent
+        // A resume would flip this; the fast-path must never invoke it.
+        var resumed = false
+        sessions.resumeRPC = { storedId, _ in
+            resumed = true
+            return self.stagedResult(sessionId: "rt-new", resumed: storedId)
+        }
+
         let rid = await sessions.ensureActiveRuntime()
-        XCTAssertEqual(rid, "rt-live", "an already-bound runtime is returned as-is")
+
+        XCTAssertEqual(rid, "rt-live",
+            "a ready transport with a matching epoch returns the bound runtime as-is")
+        XCTAssertFalse(resumed,
+            "the fast-path must not resume when the transport is ready and the epoch matches")
+    }
+
+    /// #210 companion: a runtime bound under a STALE epoch (an older transport than
+    /// the current ready one) must NOT short-circuit — it falls through to a resume
+    /// so the caller re-binds against the live socket.
+    func testEnsureActiveRuntimeResumesWhenEpochIsStale() async {
+        let (_, sessions) = makeStores()
+        let connection = sessions.connectionForTesting!
+        connection._seedConnectedForTesting(serverURL: "https://gateway.test", token: "t")
+        // Bound under the PREVIOUS transport generation — the fast-path must reject it.
+        sessions._bindActiveRuntimeForTesting(
+            id: "rt-stale", epoch: connection.transportEpoch &- 1)
+        sessions.activeStoredId = storedParent
+        var resumed = false
+        sessions.resumeRPC = { storedId, _ in
+            resumed = true
+            return self.stagedResult(sessionId: "rt-fresh", resumed: storedId)
+        }
+
+        let rid = await sessions.ensureActiveRuntime()
+
+        XCTAssertTrue(resumed,
+            "a stale-epoch runtime must fall through to a resume (#210)")
+        XCTAssertEqual(rid, "rt-fresh",
+            "the resume re-binds the runtime against the current transport")
     }
 
     func testEnsureActiveRuntimeReturnsNilWithNothingToResume() async {
