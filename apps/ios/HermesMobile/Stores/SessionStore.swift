@@ -2133,13 +2133,32 @@ final class SessionStore {
                 manifestLastSyncedAt = manifest.lastSyncedAt
                 manifestRevision = manifest.revision
             }
-            let cached = Self.filterCachedSessions(
+            var cached = Self.filterCachedSessions(
                 try await cacheStore.loadSessionList(scope: scope),
                 activeProfile: activeProfile,
                 untaggedProfile: scope.profileId == CacheScope.allProfilesKey
                     ? nil
                     : scope.profileId
             )
+            // A1(i)(iii): offline cold-open must NEVER blank the drawer just because
+            // the persisted `activeProfile` (network-mutated by
+            // `confirmActiveProfile`) partitions the concrete-profile read down to
+            // zero rows, or because rows on this device were mis-stamped with the
+            // literal "all" by an older build. When a concrete-profile scoped read
+            // comes back empty, fall back to a serverId-only aggregate read painted
+            // with aggregate semantics — the disk holds the user's chats and they
+            // must appear. The next network refresh re-narrows to the confirmed
+            // profile. The aggregate `loadSessionList` selects every non-legacy row
+            // (including any mis-stamped "all"), so this covers both root causes.
+            if cached.isEmpty, scope.profileId != CacheScope.allProfilesKey {
+                let aggregate = try await cacheStore.loadSessionList(
+                    scope: CacheScope(serverId: scope.serverId,
+                                      profileId: CacheScope.allProfilesKey)
+                )
+                cached = Self.filterCachedSessions(
+                    aggregate, activeProfile: CacheScope.allProfilesKey
+                )
+            }
             cacheReadSucceeded = true
             paintedRows = cached.count
             // Profile/server selection can change while the actor read is
