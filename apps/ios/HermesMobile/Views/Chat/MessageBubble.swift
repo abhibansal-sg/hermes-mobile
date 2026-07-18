@@ -156,11 +156,20 @@ struct MessageBubble: View {
             } else {
                 switch message.role {
                 case .user:
+                    // Text-selection fix (owner bug): NO bubble-level
+                    // `.contextMenu` here — a whole-bubble long-press menu steals
+                    // the press-hold gesture from the `.textSelection`-enabled
+                    // prose, so press-hold popped the bubble instead of starting
+                    // native in-text selection. Bubble actions now live on the
+                    // tap-triggered `userOverflowMenu` affordance (inside
+                    // `userBubble`), which never intercepts the long-press.
                     userBubble
-                        .contextMenu { userMenu }
                 case .assistant:
+                    // Same fix: the assistant document is fully selectable prose;
+                    // its actions live on the inline `assistantActionRow` (copy/
+                    // share/speak/retry) + its `assistantOverflowMenu`, not a
+                    // gesture-stealing `.contextMenu`.
                     assistantBody
-                        .contextMenu { assistantMenu }
                 case .system, .tool:
                     metaRow
                 }
@@ -173,6 +182,28 @@ struct MessageBubble: View {
                 availableWidth = width
             }
         }
+    }
+
+    // MARK: - Action affordances (replace the gesture-stealing context menus)
+
+    /// Tap-triggered overflow menu for a user bubble. A `Menu` presents on TAP,
+    /// so it never competes with the bubble's long-press text selection — the fix
+    /// for the owner's press-hold bug. Hosts the same actions the old
+    /// `.contextMenu` did (Edit / Copy / Restore checkpoint / Branch).
+    private var userOverflowMenuButton: some View {
+        Menu {
+            userMenu
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.footnote)
+                .foregroundStyle(theme.mutedFg)
+                .frame(width: 28, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Message actions")
+        .accessibilityHint("Edit, copy, or branch from this message")
+        .accessibilityIdentifier("userOverflowMenu")
     }
 
     // MARK: - Context menus
@@ -213,16 +244,18 @@ struct MessageBubble: View {
         }
     }
 
+    /// Whether the assistant action row needs its trailing overflow `Menu` — i.e.
+    /// there are actions (Undo last turn, Branch from here) that are NOT already
+    /// direct icons in the row (Copy / Share / Speak / Retry are).
+    private var hasAssistantOverflowActions: Bool {
+        onUndoLastTurn != nil || onBranch != nil
+    }
+
+    /// The assistant overflow menu content: the actions that don't have a direct
+    /// icon in `assistantActionRow`. Presented via a tap `Menu` (never a
+    /// long-press context menu) so the assistant prose stays natively selectable.
     @ViewBuilder
-    private var assistantMenu: some View {
-        if let onRetry {
-            Button {
-                onRetry(message)
-            } label: {
-                Label("Retry", systemImage: "arrow.clockwise")
-            }
-            .disabled(!menuActionsEnabled)
-        }
+    private var assistantOverflowMenu: some View {
         if let onUndoLastTurn {
             Button {
                 onUndoLastTurn(message)
@@ -231,20 +264,7 @@ struct MessageBubble: View {
             }
             .disabled(!menuActionsEnabled)
         }
-        Button {
-            copyAssistantMessage()
-        } label: {
-            Label("Copy", systemImage: "doc.on.doc")
-        }
-        if let onSpeak {
-            Button {
-                onSpeak(message)
-            } label: {
-                Label("Speak", systemImage: "speaker.wave.2")
-            }
-        }
         if let onBranch {
-            Divider()
             Button {
                 onBranch(message)
             } label: {
@@ -319,6 +339,11 @@ struct MessageBubble: View {
         let displayText = attachmentInput.displayText
         return HStack(alignment: .center, spacing: 6) {
             Spacer(minLength: 0)
+            // Text-selection fix: the former bubble-level context menu moved here,
+            // to a tap-triggered `Menu` that lives OUTSIDE the selectable bubble
+            // text — so press-hold over the message starts native selection while
+            // Edit / Copy / Restore checkpoint / Branch stay one tap away.
+            userOverflowMenuButton
             if isFailedSend {
                 deliveryFailureBadge
             }
@@ -490,8 +515,23 @@ struct MessageBubble: View {
         return VStack(alignment: .leading, spacing: 10) {
             // --- Prose / parts container (combine target) ---
             VStack(alignment: .leading, spacing: 10) {
-                ForEach(parts) { part in
-                    assistantPart(part, showsCursor: message.isStreaming && part.id == lastTextPartID)
+                // Wave-2 item dispatch (RELAY-PHONE-PROTOCOL §2): coalesce the
+                // ordered parts into render nodes so consecutive reasoning + tool/
+                // file/browser/image/error ITEM parts fold into one collapsed
+                // working section (owner spec). Standalone parts (text/usage/
+                // warning, legacy reasoning/tools) render exactly as before.
+                ForEach(WorkingSectionModel.renderNodes(from: parts)) { node in
+                    switch node {
+                    case .part(let part):
+                        assistantPart(part, showsCursor: message.isStreaming && part.id == lastTextPartID)
+                    case .working(_, let runParts):
+                        WorkingSectionView(
+                            parts: runParts,
+                            streaming: message.isStreaming,
+                            liveTurnStartedAt: liveTurnStartedAt,
+                            settledDuration: message.reasoningElapsed
+                        )
+                    }
                 }
                 if needsStandaloneCursor {
                     // CC-01: standalone cursor inherits the pulse animation.
@@ -526,6 +566,7 @@ struct MessageBubble: View {
             if Self.shouldShowAssistantActionRow(
                 messageIsStreaming: message.isStreaming,
                 hasRenderedText: hasRenderedText,
+                hasTurnActions: hasAssistantTurnActions,
                 assistantTurnActionsEnabled: assistantTurnActionsEnabled
             ) {
                 assistantActionRow
@@ -547,16 +588,31 @@ struct MessageBubble: View {
         }
     }
 
+    /// Whether this turn exposes at least one TURN-LEVEL action (retry / undo /
+    /// branch) — the affordances that must stay reachable on a settled turn even
+    /// when it rendered no prose (tool-only / reasoning-only / error-only). These
+    /// are the actions the removed whole-bubble `.contextMenu` always guaranteed;
+    /// without this, a text-less settled turn would show NO action affordance.
+    private var hasAssistantTurnActions: Bool {
+        onRetry != nil || onUndoLastTurn != nil || onBranch != nil
+    }
+
     /// Pure action-row visibility contract for tests: a completed assistant row
-    /// needs rendered prose AND the chat-level turn must be settled. The extra
-    /// chat-level gate prevents live re-entry from showing an end-of-turn row while
-    /// the runtime is still working.
+    /// shows when the chat-level turn is settled AND there is something to act on
+    /// — either rendered prose (copy / share / speak) OR a turn-level action
+    /// (retry / undo / branch). The prose-OR-turn-action rule is what keeps a
+    /// text-less settled turn (tool-only / reasoning-only / error-only) from
+    /// losing every affordance the old always-attached context menu provided.
+    /// The chat-level `assistantTurnActionsEnabled` gate prevents live re-entry
+    /// from showing an end-of-turn row while the runtime is still working.
     nonisolated static func shouldShowAssistantActionRow(
         messageIsStreaming: Bool,
         hasRenderedText: Bool,
+        hasTurnActions: Bool,
         assistantTurnActionsEnabled: Bool
     ) -> Bool {
-        !messageIsStreaming && hasRenderedText && assistantTurnActionsEnabled
+        guard !messageIsStreaming, assistantTurnActionsEnabled else { return false }
+        return hasRenderedText || hasTurnActions
     }
 
     @ViewBuilder
@@ -595,6 +651,12 @@ struct MessageBubble: View {
             }
         case .usage(_, let stats):
             usageFooter(stats)
+        case .item(_, let item):
+            // Wave-2 item-backed part (RELAY-PHONE-PROTOCOL §2): the new special
+            // renders (generic tool card, fileChange, image, browser, error)
+            // dispatch through the render-lane seam. Skeleton today; the render
+            // lane fleshes out `ChatItemView`.
+            ChatItemView(item: item)
         }
     }
 
@@ -1285,44 +1347,72 @@ struct MessageBubble: View {
     /// speak (existing `onSpeak`), retry (existing `onRetry`). 16pt glyphs,
     /// `theme.mutedFg`, 20pt spacing, no backgrounds (observed reference). Speak
     /// and retry render only when their hook is supplied (mirrors the context
-    /// menu's existing gating); copy + share are always available.
+    /// menu's existing gating); copy + share render whenever there is rendered
+    /// prose to act on. On a text-less settled turn only the turn-level actions
+    /// (Retry + overflow) render — the affordance the removed context menu
+    /// always guaranteed.
     ///
     /// CC-02: copy button shows a checkmark confirmation (+ haptic) matching
     /// CodeBlockView's copy UX so every copy surface in the transcript is consistent.
     /// CC-07: top padding raised from 4 → 8 for better separation from prose.
     private var assistantActionRow: some View {
         HStack(spacing: 20) {
-            // CC-02: confirm copy with checkmark + color change (mirrors CodeBlockView).
-            Button {
-                copyAssistantMessage()
-            } label: {
-                Image(systemName: didCopyMessage ? "checkmark" : "doc.on.doc")
-                    .font(.body)
-                    .foregroundStyle(didCopyMessage ? theme.statusOK : theme.mutedFg)
-                    .frame(width: 28, height: 28)
-                    .contentShape(Rectangle())
-                    .contentTransition(.symbolEffect(.replace))
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(didCopyMessage ? "Copied to clipboard" : "Copy")
+            // Copy / Share / Speak act on the rendered prose (`message.text` is the
+            // concat of the `.text` parts), so they appear ONLY when there is
+            // rendered text — copying/sharing/speaking an empty body is meaningless.
+            // On a text-less settled turn the row still renders (below) for the
+            // turn-level actions (Retry + overflow), which is the affordance the
+            // removed whole-bubble context menu used to guarantee.
+            if hasRenderedText {
+                // CC-02: confirm copy with checkmark + color change (mirrors CodeBlockView).
+                Button {
+                    copyAssistantMessage()
+                } label: {
+                    Image(systemName: didCopyMessage ? "checkmark" : "doc.on.doc")
+                        .font(.body)
+                        .foregroundStyle(didCopyMessage ? theme.statusOK : theme.mutedFg)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                        .contentTransition(.symbolEffect(.replace))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(didCopyMessage ? "Copied to clipboard" : "Copy")
 
-            ShareLink(item: message.text) {
-                Image(systemName: "square.and.arrow.up")
-                    .font(.body)
-                    .foregroundStyle(theme.mutedFg)
-                    .frame(width: 28, height: 28)
-                    .contentShape(Rectangle())
-            }
-            .accessibilityLabel("Share")
-            if let onSpeak {
-                actionIcon("speaker.wave.2", label: "Speak") {
-                    onSpeak(message)
+                ShareLink(item: message.text) {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.body)
+                        .foregroundStyle(theme.mutedFg)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Share")
+                if let onSpeak {
+                    actionIcon("speaker.wave.2", label: "Speak") {
+                        onSpeak(message)
+                    }
                 }
             }
             if let onRetry {
                 actionIcon("arrow.counterclockwise", label: "Retry") {
                     onRetry(message)
                 }
+            }
+            // Overflow for the less-common actions (Undo last turn, Branch) that
+            // used to live in the removed bubble context menu. A tap `Menu`, so it
+            // never steals the assistant prose's long-press text selection.
+            if hasAssistantOverflowActions {
+                Menu {
+                    assistantOverflowMenu
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.body)
+                        .foregroundStyle(theme.mutedFg)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("More actions")
+                .accessibilityIdentifier("assistantOverflowMenu")
             }
             Spacer(minLength: 0)
         }
