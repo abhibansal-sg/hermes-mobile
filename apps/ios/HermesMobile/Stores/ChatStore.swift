@@ -2301,6 +2301,35 @@ final class ChatStore {
         let hasAttachments = includeAttachments && (attachments?.hasPending ?? false)
         guard !trimmed.isEmpty || hasAttachments else { return false }
 
+        // Wave-2 relay transport: when the relay is the active transport, the
+        // gateway-direct `prompt.submit` (below and via the outbox) cannot run —
+        // the gateway socket is idle in relay-only mode, so it would throw "Not
+        // connected to the Hermes gateway" and strand the deep-link
+        // resume-to-send. Submit through the relay coordinator instead; the relay
+        // client owns its own reliability spine (seq/ack/resync), and the echoed
+        // user item + assistant stream reconcile back through the item projection,
+        // so no local echo is appended here. Text-only for now (attachments still
+        // route the gateway-direct upload path); the default gateway path below is
+        // byte-identical. Only engaged while the relay socket is actually open.
+        if !hasAttachments,
+           let connection, connection.transportPath == .relay,
+           let coordinator = connection.relayCoordinator, coordinator.isOpen {
+            setStreaming(true, reason: "relay.send")
+            lastError = nil
+            lastSendReachedServer = true
+            do {
+                _ = try await coordinator.submit(
+                    prompt: trimmed, sessionID: sessions?.activeStoredId
+                )
+                return true
+            } catch {
+                setStreaming(false, reason: "relay.sendError")
+                lastError = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                return false
+            }
+        }
+
         // Production sends enter the protected repository before session
         // creation, upload, local echo, or prompt.submit. Unit-store graphs that
         // do not install an outbox retain the legacy direct path below.
