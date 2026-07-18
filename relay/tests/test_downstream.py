@@ -635,3 +635,75 @@ async def test_submit_and_resume_replace_foreground():
     await srv.handle_upstream(conn, UpstreamRequest(UpstreamMethod.SUBMIT, {"text": "hi", "session_id": "s2"}))
     assert srv.session_has_live_phone("s1") is False
     assert srv.session_has_live_phone("s2") is True
+
+
+# ---------------------------------------------------------------------------
+# health / status surface
+# ---------------------------------------------------------------------------
+
+
+class _FakeRequest:
+    def __init__(self, path):
+        self.path = path
+
+
+class _FakeConn:
+    """Captures a synchronous ``respond(status, body)`` call from process_request."""
+
+    def __init__(self):
+        self.responded = None
+
+    def respond(self, status, body):
+        self.responded = (status, body)
+        return ("RESPONSE", status, body)
+
+
+async def test_status_reports_connections_and_foreground():
+    srv, gw = _server()
+    gw.owned_sessions = frozenset({"sOwned"})
+    await srv.start()
+    conn = srv.register(FakeWS())
+    conn.set_foreground("s1")
+    await conn.send_frame(_status("m"))
+    st = srv.status()
+    assert st["connections"] == 1
+    assert st["ring_ready"] is True
+    assert st["owned_sessions"] == ["sOwned"]
+    phone = st["phones"][0]
+    assert phone["head_seq"] == 1
+    assert phone["foreground"] == ["s1"]
+    # the whole snapshot must be JSON-serialisable (it is the health body).
+    json.dumps(st)
+
+
+async def test_process_request_serves_health_path():
+    srv, gw = _server()
+    gw.owned_sessions = frozenset()
+    await srv.start()
+    c = _FakeConn()
+    from http import HTTPStatus
+
+    out = srv._process_request(c, _FakeRequest("/healthz?probe=1"))
+    assert out is not None  # a response was produced (handshake short-circuited)
+    status, body = c.responded
+    assert status == HTTPStatus.OK
+    parsed = json.loads(body)
+    assert "connections" in parsed and "listen" in parsed
+
+
+async def test_process_request_ignores_non_health_paths():
+    srv, _ = _server()
+    await srv.start()
+    c = _FakeConn()
+    # A normal WS upgrade path returns None so the handshake proceeds.
+    assert srv._process_request(c, _FakeRequest("/ws")) is None
+    assert c.responded is None
+
+
+async def test_process_request_disabled_when_no_health_path():
+    srv, _ = _server()
+    srv._cfg.health_path = None
+    await srv.start()
+    c = _FakeConn()
+    assert srv._process_request(c, _FakeRequest("/healthz")) is None
+    assert c.responded is None

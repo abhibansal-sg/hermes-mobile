@@ -66,6 +66,9 @@ class DownstreamConfig:
     ring_total_bytes: Optional[int] = None
     ack_interval_hint_s: float = 5.0
     max_message_bytes: int = 8 * 1024 * 1024
+    # HTTP health/status path served on the SAME phone-facing port (a plain GET,
+    # not a WS upgrade). ``None`` disables the surface entirely.
+    health_path: Optional[str] = "/healthz"
 
 
 def build_ring(cfg: DownstreamConfig) -> Any:
@@ -284,11 +287,63 @@ class DownstreamServer:
             self._cfg.host,
             self._cfg.port,
             max_size=self._cfg.max_message_bytes,
+            process_request=self._process_request,
         )
         try:
             await self._stop.wait()
         finally:
             await self.close()
+
+    def _process_request(self, connection: Any, request: Any) -> Any:
+        """Serve a plain-HTTP health/status probe on the phone-facing port.
+
+        websockets calls this before the WS handshake for every inbound request.
+        A GET to the configured ``health_path`` is answered with a JSON status
+        body (HTTP 200) and never upgraded; anything else returns ``None`` so the
+        normal WS handshake proceeds. Kept defensive: a probe must never take down
+        the accept loop, so any failure falls through to the WS path.
+        """
+        health = self._cfg.health_path
+        if not health:
+            return None
+        try:
+            from http import HTTPStatus
+
+            raw_path = getattr(request, "path", "") or ""
+            path = raw_path.split("?", 1)[0]
+            if path != health:
+                return None
+            body = json.dumps(self.status(), ensure_ascii=False) + "\n"
+            return connection.respond(HTTPStatus.OK, body)
+        except Exception:  # pragma: no cover - a broken probe must not stall serve
+            _log.debug("health probe failed", exc_info=True)
+            return None
+
+    def status(self) -> dict[str, Any]:
+        """A JSON-serialisable snapshot of the phone-facing server's live state."""
+        conns = [
+            {
+                "conn_id": c.conn_id,
+                "head_seq": c.head_seq,
+                "acked_through": c.acked_through,
+                "foreground": sorted(c.foreground_sessions),
+                "seen_sessions": len(c.seen_sids),
+            }
+            for c in list(self._conns.values())
+        ]
+        owned = getattr(self._gateway, "owned_sessions", None)
+        try:
+            owned_list = sorted(owned) if owned else []
+        except TypeError:  # a non-iterable stand-in (e.g. a bare mock) — skip
+            owned_list = []
+        return {
+            "listen": f"{self._cfg.host}:{self._cfg.port}",
+            "connections": len(conns),
+            "phones": conns,
+            "owned_sessions": owned_list,
+            "ring_ready": self._ring is not None,
+            "serving": self._server is not None,
+        }
 
     def register(self, ws: Any) -> PhoneConnection:
         """Register a new phone socket, returning its :class:`PhoneConnection`."""

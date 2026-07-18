@@ -128,6 +128,21 @@ class RelayApp:
             if exc is not None:
                 raise exc
 
+    def status(self) -> dict:
+        """A JSON-serialisable snapshot of the whole relay (health surface)."""
+        from . import __version__
+
+        return {
+            "service": "hermes_relay",
+            "version": __version__,
+            "gateway": {
+                "url": self._cfg.gateway.ws_url("REDACTED"),
+                "owned_sessions": sorted(self.gateway.owned_sessions),
+            },
+            "downstream": self.downstream.status(),
+            "closing": self._closing,
+        }
+
     async def close(self) -> None:
         """Idempotent teardown: stop the long-lived lanes, cancel the pumps."""
         if self._closing and not self._tasks:
@@ -155,11 +170,19 @@ class RelayApp:
 
 
 def build_default_config(
-    *, gateway_token: str, gateway_port: int = 9126, downstream_port: int = 8765
+    *,
+    gateway_token: str,
+    gateway_host: str = "127.0.0.1",
+    gateway_port: int = 9126,
+    downstream_host: str = "127.0.0.1",
+    downstream_port: int = 8765,
+    health_path: Optional[str] = "/healthz",
 ) -> RelayConfig:
     """Convenience default config for local/isolated runs (NEVER port 9119)."""
     return RelayConfig(
-        gateway=GatewayConfig(token=gateway_token, port=gateway_port),
-        downstream=DownstreamConfig(port=downstream_port),
+        gateway=GatewayConfig(host=gateway_host, token=gateway_token, port=gateway_port),
+        downstream=DownstreamConfig(
+            host=downstream_host, port=downstream_port, health_path=health_path
+        ),
         notifier=NotifierConfig(),
     )
