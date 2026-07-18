@@ -7,8 +7,6 @@ without error and the not-yet-implemented lane methods fail LOUDLY
 
 from __future__ import annotations
 
-import pytest
-
 from hermes_relay.app import RelayApp, build_default_config
 from hermes_relay.types import Frame, FrameKind
 
@@ -25,10 +23,13 @@ def test_app_wires_all_four_lanes():
     assert app.gateway._cfg.port != 9119
 
 
-def test_reframer_reframe_is_not_yet_implemented():
+def test_reframer_reframe_is_implemented():
+    # Lane 2 is now live: reframe() maps a raw event to downstream item frames.
     app = RelayApp(build_default_config(gateway_token="t"))
-    with pytest.raises(NotImplementedError):
-        app.reframer.reframe(_dummy_event())
+    frames = app.reframer.reframe(_dummy_event())
+    assert frames  # a message.delta yields turn.started + item.started + item.delta
+    assert all(isinstance(f, Frame) for f in frames)
+    assert FrameKind.ITEM_DELTA in {f.kind for f in frames}
 
 
 def test_downstream_gate_defaults_false_with_no_connections():
