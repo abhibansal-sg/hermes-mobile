@@ -264,6 +264,125 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         await coordinator.stop()
     }
 
+    // MARK: - (4) Relay reliability: drain-on-(re)connect
+
+    /// Thread-safe vendor of fresh mock transports, one per `connect` — a
+    /// reconnect tears the prior socket down and dials a new one, so reusing a
+    /// single (now-cancelled) mock would wedge the second dial.
+    private final class TransportVendor: @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var made: [MockRelayTransport] = []
+        func make() -> MockRelayTransport {
+            lock.lock(); defer { lock.unlock() }
+            let transport = MockRelayTransport()
+            made.append(transport)
+            return transport
+        }
+    }
+
+    /// The `onReady` hook is the relay analogue of the gateway's `gateway.ready`
+    /// wake: it must fire once when the socket first comes up AND again on every
+    /// reconnect after a drop/flap, so the durable outbox drains the message the
+    /// user queued while the relay was mid-connect. Exactly-once per connect (no
+    /// double-fire from the buffered `.connecting`→`.open` pair).
+    func testOnReadyFiresOnceOnConnectAndAgainOnReconnect() async throws {
+        let vendor = TransportVendor()
+        let coordinator = RelaySessionCoordinator(
+            chatStore: ChatStore(),
+            clientFactory: { RelayClient { _ in vendor.make() } }
+        )
+        var readyCount = 0
+        coordinator.onReady = { readyCount += 1 }
+
+        try await coordinator.start(url: url)
+        await waitUntil { readyCount >= 1 }
+        XCTAssertEqual(readyCount, 1, "the initial connect fires the readiness edge exactly once")
+
+        // Simulate a drop + reconnect (the gateway mid-flap the bug reproduces).
+        await coordinator.reconnect(url: url)
+        await waitUntil { readyCount >= 2 }
+        XCTAssertEqual(readyCount, 2, "a reconnect after a drop fires the readiness edge again")
+
+        await coordinator.stop()
+    }
+
+    #if DEBUG
+    /// End-to-end of the fix: on the relay path the durable outbox drains OVER
+    /// THE RELAY (the gateway client is idle), and the drain gate tracks the live
+    /// relay socket. A send that lands while the relay is down enqueues quietly
+    /// (gate closed) and delivers once the relay is open — over the relay submit
+    /// RPC, exactly once, with an accepted receipt so it never stays pending.
+    func testOutboxDrainRoutesSubmitOverRelayAndGateTracksSocket() async throws {
+        let key = DefaultsKeys.transportPath
+        let previous = UserDefaults.standard.string(forKey: key)
+        UserDefaults.standard.set(TransportPath.relay.rawValue, forKey: key)
+        defer {
+            if let previous { UserDefaults.standard.set(previous, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+
+        let transport = MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id, upstream.method == "submit" else { return }
+            relay.deliverResult(id: id, result: .object(["session_id": .string("sess-9")]))
+        })
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let attachments = AttachmentStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        connection.relayCoordinatorFactory = {
+            RelaySessionCoordinator(
+                chatStore: chat,
+                clientFactory: { RelayClient { _ in transport } }
+            )
+        }
+        let coordinator = connection.ensureRelayCoordinator()
+        XCTAssertEqual(connection.transportPath, .relay)
+
+        // Relay not connected yet ⇒ the drain gate is CLOSED (a send here would
+        // enqueue, not churn a failed submit against a dead socket).
+        XCTAssertFalse(connection.isTransportReady, "a closed relay ⇒ transport not ready")
+
+        try await coordinator.start(url: url)
+
+        // Enqueue a durable prompt while draining is otherwise idle. The awaits
+        // below also let the coordinator's state observer settle on `.open`.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RelayOutbox-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = try WorkRepository(
+            configuration: WorkRepositoryConfiguration(containerURL: directory),
+            observation: WorkRepositoryObservation()
+        )
+        let scope = try WorkScope(serverID: "https://gateway.test", profileID: "default")
+        let job = try await repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: scope, text: "hello over relay", storedSessionID: "sess-9"
+        ))
+
+        // Relay open ⇒ the gate is OPEN.
+        XCTAssertTrue(connection.isTransportReady, "an open relay ⇒ transport ready")
+
+        // The outbox submit routes to the relay submit RPC (NOT the idle gateway
+        // client) and comes back accepted so the job completes — no permanent
+        // pending.
+        let receipt = try await chat.submitOutboxPrompt(
+            job: job, runtimeSessionID: "sess-9", remotePaths: []
+        )
+        XCTAssertTrue(receipt.accepted)
+        XCTAssertTrue(OutboxProcessor.acceptedDispositions.contains(receipt.status))
+        XCTAssertEqual(receipt.clientMessageID, job.clientMessageID)
+
+        let submitFrames = transport.upstreams().filter { $0.method == "submit" }
+        XCTAssertEqual(submitFrames.count, 1, "the prompt delivers over the relay exactly once (no dup)")
+        XCTAssertEqual(submitFrames.first?.params["prompt"] as? String, "hello over relay")
+        XCTAssertEqual(submitFrames.first?.params["session_id"] as? String, "sess-9")
+
+        // Losing the relay closes the gate again.
+        await coordinator.stop()
+        XCTAssertFalse(connection.isTransportReady, "a stopped relay ⇒ transport not ready")
+    }
+    #endif
+
     func testCoordinatorRoutesUpstreamOpsToRelay() async throws {
         let transport = MockRelayTransport(script: { upstream, relay in
             guard let id = upstream.id else { return }
