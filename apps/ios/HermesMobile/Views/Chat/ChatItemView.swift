@@ -1,24 +1,31 @@
 import SwiftUI
 
 // Wave-2 render-lane seam (docs/RELAY-PHONE-PROTOCOL.md §2/§7). MessageBubble
-// routes every `.item` ChatMessagePart here. This is the SKELETON the render
-// lane fleshes out: it renders a correct, if minimal, card for each special
-// item type today so the mock harness previews and the app compiles. The render
-// lane replaces the per-type bodies with the full special renders (generic tool
-// card, diff view, inline image, browser snapshot, error banner) WITHOUT
-// changing this dispatch surface.
+// routes every `.item` ChatMessagePart here. This file owns the DISPATCH: given a
+// resolved `ChatItem`, pick the right per-type renderer. The renderers live in
+// `Views/Chat/Items/` — one SwiftUI view per item type — and each conforms to
+// `ChatItemContentView` (init from a `ChatItem`). The dispatch SURFACE the client/
+// store lane depends on is unchanged: `ChatItemRendering` / `DefaultChatItemRenderer`
+// / `ChatItemView(item:)` are the stable contract; only which view each `type`
+// maps to lives below.
+
+/// A per-type item renderer: a SwiftUI view constructed from one resolved
+/// `ChatItem`. Every view under `Views/Chat/Items/` conforms, so `ChatItemView`
+/// can dispatch to them uniformly and tests can construct any renderer the same way.
+protocol ChatItemContentView: View {
+    init(item: ChatItem)
+}
 
 /// The render-dispatch seam the render lane implements: given a fully-resolved
-/// `ChatItem`, produce its SwiftUI view. Keeping this a protocol lets the render
-/// lane swap in a richer renderer (or a test double) without touching
-/// `MessageBubble`.
+/// `ChatItem`, produce its SwiftUI view. Keeping this a protocol lets a caller
+/// swap in a test double or an alternate renderer without touching `MessageBubble`.
 protocol ChatItemRendering {
     associatedtype Content: View
     @MainActor @ViewBuilder func view(for item: ChatItem) -> Content
 }
 
-/// Default renderer used by `ChatItemView`. The render lane extends/replaces the
-/// per-type branches; the switch is the contract, the bodies are placeholders.
+/// Default renderer used by `ChatItemView`. Delegates straight to `ChatItemView`,
+/// which owns the per-type dispatch.
 struct DefaultChatItemRenderer: ChatItemRendering {
     @MainActor
     func view(for item: ChatItem) -> some View {
@@ -26,84 +33,49 @@ struct DefaultChatItemRenderer: ChatItemRendering {
     }
 }
 
-/// Skeleton view for a Wave-2 item-backed part. Dispatches on `item.type`.
+/// Dispatches a Wave-2 item-backed part to its per-type renderer (`Views/Chat/Items/`).
+///
+/// The special-render kinds (`toolCall`/`fileChange`/`image`/`browser`/`error`)
+/// are what actually flow through `ChatMessagePart.item`; the text-shaped kinds
+/// (`agentMessage`/`reasoning`/`usage`) normally project onto legacy parts via
+/// `ChatItem.renderPart`, but are dispatched here too so this view can render ANY
+/// item type standalone (previews, tests, and a defensive fallback). An
+/// unrecognized wire `type` has already folded to `.toolCall` upstream, so the
+/// generic `ToolItemCard` is the forward-compat catch-all.
 struct ChatItemView: View {
-    @Environment(\.hermesTheme) private var theme
     let item: ChatItem
 
     var body: some View {
         switch item.type {
-        case .toolCall, .fileChange, .image, .browser:
-            genericCard
+        case .toolCall:
+            ToolItemCard(item: item)
+        case .fileChange:
+            FileChangeItemView(item: item)
+        case .image:
+            ImageItemView(item: item)
+        case .browser:
+            BrowserItemView(item: item)
         case .error:
-            errorCard
-        // Text-shaped kinds never reach here — `ChatItem.renderPart` projects
-        // `agentMessage`/`reasoning`/`usage`/`userMessage` onto legacy parts.
-        // Rendered defensively as the generic card if one ever does.
-        case .agentMessage, .reasoning, .usage, .userMessage:
-            genericCard
-        }
-    }
-
-    // MARK: - Placeholder renders (render lane replaces these)
-
-    /// Collapsed generic tool card: name + status + one-line summary (§2). Covers
-    /// ALL current + future tools by construction — the forward-compat backbone.
-    private var genericCard: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: statusSymbol)
-                .font(.caption)
-                .foregroundStyle(statusColor)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(item.toolName)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(theme.cardFg)
-                if let summary = item.summary, !summary.isEmpty {
-                    Text(summary)
-                        .font(.caption2)
-                        .foregroundStyle(theme.mutedFg)
-                        .lineLimit(2)
-                }
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(8)
-        .background(theme.card, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(theme.border, lineWidth: 1)
-        )
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(item.toolName), \(item.status.rawValue)")
-    }
-
-    /// Error item — never hidden in a collapse (§2).
-    private var errorCard: some View {
-        Label {
-            Text(item.summary ?? item.textBody)
-                .font(.caption)
-                .foregroundStyle(theme.statusError)
-        } icon: {
-            Image(systemName: "xmark.octagon.fill")
-                .foregroundStyle(theme.statusError)
-        }
-        .padding(8)
-        .background(theme.statusError.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-
-    private var statusSymbol: String {
-        switch item.status {
-        case .inProgress: return "circle.dashed"
-        case .completed: return "checkmark.circle.fill"
-        case .failed: return "xmark.octagon.fill"
-        }
-    }
-
-    private var statusColor: Color {
-        switch item.status {
-        case .inProgress: return theme.mutedFg
-        case .completed: return theme.statusOK
-        case .failed: return theme.statusError
+            ErrorItemView(item: item)
+        case .reasoning:
+            ReasoningItemView(item: item)
+        case .usage:
+            UsageFooterView(item: item)
+        case .agentMessage, .userMessage:
+            AgentMessageView(item: item)
         }
     }
 }
+
+#if DEBUG
+#Preview("All item renderers") {
+    ScrollView {
+        VStack(alignment: .leading, spacing: 14) {
+            ForEach(Array(RelayFixtures.sampleTurn().compactMap(\.item).enumerated()), id: \.offset) { _, item in
+                ChatItemView(item: item)
+            }
+        }
+        .padding()
+    }
+}
+#endif
