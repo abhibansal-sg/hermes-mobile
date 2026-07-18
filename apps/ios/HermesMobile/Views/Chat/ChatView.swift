@@ -817,40 +817,62 @@ struct ChatView: View {
 
     private func transcript(proxy: ScrollViewProxy) -> some View {
         ScrollView {
-            if isDraft && chatStore.messages.isEmpty {
+            switch Self.transcriptPlaceholder(
+                isDraft: isDraft,
+                messagesEmpty: chatStore.messages.isEmpty,
+                transcriptGeneration: chatStore.transcriptGeneration,
+                isGatewayOffline: isGatewayOffline,
+                loadError: chatStore.lastBackfillError
+            ) {
+            case .draftGreeting:
                 // Fresh draft chat — a centred time-aware greeting instead of an
                 // empty transcript (chat-as-home; serif greeting per F3).
                 draftGreeting
-            } else if chatStore.messages.isEmpty && chatStore.transcriptGeneration == 0 {
-                if let loadError = chatStore.lastBackfillError {
-                    // The seed/backfill failed — a recoverable error beats an
-                    // infinite spinner (R1 #79). Retry re-runs the REST
-                    // backfill; on success the seed bumps
-                    // `transcriptGeneration` and this state exits on its own.
-                    ContentUnavailableView {
-                        Label("Couldn't load conversation", systemImage: "wifi.exclamationmark")
-                    } description: {
-                        Text(loadError)
-                    } actions: {
-                        Button("Try Again") {
-                            Task { await chatStore.backfill() }
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                    .padding(.top, 40)
-                } else {
-                    // CACHE-MISS open (WhatsApp bar — never white): the transcript
-                    // is seeding from the network after an instant open with no
-                    // cached content. Render a theme-consistent skeleton (the same
-                    // static muted-bar design language as the drawer's
-                    // `sessionSkeletonRows`) instead of a bare spinner over a white
-                    // void — so a cache-miss open reads as "content arriving", not
-                    // a blank screen. A cache HIT never reaches here: the cached
-                    // transcript painted as the first frame.
-                    TranscriptSkeletonView(theme: theme)
-                        .padding(.top, 12)
-                        .accessibilityLabel("Loading conversation")
+            case .offlineNoCache:
+                // HONEST OFFLINE EMPTY (LANE A #4): a cached transcript would have
+                // painted as the first frame, so an empty transcript here while
+                // OFFLINE means this session was simply never downloaded to this
+                // device. That is not a load failure — show a neutral "no offline
+                // copy yet" state, NOT the network-error / Try-Again screen
+                // (reserved for reachable-but-failed loads). Reusing the
+                // ContentUnavailableView language keeps it consistent with the
+                // app's other empty states.
+                ContentUnavailableView {
+                    Label("No offline copy of this conversation yet", systemImage: "tray")
+                } description: {
+                    Text("This conversation hasn't been downloaded to this device. It'll appear here once you reconnect to the Hermes gateway.")
                 }
+                .padding(.top, 40)
+            case .loadError(let loadError):
+                // The seed/backfill failed while the gateway was reachable — a
+                // recoverable error beats an infinite spinner (R1 #79). Retry
+                // re-runs the REST backfill; on success the seed bumps
+                // `transcriptGeneration` and this state exits on its own.
+                ContentUnavailableView {
+                    Label("Couldn't load conversation", systemImage: "wifi.exclamationmark")
+                } description: {
+                    Text(loadError)
+                } actions: {
+                    Button("Try Again") {
+                        Task { await chatStore.backfill() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding(.top, 40)
+            case .skeleton:
+                // CACHE-MISS open (WhatsApp bar — never white): the transcript
+                // is seeding from the network after an instant open with no
+                // cached content. Render a theme-consistent skeleton (the same
+                // static muted-bar design language as the drawer's
+                // `sessionSkeletonRows`) instead of a bare spinner over a white
+                // void — so a cache-miss open reads as "content arriving", not
+                // a blank screen. A cache HIT never reaches here: the cached
+                // transcript painted as the first frame.
+                TranscriptSkeletonView(theme: theme)
+                    .padding(.top, 12)
+                    .accessibilityLabel("Loading conversation")
+            case .transcript:
+                EmptyView()
             }
             // TURN-AWARE SPACING (ABH-87 Batch D / contract §3.4, fixes D11):
             // the transcript is no longer a flat `spacing: 14` rhythm. The
@@ -2236,6 +2258,51 @@ struct ChatView: View {
     }
 
     // MARK: - Connection
+
+    /// The gateway is definitively unreachable (offline phase). Distinguishes a
+    /// genuine offline cold-open — where an empty, never-cached transcript is
+    /// expected and neutral — from a reachable-but-failed load that warrants the
+    /// network-error + retry screen.
+    private var isGatewayOffline: Bool {
+        if case .offline = connectionStore.phase { return true }
+        return false
+    }
+
+    /// Which placeholder (if any) the empty transcript surface should render.
+    /// Pure and deterministic so the offline-empty vs network-error distinction
+    /// (LANE A #4) is unit-testable without standing up a SwiftUI host.
+    enum TranscriptPlaceholder: Equatable {
+        /// The transcript has content (or a live turn) — render the rows, no
+        /// placeholder.
+        case transcript
+        /// Fresh draft chat — the time-aware greeting.
+        case draftGreeting
+        /// Offline with no cached copy of this session on this device — a neutral
+        /// "no offline copy yet" state, never a network error.
+        case offlineNoCache
+        /// A reachable-but-failed load — the recoverable error + retry screen.
+        case loadError(String)
+        /// A cache-miss open seeding from the network — the loading skeleton.
+        case skeleton
+    }
+
+    static func transcriptPlaceholder(
+        isDraft: Bool,
+        messagesEmpty: Bool,
+        transcriptGeneration: Int,
+        isGatewayOffline: Bool,
+        loadError: String?
+    ) -> TranscriptPlaceholder {
+        if isDraft && messagesEmpty { return .draftGreeting }
+        // Only the pristine, never-seeded empty transcript gets a placeholder; a
+        // seeded-then-emptied transcript (generation > 0) renders normally.
+        guard messagesEmpty && transcriptGeneration == 0 else { return .transcript }
+        // Offline wins over any stale backfill error: a never-cached session that
+        // could not reach the gateway is an honest empty, not a load failure.
+        if isGatewayOffline { return .offlineNoCache }
+        if let loadError { return .loadError(loadError) }
+        return .skeleton
+    }
 
     private var isConnected: Bool {
         guard case .connected = connectionStore.phase else { return false }
