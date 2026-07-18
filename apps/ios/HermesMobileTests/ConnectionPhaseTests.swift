@@ -86,19 +86,23 @@ final class ConnectionPhaseTests: XCTestCase {
     func testFreshnessStatesHaveDistinctVoiceOverTextAndAuthority() {
         let now = Date(timeIntervalSince1970: 2_000_000)
         let weekAgo = now.addingTimeInterval(-7 * 86_400)
-        // #203 contract: the freshness banner is retained for every non-fresh
-        // state (connecting, syncing, offline, failed-cache, partial) and hidden
-        // only when Fresh. The last tuple field pins `showsBanner` per state.
-        let cases: [(ConnectionStore.Phase, ManifestFreshness, FreshnessPresentation.Kind, String, Bool)] = [
-            (.connecting, .cached, .connecting, "Connecting to server", true),
-            (.hydrating, .cached, .syncing, "Synchronizing cached content", true),
-            (.connected, .fresh, .fresh, "Content is fresh", false),
-            (.offline("network unavailable"), .cached, .offline, "Offline. Last synced 1w ago", true),
-            (.offline("sync failed"), .cached, .failedCached, "Synchronization failed. Cached data is shown", true),
-            (.connected, .partial, .partial, "Partial synchronization result", true),
+        // #203 contract: every phase still resolves to a distinct VoiceOver
+        // label and honest mutation authority. The `showsBanner` column was
+        // dropped when the top status strip was removed completely on owner
+        // order (2026-07-18) — freshness is no longer rendered as a full-width
+        // banner, so there is no banner-visibility contract left to pin. The
+        // underlying kind/label/authority state machinery is retained for the
+        // surviving consumers (DrawerView, InboxView).
+        let cases: [(ConnectionStore.Phase, ManifestFreshness, FreshnessPresentation.Kind, String)] = [
+            (.connecting, .cached, .connecting, "Connecting to server"),
+            (.hydrating, .cached, .syncing, "Synchronizing cached content"),
+            (.connected, .fresh, .fresh, "Content is fresh"),
+            (.offline("network unavailable"), .cached, .offline, "Offline. Last synced 1w ago"),
+            (.offline("sync failed"), .cached, .failedCached, "Synchronization failed. Cached data is shown"),
+            (.connected, .partial, .partial, "Partial synchronization result"),
         ]
         var labels = Set<String>()
-        for (phase, freshness, kind, label, showsBanner) in cases {
+        for (phase, freshness, kind, label) in cases {
             let value = FreshnessPresentation.resolve(
                 phase: phase, manifestFreshness: freshness,
                 lastSyncedAt: weekAgo, now: now
@@ -106,7 +110,6 @@ final class ConnectionPhaseTests: XCTestCase {
             XCTAssertEqual(value.kind, kind)
             XCTAssertEqual(value.accessibilityLabel, label)
             labels.insert(value.accessibilityLabel)
-            XCTAssertEqual(value.showsBanner, showsBanner)
             XCTAssertEqual(value.allowsRemoteMutations, kind == .fresh)
         }
         XCTAssertEqual(labels.count, cases.count)
