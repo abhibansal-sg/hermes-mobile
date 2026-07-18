@@ -25,6 +25,15 @@ enum ChatMessagePart: Identifiable, Sendable, Equatable {
     case text(id: String, text: String)
     case warning(id: String, text: String)
     case usage(id: String, stats: UsageStats)
+    /// Wave-2 item-backed part (docs/RELAY-PHONE-PROTOCOL.md §2). Carries a
+    /// relay `ChatItem` for the NEW special-render kinds — generic `toolCall`,
+    /// `fileChange`, `image`, `browser`, `error` — that the render lane draws via
+    /// `ChatItemView`. ADDITIVE: the five legacy cases above are unchanged and
+    /// remain the compat layer for the live blob stream; text-shaped items
+    /// (`agentMessage`/`reasoning`/`usage`) still project onto those legacy
+    /// cases (see `ChatItem.renderPart`). Only the relay/mock item path emits
+    /// `.item` today.
+    case item(id: String, item: ChatItem)
 
     var id: String {
         switch self {
@@ -32,7 +41,8 @@ enum ChatMessagePart: Identifiable, Sendable, Equatable {
              .tools(let id, _, _, _),
              .text(let id, _),
              .warning(let id, _),
-             .usage(let id, _):
+             .usage(let id, _),
+             .item(let id, _):
             return id
         }
     }

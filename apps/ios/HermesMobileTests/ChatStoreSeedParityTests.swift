@@ -53,6 +53,10 @@ final class ChatStoreSeedParityTests: XCTestCase {
             // structural content that must match part-for-part.
             let toolSig = tools.map { "\($0.id):\($0.name):\(stateTag($0.state))" }.joined(separator: ",")
             return "tools[\(toolSig)]"
+        case .item(let id, let item):
+            // Wave-2 item-backed part is never produced by the legacy seed/stream
+            // producers this parity test compares; included only for exhaustiveness.
+            return "item(\(idShape(id, messageID: messageID)),\(item.type.rawValue))"
         }
     }
 
