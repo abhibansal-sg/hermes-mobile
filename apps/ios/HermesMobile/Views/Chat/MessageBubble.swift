@@ -17,13 +17,11 @@ struct MessageBubble: View {
     /// ``ChatView/transcriptReadingMeasure`` with the status glow and context
     /// line instead of drifting from its own 78%-of-screen formula (STR-1098).
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    /// Honors Reduce Motion on the "Select Text" mode crossfade (approved design).
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// The message to render.
     let message: ChatMessage
-
-    // MARK: - CC-01: Streaming cursor pulse animation state
-    /// Opacity driven by a repeating breathe animation while the turn streams.
-    @State private var cursorPulseOpacity: Double = 1.0
 
     // MARK: - STR-695: available-width capture (size-class / split-view safe)
     /// Measured content width from the bubble's own geometry, captured via
@@ -156,19 +154,20 @@ struct MessageBubble: View {
             } else {
                 switch message.role {
                 case .user:
-                    // Text-selection fix (owner bug): NO bubble-level
-                    // `.contextMenu` here — a whole-bubble long-press menu steals
-                    // the press-hold gesture from the `.textSelection`-enabled
-                    // prose, so press-hold popped the bubble instead of starting
-                    // native in-text selection. Bubble actions now live on the
-                    // tap-triggered `userOverflowMenu` affordance (inside
-                    // `userBubble`), which never intercepts the long-press.
+                    // Approved design §6: the user bubble is completely clean — zero
+                    // visible affordances. Its actions live on a long-press
+                    // `.contextMenu` that leads with "Select Text" (which swaps in a
+                    // first-responding `SelectableTextView`); the normal render
+                    // carries no `.textSelection`, so the menu owns the long-press
+                    // cleanly with no gesture competition.
                     userBubble
                 case .assistant:
-                    // Same fix: the assistant document is fully selectable prose;
-                    // its actions live on the inline `assistantActionRow` (copy/
-                    // share/speak/retry) + its `assistantOverflowMenu`, not a
-                    // gesture-stealing `.contextMenu`.
+                    // Approved design §7: agent turns get NO context menu — the
+                    // fully-selectable prose (`.perfTextSelection()`) means a
+                    // long-press starts native text selection directly (ChatGPT
+                    // islands: contiguous prose selects with real drag handles; code/
+                    // table/image cards are non-selectable and bound the selection).
+                    // Turn actions live on the inline `assistantActionRow`.
                     assistantBody
                 case .system, .tool:
                     metaRow
@@ -184,32 +183,35 @@ struct MessageBubble: View {
         }
     }
 
-    // MARK: - Action affordances (replace the gesture-stealing context menus)
+    // MARK: - Long-press context menu (user bubble) + native selection
 
-    /// Tap-triggered overflow menu for a user bubble. A `Menu` presents on TAP,
-    /// so it never competes with the bubble's long-press text selection — the fix
-    /// for the owner's press-hold bug. Hosts the same actions the old
-    /// `.contextMenu` did (Edit / Copy / Restore checkpoint / Branch).
-    private var userOverflowMenuButton: some View {
-        Menu {
-            userMenu
-        } label: {
-            Image(systemName: "ellipsis")
-                .font(.footnote)
-                .foregroundStyle(theme.mutedFg)
-                .frame(width: 28, height: 28)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Message actions")
-        .accessibilityHint("Edit, copy, or branch from this message")
-        .accessibilityIdentifier("userOverflowMenu")
-    }
+    /// Whether the user bubble is currently in "Select Text" mode — the normal
+    /// `Text` render is swapped for a first-responding ``SelectableTextView`` so
+    /// the reader gets native drag-handle selection + the system edit menu. Entered
+    /// from the long-press context menu's leading "Select Text" item (approved
+    /// design §6). Agent turns do NOT use this — their prose is always natively
+    /// selectable (no competing context menu).
+    @State private var isSelectingText = false
 
-    // MARK: - Context menus
-
+    /// User-bubble long-press menu. Leads with "Select Text" (the deliberate entry
+    /// into native selection), then Copy, then the wired mutable actions, and a
+    /// destructive Delete for a failed send. The bubble stays completely clean —
+    /// every action lives here behind the long-press (approved design §6).
     @ViewBuilder
     private var userMenu: some View {
+        Button {
+            beginTextSelection()
+        } label: {
+            Label("Select Text", systemImage: "selection.pin.in.out")
+        }
+        Button {
+            copyToPasteboard(message.text)
+        } label: {
+            Label("Copy", systemImage: "doc.on.doc")
+        }
+        if onEdit != nil || onBranch != nil || onRestoreCheckpoint != nil {
+            Divider()
+        }
         if let onEdit {
             Button {
                 onEdit(message)
@@ -218,13 +220,13 @@ struct MessageBubble: View {
             }
             .disabled(!menuActionsEnabled)
         }
-        Button {
-            copyToPasteboard(message.text)
-        } label: {
-            Label("Copy", systemImage: "doc.on.doc")
-        }
-        if onRestoreCheckpoint != nil || onBranch != nil {
-            Divider()
+        if let onBranch {
+            Button {
+                onBranch(message)
+            } label: {
+                Label("Branch from here", systemImage: "arrow.triangle.branch")
+            }
+            .disabled(!menuActionsEnabled)
         }
         if let onRestoreCheckpoint {
             Button {
@@ -234,44 +236,47 @@ struct MessageBubble: View {
             }
             .disabled(!menuActionsEnabled)
         }
-        if let onBranch {
-            Button {
-                onBranch(message)
+        if let onDeleteFailedSend {
+            Divider()
+            Button(role: .destructive) {
+                onDeleteFailedSend()
             } label: {
-                Label("Branch from here", systemImage: "arrow.triangle.branch")
+                Label("Delete", systemImage: "trash")
             }
-            .disabled(!menuActionsEnabled)
         }
     }
 
-    /// Whether the assistant action row needs its trailing overflow `Menu` — i.e.
-    /// there are actions (Undo last turn, Branch from here) that are NOT already
-    /// direct icons in the row (Copy / Share / Speak / Retry are).
-    private var hasAssistantOverflowActions: Bool {
-        onUndoLastTurn != nil || onBranch != nil
+    /// Enter native text-selection mode (from the menu's "Select Text"). Honors
+    /// Reduce Motion — no crossfade when the setting is on.
+    private func beginTextSelection() {
+        if reduceMotion {
+            isSelectingText = true
+        } else {
+            withAnimation(.easeOut(duration: 0.15)) { isSelectingText = true }
+        }
     }
 
-    /// The assistant overflow menu content: the actions that don't have a direct
-    /// icon in `assistantActionRow`. Presented via a tap `Menu` (never a
-    /// long-press context menu) so the assistant prose stays natively selectable.
-    @ViewBuilder
-    private var assistantOverflowMenu: some View {
-        if let onUndoLastTurn {
-            Button {
-                onUndoLastTurn(message)
-            } label: {
-                Label("Undo last turn", systemImage: "arrow.uturn.backward.circle")
-            }
-            .disabled(!menuActionsEnabled)
+    /// Exit text-selection mode ("Done").
+    private func endTextSelection() {
+        if reduceMotion {
+            isSelectingText = false
+        } else {
+            withAnimation(.easeOut(duration: 0.15)) { isSelectingText = false }
         }
-        if let onBranch {
-            Button {
-                onBranch(message)
-            } label: {
-                Label("Branch from here", systemImage: "arrow.triangle.branch")
-            }
-            .disabled(!menuActionsEnabled)
+    }
+
+    /// A trailing "Done" affordance shown under the selectable text so the reader
+    /// can leave selection mode. Sentence-case, plain, muted — quiet by design.
+    private var selectionDoneButton: some View {
+        Button {
+            endTextSelection()
+        } label: {
+            Text("Done")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(theme.accent)
         }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Done selecting text")
     }
 
     // MARK: - Pasteboard
@@ -339,11 +344,9 @@ struct MessageBubble: View {
         let displayText = attachmentInput.displayText
         return HStack(alignment: .center, spacing: 6) {
             Spacer(minLength: 0)
-            // Text-selection fix: the former bubble-level context menu moved here,
-            // to a tap-triggered `Menu` that lives OUTSIDE the selectable bubble
-            // text — so press-hold over the message starts native selection while
-            // Edit / Copy / Restore checkpoint / Branch stay one tap away.
-            userOverflowMenuButton
+            // Approved design §6: the user bubble is completely clean — NO three-dots,
+            // no inline affordances. Every action lives on the long-press
+            // `.contextMenu` attached below (leading with "Select Text").
             if isFailedSend {
                 deliveryFailureBadge
             }
@@ -361,14 +364,31 @@ struct MessageBubble: View {
                     .padding(.bottom, displayText.isEmpty ? 8 : 0)
                 }
                 if !displayText.isEmpty {
-                    Text(displayText)
-                        .foregroundStyle(theme.userBubble.contrastingForeground)
-                        .lineLimit(userBubbleExpanded ? nil : Self.userBubbleCollapsedLines)
+                    if isSelectingText {
+                        // Selection mode: real UITextView selection with drag handles
+                        // + the system edit menu. Auto-selects all on mount; the user
+                        // narrows from there.
+                        VStack(alignment: .trailing, spacing: 6) {
+                            SelectableTextView(
+                                text: displayText,
+                                font: SelectableTextView.font(textStyle: .body, serif: false),
+                                textColor: UIColor(theme.userBubble.contrastingForeground)
+                            )
+                            selectionDoneButton
+                        }
                         .padding(.horizontal, 14)
                         .padding(.vertical, 9)
-                        .textSelection(.enabled)
+                    } else {
+                        // Normal render: a plain `Text` with NO `.textSelection`, so
+                        // the long-press `.contextMenu` owns the gesture cleanly.
+                        Text(displayText)
+                            .foregroundStyle(theme.userBubble.contrastingForeground)
+                            .lineLimit(userBubbleExpanded ? nil : Self.userBubbleCollapsedLines)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 9)
+                    }
                 }
-                if shouldShowReadMore(for: displayText) {
+                if !isSelectingText, shouldShowReadMore(for: displayText) {
                     Button {
                         userBubbleExpanded.toggle()
                     } label: {
@@ -384,10 +404,9 @@ struct MessageBubble: View {
             }
             // A11y: settled user bubbles get a combined VoiceOver element so the
             // turn reads as one utterance ("You said: …") rather than separate
-            // focus stops for the text and the "Read more" button. Streaming is
-            // never true for a user message today, but the guard mirrors the
-            // assistant path so the contract is explicit and future-safe.
-            .if(!message.isStreaming) { bubble in
+            // focus stops for the text and the "Read more" button. Selection mode
+            // drops the combine so the selectable text is its own element.
+            .if(!message.isStreaming && !isSelectingText) { bubble in
                 bubble
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(MessageBubble.bubbleAccessibilityLabel(
@@ -397,6 +416,9 @@ struct MessageBubble: View {
             }
             .modifier(PerfUserBubbleChrome())
             .frame(maxWidth: maxBubbleWidth, alignment: .trailing)
+            // Approved design §6: the whole clean bubble long-presses into its
+            // action menu (Select Text / Copy / Edit / Branch / Restore / Delete).
+            .contextMenu { userMenu }
         }
     }
 
@@ -535,7 +557,7 @@ struct MessageBubble: View {
                 }
                 if needsStandaloneCursor {
                     // CC-01: standalone cursor inherits the pulse animation.
-                    cursorView
+                    StreamingCursor(isStreaming: message.isStreaming)
                         .font(.body)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -594,7 +616,7 @@ struct MessageBubble: View {
     /// are the actions the removed whole-bubble `.contextMenu` always guaranteed;
     /// without this, a text-less settled turn would show NO action affordance.
     private var hasAssistantTurnActions: Bool {
-        onRetry != nil || onUndoLastTurn != nil || onBranch != nil
+        onRetry != nil || onBranch != nil
     }
 
     /// Pure action-row visibility contract for tests: a completed assistant row
@@ -719,7 +741,7 @@ struct MessageBubble: View {
             // tiny glyph view animates. It sits just after the segment stack,
             // reading as the live tail of the turn.
             if showsCursor {
-                cursorView
+                StreamingCursor(isStreaming: message.isStreaming)
                     .font(.body)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -1299,40 +1321,12 @@ struct MessageBubble: View {
     }
 
     // MARK: - CC-01: Streaming cursor
-
-    /// A standalone animated cursor view — the single breathing cursor glyph for
-    /// the streaming tail (round-2 ROOT D: lifted off the prose `Text` so the
-    /// pulse never re-composites the prose block). Starts/stops the pulse
-    /// animation in sync with `message.isStreaming`.
-    private var cursorView: some View {
-        Text(" ▌")
-            .foregroundColor(theme.midground)
-            .opacity(message.isStreaming ? cursorPulseOpacity : 1.0)
-            .onAppear {
-                guard message.isStreaming else { return }
-                startCursorPulse()
-            }
-            .onChange(of: message.isStreaming) { _, streaming in
-                if streaming {
-                    startCursorPulse()
-                } else {
-                    // Turn complete: snap back to full opacity.
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        cursorPulseOpacity = 1.0
-                    }
-                }
-            }
-    }
-
-    /// Kick off the repeating breathe animation for the streaming cursor.
-    private func startCursorPulse() {
-        withAnimation(
-            .easeInOut(duration: 0.6)
-            .repeatForever(autoreverses: true)
-        ) {
-            cursorPulseOpacity = 0.25
-        }
-    }
+    //
+    // The breathing cursor glyph now lives in the reusable `StreamingCursor`
+    // component (bottom of this file) so both call sites share ONE themed view
+    // and the visual can be restyled in a single place. The former `cursorView`
+    // computed property + `cursorPulseOpacity` state + `startCursorPulse()` moved
+    // there verbatim (byte-identical behavior).
 
     private func usageFooter(_ usage: UsageStats) -> some View {
         Text(Self.usageLine(usage))
@@ -1356,15 +1350,20 @@ struct MessageBubble: View {
     /// CodeBlockView's copy UX so every copy surface in the transcript is consistent.
     /// CC-07: top padding raised from 4 → 8 for better separation from prose.
     private var assistantActionRow: some View {
-        HStack(spacing: 20) {
-            // Copy / Share / Speak act on the rendered prose (`message.text` is the
-            // concat of the `.text` parts), so they appear ONLY when there is
-            // rendered text — copying/sharing/speaking an empty body is meaningless.
-            // On a text-less settled turn the row still renders (below) for the
-            // turn-level actions (Retry + overflow), which is the affordance the
-            // removed whole-bubble context menu used to guarantee.
+        // Approved design §5: always-visible, muted, icon-only action row under a
+        // settled agent turn — Copy · Retry · Branch · Share · Speak, in that order.
+        // NO delete, NO overflow menu (the former undo/overflow are gone). Copy /
+        // Share / Speak act on the rendered prose (`message.text`, the concat of the
+        // `.text` parts), so they appear only when there IS rendered text; Retry /
+        // Branch are turn-level and render whenever their hook is supplied — so a
+        // text-less settled turn still exposes them (the affordance the removed
+        // whole-bubble context menu used to guarantee).
+        HStack(spacing: 18) {
             if hasRenderedText {
                 // CC-02: confirm copy with checkmark + color change (mirrors CodeBlockView).
+                // Copy grabs the whole answer body MINUS thinking + tool content
+                // (§5): `message.text` is the concat of the `.text` parts only, so
+                // reasoning and tool output are already excluded by construction.
                 Button {
                     copyAssistantMessage()
                 } label: {
@@ -1377,7 +1376,18 @@ struct MessageBubble: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(didCopyMessage ? "Copied to clipboard" : "Copy")
-
+            }
+            if let onRetry {
+                actionIcon("arrow.clockwise", label: "Retry") {
+                    onRetry(message)
+                }
+            }
+            if let onBranch {
+                actionIcon("arrow.triangle.branch", label: "Branch") {
+                    onBranch(message)
+                }
+            }
+            if hasRenderedText {
                 ShareLink(item: message.text) {
                     Image(systemName: "square.and.arrow.up")
                         .font(.body)
@@ -1392,32 +1402,11 @@ struct MessageBubble: View {
                     }
                 }
             }
-            if let onRetry {
-                actionIcon("arrow.counterclockwise", label: "Retry") {
-                    onRetry(message)
-                }
-            }
-            // Overflow for the less-common actions (Undo last turn, Branch) that
-            // used to live in the removed bubble context menu. A tap `Menu`, so it
-            // never steals the assistant prose's long-press text selection.
-            if hasAssistantOverflowActions {
-                Menu {
-                    assistantOverflowMenu
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.body)
-                        .foregroundStyle(theme.mutedFg)
-                        .frame(width: 28, height: 28)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("More actions")
-                .accessibilityIdentifier("assistantOverflowMenu")
-            }
             Spacer(minLength: 0)
         }
         // CC-07: 8pt top gap gives the action row clear breathing room from prose.
         .padding(.top, 8)
+        .accessibilityIdentifier("assistantActionRow")
     }
 
     /// One thin line-icon action button (no background).
@@ -2333,6 +2322,150 @@ extension MessageBubble: Equatable {
             // (in-transit → failed → delivered) must re-render past the A1
             // short-circuit.
             && lhs.delivery == rhs.delivery
+    }
+}
+
+// MARK: - Streaming cursor (reusable themed component)
+
+/// The single breathing cursor glyph for the streaming tail — the ChatGPT-style
+/// "I'm working" signal in the transcript (approved design §8). Extracted from
+/// `MessageBubble` (round-2 ROOT D: lifted off the prose `Text` so the pulse never
+/// re-composites the prose block) into ONE reusable component used by both the
+/// standalone-cursor and tail-of-prose call sites, so the caret can be restyled in
+/// a single place. Reads the theme from the environment (`\.hermesTheme`) and
+/// takes `isStreaming` as its only parameter; visual behavior is byte-identical to
+/// the former inline `cursorView` (▌ U+258C in `theme.midground`, easeInOut 0.6s
+/// breathe 1.0→0.25 repeatForever autoreverses, easeOut 0.15s completion snap).
+struct StreamingCursor: View {
+    /// Whether the owning turn is still streaming. Drives the pulse animation; a
+    /// settled cursor snaps back to full opacity.
+    let isStreaming: Bool
+
+    @Environment(\.hermesTheme) private var theme
+
+    /// Opacity driven by a repeating breathe animation while the turn streams.
+    @State private var cursorPulseOpacity: Double = 1.0
+
+    var body: some View {
+        Text(" ▌")
+            .foregroundColor(theme.midground)
+            .opacity(isStreaming ? cursorPulseOpacity : 1.0)
+            .onAppear {
+                guard isStreaming else { return }
+                startCursorPulse()
+            }
+            .onChange(of: isStreaming) { _, streaming in
+                if streaming {
+                    startCursorPulse()
+                } else {
+                    // Turn complete: snap back to full opacity.
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        cursorPulseOpacity = 1.0
+                    }
+                }
+            }
+    }
+
+    /// Kick off the repeating breathe animation for the streaming cursor.
+    private func startCursorPulse() {
+        withAnimation(
+            .easeInOut(duration: 0.6)
+            .repeatForever(autoreverses: true)
+        ) {
+            cursorPulseOpacity = 0.25
+        }
+    }
+}
+
+// MARK: - Native text-selection surface (user-bubble "Select Text")
+
+/// A `UITextView`-backed selectable text surface for the user bubble's "Select
+/// Text" flow (approved design §6).
+///
+/// SwiftUI `Text` cannot be told to *begin* native selection programmatically, and
+/// a whole-bubble `.contextMenu` long-press steals the press-hold gesture from
+/// `.textSelection(.enabled)` prose. The user bubble needs a context menu (Edit /
+/// Branch / Restore / Delete), so it resolves the conflict by making selection an
+/// explicit, deliberate action: long-press → context menu → "Select Text" → this
+/// view mounts, becomes first responder and selects all, so the native drag
+/// handles + system edit menu appear immediately and the user narrows from there.
+///
+/// (Agent turns need none of this: they carry no context menu, so their prose is
+/// natively selectable via `.textSelection` and long-press starts selection
+/// directly — approved design §7.)
+struct SelectableTextView: UIViewRepresentable {
+    /// The plain string to make selectable.
+    let text: String
+    /// Face + size — system body for the user bubble — so the selectable text
+    /// visually matches what it replaces.
+    let font: UIFont
+    /// Foreground color (converted from the SwiftUI theme token by the caller).
+    let textColor: UIColor
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = SelfSizingTextView()
+        view.isEditable = false
+        view.isSelectable = true
+        view.isScrollEnabled = false
+        view.backgroundColor = .clear
+        view.textContainerInset = .zero
+        view.textContainer.lineFragmentPadding = 0
+        view.adjustsFontForContentSizeCategory = true
+        view.dataDetectorTypes = []
+        view.font = font
+        view.textColor = textColor
+        view.text = text
+        view.setContentCompressionResistancePriority(.required, for: .vertical)
+        return view
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        if uiView.text != text { uiView.text = text }
+        uiView.font = font
+        uiView.textColor = textColor
+        // Enter selection exactly once per mount: select the whole body and show
+        // the handles + edit menu, then let the user narrow it by dragging.
+        guard !context.coordinator.didBeginSelection else { return }
+        context.coordinator.didBeginSelection = true
+        DispatchQueue.main.async {
+            guard uiView.window != nil else { return }
+            uiView.becomeFirstResponder()
+            uiView.selectAll(nil)
+        }
+    }
+
+    /// Self-size to the proposed width so the view lays out inline exactly like the
+    /// `Text` it replaces (multi-line height computed for the column width). Never
+    /// reads `UIScreen.main` (STR-695) — the fallback is a finite default.
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
+        let width = proposal.width ?? 320
+        let fit = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        return CGSize(width: width, height: ceil(fit.height))
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        /// Guards the one-shot select-all so a re-render (theme / Dynamic Type) does
+        /// not yank the selection back to "all" after the user narrowed it.
+        var didBeginSelection = false
+    }
+
+    /// Builds a UIFont for the given text style, optionally in the serif design.
+    static func font(textStyle: UIFont.TextStyle, serif: Bool) -> UIFont {
+        let base = UIFont.preferredFont(forTextStyle: textStyle)
+        guard serif, let descriptor = base.fontDescriptor.withDesign(.serif) else { return base }
+        return UIFont(descriptor: descriptor, size: base.pointSize)
+    }
+}
+
+/// A `UITextView` that reports its content size so SwiftUI's `sizeThatFits` path
+/// lays it out at the correct height with scrolling disabled.
+final class SelfSizingTextView: UITextView {
+    override var intrinsicContentSize: CGSize {
+        let width = bounds.width > 0 ? bounds.width : UIView.layoutFittingCompressedSize.width
+        let fit = sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        return CGSize(width: UIView.noIntrinsicMetric, height: ceil(fit.height))
     }
 }
 
