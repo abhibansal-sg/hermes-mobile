@@ -449,10 +449,22 @@ class DownstreamServer:
             text = p["text"]
             sid = p.get("session_id")
             if sid:
-                # Send into an existing (idle/foreign) session: resume to own it
-                # first if we do not already, then drive the turn (§5).
+                # Drive an existing (idle / foreign / terminal) session. Resuming
+                # REACTIVATES it, and the stock gateway may hand back a DISTINCT
+                # live session id (echoing the requested id as ``resumed``). The
+                # turn MUST be submitted to THAT live id, not the origin id — the
+                # R0/E2E finding: prompt.submit to the origin id targets a dormant
+                # session and the turn silently never runs. So take the live id
+                # the resume returns and drive it (§5).
                 if not self._gateway.owns(sid):
-                    await self._gateway.session_resume(sid)
+                    resumed = await self._gateway.session_resume(sid)
+                    if isinstance(resumed, dict):
+                        sid = resumed.get("session_id") or sid
+                else:
+                    # Already owned: a prior resume may have remapped the origin
+                    # id to a live id — resolve so a repeat submit to the origin
+                    # id still drives the live turn.
+                    sid = self._gateway.live_id_for(sid)
                 await self._gateway.prompt_submit(sid, text)
             else:
                 # Brand-new chat: create + own, then drive (§5).
@@ -466,10 +478,14 @@ class DownstreamServer:
             return {"session_id": sid}
 
         if method == UpstreamMethod.RESUME:
-            sid = p["session_id"]
-            result = await self._gateway.session_resume(sid)
-            conn.set_foreground(sid)  # resuming brings it on screen (§6)
-            return {"session_id": sid, "result": result}
+            origin = p["session_id"]
+            result = await self._gateway.session_resume(origin)
+            # Surface the LIVE id (same reactivation semantics as SUBMIT): the
+            # gateway may assign a distinct live id, and the phone must drive/
+            # foreground THAT id, not the origin.
+            live = (result.get("session_id") if isinstance(result, dict) else None) or origin
+            conn.set_foreground(live)  # resuming brings it on screen (§6)
+            return {"session_id": live, "origin": origin, "result": result}
 
         # -- interactive gates + stop (pass-through) -------------------------
         if method == UpstreamMethod.APPROVE:

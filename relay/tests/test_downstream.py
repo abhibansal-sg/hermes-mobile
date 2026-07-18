@@ -254,6 +254,10 @@ def _server():
     gw.clarify_respond = AsyncMock(return_value={"ok": True})
     gw.session_interrupt = AsyncMock(return_value={"ok": True})
     gw.owns = MagicMock(return_value=False)
+    # Default: no origin->live remap (gateway resumes in place). Individual
+    # foreign-submit tests override session_resume/live_id_for to model a distinct
+    # live id.
+    gw.live_id_for = MagicMock(side_effect=lambda s: s)
     srv = DownstreamServer(DownstreamConfig(), EventBus(), gw, SessionStore())
     return srv, gw
 
@@ -305,6 +309,53 @@ async def test_submit_into_existing_resumes_to_own_then_submits():
     assert res == {"session_id": "s5"}
 
 
+async def test_submit_into_foreign_session_submits_to_resumed_live_id():
+    """R0/E2E finding: ``session.resume`` on a foreign/idle id may return a
+    DISTINCT live id (origin echoed as ``resumed``). The turn MUST be
+    prompt.submit'd to that LIVE id, not the origin id, or it targets a dormant
+    session and never runs."""
+    srv, gw = _server()
+    gw.owns = MagicMock(return_value=False)
+    gw.session_resume = AsyncMock(
+        return_value={"session_id": "sLive", "resumed": "sOrigin", "message_count": 4}
+    )
+    await srv.start()
+    res = await _handle(srv, UpstreamMethod.SUBMIT, {"text": "go", "session_id": "sOrigin"})
+    # resume the ORIGIN id, but submit to the LIVE id it returned.
+    gw.session_resume.assert_awaited_once_with("sOrigin")
+    gw.prompt_submit.assert_awaited_once_with("sLive", "go")
+    assert res == {"session_id": "sLive"}
+    # the LIVE id is the one brought on screen (§6), not the dormant origin.
+    assert srv.session_has_live_phone("sLive") is True
+    assert srv.session_has_live_phone("sOrigin") is False
+
+
+async def test_repeat_submit_to_origin_id_still_targets_live_id():
+    """A phone that keeps addressing the ORIGIN id after the first (remapping)
+    resume must still drive the LIVE turn: the owned-session branch resolves the
+    origin id through ``live_id_for``."""
+    srv, gw = _server()
+    live_map = {"sOrigin": "sLive", "sLive": "sLive"}
+    gw.live_id_for = MagicMock(side_effect=lambda s: live_map.get(s, s))
+    gw.session_resume = AsyncMock(return_value={"session_id": "sLive", "resumed": "sOrigin"})
+
+    owned = {"flag": False}
+    gw.owns = MagicMock(side_effect=lambda s: owned["flag"])
+    await srv.start()
+
+    # First submit: not owned -> resume remaps origin->live.
+    await _handle(srv, UpstreamMethod.SUBMIT, {"text": "one", "session_id": "sOrigin"})
+    gw.prompt_submit.assert_awaited_once_with("sLive", "one")
+
+    # Now the relay owns the session; a phone still using the ORIGIN id submits
+    # again -> the owned branch resolves it back to the live id.
+    owned["flag"] = True
+    gw.prompt_submit.reset_mock()
+    await _handle(srv, UpstreamMethod.SUBMIT, {"text": "two", "session_id": "sOrigin"})
+    gw.session_resume.assert_awaited_once()  # no SECOND resume for an owned session
+    gw.prompt_submit.assert_awaited_once_with("sLive", "two")
+
+
 async def test_submit_into_owned_session_skips_resume():
     srv, gw = _server()
     gw.owns = MagicMock(return_value=True)
@@ -320,6 +371,25 @@ async def test_resume_owns_idle_session():
     res = await _handle(srv, UpstreamMethod.RESUME, {"session_id": "s5"})
     gw.session_resume.assert_awaited_once_with("s5")
     assert res["session_id"] == "s5"
+
+
+async def test_resume_surfaces_distinct_live_id():
+    """RESUME shares SUBMIT's reactivation semantics: when the gateway hands back
+    a distinct live id, the phone gets (and foregrounds) the LIVE id, with the
+    origin echoed for reconciliation."""
+    srv, gw = _server()
+    gw.session_resume = AsyncMock(
+        return_value={"session_id": "sLive", "resumed": "sOrigin", "message_count": 3}
+    )
+    await srv.start()
+    conn = srv.register(FakeWS())
+    res = await srv.handle_upstream(
+        conn, UpstreamRequest(UpstreamMethod.RESUME, {"session_id": "sOrigin"}, id=7)
+    )
+    assert res["session_id"] == "sLive"
+    assert res["origin"] == "sOrigin"
+    assert srv.session_has_live_phone("sLive") is True
+    assert srv.session_has_live_phone("sOrigin") is False
 
 
 async def test_approve_clarify_interrupt_pass_through():
