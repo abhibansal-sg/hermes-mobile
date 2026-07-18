@@ -45,12 +45,6 @@ final class AppEnvironment {
         } catch {
             fatalError("Unable to open protected Hermes work repository: \(error.localizedDescription)")
         }
-        let queueStore = QueueStore(
-            repository: workRepository,
-            observation: workObservation,
-            scopeProvider: { [weak sessionStore] in sessionStore?.durableWorkScope },
-            activeSessionProvider: { [weak sessionStore] in sessionStore?.activeStoredId }
-        )
         let voiceRecorder = VoiceRecorder()
         let speechPlayer = SpeechPlayer()
         let inboxStore = InboxStore()
@@ -60,6 +54,16 @@ final class AppEnvironment {
         let connectionStore = ConnectionStore(
             sessionStore: sessionStore,
             chatStore: chatStore
+        )
+        let queueStore = QueueStore(
+            repository: workRepository,
+            observation: workObservation,
+            scopeProvider: { [weak sessionStore] in sessionStore?.durableWorkScope },
+            activeSessionProvider: { [weak sessionStore] in sessionStore?.activeStoredId },
+            // A send is only "healthy in transit" while the live socket is ready;
+            // the instant it is not, pending rows are queued-while-offline and
+            // surface the badge/pill (C1/C2). Mirrors the drain readiness gate.
+            connectedProvider: { [weak connectionStore] in connectionStore?.isTransportReady ?? false }
         )
         let voiceConversationController = VoiceConversationController(
             dependencies: .init(
