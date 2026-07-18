@@ -356,6 +356,35 @@ final class SessionStore {
     @ObservationIgnored
     private var sessionListDeltaCursors: [SessionListDeltaScope: String] = [:]
 
+    /// The transport generation the delta rail last FULL-seeded under (A2). Every
+    /// reconnect / foreground-recovery bumps `ConnectionStore.transportEpoch`, so
+    /// comparing it here lets the FIRST session-list refresh on a new transport
+    /// bypass the persisted delta cursor and do a full first-page re-seed +
+    /// fill-to-target before incremental deltas resume — otherwise an
+    /// under-populated drawer (initial hydration cut short by the 8s timeout) can
+    /// never be repaired without a process restart. This single data-driven seam
+    /// keys off the epoch that ALL recovery entry points already advance, so no
+    /// per-path flag and no third recovery path is needed.
+    @ObservationIgnored
+    private var lastReseededTransportGeneration: UInt64?
+
+    /// The current transport generation for the A2 reseed gate. The live path is
+    /// `connection?.transportEpoch`; a test injects `reconnectGenerationProvider`
+    /// to simulate a reconnect deterministically without a live socket.
+    private var currentReconnectGeneration: UInt64? {
+        #if DEBUG
+        if let provider = reconnectGenerationProvider { return provider() }
+        #endif
+        return connection?.transportEpoch
+    }
+
+    #if DEBUG
+    /// Test seam for the A2 reconnect full-reseed gate: overrides the transport
+    /// generation the gate reads. Bumping the returned value between refreshes
+    /// simulates a reconnect (which, in the app, bumps `transportEpoch`).
+    var reconnectGenerationProvider: (() -> UInt64?)?
+    #endif
+
     /// Tombstones deferred while a row belongs to the active/pinned/live working
     /// set. They are re-evaluated on every later delta so advancing the server
     /// cursor cannot leave a protected row behind forever after protection ends.
@@ -2133,13 +2162,32 @@ final class SessionStore {
                 manifestLastSyncedAt = manifest.lastSyncedAt
                 manifestRevision = manifest.revision
             }
-            let cached = Self.filterCachedSessions(
+            var cached = Self.filterCachedSessions(
                 try await cacheStore.loadSessionList(scope: scope),
                 activeProfile: activeProfile,
                 untaggedProfile: scope.profileId == CacheScope.allProfilesKey
                     ? nil
                     : scope.profileId
             )
+            // A1(i)(iii): offline cold-open must NEVER blank the drawer just because
+            // the persisted `activeProfile` (network-mutated by
+            // `confirmActiveProfile`) partitions the concrete-profile read down to
+            // zero rows, or because rows on this device were mis-stamped with the
+            // literal "all" by an older build. When a concrete-profile scoped read
+            // comes back empty, fall back to a serverId-only aggregate read painted
+            // with aggregate semantics — the disk holds the user's chats and they
+            // must appear. The next network refresh re-narrows to the confirmed
+            // profile. The aggregate `loadSessionList` selects every non-legacy row
+            // (including any mis-stamped "all"), so this covers both root causes.
+            if cached.isEmpty, scope.profileId != CacheScope.allProfilesKey {
+                let aggregate = try await cacheStore.loadSessionList(
+                    scope: CacheScope(serverId: scope.serverId,
+                                      profileId: CacheScope.allProfilesKey)
+                )
+                cached = Self.filterCachedSessions(
+                    aggregate, activeProfile: CacheScope.allProfilesKey
+                )
+            }
             cacheReadSucceeded = true
             paintedRows = cached.count
             // Profile/server selection can change while the actor read is
@@ -2533,8 +2581,22 @@ final class SessionStore {
                 // post-fill heartbeat / gateway.ready replace can't collapse the
                 // drawer back to ~100 rows (fill30): `max(100, loadedFloor, loadedCount)`.
                 let fetchLimit = max(100, loadedFloor, loadedCount)
+                // A2: the transport generation at the start of this refresh. If it
+                // advanced since the delta rail last full-seeded, a reconnect /
+                // foreground-recovery happened and the FIRST refresh on the new
+                // transport must FULL-seed (bypass the persisted cursor) before
+                // incremental deltas resume — see `lastReseededTransportGeneration`.
+                let reseedGeneration = currentReconnectGeneration
                 if let deltaScope {
-                    let previousCursor = sessionListDeltaCursors[deltaScope]
+                    var previousCursor = sessionListDeltaCursors[deltaScope]
+                    if previousCursor != nil,
+                       reseedGeneration != lastReseededTransportGeneration {
+                        // Reconnected/recovered since the last seed: drop the cursor
+                        // so this refresh takes the full first-page seed + fill-to-
+                        // target path, then deltas resume from the new cursor.
+                        previousCursor = nil
+                        sessionListDeltaCursors[deltaScope] = nil
+                    }
                     let delta: SessionListDeltaResult?
                     do {
                         delta = try await resolvedSessionListDeltaFetch(
@@ -2553,6 +2615,10 @@ final class SessionStore {
 
                     if let delta {
                         sessionListDeltaCursors[deltaScope] = delta.cursor
+                        // This refresh is now the seed for the current transport
+                        // generation; subsequent same-generation refreshes resume
+                        // incremental deltas (A2).
+                        lastReseededTransportGeneration = reseedGeneration
                         let didChange: Bool
                         if previousCursor == nil {
                             mergeSessionPage(delta.sessions, total: delta.total)
@@ -2596,6 +2662,10 @@ final class SessionStore {
                         afterAuthoritativePage: result.sessions,
                         scope: deltaScope
                     )
+                    // The stock REST path is itself a full first-page seed; mark the
+                    // current transport generation as seeded so a delta cursor set
+                    // later this generation is not force-bypassed again (A2).
+                    lastReseededTransportGeneration = reseedGeneration
                 }
                 if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
                 lastError = nil
@@ -3305,6 +3375,20 @@ final class SessionStore {
         self.loadedCount = loadedCount
         self.loadedOffset = loadedOffset
         self.totalSessions = total
+    }
+
+    /// Read-only accessor to the wired connection so tests can seed a ready
+    /// transport (`ConnectionStore._seedConnectedForTesting`) without threading the
+    /// store through their own graph builder.
+    var connectionForTesting: ConnectionStore? { connection }
+
+    /// Stamp the active runtime binding (id + the transport epoch it was minted
+    /// under) exactly as a live resume would, so the `ensureActiveRuntime`
+    /// fast-path — which now requires a transport-ready connection AND a matching
+    /// epoch (#210) — is deterministically exercisable without a gateway.
+    func _bindActiveRuntimeForTesting(id: String, epoch: UInt64) {
+        activeRuntimeId = id
+        activeRuntimeEpoch = epoch
     }
     #endif
 
