@@ -1619,6 +1619,7 @@ final class ConnectionStore {
             )
             guard isCurrentGeneration(generation) else { return }
             sessionStore.removeForgottenGatewayState()
+            chatStore.reset()
             phase = .needsSetup
             return
         }
@@ -1637,6 +1638,12 @@ final class ConnectionStore {
         await stopLiveWork(returningTo: nil, clearSpotlight: true, generation: generation)
         guard isCurrentGeneration(generation) else { return }
         sessionStore.removeForgottenGatewayState()
+        // Forget is a privacy erase: the last-viewed transcript stays resident in
+        // ChatStore after stopLiveWork (which only ends the live stream), so clear
+        // it too before repairing to `.needsSetup` — otherwise a forgotten
+        // gateway's cached messages remain on screen (GatewayForgetCoordinatorTests
+        // testForgetClearsPublishedDrawerAndTranscriptBeforeRepairing).
+        chatStore.reset()
         try? await cacheStore?.purgeGateway(serverId: server)
         guard isCurrentGeneration(generation) else { return }
         await queueStore?.removeAll()
