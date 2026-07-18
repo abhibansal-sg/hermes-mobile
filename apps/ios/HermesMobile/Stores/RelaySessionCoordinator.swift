@@ -97,22 +97,59 @@ final class RelaySessionCoordinator {
 
     private let chatStore: ChatStore
     private let clientFactory: @Sendable () -> RelayClient
+    /// Injectable backoff sleep between reconnect attempts. Defaults to
+    /// `Task.sleep`; tests substitute a recording/zero-delay sleep so the
+    /// reconnect timing is deterministic (prompt first attempt, tight early
+    /// backoff — §4 driver policy).
+    private let backoffSleep: @Sendable (Duration) async -> Void
 
     private var client: RelayClient?
     private var pumpTask: Task<Void, Never>?
     private var stateTask: Task<Void, Never>?
+
+    // MARK: Reconnect driver state (§4)
+
+    /// The URL/token the live session was started with, retained so the auto
+    /// reconnect driver can re-dial without a caller round-trip.
+    private var reconnectURL: URL?
+    private var reconnectToken: String?
+    /// Consecutive reconnect attempts since the stream was last healthy. Reset to
+    /// 0 on `start` and on the first live frame after a reconnect (proof the
+    /// stream resumed), so the tight early backoff only escalates while a relay
+    /// stays unreachable — never hammering, never stale-slow after a real heal.
+    private var reconnectAttempt = 0
+    /// The in-flight reconnect attempt, if any. Single-owner: a new attempt is
+    /// only armed when this is `nil`, so overlapping `.failed` transitions cannot
+    /// spawn parallel reconnect storms.
+    private var reconnectTask: Task<Void, Never>?
 
     /// - Parameters:
     ///   - chatStore: the transcript owner the reconciled items are projected into.
     ///   - clientFactory: builds the relay client; tests inject one wired to a
     ///     mock relay transport. Production builds a real WS client with a modest
     ///     periodic ack cadence (§4).
+    ///   - backoffSleep: the delay applied between reconnect attempts; tests
+    ///     inject a deterministic/zero-delay sleep to assert timing.
     init(
         chatStore: ChatStore,
-        clientFactory: @escaping @Sendable () -> RelayClient = { RelayClient(ackInterval: .seconds(2)) }
+        clientFactory: @escaping @Sendable () -> RelayClient = { RelayClient(ackInterval: .seconds(2)) },
+        backoffSleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
     ) {
         self.chatStore = chatStore
         self.clientFactory = clientFactory
+        self.backoffSleep = backoffSleep
+    }
+
+    /// Tight early reconnect backoff for the relay driver (§4). Attempt 0 fires
+    /// immediately (the loop skips the sleep); attempt n≥1 waits
+    /// `min(0.25·2^(n-1), 8)s` plus 0…0.25s jitter — off the mark faster than the
+    /// gateway's `0.5·2^n` schedule, yet bounded so a persistently-dead relay is
+    /// retried at most ~every 8s rather than hammered.
+    static func reconnectBackoff(attempt: Int) -> Duration {
+        guard attempt > 0 else { return .zero }
+        let base = min(0.25 * pow(2.0, Double(attempt - 1)), 8.0)
+        let jitter = Double.random(in: 0...0.25)
+        return .milliseconds(Int((base + jitter) * 1000))
     }
 
     var isOpen: Bool { phase == .open }
@@ -128,6 +165,9 @@ final class RelaySessionCoordinator {
 
         let client = clientFactory()
         self.client = client
+        reconnectURL = url
+        reconnectToken = token
+        reconnectAttempt = 0
         store = RelayItemStore()
         phase = .connecting
 
@@ -157,17 +197,25 @@ final class RelaySessionCoordinator {
     }
 
     /// Reconnect after a drop and `resync` from the retained watermark (§4). The
-    /// replay/snapshot arrives as frames the pump reconciles.
+    /// replay/snapshot arrives as frames the pump reconciles. This is the explicit
+    /// (caller-driven) entry point — it cancels any in-flight auto-reconnect and
+    /// treats the attempt as fresh (backoff reset), then re-dials immediately.
     func reconnect(url: URL, token: String? = nil) async {
         guard let client else { return }
+        reconnectTask?.cancel(); reconnectTask = nil
+        reconnectAttempt = 0
+        reconnectURL = url
+        reconnectToken = token
         phase = .connecting
         await client.reconnect(url: url, token: token)
         phase = .open
     }
 
-    /// Tear down the socket, cancel the pump/state observers, and clear the
-    /// render store. Idempotent.
+    /// Tear down the socket, cancel the pump/state observers + reconnect driver,
+    /// and clear the render store. Idempotent.
     func stop() async {
+        reconnectTask?.cancel(); reconnectTask = nil
+        reconnectURL = nil; reconnectToken = nil; reconnectAttempt = 0
         pumpTask?.cancel(); pumpTask = nil
         stateTask?.cancel(); stateTask = nil
         if let client { await client.disconnect() }
@@ -177,9 +225,56 @@ final class RelaySessionCoordinator {
         phase = .idle
     }
 
+    // MARK: Auto-reconnect driver (§4)
+
+    /// Arm a single reconnect attempt after an unexpected socket drop. Attempt 0
+    /// fires immediately (no pre-delay) so recovery starts the instant the drop is
+    /// observed; subsequent attempts wait the tight early backoff. Single-owner:
+    /// a new attempt is armed only when none is in flight, so a burst of `.failed`
+    /// transitions cannot spawn parallel reconnect storms.
+    ///
+    /// Each attempt calls `client.reconnect`, which re-opens the socket and sends
+    /// `resync{last_seq}` immediately (the retained watermark resumes the stream
+    /// fast — §4). The relay has no `ready` handshake, so the socket is treated as
+    /// open optimistically; if it is in fact dead the receive loop posts `.failed`
+    /// again, which re-arms this driver with an incremented attempt (the backoff
+    /// escalates, bounded — never hammering). The attempt counter resets to 0 the
+    /// moment a live frame lands (`ingest`), proving the stream truly resumed.
+    private func scheduleReconnect() {
+        guard reconnectTask == nil, let client, let url = reconnectURL else { return }
+        let token = reconnectToken
+        let attempt = reconnectAttempt
+        reconnectTask = Task { [weak self] in
+            guard let self else { return }
+            if attempt > 0 {
+                await self.backoffSleep(Self.reconnectBackoff(attempt: attempt))
+            }
+            // stop()/an explicit reconnect may have raced the backoff sleep.
+            guard !Task.isCancelled,
+                  self.reconnectURL == url,
+                  self.client === client else {
+                self.reconnectTask = nil
+                return
+            }
+            self.phase = .connecting
+            await client.reconnect(url: url, token: token)   // re-open + immediate resync{last_seq}
+            self.reconnectAttempt += 1
+            self.reconnectTask = nil
+            // Insurance for the narrow window where the socket failed again
+            // *during* the reconnect await (the `.failed` observer was suppressed
+            // while this task held ownership): re-arm from the settled state.
+            if case .failed = await client.state, self.client === client {
+                self.scheduleReconnect()
+            }
+        }
+    }
+
     // MARK: Frame ingestion → transcript projection
 
     private func ingest(_ frame: RelayFrame) {
+        // A live frame proves the stream resumed: clear the backoff so a later
+        // drop reconnects promptly instead of inheriting a stale attempt count.
+        if reconnectAttempt != 0 { reconnectAttempt = 0 }
         store.apply(frame)
         chatStore.applyRelayItems(store.items)
     }
@@ -190,7 +285,13 @@ final class RelaySessionCoordinator {
         case .connecting:    phase = .connecting
         case .open:          phase = .open
         case .closed(let r): phase = .closed(reason: r)
-        case .failed(let m): phase = .failed(m)
+        case .failed(let m):
+            phase = .failed(m)
+            // An unexpected transport drop (a real error, not an intentional
+            // teardown — those cancel and yield `.closed`). Kick the tight
+            // auto-reconnect driver so the stream recovers without waiting on a
+            // coarse app-level trigger.
+            scheduleReconnect()
         }
     }
 
