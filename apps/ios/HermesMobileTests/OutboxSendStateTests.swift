@@ -144,6 +144,61 @@ final class OutboxSendStateTests: XCTestCase {
         }
     }
 
+    func testLeasedInFlightSendIsNotStuckPastThreshold() async throws {
+        // Regression (leased-in-flight): a message queued while offline that only
+        // begins submitting after reconnect can be leased and actively in flight
+        // while its enqueue-relative age already exceeds `stuckThreshold`. It must
+        // NOT show the failed badge (nor wire Delete / the pill) mid-request —
+        // cancelling here would drop a send the gateway is about to accept, then
+        // the accept transition would be lost (leaseLost) against a vanished echo.
+        for state in [WorkJobState.submitting, .uploading] {
+            let (queue, repository, scope, directory) = try makeQueue()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let job = try await repository.enqueue(WorkJobInput(
+                kind: .prompt, scope: scope, state: state, text: "draining", storedSessionID: "A"
+            ))
+            // A live drain claims the row: lease owner set, request in flight.
+            // claimNextJob does not itself republish the observation, so refresh
+            // the store's snapshot to reflect the lease before asserting.
+            _ = try await repository.claimNextJob(
+                scope: scope, owner: "drain", now: Date(), leaseDuration: 60
+            )
+            try await repository.refreshObservation()
+            let item = try XCTUnwrap(queue.items.first)
+            XCTAssertTrue(item.isClaimed, "precondition: the row is leased and in flight (\(state))")
+
+            // Far past the threshold, but leased and in flight → still in transit.
+            let late = item.createdAt.addingTimeInterval(QueueStore.stuckThreshold + 3600)
+            XCTAssertEqual(
+                queue.delivery(forClientMessageID: job.clientMessageID, now: late),
+                .inTransit,
+                "a leased in-flight \(state) must not flip to the failed badge on age alone"
+            )
+            // No backlog pill and no user-facing Delete affordance while in flight.
+            XCTAssertFalse(queue.isBacklogged(now: late), "no pill for a leased in-flight \(state)")
+            XCTAssertFalse(item.canDelete, "a leased in-flight \(state) is not user-deletable")
+        }
+    }
+
+    func testUnleasedSubmittingStillStuckPastThreshold() async throws {
+        // Guard the narrowness of the exclusion: a `.submitting` row with NO lease
+        // owner (a drain that died mid-submit, nothing re-driving it) is genuinely
+        // stuck and must still surface the failed badge past the threshold.
+        let (queue, repository, scope, directory) = try makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let job = try await repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: scope, state: .submitting, text: "orphaned", storedSessionID: "A"
+        ))
+        let item = try XCTUnwrap(queue.items.first)
+        XCTAssertFalse(item.isClaimed, "precondition: no lease owner")
+        let atBoundary = item.createdAt.addingTimeInterval(QueueStore.stuckThreshold)
+        XCTAssertEqual(
+            queue.delivery(forClientMessageID: job.clientMessageID, now: atBoundary),
+            .failed(id: item.id),
+            "an unleased submitting row is not in flight — age still marks it stuck"
+        )
+    }
+
     func testUnknownClientIDHasNoBadge() async throws {
         let (queue, _, _, directory) = try makeQueue()
         defer { try? FileManager.default.removeItem(at: directory) }
