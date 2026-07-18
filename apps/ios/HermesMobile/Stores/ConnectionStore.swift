@@ -495,6 +495,12 @@ final class ConnectionStore {
         #else
         let created = RelaySessionCoordinator(chatStore: chatStore)
         #endif
+        // When the relay socket comes up (initial connect OR a reconnect after a
+        // drop/flap), drain the durable outbox over the relay — the relay
+        // analogue of `setTransportReadiness(.ready)`'s wake on the gateway path.
+        // Without this, a prompt the user queued while the relay was mid-connect
+        // stays pending until some unrelated wake source fires.
+        created.onReady = { [weak self] in self?.queueStore?.wake() }
         relayCoordinator = created
         return created
     }
@@ -559,6 +565,18 @@ final class ConnectionStore {
     /// while no presentation-grace window is masking a dropped transport.
     var isTransportReady: Bool {
         guard !isInGrace else { return false }
+        // Wave-2 relay transport: the durable outbox drains OVER THE RELAY on this
+        // path (the gateway `client` is idle), so admission must track the RELAY
+        // socket, not the one-shot `transportReadiness` the initial configure
+        // stamped. `relayCoordinator.isOpen` closes the drain gate the instant the
+        // relay drops (a flap) and reopens it on reconnect — so a send during the
+        // flap enqueues quietly and drains once the relay is live again, rather
+        // than churning failed submits against a dead socket. Gated on the
+        // coordinator existing first: the gateway-direct default NEVER allocates
+        // it, so that path does not even read the flag and stays byte-identical.
+        if relayCoordinator != nil, transportPath == .relay {
+            return relayCoordinator?.isOpen ?? false
+        }
         if case .ready = transportReadiness { return true }
         return false
     }
