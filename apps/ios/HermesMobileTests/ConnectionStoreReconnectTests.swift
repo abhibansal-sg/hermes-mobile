@@ -49,6 +49,18 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         }
     }
 
+    private actor ResumeCallLog {
+        private var values: [String] = []
+
+        func append(_ value: String) {
+            values.append(value)
+        }
+
+        func calls(for storedId: String) -> Int {
+            values.filter { $0 == storedId }.count
+        }
+    }
+
     // MARK: - Helpers
 
     /// Build a wired store graph (ConnectionStore + SessionStore + ChatStore).
@@ -891,6 +903,179 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertFalse(connection.isInGrace, "grace must be ended, not left dangling, on auth revoke")
     }
 
+    // MARK: - Build 120 transport readiness / epoch contract
+
+    /// A silent reconnect may preserve `.connected` for presentation, but it
+    /// must revoke operational readiness immediately. The waiter must survive
+    /// that transient unavailable state and resolve only after the replacement
+    /// socket has completed its ready handshake (represented by `connectRPC`).
+    func testGraceRevokesTransportReadinessUntilNewEpochIsAccepted() async {
+        let (connection, _, _) = makeStore()
+        let gate = SuspensionGate()
+
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        let priorEpoch = connection.transportEpoch
+        XCTAssertTrue(connection.isTransportReady)
+        XCTAssertEqual(connection.transportReadiness, .ready(epoch: priorEpoch))
+
+        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection._handleGatewayStateForTesting(.failed("background socket dropped"))
+        await gate.waitUntilEntered()
+
+        XCTAssertEqual(connection.phase, .connected,
+                       "grace deliberately preserves the presentation phase")
+        XCTAssertTrue(connection.isInGrace)
+        XCTAssertFalse(connection.isTransportReady,
+                       "presentation grace must never admit transport work")
+        XCTAssertEqual(
+            connection.transportReadiness,
+            .connecting(epoch: priorEpoch + 1),
+            "the reconnect attempt owns a fresh transport epoch"
+        )
+
+        let readinessWaiter = Task { await connection.waitForTransportReady(timeout: .seconds(2)) }
+        await Task.yield()
+        await gate.release()
+
+        let becameReady = await readinessWaiter.value
+        XCTAssertTrue(becameReady)
+        await connection.waitForReconnectForTesting()
+        XCTAssertTrue(connection.isTransportReady)
+        XCTAssertEqual(connection.transportReadiness, .ready(epoch: priorEpoch + 1))
+    }
+
+    /// Timeout, cancellation, and terminal teardown must resolve a readiness
+    /// waiter with `false`; no caller may remain parked after its connection
+    /// generation is deliberately invalidated.
+    func testTransportReadinessWaiterTimeoutsCancelsAndTeardownResolvesFalse() async {
+        let (connection, _, _) = makeStore()
+        let gate = SuspensionGate()
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection._handleGatewayStateForTesting(.failed("background socket dropped"))
+        await gate.waitUntilEntered()
+
+        let timedOutResult = await connection.waitForTransportReady(timeout: .milliseconds(20))
+        XCTAssertFalse(timedOutResult)
+
+        let cancelledWaiter = Task {
+            await connection.waitForTransportReady(timeout: .seconds(30))
+        }
+        await Task.yield()
+        cancelledWaiter.cancel()
+        let cancelledResult = await cancelledWaiter.value
+        XCTAssertFalse(cancelledResult)
+
+        let terminalWaiter = Task {
+            await connection.waitForTransportReady(timeout: .seconds(30))
+        }
+        await Task.yield()
+        await connection.disconnect()
+        let terminalResult = await terminalWaiter.value
+        XCTAssertFalse(terminalResult)
+
+        // The injected hook is intentionally not cancellation-aware; release it
+        // so this deterministic test leaves no parked test task behind.
+        await gate.release()
+        await connection.waitForReconnectForTesting()
+    }
+
+    func testTransportDropInvalidatesRuntimeButRetainsLatestStoredSelection() async {
+        let (connection, sessions, _) = makeStore()
+        let gate = SuspensionGate()
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        sessions.activeStoredId = "A"
+        sessions.resumeRPC = { requested, _ in
+            XCTAssertEqual(requested, "A")
+            return self.stagedResumeResult(sessionId: "runtime-A", resumed: "A")
+        }
+        let resumed = await sessions.resumeActiveAfterReconnect()
+        XCTAssertEqual(resumed, "runtime-A")
+        XCTAssertEqual(sessions.activeRuntimeId, "runtime-A")
+
+        connection.connectRPC = { _, _, _ in await gate.suspend() }
+        connection._handleGatewayStateForTesting(.failed("background socket dropped"))
+        await gate.waitUntilEntered()
+
+        XCTAssertEqual(sessions.activeStoredId, "A",
+                       "the durable drawer selection survives transient reconnect")
+        XCTAssertNil(sessions.activeRuntimeId,
+                     "a runtime from the dropped transport epoch may not be reused")
+        XCTAssertNil(sessions.sessionActionError,
+                     "transport loss is not a user-visible session-open failure")
+
+        await gate.release()
+        await connection.waitForReconnectForTesting()
+    }
+
+    func testLateEpochFailureIsIgnoredAfterReplacementTransportBecomesReady() async {
+        let (connection, sessions, _) = makeStore()
+        let gate = SuspensionGate()
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        let epochN = connection.transportEpoch
+        sessions.activeStoredId = "A"
+        sessions.resumeRPC = { _, _ in
+            await gate.suspend()
+            throw URLError(.networkConnectionLost)
+        }
+
+        let resume = Task { await sessions.resumeActiveAfterReconnect() }
+        await gate.waitUntilEntered()
+
+        // The failed RPC belongs to epoch N. A replacement ready epoch must
+        // fence its catch path before it can set an alert on the current UI.
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        XCTAssertEqual(connection.transportEpoch, epochN + 1)
+        await gate.release()
+        let resumed = await resume.value
+        XCTAssertNil(resumed)
+
+        XCTAssertNil(sessions.sessionActionError)
+        XCTAssertNil(sessions.lastError)
+        XCTAssertNil(sessions.activeRuntimeId)
+    }
+
+    func testOpenDuringReconnectAndRecoveryIssueOneResumeForLatestSelection() async {
+        let (connection, sessions, _) = makeStore()
+        let reconnectGate = SuspensionGate()
+        let calls = ResumeCallLog()
+        connection._seedConnectedForTesting(
+            serverURL: "http://127.0.0.1:9123", token: "test-token"
+        )
+        sessions.activeStoredId = "A"
+        sessions.resumeRPC = { stored, _ in
+            await calls.append(stored)
+            return self.stagedResumeResult(sessionId: "runtime-\(stored)", resumed: stored)
+        }
+        connection.connectRPC = { _, _, _ in await reconnectGate.suspend() }
+
+        connection._handleGatewayStateForTesting(.failed("background socket dropped"))
+        await reconnectGate.waitUntilEntered()
+        sessions.open(self.sessionSummary("B"))
+
+        await reconnectGate.release()
+        await connection.waitForReconnectForTesting()
+        await sessions.waitForPendingOpenForTesting()
+
+        let aCalls = await calls.calls(for: "A")
+        let bCalls = await calls.calls(for: "B")
+        XCTAssertEqual(aCalls, 0)
+        XCTAssertEqual(bCalls, 1,
+                       "readiness-released open(B) and recovery must share one resume")
+        XCTAssertEqual(sessions.activeStoredId, "B")
+        XCTAssertEqual(sessions.activeRuntimeId, "runtime-B")
+    }
+
     // MARK: - ABH-448 connection-generation fencing
 
     func testLateOpenAndClosedFromForgottenGenerationCannotRestoreConnection() async {
@@ -1046,4 +1231,141 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertFalse(connection.hasConnected)
         XCTAssertNil(connection.reconnectTask)
     }
+
+    // MARK: - S3: self-reconnect when the network returns (NWPathMonitor seam)
+
+    #if DEBUG
+    /// Deterministic fake `NetworkPathMonitoring`: records lifecycle and lets a
+    /// test push path transitions synchronously on the main actor.
+    @MainActor
+    private final class FakePathMonitor: NetworkPathMonitoring {
+        var onPathUpdate: ((NetworkPathStatus) -> Void)?
+        private(set) var started = false
+        private(set) var cancelled = false
+        func start() { started = true }
+        func cancel() { cancelled = true }
+        func emit(_ status: NetworkPathStatus) { onPathUpdate?(status) }
+    }
+
+    private func withSavedServer(
+        _ server: String,
+        token: String,
+        _ body: () async -> Void
+    ) async {
+        let priorServerURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
+        let priorOffline = UserDefaults.standard.bool(forKey: DefaultsKeys.connectionOffline)
+        KeychainService.deleteToken(server: server)
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.connectionOffline)
+        UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
+        try? KeychainService.saveToken(token, server: server)
+        defer {
+            KeychainService.deleteToken(server: server)
+            if let priorServerURL {
+                UserDefaults.standard.set(priorServerURL, forKey: DefaultsKeys.serverURL)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+            }
+            UserDefaults.standard.set(priorOffline, forKey: DefaultsKeys.connectionOffline)
+        }
+        await body()
+    }
+
+    /// S3 core: a cold-launch-offline store (REST probe failed → terminal
+    /// `.offline`, `hasConnected == false`) reconnects BY ITSELF when the path
+    /// becomes `.satisfied` — no force-quit, no foreground event.
+    func testPathSatisfiedLiftsColdLaunchOfflineAndReconnects() async {
+        let (connection, _, _) = makeStore()
+        connection._skipEnvironmentBootstrapForTesting = true
+        let server = "https://s3-cold.example:9119"
+        await withSavedServer(server, token: "tok") {
+            let fake = FakePathMonitor()
+            connection._pathMonitorForTesting = fake
+            connection.networkReconnectDebounceOverride = .milliseconds(5)
+
+            // Cold-launch-offline: the REST probe throws, so configure returns
+            // terminal `.offline` with `hasConnected == false`, but the monitor
+            // was armed before the probe.
+            connection.statusRPC = { _, _ in throw URLError(.notConnectedToInternet) }
+            connection.connectRPC = { _, _, _ in }
+            _ = await connection.configure(urlString: server, token: "tok")
+
+            guard case .offline = connection.phase else {
+                return XCTFail("cold configure failure must land in .offline, got \(connection.phase)")
+            }
+            XCTAssertFalse(connection.hasConnected)
+            XCTAssertTrue(fake.started, "monitor must be armed even when configure fails offline")
+
+            // Network returns: the probe now succeeds. Emitting `.satisfied`
+            // must self-heal without any further user action.
+            connection.statusRPC = { _, _ in }
+            fake.emit(.satisfied)
+            await settle()
+
+            XCTAssertTrue(connection.hasConnected, "path-satisfied must reconnect from cold offline")
+            if case .offline = connection.phase {
+                XCTFail("still offline after path-satisfied reconnect: \(connection.phase)")
+            }
+        }
+    }
+
+    /// A rapidly flapping path (satisfied/unsatisfied/satisfied…) collapses to a
+    /// SINGLE reconnect attempt via the trailing-edge debounce.
+    func testFlappingPathDebouncesToSingleReconnectAttempt() async {
+        let (connection, _, _) = makeStore()
+        connection._skipEnvironmentBootstrapForTesting = true
+        let server = "https://s3-flap.example:9119"
+        await withSavedServer(server, token: "tok") {
+            let fake = FakePathMonitor()
+            connection._pathMonitorForTesting = fake
+            connection.networkReconnectDebounceOverride = .milliseconds(30)
+
+            let connectCalls = ResumeCallLog()
+            connection.statusRPC = { _, _ in throw URLError(.notConnectedToInternet) }
+            connection.connectRPC = { _, _, _ in await connectCalls.append(server) }
+            _ = await connection.configure(urlString: server, token: "tok")
+            guard case .offline = connection.phase else {
+                return XCTFail("cold configure failure must land in .offline, got \(connection.phase)")
+            }
+            // Probe reachable now; only the trailing debounce should reconnect.
+            connection.statusRPC = { _, _ in }
+
+            // Burst of transitions inside one debounce window (all synchronous on
+            // the main actor, so every `.satisfied` cancels the prior pending
+            // kick before it can run).
+            fake.emit(.satisfied)
+            fake.emit(.unsatisfied)
+            fake.emit(.satisfied)
+            fake.emit(.unsatisfied)
+            fake.emit(.satisfied)
+            await settle()
+
+            let calls = await connectCalls.calls(for: server)
+            XCTAssertEqual(calls, 1, "flapping path must debounce to a single reconnect attempt")
+            XCTAssertTrue(connection.hasConnected)
+        }
+    }
+
+    /// An already-connected store ignores a `.satisfied` path event — no
+    /// reconnect loop, no churn.
+    func testPathSatisfiedIsNoOpWhenAlreadyConnected() async {
+        let (connection, _, _) = makeStore()
+        let server = "https://s3-connected.example:9119"
+        let connectCalls = ResumeCallLog()
+        connection.networkReconnectDebounceOverride = .milliseconds(5)
+        connection.connectRPC = { _, _, _ in await connectCalls.append(server) }
+        let fake = FakePathMonitor()
+        connection._pathMonitorForTesting = fake
+        connection._startPathMonitorForTesting()
+        connection._seedConnectedForTesting(serverURL: server, token: "tok")
+        XCTAssertEqual(connection.phase, .connected)
+
+        fake.emit(.satisfied)
+        await settle()
+
+        XCTAssertEqual(connection.phase, .connected)
+        XCTAssertNil(connection.reconnectTask, "a live connection must not spawn a reconnect loop")
+        let calls = await connectCalls.calls(for: server)
+        XCTAssertEqual(calls, 0, "path-satisfied must be a no-op while connected")
+    }
+    #endif
 }

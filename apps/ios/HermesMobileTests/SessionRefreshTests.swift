@@ -1,4 +1,5 @@
 import XCTest
+import Observation
 @testable import HermesMobile
 
 /// Unit tests for ABH-86: desktop-parity session list refresh.
@@ -76,6 +77,61 @@ final class SessionRefreshTests: XCTestCase {
     /// A fresh store wired with no live connection — suitable for fetch-seam tests.
     private func makeStore() -> SessionStore {
         SessionStore()
+    }
+
+    // MARK: - build125: identical first-page refresh produces no array churn (#208)
+
+    /// A periodic first-page refresh that returns byte-identical rows must NOT
+    /// reassign the `sessions` array — under `@Observable` an equal-but-new array
+    /// still relayouts the whole drawer. `withObservationTracking`'s `onChange`
+    /// fires only if `sessions` is actually mutated.
+    func testIdenticalRefreshProducesNoSessionsChurn() async {
+        let store = makeStore()
+        let rows = [
+            makeSummary(id: "A", lastActive: 300, startedAt: 3),
+            makeSummary(id: "B", lastActive: 200, startedAt: 2),
+            makeSummary(id: "C", lastActive: 100, startedAt: 1),
+        ]
+        store.sessionsFetch = { (rows, 3) }
+        await store.refresh()
+        XCTAssertEqual(store.sessions.map(\.id), ["A", "B", "C"])
+
+        let mutated = MutationFlag()
+        withObservationTracking {
+            _ = store.sessions
+        } onChange: {
+            mutated.fire()
+        }
+        // Identical content on the next refresh.
+        await store.refresh()
+
+        XCTAssertFalse(mutated.fired,
+            "an identical-content first-page refresh must not churn the sessions array (#208)")
+        XCTAssertEqual(store.sessions.map(\.id), ["A", "B", "C"])
+    }
+
+    /// Control: a refresh that genuinely changes the row set DOES reassign
+    /// `sessions`, so the no-churn guard never suppresses a real update.
+    func testChangedRefreshStillUpdatesSessions() async {
+        let store = makeStore()
+        store.sessionsFetch = { ([self.makeSummary(id: "A", lastActive: 100)], 1) }
+        await store.refresh()
+        XCTAssertEqual(store.sessions.map(\.id), ["A"])
+
+        let mutated = MutationFlag()
+        withObservationTracking {
+            _ = store.sessions
+        } onChange: {
+            mutated.fire()
+        }
+        store.sessionsFetch = {
+            ([self.makeSummary(id: "A", lastActive: 100),
+              self.makeSummary(id: "B", lastActive: 90)], 2)
+        }
+        await store.refresh()
+
+        XCTAssertTrue(mutated.fired, "a changed refresh must still publish the sessions update")
+        XCTAssertEqual(Set(store.sessions.map(\.id)), ["A", "B"])
     }
 
     // MARK: - 1. Re-sort on bumped lastActive
@@ -156,6 +212,120 @@ final class SessionRefreshTests: XCTestCase {
 
         XCTAssertEqual(store.visibleSessions.map(\.id).first, "mine",
             "while a turn is in flight (markTurnStarted), the optimistic bump is carried forward so the row doesn't flicker down before the server catches up")
+    }
+
+    // MARK: - LANE D: live session must not sink after a reconnect reseed
+
+    /// LANE D regression. A live turn is streaming into "mine" (optimistically
+    /// bumped to the top). A quick reconnect heal force-clears every in-flight turn
+    /// flag (`clearAllTurnsInProgress`) yet PRESERVES the live-frame stamp, then its
+    /// transport-epoch bump forces a full first-page reseed. The reseed page carries
+    /// the STALE server `lastActive` for "mine" (its last `message.complete` was
+    /// yesterday; the in-flight turn has not landed) while two older rows look
+    /// fresher. Before the fix, the carry-forward gate was `turnsInProgress`-only, so
+    /// the now-empty flag let "mine" decay to its stale value and sink to "yesterday"
+    /// — the transient mis-order the user saw. The live-window signal must keep it on
+    /// top through the reseed, with no wrong-order publish.
+    func testLiveSessionSurvivesReconnectReseedWithoutSinking() async {
+        let store = makeStore()
+        let mine   = makeSummary(id: "mine", lastActive: 100, startedAt: 1)
+        let olderA = makeSummary(id: "a",    lastActive:  90, startedAt: 1)
+        let olderB = makeSummary(id: "b",    lastActive:  80, startedAt: 1)
+        store.sessions = [mine, olderA, olderB]
+
+        // A live turn is streaming into "mine": mark it in-flight and stamp a live
+        // frame (noteActivity bumps lastActive to device-now AND stamps the live
+        // window used for the dot / carry-forward).
+        store.markTurnStarted(storedId: "mine")
+        store.noteActivity(storedId: "mine")
+
+        // Quick reconnect heal: force-clears in-flight turn flags but leaves the
+        // live-frame stamp intact (the row is still visibly live).
+        store.clearAllTurnsInProgress()
+        XCTAssertTrue(store.turnsInProgressIds.isEmpty,
+            "setup: the reconnect heal cleared the turn-in-progress flag")
+
+        // The reconnect's epoch bump forces a full first-page reseed whose page still
+        // carries the stale (pre-turn) server lastActive for "mine".
+        let mineStale = makeSummary(id: "mine", lastActive: 10, startedAt: 1)
+        store.sessionsFetch = { ([olderA, olderB, mineStale], 3) }
+        await store.refresh()
+
+        XCTAssertEqual(store.visibleSessions.map(\.id).first, "mine",
+            "a still-live session must not sink to its stale server lastActive after a reconnect clears the turn-in-progress flag")
+    }
+
+    /// A turn that JUST completed (markTurnCompleted fired, `turnsInProgress` now
+    /// empty) but is still inside the live window must keep its optimistic bump over
+    /// a lagging delta so it does not flicker down before the server catches up.
+    /// This exercises the `mergeSessionDelta` carry-forward gate via the live-window
+    /// signal (the delta cursor is still set, so a heartbeat takes the delta path).
+    func testDeltaCarriesForwardLiveWindowAfterTurnCompletes() async {
+        let store = makeStore()
+        let mine  = makeSummary(id: "mine",  lastActive: 100, startedAt: 1)
+        let other = makeSummary(id: "other", lastActive:  90, startedAt: 1)
+        store.sessionListDeltaFetch = { cursor, _ in
+            if cursor == nil {
+                return SessionListDeltaResult(
+                    sessions: [mine, other], tombstones: [], cursor: "seed", total: 2)
+            }
+            // Lagging heartbeat: server still reports the OLD (pre-turn) value for
+            // mine, which would knock it below "other" without carry-forward.
+            return SessionListDeltaResult(
+                sessions: [self.makeSummary(id: "mine", lastActive: 50, startedAt: 1)],
+                tombstones: [], cursor: "next", total: 2)
+        }
+
+        await store.refresh()
+        // A live turn ran and just settled: stamp the live frame, then complete it.
+        store.markTurnStarted(storedId: "mine")
+        store.noteActivity(storedId: "mine")
+        store.markTurnCompleted(storedId: "mine")
+        XCTAssertTrue(store.turnsInProgressIds.isEmpty,
+            "setup: the turn completed so the explicit flag is clear")
+
+        await store.refresh()
+
+        XCTAssertEqual(store.visibleSessions.map(\.id).first, "mine",
+            "a just-completed session still inside the live window keeps its optimistic bump over a lagging delta")
+    }
+
+    /// A delta that updates one session's activity moves it to the correct sorted
+    /// position, and a subsequent identical (empty) refresh republishes the SAME
+    /// order — no transient reordering across merges.
+    func testDeltaActivityUpdateSortsStablyAcrossIdenticalRefresh() async {
+        let store = makeStore()
+        let a = makeSummary(id: "A", lastActive: 100, startedAt: 1)
+        let b = makeSummary(id: "B", lastActive:  50, startedAt: 1)
+        let c = makeSummary(id: "C", lastActive:  30, startedAt: 1)
+        store.sessionListDeltaFetch = { cursor, _ in
+            switch cursor {
+            case nil:
+                return SessionListDeltaResult(
+                    sessions: [a, b, c], tombstones: [], cursor: "seed", total: 3)
+            case "seed":
+                // B receives fresh (foreign) activity and must jump above A.
+                return SessionListDeltaResult(
+                    sessions: [self.makeSummary(id: "B", lastActive: 400, startedAt: 1)],
+                    tombstones: [], cursor: "moved", total: 3)
+            default:
+                // Up-to-date heartbeat: no changes.
+                return SessionListDeltaResult(
+                    sessions: [], tombstones: [], cursor: "moved", total: 3)
+            }
+        }
+
+        await store.refresh()                       // seed
+        XCTAssertEqual(store.visibleSessions.map(\.id), ["A", "B", "C"])
+
+        await store.refresh()                       // activity delta
+        XCTAssertEqual(store.visibleSessions.map(\.id), ["B", "A", "C"],
+            "a delta bumping B's activity moves it to the correct sorted position")
+
+        let orderAfterMove = store.visibleSessions.map(\.id)
+        await store.refresh()                       // identical/empty heartbeat
+        XCTAssertEqual(store.visibleSessions.map(\.id), orderAfterMove,
+            "an identical refresh must republish the same order (stable, no transient reordering)")
     }
 
     /// When `lastActive` is absent, sort falls back to `startedAt` DESC.
@@ -411,6 +581,62 @@ final class SessionRefreshTests: XCTestCase {
 
         XCTAssertEqual(store.sessions.map(\.id), ["B", "A"])
         XCTAssertEqual(store.sessions.first?.lastActive, 400)
+    }
+
+    /// A2: after a reconnect (transport generation advances), the FIRST session-
+    /// list refresh must bypass the persisted delta cursor and do a FULL first-page
+    /// re-seed + fill-to-target, so an under-populated drawer (hydration cut short)
+    /// is repaired without a process restart. Same-generation refreshes still resume
+    /// incremental deltas.
+    func testReconnectForcesFullReseedBeforeDeltasResume() async {
+        let store = makeStore()
+        var generation: UInt64 = 1
+        store.reconnectGenerationProvider = { generation }
+        var seenCursors: [String?] = []
+        let fullPage = (0..<40).map { makeSummary(id: "s\($0)", lastActive: Double(1000 - $0)) }
+        store.sessionListDeltaFetch = { cursor, _ in
+            seenCursors.append(cursor)
+            if cursor == nil {
+                return SessionListDeltaResult(
+                    sessions: fullPage, tombstones: [], cursor: "cur-\(generation)", total: 40)
+            }
+            // A non-nil cursor is an incremental heartbeat: only change-sets, never
+            // the full list — so it can never by itself repair a partial drawer.
+            return SessionListDeltaResult(
+                sessions: [], tombstones: [], cursor: "cur-\(generation)", total: 40)
+        }
+        store.initialFillFetch = { _ in (fullPage, 40) }
+
+        // Cold connect: full seed populates the drawer and sets the cursor.
+        await store.refresh()
+        await store.awaitInitialFillForTesting()
+        XCTAssertGreaterThanOrEqual(store.sessions.count, SessionStore.initialVisibleTarget)
+        XCTAssertEqual(seenCursors, [nil], "the first connect seeds with a nil cursor")
+
+        // A same-generation heartbeat resumes incremental deltas (non-nil cursor).
+        await store.refresh()
+        XCTAssertEqual(seenCursors.last, "cur-1",
+            "a same-generation refresh uses the persisted delta cursor")
+
+        // The drawer regresses to a partial state with the cursor STILL set — the
+        // exact wedge: incremental deltas alone can never refill it.
+        store.sessions = Array(fullPage.prefix(3))
+        store.setPaginationForTesting(loadedCount: 3, loadedOffset: 3, total: 40)
+
+        // Reconnect: the transport generation advances.
+        generation = 2
+        await store.refresh()
+        await store.awaitInitialFillForTesting()
+
+        XCTAssertNil(seenCursors.last!,
+            "the first refresh after a reconnect must FULL-seed with a nil cursor")
+        XCTAssertGreaterThanOrEqual(store.sessions.count, SessionStore.initialVisibleTarget,
+            "after reconnect the drawer is restored to a full list, not left partial")
+
+        // Deltas resume on the new generation's cursor for subsequent refreshes.
+        await store.refresh()
+        XCTAssertEqual(seenCursors.last, "cur-2",
+            "after the reconnect reseed, incremental deltas resume from the new cursor")
     }
 
     func testCursorDeltaTombstonesDropOnlyNonWorkingSetRows() async {
@@ -1140,4 +1366,15 @@ extension SessionSummary {
             cwd: cwd
         )
     }
+}
+
+/// A Sendable one-shot flag for `withObservationTracking`'s `@Sendable` onChange
+/// closure (Swift 6 forbids mutating a captured `var` there). All access is
+/// effectively on the MainActor in these tests; the lock makes it data-race-safe
+/// regardless.
+private final class MutationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _fired = false
+    var fired: Bool { lock.lock(); defer { lock.unlock() }; return _fired }
+    func fire() { lock.lock(); _fired = true; lock.unlock() }
 }

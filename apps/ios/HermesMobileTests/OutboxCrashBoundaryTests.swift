@@ -76,7 +76,7 @@ final class OutboxCrashBoundaryTests: XCTestCase {
             var createdDestinations = 0
             let processor = OutboxProcessor(repository: relaunched, dependencies: .init(
                 currentScope: { scope }, activeStoredSessionID: { activeStored },
-                canProcessPrompt: { true },
+                isTransportReady: { true },
                 createDestination: { _ in
                     createdDestinations += 1
                     activeStored = "stored-created"

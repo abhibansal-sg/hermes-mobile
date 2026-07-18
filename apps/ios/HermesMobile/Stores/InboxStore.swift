@@ -1,6 +1,5 @@
 import Foundation
 #if DEBUG
-import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-G)
 #endif
 
 /// Cache-first, server-reconciled owner of the global approval / clarification inbox.
@@ -105,7 +104,6 @@ final class InboxStore {
 
     /// Number of items still awaiting a response — drives toolbar badges.
     #if DEBUG
-    @Snapshotable
     #endif
     var pendingCount: Int {
         items.lazy.filter(\.state.isVisible).count

@@ -48,7 +48,17 @@ final class OutboxProcessor {
     struct Dependencies {
         var currentScope: () -> WorkScope?
         var activeStoredSessionID: () -> String?
-        var canProcessPrompt: () -> Bool
+        /// Whether the live WebSocket has completed `gateway.ready` and can admit
+        /// transport-backed work. Gates ONLY transport readiness — it no longer
+        /// folds in a global streaming block. Per-session serialization against an
+        /// in-flight turn is handled separately by ``busySessionID`` so a turn
+        /// streaming in ONE session cannot stall drains for every other session.
+        var isTransportReady: () -> Bool
+        /// The stored-session id of a session that currently has a turn streaming
+        /// or a local turn in flight, or `nil` when none is busy. A claimed
+        /// transport job whose destination equals this id waits for that turn;
+        /// session-less / new-session / other-session work drains immediately.
+        var busySessionID: () -> String? = { nil }
         var createDestination: (WorkJob) async throws -> OutboxDestination
         var resolveRuntime: (String) async -> String?
         var uploadAsset: (WorkJob, WorkJobAssetSnapshot) async throws -> OutboxUploadedAsset
@@ -119,6 +129,7 @@ final class OutboxProcessor {
         guard let scope = dependencies.currentScope() else { return }
         while !Task.isCancelled {
             let activeStoredID = dependencies.activeStoredSessionID()
+            let transportReady = dependencies.isTransportReady()
             let job: WorkJob
             do {
                 guard let claimed = try await repository.claimNextJob(
@@ -126,11 +137,13 @@ final class OutboxProcessor {
                     activeStoredSessionID: activeStoredID,
                     enforceSessionAffinity: true,
                     outboxOnly: true,
+                    allowTransportJobs: transportReady,
                     owner: owner,
                     now: Date(),
                     leaseDuration: Self.leaseDuration
                 ) else { return }
                 job = claimed
+                ReliabilityDiagnostics.shared.outboxClaim(identifier: job.jobID)
             } catch {
                 return
             }
@@ -160,8 +173,29 @@ final class OutboxProcessor {
                 return
             }
 
-            guard dependencies.canProcessPrompt() else {
-                try? await repository.releaseLease(id: job.jobID, owner: owner)
+            guard dependencies.isTransportReady() else {
+                ReliabilityDiagnostics.shared.outboxWait()
+                try? await repository.rollbackReadinessRacedLease(
+                    id: job.jobID,
+                    owner: owner
+                )
+                return
+            }
+
+            // Per-session serialization (Lane C fix 1): the destination session
+            // is mid-turn (streaming or a local turn in flight). Submitting a
+            // second prompt into it now would race that turn, so hold ONLY this
+            // job — release the lease without spending a retry and end the pass so
+            // it is not immediately re-claimed. Turn completion re-wakes the
+            // drain. Session-less / other-session work was never gated here, so it
+            // keeps draining while this one session is busy.
+            if let busySession = dependencies.busySessionID(),
+               Self.job(job, targetsSession: busySession) {
+                ReliabilityDiagnostics.shared.outboxWait()
+                try? await repository.rollbackReadinessRacedLease(
+                    id: job.jobID,
+                    owner: owner
+                )
                 return
             }
 
@@ -173,10 +207,9 @@ final class OutboxProcessor {
                 return
             }
 
-            // A streaming/queued/steered acceptance normally flips ChatStore's
-            // local turn token, so stop here. A test or non-chat consumer that
-            // remains idle may continue through the FIFO.
-            if !dependencies.canProcessPrompt() { return }
+            // A successful submit makes its destination session busy; the next
+            // FIFO claim for that same session is held by the per-session gate
+            // above, while session-less / other-session work continues to drain.
         }
     }
 
@@ -291,12 +324,14 @@ final class OutboxProcessor {
         }
         let remotePaths = try await repository.jobAssets(jobID: job.jobID).compactMap(\.link.remotePath)
         dependencies.willSubmit(job, remotePaths)
+        ReliabilityDiagnostics.shared.outboxSubmit(identifier: job.jobID)
         let result: OutboxSubmitResult
         do {
             result = try await dependencies.submit(job, runtimeID, remotePaths)
         } catch {
             // The request may have reached the gateway. Keep `submitting` and
             // release the lease; the next wake retries the same client id.
+            ReliabilityDiagnostics.shared.outboxAmbiguous(identifier: job.jobID)
             try await repository.retainPendingJob(
                 id: job.jobID,
                 owner: owner,
@@ -360,6 +395,13 @@ final class OutboxProcessor {
             // claimant. Never delete on an error path.
             _ = fallbackState
         }
+    }
+
+    /// Whether a claimed job's committed destination is `sessionID`. A job with
+    /// no destination yet (new-session / session-less work) targets no existing
+    /// session, so it is never held by the busy-session gate.
+    private static func job(_ job: WorkJob, targetsSession sessionID: String) -> Bool {
+        (job.destinationSessionID ?? job.storedSessionID) == sessionID
     }
 
     private static func requiresNewDestination(_ job: WorkJob) -> Bool {

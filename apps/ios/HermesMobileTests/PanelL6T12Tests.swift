@@ -213,6 +213,69 @@ final class PanelL6T12Tests: XCTestCase {
         XCTAssertFalse(status.needsConfigUpgrade)
     }
 
+    // MARK: - Build 120 reliability diagnostics
+
+    func testReliabilityDiagnosticsIsBoundedAndKeepsNewestEvents() {
+        let diagnostics = ReliabilityDiagnostics()
+        for index in 0...ReliabilityDiagnostics.capacity {
+            diagnostics.reconnectAttempt(number: index)
+        }
+
+        XCTAssertEqual(diagnostics.events.count, ReliabilityDiagnostics.capacity)
+        XCTAssertEqual(diagnostics.events.first?.sequence, 1)
+        XCTAssertEqual(diagnostics.events.last?.sequence, UInt64(ReliabilityDiagnostics.capacity))
+    }
+
+    func testReliabilityDiagnosticsRedactsIdentifiersAndUsesTypedKinds() throws {
+        let diagnostics = ReliabilityDiagnostics()
+        let secret = "session-token-prompt-title-body"
+        diagnostics.sessionSelected(identifier: secret)
+        diagnostics.cachePaintFinished(rowCount: 3, duration: .milliseconds(12))
+
+        XCTAssertFalse(diagnostics.redactedJSON.contains(secret))
+        XCTAssertTrue(diagnostics.redactedJSON.contains("session_select"))
+        XCTAssertTrue(diagnostics.redactedJSON.contains("idHash"))
+        XCTAssertTrue(diagnostics.redactedJSON.contains("durationMilliseconds"))
+        XCTAssertEqual(diagnostics.events.first?.kind, .sessionSelect)
+    }
+
+    func testReliabilityDiagnosticsCoversLockedEventFamilies() {
+        let diagnostics = ReliabilityDiagnostics()
+        diagnostics.websocketConnect(epoch: 1)
+        diagnostics.websocketReady(epoch: 1)
+        diagnostics.websocketClose(epoch: 1)
+        diagnostics.reconnectAttempt(number: 1)
+        diagnostics.reconnectHeal(epoch: 2)
+        diagnostics.graceStarted(duration: .seconds(1))
+        diagnostics.graceExpired(attempt: 2)
+        diagnostics.epochRejected(expected: 1, received: 2)
+        diagnostics.sessionSelected(identifier: "a")
+        diagnostics.sessionBound(identifier: "a", epoch: 2)
+        diagnostics.sessionSuperseded(identifier: "a")
+        diagnostics.cachePaintStarted(identifier: "a")
+        diagnostics.cachePaintFinished(rowCount: 2, duration: .milliseconds(1))
+        diagnostics.cachePaintFailed(rowCount: 0, duration: .milliseconds(1))
+        diagnostics.outboxWait()
+        diagnostics.outboxClaim(identifier: "job")
+        diagnostics.outboxSubmit(identifier: "job")
+        diagnostics.outboxAmbiguous(identifier: "job")
+        diagnostics.backgroundFlushStarted()
+        diagnostics.foregroundLiveness(alive: true)
+
+        XCTAssertEqual(
+            Set(diagnostics.events.map(\.kind)),
+            Set(ReliabilityDiagnostics.Kind.allCases)
+        )
+    }
+
+    func testGatewayStatusSeparatesPhoneReadinessFromGatewayProcess() {
+        let ready = GatewayStatusView.phoneBadgeState(for: .ready(epoch: 3))
+        let unavailable = GatewayStatusView.phoneBadgeState(for: .unavailable(epoch: 3))
+
+        XCTAssertEqual(ready, GatewayBadgeSnapshot(state: "ready", running: true))
+        XCTAssertEqual(unavailable, GatewayBadgeSnapshot(state: "offline", running: false))
+    }
+
     // MARK: - UsageDay totalTokens (cache-read included)
 
     func testUsageDayTotalTokensIncludesCacheRead() {

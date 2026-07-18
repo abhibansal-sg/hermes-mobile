@@ -138,11 +138,19 @@ final class LiveTurnReentryTests: XCTestCase {
         SessionStatusResponseFixtures.result(named: running ? "running" : "idle")
     }
 
-    private func openResult(runtimeId: String, storedId: String) -> SessionOpenResult {
-        JSONValue.object([
+    private func openResult(
+        runtimeId: String,
+        storedId: String,
+        running: Bool? = nil,
+        inflight: JSONValue? = nil
+    ) -> SessionOpenResult {
+        var payload: [String: JSONValue] = [
             "session_id": .string(runtimeId),
             "resumed": .string(storedId),
-        ]).decoded(as: SessionOpenResult.self)!
+        ]
+        if let running { payload["running"] = .bool(running) }
+        if let inflight { payload["inflight"] = inflight }
+        return JSONValue.object(payload).decoded(as: SessionOpenResult.self)!
     }
 
     private func summary(id: String) -> SessionSummary {
@@ -259,6 +267,70 @@ final class LiveTurnReentryTests: XCTestCase {
         ))
     }
 
+    func testResumeSnapshotRestoresPartialTurnWithoutStatusRoundTrip() async {
+        let (chat, _) = makeStore()
+        chat.seed(from: [
+            storedMessage(role: "user", text: "previous prompt"),
+            storedMessage(role: "assistant", text: "previous reply"),
+        ])
+        var statusRequests = 0
+        chat.liveTurnStatusFetch = { _ in
+            statusRequests += 1
+            return self.status(running: false)
+        }
+
+        await chat.reconcileLiveTurnStatus(
+            runtimeId: runtimeId,
+            snapshotRunning: true,
+            inflight: SessionInflightTurn(
+                user: "write a long answer",
+                assistant: "partial answer",
+                streaming: true
+            )
+        )
+
+        XCTAssertEqual(statusRequests, 0)
+        XCTAssertEqual(chat.messages.suffix(2).map(\.role), [.user, .assistant])
+        XCTAssertEqual(chat.messages.suffix(2).map(\.text), ["write a long answer", "partial answer"])
+        XCTAssertTrue(chat.messages.last?.isStreaming == true)
+        XCTAssertTrue(chat.localTurnInFlight)
+        XCTAssertEqual(chat.interruptTarget, runtimeId)
+    }
+
+    func testRepeatResumeSnapshotDoesNotDuplicateInflightPrompt() async {
+        // Regression: reconcileLiveTurnStatus runs once at open and again on every
+        // reconnect-recovery resume for the same running turn. The prompt bubble
+        // must not multiply across repeat reconciles of one inflight turn.
+        let (chat, _) = makeStore()
+        chat.seed(from: [
+            storedMessage(role: "user", text: "previous prompt"),
+            storedMessage(role: "assistant", text: "previous reply"),
+        ])
+        let inflight = SessionInflightTurn(
+            user: "write a long answer",
+            assistant: "partial answer",
+            streaming: true
+        )
+
+        for _ in 0..<3 {
+            await chat.reconcileLiveTurnStatus(
+                runtimeId: runtimeId,
+                snapshotRunning: true,
+                inflight: inflight
+            )
+        }
+
+        XCTAssertEqual(
+            chat.messages.map(\.role),
+            [.user, .assistant, .user, .assistant],
+            "repeat reconciles of the same inflight turn must not append duplicate prompt bubbles"
+        )
+        XCTAssertEqual(chat.messages.filter { $0.role == .user && $0.text == "write a long answer" }.count, 1)
+        XCTAssertTrue(chat.messages.last?.isStreaming == true)
+        XCTAssertTrue(chat.localTurnInFlight)
+        XCTAssertEqual(chat.interruptTarget, runtimeId)
+    }
+
     func testOpenWaitsForSeedThenRestoresLiveStatus() async {
         let chat = ChatStore()
         let sessions = SessionStore()
@@ -268,7 +340,16 @@ final class LiveTurnReentryTests: XCTestCase {
         sessions.attach(connection: connection, chat: chat)
         sessions.resumeRPC = { [runtimeId, storedId] requested, _ in
             XCTAssertEqual(requested, storedId)
-            return self.openResult(runtimeId: runtimeId, storedId: storedId)
+            return self.openResult(
+                runtimeId: runtimeId,
+                storedId: storedId,
+                running: true,
+                inflight: .object([
+                    "user": .string("current prompt"),
+                    "assistant": .string("partial answer"),
+                    "streaming": .bool(true),
+                ])
+            )
         }
         sessions.transcriptFetch = { [storedId] requested in
             XCTAssertEqual(requested, storedId)
@@ -277,11 +358,9 @@ final class LiveTurnReentryTests: XCTestCase {
                 self.storedMessage(role: "assistant", text: "previous reply"),
             ]
         }
-        chat.liveTurnStatusFetch = { [runtimeId] requested in
-            XCTAssertEqual(requested, runtimeId)
-            XCTAssertEqual(chat.messages.map(\.text), ["previous prompt", "previous reply"],
-                           "live status reconcile should run after the transcript seed has landed")
-            return self.status(running: true)
+        chat.liveTurnStatusFetch = { _ in
+            XCTFail("a current resume snapshot must avoid the legacy session.status round-trip")
+            return self.status(running: false)
         }
         var streamingWhenRuntimeBound: Bool?
         sessions.onActiveRuntimeBound = { streamingWhenRuntimeBound = chat.isStreaming }
@@ -296,7 +375,8 @@ final class LiveTurnReentryTests: XCTestCase {
         XCTAssertTrue(chat.localTurnInFlight)
         XCTAssertEqual(streamingWhenRuntimeBound, true,
                        "the runtime-bound queue drain must see restored busy state, not the pre-status idle gap")
-        XCTAssertEqual(chat.messages.map(\.role), [.user, .assistant, .assistant])
+        XCTAssertEqual(chat.messages.map(\.role), [.user, .assistant, .user, .assistant])
+        XCTAssertEqual(chat.messages.suffix(2).map(\.text), ["current prompt", "partial answer"])
         XCTAssertTrue(chat.messages.last?.isStreaming == true)
     }
 }

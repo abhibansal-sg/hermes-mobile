@@ -148,14 +148,15 @@ extension RestClient {
     /// `GET /api/sessions/{id}/messages[?profile=…]` — stored transcript scoped to
     /// a profile when one is active. With `profile == nil`/empty this is the plain
     /// (shipped) request.
-    func messages(sessionId: String, profile: String?) async throws -> [StoredMessage] {
+    func messages(sessionId: String, profile: String?, shape: String? = nil) async throws -> [StoredMessage] {
         guard let profile, !profile.isEmpty else {
-            return try await messages(sessionId: sessionId)
+            return try await messages(sessionId: sessionId, shape: shape)
         }
         let encodedId = sessionId.addingPercentEncoding(
             withAllowedCharacters: .urlPathAllowed
         ) ?? sessionId
-        let path = "/api/sessions/\(encodedId)/messages?" + Self.profileQuery(profile)
+        var path = "/api/sessions/\(encodedId)/messages?" + Self.profileQuery(profile)
+        if let shape, !shape.isEmpty { path += "&shape=\(shape)" }
         let data = try await get(path: path)
 
         let root = try decodeJSONValue(from: data, context: "messages")
@@ -208,6 +209,25 @@ extension RestClient {
         return (try decode(
             Wrapper.self, from: data, context: "rename", strategy: .useDefaultKeys
         ).title) ?? title
+    }
+
+    /// Profile-scoped archive mutation for aggregate rails. The gateway accepts
+    /// the profile discriminator in the PATCH body alongside `archived`.
+    func setSessionArchived(id: String, archived: Bool, profile: String?) async throws {
+        guard let profile, !profile.isEmpty else {
+            return try await setSessionArchived(id: id, archived: archived)
+        }
+        let encodedId = id.addingPercentEncoding(
+            withAllowedCharacters: .urlPathAllowed
+        ) ?? id
+        let body: JSONValue = .object([
+            "archived": .bool(archived),
+            "profile": .string(profile),
+        ])
+        var request = makeRequest(path: "/api/sessions/\(encodedId)", method: "PATCH")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encodeBody(body, context: "patch")
+        _ = try await perform(request)
     }
 
     // MARK: - Helpers

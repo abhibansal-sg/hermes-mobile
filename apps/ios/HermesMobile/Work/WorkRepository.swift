@@ -508,6 +508,7 @@ actor WorkRepository {
         activeStoredSessionID: String? = nil,
         enforceSessionAffinity: Bool = false,
         outboxOnly: Bool = false,
+        allowTransportJobs: Bool = true,
         owner: String,
         now: Date,
         leaseDuration: TimeInterval
@@ -553,6 +554,19 @@ actor WorkRepository {
                 WorkJobKind.appIntent.rawValue,
             ]
         }
+        let transportSQL: String
+        if allowTransportJobs {
+            transportSQL = ""
+        } else {
+            // Keep local navigation intents claimable while the WebSocket is
+            // unavailable, but leave every transport-backed job untouched.
+            transportSQL = " AND (kind = ? AND intent_kind IN (?, ?))"
+            arguments += [
+                WorkJobKind.appIntent.rawValue,
+                WorkIntentKind.openSessions.rawValue,
+                WorkIntentKind.newSession.rawValue,
+            ]
+        }
 
         return try database.write { db in
             try WorkJob.fetchOne(
@@ -574,6 +588,7 @@ actor WorkRepository {
                           \(scopeSQL)
                           \(affinitySQL)
                           \(outboxSQL)
+                          \(transportSQL)
                         ORDER BY created_at ASC, job_id ASC
                         LIMIT 1
                     )
@@ -638,6 +653,32 @@ actor WorkRepository {
                 sql: """
                     UPDATE work_jobs
                     SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+                    WHERE job_id = ? AND lease_owner = ?
+                    """,
+                arguments: [now.timeIntervalSince1970, id, owner]
+            )
+            return db.changesCount
+        }
+        guard changed == 1 else { throw WorkRepositoryError.leaseLost }
+        await publishObservation()
+    }
+
+    /// Undo a claim whose transport permit was revoked while the repository
+    /// actor was acquiring the lease. No delivery attempt occurred, so the
+    /// claim must not consume the job's retry budget.
+    func rollbackReadinessRacedLease(
+        id: String,
+        owner: String,
+        now: Date = Date()
+    ) async throws {
+        let changed = try await database.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE work_jobs
+                    SET lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        attempt_count = MAX(0, attempt_count - 1),
+                        updated_at = ?
                     WHERE job_id = ? AND lease_owner = ?
                     """,
                 arguments: [now.timeIntervalSince1970, id, owner]
