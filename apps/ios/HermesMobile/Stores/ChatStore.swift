@@ -3691,6 +3691,12 @@ final class ChatStore {
                     let clusterID = uniquePartID(newTools.first?.id ?? id)
                     if toolsChanged || clusterID != id { changed = true }
                     return .tools(id: clusterID, tools: newTools, collapsed: collapsed, turnElapsed: elapsed)
+                case .item(let id, let item):
+                    // Wave-2 item-backed part: its identity is the stable relay
+                    // `item_id`, unique by construction, so the de-dup pass leaves
+                    // it verbatim. (The live store does not emit `.item` today;
+                    // this arm keeps the exhaustive switch total.)
+                    return .item(id: uniquePartID(id), item: item)
                 }
             }
             guard changed else { return message }

@@ -595,6 +595,12 @@ struct MessageBubble: View {
             }
         case .usage(_, let stats):
             usageFooter(stats)
+        case .item(_, let item):
+            // Wave-2 item-backed part (RELAY-PHONE-PROTOCOL §2): the new special
+            // renders (generic tool card, fileChange, image, browser, error)
+            // dispatch through the render-lane seam. Skeleton today; the render
+            // lane fleshes out `ChatItemView`.
+            ChatItemView(item: item)
         }
     }
 
