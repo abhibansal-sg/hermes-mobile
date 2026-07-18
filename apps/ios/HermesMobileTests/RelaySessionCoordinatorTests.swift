@@ -216,6 +216,54 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.phase, .idle)
     }
 
+    /// Switching the projected session via `open` must NOT leak the previous
+    /// session's items. `RelayItemStore.reconcile(snapshot:)` retains items
+    /// absent from the snapshot, so without a reset on switch, session B's
+    /// snapshot would fold on top of session A's and the transcript would render
+    /// both. The coordinator clears the render store on a session switch.
+    func testOpenDifferentSessionDoesNotLeakPreviousSessionItems() async throws {
+        // Each `open` delivers a snapshot scoped to the opened session id.
+        let transport = MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id, upstream.method == "open",
+                  let sid = upstream.params["session_id"] as? String else { return }
+            let itemID = "\(sid)-item"
+            let snapshot = RelayFrame(
+                seq: sid == "A" ? 1 : 2, sid: sid, turn: nil, kind: .snapshot,
+                body: .object([
+                    "items": .array([.object([
+                        "item_id": .string(itemID),
+                        "type": .string(ChatItemType.userMessage.rawValue),
+                        "status": .string("completed"),
+                        "ord": .number(0),
+                        "body": .object(["text": .string("hello from \(sid)")]),
+                    ])]),
+                    "cursor": .number(Double(sid == "A" ? 1 : 2)),
+                ]))
+            relay.deliverFrame(snapshot)
+            relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+        })
+        let chat = ChatStore()
+        let coordinator = RelaySessionCoordinator(
+            chatStore: chat,
+            clientFactory: { RelayClient { _ in transport } }
+        )
+        try await coordinator.start(url: url)
+
+        _ = try await coordinator.open("A")
+        await waitUntil { coordinator.store.items.map(\.itemID) == ["A-item"] }
+
+        _ = try await coordinator.open("B")
+        // The store must hold ONLY session B's item — A's must be gone.
+        await waitUntil { coordinator.store.items.map(\.itemID) == ["B-item"] }
+        XCTAssertEqual(coordinator.store.items.map(\.itemID), ["B-item"],
+                       "opening session B must not retain session A's items")
+        XCTAssertFalse(chat.messages.contains { $0.text.contains("hello from A") },
+                       "transcript must not still show session A's projected content")
+        XCTAssertEqual(coordinator.activeSessionID, "B")
+
+        await coordinator.stop()
+    }
+
     func testCoordinatorRoutesUpstreamOpsToRelay() async throws {
         let transport = MockRelayTransport(script: { upstream, relay in
             guard let id = upstream.id else { return }
