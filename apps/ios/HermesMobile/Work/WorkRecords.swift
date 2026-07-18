@@ -232,61 +232,6 @@ struct WorkDraftAsset: Codable, FetchableRecord, PersistableRecord, Equatable, S
     }
 }
 
-struct WorkTransfer: Codable, FetchableRecord, PersistableRecord, Equatable, Sendable {
-    static let databaseTableName = "transfers"
-
-    var transferID: String
-    var backgroundSessionID: String
-    var taskIdentifier: Int?
-    var direction: String
-    var purpose: String
-    var serverID: String
-    var profileID: String
-    var ownerJobID: String?
-    var sourceRelativePath: String?
-    var destinationRelativePath: String?
-    var requestURL: String
-    var requestMethod: String
-    var mimeType: String?
-    var expectedBytes: Int?
-    var transferredBytes: Int
-    var resumeData: Data?
-    var state: String
-    var attemptCount: Int
-    var nextAttemptAt: Double?
-    var lastErrorCode: String?
-    var lastErrorMessage: String?
-    var createdAt: Double
-    var updatedAt: Double
-    var completedAt: Double?
-
-    enum CodingKeys: String, CodingKey {
-        case transferID = "transfer_id"
-        case backgroundSessionID = "background_session_id"
-        case taskIdentifier = "task_identifier"
-        case direction, purpose
-        case serverID = "server_id"
-        case profileID = "profile_id"
-        case ownerJobID = "owner_job_id"
-        case sourceRelativePath = "source_relative_path"
-        case destinationRelativePath = "destination_relative_path"
-        case requestURL = "request_url"
-        case requestMethod = "request_method"
-        case mimeType = "mime_type"
-        case expectedBytes = "expected_bytes"
-        case transferredBytes = "transferred_bytes"
-        case resumeData = "resume_data"
-        case state
-        case attemptCount = "attempt_count"
-        case nextAttemptAt = "next_attempt_at"
-        case lastErrorCode = "last_error_code"
-        case lastErrorMessage = "last_error_message"
-        case createdAt = "created_at"
-        case updatedAt = "updated_at"
-        case completedAt = "completed_at"
-    }
-}
-
 struct WorkAssetInput: Sendable {
     let data: Data
     let mimeType: String
