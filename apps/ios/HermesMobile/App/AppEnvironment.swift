@@ -130,14 +130,21 @@ final class AppEnvironment {
                 },
                 resolveRuntime: { [weak sessionStore, weak connectionStore] storedID in
                     // Wave-2 relay transport: the durable outbox drains into the
-                    // relay-OWNED session, whose id the coordinator tracks — the
-                    // gateway runtime mapping does not apply. Returning it (non-nil)
-                    // lets the drain reach the relay `submit`; nil (no owned session
-                    // yet) holds the job until the relay owns one. Gateway-direct is
+                    // relay-OWNED session. The relay keys its runtime on the STORED
+                    // session id, so the runtime id for a drain is the job's own
+                    // destination — resolved PER JOB, never collapsed to whatever
+                    // session is currently active. Returning `activeSessionID`
+                    // unconditionally mis-routed every queued row into the on-screen
+                    // session (a prompt queued for A drained into B once the user
+                    // opened B). `outboxRuntimeID(forStored:)` returns the
+                    // destination id only when the relay is driving THAT session,
+                    // else nil to HOLD the row for a later wake — mirroring the
+                    // gateway path's "no runtime mapped ⇒ hold". Gateway-direct is
                     // unchanged (this branch is never taken with the flag OFF).
                     if connectionStore?.relayCoordinator != nil,
                        connectionStore?.transportPath == .relay {
-                        return connectionStore?.relayCoordinator?.activeSessionID
+                        return connectionStore?.relayCoordinator?
+                            .outboxRuntimeID(forStored: storedID)
                     }
                     return await sessionStore?.runtimeForOutboxDestination(storedID)
                 },

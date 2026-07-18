@@ -393,12 +393,67 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(submitFrames.count, 1, "the prompt delivers over the relay exactly once (no dup)")
         XCTAssertEqual(submitFrames.first?.params["prompt"] as? String, "hello over relay")
         XCTAssertEqual(submitFrames.first?.params["session_id"] as? String, "sess-9")
+        // The row's stable id rides the submit so the relay handler can dedupe an
+        // ambiguous-flap retry into a single turn (no duplicate).
+        XCTAssertEqual(
+            submitFrames.first?.params["client_message_id"] as? String,
+            job.clientMessageID
+        )
 
         // Losing the relay closes the gate again.
         await coordinator.stop()
         XCTAssertFalse(connection.isTransportReady, "a stopped relay ⇒ transport not ready")
     }
     #endif
+
+    /// The durable-outbox drain must route PER JOB to its own destination, never
+    /// collapse to whatever session is currently active. A prompt queued for A
+    /// resolves only while the relay is driving A; once the user opens B it holds
+    /// (nil) rather than leaking into B, and the remap `submit` applies to
+    /// `activeSessionID` must not knock the active session's own drain off its
+    /// stored id.
+    func testOutboxRuntimeResolvesPerDestinationNotActiveSession() async throws {
+        let transport = MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id else { return }
+            if upstream.method == "submit" {
+                // Model the origin->live remap: the relay hands back a DISTINCT
+                // live id for the origin session it drove.
+                relay.deliverResult(id: id, result: .object(["session_id": .string("A-live")]))
+            } else {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+            }
+        })
+        let coordinator = RelaySessionCoordinator(
+            chatStore: ChatStore(),
+            clientFactory: { RelayClient { _ in transport } }
+        )
+        try await coordinator.start(url: url)
+
+        // No session driven yet ⇒ every destination holds.
+        XCTAssertNil(coordinator.outboxRuntimeID(forStored: "A"))
+
+        // Relay resumes (drives) A ⇒ only A resolves, to A itself; B holds.
+        _ = try await coordinator.resume("A")
+        XCTAssertEqual(coordinator.outboxRuntimeID(forStored: "A"), "A")
+        XCTAssertNil(coordinator.outboxRuntimeID(forStored: "B"),
+                     "a prompt queued for B must not drain into the active session A")
+
+        // A submit remaps `activeSessionID` to the live id, but the stored-id
+        // routing for A's own follow-up drain must survive that remap.
+        _ = try await coordinator.submit(prompt: "hi", sessionID: "A")
+        XCTAssertEqual(coordinator.activeSessionID, "A-live")
+        XCTAssertEqual(coordinator.outboxRuntimeID(forStored: "A"), "A",
+                       "the remapped live id must not strand A's next queued prompt")
+
+        // Opening B moves the driven session ⇒ A now holds, B resolves.
+        _ = try await coordinator.open("B")
+        XCTAssertNil(coordinator.outboxRuntimeID(forStored: "A"))
+        XCTAssertEqual(coordinator.outboxRuntimeID(forStored: "B"), "B")
+
+        await coordinator.stop()
+        XCTAssertNil(coordinator.outboxRuntimeID(forStored: "B"),
+                     "a stopped relay drives nothing ⇒ all destinations hold")
+    }
 
     func testCoordinatorRoutesUpstreamOpsToRelay() async throws {
         let transport = MockRelayTransport(script: { upstream, relay in
