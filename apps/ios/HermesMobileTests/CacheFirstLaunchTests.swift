@@ -129,6 +129,52 @@ final class CacheFirstLaunchTests: XCTestCase {
                        "second paint is latched — never clobbers a warm list")
     }
 
+    /// A1(i): the persisted `activeProfile` is network-mutated (confirmActiveProfile
+    /// adopts the server-echoed profile), so an OFFLINE cold-open can land on a
+    /// stale concrete profile whose scoped read filters to zero rows. The paint
+    /// must fall back to a serverId-only aggregate read so the drawer is never
+    /// blank when the disk holds the user's chats.
+    func testOfflineColdOpenPaintsUnderStaleConcreteProfile() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        connection.serverURLString = serverURL
+        // Rows stored under the user's real "default" profile.
+        try await cache.saveSessionList(
+            [makeSummary(id: "s1", lastActive: 200, profile: "default"),
+             makeSummary(id: "s2", lastActive: 100, profile: "default")],
+            scope: CacheScope(serverId: serverURL, profileId: "default"))
+        // The persisted active profile drifted to a concrete profile with no rows.
+        sessions.activeProfile = "ghost"
+
+        XCTAssertTrue(sessions.sessions.isEmpty)
+        await sessions.paintFromCache()
+
+        XCTAssertEqual(Set(sessions.sessions.map(\.id)), ["s1", "s2"],
+            "offline cold-open falls back to an aggregate read under a stale profile")
+    }
+
+    /// A1(iii): a row left on disk by an older build, mis-stamped with the literal
+    /// "all" selector, must still paint under a concrete-profile cold-open. The
+    /// aggregate fallback read selects every non-legacy row, so the mis-stamped
+    /// row is recovered without a data migration.
+    func testOfflineColdOpenPaintsRowMisStampedAll() async throws {
+        let (connection, sessions, _) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        connection.serverURLString = serverURL
+        try await cache._writeRawSessionRowForTesting(
+            makeSummary(id: "legacy", lastActive: 150, profile: "default"),
+            serverId: serverURL, profileId: CacheScope.allProfilesKey)
+        sessions.activeProfile = "default"
+
+        XCTAssertTrue(sessions.sessions.isEmpty)
+        await sessions.paintFromCache()
+
+        XCTAssertEqual(sessions.sessions.map(\.id), ["legacy"],
+            "a row mis-stamped \"all\" still paints under a concrete-profile cold-open")
+    }
+
     /// Cold-open frame-0 paint (build125): `paintDrawerCacheFirst()` must paint the
     /// drawer from disk WITHOUT any network step — proving the cache paint precedes
     /// (and does not depend on) the connection bootstrap. hasConnected stays false
