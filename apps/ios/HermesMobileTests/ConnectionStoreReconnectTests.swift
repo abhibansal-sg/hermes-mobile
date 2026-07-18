@@ -1231,4 +1231,141 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertFalse(connection.hasConnected)
         XCTAssertNil(connection.reconnectTask)
     }
+
+    // MARK: - S3: self-reconnect when the network returns (NWPathMonitor seam)
+
+    #if DEBUG
+    /// Deterministic fake `NetworkPathMonitoring`: records lifecycle and lets a
+    /// test push path transitions synchronously on the main actor.
+    @MainActor
+    private final class FakePathMonitor: NetworkPathMonitoring {
+        var onPathUpdate: ((NetworkPathStatus) -> Void)?
+        private(set) var started = false
+        private(set) var cancelled = false
+        func start() { started = true }
+        func cancel() { cancelled = true }
+        func emit(_ status: NetworkPathStatus) { onPathUpdate?(status) }
+    }
+
+    private func withSavedServer(
+        _ server: String,
+        token: String,
+        _ body: () async -> Void
+    ) async {
+        let priorServerURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
+        let priorOffline = UserDefaults.standard.bool(forKey: DefaultsKeys.connectionOffline)
+        KeychainService.deleteToken(server: server)
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.connectionOffline)
+        UserDefaults.standard.set(server, forKey: DefaultsKeys.serverURL)
+        try? KeychainService.saveToken(token, server: server)
+        defer {
+            KeychainService.deleteToken(server: server)
+            if let priorServerURL {
+                UserDefaults.standard.set(priorServerURL, forKey: DefaultsKeys.serverURL)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL)
+            }
+            UserDefaults.standard.set(priorOffline, forKey: DefaultsKeys.connectionOffline)
+        }
+        await body()
+    }
+
+    /// S3 core: a cold-launch-offline store (REST probe failed → terminal
+    /// `.offline`, `hasConnected == false`) reconnects BY ITSELF when the path
+    /// becomes `.satisfied` — no force-quit, no foreground event.
+    func testPathSatisfiedLiftsColdLaunchOfflineAndReconnects() async {
+        let (connection, _, _) = makeStore()
+        connection._skipEnvironmentBootstrapForTesting = true
+        let server = "https://s3-cold.example:9119"
+        await withSavedServer(server, token: "tok") {
+            let fake = FakePathMonitor()
+            connection._pathMonitorForTesting = fake
+            connection.networkReconnectDebounceOverride = .milliseconds(5)
+
+            // Cold-launch-offline: the REST probe throws, so configure returns
+            // terminal `.offline` with `hasConnected == false`, but the monitor
+            // was armed before the probe.
+            connection.statusRPC = { _, _ in throw URLError(.notConnectedToInternet) }
+            connection.connectRPC = { _, _, _ in }
+            _ = await connection.configure(urlString: server, token: "tok")
+
+            guard case .offline = connection.phase else {
+                return XCTFail("cold configure failure must land in .offline, got \(connection.phase)")
+            }
+            XCTAssertFalse(connection.hasConnected)
+            XCTAssertTrue(fake.started, "monitor must be armed even when configure fails offline")
+
+            // Network returns: the probe now succeeds. Emitting `.satisfied`
+            // must self-heal without any further user action.
+            connection.statusRPC = { _, _ in }
+            fake.emit(.satisfied)
+            await settle()
+
+            XCTAssertTrue(connection.hasConnected, "path-satisfied must reconnect from cold offline")
+            if case .offline = connection.phase {
+                XCTFail("still offline after path-satisfied reconnect: \(connection.phase)")
+            }
+        }
+    }
+
+    /// A rapidly flapping path (satisfied/unsatisfied/satisfied…) collapses to a
+    /// SINGLE reconnect attempt via the trailing-edge debounce.
+    func testFlappingPathDebouncesToSingleReconnectAttempt() async {
+        let (connection, _, _) = makeStore()
+        connection._skipEnvironmentBootstrapForTesting = true
+        let server = "https://s3-flap.example:9119"
+        await withSavedServer(server, token: "tok") {
+            let fake = FakePathMonitor()
+            connection._pathMonitorForTesting = fake
+            connection.networkReconnectDebounceOverride = .milliseconds(30)
+
+            let connectCalls = ResumeCallLog()
+            connection.statusRPC = { _, _ in throw URLError(.notConnectedToInternet) }
+            connection.connectRPC = { _, _, _ in await connectCalls.append(server) }
+            _ = await connection.configure(urlString: server, token: "tok")
+            guard case .offline = connection.phase else {
+                return XCTFail("cold configure failure must land in .offline, got \(connection.phase)")
+            }
+            // Probe reachable now; only the trailing debounce should reconnect.
+            connection.statusRPC = { _, _ in }
+
+            // Burst of transitions inside one debounce window (all synchronous on
+            // the main actor, so every `.satisfied` cancels the prior pending
+            // kick before it can run).
+            fake.emit(.satisfied)
+            fake.emit(.unsatisfied)
+            fake.emit(.satisfied)
+            fake.emit(.unsatisfied)
+            fake.emit(.satisfied)
+            await settle()
+
+            let calls = await connectCalls.calls(for: server)
+            XCTAssertEqual(calls, 1, "flapping path must debounce to a single reconnect attempt")
+            XCTAssertTrue(connection.hasConnected)
+        }
+    }
+
+    /// An already-connected store ignores a `.satisfied` path event — no
+    /// reconnect loop, no churn.
+    func testPathSatisfiedIsNoOpWhenAlreadyConnected() async {
+        let (connection, _, _) = makeStore()
+        let server = "https://s3-connected.example:9119"
+        let connectCalls = ResumeCallLog()
+        connection.networkReconnectDebounceOverride = .milliseconds(5)
+        connection.connectRPC = { _, _, _ in await connectCalls.append(server) }
+        let fake = FakePathMonitor()
+        connection._pathMonitorForTesting = fake
+        connection._startPathMonitorForTesting()
+        connection._seedConnectedForTesting(serverURL: server, token: "tok")
+        XCTAssertEqual(connection.phase, .connected)
+
+        fake.emit(.satisfied)
+        await settle()
+
+        XCTAssertEqual(connection.phase, .connected)
+        XCTAssertNil(connection.reconnectTask, "a live connection must not spawn a reconnect loop")
+        let calls = await connectCalls.calls(for: server)
+        XCTAssertEqual(calls, 0, "path-satisfied must be a no-op while connected")
+    }
+    #endif
 }
