@@ -3994,6 +3994,69 @@ final class ChatStore {
         transcriptGeneration = 0
     }
 
+    // MARK: - Wave-2 relay transport projection (RELAY-PHONE-PROTOCOL §2/§7)
+
+    /// Rebuild the visible transcript from the relay item store's reconciled
+    /// items (the NEW relay transport path — docs/RELAY-PHONE-PROTOCOL.md §2).
+    ///
+    /// ADDITIVE + flag-gated: ONLY ``RelaySessionCoordinator`` (reached when the
+    /// `transportPath` flag is `.relay`, default OFF) calls this. The gateway blob
+    /// path never does, so today's streaming rendering is byte-unchanged.
+    ///
+    /// Projection (§2): each `userMessage` item becomes its own right-aligned
+    /// `.user` bubble and flushes the assistant segment before it; every other
+    /// item projects via ``ChatItem/renderPart`` into an ordered assistant
+    /// message — text/reasoning/usage reuse the legacy renderers, the special
+    /// kinds (`toolCall`/`fileChange`/`image`/`browser`/`error`) route through
+    /// `.item` for `ChatItemView`. A non-terminal trailing item keeps the
+    /// assistant bubble streaming. `items` MUST already be in render order (the
+    /// store sorts by `ord`, ties by arrival). Message + part identities are
+    /// derived deterministically from the stable relay ids, so re-projecting on
+    /// every frame is churn-free (SwiftUI diffs cleanly, no bubble re-creation).
+    func applyRelayItems(_ items: [ChatItem]) {
+        var rebuilt: [ChatMessage] = []
+        var segmentParts: [ChatMessagePart] = []
+        var segmentAnchor: String?
+        var segmentStreaming = false
+
+        func flushSegment() {
+            guard let anchor = segmentAnchor, !segmentParts.isEmpty else {
+                segmentParts = []
+                segmentAnchor = nil
+                segmentStreaming = false
+                return
+            }
+            rebuilt.append(ChatMessage(
+                id: ChatMessage.deterministicID(seedKey: "relay-assistant-\(anchor)"),
+                role: .assistant,
+                parts: segmentParts,
+                isStreaming: segmentStreaming
+            ))
+            segmentParts = []
+            segmentAnchor = nil
+            segmentStreaming = false
+        }
+
+        for item in items {
+            if item.type == .userMessage {
+                flushSegment()
+                rebuilt.append(ChatMessage(
+                    id: ChatMessage.deterministicID(seedKey: "relay-user-\(item.itemID)"),
+                    role: .user,
+                    parts: [.text(id: item.itemID, text: item.textBody)]
+                ))
+            } else if let part = item.renderPart {
+                if segmentAnchor == nil { segmentAnchor = item.itemID }
+                segmentParts.append(part)
+                if !item.isTerminal { segmentStreaming = true }
+            }
+        }
+        flushSegment()
+
+        messages = rebuilt
+        setStreaming(rebuilt.contains { $0.isStreaming }, reason: "relayProjection")
+    }
+
     /// Surface a failed `open()`-path transcript seed the same way a failed
     /// `backfill()` is surfaced, so ChatView renders a recoverable error state
     /// (with retry via `backfill()`) instead of the infinite "Loading
