@@ -2480,6 +2480,18 @@ final class ChatStore {
         }
     }
 
+    /// Remove the optimistic user echo for a durable outbox row that the user
+    /// chose to Delete from its transcript error badge (C1). Correlates by the
+    /// shared `clientMessageID`; the QueueStore cancels/deletes the row itself.
+    /// A no-op when the echo is already gone (e.g. a late server-seeded replace).
+    func removeLocalEcho(clientMessageID: String) {
+        guard let index = messages.firstIndex(where: {
+            $0.role == .user && $0.clientMessageID == clientMessageID
+        }) else { return }
+        let removed = messages.remove(at: index)
+        userOrdinals[removed.id] = nil
+    }
+
     private func presentOutboxEcho(
         clientMessageID: String,
         text: String,
