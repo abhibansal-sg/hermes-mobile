@@ -474,6 +474,72 @@ final class ConnectionStore {
     /// The single, long-lived gateway client.
     let client = HermesGatewayClient()
 
+    /// Wave-2 relay transport bridge (docs/RELAY-PHONE-PROTOCOL.md). Owns the
+    /// live `RelayClient` and projects its item stream into the transcript. Only
+    /// created when ``transportPath`` resolves to `.relay` (default OFF = the
+    /// gateway `client` above is used instead), so the gateway-direct path never
+    /// allocates it. Read via ``ensureRelayCoordinator()``.
+    private(set) var relayCoordinator: RelaySessionCoordinator?
+
+    /// Test seam: inject a coordinator wired to a mock relay before `configure`.
+    #if DEBUG
+    var relayCoordinatorFactory: (() -> RelaySessionCoordinator)?
+    #endif
+
+    /// Lazily build (once) and return the relay bridge for the active chat store.
+    @discardableResult
+    func ensureRelayCoordinator() -> RelaySessionCoordinator {
+        if let relayCoordinator { return relayCoordinator }
+        #if DEBUG
+        let created = relayCoordinatorFactory?() ?? RelaySessionCoordinator(chatStore: chatStore)
+        #else
+        let created = RelaySessionCoordinator(chatStore: chatStore)
+        #endif
+        relayCoordinator = created
+        return created
+    }
+
+    /// The selected transport (Wave-2 convergence). Default `.gatewayDirect`
+    /// (OFF) — byte-identical to every existing install. In DEBUG a launch env
+    /// override (`HERMES_TRANSPORT=relay`, or the presence of `HERMES_RELAY_URL`)
+    /// forces `.relay` for the simulator E2E WITHOUT a Settings round-trip; the
+    /// override is DEBUG-only so a release build can never be flipped by env.
+    var transportPath: TransportPath {
+        #if DEBUG
+        let env = ProcessInfo.processInfo.environment
+        if env["HERMES_TRANSPORT"]?.lowercased() == "relay" || env["HERMES_RELAY_URL"] != nil {
+            return .relay
+        }
+        #endif
+        return DefaultsKeys.transportPathValue()
+    }
+
+    /// The relay WS URL to dial when ``transportPath`` is `.relay`. In DEBUG the
+    /// `HERMES_RELAY_URL` env var wins (the E2E points the app at the isolated
+    /// relay); otherwise it is derived from the gateway base URL (http→ws,
+    /// https→wss) with the ratified `/relay` path (§1).
+    func relayURL(forGateway gatewayURL: URL) -> URL? {
+        #if DEBUG
+        if let raw = ProcessInfo.processInfo.environment["HERMES_RELAY_URL"],
+           let override = URL(string: raw) {
+            return override
+        }
+        #endif
+        var components = URLComponents(url: gatewayURL, resolvingAgainstBaseURL: false)
+        components?.scheme = gatewayURL.scheme == "https" ? "wss" : "ws"
+        components?.path = "/relay"
+        components?.queryItems = nil
+        return components?.url
+    }
+
+    /// Test seam mirroring ``connectRPC``: when set, the relay-transport branch of
+    /// `configure` calls this instead of `relayCoordinator.start` so a test can
+    /// assert the relay path was selected without a live socket. `nil` in
+    /// production.
+    #if DEBUG
+    var relayConnectHook: ((_ relayURL: URL, _ token: String) async throws -> Void)?
+    #endif
+
     /// The accepted transport generation. Runtime bindings use this value to
     /// reject work produced by a prior socket after reconnect.
     private(set) var transportEpoch: UInt64 = 0
@@ -1304,7 +1370,25 @@ final class ConnectionStore {
 
         do {
             beginTransportAttempt()
-            if let connectRPC {
+            // Wave-2 convergence: when the transport flag is `.relay`, dial the
+            // relay WS through the RelayClient bridge INSTEAD of the gateway-direct
+            // socket — decoded item frames stream into the transcript via the item
+            // layer. The gateway `client` stays idle. `.gatewayDirect` (default,
+            // OFF) is the original branch below, byte-unchanged.
+            if transportPath == .relay {
+                guard let relayURL = relayURL(forGateway: url) else {
+                    throw RelayError.transport("Could not derive a relay URL for \(trimmedURL)")
+                }
+                #if DEBUG
+                if let relayConnectHook {
+                    try await relayConnectHook(relayURL, trimmedToken)
+                } else {
+                    try await ensureRelayCoordinator().start(url: relayURL, token: trimmedToken)
+                }
+                #else
+                try await ensureRelayCoordinator().start(url: relayURL, token: trimmedToken)
+                #endif
+            } else if let connectRPC {
                 try await connectRPC(url, trimmedToken, connectionMode)
             } else {
                 try await client.connect(baseURL: url, token: trimmedToken, mode: connectionMode)
@@ -1666,6 +1750,9 @@ final class ConnectionStore {
             Self.clearSpotlightSessionIndexForPrivacy()
         }
         await client.disconnect()
+        // Wave-2: tear down the relay bridge too, but ONLY if it was ever built
+        // (the gateway-direct default never allocates it — byte-identical path).
+        if let relayCoordinator { await relayCoordinator.stop() }
         guard isCurrentGeneration(generation) else { return }
         if let finalPhase { phase = finalPhase }
     }
