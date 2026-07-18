@@ -65,7 +65,12 @@ actor CacheStore {
         }
 
         let queue = try DatabaseQueue(path: dbURL.path, configuration: config)
-        try CacheSchema.makeMigrator().migrate(queue)
+        // Resilient, NON-erasing migration: on failure it attempts one bounded,
+        // data-preserving repair and retries rather than wiping the owner's real
+        // chats. If migration is truly impossible it rethrows; AppEnvironment then
+        // leaves the cache nil and the app runs network-only (the cache is a pure
+        // accelerator), but the on-disk database is preserved for a later build.
+        try CacheSchema.migrateResiliently(queue)
         self.db = queue
     }
 
