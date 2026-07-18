@@ -3376,6 +3376,20 @@ final class SessionStore {
         self.loadedOffset = loadedOffset
         self.totalSessions = total
     }
+
+    /// Read-only accessor to the wired connection so tests can seed a ready
+    /// transport (`ConnectionStore._seedConnectedForTesting`) without threading the
+    /// store through their own graph builder.
+    var connectionForTesting: ConnectionStore? { connection }
+
+    /// Stamp the active runtime binding (id + the transport epoch it was minted
+    /// under) exactly as a live resume would, so the `ensureActiveRuntime`
+    /// fast-path — which now requires a transport-ready connection AND a matching
+    /// epoch (#210) — is deterministically exercisable without a gateway.
+    func _bindActiveRuntimeForTesting(id: String, epoch: UInt64) {
+        activeRuntimeId = id
+        activeRuntimeEpoch = epoch
+    }
     #endif
 
     /// Resolve the page fetch for ``runInitialFill(generation:)``: the injected
