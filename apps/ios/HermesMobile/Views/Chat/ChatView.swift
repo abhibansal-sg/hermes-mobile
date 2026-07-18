@@ -8,6 +8,9 @@ struct ChatView: View {
     @Environment(ChatStore.self) private var chatStore
     @Environment(ConnectionStore.self) private var connectionStore
     @Environment(SessionStore.self) private var sessionStore
+    /// Drives the per-bubble send-state badge (C1): a bubble's delivery state is
+    /// read from its correlated outbox row by `clientMessageID`.
+    @Environment(QueueStore.self) private var queueStore
     @Environment(AttachmentStore.self) private var attachmentStore
     @Environment(InboxStore.self) private var inboxStore
     @Environment(ThemeStore.self) private var themeStore
@@ -928,6 +931,12 @@ struct ChatView: View {
                     // row is `allRows[index - 1]` — correct even for the first
                     // windowed row, which looks back at the off-window message above.
                     let previous = index > 0 ? allRows[index - 1].element : nil
+                    // C1: correlate this bubble to its durable outbox row by the
+                    // shared client id. Only optimistic user echoes carry one, so
+                    // seeded/assistant rows skip the lookup and stay `.none`.
+                    let delivery: QueueStore.SendDelivery = message.role == .user
+                        ? (message.clientMessageID.map { queueStore.delivery(forClientMessageID: $0) } ?? .none)
+                        : .none
                     MessageBubble(
                         message: message,
                         onEdit: editHandler,
@@ -939,7 +948,10 @@ struct ChatView: View {
                         menuActionsEnabled: menuActionsEnabled,
                         assistantTurnActionsEnabled: !chatStore.isStreaming,
                         liveTurnStartedAt: chatStore.turnStartedAt,
-                        appearance: BubbleAppearance(themeID: theme.id, colorScheme: colorScheme, typeSize: dynamicTypeSize)
+                        appearance: BubbleAppearance(themeID: theme.id, colorScheme: colorScheme, typeSize: dynamicTypeSize),
+                        delivery: delivery,
+                        onResend: deliveryResendHandler(for: delivery),
+                        onDeleteFailedSend: deliveryDeleteHandler(for: delivery, clientMessageID: message.clientMessageID)
                     )
                     // A1 (scarf): settled bubbles short-circuit their body — only the
                     // streaming bubble (whose `message` changed) re-evaluates. Drops the
@@ -2339,6 +2351,31 @@ struct ChatView: View {
                     sessionStore.land(storedId: ids.storedId, runtimeId: ids.runtimeId)
                 } catch {
                     // The store already surfaced `lastError`; nothing more to do.
+                }
+            }
+        }
+    }
+
+    /// "Resend" handler for a failed user bubble (C1): re-drives the existing
+    /// outbox row via the QueueStore. `nil` unless the bubble is actually failed,
+    /// so healthy bubbles carry no action.
+    private func deliveryResendHandler(for delivery: QueueStore.SendDelivery) -> (() -> Void)? {
+        guard case .failed(let id) = delivery else { return nil }
+        return { Task { await queueStore.resend(id: id) } }
+    }
+
+    /// "Delete" handler for a failed user bubble (C1): cancels the outbox row AND
+    /// removes the local transcript echo. `nil` unless the bubble is failed.
+    private func deliveryDeleteHandler(
+        for delivery: QueueStore.SendDelivery,
+        clientMessageID: String?
+    ) -> (() -> Void)? {
+        guard case .failed(let id) = delivery else { return nil }
+        return {
+            Task {
+                await queueStore.remove(id: id)
+                if let clientMessageID {
+                    chatStore.removeLocalEcho(clientMessageID: clientMessageID)
                 }
             }
         }
