@@ -101,6 +101,15 @@ final class RelaySessionCoordinator {
 
     /// The session whose item stream is currently projected into ``ChatStore``.
     private(set) var activeSessionID: String?
+    /// The STORED (durable/origin) id of the session the coordinator is currently
+    /// driving — set whenever a session is opened/resumed/started by its stored
+    /// id, and (unlike ``activeSessionID``) never remapped to the live id a
+    /// `submit` returns. The relay keys its runtime on the stored session id
+    /// (`SessionStore.bindRelayRuntime`), so this is the stable identity the
+    /// durable-outbox drain routes against: a queued prompt may drain over the
+    /// relay only when its destination IS the session the relay is driving, so a
+    /// prompt queued for A never leaks into B just because B is now on screen.
+    private(set) var activeStoredSessionID: String?
     /// The render-lane reconciled item set (mirrors the client store; the source
     /// of truth the transcript is projected from).
     private(set) var store = RelayItemStore()
@@ -202,6 +211,7 @@ final class RelaySessionCoordinator {
 
         if let sessionID {
             activeSessionID = sessionID
+            activeStoredSessionID = sessionID
             _ = try await client.open(sessionID)
         }
     }
@@ -232,6 +242,7 @@ final class RelaySessionCoordinator {
         client = nil
         store = RelayItemStore()
         activeSessionID = nil
+        activeStoredSessionID = nil
         phase = .idle
     }
 
@@ -322,14 +333,36 @@ final class RelaySessionCoordinator {
     }
 
     /// Start a new turn (or send into `activeSessionID`) and, on success, adopt
-    /// the returned session id so subsequent ops target it.
+    /// the returned session id so subsequent ops target it. `clientMessageID`
+    /// carries the durable outbox row's stable id so the relay SUBMIT handler can
+    /// dedupe a retry that follows a socket-flap-ambiguous submit (the RPC result
+    /// was lost after the relay already ran `prompt_submit`) instead of running a
+    /// second turn.
     @discardableResult
-    func submit(prompt: String, sessionID: String? = nil) async throws -> JSONValue {
+    func submit(
+        prompt: String,
+        sessionID: String? = nil,
+        clientMessageID: String? = nil
+    ) async throws -> JSONValue {
         let target = sessionID ?? activeSessionID
-        let result = try await requireClient().submit(sessionID: target, prompt: prompt)
+        let result = try await requireClient().submit(
+            sessionID: target, prompt: prompt, clientMessageID: clientMessageID
+        )
         if let sid = result["session_id"]?.stringValue { activeSessionID = sid }
         else if activeSessionID == nil, let target { activeSessionID = target }
         return result
+    }
+
+    /// The relay runtime id a durable-outbox row destined for `storedID` must
+    /// drain to, or `nil` to HOLD the row for a later wake. The relay keys its
+    /// runtime on the stored session id, so the runtime id is the destination id
+    /// itself — but only when that destination IS the session the relay is
+    /// currently driving. Returning a runtime for any other destination would
+    /// mis-route the prompt into the active session (drain-into-wrong-session);
+    /// holding instead defers the drain until that session is on the relay,
+    /// mirroring the gateway path's "no runtime mapped ⇒ hold".
+    func outboxRuntimeID(forStored storedID: String) -> String? {
+        activeStoredSessionID == storedID ? storedID : nil
     }
 
     /// Resume + own an idle/terminal session, then adopt it as active.
@@ -339,6 +372,7 @@ final class RelaySessionCoordinator {
         resetItemStoreForSessionSwitch(to: sessionID)
         let result = try await client.resumeSession(sessionID)
         activeSessionID = sessionID
+        activeStoredSessionID = sessionID
         return result
     }
 
@@ -349,6 +383,7 @@ final class RelaySessionCoordinator {
         resetItemStoreForSessionSwitch(to: sessionID)
         let result = try await client.open(sessionID)
         activeSessionID = sessionID
+        activeStoredSessionID = sessionID
         return result
     }
 

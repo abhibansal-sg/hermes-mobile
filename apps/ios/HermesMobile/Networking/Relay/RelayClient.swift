@@ -177,10 +177,17 @@ actor RelayClient {
     // MARK: - Upstream session ops (§5)
 
     /// Start a NEW chat, or send into an existing session when `sessionID` is set.
+    /// `clientMessageID` (the durable outbox row's stable id) is forwarded so the
+    /// relay SUBMIT handler can dedupe an ambiguous-flap retry into a single turn.
     @discardableResult
-    func submit(sessionID: String? = nil, prompt: String) async throws -> JSONValue {
+    func submit(
+        sessionID: String? = nil,
+        prompt: String,
+        clientMessageID: String? = nil
+    ) async throws -> JSONValue {
         var params: [String: JSONValue] = ["prompt": .string(prompt)]
         if let sessionID { params["session_id"] = .string(sessionID) }
+        if let clientMessageID { params["client_message_id"] = .string(clientMessageID) }
         return try await request(.submit, params: .object(params))
     }
 

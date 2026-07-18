@@ -2496,9 +2496,15 @@ final class ChatStore {
            connection?.transportPath == .relay {
             prepareOutboxSubmission(job: job, remotePaths: remotePaths)
             lastSendReachedServer = true
+            // Thread the durable row's stable id so an ambiguous-flap retry (the
+            // submit threw after the relay already ran `prompt_submit`, so the
+            // outbox retains the row and the next wake resubmits the SAME job) is
+            // deduped by the relay SUBMIT handler into a single turn — parity with
+            // the gateway path's `client_message_id` (see below).
             _ = try await coordinator.submit(
                 prompt: job.submissionText,
-                sessionID: runtimeSessionID
+                sessionID: runtimeSessionID,
+                clientMessageID: job.clientMessageID
             )
             return OutboxSubmitResult(
                 status: "queued",
