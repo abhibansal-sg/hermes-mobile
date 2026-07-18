@@ -1,10 +1,10 @@
 import SwiftUI
 import OSLog
+import Network  // NWPathMonitor — S3 self-reconnect when the network returns
 #if canImport(UIKit)
 import UIKit  // UIDevice.current.name — the auto-upgrade device-name hint (W3A-A)
 #endif
 #if DEBUG
-import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-G)
 #endif
 
 /// A model pick made on a DRAFT chat (no gateway session yet) — pends until
@@ -30,6 +30,19 @@ struct DraftModelSelection: Codable, Equatable, Sendable {
 final class ConnectionStore {
     private static let log = Logger(subsystem: "HermesMobile", category: "ConnectionStore")
 
+    /// Operational WebSocket capability for the current transport generation.
+    ///
+    /// This is intentionally separate from ``Phase``. In particular, `.connected`
+    /// is retained during the silent reconnect grace window as presentation policy,
+    /// while this value becomes `.unavailable` immediately when its socket drops.
+    enum TransportReadiness: Equatable {
+        case unconfigured
+        case connecting(epoch: UInt64)
+        case ready(epoch: UInt64)
+        case unavailable(epoch: UInt64)
+        case reauthRequired
+    }
+
     #if DEBUG
     /// Test seam for privacy-sensitive Spotlight purges. `nil` in app runs so the
     /// production path calls ``SpotlightIndexer.clearAll`` directly.
@@ -54,14 +67,22 @@ final class ConnectionStore {
 
     /// Current high-level connection phase.
     var phase: Phase = .connecting {
-        didSet { notifyReadinessWaiters() }
+        didSet {
+            notifyReadinessWaiters()
+            switch phase {
+            case .needsSetup, .offline:
+                resolveAllTransportReadinessWaiters(with: false)
+            case .connecting, .hydrating, .connected, .reconnecting:
+                break
+            }
+        }
     }
     #if DEBUG
     /// JSON-safe mirror of ``phase`` for the gstack debug bridge snapshot
     /// (task UI-G). `phase` is a Swift enum and not JSON-serializable, so the
     /// generated StateServer accessor reads this stable String label instead.
     /// Wrapped in `#if DEBUG` so it does not exist in Release.
-    @Snapshotable var phaseLabel: String {
+    var phaseLabel: String {
         switch phase {
         case .needsSetup: return "needsSetup"
         case .connecting: return "connecting"
@@ -80,7 +101,6 @@ final class ConnectionStore {
     #endif
     /// The server base URL string (persisted in UserDefaults).
     #if DEBUG
-    @Snapshotable
     #endif
     var serverURLString: String = ""
 
@@ -131,7 +151,6 @@ final class ConnectionStore {
     /// health and must never gate the composer: the shared token remains live, so
     /// the chat stays usable while the user revokes an unused device and retries.
     #if DEBUG
-    @Snapshotable
     #endif
     var deviceLimitAdvisory: String?
 
@@ -442,10 +461,9 @@ final class ConnectionStore {
     /// Silent-reconnect grace window for a dead socket found on a cold app
     /// open / foreground (as opposed to a drop witnessed live) — STR-973A.
     /// Shorter than `transientGraceWindow`: a cold-open dead socket is far
-    /// more often a stale-suspend reconnect than a real outage. Reserved for
-    /// the foreground/cold-open detection path; not yet wired into
-    /// `handleScenePhase` in this change (kept out of scope — see issue
-    /// notes). Named so the test can pin it.
+    /// more often a stale-suspend reconnect than a real outage. Used by the
+    /// foreground/cold-open detection path in `handleScenePhase`. Named so the
+    /// test can pin it.
     static let coldOpenGraceWindow: Duration = .seconds(5)
 
     /// Hard ceiling for a cold push tap that arrives before bootstrap/configure
@@ -455,6 +473,21 @@ final class ConnectionStore {
 
     /// The single, long-lived gateway client.
     let client = HermesGatewayClient()
+
+    /// The accepted transport generation. Runtime bindings use this value to
+    /// reject work produced by a prior socket after reconnect.
+    private(set) var transportEpoch: UInt64 = 0
+
+    /// The authoritative operational state for WebSocket RPC admission.
+    private(set) var transportReadiness: TransportReadiness = .unconfigured
+
+    /// `true` only after the current socket has completed `gateway.ready` and
+    /// while no presentation-grace window is masking a dropped transport.
+    var isTransportReady: Bool {
+        guard !isInGrace else { return false }
+        if case .ready = transportReadiness { return true }
+        return false
+    }
 
     /// Which branch-only server features the connected gateway supports (E1).
     /// Probed after a successful configure/connect; views gate on it so one
@@ -593,12 +626,136 @@ final class ConnectionStore {
     /// belonged to the prior gateway.
     private var connectionGeneration: UInt64 = 0
     private var readinessWaiters: [CheckedContinuation<Void, Never>] = []
+    private var transportReadinessWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var transportReadinessTimeouts: [UUID: Task<Void, Never>] = [:]
 
     @discardableResult
     private func advanceConnectionGeneration() -> UInt64 {
         connectionGeneration &+= 1
+        setTransportReadiness(.unconfigured, resolveWaiters: true)
+        sessionStore.transportDidBecomeUnavailable()
         sessionStore.invalidateConnectionWork()
         return connectionGeneration
+    }
+
+    /// Wait for an operationally-ready WebSocket. A visible `.connected` phase
+    /// during silent grace intentionally does not satisfy this contract.
+    ///
+    /// Waiters survive transient `.unavailable → .connecting` retries. They end
+    /// only on readiness, a terminal setup/auth state, cancellation, timeout, or
+    /// replacement of the owning connection generation.
+    func waitForTransportReady(timeout: Duration) async -> Bool {
+        if isTransportReady { return true }
+        if isTransportTerminal { return false }
+
+        let id = UUID()
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                guard !self.isTransportReady, !self.isTransportTerminal else {
+                    continuation.resume(returning: self.isTransportReady)
+                    return
+                }
+
+                self.transportReadinessWaiters[id] = continuation
+                self.transportReadinessTimeouts[id] = Task { [weak self] in
+                    do {
+                        try await Task.sleep(for: timeout)
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    self?.resolveTransportReadinessWaiter(id: id, with: false)
+                }
+            }
+        }, onCancel: {
+            Task { @MainActor [weak self] in
+                self?.resolveTransportReadinessWaiter(id: id, with: false)
+            }
+        })
+    }
+
+    private var isTransportTerminal: Bool {
+        if reauthRequired { return true }
+        switch phase {
+        case .needsSetup, .offline:
+            return true
+        case .connecting, .hydrating, .connected, .reconnecting:
+            return false
+        }
+    }
+
+    private func beginTransportAttempt() {
+        // Reserve the next epoch for this handshake, but do not publish it as
+        // accepted until `gateway.ready` has completed. Failed retries therefore
+        // never create a runtime epoch that callers could bind to.
+        let candidateEpoch = transportEpoch &+ 1
+        ReliabilityDiagnostics.shared.websocketConnect(epoch: candidateEpoch)
+        setTransportReadiness(.connecting(epoch: candidateEpoch))
+    }
+
+    private func acceptCurrentTransport() {
+        guard case .connecting(let epoch) = transportReadiness,
+              epoch == transportEpoch &+ 1 else { return }
+        transportEpoch = epoch
+        ReliabilityDiagnostics.shared.websocketReady(epoch: epoch)
+        setTransportReadiness(.ready(epoch: epoch), resolveWaiters: true)
+    }
+
+    private func markTransportUnavailable() {
+        switch transportReadiness {
+        case .ready(let epoch), .connecting(let epoch), .unavailable(let epoch):
+            ReliabilityDiagnostics.shared.websocketClose(epoch: epoch)
+            setTransportReadiness(.unavailable(epoch: epoch))
+            // The stored selection survives grace/reconnect, but its runtime id
+            // was minted by the dropped socket and is no longer admissible.
+            sessionStore.transportDidBecomeUnavailable()
+        case .unconfigured, .reauthRequired:
+            break
+        }
+    }
+
+    private func requireTransportReauthentication() {
+        setTransportReadiness(.reauthRequired, resolveWaiters: true)
+    }
+
+    private func setTransportReadiness(
+        _ readiness: TransportReadiness,
+        resolveWaiters: Bool = false
+    ) {
+        transportReadiness = readiness
+        if resolveWaiters {
+            let result: Bool
+            if case .ready = readiness {
+                result = true
+            } else {
+                result = false
+            }
+            resolveAllTransportReadinessWaiters(with: result)
+        }
+        if case .ready = readiness {
+            // A fresh transport permit must kick the durable outbox immediately.
+            // The drain gate is edge-triggered, not polled — without this wake a
+            // queued prompt would idle until the next unrelated wake source fired.
+            queueStore?.wake()
+        }
+    }
+
+    private func resolveTransportReadinessWaiter(id: UUID, with result: Bool) {
+        transportReadinessTimeouts.removeValue(forKey: id)?.cancel()
+        transportReadinessWaiters.removeValue(forKey: id)?.resume(returning: result)
+    }
+
+    private func resolveAllTransportReadinessWaiters(with result: Bool) {
+        let waiters = transportReadinessWaiters
+        transportReadinessWaiters.removeAll()
+        let timeouts = transportReadinessTimeouts
+        transportReadinessTimeouts.removeAll()
+        timeouts.values.forEach { $0.cancel() }
+        waiters.values.forEach { $0.resume(returning: result) }
     }
 
     private func isCurrentGeneration(_ generation: UInt64) -> Bool {
@@ -697,6 +854,25 @@ final class ConnectionStore {
     /// written — never cleared — so `await value` resolves once and only once.
     var lastReconnectTask: Task<Void, Never>?
     func waitForReconnectForTesting() async { await lastReconnectTask?.value }
+
+    /// Injectable path monitor (tests). When non-nil, `startPathMonitor()` wires
+    /// this fake instead of building a live `NWPathMonitor` adapter, so path
+    /// transitions can be emitted deterministically without real hardware.
+    /// Pattern mirrors `connectRPC`/`probeLivenessRPC`. `nil` in production.
+    var _pathMonitorForTesting: NetworkPathMonitoring?
+
+    /// Injectable network-reconnect debounce (tests). When non-nil, the
+    /// path-satisfied trigger uses this instead of `networkReconnectDebounce` so
+    /// flapping/single-attempt tests don't wait a real second.
+    var networkReconnectDebounceOverride: Duration?
+
+    /// Test seam: wire + start the path monitor without going through a full
+    /// `configure()` (used by the already-connected no-op test, which seeds the
+    /// connected state directly).
+    func _startPathMonitorForTesting() { startPathMonitor() }
+
+    /// Test observability: whether a path monitor is currently armed.
+    var _pathMonitorIsRunningForTesting: Bool { pathMonitor != nil }
     #endif
 
     /// Tasks that live as long as the client: the event router and the
@@ -752,6 +928,27 @@ final class ConnectionStore {
     /// phase immediately at expiry, rather than waiting for the loop's next
     /// iteration (which could be a full backoff delay away).
     private var currentReconnectAttempt = 0
+
+    // MARK: - Network path monitoring (S3 — self-reconnect)
+
+    /// The single network-path monitor owned by this store (S3). Started in
+    /// `configure()` — so even a cold-launch-offline configure whose REST probe
+    /// fails (`phase = .offline`, `hasConnected == false`) leaves a live monitor
+    /// armed — and torn down in `stopLiveWork()` (disconnect / forget / explicit
+    /// offline). When the path transitions to `.satisfied` while we are stalled
+    /// (`.offline` or `.reconnecting`), it kicks the EXISTING reconnect entry
+    /// point (`startReconnectLoop`, or `bootstrap()` for the cold case) behind a
+    /// debounce — it never invents a new connect path.
+    private var pathMonitor: NetworkPathMonitoring?
+    /// Debounced trailing-edge trigger for a path-satisfied reconnect. Cancelled
+    /// and replaced on every fresh `.satisfied`, so a rapidly flapping path
+    /// (satisfied/unsatisfied/satisfied…) collapses to a SINGLE reconnect attempt.
+    private var networkReconnectDebounceTask: Task<Void, Never>?
+    /// Debounce window between a `.satisfied` path event and the reconnect kick.
+    /// Short enough to feel instant, long enough to absorb interface flapping
+    /// (Wi-Fi↔cellular handoff, VPN re-handshake) into one attempt.
+    private static let networkReconnectDebounce: Duration = .seconds(1)
+
     /// The in-flight post-connect hydration coordinator, if any (ABH-82). Owns
     /// the `.hydrating → .connected` transition and the timeout fallback;
     /// cancelled on disconnect so a teardown mid-hydration can't later flip the
@@ -851,13 +1048,13 @@ final class ConnectionStore {
     }
 
     private func bootstrap(generation: UInt64) async {
-        if UserDefaults.standard.string(forKey: DefaultsKeys.serverURL) == nil,
-           UserDefaults.standard.data(forKey: DefaultsKeys.gatewayCleanupTombstone) != nil {
-            // A prior Forget may have been terminated after credentials were
-            // removed but before every idempotent local owner ran. Resume it.
-            await forgetGateway()
-            return
-        }
+        // Reconcile any pending gateway-forget tombstone against the CURRENT
+        // pairing BEFORE the cache-first paint path runs. A stale tombstone left
+        // by a forget whose remote revoke failed must NOT suppress the cache of a
+        // server the user has since RE-PAIRED under a new device — cached content
+        // for a currently-paired server always paints (LANE A). If this resumes a
+        // genuinely-interrupted forget, it returns `true` and bootstrap aborts.
+        if await reconcilePendingForgetTombstone() { return }
         if UserDefaults.standard.bool(forKey: DefaultsKeys.connectionOffline) {
             if let savedURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL), !savedURL.isEmpty {
                 await paintCacheFirst(serverURLString: savedURL)
@@ -946,6 +1143,31 @@ final class ConnectionStore {
     private func enterDraftAfterBootstrapConfigure() {
         guard phase != .needsSetup else { return }
         enterDraftIfNoActiveSession()
+    }
+
+    /// Cold-open frame-0 paint (build125 smoothness): resolve the returning
+    /// user's saved / dev-env gateway URL and paint the cached drawer + last-opened
+    /// transcript from disk IMMEDIATELY at launch, BEFORE the inbox cache hydrate
+    /// or any network await. `bootstrap()` re-runs this exact paint, but the
+    /// `paintFromCache()` read is latched + idempotent so it collapses onto this
+    /// one — hoisting it here only removes the frame-0 dependency on unrelated
+    /// launch awaits (the inbox hydrate). A fresh install (no saved URL, no dev
+    /// env) is a no-op, byte-identical to today. The resolution below mirrors
+    /// `bootstrap(generation:)` exactly so the painted scope matches the scope
+    /// bootstrap will connect under.
+    func paintDrawerCacheFirst() async {
+        #if DEBUG
+        let env = ProcessInfo.processInfo.environment
+        if !_skipEnvironmentBootstrapForTesting,
+           let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+           !url.isEmpty, !token.isEmpty {
+            await paintCacheFirst(serverURLString: url)
+            return
+        }
+        #endif
+        guard let savedURL = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL),
+              !savedURL.isEmpty else { return }
+        await paintCacheFirst(serverURLString: savedURL)
     }
 
     /// Bind the session cache scope to `serverURLString` and paint the drawer from
@@ -1038,6 +1260,14 @@ final class ConnectionStore {
 
         phase = .connecting
 
+        // S3: arm the network-path monitor BEFORE the REST probe. A cold-launch-
+        // offline configure fails at the probe below and returns terminal
+        // `.offline` with `hasConnected == false`; arming here (not after a
+        // verified connect) is what lets a later path-satisfied event lift that
+        // terminal state and reconnect by itself. Idempotent — a single instance
+        // survives re-configures.
+        startPathMonitor()
+
         // Probe REST first to fail fast with a clear message before opening WS.
         let previousToken = KeychainService.loadToken(server: trimmedURL)
         let isSavedTokenReuse = issuedDeviceId == nil && previousToken == trimmedToken
@@ -1062,6 +1292,7 @@ final class ConnectionStore {
             // a bootstrap of a now-revoked saved token.
             if Self.isAuthFailure(error) {
                 reauthRequired = true
+                requireTransportReauthentication()
                 phase = .needsSetup
                 return Self.reauthMessage
             }
@@ -1072,6 +1303,7 @@ final class ConnectionStore {
         guard isCurrentGeneration(generation) else { return nil }
 
         do {
+            beginTransportAttempt()
             if let connectRPC {
                 try await connectRPC(url, trimmedToken, connectionMode)
             } else {
@@ -1079,18 +1311,24 @@ final class ConnectionStore {
             }
         } catch {
             guard isCurrentGeneration(generation) else { return nil }
+            markTransportUnavailable()
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             phase = .offline(message)
             return message
         }
         guard isCurrentGeneration(generation) else { return nil }
+        // `HermesGatewayClient.connect` returns only after `gateway.ready`, so
+        // this is the first point at which operational RPC admission is allowed.
+        acceptCurrentTransport()
 
-        if !previousServerURL.isEmpty, previousServerURL != trimmedURL {
+        let switchedServers = !previousServerURL.isEmpty && previousServerURL != trimmedURL
+        if switchedServers {
             // ABH-410 follow-up: when a verified re-pair switches servers, purge
             // the previous server's indexed session titles from Spotlight before
             // the new URL becomes the cache/index identity.
             Self.log.notice("Server switch clearing Hermes Spotlight session index")
             Self.clearSpotlightSessionIndexForPrivacy()
+            sessionStore.invalidateGatewayScopeWork()
         }
 
         // Persist only after a verified connection.
@@ -1114,11 +1352,37 @@ final class ConnectionStore {
             DefaultsKeys.setDeviceId(nil, server: trimmedURL)
         }
 
+        // Re-pairing supersedes forget: a verified connection to a server that
+        // still carries a stale cleanup tombstone from a PRIOR device's forget
+        // must void that tombstone's cache-suppression now, so a later cold-open
+        // never paints an empty shell over this server's populated cache. The
+        // owed remote revoke of the old device (if any) is preserved. When the
+        // tombstone's device equals the just-configured pairing, forget semantics
+        // are kept (`.keep`) exactly as the launch reconciler decides.
+        if let tombstone = Self.pendingCleanupTombstone(),
+           tombstone.server.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedURL {
+            let decision = GatewayForgetCoordinator.evaluate(
+                tombstone: tombstone,
+                currentDeviceId: DefaultsKeys.deviceId(server: trimmedURL),
+                hasLivePairing: true
+            )
+            Self.applyTombstoneDecision(decision, for: tombstone, defaults: .standard)
+        }
+
         startLongLivedTasks()
         hasConnected = true
         // A verified connection clears any prior re-pair flag and failure tally.
         reauthRequired = false
         consecutiveReconnectFailures = 0
+        // A cold cache restore intentionally selected/painted without issuing
+        // RPC. Now that `gateway.ready` accepted this epoch, bind that latest
+        // durable selection in the background; its token/epoch guards make a
+        // newer drawer tap win while hydration continues independently.
+        if !switchedServers, sessionStore.activeStoredId != nil {
+            Task { [weak self] in
+                await self?.sessionStore.resumeActiveAfterReconnect()
+            }
+        }
         // ABH-82: enter the branded loading screen rather than flashing the empty
         // shell. The hydration coordinator below flips this to `.connected` once
         // the gateway state has been pulled (or the timeout fires first).
@@ -1351,6 +1615,11 @@ final class ConnectionStore {
         generation ownedGeneration: UInt64? = nil
     ) async {
         let generation = ownedGeneration ?? advanceConnectionGeneration()
+        // S3: tear down the path monitor on every deliberate stop — disconnect
+        // (→ needsSetup, no saved config to retry), forget (unpair), and explicit
+        // goOffline (a user-chosen offline must NOT silently self-reconnect). A
+        // later `configure()`/`bootstrap()` re-arms it.
+        stopPathMonitor()
         reconnectTask?.cancel()
         reconnectTask = nil
         // Cancel any in-flight hydration so a teardown mid-load can't later flip
@@ -1401,6 +1670,98 @@ final class ConnectionStore {
         if let finalPhase { phase = finalPhase }
     }
 
+    // MARK: - Forget tombstone reconciliation
+
+    /// Read the pending gateway-forget cleanup tombstone, if any.
+    static func pendingCleanupTombstone(
+        _ defaults: UserDefaults = .standard
+    ) -> GatewayCleanupTombstone? {
+        defaults.data(forKey: DefaultsKeys.gatewayCleanupTombstone)
+            .flatMap { try? JSONDecoder().decode(GatewayCleanupTombstone.self, from: $0) }
+    }
+
+    /// Whether a live credential currently exists for `server` — either it is the
+    /// persisted/configured server URL, or a Keychain token is present for it.
+    static func hasLivePairing(
+        for server: String,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        let target = server.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let saved = defaults.string(forKey: DefaultsKeys.serverURL),
+           saved.trimmingCharacters(in: .whitespacesAndNewlines) == target,
+           !target.isEmpty {
+            return true
+        }
+        return KeychainService.loadToken(server: server) != nil
+    }
+
+    /// Apply a ``GatewayForgetCoordinator.Decision`` to the persisted tombstone.
+    static func applyTombstoneDecision(
+        _ decision: GatewayForgetCoordinator.Decision,
+        for tombstone: GatewayCleanupTombstone,
+        defaults: UserDefaults = .standard
+    ) {
+        switch decision.rewrite {
+        case .keep:
+            break
+        case .remove:
+            defaults.removeObject(forKey: DefaultsKeys.gatewayCleanupTombstone)
+        case .supersede:
+            // Retry-only form: cache-suppression is void, the remote revoke of the
+            // OLD device stays owed (background, best-effort, never gating paint).
+            let superseded = GatewayCleanupTombstone(
+                server: tombstone.server,
+                deviceId: tombstone.deviceId,
+                remoteRetryNeeded: tombstone.remoteRetryNeeded,
+                supersededByRepair: true
+            )
+            if let data = try? JSONEncoder().encode(superseded) {
+                defaults.set(data, forKey: DefaultsKeys.gatewayCleanupTombstone)
+            }
+        }
+    }
+
+    /// Reconcile a pending forget tombstone at launch against the current pairing.
+    ///
+    /// Returns `true` when it resumed a genuinely-interrupted local forget (the
+    /// caller must abort the rest of bootstrap). Returns `false` — the common
+    /// case — when there is no tombstone, or when a re-pair under a new device has
+    /// superseded it (the stale cache-suppression is voided, only the owed remote
+    /// revoke is preserved, and the normal cache-first launch proceeds so the
+    /// re-paired server's cache paints).
+    func reconcilePendingForgetTombstone(
+        defaults: UserDefaults = .standard
+    ) async -> Bool {
+        guard let tombstone = Self.pendingCleanupTombstone(defaults) else { return false }
+        let decision = GatewayForgetCoordinator.evaluate(
+            tombstone: tombstone,
+            currentDeviceId: DefaultsKeys.deviceId(server: tombstone.server, defaults),
+            hasLivePairing: Self.hasLivePairing(for: tombstone.server, defaults: defaults)
+        )
+        guard decision.suppressesCache else {
+            // Re-pairing supersedes forget. Void the cache-suppression and keep
+            // only the owed remote revoke of the old device.
+            Self.applyTombstoneDecision(decision, for: tombstone, defaults: defaults)
+            // If the interrupted forget cleared the persisted URL but a live token
+            // for the re-paired server remains, restore the URL so the cache-first
+            // paint below binds the correct scope.
+            if defaults.string(forKey: DefaultsKeys.serverURL) == nil,
+               KeychainService.loadToken(server: tombstone.server) != nil {
+                defaults.set(tombstone.server, forKey: DefaultsKeys.serverURL)
+            }
+            return false
+        }
+        // Forget semantics preserved (deviceId == current pairing, or no live
+        // pairing). Resume the interrupted LOCAL cleanup only when no live
+        // credential URL remains — otherwise there is nothing left to resume and
+        // the normal launch path handles the still-configured server.
+        if defaults.string(forKey: DefaultsKeys.serverURL) == nil {
+            await forgetGateway()
+            return true
+        }
+        return false
+    }
+
     /// Authenticated caller-only privacy transaction. Local erasure always wins;
     /// remote failure records a minimal retry tombstone without retaining token.
     /// `serverOverride` lets a just-revoked device identify the credential even
@@ -1423,6 +1784,8 @@ final class ConnectionStore {
                 returningTo: nil, clearSpotlight: true, generation: generation
             )
             guard isCurrentGeneration(generation) else { return }
+            sessionStore.removeForgottenGatewayState()
+            chatStore.reset()
             phase = .needsSetup
             return
         }
@@ -1440,6 +1803,13 @@ final class ConnectionStore {
         guard isCurrentGeneration(generation) else { return }
         await stopLiveWork(returningTo: nil, clearSpotlight: true, generation: generation)
         guard isCurrentGeneration(generation) else { return }
+        sessionStore.removeForgottenGatewayState()
+        // Forget is a privacy erase: the last-viewed transcript stays resident in
+        // ChatStore after stopLiveWork (which only ends the live stream), so clear
+        // it too before repairing to `.needsSetup` — otherwise a forgotten
+        // gateway's cached messages remain on screen (GatewayForgetCoordinatorTests
+        // testForgetClearsPublishedDrawerAndTranscriptBeforeRepairing).
+        chatStore.reset()
         try? await cacheStore?.purgeGateway(serverId: server)
         guard isCurrentGeneration(generation) else { return }
         await queueStore?.removeAll()
@@ -1616,11 +1986,17 @@ final class ConnectionStore {
                 // mergeSessionPage's carry-forward gate is gated on a real
                 // lifecycle event, not the 10s liveWindow time-proxy.
                 if event.type == .messageStart {
-                    sessionStore.markTurnStarted(storedId: activityStoredId)
+                    sessionStore.markTurnStarted(
+                        storedId: activityStoredId,
+                        runtimeId: event.sessionId
+                    )
                 } else {
                     // .messageComplete — turn finished; server lastActive is now
                     // authoritative, so the carry-forward can release.
-                    sessionStore.markTurnCompleted(storedId: activityStoredId)
+                    sessionStore.markTurnCompleted(
+                        storedId: activityStoredId,
+                        runtimeId: event.sessionId
+                    )
                 }
                 scheduleSessionRefresh(generation: generation)
             case .error:
@@ -1630,7 +2006,10 @@ final class ConnectionStore {
                 let errorStoredId = event.storedSessionId
                     ?? (event.sessionId == sessionStore.activeRuntimeId
                         ? sessionStore.activeStoredId : nil)
-                sessionStore.markTurnCompleted(storedId: errorStoredId)
+                sessionStore.markTurnCompleted(
+                    storedId: errorStoredId,
+                    runtimeId: event.sessionId
+                )
             default:
                 break
             }
@@ -1710,6 +2089,10 @@ final class ConnectionStore {
             if reconnectTask == nil, phase != .hydrating,
                isActiveGeneration(generation) { phase = .connected }
         case .closed, .failed:
+            // Keep the UI in `.connected` during silent grace, but make the
+            // transport unusable immediately. A live task object is not proof
+            // that this generation may admit RPC.
+            markTransportUnavailable()
             // STR-973A silent reconnect: a drop after we were connected no
             // longer finalizes the stream or shows `.reconnecting` right
             // away. Start the grace window instead — it fires the reconnect
@@ -1744,6 +2127,7 @@ final class ConnectionStore {
     private func startGraceWindow(duration: Duration, generation: UInt64) {
         guard isActiveGeneration(generation) else { return }
         isInGrace = true
+        ReliabilityDiagnostics.shared.graceStarted(duration: duration)
         startReconnectLoop(generation: generation)
         graceTask = Task { [weak self] in
             try? await Task.sleep(for: duration)
@@ -1762,6 +2146,7 @@ final class ConnectionStore {
         guard isInGrace, isActiveGeneration(generation) else { return }
         isInGrace = false
         graceTask = nil
+        ReliabilityDiagnostics.shared.graceExpired(attempt: currentReconnectAttempt)
         chatStore.handleConnectionDrop()
         sessionStore.clearAllTurnsInProgress()
         phase = .reconnecting(attempt: currentReconnectAttempt)
@@ -1774,6 +2159,121 @@ final class ConnectionStore {
         graceTask?.cancel()
         graceTask = nil
         isInGrace = false
+    }
+
+    // MARK: - Network path monitoring (S3)
+
+    /// Arm the single network-path monitor. Idempotent: a monitor already
+    /// running is left untouched so re-configures don't churn it. In DEBUG a
+    /// test can inject a fake via `_pathMonitorForTesting`.
+    private func startPathMonitor() {
+        guard pathMonitor == nil else { return }
+        let monitor: NetworkPathMonitoring
+        #if DEBUG
+        if let injected = _pathMonitorForTesting {
+            monitor = injected
+        } else if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            // Under XCTest with no injected fake, do NOT arm a live NWPathMonitor:
+            // the simulator's real `.satisfied` path would fire spurious
+            // reconnects into unrelated tests that assert on a stalled `.offline`/
+            // `.reconnecting` state. S3 tests inject `_pathMonitorForTesting`.
+            return
+        } else {
+            monitor = NWPathMonitorAdapter()
+        }
+        #else
+        monitor = NWPathMonitorAdapter()
+        #endif
+        monitor.onPathUpdate = { [weak self] status in
+            self?.handleNetworkPath(status)
+        }
+        pathMonitor = monitor
+        monitor.start()
+    }
+
+    /// Disarm the monitor and drop any pending debounced kick.
+    private func stopPathMonitor() {
+        networkReconnectDebounceTask?.cancel()
+        networkReconnectDebounceTask = nil
+        pathMonitor?.onPathUpdate = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
+    }
+
+    /// A path update arrived (main actor). Only a `.satisfied` path can heal a
+    /// stalled connection, and only while we are actually stalled — `.offline`
+    /// (including the terminal cold-launch-offline state) or `.reconnecting`.
+    ///
+    /// `.requiresConnection`/`.unsatisfied` are treated as "still down" and
+    /// ignored; the next `.satisfied` fires the trigger. Constrained paths (Low
+    /// Data Mode) still report `.satisfied` — we deliberately do NOT special-case
+    /// `path.isConstrained` here, so behavior is unchanged on constrained links
+    /// (noted per spec).
+    private func handleNetworkPath(_ status: NetworkPathStatus) {
+        guard status == .satisfied else { return }
+        switch phase {
+        case .offline, .reconnecting:
+            break
+        case .needsSetup, .connecting, .hydrating, .connected:
+            // Live, hydrating, or unpaired — nothing to self-heal.
+            return
+        }
+        // A user-chosen offline (goOffline) must never be silently overridden by
+        // a returning network. (stopLiveWork also tears the monitor down in that
+        // case, so this is belt-and-suspenders against an in-flight event.)
+        if UserDefaults.standard.bool(forKey: DefaultsKeys.connectionOffline) { return }
+        scheduleNetworkReconnect()
+    }
+
+    /// Debounce the reconnect kick on the trailing edge so a flapping path
+    /// collapses to a single attempt.
+    private func scheduleNetworkReconnect() {
+        networkReconnectDebounceTask?.cancel()
+        #if DEBUG
+        let delay = networkReconnectDebounceOverride ?? Self.networkReconnectDebounce
+        #else
+        let delay = Self.networkReconnectDebounce
+        #endif
+        networkReconnectDebounceTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, !Task.isCancelled else { return }
+            self.networkReconnectDebounceTask = nil
+            self.fireNetworkReconnect()
+        }
+    }
+
+    /// Trailing-edge of the debounce: re-check state and route into the EXISTING
+    /// reconnect seam. Never a new connect path.
+    private func fireNetworkReconnect() {
+        // Re-check at fire time — the window may have healed us, or the user may
+        // have just chosen offline.
+        if UserDefaults.standard.bool(forKey: DefaultsKeys.connectionOffline) { return }
+        switch phase {
+        case .offline:
+            if hasConnected {
+                // We reached the gateway at least once this launch, so the saved
+                // URL + in-memory token are live: the reconnect loop can resume
+                // (its own backoff still applies to subsequent failures).
+                startReconnectLoop(generation: connectionGeneration)
+            } else {
+                // Cold-launch-offline: `configure()`'s REST probe never succeeded,
+                // so there is no in-memory token to resume. Re-run bootstrap — it
+                // re-reads the saved config, reloads the Keychain token, and
+                // re-probes REST — which is what lifts the TERMINAL `.offline`
+                // state (S3 cold-launch case).
+                Task { [weak self] in await self?.bootstrap() }
+            }
+        case .reconnecting:
+            // A reconnect loop is already running but may be parked deep in
+            // backoff. Reset it so the next attempt fires immediately now that
+            // the path is back — same kick `handleScenePhase` performs on
+            // foreground. The loop keeps its backoff schedule on further failures.
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            startReconnectLoop(generation: connectionGeneration)
+        case .needsSetup, .connecting, .hydrating, .connected:
+            return
+        }
     }
 
     // MARK: - Reconnect
@@ -1791,6 +2291,7 @@ final class ConnectionStore {
             while !Task.isCancelled {
                 guard self.isActiveGeneration(generation) else { return }
                 self.currentReconnectAttempt = attempt
+                ReliabilityDiagnostics.shared.reconnectAttempt(number: attempt)
                 // STR-973A: while grace is holding, keep `phase` at
                 // `.connected` — `escalateGraceExpiry()` is the only path
                 // allowed to surface `.reconnecting` during grace.
@@ -1829,6 +2330,7 @@ final class ConnectionStore {
                 }
 
                 do {
+                    self.beginTransportAttempt()
                     if let hook = self.connectRPC {
                         try await hook(url, token, self.connectionMode)
                     } else {
@@ -1848,6 +2350,12 @@ final class ConnectionStore {
                     // new grace window while `reconnectTask` is still
                     // non-nil, so ending it this early is safe.
                     self.endGrace()
+                    // The client only returns after its `gateway.ready`
+                    // handshake, so this accepts a fresh transport epoch. Grace
+                    // must end first: resolving a waiter while `isInGrace` is
+                    // still true would hand callers a false admission signal.
+                    self.acceptCurrentTransport()
+                    ReliabilityDiagnostics.shared.reconnectHeal(epoch: self.transportEpoch)
                     // A quick heal (attempt-0 success, typically still inside
                     // grace): silently finalize any stream the drop left
                     // stranded — REQUIRED for `backfill()`'s `guard
@@ -1875,6 +2383,7 @@ final class ConnectionStore {
                 } catch {
                     guard !Task.isCancelled,
                           self.isActiveGeneration(generation) else { return }
+                    self.markTransportUnavailable()
                     // The WS handshake error is not typed as auth, so once a
                     // string of reconnects keep failing we re-probe REST to tell
                     // an auth *revocation* (→ re-pair) apart from plain
@@ -1889,6 +2398,7 @@ final class ConnectionStore {
                         // grace — end it now and escalate straight to re-pair.
                         self.endGrace()
                         self.reauthRequired = true
+                        self.requireTransportReauthentication()
                         self.phase = .needsSetup
                         self.reconnectTask = nil
                         return
@@ -1972,6 +2482,7 @@ final class ConnectionStore {
             Self.clearSpotlightSessionIndexForPrivacy()
         }
         reauthRequired = true
+        requireTransportReauthentication()
         hasConnected = false
         consecutiveReconnectFailures = 0
         phase = .needsSetup
@@ -2151,6 +2662,9 @@ final class ConnectionStore {
         hasConnected = true
         reauthRequired = false
         phase = .connected
+        beginTransportAttempt()
+        acceptCurrentTransport()
+        markTransportUnavailable()
         startReconnectLoop(generation: generation)
     }
 
@@ -2164,6 +2678,8 @@ final class ConnectionStore {
         hasConnected = true
         reauthRequired = false
         phase = .connected
+        beginTransportAttempt()
+        acceptCurrentTransport()
     }
 
     /// DEBUG-only test seam for a gateway-client state transition. This keeps the
@@ -2255,9 +2771,22 @@ final class ConnectionStore {
         // offline (another client switched it) (F0).
         await refreshActiveModel(generation: generation)
         guard isActiveGeneration(generation) else { return false }
-        if sessionStore.activeStoredId != nil {
-            await sessionStore.resumeActiveAfterReconnect()
+        // A failed resume for the still-selected session means this reconnect
+        // did not recover a usable chat and must retry. A nil result after the
+        // selection changed is supersession instead: follow the latest intent
+        // (coalesced with any readiness-released `open()` task) rather than
+        // treating the old A failure as B's failure.
+        var selectedIdentity = sessionStore.activeScopedIdentity
+        while let expectedIdentity = selectedIdentity {
+            let resumedRuntime = await sessionStore.resumeActiveAfterReconnect()
             guard isActiveGeneration(generation) else { return false }
+            if resumedRuntime != nil { break }
+
+            let latestIdentity = sessionStore.activeScopedIdentity
+            guard latestIdentity != expectedIdentity else { return false }
+            selectedIdentity = latestIdentity
+        }
+        if sessionStore.activeStoredId != nil {
             await chatStore.backfill()
             guard isActiveGeneration(generation) else { return false }
             // Flush the offline outbox now the transcript is current — but only
@@ -2314,6 +2843,9 @@ final class ConnectionStore {
             }
 
             if dead {
+                // The presentation phase may still be `.connected`; that is
+                // silent-grace policy, not permission to send JSON-RPC.
+                self.markTransportUnavailable()
                 // iOS killed the socket in the background. If we already have a
                 // reconnect loop running (possibly mid-backoff), RESET it so the
                 // next attempt fires immediately rather than waiting out whatever
@@ -2321,26 +2853,27 @@ final class ConnectionStore {
                 // they expect instant reconnection. Cancelling the existing task
                 // also cancels any pending `Task.sleep` inside it, so
                 // `startReconnectLoop` can begin at attempt 0 with zero delay.
-                if self.reconnectTask != nil {
+                if self.reconnectTask != nil || self.graceTask != nil {
                     self.reconnectTask?.cancel()
                     self.reconnectTask = nil
+                    self.graceTask?.cancel()
+                    self.graceTask = nil
+                    self.isInGrace = false
                 }
-                // iOS killed the socket in the background and the state observer
-                // may not have seen the transition — finalize any in-flight stream
-                // before reconnecting so the recovery backfill isn't no-op'd
-                // (R1 #9/#42).
-                self.chatStore.handleConnectionDrop()
-                // ABH-178: the state observer's clearAllTurnsInProgress() may not
-                // have fired either (same reason as handleConnectionDrop above).
-                // Clear here so the subsequent recoverActiveSession→refresh→
-                // mergeSessionPage doesn't carry a stale lastActive forward.
-                self.sessionStore.clearAllTurnsInProgress()
-                // ABH-182 Inc-1: a dead socket means any in-progress turn is
-                // interrupted; reconcile the LA so an orphaned "Thinking" activity
-                // is dismissed rather than expiring on the lock screen at staleAfter.
-                LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
+                // Do not finalize a turn or stamp a warning here. Cold-open
+                // grace has the same presentation contract as a witnessed live
+                // drop: `escalateGraceExpiry` performs that work only if the
+                // replacement transport still has not healed.
                 guard self.isActiveGeneration(generation) else { return }
-                self.startReconnectLoop(generation: generation)
+                // A foreground/cold-open discovery has a shorter grace window
+                // than a witnessed live drop. It preserves the existing UI
+                // policy while ensuring the readiness contract is already false.
+                #if DEBUG
+                let grace = self.graceWindowOverride ?? Self.coldOpenGraceWindow
+                #else
+                let grace = Self.coldOpenGraceWindow
+                #endif
+                self.startGraceWindow(duration: grace, generation: generation)
             } else if case .connected = self.phase {
                 // ABH-177: verify the socket is still alive with a read-only ping
                 // before attempting the REST backfill. A silent-dead socket that
@@ -2365,25 +2898,34 @@ final class ConnectionStore {
                 #endif
                 guard self.isActiveGeneration(generation) else { return }
                 guard alive else {
+                    ReliabilityDiagnostics.shared.foregroundLiveness(alive: false)
+                    self.markTransportUnavailable()
                     // ABH-177: the real `probeLiveness` path calls `handleSocketFailure`
                     // which sets transport state to `.failed`; the existing state observer
                     // then starts the reconnect loop. In tests the injected hook does NOT
                     // call `handleSocketFailure`, so we start the loop explicitly here to
                     // keep the routing correct in both code paths.
                     LiveActivityManager.shared.reconcile(hasActiveTurn: self.chatStore.isStreaming)
-                    // ABH-178: in the real path the state observer's .failed transition
-                    // fires clearAllTurnsInProgress(); in the injected-hook test path the
-                    // observer is never driven, so clear explicitly here to guarantee the
-                    // flag can't stay stuck and revive the ABH-157 never-converge bug.
-                    self.sessionStore.clearAllTurnsInProgress()
-                    if self.reconnectTask != nil {
+                    // Keep active-turn state intact during cold-open grace. If
+                    // recovery does not heal in time, `escalateGraceExpiry`
+                    // clears it alongside the visible disconnect treatment.
+                    if self.reconnectTask != nil || self.graceTask != nil {
                         self.reconnectTask?.cancel()
                         self.reconnectTask = nil
+                        self.graceTask?.cancel()
+                        self.graceTask = nil
+                        self.isInGrace = false
                     }
                     guard self.isActiveGeneration(generation) else { return }
-                    self.startReconnectLoop(generation: generation)
+                    #if DEBUG
+                    let grace = self.graceWindowOverride ?? Self.coldOpenGraceWindow
+                    #else
+                    let grace = Self.coldOpenGraceWindow
+                    #endif
+                    self.startGraceWindow(duration: grace, generation: generation)
                     return
                 }
+                ReliabilityDiagnostics.shared.foregroundLiveness(alive: true)
                 // ABH-182 Inc-1: on a healthy foreground, reconcile the LA so
                 // any orphaned activity (e.g. from a previous backgrounded turn
                 // whose message.complete was missed) is dismissed.
@@ -2468,5 +3010,69 @@ final class ConnectionStore {
 
         let trimmed = name.trimmingCharacters(in: CharacterSet(charactersIn: "-").union(.whitespaces))
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+// MARK: - Network path monitoring seam (S3)
+
+/// The minimal path-reachability signal the S3 self-reconnect trigger consumes.
+/// A deliberately reduced projection of `NWPath.Status` so the store's trigger
+/// logic (and its tests) never depend on the `Network` framework's concrete
+/// types.
+enum NetworkPathStatus: Equatable, Sendable {
+    /// A usable path exists (the only status that kicks a reconnect).
+    case satisfied
+    /// No usable path.
+    case unsatisfied
+    /// A path may become satisfied after a connection step (e.g. captive portal
+    /// / VPN handshake). Treated as "still down" until it flips to `.satisfied`.
+    case requiresConnection
+}
+
+/// Protocol-wrapped `NWPathMonitor` so tests can inject deterministic path
+/// transitions without real hardware (the production impl is
+/// ``NWPathMonitorAdapter``). Main-actor bound because its single consumer,
+/// `ConnectionStore`, is `@MainActor` and mutates connection state on every
+/// update.
+@MainActor
+protocol NetworkPathMonitoring: AnyObject {
+    /// Invoked on the main actor for each path update after `start()`.
+    var onPathUpdate: ((NetworkPathStatus) -> Void)? { get set }
+    /// Begin delivering updates. Idempotent per instance.
+    func start()
+    /// Stop delivering updates and release the underlying monitor.
+    func cancel()
+}
+
+/// Production ``NetworkPathMonitoring`` backed by `NWPathMonitor`. `NWPathMonitor`
+/// delivers updates on a background dispatch queue, so each update hops to the
+/// main actor before touching `onPathUpdate`.
+@MainActor
+final class NWPathMonitorAdapter: NetworkPathMonitoring {
+    var onPathUpdate: ((NetworkPathStatus) -> Void)?
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "ai.hermes.app.networkpath")
+    private var started = false
+
+    func start() {
+        guard !started else { return }
+        started = true
+        monitor.pathUpdateHandler = { [weak self] path in
+            let status: NetworkPathStatus
+            switch path.status {
+            case .satisfied: status = .satisfied
+            case .unsatisfied: status = .unsatisfied
+            case .requiresConnection: status = .requiresConnection
+            @unknown default: status = .unsatisfied
+            }
+            Task { @MainActor [weak self] in
+                self?.onPathUpdate?(status)
+            }
+        }
+        monitor.start(queue: queue)
+    }
+
+    func cancel() {
+        monitor.cancel()
     }
 }

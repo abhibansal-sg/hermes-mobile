@@ -31,6 +31,25 @@ extension GatewayWebSocketTask {
     func sendPing() async throws {}
 }
 
+/// Serializes completion of the callback-based URLSession ping bridge.
+///
+/// URLSession can race a ping completion with task cancellation when the app
+/// returns from the background. Only the first callback may resume the checked
+/// continuation; a second resume is a process-terminating Swift trap.
+final class GatewayPingCompletionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !completed else { return false }
+        completed = true
+        return true
+    }
+}
+
 extension URLSessionWebSocketTask: GatewayWebSocketTask {
     func sendPing() async throws {
         // MUST use withTaskCancellationHandler: when `probeLiveness` times out
@@ -42,7 +61,10 @@ extension URLSessionWebSocketTask: GatewayWebSocketTask {
         // continuation resolves and `probeLiveness` returns within ~livenessPingTimeout.
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let completionGate = GatewayPingCompletionGate()
                 self.sendPing { error in
+                    guard completionGate.claim() else { return }
+
                     if let error {
                         continuation.resume(throwing: error)
                     } else {
@@ -261,7 +283,10 @@ actor HermesGatewayClient {
         params: JSONValue = .object([:]),
         timeout: Duration = .seconds(30)
     ) async throws -> JSONValue {
-        guard let task else { throw GatewayError.notConnected }
+        // A task can survive a close/failure transition long enough to be
+        // non-nil. Only the actor's `.open` state, set after `gateway.ready`,
+        // authorizes a new JSON-RPC request for this transport generation.
+        guard state == .open, let task else { throw GatewayError.notConnected }
 
         requestCounter &+= 1
         let id = "r\(requestCounter)"
@@ -443,8 +468,10 @@ actor HermesGatewayClient {
     // MARK: - Pending bookkeeping
 
     private func storePending(id: String, continuation: CheckedContinuation<JSONValue, Error>) {
-        // If the socket already died, fail immediately rather than hang.
-        guard task != nil else {
+        // Re-check the same admission invariant while installing the waiter.
+        // This protects a future refactor that introduces an actor suspension
+        // between `requestRaw`'s initial guard and this bookkeeping step.
+        guard state == .open, task != nil else {
             continuation.resume(throwing: GatewayError.notConnected)
             return
         }

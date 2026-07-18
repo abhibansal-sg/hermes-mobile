@@ -435,6 +435,37 @@ final class GatewayRequestRaceTests: XCTestCase {
         await client.disconnect()
     }
 
+    /// A WebSocket task exists as soon as `connect()` starts, but it is not a
+    /// usable RPC transport until the gateway emits `gateway.ready`. This guards
+    /// the Build 120 admission rule against regressing to a task-only check.
+    func testRequestIsRejectedUntilGatewayReadyOpensTransport() async throws {
+        let transport = NeverReadyTransport()
+        let client = HermesGatewayClient { _ in transport }
+        let baseURL = URL(string: "ws://127.0.0.1:9999")!
+
+        let connecting = Task {
+            try await client.connect(baseURL: baseURL, token: "t")
+        }
+        try await waitForState(.connecting, client: client)
+
+        do {
+            let _: Echo = try await client.request("must.wait", timeout: .seconds(1))
+            XCTFail("A request must not be admitted before gateway.ready")
+        } catch let error as GatewayError {
+            guard case .notConnected = error else {
+                return XCTFail("Expected .notConnected before ready, got \(error)")
+            }
+        }
+
+        await client.disconnect()
+        do {
+            try await connecting.value
+            XCTFail("Disconnect must fail the pending connect")
+        } catch {
+            // Expected: disconnect tears down the unanswered ready handshake.
+        }
+    }
+
     /// If an older connect attempt is failed by a newer `connect()` call, its
     /// catch path must not tear down the newer socket. The old behavior cancelled
     /// transport #2 and overwrote `.open`/`.connecting` with `.failed`.

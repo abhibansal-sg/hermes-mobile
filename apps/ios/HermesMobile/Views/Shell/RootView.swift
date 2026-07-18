@@ -302,33 +302,28 @@ struct RootView: View {
 
     @ViewBuilder
     private var mainUI: some View {
-        VStack(spacing: 0) {
-            if freshnessPresentation.showsBanner {
-                FreshnessBanner(presentation: freshnessPresentation)
-            }
-            if effectiveHorizontalSizeClass == .regular {
-                SplitLayout(
-                    showingInspector: $showingInspector,
-                    inspectorTab: $inspectorTab,
-                    onOpenSettings: openSettings
-                )
-            } else {
-                CompactLayout(onOpenSettings: openSettings)
-            }
+        // Owner order (2026-07-18): the full-width top status strip ("Offline"/
+        // "Syncing"/"Fresh") was removed completely — "remove that element
+        // completely… irrelevant because we have the pill under the title bar."
+        // The surviving connection surface is the orange ConnectionStatusBanner
+        // under the title bar. No VStack/banner slot remains so the app's top
+        // edge reserves no space and shows no residual safe-area artifact. The
+        // FreshnessPresentation state machinery below is retained — other
+        // consumers (DrawerView, InboxView) still read it.
+        if effectiveHorizontalSizeClass == .regular {
+            SplitLayout(
+                showingInspector: $showingInspector,
+                inspectorTab: $inspectorTab,
+                onOpenSettings: openSettings
+            )
+        } else {
+            CompactLayout(onOpenSettings: openSettings)
         }
     }
 
     private var hasCachedContent: Bool {
         !sessions.sessions.isEmpty || sessions.activeStoredId != nil
             || !chat.messages.isEmpty || sessions.manifestRevision > 0
-    }
-
-    private var freshnessPresentation: FreshnessPresentation {
-        FreshnessPresentation.resolve(
-            phase: connection.phase,
-            manifestFreshness: sessions.manifestFreshness,
-            lastSyncedAt: sessions.manifestLastSyncedAt
-        )
     }
 
     /// `hermesapp://debug/open-settings` opens the same root-owned Settings
@@ -384,7 +379,9 @@ struct FreshnessPresentation: Equatable, Sendable {
     let text: String
     let accessibilityLabel: String
 
-    var showsBanner: Bool { kind != .fresh }
+    // `showsBanner` was removed with the top status strip (owner order,
+    // 2026-07-18). Freshness is no longer surfaced as a full-width banner;
+    // the remaining consumers read authority state below, not a banner gate.
     var allowsRemoteMutations: Bool { kind == .fresh }
     var mutationUnavailableExplanation: String {
         "Available after synchronization establishes a fresh connection."
@@ -431,19 +428,10 @@ struct FreshnessPresentation: Equatable, Sendable {
     }
 }
 
-private struct FreshnessBanner: View {
-    let presentation: FreshnessPresentation
-
-    var body: some View {
-        Text(presentation.text)
-            .font(.caption.weight(.semibold))
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 5)
-            .background(.ultraThinMaterial)
-            .accessibilityLabel(presentation.accessibilityLabel)
-            .accessibilityIdentifier("syncFreshness")
-    }
-}
+// The top FreshnessBanner view was removed on owner order (2026-07-18). The
+// FreshnessPresentation state machinery above is retained for DrawerView /
+// InboxView, which read it for mutation authority — this was a presentation
+// removal only.
 
 // MARK: - Inbox presentation routing (STR-290 / STR-297)
 

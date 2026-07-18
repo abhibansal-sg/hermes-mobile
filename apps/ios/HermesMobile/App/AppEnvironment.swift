@@ -45,11 +45,6 @@ final class AppEnvironment {
         } catch {
             fatalError("Unable to open protected Hermes work repository: \(error.localizedDescription)")
         }
-        let queueStore = QueueStore(
-            repository: workRepository,
-            observation: workObservation,
-            scopeProvider: { [weak sessionStore] in sessionStore?.durableWorkScope }
-        )
         let voiceRecorder = VoiceRecorder()
         let speechPlayer = SpeechPlayer()
         let inboxStore = InboxStore()
@@ -59,6 +54,16 @@ final class AppEnvironment {
         let connectionStore = ConnectionStore(
             sessionStore: sessionStore,
             chatStore: chatStore
+        )
+        let queueStore = QueueStore(
+            repository: workRepository,
+            observation: workObservation,
+            scopeProvider: { [weak sessionStore] in sessionStore?.durableWorkScope },
+            activeSessionProvider: { [weak sessionStore] in sessionStore?.activeStoredId },
+            // A send is only "healthy in transit" while the live socket is ready;
+            // the instant it is not, pending rows are queued-while-offline and
+            // surface the badge/pill (C1/C2). Mirrors the drain readiness gate.
+            connectedProvider: { [weak connectionStore] in connectionStore?.isTransportReady ?? false }
         )
         let voiceConversationController = VoiceConversationController(
             dependencies: .init(
@@ -100,10 +105,24 @@ final class AppEnvironment {
             dependencies: .init(
                 currentScope: { [weak sessionStore] in sessionStore?.durableWorkScope },
                 activeStoredSessionID: { [weak sessionStore] in sessionStore?.activeStoredId },
-                canProcessPrompt: { [weak connectionStore, weak chatStore] in
-                    guard let connectionStore, let chatStore else { return false }
-                    guard case .connected = connectionStore.phase else { return false }
-                    return !chatStore.isStreaming && !chatStore.localTurnInFlight
+                isTransportReady: { [weak connectionStore] in
+                    guard let connectionStore else { return false }
+                    // Presentation grace intentionally retains `.connected` so
+                    // cached chat stays calm. Durable prompts may drain only
+                    // after the live socket completed `gateway.ready`.
+                    return connectionStore.isTransportReady
+                },
+                busySessionID: { [weak chatStore] in
+                    // Per-session serialization (Lane C fix 1): a turn streaming —
+                    // or a local turn in flight — belongs to the ACTIVE session.
+                    // Report its stored id so the processor holds only that
+                    // session's queued prompts and drains every other session
+                    // now, instead of the old global "any turn streams" block.
+                    guard let chatStore,
+                          chatStore.isStreaming || chatStore.localTurnInFlight else {
+                        return nil
+                    }
+                    return chatStore.activeStoredSessionId
                 },
                 createDestination: { [weak sessionStore] _ in
                     guard let sessionStore else { throw OutboxProcessorError.destinationUnavailable }

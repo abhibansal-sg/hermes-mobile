@@ -261,9 +261,14 @@ extension RestClient {
     /// Served by the hermes-mobile plugin mount only. The server imports and calls
     /// the same `build_debug_share` core as desktop `/api/ops/debug-share`, with
     /// redaction forced on. The response is shareable paste URLs for support.
-    func debugShareReport() async throws -> DebugShareReport {
+    func debugShareReport(reliabilityTrace: String? = nil) async throws -> DebugShareReport {
         var request = makeRequest(path: "\(mobileAPIPrefix)/debug-share", method: "POST")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let reliabilityTrace, !reliabilityTrace.isEmpty {
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "reliability_trace": reliabilityTrace,
+            ])
+        }
         let data = try await perform(request)
         return try decode(
             DebugShareReport.self,

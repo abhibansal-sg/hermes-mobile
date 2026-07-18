@@ -42,9 +42,11 @@ final class OutboxStateProjectionTests: XCTestCase {
 
         XCTAssertEqual(
             Dictionary(uniqueKeysWithValues: queue.items.map { ($0.text, $0.displayState.title) }),
+            // Wave 1.2 humanized the outbox labels (owner request): "Waiting for
+            // connection" and "Needs retry" replace the terse "Waiting"/"Failed — Retry".
             [
-                "waiting": "Waiting", "uploading": "Uploading", "sending": "Sending",
-                "sent": "Sent", "failed": "Failed — Retry", "cancelled": "Cancelled",
+                "waiting": "Waiting for connection", "uploading": "Uploading", "sending": "Sending",
+                "sent": "Sent", "failed": "Needs retry", "cancelled": "Cancelled",
             ]
         )
     }

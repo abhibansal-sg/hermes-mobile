@@ -39,6 +39,7 @@ final class StateFlushCoordinator {
 
     func enterBackground() {
         guard flushTask == nil, identifier == .invalid else { return }
+        ReliabilityDiagnostics.shared.backgroundFlushStarted()
         identifier = backgroundTasks.begin("Hermes state flush") { [weak self] in
             Task { @MainActor in self?.expire() }
         }
@@ -72,6 +73,7 @@ final class StateFlushCoordinator {
         identifier = .invalid
         flushTask = nil
         backgroundTasks.end(completed)
+        ReliabilityDiagnostics.shared.backgroundFlushFinished()
     }
 }
 
@@ -181,20 +183,8 @@ struct HermesMobileApp: App {
                     // seeded captures (demo footage) are clean.
                     if let seed = UITestSeed.requestedMode {
                         UITestSeed.apply(seed, environment: environment)
-                        // MEASUREMENT MODE: when BOTH the seed AND the debug bridge are
-                        // requested (HERMES_DEBUG_BRIDGE=1), start the bridge anyway so a
-                        // harness can drive scrolls (/swipe → setContentOffset) against
-                        // the seeded transcript. The on-device badge/overlay is fine
-                        // during measurement (it is not a demo capture). Clean seeded
-                        // captures simply omit HERMES_DEBUG_BRIDGE.
-                        if ProcessInfo.processInfo.environment["HERMES_DEBUG_BRIDGE"] == "1" {
-                            startGstackDebugBridge(environment: environment)
-                        }
                         return
                     }
-                    // gstack debug bridge (task UI-G): loopback-only StateServer
-                    // + typed store accessors. DEBUG-only; absent in Release.
-                    startGstackDebugBridge(environment: environment)
                     #endif
                     environment.appLock.authenticateAtLaunch()
                     // The notification-action backend is already installed by
@@ -211,6 +201,12 @@ struct HermesMobileApp: App {
                             pushIsAuthoritative: PushRegistrar.shared.isAlertAuthorityRegistered
                         )
                     }
+                    // Cold-open frame-0 paint (build125 smoothness): kick the
+                    // cached drawer + last-opened transcript paint FIRST, so it is
+                    // not sequenced behind the inbox cache hydrate or any unrelated
+                    // launch await. This is a cheap disk read; bootstrap() re-runs
+                    // the same latched paint, which collapses onto this one.
+                    await environment.connectionStore.paintDrawerCacheFirst()
                     await environment.inboxStore.hydrateCachedGateway()
                     await environment.connectionStore.bootstrap()
                     await environment.inboxStore.refresh()
@@ -362,8 +358,12 @@ struct HermesMobileApp: App {
                 }
                 // Highest app layer: covers sheets, alerts, toasts, navigation,
                 // attachments, and every connection phase before iOS snapshots
-                // the scene. The content-free privacy cover wins while inactive;
-                // on return, the authentication cover remains when required.
+                // the scene. The content-free privacy cover is raised on
+                // `.background` only (per #207) and takes precedence over the
+                // authentication cover; `.inactive` shows neither. Known #207
+                // tradeoff: the swipe-up-and-hold app-switcher path stays
+                // `.inactive` (never reaching `.background` while the card is
+                // visible), so that card can briefly composite live content.
                 .overlay {
                     if environment.appLock.isPrivacyShieldVisible {
                         PrivacyShieldCover()

@@ -205,7 +205,12 @@ struct ComposerView: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            if queueStore.pendingCount > 0 {
+            // C2: the pill is a BACKLOG indicator, not a per-send affordance. A
+            // healthy in-transit send never surfaces it; only stuck / failed /
+            // queued-while-offline rows for THIS session do. When it does show,
+            // its count is still `pendingCount` (== the Outbox sheet's rows), so
+            // pill and sheet never diverge.
+            if queueStore.hasBacklog {
                 queueChip
             }
             // Transient steer-outcome note (auto-clears after 2 s).
@@ -259,7 +264,10 @@ struct ComposerView: View {
         .animation(.easeInOut(duration: 0.16), value: showSlashCommandPicker)
         .animation(.easeInOut(duration: 0.18), value: isCapturing)
         .animation(.easeInOut(duration: 0.18), value: voice.isEnabled)
-        .animation(.easeInOut(duration: 0.18), value: queueStore.items.count)
+        .animation(.easeInOut(duration: 0.18), value: queueStore.activeItems.count)
+        // The pill's visibility is gated on backlog, which can flip (in-transit →
+        // stuck at the 7s boundary, or offline) without the count changing (C2).
+        .animation(.easeInOut(duration: 0.18), value: queueStore.hasBacklog)
         .animation(.easeInOut(duration: 0.18), value: steerNote)
         .animation(.easeInOut(duration: 0.18), value: yoloStatusNote)
         .animation(.snappy(duration: 0.16), value: holdActive)
@@ -1704,7 +1712,7 @@ private struct QueueSheet: View {
     var body: some View {
         NavigationStack {
             Group {
-                if queueStore.items.isEmpty {
+                if queueStore.activeItems.isEmpty {
                     ContentUnavailableView(
                         "Queue empty",
                         systemImage: "text.badge.plus",
@@ -1712,13 +1720,17 @@ private struct QueueSheet: View {
                     )
                 } else {
                     List {
-                        ForEach(queueStore.items) { item in
+                        ForEach(queueStore.activeItems) { item in
                             QueuedPromptRow(
                                 text: item.text,
                                 kind: item.kind,
                                 createdAt: item.createdAt,
                                 status: item.displayState.title,
-                                errorMessage: item.errorMessage,
+                                // Lane C fix 3: only a genuinely failed row shows
+                                // its raw error in red — a queued-offline row that
+                                // is merely waiting must not render a red error
+                                // line under its "Waiting for connection" label.
+                                errorMessage: item.showsError ? item.errorMessage : nil,
                                 editable: item.isEditable,
                                 canRetry: item.canRetry,
                                 onCommit: { newText in
@@ -1731,14 +1743,14 @@ private struct QueueSheet: View {
                         }
                         .onDelete { offsets in
                             for index in offsets {
-                                let id = queueStore.items[index].id
+                                let id = queueStore.activeItems[index].id
                                 Task { await queueStore.remove(id: id) }
                             }
                         }
                         // Drag-to-reorder: tapping the EditButton (leading toolbar)
                         // shows grab handles; releasing persists the new order.
                         .onMove { source, destination in
-                            Task { await queueStore.move(fromOffsets: source, toOffset: destination) }
+                            Task { await queueStore.moveActive(fromOffsets: source, toOffset: destination) }
                         }
                     }
                     .scrollContentBackground(.hidden)
@@ -1763,7 +1775,7 @@ private struct QueueSheet: View {
                     } label: {
                         Label("Send next now", systemImage: "paperplane.fill")
                     }
-                    .disabled(queueStore.items.isEmpty || chatStore.isStreaming)
+                    .disabled(queueStore.activeItems.isEmpty || chatStore.isStreaming)
                 }
             }
         }

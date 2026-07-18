@@ -3,7 +3,6 @@ import SwiftUI  // A2: withTransaction(Transaction(animation: nil)) on the final
 import UIKit
 import os
 #if DEBUG
-import DebugBridgeCore  // @Snapshotable marker for the gstack debug bridge (UI-G)
 #endif
 
 struct TranscriptPageFetch: Sendable {
@@ -26,16 +25,23 @@ func fetchTranscriptPage(
     rest: RestClient,
     sessionId: String,
     limit: Int,
-    before: Int? = nil
+    before: Int? = nil,
+    shape: String? = nil
 ) async -> TranscriptPageFetch? {
     guard rest.pathStyle == .plugin else { return nil }
     let encodedId = sessionId.addingPercentEncoding(
         withAllowedCharacters: .urlPathAllowed
     ) ?? sessionId
+    // WS-5.1: `shape` is a PARAMETER now (was hardcoded `skeleton`, which stranded
+    // reopened chats on text-only rows with no hydrate). Default `nil` ⇒ FULL; the
+    // cold-open seed passes `skeleton` and pairs it with a background hydrate.
     var path = "\(rest.pathStyle.mobileAPIPrefix)/sessions/\(encodedId)/messages"
         + "?limit=\(max(1, limit))"
     if let before, before > 0 {
         path += "&before=\(before)"
+    }
+    if let shape, !shape.isEmpty {
+        path += "&shape=\(shape)"
     }
     do {
         let data = try await rest.get(path: path)
@@ -152,7 +158,6 @@ final class ChatStore {
     var messages: [ChatMessage] = []
     /// True while the agent is producing a streaming turn.
     #if DEBUG
-    @Snapshotable
     #endif
     var isStreaming: Bool = false
     /// An approval the user must answer, or `nil`.
@@ -173,7 +178,6 @@ final class ChatStore {
     /// reset on a fresh turn / open / reset. The view renders ``subagentRoots``
     /// + ``subagentChildren(of:)`` so it never touches the assembly map.
     #if DEBUG
-    @Snapshotable
     #endif
     private(set) var subagentNodeCount: Int = 0
 
@@ -182,14 +186,12 @@ final class ChatStore {
     /// secure prompt (`"sudo"` / `"secret"` / `"none"`) so the gate can assert a
     /// prompt is up WITHOUT ever reading the entered value (which is never held in
     /// the store at all — see ``PendingSecurePrompt``). Bridge-exposed as a String.
-    @Snapshotable
     var activeSecurePromptKind: String {
         pendingSecurePrompt?.kind.rawValue ?? "none"
     }
     #endif
     /// Last user-facing error (busy, send failure, …), or `nil`.
     #if DEBUG
-    @Snapshotable
     #endif
     var lastError: String?
 
@@ -229,20 +231,17 @@ final class ChatStore {
     /// `catch`. Not user-facing chrome — it drives diagnostics and the DEBUG
     /// bridge — so it never clobbers `lastError`.
     #if DEBUG
-    @Snapshotable
     #endif
     private(set) var lastBackfillError: String?
 
     #if DEBUG
     /// DEBUG-only adoption-gate telemetry, bridge-exposed via the UI-G
     /// StateAccessor pattern. Release builds never reference this.
-    @Snapshotable
     private(set) var foreignMirrorTelemetry = ForeignMirrorTelemetry()
 
     /// DEBUG-only label of the most recent `isStreaming` write (F3-H2). Names the
     /// function + reason + the inbound event's ids vs. the active ids, so the gate
     /// can read which path flipped streaming on. Bridge-exposed as a String.
-    @Snapshotable
     private(set) var lastStreamingSetter: String = "(none)"
 
     /// DEBUG-only ordered ring buffer of the last `streamingRingCapacity`
@@ -343,7 +342,6 @@ final class ChatStore {
     /// the turn activity bar. `nil` when no tool is running. Set on `tool.start`
     /// and cleared on that tool's `tool.complete` / turn completion.
     #if DEBUG
-    @Snapshotable
     #endif
     private(set) var activeToolName: String?
     /// `tool_call_id` backing `activeToolName`, so completion of an *earlier*
@@ -1266,7 +1264,8 @@ final class ChatStore {
     /// (for example, the user re-enters a chat whose turn was started elsewhere or
     /// before navigating away). The REST transcript only contains persisted rows;
     /// it does NOT prove the current runtime is idle. After the open seed has
-    /// landed, ask the gateway for `session.status` and, if it reports `running`,
+    /// landed, consume the resume snapshot when available; older gateways fall
+    /// back to `session.status`. If either reports `running`,
     /// re-create the local in-flight UI state: a streaming assistant placeholder,
     /// the global `isStreaming` flag, the local-turn ownership token (so mutable
     /// actions are disabled), and the Stop target (`activeSessionId`).
@@ -1274,7 +1273,17 @@ final class ChatStore {
     /// This is deliberately idempotent: a live websocket `message.start` that wins
     /// the race simply means the streaming row already exists, and a superseded
     /// open drops out via the runtime-id guard.
-    func reconcileLiveTurnStatus(runtimeId: String) async {
+    func reconcileLiveTurnStatus(
+        runtimeId: String,
+        snapshotRunning: Bool? = nil,
+        inflight: SessionInflightTurn? = nil
+    ) async {
+        guard runtimeId == activeSessionId else { return }
+        if let snapshotRunning {
+            guard snapshotRunning else { return }
+            restoreInflightTurn(inflight)
+            return
+        }
         guard let fetch = resolvedLiveTurnStatusFetch else { return }
         let status = try? await fetch(runtimeId)
         guard runtimeId == activeSessionId else { return }
@@ -1282,8 +1291,39 @@ final class ChatStore {
             applyContextUsage(from: usage)
         }
         guard status?.running == true else { return }
+        restoreInflightTurn(nil)
+    }
+
+    private func restoreInflightTurn(_ inflight: SessionInflightTurn?) {
+        let user = inflight?.user.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !user.isEmpty, !inflightUserPromptAlreadyRestored(user) {
+            messages.append(ChatMessage(role: .user, text: user))
+            rebuildUserOrdinals()
+        }
         beginLocalTurn()
         beginStreamingMessage()
+        if let assistant = inflight?.assistant, !assistant.isEmpty {
+            mutateStreaming { $0.applyFinalText(assistant) }
+        }
+    }
+
+    /// True when `user` is already the prompt row that opened the in-flight
+    /// streaming turn, so a repeat `reconcileLiveTurnStatus` must not re-append a
+    /// duplicate prompt bubble. `reconcileLiveTurnStatus` runs once at open and
+    /// again on every reconnect-recovery resume for the same running turn; the
+    /// prior guard (`lastUser?.text != user || messages.last?.role != .user`) was
+    /// always satisfied once the streaming assistant row trailed the prompt, so
+    /// each repeat call appended another copy of the same inflight prompt.
+    private func inflightUserPromptAlreadyRestored(_ user: String) -> Bool {
+        guard let streamingMessageID,
+              let streamIndex = messages.firstIndex(where: { $0.id == streamingMessageID })
+        else { return false }
+        // Walk back from the streaming assistant row to the prompt that started
+        // it; equality there means this exact inflight turn is already restored.
+        var index = streamIndex - 1
+        while index >= 0, messages[index].role != .user { index -= 1 }
+        guard index >= 0 else { return false }
+        return messages[index].text == user
     }
 
     /// Injectable seam for `reconcileLiveTurnStatus` tests. The live path uses the
@@ -2438,6 +2478,18 @@ final class ChatStore {
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             throw error
         }
+    }
+
+    /// Remove the optimistic user echo for a durable outbox row that the user
+    /// chose to Delete from its transcript error badge (C1). Correlates by the
+    /// shared `clientMessageID`; the QueueStore cancels/deletes the row itself.
+    /// A no-op when the echo is already gone (e.g. a late server-seeded replace).
+    func removeLocalEcho(clientMessageID: String) {
+        guard let index = messages.firstIndex(where: {
+            $0.role == .user && $0.clientMessageID == clientMessageID
+        }) else { return }
+        let removed = messages.remove(at: index)
+        userOrdinals[removed.id] = nil
     }
 
     private func presentOutboxEcho(

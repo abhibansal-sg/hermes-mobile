@@ -42,6 +42,25 @@ enum ThinkingDisplay {
         return "Thought for \(durationText(seconds: max(0, Int(duration))))"
     }
 
+    /// Resolve the effective open state of the reasoning accordion: an explicit
+    /// user override (`nil` = none yet) wins over the streaming-driven default —
+    /// open while the turn streams, collapsed once it settles.
+    static func expansionResolved(userOverride: Bool?, streaming: Bool) -> Bool {
+        userOverride ?? streaming
+    }
+
+    /// Interpret a `DisclosureGroup` expansion write and decide whether it latches
+    /// as a user override. A write whose value already equals the streaming-driven
+    /// default is a no-op ECHO — SwiftUI emits one back through a binding-driven
+    /// group as it animates, including on the streaming→settled transition. Latching
+    /// that echo pins the section open, so a settled reasoning block never
+    /// auto-collapses (the stuck-expanded regression). Only a write that CROSSES the
+    /// current default is a deliberate user toggle worth remembering; an echo clears
+    /// any prior override so the auto default resumes control.
+    static func expansionOverride(forWrite newValue: Bool, streaming: Bool) -> Bool? {
+        newValue == streaming ? nil : newValue
+    }
+
     private static func durationText(seconds: Int) -> String {
         if seconds < 60 { return "\(seconds)s" }
         return "\(seconds / 60)m \(seconds % 60)s"
