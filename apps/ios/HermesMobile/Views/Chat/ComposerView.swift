@@ -205,7 +205,12 @@ struct ComposerView: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            if queueStore.pendingCount > 0 {
+            // C2: the pill is a BACKLOG indicator, not a per-send affordance. A
+            // healthy in-transit send never surfaces it; only stuck / failed /
+            // queued-while-offline rows for THIS session do. When it does show,
+            // its count is still `pendingCount` (== the Outbox sheet's rows), so
+            // pill and sheet never diverge.
+            if queueStore.hasBacklog {
                 queueChip
             }
             // Transient steer-outcome note (auto-clears after 2 s).
@@ -260,6 +265,9 @@ struct ComposerView: View {
         .animation(.easeInOut(duration: 0.18), value: isCapturing)
         .animation(.easeInOut(duration: 0.18), value: voice.isEnabled)
         .animation(.easeInOut(duration: 0.18), value: queueStore.activeItems.count)
+        // The pill's visibility is gated on backlog, which can flip (in-transit →
+        // stuck at the 7s boundary, or offline) without the count changing (C2).
+        .animation(.easeInOut(duration: 0.18), value: queueStore.hasBacklog)
         .animation(.easeInOut(duration: 0.18), value: steerNote)
         .animation(.easeInOut(duration: 0.18), value: yoloStatusNote)
         .animation(.snappy(duration: 0.16), value: holdActive)
