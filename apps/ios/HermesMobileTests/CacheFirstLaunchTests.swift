@@ -257,6 +257,53 @@ final class CacheFirstLaunchTests: XCTestCase {
         XCTAssertEqual(chat.messages.last?.text, "from disk")
     }
 
+    /// Cold-launch RESUME regression (#208 follow-up): the last-active session's
+    /// transcript must paint from cache on cold launch even though the connection
+    /// work generation is advanced BETWEEN the frame-0 `open(bindRuntime:false)`
+    /// (scheduled by `paintFromCache`) and the moment its async seed Task drains.
+    ///
+    /// The real launch order is: `paintDrawerCacheFirst()` schedules the transcript
+    /// seed under the pre-bootstrap generation, then `bootstrap()`'s
+    /// `advanceConnectionGeneration()` bumps `connectionWorkGeneration`. The old
+    /// phase-1 guard (`isCurrentTranscriptSelection`, generation-keyed) then treated
+    /// the LOCAL cache paint as stale and skipped BOTH the paint and the miss-path
+    /// `reset()`, stranding the transcript on its launch skeleton (isLoading:false,
+    /// no error) even though the cache existed — while a manual drawer re-tap (which
+    /// captures a settled generation) painted it instantly. This test bumps the
+    /// generation exactly as bootstrap does, with ZERO network, and proves both the
+    /// drawer AND the transcript paint from persisted identity alone.
+    func testColdLaunchResumePaintsTranscriptAcrossGenerationAdvance() async throws {
+        let (connection, sessions, chat) = makeGraph()
+        let cache = try makeInMemoryCache()
+        sessions.attachCache(cache)
+        chat.attachCache(cache)
+        connection.serverURLString = serverURL
+        let scope = CacheScope(serverId: serverURL, profileId: DefaultsKeys.allProfilesScope)
+        let identity = CacheIdentity(serverId: serverURL, profileId: "default", sessionId: "remembered")
+        try await cache.saveSessionList([makeSummary(id: "remembered")], scope: scope)
+        try await cache.saveTranscript(identity: identity, messages: [stubStored("cold-resume")])
+        try await cache.saveLastOpenedSession(identity, manifestScope: scope)
+
+        // No transcript fetch seam is wired: this is a pure offline cold launch, so
+        // the ONLY way the transcript can paint is the local cache seed.
+        await sessions.paintFromCache()
+
+        // Mirror ConnectionStore.advanceConnectionGeneration() landing at
+        // bootstrap-start, AFTER the frame-0 open() scheduled the seed but BEFORE it
+        // drains — the exact reorder that stranded the transcript.
+        sessions.transportDidBecomeUnavailable()
+        sessions.invalidateConnectionWork()
+
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(sessions.sessions.map(\.id), ["remembered"],
+                       "the drawer paints from cache with zero network")
+        XCTAssertEqual(sessions.activeStoredId, "remembered",
+                       "the last-opened session is restored as active")
+        XCTAssertEqual(chat.messages.last?.text, "cold-resume",
+                       "the cached transcript paints on cold-launch resume despite the generation advance")
+    }
+
     func testCacheRestoreSelectsAndPaintsWithoutStartingResume() async throws {
         let (connection, sessions, chat) = makeGraph()
         let cache = try makeInMemoryCache()

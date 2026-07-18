@@ -4999,6 +4999,27 @@ final class SessionStore {
             && connectionWorkGeneration == workGeneration
     }
 
+    /// Validity of the LOCAL (memory/disk) cache paint — phase 1 of a cold-open
+    /// seed. Deliberately transport-generation-INDEPENDENT: a cache paint reads
+    /// disk for the captured scoped identity, so it is correct regardless of the
+    /// `connectionWorkGeneration` (which fences prior-GATEWAY NETWORK data — the
+    /// concern of phase 2's ``isCurrentTranscriptNetworkWork``, not a disk read).
+    ///
+    /// This is the cold-launch-resume fix (#208 follow-up): `open(bindRuntime:false)`
+    /// scheduled from `paintFromCache()` at frame 0 captures the pre-bootstrap
+    /// generation, then `ConnectionStore.bootstrap()` runs `advanceConnectionGeneration()`
+    /// (which bumps `connectionWorkGeneration`) BEFORE this seed's Task drains. The
+    /// old `isCurrentTranscriptSelection` phase-1 guard then treated the cache paint
+    /// as stale and skipped BOTH the paint AND the miss-path `reset()`, stranding
+    /// the transcript on its launch skeleton (isLoading:false, no error). The
+    /// manual drawer re-tap never hit this because it captures a settled generation.
+    /// `openToken` alone is the correct supersession key here — a newer open or a
+    /// gateway scope switch (``invalidateGatewayScopeWork``) rotates it, which
+    /// still cancels a superseded/foreign cache paint.
+    private func isCurrentTranscriptOpen(token: UUID) -> Bool {
+        !Task.isCancelled && openToken == token
+    }
+
     private func isCurrentTranscriptNetworkWork(
         token: UUID,
         workGeneration: UInt64,
@@ -5056,10 +5077,11 @@ final class SessionStore {
         func signalFirstPaint() {
             guard !firstPaintSignalled else { return }
             firstPaintSignalled = true
-            if isCurrentTranscriptSelection(
-                token: token,
-                workGeneration: workGeneration
-            ) { onFirstPaint?() }
+            // The reveal fires once phase 1 lands a first frame; it is gated only by
+            // the open identity (a generation bump between open() and this seed —
+            // e.g. bootstrap's advanceConnectionGeneration — must not strand the
+            // drawer open on a cold-launch resume).
+            if isCurrentTranscriptOpen(token: token) { onFirstPaint?() }
         }
         guard let chat else {
             paintFinished = true
@@ -5085,7 +5107,7 @@ final class SessionStore {
         // reconciles any tail/delta afterward.
         var paintedFromCache = false
         var paintedFromDisk = false
-        if isCurrentTranscriptSelection(token: token, workGeneration: workGeneration),
+        if isCurrentTranscriptOpen(token: token),
            let cached = cachedWarmOpenSnapshot(for: storedId) {
             chat.seed(normalized: Array(cached.suffix(ChatStore.transcriptOpenWindowLimit)))
             paintedRows = cached.count
@@ -5104,19 +5126,16 @@ final class SessionStore {
             // never ages out of the eviction horizon.
             guard let identity = capturedIdentity else { return }
             try? await cacheStore.touchSession(identity)
-            if isCurrentTranscriptSelection(token: token, workGeneration: workGeneration),
+            if isCurrentTranscriptOpen(token: token),
                (try? await cacheStore.hasTranscript(identity)) == true,
-               isCurrentTranscriptSelection(token: token, workGeneration: workGeneration),
+               isCurrentTranscriptOpen(token: token),
                let cached = try? await cacheStore.loadTranscript(identity),
-               isCurrentTranscriptSelection(token: token, workGeneration: workGeneration) {
+               isCurrentTranscriptOpen(token: token) {
                 // ARCH37 STEP 2 — normalize the cached rows OFF main, hop to main
                 // only for the in-place reconcile (the FIRST painted frame).
                 let cachedWindow = Array(cached.suffix(ChatStore.transcriptOpenWindowLimit))
                 let normalized = await Self.normalizeOffMain(cachedWindow)
-                guard isCurrentTranscriptSelection(
-                    token: token,
-                    workGeneration: workGeneration
-                ) else { return }
+                guard isCurrentTranscriptOpen(token: token) else { return }
                 rememberWarmOpenSnapshot(normalized, for: storedId)
                 chat.seed(normalized: normalized)  // in-place reconcile — FIRST frame
                 paintedRows = cachedWindow.count
@@ -5125,8 +5144,7 @@ final class SessionStore {
                 paintedFromDisk = true
             }
         }
-        if !paintedFromCache,
-           isCurrentTranscriptSelection(token: token, workGeneration: workGeneration) {
+        if !paintedFromCache, isCurrentTranscriptOpen(token: token) {
             // Cache miss (or no cache): empty the transcript so ChatView shows the
             // skeleton, not a stale prior session's rows, while the network loads.
             chat.reset()
