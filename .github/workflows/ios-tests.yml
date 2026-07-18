@@ -32,6 +32,16 @@ jobs:
           sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
           xcodebuild -version
 
+      - name: Regenerate project (project.yml is source of truth)
+        run: |
+          # The committed .xcodeproj is an XcodeGen artifact and drifts from
+          # project.yml (a source file committed without regenerating the pbxproj
+          # compiles locally — where the build wrapper always runs xcodegen — but
+          # fails CI with "cannot find <Type> in scope"). Regenerate here so CI
+          # matches local + Xcode Cloud's ci_post_clone.sh, which also regenerates.
+          brew install xcodegen 2>&1 | tail -1 || brew upgrade xcodegen 2>&1 | tail -1 || true
+          (cd apps/ios && xcodegen generate)
+
       - name: Resolve destination
         id: dest
         run: |
