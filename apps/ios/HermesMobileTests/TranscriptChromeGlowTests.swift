@@ -139,6 +139,56 @@ final class TranscriptChromeGlowTests: XCTestCase {
         XCTAssertEqual(ThinkingDisplay.settledLabel(duration: 65), "Thought for 1m 5s")
     }
 
+    // MARK: - 2c. Reasoning accordion auto-collapse (stuck-expanded regression)
+
+    /// The streaming-driven default with no user choice: open while the turn
+    /// streams, collapsed the moment it settles. This is the core auto-collapse
+    /// contract a settled reasoning block must honor.
+    func testReasoningExpansionAutoDefaultFollowsStreaming() {
+        XCTAssertTrue(ThinkingDisplay.expansionResolved(userOverride: nil, streaming: true),
+                      "a live turn opens its reasoning so the reader watches it stream")
+        XCTAssertFalse(ThinkingDisplay.expansionResolved(userOverride: nil, streaming: false),
+                       "a settled turn auto-collapses to the compact one-line affordance")
+    }
+
+    /// A deliberate user toggle (a value that crosses the current default) wins
+    /// over the auto default and is remembered.
+    func testReasoningExpansionUserToggleWins() {
+        // Opened by hand on a settled turn → stays open.
+        XCTAssertTrue(ThinkingDisplay.expansionResolved(userOverride: true, streaming: false))
+        // Closed by hand while streaming → stays closed.
+        XCTAssertFalse(ThinkingDisplay.expansionResolved(userOverride: false, streaming: true))
+    }
+
+    /// The regression guard: a DisclosureGroup echo write equal to the current
+    /// default must NOT latch as an override — otherwise the settle transition's
+    /// echo would pin the section open and it would never auto-collapse. A cross
+    /// of the default is the only genuine user toggle.
+    func testReasoningExpansionOverrideIgnoresEchoWrites() {
+        // Echo equal to the streaming default → no override (auto default resumes).
+        XCTAssertNil(ThinkingDisplay.expansionOverride(forWrite: true, streaming: true))
+        XCTAssertNil(ThinkingDisplay.expansionOverride(forWrite: false, streaming: false))
+        // Deliberate toggle crossing the default → latches.
+        XCTAssertEqual(ThinkingDisplay.expansionOverride(forWrite: true, streaming: false), true)
+        XCTAssertEqual(ThinkingDisplay.expansionOverride(forWrite: false, streaming: true), false)
+    }
+
+    /// End-to-end of the stuck-expanded fix: a turn opens while streaming, the
+    /// group echoes its open state back through the setter (equal to the default),
+    /// and when the turn settles the resolved state collapses instead of staying
+    /// pinned open.
+    func testReasoningSettleCollapsesAfterEchoWrite() {
+        // Streaming: default open.
+        var override = ThinkingDisplay.expansionOverride(forWrite: true, streaming: true) // echo
+        XCTAssertNil(override, "echo write while streaming does not latch")
+        XCTAssertTrue(ThinkingDisplay.expansionResolved(userOverride: override, streaming: true))
+        // Turn settles: no override, so it collapses.
+        XCTAssertFalse(ThinkingDisplay.expansionResolved(userOverride: override, streaming: false),
+                       "settled reasoning collapses; the streaming echo never pinned it open")
+        override = ThinkingDisplay.expansionOverride(forWrite: false, streaming: false) // settle echo
+        XCTAssertNil(override)
+    }
+
     // MARK: - 3. Activity label logic (unchanged helpers still pass)
 
     func testLabelShowsActiveToolNameWhenPresent() {
