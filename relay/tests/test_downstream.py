@@ -444,7 +444,7 @@ async def test_approve_clarify_interrupt_pass_through():
     srv, gw = _server()
     await srv.start()
     await _handle(srv, UpstreamMethod.APPROVE, {"session_id": "s1", "request_id": "r", "decision": "allow"})
-    gw.approval_respond.assert_awaited_once_with("s1", "r", "allow")
+    gw.approval_respond.assert_awaited_once_with("s1", "r", "allow", resolve_all=False)
     await _handle(srv, UpstreamMethod.CLARIFY, {"session_id": "s1", "request_id": "r", "text": "yes"})
     gw.clarify_respond.assert_awaited_once_with("s1", "r", "yes")
     await _handle(srv, UpstreamMethod.INTERRUPT, {"session_id": "s1"})

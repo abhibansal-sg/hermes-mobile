@@ -578,12 +578,18 @@ class DownstreamServer:
 
         # -- interactive gates + stop (pass-through) -------------------------
         if method == UpstreamMethod.APPROVE:
+            # ``decision`` is the phone's chosen gate answer (once/session/always/
+            # deny/approve); the gateway maps it onto its ``choice`` param. ``all``
+            # (optional) applies the decision to every matching pending approval.
             return await self._gateway.approval_respond(
-                p["session_id"], p["request_id"], p["decision"]
+                p["session_id"],
+                p.get("request_id", ""),
+                p["decision"],
+                resolve_all=bool(p.get("all", False)),
             )
         if method == UpstreamMethod.CLARIFY:
             return await self._gateway.clarify_respond(
-                p["session_id"], p["request_id"], p["text"]
+                p["session_id"], p.get("request_id", ""), p["text"]
             )
         if method == UpstreamMethod.INTERRUPT:
             return await self._gateway.session_interrupt(p["session_id"])
