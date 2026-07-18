@@ -395,12 +395,19 @@ actor CacheStore {
                     .deleteAll(db)
             }
             for summary in chain.sessions where !chain.tombstones.contains(summary.id) {
+                // A1(ii): stamp the row's stored profileId with the SAME
+                // normalization `saveSessionList` uses. Previously this passed the
+                // raw `scope` straight through, so an aggregate ("all") manifest
+                // apply persisted the literal "all" onto rows — violating the
+                // identity invariant that "all" is a query selector, never a stored
+                // value, and stranding those rows out of every concrete-profile read.
+                let rowProfile = Self.storedProfileId(for: summary, scope: scope)
                 let existing = try SessionCacheRecord
                     .filter(Column("serverId") == scope.serverId)
-                    .filter(Column("profileId") == scope.profileId)
+                    .filter(Column("profileId") == rowProfile)
                     .filter(Column("id") == summary.id)
                     .fetchOne(db)
-                let record = try SessionCacheRecord.make(from: summary, scope: scope, isPinned: existing?.isPinned ?? false, lastAccessedAt: existing?.lastAccessedAt ?? 0, transcriptCachedAt: existing?.transcriptCachedAt, maxMessageId: existing?.maxMessageId)
+                let record = try SessionCacheRecord.make(from: summary, scope: CacheScope(serverId: scope.serverId, profileId: rowProfile), isPinned: existing?.isPinned ?? false, lastAccessedAt: existing?.lastAccessedAt ?? 0, transcriptCachedAt: existing?.transcriptCachedAt, maxMessageId: existing?.maxMessageId)
                 try record.save(db)
             }
             let previous: [SessionSummary]
@@ -429,8 +436,7 @@ actor CacheStore {
     func saveSessionList(_ summaries: [SessionSummary], scope: CacheScope) throws {
         try db.write { db in
             for summary in summaries {
-                let profile = summary.profile?.trimmingCharacters(in: .whitespacesAndNewlines)
-                let actualProfile = (profile?.isEmpty == false) ? profile! : (scope.profileId == CacheScope.allProfilesKey ? "default" : scope.profileId)
+                let actualProfile = Self.storedProfileId(for: summary, scope: scope)
                 let identity = CacheIdentity(serverId: scope.serverId, profileId: actualProfile, sessionId: summary.id)
                 let existing = try Self.session(identity, in: db)
                 let record = try SessionCacheRecord.make(
@@ -818,7 +824,7 @@ actor CacheStore {
     /// (the active scope is authoritative for where the row currently lives).
     func upsertSession(_ summary: SessionSummary, scope: CacheScope) throws {
         try db.write { db in
-            let profile = summary.profile ?? (scope.profileId == CacheScope.allProfilesKey ? "default" : scope.profileId)
+            let profile = Self.storedProfileId(for: summary, scope: scope)
             let identity = CacheIdentity(serverId: scope.serverId, profileId: profile, sessionId: summary.id)
             let existing = try Self.session(identity, in: db)
             let record = try SessionCacheRecord.make(
@@ -972,6 +978,40 @@ actor CacheStore {
                 .fetchCount(db)
             return (afterId, prefixCount)
         }
+    }
+
+    #if DEBUG
+    /// TEST-ONLY: persist a session row stamped with an EXACT `profileId`,
+    /// bypassing the `storedProfileId` normalization, so the read-side tolerance
+    /// for legacy rows mis-stamped with the literal "all" (A1(iii)) can be
+    /// exercised deterministically. Never used outside tests.
+    func _writeRawSessionRowForTesting(
+        _ summary: SessionSummary, serverId: String, profileId: String
+    ) throws {
+        try db.write { db in
+            let record = try SessionCacheRecord.make(
+                from: summary,
+                scope: CacheScope(serverId: serverId, profileId: profileId)
+            )
+            try record.save(db)
+        }
+    }
+    #endif
+
+    /// The concrete profile a row must be STORED under, given a summary and the
+    /// active write scope. `all` is only ever a query selector, never a stored
+    /// value (CONTRACT-OFFLINE-CACHE identity invariant): a blank/absent summary
+    /// profile collapses to the scope's own profile, or `default` when the scope
+    /// itself is the aggregate key. Shared by EVERY write path (`saveSessionList`,
+    /// `upsertSession`, `applyManifest`) so the stored profileId can never drift
+    /// between them — the divergence that previously let a literal `all` reach a
+    /// row via the un-normalized manifest apply.
+    static func storedProfileId(for summary: SessionSummary, scope: CacheScope) -> String {
+        let profile = summary.profile?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A real session profile is never the aggregate sentinel — reject a
+        // literal "all" here too so no write path can stamp the selector onto a row.
+        if let profile, !profile.isEmpty, profile != CacheScope.allProfilesKey { return profile }
+        return scope.profileId == CacheScope.allProfilesKey ? "default" : scope.profileId
     }
 
     private static func session(_ identity: CacheIdentity, in db: Database) throws -> SessionCacheRecord? {
