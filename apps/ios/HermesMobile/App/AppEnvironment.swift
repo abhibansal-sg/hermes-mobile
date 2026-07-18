@@ -128,8 +128,18 @@ final class AppEnvironment {
                     guard let sessionStore else { throw OutboxProcessorError.destinationUnavailable }
                     return try await sessionStore.createOutboxDestination()
                 },
-                resolveRuntime: { [weak sessionStore] storedID in
-                    await sessionStore?.runtimeForOutboxDestination(storedID)
+                resolveRuntime: { [weak sessionStore, weak connectionStore] storedID in
+                    // Wave-2 relay transport: the durable outbox drains into the
+                    // relay-OWNED session, whose id the coordinator tracks — the
+                    // gateway runtime mapping does not apply. Returning it (non-nil)
+                    // lets the drain reach the relay `submit`; nil (no owned session
+                    // yet) holds the job until the relay owns one. Gateway-direct is
+                    // unchanged (this branch is never taken with the flag OFF).
+                    if connectionStore?.relayCoordinator != nil,
+                       connectionStore?.transportPath == .relay {
+                        return connectionStore?.relayCoordinator?.activeSessionID
+                    }
+                    return await sessionStore?.runtimeForOutboxDestination(storedID)
                 },
                 uploadAsset: { [weak connectionStore, weak workRepository] job, snapshot in
                     guard let connectionStore,

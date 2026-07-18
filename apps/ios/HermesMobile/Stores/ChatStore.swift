@@ -2450,6 +2450,33 @@ final class ChatStore {
         runtimeSessionID: String,
         remotePaths: [String]
     ) async throws -> OutboxSubmitResult {
+        // Wave-2 relay transport: when the flag is `.relay` the gateway `client`
+        // is idle, so the durable outbox must drain OVER THE RELAY (§5:
+        // `prompt.submit` maps to the relay `submit` RPC into the relay-owned
+        // session). The relay item projection owns the transcript + streaming
+        // state, so this branch deliberately skips the gateway-style local-turn /
+        // streaming bookkeeping — it routes the prompt and maps the RPC result to
+        // a receipt. A returned result (no throw) means the relay accepted the
+        // prompt → an accepted `queued` receipt marks the job completed (no
+        // permanent pending). A transport failure throws, and the outbox retains
+        // the row for the next wake so it delivers once the relay reconnects; the
+        // job's stable identity keeps that retry from creating a second row.
+        // Gated on the coordinator existing first: gateway-direct never allocates
+        // it, so that path skips the flag read and stays byte-identical.
+        if let coordinator = connection?.relayCoordinator,
+           connection?.transportPath == .relay {
+            prepareOutboxSubmission(job: job, remotePaths: remotePaths)
+            lastSendReachedServer = true
+            _ = try await coordinator.submit(
+                prompt: job.submissionText,
+                sessionID: runtimeSessionID
+            )
+            return OutboxSubmitResult(
+                status: "queued",
+                accepted: true,
+                clientMessageID: job.clientMessageID
+            )
+        }
         guard let client else { throw GatewayError.notConnected }
         prepareOutboxSubmission(job: job, remotePaths: remotePaths)
         pendingReconnectReconcileID = nil
