@@ -2796,6 +2796,33 @@ final class SessionStore {
     /// Merge changed rows and deferred removals without replacing the loaded
     /// grow-limit window. Returns whether the backing `sessions` rows changed so
     /// empty heartbeats can skip cache and Spotlight rewrites.
+    /// Whether an optimistically-bumped local `lastActive` should be carried
+    /// forward over a lagging server value for `identity` on a list merge (the
+    /// anti-flicker keep-active-at-top invariant, ABH-86/178/157).
+    ///
+    /// A row is kept ahead of the server only while it is genuinely being driven.
+    /// Two independent liveness signals qualify, OR'd so a gap in one never
+    /// regresses the other:
+    ///   - `turnsInProgress`: the EXPLICIT per-turn flag (ABH-178). Covers a long
+    ///     turn whose silent inter-frame gap exceeds ``liveWindow`` — a time-proxy
+    ///     alone would decay mid-turn and flicker the row down.
+    ///   - `lastActivityAt` fresh within ``liveWindow``: a live-frame time signal.
+    ///     Covers a turn STILL receiving frames after `turnsInProgress` was
+    ///     force-cleared by a disconnect/reconnect (`clearAllTurnsInProgress`).
+    ///     Without it, the reconnect's transport-epoch bump forces an A2 full
+    ///     first-page reseed (`mergeSessionPage`) in which the active session —
+    ///     present in the server page, so not a working-set survivor — decays to
+    ///     the server's stale `lastActive` and sinks to "yesterday" until the next
+    ///     live frame re-bumps it (LANE D transient mis-order).
+    /// A SETTLED row (no in-flight turn AND no recent frame) qualifies for NEITHER,
+    /// so a stale device-clock bump still decays to server authority (ABH-157).
+    private func shouldCarryForwardLastActive(_ identity: String) -> Bool {
+        if turnsInProgress.contains(identity) { return true }
+        if let at = lastActivityAt[identity],
+           Date().timeIntervalSince(at) < Self.liveWindow { return true }
+        return false
+    }
+
     private func mergeSessionDelta(
         _ delta: SessionListDeltaResult,
         scope: SessionListDeltaScope
@@ -2849,11 +2876,12 @@ final class SessionStore {
         let didRemove = sessions.count != countBeforeRemoval
 
         let priorLastActive: [String: Double] = sessions.reduce(into: [:]) { result, row in
-            if let lastActive = row.lastActive { result[row.id] = lastActive }
+            if let lastActive = row.lastActive { result[sessionListIdentity(row)] = lastActive }
         }
         let reconciled = incoming.map { row -> SessionSummary in
-            guard let prior = priorLastActive[row.id],
-                  turnsInProgress.contains(row.id),
+            let identity = sessionListIdentity(row)
+            guard let prior = priorLastActive[identity],
+                  shouldCarryForwardLastActive(identity),
                   prior > (row.lastActive ?? -.greatestFiniteMagnitude) else { return row }
             var bumped = row
             bumped.lastActive = prior
@@ -3001,22 +3029,25 @@ final class SessionStore {
         let priorLastActive: [String: Double] = sessions.reduce(into: [:]) { acc, s in
             if let la = s.lastActive { acc[sessionListIdentity(s)] = la }
         }
-        // ABH-178 — gate the carry-forward on an EXPLICIT per-turn flag
-        // (turnsInProgress) instead of the 10s liveWindow time-proxy. The
-        // time-proxy worked well for the common case (frequent delta frames keep
-        // lastActivityAt fresh) but opened a residual flicker window when a turn
-        // had a >liveWindow silent inter-frame gap: the carry-forward decayed mid-turn
-        // and a refresh would temporarily drop the row to server authority. The
-        // explicit flag is toggled on message.start (set) and cleared on every
-        // turn-end path: message.complete, gateway error, user cancel, and — as a
-        // belt-and-suspenders — disconnect/reconnect (clearAllTurnsInProgress).
-        // That final path ensures a mid-turn socket drop can NEVER leave the flag
-        // stuck, which would bring back the infinite-carry-forward bug from ABH-157.
-        // NOTE: `lastActivityAt` / `liveWindow` are PRESERVED for the live-dot
-        // (the pulsing row indicator) — only this carry-forward gate has changed.
+        // ABH-178 / LANE D — gate the carry-forward on `shouldCarryForwardLastActive`:
+        // the EXPLICIT per-turn flag (turnsInProgress) OR a live frame within the
+        // ``liveWindow``. The explicit flag covers a long turn whose silent
+        // inter-frame gap exceeds `liveWindow` (a time-proxy alone decayed mid-turn
+        // and dropped the row to server authority). The live-window signal covers a
+        // turn STILL streaming after `turnsInProgress` was force-cleared by a
+        // disconnect/reconnect (`clearAllTurnsInProgress`): the reconnect's
+        // transport-epoch bump forces an A2 full first-page reseed here, and without
+        // the second signal the still-live active session would decay to the
+        // server's stale `lastActive` and sink to "yesterday" (LANE D). The flag is
+        // set on message.start and cleared on every turn-end path (complete, error,
+        // cancel, disconnect/reconnect), so a mid-turn socket drop can never leave it
+        // stuck; the live-window signal is self-expiring (pruned after `liveWindow`),
+        // so a SETTLED bump still decays and neither signal revives the ABH-157
+        // infinite-carry-forward bug.
         let reconciled = incoming.map { row -> SessionSummary in
-            guard let prior = priorLastActive[sessionListIdentity(row)],
-                  turnsInProgress.contains(sessionListIdentity(row)),
+            let identity = sessionListIdentity(row)
+            guard let prior = priorLastActive[identity],
+                  shouldCarryForwardLastActive(identity),
                   prior > (row.lastActive ?? -.greatestFiniteMagnitude) else { return row }
             var bumped = row
             bumped.lastActive = prior
