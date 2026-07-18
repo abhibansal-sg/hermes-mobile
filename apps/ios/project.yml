@@ -13,12 +13,6 @@ settings:
     CURRENT_PROJECT_VERSION: 114
     MARKETING_VERSION: 1.0.1
 packages:
-  # gstack iOS debug bridge (task UI-G). Local SPM package. Every source file
-  # is #if DEBUG-gated (Swift) / #if DEBUG (ObjC), so a Release build links
-  # empty modules and carries no StateServer/DebugBridge symbols. Remove via
-  # the ios-clean procedure (see HermesMobile/App/DebugBridgeWiring.swift).
-  DebugBridge:
-    path: DebugBridge
   # Offline-first cache plus the protected app-group WorkRepository. The share
   # extension links GRDB so it can atomically enqueue into the same database.
   GRDB:
@@ -52,9 +46,6 @@ targets:
         embed: true
       # DEBUG-only debug bridge. Linked in all configs by XcodeGen, but its
       # modules compile to nothing in Release (source-level #if DEBUG), so no
-      # bridge symbols ship. DebugBridgeUI transitively pulls Core + Touch.
-      - package: DebugBridge
-        product: DebugBridgeUI
       # Offline-first SQLite cache (CONTRACT-OFFLINE-CACHE.md P1/P2).
       # HermesMobile only; no extension target links this.
       - package: GRDB

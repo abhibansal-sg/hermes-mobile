@@ -183,20 +183,8 @@ struct HermesMobileApp: App {
                     // seeded captures (demo footage) are clean.
                     if let seed = UITestSeed.requestedMode {
                         UITestSeed.apply(seed, environment: environment)
-                        // MEASUREMENT MODE: when BOTH the seed AND the debug bridge are
-                        // requested (HERMES_DEBUG_BRIDGE=1), start the bridge anyway so a
-                        // harness can drive scrolls (/swipe → setContentOffset) against
-                        // the seeded transcript. The on-device badge/overlay is fine
-                        // during measurement (it is not a demo capture). Clean seeded
-                        // captures simply omit HERMES_DEBUG_BRIDGE.
-                        if ProcessInfo.processInfo.environment["HERMES_DEBUG_BRIDGE"] == "1" {
-                            startGstackDebugBridge(environment: environment)
-                        }
                         return
                     }
-                    // gstack debug bridge (task UI-G): loopback-only StateServer
-                    // + typed store accessors. DEBUG-only; absent in Release.
-                    startGstackDebugBridge(environment: environment)
                     #endif
                     environment.appLock.authenticateAtLaunch()
                     // The notification-action backend is already installed by
