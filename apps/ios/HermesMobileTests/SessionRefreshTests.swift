@@ -214,6 +214,120 @@ final class SessionRefreshTests: XCTestCase {
             "while a turn is in flight (markTurnStarted), the optimistic bump is carried forward so the row doesn't flicker down before the server catches up")
     }
 
+    // MARK: - LANE D: live session must not sink after a reconnect reseed
+
+    /// LANE D regression. A live turn is streaming into "mine" (optimistically
+    /// bumped to the top). A quick reconnect heal force-clears every in-flight turn
+    /// flag (`clearAllTurnsInProgress`) yet PRESERVES the live-frame stamp, then its
+    /// transport-epoch bump forces a full first-page reseed. The reseed page carries
+    /// the STALE server `lastActive` for "mine" (its last `message.complete` was
+    /// yesterday; the in-flight turn has not landed) while two older rows look
+    /// fresher. Before the fix, the carry-forward gate was `turnsInProgress`-only, so
+    /// the now-empty flag let "mine" decay to its stale value and sink to "yesterday"
+    /// — the transient mis-order the user saw. The live-window signal must keep it on
+    /// top through the reseed, with no wrong-order publish.
+    func testLiveSessionSurvivesReconnectReseedWithoutSinking() async {
+        let store = makeStore()
+        let mine   = makeSummary(id: "mine", lastActive: 100, startedAt: 1)
+        let olderA = makeSummary(id: "a",    lastActive:  90, startedAt: 1)
+        let olderB = makeSummary(id: "b",    lastActive:  80, startedAt: 1)
+        store.sessions = [mine, olderA, olderB]
+
+        // A live turn is streaming into "mine": mark it in-flight and stamp a live
+        // frame (noteActivity bumps lastActive to device-now AND stamps the live
+        // window used for the dot / carry-forward).
+        store.markTurnStarted(storedId: "mine")
+        store.noteActivity(storedId: "mine")
+
+        // Quick reconnect heal: force-clears in-flight turn flags but leaves the
+        // live-frame stamp intact (the row is still visibly live).
+        store.clearAllTurnsInProgress()
+        XCTAssertTrue(store.turnsInProgressIds.isEmpty,
+            "setup: the reconnect heal cleared the turn-in-progress flag")
+
+        // The reconnect's epoch bump forces a full first-page reseed whose page still
+        // carries the stale (pre-turn) server lastActive for "mine".
+        let mineStale = makeSummary(id: "mine", lastActive: 10, startedAt: 1)
+        store.sessionsFetch = { ([olderA, olderB, mineStale], 3) }
+        await store.refresh()
+
+        XCTAssertEqual(store.visibleSessions.map(\.id).first, "mine",
+            "a still-live session must not sink to its stale server lastActive after a reconnect clears the turn-in-progress flag")
+    }
+
+    /// A turn that JUST completed (markTurnCompleted fired, `turnsInProgress` now
+    /// empty) but is still inside the live window must keep its optimistic bump over
+    /// a lagging delta so it does not flicker down before the server catches up.
+    /// This exercises the `mergeSessionDelta` carry-forward gate via the live-window
+    /// signal (the delta cursor is still set, so a heartbeat takes the delta path).
+    func testDeltaCarriesForwardLiveWindowAfterTurnCompletes() async {
+        let store = makeStore()
+        let mine  = makeSummary(id: "mine",  lastActive: 100, startedAt: 1)
+        let other = makeSummary(id: "other", lastActive:  90, startedAt: 1)
+        store.sessionListDeltaFetch = { cursor, _ in
+            if cursor == nil {
+                return SessionListDeltaResult(
+                    sessions: [mine, other], tombstones: [], cursor: "seed", total: 2)
+            }
+            // Lagging heartbeat: server still reports the OLD (pre-turn) value for
+            // mine, which would knock it below "other" without carry-forward.
+            return SessionListDeltaResult(
+                sessions: [self.makeSummary(id: "mine", lastActive: 50, startedAt: 1)],
+                tombstones: [], cursor: "next", total: 2)
+        }
+
+        await store.refresh()
+        // A live turn ran and just settled: stamp the live frame, then complete it.
+        store.markTurnStarted(storedId: "mine")
+        store.noteActivity(storedId: "mine")
+        store.markTurnCompleted(storedId: "mine")
+        XCTAssertTrue(store.turnsInProgressIds.isEmpty,
+            "setup: the turn completed so the explicit flag is clear")
+
+        await store.refresh()
+
+        XCTAssertEqual(store.visibleSessions.map(\.id).first, "mine",
+            "a just-completed session still inside the live window keeps its optimistic bump over a lagging delta")
+    }
+
+    /// A delta that updates one session's activity moves it to the correct sorted
+    /// position, and a subsequent identical (empty) refresh republishes the SAME
+    /// order — no transient reordering across merges.
+    func testDeltaActivityUpdateSortsStablyAcrossIdenticalRefresh() async {
+        let store = makeStore()
+        let a = makeSummary(id: "A", lastActive: 100, startedAt: 1)
+        let b = makeSummary(id: "B", lastActive:  50, startedAt: 1)
+        let c = makeSummary(id: "C", lastActive:  30, startedAt: 1)
+        store.sessionListDeltaFetch = { cursor, _ in
+            switch cursor {
+            case nil:
+                return SessionListDeltaResult(
+                    sessions: [a, b, c], tombstones: [], cursor: "seed", total: 3)
+            case "seed":
+                // B receives fresh (foreign) activity and must jump above A.
+                return SessionListDeltaResult(
+                    sessions: [self.makeSummary(id: "B", lastActive: 400, startedAt: 1)],
+                    tombstones: [], cursor: "moved", total: 3)
+            default:
+                // Up-to-date heartbeat: no changes.
+                return SessionListDeltaResult(
+                    sessions: [], tombstones: [], cursor: "moved", total: 3)
+            }
+        }
+
+        await store.refresh()                       // seed
+        XCTAssertEqual(store.visibleSessions.map(\.id), ["A", "B", "C"])
+
+        await store.refresh()                       // activity delta
+        XCTAssertEqual(store.visibleSessions.map(\.id), ["B", "A", "C"],
+            "a delta bumping B's activity moves it to the correct sorted position")
+
+        let orderAfterMove = store.visibleSessions.map(\.id)
+        await store.refresh()                       // identical/empty heartbeat
+        XCTAssertEqual(store.visibleSessions.map(\.id), orderAfterMove,
+            "an identical refresh must republish the same order (stable, no transient reordering)")
+    }
+
     /// When `lastActive` is absent, sort falls back to `startedAt` DESC.
     func testVisibleSessionsSortsByStartedAtWhenNoLastActive() async {
         let store = makeStore()
