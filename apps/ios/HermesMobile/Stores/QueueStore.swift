@@ -19,16 +19,24 @@ final class QueueStore {
             case inProgress
             case indeterminate
 
+            /// User-facing row label for the Outbox sheet (Lane C fix 2). No raw
+            /// internal state names ("Indeterminate", …) leak to the sheet: every
+            /// case maps to plain words the owner can act on — waiting for a
+            /// connection, sending, or needing a manual retry.
             var title: String {
                 switch self {
-                case .waiting: "Waiting"
+                case .waiting: "Waiting for connection"
                 case .uploading: "Uploading"
                 case .sending: "Sending"
                 case .sent: "Sent"
-                case .failed: "Failed — Retry"
+                case .failed: "Needs retry"
                 case .cancelled: "Cancelled"
                 case .inProgress: "In progress"
-                case .indeterminate: "Indeterminate"
+                // Reached the gateway but the disposition is still resolving /
+                // retrying — to the owner this is indistinguishable from an
+                // ordinary in-flight send, so it reads as "Sending", never as the
+                // internal "Indeterminate".
+                case .indeterminate: "Sending"
                 }
             }
         }
@@ -54,6 +62,18 @@ final class QueueStore {
         /// `activeItems` pending filter so the badge/pill/sheet share one notion
         /// of "still in the outbox".
         var isPending: Bool { displayState != .sent && displayState != .cancelled }
+
+        /// Whether the row should paint its raw error message red in the Outbox
+        /// sheet (Lane C fix 3). Red is reserved for a genuinely FAILED row — a
+        /// terminal failure that needs a manual retry. A merely-queued /
+        /// retry-waiting / in-flight / indeterminate row is NOT an error: its
+        /// human state text already says what it is doing, so a stale transport
+        /// message (e.g. "Not connected to the Hermes gateway") must never bleed
+        /// red onto a row that is simply waiting for the connection to return.
+        /// Consistent with the WhatsApp ``SendDelivery`` model, where only a
+        /// terminal failure (or a stuck-past-threshold row, which carries no
+        /// message to show) is treated as failed.
+        var showsError: Bool { displayState == .failed }
 
         init(job: WorkJob) {
             id = UUID(uuidString: job.jobID) ?? UUID()
