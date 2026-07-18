@@ -736,6 +736,12 @@ final class ConnectionStore {
             }
             resolveAllTransportReadinessWaiters(with: result)
         }
+        if case .ready = readiness {
+            // A fresh transport permit must kick the durable outbox immediately.
+            // The drain gate is edge-triggered, not polled — without this wake a
+            // queued prompt would idle until the next unrelated wake source fired.
+            queueStore?.wake()
+        }
     }
 
     private func resolveTransportReadinessWaiter(id: UUID, with result: Bool) {

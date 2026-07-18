@@ -309,4 +309,75 @@ final class OutboxSendStateTests: XCTestCase {
         XCTAssertEqual(queue.pendingCount, queue.activeItems.count)
         XCTAssertEqual(queue.pendingCount, 2)
     }
+
+    // MARK: - Lane C fix 2: human-readable Outbox row labels
+
+    /// Every Outbox row label is plain words the owner can act on — no raw
+    /// internal state name (notably "Indeterminate") ever reaches the sheet.
+    func testOutboxRowLabelsAreHumanReadable() {
+        typealias State = QueueStore.QueuedPrompt.DisplayState
+        XCTAssertEqual(State.waiting.title, "Waiting for connection")
+        XCTAssertEqual(State.uploading.title, "Uploading")
+        XCTAssertEqual(State.sending.title, "Sending")
+        XCTAssertEqual(State.sent.title, "Sent")
+        XCTAssertEqual(State.failed.title, "Needs retry")
+        XCTAssertEqual(State.cancelled.title, "Cancelled")
+        XCTAssertEqual(State.inProgress.title, "In progress")
+        // Reached-server-but-resolving reads as an ordinary in-flight send.
+        XCTAssertEqual(State.indeterminate.title, "Sending")
+
+        let allStates: [State] = [
+            .waiting, .uploading, .sending, .sent, .failed, .cancelled, .inProgress, .indeterminate,
+        ]
+        for state in allStates {
+            XCTAssertFalse(
+                state.title.contains("Indeterminate"),
+                "no raw internal state name may surface in the Outbox sheet"
+            )
+        }
+    }
+
+    // MARK: - Lane C fix 3: red error line reserved for genuine failures
+
+    /// A merely-queued / retrying / indeterminate row must not paint red — only a
+    /// terminal failure surfaces its raw error line in the Outbox sheet.
+    func testOnlyGenuinelyFailedRowsSurfaceTheRedErrorLine() async throws {
+        let (queue, repository, scope, directory) = try makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let queued = try await repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: scope, state: .queued, text: "waiting", storedSessionID: "A"
+        ))
+        let retrying = try await repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: scope, state: .retryWait, text: "retrying", storedSessionID: "A"
+        ))
+        let failed = try await repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: scope, state: .failed, text: "failed", storedSessionID: "A"
+        ))
+
+        func row(_ jobID: String) throws -> QueueStore.QueuedPrompt {
+            try XCTUnwrap(queue.items.first { $0.jobID == jobID })
+        }
+        XCTAssertFalse(try row(queued.jobID).showsError,
+                       "a queued-offline row is waiting for the connection, not failed")
+        XCTAssertFalse(try row(retrying.jobID).showsError,
+                       "a row still retrying after a transport error is not a terminal failure")
+        XCTAssertTrue(try row(failed.jobID).showsError,
+                      "a terminal failure paints its row red so the owner can retry")
+    }
+
+    /// Reached-the-gateway-but-indeterminate is protocol truth, not a failure —
+    /// its row reads "Sending" and shows no red error line.
+    func testIndeterminateRowShowsNoErrorLine() async throws {
+        let (queue, repository, scope, directory) = try makeQueue()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let job = try await repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: scope, state: .submitting, text: "indet", storedSessionID: "A"
+        ))
+        _ = try await repository.claimNextJob(scope: scope, owner: "t", now: Date(), leaseDuration: 60)
+        try await repository.retainPendingJob(id: job.jobID, owner: "t", status: "indeterminate")
+        let row = try XCTUnwrap(queue.items.first { $0.jobID == job.jobID })
+        XCTAssertEqual(row.displayState, .indeterminate)
+        XCTAssertFalse(row.showsError, "indeterminate is sending, not a failure")
+    }
 }

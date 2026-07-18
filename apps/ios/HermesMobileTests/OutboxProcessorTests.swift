@@ -46,7 +46,7 @@ final class OutboxProcessorTests: XCTestCase {
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope },
             activeStoredSessionID: { "stored-A" },
-            canProcessPrompt: { false },
+            isTransportReady: { false },
             createDestination: { _ in XCTFail("transport work must not be claimed"); throw Ambiguous() },
             resolveRuntime: { _ in XCTFail("transport work must not be resolved"); return nil },
             uploadAsset: { _, _ in XCTFail("transport work must not upload"); throw Ambiguous() },
@@ -87,7 +87,7 @@ final class OutboxProcessorTests: XCTestCase {
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope },
             activeStoredSessionID: { "stored-A" },
-            canProcessPrompt: {
+            isTransportReady: {
                 readinessChecks += 1
                 return readinessChecks == 1
             },
@@ -118,7 +118,7 @@ final class OutboxProcessorTests: XCTestCase {
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope },
             activeStoredSessionID: { "stored-A" },
-            canProcessPrompt: { true },
+            isTransportReady: { true },
             createDestination: { _ in XCTFail("existing-session job must not create"); throw Ambiguous() },
             resolveRuntime: { _ in "runtime-A" },
             uploadAsset: { _, _ in XCTFail("no assets"); throw Ambiguous() },
@@ -160,7 +160,7 @@ final class OutboxProcessorTests: XCTestCase {
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope },
             activeStoredSessionID: { activeStored },
-            canProcessPrompt: { true },
+            isTransportReady: { true },
             createDestination: { _ in
                 createCount += 1
                 activeStored = "stored-created"
@@ -198,7 +198,7 @@ final class OutboxProcessorTests: XCTestCase {
         var localCount = 0
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope }, activeStoredSessionID: { nil },
-            canProcessPrompt: { true },
+            isTransportReady: { true },
             createDestination: { _ in
                 createCount += 1
                 return OutboxDestination(runtimeSessionID: "runtime-intent", storedSessionID: "stored-intent")
@@ -245,7 +245,7 @@ final class OutboxProcessorTests: XCTestCase {
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope },
             activeStoredSessionID: { nil },
-            canProcessPrompt: { true },
+            isTransportReady: { true },
             createDestination: { _ in
                 createCount += 1
                 return OutboxDestination(runtimeSessionID: "runtime-share", storedSessionID: "stored-share")
@@ -288,7 +288,7 @@ final class OutboxProcessorTests: XCTestCase {
             ))
             let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
                 currentScope: { harness.scope }, activeStoredSessionID: { "stored-A" },
-                canProcessPrompt: { true },
+                isTransportReady: { true },
                 createDestination: { _ in throw Ambiguous() },
                 resolveRuntime: { _ in "runtime-A" },
                 uploadAsset: { _, _ in throw Ambiguous() },
@@ -313,7 +313,7 @@ final class OutboxProcessorTests: XCTestCase {
             ))
             let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
                 currentScope: { harness.scope }, activeStoredSessionID: { "stored-A" },
-                canProcessPrompt: { true }, createDestination: { _ in throw Ambiguous() },
+                isTransportReady: { true }, createDestination: { _ in throw Ambiguous() },
                 resolveRuntime: { _ in "runtime-A" }, uploadAsset: { _, _ in throw Ambiguous() },
                 willSubmit: { _, _ in },
                 submit: { submitted, _, _ in
@@ -339,7 +339,7 @@ final class OutboxProcessorTests: XCTestCase {
         ))
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope }, activeStoredSessionID: { "stored-A" },
-            canProcessPrompt: { true }, createDestination: { _ in throw Ambiguous() },
+            isTransportReady: { true }, createDestination: { _ in throw Ambiguous() },
             resolveRuntime: { _ in "runtime-A" }, uploadAsset: { _, _ in throw Ambiguous() },
             willSubmit: { _, _ in },
             submit: { _, _, _ in
@@ -368,7 +368,7 @@ final class OutboxProcessorTests: XCTestCase {
         var failSecondOnce = true
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope }, activeStoredSessionID: { "stored-A" },
-            canProcessPrompt: { true }, createDestination: { _ in throw Ambiguous() },
+            isTransportReady: { true }, createDestination: { _ in throw Ambiguous() },
             resolveRuntime: { _ in "runtime-A" },
             uploadAsset: { _, snapshot in
                 uploadCounts[snapshot.link.ordinal, default: 0] += 1
@@ -406,7 +406,7 @@ final class OutboxProcessorTests: XCTestCase {
         ))
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope }, activeStoredSessionID: { "stored-A" },
-            canProcessPrompt: { true }, createDestination: { _ in throw Ambiguous() },
+            isTransportReady: { true }, createDestination: { _ in throw Ambiguous() },
             resolveRuntime: { _ in "runtime-A" }, uploadAsset: { _, _ in throw Ambiguous() },
             willSubmit: { _, _ in },
             submit: { submitted, _, _ in
@@ -435,7 +435,7 @@ final class OutboxProcessorTests: XCTestCase {
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope },
             activeStoredSessionID: { "stored-A" },
-            canProcessPrompt: { true },
+            isTransportReady: { true },
             createDestination: { _ in throw Ambiguous() },
             resolveRuntime: { _ in "runtime-A" },
             uploadAsset: { _, _ in throw Ambiguous() },
@@ -472,7 +472,7 @@ final class OutboxProcessorTests: XCTestCase {
         let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
             currentScope: { harness.scope },
             activeStoredSessionID: { "stored-A" },
-            canProcessPrompt: { true },
+            isTransportReady: { true },
             createDestination: { _ in throw Ambiguous() },
             resolveRuntime: { _ in "runtime-A" },
             uploadAsset: { _, _ in throw Ambiguous() },
@@ -494,6 +494,127 @@ final class OutboxProcessorTests: XCTestCase {
 
         let persisted = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(submissions, 1)
+        XCTAssertEqual(persisted?.state, .completed)
+    }
+
+    // MARK: - Lane C fix 1: per-session drain serialization
+
+    private final class Box<T> {
+        var value: T
+        init(_ value: T) { self.value = value }
+    }
+
+    /// A turn streaming in session A must not stall a queued prompt for session B.
+    /// The busy-session gate holds only A's own work; B drains immediately.
+    func testDrainProceedsForOtherSessionWhileOneSessionStreams() async throws {
+        let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let job = try await harness.repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: harness.scope, text: "for-B", storedSessionID: "stored-B"
+        ))
+        var submitted: [String] = []
+        let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
+            currentScope: { harness.scope },
+            activeStoredSessionID: { "stored-B" },
+            isTransportReady: { true },
+            // Session A is mid-turn; B is not.
+            busySessionID: { "stored-A" },
+            createDestination: { _ in XCTFail("existing-session job must not create"); throw Ambiguous() },
+            resolveRuntime: { _ in "runtime-B" },
+            uploadAsset: { _, _ in XCTFail("no assets"); throw Ambiguous() },
+            willSubmit: { _, _ in },
+            submit: { job, _, _ in
+                submitted.append(job.clientMessageID)
+                return OutboxSubmitResult(status: "streaming", accepted: true,
+                                          clientMessageID: job.clientMessageID)
+            }
+        ))
+
+        processor.wake(); await processor.waitUntilIdleForTesting()
+
+        XCTAssertEqual(submitted, [job.clientMessageID], "session B drained past A's live turn")
+        let persisted = try await harness.repository.job(id: job.jobID)
+        XCTAssertEqual(persisted?.state, .completed)
+    }
+
+    /// A prompt destined for the SAME session that is streaming is held — no
+    /// submit, no retry spent — until that turn ends, then it drains on re-wake.
+    func testSameSessionPromptWaitsForItsOwnStreamThenDrains() async throws {
+        let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let job = try await harness.repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: harness.scope, text: "for-A", storedSessionID: "stored-A"
+        ))
+        let busy = Box<String?>("stored-A")
+        var submitted: [String] = []
+        let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
+            currentScope: { harness.scope },
+            activeStoredSessionID: { "stored-A" },
+            isTransportReady: { true },
+            busySessionID: { busy.value },
+            createDestination: { _ in throw Ambiguous() },
+            resolveRuntime: { _ in "runtime-A" },
+            uploadAsset: { _, _ in throw Ambiguous() },
+            willSubmit: { _, _ in },
+            submit: { job, _, _ in
+                submitted.append(job.clientMessageID)
+                return OutboxSubmitResult(status: "streaming", accepted: true,
+                                          clientMessageID: job.clientMessageID)
+            }
+        ))
+
+        // While A streams the prompt is held: not submitted, lease released, and
+        // its retry budget untouched (a hold is not an attempt).
+        processor.wake(); await processor.waitUntilIdleForTesting()
+        XCTAssertTrue(submitted.isEmpty, "must not submit into the streaming session")
+        var persisted = try await harness.repository.job(id: job.jobID)
+        XCTAssertEqual(persisted?.state, .queued)
+        XCTAssertEqual(persisted?.attemptCount, 0, "a busy-session hold spends no retry")
+        XCTAssertNil(persisted?.leaseOwner)
+
+        // Turn ends → the session is free → the same wake path drains it.
+        busy.value = nil
+        processor.wake(); await processor.waitUntilIdleForTesting()
+        XCTAssertEqual(submitted, [job.clientMessageID])
+        persisted = try await harness.repository.job(id: job.jobID)
+        XCTAssertEqual(persisted?.state, .completed)
+    }
+
+    /// A transport-ready transition drains on the very next wake — no polling
+    /// loop. A prompt held while the socket was down submits the instant
+    /// readiness flips true and `wake()` is called (the existing edge-trigger).
+    func testTransportReadyTransitionDrainsOnNextWake() async throws {
+        let harness = try makeHarness(); defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let job = try await harness.repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: harness.scope, text: "held-offline", storedSessionID: "stored-A"
+        ))
+        let ready = Box(false)
+        var submitted: [String] = []
+        let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
+            currentScope: { harness.scope },
+            activeStoredSessionID: { "stored-A" },
+            isTransportReady: { ready.value },
+            createDestination: { _ in throw Ambiguous() },
+            resolveRuntime: { _ in "runtime-A" },
+            uploadAsset: { _, _ in throw Ambiguous() },
+            willSubmit: { _, _ in },
+            submit: { job, _, _ in
+                submitted.append(job.clientMessageID)
+                return OutboxSubmitResult(status: "streaming", accepted: true,
+                                          clientMessageID: job.clientMessageID)
+            }
+        ))
+
+        // Transport down: the prompt stays durable and unclaimed.
+        processor.wake(); await processor.waitUntilIdleForTesting()
+        XCTAssertTrue(submitted.isEmpty)
+        var persisted = try await harness.repository.job(id: job.jobID)
+        XCTAssertEqual(persisted?.state, .queued)
+        XCTAssertEqual(persisted?.attemptCount, 0)
+
+        // Readiness flips true → the next wake drains it with no intervening poll.
+        ready.value = true
+        processor.wake(); await processor.waitUntilIdleForTesting()
+        XCTAssertEqual(submitted, [job.clientMessageID])
+        persisted = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(persisted?.state, .completed)
     }
 }
