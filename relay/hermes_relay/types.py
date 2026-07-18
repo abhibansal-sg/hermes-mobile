@@ -137,15 +137,21 @@ class RawEvent:
     """Gateway ``event.params.type`` values the Reframer maps from (§2, R0)."""
 
     GATEWAY_READY = "gateway.ready"
-    MESSAGE_START = "message.start"
+    SESSION_INFO = "session.info"          # per-session model/tool metadata (non-turn)
+    MESSAGE_START = "message.start"        # payload is null on the wire -> turn boundary
     MESSAGE_DELTA = "message.delta"        # payload.text
-    MESSAGE_COMPLETE = "message.complete"  # payload.usage
-    REASONING_DELTA = "reasoning.delta"
-    REASONING_AVAILABLE = "reasoning.available"
-    TOOL_START = "tool.start"              # payload.name, payload.args
-    TOOL_COMPLETE = "tool.complete"        # payload.{name,result,duration_s,inline_diff}
-    STATUS_UPDATE = "status.update"
-    ERROR = "error"
+    MESSAGE_COMPLETE = "message.complete"  # payload.{text,usage,reasoning,status} (authoritative)
+    REASONING_DELTA = "reasoning.delta"    # payload.text
+    REASONING_AVAILABLE = "reasoning.available"  # payload.text (authoritative reasoning)
+    THINKING_DELTA = "thinking.delta"      # payload.text — ephemeral "formulating…" chatter
+    TOOL_START = "tool.start"              # payload.{tool_id,name,context,args_text?}
+    TOOL_COMPLETE = "tool.complete"        # payload.{tool_id,name,args,result,duration_s,summary,inline_diff}
+    STATUS_UPDATE = "status.update"        # payload.{kind,text}
+    SESSION_TITLE = "session.title"        # payload.{session_id,title}
+    TITLE = "title"                        # alias some emitters use for a title change
+    APPROVAL_REQUEST = "approval.request"  # payload.{command,choices,...} interactive gate
+    CLARIFY_REQUEST = "clarify.request"    # payload.{question,choices} interactive gate
+    ERROR = "error"                        # payload.{message}
 
 
 # ---------------------------------------------------------------------------

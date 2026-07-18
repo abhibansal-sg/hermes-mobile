@@ -3,49 +3,94 @@
 The single mapping layer (protocol §2/§3). It consumes
 :class:`~hermes_relay.types.GatewayEvent` off ``TOPIC_GATEWAY_EVENTS`` and emits
 zero or more :class:`~hermes_relay.types.Frame` objects (seq unstamped) onto
-``TOPIC_RELAY_FRAMES``. It holds per-session bookkeeping (via
-:class:`~hermes_relay.session_state.SessionStore`) to assign stable ``item_id``
-and monotonic ``ord``, and to know which in-progress item a delta belongs to.
+``TOPIC_RELAY_FRAMES``. It holds per-session bookkeeping — the
+:class:`~hermes_relay.session_state.SessionStore` for accumulated items (ord +
+snapshot) plus a small transient :class:`_Ctx` per session for turn/open-item
+tracking — to assign stable ``item_id`` and monotonic ``ord`` and to know which
+in-progress item a delta belongs to.
 
-The raw -> item mapping (R0-confirmed field names, protocol §2 catalog):
+The raw -> item mapping (grounded in the R0 fixture AND the gateway's own
+``tui_gateway/server.py`` ``_emit(...)`` sites, protocol §2 catalog):
 
-| raw event (``type``)              | -> item type / frame                              |
-|-----------------------------------|---------------------------------------------------|
-| ``message.start``                 | ``item.started`` agentMessage                     |
-| ``message.delta`` (``.text``)     | ``item.delta`` {patch:{text}}                     |
-| ``message.complete`` (``.usage``) | ``item.completed`` agentMessage + turn usage      |
-| ``reasoning.delta``               | ``item.started``/``item.delta`` reasoning         |
-| ``reasoning.available``           | ``item.completed`` reasoning                      |
-| ``tool.start`` (``.name,.args``)  | ``item.started`` toolCall (name-keyed)            |
-| ``tool.complete`` (``.name,       | ``item.completed`` toolCall — OR ``fileChange``   |
-|   .result,.duration_s,            |   when ``inline_diff`` present; ``browser`` for   |
-|   .inline_diff``)                 |   ``browser_*`` names; ``image`` for image tools  |
-| ``error``                         | ``item.completed`` error (status=failed)          |
-| ``status.update``                 | ``status`` frame (non-item chatter)               |
+| raw event (``type``)               | -> frame(s)                                       |
+|------------------------------------|---------------------------------------------------|
+| ``message.start`` (payload null)   | ``turn.started`` (opens a turn; no item yet)      |
+| ``message.delta`` (``.text``)      | lazy ``item.started`` agentMessage + ``item.delta``|
+| ``message.complete`` (``.text,     | ``item.completed`` agentMessage (authoritative) + |
+|   .usage``)                        |   ``usage`` item + ``turn.completed`` (usage)     |
+| ``reasoning.delta`` (``.text``)    | lazy ``item.started`` reasoning + ``item.delta``  |
+| ``reasoning.available`` (``.text``)| ``item.completed`` reasoning (authoritative)      |
+| ``thinking.delta`` (``.text``)     | ``status`` frame ``{kind:"thinking"}`` (ephemeral)|
+| ``tool.start`` (``.tool_id,.name``)| ``item.started`` toolCall/browser/image (id=tool_id)|
+| ``tool.complete`` (``.tool_id,     | ``item.completed`` toolCall — OR ``fileChange``   |
+|   .name,.args,.result,             |   when ``inline_diff`` present; ``browser`` for   |
+|   .duration_s,.inline_diff``)      |   ``browser_*``; ``image`` for image tools        |
+| ``error`` (``.message``)           | ``item.completed`` error (status=failed)          |
+| ``status.update`` (``.kind,.text``)| ``status`` frame (non-item chatter)               |
+| ``session.title``/``title``        | ``title`` frame                                   |
+| ``approval.request``               | ``approval.request`` frame (interactive gate)     |
+| ``clarify.request``                | ``clarify.request`` frame (interactive gate)      |
+| ``session.info``/``gateway.ready`` | ignored (session/gateway metadata, not turn content)|
+| anything else (unknown)            | generic ``toolCall`` item — NEVER dropped         |
 
 Type-selection rule (protocol §2 forward-compat): EVERY tool maps to a generic
 ``toolCall`` keyed by ``name``; the special types (``fileChange``/``image``/
 ``browser``) are refinements chosen from the tool ``name`` / result shape. An
-unrecognized tool still yields a valid ``toolCall`` — the phone never breaks on
-a new Hermes tool.
+unrecognized tool — and even an unrecognized top-level event — still yields a
+valid ordered item, so the phone never breaks on a new Hermes tool/event.
 
-INTERFACE THE LANE IMPLEMENTS: :meth:`reframe` (pure per-event mapping) plus the
-:meth:`run` pump. All state lives in the injected :class:`SessionStore`.
+``message.complete`` and ``tool.complete`` payloads are the AUTHORITATIVE
+completed items: their ``item.completed`` frame carries the full body and
+replaces whatever the deltas accumulated (the ``completed``-is-authoritative
+rule, protocol §2/§4).
+
+INTERFACE THE LANE IMPLEMENTS: :meth:`reframe` (per-event mapping that also folds
+its own output into the :class:`SessionStore` so a resume-as-items snapshot is
+always current) plus the :meth:`run` pump. Pure function of the event stream —
+no gateway dependency, no I/O.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Optional
 
-from .bus import EventBus
+from .bus import TOPIC_GATEWAY_EVENTS, TOPIC_RELAY_FRAMES, EventBus
 from .session_state import SessionStore
-from .types import Frame, GatewayEvent
-
+from .types import (
+    Frame,
+    FrameKind,
+    GatewayEvent,
+    Item,
+    ItemStatus,
+    ItemType,
+    RawEvent,
+)
 
 # Tool name families that get a special render (protocol §2). Everything else is
 # a generic toolCall. Kept as data so the mapping stays declarative.
 _BROWSER_PREFIX = "browser_"
-_IMAGE_TOOLS = frozenset({"image_generate"})
+_IMAGE_TOOLS = frozenset({"image_generate", "image_edit"})
+
+# Top-level events that are gateway/session metadata, not turn content. They
+# produce no downstream frame (they are neither ordered items nor phone chatter).
+_IGNORED_EVENTS = frozenset({RawEvent.GATEWAY_READY, RawEvent.SESSION_INFO})
+
+
+@dataclass
+class _Ctx:
+    """Transient per-session reframer bookkeeping (mapping state only).
+
+    Distinct from :class:`SessionState`, which holds the accumulated *items*.
+    This tracks the turn currently open and which synthesized item id the next
+    text/reasoning delta belongs to, plus monotonic counters for id synthesis.
+    """
+
+    turn_seq: int = 0
+    item_seq: int = 0
+    current_turn: Optional[str] = None
+    text_item: Optional[str] = None
+    reasoning_item: Optional[str] = None
 
 
 class Reframer:
@@ -54,48 +99,379 @@ class Reframer:
     def __init__(self, bus: EventBus, store: SessionStore) -> None:
         self._bus = bus
         self._store = store
+        self._ctx: dict[str, _Ctx] = {}
 
+    # -- pump ------------------------------------------------------------
     async def run(self) -> None:
         """Pump: subscribe ``TOPIC_GATEWAY_EVENTS``, reframe, publish frames.
 
-        For each inbound event, call :meth:`reframe`, then publish every emitted
-        frame to ``TOPIC_RELAY_FRAMES`` and fold it into the SessionStore (so the
-        snapshot/resync path stays current). Runs until cancelled.
+        For each inbound event, call :meth:`reframe` (which also folds its output
+        into the SessionStore), then publish every emitted frame to
+        ``TOPIC_RELAY_FRAMES``. A single malformed event never kills the pump.
+        Runs until cancelled/closed.
         """
-        raise NotImplementedError
+        sub = self._bus.subscribe(TOPIC_GATEWAY_EVENTS)
+        try:
+            async for event in sub:
+                if not isinstance(event, GatewayEvent):
+                    continue
+                try:
+                    frames = self.reframe(event)
+                except Exception:  # pragma: no cover - defensive pump guard
+                    continue
+                for frame in frames:
+                    self._bus.publish(TOPIC_RELAY_FRAMES, frame)
+        finally:
+            self._bus.unsubscribe(sub)
 
+    # -- mapping ---------------------------------------------------------
     def reframe(self, event: GatewayEvent) -> list[Frame]:
         """Map ONE raw gateway event to zero+ downstream frames (seq unstamped).
 
-        Pure w.r.t. the bus (does not publish) but reads/writes per-session
-        bookkeeping in the SessionStore (item_id + ord allocation, in-progress
-        item tracking). This is the function every mapping unit test drives.
+        Reads/writes per-session bookkeeping (the :class:`_Ctx` mapping state and
+        the :class:`SessionStore` item accumulator: ord allocation, in-progress
+        item tracking) and folds every frame it emits into the store so the
+        snapshot/resync path stays current. This is the function every mapping
+        unit test drives.
         """
-        raise NotImplementedError
+        sid = event.session_id
+        if not sid:
+            # gateway.ready and other session-less signals carry no per-session
+            # item; nothing to reframe.
+            return []
 
-    # -- per-family mappers (internal; declarative split so the table above is
-    #    one-to-one with code and new tools slot in without touching others) --
+        etype = event.type
+        if etype in _IGNORED_EVENTS:
+            return []
 
+        if etype in (RawEvent.MESSAGE_START, RawEvent.MESSAGE_DELTA, RawEvent.MESSAGE_COMPLETE):
+            frames = self._reframe_message(event)
+        elif etype in (RawEvent.REASONING_DELTA, RawEvent.REASONING_AVAILABLE):
+            frames = self._reframe_reasoning(event)
+        elif etype == RawEvent.THINKING_DELTA:
+            frames = self._reframe_thinking(event)
+        elif etype in (RawEvent.TOOL_START, RawEvent.TOOL_COMPLETE):
+            frames = self._reframe_tool(event)
+        elif etype == RawEvent.ERROR:
+            frames = self._reframe_error(event)
+        elif etype == RawEvent.STATUS_UPDATE:
+            frames = self._reframe_status(event)
+        elif etype in (RawEvent.SESSION_TITLE, RawEvent.TITLE):
+            frames = self._reframe_title(event)
+        elif etype == RawEvent.APPROVAL_REQUEST:
+            frames = self._reframe_interactive(event, FrameKind.APPROVAL_REQUEST)
+        elif etype == RawEvent.CLARIFY_REQUEST:
+            frames = self._reframe_interactive(event, FrameKind.CLARIFY_REQUEST)
+        else:
+            # Forward-compat: an unrecognized event is never dropped — it becomes
+            # a generic toolCall item so the phone renders *something* stable.
+            frames = self._reframe_unknown(event)
+
+        # Fold every emitted frame into the accumulator so a mid-stream snapshot
+        # (resync) is coherent. Non-item frames only advance last_turn.
+        state = self._store.get(sid)
+        for frame in frames:
+            state.apply(frame)
+        return frames
+
+    # -- turn helper -----------------------------------------------------
+    def _ensure_turn(self, sid: str) -> list[Frame]:
+        """Open a turn if none is active; emit its ``turn.started`` frame.
+
+        Every content-bearing event guards through here, so a turn boundary is
+        emitted even if a ``message.start`` was never seen (robustness).
+        """
+        ctx = self._ctx_for(sid)
+        if ctx.current_turn is not None:
+            return []
+        ctx.turn_seq += 1
+        ctx.current_turn = f"{sid}:t{ctx.turn_seq}"
+        return [Frame(sid=sid, kind=FrameKind.TURN_STARTED, body={}, turn=ctx.current_turn)]
+
+    def _ctx_for(self, sid: str) -> _Ctx:
+        ctx = self._ctx.get(sid)
+        if ctx is None:
+            ctx = _Ctx()
+            self._ctx[sid] = ctx
+        return ctx
+
+    def _new_item_id(self, sid: str) -> str:
+        ctx = self._ctx_for(sid)
+        ctx.item_seq += 1
+        return f"{sid}:i{ctx.item_seq}"
+
+    # -- message (agentMessage) ------------------------------------------
     def _reframe_message(self, event: GatewayEvent) -> list[Frame]:
-        """message.start/delta/complete -> agentMessage item lifecycle."""
-        raise NotImplementedError
+        """message.start/delta/complete -> agentMessage item lifecycle + turn."""
+        sid = event.session_id or ""
+        ctx = self._ctx_for(sid)
+        state = self._store.get(sid)
 
+        if event.type == RawEvent.MESSAGE_START:
+            # Pure turn boundary. The agentMessage item is created lazily at the
+            # first message.delta so it sorts *after* any reasoning/tool items
+            # that stream first within the turn.
+            return self._ensure_turn(sid)
+
+        if event.type == RawEvent.MESSAGE_DELTA:
+            text = _text(event.payload)
+            if not text:
+                return []
+            frames = self._ensure_turn(sid)
+            if ctx.text_item is None:
+                item_id = self._new_item_id(sid)
+                ctx.text_item = item_id
+                item = Item(
+                    item_id=item_id,
+                    type=ItemType.AGENT_MESSAGE,
+                    status=ItemStatus.IN_PROGRESS,
+                    ord=state.allocate_ord(),
+                    body={"text": ""},
+                )
+                frames.append(Frame.with_item(sid, FrameKind.ITEM_STARTED, item, ctx.current_turn))
+            frames.append(Frame.item_delta(sid, ctx.text_item, {"text": text}, ctx.current_turn))
+            return frames
+
+        # MESSAGE_COMPLETE — authoritative agentMessage + usage footer + turn end.
+        frames = self._ensure_turn(sid)
+        text = _text(event.payload)
+        usage = event.payload.get("usage")
+
+        if ctx.text_item is None:
+            # A turn with no streamed text deltas (e.g. tool-only, or a summary
+            # delivered whole). Materialize the item now so the turn has a body.
+            item_id = self._new_item_id(sid)
+            ctx.text_item = item_id
+            ord_ = state.allocate_ord()
+        else:
+            item_id = ctx.text_item
+            existing = state.items.get(item_id)
+            ord_ = existing.ord if existing is not None else state.allocate_ord()
+
+        done = Item(
+            item_id=item_id,
+            type=ItemType.AGENT_MESSAGE,
+            status=ItemStatus.COMPLETED,
+            ord=ord_,
+            summary=_one_line(text),
+            body={"text": text or ""},
+        )
+        frames.append(Frame.with_item(sid, FrameKind.ITEM_COMPLETED, done, ctx.current_turn))
+
+        if isinstance(usage, dict) and usage:
+            usage_item = Item(
+                item_id=self._new_item_id(sid),
+                type=ItemType.USAGE,
+                status=ItemStatus.COMPLETED,
+                ord=state.allocate_ord(),
+                summary=_usage_summary(usage),
+                body=dict(usage),
+            )
+            frames.append(Frame.with_item(sid, FrameKind.ITEM_COMPLETED, usage_item, ctx.current_turn))
+
+        frames.append(
+            Frame(
+                sid=sid,
+                kind=FrameKind.TURN_COMPLETED,
+                body={"usage": usage} if isinstance(usage, dict) else {},
+                turn=ctx.current_turn,
+            )
+        )
+        # Close the turn — the next content event opens a fresh one.
+        ctx.current_turn = None
+        ctx.text_item = None
+        ctx.reasoning_item = None
+        return frames
+
+    # -- reasoning -------------------------------------------------------
     def _reframe_reasoning(self, event: GatewayEvent) -> list[Frame]:
         """reasoning.delta/available -> reasoning item lifecycle."""
-        raise NotImplementedError
+        sid = event.session_id or ""
+        ctx = self._ctx_for(sid)
+        state = self._store.get(sid)
+        text = _text(event.payload)
 
+        if event.type == RawEvent.REASONING_DELTA:
+            if not text:
+                return []
+            frames = self._ensure_turn(sid)
+            if ctx.reasoning_item is None:
+                item_id = self._new_item_id(sid)
+                ctx.reasoning_item = item_id
+                item = Item(
+                    item_id=item_id,
+                    type=ItemType.REASONING,
+                    status=ItemStatus.IN_PROGRESS,
+                    ord=state.allocate_ord(),
+                    body={"text": ""},
+                )
+                frames.append(Frame.with_item(sid, FrameKind.ITEM_STARTED, item, ctx.current_turn))
+            frames.append(Frame.item_delta(sid, ctx.reasoning_item, {"text": text}, ctx.current_turn))
+            return frames
+
+        # REASONING_AVAILABLE — authoritative full reasoning text.
+        frames = self._ensure_turn(sid)
+        if ctx.reasoning_item is None:
+            item_id = self._new_item_id(sid)
+            ord_ = state.allocate_ord()
+        else:
+            item_id = ctx.reasoning_item
+            existing = state.items.get(item_id)
+            ord_ = existing.ord if existing is not None else state.allocate_ord()
+        done = Item(
+            item_id=item_id,
+            type=ItemType.REASONING,
+            status=ItemStatus.COMPLETED,
+            ord=ord_,
+            summary=_one_line(text),
+            body={"text": text or ""},
+        )
+        frames.append(Frame.with_item(sid, FrameKind.ITEM_COMPLETED, done, ctx.current_turn))
+        ctx.reasoning_item = None
+        return frames
+
+    # -- thinking (ephemeral) --------------------------------------------
+    def _reframe_thinking(self, event: GatewayEvent) -> list[Frame]:
+        """thinking.delta -> status frame (ephemeral 'formulating…' chatter).
+
+        Not an ordered item: it is a placeholder animation the desktop shows
+        while the model spins up. Surfaced as ``status`` so nothing is dropped,
+        but it never pollutes the turn's item list.
+        """
+        sid = event.session_id or ""
+        text = _text(event.payload)
+        if not text:
+            return []
+        ctx = self._ctx_for(sid)
+        return [
+            Frame(sid=sid, kind=FrameKind.STATUS, body={"kind": "thinking", "text": text}, turn=ctx.current_turn)
+        ]
+
+    # -- tools -----------------------------------------------------------
     def _reframe_tool(self, event: GatewayEvent) -> list[Frame]:
-        """tool.start/complete -> generic toolCall (or special type)."""
-        raise NotImplementedError
+        """tool.start/complete -> generic toolCall (or a special render type).
 
+        ``tool_id`` is reused verbatim as the ``item_id`` so start and complete
+        land on the same card. An unknown ``name`` still yields a valid toolCall.
+        """
+        sid = event.session_id or ""
+        state = self._store.get(sid)
+        payload = event.payload
+        name = str(payload.get("name") or "")
+        tool_id = str(payload.get("tool_id") or "") or self._new_item_id(sid)
+        itype = self._tool_item_type(name, payload)
+
+        if event.type == RawEvent.TOOL_START:
+            frames = self._ensure_turn(sid)
+            ctx = self._ctx_for(sid)
+            body: dict[str, Any] = {"name": name}
+            for key in ("context", "args_text", "args"):
+                if payload.get(key) is not None:
+                    body[key] = payload[key]
+            item = Item(
+                item_id=tool_id,
+                type=itype,
+                status=ItemStatus.IN_PROGRESS,
+                ord=state.allocate_ord(),
+                summary=_tool_summary(name, payload),
+                body=body,
+            )
+            frames.append(Frame.with_item(sid, FrameKind.ITEM_STARTED, item, ctx.current_turn))
+            return frames
+
+        # TOOL_COMPLETE — authoritative tool result. May arrive with no prior
+        # tool.start (progress disabled but an inline_diff forced the emit).
+        frames = self._ensure_turn(sid)
+        ctx = self._ctx_for(sid)
+        existing = state.items.get(tool_id)
+        ord_ = existing.ord if existing is not None else state.allocate_ord()
+        body = {"name": name}
+        for key in ("args", "result", "duration_s", "inline_diff", "summary", "result_text", "todos", "context"):
+            if payload.get(key) is not None:
+                body[key] = payload[key]
+        failed = _is_error_result(payload)
+        item = Item(
+            item_id=tool_id,
+            type=ItemType.ERROR if failed else itype,
+            status=ItemStatus.FAILED if failed else ItemStatus.COMPLETED,
+            ord=ord_,
+            summary=_tool_summary(name, payload),
+            body=body,
+        )
+        frames.append(Frame.with_item(sid, FrameKind.ITEM_COMPLETED, item, ctx.current_turn))
+        return frames
+
+    # -- error -----------------------------------------------------------
     def _reframe_error(self, event: GatewayEvent) -> list[Frame]:
         """error -> error item (never hidden in a collapse, protocol §2)."""
-        raise NotImplementedError
+        sid = event.session_id or ""
+        state = self._store.get(sid)
+        frames = self._ensure_turn(sid)
+        ctx = self._ctx_for(sid)
+        message = str(event.payload.get("message") or event.payload.get("text") or "error")
+        item = Item(
+            item_id=self._new_item_id(sid),
+            type=ItemType.ERROR,
+            status=ItemStatus.FAILED,
+            ord=state.allocate_ord(),
+            summary=_one_line(message),
+            body={"message": message},
+        )
+        frames.append(Frame.with_item(sid, FrameKind.ITEM_COMPLETED, item, ctx.current_turn))
+        return frames
 
+    # -- status ----------------------------------------------------------
     def _reframe_status(self, event: GatewayEvent) -> list[Frame]:
-        """status.update -> status frame (non-item chatter)."""
-        raise NotImplementedError
+        """status.update -> status frame (non-item lifecycle chatter)."""
+        sid = event.session_id or ""
+        ctx = self._ctx_for(sid)
+        payload = event.payload
+        return [
+            Frame(
+                sid=sid,
+                kind=FrameKind.STATUS,
+                body={"kind": str(payload.get("kind") or "status"), "text": str(payload.get("text") or "")},
+                turn=ctx.current_turn,
+            )
+        ]
 
+    # -- title -----------------------------------------------------------
+    def _reframe_title(self, event: GatewayEvent) -> list[Frame]:
+        """session.title/title -> title frame (session title changed)."""
+        sid = event.session_id or ""
+        title = str(event.payload.get("title") or "")
+        return [Frame(sid=sid, kind=FrameKind.TITLE, body={"title": title})]
+
+    # -- interactive gates -----------------------------------------------
+    def _reframe_interactive(self, event: GatewayEvent, kind: str) -> list[Frame]:
+        """approval.request / clarify.request -> interactive gate frame.
+
+        Passed through as the frame body verbatim (already redacted upstream by
+        the gateway for approvals). The phone replies via an upstream RPC.
+        """
+        sid = event.session_id or ""
+        ctx = self._ctx_for(sid)
+        return [Frame(sid=sid, kind=kind, body=dict(event.payload), turn=ctx.current_turn)]
+
+    # -- unknown (forward-compat, never drop) ----------------------------
+    def _reframe_unknown(self, event: GatewayEvent) -> list[Frame]:
+        """An unrecognized event becomes a generic toolCall — never dropped."""
+        sid = event.session_id or ""
+        state = self._store.get(sid)
+        frames = self._ensure_turn(sid)
+        ctx = self._ctx_for(sid)
+        item = Item(
+            item_id=self._new_item_id(sid),
+            type=ItemType.TOOL_CALL,
+            status=ItemStatus.COMPLETED,
+            ord=state.allocate_ord(),
+            summary=event.type,
+            body={"event_type": event.type, "payload": dict(event.payload)},
+        )
+        frames.append(Frame.with_item(sid, FrameKind.ITEM_COMPLETED, item, ctx.current_turn))
+        return frames
+
+    # -- type selection --------------------------------------------------
     @staticmethod
     def _tool_item_type(name: str, payload: dict) -> str:
         """Select the item type for a tool by name/result (protocol §2 rule).
@@ -104,4 +480,52 @@ class Reframer:
         image tool -> image; otherwise the generic toolCall. Never raises on an
         unknown name.
         """
-        raise NotImplementedError
+        if payload.get("inline_diff"):
+            return ItemType.FILE_CHANGE
+        if name.startswith(_BROWSER_PREFIX):
+            return ItemType.BROWSER
+        if name in _IMAGE_TOOLS:
+            return ItemType.IMAGE
+        return ItemType.TOOL_CALL
+
+
+# ---------------------------------------------------------------------------
+# Small pure helpers (payload normalization / summary lines).
+# ---------------------------------------------------------------------------
+
+
+def _text(payload: dict[str, Any]) -> str:
+    """Extract the streaming ``text`` field, tolerant of shape drift."""
+    val = payload.get("text")
+    return val if isinstance(val, str) else ""
+
+
+def _one_line(text: str, limit: int = 120) -> str:
+    """First non-empty line of ``text``, clipped — the item card summary."""
+    if not text or not text.strip():
+        return ""
+    return text.strip().splitlines()[0][:limit]
+
+
+def _tool_summary(name: str, payload: dict[str, Any]) -> str:
+    """One-line tool card summary — prefer the gateway's own ``summary``/``context``."""
+    for key in ("summary", "context"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:120]
+    return name
+
+
+def _usage_summary(usage: dict[str, Any]) -> str:
+    total = usage.get("total")
+    return f"{total} tokens" if isinstance(total, int) else "usage"
+
+
+def _is_error_result(payload: dict[str, Any]) -> bool:
+    """A tool.complete is a failure when its result carries an explicit error."""
+    if payload.get("is_error"):
+        return True
+    result = payload.get("result")
+    if isinstance(result, dict):
+        return bool(result.get("error") or result.get("is_error"))
+    return False
