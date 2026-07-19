@@ -32,6 +32,13 @@ struct RelayItemStore: Sendable, Equatable {
 
     init() {}
 
+    /// Start the seq spine for a fresh relay socket while retaining reconciled
+    /// items. Sequence numbers are per connection, so every reconnect starts at 1.
+    mutating func beginConnectionEpoch() {
+        lastSeq = 0
+        appliedDeltaSeqs.removeAll(keepingCapacity: true)
+    }
+
     /// The current items in render order: by `ord` ascending, ties broken by
     /// first-seen arrival order (a stable sort key, so streaming never reshuffles
     /// equal-`ord` rows).

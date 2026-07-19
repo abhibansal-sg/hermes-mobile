@@ -691,8 +691,9 @@ async def test_submit_and_resume_replace_foreground():
 
 
 class _FakeRequest:
-    def __init__(self, path):
+    def __init__(self, path, headers=None):
         self.path = path
+        self.headers = headers or {}
 
 
 class _FakeConn:
@@ -739,12 +740,42 @@ async def test_process_request_serves_health_path():
     assert "connections" in parsed and "listen" in parsed
 
 
+async def test_process_request_authenticates_health_path():
+    srv, _ = _server()
+    srv._cfg.auth_token = "secret"
+    await srv.start()
+    c = _FakeConn()
+    srv._process_request(c, _FakeRequest("/healthz"))
+    from http import HTTPStatus
+    assert c.responded[0] == HTTPStatus.UNAUTHORIZED
+
+
 async def test_process_request_ignores_non_health_paths():
     srv, _ = _server()
     await srv.start()
     c = _FakeConn()
     # A normal WS upgrade path returns None so the handshake proceeds.
     assert srv._process_request(c, _FakeRequest("/ws")) is None
+    assert c.responded is None
+
+
+async def test_process_request_rejects_unauthenticated_websocket():
+    srv, _ = _server()
+    srv._cfg.auth_token = "secret"
+    await srv.start()
+    c = _FakeConn()
+    srv._process_request(c, _FakeRequest("/ws"))
+    from http import HTTPStatus
+    assert c.responded[0] == HTTPStatus.UNAUTHORIZED
+
+
+async def test_process_request_accepts_authenticated_websocket():
+    srv, _ = _server()
+    srv._cfg.auth_token = "secret"
+    await srv.start()
+    c = _FakeConn()
+    request = _FakeRequest("/ws", {"Authorization": "Bearer secret"})
+    assert srv._process_request(c, request) is None
     assert c.responded is None
 
 
@@ -755,3 +786,14 @@ async def test_process_request_disabled_when_no_health_path():
     c = _FakeConn()
     assert srv._process_request(c, _FakeRequest("/healthz")) is None
     assert c.responded is None
+
+
+async def test_disabling_health_does_not_disable_websocket_auth():
+    srv, _ = _server()
+    srv._cfg.health_path = None
+    srv._cfg.auth_token = "secret"
+    await srv.start()
+    c = _FakeConn()
+    srv._process_request(c, _FakeRequest("/ws"))
+    from http import HTTPStatus
+    assert c.responded[0] == HTTPStatus.UNAUTHORIZED

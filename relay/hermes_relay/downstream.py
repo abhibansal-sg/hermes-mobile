@@ -38,6 +38,7 @@ tail); ``replay_ring.py`` itself is never modified.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import uuid
@@ -70,6 +71,9 @@ class DownstreamConfig:
     # HTTP health/status path served on the SAME phone-facing port (a plain GET,
     # not a WS upgrade). ``None`` disables the surface entirely.
     health_path: Optional[str] = "/healthz"
+    # The iOS client already sends the gateway token as a bearer credential;
+    # reuse it rather than adding a second secret or config surface.
+    auth_token: str = ""
 
 
 def build_ring(cfg: DownstreamConfig) -> Any:
@@ -315,17 +319,19 @@ class DownstreamServer:
         the accept loop, so any failure falls through to the WS path.
         """
         health = self._cfg.health_path
-        if not health:
-            return None
         try:
             from http import HTTPStatus
 
             raw_path = getattr(request, "path", "") or ""
             path = raw_path.split("?", 1)[0]
-            if path != health:
-                return None
-            body = json.dumps(self.status(), ensure_ascii=False) + "\n"
-            return connection.respond(HTTPStatus.OK, body)
+            token = self._cfg.auth_token
+            supplied = (getattr(request, "headers", {}) or {}).get("Authorization", "")
+            if token and not hmac.compare_digest(supplied, f"Bearer {token}"):
+                return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
+            if health and path == health:
+                body = json.dumps(self.status(), ensure_ascii=False) + "\n"
+                return connection.respond(HTTPStatus.OK, body)
+            return None
         except Exception:  # pragma: no cover - a broken probe must not stall serve
             _log.debug("health probe failed", exc_info=True)
             return None

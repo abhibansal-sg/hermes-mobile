@@ -330,6 +330,68 @@ final class RelayClientMockTests: XCTestCase {
         await client.disconnect()
     }
 
+    /// A new relay socket starts a new per-connection seq epoch at 1. The phone
+    /// must send the old watermark in resync, then admit the fresh snapshot and
+    /// following live frames instead of rejecting them as old duplicates.
+    func testReconnectAdmitsFreshSequenceEpoch() async {
+        let full = sampleTurn()
+        let snapshot = frame(1, "snapshot", .object([
+            "cursor": .number(0),
+            "items": .array([full[0].body]),
+        ]))
+        let liveDelta = frame(2, "item.delta", .object([
+            "item_id": .string("msg-2"), "patch": ["text": "streaming"],
+        ]))
+        let live = MockRelayTransport()
+        let resumed = MockRelayTransport(script: { upstream, relay in
+            guard upstream.method == "resync" else { return }
+            XCTAssertEqual((upstream.params["last_seq"] as? NSNumber)?.intValue, 5)
+            relay.deliverFrames([snapshot, liveDelta])
+        })
+        let queue = TransportQueue([live, resumed])
+        let client = RelayClient { _ in queue.next() }
+
+        await client.connect(url: url)
+        live.deliverFrames(full)
+        await waitUntil { await client.lastSeq == 5 }
+
+        await client.reconnect(url: url)
+        await waitUntil { await client.lastSeq == 2 }
+        let items = await client.items
+        XCTAssertEqual(items.first { $0.itemID == "msg-2" }?.textBody, "streaming")
+
+        await client.disconnect()
+    }
+
+    /// Interactive gate RPCs must use the relay protocol's exact wire keys.
+    func testApprovalAndClarifyUseRelayWireShape() async throws {
+        let transport = MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id else { return }
+            relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+        })
+        let client = RelayClient { _ in transport }
+        await client.connect(url: url)
+
+        _ = try await client.approve(
+            sessionID: "s1", requestID: "a1", approved: true
+        )
+        _ = try await client.clarify(
+            sessionID: "s1", requestID: "c1", response: "staging"
+        )
+
+        let approve = transport.upstreams().first { $0.method == "approve" }
+        XCTAssertEqual(approve?.params["session_id"] as? String, "s1")
+        XCTAssertEqual(approve?.params["decision"] as? String, "approve")
+        XCTAssertNil(approve?.params["approved"])
+
+        let clarify = transport.upstreams().first { $0.method == "clarify" }
+        XCTAssertEqual(clarify?.params["session_id"] as? String, "s1")
+        XCTAssertEqual(clarify?.params["text"] as? String, "staging")
+        XCTAssertNil(clarify?.params["response"])
+
+        await client.disconnect()
+    }
+
     /// A LIVE gap (frames missed without a socket tear) must auto-`resync` from the
     /// dense watermark — the store leaves `lastSeq` pinned at the last in-order seq,
     /// so the replay backfills the hole (§4). Without this the discarded gap

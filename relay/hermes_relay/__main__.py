@@ -24,13 +24,13 @@ Environment variables (back-compat with ``scripts/run-relay.sh`` /
     HERMES_RELAY_GATEWAY_TOKEN     (required unless --token/--token-file given)
     HERMES_RELAY_GATEWAY_URL       ws://host:port (overrides host/port)
     HERMES_RELAY_GATEWAY_HOST      default 127.0.0.1
-    HERMES_RELAY_GATEWAY_PORT      default 9126 (isolated range; NEVER 9119 live)
+    HERMES_RELAY_GATEWAY_PORT      default 9133
     HERMES_RELAY_DOWNSTREAM_HOST   default 127.0.0.1
     HERMES_RELAY_DOWNSTREAM_PORT   default 8765
     HERMES_RELAY_HEALTH_PATH       default /healthz
 
-SAFETY: the live production gateway on port 9119 is refused outright — the relay
-is a client of an isolated/stock gateway only.
+Automated tests use isolated ports 9130+; deployment may target the stock live
+gateway selected by its operator.
 """
 
 from __future__ import annotations
@@ -46,11 +46,8 @@ from urllib.parse import urlsplit
 
 from .app import RelayApp, build_default_config
 
-#: The live production gateway port the relay must never dial.
-LIVE_GATEWAY_PORT = 9119
-
 _DEF_GATEWAY_HOST = "127.0.0.1"
-_DEF_GATEWAY_PORT = 9126
+_DEF_GATEWAY_PORT = 9133
 _DEF_DOWNSTREAM_HOST = "127.0.0.1"
 _DEF_DOWNSTREAM_PORT = 8765
 _DEF_HEALTH_PATH = "/healthz"
@@ -148,12 +145,6 @@ def resolve_config(argv: Optional[list[str]] = None) -> ResolvedConfig:
 
     token = _read_token(args)
 
-    if gw_port == LIVE_GATEWAY_PORT:
-        raise SystemExit(
-            f"hermes_relay: refusing to dial the LIVE gateway port {LIVE_GATEWAY_PORT}. "
-            "Point --gateway-port/-url at an isolated/stock gateway."
-        )
-
     return ResolvedConfig(
         gateway_host=gw_host,
         gateway_port=gw_port,
@@ -172,7 +163,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--gateway-url", help="ws://HOST:PORT[/path] of the upstream gateway")
     p.add_argument("--gateway-host", help="upstream gateway host")
-    p.add_argument("--gateway-port", type=int, help="upstream gateway port (NEVER 9119)")
+    p.add_argument("--gateway-port", type=int, help="upstream gateway port")
     p.add_argument("--token", help="gateway ?token= auth (prefer --token-file)")
     p.add_argument("--token-file", help="path to a file containing the gateway token")
     p.add_argument("--listen", help="phone-facing downstream bind, HOST:PORT")

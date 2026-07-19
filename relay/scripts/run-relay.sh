@@ -12,13 +12,12 @@
 # relay dials the gateway UP, reframes raw events into the ratified item
 # envelope (docs/RELAY-PHONE-PROTOCOL.md), and serves seq/ack/replay frames.
 #
-# SAFETY: the live production gateway on port 9119 is refused by the entrypoint.
-# Point this at an isolated/stock gateway only (e.g. launch_isolated_gateway.sh,
-# default 9127). ZERO CORE PATCH — this only runs the relay CLIENT.
+# Automated tests point this at an isolated stock gateway on 9130+. Production
+# may select its operator-owned live gateway. ZERO CORE PATCH: relay is a client.
 #
 # Config (all overridable from the environment; CLI flags below win):
 #   GATEWAY_HOST   default 127.0.0.1
-#   GATEWAY_PORT   default 9127   (isolated E2E range; NEVER 9119)
+#   GATEWAY_PORT   default 9133   (isolated E2E range)
 #   LISTEN         default 127.0.0.1:8788   (phone-facing bind)
 #   HEALTH_PATH    default /healthz
 #   TOKEN_FILE     default $EVID/.gwtoken (written by launch_isolated_gateway.sh)
@@ -31,7 +30,7 @@ EVID="${EVID:-/Volumes/MainData/Developer/hermes-tmp/evidence/convergence}"
 VENV="${RELAY_VENV:-/Volumes/MainData/Developer/hermes-tmp/convergence-lanes/relay-venv}"
 
 GATEWAY_HOST="${GATEWAY_HOST:-127.0.0.1}"
-GATEWAY_PORT="${GATEWAY_PORT:-9127}"
+GATEWAY_PORT="${GATEWAY_PORT:-9133}"
 LISTEN="${LISTEN:-127.0.0.1:8788}"
 HEALTH_PATH="${HEALTH_PATH:-/healthz}"
 TOKEN_FILE="${TOKEN_FILE:-$EVID/.gwtoken}"

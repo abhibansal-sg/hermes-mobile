@@ -10,11 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_relay.__main__ import (
-    LIVE_GATEWAY_PORT,
-    _to_relay_config,
-    resolve_config,
-)
+from hermes_relay.__main__ import _to_relay_config, resolve_config
 
 
 @pytest.fixture(autouse=True)
@@ -36,7 +32,7 @@ def test_defaults_with_env_token(monkeypatch):
     monkeypatch.setenv("HERMES_RELAY_GATEWAY_TOKEN", "envtok")
     rc = resolve_config([])
     assert rc.token == "envtok"
-    assert (rc.gateway_host, rc.gateway_port) == ("127.0.0.1", 9126)
+    assert (rc.gateway_host, rc.gateway_port) == ("127.0.0.1", 9133)
     assert (rc.downstream_host, rc.downstream_port) == ("127.0.0.1", 8765)
     assert rc.health_path == "/healthz"
 
@@ -73,17 +69,14 @@ def test_listen_bare_port(monkeypatch):
     assert rc.downstream_host == "127.0.0.1"  # host falls back to default
 
 
-def test_live_gateway_port_is_refused(monkeypatch):
+def test_live_gateway_port_is_allowed_for_deployment(monkeypatch):
     monkeypatch.setenv("HERMES_RELAY_GATEWAY_TOKEN", "t")
-    with pytest.raises(SystemExit) as ei:
-        resolve_config(["--gateway-port", str(LIVE_GATEWAY_PORT)])
-    assert str(LIVE_GATEWAY_PORT) in str(ei.value)
+    assert resolve_config(["--gateway-port", "9119"]).gateway_port == 9119
 
 
-def test_live_gateway_port_refused_via_url(monkeypatch):
+def test_live_gateway_port_allowed_via_url(monkeypatch):
     monkeypatch.setenv("HERMES_RELAY_GATEWAY_TOKEN", "t")
-    with pytest.raises(SystemExit):
-        resolve_config(["--gateway-url", f"ws://127.0.0.1:{LIVE_GATEWAY_PORT}"])
+    assert resolve_config(["--gateway-url", "ws://127.0.0.1:9119"]).gateway_port == 9119
 
 
 def test_missing_token_raises(monkeypatch):

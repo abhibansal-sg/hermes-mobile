@@ -173,16 +173,19 @@ def build_default_config(
     *,
     gateway_token: str,
     gateway_host: str = "127.0.0.1",
-    gateway_port: int = 9126,
+    gateway_port: int = 9133,
     downstream_host: str = "127.0.0.1",
     downstream_port: int = 8765,
     health_path: Optional[str] = "/healthz",
 ) -> RelayConfig:
-    """Convenience default config for local/isolated runs (NEVER port 9119)."""
+    """Convenience defaults for a local isolated run; deployment can override."""
     return RelayConfig(
         gateway=GatewayConfig(host=gateway_host, token=gateway_token, port=gateway_port),
         downstream=DownstreamConfig(
-            host=downstream_host, port=downstream_port, health_path=health_path
+            host=downstream_host,
+            port=downstream_port,
+            health_path=health_path,
+            auth_token=gateway_token,
         ),
         notifier=NotifierConfig(),
     )

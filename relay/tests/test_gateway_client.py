@@ -336,8 +336,19 @@ async def test_clarify_respond_sends_answer_not_text():
 # reconnect + re-resume of owned sessions
 # ---------------------------------------------------------------------------
 async def test_reconnect_reresumes_owned_sessions():
-    t1 = FakeTransport(responder=echo_responder)
-    t2 = FakeTransport(responder=echo_responder)
+    resumes = iter(["live-1", "live-2"])
+
+    def responder(frame):
+        params = frame.get("params") or {}
+        result = (
+            {"session_id": next(resumes), "resumed": params.get("session_id")}
+            if frame["method"] == "session.resume"
+            else {"accepted": True}
+        )
+        return {"jsonrpc": "2.0", "id": frame["id"], "result": result}
+
+    t1 = FakeTransport(responder=responder)
+    t2 = FakeTransport(responder=responder)
     connector = ScriptedConnector([t1, t2])
     bus = EventBus()
     cfg = GatewayConfig(token="tok", port=9126, connect_timeout_s=0.5,
@@ -349,19 +360,22 @@ async def test_reconnect_reresumes_owned_sessions():
     await wait_until(lambda: client._transport is t1 and client._ready.is_set())
 
     # own an idle foreign session over connection #1
-    await client.session_resume("clisess01")
-    assert client.owns("clisess01")
+    await client.session_resume("origin")
+    assert client.live_id_for("origin") == "live-1"
 
     # drop connection #1 -> reconnect loop should move to t2 and re-resume
     await t1.close()
     await wait_until(lambda: client._transport is t2 and client._ready.is_set())
-    await wait_until(lambda: any(
-        f.get("method") == "session.resume"
-        and (f.get("params") or {}).get("session_id") == "clisess01"
-        for f in t2.sent
-    ))
+    await wait_until(lambda: client.live_id_for("origin") == "live-2")
 
     assert len(connector.made) == 2  # exactly one reconnect
+    resumed_ids = [
+        f["params"]["session_id"] for f in t2.sent
+        if f.get("method") == "session.resume"
+    ]
+    assert resumed_ids == ["origin"]
+    assert not client.owns("live-1")
+
     await client.close()
     run_task.cancel()
     try:

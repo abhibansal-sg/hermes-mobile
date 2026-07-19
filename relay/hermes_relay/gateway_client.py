@@ -85,7 +85,7 @@ class GatewayConfig:
     """Connection parameters for the gateway WS + REST surface."""
 
     host: str = "127.0.0.1"
-    port: int = 9126  # isolated test gateway range (NEVER 9119 live)
+    port: int = 9133  # isolated default; deployment may override
     token: str = ""
     source: str = RELAY_SOURCE
     cols: int = 80
@@ -464,13 +464,26 @@ class GatewayClient:
         re-drive. Ids are snapshotted so a concurrent submit can't mutate the
         set mid-iteration.
         """
-        for sid in sorted(self._owned):
+        # Distinct live ids are connection-local. Resume only their stable
+        # origins, then replace each stale live mapping with the fresh result.
+        prior_live_ids = {
+            live for origin, live in self._live_by_origin.items() if origin != live
+        }
+        for sid in sorted(self._owned - prior_live_ids):
             try:
-                await self.call(
+                result = await self._call_result(
                     "session.resume",
                     {"session_id": sid, "cols": self._cfg.cols, "source": self._cfg.source},
                     timeout=self._cfg.rpc_timeout_s,
                 )
+                live = result.get("session_id") or sid
+                old_live = self._live_by_origin.get(sid)
+                if old_live and old_live != sid:
+                    self._owned.discard(old_live)
+                    self._live_by_origin.pop(old_live, None)
+                self._owned.add(live)
+                self._live_by_origin[sid] = live
+                self._live_by_origin[live] = live
             except Exception:
                 # Keep the session owned; a later phone action re-drives it.
                 continue

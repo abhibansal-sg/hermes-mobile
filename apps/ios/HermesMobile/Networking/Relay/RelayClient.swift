@@ -137,6 +137,9 @@ actor RelayClient {
     /// first; the item store is preserved so a following `resync` reconciles.
     func connect(url: URL, token: String? = nil) {
         teardown(state: .connecting)
+        store.beginConnectionEpoch()
+        lastAckedSeq = 0
+        lastGapResyncSeq = -1
 
         generation &+= 1
         let myGeneration = generation
@@ -158,14 +161,19 @@ actor RelayClient {
     /// sends a fresh `snapshot`; either arrives as downstream frames the receive
     /// loop reconciles by `item_id`.
     func reconnect(url: URL, token: String? = nil) async {
+        let previousSeq = store.lastSeq
         connect(url: url, token: token)
-        await resync()
+        await resync(from: previousSeq)
     }
 
     /// Send `resync{last_seq}` (§4). Fire-and-forget: the replay / snapshot returns
     /// as downstream frames, not as an RPC result.
     func resync() async {
-        await notify(.resync, params: .object(["last_seq": .number(Double(store.lastSeq))]))
+        await resync(from: store.lastSeq)
+    }
+
+    private func resync(from lastSeq: Int) async {
+        await notify(.resync, params: .object(["last_seq": .number(Double(lastSeq))]))
     }
 
     /// Close the socket, fail in-flight requests, move to `.closed`. Streams and
@@ -218,19 +226,21 @@ actor RelayClient {
 
     /// Answer an `approval.request` gate (§5).
     @discardableResult
-    func approve(requestID: String, approved: Bool) async throws -> JSONValue {
+    func approve(sessionID: String, requestID: String, approved: Bool) async throws -> JSONValue {
         try await request(.approve, params: .object([
+            "session_id": .string(sessionID),
             "request_id": .string(requestID),
-            "approved": .bool(approved),
+            "decision": .string(approved ? "approve" : "deny"),
         ]))
     }
 
     /// Answer a `clarify.request` gate (§5).
     @discardableResult
-    func clarify(requestID: String, response: String) async throws -> JSONValue {
+    func clarify(sessionID: String, requestID: String, response: String) async throws -> JSONValue {
         try await request(.clarify, params: .object([
+            "session_id": .string(sessionID),
             "request_id": .string(requestID),
-            "response": .string(response),
+            "text": .string(response),
         ]))
     }
 

@@ -415,12 +415,18 @@ final class RelaySessionCoordinator {
 
     @discardableResult
     func approve(requestID: String, approved: Bool) async throws -> JSONValue {
-        try await requireClient().approve(requestID: requestID, approved: approved)
+        guard let sessionID = activeSessionID else { throw RelayError.notConnected }
+        return try await requireClient().approve(
+            sessionID: sessionID, requestID: requestID, approved: approved
+        )
     }
 
     @discardableResult
     func clarify(requestID: String, response: String) async throws -> JSONValue {
-        try await requireClient().clarify(requestID: requestID, response: response)
+        guard let sessionID = activeSessionID else { throw RelayError.notConnected }
+        return try await requireClient().clarify(
+            sessionID: sessionID, requestID: requestID, response: response
+        )
     }
 
     @discardableResult

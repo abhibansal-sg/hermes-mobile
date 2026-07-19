@@ -45,7 +45,7 @@ relay/
     __main__.py      [DONE] # entrypoint: python -m hermes_relay (argparse CLI)
   scripts/
     run-relay.sh            # canonical launcher (provisions venv, runs the CLI)
-    launch_isolated_gateway.sh  # stock isolated gateway on 9127 (E2E upstream)
+    launch_isolated_gateway.sh  # stock isolated gateway on 9133 (E2E upstream)
     launch_relay.sh         # env-var launcher co-located with the isolated gateway
   tests/
     test_types.py           # Frame/Item round-trip + seq-stamp guard
@@ -93,13 +93,13 @@ Contracts the lanes rely on (already implemented in `[DONE]` modules):
 - **Gate** — `DownstreamServer.session_has_live_phone(sid)` is injected into the
   Notifier as the §6 foreground gate.
 
-## Run (local, isolated — NEVER the live gateway on 9119)
+## Run locally (isolated)
 
 The one-liner launcher provisions the external-volume venv and starts the CLI:
 
 ```bash
 # 1) start a STOCK isolated gateway (writes its loopback token to $EVID/.gwtoken)
-scripts/launch_isolated_gateway.sh            # gateway on 127.0.0.1:9127
+scripts/launch_isolated_gateway.sh            # gateway on 127.0.0.1:9133
 
 # 2) start the relay against it (reads the token file, serves the phone on 8788)
 scripts/run-relay.sh                          # downstream ws://127.0.0.1:8788
@@ -115,15 +115,15 @@ pip install -e '.[dev]'         # from relay/  (runtime: websockets, httpx, pyya
 pytest                          # unit tests (no network)
 
 python -m hermes_relay \
-  --gateway-url ws://127.0.0.1:9127 \
+  --gateway-url ws://127.0.0.1:9133 \
   --token-file "$EVID/.gwtoken" \
   --listen 127.0.0.1:8788
 ```
 
 CLI flags: `--gateway-url ws://host:port` (or `--gateway-host/--gateway-port`),
 `--token`/`--token-file` (or `HERMES_RELAY_GATEWAY_TOKEN`), `--listen host:port`,
-`--health-path /healthz` / `--no-health`, `--log-level`. The entrypoint **refuses
-gateway port 9119** (the live gateway) outright.
+`--health-path /healthz` / `--no-health`, `--log-level`. Automated tests and
+development use an isolated gateway on port 9130+; deployment may select 9119.
 
 Env equivalents (used by `launch_relay.sh`): `HERMES_RELAY_GATEWAY_TOKEN`,
 `HERMES_RELAY_GATEWAY_URL`, `HERMES_RELAY_GATEWAY_HOST`/`_PORT`,
@@ -136,7 +136,8 @@ not a WS upgrade) with a JSON status snapshot — connections, per-phone seq/ack
 watermarks + foreground, owned sessions, and ring/serving state:
 
 ```bash
-curl -s http://127.0.0.1:8788/healthz
+curl -s -H "Authorization: Bearer $(cat \"$EVID/.gwtoken\")" \
+  http://127.0.0.1:8788/healthz
 # {"listen":"127.0.0.1:8788","connections":0,"phones":[],"owned_sessions":[],
 #  "ring_ready":true,"serving":true}
 ```
@@ -145,8 +146,8 @@ curl -s http://127.0.0.1:8788/healthz
 
 - Never touch the `hermes-mobile` product working tree; build only in this
   worktree / a lane worktree on `/Volumes/MainData`.
-- Never touch the live gateway on port **9119**. E2E uses a STOCK isolated
-  gateway on **9126+** with a temp `HERMES_HOME`.
+- Never aim automated tests at the live gateway on port **9119**. E2E uses a
+  STOCK isolated gateway on **9130+** with a temp `HERMES_HOME`.
 - ZERO CORE PATCH: no edits to `tui_gateway/`, `gateway/`, `run_agent.py`,
   `model_tools.py`, or `hermes_cli/` core. The relay is a client that reuses
   `plugins/hermes-mobile` plumbing only.
