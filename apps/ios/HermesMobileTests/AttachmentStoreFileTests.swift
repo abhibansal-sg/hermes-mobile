@@ -82,4 +82,76 @@ final class AttachmentStoreFileTests: XCTestCase {
             try AttachmentStore.validateFileAttachment(data: atCap, filename: "cap.bin")
         )
     }
+
+    // MARK: - Pre-read size guard (readPickedFileData)
+
+    /// Write `data` to a unique temp file and return its URL; the caller removes it.
+    private func writeTempFile(_ data: Data, ext: String) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(ext)
+        try data.write(to: url)
+        return url
+    }
+
+    func testReadPickedFileReturnsBytesForInCapFile() throws {
+        let bytes = Data("hello, files\n".utf8)
+        let url = try writeTempFile(bytes, ext: "txt")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        switch AttachmentStore.readPickedFileData(at: url) {
+        case .success(let read):
+            XCTAssertEqual(read, bytes)
+        case .failure(let message):
+            XCTFail("expected bytes, got failure: \(message)")
+        }
+    }
+
+    /// The core of the finding: an over-cap file must be REJECTED by the on-disk
+    /// size check WITHOUT being read into memory. We prove rejection here; the
+    /// "without reading" property is structural — the guard returns before the
+    /// `Data(contentsOf:)` call.
+    func testReadPickedFileRejectsOverCapFileWithoutReading() throws {
+        // One byte over the cap. Written to disk once, but the guard must not
+        // resident-load it on the attach path.
+        let oversized = Data(count: AttachmentStore.maxFileAttachmentBytes + 1)
+        let url = try writeTempFile(oversized, ext: "bin")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        switch AttachmentStore.readPickedFileData(at: url) {
+        case .success:
+            XCTFail("over-cap file should have been rejected before reading")
+        case .failure(let message):
+            XCTAssertTrue(
+                message.contains("too large"),
+                "unexpected rejection message: \(message)"
+            )
+        }
+    }
+
+    func testReadPickedFileAcceptsFileAtExactCap() throws {
+        let atCap = Data(count: AttachmentStore.maxFileAttachmentBytes)
+        let url = try writeTempFile(atCap, ext: "bin")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        switch AttachmentStore.readPickedFileData(at: url) {
+        case .success(let read):
+            XCTAssertEqual(read.count, AttachmentStore.maxFileAttachmentBytes)
+        case .failure(let message):
+            XCTFail("at-cap file should be accepted, got: \(message)")
+        }
+    }
+
+    func testReadPickedFileReportsUnreadablePath() {
+        let missing = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("bin")
+
+        switch AttachmentStore.readPickedFileData(at: missing) {
+        case .success:
+            XCTFail("nonexistent file should not read successfully")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("Couldn't read"), "unexpected message: \(message)")
+        }
+    }
 }
