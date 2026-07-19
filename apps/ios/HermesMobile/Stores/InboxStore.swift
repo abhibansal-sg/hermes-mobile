@@ -148,6 +148,8 @@ final class InboxStore {
     /// Called only after a database transaction commits, allowing the widget to
     /// publish the exact same pending count as the rows just exposed here.
     var onCommittedSnapshot: ((AttentionSnapshot) -> Void)?
+    /// Projects the same visible-row count to system UI (the app-icon badge).
+    var onPendingCountChange: ((Int) -> Void)?
 
     init() {}
 
@@ -244,6 +246,7 @@ final class InboxStore {
     private func publish(_ snapshot: AttentionSnapshot) {
         metadata = snapshot.metadata
         items = snapshot.items.map(Self.item(from:))
+        onPendingCountChange?(pendingCount)
         onCommittedSnapshot?(snapshot)
     }
 
@@ -331,6 +334,7 @@ final class InboxStore {
             }
         } else {
             insert(item)
+            onPendingCountChange?(pendingCount)
         }
     }
 
@@ -344,6 +348,7 @@ final class InboxStore {
             for index in items.indices where items[index].sessionId == sessionId && items[index].state.isVisible {
                 items[index].state = .expired
             }
+            onPendingCountChange?(pendingCount)
         }
     }
 
@@ -432,6 +437,7 @@ final class InboxStore {
             }
         } else {
             items.removeAll { $0.id == item.id }
+            onPendingCountChange?(pendingCount)
         }
     }
 
@@ -443,12 +449,14 @@ final class InboxStore {
             }
         } else {
             items.removeAll { $0.state == .expired || $0.state == .resolvedElsewhere }
+            onPendingCountChange?(pendingCount)
         }
     }
 
     /// Privacy reset used by Forget Gateway. Repeated calls are harmless.
     func removeAll() {
         items.removeAll()
+        onPendingCountChange?(0)
     }
 
     // MARK: - Response bookkeeping
@@ -458,6 +466,7 @@ final class InboxStore {
               let lifecycle = Self.lifecycle(from: state) else {
             if let index = items.firstIndex(where: { $0.id == id }) {
                 items[index].state = state
+                onPendingCountChange?(pendingCount)
             }
             return
         }

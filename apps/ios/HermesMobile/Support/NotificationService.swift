@@ -82,6 +82,11 @@ final class NotificationDeliveryLedger {
 /// alert ownership to APNs.
 @MainActor
 enum NotificationService {
+    /// Keep the system app-icon badge aligned with the durable attention inbox.
+    static func setBadgeCount(_ count: Int) {
+        UNUserNotificationCenter.current().setBadgeCount(max(0, count))
+    }
+
     enum AlertKind: String, Sendable, Equatable {
         case approval
         case clarify

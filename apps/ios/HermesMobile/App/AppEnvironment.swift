@@ -245,6 +245,9 @@ final class AppEnvironment {
         // The inbox accumulates broadcast approval/clarify prompts and answers
         // them against each prompt's own runtime via the gateway client.
         inboxStore.attach(connection: connectionStore)
+        inboxStore.onPendingCountChange = { count in
+            NotificationService.setBadgeCount(count)
+        }
         inboxStore.onCommittedSnapshot = { snapshot in
             var patch = WidgetSnapshotWriter.Patch()
             patch.pendingAttentionCount = .set(snapshot.pendingCount)

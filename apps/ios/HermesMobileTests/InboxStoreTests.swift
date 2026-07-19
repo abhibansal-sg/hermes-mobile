@@ -12,11 +12,14 @@ final class InboxStoreTests: XCTestCase {
 
     func testMessageCompletionExpiresVisibleFailedOrPendingRows() {
         let inbox = InboxStore()
+        var badgeCounts: [Int] = []
+        inbox.onPendingCountChange = { badgeCounts.append($0) }
         inbox.handle(event: event("approval.request", session: "runtime"))
         XCTAssertEqual(inbox.pendingCount, 1)
         inbox.handle(event: event("message.complete", session: "runtime"))
         XCTAssertEqual(inbox.pendingCount, 0)
         XCTAssertEqual(inbox.items.first?.state, .expired)
+        XCTAssertEqual(badgeCounts, [1, 0])
     }
 
     func testExplicitDismissRemainsAnIntentionalLocalAction() {
