@@ -120,11 +120,21 @@ struct TurnDock: View {
 
 // MARK: - Task box
 
-/// Collapsed snapshot row (checklist glyph + "X of Y" + current in-progress task
-/// + a thin progress line) that expands IN PLACE to the full checklist. The rows
-/// reuse ``TodoChecklistRow`` — the exact styling the transcript's
-/// ``TodoCardView`` uses — so the dock and the transcript render a todo item
-/// identically.
+/// A SLIM ONE-LINE PILL (checklist glyph + "X of Y" + current in-progress task
+/// title) that expands IN PLACE to the full checklist. Owner QA redesign:
+///
+///  • Collapsed = a single-line pill in the same visual language as the queued
+///    strip — NOT a tall lighter floating card. Its fill is `theme.muted`, a
+///    subtle wash on the transcript surface, so it reads as part of the transcript
+///    rather than a lighter box hovering over it.
+///  • NO progress bar. The old full-width `theme.midground` progress rule under
+///    the header read as a "mystery blue line"; the "X of Y" count carries the
+///    same information without a coloured rule.
+///  • Expanded = a compact, theme-matched checklist with tight row spacing.
+///
+/// The expanded rows reuse ``TodoChecklistRow`` — the exact styling the
+/// transcript's ``TodoCardView`` uses — so the dock and the transcript render a
+/// todo item identically.
 struct DockTaskBox: View {
     let todos: TodoList
 
@@ -137,12 +147,9 @@ struct DockTaskBox: View {
         todos.items.filter { $0.status == .completed }.count
     }
     private var total: Int { todos.items.count }
-    private var progress: Double {
-        total == 0 ? 0 : Double(doneCount) / Double(total)
-    }
     /// The task the agent is actively working, if any — shown in the collapsed
-    /// snapshot. Falls back to the first not-yet-done item so the snapshot always
-    /// names *something* actionable.
+    /// pill. Falls back to the first not-yet-done item so the pill always names
+    /// *something* actionable.
     private var currentTitle: String? {
         todos.items.first { $0.status == .inProgress }?.content
             ?? todos.items.first { $0.status == .pending || $0.status == .other }?.content
@@ -150,19 +157,21 @@ struct DockTaskBox: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            snapshot
-            progressLine
+            pill
             if isExpanded { list }
         }
-        .background(theme.card, in: RoundedRectangle(cornerRadius: 13))
+        // Subtle transcript-matched wash (owner QA: "not a lighter box"), hairline
+        // border. Corner radius + horizontal metrics mirror the queued strip so the
+        // two dock surfaces share one visual language.
+        .background(theme.muted, in: RoundedRectangle(cornerRadius: 12))
         .overlay(
-            RoundedRectangle(cornerRadius: 13)
-                .strokeBorder(theme.border, lineWidth: 1)
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(theme.border.opacity(0.6), lineWidth: 1)
         )
         .accessibilityElement(children: .contain)
     }
 
-    private var snapshot: some View {
+    private var pill: some View {
         Button {
             withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.86)) {
                 isExpanded.toggle()
@@ -193,7 +202,7 @@ struct DockTaskBox: View {
                     .rotationEffect(.degrees(isExpanded ? 180 : 0))
             }
             .padding(.horizontal, 13)
-            .padding(.vertical, 11)
+            .padding(.vertical, 10)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -203,29 +212,22 @@ struct DockTaskBox: View {
         .accessibilityAddTraits(.isButton)
     }
 
-    private var progressLine: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                Rectangle()
-                    .fill(theme.muted)
-                Rectangle()
-                    .fill(theme.midground)
-                    .frame(width: max(0, geo.size.width * progress))
-            }
-        }
-        .frame(height: 2.5)
-        .accessibilityHidden(true)
-    }
-
     private var list: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
+            // Hairline divider between the pill and the expanded list, matched to the
+            // subtle wash — replaces the old coloured progress rule.
+            Rectangle()
+                .fill(theme.border.opacity(0.6))
+                .frame(height: 1)
+                .padding(.bottom, 2)
+                .accessibilityHidden(true)
             ForEach(todos.items) { item in
                 TodoChecklistRow(item: item)
             }
         }
         .padding(.horizontal, 13)
-        .padding(.top, 11)
-        .padding(.bottom, 13)
+        .padding(.top, 8)
+        .padding(.bottom, 11)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
