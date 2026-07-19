@@ -23,6 +23,12 @@ struct RelayItemStore: Sendable, Equatable {
     private(set) var arrivalOrder: [String] = []
     /// Highest downstream `seq` folded in — the ack / replay watermark (§4).
     private(set) var lastSeq: Int = 0
+    /// Seqs whose `item.delta` was applied AHEAD of the dense watermark (i.e. a
+    /// gap frame painted optimistically). Deltas APPEND text, so they must fold
+    /// AT MOST ONCE; when a `resync` replay re-sends such a frame, its seq is
+    /// still here and we skip the second append. Pruned to only-ahead-of-`lastSeq`
+    /// on every `apply`, so it holds at most the current gap window (usually empty).
+    private(set) var appliedDeltaSeqs: Set<Int> = []
 
     init() {}
 
@@ -72,9 +78,17 @@ struct RelayItemStore: Sendable, Equatable {
     // MARK: - Reduction (§3)
 
     /// Fold one downstream frame into the store. Returns the `seq` classification
-    /// so the client can trigger a `resync` on a gap. The payload is applied
-    /// regardless of ordering: reduction is idempotent, so a duplicate re-applies
-    /// harmlessly and a gap still paints optimistically until the backfill lands.
+    /// so the client can trigger a `resync` on a gap.
+    ///
+    /// Idempotency is per-kind, NOT universal: `started` (insert-if-absent),
+    /// `completed` (authoritative replace) and `snapshot` (replace-by-id) are
+    /// idempotent, so re-applying them converges. But `delta` APPENDS text, so a
+    /// re-applied delta doubles the prose (`"hello"` → `"hellohel"`). A delta can
+    /// arrive twice two ways — a pure duplicate (`seq <= lastSeq`, e.g. a `resync`
+    /// that re-sends already-folded frames) and a gap frame applied optimistically
+    /// ahead of the watermark then re-sent inside the replay — so a delta is folded
+    /// AT MOST ONCE per seq (both guards below). started/completed/snapshot stay
+    /// unconditional: idempotent, and completed/snapshot must always be free to heal.
     @discardableResult
     mutating func apply(_ frame: RelayFrame) -> SeqAdmission {
         let admission = classify(seq: frame.seq)
@@ -82,7 +96,12 @@ struct RelayItemStore: Sendable, Equatable {
         case .itemStarted:
             if let item = frame.item { applyStarted(item) }
         case .itemDelta:
-            if let delta = frame.itemDelta { applyDelta(delta) }
+            if let delta = frame.itemDelta,
+               admission != .duplicate,                        // already below the dense watermark
+               !appliedDeltaSeqs.contains(frame.seq) {         // already applied ahead (gap → replay)
+                applyDelta(delta)
+                appliedDeltaSeqs.insert(frame.seq)
+            }
         case .itemCompleted:
             if let item = frame.item { applyCompleted(item) }
         case .snapshot:
@@ -102,6 +121,13 @@ struct RelayItemStore: Sendable, Equatable {
         // stuck `.inProgress` with no recovery short of a full snapshot.
         let advancesWatermark = frame.kind == .snapshot || !admission.isGap
         if advancesWatermark, frame.seq > lastSeq { lastSeq = frame.seq }
+        // Retain only delta seqs applied AHEAD of the dense watermark. Once the
+        // watermark passes a seq, any later copy is a plain `.duplicate` and the
+        // classification guard catches it — so this set never needs to remember it.
+        // Keeps the set to the live gap window (empty in the steady dense case).
+        if !appliedDeltaSeqs.isEmpty {
+            appliedDeltaSeqs = appliedDeltaSeqs.filter { $0 > lastSeq }
+        }
         return admission
     }
 
