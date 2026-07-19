@@ -977,6 +977,14 @@ struct ChatView: View {
                 let lastAssistantId = allRows.last(where: { $0.element.role == .assistant })?.element.id
                 let windowStart = max(0, allRows.count - windowSize)
                 let rows = Array(allRows[windowStart...])
+                // PERF (Wave 25): hoist the dock/inline-todo suppression id to a
+                // SINGLE evaluation for the whole transcript. `dockSuppressedTodoToolID`
+                // resolves `chatStore.latestTodoList` (an unmemoized O(messages × tools)
+                // reverse scan with no early return in the common no-todo case), and its
+                // value is identical for every row. Evaluating it inside the `ForEach`
+                // body made it O(rows × messages × tools) per streaming flush; binding it
+                // once here makes it O(messages × tools) — one scan per body eval.
+                let suppressedTodoToolID = dockSuppressedTodoToolID
                 if chatStore.isLoadingJumpTarget {
                     transcriptStatusChip(
                         "Loading earlier messages…",
@@ -1029,7 +1037,7 @@ struct ChatView: View {
                         delivery: delivery,
                         onResend: deliveryResendHandler(for: delivery),
                         onDeleteFailedSend: deliveryDeleteHandler(for: delivery, clientMessageID: message.clientMessageID),
-                        suppressedTodoToolID: dockSuppressedTodoToolID
+                        suppressedTodoToolID: suppressedTodoToolID
                     )
                     // A1 (scarf): settled bubbles short-circuit their body — only the
                     // streaming bubble (whose `message` changed) re-evaluates. Drops the
