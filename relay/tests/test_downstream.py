@@ -731,7 +731,7 @@ async def test_process_request_serves_health_path():
     c = _FakeConn()
     from http import HTTPStatus
 
-    out = srv._process_request(c, _FakeRequest("/healthz?probe=1"))
+    out = await srv._process_request(c, _FakeRequest("/healthz?probe=1"))
     assert out is not None  # a response was produced (handshake short-circuited)
     status, body = c.responded
     assert status == HTTPStatus.OK
@@ -739,12 +739,23 @@ async def test_process_request_serves_health_path():
     assert "connections" in parsed and "listen" in parsed
 
 
-async def test_process_request_ignores_non_health_paths():
+async def test_process_request_rejects_unauthenticated_websocket():
     srv, _ = _server()
+    srv._cfg.auth_token = "secret"
     await srv.start()
     c = _FakeConn()
-    # A normal WS upgrade path returns None so the handshake proceeds.
-    assert srv._process_request(c, _FakeRequest("/ws")) is None
+    await srv._process_request(c, _FakeRequest("/ws"))
+    from http import HTTPStatus
+    assert c.responded[0] == HTTPStatus.UNAUTHORIZED
+
+
+async def test_process_request_accepts_authenticated_websocket():
+    srv, _ = _server()
+    srv._cfg.auth_token = "secret"
+    await srv.start()
+    c = _FakeConn()
+    request = _FakeRequest("/ws", {"Authorization": "Bearer secret"})
+    assert await srv._process_request(c, request) is None
     assert c.responded is None
 
 
@@ -753,5 +764,16 @@ async def test_process_request_disabled_when_no_health_path():
     srv._cfg.health_path = None
     await srv.start()
     c = _FakeConn()
-    assert srv._process_request(c, _FakeRequest("/healthz")) is None
+    assert await srv._process_request(c, _FakeRequest("/healthz")) is None
     assert c.responded is None
+
+
+async def test_disabling_health_does_not_disable_websocket_auth():
+    srv, _ = _server()
+    srv._cfg.health_path = None
+    srv._cfg.auth_token = "secret"
+    await srv.start()
+    c = _FakeConn()
+    await srv._process_request(c, _FakeRequest("/ws"))
+    from http import HTTPStatus
+    assert c.responded[0] == HTTPStatus.UNAUTHORIZED

@@ -28,6 +28,7 @@ from typing import Optional
 
 from .bus import TOPIC_GATEWAY_EVENTS, TOPIC_RELAY_FRAMES, EventBus
 from .downstream import DownstreamConfig, DownstreamServer
+from .durable_state import DurableState
 from .gateway_client import GatewayClient, GatewayConfig
 from .notifier import Notifier, NotifierConfig
 from .reframer import Reframer
@@ -52,19 +53,21 @@ class RelayApp:
         self._cfg = config
         self.bus = EventBus()
         self.store = SessionStore()
+        self.durable = DurableState()
         self._tasks: dict[str, asyncio.Task] = {}
         self._closing = False
 
         self.gateway = GatewayClient(config.gateway, self.bus)
         self.reframer = Reframer(self.bus, self.store)
         self.downstream = DownstreamServer(
-            config.downstream, self.bus, self.gateway, self.store
+            config.downstream, self.bus, self.gateway, self.store, self.durable
         )
         self.notifier = Notifier(
             config.notifier,
             self.bus,
             self.gateway,
             is_foregrounded=self.downstream.session_has_live_phone,
+            durable=self.durable,
         )
 
     async def run(self) -> None:

@@ -546,6 +546,18 @@ final class ConnectionStore {
         return components?.url
     }
 
+    /// HTTP sibling of the relay WebSocket, used only for relay-owned truth.
+    func relayControlURL(forGateway gatewayURL: URL) -> URL? {
+        guard transportPath == .relay,
+              let relayURL = relayURL(forGateway: gatewayURL),
+              var components = URLComponents(url: relayURL, resolvingAgainstBaseURL: false)
+        else { return nil }
+        components.scheme = relayURL.scheme == "wss" ? "https" : "http"
+        components.path = ""
+        components.queryItems = nil
+        return components.url
+    }
+
     /// Test seam mirroring ``connectRPC``: when set, the relay-transport branch of
     /// `configure` calls this instead of `relayCoordinator.start` so a test can
     /// assert the relay path was selected without a live socket. `nil` in
@@ -601,7 +613,8 @@ final class ConnectionStore {
         #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
         return RestClient(
-            baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
+            baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle,
+            relayControlBaseURL: relayControlURL(forGateway: url)
         )
     }
 
