@@ -235,6 +235,12 @@ final class AppEnvironment {
             chatStore.attachCache(cacheStore)
             inboxStore.attachCache(cacheStore)
             connectionStore.cacheStore = cacheStore
+            // Cache-first Projects: share the SESSION list's active
+            // (serverId, profileId) partition so a profile/server switch
+            // re-partitions Projects in lockstep. Seeds from disk immediately.
+            projectsStore.attachCache(cacheStore, scope: { [weak sessionStore] in
+                sessionStore?.projectsCacheScope
+            })
         }
         // The inbox accumulates broadcast approval/clarify prompts and answers
         // them against each prompt's own runtime via the gateway client.

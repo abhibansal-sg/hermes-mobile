@@ -98,6 +98,8 @@ struct DrawerView: View {
     /// Drives navigation into ArchivedSessionsView (pull-to-reveal row in the
     /// drawer list — see `archivedRevealRow`).
     @State private var showingArchivedChats = false
+    /// Drives presentation of the New Project sheet (fix b — Projects tab).
+    @State private var showingNewProject = false
     /// Drives presentation of the global approval/clarification inbox sheet.
     @State private var showingInbox = false
     /// Drives presentation of the automation-runs sheet (build-32 QA: the
@@ -196,6 +198,20 @@ struct DrawerView: View {
                                     .combined(with: .opacity)
                             )
                         )
+                } else {
+                    // Projects tab (fix b): the global "New project" action lives in
+                    // the same floating-capsule slot the Sessions tab uses for
+                    // "New chat" — a symmetric, per-tab primary action.
+                    newProjectCapsule
+                        .ignoresSafeArea(.container, edges: .bottom)
+                        .transition(
+                            .asymmetric(
+                                insertion: .scale(scale: 0.8, anchor: .bottomTrailing)
+                                    .combined(with: .opacity),
+                                removal: .scale(scale: 0.8, anchor: .bottomTrailing)
+                                    .combined(with: .opacity)
+                            )
+                        )
                 }
             }
             // The drawer hosts no pushed destinations in F1 (Settings is a sheet
@@ -222,6 +238,22 @@ struct DrawerView: View {
                     }
             }
             .hermesThemed(themeStore)
+        }
+        // New Project sheet (fix b). On success the store already refreshed the
+        // overview; we switch to the Projects tab and push the created project's
+        // detail so the user lands right where they created it.
+        .sheet(isPresented: $showingNewProject) {
+            NewProjectSheet(
+                defaultRoot: newProjectDefaultRoot,
+                create: { name, root in
+                    await projectsStore.createProject(name: name, root: root)
+                },
+                onCreated: { project in
+                    selectedTab = .projects
+                    path.append(project)
+                }
+            )
+            .environment(themeStore)
         }
         // Rename alert (R1 #66): a system alert with a text field, committed
         // through the previously-unreachable `SessionStore.rename`.
@@ -1705,6 +1737,8 @@ struct DrawerView: View {
 
     /// Haptic trigger for the New Chat capsule — bumped on each tap.
     @State private var newChatFeedbackTrigger = UUID()
+    /// Haptic trigger for the New Project capsule — bumped on each tap.
+    @State private var newProjectFeedbackTrigger = UUID()
 
     /// The floating "New chat" capsule overlapping the list bottom-right (observed
     /// reference). Carries the `drawerNewChat` id (preserved). BUG 3: hugs the
@@ -1791,6 +1825,73 @@ struct DrawerView: View {
             Image(systemName: "square.and.pencil")
                 .font(.body.weight(.semibold))
             Text("New chat")
+                .font(.body.weight(.semibold))
+        }
+    }
+
+    /// A sensible default root for the New Project sheet: the parent directory of
+    /// the first known project (that's where the user's repos already live), or
+    /// empty when nothing is loaded yet (the field then shows its placeholder).
+    private var newProjectDefaultRoot: String {
+        guard let root = projectsStore.projects?.first?.root, !root.isEmpty else {
+            return ""
+        }
+        let trimmed = root.hasSuffix("/") ? String(root.dropLast()) : root
+        guard let slash = trimmed.lastIndex(of: "/"), slash != trimmed.startIndex else {
+            return ""
+        }
+        return String(trimmed[..<slash])
+    }
+
+    /// The Projects-tab equivalent of ``newChatCapsule``: a floating primary
+    /// action that opens the New Project sheet (fix b). Mirrors the New-chat
+    /// capsule's glass/solid branches, sizing, haptic, and baseline so the two
+    /// tabs feel symmetric.
+    @ViewBuilder
+    private var newProjectCapsule: some View {
+        if #available(iOS 26.0, *) {
+            Button {
+                newProjectFeedbackTrigger = UUID()
+                showingNewProject = true
+            } label: {
+                newProjectCapsuleLabel
+                    .font(.body.weight(.semibold))
+            }
+            .buttonStyle(.glassProminent)
+            .controlSize(.large)
+            .tint(theme.midground)
+            .sensoryFeedback(.impact(weight: .medium), trigger: newProjectFeedbackTrigger)
+            .padding(.trailing, 16)
+            .padding(.bottom, HermesLayoutConstants.controlBottomBaseline)
+            .accessibilityIdentifier("drawerNewProject")
+            .accessibilityLabel("New project")
+        } else {
+            Button {
+                newProjectFeedbackTrigger = UUID()
+                showingNewProject = true
+            } label: {
+                newProjectCapsuleLabel
+                    .foregroundStyle(theme.fg.contrastingForeground)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 14)
+                    .background(theme.fg, in: Capsule())
+                    .shadow(color: .black.opacity(0.18), radius: 10, x: 0, y: 3)
+            }
+            .buttonStyle(.plain)
+            .sensoryFeedback(.impact(weight: .medium), trigger: newProjectFeedbackTrigger)
+            .padding(.trailing, 16)
+            .padding(.bottom, HermesLayoutConstants.controlBottomBaseline)
+            .accessibilityIdentifier("drawerNewProject")
+            .accessibilityLabel("New project")
+        }
+    }
+
+    /// Shared label for the New-project capsule across the glass / solid branches.
+    private var newProjectCapsuleLabel: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "folder.badge.plus")
+                .font(.body.weight(.semibold))
+            Text("New project")
                 .font(.body.weight(.semibold))
         }
     }

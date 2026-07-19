@@ -1392,6 +1392,11 @@ final class SessionStore {
         return CacheScope(serverId: serverURL, profileId: activeProfile)
     }
 
+    /// The active `(serverId, profileId)` cache partition, exposed so the
+    /// composition root can hand ``ProjectsStore`` the SAME scope the session
+    /// list uses (a profile/server switch then re-partitions both in lockstep).
+    var projectsCacheScope: CacheScope? { currentCacheScope }
+
     func cacheIdentity(_ sessionId: String, profile: String? = nil) -> CacheIdentity? {
         guard let scope = currentCacheScope else { return nil }
         let actual = profile?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5807,6 +5812,19 @@ final class ProjectsStore {
     /// ``attach(connection:)`` is called by the composition root.
     private var connection: ConnectionStore?
 
+    // MARK: - Offline cache (cache-first projects)
+
+    /// The shared cache actor, injected by ``attachCache(_:scope:)``. `nil` until
+    /// wired (or when the cache failed to open) — every cache path then no-ops
+    /// and the store runs network-only, byte-identical to before.
+    private var cacheStore: CacheStore?
+
+    /// Supplies the ACTIVE `(serverId, profileId)` cache partition. Sourced from
+    /// ``SessionStore`` so Projects share the same scope as the session list
+    /// (a profile/server switch re-partitions both). `nil` before there is a
+    /// connection.
+    private var cacheScopeProvider: (() -> CacheScope?)?
+
     init() {}
 
     /// Inject the connection store (REST access). Called once by
@@ -5814,6 +5832,30 @@ final class ProjectsStore {
     /// attach-pattern the other stores use (``SessionStore/attach`` etc.).
     func attach(connection: ConnectionStore) {
         self.connection = connection
+    }
+
+    /// Inject the offline cache + its scope provider, and immediately seed the
+    /// in-memory list from disk so a cold/offline launch paints projects instead
+    /// of a blank "Not connected" wall (the network refresh write-through then
+    /// repaints). Mirrors the session-list cache-first pattern.
+    func attachCache(_ cache: CacheStore, scope: @escaping () -> CacheScope?) {
+        self.cacheStore = cache
+        self.cacheScopeProvider = scope
+        Task { await seedFromCache() }
+    }
+
+    /// Paint ``projects`` from the on-disk snapshot when nothing is loaded yet.
+    /// No-op once a (possibly empty) network result has landed — the cache never
+    /// clobbers fresher server data.
+    func seedFromCache() async {
+        guard projects == nil,
+              let cache = cacheStore,
+              let scope = cacheScopeProvider?() else { return }
+        if let cached = try? await cache.loadProjects(scope: scope),
+           !cached.isEmpty,
+           projects == nil {
+            projects = cached
+        }
     }
 
     // MARK: - Fetch
@@ -5827,7 +5869,10 @@ final class ProjectsStore {
     /// UI doesn't flicker on a transient network blip.
     func refresh() async {
         guard let rest = connection?.rest else {
-            loadError = "Not connected"
+            // Offline: paint from disk so cold launch shows the last-known
+            // projects instead of a blank "Not connected" list.
+            await seedFromCache()
+            if projects == nil { loadError = "Not connected" }
             return
         }
         isLoading = true
@@ -5844,14 +5889,54 @@ final class ProjectsStore {
             )
             projects = decoded
             loadError = nil
+            // Write-through: persist the fresh list so the next cold/offline
+            // launch paints instantly.
+            writeThroughProjects(decoded)
         } catch {
             // Preserve the last successful list so the UI doesn't blank out
             // on a transient failure — only surface the error when there is no
-            // cached data to show.
+            // cached data to show. Seed from disk first so a transient network
+            // failure at cold launch still paints the last-known list.
+            if projects == nil { await seedFromCache() }
             if projects == nil {
                 loadError = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
             }
+        }
+    }
+
+    /// Persist the freshly-fetched projects overview to the on-disk snapshot.
+    private func writeThroughProjects(_ projects: [Project]) {
+        guard let cache = cacheStore, let scope = cacheScopeProvider?() else { return }
+        Task { try? await cache.saveProjects(projects, scope: scope) }
+    }
+
+    // MARK: - Create (cache-first project creation)
+
+    /// The outcome of a create-project attempt: the created ``Project`` on
+    /// success (so the caller can open it), or a human-readable error message.
+    enum CreateResult: Sendable, Equatable {
+        case created(Project)
+        case failure(String)
+    }
+
+    /// Create a project via the plugin `POST /projects` route, then refresh the
+    /// overview so the new project appears in the list. Never throws — failures
+    /// come back as ``CreateResult/failure`` for the sheet to surface.
+    func createProject(name: String, root: String) async -> CreateResult {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedRoot = root.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return .failure("Project name is required.") }
+        guard !trimmedRoot.isEmpty else { return .failure("Root folder path is required.") }
+        guard let rest = connection?.rest else { return .failure("Not connected") }
+        do {
+            let project = try await rest.createProject(name: trimmedName, root: trimmedRoot)
+            await refresh()
+            return .created(project)
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            return .failure(message)
         }
     }
 
@@ -5871,23 +5956,63 @@ final class ProjectsStore {
             fetch = { try await sessionsFetch(project) }
         } else {
             guard let rest = connection?.rest else {
-                projectSessionsErrorById[project.id] = "Not connected"
+                // Offline: paint from the per-project cache snapshot if we have
+                // one, so cold-launch detail isn't a blank "Not connected" wall.
+                await seedProjectSessionsFromCache(for: project)
+                if projectSessionsById[project.id] == nil {
+                    projectSessionsErrorById[project.id] = "Not connected"
+                }
                 return
             }
-            fetch = { try await rest.sessionsWithTotal(cwdPrefix: project.root) }
+            // Primary: the plugin's folded project-sessions route (matches the
+            // count). Fall back to the legacy cwd_prefix path ONLY when the
+            // gateway is too old to serve the plugin route (404) — every other
+            // failure propagates so the designed error state is honest.
+            fetch = {
+                do {
+                    return try await rest.projectSessions(projectId: project.id)
+                } catch let RestError.badStatus(status, _) where status == 404 {
+                    return try await rest.sessionsWithTotal(cwdPrefix: project.root)
+                }
+            }
         }
+        // Seed instantly from the per-project cache snapshot so the detail view
+        // paints before the network returns (write-through repaints on success).
+        await seedProjectSessionsFromCache(for: project)
         projectSessionsLoadingIds.insert(project.id)
         defer { projectSessionsLoadingIds.remove(project.id) }
         do {
             let result = try await fetch()
             projectSessionsById[project.id] = result.sessions
             projectSessionsErrorById[project.id] = nil
+            writeThroughProjectSessions(result.sessions, for: project)
         } catch {
             if projectSessionsById[project.id] == nil {
                 projectSessionsErrorById[project.id] = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
             }
         }
+    }
+
+    /// Paint `project`'s detail list from the on-disk snapshot when nothing is in
+    /// memory yet. No-op when a cache/scope isn't wired, the snapshot is missing,
+    /// or an in-memory list already exists (never clobber fresher data).
+    private func seedProjectSessionsFromCache(for project: Project) async {
+        guard projectSessionsById[project.id] == nil,
+              let cache = cacheStore,
+              let scope = cacheScopeProvider?() else { return }
+        if let cached = try? await cache.loadProjectSessions(scope: scope, projectId: project.id),
+           !cached.isEmpty,
+           projectSessionsById[project.id] == nil {
+            projectSessionsById[project.id] = cached
+        }
+    }
+
+    /// Persist `project`'s freshly-fetched sessions to the on-disk snapshot.
+    private func writeThroughProjectSessions(_ sessions: [SessionSummary], for project: Project) {
+        guard let cache = cacheStore, let scope = cacheScopeProvider?() else { return }
+        let projectId = project.id
+        Task { try? await cache.saveProjectSessions(sessions, scope: scope, projectId: projectId) }
     }
 
     /// The server-scoped session list for `project`, or `[]` if it hasn't
