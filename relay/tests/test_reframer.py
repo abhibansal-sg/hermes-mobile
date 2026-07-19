@@ -464,6 +464,69 @@ def test_todo_reopen_after_complete_rematerializes_in_progress():
     assert snap.body["all_complete"] is False
 
 
+def test_todo_reemit_identical_complete_across_turns_is_idempotent():
+    """A later turn re-writing the SAME already-complete list emits no 2nd completion.
+
+    The taskList id is cross-turn stable (``s1:tasks``) but the Notifier dedupes
+    task_complete per-turn, so a duplicate item.completed on a fresh turn would
+    fire a second "Hermes finished its tasks" push for zero new work. Agents
+    defensively re-write the identical TodoWrite list across turns, so
+    completion must be idempotent: no change -> no frame.
+    """
+    rf = _rf()
+    done = _todos(("1", "A", "completed"))
+    frames = _drive(
+        rf,
+        [
+            # turn 1 — first all-complete sighting -> item.completed
+            _ev("message.start"),
+            _ev("tool.complete", tool_id="a", name="todo", todos=done),
+            _ev("message.complete", text="done turn 1"),
+            # turn 2 — IDENTICAL already-complete list re-emitted (new turn)
+            _ev("message.start"),
+            _ev("tool.complete", tool_id="b", name="todo", todos=done),
+            _ev("message.complete", text="done turn 2"),
+        ],
+    )
+    tasklist_completions = [
+        f for f in frames
+        if f.kind == FrameKind.ITEM_COMPLETED
+        and f.body.get("type") == ItemType.TASK_LIST
+    ]
+    assert len(tasklist_completions) == 1  # exactly one push-worthy completion
+    # store still holds a single, authoritative completed card.
+    tasklists = [it for it in rf._store.get("s1").ordered_items()
+                 if it.type == ItemType.TASK_LIST]
+    assert len(tasklists) == 1
+    assert tasklists[0].status == ItemStatus.COMPLETED
+    assert [t["id"] for t in tasklists[0].body["tasks"]] == ["1"]
+
+
+def test_todo_complete_re_emitted_with_changed_taskset_fires_again():
+    """A genuinely NEW all-complete list (different tasks) DOES re-complete."""
+    rf = _rf()
+    frames = _drive(
+        rf,
+        [
+            _ev("message.start"),
+            _ev("tool.complete", tool_id="a", name="todo",
+                todos=_todos(("1", "A", "completed"))),
+            _ev("message.complete"),
+            # turn 2 — a new task was added and also finished: real new completion.
+            _ev("message.start"),
+            _ev("tool.complete", tool_id="b", name="todo",
+                todos=_todos(("1", "A", "completed"), ("2", "B", "completed"))),
+            _ev("message.complete"),
+        ],
+    )
+    tasklist_completions = [
+        f for f in frames
+        if f.kind == FrameKind.ITEM_COMPLETED
+        and f.body.get("type") == ItemType.TASK_LIST
+    ]
+    assert len(tasklist_completions) == 2  # changed set -> a second completion fires
+
+
 def test_todo_tolerates_malformed_entries():
     rf = _rf()
     frames = _drive(

@@ -508,6 +508,24 @@ class Reframer:
         summary = _tasks_summary(tasks)
 
         if _tasks_all_complete(tasks):
+            # Idempotent completion. The taskList id is deliberately cross-turn
+            # stable (``<sid>:tasks``), so a LATER turn can re-emit the SAME
+            # already-complete list — agents defensively re-write the TodoWrite
+            # list across turns. Re-emitting item.completed would fire a second
+            # task_complete push: the Notifier dedupes per-turn
+            # (notifier._identity keys on frame.turn), but this is the one item
+            # type that is intentionally cross-turn, so a new turn defeats that
+            # key and the user gets a repeated "Hermes finished its tasks"
+            # banner for zero new work. When the stored card is already
+            # COMPLETED with an identical task set, nothing changed: emit no
+            # frame (the store already holds the authoritative completed item,
+            # so a resync snapshot stays coherent).
+            if (
+                existing is not None
+                and existing.status == ItemStatus.COMPLETED
+                and existing.body.get("tasks") == tasks
+            ):
+                return frames
             item = Item(
                 item_id=item_id,
                 type=ItemType.TASK_LIST,
