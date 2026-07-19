@@ -82,6 +82,15 @@ struct ComposerView: View {
     /// Whether the file-browser sheet (F4A-A1 `FileBrowserView`) is up. Reached
     /// from the attach dialog's "Browse Files" entry, gated on `fs` support.
     @State private var showFileBrowser = false
+    /// Whether the document `.fileImporter` (W25 files-phase-1) is up. Reached
+    /// from the attach dialog's "Files" entry; picks arbitrary on-device files and
+    /// attaches them to the active session via the gateway `file.attach` RPC,
+    /// appending the returned `@file:` ref to the composer.
+    @State private var showFileImporter = false
+    /// Surfaced when a picked file can't be read or the `file.attach` RPC fails.
+    @State private var fileAttachError: String?
+    /// True while a picked file is uploading via `file.attach` (guards re-entry).
+    @State private var fileAttachInFlight = false
 
     /// Whether the microphone-denied alert is showing.
     @State private var showMicDeniedAlert = false
@@ -398,6 +407,21 @@ struct ComposerView: View {
         } message: {
             Text(photoLoadError ?? "")
         }
+        .fileImporter(
+            isPresented: $showFileImporter,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            handleFileImport(result)
+        }
+        .alert("Attachment Error", isPresented: Binding(
+            get: { fileAttachError != nil },
+            set: { if !$0 { fileAttachError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(fileAttachError ?? "")
+        }
         .onAppear {
             text = sessions.composerDraft(for: draftKey)
             sessions.restoreComposerDraft(for: draftKey)
@@ -670,6 +694,21 @@ struct ComposerView: View {
                         Label("Browse Files", systemImage: "folder")
                     }
                     .accessibilityIdentifier("composerBrowseFiles")
+                }
+                // W25 files-phase-1: attach an arbitrary on-device file (PDF, CSV,
+                // source, …). Needs a live session (file.attach materialises the
+                // bytes into the session workspace), so it is only offered once a
+                // runtime session exists — matching the Browse Files gate.
+                if let sid = sessions.activeRuntimeId,
+                   !sid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button {
+                        isFocused = false
+                        showFileImporter = true
+                    } label: {
+                        Label("Files", systemImage: "doc.badge.plus")
+                    }
+                    .disabled(fileAttachInFlight)
+                    .accessibilityIdentifier("composerAttachFile")
                 }
             } label: {
                 Image(systemName: "plus.circle.fill")
@@ -1230,6 +1269,66 @@ struct ComposerView: View {
     private func appendTranscript(_ transcript: String) {
         let existing = text.trimmingCharacters(in: .whitespacesAndNewlines)
         text = existing.isEmpty ? transcript : existing + " " + transcript
+        isFocused = true
+    }
+
+    // MARK: - File attachment (W25 files-phase-1)
+
+    /// Handle the `.fileImporter` result: resolve the active session and hand the
+    /// picked URLs off to the async upload. A missing session or picker error is
+    /// surfaced via the "Attachment Error" alert rather than failing silently.
+    private func handleFileImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .failure(let error):
+            fileAttachError = "Couldn't open the file: \(error.localizedDescription)"
+        case .success(let urls):
+            guard let sid = sessions.activeRuntimeId,
+                  !sid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                fileAttachError = "Open a chat before attaching a file."
+                return
+            }
+            guard !urls.isEmpty else { return }
+            Task { await attachPickedFiles(urls, sessionId: sid) }
+        }
+    }
+
+    /// Read each picked file (security-scoped) and upload it via
+    /// ``AttachmentStore/attachFile(data:filename:sessionId:connection:)``,
+    /// appending the returned `@file:` ref to the composer as it lands. Per-file
+    /// failures are collected into the error alert; successful refs still stick.
+    @MainActor
+    private func attachPickedFiles(_ urls: [URL], sessionId: String) async {
+        guard !fileAttachInFlight else { return }
+        fileAttachInFlight = true
+        defer { fileAttachInFlight = false }
+
+        for url in urls {
+            let scoped = url.startAccessingSecurityScopedResource()
+            let filename = url.lastPathComponent
+            let data: Data?
+            do {
+                data = try Data(contentsOf: url)
+            } catch {
+                data = nil
+                fileAttachError = "Couldn't read \(filename): \(error.localizedDescription)"
+            }
+            if scoped { url.stopAccessingSecurityScopedResource() }
+            guard let bytes = data else { continue }
+
+            do {
+                let attached = try await attachmentStore.attachFile(
+                    data: bytes,
+                    filename: filename,
+                    sessionId: sessionId,
+                    connection: connection
+                )
+                text = MentionCompletion.appendToken(attached.refText, to: text)
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                fileAttachError = message
+            }
+        }
         isFocused = true
     }
 
