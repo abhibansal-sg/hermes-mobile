@@ -363,8 +363,15 @@ final class AppEnvironment {
             sessionStore.applyManifestProjection(projection, scope: scope)
             return (projection, projection.revision > (before?.revision ?? -1))
         }
-        let syncCoordinator = ManifestInvalidationCoordinator { [weak connectionStore] invalidation in
-            guard let connectionStore, let rest = connectionStore.rest else { throw CancellationError() }
+        let syncCoordinator = ManifestInvalidationCoordinator {
+            [weak connectionStore, weak sessionStore] invalidation in
+            guard let connectionStore, let sessionStore,
+                  let rest = connectionStore.rest else { throw CancellationError() }
+            // Gateway-direct retains its established full-refresh fallback. The
+            // new manifest authority is intentionally relay-only.
+            guard rest.relayControlBaseURL != nil else {
+                return await sessionStore.refreshOutcome() == .success
+            }
             let profile = invalidation.scope.hasPrefix("profile:")
                 ? (String(invalidation.scope.dropFirst(8)).removingPercentEncoding ?? "")
                 : invalidation.scope
@@ -396,14 +403,18 @@ final class AppEnvironment {
                 let profile = defaults.string(forKey: DefaultsKeys.activeProfile) ?? DefaultsKeys.allProfilesScope
                 return BackgroundManifestScope(gatewayURL: url, scope: profile, token: token)
             },
-            sync: { [weak connectionStore] pairing in
-                guard let connectionStore, let gatewayURL = URL(string: pairing.gatewayURL) else {
+            sync: { [weak connectionStore, weak sessionStore] pairing in
+                guard let connectionStore, let sessionStore,
+                      let gatewayURL = URL(string: pairing.gatewayURL) else {
                     return .retryableFailure
+                }
+                guard let relayControl = connectionStore.relayControlURL(forGateway: gatewayURL) else {
+                    return await sessionStore.refreshOutcome()
                 }
                 let rest = RestClient(
                     baseURL: gatewayURL, token: pairing.token,
                     pathStyle: connectionStore.capabilities.resolvedPathStyle,
-                    relayControlBaseURL: connectionStore.relayControlURL(forGateway: gatewayURL)
+                    relayControlBaseURL: relayControl
                 )
                 let scope = CacheScope(serverId: pairing.gatewayURL, profileId: pairing.scope)
                 guard let (_, changed) = await applyManifest(scope, rest) else {
