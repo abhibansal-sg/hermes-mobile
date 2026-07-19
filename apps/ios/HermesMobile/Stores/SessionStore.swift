@@ -5940,6 +5940,50 @@ final class ProjectsStore {
         }
     }
 
+    /// Testing seam: overrides the retry backoff in ``refreshSessions(for:)``
+    /// so unit tests don't burn wall-clock time on the real delay. `nil` (the
+    /// production default) uses ``projectSessionsRetryDelayNanoseconds``.
+    var projectSessionsRetryDelayOverrideNanoseconds: UInt64?
+
+    /// Delay before the single automatic retry in ``refreshSessions(for:)``.
+    /// Short and fixed (not exponential) — this covers a sub-second gateway
+    /// respawn window (PROJECTS-401), not a sustained outage; the manual
+    /// "Retry" affordance in the detail view's error row handles anything
+    /// longer.
+    private static let projectSessionsRetryDelayNanoseconds: UInt64 = 600_000_000
+
+    /// `true` for a failure the gateway can recover from within the same
+    /// respawn window: a 401/403 (device-token auth racing plugin-route
+    /// registration during a crash-respawn — PROJECTS-401), any 5xx, or a
+    /// transport-level failure (timeout / dropped connection). Treated
+    /// exactly like the legacy "gateway too old" 404 — fall back to the
+    /// `cwd_prefix` path, and retry the whole two-tier fetch once.
+    ///
+    /// NOT transient: 4xx other than 401/403/404 (a genuinely malformed
+    /// request) and decode failures (a real contract mismatch) — those
+    /// propagate immediately so the designed error state stays honest.
+    static func isTransientProjectSessionsFailure(_ error: Error) -> Bool {
+        switch error {
+        case RestError.badStatus(let status, _):
+            return status == 401 || status == 403 || status == 404 || (500...599).contains(status)
+        case RestError.network:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// The detail view's error row copy for `error`. Transient failures (see
+    /// ``isTransientProjectSessionsFailure(_:)``) get directional copy — the
+    /// user should just retry, a raw "HTTP 401" is not actionable — everything
+    /// else keeps its specific message.
+    static func projectSessionsErrorMessage(for error: Error) -> String {
+        guard isTransientProjectSessionsFailure(error) else {
+            return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+        return "Reconnecting to gateway — retry"
+    }
+
     /// Fetch a project's sessions from the server with `cwd_prefix=project.root`
     /// (ABH-407) and update ``projectSessionsById`` / ``projectSessionsLoadingIds``
     /// / ``projectSessionsErrorById`` for that project's id. This is the primary
@@ -5965,13 +6009,16 @@ final class ProjectsStore {
                 return
             }
             // Primary: the plugin's folded project-sessions route (matches the
-            // count). Fall back to the legacy cwd_prefix path ONLY when the
-            // gateway is too old to serve the plugin route (404) — every other
-            // failure propagates so the designed error state is honest.
+            // count). Fall back to the legacy cwd_prefix path on a 404 (gateway
+            // too old to serve the plugin route) OR a transient failure — a
+            // 401/403/5xx/timeout observed during a gateway crash-respawn
+            // window (PROJECTS-401: device-token auth can race plugin-route
+            // registration on a fresh process). A non-transient failure
+            // propagates so the designed error state is honest.
             fetch = {
                 do {
                     return try await rest.projectSessions(projectId: project.id)
-                } catch let RestError.badStatus(status, _) where status == 404 {
+                } catch let error where Self.isTransientProjectSessionsFailure(error) {
                     return try await rest.sessionsWithTotal(cwdPrefix: project.root)
                 }
             }
@@ -5982,15 +6029,34 @@ final class ProjectsStore {
         projectSessionsLoadingIds.insert(project.id)
         defer { projectSessionsLoadingIds.remove(project.id) }
         do {
-            let result = try await fetch()
+            let result = try await fetchProjectSessionsWithRetry(fetch)
             projectSessionsById[project.id] = result.sessions
             projectSessionsErrorById[project.id] = nil
             writeThroughProjectSessions(result.sessions, for: project)
         } catch {
             if projectSessionsById[project.id] == nil {
-                projectSessionsErrorById[project.id] = (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
+                projectSessionsErrorById[project.id] = Self.projectSessionsErrorMessage(for: error)
             }
+        }
+    }
+
+    /// Runs `fetch` (which already carries the 404/transient → `cwd_prefix`
+    /// fallback above); on a transient failure from THAT combined attempt,
+    /// waits one short fixed backoff and retries the whole thing exactly
+    /// once before giving up. Covers the case where a gateway respawn window
+    /// outlasts both the primary and fallback request in the same call.
+    private func fetchProjectSessionsWithRetry(
+        _ fetch: () async throws -> (sessions: [SessionSummary], total: Int?)
+    ) async throws -> (sessions: [SessionSummary], total: Int?) {
+        do {
+            return try await fetch()
+        } catch {
+            guard Self.isTransientProjectSessionsFailure(error) else { throw error }
+            let delay = projectSessionsRetryDelayOverrideNanoseconds ?? Self.projectSessionsRetryDelayNanoseconds
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            return try await fetch()
         }
     }
 
