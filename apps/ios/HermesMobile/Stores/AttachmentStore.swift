@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 /// Owns the composer's pending image attachments and drives the two-step
 /// upload → attach flow (`POST /api/upload` then the `image.attach` RPC).
@@ -140,6 +141,121 @@ final class AttachmentStore {
 
     func draftAssetInputs() -> [WorkAssetInput] {
         pending.map { WorkAssetInput(data: $0.jpegData, mimeType: "image/jpeg", fileExtension: "jpg") }
+    }
+
+    // MARK: - Non-image file attachments (W25 files-phase-1)
+    //
+    // Images ride the multipart `POST /api/upload` → `image.attach` path above,
+    // which the gateway restricts to a small image-extension whitelist. Arbitrary
+    // files (PDF, CSV, source, archives, …) are 415'd by that route, so they take
+    // the gateway's `file.attach` RPC instead: the bytes are base64-inlined as a
+    // `data:<mime>;base64,…` payload, the gateway materialises the file inside the
+    // session workspace, and it returns a workspace-relative `@file:` reference
+    // that the composer appends to the prompt (the same ref surface the file
+    // browser's "@" button and `agent.context_references` already use). No image
+    // decode, no re-encode — the original bytes round-trip untouched.
+
+    /// Server-side cap mirrored from the gateway upload/attach bridge (25 MB).
+    /// Enforced client-side so an oversized pick fails fast with a clear message
+    /// instead of a round-trip that ends in a 413.
+    static let maxFileAttachmentBytes = 25 * 1024 * 1024
+
+    /// Outcome of a successful ``attachFile(data:filename:sessionId:connection:)``.
+    struct FileAttachResult: Sendable, Equatable {
+        /// Filename the gateway stored the attachment under (may be de-duplicated).
+        let name: String
+        /// Absolute path of the materialised file on the gateway.
+        let path: String
+        /// Workspace-relative ref path (no `@file:` prefix / quoting).
+        let refPath: String
+        /// Ready-to-insert composer token, e.g. `@file:report.pdf` (already quoted
+        /// by the gateway when the path needs it).
+        let refText: String
+    }
+
+    /// Best-effort MIME type for a picked file, inferred from its extension via
+    /// `UTType`. Falls back to `application/octet-stream` for unknown/extension-
+    /// less names — the gateway's `file.attach` accepts any media type, so an
+    /// imperfect guess never blocks the upload; it only labels the data URL.
+    static func detectedMimeType(forFilename filename: String) -> String {
+        let ext = (filename as NSString).pathExtension.lowercased()
+        guard !ext.isEmpty,
+              let type = UTType(filenameExtension: ext),
+              let mime = type.preferredMIMEType else {
+            return "application/octet-stream"
+        }
+        return mime
+    }
+
+    /// Build a `data:<mime>;base64,<payload>` URL for `data`. The gateway's
+    /// `file.attach` decoder tolerates any media type here (unlike the image-only
+    /// `image.attach_bytes` path).
+    static func fileDataURL(_ data: Data, mimeType: String) -> String {
+        "data:\(mimeType);base64,\(data.base64EncodedString())"
+    }
+
+    /// Validate a freshly-picked non-image file before any network work: reject
+    /// an empty read and anything over ``maxFileAttachmentBytes``. Pure + sync so
+    /// it is unit-testable without a live connection. Returns the resolved MIME
+    /// type on success.
+    static func validateFileAttachment(data: Data, filename: String) throws -> String {
+        guard !data.isEmpty else {
+            throw AttachmentError.failed("The file is empty.")
+        }
+        guard data.count <= maxFileAttachmentBytes else {
+            let cap = ByteCountFormatter.string(fromByteCount: Int64(maxFileAttachmentBytes), countStyle: .file)
+            throw AttachmentError.failed("File is too large (max \(cap)).")
+        }
+        return detectedMimeType(forFilename: filename)
+    }
+
+    /// Upload one arbitrary (non-image) file to the active session via the
+    /// gateway `file.attach` RPC and return the `@file:` reference the composer
+    /// should append to the outgoing prompt. Throws ``AttachmentError`` on an
+    /// empty/oversized file, a missing connection, or an RPC failure.
+    ///
+    /// Unlike the image path this does NOT queue anything in ``pending``: the file
+    /// is materialised on the gateway immediately and represented purely by its
+    /// `@file:` ref in the composer text, exactly like a browsed-file mention.
+    @discardableResult
+    func attachFile(
+        data: Data,
+        filename: String,
+        sessionId: String,
+        connection: ConnectionStore
+    ) async throws -> FileAttachResult {
+        let mime = try Self.validateFileAttachment(data: data, filename: filename)
+        let trimmedSession = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedSession.isEmpty else {
+            throw AttachmentError.notConfigured
+        }
+        let client = connection.client
+        let dataURL = Self.fileDataURL(data, mimeType: mime)
+        let result: JSONValue
+        do {
+            result = try await client.requestRaw(
+                "file.attach",
+                params: .object([
+                    "session_id": .string(trimmedSession),
+                    "name": .string(filename),
+                    "data_url": .string(dataURL),
+                ]),
+                timeout: .seconds(60)
+            )
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            throw AttachmentError.failed(message)
+        }
+        guard let refText = result["ref_text"]?.stringValue, !refText.isEmpty else {
+            throw AttachmentError.failed("The gateway did not return a file reference.")
+        }
+        return FileAttachResult(
+            name: result["name"]?.stringValue ?? filename,
+            path: result["path"]?.stringValue ?? "",
+            refPath: result["ref_path"]?.stringValue ?? refText,
+            refText: refText
+        )
     }
 
     func restoreDraftAssets(_ data: [Data]) {

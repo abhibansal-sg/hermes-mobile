@@ -139,6 +139,35 @@ final class MentionCompletionTests: XCTestCase {
             "@file:a/b "
         )
     }
+
+    // MARK: - appendToken (W25 files-phase-1: gateway-returned @file: ref)
+
+    func testAppendTokenIntoEmptyBuffer() {
+        XCTAssertEqual(
+            MentionCompletion.appendToken("@file:report.pdf", to: ""),
+            "@file:report.pdf "
+        )
+    }
+
+    func testAppendTokenDoesNotReprefixOrNormalise() {
+        // A pre-quoted ref from the gateway must pass through verbatim (aside from
+        // the trailing space), unlike appendMention which re-adds @file:.
+        XCTAssertEqual(
+            MentionCompletion.appendToken("@file:`a b.pdf`", to: "see"),
+            "see @file:`a b.pdf` "
+        )
+    }
+
+    func testAppendTokenNoDoubleSpaceWhenBufferEndsInWhitespace() {
+        XCTAssertEqual(
+            MentionCompletion.appendToken("@file:a.pdf", to: "look at "),
+            "look at @file:a.pdf "
+        )
+        XCTAssertEqual(
+            MentionCompletion.appendToken("@file:a.pdf", to: "line\n"),
+            "line\n@file:a.pdf "
+        )
+    }
 }
 
 /// ABH-382: iOS composer @-context trigger parity with the gateway's
