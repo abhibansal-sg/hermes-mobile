@@ -173,12 +173,13 @@ struct MessageBubble: View {
                     // cleanly with no gesture competition.
                     userBubble
                 case .assistant:
-                    // Approved design §7: agent turns get NO context menu — the
-                    // fully-selectable prose (`.perfTextSelection()`) means a
-                    // long-press starts native text selection directly (ChatGPT
-                    // islands: contiguous prose selects with real drag handles; code/
-                    // table/image cards are non-selectable and bound the selection).
-                    // Turn actions live on the inline `assistantActionRow`.
+                    // Approved design §7: agent turns get NO context menu. Each
+                    // contiguous prose run (`SelectableProseText`) long-presses into
+                    // GENUINE native selection — a first-responding `UITextView` with
+                    // real drag handles + the system edit menu, NOT the old
+                    // `.textSelection` Copy|Share pill (ChatGPT islands: prose selects
+                    // with handles; code/table/image cards are non-selectable and
+                    // bound the selection). Turn actions live on `assistantActionRow`.
                     assistantBody
                 case .system, .tool:
                     metaRow
@@ -797,11 +798,16 @@ struct MessageBubble: View {
     }
 
     private func paragraphText(_ text: String) -> some View {
-        (Text(RenderCache.prose(text, linkColor: theme.midground)).font(Self.proseFont))
-            .foregroundStyle(theme.fg)
-            .lineSpacing(Self.proseLineSpacing)
-            .perfTextSelection()
-            .frame(maxWidth: .infinity, alignment: .leading)
+        // Agent prose selection island: long-press swaps this paragraph into a
+        // real `UITextView` with native drag handles (approved design §7), instead
+        // of the former `.textSelection` Copy|Share pill.
+        SelectableProseText(
+            attributed: RenderCache.prose(text, linkColor: theme.midground),
+            font: Self.proseFont,
+            color: theme.fg,
+            uiColor: UIColor(theme.fg),
+            lineSpacing: Self.proseLineSpacing
+        )
     }
 
     // MARK: - STR-695 assistant-prose markdown image blocks
@@ -1941,12 +1947,12 @@ struct MarkdownBlockquoteView: View {
             RoundedRectangle(cornerRadius: 2, style: .circular)
                 .fill(theme.midground.opacity(0.72))
                 .frame(width: 3)
-            Text(RenderCache.prose(text, linkColor: theme.midground))
-                .font(.system(.body, design: .serif))
-                .foregroundStyle(theme.mutedFg)
-                .lineSpacing(3.5)
-                .perfTextSelection()
-                .frame(maxWidth: .infinity, alignment: .leading)
+            SelectableProseText(
+                attributed: RenderCache.prose(text, linkColor: theme.midground),
+                color: theme.mutedFg,
+                uiColor: UIColor(theme.mutedFg),
+                lineSpacing: 3.5
+            )
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 10)
@@ -1976,12 +1982,12 @@ struct MarkdownAlertView: View {
             .accessibilityHidden(true)
 
             if !alert.body.isEmpty {
-                Text(RenderCache.prose(alert.body, linkColor: theme.midground))
-                    .font(.system(.body, design: .serif))
-                    .foregroundStyle(theme.fg)
-                    .lineSpacing(3.5)
-                    .perfTextSelection()
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                SelectableProseText(
+                    attributed: RenderCache.prose(alert.body, linkColor: theme.midground),
+                    color: theme.fg,
+                    uiColor: UIColor(theme.fg),
+                    lineSpacing: 3.5
+                )
             }
         }
         .padding(.vertical, 10)
@@ -2015,11 +2021,12 @@ struct MarkdownTaskListView: View {
                         .font(.body.weight(.semibold))
                         .foregroundStyle(item.checked ? theme.statusOK : theme.mutedFg)
                         .accessibilityHidden(true)
-                    Text(RenderCache.prose(item.text, linkColor: theme.midground))
-                        .font(.system(.body, design: .serif))
-                        .foregroundStyle(theme.fg)
-                        .strikethrough(item.checked, color: theme.mutedFg)
-                        .perfTextSelection()
+                    SelectableProseText(
+                        attributed: RenderCache.prose(item.text, linkColor: theme.midground),
+                        color: theme.fg,
+                        uiColor: UIColor(theme.fg),
+                        strikethrough: item.checked
+                    )
                 }
                 .padding(.leading, CGFloat(item.level) * 18)
                 .accessibilityLabel("\(item.checked ? "Completed" : "Incomplete") task: \(item.text)")
@@ -2042,11 +2049,12 @@ struct MarkdownListBlockView: View {
                         .font(.system(.body, design: .serif).monospacedDigit().weight(.semibold))
                         .foregroundStyle(theme.mutedFg)
                         .frame(width: item.marker == "•" ? 14 : 28, alignment: .trailing)
-                    Text(RenderCache.prose(item.text, linkColor: theme.midground))
-                        .font(.system(.body, design: .serif))
-                        .foregroundStyle(theme.fg)
-                        .lineSpacing(3.5)
-                        .perfTextSelection()
+                    SelectableProseText(
+                        attributed: RenderCache.prose(item.text, linkColor: theme.midground),
+                        color: theme.fg,
+                        uiColor: UIColor(theme.fg),
+                        lineSpacing: 3.5
+                    )
                 }
                 .padding(.leading, CGFloat(item.level) * 18)
             }
@@ -2561,6 +2569,102 @@ final class SelfSizingTextView: UITextView {
         let width = bounds.width > 0 ? bounds.width : UIView.layoutFittingCompressedSize.width
         let fit = sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
         return CGSize(width: UIView.noIntrinsicMetric, height: ceil(fit.height))
+    }
+}
+
+// MARK: - Agent-prose native selection island (owner QA, 2026-07-19)
+
+/// One contiguous agent-prose run (a paragraph / list-item / blockquote / alert
+/// body) that supports GENUINE native text selection.
+///
+/// The old behavior attached `.textSelection(.enabled)` to agent prose, which on
+/// long-press produced only the small Copy|Share edit-menu pill — NO drag handles.
+/// The approved behavior is long-press → real native selection with drag handles.
+/// SwiftUI `Text` cannot start native selection programmatically, so this view
+/// renders the styled markdown `Text` normally and, on a long-press, swaps ITSELF
+/// for a first-responding ``SelectableTextView`` (a `UITextView`, `isSelectable`,
+/// `becomeFirstResponder`, `selectAll` — the approved fallback) so the real handles
+/// + system edit menu appear immediately; the reader narrows from there. A trailing
+/// "Done" exits. Selection is bounded to THIS run — the surrounding code / table /
+/// image cards are separate views with no selection, so they cleanly island the
+/// selection (approved design §7).
+///
+/// The long-press uses a min-duration `LongPressGesture` attached with `.gesture`
+/// (default priority), so a drag still belongs to the enclosing `ScrollView` — the
+/// press only fires on a stationary hold and never blocks scrolling.
+struct SelectableProseText: View {
+    /// The styled markdown render shown in normal (non-selecting) mode.
+    let attributed: AttributedString
+    /// SwiftUI face for the normal render.
+    var font: Font = .system(.body, design: .serif)
+    /// UIKit text style + design used to build the selection `UITextView`'s font,
+    /// so the selectable text matches the prose it replaces.
+    var uiTextStyle: UIFont.TextStyle = .body
+    var serif: Bool = true
+    /// Default foreground for the normal render (link runs keep their own color).
+    var color: Color
+    /// Foreground for the selection `UITextView` (plain text has no link runs).
+    var uiColor: UIColor
+    var lineSpacing: CGFloat = 0
+    var strikethrough: Bool = false
+
+    @Environment(\.hermesTheme) private var theme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var selecting = false
+
+    /// The plain, visible text handed to the selection surface — derived from the
+    /// attributed characters so markdown syntax (`**`, `_`, link brackets) is
+    /// already stripped and the reader selects clean prose, not raw source.
+    private var plain: String { String(attributed.characters) }
+
+    var body: some View {
+        Group {
+            if selecting {
+                VStack(alignment: .leading, spacing: 6) {
+                    SelectableTextView(
+                        text: plain,
+                        font: SelectableTextView.font(textStyle: uiTextStyle, serif: serif),
+                        textColor: uiColor
+                    )
+                    Button {
+                        exit()
+                    } label: {
+                        Text("Done")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(theme.accent)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Done selecting text")
+                }
+            } else {
+                Text(attributed)
+                    .font(font)
+                    .foregroundStyle(color)
+                    .strikethrough(strikethrough, color: theme.mutedFg)
+                    .lineSpacing(lineSpacing)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        LongPressGesture(minimumDuration: 0.4).onEnded { _ in enter() }
+                    )
+            }
+        }
+    }
+
+    private func enter() {
+        if reduceMotion {
+            selecting = true
+        } else {
+            withAnimation(.easeOut(duration: 0.15)) { selecting = true }
+        }
+    }
+
+    private func exit() {
+        if reduceMotion {
+            selecting = false
+        } else {
+            withAnimation(.easeOut(duration: 0.15)) { selecting = false }
+        }
     }
 }
 
