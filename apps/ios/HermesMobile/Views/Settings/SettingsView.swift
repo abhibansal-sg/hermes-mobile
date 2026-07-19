@@ -65,9 +65,9 @@ import UserNotifications
 /// ## Layout (headed grouped sections — W25 restructure)
 ///
 /// Nine headed sections replace the earlier flat wall of unlabeled `Section`s:
-/// **Account** (name + Nous credits), **Connection** (server, Devices, Go
-/// Offline, destructive Forget Gateway), **Notifications** (master + per-event
-/// toggles + Read replies aloud), **Appearance** (theme + Personality),
+/// **Account** (name + Nous credits), **Appearance** (theme + Personality),
+/// **Connection** (server, Devices, Go Offline, destructive Forget Gateway),
+/// **Notifications** (master + per-event toggles + Read replies aloud),
 /// **Models & Keys** (Model panel, Model provider keys, Toolset keys),
 /// **Privacy & Security** (App Lock, Secrets biometric gate, File
 /// @-mentions), **Agent & Panels** (Usage, Automations, Skills, Learning
@@ -75,7 +75,11 @@ import UserNotifications
 /// Relay Push, Gateway Status, System Logs, Share debug report, the
 /// experimental relay-transport toggle), and **About**. Every row from the
 /// prior flat layout remains reachable — only headers, grouping, and a few
-/// jargon-y labels changed; no bindings or behavior moved. Simple settings
+/// jargon-y labels changed; no bindings or behavior moved. Appearance stays
+/// second (right after Account) deliberately: it is the row a pre-existing
+/// regression test (and real users) reach with NO scroll, and the native
+/// `.insetGrouped` `List`'s lazy row materialization means anything much
+/// further down is not reliably hittable on first render. Simple settings
 /// render their value inline via `LabeledContent` and never push; the control
 /// panels push within this sheet's own stack.
 struct SettingsView: View {
@@ -190,9 +194,19 @@ struct SettingsView: View {
         NavigationStack(path: $path) {
             List {
                 accountSection
+                // Appearance stays second (right after the short Account
+                // card) so it is reachable without scrolling: on a native
+                // `.insetGrouped` List (UITableView-backed, lazy row
+                // materialization) pushing it behind Connection's + an
+                // expanded Notifications' rows put it 800-1000pt down the
+                // list — beyond one screen height on most devices — which
+                // broke both `testSettingsAppearanceRowOpensThemePicker()`
+                // (no scroll step) and real no-scroll taps. See the
+                // "no behavior change" reachability contract in the type
+                // doc above.
+                appearanceSection
                 connectionSection
                 notificationsSection
-                appearanceSection
                 modelsAndKeysSection
                 privacySecuritySection
                 agentPanelsSection
