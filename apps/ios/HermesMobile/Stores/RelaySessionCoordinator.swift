@@ -110,6 +110,9 @@ final class RelaySessionCoordinator {
     /// relay only when its destination IS the session the relay is driving, so a
     /// prompt queued for A never leaks into B just because B is now on screen.
     private(set) var activeStoredSessionID: String?
+    /// Session currently being opened/resumed. Snapshot frames can arrive before
+    /// the RPC result, so this id is temporarily eligible for projection.
+    private var pendingProjectionSessionID: String?
     /// The render-lane reconciled item set (mirrors the client store; the source
     /// of truth the transcript is projected from).
     private(set) var store = RelayItemStore()
@@ -243,6 +246,7 @@ final class RelaySessionCoordinator {
         store = RelayItemStore()
         activeSessionID = nil
         activeStoredSessionID = nil
+        pendingProjectionSessionID = nil
         phase = .idle
     }
 
@@ -296,6 +300,11 @@ final class RelaySessionCoordinator {
         // A live frame proves the stream resumed: clear the backoff so a later
         // drop reconnects promptly instead of inheriting a stale attempt count.
         if reconnectAttempt != 0 { reconnectAttempt = 0 }
+        // One relay socket multiplexes every live gateway session. Only the
+        // selected stored/live session may rebuild the visible transcript.
+        guard frame.sid == pendingProjectionSessionID
+                || frame.sid == activeSessionID
+                || frame.sid == activeStoredSessionID else { return }
         store.apply(frame)
         chatStore.applyRelayItems(store.items)
     }
@@ -370,8 +379,12 @@ final class RelaySessionCoordinator {
     func resume(_ sessionID: String) async throws -> JSONValue {
         let client = try requireClient()
         resetItemStoreForSessionSwitch(to: sessionID)
+        pendingProjectionSessionID = sessionID
+        defer {
+            if pendingProjectionSessionID == sessionID { pendingProjectionSessionID = nil }
+        }
         let result = try await client.resumeSession(sessionID)
-        activeSessionID = sessionID
+        activeSessionID = result["session_id"]?.stringValue ?? sessionID
         activeStoredSessionID = sessionID
         return result
     }
@@ -381,8 +394,12 @@ final class RelaySessionCoordinator {
     func open(_ sessionID: String) async throws -> JSONValue {
         let client = try requireClient()
         resetItemStoreForSessionSwitch(to: sessionID)
+        pendingProjectionSessionID = sessionID
+        defer {
+            if pendingProjectionSessionID == sessionID { pendingProjectionSessionID = nil }
+        }
         let result = try await client.open(sessionID)
-        activeSessionID = sessionID
+        activeSessionID = result["session_id"]?.stringValue ?? sessionID
         activeStoredSessionID = sessionID
         return result
     }

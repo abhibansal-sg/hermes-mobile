@@ -235,14 +235,17 @@ final class RelaySessionCoordinatorTests: XCTestCase {
     // MARK: - (3) Coordinator streams into ChatStore + routes ops
 
     func testCoordinatorStreamsFramesIntoTranscript() async throws {
-        let transport = MockRelayTransport()
+        let transport = MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id, upstream.method == "open" else { return }
+            relay.deliverResult(id: id, result: .object(["session_id": .string("s")]))
+        })
         let chat = ChatStore()
         let coordinator = RelaySessionCoordinator(
             chatStore: chat,
             clientFactory: { RelayClient { _ in transport } }
         )
 
-        try await coordinator.start(url: url)
+        try await coordinator.start(url: url, sessionID: "s")
         transport.deliverFrames(sampleTurn())
 
         await waitUntil { chat.messages.count == 2 && chat.messages.last?.role == .assistant }
@@ -300,6 +303,67 @@ final class RelaySessionCoordinatorTests: XCTestCase {
                        "transcript must not still show session A's projected content")
         XCTAssertEqual(coordinator.activeSessionID, "B")
 
+        await coordinator.stop()
+    }
+
+    /// The relay connection multiplexes every live session on one seq stream.
+    /// A frame for session B must never rebuild the transcript while A remains
+    /// selected, even though B's turn continues in the background.
+    func testForeignLiveSessionFrameCannotHijackSelectedTranscript() async throws {
+        let transport = MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id, upstream.method == "open",
+                  upstream.params["session_id"] as? String == "A" else { return }
+            relay.deliverFrame(RelayFrame(
+                seq: 1, sid: "A", turn: nil, kind: .snapshot,
+                body: .object([
+                    "items": .array([.object([
+                        "item_id": .string("A-item"),
+                        "type": .string(ChatItemType.agentMessage.rawValue),
+                        "status": .string("completed"),
+                        "ord": .number(0),
+                        "body": .object(["text": .string("selected A")]),
+                    ])]),
+                    "cursor": .number(1),
+                ])
+            ))
+            relay.deliverResult(id: id, result: .object(["session_id": .string("A")]))
+        })
+        let chat = ChatStore()
+        let coordinator = RelaySessionCoordinator(
+            chatStore: chat,
+            clientFactory: { RelayClient { _ in transport } }
+        )
+        try await coordinator.start(url: url)
+        _ = try await coordinator.open("A")
+        await waitUntil { coordinator.store.itemsByID["A-item"]?.textBody == "selected A" }
+
+        // B emits the tool call that reproduced the user's visible hijack.
+        transport.deliverFrame(RelayFrame(
+            seq: 2, sid: "B", turn: "B:t1", kind: .itemCompleted,
+            body: .object([
+                "item_id": .string("B-tool"),
+                "type": .string(ChatItemType.toolCall.rawValue),
+                "status": .string("completed"),
+                "ord": .number(1),
+                "body": .object(["name": .string("read_file")]),
+            ])
+        ))
+        // A's next frame proves the pump has processed the preceding B frame.
+        transport.deliverFrame(RelayFrame(
+            seq: 3, sid: "A", turn: "A:t1", kind: .itemCompleted,
+            body: .object([
+                "item_id": .string("A-item"),
+                "type": .string(ChatItemType.agentMessage.rawValue),
+                "status": .string("completed"),
+                "ord": .number(0),
+                "body": .object(["text": .string("still selected A")]),
+            ])
+        ))
+        await waitUntil { coordinator.store.itemsByID["A-item"]?.textBody == "still selected A" }
+
+        XCTAssertNil(coordinator.store.itemsByID["B-tool"])
+        XCTAssertEqual(chat.messages.map(\.text), ["still selected A"])
+        XCTAssertEqual(coordinator.activeSessionID, "A")
         await coordinator.stop()
     }
 
@@ -540,7 +604,10 @@ final class RelaySessionCoordinatorTests: XCTestCase {
     /// socket, anchored on the retained watermark — the stream resumes fast.
     func testAutoReconnectIsPromptAndResyncsFromWatermark() async throws {
         let recorder = SleepRecorder()
-        let live = MockRelayTransport()
+        let live = MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id, upstream.method == "open" else { return }
+            relay.deliverResult(id: id, result: .object(["session_id": .string("s")]))
+        })
         let resumed = MockRelayTransport(script: { upstream, _ in
             _ = upstream   // the resumed relay only needs to record the resync
         })
@@ -550,7 +617,7 @@ final class RelaySessionCoordinatorTests: XCTestCase {
             clientFactory: { RelayClient { _ in queue.next() } },
             backoffSleep: { await recorder.record($0) }
         )
-        try await coordinator.start(url: url)
+        try await coordinator.start(url: url, sessionID: "s")
 
         // Stream two dense frames so the resync watermark is 2.
         live.deliverFrames(Array(sampleTurn().prefix(2)))
