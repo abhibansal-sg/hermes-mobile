@@ -29,6 +29,7 @@ the W2 auth-provider conversion).
 from __future__ import annotations
 
 import asyncio
+import base64
 import email.utils
 import hashlib
 import importlib
@@ -1101,16 +1102,26 @@ def _decode_truncated_utf8(head: bytes) -> Optional[str]:
 
 
 @router.get("/fs/read")
-async def fs_read(request: Request, session_id: str = "", path: str = ""):
+async def fs_read(
+    request: Request, session_id: str = "", path: str = "", format: str = ""
+):
     """Read a file's contents under a session's cwd (sandboxed, read-only).
 
     Query params: ``session_id`` (required), ``path`` (required, relative to the
-    cwd root). Hard cap ``_MAX_FS_READ_BYTES`` (1 MB): above it → 413. A large
-    BUT decodable text file is NOT 413'd — it is truncated to the cap and flagged
-    ``truncated:true``. UTF-8 decode → ``encoding:"utf-8"`` with ``content``;
-    otherwise → ``encoding:"binary"`` with ``content:null`` (no base64 in v1).
+    cwd root), ``format`` (optional). Hard cap ``_MAX_FS_READ_BYTES`` (1 MB):
+    above it → 413. A large BUT decodable text file is NOT 413'd — it is truncated
+    to the cap and flagged ``truncated:true``. UTF-8 decode → ``encoding:"utf-8"``
+    with ``content``; otherwise → ``encoding:"binary"`` with ``content:null``.
+
+    ``format=data_url`` additionally inlines the raw file bytes (any media type,
+    within the read cap) as a ``data:<mime>;base64,…`` ``data_url`` field, so a
+    mobile client can render an image inline OR Share / Save a binary file that
+    has no UTF-8 text form. It is additive: ``content``/``encoding`` are unchanged,
+    and it is omitted for files over the cap (those still 413 for binary).
+
     Errors: 400 missing session_id, 401 bad token, 403 escape, 404 not a file.
     """
+    want_data_url = format == "data_url"
     if not _has_dashboard_api_auth(request):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
 
@@ -1166,6 +1177,15 @@ async def fs_read(request: Request, session_id: str = "", path: str = ""):
 
     metadata = _file_response_metadata(abspath, read_stat, data)
 
+    # `format=data_url` inlines the raw bytes so a mobile client can render an
+    # image OR Share/Save a binary file. Only for files fully within the read cap
+    # (this branch already guarantees `size <= _MAX_FS_READ_BYTES`).
+    data_url_field: Dict[str, str] = {}
+    if want_data_url:
+        mime = metadata.get("mime") or "application/octet-stream"
+        b64 = base64.b64encode(data).decode("ascii")
+        data_url_field = {"data_url": f"data:{mime};base64,{b64}"}
+
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -1173,6 +1193,7 @@ async def fs_read(request: Request, session_id: str = "", path: str = ""):
             "path": path,
             "encoding": "binary",
             "content": None,
+            **data_url_field,
             **metadata,
         }
 
@@ -1181,6 +1202,7 @@ async def fs_read(request: Request, session_id: str = "", path: str = ""):
         "encoding": "utf-8",
         "content": text,
         "truncated": False,
+        **data_url_field,
         **metadata,
     }
 
