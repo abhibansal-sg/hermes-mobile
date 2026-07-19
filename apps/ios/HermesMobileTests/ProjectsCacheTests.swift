@@ -56,16 +56,19 @@ final class ProjectsCacheTests: XCTestCase {
         let cache = try store()
         try await cache.saveProjects([project("/a/one")], scope: scopeA)
 
-        XCTAssertEqual(try await cache.loadProjects(scope: scopeA).map(\.id), ["/a/one"])
+        let loadedA = try await cache.loadProjects(scope: scopeA)
+        XCTAssertEqual(loadedA.map(\.id), ["/a/one"])
+        let loadedB = try await cache.loadProjects(scope: scopeB)
         XCTAssertTrue(
-            try await cache.loadProjects(scope: scopeB).isEmpty,
+            loadedB.isEmpty,
             "another (server, profile) partition must not see scopeA's projects"
         )
     }
 
     func testLoadProjectsEmptyWhenNothingPersisted() async throws {
         let cache = try store()
-        XCTAssertTrue(try await cache.loadProjects(scope: scopeA).isEmpty)
+        let loaded = try await cache.loadProjects(scope: scopeA)
+        XCTAssertTrue(loaded.isEmpty)
     }
 
     // MARK: - project_session_cache (detail)
@@ -107,7 +110,9 @@ final class ProjectsCacheTests: XCTestCase {
         try await cache.saveProjectSessions(
             [summary("s1", cwd: "/a/one")], scope: scopeA, projectId: "/a/one"
         )
-        XCTAssertNil(try await cache.loadProjectSessions(scope: scopeB, projectId: "/a/one"))
-        XCTAssertNil(try await cache.loadProjectSessions(scope: scopeA, projectId: "/a/other"))
+        let otherScope = try await cache.loadProjectSessions(scope: scopeB, projectId: "/a/one")
+        XCTAssertNil(otherScope)
+        let otherProject = try await cache.loadProjectSessions(scope: scopeA, projectId: "/a/other")
+        XCTAssertNil(otherProject)
     }
 }
