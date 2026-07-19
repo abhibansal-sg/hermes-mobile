@@ -57,7 +57,7 @@ class RelayApp:
         self._tasks: dict[str, asyncio.Task] = {}
         self._closing = False
 
-        self.gateway = GatewayClient(config.gateway, self.bus)
+        self.gateway = GatewayClient(config.gateway, self.bus, durable=self.durable)
         self.reframer = Reframer(self.bus, self.store, self.durable)
         self.downstream = DownstreamServer(
             config.downstream, self.bus, self.gateway, self.store, self.durable

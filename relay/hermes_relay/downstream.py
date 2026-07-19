@@ -550,6 +550,17 @@ class DownstreamServer:
             conn.set_foreground(p.get("session_id"))
             return None
 
+        # -- gateway-readiness gate ------------------------------------------
+        # Every method below this point hits the gateway. After a relay restart
+        # the phone reconnects to the downstream server immediately, but the
+        # relay's gateway connection might not be up yet. Without this gate a
+        # submit/resume arriving in that window fails with "gateway not
+        # connected" and the outbox retains the job with no further wake. Wait
+        # (bounded) for the gateway to come up; if it doesn't, raise so the
+        # phone's outbox retains the job and retries on the next wake.
+        if not await self._gateway.wait_ready(timeout=10.0):
+            raise ConnectionError("relay gateway not ready")
+
         # -- reads -----------------------------------------------------------
         if method == UpstreamMethod.LIST:
             return {"sessions": await self._gateway.session_list(int(p.get("limit", 200)))}

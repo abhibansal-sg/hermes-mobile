@@ -223,6 +223,10 @@ final class RelaySessionCoordinator {
     /// replay/snapshot arrives as frames the pump reconciles. This is the explicit
     /// (caller-driven) entry point — it cancels any in-flight auto-reconnect and
     /// treats the attempt as fresh (backoff reset), then re-dials immediately.
+    ///
+    /// Foreground re-establishment + session re-open happen in `applyState` when
+    /// the state crosses into `.open`, so they fire on both manual and auto
+    /// reconnects without duplication.
     func reconnect(url: URL, token: String? = nil) async {
         guard let client else { return }
         reconnectTask?.cancel(); reconnectTask = nil
@@ -331,7 +335,20 @@ final class RelaySessionCoordinator {
         // set `phase` before this observer drains them), so this fires exactly once
         // per connect. Edge-triggered — a redundant same-state yield does not
         // re-fire, and `wake()` coalesces regardless.
-        if phase == .open, !wasOpen { onReady?() }
+        if phase == .open, !wasOpen {
+            onReady?()
+            // Re-establish the session the phone was driving on the fresh
+            // connection. The relay's new PhoneConnection has no foreground set
+            // and no seen_sids, so without this the Notifier fires spurious APNs
+            // and the resync snapshot is empty. Best-effort: a failure here is
+            // non-fatal — the resync already ran inside client.reconnect.
+            if let sid = activeStoredSessionID ?? activeSessionID, let client {
+                Task {
+                    await client.setForeground(sid)
+                    _ = try? await client.open(sid)
+                }
+            }
+        }
     }
 
     // MARK: Upstream session ops (§5)
