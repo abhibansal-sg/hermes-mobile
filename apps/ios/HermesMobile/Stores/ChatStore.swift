@@ -208,6 +208,42 @@ final class ChatStore {
     /// `HermesGatewayClient.requestRaw` through `undoRollbackRequest`.
     var undoRollbackRPC: ((String, JSONValue, Duration) async throws -> JSONValue)?
 
+    // MARK: - Turn dock accessors (Wave 25)
+
+    /// The latest todo list for the active session, or `nil` — the single
+    /// evolving checklist the Turn Dock's task box mirrors. Scans the visible
+    /// transcript (`messages`, already scoped to the active session) in reverse
+    /// for the most recent `todo` tool activity that yields a parseable list.
+    /// `nil` when the session has no todo activity yet, or the newest one carries
+    /// no list (e.g. a mid-run write before its first result).
+    ///
+    /// The dock renders THIS; the transcript suppresses the matching inline
+    /// `TodoCardView` (keyed by ``latestTodoToolID``) while the dock shows the
+    /// task box, so the same list never renders twice.
+    var latestTodoList: TodoList? { latestTodo?.list }
+
+    /// The `tool_call_id` of the activity backing ``latestTodoList``. The
+    /// transcript suppresses exactly that inline card while the dock owns it.
+    var latestTodoToolID: String? { latestTodo?.id }
+
+    /// Shared scan behind both dock accessors: the newest todo activity that
+    /// yields a parseable list, with its identity. Reverse order so the list the
+    /// agent is actively updating wins. The parse mirrors
+    /// `ToolClusterView.toolCard` exactly — structured `tool.todos` first, then
+    /// the `resultPreview` JSON fallback — so the dock and the (suppressed)
+    /// inline card would derive the identical list.
+    private var latestTodo: (id: String, list: TodoList)? {
+        for message in messages.reversed() {
+            for tool in message.tools.reversed() where tool.name == TodoList.toolName {
+                if let list = tool.todos.flatMap({ TodoList(todosArray: $0) })
+                    ?? TodoList(resultJSON: tool.resultPreview) {
+                    return (tool.id, list)
+                }
+            }
+        }
+        return nil
+    }
+
     /// Whether the most recent `send(text:)` call actually dispatched
     /// `prompt.submit` to the server, vs. refusing before ever asking (empty
     /// text, no connection, no resolvable runtime, attachment-upload

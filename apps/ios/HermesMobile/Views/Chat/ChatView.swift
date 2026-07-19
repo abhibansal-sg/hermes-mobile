@@ -1,3 +1,4 @@
+import SafariServices
 import SwiftUI
 
 /// The conversation surface: a scrolling transcript with auto-scroll, banners
@@ -169,6 +170,16 @@ struct ChatView: View {
         let text: String
     }
     @State private var exportedTranscript: ExportedTranscript?
+
+    /// The URL awaiting the in-app Safari sheet (Wave 25 link fix #1). Wrapped
+    /// in an `Identifiable` item (bare `URL` has no stable identity SwiftUI can
+    /// key a `.sheet(item:)` off) so each tapped link presents its own sheet
+    /// instance even if the same URL is tapped twice in a row.
+    private struct InAppSafariItem: Identifiable {
+        let id = UUID()
+        let url: URL
+    }
+    @State private var presentedSafariURL: InAppSafariItem?
 
     /// The live biometric backend injected into the secure prompt (F4A-A2). A
     /// stateless `LAContextAuthenticator` (the F2 seam); falls back to the device
@@ -648,6 +659,25 @@ struct ChatView: View {
                         )
                     }
                 }
+                // In-app Safari (Wave 25 link fix #1): every `openURL` call
+                // anywhere below this point in the chat surface — a tapped
+                // transcript link, a rich-embed card's "Open" button — is
+                // intercepted here. http/https links present a dismissable
+                // in-app `SFSafariViewController` sheet instead of switching to
+                // the system Safari app; any other scheme (mailto:, tel:,
+                // custom app schemes, …) falls through to the system's default
+                // handling unchanged.
+                .environment(\.openURL, OpenURLAction { url in
+                    guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+                        return .systemAction
+                    }
+                    presentedSafariURL = InAppSafariItem(url: url)
+                    return .handled
+                })
+                .sheet(item: $presentedSafariURL) { item in
+                    InAppSafariView(url: item.url)
+                        .ignoresSafeArea()
+                }
         }
     }
 
@@ -757,6 +787,27 @@ struct ChatView: View {
     /// backing is painted BEHIND the composer on ALL OS versions so the composer
     /// floats over a clean substrate while the transcript's `EdgeFadeMask`
     /// dissolves the scrolling text above it (see `TranscriptEdgeEffect`).
+    /// The Turn Dock's active surface (Wave 25) — one interactive element at a
+    /// time, by priority (approval > clarify > tasks > queued). Shared with the
+    /// inline-todo suppression below so the dock and the transcript never
+    /// disagree about who owns the task list.
+    private var dockContent: TurnDockContent {
+        TurnDockContent.resolve(
+            hasApproval: chatStore.pendingApproval != nil,
+            hasClarification: chatStore.pendingClarification != nil,
+            hasTasks: chatStore.latestTodoList != nil,
+            hasQueued: TurnDock.hasQueued(queueStore)
+        )
+    }
+
+    /// The todo `tool_call_id` whose inline ``TodoCardView`` the transcript must
+    /// suppress — non-nil ONLY while the dock is actually showing the task box for
+    /// that same list, so the list is never hidden when the dock isn't rendering
+    /// it (e.g. an approval preempts the task box).
+    private var dockSuppressedTodoToolID: String? {
+        dockContent == .tasks ? chatStore.latestTodoToolID : nil
+    }
+
     @ViewBuilder
     private func bottomStack(proxy: ScrollViewProxy) -> some View {
         VStack(spacing: 8) {
@@ -764,6 +815,10 @@ struct ChatView: View {
             if isCompact && !atBottom {
                 scrollToBottomPill(proxy: proxy)
             }
+            // Wave 25: the Turn Dock — the single home for interactive elements
+            // (approval / clarify / tasks / queued), attached directly above the
+            // frozen composer.
+            TurnDock(chatStore: chatStore, queueStore: queueStore, themeStore: themeStore)
             ComposerView(
                 chatStore: chatStore,
                 attachmentStore: attachmentStore,
@@ -922,6 +977,14 @@ struct ChatView: View {
                 let lastAssistantId = allRows.last(where: { $0.element.role == .assistant })?.element.id
                 let windowStart = max(0, allRows.count - windowSize)
                 let rows = Array(allRows[windowStart...])
+                // PERF (Wave 25): hoist the dock/inline-todo suppression id to a
+                // SINGLE evaluation for the whole transcript. `dockSuppressedTodoToolID`
+                // resolves `chatStore.latestTodoList` (an unmemoized O(messages × tools)
+                // reverse scan with no early return in the common no-todo case), and its
+                // value is identical for every row. Evaluating it inside the `ForEach`
+                // body made it O(rows × messages × tools) per streaming flush; binding it
+                // once here makes it O(messages × tools) — one scan per body eval.
+                let suppressedTodoToolID = dockSuppressedTodoToolID
                 if chatStore.isLoadingJumpTarget {
                     transcriptStatusChip(
                         "Loading earlier messages…",
@@ -973,7 +1036,8 @@ struct ChatView: View {
                         appearance: BubbleAppearance(themeID: theme.id, colorScheme: colorScheme, typeSize: dynamicTypeSize),
                         delivery: delivery,
                         onResend: deliveryResendHandler(for: delivery),
-                        onDeleteFailedSend: deliveryDeleteHandler(for: delivery, clientMessageID: message.clientMessageID)
+                        onDeleteFailedSend: deliveryDeleteHandler(for: delivery, clientMessageID: message.clientMessageID),
+                        suppressedTodoToolID: suppressedTodoToolID
                     )
                     // A1 (scarf): settled bubbles short-circuit their body — only the
                     // streaming bubble (whose `message` changed) re-evaluates. Drops the
@@ -1002,22 +1066,12 @@ struct ChatView: View {
                         ))
                         .id("hermes.chat.auto-compaction-indicator")
                 }
-                // ABH-83: Inline approval card — rendered as ADDITIVE transcript
-                // content after the last message when there is a pending approval
-                // for the current session. This is pure additive content: it does
-                // not touch any scroll/anchor/keyboard machinery. The existing
-                // re-pin-on-settle (BottomEdgeScroll / pendingLandOnNewest /
-                // scrollToBottomIfNeeded) naturally keeps this card visible when
-                // it appears at the tail, exactly like a new message row.
-                // The card disappears when pendingApproval is cleared (respondApproval
-                // sets it nil, expireTurnScopedPrompts sets it nil on turn end /
-                // session switch) — no manual lifecycle needed.
-                if let approval = chatStore.pendingApproval {
-                    ApprovalCard(approval: approval, chatStore: chatStore)
-                        .padding(.top, Self.intraTurnGap)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
-                        .id("inline-approval-\(approval.id)")
-                }
+                // Wave 25: the pending-approval card is no longer injected inline
+                // here — it now lives in the Turn Dock (attached above the
+                // composer), the single home for interactive elements. See
+                // `bottomStack` → `TurnDock`. Its lifecycle is unchanged
+                // (pendingApproval cleared by respondApproval / turn end / session
+                // switch); only its mount point moved.
                 // Session context line (STR-1029 §4): a small, muted,
                 // desktop-parity line at the transcript edge that surfaces the
                 // attached workspace/cwd when one exists. Reuses
@@ -1617,10 +1671,10 @@ struct ChatView: View {
                 )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            if let clarification = chatStore.pendingClarification {
-                ClarifyBanner(clarification: clarification, chatStore: chatStore)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
+            // Wave 25: the clarify card moved into the Turn Dock (attached above
+            // the composer) for one consistent home alongside approval / tasks /
+            // queued. See `bottomStack` → `TurnDock`. Its design and respond
+            // wiring are unchanged.
             if let deviceLimitAdvisory = connectionStore.deviceLimitAdvisory {
                 deviceLimitAdvisoryBanner(deviceLimitAdvisory)
                     .transition(.move(edge: .top).combined(with: .opacity))
