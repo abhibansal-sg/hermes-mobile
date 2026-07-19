@@ -104,6 +104,14 @@ struct ChatView: View {
     /// (desktop `--composer-measured-height` analog). Floors at `composerFloatInset`
     /// so the UX1 gate (≥120) holds and a pre-measurement frame never under-clears.
     @State private var composerHeight: CGFloat = ChatView.composerFloatInset
+    /// The MEASURED height of the Turn Dock's active surface (0 when the dock shows
+    /// nothing), measured the same way the composer is. Added to the transcript's
+    /// bottom clearance so the dock — which, like the composer, is a floating overlay
+    /// above the scroll surface and reserves NO layout inset of its own — never
+    /// covers the last message (owner QA §c: the transcript bottom inset previously
+    /// measured only the composer, so the taller dock surfaces sat on top of the
+    /// final row).
+    @State private var dockHeight: CGFloat = 0
     /// The live software-keyboard height (0 at rest), observed explicitly via
     /// `KeyboardHeightReader`. Added to the transcript's bottom clearance so the
     /// content rises WITH the keyboard by construction — not by SwiftUI inferring a
@@ -237,15 +245,28 @@ struct ChatView: View {
     ///    bottom-anchored (`defaultScrollAnchor(.bottom)`), growing this spacer
     ///    pushes the content up by exactly the keyboard height → the transcript
     ///    rises WITH the composer, deterministically.
+    ///  • Turn Dock present: ADD the measured dock height plus the `bottomStack`'s
+    ///    inter-element spacing, because the dock sits in the SAME floating overlay
+    ///    stack directly ABOVE the composer and reserves no inset of its own. Without
+    ///    this term the dock (approval / clarify / task box / queued strip) covers the
+    ///    last transcript row (owner QA §c). Zero when the dock shows nothing, so the
+    ///    at-rest full-bleed layout is byte-identical when no surface is up.
     static func composerClearance(
         composerHeight: CGFloat,
         keyboardHeight: CGFloat,
+        dockHeight: CGFloat = 0,
         baseline: CGFloat = HermesLayoutConstants.controlBottomBaseline
     ) -> CGFloat {
         let resting = max(composerFloatInset, composerHeight + composerBreathingGap)
         let keyboardClearance = max(0, keyboardHeight - baseline)
-        return resting + keyboardClearance
+        let dockClearance = dockHeight > 0 ? dockHeight + bottomStackSpacing : 0
+        return resting + dockClearance + keyboardClearance
     }
+
+    /// The vertical spacing between elements in `bottomStack`'s VStack (dock →
+    /// composer). Shared with `composerClearance` so the reserved dock clearance
+    /// matches the on-screen gap exactly.
+    static let bottomStackSpacing: CGFloat = 8
 
     /// Distance (pts) from the content's true bottom within which the transcript is
     /// considered "at bottom" — drives the streaming auto-stick gate and the
@@ -800,17 +821,19 @@ struct ChatView: View {
         )
     }
 
-    /// The todo `tool_call_id` whose inline ``TodoCardView`` the transcript must
-    /// suppress — non-nil ONLY while the dock is actually showing the task box for
-    /// that same list, so the list is never hidden when the dock isn't rendering
-    /// it (e.g. an approval preempts the task box).
-    private var dockSuppressedTodoToolID: String? {
-        dockContent == .tasks ? chatStore.latestTodoToolID : nil
+    /// Whether the transcript must suppress ALL its inline ``TodoCardView``s —
+    /// true ONLY while the dock is actually showing the task box (`.tasks`), so the
+    /// checklist is never hidden when the dock isn't rendering it (e.g. an approval
+    /// preempts the task box). The dock is the single home for the checklist:
+    /// suppressing every todo card (not just the latest) is what stops the one
+    /// evolving list from re-snapshotting inline 2-3x above the dock (owner QA §d).
+    private var dockSuppressesTodoCards: Bool {
+        dockContent == .tasks
     }
 
     @ViewBuilder
     private func bottomStack(proxy: ScrollViewProxy) -> some View {
-        VStack(spacing: 8) {
+        VStack(spacing: Self.bottomStackSpacing) {
             banners
             if isCompact && !atBottom {
                 scrollToBottomPill(proxy: proxy)
@@ -818,7 +841,19 @@ struct ChatView: View {
             // Wave 25: the Turn Dock — the single home for interactive elements
             // (approval / clarify / tasks / queued), attached directly above the
             // frozen composer.
+            //
+            // Measure the dock's active-surface height so the transcript's bottom
+            // clearance reserves room for it the same way it does for the composer
+            // (owner QA §c). The dock is a floating overlay above the scroll surface,
+            // so without this the taller surfaces cover the last message. Collapses
+            // to 0 when the dock shows nothing (EmptyView), restoring the exact
+            // composer-only clearance.
             TurnDock(chatStore: chatStore, queueStore: queueStore, themeStore: themeStore)
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.size.height
+                } action: { height in
+                    if abs(height - dockHeight) > 0.5 { dockHeight = height }
+                }
             ComposerView(
                 chatStore: chatStore,
                 attachmentStore: attachmentStore,
@@ -977,14 +1012,15 @@ struct ChatView: View {
                 let lastAssistantId = allRows.last(where: { $0.element.role == .assistant })?.element.id
                 let windowStart = max(0, allRows.count - windowSize)
                 let rows = Array(allRows[windowStart...])
-                // PERF (Wave 25): hoist the dock/inline-todo suppression id to a
-                // SINGLE evaluation for the whole transcript. `dockSuppressedTodoToolID`
-                // resolves `chatStore.latestTodoList` (an unmemoized O(messages × tools)
-                // reverse scan with no early return in the common no-todo case), and its
-                // value is identical for every row. Evaluating it inside the `ForEach`
-                // body made it O(rows × messages × tools) per streaming flush; binding it
-                // once here makes it O(messages × tools) — one scan per body eval.
-                let suppressedTodoToolID = dockSuppressedTodoToolID
+                // PERF (Wave 25): hoist the dock/inline-todo suppression flag to a
+                // SINGLE evaluation for the whole transcript. `dockSuppressesTodoCards`
+                // resolves `dockContent` (which touches `chatStore.latestTodoList`, an
+                // unmemoized O(messages × tools) reverse scan with no early return in the
+                // common no-todo case), and its value is identical for every row.
+                // Evaluating it inside the `ForEach` body made it O(rows × messages ×
+                // tools) per streaming flush; binding it once here makes it
+                // O(messages × tools) — one scan per body eval.
+                let suppressTodoCards = dockSuppressesTodoCards
                 if chatStore.isLoadingJumpTarget {
                     transcriptStatusChip(
                         "Loading earlier messages…",
@@ -1037,7 +1073,7 @@ struct ChatView: View {
                         delivery: delivery,
                         onResend: deliveryResendHandler(for: delivery),
                         onDeleteFailedSend: deliveryDeleteHandler(for: delivery, clientMessageID: message.clientMessageID),
-                        suppressedTodoToolID: suppressedTodoToolID
+                        suppressTodoCards: suppressTodoCards
                     )
                     // A1 (scarf): settled bubbles short-circuit their body — only the
                     // streaming bubble (whose `message` changed) re-evaluates. Drops the
@@ -1116,7 +1152,8 @@ struct ChatView: View {
                 Color.clear
                     .frame(height: Self.composerClearance(
                         composerHeight: composerHeight,
-                        keyboardHeight: keyboardHeight))
+                        keyboardHeight: keyboardHeight,
+                        dockHeight: dockHeight))
                     .accessibilityHidden(true)
                 // True content-end anchor (1pt) — search-jump target.
                 Color.clear
