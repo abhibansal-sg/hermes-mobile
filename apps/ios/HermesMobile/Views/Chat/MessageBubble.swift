@@ -777,7 +777,7 @@ struct MessageBubble: View {
     }
 
     private func paragraphText(_ text: String) -> some View {
-        (Text(RenderCache.prose(text)).font(Self.proseFont))
+        (Text(RenderCache.prose(text, linkColor: theme.midground)).font(Self.proseFont))
             .foregroundStyle(theme.fg)
             .lineSpacing(Self.proseLineSpacing)
             .perfTextSelection()
@@ -1434,12 +1434,84 @@ struct MessageBubble: View {
 
     // MARK: - Formatting
 
-    /// Render markdown inline, preserving whitespace, falling back to plain text.
-    static func attributed(_ text: String) -> AttributedString {
-        (try? AttributedString(
+    /// Render markdown inline, preserving whitespace, falling back to plain
+    /// text; then (Wave 25 link fixes) autolink any bare `http(s)://` URL the
+    /// markdown parse left as dead text, and give every link run — markdown
+    /// `[label](url)` links and newly-autolinked bare URLs alike — the
+    /// explicit transcript link style (`linkColor` + underline) instead of
+    /// inheriting only the ambient tint.
+    static func attributed(_ text: String, linkColor: Color = .accentColor) -> AttributedString {
+        var result = (try? AttributedString(
             markdown: text,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         )) ?? AttributedString(text)
+        result = Self.autolinkBareURLs(in: result)
+        Self.styleLinks(in: &result, color: linkColor)
+        return result
+    }
+
+    /// Pure post-processor: detects bare `http://`/`https://` URLs in `attributed`
+    /// that markdown's inline parse did not linkify (a pasted URL with no
+    /// `[label](url)` wrapper renders as dead text otherwise) and sets `.link`
+    /// on the matched run.
+    ///
+    /// Deliberately conservative:
+    ///  - A run that already carries `.link` (a real markdown link, or one this
+    ///    pass already set) is left untouched.
+    ///  - A run inside inline code styling (`` `like this` ``,
+    ///    `InlinePresentationIntent.code`) is left untouched — a URL shown as
+    ///    code is meant to be read verbatim, not tapped.
+    ///  - Only the exact `http://`/`https://` token text becomes the link
+    ///    (NSDataDetector's own trailing-punctuation trimming), so a sentence
+    ///    like "see https://example.com." does not swallow the period.
+    ///
+    /// This never runs on provider-embed URLs (YouTube/Spotify/etc.) — those
+    /// are already lifted out of prose into `.embed` segments by
+    /// `MessageSegmenter` before any text reaches here — and never touches the
+    /// destination of a markdown inline link, because that destination is an
+    /// attribute value, not rendered text, so it is never present in
+    /// `attributed`'s character content for this pass to see.
+    static func autolinkBareURLs(in attributed: AttributedString) -> AttributedString {
+        var result = attributed
+        let plain = String(attributed.characters)
+        guard !plain.isEmpty,
+              let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+        else { return result }
+
+        let nsRange = NSRange(plain.startIndex..<plain.endIndex, in: plain)
+        let matches = detector.matches(in: plain, options: [], range: nsRange)
+        for match in matches {
+            guard let stringRange = Range(match.range, in: plain) else { continue }
+            let token = plain[stringRange]
+            let lowered = token.lowercased()
+            guard lowered.hasPrefix("http://") || lowered.hasPrefix("https://") else { continue }
+            guard let url = URL(string: String(token)) else { continue }
+            guard let attrRange = Range(stringRange, in: result) else { continue }
+            guard !hasProtectedLinkAttributes(result[attrRange]) else { continue }
+            result[attrRange].link = url
+        }
+        return result
+    }
+
+    /// True when any run in `substring` already carries a `.link` or code
+    /// (`InlinePresentationIntent.code`) attribute — either disqualifies the
+    /// range from bare-URL autolinking.
+    private static func hasProtectedLinkAttributes(_ substring: AttributedSubstring) -> Bool {
+        for run in substring.runs {
+            if run.link != nil { return true }
+            if run.inlinePresentationIntent?.contains(.code) == true { return true }
+        }
+        return false
+    }
+
+    /// Apply the explicit transcript link style — `linkColor` tint + a single
+    /// underline — to every run that carries a `.link` attribute, so links
+    /// read as links rather than inheriting only the ambient global tint.
+    private static func styleLinks(in attributed: inout AttributedString, color: Color) {
+        for run in attributed.runs where run.link != nil {
+            attributed[run.range].foregroundColor = color
+            attributed[run.range].underlineStyle = .single
+        }
     }
 
     // MARK: - Prose list rendering (UI-C C1)
@@ -1455,15 +1527,15 @@ struct MessageBubble: View {
     /// continuations align under the item text. Ordinals are monospaced-digit so
     /// numbered lists stay column-aligned. Non-list prose keeps the existing
     /// inline-markdown rendering verbatim.
-    static func prose(_ text: String) -> AttributedString {
+    static func prose(_ text: String, linkColor: Color = .accentColor) -> AttributedString {
         let lines = text.components(separatedBy: "\n")
         guard lines.contains(where: { listMarker($0) != nil }) else {
-            return attributed(text)
+            return attributed(text, linkColor: linkColor)
         }
 
         var result = AttributedString()
         for (index, line) in lines.enumerated() {
-            var lineAttr = attributed(line)
+            var lineAttr = attributed(line, linkColor: linkColor)
             if let marker = listMarker(line) {
                 let paragraph = NSMutableParagraphStyle()
                 paragraph.firstLineHeadIndent = listFirstLineHeadIndent
@@ -1733,7 +1805,7 @@ struct MarkdownTableBlockView: View {
             : (rowIndex.isMultiple(of: 2) ? theme.card.opacity(0.22) : Color.clear)
         let displayedText = text.isEmpty ? "—" : text
 
-        return Text(RenderCache.prose(displayedText))
+        return Text(RenderCache.prose(displayedText, linkColor: theme.midground))
             .font(.system(isHeader ? .subheadline : .body, design: .serif).weight(isHeader ? .semibold : .regular))
             .foregroundStyle(isHeader ? theme.fg : (text.isEmpty ? theme.mutedFg : theme.fg))
             .lineLimit(nil)
@@ -1849,7 +1921,7 @@ struct MarkdownBlockquoteView: View {
             RoundedRectangle(cornerRadius: 2, style: .circular)
                 .fill(theme.midground.opacity(0.72))
                 .frame(width: 3)
-            Text(RenderCache.prose(text))
+            Text(RenderCache.prose(text, linkColor: theme.midground))
                 .font(.system(.body, design: .serif))
                 .foregroundStyle(theme.mutedFg)
                 .lineSpacing(3.5)
@@ -1884,7 +1956,7 @@ struct MarkdownAlertView: View {
             .accessibilityHidden(true)
 
             if !alert.body.isEmpty {
-                Text(RenderCache.prose(alert.body))
+                Text(RenderCache.prose(alert.body, linkColor: theme.midground))
                     .font(.system(.body, design: .serif))
                     .foregroundStyle(theme.fg)
                     .lineSpacing(3.5)
@@ -1923,7 +1995,7 @@ struct MarkdownTaskListView: View {
                         .font(.body.weight(.semibold))
                         .foregroundStyle(item.checked ? theme.statusOK : theme.mutedFg)
                         .accessibilityHidden(true)
-                    Text(RenderCache.prose(item.text))
+                    Text(RenderCache.prose(item.text, linkColor: theme.midground))
                         .font(.system(.body, design: .serif))
                         .foregroundStyle(theme.fg)
                         .strikethrough(item.checked, color: theme.mutedFg)
@@ -1950,7 +2022,7 @@ struct MarkdownListBlockView: View {
                         .font(.system(.body, design: .serif).monospacedDigit().weight(.semibold))
                         .foregroundStyle(theme.mutedFg)
                         .frame(width: item.marker == "•" ? 14 : 28, alignment: .trailing)
-                    Text(RenderCache.prose(item.text))
+                    Text(RenderCache.prose(item.text, linkColor: theme.midground))
                         .font(.system(.body, design: .serif))
                         .foregroundStyle(theme.fg)
                         .lineSpacing(3.5)

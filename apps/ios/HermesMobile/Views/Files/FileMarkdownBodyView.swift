@@ -64,7 +64,7 @@ struct FileMarkdownBodyView: View {
             // Same inline-markdown path as `MessageBubble.paragraphText`: cached
             // `AttributedString(markdown:)` via `RenderCache.prose`, serif body,
             // theme foreground, selectable.
-            Text(RenderCache.prose(text))
+            Text(RenderCache.prose(text, linkColor: theme.midground))
                 .font(Self.proseFont)
                 .foregroundStyle(theme.fg)
                 .lineSpacing(Self.proseLineSpacing)
