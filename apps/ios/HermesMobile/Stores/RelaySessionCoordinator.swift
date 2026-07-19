@@ -374,6 +374,20 @@ final class RelaySessionCoordinator {
         activeStoredSessionID == storedID ? storedID : nil
     }
 
+    /// Re-bind a queued prompt only when its destination is still the session
+    /// selected by the user. A relay restart can lose the coordinator binding
+    /// while SessionStore correctly retains the visible selection.
+    func ensureOutboxRuntime(forStored storedID: String, selectedStoredID: String?) async -> String? {
+        guard selectedStoredID == storedID else { return nil }
+        if let runtime = outboxRuntimeID(forStored: storedID) { return runtime }
+        do {
+            _ = try await resume(storedID)
+            return outboxRuntimeID(forStored: storedID)
+        } catch {
+            return nil
+        }
+    }
+
     /// Resume + own an idle/terminal session, then adopt it as active.
     @discardableResult
     func resume(_ sessionID: String) async throws -> JSONValue {

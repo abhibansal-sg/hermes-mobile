@@ -541,6 +541,24 @@ final class RelaySessionCoordinatorTests: XCTestCase {
                      "a stopped relay drives nothing ⇒ all destinations hold")
     }
 
+    func testOutboxRuntimeRebindsOnlySelectedDestinationAfterRelayRestart() async throws {
+        let transport = MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id else { return }
+            relay.deliverResult(id: id, result: .object(["session_id": .string("A-live")]))
+        })
+        let coordinator = RelaySessionCoordinator(
+            chatStore: ChatStore(),
+            clientFactory: { RelayClient { _ in transport } }
+        )
+        try await coordinator.start(url: url)
+
+        let foreign = await coordinator.ensureOutboxRuntime(forStored: "A", selectedStoredID: "B")
+        XCTAssertNil(foreign)
+        let selected = await coordinator.ensureOutboxRuntime(forStored: "A", selectedStoredID: "A")
+        XCTAssertEqual(selected, "A")
+        XCTAssertEqual(transport.upstreams().filter { $0.method == "resume" }.count, 1)
+    }
+
     func testCoordinatorRoutesUpstreamOpsToRelay() async throws {
         let transport = MockRelayTransport(script: { upstream, relay in
             guard let id = upstream.id else { return }

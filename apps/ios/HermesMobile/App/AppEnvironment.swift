@@ -143,8 +143,10 @@ final class AppEnvironment {
                     // unchanged (this branch is never taken with the flag OFF).
                     if connectionStore?.relayCoordinator != nil,
                        connectionStore?.transportPath == .relay {
-                        return connectionStore?.relayCoordinator?
-                            .outboxRuntimeID(forStored: storedID)
+                        return await connectionStore?.relayCoordinator?.ensureOutboxRuntime(
+                            forStored: storedID,
+                            selectedStoredID: sessionStore?.activeStoredId
+                        )
                     }
                     return await sessionStore?.runtimeForOutboxDestination(storedID)
                 },
