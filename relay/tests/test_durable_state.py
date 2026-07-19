@@ -1,7 +1,32 @@
+import sqlite3
 from pathlib import Path
 
 from hermes_relay.durable_state import DurableState
 from hermes_relay.types import Frame, FrameKind
+
+
+def test_database_connections_are_closed(tmp_path: Path, monkeypatch):
+    real_connect = sqlite3.connect
+    opened = 0
+    closed = 0
+
+    class TrackingConnection(sqlite3.Connection):
+        def close(self):
+            nonlocal closed
+            closed += 1
+            super().close()
+
+    def connect(*args, **kwargs):
+        nonlocal opened
+        opened += 1
+        return real_connect(*args, **kwargs, factory=TrackingConnection)
+
+    monkeypatch.setattr("hermes_relay.durable_state.sqlite3.connect", connect)
+    state = DurableState(tmp_path / "state.sqlite3")
+    for _ in range(20):
+        state.current_revision()
+
+    assert opened == closed == 20
 
 
 def _approval(request_id="a1"):

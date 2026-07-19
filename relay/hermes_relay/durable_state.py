@@ -8,6 +8,7 @@ import os
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from pathlib import Path
 from threading import RLock
 from typing import Any, Optional
@@ -58,7 +59,7 @@ class DurableState:
         return db
 
     def current_revision(self) -> int:
-        with self._lock, self._connect() as db:
+        with self._lock, closing(self._connect()) as db, db:
             return int(db.execute("SELECT value FROM meta WHERE key='revision'").fetchone()[0])
 
     @staticmethod
@@ -77,7 +78,7 @@ class DurableState:
             self._set_active_turn(frame, active=True, now=now)
 
     def _set_active_turn(self, frame: Frame, *, active: bool, now: Optional[float]) -> None:
-        with self._lock, self._connect() as db:
+        with self._lock, closing(self._connect()) as db, db:
             exists = db.execute(
                 "SELECT 1 FROM active_turns WHERE session_id=?", (frame.sid,)
             ).fetchone()
@@ -114,7 +115,7 @@ class DurableState:
             "created_at": float(body.get("created_at") or now),
             "expires_at": body.get("expires_at"), "status": "pending",
         }
-        with self._lock, self._connect() as db:
+        with self._lock, closing(self._connect()) as db, db:
             previous = db.execute("SELECT payload,deleted FROM attention WHERE id=?", (record_id,)).fetchone()
             if previous and not previous["deleted"]:
                 previous_record = json.loads(previous["payload"])
@@ -133,7 +134,7 @@ class DurableState:
         kind: Optional[str] = None, status: str = "resolved_elsewhere",
         now: Optional[float] = None,
     ) -> None:
-        with self._lock, self._connect() as db:
+        with self._lock, closing(self._connect()) as db, db:
             rows = db.execute("SELECT * FROM attention WHERE deleted=0").fetchall()
             for row in rows:
                 record = json.loads(row["payload"])
@@ -155,7 +156,7 @@ class DurableState:
                 )
 
     def pending_attention(self, cursor: Optional[str]) -> dict[str, Any]:
-        with self._lock, self._connect() as db:
+        with self._lock, closing(self._connect()) as db, db:
             instance = db.execute("SELECT value FROM meta WHERE key='instance_id'").fetchone()[0]
             revision = int(db.execute("SELECT value FROM meta WHERE key='revision'").fetchone()[0])
             requested: Optional[int] = None
@@ -209,7 +210,7 @@ class DurableState:
                     "source", "last_active", "cwd", "profile",
                 ) if source.get(key) is not None
             }
-        with self._lock, self._connect() as db:
+        with self._lock, closing(self._connect()) as db, db:
             previous_rows = db.execute(
                 "SELECT * FROM manifest_sessions WHERE scope=?", (scope,)
             ).fetchall()
@@ -287,7 +288,7 @@ class DurableState:
         timestamp = now or time.time()
         event_id = descriptor["collapse_id"]
         ttl = max(int(descriptor.get("expiration") or 0), 15 * 60)
-        with self._lock, self._connect() as db:
+        with self._lock, closing(self._connect()) as db, db:
             changed = db.execute(
                 "INSERT OR IGNORE INTO push_outbox(event_id,payload,next_attempt,expires_at) VALUES(?,?,?,?)",
                 (event_id, json.dumps(descriptor), timestamp, timestamp + ttl),
@@ -296,7 +297,7 @@ class DurableState:
 
     def due_pushes(self, now: Optional[float] = None) -> list[dict[str, Any]]:
         timestamp = now or time.time()
-        with self._lock, self._connect() as db:
+        with self._lock, closing(self._connect()) as db, db:
             db.execute("UPDATE push_outbox SET status='expired' WHERE status='pending' AND expires_at<=?", (timestamp,))
             rows = db.execute(
                 "SELECT event_id,payload,attempts FROM push_outbox "
@@ -306,7 +307,7 @@ class DurableState:
             return [dict(json.loads(row["payload"]), _event_id=row["event_id"], _attempts=row["attempts"]) for row in rows]
 
     def finish_push(self, event_id: str, delivered: bool, attempts: int, now: Optional[float] = None) -> None:
-        with self._lock, self._connect() as db:
+        with self._lock, closing(self._connect()) as db, db:
             if delivered:
                 db.execute("UPDATE push_outbox SET status='delivered' WHERE event_id=?", (event_id,))
             else:
