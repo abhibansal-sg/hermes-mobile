@@ -217,13 +217,21 @@ final class ChatStore {
     /// `nil` when the session has no todo activity yet, or the newest one carries
     /// no list (e.g. a mid-run write before its first result).
     ///
-    /// The dock renders THIS; the transcript suppresses the matching inline
-    /// `TodoCardView` (keyed by ``latestTodoToolID``) while the dock shows the
-    /// task box, so the same list never renders twice.
+    /// The dock renders THIS; while it shows the task box the transcript
+    /// suppresses EVERY inline `TodoCardView` for the session — not just the one
+    /// backing this list (owner QA §d). The dock is the single home for the
+    /// checklist, and because the agent rewrites the one evolving list across
+    /// several `todo` tool calls, suppressing only the latest still left the
+    /// earlier snapshots of the same list rendering inline 2-3×. The suppression
+    /// rule therefore lives in `ChatView.dockSuppressesTodoCards` as a pure
+    /// `dockContent == .tasks` flag, not a per-`tool_call_id` match.
     var latestTodoList: TodoList? { latestTodo?.list }
 
-    /// The `tool_call_id` of the activity backing ``latestTodoList``. The
-    /// transcript suppresses exactly that inline card while the dock owns it.
+    /// The `tool_call_id` of the activity backing ``latestTodoList`` — the
+    /// identity of the newest todo list (exposed for tests and callers that need
+    /// to key on the active list). NOTE: inline-card suppression no longer keys on
+    /// this; the dock suppresses all todo cards wholesale while the task box is up
+    /// (see ``latestTodoList``).
     var latestTodoToolID: String? { latestTodo?.id }
 
     /// Shared scan behind both dock accessors: the newest todo activity that
