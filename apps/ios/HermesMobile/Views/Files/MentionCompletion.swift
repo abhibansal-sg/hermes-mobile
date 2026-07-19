@@ -122,6 +122,21 @@ enum MentionCompletion {
     /// space is added only when the buffer is non-empty and does not already end
     /// in whitespace, and a trailing space lets the user keep typing after the
     /// token. Same one-deep `@file:` normalization as ``insert``.
+    /// Append a PRE-FORMED context token (e.g. a gateway-returned
+    /// `@file:report.pdf`, already prefixed and quoted) to the composer buffer.
+    /// Unlike ``appendMention(path:to:)`` this does NOT re-prefix or normalise the
+    /// value — the caller owns the exact token. Same whitespace-separation rule: a
+    /// separating space only when the buffer is non-empty and doesn't already end
+    /// in whitespace, plus a trailing space so the user can keep typing.
+    static func appendToken(_ token: String, to text: String) -> String {
+        let piece = token.hasSuffix(" ") ? token : token + " "
+        if text.isEmpty {
+            return piece
+        }
+        let needsSeparator = !(text.hasSuffix(" ") || text.hasSuffix("\n"))
+        return text + (needsSeparator ? " " : "") + piece
+    }
+
     static func appendMention(path: String, to text: String) -> String {
         let token = "@file:" + normalizedPath(path) + " "
         if text.isEmpty {
