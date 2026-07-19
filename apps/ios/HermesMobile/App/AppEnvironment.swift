@@ -343,23 +343,44 @@ final class AppEnvironment {
         }
         // ConnectionStore drains the offline outbox after reconnect backfill.
         connectionStore.queueStore = queueStore
-        // Silent pushes are invalidation hints only. Route them through the same
-        // authoritative refresh used by foreground recovery, then project the
-        // widget after that refresh has completed.
-        let syncCoordinator = ManifestInvalidationCoordinator { [weak sessionStore, weak connectionStore] _ in
-            guard let sessionStore, let connectionStore else { throw CancellationError() }
-            try Task.checkCancellation()
-            await sessionStore.refresh()
-            try Task.checkCancellation()
-            await MainActor.run {
-                let connected: Bool
-                if case .connected = connectionStore.phase { connected = true } else { connected = false }
-                var patch = WidgetSnapshotWriter.Patch()
-                patch.connectionState = .set(connected ? .connected : .offline)
-                patch.activeTurnCount = .set(sessionStore.activeStoredId == nil ? 0 : 1)
-                WidgetSnapshotWriter.write(patch)
+        // One manifest transaction powers foreground, silent-push, and scheduled
+        // refresh. The relay path uses relay-owned truth; gateway-direct keeps the
+        // plugin/legacy fallback already encapsulated by SyncCoordinator.
+        let applyManifest: @MainActor @Sendable (CacheScope, RestClient) async -> (ManifestProjection, Bool)? = {
+            [weak sessionStore, weak chatStore] scope, rest in
+            guard let sessionStore else { return nil }
+            let before = try? await cacheStore?.loadManifestProjection(scope: scope)
+            guard let cacheStore else { return nil }
+            let coordinator = SyncCoordinator(
+                cache: cacheStore, scope: scope, client: rest,
+                legacyFallback: { await sessionStore.refresh() },
+                transcriptDelta: { [weak sessionStore, weak chatStore] id in
+                    guard await sessionStore?.activeStoredId == id else { return }
+                    await chatStore?.backfill()
+                }
+            )
+            guard let projection = await coordinator.synchronize() else { return nil }
+            sessionStore.applyManifestProjection(projection, scope: scope)
+            return (projection, projection.revision > (before?.revision ?? -1))
+        }
+        let syncCoordinator = ManifestInvalidationCoordinator { [weak connectionStore] invalidation in
+            guard let connectionStore, let rest = connectionStore.rest else { throw CancellationError() }
+            let profile = invalidation.scope.hasPrefix("profile:")
+                ? (String(invalidation.scope.dropFirst(8)).removingPercentEncoding ?? "")
+                : invalidation.scope
+            let scope = CacheScope(serverId: connectionStore.serverURLString, profileId: profile)
+            guard let (projection, changed) = await applyManifest(scope, rest),
+                  projection.revision >= invalidation.revision else { throw CancellationError() }
+            var patch = WidgetSnapshotWriter.Patch()
+            patch.serverRevision = .set(String(projection.revision))
+            patch.openSessionCount = .set(projection.sessions.count)
+            patch.activeTurnCount = .set(projection.activeTurns.count)
+            if let lastSyncedAt = projection.lastSyncedAt {
+                patch.fetchedAt = .set(lastSyncedAt)
             }
-            return true
+            patch.isStale = .set(false)
+            WidgetSnapshotWriter.write(patch)
+            return changed
         }
         self.syncCoordinator = syncCoordinator
         Task { await SilentSyncBridge.shared.attach(syncCoordinator) }
@@ -375,11 +396,21 @@ final class AppEnvironment {
                 let profile = defaults.string(forKey: DefaultsKeys.activeProfile) ?? DefaultsKeys.allProfilesScope
                 return BackgroundManifestScope(gatewayURL: url, scope: profile, token: token)
             },
-            sync: { [weak sessionStore] _ in
-                guard let sessionStore else { return .retryableFailure }
-                let outcome = await sessionStore.refreshOutcome()
+            sync: { [weak connectionStore] pairing in
+                guard let connectionStore, let gatewayURL = URL(string: pairing.gatewayURL) else {
+                    return .retryableFailure
+                }
+                let rest = RestClient(
+                    baseURL: gatewayURL, token: pairing.token,
+                    pathStyle: connectionStore.capabilities.resolvedPathStyle,
+                    relayControlBaseURL: connectionStore.relayControlURL(forGateway: gatewayURL)
+                )
+                let scope = CacheScope(serverId: pairing.gatewayURL, profileId: pairing.scope)
+                guard let (_, changed) = await applyManifest(scope, rest) else {
+                    return .retryableFailure
+                }
                 try Task.checkCancellation()
-                return outcome
+                return changed ? .success : .noChange
             },
             maintenance: { [weak workRepository, weak queueStore] in
                 guard let workRepository else { return }

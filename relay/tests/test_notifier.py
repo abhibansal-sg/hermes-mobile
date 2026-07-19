@@ -148,6 +148,24 @@ def test_durable_outbox_prevents_refire_after_restart(tmp_path: Path):
     assert len(push.calls) == 1
 
 
+def test_attention_emits_manifest_invalidation(tmp_path: Path):
+    class PushWithInvalidation(FakePush):
+        def __init__(self):
+            super().__init__(); self.invalidations = []
+        def notify_manifest_invalidation(self, scope, revision, reason):
+            self.invalidations.append((scope, revision, reason)); return 1
+
+    push = PushWithInvalidation()
+    state = DurableState(tmp_path / "state.sqlite3")
+    state.observe_frame(_approval("s1"))
+    notifier = Notifier(
+        NotifierConfig(), EventBus(), FakeGateway({"s1"}),
+        is_foregrounded=lambda _: False, push_engine=push, durable=state,
+    )
+    notifier.observe(_approval("s1"))
+    assert push.invalidations == [("all", state.current_revision(), "coalesced")]
+
+
 def test_turn_complete_suppressed_when_foregrounded():
     notifier, push, _, _ = _make(owned=("s1",), foreground=("s1",))
     desc = notifier.observe(_agent_completed("s1"))

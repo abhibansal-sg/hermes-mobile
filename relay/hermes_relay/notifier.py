@@ -179,6 +179,7 @@ class Notifier:
         delegated send, so a unit test asserts on the return value with a fake
         push_engine.
         """
+        self._invalidate_manifest(frame)
         if not self._cfg.enabled:
             return None
 
@@ -196,6 +197,17 @@ class Notifier:
         descriptor = self._fire(event_type, frame)
         self.metrics.fired += 1
         return descriptor
+
+    def _invalidate_manifest(self, frame: Frame) -> None:
+        if (self._durable is None or self._push is None
+                or frame.kind not in {
+                    FrameKind.TURN_COMPLETED, FrameKind.APPROVAL_REQUEST,
+                    FrameKind.CLARIFY_REQUEST, FrameKind.TITLE,
+                }):
+            return
+        sender = getattr(self._push, "notify_manifest_invalidation", None)
+        if sender is not None:
+            sender("all", self._durable.current_revision(), "coalesced")
 
     def _should_push(self, frame: Frame) -> Optional[str]:
         """Return the push event_type for a push-worthy frame, else ``None``.

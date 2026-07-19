@@ -60,6 +60,7 @@ from typing import Any, Optional
 
 from .bus import TOPIC_GATEWAY_EVENTS, TOPIC_RELAY_FRAMES, EventBus
 from .session_state import SessionStore
+from .durable_state import DurableState
 from .types import (
     Frame,
     FrameKind,
@@ -116,9 +117,12 @@ class _Ctx:
 class Reframer:
     """Maps one gateway stream into the item-lifecycle envelope."""
 
-    def __init__(self, bus: EventBus, store: SessionStore) -> None:
+    def __init__(
+        self, bus: EventBus, store: SessionStore, durable: Optional[DurableState] = None
+    ) -> None:
         self._bus = bus
         self._store = store
+        self._durable = durable
         self._ctx: dict[str, _Ctx] = {}
 
     # -- pump ------------------------------------------------------------
@@ -192,6 +196,8 @@ class Reframer:
         state = self._store.get(sid)
         for frame in frames:
             state.apply(frame)
+            if self._durable is not None:
+                self._durable.observe_frame(frame)
         return frames
 
     # -- turn helper -----------------------------------------------------

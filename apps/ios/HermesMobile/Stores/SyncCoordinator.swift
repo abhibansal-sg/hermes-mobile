@@ -30,13 +30,21 @@ final class SyncCoordinator {
         trigger(.launch)
     }
 
+    /// Await one atomic manifest recovery (used by silent/background triggers).
+    func synchronize() async -> ManifestProjection? {
+        if let cached = try? await cache.loadManifestProjection(scope: scope) {
+            projection = cached
+        }
+        return await recover() ? projection : nil
+    }
+
     func trigger(_ trigger: Trigger, invalidationRevision: Int64? = nil) {
         if inFlight != nil {
             if let invalidationRevision, invalidationRevision > (pendingRevision ?? projection.revision) { pendingRevision = invalidationRevision }
             return
         }
         inFlight = Task { [weak self] in
-            await self?.recover()
+            _ = await self?.recover()
             guard let self else { return }
             self.inFlight = nil
             if let pending = self.pendingRevision, pending > self.projection.revision {
@@ -46,7 +54,7 @@ final class SyncCoordinator {
         }
     }
 
-    private func recover() async {
+    private func recover() async -> Bool {
         do {
             var pages: [SyncManifestPage] = []
             var cursor = projection.cursor
@@ -57,18 +65,21 @@ final class SyncCoordinator {
             } while pages.last?.hasMore == true
             let chain = try ManifestChain(validating: pages)
             let committed = try await cache.applyManifest(chain, scope: scope)
-            guard committed.revision >= projection.revision else { return }
+            guard committed.revision >= projection.revision else { return false }
             let priorHeads = projection.transcriptHeads
             projection = committed // exactly one observable assignment
             for (id, head) in committed.transcriptHeads where priorHeads[id] != head {
                 Task { await transcriptDelta(id) }
             }
             if chain.deviceRegistered == false { await registerPush() }
+            return true
         } catch RestError.badStatus(let code, _) where code == 404 || code == 405 {
             await legacyFallback()
             projection = ManifestProjection(revision: projection.revision, cursor: projection.cursor, sessions: projection.sessions, attention: projection.attention, activeTurns: projection.activeTurns, transcriptHeads: projection.transcriptHeads, capabilities: projection.capabilities, freshness: .partial)
+            return false
         } catch {
             // Atomic cache and the last published projection remain untouched.
+            return false
         }
     }
 }

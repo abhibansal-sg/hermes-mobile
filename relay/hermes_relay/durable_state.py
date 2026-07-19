@@ -57,6 +57,10 @@ class DurableState:
         db.commit()
         return db
 
+    def current_revision(self) -> int:
+        with self._lock, self._connect() as db:
+            return int(db.execute("SELECT value FROM meta WHERE key='revision'").fetchone()[0])
+
     @staticmethod
     def _next_revision(db: sqlite3.Connection) -> int:
         revision = int(db.execute("SELECT value FROM meta WHERE key='revision'").fetchone()[0]) + 1

@@ -472,8 +472,6 @@ class DownstreamServer:
 
     async def _dispatch(self, frame: Frame) -> None:
         """Fan one Reframer frame out to every connection (per-connection seq)."""
-        if self._durable is not None:
-            self._durable.observe_frame(frame)
         for conn in list(self._conns.values()):
             try:
                 await conn.send_frame(frame)

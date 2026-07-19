@@ -45,7 +45,7 @@ protocol SilentSyncCoordinating: Sendable {
 /// transaction entry point; widget projection is deliberately part of that
 /// operation so callers cannot publish it before the commit succeeds.
 actor ManifestInvalidationCoordinator: SilentSyncCoordinating {
-    typealias FetchApply = @Sendable (SilentSyncInvalidation) async throws -> Bool
+    typealias FetchApply = @MainActor @Sendable (SilentSyncInvalidation) async throws -> Bool
     private let fetchApply: FetchApply
     private var committed: [String: Int64] = [:]
     private var inFlight: [String: Task<SilentSyncResult, Never>] = [:]
@@ -53,6 +53,7 @@ actor ManifestInvalidationCoordinator: SilentSyncCoordinating {
     init(fetchApply: @escaping FetchApply) { self.fetchApply = fetchApply }
 
     func synchronize(for invalidation: SilentSyncInvalidation) async -> SilentSyncResult {
+        guard !Task.isCancelled else { return .failed }
         if (committed[invalidation.scope] ?? -1) >= invalidation.revision { return .noData }
         if let task = inFlight[invalidation.scope] { return await task.value }
         let operation = fetchApply

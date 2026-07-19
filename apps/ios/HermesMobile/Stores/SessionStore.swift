@@ -1397,6 +1397,23 @@ final class SessionStore {
     /// list uses (a profile/server switch then re-partitions both in lockstep).
     var projectsCacheScope: CacheScope? { currentCacheScope }
 
+    /// Publish an atomically committed manifest into the existing drawer state.
+    func applyManifestProjection(_ projection: ManifestProjection, scope: CacheScope) {
+        guard currentCacheScope == scope else { return }
+        let projected = Self.filterCachedSessions(
+            projection.sessions, activeProfile: activeProfile,
+            untaggedProfile: scope.profileId == CacheScope.allProfilesKey ? nil : scope.profileId
+        ).filter(Self.isHumanRecentsSession)
+        sessions = projected
+        seenServerSessionIds = Set(projection.sessions.map(sessionListIdentity))
+        loadedCount = projection.sessions.count
+        loadedOffset = projection.sessions.count
+        manifestFreshness = projection.freshness
+        manifestLastSyncedAt = projection.lastSyncedAt
+        manifestRevision = projection.revision
+        SpotlightIndexer.index(sessions: sessions)
+    }
+
     func cacheIdentity(_ sessionId: String, profile: String? = nil) -> CacheIdentity? {
         guard let scope = currentCacheScope else { return nil }
         let actual = profile?.trimmingCharacters(in: .whitespacesAndNewlines)

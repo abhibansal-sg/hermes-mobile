@@ -58,7 +58,7 @@ class RelayApp:
         self._closing = False
 
         self.gateway = GatewayClient(config.gateway, self.bus)
-        self.reframer = Reframer(self.bus, self.store)
+        self.reframer = Reframer(self.bus, self.store, self.durable)
         self.downstream = DownstreamServer(
             config.downstream, self.bus, self.gateway, self.store, self.durable
         )
