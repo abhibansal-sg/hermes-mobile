@@ -44,7 +44,11 @@ The current repository already has useful pieces:
 - A durable iOS WorkRepository/outbox that should become the phone-side command authority.
 - An existing APNs relay and reverse tunnel that can be mined for operational code, but not used as the new privacy boundary.
 
-The four relay lanes and item-stream foundation are real, not hypothetical.  However, the Swift path is still described in the code as additive/mock-only and not yet wired as the live app transport.
+The four relay lanes and item-stream foundation are real, not hypothetical. The
+Swift path is wired into the live app behind the default-off
+`TransportPath.relay` feature flag, although some source comments still
+incorrectly describe it as mock-only. HRP/2 must replace that prototype path
+through an explicit migration; it must not assume the live wiring is absent.
 
 ---
 
@@ -67,7 +71,8 @@ That is tolerable only as an isolated local prototype. It is catastrophic when p
 
 ## P0 — the existing Swift and Python wire contracts do not agree
 
-On `main`:
+On the audited implementation base, `origin/wave2/relay-turn-elements` at
+`ab570aa74`:
 
 - Swift sends prompt text as `prompt`; Python reads `text`.
 - Swift approval sends `{request_id, approved}`; Python requires `session_id`, `request_id`, and `decision`.
@@ -238,12 +243,19 @@ The open relay work adds an in-memory `client_message_id` LRU around prompt subm
 - Multiple Agent processes.
 - Database restore or failover.
 
-True exactly-once execution cannot be manufactured solely at the relay edge if the stock gateway does not persist an idempotency key.
+The gateway on this branch already exposes
+`register_prompt_receipt_provider()`, and `plugins/hermes-mobile/prompt_receipts.py`
+implements durable, profile-scoped `client_message_id` receipts. The current
+relay nevertheless drops `client_message_id` in
+`GatewayClient.prompt_submit()`, so it bypasses that durable authority and
+falls back to its process-local LRU.
 
-**Required fix:** define a durable Agent operation ledger and one of these gateway policies:
-
-1. **Preferred:** add durable `client_message_id` support to `prompt.submit`.
-2. **Zero-core fallback:** mark an interrupted operation as `ambiguous`, reconcile against history, and never blindly resubmit if acceptance cannot be proved.
+**Required fix:** define the durable Agent operation ledger for HRP/2 and pass
+the WorkRepository `client_message_id` unchanged through the relay into the
+existing gateway receipt provider. Do not build a competing gateway receipt
+system. If the provider is unavailable or reports an indeterminate execution,
+mark the operation `ambiguous`, reconcile against history, and never blindly
+resubmit when acceptance cannot be proved.
 
 The existing iOS outbox is already designed to retain ambiguous submissions using the same client ID; that should be reused rather than replaced.
 
@@ -251,11 +263,14 @@ The existing iOS outbox is already designed to retain ambiguous submissions usin
 
 ## P1 — session resume may return a different live ID
 
-The gateway resume API may return a live session ID distinct from the requested/original session ID.  On `main`, the relay resumes the origin but then submits to the original ID.
+The gateway resume API may return a live session ID distinct from the
+requested/original session ID. An earlier relay prototype resumed the origin
+but then submitted to the original ID. The audited branch corrects this in
+memory by recording and using the returned live ID.
 
-The open relay work corrects this by recording and using the live ID.
-
-**Required fix:** persist `(origin_session_id, live_session_id)` aliases, return both to the phone, and always use the live ID for driving and foreground presence.
+**Required fix:** persist `(origin_session_id, live_session_id)` aliases across
+Agent restarts, return both to the phone, and always use the live ID for driving
+and foreground presence.
 
 ---
 
@@ -643,6 +658,13 @@ The temporary route and tokens are then deleted.
 ## 3.5 Hosted enrollment and accountless abuse control
 
 App Attest should not be used as vague “registration protection.” It must bind a concrete challenge and request.
+
+The repository already contains partial server-side App Attest infrastructure
+in `server/push-relay/push_relay/attestation.py` and
+`GET /v1/attest/challenge`. HRP/2 should adapt and harden that implementation,
+adding request-hash assertions, counter validation, and the endpoint-binding
+contract below. The iOS entitlement, client assertion flow, and Notification
+Service Extension integration remain new work.
 
 The Push Gateway issues a one-time challenge. The iOS app produces an assertion covering:
 
@@ -1150,13 +1172,15 @@ Rules:
 }
 ```
 
-Recommended gateway enhancement:
+Existing gateway receipt contract to reuse:
 
 ```text
-UNIQUE(gateway_scope, client_message_id)
+UNIQUE(profile_home, client_message_id)
 ```
 
-and a persisted receipt:
+This is implemented as a per-profile receipt database with
+`client_message_id` as its primary key. A successful submission returns a
+persisted disposition such as:
 
 ```json
 {
@@ -1167,7 +1191,10 @@ and a persisted receipt:
 }
 ```
 
-Without that gateway enhancement, an ambiguous prompt must not be blindly retried. The Agent first reconciles history. If it cannot prove acceptance, it returns `GATEWAY_AMBIGUOUS` and preserves the phone job.
+The relay must forward `client_message_id` to this existing provider and retain
+the same ID through every retry. If the provider is disabled or returns an
+indeterminate receipt, the Agent first reconciles history. If it cannot prove
+acceptance, it returns `GATEWAY_AMBIGUOUS` and preserves the phone job.
 
 ### Gateway parameter mappings
 
@@ -1810,9 +1837,14 @@ The present relay-push implementation is environment and `.env` based.  A migrat
 
 ## Service machinery
 
-The repository’s existing service code is gateway-specific rather than a clean generic service abstraction. The gateway CLI exposes gateway install/start/status commands and contains hardcoded gateway service discovery.
+The repository already has a backend-neutral `ServiceManager` protocol in
+`hermes_cli/service_manager.py`, with systemd, launchd, Windows, and s6
+adapters. Host adapters currently provide lifecycle control for predeclared
+services, while s6 also supports runtime profile registration. Extend this
+abstraction rather than introducing a parallel service-management framework.
 
-Extract:
+If a declarative specification is needed, add it beside and route it through
+the existing `ServiceManager` implementations:
 
 ```python
 @dataclass(frozen=True)
@@ -1827,7 +1859,11 @@ class ServiceSpec:
     restart_policy: str
 ```
 
-Then implement launchd, systemd user/system, and Windows backends against `ServiceSpec`.
+Widen the existing launchd, systemd user/system, Windows, and s6 adapters to
+install the Agent Relay from `ServiceSpec`, preserving their current gateway
+behavior. Register the `hermes mobile` commands from the mobile package/plugin
+surface, and retain `hermes mobile-pair` as a compatibility alias during the
+command-hierarchy migration.
 
 Service names must include a stable hash of the active `HERMES_HOME` so multiple profiles do not collide.
 
