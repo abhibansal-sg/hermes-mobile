@@ -121,10 +121,10 @@ final class AttachmentStoreFileTests: XCTestCase {
         switch AttachmentStore.readPickedFileData(at: url) {
         case .success:
             XCTFail("over-cap file should have been rejected before reading")
-        case .failure(let message):
+        case .failure(let error):
             XCTAssertTrue(
-                message.contains("too large"),
-                "unexpected rejection message: \(message)"
+                error.message.contains("too large"),
+                "unexpected rejection message: \(error.message)"
             )
         }
     }
@@ -150,8 +150,8 @@ final class AttachmentStoreFileTests: XCTestCase {
         switch AttachmentStore.readPickedFileData(at: missing) {
         case .success:
             XCTFail("nonexistent file should not read successfully")
-        case .failure(let message):
-            XCTAssertTrue(message.contains("Couldn't read"), "unexpected message: \(message)")
+        case .failure(let error):
+            XCTAssertTrue(error.message.contains("Couldn't read"), "unexpected message: \(error.message)")
         }
     }
 }
