@@ -65,6 +65,23 @@ final class PendingAttentionClientTests: XCTestCase {
         } catch { XCTFail("unexpected error: \(error)") }
     }
 
+    func testRelayControlRouteUsesBearerTokenWithoutPluginStyle() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        StubURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.absoluteString, "http://relay.example:8793/attention/pending")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer token")
+            return (200, Data(#"{"server_instance_id":"relay","cursor":"pa1.relay.0","reset":true,"reset_reason":"initial_snapshot","upserts":[],"tombstones":[]}"#.utf8))
+        }
+        let client = RestClient(
+            baseURL: URL(string: "https://gateway.example")!, token: "token",
+            session: URLSession(configuration: configuration), pathStyle: .legacy,
+            relayControlBaseURL: URL(string: "http://relay.example:8793")!
+        )
+        let result = try await client.pendingAttention(cursor: nil)
+        XCTAssertEqual(result.serverInstanceId, "relay")
+    }
+
     @MainActor
     func testLaunchFetchAddsAttentionCreatedWhileAppWasTerminated() async throws {
         StubURLProtocol.handler = { _ in

@@ -74,12 +74,17 @@ struct RestClient: Sendable {
     /// Defaults to `.legacy` so an un-migrated construction site keeps today's
     /// behavior; ``ConnectionStore`` passes the probed style.
     let pathStyle: APIPathStyle
+    /// Relay-only control plane for durable attention/manifest reads.
+    let relayControlBaseURL: URL?
 
     /// - Parameters:
     ///   - baseURL: The gateway base, e.g. `https://host[:port]`.
     ///   - token: The session token sent as `X-Hermes-Session-Token`.
     ///   - pathStyle: Path family for the mobile endpoint group.
-    init(baseURL: URL, token: String, pathStyle: APIPathStyle = .legacy) {
+    init(
+        baseURL: URL, token: String, pathStyle: APIPathStyle = .legacy,
+        relayControlBaseURL: URL? = nil
+    ) {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = Self.timeout
         config.waitsForConnectivity = false
@@ -88,6 +93,7 @@ struct RestClient: Sendable {
             token: token,
             session: URLSession(configuration: config),
             pathStyle: pathStyle,
+            relayControlBaseURL: relayControlBaseURL,
             usesInjectedUploadSession: false
         )
     }
@@ -99,13 +105,15 @@ struct RestClient: Sendable {
         baseURL: URL,
         token: String,
         session: URLSession,
-        pathStyle: APIPathStyle = .legacy
+        pathStyle: APIPathStyle = .legacy,
+        relayControlBaseURL: URL? = nil
     ) {
         self.init(
             baseURL: baseURL,
             token: token,
             session: session,
             pathStyle: pathStyle,
+            relayControlBaseURL: relayControlBaseURL,
             usesInjectedUploadSession: true
         )
     }
@@ -115,12 +123,14 @@ struct RestClient: Sendable {
         token: String,
         session: URLSession,
         pathStyle: APIPathStyle,
+        relayControlBaseURL: URL?,
         usesInjectedUploadSession: Bool
     ) {
         self.baseURL = baseURL
         self.token = token
         self.session = session
         self.pathStyle = pathStyle
+        self.relayControlBaseURL = relayControlBaseURL
         self.usesInjectedUploadSession = usesInjectedUploadSession
     }
 
@@ -131,6 +141,7 @@ struct RestClient: Sendable {
             token: token,
             session: session,
             pathStyle: style,
+            relayControlBaseURL: relayControlBaseURL,
             usesInjectedUploadSession: usesInjectedUploadSession
         )
     }
@@ -647,6 +658,22 @@ struct RestClient: Sendable {
 
     func get(path: String) async throws -> Data {
         try await perform(makeRequest(path: path, method: "GET"))
+    }
+
+    func getRelayControl(path: String) async throws -> Data {
+        guard let relayControlBaseURL else {
+            throw RestError.badStatus(404, body: "relay control plane unavailable")
+        }
+        let parts = path.split(separator: "?", maxSplits: 1)
+        var url = relayControlBaseURL.appendingPathComponent(String(parts[0]).trimmingCharacters(in: CharacterSet(charactersIn: "/")))
+        if parts.count == 2, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            components.percentEncodedQuery = String(parts[1])
+            url = components.url ?? url
+        }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: Self.timeout)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        return try await perform(request)
     }
 
     /// JSON-encode a ``JSONValue`` request body, mapping failures to ``RestError``.

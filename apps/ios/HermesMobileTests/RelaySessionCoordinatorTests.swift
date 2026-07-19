@@ -168,6 +168,28 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(DefaultsKeys.transportPathValue(suite), .relay)
     }
 
+    func testRelayControlURLUsesHTTPSiblingAndDropsWebSocketPath() {
+        let key = DefaultsKeys.transportPath
+        let previous = UserDefaults.standard.string(forKey: key)
+        let previousOverride = UserDefaults.standard.string(forKey: DefaultsKeys.relayURLOverride)
+        UserDefaults.standard.set(TransportPath.relay.rawValue, forKey: key)
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.relayURLOverride)
+        defer {
+            if let previous { UserDefaults.standard.set(previous, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+            if let previousOverride {
+                UserDefaults.standard.set(previousOverride, forKey: DefaultsKeys.relayURLOverride)
+            } else {
+                UserDefaults.standard.removeObject(forKey: DefaultsKeys.relayURLOverride)
+            }
+        }
+        let connection = ConnectionStore(sessionStore: SessionStore(), chatStore: ChatStore())
+        let url = connection.relayControlURL(
+            forGateway: URL(string: "https://gateway.example:9119")!
+        )
+        XCTAssertEqual(url?.absoluteString, "https://gateway.example:9119")
+    }
+
     // MARK: - (2) ChatStore projection
 
     func testApplyRelayItemsProjectsTranscript() {
