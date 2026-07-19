@@ -787,6 +787,27 @@ struct ChatView: View {
     /// backing is painted BEHIND the composer on ALL OS versions so the composer
     /// floats over a clean substrate while the transcript's `EdgeFadeMask`
     /// dissolves the scrolling text above it (see `TranscriptEdgeEffect`).
+    /// The Turn Dock's active surface (Wave 25) — one interactive element at a
+    /// time, by priority (approval > clarify > tasks > queued). Shared with the
+    /// inline-todo suppression below so the dock and the transcript never
+    /// disagree about who owns the task list.
+    private var dockContent: TurnDockContent {
+        TurnDockContent.resolve(
+            hasApproval: chatStore.pendingApproval != nil,
+            hasClarification: chatStore.pendingClarification != nil,
+            hasTasks: chatStore.latestTodoList != nil,
+            hasQueued: TurnDock.hasQueued(queueStore)
+        )
+    }
+
+    /// The todo `tool_call_id` whose inline ``TodoCardView`` the transcript must
+    /// suppress — non-nil ONLY while the dock is actually showing the task box for
+    /// that same list, so the list is never hidden when the dock isn't rendering
+    /// it (e.g. an approval preempts the task box).
+    private var dockSuppressedTodoToolID: String? {
+        dockContent == .tasks ? chatStore.latestTodoToolID : nil
+    }
+
     @ViewBuilder
     private func bottomStack(proxy: ScrollViewProxy) -> some View {
         VStack(spacing: 8) {
@@ -794,6 +815,10 @@ struct ChatView: View {
             if isCompact && !atBottom {
                 scrollToBottomPill(proxy: proxy)
             }
+            // Wave 25: the Turn Dock — the single home for interactive elements
+            // (approval / clarify / tasks / queued), attached directly above the
+            // frozen composer.
+            TurnDock(chatStore: chatStore, queueStore: queueStore, themeStore: themeStore)
             ComposerView(
                 chatStore: chatStore,
                 attachmentStore: attachmentStore,
@@ -1003,7 +1028,8 @@ struct ChatView: View {
                         appearance: BubbleAppearance(themeID: theme.id, colorScheme: colorScheme, typeSize: dynamicTypeSize),
                         delivery: delivery,
                         onResend: deliveryResendHandler(for: delivery),
-                        onDeleteFailedSend: deliveryDeleteHandler(for: delivery, clientMessageID: message.clientMessageID)
+                        onDeleteFailedSend: deliveryDeleteHandler(for: delivery, clientMessageID: message.clientMessageID),
+                        suppressedTodoToolID: dockSuppressedTodoToolID
                     )
                     // A1 (scarf): settled bubbles short-circuit their body — only the
                     // streaming bubble (whose `message` changed) re-evaluates. Drops the
@@ -1032,22 +1058,12 @@ struct ChatView: View {
                         ))
                         .id("hermes.chat.auto-compaction-indicator")
                 }
-                // ABH-83: Inline approval card — rendered as ADDITIVE transcript
-                // content after the last message when there is a pending approval
-                // for the current session. This is pure additive content: it does
-                // not touch any scroll/anchor/keyboard machinery. The existing
-                // re-pin-on-settle (BottomEdgeScroll / pendingLandOnNewest /
-                // scrollToBottomIfNeeded) naturally keeps this card visible when
-                // it appears at the tail, exactly like a new message row.
-                // The card disappears when pendingApproval is cleared (respondApproval
-                // sets it nil, expireTurnScopedPrompts sets it nil on turn end /
-                // session switch) — no manual lifecycle needed.
-                if let approval = chatStore.pendingApproval {
-                    ApprovalCard(approval: approval, chatStore: chatStore)
-                        .padding(.top, Self.intraTurnGap)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
-                        .id("inline-approval-\(approval.id)")
-                }
+                // Wave 25: the pending-approval card is no longer injected inline
+                // here — it now lives in the Turn Dock (attached above the
+                // composer), the single home for interactive elements. See
+                // `bottomStack` → `TurnDock`. Its lifecycle is unchanged
+                // (pendingApproval cleared by respondApproval / turn end / session
+                // switch); only its mount point moved.
                 // Session context line (STR-1029 §4): a small, muted,
                 // desktop-parity line at the transcript edge that surfaces the
                 // attached workspace/cwd when one exists. Reuses
@@ -1647,10 +1663,10 @@ struct ChatView: View {
                 )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            if let clarification = chatStore.pendingClarification {
-                ClarifyBanner(clarification: clarification, chatStore: chatStore)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
+            // Wave 25: the clarify card moved into the Turn Dock (attached above
+            // the composer) for one consistent home alongside approval / tasks /
+            // queued. See `bottomStack` → `TurnDock`. Its design and respond
+            // wiring are unchanged.
             if let deviceLimitAdvisory = connectionStore.deviceLimitAdvisory {
                 deviceLimitAdvisoryBanner(deviceLimitAdvisory)
                     .transition(.move(edge: .top).combined(with: .opacity))
