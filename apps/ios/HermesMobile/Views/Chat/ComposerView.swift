@@ -1,6 +1,7 @@
 import PhotosUI
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 /// The bottom input: a TWO-ROW rounded card (F3 composer — Claude-iOS anatomy).
 ///
