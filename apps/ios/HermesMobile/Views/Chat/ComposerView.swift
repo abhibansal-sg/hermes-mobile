@@ -1304,17 +1304,24 @@ struct ComposerView: View {
         defer { fileAttachInFlight = false }
 
         for url in urls {
-            let scoped = url.startAccessingSecurityScopedResource()
             let filename = url.lastPathComponent
-            let data: Data?
-            do {
-                data = try Data(contentsOf: url)
-            } catch {
-                data = nil
-                fileAttachError = "Couldn't read \(filename): \(error.localizedDescription)"
+            // Size-guard THEN read entirely off the main actor. `.fileImporter`
+            // allows `.item`, so a pick may be a multi-GB video/archive; reading it
+            // synchronously on @MainActor before the (post-read) 25 MB cap could
+            // hang the UI and OOM the app. The detached task checks the on-disk
+            // size first and rejects over-cap picks without ever loading them.
+            let outcome = await Task.detached(priority: .userInitiated) {
+                AttachmentStore.readPickedFileData(at: url)
+            }.value
+
+            let bytes: Data
+            switch outcome {
+            case .success(let data):
+                bytes = data
+            case .failure(let message):
+                fileAttachError = message
+                continue
             }
-            if scoped { url.stopAccessingSecurityScopedResource() }
-            guard let bytes = data else { continue }
 
             do {
                 let attached = try await attachmentStore.attachFile(

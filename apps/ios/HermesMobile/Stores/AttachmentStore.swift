@@ -160,6 +160,14 @@ final class AttachmentStore {
     /// instead of a round-trip that ends in a 413.
     static let maxFileAttachmentBytes = 25 * 1024 * 1024
 
+    /// Human-readable form of ``maxFileAttachmentBytes`` (e.g. "25 MB") for
+    /// oversize error messages. Shared by the pre-read size guard (ComposerView)
+    /// and the post-read ``validateFileAttachment`` check so both report the same
+    /// cap.
+    nonisolated static var maxFileAttachmentCapDescription: String {
+        ByteCountFormatter.string(fromByteCount: Int64(maxFileAttachmentBytes), countStyle: .file)
+    }
+
     /// Outcome of a successful ``attachFile(data:filename:sessionId:connection:)``.
     struct FileAttachResult: Sendable, Equatable {
         /// Filename the gateway stored the attachment under (may be de-duplicated).
@@ -190,8 +198,35 @@ final class AttachmentStore {
     /// Build a `data:<mime>;base64,<payload>` URL for `data`. The gateway's
     /// `file.attach` decoder tolerates any media type here (unlike the image-only
     /// `image.attach_bytes` path).
-    static func fileDataURL(_ data: Data, mimeType: String) -> String {
+    nonisolated static func fileDataURL(_ data: Data, mimeType: String) -> String {
         "data:\(mimeType);base64,\(data.base64EncodedString())"
+    }
+
+    /// Read a picked file's bytes for attachment, enforcing ``maxFileAttachmentBytes``
+    /// BEFORE the read so an over-cap pick (a `.fileImporter` accepting `.item` can
+    /// hand back a multi-GB video/archive) is rejected off the fast path without ever
+    /// loading it into memory — the earlier post-read cap could hang the UI and OOM
+    /// the app first. Acquires the URL's security scope for the read only.
+    ///
+    /// `nonisolated` so the composer runs it off the main actor via `Task.detached`;
+    /// returns a ready-to-display message (not an `AttachmentError`, whose prefix
+    /// would double up) on an over-cap file or unreadable path.
+    nonisolated static func readPickedFileData(at url: URL) -> Result<Data, String> {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+           size > maxFileAttachmentBytes {
+            return .failure("File is too large (max \(maxFileAttachmentCapDescription)).")
+        }
+        do {
+            // Fully resident read (NOT .mappedIfSafe): the size guard above bounds
+            // this to <= 25 MB, and the mapped variant would fault pages lazily
+            // after the security scope is released on return — risking SIGBUS when
+            // the bytes are base64-encoded later.
+            return .success(try Data(contentsOf: url))
+        } catch {
+            return .failure("Couldn't read \(url.lastPathComponent): \(error.localizedDescription)")
+        }
     }
 
     /// Validate a freshly-picked non-image file before any network work: reject
@@ -203,8 +238,7 @@ final class AttachmentStore {
             throw AttachmentError.failed("The file is empty.")
         }
         guard data.count <= maxFileAttachmentBytes else {
-            let cap = ByteCountFormatter.string(fromByteCount: Int64(maxFileAttachmentBytes), countStyle: .file)
-            throw AttachmentError.failed("File is too large (max \(cap)).")
+            throw AttachmentError.failed("File is too large (max \(maxFileAttachmentCapDescription)).")
         }
         return detectedMimeType(forFilename: filename)
     }
@@ -230,7 +264,11 @@ final class AttachmentStore {
             throw AttachmentError.notConfigured
         }
         let client = connection.client
-        let dataURL = Self.fileDataURL(data, mimeType: mime)
+        // Base64-encode off the main actor: for a file at the 25 MB cap this is a
+        // multi-MB string build that would otherwise block the UI on @MainActor.
+        let dataURL = await Task.detached(priority: .userInitiated) {
+            Self.fileDataURL(data, mimeType: mime)
+        }.value
         let result: JSONValue
         do {
             result = try await client.requestRaw(
