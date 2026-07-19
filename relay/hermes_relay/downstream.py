@@ -49,6 +49,7 @@ from typing import Any, Optional
 from . import plugin_bridge
 from .bus import TOPIC_RELAY_FRAMES, EventBus
 from .gateway_client import GatewayClient
+from .durable_state import DurableState
 from .session_state import SessionStore
 from .types import Frame, FrameKind, UpstreamMethod, UpstreamRequest
 
@@ -258,11 +259,13 @@ class DownstreamServer:
         bus: EventBus,
         gateway: GatewayClient,
         store: SessionStore,
+        durable: Optional[DurableState] = None,
     ) -> None:
         self._cfg = config
         self._bus = bus
         self._gateway = gateway
         self._store = store
+        self._durable = durable
         self._ring = None  # set in start(): reused ReplayRingManager
         self._conns: dict[str, PhoneConnection] = {}
         self._server = None
@@ -309,7 +312,7 @@ class DownstreamServer:
         finally:
             await self.close()
 
-    def _process_request(self, connection: Any, request: Any) -> Any:
+    async def _process_request(self, connection: Any, request: Any) -> Any:
         """Serve a plain-HTTP health/status probe on the phone-facing port.
 
         websockets calls this before the WS handshake for every inbound request.
@@ -330,6 +333,26 @@ class DownstreamServer:
                 return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
             if health and path == health:
                 body = json.dumps(self.status(), ensure_ascii=False) + "\n"
+                return connection.respond(HTTPStatus.OK, body)
+            if path == "/attention/pending" and self._durable is not None:
+                from urllib.parse import parse_qs, urlsplit
+
+                cursor = parse_qs(urlsplit(raw_path).query).get("cursor", [None])[0]
+                body = json.dumps(self._durable.pending_attention(cursor)) + "\n"
+                return connection.respond(HTTPStatus.OK, body)
+            if path == "/sync/manifest" and self._durable is not None:
+                from urllib.parse import parse_qs, urlsplit
+
+                query = parse_qs(urlsplit(raw_path).query)
+                try:
+                    sessions = await self._gateway.session_list(100_000)
+                except Exception:
+                    _log.warning("sync manifest gateway snapshot failed", exc_info=True)
+                    return connection.respond(HTTPStatus.SERVICE_UNAVAILABLE, "Unavailable\n")
+                body = json.dumps(self._durable.sync_manifest(
+                    query.get("profile", ["all"])[0],
+                    query.get("cursor", [None])[0], sessions,
+                )) + "\n"
                 return connection.respond(HTTPStatus.OK, body)
             return None
         except Exception:  # pragma: no cover - a broken probe must not stall serve
@@ -449,6 +472,8 @@ class DownstreamServer:
 
     async def _dispatch(self, frame: Frame) -> None:
         """Fan one Reframer frame out to every connection (per-connection seq)."""
+        if self._durable is not None:
+            self._durable.observe_frame(frame)
         for conn in list(self._conns.values()):
             try:
                 await conn.send_frame(frame)
@@ -587,16 +612,28 @@ class DownstreamServer:
             # ``decision`` is the phone's chosen gate answer (once/session/always/
             # deny/approve); the gateway maps it onto its ``choice`` param. ``all``
             # (optional) applies the decision to every matching pending approval.
-            return await self._gateway.approval_respond(
+            result = await self._gateway.approval_respond(
                 p["session_id"],
                 p.get("request_id", ""),
                 p["decision"],
                 resolve_all=bool(p.get("all", False)),
             )
+            if self._durable is not None:
+                self._durable.resolve_attention(
+                    request_id=None if p.get("all") else p.get("request_id") or None,
+                    session_id=p["session_id"], kind="approval",
+                )
+            return result
         if method == UpstreamMethod.CLARIFY:
-            return await self._gateway.clarify_respond(
+            result = await self._gateway.clarify_respond(
                 p["session_id"], p.get("request_id", ""), p["text"]
             )
+            if self._durable is not None:
+                self._durable.resolve_attention(
+                    request_id=p.get("request_id") or None,
+                    session_id=p["session_id"], kind="clarify",
+                )
+            return result
         if method == UpstreamMethod.INTERRUPT:
             return await self._gateway.session_interrupt(p["session_id"])
 

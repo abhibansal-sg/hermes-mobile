@@ -46,6 +46,7 @@ inject a fake.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -54,6 +55,7 @@ from typing import Any, Callable, Optional
 from . import plugin_bridge
 from .bus import EventBus, TOPIC_RELAY_FRAMES
 from .gateway_client import GatewayClient
+from .durable_state import DurableState
 from .types import Frame, FrameKind, ItemType
 
 _log = logging.getLogger(__name__)
@@ -123,6 +125,7 @@ class Notifier:
         *,
         is_foregrounded: Callable[[str], bool],
         push_engine: Any = None,
+        durable: Optional[DurableState] = None,
     ) -> None:
         self._cfg = config
         self._bus = bus
@@ -132,6 +135,7 @@ class Notifier:
         # Injected push_engine module (plugin_bridge.import_push_engine()); a
         # fake is injected in tests. Resolved lazily in run() if None.
         self._push = push_engine
+        self._durable = durable
         # Bounded LRU of already-fired signal identities (dedupe). Value unused;
         # OrderedDict gives O(1) move-to-end + evict-oldest.
         self._seen: "OrderedDict[tuple[str, str, str], None]" = OrderedDict()
@@ -148,6 +152,7 @@ class Notifier:
         if self._push is None:
             self._push = plugin_bridge.import_push_engine()
         sub = self._bus.subscribe(TOPIC_RELAY_FRAMES)
+        drain_task = asyncio.create_task(self._drain_loop()) if self._durable else None
         try:
             async for frame in sub:
                 try:
@@ -155,7 +160,15 @@ class Notifier:
                 except Exception:  # pragma: no cover - defensive
                     _log.debug("notifier.observe failed", exc_info=True)
         finally:
+            if drain_task is not None:
+                drain_task.cancel()
+                await asyncio.gather(drain_task, return_exceptions=True)
             self._bus.unsubscribe(sub)
+
+    async def _drain_loop(self) -> None:
+        while True:
+            self._drain_outbox()
+            await asyncio.sleep(1)
 
     def observe(self, frame: Frame) -> Optional[dict[str, Any]]:
         """Decide whether ``frame`` warrants a push; fire it if so.
@@ -284,30 +297,39 @@ class Notifier:
         # the same banner rather than stacking.
         collapse_id = f"{sid}:{event_type}:{self._identity(event_type, frame)[2]}"
 
+        descriptor = {
+            "event_type": event_type, "sid": sid, "title": title,
+            "body": body_text, "category": category, "expiration": expiration,
+            "collapse_id": collapse_id, "payload": payload,
+        }
+        if self._durable is not None:
+            self._durable.enqueue_push(descriptor)
+            self._drain_outbox()
+        else:
+            self._send(descriptor)
+
+        return descriptor
+
+    def _send(self, descriptor: dict[str, Any]) -> int:
         if self._push is not None:
             try:
-                self._push.notify(
-                    event_type,
-                    title,
-                    body_text,
-                    payload,
-                    category=category,
-                    expiration=expiration,
-                    collapse_id=collapse_id,
-                )
+                return int(self._push.notify(
+                    descriptor["event_type"], descriptor["title"], descriptor["body"],
+                    descriptor["payload"], category=descriptor["category"],
+                    expiration=descriptor["expiration"], collapse_id=descriptor["collapse_id"],
+                ))
             except Exception:  # pragma: no cover - notify() never raises, belt+braces
                 _log.debug("push_engine.notify failed", exc_info=True)
+        return 0
 
-        return {
-            "event_type": event_type,
-            "sid": sid,
-            "title": title,
-            "body": body_text,
-            "category": category,
-            "expiration": expiration,
-            "collapse_id": collapse_id,
-            "payload": payload,
-        }
+    def _drain_outbox(self) -> None:
+        if self._durable is None:
+            return
+        for descriptor in self._durable.due_pushes():
+            delivered = self._send(descriptor) > 0
+            self._durable.finish_push(
+                descriptor["_event_id"], delivered, descriptor["_attempts"]
+            )
 
     def _render(self, event_type: str, frame: Frame) -> tuple[str, str, str, int]:
         """Return ``(title, body, category, expiration)`` for a push.

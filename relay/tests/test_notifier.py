@@ -17,9 +17,11 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from pathlib import Path
 
 from hermes_relay.bus import EventBus, TOPIC_RELAY_FRAMES
 from hermes_relay.notifier import Notifier, NotifierConfig
+from hermes_relay.durable_state import DurableState
 from hermes_relay.types import Frame, FrameKind, Item, ItemStatus, ItemType
 
 
@@ -127,6 +129,23 @@ def test_turn_complete_fires_when_phone_absent():
     assert call["category"] == "HERMES_TURN"
     assert call["expiration"] == 14400
     assert notifier.metrics.fired == 1
+
+
+def test_durable_outbox_prevents_refire_after_restart(tmp_path: Path):
+    push = FakePush()
+    state = DurableState(tmp_path / "state.sqlite3")
+    notifier = Notifier(
+        NotifierConfig(), EventBus(), FakeGateway({"s1"}),
+        is_foregrounded=lambda _: False, push_engine=push, durable=state,
+    )
+    notifier.observe(_approval("s1"))
+    restarted = Notifier(
+        NotifierConfig(), EventBus(), FakeGateway({"s1"}),
+        is_foregrounded=lambda _: False, push_engine=push,
+        durable=DurableState(state.path),
+    )
+    restarted.observe(_approval("s1"))
+    assert len(push.calls) == 1
 
 
 def test_turn_complete_suppressed_when_foregrounded():

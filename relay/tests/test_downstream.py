@@ -732,7 +732,7 @@ async def test_process_request_serves_health_path():
     c = _FakeConn()
     from http import HTTPStatus
 
-    out = srv._process_request(c, _FakeRequest("/healthz?probe=1"))
+    out = await srv._process_request(c, _FakeRequest("/healthz?probe=1"))
     assert out is not None  # a response was produced (handshake short-circuited)
     status, body = c.responded
     assert status == HTTPStatus.OK
@@ -740,12 +740,53 @@ async def test_process_request_serves_health_path():
     assert "connections" in parsed and "listen" in parsed
 
 
+async def test_process_request_serves_durable_attention(tmp_path):
+    from hermes_relay.durable_state import DurableState
+
+    srv, _ = _server()
+    srv._durable = DurableState(tmp_path / "state.sqlite3")
+    srv._durable.observe_frame(
+        Frame(sid="s1", kind=FrameKind.APPROVAL_REQUEST, body={"id": "a1"})
+    )
+    c = _FakeConn()
+    await srv._process_request(c, _FakeRequest("/attention/pending"))
+    parsed = json.loads(c.responded[1])
+    assert parsed["reset"] is True
+    assert parsed["upserts"][0]["request_id"] == "a1"
+
+
+async def test_process_request_serves_sync_manifest_from_gateway_list(tmp_path):
+    from hermes_relay.durable_state import DurableState
+
+    srv, gw = _server()
+    srv._durable = DurableState(tmp_path / "state.sqlite3")
+    gw.session_list.return_value = [{"id": "s1", "title": "Fresh", "message_count": 3}]
+    c = _FakeConn()
+    await srv._process_request(c, _FakeRequest("/sync/manifest?profile=all"))
+    parsed = json.loads(c.responded[1])
+    assert parsed["sessions"][0]["id"] == "s1"
+    assert parsed["transcript_heads"] == {"s1": 3}
+    gw.session_list.assert_awaited_once_with(100_000)
+
+
+async def test_process_request_reports_manifest_snapshot_failure(tmp_path):
+    from http import HTTPStatus
+    from hermes_relay.durable_state import DurableState
+
+    srv, gw = _server()
+    srv._durable = DurableState(tmp_path / "state.sqlite3")
+    gw.session_list.side_effect = ConnectionError("gateway unavailable")
+    c = _FakeConn()
+    await srv._process_request(c, _FakeRequest("/sync/manifest?profile=all"))
+    assert c.responded[0] == HTTPStatus.SERVICE_UNAVAILABLE
+
+
 async def test_process_request_authenticates_health_path():
     srv, _ = _server()
     srv._cfg.auth_token = "secret"
     await srv.start()
     c = _FakeConn()
-    srv._process_request(c, _FakeRequest("/healthz"))
+    await srv._process_request(c, _FakeRequest("/healthz"))
     from http import HTTPStatus
     assert c.responded[0] == HTTPStatus.UNAUTHORIZED
 
@@ -755,7 +796,7 @@ async def test_process_request_ignores_non_health_paths():
     await srv.start()
     c = _FakeConn()
     # A normal WS upgrade path returns None so the handshake proceeds.
-    assert srv._process_request(c, _FakeRequest("/ws")) is None
+    assert await srv._process_request(c, _FakeRequest("/ws")) is None
     assert c.responded is None
 
 
@@ -764,7 +805,7 @@ async def test_process_request_rejects_unauthenticated_websocket():
     srv._cfg.auth_token = "secret"
     await srv.start()
     c = _FakeConn()
-    srv._process_request(c, _FakeRequest("/ws"))
+    await srv._process_request(c, _FakeRequest("/ws"))
     from http import HTTPStatus
     assert c.responded[0] == HTTPStatus.UNAUTHORIZED
 
@@ -775,7 +816,7 @@ async def test_process_request_accepts_authenticated_websocket():
     await srv.start()
     c = _FakeConn()
     request = _FakeRequest("/ws", {"Authorization": "Bearer secret"})
-    assert srv._process_request(c, request) is None
+    assert await srv._process_request(c, request) is None
     assert c.responded is None
 
 
@@ -784,7 +825,7 @@ async def test_process_request_disabled_when_no_health_path():
     srv._cfg.health_path = None
     await srv.start()
     c = _FakeConn()
-    assert srv._process_request(c, _FakeRequest("/healthz")) is None
+    assert await srv._process_request(c, _FakeRequest("/healthz")) is None
     assert c.responded is None
 
 
@@ -794,6 +835,6 @@ async def test_disabling_health_does_not_disable_websocket_auth():
     srv._cfg.auth_token = "secret"
     await srv.start()
     c = _FakeConn()
-    srv._process_request(c, _FakeRequest("/ws"))
+    await srv._process_request(c, _FakeRequest("/ws"))
     from http import HTTPStatus
     assert c.responded[0] == HTTPStatus.UNAUTHORIZED
