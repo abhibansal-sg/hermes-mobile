@@ -62,14 +62,26 @@ import UserNotifications
 /// > pushed panels — painted in the active palette. The `ThemeStore` must already
 /// > be in the environment at the call site (it is, app-wide).
 ///
-/// ## Layout (native grouped sections)
+/// ## Layout (headed grouped sections — W25 restructure)
 ///
-/// An account+server **card** (display name, server URL) sits in the first
-/// section as content; the rest is grouped settings sections: Appearance + the
-/// control panels (each a push), inline Toggles (Notifications, Security),
-/// Connection (server value + destructive Disconnect), and About (version + push).
-/// Simple settings render their value inline via `LabeledContent` and never push;
-/// the control panels push within this sheet's own stack.
+/// Nine headed sections replace the earlier flat wall of unlabeled `Section`s:
+/// **Account** (name + Nous credits), **Appearance** (theme + Personality),
+/// **Connection** (server, Devices, Go Offline, destructive Forget Gateway),
+/// **Notifications** (master + per-event toggles + Read replies aloud),
+/// **Models & Keys** (Model panel, Model provider keys, Toolset keys),
+/// **Privacy & Security** (App Lock, Secrets biometric gate, File
+/// @-mentions), **Agent & Panels** (Usage, Automations, Skills, Learning
+/// Journey, Artifacts, Webhooks), **Advanced** (approval-bypass escalation,
+/// Relay Push, Gateway Status, System Logs, Share debug report, the
+/// experimental relay-transport toggle), and **About**. Every row from the
+/// prior flat layout remains reachable — only headers, grouping, and a few
+/// jargon-y labels changed; no bindings or behavior moved. Appearance stays
+/// second (right after Account) deliberately: it is the row a pre-existing
+/// regression test (and real users) reach with NO scroll, and the native
+/// `.insetGrouped` `List`'s lazy row materialization means anything much
+/// further down is not reliably hittable on first render. Simple settings
+/// render their value inline via `LabeledContent` and never push; the control
+/// panels push within this sheet's own stack.
 struct SettingsView: View {
     /// Owns the connection lifecycle (server URL, disconnect, control client).
     let connectionStore: ConnectionStore
@@ -181,30 +193,24 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
-                #if DEBUG
-                if Self.providerKeySurvivalSeedEnabled {
-                    modelProviderSection
-                }
-                #endif
                 accountSection
-                appearanceAndPanelsSection
-                notificationsAndSecuritySection
-                voiceSection
-                relayPushSection
-                approvalBypassSection
-                devicesSection
-                #if DEBUG
-                if !Self.providerKeySurvivalSeedEnabled {
-                    modelProviderSection
-                }
-                #else
-                modelProviderSection
-                #endif
-                toolsetKeysSection
-                creditsBillingSection
-                debugShareSection
-                experimentalTransportSection
+                // Appearance stays second (right after the short Account
+                // card) so it is reachable without scrolling: on a native
+                // `.insetGrouped` List (UITableView-backed, lazy row
+                // materialization) pushing it behind Connection's + an
+                // expanded Notifications' rows put it 800-1000pt down the
+                // list — beyond one screen height on most devices — which
+                // broke both `testSettingsAppearanceRowOpensThemePicker()`
+                // (no scroll step) and real no-scroll taps. See the
+                // "no behavior change" reachability contract in the type
+                // doc above.
+                appearanceSection
                 connectionSection
+                notificationsSection
+                modelsAndKeysSection
+                privacySecuritySection
+                agentPanelsSection
+                advancedSection
                 aboutSection
             }
             .listStyle(.insetGrouped)
@@ -307,12 +313,14 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Account / server section (content card)
+    // MARK: - Account (name + Nous credits)
 
     /// The account header card: an avatar circle with the user's initials, the
-    /// editable display name, and the server URL. A single content card hosted in
-    /// the list's first section (Claude's "account email card"). It is content,
-    /// not chrome, so it keeps its themed card fill + hairline.
+    /// editable display name, and the server URL. Content, not chrome, so it
+    /// keeps its themed card fill + hairline. Note: the server URL is repeated
+    /// as an explicit "Server" row in ``connectionSection`` — this subtitle is
+    /// identity context on the account card, not a second source of truth.
+    @ViewBuilder
     private var accountSection: some View {
         Section {
             HStack(spacing: 14) {
@@ -336,6 +344,27 @@ struct SettingsView: View {
             }
             .padding(.vertical, 4)
             .listRowBackground(theme.card)
+
+            // Nous Credits (ABH-237 — view-only credits + auto-reload). Credits
+            // are display-only; top-up opens the portal URL in the browser, and
+            // the only in-app mutation is the existing auto-reload setting.
+            if connectionStore.control != nil {
+                NavigationLink {
+                    CreditsBillingView(client: connectionStore.client)
+                        .background(theme.bg)
+                } label: {
+                    SettingsRow(icon: "creditcard", title: "Nous credits", value: nil)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsNousCredits")
+
+                Text("View your Nous balance and manage auto-reload. Top-ups open in the browser.")
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+                    .listRowBackground(theme.card)
+            }
+        } header: {
+            Text("Account")
         }
     }
 
@@ -373,10 +402,10 @@ struct SettingsView: View {
                                                  : connectionStore.serverURLString
     }
 
-    // MARK: - Appearance + control panels
+    // MARK: - Appearance (theme + personality)
 
     @ViewBuilder
-    private var appearanceAndPanelsSection: some View {
+    private var appearanceSection: some View {
         Section {
             // Appearance — inline current theme name; tap pushes the picker within
             // this sheet's own NavigationStack via the system NavigationLink. The
@@ -392,21 +421,14 @@ struct SettingsView: View {
             .listRowBackground(theme.card)
             .accessibilityIdentifier("settingsAppearanceRow")
 
-            // Control panels — each pushes within this sheet's stack.
             if connectionStore.control != nil {
-                ForEach(ControlPanel.pushable) { panel in
-                    NavigationLink(value: panel) {
-                        SettingsRow(
-                            icon: panel.systemImage,
-                            title: panel.title,
-                            value: panel.inlineValue(connectionStore: connectionStore)
-                        )
-                    }
-                    .listRowBackground(theme.card)
-                    .accessibilityIdentifier(panel.accessibilityIdentifier)
-                }
+                panelLink(.personality)
             } else {
                 // Disconnected placeholder: describe + offer a Reconnect CTA.
+                // This is the ONE place the "reconnect to unlock control panels"
+                // affordance lives — Models & Keys / Agent & Panels / Advanced
+                // simply hide their control-only rows while disconnected instead
+                // of repeating this placeholder in four different sections.
                 VStack(alignment: .leading, spacing: 8) {
                     SettingsRow(
                         icon: "cpu",
@@ -426,13 +448,30 @@ struct SettingsView: View {
                 }
                 .listRowBackground(theme.card)
             }
+        } header: {
+            Text("Appearance")
         }
     }
 
-    // MARK: - Notifications + Security (inline toggles)
+    /// Shared control-panel row (icon + title + optional inline value +
+    /// chevron), used by every section that surfaces a ``ControlPanel``.
+    @ViewBuilder
+    private func panelLink(_ panel: ControlPanel) -> some View {
+        NavigationLink(value: panel) {
+            SettingsRow(
+                icon: panel.systemImage,
+                title: panel.title,
+                value: panel.inlineValue(connectionStore: connectionStore)
+            )
+        }
+        .listRowBackground(theme.card)
+        .accessibilityIdentifier(panel.accessibilityIdentifier)
+    }
+
+    // MARK: - Notifications (master + per-event toggles + spoken replies)
 
     @ViewBuilder
-    private var notificationsAndSecuritySection: some View {
+    private var notificationsSection: some View {
         Section {
             // Notifications — inline Toggle (master opt-in).
             // P0 PERMISSION BRIDGE: if the OS has denied notification access the
@@ -540,7 +579,40 @@ struct SettingsView: View {
                 }
             }
 
-            // Security — App Lock Toggle with dynamic biometric label.
+            // Read replies aloud (STR-344 / STR-533 ambient auto-speak).
+            // Default-off: reads a completed assistant reply aloud when
+            // hands-free conversation mode is NOT active. Conversation mode
+            // always speaks its own replies regardless of this toggle.
+            Toggle(isOn: Binding(
+                get: { DefaultsKeys.voiceAutoTTSValue() },
+                set: { UserDefaults.standard.set($0, forKey: DefaultsKeys.voiceAutoTTS) }
+            )) {
+                SettingsRowLabel(icon: "speaker.wave.2", title: "Read replies aloud")
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsVoiceAutoTTSToggle")
+        } header: {
+            Text("Notifications")
+        } footer: {
+            VStack(alignment: .leading, spacing: 6) {
+                if pushUnsupported {
+                    Text("Notifications are not supported by this server.")
+                } else if notifAuthStatus == .denied {
+                    Text("Notification access is blocked. Tap Notifications to open Settings and re-grant.")
+                } else if PushRegistrar.shared.isEnabled {
+                    Text("Choose which agent events notify you on this device.")
+                }
+                Text("Read replies aloud speaks each completed assistant reply when conversation mode is off.")
+            }
+        }
+    }
+
+    // MARK: - Privacy & Security
+
+    @ViewBuilder
+    private var privacySecuritySection: some View {
+        Section {
+            // App Lock Toggle with dynamic biometric label.
             Toggle(isOn: Binding(
                 get: { appLock.isEnabled },
                 set: { enabled in
@@ -562,6 +634,7 @@ struct SettingsView: View {
                 Text(appLockGuidance)
                     .font(.footnote)
                     .foregroundStyle(theme.mutedFg)
+                    .listRowBackground(theme.card)
                     .accessibilityIdentifier("settingsAppLockGuidance")
             }
 
@@ -585,34 +658,8 @@ struct SettingsView: View {
             }
             .listRowBackground(theme.card)
             .accessibilityIdentifier("settingsMentionAutocompleteToggle")
-        } footer: {
-            if pushUnsupported {
-                Text("Notifications are not supported by this server.")
-            } else if notifAuthStatus == .denied {
-                Text("Notification access is blocked. Tap Notifications to open Settings and re-grant.")
-            } else if PushRegistrar.shared.isEnabled {
-                Text("Choose which agent events notify you on this device.")
-            }
-        }
-    }
-
-    // MARK: - Voice (STR-344 / STR-533 ambient auto-speak)
-
-    private var voiceSection: some View {
-        Section {
-            // Default-off: reads a completed assistant reply aloud when
-            // hands-free conversation mode is NOT active. Conversation mode
-            // always speaks its own replies regardless of this toggle.
-            Toggle(isOn: Binding(
-                get: { DefaultsKeys.voiceAutoTTSValue() },
-                set: { UserDefaults.standard.set($0, forKey: DefaultsKeys.voiceAutoTTS) }
-            )) {
-                SettingsRowLabel(icon: "speaker.wave.2", title: "Read replies aloud")
-            }
-            .listRowBackground(theme.card)
-            .accessibilityIdentifier("settingsVoiceAutoTTSToggle")
-        } footer: {
-            Text("Speaks each completed assistant reply out loud when conversation mode is off.")
+        } header: {
+            Text("Privacy & Security")
         }
     }
 
@@ -651,246 +698,31 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Approval bypass (global escalation)
+    // MARK: - Agent & Panels (control panels needing a live control client)
 
     @ViewBuilder
-    private var approvalBypassSection: some View {
-        Section {
-            Toggle(isOn: Binding(
-                get: { connectionStore.sessionYolo },
-                set: { newValue in
-                    setGlobalYolo(newValue)
-                }
-            )) {
-                SettingsRowLabel(icon: "bolt.fill", title: "Global flow-state")
-            }
-            .disabled(globalYoloPending)
-            .listRowBackground(theme.card)
-            .accessibilityIdentifier("settingsGlobalYoloToggle")
-        } footer: {
-            Text("Escalates approval bypass globally across sessions. Use the composer bolt for this chat only.")
-        }
-    }
-
-    // MARK: - Relay Push (ABH-282 — plugin-mount only)
-
-    /// The relay-push ENABLE section — a single push to ``RelaySettingsView``.
-    /// Rendered only once the hermes-mobile plugin mount is available, because
-    /// the config route lives at `/api/plugins/hermes-mobile/relay/config`.
-    @ViewBuilder
-    private var relayPushSection: some View {
-        if connectionStore.capabilities.pluginMount == .available,
-           let rest = connectionStore.rest {
-            Section {
-                NavigationLink {
-                    RelaySettingsView(rest: rest)
-                        .background(theme.bg)
-                } label: {
-                    SettingsRow(icon: "antenna.radiowaves.left.and.right", title: "Relay Push", value: nil)
-                }
-                .listRowBackground(theme.card)
-                .accessibilityIdentifier("settingsRelayPush")
-            } footer: {
-                Text("Configure the optional relay URL and registration token used for relay push mode.")
-            }
-        }
-    }
-
-    // MARK: - Devices (W3A-A — feature-detected; hidden on a stock server)
-
-    /// The W3a Devices section — a single push to ``DevicesView`` (the native
-    /// device list + revoke + approval audit). Rendered ONLY when the connected
-    /// gateway advertises the `devices` capability AND a live REST client exists;
-    /// on a stock hermes-agent (`devices != .available`) the whole section is
-    /// absent and the legacy shared token is untouched (W3a stock degradation).
-    @ViewBuilder
-    private var devicesSection: some View {
-        if connectionStore.capabilities.devices == .available,
-           let rest = connectionStore.rest {
-            Section {
-                NavigationLink {
-                    DevicesView(
-                        rest: rest,
-                        serverURL: connectionStore.serverURLString,
-                        authenticator: LAContextAuthenticator()
-                    )
-                } label: {
-                    SettingsRow(icon: "iphone.and.arrow.forward", title: "Devices", value: nil)
-                }
-                .listRowBackground(theme.card)
-                .accessibilityIdentifier("settingsDevices")
-            } footer: {
-                Text("Manage the devices paired with this server and review who approved what.")
-            }
-        }
-    }
-
-    // MARK: - Model Provider (ABH-183 — feature-detected; plugin-mount only)
-
-    /// The ABH-183 Model Provider section — a single push to
-    /// ``ProviderListView`` (the provider universe + authenticated? + add-key /
-    /// custom-provider / disconnect affordances). Rendered ONLY when the
-    /// connected gateway advertises the plugin mount (these routes live on
-    /// `/api/plugins/hermes-mobile/providers`); on a stock hermes-agent
-    /// (`pluginMount != .available`) the whole section is absent (graceful stock
-    /// degradation). On a plugin-mount gateway that PREDATES the provider routes,
-    /// the list surfaces the 404 as an inline error.
-    @ViewBuilder
-    private var modelProviderSection: some View {
-        #if DEBUG
-        if Self.providerKeySurvivalSeedEnabled,
-           let rest = Self.providerKeySurvivalSeedRest {
-            Section {
-                NavigationLink {
-                    ProviderListView(
-                        rest: rest,
-                        debugSeedProviders: [Self.providerKeySurvivalSeedProvider]
-                    )
-                    .background(theme.bg)
-                } label: {
-                    SettingsRow(icon: "key.horizontal", title: "Model Provider", value: nil)
-                }
-                .listRowBackground(theme.card)
-                .accessibilityIdentifier("settingsModelProvider")
-            } footer: {
-                Text("Add or remove API keys for model providers. New chats use the provider you pick in Model.")
-            }
-        } else if connectionStore.capabilities.pluginMount == .available,
-                  let rest = connectionStore.rest {
-            liveModelProviderSection(rest: rest)
-        }
-        #else
-        if connectionStore.capabilities.pluginMount == .available,
-           let rest = connectionStore.rest {
-            liveModelProviderSection(rest: rest)
-        }
-        #endif
-    }
-
-    private func liveModelProviderSection(rest: RestClient) -> some View {
-        Section {
-            NavigationLink {
-                ProviderListView(rest: rest) {
-                    // Re-resolve the running model + repopulate the Model
-                    // picker so a newly-authenticated provider's models (or a
-                    // just-disconnected provider's removal) is reflected.
-                    Task { await connectionStore.refreshActiveModel() }
-                }
-                .background(theme.bg)
-            } label: {
-                SettingsRow(icon: "key.horizontal", title: "Model Provider", value: nil)
-            }
-            .listRowBackground(theme.card)
-            .accessibilityIdentifier("settingsModelProvider")
-        } footer: {
-            Text("Add or remove API keys for model providers. New chats use the provider you pick in Model.")
-        }
-    }
-
-    #if DEBUG
-    private static var providerKeySurvivalSeedEnabled: Bool {
-        ProcessInfo.processInfo.environment["HERMES_UITEST_PROVIDER_KEY_SURVIVAL"] == "1"
-    }
-
-    private static var providerKeySurvivalSeedRest: RestClient? {
-        guard let url = URL(string: "http://127.0.0.1") else { return nil }
-        return RestClient(baseURL: url, token: "uitest")
-    }
-
-    private static var providerKeySurvivalSeedProvider: ProviderRow {
-        ProviderRow(
-            slug: "openai",
-            name: "OpenAI",
-            authType: .apiKey,
-            isCurrent: false,
-            authenticated: false,
-            totalModels: 2,
-            models: ["gpt-5.5", "gpt-5.5-mini"]
-        )
-    }
-    #endif
-
-    // MARK: - Toolset Keys (ABH-262 — feature-detected; plugin-mount only)
-
-    /// The ABH-262 Toolset Keys section — a single push to
-    /// ``ToolsetConfigView`` (web + image_gen credential state, set, and
-    /// clear). Rendered ONLY when the connected gateway advertises the plugin
-    /// mount because the routes live at
-    /// `/api/plugins/hermes-mobile/toolsets/{name}/config`. Stored key values are
-    /// never returned by the gateway; the pushed form always starts blank.
-    @ViewBuilder
-    private var toolsetKeysSection: some View {
-        if connectionStore.capabilities.pluginMount == .available,
-           let rest = connectionStore.rest {
-            Section {
-                NavigationLink {
-                    ToolsetConfigView(rest: rest)
-                        .background(theme.bg)
-                } label: {
-                    SettingsRow(icon: "key.viewfinder", title: "Toolset Keys", value: nil)
-                }
-                .listRowBackground(theme.card)
-                .accessibilityIdentifier("settingsToolsetKeys")
-            } footer: {
-                Text("Add or clear keys for web search and image generation toolsets. Stored key values are never shown on the phone.")
-            }
-        }
-    }
-
-    // MARK: - Nous Credits / Billing (ABH-237 — view-only credits + auto-reload)
-
-    /// The ABH-237 credits/billing section — a single push to
-    /// ``CreditsBillingView``. Credits are display-only; top-up opens the portal
-    /// URL in the browser, and the only in-app mutation is the existing
-    /// auto-reload setting.
-    @ViewBuilder
-    private var creditsBillingSection: some View {
+    private var agentPanelsSection: some View {
         if connectionStore.control != nil {
             Section {
-                NavigationLink {
-                    CreditsBillingView(client: connectionStore.client)
-                        .background(theme.bg)
-                } label: {
-                    SettingsRow(icon: "creditcard", title: "Nous Credits", value: nil)
-                }
-                .listRowBackground(theme.card)
-                .accessibilityIdentifier("settingsNousCredits")
-            } footer: {
-                Text("View your Nous balance and manage auto-reload. Top-ups open in the browser.")
+                panelLink(.usage)
+                panelLink(.cron)
+                panelLink(.skills)
+                panelLink(.learning)
+                panelLink(.artifacts)
+                panelLink(.webhooks)
+            } header: {
+                Text("Agent & Panels")
             }
         }
     }
 
-    // MARK: - Debug share (ABH-223 — plugin-mount only)
+    // MARK: - Connection (server, devices, disconnect / forget)
 
-    @ViewBuilder
-    private var debugShareSection: some View {
-        if connectionStore.capabilities.pluginMount == .available,
-           connectionStore.rest != nil {
-            Section {
-                Button {
-                    generateDebugShare()
-                } label: {
-                    HStack(spacing: 12) {
-                        SettingsRowLabel(icon: "ladybug", title: "Share debug report")
-                        Spacer(minLength: 8)
-                        if debugSharePending {
-                            ProgressView()
-                                .controlSize(.small)
-                        }
-                    }
-                }
-                .disabled(debugSharePending)
-                .listRowBackground(theme.card)
-                .accessibilityIdentifier("settingsShareDebugReport")
-            } footer: {
-                Text("Generates a redacted support bundle on the server and opens a share/copy sheet.")
-            }
-        }
-    }
-
-    // MARK: - Connection
-
+    /// The W3a Devices row pushes ``DevicesView`` (the native device list +
+    /// revoke + approval audit). Rendered ONLY when the connected gateway
+    /// advertises the `devices` capability AND a live REST client exists; on a
+    /// stock hermes-agent (`devices != .available`) it is absent and the
+    /// legacy shared token is untouched (W3a stock degradation).
     @ViewBuilder
     private var connectionSection: some View {
         Section {
@@ -903,6 +735,26 @@ struct SettingsView: View {
                 SettingsRowLabel(icon: "network", title: "Server")
             }
             .listRowBackground(theme.card)
+
+            if connectionStore.capabilities.devices == .available,
+               let rest = connectionStore.rest {
+                NavigationLink {
+                    DevicesView(
+                        rest: rest,
+                        serverURL: connectionStore.serverURLString,
+                        authenticator: LAContextAuthenticator()
+                    )
+                } label: {
+                    SettingsRow(icon: "iphone.and.arrow.forward", title: "Devices", value: nil)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsDevices")
+
+                Text("Manage the devices paired with this server and review who approved what.")
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+                    .listRowBackground(theme.card)
+            }
 
             Button {
                 Task {
@@ -918,6 +770,7 @@ struct SettingsView: View {
             .listRowBackground(theme.card)
             .accessibilityIdentifier("settingsGoOffline")
 
+            // Destructive — stays last, gated behind two confirmations.
             Button(role: .destructive) {
                 confirmingForget = true
             } label: {
@@ -962,7 +815,234 @@ struct SettingsView: View {
             )) { Button("OK", role: .cancel) {} } message: {
                 Text(forgetAuthenticationError ?? "Authentication failed.")
             }
+        } header: {
+            Text("Connection")
         }
+    }
+
+    // MARK: - Models & Keys (model picker, provider keys, toolset keys)
+
+    /// Whether the section would render at least one visible row. Avoids a
+    /// header-with-no-rows flash when disconnected and the plugin mount isn't
+    /// known available yet.
+    private var modelsAndKeysSectionVisible: Bool {
+        if connectionStore.control != nil { return true }
+        if connectionStore.capabilities.pluginMount == .available, connectionStore.rest != nil { return true }
+        #if DEBUG
+        if Self.providerKeySurvivalSeedEnabled { return true }
+        #endif
+        return false
+    }
+
+    @ViewBuilder
+    private var modelsAndKeysSection: some View {
+        if modelsAndKeysSectionVisible {
+            Section {
+                if connectionStore.control != nil {
+                    panelLink(.model)
+                }
+                modelProviderRow
+                toolsetKeysRow
+            } header: {
+                Text("Models & Keys")
+            }
+        }
+    }
+
+    /// The ABH-183 Model provider keys row — a single push to
+    /// ``ProviderListView`` (the provider universe + authenticated? + add-key /
+    /// custom-provider / disconnect affordances). Rendered ONLY when the
+    /// connected gateway advertises the plugin mount (these routes live on
+    /// `/api/plugins/hermes-mobile/providers`); on a stock hermes-agent
+    /// (`pluginMount != .available`) the row is absent (graceful stock
+    /// degradation). On a plugin-mount gateway that PREDATES the provider
+    /// routes, the list surfaces the 404 as an inline error.
+    @ViewBuilder
+    private var modelProviderRow: some View {
+        #if DEBUG
+        if Self.providerKeySurvivalSeedEnabled,
+           let rest = Self.providerKeySurvivalSeedRest {
+            NavigationLink {
+                ProviderListView(
+                    rest: rest,
+                    debugSeedProviders: [Self.providerKeySurvivalSeedProvider]
+                )
+                .background(theme.bg)
+            } label: {
+                SettingsRow(icon: "key.horizontal", title: "Model provider keys", value: nil)
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsModelProvider")
+
+            Text("Add or remove API keys for model providers. New chats use the provider you pick in Model.")
+                .font(.footnote)
+                .foregroundStyle(theme.mutedFg)
+                .listRowBackground(theme.card)
+        } else if connectionStore.capabilities.pluginMount == .available,
+                  let rest = connectionStore.rest {
+            liveModelProviderRow(rest: rest)
+        }
+        #else
+        if connectionStore.capabilities.pluginMount == .available,
+           let rest = connectionStore.rest {
+            liveModelProviderRow(rest: rest)
+        }
+        #endif
+    }
+
+    @ViewBuilder
+    private func liveModelProviderRow(rest: RestClient) -> some View {
+        NavigationLink {
+            ProviderListView(rest: rest) {
+                // Re-resolve the running model + repopulate the Model
+                // picker so a newly-authenticated provider's models (or a
+                // just-disconnected provider's removal) is reflected.
+                Task { await connectionStore.refreshActiveModel() }
+            }
+            .background(theme.bg)
+        } label: {
+            SettingsRow(icon: "key.horizontal", title: "Model provider keys", value: nil)
+        }
+        .listRowBackground(theme.card)
+        .accessibilityIdentifier("settingsModelProvider")
+
+        Text("Add or remove API keys for model providers. New chats use the provider you pick in Model.")
+            .font(.footnote)
+            .foregroundStyle(theme.mutedFg)
+            .listRowBackground(theme.card)
+    }
+
+    #if DEBUG
+    private static var providerKeySurvivalSeedEnabled: Bool {
+        ProcessInfo.processInfo.environment["HERMES_UITEST_PROVIDER_KEY_SURVIVAL"] == "1"
+    }
+
+    private static var providerKeySurvivalSeedRest: RestClient? {
+        guard let url = URL(string: "http://127.0.0.1") else { return nil }
+        return RestClient(baseURL: url, token: "uitest")
+    }
+
+    private static var providerKeySurvivalSeedProvider: ProviderRow {
+        ProviderRow(
+            slug: "openai",
+            name: "OpenAI",
+            authType: .apiKey,
+            isCurrent: false,
+            authenticated: false,
+            totalModels: 2,
+            models: ["gpt-5.5", "gpt-5.5-mini"]
+        )
+    }
+    #endif
+
+    /// The ABH-262 Toolset keys row — a single push to ``ToolsetConfigView``
+    /// (web + image_gen credential state, set, and clear). Rendered ONLY when
+    /// the connected gateway advertises the plugin mount because the routes
+    /// live at `/api/plugins/hermes-mobile/toolsets/{name}/config`. Stored key
+    /// values are never returned by the gateway; the pushed form always
+    /// starts blank.
+    @ViewBuilder
+    private var toolsetKeysRow: some View {
+        if connectionStore.capabilities.pluginMount == .available,
+           let rest = connectionStore.rest {
+            NavigationLink {
+                ToolsetConfigView(rest: rest)
+                    .background(theme.bg)
+            } label: {
+                SettingsRow(icon: "key.viewfinder", title: "Toolset keys", value: nil)
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsToolsetKeys")
+
+            Text("Add or clear keys for web search and image generation toolsets. Stored key values are never shown on the phone.")
+                .font(.footnote)
+                .foregroundStyle(theme.mutedFg)
+                .listRowBackground(theme.card)
+        }
+    }
+
+    // MARK: - Advanced
+
+    @ViewBuilder
+    private var advancedSection: some View {
+        Section {
+            // Approval-bypass escalation. Renamed from the jargon-y "Global
+            // flow-state" (ABH audit finding) — the toggle's binding and RPC
+            // are unchanged, only the label + an explanatory caption are new.
+            Toggle(isOn: Binding(
+                get: { connectionStore.sessionYolo },
+                set: { newValue in
+                    setGlobalYolo(newValue)
+                }
+            )) {
+                SettingsRowLabel(icon: "bolt.fill", title: "Skip approvals (flow state)")
+            }
+            .disabled(globalYoloPending)
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsGlobalYoloToggle")
+
+            Text("Escalates approval bypass globally across sessions. Use the composer bolt for this chat only.")
+                .font(.footnote)
+                .foregroundStyle(theme.mutedFg)
+                .listRowBackground(theme.card)
+
+            // Relay Push (ABH-282 — plugin-mount only). Rendered only once the
+            // hermes-mobile plugin mount is available, because the config
+            // route lives at `/api/plugins/hermes-mobile/relay/config`.
+            if connectionStore.capabilities.pluginMount == .available,
+               let rest = connectionStore.rest {
+                NavigationLink {
+                    RelaySettingsView(rest: rest)
+                        .background(theme.bg)
+                } label: {
+                    SettingsRow(icon: "antenna.radiowaves.left.and.right", title: "Relay Push", value: nil)
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsRelayPush")
+
+                Text("Configure the optional relay URL and registration token used for relay push mode.")
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+                    .listRowBackground(theme.card)
+            }
+
+            if connectionStore.control != nil {
+                panelLink(.gateway)
+                panelLink(.logs)
+            }
+
+            // Debug share (ABH-223 — plugin-mount only).
+            if connectionStore.capabilities.pluginMount == .available,
+               connectionStore.rest != nil {
+                Button {
+                    generateDebugShare()
+                } label: {
+                    HStack(spacing: 12) {
+                        SettingsRowLabel(icon: "ladybug", title: "Share debug report")
+                        Spacer(minLength: 8)
+                        if debugSharePending {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+                }
+                .disabled(debugSharePending)
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("settingsShareDebugReport")
+
+                Text("Generates a redacted support bundle on the server and opens a share/copy sheet.")
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+                    .listRowBackground(theme.card)
+            }
+        } header: {
+            Text("Advanced")
+        }
+
+        // The experimental relay-transport toggle keeps its own header/footer
+        // (it is a distinct, clearly-labeled "Experimental" sub-block) and
+        // works exactly as before — only its position moved, into Advanced.
+        experimentalTransportSection
     }
 
     // MARK: - About (version inline + push)
@@ -975,6 +1055,8 @@ struct SettingsView: View {
             }
             .listRowBackground(theme.card)
             .accessibilityIdentifier("settingsAbout")
+        } header: {
+            Text("About")
         }
     }
 
@@ -986,12 +1068,6 @@ struct SettingsView: View {
     private enum ControlPanel: String, Identifiable, Hashable {
         case appearance, model, personality, usage, cron, skills, learning, gateway, artifacts, logs, webhooks, about
         var id: String { rawValue }
-
-        /// The panels that need a live control client (`appearance` + `about` do
-        /// NOT — they are local pages, excluded from ``pushable``).
-        static var pushable: [ControlPanel] {
-            [.model, .personality, .usage, .cron, .skills, .learning, .gateway, .artifacts, .logs, .webhooks]
-        }
 
         var title: String {
             switch self {
