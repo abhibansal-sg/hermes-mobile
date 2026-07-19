@@ -72,8 +72,9 @@ class DownstreamConfig:
     # HTTP health/status path served on the SAME phone-facing port (a plain GET,
     # not a WS upgrade). ``None`` disables the surface entirely.
     health_path: Optional[str] = "/healthz"
-    # The iOS client already sends the gateway token as a bearer credential;
-    # reuse it rather than adding a second secret or config surface.
+    # The iOS client sends either the shared gateway token or its gateway-issued
+    # device token. Reuse the existing device registry rather than adding a
+    # second relay credential or configuration surface.
     auth_token: str = ""
 
 
@@ -329,7 +330,7 @@ class DownstreamServer:
             path = raw_path.split("?", 1)[0]
             token = self._cfg.auth_token
             supplied = (getattr(request, "headers", {}) or {}).get("Authorization", "")
-            if token and not hmac.compare_digest(supplied, f"Bearer {token}"):
+            if token and not self._authorized(supplied, token):
                 return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
             if health and path == health:
                 body = json.dumps(self.status(), ensure_ascii=False) + "\n"
@@ -358,6 +359,21 @@ class DownstreamServer:
         except Exception:  # pragma: no cover - a broken probe must not stall serve
             _log.debug("health probe failed", exc_info=True)
             return None
+
+    @staticmethod
+    def _authorized(supplied: str, shared_token: str) -> bool:
+        """Accept the shared token or an active token from the reused registry."""
+        prefix = "Bearer "
+        if not supplied.startswith(prefix):
+            return False
+        presented = supplied[len(prefix):]
+        if hmac.compare_digest(presented, shared_token):
+            return True
+        try:
+            return plugin_bridge.import_device_tokens().match(presented) is not None
+        except Exception:
+            _log.warning("device-token validation failed", exc_info=True)
+            return False
 
     def status(self) -> dict[str, Any]:
         """A JSON-serialisable snapshot of the phone-facing server's live state."""

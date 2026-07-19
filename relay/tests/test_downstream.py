@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -818,6 +819,33 @@ async def test_process_request_accepts_authenticated_websocket():
     request = _FakeRequest("/ws", {"Authorization": "Bearer secret"})
     assert await srv._process_request(c, request) is None
     assert c.responded is None
+
+
+async def test_process_request_accepts_registered_device_token(monkeypatch):
+    srv, _ = _server()
+    srv._cfg.auth_token = "shared"
+    await srv.start()
+    registry = SimpleNamespace(
+        match=lambda token: {"device_id": "dev_1"} if token == "device" else None
+    )
+    monkeypatch.setattr(plugin_bridge, "import_device_tokens", lambda: registry)
+    c = _FakeConn()
+    request = _FakeRequest("/ws", {"Authorization": "Bearer device"})
+    assert await srv._process_request(c, request) is None
+
+
+async def test_process_request_rejects_unknown_device_token(monkeypatch):
+    srv, _ = _server()
+    srv._cfg.auth_token = "shared"
+    await srv.start()
+    monkeypatch.setattr(
+        plugin_bridge, "import_device_tokens",
+        lambda: SimpleNamespace(match=lambda _token: None),
+    )
+    c = _FakeConn()
+    await srv._process_request(c, _FakeRequest("/ws", {"Authorization": "Bearer unknown"}))
+    from http import HTTPStatus
+    assert c.responded[0] == HTTPStatus.UNAUTHORIZED
 
 
 async def test_process_request_disabled_when_no_health_path():
