@@ -290,6 +290,44 @@ enum CacheSchema {
             ).save(db)
         }
 
+        // v6 — cache-first Projects. Two scope-partitioned tables so the Projects
+        // tab paints from disk on a cold/offline launch (today it is in-memory
+        // only and blanks to "Not connected" while the session list paints fine):
+        //   • project_cache          — one row per project in the overview list,
+        //     keyed by (serverId, profileId, id); `orderIndex` preserves the
+        //     server's list order.
+        //   • project_session_cache  — one JSON snapshot of a project's detail
+        //     session list, keyed by (serverId, profileId, projectId).
+        // Purely ADDITIVE (new tables only) — no fingerprint bump, so no existing
+        // cache is nuked. Both are fully reconstructible from the gateway.
+        migrator.registerMigration("v6-projects") { db in
+            try db.create(table: "project_cache", ifNotExists: true) { t in
+                t.column("serverId", .text).notNull()
+                t.column("profileId", .text).notNull()
+                t.column("id", .text).notNull()
+                t.column("label", .text).notNull()
+                t.column("root", .text).notNull()
+                t.column("sessionCount", .integer).notNull().defaults(to: 0)
+                t.column("orderIndex", .integer).notNull().defaults(to: 0)
+                t.column("updatedAt", .double).notNull().defaults(to: 0)
+                t.primaryKey(["serverId", "profileId", "id"])
+            }
+            try db.create(
+                index: "project_cache_scope_order",
+                on: "project_cache",
+                columns: ["serverId", "profileId", "orderIndex"],
+                ifNotExists: true
+            )
+            try db.create(table: "project_session_cache", ifNotExists: true) { t in
+                t.column("serverId", .text).notNull()
+                t.column("profileId", .text).notNull()
+                t.column("projectId", .text).notNull()
+                t.column("sessionsJSON", .blob).notNull()
+                t.column("updatedAt", .double).notNull().defaults(to: 0)
+                t.primaryKey(["serverId", "profileId", "projectId"])
+            }
+        }
+
         return migrator
     }
 

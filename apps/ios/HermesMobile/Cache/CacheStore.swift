@@ -1026,4 +1026,77 @@ actor CacheStore {
             .filter(Column("id") == identity.sessionId)
             .fetchOne(db)
     }
+
+    // MARK: - Projects (cache-first Projects tab, CacheSchema v6)
+
+    /// Load the cached projects overview for `scope`, in the server's list order
+    /// (`orderIndex`). Empty when nothing has been persisted for this partition.
+    func loadProjects(scope: CacheScope) throws -> [Project] {
+        try db.read { db in
+            let records = try ProjectCacheRecord
+                .filter(Column("serverId") == scope.serverId)
+                .filter(Column("profileId") == scope.profileId)
+                .order(Column("orderIndex"))
+                .fetchAll(db)
+            return records.map {
+                Project(id: $0.id, label: $0.label, root: $0.root, sessionCount: $0.sessionCount)
+            }
+        }
+    }
+
+    /// Replace the persisted projects overview for `scope` with `projects`
+    /// (full-list write-through). The delete-then-insert runs in one transaction
+    /// so a reader never observes a partial list, and stale projects (deleted
+    /// server-side) never linger.
+    func saveProjects(_ projects: [Project], scope: CacheScope) throws {
+        let now = Date().timeIntervalSince1970
+        try db.write { db in
+            try ProjectCacheRecord
+                .filter(Column("serverId") == scope.serverId)
+                .filter(Column("profileId") == scope.profileId)
+                .deleteAll(db)
+            for (index, project) in projects.enumerated() {
+                try ProjectCacheRecord(
+                    serverId: scope.serverId,
+                    profileId: scope.profileId,
+                    id: project.id,
+                    label: project.label,
+                    root: project.root,
+                    sessionCount: project.sessionCount,
+                    orderIndex: index,
+                    updatedAt: now
+                ).insert(db)
+            }
+        }
+    }
+
+    /// Load the cached detail session snapshot for one project, or `nil` when no
+    /// snapshot has been persisted for this (scope, projectId).
+    func loadProjectSessions(scope: CacheScope, projectId: String) throws -> [SessionSummary]? {
+        try db.read { db in
+            guard let record = try ProjectSessionCacheRecord
+                .filter(Column("serverId") == scope.serverId)
+                .filter(Column("profileId") == scope.profileId)
+                .filter(Column("projectId") == projectId)
+                .fetchOne(db)
+            else { return nil }
+            return try? JSONDecoder().decode([SessionSummary].self, from: record.sessionsJSON)
+        }
+    }
+
+    /// Persist (upsert) a project's detail session snapshot for (scope, projectId).
+    func saveProjectSessions(
+        _ sessions: [SessionSummary], scope: CacheScope, projectId: String
+    ) throws {
+        let data = try JSONEncoder().encode(sessions)
+        try db.write { db in
+            try ProjectSessionCacheRecord(
+                serverId: scope.serverId,
+                profileId: scope.profileId,
+                projectId: projectId,
+                sessionsJSON: data,
+                updatedAt: Date().timeIntervalSince1970
+            ).save(db)
+        }
+    }
 }
