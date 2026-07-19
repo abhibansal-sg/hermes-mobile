@@ -48,6 +48,9 @@ class DurableState:
             CREATE TABLE IF NOT EXISTS active_turns (
               session_id TEXT PRIMARY KEY, turn_id TEXT, started_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS owned_sessions (
+              session_id TEXT PRIMARY KEY, added_at REAL NOT NULL
+            );
             """
         )
         db.execute(
@@ -128,6 +131,41 @@ class DurableState:
                 "INSERT OR REPLACE INTO attention(id,payload,deleted,revision) VALUES(?,?,0,?)",
                 (record_id, json.dumps(record), revision),
             )
+
+    # -- owned-session persistence (survives relay restart) ---------------
+    # The GatewayClient's in-memory ``_owned`` set is the live authority; these
+    # mirror it to disk so a relay restart re-resumes the phone's sessions
+    # instead of dropping them (the "destination session not active" failure).
+    # Only STABLE origin ids (what the phone sends) are persisted — connection-
+    # local live ids are re-learned on every reconnect and stay in-memory.
+
+    def add_owned_session(self, session_id: str, now: Optional[float] = None) -> None:
+        if not session_id:
+            return
+        with self._lock, closing(self._connect()) as db, db:
+            db.execute(
+                "INSERT OR IGNORE INTO owned_sessions(session_id, added_at) VALUES(?,?)",
+                (session_id, now or time.time()),
+            )
+
+    def remove_owned_session(self, session_id: str) -> None:
+        if not session_id:
+            return
+        with self._lock, closing(self._connect()) as db, db:
+            db.execute("DELETE FROM owned_sessions WHERE session_id=?", (session_id,))
+
+    def load_owned_sessions(self, max_age_s: float = 7 * 24 * 3600) -> set[str]:
+        """Load non-stale owned session ids. Empty set on any error (degrades to
+        in-memory-only behaviour)."""
+        try:
+            with self._lock, closing(self._connect()) as db:
+                cutoff = time.time() - max_age_s
+                rows = db.execute(
+                    "SELECT session_id FROM owned_sessions WHERE added_at>?", (cutoff,)
+                ).fetchall()
+                return {row["session_id"] for row in rows}
+        except Exception:
+            return set()
 
     def resolve_attention(
         self, *, request_id: Optional[str] = None, session_id: Optional[str] = None,

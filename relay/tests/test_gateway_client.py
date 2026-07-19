@@ -456,3 +456,56 @@ async def test_foreign_history_via_rest_no_ws_no_ownership():
     assert transport.methods_sent() == []
     assert not client.owns("tgsess001")
     await client.close()
+
+
+async def test_owned_sessions_survive_relay_restart(tmp_path):
+    """A relay RESTART (fresh GatewayClient on the same DurableState) must
+    re-seed its owned set from disk and re-resume the phone's sessions — the
+    'destination session not active' failure happened because the in-memory
+    _owned set was lost on restart, so the relay never re-drove the session."""
+    from hermes_relay.durable_state import DurableState
+
+    durable_path = tmp_path / "state.sqlite3"
+
+    # --- First relay process: phone drives a session, ownership is persisted ---
+    t1 = FakeTransport(responder=echo_responder)
+    bus1 = EventBus()
+    cfg = GatewayConfig(token="tok", port=9126, connect_timeout_s=0.5,
+                        backoff_initial_s=0.0, backoff_max_s=0.0)
+    durable1 = DurableState(durable_path)
+    client1 = GatewayClient(cfg, bus1, connector=one_shot_connector(t1),
+                            sleep=_noop_sleep, durable=durable1)
+    await client1.connect()
+    await client1.session_resume("phone-session")   # phone opens/drives a chat
+    assert client1.owns("phone-session")
+    assert "phone-session" in durable1.load_owned_sessions()
+    await client1.close()   # relay process exits
+
+    # --- Second relay process: fresh client, SAME durable DB ---
+    resumed_ids: list[str] = []
+
+    def tracking_responder(frame):
+        if frame["method"] == "session.resume":
+            resumed_ids.append(str((frame.get("params") or {}).get("session_id")))
+        return echo_responder(frame)
+
+    t2 = FakeTransport(responder=tracking_responder)
+    bus2 = EventBus()
+    durable2 = DurableState(durable_path)
+    client2 = GatewayClient(cfg, bus2, connector=one_shot_connector(t2),
+                            sleep=_noop_sleep, durable=durable2)
+    # The owned set is re-seeded from disk at construction — BEFORE any reconnect.
+    assert client2.owns("phone-session")
+
+    run_task = asyncio.create_task(client2.run())
+    await wait_until(lambda: client2._transport is t2 and client2._ready.is_set())
+    # run() re-establishes every durable-owned session on the fresh connection.
+    await wait_until(lambda: "phone-session" in resumed_ids)
+    assert "phone-session" in resumed_ids
+
+    await client2.close()
+    run_task.cancel()
+    try:
+        await run_task
+    except asyncio.CancelledError:
+        pass

@@ -254,6 +254,8 @@ def _server():
     gw.clarify_respond = AsyncMock(return_value={"ok": True})
     gw.session_interrupt = AsyncMock(return_value={"ok": True})
     gw.owns = MagicMock(return_value=False)
+    # Gateway-readiness gate: default to ready so upstream RPCs proceed.
+    gw.wait_ready = AsyncMock(return_value=True)
     # Default: no origin->live remap (gateway resumes in place). Individual
     # foreign-submit tests override session_resume/live_id_for to model a distinct
     # live id.
@@ -473,6 +475,36 @@ async def test_unknown_method_raises():
     await srv.start()
     with pytest.raises(ValueError):
         await _handle(srv, "bogus", {})
+
+
+async def test_gateway_readiness_gate_blocks_when_not_ready():
+    """When the gateway is not ready (relay just restarted), upstream RPCs that
+    hit the gateway raise ConnectionError instead of failing with a confusing
+    'gateway not connected' error. Local-only methods (ack/resync/foreground)
+    are unaffected."""
+    srv, gw = _server()
+    gw.wait_ready = AsyncMock(return_value=False)  # gateway not ready
+    await srv.start()
+
+    # Gateway-hitting methods raise ConnectionError
+    with pytest.raises(ConnectionError, match="relay gateway not ready"):
+        await _handle(srv, "list", {})
+    with pytest.raises(ConnectionError, match="relay gateway not ready"):
+        await _handle(srv, "submit", {"text": "hi"})
+    with pytest.raises(ConnectionError, match="relay gateway not ready"):
+        await _handle(srv, "resume", {"session_id": "s1"})
+
+    # Local-only methods still work
+    conn = srv.register(FakeWS())
+    result = await srv.handle_upstream(
+        conn, UpstreamRequest(method="ack", params={"through": 5}, id=1)
+    )
+    assert result is None
+    result = await srv.handle_upstream(
+        conn, UpstreamRequest(method="foreground", params={"session_id": "s1"}, id=2)
+    )
+    assert result is None
+    assert conn.foreground_sessions == {"s1"}
 
 
 # ---------------------------------------------------------------------------

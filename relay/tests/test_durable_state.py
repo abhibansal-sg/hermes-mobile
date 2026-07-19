@@ -102,3 +102,26 @@ def test_sync_manifest_persists_session_deltas_attention_and_active_turns(tmp_pa
     assert unchanged["reset"] is False and unchanged["sessions"] == []
     removed = restarted.sync_manifest("all", unchanged["cursor"], [])
     assert removed["tombstones"] == [{"id": "s1"}]
+
+
+def test_owned_sessions_survive_restart_and_prune_stale(tmp_path: Path):
+    path = tmp_path / "state.sqlite3"
+    state = DurableState(path)
+    state.add_owned_session("s1")
+    state.add_owned_session("s2")
+    state.add_owned_session("s1")  # idempotent
+    assert state.load_owned_sessions() == {"s1", "s2"}
+
+    # A fresh process (relay restart) sees the same owned set.
+    assert DurableState(path).load_owned_sessions() == {"s1", "s2"}
+
+    # Removing a session drops it from the durable set.
+    state.remove_owned_session("s1")
+    assert DurableState(path).load_owned_sessions() == {"s2"}
+
+    # Stale sessions (older than max_age) are pruned on load.
+    import sqlite3
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE owned_sessions SET added_at=0")  # epoch = very old
+        db.commit()
+    assert DurableState(path).load_owned_sessions(max_age_s=3600) == set()

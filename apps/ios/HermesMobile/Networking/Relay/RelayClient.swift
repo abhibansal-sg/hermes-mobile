@@ -240,6 +240,15 @@ actor RelayClient {
         try await request(.interrupt, params: .object(["session_id": .string(sessionID)]))
     }
 
+    /// Declare the session the phone holds foregrounded (§6 gate). Fire-and-forget:
+    /// the relay answers inline (no downstream frame). Called on reconnect so the
+    /// relay's Notifier knows the phone is watching and suppresses spurious APNs.
+    func setForeground(_ sessionID: String?) async {
+        let params: JSONValue = sessionID.map { .object(["session_id": .string($0)]) }
+            ?? .object(["session_id": .null])
+        await notify(.foreground, params: params)
+    }
+
     // MARK: - Ack (§4)
 
     /// Force-send an `ack{through:lastSeq}` if the watermark has advanced since the
