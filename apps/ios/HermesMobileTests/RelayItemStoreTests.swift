@@ -238,6 +238,46 @@ final class RelayItemStoreTests: XCTestCase {
         XCTAssertEqual(replayed, reference)
     }
 
+    /// Regression (Codex HRP/2 audit, confirmed live 2026-07-19): a duplicate
+    /// `item.delta` replayed WHILE the item is still streaming must not re-append
+    /// its text. The old reducer applied every payload unconditionally, so a
+    /// reconnect `resync` turned "hello" into "hellohel…"; the earlier
+    /// `testReplayOfMissedFramesIsIdempotent` missed it because its delta's item
+    /// is `completed` (authoritative) which masked the doubling.
+    func testDuplicateDeltaDoesNotDoubleStreamingText() {
+        var store = RelayItemStore()
+        store.apply(started("msg-1", .agentMessage, ord: 1, seq: 1, body: ["text": ""]))
+        store.apply(delta("msg-1", seq: 2, patch: ["text": "hel"]))
+        store.apply(delta("msg-1", seq: 3, patch: ["text": "lo"]))
+        XCTAssertEqual(store.itemsByID["msg-1"]?.textBody, "hello")
+
+        // Relay replays seq 2–3 (already folded); item is STILL in_progress.
+        store.apply(delta("msg-1", seq: 2, patch: ["text": "hel"]))
+        store.apply(delta("msg-1", seq: 3, patch: ["text": "lo"]))
+        XCTAssertEqual(store.itemsByID["msg-1"]?.textBody, "hello",
+                       "duplicate deltas must not re-append (was 'hellohello')")
+        XCTAssertEqual(store.itemsByID["msg-1"]?.status, .inProgress)
+    }
+
+    /// A gap delta paints optimistically AHEAD of the watermark; when `resync`
+    /// replays it in order, it must fold exactly once — not a second time.
+    func testGapDeltaIsNotReAppliedOnReplay() {
+        var store = RelayItemStore()
+        store.apply(started("msg-1", .agentMessage, ord: 1, seq: 1, body: ["text": ""]))
+        // seq 2 missed; seq 3 arrives as a gap and paints optimistically.
+        let gap = store.apply(delta("msg-1", seq: 3, patch: ["text": "C"]))
+        XCTAssertTrue(gap.isGap)
+        XCTAssertEqual(store.lastSeq, 1, "gap must not advance the watermark")
+
+        // resync replays 2,3 in order. seq 3 must not append "C" again.
+        store.apply(delta("msg-1", seq: 2, patch: ["text": "B"]))
+        store.apply(delta("msg-1", seq: 3, patch: ["text": "C"]))
+        let text = store.itemsByID["msg-1"]?.textBody ?? ""
+        XCTAssertEqual(text.filter { $0 == "C" }.count, 1,
+                       "gap delta must fold exactly once across optimistic paint + replay")
+        XCTAssertEqual(store.lastSeq, 3)
+    }
+
     // MARK: - Fixtures
 
     private func fullTurnFrames() -> [RelayFrame] {
