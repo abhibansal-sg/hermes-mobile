@@ -1,3 +1,4 @@
+import SafariServices
 import SwiftUI
 
 /// The conversation surface: a scrolling transcript with auto-scroll, banners
@@ -169,6 +170,16 @@ struct ChatView: View {
         let text: String
     }
     @State private var exportedTranscript: ExportedTranscript?
+
+    /// The URL awaiting the in-app Safari sheet (Wave 25 link fix #1). Wrapped
+    /// in an `Identifiable` item (bare `URL` has no stable identity SwiftUI can
+    /// key a `.sheet(item:)` off) so each tapped link presents its own sheet
+    /// instance even if the same URL is tapped twice in a row.
+    private struct InAppSafariItem: Identifiable {
+        let id = UUID()
+        let url: URL
+    }
+    @State private var presentedSafariURL: InAppSafariItem?
 
     /// The live biometric backend injected into the secure prompt (F4A-A2). A
     /// stateless `LAContextAuthenticator` (the F2 seam); falls back to the device
@@ -647,6 +658,25 @@ struct ChatView: View {
                             description: Text("Open a chat to change its working directory.")
                         )
                     }
+                }
+                // In-app Safari (Wave 25 link fix #1): every `openURL` call
+                // anywhere below this point in the chat surface — a tapped
+                // transcript link, a rich-embed card's "Open" button — is
+                // intercepted here. http/https links present a dismissable
+                // in-app `SFSafariViewController` sheet instead of switching to
+                // the system Safari app; any other scheme (mailto:, tel:,
+                // custom app schemes, …) falls through to the system's default
+                // handling unchanged.
+                .environment(\.openURL, OpenURLAction { url in
+                    guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+                        return .systemAction
+                    }
+                    presentedSafariURL = InAppSafariItem(url: url)
+                    return .handled
+                })
+                .sheet(item: $presentedSafariURL) { item in
+                    InAppSafariView(url: item.url)
+                        .ignoresSafeArea()
                 }
         }
     }
