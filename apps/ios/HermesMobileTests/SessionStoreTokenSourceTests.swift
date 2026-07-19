@@ -380,4 +380,47 @@ final class DrawerGestureArbitrationTests: XCTestCase {
         XCTAssertEqual(latch, false,
             "ABH-399 priority: text interaction yield must take precedence over the horizontal-scroller yield")
     }
+
+    // MARK: - Drawer session-switch: latched drag branch (symptom 2)
+
+    /// A CLOSED-at-start drawer tracks only rightward (opening) travel; a leftward
+    /// pull is clamped to 0 (there is nothing to the left of closed).
+    func testLatchedDragTranslationClosedAtStartTracksRightwardOnly() {
+        XCTAssertEqual(
+            DrawerGestureArbitration.latchedDragTranslation(openAtStart: false, effectiveTranslation: 40),
+            40, accuracy: 0.001,
+            "A closed drawer must open rightward: positive travel passes through")
+        XCTAssertEqual(
+            DrawerGestureArbitration.latchedDragTranslation(openAtStart: false, effectiveTranslation: -40),
+            0, accuracy: 0.001,
+            "A closed drawer cannot travel left: leftward drag clamps to 0")
+    }
+
+    /// An OPEN-at-start drawer tracks only leftward (closing) travel; a rightward
+    /// pull past fully-open is clamped to 0.
+    func testLatchedDragTranslationOpenAtStartTracksLeftwardOnly() {
+        XCTAssertEqual(
+            DrawerGestureArbitration.latchedDragTranslation(openAtStart: true, effectiveTranslation: -40),
+            -40, accuracy: 0.001,
+            "An open drawer must close leftward: negative travel passes through")
+        XCTAssertEqual(
+            DrawerGestureArbitration.latchedDragTranslation(openAtStart: true, effectiveTranslation: 40),
+            0, accuracy: 0.001,
+            "An open drawer is already fully right: rightward drag clamps to 0")
+    }
+
+    /// The core symptom-2 invariant: the branch is chosen by the LATCHED start
+    /// state, NOT by any live `isOpen` that may flip mid-drag. Given the same
+    /// effective travel, the two latch states yield different, self-consistent
+    /// results — proving an async flip cannot retroactively change how in-flight
+    /// travel is interpreted (which produced the "steps back, tries again" jitter).
+    func testLatchedDragTranslationBranchDependsOnLatchedStateNotLiveState() {
+        let travel: CGFloat = 30
+        let asClosed = DrawerGestureArbitration.latchedDragTranslation(openAtStart: false, effectiveTranslation: travel)
+        let asOpen = DrawerGestureArbitration.latchedDragTranslation(openAtStart: true, effectiveTranslation: travel)
+        XCTAssertEqual(asClosed, 30, accuracy: 0.001)
+        XCTAssertEqual(asOpen, 0, accuracy: 0.001)
+        XCTAssertNotEqual(asClosed, asOpen,
+            "The drag branch must be decided by the latched start-state so an async isOpen flip cannot swap it mid-drag")
+    }
 }
