@@ -1318,8 +1318,8 @@ struct ComposerView: View {
             switch outcome {
             case .success(let data):
                 bytes = data
-            case .failure(let message):
-                fileAttachError = message
+            case .failure(let error):
+                fileAttachError = error.message
                 continue
             }
 

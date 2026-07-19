@@ -208,15 +208,21 @@ final class AttachmentStore {
     /// loading it into memory — the earlier post-read cap could hang the UI and OOM
     /// the app first. Acquires the URL's security scope for the read only.
     ///
+    /// Failure from ``readPickedFileData(at:)`` carrying a ready-to-display
+    /// message (not an `AttachmentError`, whose prefix would double up).
+    struct PickedFileReadError: Error, Equatable {
+        let message: String
+    }
+
     /// `nonisolated` so the composer runs it off the main actor via `Task.detached`;
-    /// returns a ready-to-display message (not an `AttachmentError`, whose prefix
-    /// would double up) on an over-cap file or unreadable path.
-    nonisolated static func readPickedFileData(at url: URL) -> Result<Data, String> {
+    /// the failure carries a ready-to-display message for an over-cap file or
+    /// unreadable path.
+    nonisolated static func readPickedFileData(at url: URL) -> Result<Data, PickedFileReadError> {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
            size > maxFileAttachmentBytes {
-            return .failure("File is too large (max \(maxFileAttachmentCapDescription)).")
+            return .failure(PickedFileReadError(message: "File is too large (max \(maxFileAttachmentCapDescription))."))
         }
         do {
             // Fully resident read (NOT .mappedIfSafe): the size guard above bounds
@@ -225,7 +231,7 @@ final class AttachmentStore {
             // the bytes are base64-encoded later.
             return .success(try Data(contentsOf: url))
         } catch {
-            return .failure("Couldn't read \(url.lastPathComponent): \(error.localizedDescription)")
+            return .failure(PickedFileReadError(message: "Couldn't read \(url.lastPathComponent): \(error.localizedDescription)"))
         }
     }
 
