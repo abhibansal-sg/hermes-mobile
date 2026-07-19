@@ -48,6 +48,8 @@ final class PushRegistrar {
     @ObservationIgnored
     var tokenRegisterOverride: (@MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome)?
     @ObservationIgnored
+    var relayV2TokenRefreshOverride: (@MainActor @Sendable (String, Data) async throws -> Void)?
+    @ObservationIgnored
     private var registrationInFlight = false
     @ObservationIgnored
     private var pendingRegistrationRequest: RegistrationRequest?
@@ -68,6 +70,9 @@ final class PushRegistrar {
     /// the other `attach`-style hooks).
     func attach(connection: ConnectionStore) {
         self.connection = connection
+        Task { @MainActor in
+            await RelayV2MigrationCoordinator().resumePendingCutover()
+        }
     }
 
     /// Whether the user has opted into push. A TRACKED stored property (R1
@@ -82,12 +87,25 @@ final class PushRegistrar {
     /// successful push registration and the server capability remains healthy.
     /// This is the ownership rule consumed by live-event notification fallback.
     var isAlertAuthorityRegistered: Bool {
+        if DefaultsKeys.transportPathValue() == .relayV2 {
+            let accountID = DefaultsKeys.relayV2AccountIDValue()
+            guard isEnabled,
+                  RelayV2Wire.isToken(accountID),
+                  UserDefaults.standard.bool(
+                    forKey: DefaultsKeys.pushRegistrationHealthy
+                  ),
+                  let state = try? RelayV2KeychainStore().loadPushRegistrationState(
+                    accountID: accountID
+                  ),
+                  state.endpointID != nil,
+                  state.attestationPhase == .committed else { return false }
+            return true
+        }
         guard isEnabled,
               connection?.capabilities.pushRegistry == .available,
               UserDefaults.standard.bool(forKey: DefaultsKeys.pushRegistrationHealthy),
-              let token = UserDefaults.standard.string(
-                  forKey: DefaultsKeys.pushLastDeviceToken
-              ), !token.isEmpty,
+              let token = KeychainService.loadRegisteredAPNsDeviceToken(),
+              !token.isEmpty,
               let scope = currentRegistrationScope,
               scope == UserDefaults.standard.string(
                   forKey: DefaultsKeys.pushLastRegistrationScope
@@ -97,7 +115,14 @@ final class PushRegistrar {
 
     /// Stable, non-secret namespace for the current gateway + device pairing.
     /// Credential hashing makes a same-URL re-pair a fresh dedupe scope.
-    var notificationScope: String? { currentRegistrationScope }
+    var notificationScope: String? {
+        if DefaultsKeys.transportPathValue() == .relayV2 {
+            let accountID = DefaultsKeys.relayV2AccountIDValue()
+            guard RelayV2Wire.isToken(accountID) else { return nil }
+            return "relay-v2-device_\(RelayV2Identifiers.cacheNamespace(accountID: accountID))"
+        }
+        return currentRegistrationScope
+    }
 
     private var currentRegistrationScope: String? {
         guard let endpoint = resolveEndpoint(), let connection else { return nil }
@@ -121,9 +146,7 @@ final class PushRegistrar {
             // only applies to the silent launch path).
             enableIfAllowed(forcePrompt: true)
         } else {
-            let lastDeviceToken = UserDefaults.standard.string(
-                forKey: DefaultsKeys.pushLastDeviceToken
-            )
+            let lastDeviceToken = KeychainService.loadRegisteredAPNsDeviceToken()
             let poster = makePoster()
             if let lastDeviceToken, !lastDeviceToken.isEmpty, let poster {
                 Task { @MainActor in
@@ -140,7 +163,10 @@ final class PushRegistrar {
                     }
                 }
             }
-            UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastDeviceToken)
+            KeychainService.deleteAPNsDeviceTokens()
+            UserDefaults.standard.removeObject(
+                forKey: DefaultsKeys.pushLastDeviceTokenDigest
+            )
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEvents)
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastEnv)
             UserDefaults.standard.removeObject(forKey: DefaultsKeys.pushLastRegistrationScope)
@@ -213,6 +239,40 @@ final class PushRegistrar {
         guard isEnabled else { return }
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
         guard !hex.isEmpty else { return }
+        try? KeychainService.saveAPNsDeviceToken(hex)
+        if DefaultsKeys.transportPathValue() == .relayV2 {
+            let accountID = DefaultsKeys.relayV2AccountIDValue()
+            guard RelayV2Wire.isToken(accountID) else { return }
+            Task { @MainActor in
+                do {
+                    if let relayV2TokenRefreshOverride {
+                        try await relayV2TokenRefreshOverride(accountID, deviceToken)
+                    } else {
+                        let keyStore = RelayV2KeychainStore()
+                        guard try keyStore.loadPushRegistrationState(accountID: accountID) != nil,
+                              let identity = try keyStore.loadIdentity(accountID: accountID),
+                              let hubURL = identity.hubURL else { return }
+                        let client = try RelayV2PushRegistrationClient(
+                            baseURL: hubURL,
+                            keyStore: keyStore
+                        )
+                        try await client.refreshToken(
+                            accountID: accountID,
+                            apnsToken: deviceToken,
+                            bundleID: Bundle.main.bundleIdentifier ?? "ai.hermes.app"
+                        )
+                    }
+                    UserDefaults.standard.set(
+                        true, forKey: DefaultsKeys.pushRegistrationHealthy
+                    )
+                } catch {
+                    UserDefaults.standard.set(
+                        false, forKey: DefaultsKeys.pushRegistrationHealthy
+                    )
+                }
+            }
+            return
+        }
         let events = DefaultsKeys.pushEventList()
         let env = PushTokenPoster.apnsEnvironment
         // Skip a redundant POST only when the token, event prefs, AND APNs
@@ -220,7 +280,9 @@ final class PushRegistrar {
         // flip (e.g. Xcode sandbox → TestFlight production on the same token)
         // must force a re-POST so the gateway re-routes the token to the correct
         // APNs host. A prefs change (A4) must re-POST even when token+env match.
-        if UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken) == hex,
+        if UserDefaults.standard.string(
+            forKey: DefaultsKeys.pushLastDeviceTokenDigest
+        ) == Self.deviceTokenDigest(hex),
            lastRegisteredEvents == events,
            lastRegisteredEnv == env,
            currentRegistrationScope == UserDefaults.standard.string(
@@ -281,14 +343,26 @@ final class PushRegistrar {
             // real success; soft-fail (404) and a validation rejection both
             // persisted nothing, so we retry next launch.
             if case .success = outcome {
-                UserDefaults.standard.set(hex, forKey: DefaultsKeys.pushLastDeviceToken)
-                lastRegisteredEvents = events
-                lastRegisteredEnv = env
-                UserDefaults.standard.set(
-                    currentRegistrationScope,
-                    forKey: DefaultsKeys.pushLastRegistrationScope
-                )
-                UserDefaults.standard.set(true, forKey: DefaultsKeys.pushRegistrationHealthy)
+                do {
+                    try KeychainService.saveRegisteredAPNsDeviceToken(hex)
+                    UserDefaults.standard.set(
+                        Self.deviceTokenDigest(hex),
+                        forKey: DefaultsKeys.pushLastDeviceTokenDigest
+                    )
+                    lastRegisteredEvents = events
+                    lastRegisteredEnv = env
+                    UserDefaults.standard.set(
+                        currentRegistrationScope,
+                        forKey: DefaultsKeys.pushLastRegistrationScope
+                    )
+                    UserDefaults.standard.set(
+                        true, forKey: DefaultsKeys.pushRegistrationHealthy
+                    )
+                } catch {
+                    UserDefaults.standard.set(
+                        false, forKey: DefaultsKeys.pushRegistrationHealthy
+                    )
+                }
             } else {
                 UserDefaults.standard.set(false, forKey: DefaultsKeys.pushRegistrationHealthy)
             }
@@ -304,9 +378,10 @@ final class PushRegistrar {
     /// enabled, a token is already known, and the app is configured. Re-issues a
     /// fresh APNs registration if no token is cached yet so the events still land.
     func reRegisterEvents() {
-        guard isEnabled else { return }
+        guard isEnabled, DefaultsKeys.legacyDirectActionsAllowed() else { return }
         let events = DefaultsKeys.pushEventList()
-        guard let hex = UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken),
+        guard let hex = KeychainService.loadAPNsDeviceToken()
+                ?? KeychainService.loadRegisteredAPNsDeviceToken(),
               !hex.isEmpty else {
             // No token cached yet — kick a fresh registration; `didRegister` will
             // carry the current events when the token arrives.
@@ -368,6 +443,12 @@ final class PushRegistrar {
         UserDefaults.standard.set(false, forKey: DefaultsKeys.pushRegistrationHealthy)
     }
 
+    static func deviceTokenDigest(_ token: String) -> String {
+        SHA256.hash(data: Data(token.utf8)).map {
+            String(format: "%02x", $0)
+        }.joined()
+    }
+
     // MARK: - Configuration resolution
 
     /// Build a poster from the current base URL + token, or `nil` when the app
@@ -394,6 +475,7 @@ final class PushRegistrar {
     /// where the probe hasn't run this process. Either way a stale answer
     /// self-heals via the callers' alternate-family 404 retry.
     func resolveEndpoint() -> (url: URL, token: String, pathStyle: APIPathStyle)? {
+        guard DefaultsKeys.legacyDirectActionsAllowed() else { return nil }
         guard let connection else { return nil }
         let urlString = connection.serverURLString
         guard !urlString.isEmpty, let url = URL(string: urlString) else { return nil }

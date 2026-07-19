@@ -135,6 +135,93 @@ enum WorkSchema {
                 table.add(column: "revision", .integer).notNull().defaults(to: 1)
             }
         }
+        migrator.registerMigration("work-v3-relay-v2-command-outbox") { db in
+            try db.execute(sql: """
+                CREATE TABLE relay_v2_commands (
+                    op_id TEXT PRIMARY KEY NOT NULL,
+                    client_message_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    session_id TEXT,
+                    kind TEXT NOT NULL CHECK(kind IN ('prompt','approval','interrupt')),
+                    payload_json BLOB NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'queued','sending','accepted','retry_wait','ambiguous','completed','expired'
+                    )),
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at REAL,
+                    lease_owner TEXT,
+                    lease_expires_at REAL,
+                    last_error_code TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    completed_at REAL
+                );
+                CREATE UNIQUE INDEX relay_v2_commands_client_message
+                    ON relay_v2_commands(account_id, client_message_id);
+                CREATE INDEX relay_v2_commands_drain
+                    ON relay_v2_commands(account_id, state, next_attempt_at, created_at);
+                """)
+        }
+        migrator.registerMigration("work-v4-relay-v2-stable-envelope") { db in
+            try db.alter(table: "relay_v2_commands") { table in
+                table.add(column: "fixed_expires_at", .double)
+                table.add(column: "envelope_json", .blob)
+            }
+            try db.execute(sql: """
+                UPDATE relay_v2_commands
+                SET fixed_expires_at = created_at + 86400
+                WHERE fixed_expires_at IS NULL
+                """)
+        }
+        migrator.registerMigration("work-v5-relay-v2-command-kinds") { db in
+            // SQLite cannot widen a CHECK constraint in place. Rebuild the
+            // outbox so existing installs keep every durable command while
+            // gaining the complete HRP/2 RPC surface.
+            try db.execute(sql: """
+                CREATE TABLE relay_v2_commands_v5 (
+                    op_id TEXT PRIMARY KEY NOT NULL,
+                    client_message_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    session_id TEXT,
+                    kind TEXT NOT NULL CHECK(kind IN (
+                        'prompt','approval','interrupt','session_list','session_history',
+                        'session_open','session_resume','clarify','presence_set'
+                    )),
+                    payload_json BLOB NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN (
+                        'queued','sending','accepted','retry_wait','ambiguous','completed','expired'
+                    )),
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at REAL,
+                    lease_owner TEXT,
+                    lease_expires_at REAL,
+                    last_error_code TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    completed_at REAL,
+                    fixed_expires_at REAL,
+                    envelope_json BLOB
+                );
+                INSERT INTO relay_v2_commands_v5(
+                    op_id,client_message_id,account_id,session_id,kind,payload_json,payload_hash,
+                    state,attempt_count,next_attempt_at,lease_owner,lease_expires_at,last_error_code,
+                    created_at,updated_at,completed_at,fixed_expires_at,envelope_json
+                )
+                SELECT
+                    op_id,client_message_id,account_id,session_id,kind,payload_json,payload_hash,
+                    state,attempt_count,next_attempt_at,lease_owner,lease_expires_at,last_error_code,
+                    created_at,updated_at,completed_at,fixed_expires_at,envelope_json
+                FROM relay_v2_commands ORDER BY rowid;
+                DROP TABLE relay_v2_commands;
+                ALTER TABLE relay_v2_commands_v5 RENAME TO relay_v2_commands;
+                CREATE UNIQUE INDEX relay_v2_commands_client_message
+                    ON relay_v2_commands(account_id, client_message_id);
+                CREATE INDEX relay_v2_commands_drain
+                    ON relay_v2_commands(account_id, state, next_attempt_at, created_at);
+                """)
+        }
         return migrator
     }
 }

@@ -641,6 +641,12 @@ struct ApprovalRequestPayload: Sendable, Identifiable, Equatable {
     let command: String?
     /// The dangerous-command pattern that gated this approval (`pattern_key`).
     let patternKey: String?
+    /// HRP/2 one-time, device-bound approval authority. Nil on the legacy
+    /// gateway-direct transport, where approval authorization is socket-bound.
+    let capability: String?
+    let allowedDecisions: [String]
+    let deviceID: String?
+    let deviceGeneration: UInt32?
 
     init(payload: JSONValue) {
         // Stable server identity only. An id-less legacy payload remains
@@ -653,6 +659,14 @@ struct ApprovalRequestPayload: Sendable, Identifiable, Equatable {
         let command = payload["command"]?.stringValue
         self.command = (command?.isEmpty == false) ? command : nil
         self.patternKey = payload["pattern_key"]?.stringValue
+        self.capability = payload["capability"]?.stringValue
+        self.allowedDecisions = payload["allowed_decisions"]?.arrayValue?
+            .compactMap(\.stringValue) ?? []
+        self.deviceID = payload["device_id"]?.stringValue
+        self.deviceGeneration = payload["device_generation"]?.intValue.flatMap {
+            guard $0 > 0, $0 <= Int(UInt32.max) else { return nil }
+            return UInt32($0)
+        }
         self.descriptionText = payload["description"]?.stringValue
         self.action = payload["action"]?.stringValue
         self.target = payload["target"]?.stringValue

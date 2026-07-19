@@ -21,12 +21,14 @@ import SwiftUI
 enum TransportPath: String, Sendable, CaseIterable {
     case gatewayDirect
     case relay
+    case relayV2
 
     /// Human-readable label for a Settings picker/row.
     var label: String {
         switch self {
         case .gatewayDirect: return "Gateway (direct)"
         case .relay:         return "Relay (Wave 2)"
+        case .relayV2:       return "Relay (secure hosted v2)"
         }
     }
 }
@@ -350,6 +352,7 @@ final class RelaySessionCoordinator {
         )
         if let sid = result["session_id"]?.stringValue { activeSessionID = sid }
         else if activeSessionID == nil, let target { activeSessionID = target }
+        await requireClientSilently()?.foreground(sessionID: activeSessionID)
         return result
     }
 
@@ -373,6 +376,7 @@ final class RelaySessionCoordinator {
         let result = try await client.resumeSession(sessionID)
         activeSessionID = sessionID
         activeStoredSessionID = sessionID
+        await client.foreground(sessionID: sessionID)
         return result
     }
 
@@ -384,6 +388,7 @@ final class RelaySessionCoordinator {
         let result = try await client.open(sessionID)
         activeSessionID = sessionID
         activeStoredSessionID = sessionID
+        await client.foreground(sessionID: sessionID)
         return result
     }
 
@@ -415,17 +420,34 @@ final class RelaySessionCoordinator {
 
     @discardableResult
     func approve(requestID: String, approved: Bool) async throws -> JSONValue {
-        try await requireClient().approve(requestID: requestID, approved: approved)
+        guard let sessionID = activeSessionID else { throw RelayError.notConnected }
+        return try await requireClient().approve(
+            sessionID: sessionID,
+            requestID: requestID,
+            decision: approved ? "approve_once" : "deny"
+        )
     }
 
     @discardableResult
     func clarify(requestID: String, response: String) async throws -> JSONValue {
-        try await requireClient().clarify(requestID: requestID, response: response)
+        guard let sessionID = activeSessionID else { throw RelayError.notConnected }
+        return try await requireClient().clarify(
+            sessionID: sessionID, requestID: requestID, text: response
+        )
     }
 
     @discardableResult
     func interrupt(_ sessionID: String? = nil) async throws -> JSONValue {
         guard let sid = sessionID ?? activeSessionID else { throw RelayError.notConnected }
         return try await requireClient().interrupt(sid)
+    }
+
+    func setForeground(_ isForeground: Bool) async {
+        await client?.foreground(sessionID: isForeground ? activeSessionID : nil)
+    }
+
+    private func requireClientSilently() -> RelayClient? {
+        guard phase == .open else { return nil }
+        return client
     }
 }

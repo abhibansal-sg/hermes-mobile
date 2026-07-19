@@ -36,6 +36,19 @@ async def test_drop_oldest_overflow():
     assert (first, second) == (3, 4)
 
 
+async def test_lossless_publish_wait_applies_bounded_backpressure():
+    bus = EventBus()
+    sub = bus.subscribe(TOPIC_RELAY_FRAMES, maxsize=1)
+    assert await bus.publish_wait(TOPIC_RELAY_FRAMES, "first") == 1
+    blocked = asyncio.create_task(bus.publish_wait(TOPIC_RELAY_FRAMES, "second"))
+    await asyncio.sleep(0)
+    assert not blocked.done()
+    assert await sub.get() == "first"
+    assert await blocked == 1
+    assert await sub.get() == "second"
+    assert sub.dropped == 0
+
+
 async def test_unsubscribe_stops_delivery():
     bus = EventBus()
     sub = bus.subscribe(TOPIC_RELAY_FRAMES)

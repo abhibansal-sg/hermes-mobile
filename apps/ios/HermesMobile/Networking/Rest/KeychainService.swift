@@ -107,6 +107,82 @@ enum KeychainService {
     /// The Keychain account string for `slug`'s transient provider key.
     static func providerKeyAccount(_ slug: String) -> String { "providerKey:\(slug)" }
 
+    // MARK: - APNs token storage
+
+    private static let currentAPNsTokenAccount = "apnsToken:current"
+    private static let registeredAPNsTokenAccount = "apnsToken:registered"
+
+    /// Persist the most recently issued APNs token. APNs tokens are credentials:
+    /// they use ThisDeviceOnly Keychain storage and are never written to defaults.
+    static func saveAPNsDeviceToken(
+        _ token: String,
+        defaults: UserDefaults = .standard
+    ) throws {
+        _ = migrateLegacyAPNsTokens(defaults: defaults)
+        try saveValue(token, account: currentAPNsTokenAccount)
+    }
+
+    static func loadAPNsDeviceToken(defaults: UserDefaults = .standard) -> String? {
+        migrateLegacyAPNsTokens(defaults: defaults).current
+    }
+
+    /// The exact token whose legacy gateway registration succeeded. It is kept
+    /// separately from the current OS token so opt-out/cutover can unregister
+    /// the correct old row after APNs rotates the device token.
+    static func saveRegisteredAPNsDeviceToken(
+        _ token: String,
+        defaults: UserDefaults = .standard
+    ) throws {
+        _ = migrateLegacyAPNsTokens(defaults: defaults)
+        try saveValue(token, account: registeredAPNsTokenAccount)
+    }
+
+    static func loadRegisteredAPNsDeviceToken(
+        defaults: UserDefaults = .standard
+    ) -> String? {
+        migrateLegacyAPNsTokens(defaults: defaults).registered
+    }
+
+    static func deleteRegisteredAPNsDeviceToken(defaults: UserDefaults = .standard) {
+        clearLegacyAPNsDefaults(defaults)
+        deleteValue(account: registeredAPNsTokenAccount)
+    }
+
+    static func deleteAPNsDeviceTokens(defaults: UserDefaults = .standard) {
+        clearLegacyAPNsDefaults(defaults)
+        deleteValue(account: currentAPNsTokenAccount)
+        deleteValue(account: registeredAPNsTokenAccount)
+    }
+
+    /// One-time plaintext migration. Both legacy values are captured before
+    /// either defaults key is erased; a failed Keychain write may still supply
+    /// the token to this caller in memory, but plaintext is never retained.
+    private static func migrateLegacyAPNsTokens(
+        defaults: UserDefaults
+    ) -> (current: String?, registered: String?) {
+        let storedCurrent = loadValue(account: currentAPNsTokenAccount)
+        let storedRegistered = loadValue(account: registeredAPNsTokenAccount)
+        let legacyCurrent = defaults.string(forKey: DefaultsKeys.pushAPNsDeviceToken)
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let legacyRegistered = defaults.string(forKey: DefaultsKeys.pushLastDeviceToken)
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let current = storedCurrent ?? legacyCurrent ?? legacyRegistered
+        let registered = storedRegistered ?? legacyRegistered
+        if storedCurrent == nil, let current {
+            try? saveValue(current, account: currentAPNsTokenAccount)
+        }
+        if storedRegistered == nil, let registered {
+            try? saveValue(registered, account: registeredAPNsTokenAccount)
+        }
+        clearLegacyAPNsDefaults(defaults)
+        return (current, registered)
+    }
+
+    private static func clearLegacyAPNsDefaults(_ defaults: UserDefaults) {
+        defaults.removeObject(forKey: DefaultsKeys.pushAPNsDeviceToken)
+        defaults.removeObject(forKey: DefaultsKeys.pushLastDeviceToken)
+    }
+
     // MARK: - Shared generic-password upsert/load/delete (account-keyed)
 
     private static func saveValue(_ value: String, account: String) throws {

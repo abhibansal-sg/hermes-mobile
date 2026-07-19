@@ -1,0 +1,911 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes.example/protocol/hrp2/schema.json",
+  "title": "Hermes Relay Protocol v2 wire objects",
+  "type": "object",
+  "$defs": {
+    "token": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._~-]+$",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "collapseToken": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._~-]+$",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "messageID": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{22}$"
+    },
+    "uint32Nonzero": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "uint64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "description": "Non-negative HRP/2 wire integer restricted to the exact cross-runtime JSON range (2^53 - 1)."
+    },
+    "positiveSequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "base64url": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "base64url16": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{22}$"
+    },
+    "base64url32": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$"
+    },
+    "base64url64": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{86}$"
+    },
+    "canonicalUUID": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "rpcID": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._~-]+$",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "operationID": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._~-]+$",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "pairingOffer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "hub",
+        "relay_route",
+        "offer_route",
+        "offer_id",
+        "offer_transport_token",
+        "expires_at_ms",
+        "relay_kem_pub",
+        "relay_sign_pub",
+        "pair_secret"
+      ],
+      "properties": {
+        "v": { "const": 2 },
+        "hub": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "relay_route": { "$ref": "#/$defs/token" },
+        "offer_route": { "$ref": "#/$defs/token" },
+        "offer_id": { "$ref": "#/$defs/token" },
+        "offer_transport_token": { "$ref": "#/$defs/base64url32" },
+        "expires_at_ms": { "$ref": "#/$defs/uint64" },
+        "relay_kem_pub": { "$ref": "#/$defs/base64url32" },
+        "relay_sign_pub": { "$ref": "#/$defs/base64url32" },
+        "pair_secret": { "$ref": "#/$defs/base64url32" }
+      }
+    },
+    "pairInit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "offer_id",
+        "device_name",
+        "device_kem_pub",
+        "device_sign_pub",
+        "preview_kem_pub",
+        "device_nonce",
+        "push_bind_token",
+        "hub_activation_token",
+        "pair_mac"
+      ],
+      "properties": {
+        "v": { "const": 2 },
+        "offer_id": { "$ref": "#/$defs/token" },
+        "device_name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "device_kem_pub": { "$ref": "#/$defs/base64url32" },
+        "device_sign_pub": { "$ref": "#/$defs/base64url32" },
+        "preview_kem_pub": { "$ref": "#/$defs/base64url32" },
+        "device_nonce": {
+          "allOf": [
+            { "$ref": "#/$defs/base64url" },
+            { "minLength": 22, "maxLength": 86 }
+          ]
+        },
+        "push_bind_token": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 512 },
+            { "type": "null" }
+          ]
+        },
+        "hub_activation_token": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 1024 },
+            { "type": "null" }
+          ]
+        },
+        "pair_mac": { "$ref": "#/$defs/base64url32" }
+      }
+    },
+    "pairAccept": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device_id",
+        "relay_instance_id",
+        "device_route",
+        "stream_id",
+        "relay_key_generation",
+        "push_binding_id",
+        "capabilities"
+      ],
+      "properties": {
+        "device_id": { "$ref": "#/$defs/token" },
+        "relay_instance_id": { "$ref": "#/$defs/token" },
+        "device_route": { "$ref": "#/$defs/token" },
+        "stream_id": { "$ref": "#/$defs/token" },
+        "relay_key_generation": { "$ref": "#/$defs/uint32Nonzero" },
+        "push_binding_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/token" },
+            { "type": "null" }
+          ]
+        },
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "chat",
+              "history",
+              "notifications",
+              "approve_once",
+              "deny"
+            ]
+          }
+        }
+      }
+    },
+    "pairConfirm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["offer_id", "device_id", "response_hash", "pair_accept_mid"],
+      "properties": {
+        "offer_id": { "$ref": "#/$defs/token" },
+        "device_id": { "$ref": "#/$defs/token" },
+        "response_hash": { "$ref": "#/$defs/base64url32" },
+        "pair_accept_mid": { "$ref": "#/$defs/messageID" }
+      }
+    },
+    "fullItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "item_id",
+        "session_id",
+        "turn_id",
+        "type",
+        "status",
+        "ord",
+        "rev",
+        "summary",
+        "body"
+      ],
+      "properties": {
+        "item_id": { "$ref": "#/$defs/token" },
+        "session_id": { "$ref": "#/$defs/token" },
+        "turn_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/token" },
+            { "type": "null" }
+          ]
+        },
+        "type": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "status": { "enum": ["in_progress", "completed", "failed"] },
+        "ord": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+        "rev": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "summary": { "type": "string", "maxLength": 2000 },
+        "body": { "type": "object" }
+      }
+    },
+    "itemDelta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "from_rev", "to_rev", "ops"],
+      "properties": {
+        "item_id": { "$ref": "#/$defs/token" },
+        "from_rev": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "to_rev": { "type": "integer", "minimum": 2, "maximum": 9007199254740991 },
+        "ops": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["op", "path", "offset", "data"],
+            "properties": {
+              "op": { "const": "append_utf8" },
+              "path": { "const": "/body/text" },
+              "offset": { "type": "integer", "minimum": 0, "maximum": 10485760 },
+              "data": { "type": "string", "maxLength": 262144 }
+            }
+          }
+        }
+      }
+    },
+    "tombstone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["item_id", "deleted_at_revision"],
+      "properties": {
+        "item_id": { "$ref": "#/$defs/token" },
+        "deleted_at_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      }
+    },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream_id",
+        "through_seq",
+        "session_id",
+        "snapshot_revision",
+        "replace",
+        "items",
+        "tombstones"
+      ],
+      "properties": {
+        "stream_id": { "$ref": "#/$defs/token" },
+        "through_seq": { "$ref": "#/$defs/uint64" },
+        "session_id": { "$ref": "#/$defs/token" },
+        "snapshot_revision": { "$ref": "#/$defs/uint64" },
+        "replace": { "type": "boolean" },
+        "items": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/fullItem" }
+        },
+        "tombstones": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/tombstone" }
+        }
+      }
+    },
+    "wireFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sid", "turn", "kind", "body"],
+      "properties": {
+        "sid": { "$ref": "#/$defs/token" },
+        "turn": {
+          "oneOf": [
+            { "$ref": "#/$defs/token" },
+            { "type": "null" }
+          ]
+        },
+        "kind": {
+          "enum": [
+            "item.started",
+            "item.delta",
+            "item.completed",
+            "turn.started",
+            "turn.completed",
+            "approval.request",
+            "clarify.request",
+            "status",
+            "title",
+            "snapshot",
+            "checkpoint"
+          ]
+        },
+        "body": { "type": "object" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "enum": ["item.started", "item.completed"] } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/fullItem" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "item.delta" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/itemDelta" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "checkpoint" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/checkpoint" } } }
+        }
+      ]
+    },
+    "frameBatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stream_id", "first_seq", "frames"],
+      "properties": {
+        "stream_id": { "$ref": "#/$defs/token" },
+        "first_seq": { "$ref": "#/$defs/positiveSequence" },
+        "frames": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/wireFrame" }
+        }
+      }
+    },
+    "rpcRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jsonrpc", "id", "method", "params"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/$defs/rpcID" },
+        "method": {
+          "enum": [
+            "session.list",
+            "session.open",
+            "session.history",
+            "session.resume",
+            "prompt.submit",
+            "session.interrupt",
+            "approval.respond",
+            "clarify.respond",
+            "presence.set",
+            "item.fetch",
+            "sync.request"
+          ]
+        },
+        "params": { "type": "object" },
+        "op_id": { "$ref": "#/$defs/operationID" },
+        "deadline_ms": { "$ref": "#/$defs/uint64" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "enum": [
+                  "session.resume",
+                  "prompt.submit",
+                  "session.interrupt",
+                  "approval.respond",
+                  "clarify.respond"
+                ]
+              }
+            }
+          },
+          "then": { "required": ["op_id"] }
+        },
+        {
+          "if": { "properties": { "method": { "const": "session.list" } } },
+          "then": {
+            "properties": {
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": {
+                "enum": ["session.open", "session.resume", "session.interrupt"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["session_id"],
+                "properties": {
+                  "session_id": { "type": "string", "minLength": 1, "maxLength": 256 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "method": { "const": "session.history" } } },
+          "then": {
+            "properties": {
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["session_id"],
+                "properties": {
+                  "session_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "limit": { "type": "integer", "minimum": 1, "maximum": 5000 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "method": { "const": "prompt.submit" } } },
+          "then": {
+            "properties": {
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["text", "client_message_id"],
+                "properties": {
+                  "text": { "type": "string", "minLength": 1, "maxLength": 1000000 },
+                  "client_message_id": { "$ref": "#/$defs/canonicalUUID" },
+                  "session_id": {
+                    "type": ["string", "null"],
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "title": { "type": ["string", "null"], "minLength": 1, "maxLength": 200 },
+                  "model": { "type": ["string", "null"], "minLength": 1, "maxLength": 200 },
+                  "provider": { "type": ["string", "null"], "minLength": 1, "maxLength": 200 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "method": { "const": "approval.respond" } } },
+          "then": {
+            "properties": {
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["session_id", "request_id", "decision", "capability"],
+                "properties": {
+                  "session_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "request_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "decision": { "enum": ["approve_once", "deny"] },
+                  "capability": { "$ref": "#/$defs/base64url32" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "method": { "const": "clarify.respond" } } },
+          "then": {
+            "properties": {
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["session_id", "request_id", "text"],
+                "properties": {
+                  "session_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "request_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "text": { "type": "string", "minLength": 1, "maxLength": 100000 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "method": { "const": "presence.set" } } },
+          "then": {
+            "properties": {
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["foreground"],
+                "properties": {
+                  "foreground": { "type": "boolean" },
+                  "session_id": {
+                    "type": ["string", "null"],
+                    "minLength": 1,
+                    "maxLength": 256
+                  }
+                },
+                "allOf": [
+                  {
+                    "if": { "properties": { "foreground": { "const": true } } },
+                    "then": {
+                      "required": ["session_id"],
+                      "properties": { "session_id": { "type": "string" } }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "method": { "const": "item.fetch" } } },
+          "then": {
+            "properties": {
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["session_id", "item_id"],
+                "properties": {
+                  "session_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "item_id": { "type": "string", "minLength": 1, "maxLength": 256 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "method": { "const": "sync.request" } } },
+          "then": {
+            "properties": {
+              "params": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["session_id"],
+                "properties": {
+                  "session_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+                  "last_seq": { "$ref": "#/$defs/uint64" },
+                  "stream_id": { "type": "string", "minLength": 1, "maxLength": 256 }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "rpcError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "enum": [
+            "INVALID_ARGUMENT",
+            "UNAUTHENTICATED",
+            "REVOKED",
+            "EXPIRED",
+            "UNSUPPORTED_VERSION",
+            "NOT_FOUND",
+            "CONFLICT",
+            "ALREADY_RESOLVED",
+            "GATEWAY_OFFLINE",
+            "GATEWAY_AMBIGUOUS",
+            "MAILBOX_FULL",
+            "RATE_LIMITED",
+            "INTERNAL"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "details": { "type": "object" }
+      }
+    },
+    "rpcResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["jsonrpc", "id", "result"],
+          "properties": {
+            "jsonrpc": { "const": "2.0" },
+            "id": { "$ref": "#/$defs/token" },
+            "result": { "type": "object" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["jsonrpc", "id", "error"],
+          "properties": {
+            "jsonrpc": { "const": "2.0" },
+            "id": { "$ref": "#/$defs/token" },
+            "error": { "$ref": "#/$defs/rpcError" }
+          }
+        }
+      ]
+    },
+    "streamAck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stream_id", "through_seq"],
+      "properties": {
+        "stream_id": { "$ref": "#/$defs/token" },
+        "through_seq": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "syncRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "stream_id", "last_seq"],
+      "properties": {
+        "session_id": { "$ref": "#/$defs/token" },
+        "stream_id": { "$ref": "#/$defs/token" },
+        "last_seq": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "keyRotate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["purpose", "generation", "public_key", "previous_not_after_ms"],
+      "properties": {
+        "purpose": { "enum": ["kem", "preview"] },
+        "generation": { "$ref": "#/$defs/uint32Nonzero" },
+        "public_key": { "$ref": "#/$defs/base64url32" },
+        "previous_not_after_ms": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "deviceRevoke": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device_id"],
+      "properties": {
+        "device_id": { "$ref": "#/$defs/token" }
+      }
+    },
+    "deliveryReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mid"],
+      "properties": {
+        "mid": { "$ref": "#/$defs/messageID" }
+      }
+    },
+    "approvalAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capability",
+        "request_id",
+        "session_id",
+        "allowed_decisions",
+        "destructive",
+        "device_id",
+        "device_generation"
+      ],
+      "properties": {
+        "capability": { "$ref": "#/$defs/base64url32" },
+        "request_id": { "$ref": "#/$defs/token" },
+        "session_id": { "$ref": "#/$defs/token" },
+        "allowed_decisions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "enum": ["approve_once", "deny"] }
+        },
+        "destructive": { "type": "boolean" },
+        "device_id": { "$ref": "#/$defs/token" },
+        "device_generation": { "$ref": "#/$defs/uint32Nonzero" }
+      }
+    },
+    "outerEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "src",
+        "dst",
+        "mid",
+        "class",
+        "expires_at_ms",
+        "recipient_key_generation",
+        "collapse",
+        "enc",
+        "ct",
+        "sig"
+      ],
+      "properties": {
+        "v": { "const": 2 },
+        "src": { "$ref": "#/$defs/token" },
+        "dst": { "$ref": "#/$defs/token" },
+        "mid": { "$ref": "#/$defs/messageID" },
+        "class": { "enum": ["realtime", "state", "command", "control"] },
+        "expires_at_ms": { "$ref": "#/$defs/uint64" },
+        "recipient_key_generation": { "$ref": "#/$defs/uint32Nonzero" },
+        "collapse": {
+          "oneOf": [
+            { "$ref": "#/$defs/collapseToken" },
+            { "type": "null" }
+          ]
+        },
+        "enc": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "ct": {
+          "allOf": [
+            { "$ref": "#/$defs/base64url" },
+            { "minLength": 22, "maxLength": 349547 }
+          ]
+        },
+        "sig": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{86}$"
+        }
+      }
+    },
+    "secureMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "mid",
+        "kind",
+        "sender_key_generation",
+        "created_at_ms",
+        "expires_at_ms",
+        "body"
+      ],
+      "properties": {
+        "v": { "const": 2 },
+        "mid": { "$ref": "#/$defs/messageID" },
+        "kind": {
+          "enum": [
+            "pair.init",
+            "pair.accept",
+            "pair.confirm",
+            "frame_batch",
+            "checkpoint",
+            "rpc_request",
+            "rpc_response",
+            "stream_ack",
+            "sync_request",
+            "key_rotate",
+            "device_revoke",
+            "delivery_receipt"
+          ]
+        },
+        "sender_key_generation": { "$ref": "#/$defs/uint32Nonzero" },
+        "created_at_ms": { "$ref": "#/$defs/uint64" },
+        "expires_at_ms": { "$ref": "#/$defs/uint64" },
+        "body": { "type": "object" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "pair.init" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/pairInit" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "pair.accept" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/pairAccept" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "pair.confirm" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/pairConfirm" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "frame_batch" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/frameBatch" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "checkpoint" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/checkpoint" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "rpc_request" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/rpcRequest" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "rpc_response" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/rpcResponse" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "stream_ack" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/streamAck" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "sync_request" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/syncRequest" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "key_rotate" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/keyRotate" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "device_revoke" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/deviceRevoke" } } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "delivery_receipt" } } },
+          "then": { "properties": { "body": { "$ref": "#/$defs/deliveryReceipt" } } }
+        }
+      ]
+    },
+    "notificationPreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "notification_id",
+        "class",
+        "title",
+        "body",
+        "thread_token",
+        "category",
+        "expires_at_ms",
+        "action"
+      ],
+      "properties": {
+        "v": { "const": 2 },
+        "notification_id": { "$ref": "#/$defs/token" },
+        "class": { "enum": ["update", "approval", "error"] },
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "body": { "type": "string", "minLength": 1, "maxLength": 1200 },
+        "thread_token": { "$ref": "#/$defs/token" },
+        "category": {
+          "oneOf": [
+            { "$ref": "#/$defs/token" },
+            { "type": "null" }
+          ]
+        },
+        "expires_at_ms": { "$ref": "#/$defs/uint64" },
+        "action": {
+          "oneOf": [
+            { "$ref": "#/$defs/approvalAction" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "class": { "const": "approval" } } },
+          "then": { "properties": { "action": { "$ref": "#/$defs/approvalAction" } } }
+        },
+        {
+          "if": { "properties": { "class": { "enum": ["update", "error"] } } },
+          "then": { "properties": { "action": { "type": "null" } } }
+        }
+      ]
+    },
+    "notificationSendDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "class",
+        "notification_id",
+        "preview_enc",
+        "preview_ct",
+        "collapse_id",
+        "expires_at_ms",
+        "sound"
+      ],
+      "properties": {
+        "v": { "const": 2 },
+        "class": { "enum": ["update", "approval", "error"] },
+        "notification_id": { "$ref": "#/$defs/token" },
+        "preview_enc": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "preview_ct": {
+          "allOf": [
+            { "$ref": "#/$defs/base64url" },
+            { "minLength": 22, "maxLength": 5462 }
+          ]
+        },
+        "collapse_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/collapseToken" },
+            { "type": "null" }
+          ]
+        },
+        "expires_at_ms": { "$ref": "#/$defs/uint64" },
+        "sound": { "type": "boolean" }
+      }
+    }
+  }
+}

@@ -1,40 +1,41 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools==80.9.0", "wheel==0.46.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-relay"
-version = "0.1.0"
-description = "Mobile relay-client for the stock Hermes gateway (Wave 2): reframes the gateway event stream into the ratified item-lifecycle envelope and serves it to the iOS app over a reliable seq/ack/replay WS, with owned-session APNs."
+version = "0.2.0"
+description = "Content-blind HRP/2 Mobile Agent Relay with authenticated per-device HPKE, durable streams, encrypted Push previews, and explicit v1 compatibility."
 readme = "README.md"
-requires-python = ">=3.13"
-license = { text = "Proprietary" }
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Hermes Mobile" }]
 
-# Runtime deps mirror the R0 spike (relay_client.py): a WS client + an async
-# HTTP client for the REST store-read path. The reused plumbing
-# (replay_ring / push_engine / device_tokens) is imported from
-# plugins/hermes-mobile via hermes_relay.plugin_bridge (NOT a PyPI dep) so the
-# relay stays a zero-core-patch client of the same tree.
+# Exact runtime pins are deliberate: HRP/2's Hub/Gateway transports and HPKE
+# interoperability fixtures must not drift under an implicit dependency
+# upgrade. The relay remains a zero-core-patch client of the stock Gateway.
 dependencies = [
-    "websockets>=12",
-    "httpx>=0.27",
-    # The reused notifier plumbing (push_engine -> utils) reads YAML config, so a
-    # runnable relay needs pyyaml even though the relay itself parses no YAML.
-    "pyyaml>=6",
+    "websockets==15.0.1",
+    "httpx==0.28.1",
+    # v1 compatibility still reuses notifier plumbing which reads YAML.
+    "pyyaml==6.0.3",
+    # HRP/2 cryptographic suite, pinned for Python/Swift fixture stability.
+    "pyhpke==0.6.5",
+    "cryptography==48.0.1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8",
-    "pytest-asyncio>=0.23",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
 ]
 
 [project.scripts]
 hermes-relay = "hermes_relay.__main__:main"
 
-[tool.setuptools]
-packages = ["hermes_relay"]
+[tool.setuptools.packages.find]
+include = ["hermes_relay*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

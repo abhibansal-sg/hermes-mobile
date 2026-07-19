@@ -23,9 +23,10 @@ keep the Reframer and DownstreamServer lanes from colliding on item bookkeeping.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from typing import Any, Optional
 
-from .types import Frame, FrameKind, Item, ItemStatus
+from .types import Frame, FrameKind, Item, ItemStatus, ItemType
 
 
 @dataclass
@@ -82,9 +83,10 @@ class SessionState:
     # -- read ------------------------------------------------------------
     def ordered_items(self) -> list[Item]:
         """Current items in ``ord`` order (stable, first-seen tiebreak)."""
+        first_seen = {item_id: index for index, item_id in enumerate(self.order)}
         return sorted(
             (self.items[i] for i in self.order),
-            key=lambda it: (it.ord, self.order.index(it.item_id)),
+            key=lambda it: (it.ord, first_seen[it.item_id]),
         )
 
     def snapshot(self, cursor: Any = None) -> dict[str, Any]:
@@ -150,6 +152,42 @@ class SessionStore:
         socket yet.
         """
         return list(self._states.keys())
+
+    def replace_history(self, sid: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """Build an authoritative v1 item snapshot from the REST store-read.
+
+        ``open`` promises a snapshot frame, not merely an unrelated raw-history
+        RPC result.  IDs are stable per history ordinal so repeated opens replace
+        cards instead of duplicating them.
+        """
+
+        state = SessionState(sid=sid)
+        for ordinal, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", "unknown"))
+            content = message.get("content", message.get("text", ""))
+            if isinstance(content, list):
+                text = "".join(
+                    str(part.get("text", "")) if isinstance(part, dict) else str(part)
+                    for part in content
+                )
+            else:
+                text = str(content or "")
+            digest = hashlib.sha256(f"{sid}\x00{ordinal}".encode()).hexdigest()[:24]
+            item = Item(
+                item_id=f"hist_{digest}",
+                type=(ItemType.USER_MESSAGE if role == "user" else ItemType.AGENT_MESSAGE),
+                status=ItemStatus.COMPLETED,
+                ord=ordinal,
+                summary=text.splitlines()[0][:160] if text else "",
+                body={"text": text, "role": role},
+            )
+            state.items[item.item_id] = item
+            state.order.append(item.item_id)
+            state._next_ord = ordinal + 1
+        self._states[sid] = state
+        return state.snapshot(cursor=len(messages))
 
     def drop(self, sid: str) -> bool:
         return self._states.pop(sid, None) is not None

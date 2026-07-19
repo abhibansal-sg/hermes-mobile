@@ -9,6 +9,8 @@ final class PushRegistrarPairFlowTests: XCTestCase {
     private let pushDefaultsKeys = [
         DefaultsKeys.pushEnabled,
         DefaultsKeys.pushLastDeviceToken,
+        DefaultsKeys.pushAPNsDeviceToken,
+        DefaultsKeys.pushLastDeviceTokenDigest,
         DefaultsKeys.pushLastEvents,
         DefaultsKeys.pushLastEnv,
         DefaultsKeys.pushLastRegistrationScope,
@@ -57,9 +59,13 @@ final class PushRegistrarPairFlowTests: XCTestCase {
             postedRegistrations[0].events,
             ["approval", "clarify", "turn_complete", "turn_error", "background_done"]
         )
+        XCTAssertEqual(KeychainService.loadAPNsDeviceToken(), "deadbeef")
+        XCTAssertEqual(KeychainService.loadRegisteredAPNsDeviceToken(), "deadbeef")
+        XCTAssertNil(UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken))
+        XCTAssertNil(UserDefaults.standard.string(forKey: DefaultsKeys.pushAPNsDeviceToken))
         XCTAssertEqual(
-            UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken),
-            "deadbeef"
+            UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceTokenDigest),
+            PushRegistrar.deviceTokenDigest("deadbeef")
         )
 
         // Foreground reconciliation may ask APNs to re-deliver the current token;
@@ -149,14 +155,33 @@ final class PushRegistrarPairFlowTests: XCTestCase {
         ])
         XCTAssertEqual(completions.last?.events, latestEvents)
         XCTAssertEqual(UserDefaults.standard.stringArray(forKey: DefaultsKeys.pushLastEvents), latestEvents)
-        XCTAssertEqual(UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken), token)
+        XCTAssertEqual(KeychainService.loadRegisteredAPNsDeviceToken(), token)
+        XCTAssertNil(UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken))
         XCTAssertEqual(UserDefaults.standard.string(forKey: DefaultsKeys.pushLastEnv), currentEnv)
+    }
+
+    func testNotificationOptOutDeletesCurrentAndRegisteredAPNsCredentials() throws {
+        try KeychainService.saveAPNsDeviceToken("current-token")
+        try KeychainService.saveRegisteredAPNsDeviceToken("registered-token")
+        UserDefaults.standard.set(
+            PushRegistrar.deviceTokenDigest("registered-token"),
+            forKey: DefaultsKeys.pushLastDeviceTokenDigest
+        )
+
+        registrar.setEnabled(false)
+
+        XCTAssertNil(KeychainService.loadAPNsDeviceToken())
+        XCTAssertNil(KeychainService.loadRegisteredAPNsDeviceToken())
+        XCTAssertNil(
+            UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceTokenDigest)
+        )
     }
 
     private func resetRegistrarState() {
         registrar.authorizationRequester = nil
         registrar.remoteNotificationsRegistrar = nil
         registrar.tokenRegisterOverride = nil
+        KeychainService.deleteAPNsDeviceTokens()
         for key in pushDefaultsKeys {
             UserDefaults.standard.removeObject(forKey: key)
         }

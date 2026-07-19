@@ -1,26 +1,132 @@
 """Abstract service manager interface.
 
-Wraps the existing systemd (Linux host), launchd (macOS host), Windows
-Scheduled Task (native Windows host), and s6 (container) backends behind
-a common Protocol. Only the s6 backend supports runtime registration
-(for per-profile gateways) — host backends raise NotImplementedError
-from those methods, and callers MUST check supports_runtime_registration()
-before invoking them.
+Wraps systemd (Linux host), launchd (macOS host), Windows Scheduled Task
+(native Windows host), and s6 (container) backends behind a common Protocol.
+All backends can install a declarative :class:`ServiceSpec` for trusted edge
+processes such as the Mobile Agent Relay. Only s6 supports the older runtime
+*profile-gateway* registration API; host backends raise NotImplementedError
+from those profile-specific methods.
 
 Host-side call sites (setup wizard, uninstall, status) continue to use
-the existing module-level functions in hermes_cli.gateway and
-hermes_cli.gateway_windows directly. This protocol is a thin facade
-used by new code that needs to be backend-agnostic — specifically the
-profile create/delete hooks (Phase 4) and the s6 dispatch path in
-``hermes gateway start/stop/restart`` when running inside a container.
+the existing module-level gateway functions directly. Backend-neutral edge
+services use ``ServiceSpec`` through this facade, while profile create/delete
+hooks and the container gateway dispatch continue to use the s6-specific API.
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import re
+import shlex
+import subprocess
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Mapping, Protocol, runtime_checkable
 
 ServiceManagerKind = Literal["systemd", "launchd", "windows", "s6", "none"]
+RestartPolicy = Literal["always", "on-failure", "never"]
+_SENSITIVE_ENV_RE = re.compile(
+    r"(?:^|_)(?:API_KEY|PRIVATE_KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|CAPABILITY)(?:$|_)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class ServiceSpec:
+    """Declarative description of a Hermes-managed background process.
+
+    ``ServiceSpec`` intentionally contains only process metadata. Credentials
+    stay in the profile's protected state store and are loaded by the process;
+    callers should only place non-secret values such as ``HERMES_HOME`` in
+    ``environment``.
+    """
+
+    name: str
+    description: str
+    command: tuple[str, ...] | list[str]
+    working_directory: Path
+    environment: Mapping[str, str]
+    stdout_path: Path
+    stderr_path: Path
+    restart_policy: RestartPolicy = "on-failure"
+
+    def __post_init__(self) -> None:
+        validate_service_name(self.name)
+        if not isinstance(self.description, str) or not self.description.strip():
+            raise ValueError("service description must not be empty")
+        if any(char in self.description for char in ("\x00", "\r", "\n")):
+            raise ValueError("service description must be a single NUL-free line")
+        if not isinstance(self.command, (tuple, list)) or not self.command or any(
+            not isinstance(arg, str) or any(char in arg for char in ("\x00", "\r", "\n"))
+            for arg in self.command
+        ):
+            raise ValueError("service command must contain non-empty, NUL-free arguments")
+        if not str(self.command[0]).strip():
+            raise ValueError("service executable must not be empty")
+        if self.restart_policy not in ("always", "on-failure", "never"):
+            raise ValueError(f"unsupported restart policy: {self.restart_policy!r}")
+        if not isinstance(self.environment, Mapping):
+            raise ValueError("service environment must be a string mapping")
+        if not all(
+            isinstance(path, Path)
+            for path in (
+                self.working_directory,
+                self.stdout_path,
+                self.stderr_path,
+            )
+        ):
+            raise ValueError("service paths must be pathlib.Path values")
+        for key, value in self.environment.items():
+            if not isinstance(key, str) or not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*", key
+            ):
+                raise ValueError(f"invalid environment variable name: {key!r}")
+            if _SENSITIVE_ENV_RE.search(key):
+                raise ValueError(
+                    f"service environment must not embed credential-like value: {key!r}"
+                )
+            if not isinstance(value, str) or any(
+                char in value for char in ("\x00", "\r", "\n")
+            ):
+                raise ValueError(f"invalid environment value for {key!r}")
+
+
+_VALID_SERVICE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,126}$")
+
+
+def validate_service_name(name: str) -> None:
+    """Validate a portable systemd/launchd/s6/Task Scheduler name."""
+    if not _VALID_SERVICE_RE.fullmatch(name):
+        raise ValueError(
+            "service name must be 1-127 lowercase letters, digits, dots, "
+            f"underscores, or dashes, got {name!r}"
+        )
+
+
+def profile_scoped_service_name(
+    base: str,
+    hermes_home: Path | str | None = None,
+) -> str:
+    """Return a stable service name unique to the active ``HERMES_HOME``.
+
+    Hashing the normalized absolute profile directory prevents two Hermes
+    profiles from replacing each other's relay service while keeping paths and
+    usernames out of the service label.
+    """
+    validate_service_name(base)
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
+
+        home = Path(get_hermes_home())
+    else:
+        home = Path(hermes_home)
+    normalized = os.path.normcase(str(home.expanduser().resolve(strict=False)))
+    suffix = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    name = f"{base}-{suffix}"
+    validate_service_name(name)
+    return name
+
 
 # Profile name → service directory mapping. Profile names must be safe
 # as filesystem directory names because the s6 backend creates a service
@@ -54,8 +160,9 @@ def validate_profile_name(name: str) -> None:
 class ServiceManager(Protocol):
     """Abstract interface for init-system-specific service operations.
 
-    Lifecycle methods (start / stop / restart / is_running) are
-    implemented by every backend. Runtime registration
+    Legacy gateway lifecycle methods (start / stop / restart / is_running)
+    and declarative managed-service methods are implemented by every backend.
+    Profile-gateway runtime registration
     (register_profile_gateway / unregister_profile_gateway /
     list_profile_gateways) is implemented only by the s6 backend —
     callers MUST check ``supports_runtime_registration()`` before
@@ -69,6 +176,21 @@ class ServiceManager(Protocol):
     def stop(self, name: str) -> None: ...
     def restart(self, name: str) -> None: ...
     def is_running(self, name: str) -> bool: ...
+
+    # Declarative managed services (Agent Relay and future edge services).
+    def install_service(
+        self,
+        spec: ServiceSpec,
+        *,
+        system: bool = False,
+        start_now: bool = True,
+    ) -> Path: ...
+    def uninstall_service(self, name: str, *, system: bool = False) -> None: ...
+    def start_service(self, name: str, *, system: bool = False) -> None: ...
+    def stop_service(self, name: str, *, system: bool = False) -> None: ...
+    def restart_service(self, name: str, *, system: bool = False) -> None: ...
+    def is_service_running(self, name: str, *, system: bool = False) -> bool: ...
+    def is_service_installed(self, name: str, *, system: bool = False) -> bool: ...
 
     # Runtime registration (s6 only).
     def supports_runtime_registration(self) -> bool: ...
@@ -162,13 +284,10 @@ def _s6_running() -> bool:
 # ---------------------------------------------------------------------------
 # Backend wrappers
 #
-# These adapters are thin facades over the existing module-level functions
-# in ``hermes_cli.gateway`` (systemd/launchd) and ``hermes_cli.gateway_windows``
-# (Windows Scheduled Tasks). The protocol's ``name`` parameter is currently
-# unused for host backends — they operate on whichever profile is currently
-# active (set via the ``hermes -p <profile>`` flag before the call). This
-# matches existing host-side semantics; the parameter shape is designed
-# for s6 where each profile maps to a distinct service directory.
+# Legacy ``start``/``stop`` methods remain thin facades over the existing
+# gateway functions, where the ``name`` argument is intentionally ignored on
+# hosts. The ``*_service`` methods below are the generic, name-aware path used
+# for declarative edge services and never change legacy gateway behavior.
 # ---------------------------------------------------------------------------
 
 
@@ -200,6 +319,158 @@ class _RegistrationUnsupportedMixin:
         return []
 
 
+def _atomic_write(path: Path, content: str | bytes, *, mode: int = 0o644) -> None:
+    """Atomically replace ``path`` without exposing a partial service file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    binary = isinstance(content, bytes)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(
+            fd,
+            "wb" if binary else "w",
+            encoding=None if binary else "utf-8",
+        ) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_path.chmod(mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _prepare_service_paths(spec: ServiceSpec) -> None:
+    if any(
+        char in str(path)
+        for path in (spec.working_directory, spec.stdout_path, spec.stderr_path)
+        for char in ("\r", "\n")
+    ):
+        raise ValueError("service paths must not contain newlines")
+    if not spec.working_directory.is_dir():
+        raise FileNotFoundError(
+            f"service working directory does not exist: {spec.working_directory}"
+        )
+    spec.stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    spec.stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    for path in {spec.stdout_path, spec.stderr_path}:
+        path.touch(exist_ok=True)
+        if os.name == "posix":
+            path.chmod(0o600)
+
+
+def _systemd_quote(value: str) -> str:
+    """Quote one systemd directive value without invoking a shell."""
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("%", "%%")
+        .replace("$", "$$")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+    return f'"{escaped}"'
+
+
+def render_systemd_service(
+    spec: ServiceSpec,
+    *,
+    system: bool = False,
+    run_as_user: str | None = None,
+) -> str:
+    """Render a hardened systemd unit for a declarative service."""
+    restart = {
+        "always": "always",
+        "on-failure": "on-failure",
+        "never": "no",
+    }[spec.restart_policy]
+    lines = [
+        "[Unit]",
+        f"Description={spec.description}",
+        "Wants=network-online.target",
+        "After=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        "ExecStart=" + " ".join(_systemd_quote(arg) for arg in spec.command),
+        f"WorkingDirectory={_systemd_quote(str(spec.working_directory))}",
+    ]
+    if run_as_user:
+        lines.append(f"User={run_as_user}")
+    for key, value in sorted(spec.environment.items()):
+        lines.append(f"Environment={_systemd_quote(f'{key}={value}')}")
+    writable_paths = {spec.stdout_path.parent, spec.stderr_path.parent}
+    configured_home = spec.environment.get("HERMES_HOME")
+    if configured_home:
+        writable_paths.add(Path(configured_home))
+    lines.extend(
+        [
+            f"StandardOutput={_systemd_quote(f'append:{spec.stdout_path}')}",
+            f"StandardError={_systemd_quote(f'append:{spec.stderr_path}')}",
+            f"Restart={restart}",
+            "RestartSec=2s",
+            "UMask=0077",
+            "NoNewPrivileges=true",
+            "PrivateTmp=true",
+            "ProtectSystem=strict",
+            "ProtectHome=read-only",
+            f"ReadOnlyPaths={_systemd_quote(str(spec.working_directory))}",
+            "ReadWritePaths="
+            + " ".join(_systemd_quote(str(path)) for path in sorted(writable_paths)),
+            "",
+            "[Install]",
+            f"WantedBy={'multi-user.target' if system else 'default.target'}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+class ManagedServiceCommandError(RuntimeError):
+    """Raised when an init-system command fails."""
+
+    def __init__(self, manager: str, action: str, detail: str = "") -> None:
+        message = f"{manager} could not {action} managed service"
+        if detail:
+            message += f": {detail.strip()}"
+        super().__init__(message)
+
+
+def _run_managed_command(command: list[str], *, manager: str, action: str) -> None:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ManagedServiceCommandError(manager, action, str(exc)) from exc
+    if result.returncode != 0:
+        raise ManagedServiceCommandError(
+            manager,
+            action,
+            result.stderr or result.stdout or f"exit {result.returncode}",
+        )
+
+
+def _run_managed_rollback(command: list[str]) -> bool:
+    """Run rollback cleanup without replacing the triggering exception."""
+
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 class SystemdServiceManager(_RegistrationUnsupportedMixin):
     """Thin wrapper around the ``systemd_*`` functions in hermes_cli.gateway.
 
@@ -209,6 +480,159 @@ class SystemdServiceManager(_RegistrationUnsupportedMixin):
     """
 
     kind: ServiceManagerKind = "systemd"
+
+    def __init__(
+        self,
+        *,
+        user_unit_dir: Path | None = None,
+        system_unit_dir: Path | None = None,
+    ) -> None:
+        self.user_unit_dir = user_unit_dir or Path.home() / ".config/systemd/user"
+        self.system_unit_dir = system_unit_dir or Path("/etc/systemd/system")
+
+    def _managed_unit_path(self, name: str, *, system: bool) -> Path:
+        validate_service_name(name)
+        root = self.system_unit_dir if system else self.user_unit_dir
+        return root / f"{name}.service"
+
+    @staticmethod
+    def _systemctl(*args: str, system: bool) -> list[str]:
+        return ["systemctl", *([] if system else ["--user"]), *args]
+
+    def install_service(
+        self,
+        spec: ServiceSpec,
+        *,
+        system: bool = False,
+        start_now: bool = True,
+    ) -> Path:
+        if system and os.name != "nt" and os.geteuid() != 0:
+            raise PermissionError("system service installation requires root")
+        _prepare_service_paths(spec)
+        unit_path = self._managed_unit_path(spec.name, system=system)
+        previous = unit_path.read_bytes() if unit_path.exists() else None
+        run_as_user: str | None = None
+        if system:
+            import pwd
+
+            owner_path = Path(spec.environment.get("HERMES_HOME", spec.working_directory))
+            run_as_user = pwd.getpwuid(owner_path.stat().st_uid).pw_name
+        rendered = render_systemd_service(
+            spec,
+            system=system,
+            run_as_user=run_as_user,
+        ).encode("utf-8")
+        changed = previous is not None and previous != rendered
+        try:
+            _atomic_write(unit_path, rendered)
+            _run_managed_command(
+                self._systemctl("daemon-reload", system=system),
+                manager="systemd",
+                action="reload units",
+            )
+            enable_args = [
+                "enable",
+                *(["--now"] if start_now else []),
+                f"{spec.name}.service",
+            ]
+            _run_managed_command(
+                self._systemctl(*enable_args, system=system),
+                manager="systemd",
+                action=f"enable {spec.name}",
+            )
+            if start_now and changed:
+                _run_managed_command(
+                    self._systemctl(
+                        "restart", f"{spec.name}.service", system=system
+                    ),
+                    manager="systemd",
+                    action=f"restart {spec.name} with updated specification",
+                )
+        except Exception:
+            if previous is None:
+                # `enable --now` is not transactional: systemd may create the
+                # enable symlink and start the unit before returning non-zero.
+                # Stop/disable by name while the new unit is still present so
+                # a failed first install cannot leave a restarting process.
+                disabled = _run_managed_rollback(
+                    self._systemctl(
+                        "disable",
+                        "--now",
+                        f"{spec.name}.service",
+                        system=system,
+                    )
+                )
+                # Keep the unit file when disable could not be confirmed. The
+                # caller's strict uninstall rollback can then see it and retry;
+                # deleting it here would hide a loaded/restarting orphan.
+                if disabled:
+                    unit_path.unlink(missing_ok=True)
+            else:
+                _atomic_write(unit_path, previous)
+            _run_managed_rollback(
+                self._systemctl("daemon-reload", system=system)
+            )
+            if previous is not None and start_now:
+                _run_managed_rollback(
+                    self._systemctl(
+                        "restart", f"{spec.name}.service", system=system
+                    )
+                )
+            raise
+        return unit_path
+
+    def uninstall_service(self, name: str, *, system: bool = False) -> None:
+        unit_path = self._managed_unit_path(name, system=system)
+        if not unit_path.exists():
+            return
+        _run_managed_command(
+            self._systemctl("disable", "--now", f"{name}.service", system=system),
+            manager="systemd",
+            action=f"disable {name}",
+        )
+        unit_path.unlink(missing_ok=True)
+        _run_managed_command(
+            self._systemctl("daemon-reload", system=system),
+            manager="systemd",
+            action="reload units",
+        )
+
+    def start_service(self, name: str, *, system: bool = False) -> None:
+        validate_service_name(name)
+        _run_managed_command(
+            self._systemctl("start", f"{name}.service", system=system),
+            manager="systemd",
+            action=f"start {name}",
+        )
+
+    def stop_service(self, name: str, *, system: bool = False) -> None:
+        validate_service_name(name)
+        _run_managed_command(
+            self._systemctl("stop", f"{name}.service", system=system),
+            manager="systemd",
+            action=f"stop {name}",
+        )
+
+    def restart_service(self, name: str, *, system: bool = False) -> None:
+        validate_service_name(name)
+        _run_managed_command(
+            self._systemctl("restart", f"{name}.service", system=system),
+            manager="systemd",
+            action=f"restart {name}",
+        )
+
+    def is_service_running(self, name: str, *, system: bool = False) -> bool:
+        validate_service_name(name)
+        result = subprocess.run(
+            self._systemctl("is-active", "--quiet", f"{name}.service", system=system),
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+
+    def is_service_installed(self, name: str, *, system: bool = False) -> bool:
+        return self._managed_unit_path(name, system=system).is_file()
 
     def start(self, name: str) -> None:
         from hermes_cli.gateway import systemd_start
@@ -232,6 +656,178 @@ class LaunchdServiceManager(_RegistrationUnsupportedMixin):
     """Thin wrapper around the ``launchd_*`` functions in hermes_cli.gateway."""
 
     kind: ServiceManagerKind = "launchd"
+
+    def __init__(self, *, agents_dir: Path | None = None, uid: int | None = None) -> None:
+        self.agents_dir = agents_dir or Path.home() / "Library/LaunchAgents"
+        self.uid = os.getuid() if uid is None else uid
+
+    @staticmethod
+    def _label(name: str) -> str:
+        validate_service_name(name)
+        return f"ai.hermes.{name}"
+
+    def _managed_plist_path(self, name: str) -> Path:
+        return self.agents_dir / f"{self._label(name)}.plist"
+
+    @property
+    def _domain(self) -> str:
+        return f"gui/{self.uid}"
+
+    def _target(self, name: str) -> str:
+        return f"{self._domain}/{self._label(name)}"
+
+    def _bootout(self, name: str, *, allow_absent: bool) -> None:
+        result = subprocess.run(
+            ["launchctl", "bootout", self._target(name)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return
+        detail = (result.stderr or result.stdout or "").strip()
+        lowered = detail.lower()
+        absent = any(
+            marker in lowered
+            for marker in ("could not find service", "no such process", "not found")
+        )
+        if not (allow_absent and absent):
+            raise ManagedServiceCommandError(
+                "launchd", f"stop {name}", detail or f"exit {result.returncode}"
+            )
+
+    @staticmethod
+    def _render_plist(spec: ServiceSpec, *, start_now: bool) -> bytes:
+        import plistlib
+
+        keep_alive: bool | dict[str, bool]
+        if spec.restart_policy == "always":
+            keep_alive = True
+        elif spec.restart_policy == "on-failure":
+            keep_alive = {"SuccessfulExit": False}
+        else:
+            keep_alive = False
+        payload: dict[str, object] = {
+            "Label": LaunchdServiceManager._label(spec.name),
+            "ProgramArguments": list(spec.command),
+            "WorkingDirectory": str(spec.working_directory),
+            "EnvironmentVariables": dict(spec.environment),
+            "StandardOutPath": str(spec.stdout_path),
+            "StandardErrorPath": str(spec.stderr_path),
+            "RunAtLoad": start_now,
+            "KeepAlive": keep_alive,
+            "ProcessType": "Background",
+            "Umask": 0o077,
+        }
+        return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
+
+    def install_service(
+        self,
+        spec: ServiceSpec,
+        *,
+        system: bool = False,
+        start_now: bool = True,
+    ) -> Path:
+        if system:
+            raise NotImplementedError(
+                "managed launchd services currently support per-user LaunchAgents only"
+            )
+        _prepare_service_paths(spec)
+        plist_path = self._managed_plist_path(spec.name)
+        previous = plist_path.read_bytes() if plist_path.exists() else None
+        target = self._target(spec.name)
+        self._bootout(spec.name, allow_absent=True)
+        try:
+            _atomic_write(plist_path, self._render_plist(spec, start_now=start_now))
+            _run_managed_command(
+                ["launchctl", "bootstrap", self._domain, str(plist_path)],
+                manager="launchd",
+                action=f"install {spec.name}",
+            )
+            if start_now:
+                _run_managed_command(
+                    ["launchctl", "kickstart", "-k", target],
+                    manager="launchd",
+                    action=f"start {spec.name}",
+                )
+        except Exception:
+            subprocess.run(
+                ["launchctl", "bootout", target],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+            if previous is None:
+                plist_path.unlink(missing_ok=True)
+            else:
+                _atomic_write(plist_path, previous)
+                subprocess.run(
+                    ["launchctl", "bootstrap", self._domain, str(plist_path)],
+                    check=False,
+                    capture_output=True,
+                    timeout=10,
+                )
+            raise
+        return plist_path
+
+    def uninstall_service(self, name: str, *, system: bool = False) -> None:
+        if system:
+            raise NotImplementedError("launchd system service removal is not supported")
+        plist_path = self._managed_plist_path(name)
+        if not plist_path.exists():
+            return
+        self._bootout(name, allow_absent=True)
+        plist_path.unlink(missing_ok=True)
+
+    def start_service(self, name: str, *, system: bool = False) -> None:
+        if system:
+            raise NotImplementedError("launchd system services are not supported")
+        plist_path = self._managed_plist_path(name)
+        if not plist_path.is_file():
+            raise FileNotFoundError(f"managed launchd service is not installed: {name}")
+        probe = subprocess.run(
+            ["launchctl", "print", self._target(name)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if probe.returncode != 0:
+            _run_managed_command(
+                ["launchctl", "bootstrap", self._domain, str(plist_path)],
+                manager="launchd",
+                action=f"load {name}",
+            )
+        _run_managed_command(
+            ["launchctl", "kickstart", "-k", self._target(name)],
+            manager="launchd",
+            action=f"start {name}",
+        )
+
+    def stop_service(self, name: str, *, system: bool = False) -> None:
+        if system:
+            raise NotImplementedError("launchd system services are not supported")
+        self._bootout(name, allow_absent=True)
+
+    def restart_service(self, name: str, *, system: bool = False) -> None:
+        self.stop_service(name, system=system)
+        self.start_service(name, system=system)
+
+    def is_service_running(self, name: str, *, system: bool = False) -> bool:
+        if system:
+            return False
+        result = subprocess.run(
+            ["launchctl", "print", self._target(name)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode == 0 and "state = running" in result.stdout
+
+    def is_service_installed(self, name: str, *, system: bool = False) -> bool:
+        return not system and self._managed_plist_path(name).is_file()
 
     def start(self, name: str) -> None:
         from hermes_cli.gateway import launchd_start
@@ -263,6 +859,218 @@ class WindowsServiceManager(_RegistrationUnsupportedMixin):
     """
 
     kind: ServiceManagerKind = "windows"
+
+    def __init__(self, *, services_dir: Path | None = None) -> None:
+        default_root = Path(
+            os.environ.get(
+                "LOCALAPPDATA",
+                str(Path.home() / "AppData" / "Local"),
+            )
+        )
+        self.services_dir = services_dir or default_root / "Hermes" / "services"
+
+    @staticmethod
+    def _task_name(name: str) -> str:
+        validate_service_name(name)
+        return rf"Hermes\{name}"
+
+    def _script_path(self, name: str) -> Path:
+        validate_service_name(name)
+        return self.services_dir / f"{name}.cmd"
+
+    @staticmethod
+    def _cmd_argument(value: str) -> str:
+        # ``list2cmdline`` targets the Windows CRT, while this command first
+        # passes through cmd.exe. Quote every argument (not only whitespace)
+        # so &, |, <, > and parentheses remain data, and double percent signs
+        # so cmd does not expand environment references inside arguments.
+        escaped = subprocess.list2cmdline([value.replace("%", "%%")])
+        return escaped if escaped.startswith('"') else f'"{escaped}"'
+
+    @staticmethod
+    def _render_script(spec: ServiceSpec) -> str:
+        for value in spec.environment.values():
+            if '"' in value or "\r" in value or "\n" in value:
+                raise ValueError(
+                    "Windows service environment values cannot contain quotes or newlines"
+                )
+        lines = ["@echo off", "setlocal DisableDelayedExpansion"]
+        for key, value in sorted(spec.environment.items()):
+            lines.append(f'set "{key}={value.replace("%", "%%")}"')
+        working_directory = str(spec.working_directory).replace("%", "%%")
+        stdout_path = str(spec.stdout_path).replace("%", "%%")
+        stderr_path = str(spec.stderr_path).replace("%", "%%")
+        lines.append(f'cd /d "{working_directory}"')
+        command = " ".join(
+            WindowsServiceManager._cmd_argument(value) for value in spec.command
+        )
+        lines.append(
+            f'{command} 1>>"{stdout_path}" 2>>"{stderr_path}"'
+        )
+        return "\r\n".join(lines) + "\r\n"
+
+    @staticmethod
+    def _render_task_xml(spec: ServiceSpec, script_path: Path) -> str:
+        from xml.sax.saxutils import escape
+
+        restart = ""
+        if spec.restart_policy in ("always", "on-failure"):
+            restart = (
+                "\n    <RestartOnFailure>\n"
+                "      <Interval>PT1M</Interval>\n"
+                "      <Count>999</Count>\n"
+                "    </RestartOnFailure>"
+            )
+        return f'''<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>{escape(spec.description)}</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>{restart}
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/D /C &quot;{escape(str(script_path))}&quot;</Arguments>
+      <WorkingDirectory>{escape(str(spec.working_directory))}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+'''
+
+    @staticmethod
+    def _run_schtasks(args: list[str], *, action: str, allow_absent: bool = False) -> str:
+        from hermes_cli import gateway_windows
+
+        code, stdout, stderr = gateway_windows._exec_schtasks(args)
+        detail = stderr or stdout or ""
+        if code != 0:
+            absent = "cannot find" in detail.lower() or "not exist" in detail.lower()
+            if not (allow_absent and absent):
+                raise ManagedServiceCommandError("Windows Task Scheduler", action, detail)
+        return stdout
+
+    def install_service(
+        self,
+        spec: ServiceSpec,
+        *,
+        system: bool = False,
+        start_now: bool = True,
+    ) -> Path:
+        if system:
+            raise NotImplementedError("Windows managed services are installed per user")
+        _prepare_service_paths(spec)
+        script_path = self._script_path(spec.name)
+        previous = script_path.read_bytes() if script_path.exists() else None
+        was_running = previous is not None and self.is_service_running(spec.name)
+        xml_path = script_path.with_suffix(".task.xml")
+        task_created = False
+        try:
+            _atomic_write(script_path, self._render_script(spec))
+            _atomic_write(
+                xml_path,
+                self._render_task_xml(spec, script_path).encode("utf-16"),
+            )
+            self._run_schtasks(
+                ["/Create", "/F", "/TN", self._task_name(spec.name), "/XML", str(xml_path)],
+                action=f"install {spec.name}",
+            )
+            task_created = True
+            if start_now:
+                if was_running:
+                    self.stop_service(spec.name)
+                self.start_service(spec.name)
+        except Exception:
+            if previous is None:
+                script_path.unlink(missing_ok=True)
+                if task_created:
+                    try:
+                        self._run_schtasks(
+                            ["/Delete", "/F", "/TN", self._task_name(spec.name)],
+                            action=f"roll back {spec.name}",
+                            allow_absent=True,
+                        )
+                    except ManagedServiceCommandError:
+                        pass
+            else:
+                _atomic_write(script_path, previous)
+                if was_running:
+                    try:
+                        self.start_service(spec.name)
+                    except ManagedServiceCommandError:
+                        pass
+            raise
+        finally:
+            xml_path.unlink(missing_ok=True)
+        return script_path
+
+    def uninstall_service(self, name: str, *, system: bool = False) -> None:
+        if system:
+            raise NotImplementedError("Windows managed services are installed per user")
+        self._run_schtasks(
+            ["/Delete", "/F", "/TN", self._task_name(name)],
+            action=f"remove {name}",
+            allow_absent=True,
+        )
+        self._script_path(name).unlink(missing_ok=True)
+
+    def start_service(self, name: str, *, system: bool = False) -> None:
+        if system:
+            raise NotImplementedError("Windows managed services are installed per user")
+        self._run_schtasks(
+            ["/Run", "/TN", self._task_name(name)],
+            action=f"start {name}",
+        )
+
+    def stop_service(self, name: str, *, system: bool = False) -> None:
+        if system:
+            raise NotImplementedError("Windows managed services are installed per user")
+        self._run_schtasks(
+            ["/End", "/TN", self._task_name(name)],
+            action=f"stop {name}",
+            allow_absent=True,
+        )
+
+    def restart_service(self, name: str, *, system: bool = False) -> None:
+        self.stop_service(name, system=system)
+        self.start_service(name, system=system)
+
+    def is_service_running(self, name: str, *, system: bool = False) -> bool:
+        if system:
+            return False
+        try:
+            output = self._run_schtasks(
+                ["/Query", "/TN", self._task_name(name), "/V", "/FO", "LIST"],
+                action=f"query {name}",
+            )
+        except ManagedServiceCommandError:
+            return False
+        return bool(re.search(r"(?im)^\s*(status|state)\s*:\s*running\s*$", output))
+
+    def is_service_installed(self, name: str, *, system: bool = False) -> bool:
+        if system:
+            return False
+        try:
+            self._run_schtasks(
+                ["/Query", "/TN", self._task_name(name)],
+                action=f"query {name}",
+            )
+        except ManagedServiceCommandError:
+            return False
+        return True
 
     def install(
         self,
@@ -487,7 +1295,6 @@ def _seed_supervise_skeleton(svc_dir: Path) -> None:
         if path.exists():
             return
         path.mkdir(parents=False, exist_ok=False)
-        path.chmod(mode)
         try:
             os.chown(path, _HERMES_UID, _HERMES_GID)
         except PermissionError:
@@ -495,7 +1302,17 @@ def _seed_supervise_skeleton(svc_dir: Path) -> None:
             # owned by default. The chown is a no-op in that case, so
             # swallowing this keeps both root and unprivileged callers
             # on one code path.
-            pass
+            # Development hosts can create temp directories in a group the
+            # current user does not belong to (notably wheel on macOS), which
+            # makes the kernel silently clear setgid during chmod. Normalize
+            # to the caller's primary group in that non-root fallback.
+            try:
+                os.chown(path, -1, os.getgid())
+            except PermissionError:
+                pass
+        # chown may clear setgid/sticky bits on some hosts; apply the
+        # intended permissions only after ownership is settled.
+        path.chmod(mode)
 
     # Top-level event/ dir (this is the s6-svlisten1 event-subscription
     # dir at the service root, distinct from supervise/event/).
@@ -517,11 +1334,11 @@ def _seed_supervise_skeleton(svc_dir: Path) -> None:
     control = supervise / "control"
     if not control.exists():
         os.mkfifo(control, 0o660)
-        control.chmod(0o660)
         try:
             os.chown(control, _HERMES_UID, _HERMES_GID)
         except PermissionError:
             pass
+        control.chmod(0o660)
 
     # If a log/ subdir is present (the canonical s6 logger pattern —
     # see servicedir(7)), it gets its own s6-supervise instance and
@@ -537,11 +1354,11 @@ def _seed_supervise_skeleton(svc_dir: Path) -> None:
         log_control = log_supervise / "control"
         if not log_control.exists():
             os.mkfifo(log_control, 0o660)
-            log_control.chmod(0o660)
             try:
                 os.chown(log_control, _HERMES_UID, _HERMES_GID)
             except PermissionError:
                 pass
+            log_control.chmod(0o660)
 
 
 class S6Error(RuntimeError):
@@ -619,6 +1436,208 @@ class S6ServiceManager:
 
     def _service_name(self, profile: str) -> str:
         return f"{S6_SERVICE_PREFIX}{profile}"
+
+    @staticmethod
+    def _render_managed_run_script(spec: ServiceSpec) -> str:
+        lines = [
+            "#!/command/with-contenv sh",
+            "# shellcheck shell=sh",
+            "set -eu",
+            "umask 077",
+            f"cd {shlex.quote(str(spec.working_directory))}",
+        ]
+        for key, value in sorted(spec.environment.items()):
+            lines.append(f"export {key}={shlex.quote(value)}")
+        command = shlex.join(list(spec.command))
+        lines.append(
+            f"exec {command} >>{shlex.quote(str(spec.stdout_path))} "
+            f"2>>{shlex.quote(str(spec.stderr_path))}"
+        )
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _render_managed_finish_script(spec: ServiceSpec) -> str:
+        if spec.restart_policy == "always":
+            body = "exit 0"
+        elif spec.restart_policy == "never":
+            body = "exit 125"
+        else:
+            body = '[ "$1" = "0" ] && exit 125\nexit 0'
+        return (
+            "#!/command/with-contenv sh\n"
+            "# $1 is the service exit code; 125 tells s6 not to restart.\n"
+            f"{body}\n"
+        )
+
+    def install_service(
+        self,
+        spec: ServiceSpec,
+        *,
+        system: bool = False,
+        start_now: bool = True,
+    ) -> Path:
+        """Atomically install or reconcile an s6 longrun service."""
+        import shutil
+
+        if system:
+            raise NotImplementedError("s6 uses its active scandir, not system scope")
+        _prepare_service_paths(spec)
+        validate_service_name(spec.name)
+        self.scandir.mkdir(parents=True, exist_ok=True)
+        service_dir = self.scandir / spec.name
+        staging = self.scandir / f".{spec.name}.tmp"
+        backup = self.scandir / f".{spec.name}.backup"
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+        had_existing = service_dir.exists()
+        prior_should_run = had_existing and not (service_dir / "down").exists()
+        prior_stopped = False
+        staging.mkdir()
+        try:
+            (staging / "type").write_text("longrun\n", encoding="utf-8")
+            run_path = staging / "run"
+            run_path.write_text(self._render_managed_run_script(spec), encoding="utf-8")
+            run_path.chmod(0o755)
+            finish_path = staging / "finish"
+            finish_path.write_text(
+                self._render_managed_finish_script(spec),
+                encoding="utf-8",
+            )
+            finish_path.chmod(0o755)
+            if not start_now:
+                (staging / "down").touch()
+            _seed_supervise_skeleton(staging)
+
+            if service_dir.exists():
+                _run_managed_command(
+                    [f"{_S6_BIN_DIR}/s6-svc", "-d", str(service_dir)],
+                    manager="s6",
+                    action=f"stop prior {spec.name}",
+                )
+                prior_stopped = True
+                _run_managed_command(
+                    [
+                        f"{_S6_BIN_DIR}/s6-svwait",
+                        "-D",
+                        "-t",
+                        "10000",
+                        str(service_dir),
+                    ],
+                    manager="s6",
+                    action=f"wait for prior {spec.name} to stop",
+                )
+                service_dir.rename(backup)
+            staging.rename(service_dir)
+            try:
+                _run_managed_command(
+                    [f"{_S6_BIN_DIR}/s6-svscanctl", "-a", str(self.scandir)],
+                    manager="s6",
+                    action=f"install {spec.name}",
+                )
+            except Exception:
+                shutil.rmtree(service_dir, ignore_errors=True)
+                if backup.exists():
+                    backup.rename(service_dir)
+                    subprocess.run(
+                        [f"{_S6_BIN_DIR}/s6-svscanctl", "-a", str(self.scandir)],
+                        check=False,
+                        capture_output=True,
+                        timeout=5,
+                    )
+                raise
+            shutil.rmtree(backup, ignore_errors=True)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            # A failure before or during the atomic swap must leave the exact
+            # prior directory registered and restore its former up-state.
+            if backup.exists() and not service_dir.exists():
+                try:
+                    backup.rename(service_dir)
+                    subprocess.run(
+                        [f"{_S6_BIN_DIR}/s6-svscanctl", "-a", str(self.scandir)],
+                        check=False,
+                        capture_output=True,
+                        timeout=5,
+                    )
+                except OSError:
+                    pass
+            if prior_stopped and prior_should_run and service_dir.exists():
+                subprocess.run(
+                    [f"{_S6_BIN_DIR}/s6-svc", "-u", str(service_dir)],
+                    check=False,
+                    capture_output=True,
+                    timeout=5,
+                )
+            raise
+        return service_dir
+
+    def uninstall_service(self, name: str, *, system: bool = False) -> None:
+        import shutil
+
+        if system:
+            raise NotImplementedError("s6 uses its active scandir, not system scope")
+        validate_service_name(name)
+        service_dir = self.scandir / name
+        if not service_dir.exists():
+            return
+        _run_managed_command(
+            [f"{_S6_BIN_DIR}/s6-svc", "-d", str(service_dir)],
+            manager="s6",
+            action=f"stop {name} before uninstall",
+        )
+        _run_managed_command(
+            [f"{_S6_BIN_DIR}/s6-svwait", "-D", "-t", "10000", str(service_dir)],
+            manager="s6",
+            action=f"wait for {name} to stop before uninstall",
+        )
+        tombstone = self.scandir / f".{name}.removing"
+        if tombstone.exists():
+            shutil.rmtree(tombstone, ignore_errors=True)
+        service_dir.rename(tombstone)
+        try:
+            _run_managed_command(
+                [f"{_S6_BIN_DIR}/s6-svscanctl", "-an", str(self.scandir)],
+                manager="s6",
+                action=f"unregister {name}",
+            )
+        except Exception:
+            tombstone.rename(service_dir)
+            raise
+        shutil.rmtree(tombstone, ignore_errors=True)
+
+    def start_service(self, name: str, *, system: bool = False) -> None:
+        if system:
+            raise NotImplementedError("s6 uses its active scandir, not system scope")
+        validate_service_name(name)
+        (self.scandir / name / "down").unlink(missing_ok=True)
+        self._run_svc("-u", "start", name)
+
+    def stop_service(self, name: str, *, system: bool = False) -> None:
+        if system:
+            raise NotImplementedError("s6 uses its active scandir, not system scope")
+        validate_service_name(name)
+        self._run_svc("-d", "stop", name)
+        (self.scandir / name / "down").touch()
+
+    def restart_service(self, name: str, *, system: bool = False) -> None:
+        if system:
+            raise NotImplementedError("s6 uses its active scandir, not system scope")
+        validate_service_name(name)
+        self._run_svc("-t", "restart", name)
+
+    def is_service_running(self, name: str, *, system: bool = False) -> bool:
+        if system:
+            return False
+        validate_service_name(name)
+        return self.is_running(name)
+
+    def is_service_installed(self, name: str, *, system: bool = False) -> bool:
+        if system:
+            return False
+        validate_service_name(name)
+        return (self.scandir / name).is_dir()
 
     @staticmethod
     def _render_run_script(

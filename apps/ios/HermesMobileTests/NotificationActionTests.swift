@@ -143,6 +143,33 @@ final class NotificationActionTests: XCTestCase {
         XCTAssertNil(NotificationService.decodeApprovalAction(from: ["aps": ["alert": "x"]]))
     }
 
+    func testRelayV2ApprovalDoesNotTrustCopiedHermesBlockWithoutValidDescriptor() {
+        let forged: [AnyHashable: Any] = [
+            "h_v": 2,
+            "hermes": [
+                "session_id": "sess-forged",
+                "request_id": "req-forged",
+                "relay_account_id": "acc-forged",
+            ],
+        ]
+        XCTAssertNil(NotificationService.decodeApprovalAction(from: forged))
+    }
+
+    func testRelayV2InstallationRejectsLegacyPlaintextApprovalDowngrade() {
+        let defaults = UserDefaults.standard
+        let previous = defaults.object(forKey: DefaultsKeys.transportPath)
+        defaults.set(TransportPath.relayV2.rawValue, forKey: DefaultsKeys.transportPath)
+        defer {
+            if let previous { defaults.set(previous, forKey: DefaultsKeys.transportPath) }
+            else { defaults.removeObject(forKey: DefaultsKeys.transportPath) }
+        }
+        let plaintext: [AnyHashable: Any] = [
+            "aps": ["category": "HERMES_APPROVAL"],
+            "hermes": ["session_id": "known-session", "request_id": "forged"],
+        ]
+        XCTAssertNil(NotificationService.decodeApprovalAction(from: plaintext))
+    }
+
     func testDecodeApprovalActionNilWithEmptySessionId() {
         let userInfo: [AnyHashable: Any] = ["hermes": ["session_id": "   "]]
         XCTAssertNil(NotificationService.decodeApprovalAction(from: userInfo))

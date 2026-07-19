@@ -7,6 +7,13 @@
         <string>group.ai.hermes.app</string>
     </array>
     <key>aps-environment</key>
-    <string>development</string>
+    <string>$(HERMES_APNS_ENVIRONMENT)</string>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)ai.hermes.app</string>
+        <string>$(AppIdentifierPrefix)ai.hermes.app.relay-preview</string>
+    </array>
+    <key>com.apple.developer.devicecheck.appattest-environment</key>
+    <string>$(HERMES_APP_ATTEST_ENVIRONMENT)</string>
 </dict>
 </plist>

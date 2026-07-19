@@ -1,0 +1,113 @@
+name: hermes-hrp2-hub
+
+services:
+  relay-hub-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: relay_hub
+      POSTGRES_USER: relay_hub
+      POSTGRES_PASSWORD: ${HRH_POSTGRES_PASSWORD:?set HRH_POSTGRES_PASSWORD}
+    volumes:
+      - relay-hub-db:/var/lib/postgresql/data
+    networks: [hub-db]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay_hub -d relay_hub"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  relay-hub-migrate:
+    image: postgres:17-alpine
+    depends_on:
+      relay-hub-db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${HRH_POSTGRES_PASSWORD:?set HRH_POSTGRES_PASSWORD}
+    volumes:
+      - ./relay-hub/migrations/postgresql/001_hrp2.sql:/migration.sql:ro
+    command:
+      - psql
+      - -h
+      - relay-hub-db
+      - -U
+      - relay_hub
+      - -d
+      - relay_hub
+      - -v
+      - ON_ERROR_STOP=1
+      - -f
+      - /migration.sql
+    networks: [hub-db]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  relay-hub:
+    build: ./relay-hub
+    depends_on:
+      relay-hub-migrate:
+        condition: service_completed_successfully
+    environment:
+      HRH_PRODUCTION: "true"
+      HRH_DATABASE_URL: postgresql+psycopg://relay_hub:${HRH_POSTGRES_PASSWORD:?set HRH_POSTGRES_PASSWORD}@relay-hub-db:5432/relay_hub
+      HRH_OPERATOR_ENROLLMENT_TOKEN: ${HRH_OPERATOR_ENROLLMENT_TOKEN:-}
+      HRH_ACTIVATION_PUBLIC_KEY_B64: ${HRH_ACTIVATION_PUBLIC_KEY_B64:-}
+      HRH_AUTO_CREATE_SCHEMA: "false"
+      HRH_MAXIMUM_REQUEST_BODY_BYTES: "400000"
+      # Only the fixed Caddy address may supply X-Forwarded-* client identity.
+      FORWARDED_ALLOW_IPS: "172.31.250.2"
+    expose: ["8080"]
+    networks:
+      hub-ingress:
+        ipv4_address: 172.31.250.3
+      hub-db:
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    depends_on:
+      relay-hub:
+        condition: service_healthy
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+      HRH_PUBLIC_HOST: ${HRH_PUBLIC_HOST:?set HRH_PUBLIC_HOST}
+    volumes:
+      - ./relay-hub/deploy/Caddyfile.hub-only:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    networks:
+      hub-ingress:
+        ipv4_address: 172.31.250.2
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+networks:
+  # Keep the trusted proxy on an isolated, fixed subnet. If this subnet moves,
+  # update both Caddy's address and relay-hub's FORWARDED_ALLOW_IPS together.
+  hub-ingress:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
+  hub-db:
+    internal: true
+
+volumes:
+  relay-hub-db:
+  caddy-data:
+  caddy-config:

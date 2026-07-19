@@ -1,6 +1,6 @@
 # Hermes Relay Protocol v2 — Architecture and Implementation Proposal
 
-**Status:** PROPOSAL — not yet implemented
+**Status:** IMPLEMENTATION CANDIDATE — isolated branch; not production-certified
 **Published:** 2026-07-19
 **Implementation base:** `origin/wave2/relay-turn-elements` at `ab570aa74`
 
@@ -10,9 +10,13 @@ intentionally published on an isolated branch based on the newest focused relay
 work. It does not modify or supersede that implementation branch, and it does
 not claim that the current v1 local relay prototype already satisfies HRP/2.
 
-The existing `docs/RELAY-PHONE-PROTOCOL.md` remains the description of the local
-Wave 2 v1 prototype until the migration and ratification gates in this proposal
-are completed.
+This file preserves the original verdict and design rationale. The current
+implementation contract and operator guidance are indexed in
+[`docs/mobile-relay/README.md`](README.md); the machine-readable wire source of
+truth is `protocol/hrp2/schema.json`. Physical-device APNs/App Attest/TestFlight
+validation remains a release gate and is not claimed by this branch. Local
+automated evidence and the remaining external gates are recorded in
+[`VERIFICATION.md`](VERIFICATION.md).
 
 ---
 
@@ -455,6 +459,30 @@ Established-device messages carry the intended recipient generation in the outer
 - Previous generation during a bounded rollover window.
 - Revoked generations.
 
+A rotation is prepared locally and sent as a durable `key_rotate` control
+message. Hub acceptance proves only that the ciphertext was stored; it does
+not activate the new generation for that peer. A device promotes its prepared
+local generation only after receiving an authenticated inner
+`delivery_receipt` for that exact rotation message ID. The Agent encrypts that
+receipt to the prepared device generation so possession of the new private key
+is proven before promotion.
+
+For Agent KEM rotation, the Agent atomically stores its new global key and one
+exact old-generation notice for every active device, then tracks activation
+independently per device. Until device A has acknowledged the Agent's new
+public key, all Agent-to-A messages—including notifications—continue to use the
+last generation A proved it installed. Acknowledgement by device B must never
+advance device A. Exact ciphertext and the semantic receipt ledger survive
+crashes and replay, so a duplicate receipt cannot promote twice or create a
+receipt-of-receipt loop.
+
+The implementation treats overlap expiry as a revocation boundary. A device
+that has not proved the new Agent generation is atomically quarantined with an
+explicit re-pair requirement; retiring keys are hidden before external
+erasure, and Hub route/grant plus Push binding deletion proceeds through
+durable idempotent jobs. A lagging device therefore cannot block healthy-device
+rotation or retain indefinite hosted authority after a transient response loss.
+
 Recommended automatic rotation:
 
 - Every 7 days, or
@@ -653,6 +681,34 @@ The phone responds using authenticated HPKE with its newly enrolled static devic
 
 The temporary route and tokens are then deleted.
 
+### Concrete Hub pairing transaction
+
+The hosted Hub wires those messages into one response-loss-safe transaction:
+
+1. The Agent signs `POST /v2/offers` with client-generated `ofr_...` and
+   `off_...` identifiers, the owner route, expiry, and
+   `base64url(SHA256(raw transport token))`.
+2. The phone submits exactly one opaque PairInit `enc`/`ct` pair to
+   `POST /v2/offers/{offer_route}/messages` using the raw transport token as a
+   bearer credential. `message_hash` is `SHA256(raw enc || raw ct)`.
+3. The Agent signs `GET /v2/offers/{offer_id}`, creates a pending device route
+   with `POST /v2/routes`, and creates both directional pending grants.
+4. The Agent signs `POST /v2/offers/{offer_id}/accept` with `message_hash`, the
+   pending device route, and opaque PairAccept `enc`/`ct`.
+   `response_hash` is `SHA256(raw enc || raw ct)`.
+5. The phone polls `GET /v2/offers/{offer_route}/accept` with the transport
+   token. Before offer expiry, the pending device route may send exactly one
+   new `control` envelope to its owning Agent, plus an exact retransmission.
+6. After committing that PairConfirm control proof, the Agent signs
+   `POST /v2/offers/{offer_id}/confirm` with both hashes and the device route.
+   One database transaction activates the route and both grants and removes
+   the offer.
+
+Cancellation or expiry revokes the pending route and grants. Every mutation
+has exact-retry semantics; reusing its idempotency identity with changed
+content is a conflict. A bounded hash-only confirmation receipt makes a retry
+safe after the successful transaction has already deleted the offer.
+
 ---
 
 ## 3.5 Hosted enrollment and accountless abuse control
@@ -689,6 +745,13 @@ For the hosted Hub:
 - Self-hosted deployments may instead require an operator enrollment token.
 - Development builds may use a development-only registration token.
 - Production must not silently fall back to public open enrollment.
+
+`POST /v2/enroll/provisional` requires a caller-generated opaque
+`enrollment_id`, route type, and Ed25519 authorization public key. An exact
+retry during the lifetime returns the same route; changing the key or route
+type conflicts. A provisional Agent may only create, read, or cancel its own
+pair offer. Grants, pending routes, ordinary messages, PairAccept, PairConfirm,
+and revocation remain active-route operations.
 
 ---
 
@@ -810,7 +873,8 @@ There are three distinct acknowledgements:
 
 1. **Hub acceptance:** ciphertext was accepted or deduplicated.
 2. **Hub delivery ACK:** recipient decrypted and committed it; Hub may delete the row.
-3. **Inner stream ACK:** recipient applied application frames through a sequence.
+3. **Inner stream/application receipt:** recipient applied application frames
+   through a sequence, or committed the exact control/RPC message ID.
 
 Do not conflate them.
 
@@ -820,15 +884,26 @@ The recipient sends the Hub delivery ACK only after:
 decrypt -> validate -> database transaction commit
 ```
 
-The Agent deletes its application outbox only after receiving the E2EE inner stream or RPC receipt—not merely because the Hub delivered the ciphertext.
+The Agent deletes its application outbox only after receiving the appropriate
+E2EE stream ACK or application receipt—not merely because the Hub delivered the
+ciphertext. Key rotation is therefore never promoted on Hub acceptance.
 
 ### Required HTTP and WebSocket surfaces
 
 ```text
 POST   /v2/enroll/provisional
 POST   /v2/enroll/activate
+POST   /v2/routes
 POST   /v2/grants
 DELETE /v2/grants/{grant_id}
+
+POST   /v2/offers
+POST   /v2/offers/{offer_route}/messages
+GET    /v2/offers/{offer_id}
+POST   /v2/offers/{offer_id}/accept
+GET    /v2/offers/{offer_route}/accept
+POST   /v2/offers/{offer_id}/confirm
+DELETE /v2/offers/{offer_id}/cancel
 
 GET    /v2/socket
 POST   /v2/messages
@@ -910,10 +985,17 @@ Each Agent/device binding has:
 
 ```text
 stream_id: random 128-bit ID
-next_seq: UInt64
-acked_through: UInt64
-checkpoint_revision: UInt64
+next_seq: NonNegativeSafeJSONInteger
+acked_through: NonNegativeSafeJSONInteger
+checkpoint_revision: NonNegativeSafeJSONInteger
 ```
+
+Although these values are logically unsigned, the HRP/2 JSON wire contract
+caps them at `9007199254740991` (`2^53 - 1`). This is the largest integer that
+round-trips exactly through every supported JSON implementation, including the
+iOS app's `Double`-backed generic JSON value. Implementations must reject
+larger JSON numbers before durable admission instead of rounding or coercing
+them. Persisted SQLite and Swift representations remain signed 64-bit values.
 
 A stream ID persists across socket reconnects and Agent restarts.
 
@@ -978,7 +1060,9 @@ On crash after step 5, resend the identical `mid`, `enc`, and ciphertext. Do not
 
 1. Verify route and HPKE.
 2. Reject expired/replayed message.
-3. Validate stream ID and sequence continuity.
+3. For a frame batch, validate stream ID and sequence continuity. For a
+   standalone checkpoint, validate stream ID plus a non-rollback checkpoint
+   revision/boundary even if the current frame watermark has a gap.
 4. Apply all frames.
 5. Persist item state, stream watermark, and seen message ID in one GRDB transaction.
 6. Commit.
@@ -1059,6 +1143,13 @@ Client rules:
 ```
 
 `replace: true` means local items in that session that are absent and older than the checkpoint are removed, subject to unsent local optimistic work.
+
+The checkpoint is carried as a standalone authenticated `checkpoint` secure
+message. It is not assigned the next frame sequence; `through_seq` is the
+authoritative boundary immediately before future frame allocation. This lets a
+fresh or gapped device converge without first accepting the very sequence it
+is missing. Apply is idempotent and rejects revision/boundary rollback; delayed
+pre-boundary batches are ignored.
 
 ### Unknown item types
 
@@ -1166,7 +1257,7 @@ Rules:
 
 ```json
 {
-  "client_message_id": "stable WorkRepository job ID",
+  "client_message_id": "lowercase canonical UUID created by WorkRepository",
   "session_id": "origin or live ID",
   "text": "..."
 }
@@ -1300,6 +1391,7 @@ The Hub process must never receive APNs credentials.
 
 ```text
 GET  /v2/attest/challenge
+POST /v2/hub-activations
 POST /v2/endpoints/register
 POST /v2/endpoints/token-refresh
 POST /v2/bindings/exchange
@@ -1316,11 +1408,13 @@ The phone sends:
   "challenge": "...",
   "app_attest_key_id": "...",
   "assertion": "...",
+  "attestation": "...",
   "apns_token": "...",
   "environment": "production",
   "bundle_id": "ai.hermes.app",
   "preview_kem_pub": "...",
-  "installation_nonce": "..."
+  "installation_nonce": "...",
+  "hub_route_id": "rte_..."
 }
 ```
 
@@ -1336,11 +1430,42 @@ The server returns:
 
 The bind token is delivered E2EE to the Agent during pairing.
 
+The optional `attestation` is required on first use of an App Attest key. The
+optional `hub_route_id` requests a short-lived activation token in the same
+response. A push-disabled official app instead calls
+`POST /v2/hub-activations`; its separate `HPG2ACTIVATE` transcript and response
+create no endpoint, APNs-token, or bind row.
+
+Registration stores an encrypted exact-response receipt before returning. An
+exact retry with the same challenge and complete body returns the same endpoint
+and bind token without consuming another App Attest counter. Reusing the
+challenge with changed content conflicts. After that receipt expires, a fresh
+challenge with the same attested key, installation nonce, preview key,
+bundle, and environment recovers the existing endpoint and rotates its bind
+token rather than creating a duplicate. This recovery request sets
+`attestation` to null because the original verified leaf key is already
+committed. An unknown/uncommitted key returns typed
+`409 app_attest_initial_required`; an installation bound to a different
+committed key returns terminal `409 installation_key_mismatch`. The
+activation-only surface follows the same fresh-challenge and initial-key error
+contract without creating endpoint or APNs artifacts.
+
 ---
 
 ## 4.3 Send capability
 
-The Agent exchanges the one-time bind token for:
+The Agent exchanges the one-time bind token using a persisted caller-generated
+opaque `exchange_id` and optional requested class set:
+
+```json
+{
+  "bind_token": "one-time-256-bit-secret",
+  "exchange_id": "opaque-retry-identity",
+  "requested_classes": ["update", "approval", "error"]
+}
+```
+
+The server returns:
 
 ```json
 {
@@ -1364,6 +1489,18 @@ one revocation state
 
 Possession of it does not permit registering another APNs token.
 
+The Agent retains `exchange_id` until this response is durable. An exact retry
+returns the same binding and capability from an encrypted bounded receipt;
+changing the bind token, exchange ID, or class set conflicts.
+
+Because the exchange may commit remotely before its response is durable at the
+Agent, the Push Gateway also exposes a revoke-only operation keyed by the
+original exchange ID and bind token. It returns no capability, is idempotent
+before or after exchange commit, and commits a durable non-resurrectable
+exchange tombstone. Pair cancellation/expiry retains these cleanup credentials
+until that revocation is confirmed; receipt/token expiry must not let a delayed
+exchange recreate the binding.
+
 ---
 
 ## 4.4 Send request
@@ -1372,6 +1509,7 @@ The Agent sends only:
 
 ```json
 {
+  "v": 2,
   "class": "approval",
   "notification_id": "opaque-random-ID",
   "preview_enc": "...",
@@ -1418,9 +1556,19 @@ The Push Gateway constructs:
   "class": "approval",
   "nid": "...",
   "enc": "...",
-  "ct": "..."
+  "ct": "...",
+  "exp": 1784450000000,
+  "collapse": null,
+  "sound": true
 }
 ```
+
+The `aps.sound` key is omitted when `sound` is false; the authenticated outer
+`sound` boolean is always present. The Gateway derives stable `apns-id` and,
+when `collapse` is null, stable fallback collapse identifiers from the binding
+and notification ID. Retries after timeout or ambiguous provider results reuse
+the identical identifiers, payload, and expiration without charging quota a
+second time.
 
 The outer APNs payload must not include `HERMES_APPROVAL`.
 
@@ -1777,7 +1925,7 @@ The WorkRepository remains the source of truth for unsent commands and prompts.
 ## Commands
 
 ```text
-hermes mobile enable [--hub URL] [--no-push] [--system]
+hermes mobile enable [--hub URL] [--push-url URL | --no-push] [--system]
 hermes mobile relay run
 hermes mobile status [--json]
 hermes mobile pair [--ttl 300] [--auto-approve]

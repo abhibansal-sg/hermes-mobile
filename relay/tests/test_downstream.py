@@ -383,7 +383,7 @@ async def test_submit_dedupes_repeat_client_message_id_across_reconnect():
         ),
     )
     assert res1 == {"session_id": "s5"}
-    gw.prompt_submit.assert_awaited_once_with("s5", "hi")
+    gw.prompt_submit.assert_awaited_once_with("s5", "hi", client_message_id="cm-1")
 
     # The socket flapped before the phone saw res1; the outbox resubmits the SAME
     # job on a FRESH connection. prompt_submit must NOT run a second time.

@@ -1,154 +1,135 @@
 # hermes-relay
 
-The **mobile relay-client** for the stock Hermes gateway — the Wave 2 linchpin.
-A ZERO-CORE-PATCH, co-located process that makes the phone a first-class client
-of the unpatched gateway: it reframes the gateway's raw event stream into the
-ratified **item-lifecycle envelope** (`docs/RELAY-PHONE-PROTOCOL.md`) and serves
-it to the iOS app over a reliable **seq/ack/replay** WS, firing APNs for the
-phone's own sessions.
+`hermes-relay` is the trusted, co-located Agent component of Hermes Relay
+Protocol v2 (HRP/2). It connects to the stock Hermes Gateway on loopback and to
+a content-untrusted Relay Hub, giving each paired iOS device an independent,
+authenticated, end-to-end encrypted mailbox and durable stream.
 
-Architecture + zero-patch ledger: `docs/MOBILE-RELAY-CLIENT-DESIGN.md`.
-Wire contract (frozen v1): `docs/RELAY-PHONE-PROTOCOL.md`.
-Proof it works end-to-end: `hermes-tmp/r0-relay-spike/VERDICT.md` (all 4 claims PASS).
+The stock Gateway is not modified. Gateway credentials never leave this host;
+Hub, Push Gateway, APNs, and network intermediaries see routing metadata and
+ciphertext, not Hermes content.
 
-## Why this home (`plugins/hermes-mobile`-reusing, but its own process)
+Normative contract and operations:
 
-`hermes-relay` is a **standalone service process**, not a gateway plugin hook —
-it opens a durable *client* WS to `/api/ws?token=` and runs its own phone-facing
-server. It therefore lives as its own package with its own `pyproject`, entry
-point (`python -m hermes_relay`), and lifecycle, kept OUT of the gateway process
-so the stock gateway stays byte-for-byte unchanged. It still **reuses** (never
-forks) four `plugins/hermes-mobile` modules — `replay_ring`, `push_engine`,
-`device_tokens`, `relay_client` — via `hermes_relay.plugin_bridge`, which puts
-the (hyphen-named, not dotted-importable) plugin dir on `sys.path`. So it is
-co-located with the mobile plumbing it depends on without being coupled into the
-gateway's plugin-load path.
+- `docs/mobile-relay/HRP-V2.md`
+- `docs/mobile-relay/PAIRING-V2.md`
+- `docs/mobile-relay/PUSH-V2.md`
+- `docs/mobile-relay/OPERATIONS.md`
+- `docs/mobile-relay/THREAT-MODEL.md`
 
-## Module map
+## HRP/2 capabilities
 
-```
+- X25519/HKDF-SHA256/ChaCha20-Poly1305 authenticated HPKE per message.
+- Strict shared Python/Swift wire schemas and conformance fixtures.
+- Protected, profile-scoped SQLite identity, pairing, route, grant, stream,
+  outbox, replay, operation, approval-capability, and projection state.
+- One independently revocable identity and send worker per device.
+- Durable `stream_id` plus revision/offset-safe deltas and authoritative
+  checkpoints.
+- Crash-safe exact-idempotent pairing, Hub requests, delivery receipts,
+  operations, Push binding, and revocation.
+- Encrypted per-device notification previews; Push never receives titles,
+  bodies, session IDs, request IDs, or action authority in plaintext.
+- Explicit v1 compatibility. HRP/2 never silently downgrades to v1.
+
+## Package layout
+
+```text
 relay/
-  pyproject.toml            # packaging (name: hermes-relay); deps: websockets, httpx
-  requirements-dev.txt      # venv/test note (external-volume venvs, 3.13)
-  README.md                 # this file
+  pyproject.toml
   hermes_relay/
-    __init__.py             # public surface (shared types + bus + state)
-    types.py        [DONE]  # Frame envelope, Item, GatewayEvent, UpstreamRequest, enums
-    bus.py          [DONE]  # EventBus: bounded fan-out pub/sub, 2 topics
-    session_state.py[DONE]  # SessionState / SessionStore — resume-as-items accumulator
-    plugin_bridge.py[DONE]  # locate + import the reused plugins/hermes-mobile modules
-    gateway_client.py[DONE] # LANE 1 — durable multiplexing WS client (§5)
-    reframer.py      [DONE] # LANE 2 — raw events -> item envelope (§2/§3)
-    downstream.py    [DONE] # LANE 3 — phone WS server + replay ring (§1/§4) + health
-    notifier.py      [DONE] # LANE 4 — owned-session APNs observer (§6)
-    app.py           [DONE] # composition root: wires the 4 lanes on one bus + status()
-    __main__.py      [DONE] # entrypoint: python -m hermes_relay (argparse CLI)
-  scripts/
-    run-relay.sh            # canonical launcher (provisions venv, runs the CLI)
-    launch_isolated_gateway.sh  # stock isolated gateway on 9127 (E2E upstream)
-    launch_relay.sh         # env-var launcher co-located with the isolated gateway
+    __main__.py          explicit v1/v2 process entry point
+    gateway_client.py    stock Gateway WS + authenticated REST client
+    reframer.py          Gateway events -> item lifecycle
+    downstream.py        legacy v1 local transport
+    v2/
+      app.py             HRP/2 composition root
+      protocol.py        strict schemas and canonical encoding
+      crypto.py          authenticated HPKE + envelope signatures
+      protection.py      Keychain/DPAPI/keyring/fallback protection
+      storage.py         crash-consistent local authority
+      enrollment.py      provisional + operator activation lifecycle
+      pairing.py         PairInit/PairAccept/PairConfirm state machine
+      hub_client.py      opaque Hub transport
+      push_client.py     encrypted Push descriptor transport
+      device_router.py   independent durable per-device senders
+      inbound.py         decrypt/replay/receipt/dispatch pipeline
+      rpc.py             durable operation ledger + Gateway mapping
+      projection.py      revisioned items/checkpoints/session aliases
+      notification_sender.py
+      revocation.py
   tests/
-    test_types.py           # Frame/Item round-trip + seq-stamp guard
-    test_session_state.py   # accumulator fold + snapshot
-    test_bus.py             # fan-out + drop-oldest overflow
-    test_downstream.py      # seq/ack/replay, upstream RPC, foreign-submit, health
-    test_gateway_client.py  # RPC match, demux, reconnect, resume live-id remap
-    test_cli.py             # CLI>env>default resolution + live-port refusal
+    v2/
 ```
 
-`[DONE]` = implemented shared contract/infra. `[SKEL]` = signatures + docstrings;
-the four lanes build against the shared types and bus with no cross-lane coupling.
+## Run HRP/2 directly
 
-## Dataflow (one bus, two topics)
-
-```
-GatewayClient --GatewayEvent--> gateway.events
-                                     |
-                                  Reframer --Frame(seq=None)--> relay.frames
-                                     |                              |
-                              SessionStore.apply            DownstreamServer (stamp seq +
-                              (snapshot truth)              ReplayRing + send to phone)
-                                     |                              |
-                                     +----------- Notifier (owned && !foregrounded -> APNs)
-```
-
-## The interface each lane implements against
-
-| Lane | Class (module) | Consumes | Produces | Reuses | Key methods to implement |
-|---|---|---|---|---|---|
-| 1 GatewayClient | `GatewayClient` (`gateway_client.py`) | phone-driven RPC calls | `GatewayEvent` on `gateway.events` | — | `run/connect/close/call`, `session_list/create/resume`, `rest_history`, `prompt_submit`, `approval_respond`, `clarify_respond`, `session_interrupt`, `owns` |
-| 2 Reframer | `Reframer` (`reframer.py`) | `GatewayEvent` (`gateway.events`) | `Frame` (seq=None) on `relay.frames` + folds `SessionStore` | `SessionStore` | `run`, `reframe(event)->list[Frame]`, `_tool_item_type` |
-| 3 Downstream | `DownstreamServer` + `PhoneConnection` (`downstream.py`) | `Frame` (`relay.frames`) + phone `UpstreamRequest` | wire frames to phone; gateway RPCs | `replay_ring.ReplayRingManager`, `SessionStore` | `start/serve/close`, `handle_upstream`, `PhoneConnection.send_frame/replay/ack`, `session_has_live_phone` |
-| 4 Notifier | `Notifier` (`notifier.py`) | `Frame` (`relay.frames`) | APNs pushes | `push_engine.notify` | `run`, `observe(frame)`, `_should_push`, `_fire` |
-
-Contracts the lanes rely on (already implemented in `[DONE]` modules):
-- **Envelope/item** — `types.Frame` (`seq` stamped LATE by Lane 3), `types.Item`
-  (`completed` is authoritative). Enums: `FrameKind`, `ItemType`, `ItemStatus`,
-  `UpstreamMethod`, `RawEvent`.
-- **Bus** — `EventBus.publish/subscribe`; topics `TOPIC_GATEWAY_EVENTS`,
-  `TOPIC_RELAY_FRAMES`.
-- **Resume-as-items** — `SessionStore.apply(frame)` folds truth;
-  `SessionStore.snapshot(sid, cursor)` builds the `snapshot` body for a ring-miss
-  resync (Lane 3 calls it; Lane 2 keeps it current).
-- **Gate** — `DownstreamServer.session_has_live_phone(sid)` is injected into the
-  Notifier as the §6 foreground gate.
-
-## Run (local, isolated — NEVER the live gateway on 9119)
-
-The one-liner launcher provisions the external-volume venv and starts the CLI:
+Use the operator CLI for normal installation:
 
 ```bash
-# 1) start a STOCK isolated gateway (writes its loopback token to $EVID/.gwtoken)
-scripts/launch_isolated_gateway.sh            # gateway on 127.0.0.1:9127
-
-# 2) start the relay against it (reads the token file, serves the phone on 8788)
-scripts/run-relay.sh                          # downstream ws://127.0.0.1:8788
+hermes plugins enable hermes-mobile
+hermes mobile enable \
+  --hub https://relay.example \
+  --push-url https://push.example
+hermes mobile pair
+hermes mobile status --json
 ```
 
-Or drive `python -m hermes_relay` directly. Every knob is **CLI flag > env var >
-default**:
+The foreground package entry point is useful for isolated development:
 
 ```bash
-/opt/homebrew/bin/python3.13 -m venv /Volumes/MainData/Developer/hermes-tmp/venvs/relay
-source /Volumes/MainData/Developer/hermes-tmp/venvs/relay/bin/activate
-pip install -e '.[dev]'         # from relay/  (runtime: websockets, httpx, pyyaml)
-pytest                          # unit tests (no network)
-
 python -m hermes_relay \
-  --gateway-url ws://127.0.0.1:9127 \
-  --token-file "$EVID/.gwtoken" \
-  --listen 127.0.0.1:8788
+  --protocol v2 \
+  --gateway-host 127.0.0.1 \
+  --gateway-port 9127 \
+  --token-file "$TEST_HERMES_HOME/dashboard.token" \
+  --hub-url http://127.0.0.1:9130 \
+  --push-url http://127.0.0.1:9131 \
+  --state-dir "$TEST_HERMES_HOME/mobile-relay" \
+  --allow-insecure-local-services
 ```
 
-CLI flags: `--gateway-url ws://host:port` (or `--gateway-host/--gateway-port`),
-`--token`/`--token-file` (or `HERMES_RELAY_GATEWAY_TOKEN`), `--listen host:port`,
-`--health-path /healthz` / `--no-health`, `--log-level`. The entrypoint **refuses
-gateway port 9119** (the live gateway) outright.
-
-Env equivalents (used by `launch_relay.sh`): `HERMES_RELAY_GATEWAY_TOKEN`,
-`HERMES_RELAY_GATEWAY_URL`, `HERMES_RELAY_GATEWAY_HOST`/`_PORT`,
-`HERMES_RELAY_DOWNSTREAM_HOST`/`_PORT`, `HERMES_RELAY_HEALTH_PATH`.
-
-### Health / status surface
-
-The phone-facing port also answers a plain-HTTP **`GET /healthz`** (a normal GET,
-not a WS upgrade) with a JSON status snapshot — connections, per-phone seq/ack
-watermarks + foreground, owned sessions, and ring/serving state:
+For self-hosted operation without a Push Gateway, the first activation needs an
+owner-only operator token file:
 
 ```bash
-curl -s http://127.0.0.1:8788/healthz
-# {"listen":"127.0.0.1:8788","connections":0,"phones":[],"owned_sessions":[],
-#  "ring_ready":true,"serving":true}
+chmod 600 "$TEST_HERMES_HOME/hub-enrollment.token"
+hermes mobile enable \
+  --hub http://127.0.0.1:9130 \
+  --no-push \
+  --hub-enrollment-token-file "$TEST_HERMES_HOME/hub-enrollment.token" \
+  --allow-insecure-local-services
 ```
 
-## Non-negotiables
+Only file paths appear in service definitions and `config.yaml`; token contents
+never appear in argv, environment, config, or logs.
 
-- Never touch the `hermes-mobile` product working tree; build only in this
-  worktree / a lane worktree on `/Volumes/MainData`.
-- Never touch the live gateway on port **9119**. E2E uses a STOCK isolated
-  gateway on **9126+** with a temp `HERMES_HOME`.
-- ZERO CORE PATCH: no edits to `tui_gateway/`, `gateway/`, `run_agent.py`,
-  `model_tools.py`, or `hermes_cli/` core. The relay is a client that reuses
-  `plugins/hermes-mobile` plumbing only.
-- No secrets in output/evidence (tokens, APNs creds, bearer tokens).
+HRP/2 normally connects to the real co-located Gateway on loopback port 9119.
+Tests and development probes must use isolated ports 9123+ and must never touch
+a user's live 9119 process. The legacy v1 entry point retains its runtime
+refusal of 9119 as an additional test-safety guard.
+
+## Test and package
+
+```bash
+uv sync --extra dev --python 3.13
+.venv/bin/python -m pytest -q
+uv build
 ```
+
+Runtime and build dependencies are exact-pinned in `pyproject.toml`. Release
+verification installs both the wheel and sdist into clean environments, imports
+the v2 modules, and exercises the CLI parser.
+
+## Security boundaries
+
+- No edits to stock Gateway/TUI/Desktop core are required by this package.
+- The Gateway endpoint must be loopback; HRP/2 refuses a remote Gateway host.
+- v2 accepts the real loopback 9119 Gateway only when authentication is loaded
+  from `--token-file`; it refuses argv/environment token sources.
+- Pair secrets, private keys, Hub/Push capabilities, APNs tokens, prompt text,
+  tool data, session identifiers, approval plaintext, and encrypted envelopes
+  are never emitted to normal logs.
+- `hermes mobile disable` retains authority for reversible shutdown.
+  `hermes mobile disable --purge` requires explicit confirmation, revokes remote
+  authority first, then erases OS credential handles and local state.

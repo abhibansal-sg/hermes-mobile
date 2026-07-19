@@ -30,6 +30,10 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
+class ProtocolValidationError(ValueError):
+    """A content-safe malformed v1 request (never serialize its cause)."""
+
+
 # ---------------------------------------------------------------------------
 # Enumerations (kept as plain str constants so they serialize transparently and
 # an unknown value never raises — forward-compat is a protocol requirement).
@@ -279,15 +283,87 @@ class UpstreamRequest:
 
     method: str
     params: dict[str, Any] = field(default_factory=dict)
-    id: Optional[int] = None
+    id: Optional[int | str] = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> "UpstreamRequest":
-        return cls(
-            method=d.get("method", ""),
-            params=dict(d.get("params") or {}),
-            id=d.get("id"),
-        )
+        if not isinstance(d, dict):
+            raise ProtocolValidationError("request must be an object")
+        if set(d) - {"jsonrpc", "id", "method", "params"}:
+            raise ProtocolValidationError("unknown request field")
+        if "jsonrpc" in d and d["jsonrpc"] != "2.0":
+            raise ProtocolValidationError("unsupported jsonrpc version")
+        method = d.get("method")
+        if not isinstance(method, str) or method not in UpstreamMethod.ALL:
+            raise ProtocolValidationError("unsupported method")
+        rid = d.get("id")
+        if rid is not None and (isinstance(rid, bool) or not isinstance(rid, (int, str))):
+            raise ProtocolValidationError("invalid request id")
+        params = d.get("params", {})
+        if not isinstance(params, dict):
+            raise ProtocolValidationError("params must be an object")
+        _validate_v1_params(method, params)
+        return cls(method=method, params=dict(params), id=rid)
+
+
+def _validate_v1_params(method: str, params: dict[str, Any]) -> None:
+    """Strict legacy shape validation while retaining its documented fields."""
+
+    specs: dict[str, tuple[set[str], set[str]]] = {
+        UpstreamMethod.SUBMIT: ({"text"}, {"session_id", "client_message_id", "title", "model", "provider"}),
+        UpstreamMethod.RESUME: ({"session_id"}, set()),
+        UpstreamMethod.OPEN: ({"session_id"}, set()),
+        UpstreamMethod.LIST: (set(), {"limit"}),
+        UpstreamMethod.HISTORY: ({"session_id"}, set()),
+        UpstreamMethod.APPROVE: ({"session_id", "request_id", "decision"}, {"all"}),
+        UpstreamMethod.CLARIFY: ({"session_id", "request_id", "text"}, set()),
+        UpstreamMethod.INTERRUPT: ({"session_id"}, set()),
+        UpstreamMethod.ACK: ({"through"}, set()),
+        UpstreamMethod.RESYNC: ({"last_seq"}, set()),
+        UpstreamMethod.FOREGROUND: ({"session_id"}, set()),
+    }
+    required, optional = specs[method]
+    if required - set(params) or set(params) - required - optional:
+        raise ProtocolValidationError("invalid method parameters")
+
+    def text(field: str, *, nullable: bool = False, maximum: int = 1_000_000) -> None:
+        value = params.get(field)
+        if nullable and value is None:
+            return
+        if not isinstance(value, str) or not value or len(value.encode("utf-8")) > maximum:
+            raise ProtocolValidationError("invalid text parameter")
+
+    if method == UpstreamMethod.SUBMIT:
+        text("text")
+        for field in ("session_id", "client_message_id", "title", "model", "provider"):
+            if field in params and params[field] is not None:
+                text(field, maximum=256)
+    elif method in {
+        UpstreamMethod.RESUME,
+        UpstreamMethod.OPEN,
+        UpstreamMethod.HISTORY,
+        UpstreamMethod.INTERRUPT,
+    }:
+        text("session_id", maximum=256)
+    elif method == UpstreamMethod.APPROVE:
+        text("session_id", maximum=256)
+        text("request_id", maximum=256)
+        text("decision", maximum=32)
+        if "all" in params and not isinstance(params["all"], bool):
+            raise ProtocolValidationError("invalid boolean parameter")
+    elif method == UpstreamMethod.CLARIFY:
+        text("session_id", maximum=256)
+        text("request_id", maximum=256)
+        text("text")
+    elif method in {UpstreamMethod.ACK, UpstreamMethod.RESYNC}:
+        field = "through" if method == UpstreamMethod.ACK else "last_seq"
+        if isinstance(params[field], bool) or not isinstance(params[field], int) or params[field] < 0:
+            raise ProtocolValidationError("invalid sequence parameter")
+    elif method == UpstreamMethod.LIST and "limit" in params:
+        if isinstance(params["limit"], bool) or not isinstance(params["limit"], int):
+            raise ProtocolValidationError("invalid limit")
+    elif method == UpstreamMethod.FOREGROUND:
+        text("session_id", nullable=True, maximum=256)
 
 
 # ---------------------------------------------------------------------------

@@ -8,19 +8,21 @@
 #   pip install -r requirements-dev.txt
 #   # or: pip install -e '.[dev]'   (uses pyproject)
 #
-# Unit tests use stdlib + pytest + unittest.mock only and NEVER touch the
-# network. End-to-end tests run against a STOCK isolated gateway on port 9126+
-# with a temp HERMES_HOME (see r0-relay-spike/launch_gateway.sh) — NEVER the
-# live gateway on 9119.
+# Unit tests mock every external transport and never touch the network.
+# End-to-end tests use a stock isolated Gateway on port 9123+ and a temporary
+# HERMES_HOME. Production HRP/2 may use the real co-located loopback 9119
+# Gateway, but automated tests and probes never do.
 #
-# The reused plumbing (replay_ring / push_engine / device_tokens) is imported
-# from plugins/hermes-mobile at runtime via hermes_relay.plugin_bridge; it is
-# NOT installed as a package.
+# Legacy v1 notifier/replay plumbing is imported from plugins/hermes-mobile via
+# hermes_relay.plugin_bridge. HRP/2's trust boundary lives in hermes_relay.v2.
 
 # runtime
-websockets>=12
-httpx>=0.27
+websockets==15.0.1
+httpx==0.28.1
+pyyaml==6.0.3
+pyhpke==0.6.5
+cryptography==48.0.1
 
 # dev/test
-pytest>=8
-pytest-asyncio>=0.23
+pytest==9.1.1
+pytest-asyncio==1.4.0

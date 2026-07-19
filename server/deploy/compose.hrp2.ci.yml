@@ -1,0 +1,6 @@
+# CI starts the complete production topology, including Caddy, but probes the
+# application containers from inside their namespaces. Publishing ingress on
+# the runner would add port-collision risk without increasing test coverage.
+services:
+  caddy:
+    ports: !reset []

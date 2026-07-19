@@ -55,6 +55,8 @@ no gateway dependency, no I/O.
 
 from __future__ import annotations
 
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -116,10 +118,19 @@ class _Ctx:
 class Reframer:
     """Maps one gateway stream into the item-lifecycle envelope."""
 
-    def __init__(self, bus: EventBus, store: SessionStore) -> None:
+    def __init__(
+        self,
+        bus: EventBus,
+        store: SessionStore,
+        *,
+        reliable_output: bool = False,
+        max_contexts: int | None = None,
+    ) -> None:
         self._bus = bus
         self._store = store
-        self._ctx: dict[str, _Ctx] = {}
+        self._ctx: OrderedDict[str, _Ctx] = OrderedDict()
+        self._reliable_output = reliable_output
+        self._max_contexts = max_contexts
 
     # -- pump ------------------------------------------------------------
     async def run(self) -> None:
@@ -140,7 +151,10 @@ class Reframer:
                 except Exception:  # pragma: no cover - defensive pump guard
                     continue
                 for frame in frames:
-                    self._bus.publish(TOPIC_RELAY_FRAMES, frame)
+                    if self._reliable_output:
+                        await self._bus.publish_wait(TOPIC_RELAY_FRAMES, frame)
+                    else:
+                        self._bus.publish(TOPIC_RELAY_FRAMES, frame)
         finally:
             self._bus.unsubscribe(sub)
 
@@ -192,6 +206,11 @@ class Reframer:
         state = self._store.get(sid)
         for frame in frames:
             state.apply(frame)
+        if getattr(self._store, "transient", False) and any(
+            frame.kind == FrameKind.TURN_COMPLETED for frame in frames
+        ):
+            self._store.drop(sid)
+            self._ctx.pop(sid, None)
         return frames
 
     # -- turn helper -----------------------------------------------------
@@ -205,20 +224,33 @@ class Reframer:
         if ctx.current_turn is not None:
             return []
         ctx.turn_seq += 1
-        ctx.current_turn = f"{sid}:t{ctx.turn_seq}"
+        # Random IDs cannot collide with cached phone state after an Agent
+        # restart; the old in-memory ``sid:t1`` counter could.
+        ctx.current_turn = f"turn_{uuid.uuid4().hex}"
         return [Frame(sid=sid, kind=FrameKind.TURN_STARTED, body={}, turn=ctx.current_turn)]
 
     def _ctx_for(self, sid: str) -> _Ctx:
         ctx = self._ctx.get(sid)
         if ctx is None:
+            if self._max_contexts is not None and self._max_contexts <= 0:
+                raise ValueError("max_contexts must be positive")
+            if (
+                self._max_contexts is not None
+                and len(self._ctx) >= self._max_contexts
+            ):
+                self._ctx.popitem(last=False)
             ctx = _Ctx()
             self._ctx[sid] = ctx
+        else:
+            self._ctx.move_to_end(sid)
         return ctx
 
     def _new_item_id(self, sid: str) -> str:
         ctx = self._ctx_for(sid)
         ctx.item_seq += 1
-        return f"{sid}:i{ctx.item_seq}"
+        # Preserve the v1 session namespace while adding restart-safe entropy.
+        # Existing clients use the prefix to partition cached cards by session.
+        return f"{sid}:itm_{uuid.uuid4().hex}"
 
     # -- message (agentMessage) ------------------------------------------
     def _reframe_message(self, event: GatewayEvent) -> list[Frame]:

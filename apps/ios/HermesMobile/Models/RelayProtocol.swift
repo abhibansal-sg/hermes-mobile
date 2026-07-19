@@ -128,11 +128,17 @@ struct RelayItemDelta: Sendable, Equatable {
 struct RelaySnapshot: Sendable, Equatable {
     let items: [ChatItem]
     let cursor: Int?
+    let replace: Bool
+    let tombstoneItemIDs: Set<String>
 
     init?(body: JSONValue) {
         guard let rawItems = body["items"]?.arrayValue else { return nil }
         self.items = rawItems.compactMap(ChatItem.init(json:))
         self.cursor = body["cursor"]?.intValue
+        self.replace = body["replace"]?.boolValue ?? true
+        self.tombstoneItemIDs = Set(
+            body["tombstones"]?.arrayValue?.compactMap { $0["item_id"]?.stringValue } ?? []
+        )
     }
 }
 
@@ -181,4 +187,5 @@ enum RelayUpstreamMethod: String, Sendable, CaseIterable {
     case interrupt
     case ack
     case resync
+    case foreground
 }

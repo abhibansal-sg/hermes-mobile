@@ -1,8 +1,8 @@
 name: Docker / shell lint
 
-# Lints the container build inputs: Dockerfile (via hadolint) and any shell
-# scripts under docker/ (via shellcheck). These catch the class of regression
-# the behavioral docker smoke test can't — unquoted variable
+# Lints the container build inputs: every shipped Dockerfile (via hadolint)
+# and any shell scripts under docker/ (via shellcheck). These catch the class
+# of regression the behavioral docker smoke test can't — unquoted variable
 # expansions, silently-failing RUN commands, etc.
 #
 # Rules and ignores are documented in .hadolint.yaml at the repo root.
@@ -22,9 +22,16 @@ concurrency:
 
 jobs:
   hadolint:
-    name: Lint Dockerfile (hadolint)
+    name: Lint ${{ matrix.dockerfile }} (hadolint)
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile:
+          - Dockerfile
+          - server/relay-hub/Dockerfile
+          - server/push-gateway/Dockerfile
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -32,7 +39,7 @@ jobs:
       - name: hadolint
         uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
         with:
-          dockerfile: Dockerfile
+          dockerfile: ${{ matrix.dockerfile }}
           config: .hadolint.yaml
           failure-threshold: warning
 

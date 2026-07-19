@@ -9,7 +9,7 @@ CLI flags::
 
     --gateway-url ws://HOST:PORT[/path]   upstream gateway (parsed to host/port)
     --gateway-host HOST                   (alt to --gateway-url)
-    --gateway-port PORT
+    --gateway-port PORT                   v1 refuses 9119; v2 permits loopback 9119
     --token TOKEN                         gateway ?token= auth
     --token-file PATH                     read the token from a file (keeps it
                                           out of argv / the process table)
@@ -29,31 +29,46 @@ Environment variables (back-compat with ``scripts/run-relay.sh`` /
     HERMES_RELAY_DOWNSTREAM_PORT   default 8765
     HERMES_RELAY_HEALTH_PATH       default /healthz
 
-SAFETY: the live production gateway on port 9119 is refused outright — the relay
-is a client of an isolated/stock gateway only.
+SAFETY: v1 refuses port 9119 and all tests use an isolated Gateway on 9123+.
+Production HRP/2 may use the real 9119 Gateway only on loopback and only with a
+token file; it refuses remote Gateway hosts and process-visible token sources.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
+import json
 import logging
 import os
+import secrets
 import sys
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
 from .app import RelayApp, build_default_config
+from .runtime_lock import (
+    RelayRuntimeAlreadyRunning,
+    RelayRuntimeLock,
+    _RelayRuntimeLock,
+)
+from .secure_files import read_secure_text_file
+from .v2.service_url import canonical_service_origin
 
 #: The live production gateway port the relay must never dial.
 LIVE_GATEWAY_PORT = 9119
 
 _DEF_GATEWAY_HOST = "127.0.0.1"
 _DEF_GATEWAY_PORT = 9126
+_DEF_V2_GATEWAY_PORT = LIVE_GATEWAY_PORT
 _DEF_DOWNSTREAM_HOST = "127.0.0.1"
 _DEF_DOWNSTREAM_PORT = 8765
 _DEF_HEALTH_PATH = "/healthz"
+_V2_READINESS_FILENAME = "readiness.json"
 
 
 @dataclass
@@ -67,6 +82,17 @@ class ResolvedConfig:
     downstream_port: int
     health_path: Optional[str]
     log_level: str
+    protocol: str = "v1"
+    hub_url: str | None = None
+    push_url: str | None = None
+    state_directory: str | None = None
+    allow_insecure_local_services: bool = False
+    create_pair_offer: bool = False
+    pair_ttl_seconds: int = 300
+    pair_auto_approve: bool = False
+    hub_enrollment_token_file: str | None = None
+    ready_file: str | None = None
+    launch_nonce: str | None = None
 
 
 def _split_hostport(value: str, *, what: str) -> tuple[Optional[str], Optional[int]]:
@@ -97,8 +123,10 @@ def _read_token(args: argparse.Namespace) -> str:
         return args.token.strip()
     if args.token_file:
         try:
-            return open(args.token_file, encoding="utf-8").read().strip()
-        except OSError as exc:
+            return read_secure_text_file(
+                Path(args.token_file), owner_only=False
+            ).strip()
+        except (OSError, PermissionError, ValueError) as exc:
             raise SystemExit(f"hermes_relay: cannot read --token-file: {exc}")
     env = os.environ.get("HERMES_RELAY_GATEWAY_TOKEN", "").strip()
     if env:
@@ -107,6 +135,27 @@ def _read_token(args: argparse.Namespace) -> str:
         "hermes_relay: a gateway token is required "
         "(--token / --token-file / HERMES_RELAY_GATEWAY_TOKEN)."
     )
+
+
+def _read_v2_token(args: argparse.Namespace) -> str:
+    """HRP/2 services load the local Gateway secret from a protected file."""
+
+    if args.token:
+        raise SystemExit(
+            "hermes_relay: HRP/2 refuses --token because argv is process-visible; "
+            "use --token-file."
+        )
+    if not args.token_file:
+        raise SystemExit("hermes_relay: HRP/2 requires --token-file.")
+    try:
+        token = read_secure_text_file(
+            Path(args.token_file), owner_only=True
+        ).strip()
+    except (OSError, PermissionError, ValueError) as exc:
+        raise SystemExit(f"hermes_relay: cannot read --token-file: {exc}")
+    if not token:
+        raise SystemExit("hermes_relay: --token-file is empty.")
+    return token
 
 
 def resolve_config(argv: Optional[list[str]] = None) -> ResolvedConfig:
@@ -124,7 +173,11 @@ def resolve_config(argv: Optional[list[str]] = None) -> ResolvedConfig:
     gw_host = gw_host or os.environ.get("HERMES_RELAY_GATEWAY_HOST") or _DEF_GATEWAY_HOST
     if gw_port is None:
         env_port = os.environ.get("HERMES_RELAY_GATEWAY_PORT")
-        gw_port = int(env_port) if env_port else _DEF_GATEWAY_PORT
+        gw_port = (
+            int(env_port)
+            if env_port
+            else (_DEF_V2_GATEWAY_PORT if args.protocol == "v2" else _DEF_GATEWAY_PORT)
+        )
 
     # -- downstream (phone-facing) bind --
     ds_host: Optional[str] = None
@@ -146,13 +199,65 @@ def resolve_config(argv: Optional[list[str]] = None) -> ResolvedConfig:
             or _DEF_HEALTH_PATH
         )
 
-    token = _read_token(args)
+    token = _read_v2_token(args) if args.protocol == "v2" else _read_token(args)
 
-    if gw_port == LIVE_GATEWAY_PORT:
+    if args.protocol == "v1" and gw_port == LIVE_GATEWAY_PORT:
         raise SystemExit(
             f"hermes_relay: refusing to dial the LIVE gateway port {LIVE_GATEWAY_PORT}. "
             "Point --gateway-port/-url at an isolated/stock gateway."
         )
+    if args.protocol == "v2" and not _is_loopback_host(gw_host):
+        raise SystemExit(
+            "hermes_relay: HRP/2 requires a co-located loopback Gateway; "
+            "Gateway credentials are never sent to a remote host."
+        )
+
+    if args.protocol == "v2" and not args.hub_url:
+        raise SystemExit("hermes_relay: HRP/2 requires --hub-url.")
+    if args.protocol == "v2" and not args.no_push and not args.push_url:
+        raise SystemExit("hermes_relay: HRP/2 requires --push-url or --no-push.")
+    if args.protocol == "v2":
+        try:
+            args.hub_url = canonical_service_origin(
+                args.hub_url,
+                label="Hub URL",
+                allow_insecure_local=args.allow_insecure_local_services,
+            )
+            if args.push_url is not None:
+                args.push_url = canonical_service_origin(
+                    args.push_url,
+                    label="Push Gateway URL",
+                    allow_insecure_local=args.allow_insecure_local_services,
+                )
+        except ValueError as exc:
+            raise SystemExit(f"hermes_relay: {exc}") from exc
+    if bool(args.ready_file) != bool(args.launch_nonce):
+        raise SystemExit(
+            "hermes_relay: --ready-file and --launch-nonce must be supplied together."
+        )
+    if args.launch_nonce is not None and (
+        not 32 <= len(args.launch_nonce) <= 128
+        or any(
+            char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+            for char in args.launch_nonce
+        )
+    ):
+        raise SystemExit("hermes_relay: --launch-nonce is invalid.")
+    if args.ready_file is not None:
+        if args.protocol != "v2" or args.state_dir is None:
+            raise SystemExit(
+                "hermes_relay: process readiness requires HRP/2 and --state-dir."
+            )
+        ready_parent = Path(args.ready_file).expanduser().resolve(strict=False).parent
+        state_directory = Path(args.state_dir).expanduser().resolve(strict=False)
+        if (
+            ready_parent != state_directory
+            or Path(args.ready_file).name != _V2_READINESS_FILENAME
+        ):
+            raise SystemExit(
+                "hermes_relay: --ready-file must name the reserved readiness file "
+                "directly inside --state-dir."
+            )
 
     return ResolvedConfig(
         gateway_host=gw_host,
@@ -162,23 +267,73 @@ def resolve_config(argv: Optional[list[str]] = None) -> ResolvedConfig:
         downstream_port=ds_port,
         health_path=health_path,
         log_level=(args.log_level or os.environ.get("HERMES_RELAY_LOG_LEVEL") or "INFO"),
+        protocol=args.protocol,
+        hub_url=args.hub_url,
+        push_url=None if args.no_push else args.push_url,
+        state_directory=args.state_dir,
+        allow_insecure_local_services=args.allow_insecure_local_services,
+        create_pair_offer=args.pair,
+        pair_ttl_seconds=args.pair_ttl,
+        pair_auto_approve=args.auto_approve,
+        hub_enrollment_token_file=args.hub_enrollment_token_file,
+        ready_file=args.ready_file,
+        launch_nonce=args.launch_nonce,
     )
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m hermes_relay",
-        description="Run the Hermes mobile relay (gateway upstream, phone downstream).",
+        description="Run the Hermes Mobile Agent Relay (legacy v1 or encrypted HRP/2).",
+    )
+    p.add_argument(
+        "--protocol", choices=("v1", "v2"), default="v1",
+        help="relay protocol generation (default v1; v2 is explicit opt-in)",
     )
     p.add_argument("--gateway-url", help="ws://HOST:PORT[/path] of the upstream gateway")
     p.add_argument("--gateway-host", help="upstream gateway host")
-    p.add_argument("--gateway-port", type=int, help="upstream gateway port (NEVER 9119)")
+    p.add_argument(
+        "--gateway-port",
+        type=int,
+        help="upstream Gateway port (v1 refuses 9119; v2 permits loopback 9119)",
+    )
     p.add_argument("--token", help="gateway ?token= auth (prefer --token-file)")
     p.add_argument("--token-file", help="path to a file containing the gateway token")
     p.add_argument("--listen", help="phone-facing downstream bind, HOST:PORT")
     p.add_argument("--health-path", help=f"HTTP health path (default {_DEF_HEALTH_PATH})")
     p.add_argument("--no-health", action="store_true", help="disable the health surface")
     p.add_argument("--log-level", help="logging level (default INFO)")
+    p.add_argument("--hub-url", help="HRP/2 Relay Hub HTTPS URL")
+    p.add_argument(
+        "--hub-enrollment-token-file",
+        help="owner-only file containing self-host Hub activation authority",
+    )
+    p.add_argument("--push-url", help="HRP/2 Push Gateway HTTPS URL")
+    p.add_argument("--no-push", action="store_true", help="run HRP/2 without notifications")
+    p.add_argument("--state-dir", help="profile-scoped HRP/2 state directory")
+    p.add_argument("--ready-file", help=argparse.SUPPRESS)
+    p.add_argument("--launch-nonce", help=argparse.SUPPRESS)
+    p.add_argument(
+        "--allow-insecure-local-services",
+        action="store_true",
+        help="allow HTTP only for loopback self-host development",
+    )
+    p.add_argument("--pair", action="store_true", help="create/register a pairing offer at startup")
+    p.add_argument("--pair-ttl", type=int, default=300, help="pairing offer TTL seconds")
+    p.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="explicitly bypass human code confirmation for the startup offer",
+    )
     return p
 
 
@@ -200,20 +355,155 @@ def main(argv: Optional[list[str]] = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     log = logging.getLogger("hermes_relay")
-    log.info(
-        "relay up: gateway ws://%s:%s -> downstream ws://%s:%s (health=%s)",
-        rc.gateway_host,
-        rc.gateway_port,
-        rc.downstream_host,
-        rc.downstream_port,
-        rc.health_path or "off",
-    )
-    app = RelayApp(_to_relay_config(rc))
     try:
-        asyncio.run(app.run())
+        if rc.protocol == "v2":
+            asyncio.run(_run_v2(rc))
+        else:
+            log.info(
+                "relay up: gateway ws://%s:%s -> downstream ws://%s:%s (health=%s)",
+                rc.gateway_host,
+                rc.gateway_port,
+                rc.downstream_host,
+                rc.downstream_port,
+                rc.health_path or "off",
+            )
+            app = RelayApp(_to_relay_config(rc))
+            asyncio.run(app.run())
     except KeyboardInterrupt:  # graceful Ctrl-C
         log.info("relay interrupted; shutting down.")
         sys.exit(0)
+    except RelayRuntimeAlreadyRunning:
+        log.error(
+            "another HRP/2 Relay process already owns this state directory"
+        )
+        sys.exit(1)
+
+
+async def _run_v2(rc: ResolvedConfig) -> None:
+    from .v2.storage import resolve_state_directory
+
+    state_directory = (
+        Path(rc.state_directory).expanduser()
+        if rc.state_directory is not None
+        else resolve_state_directory()
+    ).resolve(strict=False)
+    with RelayRuntimeLock(state_directory):
+        await _run_v2_locked(rc, state_directory=state_directory)
+
+
+async def _run_v2_locked(rc: ResolvedConfig, *, state_directory: Path) -> None:
+    from .gateway_client import GatewayConfig
+    from .v2.app import V2RelayApp, V2RelayConfig
+
+    assert rc.hub_url is not None
+    ready_path = Path(rc.ready_file).expanduser() if rc.ready_file else None
+    if ready_path is not None:
+        _remove_runtime_readiness(ready_path)
+    app = await V2RelayApp.create(
+        V2RelayConfig(
+            gateway=GatewayConfig(
+                host=rc.gateway_host,
+                port=rc.gateway_port,
+                token=rc.token,
+            ),
+            hub_url=rc.hub_url,
+            push_url=rc.push_url,
+            state_directory=state_directory,
+            allow_insecure_local_services=rc.allow_insecure_local_services,
+            hub_enrollment_token_file=(
+                Path(rc.hub_enrollment_token_file).expanduser()
+                if rc.hub_enrollment_token_file is not None
+                else None
+            ),
+        )
+    )
+    if rc.create_pair_offer:
+        qr = await app.pairing.create_registered_offer(
+            ttl_seconds=rc.pair_ttl_seconds,
+            auto_approve=rc.pair_auto_approve,
+        )
+        # This one-time object is intended for QR encoding by the invoking
+        # terminal.  It is never logged and never placed in a URL.
+        print(json.dumps(qr, sort_keys=True, separators=(",", ":")), flush=True)
+    readiness_callback = None
+    if ready_path is not None:
+        assert rc.launch_nonce is not None
+
+        def readiness_callback(route_id: str | None) -> None:
+            if route_id is None:
+                _remove_runtime_readiness(ready_path)
+                return
+            _write_runtime_readiness(
+                ready_path,
+                launch_nonce=rc.launch_nonce,
+                route_id=route_id,
+            )
+
+    try:
+        await app.run(readiness_callback=readiness_callback)
+    finally:
+        if ready_path is not None:
+            _remove_runtime_readiness(ready_path)
+
+
+def _remove_runtime_readiness(path: Path) -> None:
+    if path.name != _V2_READINESS_FILENAME:
+        raise ValueError("refusing to remove a non-readiness runtime path")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _write_runtime_readiness(
+    path: Path,
+    *,
+    launch_nonce: str,
+    route_id: str,
+) -> None:
+    """Atomically publish one content-free, process-bound heartbeat."""
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "posix":
+        os.chmod(path.parent, 0o700)
+    payload = json.dumps(
+        {
+            "v": 1,
+            "pid": os.getpid(),
+            "launch_nonce": launch_nonce,
+            "written_at_ms": time.time_ns() // 1_000_000,
+            "route_id": route_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, path)
+        if os.name == "posix":
+            os.chmod(path, 0o600)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

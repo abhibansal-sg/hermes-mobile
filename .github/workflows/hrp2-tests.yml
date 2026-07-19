@@ -1,0 +1,343 @@
+name: HRP/2 Tests
+
+# Required, reusable HRP/2 lane. The root pytest shard deliberately discovers
+# only tests/** and excludes tests/e2e/**, so it cannot stand in for the Relay,
+# Hub, Push Gateway, plugin-owned, or local cross-component suites below.
+on:
+  workflow_call:
+    inputs:
+      root_python_suite_runs:
+        description: >-
+          The orchestrator is also running tests.yml, which already owns the
+          root unit-test files. HRP/2 cross-component E2E remains here.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hrp2-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  relay:
+    name: Standalone Relay (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: relay/uv.lock
+
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install '${{ matrix.python-version }}'
+
+      - name: Sync standalone Relay from its lockfile
+        uses: ./.github/actions/retry
+        with:
+          command: >-
+            uv sync --project relay --locked
+            --python '${{ matrix.python-version }}' --extra dev
+
+      - name: Run complete standalone Relay suite
+        run: >-
+          uv run --project relay --locked
+          --python '${{ matrix.python-version }}'
+          python -m pytest relay/tests -q --tb=short
+
+  relay-hub:
+    name: Relay Hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UV_EXCLUDE_NEWER: "2026-07-20T00:00:00Z"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: server/relay-hub/requirements*.txt
+
+      - name: Install Python 3.13
+        run: uv python install 3.13
+
+      - name: Verify direct requirements are exact pins
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for path in Path("server/relay-hub").glob("requirements*.txt"):
+              for raw in path.read_text(encoding="utf-8").splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith(("#", "-r ")):
+                      continue
+                  assert "==" in line, f"unlocked requirement in {path}: {line}"
+          PY
+
+      - name: Install exact Relay Hub requirements
+        uses: ./.github/actions/retry
+        with:
+          command: >-
+            uv venv --python 3.13 .venv-hub &&
+            uv pip install --python .venv-hub/bin/python
+            -r server/relay-hub/requirements-test.txt
+
+      - name: Run Relay Hub suite
+        env:
+          PYTHONPATH: server/relay-hub
+        run: .venv-hub/bin/python -m pytest server/relay-hub/tests -q --tb=short
+
+  push-gateway:
+    name: Push Gateway
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UV_EXCLUDE_NEWER: "2026-07-20T00:00:00Z"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: server/push-gateway/requirements*.txt
+
+      - name: Install Python 3.13
+        run: uv python install 3.13
+
+      - name: Verify direct requirements are exact pins
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for path in Path("server/push-gateway").glob("requirements*.txt"):
+              for raw in path.read_text(encoding="utf-8").splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith(("#", "-r ")):
+                      continue
+                  assert "==" in line, f"unlocked requirement in {path}: {line}"
+          PY
+
+      - name: Install exact Push Gateway requirements
+        uses: ./.github/actions/retry
+        with:
+          command: >-
+            uv venv --python 3.13 .venv-push &&
+            uv pip install --python .venv-push/bin/python
+            -r server/push-gateway/requirements-test.txt
+
+      - name: Run Push Gateway suite
+        env:
+          PYTHONPATH: server/push-gateway
+        run: .venv-push/bin/python -m pytest server/push-gateway/tests -q --tb=short
+
+  compose:
+    name: Live PostgreSQL deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Every value below is ephemeral CI-only configuration. The Push key is
+      # generated during the job and never uses an Apple-issued credential.
+      COMPOSE_PROJECT_NAME: hrp2-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      HRH_POSTGRES_PASSWORD: ci-hub-postgres-password
+      HRH_OPERATOR_ENROLLMENT_TOKEN: ci-enrollment-token
+      HPG_POSTGRES_PASSWORD: ci-push-postgres-password
+      HPG_APPLE_APP_ID: CI12345678.ai.hermes.app
+      HPG_APNS_KEY_ID: CIKEY12345
+      HPG_APNS_TEAM_ID: CI12345678
+      HPG_APNS_KEY_FILE: ${{ runner.temp }}/hrp2-ci/AuthKey_CI.p8
+      ACME_EMAIL: ci@example.invalid
+      # Explicit HTTP test origins keep Caddy local and prevent ACME traffic.
+      HRH_PUBLIC_HOST: http://relay.example.invalid
+      HPG_PUBLIC_HOST: http://push.example.invalid
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Generate test-only Push credentials
+        run: |
+          python3 - <<'PY'
+          import base64
+          import os
+          import secrets
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as environment:
+              for label in ("TOKEN_MASTER", "CAPABILITY_PEPPER"):
+                  name = f"HPG_{label}_" + ("KEY_" if label == "TOKEN_MASTER" else "") + "B64"
+                  value = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+                  environment.write(f"{name}={value}\n")
+          PY
+          install -d -m 700 "$(dirname "$HPG_APNS_KEY_FILE")"
+          umask 077
+          openssl genpkey -algorithm EC \
+            -pkeyopt ec_paramgen_curve:P-256 \
+            -out "$HPG_APNS_KEY_FILE"
+          # Local Compose implements file-backed secrets as bind mounts, so
+          # uid/gid/mode metadata in the Compose file is not portable. Match
+          # the image's fixed unprivileged runtime identity on Linux.
+          sudo chown 999:999 "$HPG_APNS_KEY_FILE"
+          sudo chmod 0400 "$HPG_APNS_KEY_FILE"
+          test "$(stat -c '%u:%g %a' "$HPG_APNS_KEY_FILE")" = "999:999 400"
+
+      - name: Validate full, Hub-only, and standalone Push deployments
+        run: |
+          docker compose -f server/compose.hrp2.yml config --quiet
+          docker compose \
+            -f server/compose.hrp2.yml \
+            -f server/deploy/compose.hrp2.ci.yml \
+            config --quiet
+          docker compose -f server/compose.hub-only.yml config --quiet
+          docker compose \
+            -f server/push-gateway/compose.example.yml \
+            --project-directory server/push-gateway \
+            config --quiet
+          python3 - <<'PY'
+          import subprocess
+
+          services = subprocess.check_output(
+              [
+                  "docker",
+                  "compose",
+                  "-f",
+                  "server/compose.hub-only.yml",
+                  "config",
+                  "--services",
+              ],
+              text=True,
+          ).splitlines()
+          assert "relay-hub" in services
+          assert "relay-hub-db" in services
+          assert not any("push" in service.lower() for service in services), services
+          PY
+
+      - name: Build and start the complete production topology
+        run: |
+          docker compose \
+            -f server/compose.hrp2.yml \
+            -f server/deploy/compose.hrp2.ci.yml \
+            up --build --wait --wait-timeout 240
+
+      - name: Prove migrations, startup ordering, readiness, and PostgreSQL writes
+        run: python3 server/deploy/verify_hrp2_compose.py
+
+      - name: Capture deployment diagnostics
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: |
+          docker compose \
+            -f server/compose.hrp2.yml \
+            -f server/deploy/compose.hrp2.ci.yml \
+            ps --all
+          docker compose \
+            -f server/compose.hrp2.yml \
+            -f server/deploy/compose.hrp2.ci.yml \
+            logs --no-color --timestamps
+
+      - name: Remove deployment containers, networks, and data
+        if: ${{ always() }}
+        run: |
+          docker compose \
+            -f server/compose.hrp2.yml \
+            -f server/deploy/compose.hrp2.ci.yml \
+            down --volumes --remove-orphans --timeout 10
+
+  plugin-and-conformance:
+    name: Plugin, conformance, local E2E, and distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # Hub/Push use exact direct pins. Freeze transitive resolution at a
+      # known timestamp for the dedicated merged E2E environment as well.
+      UV_EXCLUDE_NEWER: "2026-07-20T00:00:00Z"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install Python 3.13
+        run: uv python install 3.13
+
+      - name: Sync root environment from lockfile
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.13 --extra all --extra dev
+
+      - name: Run blocking HRP/2 lint when the generic lint lane is skipped
+        if: ${{ !inputs.root_python_suite_runs }}
+        run: |
+          .venv/bin/ruff check \
+            relay/hermes_relay relay/tests \
+            server/relay-hub/relay_hub server/relay-hub/tests \
+            server/push-gateway/push_gateway server/push-gateway/tests \
+            plugins/hermes-mobile tests/plugins/hermes_mobile \
+            tests/test_hrp2_conformance_sources.py \
+            tests/test_mobile_relay_distribution.py \
+            tests/e2e/test_hrp2_agent_hub.py \
+            tests/e2e/test_hrp2_privacy_evidence.py
+
+      - name: Run plugin-owned tests
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: >-
+          .venv/bin/python -m pytest
+          plugins/hermes-mobile/tests
+          -q --tb=short
+
+      - name: Run HRP/2 root evidence when the generic suite is skipped
+        if: ${{ !inputs.root_python_suite_runs }}
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          .venv/bin/python -m pytest \
+            tests/plugins/hermes_mobile \
+            tests/test_hrp2_conformance_sources.py \
+            tests/test_mobile_relay_distribution.py \
+            -q --tb=short
+
+      - name: Create reproducible cross-component E2E environment
+        uses: ./.github/actions/retry
+        with:
+          command: >-
+            uv venv --python 3.13 .venv-hrp2-e2e &&
+            uv pip install --python .venv-hrp2-e2e/bin/python
+            -r server/relay-hub/requirements-test.txt
+            -r server/push-gateway/requirements-test.txt
+            pyhpke==0.6.5 pytest-asyncio==1.3.0
+
+      - name: Run real local Agent, Hub, and Push E2E
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          .venv-hrp2-e2e/bin/python -c \
+            'import fastapi, httpx, pyhpke, sqlalchemy, uvicorn'
+          .venv-hrp2-e2e/bin/python -m pytest \
+            tests/e2e/test_hrp2_agent_hub.py \
+            tests/e2e/test_hrp2_privacy_evidence.py \
+            -q --tb=short

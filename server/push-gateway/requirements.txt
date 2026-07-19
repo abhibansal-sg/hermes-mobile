@@ -1,0 +1,9 @@
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+pydantic==2.13.4
+cryptography==48.0.1
+SQLAlchemy==2.0.51
+psycopg[binary]==3.3.4
+httpx[http2]==0.28.1
+PyJWT[crypto]==2.13.0
+cbor2==5.9.0

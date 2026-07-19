@@ -233,7 +233,7 @@ final class RelayClientMockTests: XCTestCase {
         let methods = transport.upstreams().map(\.method)
         XCTAssertTrue(methods.contains("list"))
         let submit = transport.upstreams().first { $0.method == "submit" }
-        XCTAssertEqual(submit?.params["prompt"] as? String, "Hello")
+        XCTAssertEqual(submit?.params["text"] as? String, "Hello")
 
         await client.disconnect()
     }

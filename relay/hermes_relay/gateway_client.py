@@ -44,7 +44,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol, runtime_checkable
 
 from .bus import EventBus, TOPIC_GATEWAY_EVENTS
 from .types import GatewayEvent, RawEvent
@@ -67,6 +67,7 @@ class WSTransport(Protocol):
 
 
 Connector = Callable[[str], Awaitable[WSTransport]]
+OwnedSessionCallback = Callable[[str, str], None]
 
 
 class GatewayRPCError(RuntimeError):
@@ -119,6 +120,8 @@ class GatewayClient:
         rest_client: Any = None,
         sleep: Optional[Callable[[float], Awaitable[None]]] = None,
         token_provider: Optional[Callable[[], str]] = None,
+        owned_session_callback: Optional[OwnedSessionCallback] = None,
+        reliable_events: bool = False,
     ) -> None:
         self._cfg = config
         self._bus = bus
@@ -127,16 +130,30 @@ class GatewayClient:
         self._owns_rest_client = rest_client is None
         self._sleep = sleep or asyncio.sleep
         self._token_provider = token_provider
+        self._owned_session_callback = owned_session_callback
+        self._reliable_events = reliable_events
 
         # Sessions this relay OWNS (created/resumed here) — re-established on
         # reconnect and observed by the Notifier for owned-session pushes.
         self._owned: set[str] = set()
+
+        # Canonical session origins are the only IDs that may be re-resumed.
+        # Live IDs are connection-generation aliases: resuming an obsolete live
+        # alias can create a second replacement session after Gateway restart.
+        self._owned_origins: set[str] = set()
+        # Origins whose live alias was successfully established on the current
+        # Gateway connection. Durable ownership alone is never command-safe.
+        self._command_safe_origins: set[str] = set()
 
         # Origin/requested id -> live id learned at resume time. A stock gateway
         # may hand a resumed session a DISTINCT live id (echoing the requested id
         # back as ``resumed``); a submit MUST target the live id, so we remember
         # the mapping and resolve it in :meth:`live_id_for` (R0/E2E finding).
         self._live_by_origin: dict[str, str] = {}
+        # Retain reverse knowledge of retired connection-scoped aliases so a
+        # command already carrying the old ID can canonicalize after waiting
+        # for reconnect restoration to finish.
+        self._origin_by_alias: dict[str, str] = {}
 
         # Live token (re-minted on each connect via token_provider, if given).
         self._token: str = config.token
@@ -149,9 +166,35 @@ class GatewayClient:
         self._transport: Optional[WSTransport] = None
         self._reader_task: Optional[asyncio.Task[None]] = None
         self._ready = asyncio.Event()
+        # A socket is not command-safe until restored owned sessions have been
+        # resumed and any stale live aliases replaced for this connection.
+        self._operational = asyncio.Event()
         self._reader_done = asyncio.Event()
         self._closing = False
         self._run_task: Optional[asyncio.Task[None]] = None
+        # Monotonic socket generation used to fence session-id resolution from
+        # a reconnect that happens between the readiness gate and the send.
+        self._connection_generation = 0
+
+    def restore_owned_sessions(self, aliases: Mapping[str, str]) -> None:
+        """Hydrate durable origin/live ownership before the reconnect loop.
+
+        The v2 Relay persists this mapping independently of the stock Gateway.
+        Restoring both coordinates makes reconnect re-resume the sessions and
+        immediately recognize events addressed to the distinct live ID.
+        """
+
+        for origin, live in aliases.items():
+            if not isinstance(origin, str) or not origin:
+                continue
+            normalized_live = live if isinstance(live, str) and live else origin
+            self._owned_origins.add(origin)
+            self._owned.add(origin)
+            self._owned.add(normalized_live)
+            self._live_by_origin[origin] = normalized_live
+            self._live_by_origin[normalized_live] = normalized_live
+            self._origin_by_alias[origin] = origin
+            self._origin_by_alias[normalized_live] = origin
 
     # -- lifecycle --------------------------------------------------------
     async def connect(self) -> None:
@@ -163,6 +206,8 @@ class GatewayClient:
         :meth:`run`'s job; callers wanting resilience use :meth:`run`.
         """
         await self._connect_once()
+        await self._reestablish_owned()
+        self._operational.set()
 
     async def run(self) -> None:
         """Durable connect/serve/reconnect loop with exponential backoff.
@@ -185,6 +230,7 @@ class GatewayClient:
             # Connected. Re-establish ownership of every session we drive, then
             # reset the backoff — a healthy connection earns a fresh schedule.
             await self._reestablish_owned()
+            self._operational.set()
             backoff = self._cfg.backoff_initial_s
 
             # Block until the reader loop signals the socket dropped.
@@ -211,9 +257,12 @@ class GatewayClient:
     async def _connect_once(self) -> None:
         """Open a fresh transport, start its reader, await readiness."""
         url = self._mint_url()
+        self._operational.clear()
+        self._command_safe_origins.clear()
         self._ready.clear()
         self._reader_done = asyncio.Event()
         self._transport = await self._connector(url)
+        self._connection_generation += 1
         self._reader_task = asyncio.create_task(self._read_loop(self._transport))
         try:
             await asyncio.wait_for(self._ready.wait(), timeout=self._cfg.connect_timeout_s)
@@ -237,6 +286,8 @@ class GatewayClient:
             except (asyncio.CancelledError, Exception):
                 pass
         self._fail_pending(ConnectionError("gateway connection closed"))
+        self._operational.clear()
+        self._command_safe_origins.clear()
         self._ready.clear()
 
     def _mint_url(self) -> str:
@@ -262,7 +313,7 @@ class GatewayClient:
                     except json.JSONDecodeError:
                         continue
                     if isinstance(msg, dict):
-                        self._dispatch(msg)
+                        await self._dispatch(msg)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -272,7 +323,7 @@ class GatewayClient:
             self._fail_pending(ConnectionError("gateway connection closed"))
             self._reader_done.set()
 
-    def _dispatch(self, msg: dict[str, Any]) -> None:
+    async def _dispatch(self, msg: dict[str, Any]) -> None:
         """Route one parsed frame: event -> bus, response -> matched future."""
         if msg.get("method") == "event":
             params = msg.get("params") or {}
@@ -281,7 +332,10 @@ class GatewayClient:
                 self._ready.set()
             # Demux by session_id happens downstream (Reframer keys on it); we
             # publish every event verbatim onto the one gateway-events topic.
-            self._bus.publish(TOPIC_GATEWAY_EVENTS, ev)
+            if self._reliable_events:
+                await self._bus.publish_wait(TOPIC_GATEWAY_EVENTS, ev)
+            else:
+                self._bus.publish(TOPIC_GATEWAY_EVENTS, ev)
             return
         rid = msg.get("id")
         if rid is not None:
@@ -310,6 +364,20 @@ class GatewayClient:
         ``result``/``error``). The typed convenience methods below wrap this and
         raise :class:`GatewayRPCError` on an ``error`` object.
         """
+        if self._transport is None:
+            raise ConnectionError("gateway not connected")
+        if not self._operational.is_set():
+            await self._operational.wait()
+        return await self._call_connected(method, params, timeout)
+
+    async def _call_connected(
+        self,
+        method: str,
+        params: Optional[dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Issue an RPC on the current socket, including during restoration."""
+
         transport = self._transport
         if transport is None:
             raise ConnectionError("gateway not connected")
@@ -333,6 +401,16 @@ class GatewayClient:
     ) -> dict[str, Any]:
         """``call`` + unwrap: raise on ``error``, else return ``result`` dict."""
         resp = await self.call(method, params, timeout=timeout)
+        return self._unwrap_result(method, resp)
+
+    async def _call_result_connected(
+        self, method: str, params: dict[str, Any], timeout: Optional[float] = None
+    ) -> dict[str, Any]:
+        resp = await self._call_connected(method, params, timeout=timeout)
+        return self._unwrap_result(method, resp)
+
+    @staticmethod
+    def _unwrap_result(method: str, resp: dict[str, Any]) -> dict[str, Any]:
         if "error" in resp and resp["error"] is not None:
             raise GatewayRPCError(method, resp["error"])
         return resp.get("result") or {}
@@ -361,7 +439,7 @@ class GatewayClient:
         sid = result.get("session_id")
         if not sid:
             raise GatewayRPCError("session.create", {"code": -1, "message": "no session_id in result"})
-        self._owned.add(sid)
+        self._remember_owned_session(sid, sid)
         return sid
 
     async def session_resume(self, session_id: str, *, cols: Optional[int] = None) -> dict[str, Any]:
@@ -373,21 +451,33 @@ class GatewayClient:
         ``message_count``). The requested id is marked owned so reconnect
         re-resumes it.
         """
+        if self._transport is None:
+            raise ConnectionError("gateway not connected")
+        if not self._operational.is_set():
+            await self._operational.wait()
+        return await self._session_resume_connected(session_id, cols=cols)
+
+    async def _session_resume_connected(
+        self, session_id: str, *, cols: Optional[int] = None
+    ) -> dict[str, Any]:
         params = {
             "session_id": session_id,
             "cols": cols if cols is not None else self._cfg.cols,
             "source": self._cfg.source,
         }
-        result = await self._call_result("session.resume", params, timeout=self._cfg.rpc_timeout_s)
-        self._owned.add(session_id)
+        origin = self._canonical_origin(session_id)
+        params["session_id"] = origin
+        result = await self._call_result_connected(
+            "session.resume", params, timeout=self._cfg.rpc_timeout_s
+        )
         # If the gateway hands back a distinct live id, own it too so events on
         # that id are recognised as ours, and remember origin->live so a submit
         # to EITHER id drives the live turn (see :meth:`live_id_for`).
         live = result.get("session_id")
         if live:
-            self._owned.add(live)
-            self._live_by_origin[session_id] = live
-            self._live_by_origin[live] = live
+            self._remember_owned_session(origin, live)
+        else:
+            self._remember_owned_session(origin, origin)
         return result
 
     async def rest_history(self, session_id: str) -> list[dict[str, Any]]:
@@ -404,14 +494,26 @@ class GatewayClient:
         data = resp.json()
         return list(data.get("messages") or [])
 
-    async def prompt_submit(self, session_id: str, text: str) -> dict[str, Any]:
+    async def prompt_submit(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        client_message_id: str | None = None,
+    ) -> dict[str, Any]:
         """``prompt.submit`` — become owner of ``session_id`` and drive a turn.
 
         Marks the session owned so reconnect re-establishes it and the Notifier
         treats its completion/approval/error events as push-worthy.
         """
-        self._owned.add(session_id)
-        return await self._call_result("prompt.submit", {"session_id": session_id, "text": text})
+        params = {"text": text}
+        if client_message_id is not None:
+            # Preserve the WorkRepository job ID end-to-end so the gateway's
+            # plugin-owned durable prompt receipt provider is authoritative.
+            params["client_message_id"] = client_message_id
+        return await self._session_command_result(
+            "prompt.submit", session_id, params, claim_ownership=True
+        )
 
     async def approval_respond(
         self, session_id: str, request_id: str, decision: str, *, resolve_all: bool = False
@@ -426,10 +528,10 @@ class GatewayClient:
         We map the phone's ``decision`` onto ``choice`` (``request_id`` is kept
         for logging/forward-compat but the gateway ignores it).
         """
-        return await self._call_result(
+        return await self._session_command_result(
             "approval.respond",
+            session_id,
             {
-                "session_id": session_id,
                 "request_id": request_id,
                 "choice": decision,
                 "all": resolve_all,
@@ -446,14 +548,60 @@ class GatewayClient:
         blocked agent. We send ``answer`` (``session_id`` is kept for symmetry;
         the gateway resolves by ``request_id``).
         """
-        return await self._call_result(
+        return await self._session_command_result(
             "clarify.respond",
-            {"session_id": session_id, "request_id": request_id, "answer": text},
+            session_id,
+            {"request_id": request_id, "answer": text},
         )
 
     async def session_interrupt(self, session_id: str) -> dict[str, Any]:
         """``session.interrupt`` — stop the active turn (pass-through)."""
-        return await self._call_result("session.interrupt", {"session_id": session_id})
+        return await self._session_command_result("session.interrupt", session_id, {})
+
+    async def _session_command_result(
+        self,
+        method: str,
+        session_id: str,
+        params: dict[str, Any],
+        *,
+        claim_ownership: bool = False,
+    ) -> dict[str, Any]:
+        """Resolve and send one session command on one Gateway generation.
+
+        Durable live IDs are only aliases for the connection that produced
+        them. After reconnect, a known origin must be successfully resumed
+        before *any* command—not just a prompt—may reuse its mapping. The
+        generation fence prevents a reconnect between resolution and send from
+        moving an already-resolved stale ID onto the replacement socket.
+        """
+
+        while True:
+            if self._transport is None:
+                raise ConnectionError("gateway not connected")
+            if not self._operational.is_set():
+                await self._operational.wait()
+            generation = self._connection_generation
+            origin = self._canonical_origin(session_id)
+            if (
+                origin in self._owned_origins
+                and origin not in self._command_safe_origins
+            ):
+                await self._session_resume_connected(origin)
+            live = self._live_by_origin.get(origin, session_id)
+
+            # No await occurs between this fence and _call_connected capturing
+            # the transport. A later drop makes the call ambiguous; it cannot
+            # silently send this generation's alias on a newer connection.
+            if (
+                generation != self._connection_generation
+                or not self._operational.is_set()
+            ):
+                continue
+            if claim_ownership:
+                self._remember_owned_session(origin, live)
+            command_params = {**params, "session_id": live}
+            response = await self._call_connected(method, command_params)
+            return self._unwrap_result(method, response)
 
     # -- reconnect re-establishment --------------------------------------
     async def _reestablish_owned(self) -> None:
@@ -464,16 +612,48 @@ class GatewayClient:
         re-drive. Ids are snapshotted so a concurrent submit can't mutate the
         set mid-iteration.
         """
-        for sid in sorted(self._owned):
+        for sid in sorted(self._owned_origins):
             try:
-                await self.call(
-                    "session.resume",
-                    {"session_id": sid, "cols": self._cfg.cols, "source": self._cfg.source},
-                    timeout=self._cfg.rpc_timeout_s,
-                )
+                # Use the public helper so a replacement live ID is adopted in
+                # memory and durably reported to the v2 Relay before prompts can
+                # target the restarted Gateway.
+                await self._session_resume_connected(sid)
             except Exception:
-                # Keep the session owned; a later phone action re-drives it.
+                # Keep durable origin knowledge, but remove the stale live
+                # alias from command-safe ownership. A later phone action must
+                # successfully resume before it can submit.
+                self._command_safe_origins.discard(sid)
+                stale = self._live_by_origin.get(sid)
+                self._owned.discard(sid)
+                if stale is not None:
+                    self._owned.discard(stale)
                 continue
+
+    def _canonical_origin(self, session_id: str) -> str:
+        return self._origin_by_alias.get(session_id, session_id)
+
+    def _remember_owned_session(self, origin: str, live: str) -> None:
+        """Atomically replace one connection-scoped live alias.
+
+        The optional callback is invoked first so a v2 Relay never advertises a
+        new in-memory alias that failed to reach its durable ownership table.
+        """
+
+        if self._owned_session_callback is not None:
+            self._owned_session_callback(origin, live)
+        previous = self._live_by_origin.get(origin)
+        self._owned_origins.add(origin)
+        self._command_safe_origins.add(origin)
+        self._origin_by_alias[origin] = origin
+        self._owned.add(origin)
+        if previous is not None and previous != origin and previous != live:
+            self._owned.discard(previous)
+            self._live_by_origin.pop(previous, None)
+            self._origin_by_alias[previous] = origin
+        self._owned.add(live)
+        self._live_by_origin[origin] = live
+        self._live_by_origin[live] = live
+        self._origin_by_alias[live] = origin
 
     # -- REST client ------------------------------------------------------
     def _rest(self) -> Any:
@@ -487,7 +667,12 @@ class GatewayClient:
     # -- ownership introspection -----------------------------------------
     def owns(self, session_id: str) -> bool:
         """True iff the relay owns (submitted/resumed-to-drive) this session."""
-        return session_id in self._owned
+        origin = self._canonical_origin(session_id)
+        return (
+            self._operational.is_set()
+            and origin in self._command_safe_origins
+            and session_id in self._owned
+        )
 
     def live_id_for(self, session_id: str) -> str:
         """Resolve a requested/origin id to the live id a prior resume assigned.
@@ -497,7 +682,8 @@ class GatewayClient:
         a distinct live id at resume time, this lets a repeat submit addressed to
         the ORIGIN id still target the live turn instead of the dormant origin.
         """
-        return self._live_by_origin.get(session_id, session_id)
+        origin = self._canonical_origin(session_id)
+        return self._live_by_origin.get(origin, session_id)
 
     @property
     def owned_sessions(self) -> frozenset[str]:

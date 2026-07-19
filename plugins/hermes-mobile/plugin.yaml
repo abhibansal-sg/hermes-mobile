@@ -1,11 +1,11 @@
 name: hermes-mobile
-version: 1.0.0
+version: 2.0.0
 description: >-
-  Multi-client gateway support for the HermesMobile iOS app: event broadcast
-  fan-out, APNs push + Live Activities, durable prompt receipts, device pairing
-  REST API, sandboxed file browse, and attachment upload. Enable with
-  `hermes plugins enable hermes-mobile`; broadcast additionally requires
-  HERMES_GATEWAY_BROADCAST=1.
+  HermesMobile edge integration plus the HRP/2 Mobile Agent Relay operator
+  CLI. HRP/2 provides authenticated per-device encryption, durable streams,
+  encrypted Push previews, pairing, and independent revocation without
+  modifying the stock gateway. Enable the plugin, then run `hermes mobile
+  enable --hub URL`.
 author: Hermes Mobile (ABH-88)
 kind: standalone
 provides_hooks: []

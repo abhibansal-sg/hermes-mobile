@@ -175,7 +175,7 @@ final class RelayItemStoreTests: XCTestCase {
 
     // MARK: - Snapshot reconciliation (§4)
 
-    func testSnapshotReconcilesByItemIDAndRetainsOthers() {
+    func testSnapshotIsAuthoritativeAndRemovesAbsentItems() {
         var store = RelayItemStore()
         store.apply(completed("keep", .agentMessage, ord: 0, seq: 1, body: ["text": "kept"]))
         store.apply(completed("stale", .agentMessage, ord: 1, seq: 2, body: ["text": "old"]))
@@ -189,10 +189,10 @@ final class RelayItemStoreTests: XCTestCase {
         ])
         store.apply(frame(seq: 11, kind: "snapshot", body: snapshotBody))
 
-        // Snapshot item replaces the stale copy; new item added; untouched item kept.
+        // Snapshot item replaces the stale copy; new item added; absent item removed.
         XCTAssertEqual(store.itemsByID["stale"]?.textBody, "new")
         XCTAssertEqual(store.itemsByID["fresh"]?.toolName, "grep")
-        XCTAssertEqual(store.itemsByID["keep"]?.textBody, "kept")
+        XCTAssertNil(store.itemsByID["keep"])
         // Cursor advances the watermark past the raw seqs.
         XCTAssertEqual(store.lastSeq, 11)
     }

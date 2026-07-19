@@ -38,6 +38,8 @@ jobs:
     outputs:
       python: ${{ steps.classify.outputs.python }}
       frontend: ${{ steps.classify.outputs.frontend }}
+      hrp2: ${{ steps.classify.outputs.hrp2 }}
+      ios: ${{ steps.classify.outputs.ios }}
       site: ${{ steps.classify.outputs.site }}
       scan: ${{ steps.classify.outputs.scan }}
       deps: ${{ steps.classify.outputs.deps }}
@@ -75,6 +77,20 @@ jobs:
     needs: detect
     if: needs.detect.outputs.frontend == 'true'
     uses: ./.github/workflows/js-tests.yml
+
+  hrp2-tests:
+    name: HRP/2 Relay, Hub, Push, and conformance
+    needs: detect
+    if: needs.detect.outputs.hrp2 == 'true'
+    uses: ./.github/workflows/hrp2-tests.yml
+    with:
+      root_python_suite_runs: ${{ needs.detect.outputs.python == 'true' }}
+
+  ios-tests:
+    name: iOS focused unit tests
+    needs: detect
+    if: needs.detect.outputs.ios == 'true'
+    uses: ./.github/workflows/ios-tests.yml
 
   docs-site:
     name: Docs Site
@@ -129,17 +145,21 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when some deps were skipped. Only ``success`` and an
+  # intentional conditional ``skipped`` are accepted; cancellation and any
+  # future non-success terminal result fail closed.
   #
   # Branch protection should require ONLY this check.
   # ─────────────────────────────────────────────────────────────────────
   all-checks-pass:
     name: All required checks pass
     needs:
+      - detect
       - tests
       - lint
       - js-tests
+      - hrp2-tests
+      - ios-tests
       - docs-site
       - history-check
       - contributor-check
@@ -159,13 +179,18 @@ jobs:
           echo "$NEEDS" | python3 -c "
           import json, sys
           needs = json.load(sys.stdin)
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          accepted = {'success', 'skipped'}
+          unsuccessful = [
+              name for name, info in needs.items()
+              if info['result'] not in accepted
+          ]
           for name, info in sorted(needs.items()):
               result = info['result']
-              icon = '✅' if result in ('success', 'skipped') else '❌'
+              icon = '✅' if result in accepted else '❌'
               print(f'{icon} {name}: {result}')
-          if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+          if unsuccessful:
+              names = ', '.join(unsuccessful)
+              print(f'::error::{len(unsuccessful)} required job(s) did not succeed: {names}')
               sys.exit(1)
           print('All checks passed (or were skipped)')
           "

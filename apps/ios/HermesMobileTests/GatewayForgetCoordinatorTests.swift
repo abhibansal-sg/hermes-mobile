@@ -110,6 +110,27 @@ final class GatewayForgetCoordinatorTests: XCTestCase {
         XCTAssertEqual(sessions.manifestRevision, 0)
         XCTAssertEqual(connection.phase, .needsSetup)
     }
+
+    func testAlreadyForgottenAndSelfRevokedPathsEraseAPNsKeychainCredentials() async throws {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: DefaultsKeys.serverURL)
+        KeychainService.deleteAPNsDeviceTokens()
+        defer { KeychainService.deleteAPNsDeviceTokens() }
+        let (connection, _, _, _, _, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try KeychainService.saveAPNsDeviceToken("current")
+        try KeychainService.saveRegisteredAPNsDeviceToken("registered")
+        await connection.forgetGateway()
+        XCTAssertNil(KeychainService.loadAPNsDeviceToken())
+        XCTAssertNil(KeychainService.loadRegisteredAPNsDeviceToken())
+
+        try KeychainService.saveAPNsDeviceToken("current-again")
+        try KeychainService.saveRegisteredAPNsDeviceToken("registered-again")
+        connection.requireRepairAfterCurrentDeviceRevoked()
+        XCTAssertNil(KeychainService.loadAPNsDeviceToken())
+        XCTAssertNil(KeychainService.loadRegisteredAPNsDeviceToken())
+    }
 }
 
 private func makeWorkRepositoryTestConfiguration(

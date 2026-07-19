@@ -391,7 +391,7 @@ final class RelaySessionCoordinatorTests: XCTestCase {
 
         let submitFrames = transport.upstreams().filter { $0.method == "submit" }
         XCTAssertEqual(submitFrames.count, 1, "the prompt delivers over the relay exactly once (no dup)")
-        XCTAssertEqual(submitFrames.first?.params["prompt"] as? String, "hello over relay")
+        XCTAssertEqual(submitFrames.first?.params["text"] as? String, "hello over relay")
         XCTAssertEqual(submitFrames.first?.params["session_id"] as? String, "sess-9")
         // The row's stable id rides the submit so the relay handler can dedupe an
         // ambiguous-flap retry into a single turn (no duplicate).
@@ -481,7 +481,7 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         XCTAssertTrue(methods.contains("submit"))
         XCTAssertTrue(methods.contains("interrupt"))
         let submitFrame = transport.upstreams().first { $0.method == "submit" }
-        XCTAssertEqual(submitFrame?.params["prompt"] as? String, "Hello relay")
+        XCTAssertEqual(submitFrame?.params["text"] as? String, "Hello relay")
         let interruptFrame = transport.upstreams().first { $0.method == "interrupt" }
         XCTAssertEqual(interruptFrame?.params["session_id"] as? String, "sess-42")
 
@@ -715,7 +715,7 @@ final class RelayDeepLinkResumeTests: XCTestCase {
 
         let submit = s.transport.upstreams().first { $0.method == "submit" }
         XCTAssertNotNil(submit, "the send must route prompt.submit over the relay")
-        XCTAssertEqual(submit?.params["prompt"] as? String, "resume and send me")
+        XCTAssertEqual(submit?.params["text"] as? String, "resume and send me")
         XCTAssertEqual(submit?.params["session_id"] as? String, "abc123")
     }
 

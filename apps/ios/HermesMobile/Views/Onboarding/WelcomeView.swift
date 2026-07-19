@@ -19,6 +19,9 @@ struct WelcomeView: View {
 
     /// Drives the full-screen QR scanner presentation.
     @State private var showingScanner = false
+    @State private var showingRelayV2Scanner = false
+    @State private var showingRelayV2Resume = false
+    @State private var hasPendingRelayV2Pairing = false
 
     /// Drives the slide-up manual-setup sheet.
     @State private var showingManualSetup = false
@@ -53,6 +56,10 @@ struct WelcomeView: View {
                 actionButtons
                     .padding(.horizontal, 24)
                     .padding(.bottom, 24)
+
+                secureRelayButton
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 24)
             }
             .animation(.easeInOut(duration: 0.2), value: connection.reauthRequired)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -60,9 +67,18 @@ struct WelcomeView: View {
             .onAppear {
                 // Sync from persisted value on every appearance.
                 selectedMode = connection.connectionMode
+                hasPendingRelayV2Pairing = (try? RelayV2KeychainStore().loadPendingPairing()) != nil
             }
             .fullScreenCover(isPresented: $showingScanner) {
                 QRScannerView()
+                    .hermesThemed(themeStore)
+            }
+            .fullScreenCover(isPresented: $showingRelayV2Scanner) {
+                QRScannerView(pairingMode: .relayV2)
+                    .hermesThemed(themeStore)
+            }
+            .fullScreenCover(isPresented: $showingRelayV2Resume) {
+                RelayV2PairingView(offer: nil)
                     .hermesThemed(themeStore)
             }
             // The manual URL+token form slides up as a native sheet with
@@ -204,6 +220,32 @@ struct WelcomeView: View {
     }
 
     // MARK: - Actions
+
+    private var secureRelayButton: some View {
+        VStack(spacing: 8) {
+            Button {
+                showingRelayV2Scanner = true
+            } label: {
+                Label("Pair with Secure Relay (HRP/2)", systemImage: "lock.shield")
+                    .font(.body.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 52)
+            }
+            .foregroundStyle(theme.fg)
+            .background(theme.secondary, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(theme.border, lineWidth: 1)
+            )
+            .accessibilityIdentifier("pairRelayV2Button")
+
+            if hasPendingRelayV2Pairing {
+                Button("Resume secure pairing") { showingRelayV2Resume = true }
+                    .font(.footnote.weight(.medium))
+                    .accessibilityIdentifier("resumeRelayV2PairingButton")
+            }
+        }
+    }
 
     /// The CTA adapts to the selected mode:
     /// - Shared dashboard → primary = scan QR, secondary = enter manually.

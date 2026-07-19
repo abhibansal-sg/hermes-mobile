@@ -79,6 +79,9 @@ def test_authenticated_registered_api_key_provider_serializes_auth_type(api, mon
 
     monkeypatch.setattr(inventory, "load_picker_context", lambda: object())
     monkeypatch.setattr(inventory, "build_models_payload", fake_build_models_payload)
+    # The test describes a registered provider, independent of any custom
+    # providers configured in the developer/runner profile.
+    monkeypatch.setattr(api, "_custom_provider_entries", lambda: {})
     monkeypatch.setattr(api, "_has_dashboard_api_auth", lambda request: True)
     monkeypatch.setattr(api, "_device_has_scope", lambda request, scope: True)
 

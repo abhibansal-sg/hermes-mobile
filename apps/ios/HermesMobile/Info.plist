@@ -72,6 +72,8 @@
 	<array>
 		<string>ai.hermes.app.openSession</string>
 	</array>
+	<key>RelayPreviewAccessGroup</key>
+	<string>$(AppIdentifierPrefix)ai.hermes.app.relay-preview</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>

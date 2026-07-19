@@ -1,0 +1,209 @@
+name: hermes-hrp2
+
+services:
+  relay-hub-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: relay_hub
+      POSTGRES_USER: relay_hub
+      POSTGRES_PASSWORD: ${HRH_POSTGRES_PASSWORD:?set HRH_POSTGRES_PASSWORD}
+    volumes:
+      - relay-hub-db:/var/lib/postgresql/data
+    networks: [hub-db]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay_hub -d relay_hub"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  relay-hub-migrate:
+    image: postgres:17-alpine
+    depends_on:
+      relay-hub-db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${HRH_POSTGRES_PASSWORD:?set HRH_POSTGRES_PASSWORD}
+    volumes:
+      - ./relay-hub/migrations/postgresql/001_hrp2.sql:/migration.sql:ro
+    command:
+      - psql
+      - -h
+      - relay-hub-db
+      - -U
+      - relay_hub
+      - -d
+      - relay_hub
+      - -v
+      - ON_ERROR_STOP=1
+      - -f
+      - /migration.sql
+    networks: [hub-db]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  relay-hub:
+    build: ./relay-hub
+    depends_on:
+      relay-hub-migrate:
+        condition: service_completed_successfully
+    environment:
+      HRH_PRODUCTION: "true"
+      HRH_DATABASE_URL: postgresql+psycopg://relay_hub:${HRH_POSTGRES_PASSWORD:?set HRH_POSTGRES_PASSWORD}@relay-hub-db:5432/relay_hub
+      HRH_OPERATOR_ENROLLMENT_TOKEN: ${HRH_OPERATOR_ENROLLMENT_TOKEN:-}
+      HRH_ACTIVATION_PUBLIC_KEY_B64: ${HRH_ACTIVATION_PUBLIC_KEY_B64:-}
+      HRH_AUTO_CREATE_SCHEMA: "false"
+      HRH_MAXIMUM_REQUEST_BODY_BYTES: "400000"
+      # Only the fixed Caddy address may supply X-Forwarded-* client identity.
+      FORWARDED_ALLOW_IPS: "172.31.250.2"
+    expose: ["8080"]
+    networks:
+      hub-ingress:
+        ipv4_address: 172.31.250.3
+      hub-db:
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  push-gateway-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: push_gateway
+      POSTGRES_USER: push_gateway
+      POSTGRES_PASSWORD: ${HPG_POSTGRES_PASSWORD:?set HPG_POSTGRES_PASSWORD}
+    volumes:
+      - push-gateway-db:/var/lib/postgresql/data
+    networks: [push-db]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U push_gateway -d push_gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  push-gateway-migrate:
+    image: postgres:17-alpine
+    depends_on:
+      push-gateway-db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${HPG_POSTGRES_PASSWORD:?set HPG_POSTGRES_PASSWORD}
+    volumes:
+      - ./push-gateway/migrations/postgresql:/migrations:ro
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        for migration in /migrations/*.sql; do
+          psql -h push-gateway-db -U push_gateway -d push_gateway \
+            -v ON_ERROR_STOP=1 -f "$${migration}"
+        done
+    networks: [push-db]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  push-gateway:
+    build: ./push-gateway
+    depends_on:
+      push-gateway-migrate:
+        condition: service_completed_successfully
+    environment:
+      HPG_PRODUCTION: "true"
+      HPG_DATABASE_URL: postgresql+psycopg://push_gateway:${HPG_POSTGRES_PASSWORD:?set HPG_POSTGRES_PASSWORD}@push-gateway-db:5432/push_gateway
+      HPG_TOKEN_MASTER_KEY_B64: ${HPG_TOKEN_MASTER_KEY_B64:?set HPG_TOKEN_MASTER_KEY_B64}
+      HPG_CAPABILITY_PEPPER_B64: ${HPG_CAPABILITY_PEPPER_B64:?set HPG_CAPABILITY_PEPPER_B64}
+      HPG_ALLOWED_BUNDLE_IDS: ${HPG_ALLOWED_BUNDLE_IDS:-ai.hermes.app}
+      HPG_APPLE_APP_ID: ${HPG_APPLE_APP_ID:?set HPG_APPLE_APP_ID}
+      HPG_APP_ATTEST_PRODUCTION: ${HPG_APP_ATTEST_PRODUCTION:-true}
+      HPG_APNS_KEY_PATH: /run/secrets/apns_key
+      HPG_APNS_KEY_ID: ${HPG_APNS_KEY_ID:?set HPG_APNS_KEY_ID}
+      HPG_APNS_TEAM_ID: ${HPG_APNS_TEAM_ID:?set HPG_APNS_TEAM_ID}
+      HPG_HUB_ACTIVATION_PRIVATE_KEY_B64: ${HPG_HUB_ACTIVATION_PRIVATE_KEY_B64:-}
+      HPG_AUTO_CREATE_SCHEMA: "false"
+      # Only the fixed Caddy address may supply X-Forwarded-* client identity.
+      FORWARDED_ALLOW_IPS: "172.31.251.2"
+    secrets:
+      # Local Compose bind-mounts file secrets: prepare the source as 999:999
+      # mode 0400 as documented. Engines that honor secret metadata also get
+      # the explicit least-privilege mode below.
+      - source: apns_key
+        target: apns_key
+        mode: 0400
+    expose: ["8081"]
+    networks:
+      push-ingress:
+        ipv4_address: 172.31.251.3
+      push-db:
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    depends_on:
+      relay-hub:
+        condition: service_healthy
+      push-gateway:
+        condition: service_healthy
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+      HRH_PUBLIC_HOST: ${HRH_PUBLIC_HOST:?set HRH_PUBLIC_HOST}
+      HPG_PUBLIC_HOST: ${HPG_PUBLIC_HOST:?set HPG_PUBLIC_HOST}
+    volumes:
+      - ./relay-hub/deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    networks:
+      hub-ingress:
+        ipv4_address: 172.31.250.2
+      push-ingress:
+        ipv4_address: 172.31.251.2
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+secrets:
+  apns_key:
+    file: ${HPG_APNS_KEY_FILE:?set HPG_APNS_KEY_FILE}
+
+networks:
+  # These isolated networks make the exact trusted-proxy IPs above meaningful.
+  # If an operator changes either subnet, both Caddy's IP and the matching
+  # FORWARDED_ALLOW_IPS value must change together.
+  hub-ingress:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
+  push-ingress:
+    ipam:
+      config:
+        - subnet: 172.31.251.0/24
+  hub-db:
+    internal: true
+  push-db:
+    internal: true
+
+volumes:
+  relay-hub-db:
+  push-gateway-db:
+  caddy-data:
+  caddy-config:

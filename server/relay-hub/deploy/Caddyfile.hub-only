@@ -1,0 +1,20 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$HRH_PUBLIC_HOST} {
+	request_body {
+		max_size 400KB
+	}
+	reverse_proxy relay-hub:8080 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}

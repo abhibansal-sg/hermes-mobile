@@ -126,6 +126,7 @@ def test_register_late_wires_every_core_seam_after_attrs_restore(
     assert broadcast.on_owner_write in server._EVENT_FANOUT_SUBSCRIBERS
     assert push_engine.handle_gateway_event in server._EMIT_OBSERVERS
     assert broadcast.on_transport in ws.TRANSPORT_OBSERVERS
+    assert "mobile" in manager._cli_commands
     assert "mobile-pair" in manager._cli_commands
 
     monkeypatch.setenv("HERMES_GATEWAY_BROADCAST", "1")
@@ -158,7 +159,13 @@ def test_register_late_wires_every_core_seam_after_attrs_restore(
             "method": "event",
             "params": {"type": "message.delta", "session_id": "late-wire-sid"},
         }
-        assert server.write_json(frame) is True
+        # This branch models an older core after deliberately hiding the
+        # current first-class hooks.  The current server.write_json no longer
+        # iterates the legacy list, so invoke the registered S1 subscriber as
+        # that older core did instead of mixing both core generations.
+        assert owner.write(frame) is True
+        for subscriber in server._EVENT_FANOUT_SUBSCRIBERS:
+            subscriber(frame, "late-wire-sid", owner)
     finally:
         server._sessions.pop("late-wire-sid", None)
 

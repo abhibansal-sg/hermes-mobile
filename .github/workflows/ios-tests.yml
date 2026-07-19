@@ -1,15 +1,11 @@
 name: iOS Tests
 
-# iOS lane for the autonomous pipeline (Abhi order 2026-07-11).
-# Runs focused HermesMobile unit suites on PRs that touch apps/ios/**.
-# OBSERVE-FIRST: not yet in the required gate — promote to required
-# once it proves stable/fast enough (watch 5-10 PRs).
+# Required reusable iOS lane. ci.yml applies the native/compatibility-fixture
+# path condition and aggregates this workflow into the branch-protection gate.
+# Keeping workflow_call as the only trigger prevents duplicate PR executions.
 
 on:
-  pull_request:
-    paths:
-      - "apps/ios/**"
-      - ".github/workflows/ios-tests.yml"
+  workflow_call:
 
 permissions:
   contents: read
@@ -42,6 +38,19 @@ jobs:
           brew install xcodegen 2>&1 | tail -1 || brew upgrade xcodegen 2>&1 | tail -1 || true
           (cd apps/ios && xcodegen generate)
 
+      - name: Verify production Swift wire fixture is byte-stable
+        run: |
+          swiftc \
+            apps/ios/HermesMobile/Models/JSONValue.swift \
+            apps/ios/HermesMobile/RelayV2/RelayV2Protocol.swift \
+            tests/fixtures/hrp2/SwiftProducedFixture.swift \
+            -o "$RUNNER_TEMP/hrp2-swift-fixture"
+          "$RUNNER_TEMP/hrp2-swift-fixture" \
+            > "$RUNNER_TEMP/swift-produced-secure-message.json"
+          cmp \
+            tests/fixtures/hrp2/swift-produced-secure-message.json \
+            "$RUNNER_TEMP/swift-produced-secure-message.json"
+
       - name: Resolve destination
         id: dest
         run: |
@@ -51,17 +60,21 @@ jobs:
           echo "Using simulator: ${DEVICE:-iPhone 16}"
 
       - name: Build and test (focused suites)
+        env:
+          HERMES_BUILD_LOG: ${{ runner.temp }}/ios-tests.log
+          HERMES_BUILD_TIMEOUT: "2400"
+          HERMES_NO_DEV_GATEWAY_AUTOPROVISION: "1"
         run: |
-          set -o pipefail
-          xcodebuild test \
-            -project apps/ios/HermesMobile.xcodeproj \
+          scripts/ios-build.sh test \
             -scheme HermesMobile \
             -destination "platform=iOS Simulator,name=${{ steps.dest.outputs.device }}" \
             -only-testing:HermesMobileTests \
             -parallel-testing-enabled NO \
             -retry-tests-on-failure \
             -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult"
-          # STR-1481: CODE_SIGNING_ALLOWED=NO was dropped -- it breaks the test
+          # The wrapper serializes all Xcode builds, gives this checkout its own
+          # DerivedData, and safely terminates a wedged build service. STR-1481:
+          # CODE_SIGNING_ALLOWED=NO was dropped -- it breaks the test
           # host's Keychain entitlement (SecItemAdd/SecItemCopyMatching silently
           # fail under `try?`), corrupting ConnectionStoreReconnectTests +
           # SessionStoreTokenSourceTests state on gateway-less runners. Ad-hoc

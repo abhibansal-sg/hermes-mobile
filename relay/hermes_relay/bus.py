@@ -61,6 +61,13 @@ class Subscription:
             except asyncio.QueueEmpty:  # pragma: no cover - race guard
                 pass
 
+    async def _put(self, msg: Any) -> None:
+        """Losslessly enqueue with bounded producer backpressure."""
+
+        if self._closed:
+            return
+        await self._q.put(msg)
+
     async def get(self) -> Any:
         """Await the next message on this subscription."""
         return await self._q.get()
@@ -104,6 +111,19 @@ class EventBus:
         subs = self._subs.get(topic) or ()
         for sub in subs:
             sub._offer(msg)
+        return len(subs)
+
+    async def publish_wait(self, topic: str, msg: Any) -> int:
+        """Losslessly publish, awaiting bounded subscriber capacity.
+
+        This is reserved for authoritative trusted-local pipelines whose
+        producers are async and can safely propagate backpressure. Legacy
+        best-effort observers continue to use :meth:`publish`.
+        """
+
+        subs = tuple(self._subs.get(topic) or ())
+        for sub in subs:
+            await sub._put(msg)
         return len(subs)
 
     def subscriber_count(self, topic: str) -> int:

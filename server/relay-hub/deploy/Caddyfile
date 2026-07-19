@@ -1,0 +1,51 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$HRH_PUBLIC_HOST} {
+	request_body {
+		max_size 400KB
+	}
+	# The pairing QR deliberately has one public origin and no second hosted
+	# service URL. Route only the phone's App-Attest registration/activation
+	# surface to the separately deployed Push Gateway; all Hub routes remain
+	# content-blind and terminate in relay-hub.
+	@phone_push {
+		path /v2/attest/challenge /v2/hub-activations /v2/endpoints/register /v2/endpoints/token-refresh
+	}
+	route {
+		reverse_proxy @phone_push push-gateway:8081 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+		reverse_proxy relay-hub:8080 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
+
+{$HPG_PUBLIC_HOST} {
+	request_body {
+		max_size 128KB
+	}
+	reverse_proxy push-gateway:8081 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}

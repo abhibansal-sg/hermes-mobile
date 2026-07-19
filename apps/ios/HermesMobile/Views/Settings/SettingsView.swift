@@ -130,6 +130,8 @@ struct SettingsView: View {
     /// by ``ConnectionStore/relayURL(forGateway:)`` on device (the sim used the
     /// `HERMES_RELAY_URL` env var). Empty ⇒ derive from the gateway URL.
     @AppStorage(DefaultsKeys.relayURLOverride) private var relayURLOverride = ""
+    @AppStorage(RelayV2PreviewPolicy.defaultsKey)
+    private var relayV2PreviewPolicyRaw = RelayV2PreviewPolicy.afterFirstUnlock.rawValue
 
     // MARK: Per-event push prefs (F2-A / A4)
 
@@ -177,6 +179,7 @@ struct SettingsView: View {
     @State private var debugShareResult: DebugShareReport?
     /// User-visible error if debug-share generation fails.
     @State private var debugShareError: String?
+    @State private var showingRelayV2PairingScanner = false
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -203,6 +206,7 @@ struct SettingsView: View {
                 toolsetKeysSection
                 creditsBillingSection
                 debugShareSection
+                secureRelaySection
                 experimentalTransportSection
                 connectionSection
                 aboutSection
@@ -270,6 +274,12 @@ struct SettingsView: View {
             }
             .sheet(item: $debugShareResult) { report in
                 DebugShareSheet(report: report)
+                    .hermesThemed(themeStore)
+            }
+            .fullScreenCover(isPresented: $showingRelayV2PairingScanner) {
+                QRScannerView(pairingMode: .relayV2)
+                    .environment(connectionStore)
+                    .environment(themeStore)
                     .hermesThemed(themeStore)
             }
         }
@@ -481,12 +491,35 @@ struct SettingsView: View {
 
                 LabeledContent("Push token") {
                     Text(Self.pushTokenRegistrationLabel(
-                        token: UserDefaults.standard.string(forKey: DefaultsKeys.pushLastDeviceToken)
+                        token: KeychainService.loadRegisteredAPNsDeviceToken()
                     ))
                     .foregroundStyle(theme.mutedFg)
                 }
                 .listRowBackground(theme.card)
                 .accessibilityIdentifier("pushTokenRegistrationState")
+            }
+
+            if transportPathRaw == TransportPath.relayV2.rawValue {
+                Picker("Encrypted previews", selection: Binding(
+                    get: {
+                        RelayV2PreviewPolicy(rawValue: relayV2PreviewPolicyRaw)
+                            ?? .afterFirstUnlock
+                    },
+                    set: { policy in
+                        relayV2PreviewPolicyRaw = policy.rawValue
+                        let accountID = DefaultsKeys.relayV2AccountIDValue()
+                        if RelayV2Wire.isToken(accountID) {
+                            try? RelayV2KeychainStore().applyPreviewPolicy(policy, accountID: accountID)
+                        }
+                        if policy == .disabled { PushRegistrar.shared.setEnabled(false) }
+                    }
+                )) {
+                    ForEach(RelayV2PreviewPolicy.allCases) { policy in
+                        Text(policy.label).tag(policy)
+                    }
+                }
+                .listRowBackground(theme.card)
+                .accessibilityIdentifier("relayV2PreviewPolicyPicker")
             }
 
             // Per-event push prefs (A4): native Toggles, shown only when
@@ -617,6 +650,66 @@ struct SettingsView: View {
     }
 
     // MARK: - Experimental transport (Wave-2 relay)
+
+    @ViewBuilder
+    private var secureRelaySection: some View {
+        Section {
+            LabeledContent("Protocol") {
+                Text("HRP/\(RelayV2.protocolVersion)")
+                    .foregroundStyle(theme.mutedFg)
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsRelayV2Protocol")
+
+            LabeledContent("Transport") {
+                Text(relayV2TransportDomain)
+                    .foregroundStyle(theme.mutedFg)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsRelayV2TransportDomain")
+
+            Button {
+                showingRelayV2PairingScanner = true
+            } label: {
+                Label(
+                    transportPathRaw == TransportPath.relayV2.rawValue
+                        ? "Pair a different secure relay"
+                        : "Migrate to secure relay",
+                    systemImage: "lock.shield"
+                )
+            }
+            .listRowBackground(theme.card)
+            .accessibilityIdentifier("settingsRelayV2Pairing")
+
+            if unsentLegacyOperationCount > 0 {
+                Text("\(unsentLegacyOperationCount) operation\(unsentLegacyOperationCount == 1 ? "" : "s") remain in the previous outbox. Review and resubmit them from Outbox; migration does not send them automatically.")
+                    .font(.footnote)
+                    .foregroundStyle(theme.mutedFg)
+                    .listRowBackground(theme.card)
+                    .accessibilityIdentifier("settingsRelayV2LegacyOutboxGuidance")
+            }
+        } header: {
+            Text("Secure Relay")
+        } footer: {
+            Text("Pairing creates device-only HRP/2 keys and switches this account only after the computer confirms the code.")
+        }
+    }
+
+    private var relayV2TransportDomain: String {
+        let accountID = DefaultsKeys.relayV2AccountIDValue()
+        guard RelayV2Wire.isToken(accountID),
+              let identity = try? RelayV2KeychainStore().loadIdentity(accountID: accountID),
+              let host = identity.hubURL?.host, !host.isEmpty else {
+            return transportPathRaw == TransportPath.relayV2.rawValue ? "Unavailable" : "Not paired"
+        }
+        return host
+    }
+
+    private var unsentLegacyOperationCount: Int {
+        connectionStore.queueStore?.items.filter(\.isPending).count ?? 0
+    }
 
     /// Developer/experimental controls for the Wave-2 relay transport. Default OFF
     /// (`.gatewayDirect`) = today's behaviour, byte-identical. Flipping the toggle

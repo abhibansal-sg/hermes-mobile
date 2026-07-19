@@ -108,9 +108,18 @@ enum DefaultsKeys {
     /// ``PushRegistrar``.
     static let pushEnabled = "hermes.pushEnabled"
 
-    /// `String` — the last APNs device token registered with the gateway, so a
-    /// no-op re-register can be skipped. Owned by ``PushRegistrar``.
+    /// Legacy plaintext APNs token key. Read once into ThisDeviceOnly Keychain
+    /// and immediately deleted; retained only for migration compatibility.
     static let pushLastDeviceToken = "hermes.push.lastDeviceToken"
+
+    /// Legacy plaintext current-token key. Read once into ThisDeviceOnly
+    /// Keychain and immediately deleted.
+    static let pushAPNsDeviceToken = "hermes.push.apnsDeviceToken"
+
+    /// Non-secret SHA-256 digest of the last APNs token registered with a legacy
+    /// gateway. This preserves idempotent POST behavior without persisting the
+    /// credential outside Keychain.
+    static let pushLastDeviceTokenDigest = "hermes.push.lastDeviceTokenDigest"
 
     /// `[String]` — the per-event subset last successfully registered with the
     /// gateway, so a prefs change (A4) can force a re-POST even when the device
@@ -134,6 +143,19 @@ enum DefaultsKeys {
     /// known healthy. Missing is deliberately false (local fallback) until a
     /// successful registration proves remote delivery is authoritative.
     static let pushRegistrationHealthy = "hermes.push.registrationHealthy"
+
+    /// Terminal local fence for legacy gateway notification actions after a
+    /// successful HRP/2 PairConfirm. It is written before the transport selector
+    /// changes, so a background approval/reply that already decoded its payload
+    /// still rechecks and stops immediately before REST I/O.
+    static let relayV2LegacyActionsDisabled = "hermes.relayV2.legacyActionsDisabled"
+
+    static func legacyDirectActionsAllowed(
+        _ defaults: UserDefaults = .standard
+    ) -> Bool {
+        !defaults.bool(forKey: relayV2LegacyActionsDisabled)
+            && transportPathValue(defaults) != .relayV2
+    }
 
     /// `Bool` — whether notification authorization has already been requested once,
     /// so the prompt isn't re-shown. Owned by ``NotificationService``.

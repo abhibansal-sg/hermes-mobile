@@ -10,8 +10,9 @@ Modules:
 * ``broadcast``   — multi-client event fan-out engine (S1).
 * ``push_engine`` — APNs alert + Live Activity push, gateway event intake (S2).
 * ``gitbranch``   — fork-free branch lookup for the session.create fast path.
-* ``mobile_pair`` — the ``hermes mobile-pair`` CLI command (QR pairing),
-  registered through the stock ``register_cli_command`` facade.
+* ``mobile_relay_cli`` — the ``hermes mobile`` HRP/2 service, pairing, status,
+  device, revocation, log, and purge commands. ``mobile-pair`` is a v2-only
+  compatibility alias.
 * ``prompt_receipts`` — profile-scoped SQLite idempotency receipts for
   ID-enabled ``prompt.submit`` requests.
 * ``dashboard/api.py`` — REST routes, auto-mounted by the dashboard plugin
@@ -80,17 +81,17 @@ def _append_unique(module, attr: str, callback, seam: str) -> bool:
 
 
 def _setup_mobile_pair_parser(parser) -> None:
-    """argparse wiring for ``hermes mobile-pair`` (moved from main.py)."""
+    """Compatibility wiring for v2-only ``hermes mobile-pair``."""
     parser.description = (
-        "Print a hermesapp://pair deep link and an in-terminal QR code so "
-        "the HermesMobile app can scan it to configure its connection."
+        "Create one expiring HRP/2 device offer. This is an alias for "
+        "`hermes mobile pair`; it never falls back to shared-token v1."
     )
     parser.add_argument(
         "--url",
         default=None,
         help=(
-            "Override the dashboard URL embedded in the pairing code "
-            "(default: auto-detect from Tailscale Serve)"
+            "Deprecated alias for the Relay Hub URL; prefer "
+            "`hermes mobile enable --hub URL`."
         ),
     )
     parser.add_argument(
@@ -110,16 +111,34 @@ def _setup_mobile_pair_parser(parser) -> None:
         action="store_false",
         dest="device_token",
         help=(
-            "Use the legacy shared-dashboard-token pairing flow. Only use this "
-            "for stock gateways without the device-token routes."
+            "Rejected for HRP/2 because shared-token pairing is a plaintext "
+            "legacy downgrade."
         ),
+    )
+    parser.add_argument("--ttl", type=int, default=300, help="offer lifetime in seconds")
+    parser.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="explicitly bypass human verification for headless deployments",
     )
 
 
 def _cmd_mobile_pair(args) -> int:
-    from . import mobile_pair
+    from . import mobile_relay_cli
 
-    return mobile_pair.mobile_pair_command(args)
+    return mobile_relay_cli.compatibility_pair_command(args)
+
+
+def _setup_mobile_parser(parser) -> None:
+    from .mobile_relay_cli import register_cli
+
+    register_cli(parser)
+
+
+def _cmd_mobile(args) -> int:
+    from .mobile_relay_cli import mobile_command
+
+    return mobile_command(args)
 
 
 def _wire_approval_audit() -> None:
@@ -249,13 +268,23 @@ def register(ctx) -> None:
         _log.warning("hermes-mobile: prompt-receipt wiring failed", exc_info=True)
     try:
         ctx.register_cli_command(
+            name="mobile",
+            help="Operate the encrypted HRP/2 Mobile Agent Relay",
+            setup_fn=_setup_mobile_parser,
+            handler_fn=_cmd_mobile,
+            description=(
+                "Enable, run, pair, inspect, revoke, and disable the "
+                "content-blind HRP/2 Mobile Agent Relay."
+            ),
+        )
+        ctx.register_cli_command(
             name="mobile-pair",
-            help="Pair the HermesMobile iOS app via a QR code",
+            help="Compatibility alias for `hermes mobile pair` (HRP/2 only)",
             setup_fn=_setup_mobile_pair_parser,
             handler_fn=_cmd_mobile_pair,
             description=(
-                "Print a hermesapp://pair deep link and an in-terminal QR "
-                "code so the HermesMobile app can scan it to pair."
+                "Create one expiring per-device HRP/2 pairing offer. Shared "
+                "v1 bearer pairing is deliberately unavailable."
             ),
         )
     except Exception:

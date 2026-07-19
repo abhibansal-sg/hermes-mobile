@@ -21,6 +21,9 @@ import UIKit
 /// about requiring both `url` and `token`, mirroring
 /// `HermesURLRouter`'s pair route so a scan and a tapped link behave identically.
 struct QRScannerView: View {
+    enum PairingMode: Equatable, Sendable { case legacyGateway, relayV2 }
+
+    let pairingMode: PairingMode
     @Environment(ConnectionStore.self) private var connection
     @Environment(ThemeStore.self) private var themeStore
     @Environment(\.hermesTheme) private var theme
@@ -38,14 +41,25 @@ struct QRScannerView: View {
     /// Holds the in-flight pairing poll so it can be cancelled on dismiss or
     /// re-scan — prevents an orphaned poll writing to a dismissed view. [Inc2 fix]
     @State private var connectTask: Task<Void, Never>?
+    @State private var relayV2Offer: RelayV2PairingOffer?
+
+    init(pairingMode: PairingMode = .legacyGateway) {
+        self.pairingMode = pairingMode
+    }
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
+        Group {
+            if let relayV2Offer {
+                RelayV2PairingView(offer: relayV2Offer)
+            } else {
+                ZStack {
+                    Color.black.ignoresSafeArea()
 
-            content
+                    content
 
-            overlayChrome
+                    overlayChrome
+                }
+            }
         }
         .task {
             permission = await CameraPermission.request()
@@ -198,6 +212,20 @@ struct QRScannerView: View {
 
     private func handleScan(_ payload: String) {
         guard !isConnecting else { return }
+
+        if pairingMode == .relayV2 {
+            do {
+                relayV2Offer = try RelayV2PairingOffer.decodeScannerPayload(payload)
+                UIAccessibility.post(
+                    notification: .announcement,
+                    argument: "Secure relay code scanned. Review pairing options."
+                )
+            } catch {
+                errorText = "That is not a valid HRP/2 relay offer."
+                reArmAfterFailure()
+            }
+            return
+        }
 
         // Shared v1/v2 parse (HermesURLRouter): a v1 payload yields a shared
         // pairing (auto-upgrade swaps to a device token after connect on a W3a

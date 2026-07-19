@@ -45,7 +45,7 @@ extension JSONValue: Codable {
             // Encode whole numbers without a trailing ".0" so server-side
             // integer params (cols, limit, ordinals) round-trip cleanly.
             if value.truncatingRemainder(dividingBy: 1) == 0,
-               value >= Double(Int64.min), value <= Double(Int64.max) {
+               value >= Double(Int64.min), value < Double(Int64.max) {
                 try container.encode(Int64(value))
             } else {
                 try container.encode(value)
@@ -94,7 +94,7 @@ extension JSONValue {
         case .string(let value): return value
         case .number(let value):
             if value.truncatingRemainder(dividingBy: 1) == 0,
-               value >= Double(Int64.min), value <= Double(Int64.max) {
+               value >= Double(Int64.min), value < Double(Int64.max) {
                 return String(Int64(value))
             }
             return String(value)
@@ -109,7 +109,11 @@ extension JSONValue {
     }
 
     var intValue: Int? {
-        if case .number(let value) = self { return Int(value) }
+        if case .number(let value) = self {
+            guard value.isFinite, value.rounded(.towardZero) == value,
+                  value >= Double(Int.min), value < Double(Int.max) else { return nil }
+            return Int(value)
+        }
         return nil
     }
 
@@ -158,7 +162,7 @@ extension JSONValue {
         case .null: return "null"
         case .bool(let value): return value ? "true" : "false"
         case .number(let value):
-            if value.truncatingRemainder(dividingBy: 1) == 0 { return String(Int(value)) }
+            if let integer = intValue { return String(integer) }
             return String(value)
         case .string(let value): return value
         case .array(let value):

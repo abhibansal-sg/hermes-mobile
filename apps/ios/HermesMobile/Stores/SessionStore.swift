@@ -2501,6 +2501,23 @@ final class SessionStore {
         refreshToken &+= 1
         let myToken = refreshToken
 
+        if connection?.transportPath == .relayV2, let fetch = relayV2SessionsFetch {
+            do {
+                let (fetched, total) = try await fetch()
+                guard refreshToken == myToken,
+                      currentCacheScope == myCacheScope else { return .timeout }
+                mergeSessionPage(fetched, total: total)
+                if let myCacheScope { persistSessionListToCache(scope: myCacheScope) }
+                lastError = nil
+                SpotlightIndexer.index(sessions: sessions)
+                return .success
+            } catch {
+                guard refreshToken == myToken,
+                      currentCacheScope == myCacheScope else { return .timeout }
+                return recordRefreshFailure(error)
+            }
+        }
+
         // Use the injected seam when present (unit tests, no live gateway).
         if let fetch = sessionsFetch {
             do {
@@ -3815,6 +3832,28 @@ final class SessionStore {
             return
         }
 
+        if let connection, connection.transportPath == .relayV2 {
+            let resumeTask = Task { [weak self, weak connection] in
+                guard let self, let connection, self.openToken == token else { return }
+                do {
+                    let liveID = try await connection.openRelayV2Session(summary.id)
+                    guard self.openToken == token, self.activeStoredId == summary.id else { return }
+                    self.activeRuntimeId = liveID
+                    self.activeRuntimeEpoch = connection.transportEpoch
+                    self.lastError = nil
+                    self.sessionActionError = nil
+                    self.onActiveRuntimeBound?()
+                } catch {
+                    guard self.openToken == token else { return }
+                    self.lastError = self.errorMessage(from: error)
+                }
+            }
+            #if DEBUG
+            lastOpenResumeTask = resumeTask
+            #endif
+            return
+        }
+
         // Slow path: gateway resume — spins up the agent server-side; only
         // prompt submission depends on it.
         let resumeTask = Task { [weak self] in
@@ -4346,6 +4385,27 @@ final class SessionStore {
     func resumeActiveAfterReconnect() async -> String? {
         let myConnectionWorkGeneration = connectionWorkGeneration
         let token = openToken
+        if let connection, connection.transportPath == .relayV2 {
+            guard let storedID = activeStoredId else { return nil }
+            do {
+                let liveID = try await connection.openRelayV2Session(storedID)
+                guard connectionWorkGeneration == myConnectionWorkGeneration,
+                      openToken == token,
+                      activeStoredId == storedID else { return nil }
+                activeRuntimeId = liveID
+                activeRuntimeEpoch = connection.transportEpoch
+                lastError = nil
+                sessionActionError = nil
+                onActiveRuntimeBound?()
+                return liveID
+            } catch {
+                guard connectionWorkGeneration == myConnectionWorkGeneration,
+                      openToken == token,
+                      activeStoredId == storedID else { return nil }
+                lastError = errorMessage(from: error)
+                return nil
+            }
+        }
         guard let storedId = activeStoredId, client != nil || resumeRPC != nil else { return nil }
         let bindingProfile = activeStoredProfile
         let usingResumeTestSeam = resumeRPC != nil
@@ -5134,6 +5194,10 @@ final class SessionStore {
     /// tests can also verify that `totalSessions` is decoded and exposed.
     var sessionsFetch: (() async throws -> (sessions: [SessionSummary], total: Int?))?
 
+    /// Production HRP/2 session adapter. Kept separate from test seams so a
+    /// transport switch cannot accidentally route gateway-direct work to Relay.
+    var relayV2SessionsFetch: (() async throws -> (sessions: [SessionSummary], total: Int?))?
+
     /// Injectable seam for the plugin session-list delta endpoint. The first
     /// parameter is the previously stored cursor, if any; the second is the
     /// grow-limit window size requested for this refresh.
@@ -5150,6 +5214,7 @@ final class SessionStore {
     /// live `connection?.rest` lazily on each call. The legacy one-argument seam
     /// is kept so existing tests/default-scope callers remain byte-for-byte.
     var transcriptFetch: ((String) async throws -> [StoredMessage])?
+    var relayV2TranscriptFetch: ((String) async throws -> [StoredMessage])?
 
     /// Profile-aware transcript seam for ABH-408: All-profiles row opens must
     /// invoke the stored-transcript fetch with the row's owning profile.
@@ -5635,6 +5700,9 @@ final class SessionStore {
     private func resolvedTranscriptFetch(
         shape: String? = nil
     ) -> ((String, String?) async throws -> [StoredMessage])? {
+        if connection?.transportPath == .relayV2, let relayV2TranscriptFetch {
+            return { sessionID, _ in try await relayV2TranscriptFetch(sessionID) }
+        }
         if let transcriptFetchShaped {
             let seam = transcriptFetchShaped
             return { sessionId, profile in
@@ -5672,6 +5740,23 @@ final class SessionStore {
                 rest: rest, cacheStore: cacheStore, sessionId: sessionId,
                 identity: self.cacheIdentity(sessionId), shape: shape)
         }
+    }
+
+    /// Bind the durable origin and live runtime returned by an HRP/2
+    /// `prompt.submit` response. This turns the first draft send into the same
+    /// session identity used by every later send instead of creating a new chat.
+    func bindRelayV2Session(originSessionID: String, liveSessionID: String) {
+        guard connection?.transportPath == .relayV2 else { return }
+        if isDraft || activeStoredId == nil {
+            isDraft = false
+            activeStoredId = originSessionID
+            activeStoredProfile = Self.defaultProfileName
+        }
+        guard activeStoredId == originSessionID else { return }
+        activeRuntimeId = liveSessionID
+        activeRuntimeEpoch = connection?.transportEpoch
+        onActiveRuntimeBound?()
+        Task { [weak self] in await self?.refresh() }
     }
 
     /// Whether the cold-open network seed should request the `skeleton` tier and

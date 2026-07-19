@@ -155,7 +155,12 @@ struct StreamingTransition: Sendable, Equatable {
 @Observable
 final class ChatStore {
     /// The visible transcript for the active session.
-    var messages: [ChatMessage] = []
+    var messages: [ChatMessage] = [] {
+        didSet {
+            guard relayV2TargetedMutationDepth == 0 else { return }
+            invalidateRelayV2PartLocations()
+        }
+    }
     /// True while the agent is producing a streaming turn.
     #if DEBUG
     #endif
@@ -357,6 +362,29 @@ final class ChatStore {
     // behavioral proxy — a failed submit's leftover truncation — was removed
     // when ABH-48 made unaccepted truncations roll back).
     private(set) var userOrdinals: [UUID: Int] = [:]
+
+    /// Stable location of an HRP/2 item-backed part in the visible transcript.
+    /// The cache is invalidated by every non-targeted `messages` mutation and
+    /// rebuilt lazily on the next committed delta.
+    private struct RelayV2PartLocation: Equatable {
+        let messageIndex: Int
+        let partIndex: Int
+    }
+
+    @ObservationIgnored
+    private var relayV2PartLocations: [String: RelayV2PartLocation] = [:]
+    @ObservationIgnored
+    private var relayV2PartLocationsAreValid = false
+    @ObservationIgnored
+    private var relayV2TargetedMutationDepth = 0
+
+    #if DEBUG
+    /// Test evidence that repeated committed deltas reuse the location index and
+    /// do not replace/invalidate the whole transcript array.
+    @ObservationIgnored private(set) var relayV2PartLocationIndexBuildCount = 0
+    @ObservationIgnored private(set) var relayV2PartLocationIndexInvalidationCount = 0
+    @ObservationIgnored private(set) var relayV2TargetedPartMutationCount = 0
+    #endif
 
     /// The subagent tree, keyed by node id. Insertion-ordered child lists live on
     /// each node (``SubagentNode.childIds``), ordered by `taskIndex`. The map is
@@ -2330,6 +2358,21 @@ final class ChatStore {
             }
         }
 
+        if !hasAttachments, let connection, connection.transportPath == .relayV2 {
+            do {
+                let clientID = try await connection.enqueueRelayV2Prompt(
+                    text: trimmed,
+                    sessionID: sessions?.activeRuntimeId ?? sessions?.activeStoredId
+                )
+                presentOutboxEcho(clientMessageID: clientID, text: trimmed, remotePaths: [])
+                lastSendReachedServer = true
+                return true
+            } catch {
+                lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                return false
+            }
+        }
+
         // Production sends enter the protected repository before session
         // creation, upload, local echo, or prompt.submit. Unit-store graphs that
         // do not install an outbox retain the legacy direct path below.
@@ -2554,7 +2597,31 @@ final class ChatStore {
         userOrdinals[removed.id] = nil
     }
 
-    private func presentOutboxEcho(
+    /// Resolve an HRP/2 command against its optimistic transcript echo. An
+    /// authenticated error is terminal for that op_id/MID, so leaving the
+    /// bubble in place would falsely present an unsent prompt as delivered.
+    func applyRelayV2CommandResolution(
+        clientMessageID: String,
+        kind: RelayV2CommandKind,
+        errorCode: RelayV2ErrorCode?
+    ) {
+        guard kind == .prompt, let errorCode else { return }
+        if errorCode != .gatewayAmbiguous {
+            removeLocalEcho(clientMessageID: clientMessageID)
+        }
+        let detail: String
+        switch errorCode {
+        case .gatewayOffline: detail = "The agent is offline. Try sending again."
+        case .rateLimited: detail = "The relay is rate limited. Try again shortly."
+        case .mailboxFull: detail = "The relay mailbox is full. Try again shortly."
+        case .gatewayAmbiguous: detail = "The relay could not confirm delivery."
+        case .revoked, .unauthenticated: detail = "This device is no longer authorized."
+        default: detail = "The message was rejected (\(errorCode.rawValue))."
+        }
+        lastError = detail
+    }
+
+    func presentOutboxEcho(
         clientMessageID: String,
         text: String,
         remotePaths: [String]
@@ -2751,8 +2818,17 @@ final class ChatStore {
     /// the one streaming, and is `nil` outright during the resume window), or
     /// the visible stream can never be stopped from this device (R1 #2).
     func interrupt() async {
-        guard let client, let sessionId = interruptTarget else { return }
+        guard let sessionId = interruptTarget else { return }
         do {
+            if let connection, connection.transportPath == .relayV2 {
+                _ = try await connection.requestRelayV2(
+                    kind: .interrupt,
+                    sessionID: sessionId,
+                    params: ["session_id": .string(sessionId)]
+                )
+                return
+            }
+            guard let client else { return }
             _ = try await client.requestRaw(
                 "session.interrupt",
                 params: .object(["session_id": .string(sessionId)])
@@ -2911,18 +2987,51 @@ final class ChatStore {
     }
 
     /// Answer a pending approval (`approval.respond`) and clear it.
+    static func relayV2ApprovalParams(
+        sessionID: String,
+        request: ApprovalRequestPayload,
+        approve: Bool
+    ) throws -> [String: JSONValue] {
+        let decision = approve ? "approve_once" : "deny"
+        guard !request.id.isEmpty,
+              let capability = request.capability,
+              (try? RelayV2Wire.decodeBase64URL(capability, exactBytes: 32)) != nil,
+              request.allowedDecisions.contains(decision) else {
+            throw RelayV2ProtocolError.unauthenticated
+        }
+        return [
+            "session_id": .string(sessionID),
+            "request_id": .string(request.id),
+            "decision": .string(decision),
+            "capability": .string(capability),
+        ]
+    }
+
     func respondApproval(approve: Bool, all: Bool) async {
         // Answer against the session the approval came from — for mirrored
         // approvals (broadcast from another client's turn) that is a foreign
         // runtime id, not our own.
-        let approvalSession = pendingApproval?.sessionId
-        guard let client,
-              let sessionId = (approvalSession?.isEmpty == false ? approvalSession : activeSessionId)
+        let pending = pendingApproval
+        let approvalSession = pending?.sessionId
+        guard let sessionId = (approvalSession?.isEmpty == false ? approvalSession : activeSessionId)
         else { return }
         let choice = approve ? "approve" : "deny"
         pendingApproval = nil
         onApprovalChange?(false)
         do {
+            if let connection, connection.transportPath == .relayV2 {
+                guard let request = pending?.request else {
+                    throw RelayV2ProtocolError.unauthenticated
+                }
+                let params = try Self.relayV2ApprovalParams(
+                    sessionID: sessionId, request: request, approve: approve
+                )
+                _ = try await connection.requestRelayV2(
+                    kind: .approval, sessionID: sessionId, params: params
+                )
+                return
+            }
+            guard let client else { return }
             _ = try await client.requestRaw(
                 "approval.respond",
                 params: .object([
@@ -2942,11 +3051,26 @@ final class ChatStore {
     /// answer by `_pending[request_id]` (the generic `_respond`,
     /// `tui_gateway/server.py:5059`) — a reply without it 4009s ("no pending
     /// clarify request") and the agent stays blocked on the prompt forever.
+    static func relayV2ClarificationParams(
+        sessionID: String,
+        requestID: String?,
+        text: String
+    ) throws -> [String: JSONValue] {
+        guard let requestID, !requestID.isEmpty else {
+            throw RelayV2ProtocolError.invalidArgument(field: "request_id")
+        }
+        let params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "text": .string(text),
+            "request_id": .string(requestID),
+        ]
+        return params
+    }
+
     func respondClarification(_ answer: String) async {
         let pending = pendingClarification
         let clarifySession = pending?.sessionId
-        guard let client,
-              let sessionId = (clarifySession?.isEmpty == false ? clarifySession : activeSessionId)
+        guard let sessionId = (clarifySession?.isEmpty == false ? clarifySession : activeSessionId)
         else { return }
         pendingClarification = nil
         var params: [String: JSONValue] = [
@@ -2957,6 +3081,18 @@ final class ChatStore {
             params["request_id"] = .string(rid)
         }
         do {
+            if let connection, connection.transportPath == .relayV2 {
+                let relayParams = try Self.relayV2ClarificationParams(
+                    sessionID: sessionId,
+                    requestID: pending?.request.requestId,
+                    text: answer
+                )
+                _ = try await connection.requestRelayV2(
+                    kind: .clarify, sessionID: sessionId, params: relayParams
+                )
+                return
+            }
+            guard let client else { return }
             _ = try await client.requestRaw("clarify.respond", params: .object(params))
         } catch {
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -4115,8 +4251,190 @@ final class ChatStore {
         }
         flushSegment()
 
-        messages = rebuilt
-        setStreaming(rebuilt.contains { $0.isStreaming }, reason: "relayProjection")
+        if messages != rebuilt {
+            messages = rebuilt
+        }
+        let shouldStream = rebuilt.contains { $0.isStreaming }
+        if isStreaming != shouldStream {
+            setStreaming(shouldStream, reason: "relayProjection")
+        }
+    }
+
+    private func invalidateRelayV2PartLocations() {
+        relayV2PartLocationsAreValid = false
+        relayV2PartLocations.removeAll(keepingCapacity: true)
+        #if DEBUG
+        relayV2PartLocationIndexInvalidationCount += 1
+        #endif
+    }
+
+    private func rebuildRelayV2PartLocations() {
+        var rebuilt: [String: RelayV2PartLocation] = [:]
+        rebuilt.reserveCapacity(messages.reduce(into: 0) { $0 += $1.parts.count })
+        for messageIndex in messages.indices {
+            for partIndex in messages[messageIndex].parts.indices {
+                rebuilt[messages[messageIndex].parts[partIndex].id] = .init(
+                    messageIndex: messageIndex,
+                    partIndex: partIndex
+                )
+            }
+        }
+        relayV2PartLocations = rebuilt
+        relayV2PartLocationsAreValid = true
+        #if DEBUG
+        relayV2PartLocationIndexBuildCount += 1
+        #endif
+    }
+
+    private func relayV2PartLocation(for itemID: String) -> RelayV2PartLocation? {
+        if !relayV2PartLocationsAreValid {
+            rebuildRelayV2PartLocations()
+        }
+        guard let location = relayV2PartLocations[itemID] else { return nil }
+        if messages.indices.contains(location.messageIndex),
+           messages[location.messageIndex].parts.indices.contains(location.partIndex),
+           messages[location.messageIndex].parts[location.partIndex].id == itemID {
+            return location
+        }
+
+        // Defensive self-heal if a future mutation path bypasses the property
+        // observer. Correctness wins over the fast path for that one batch.
+        invalidateRelayV2PartLocations()
+        rebuildRelayV2PartLocations()
+        guard let repaired = relayV2PartLocations[itemID],
+              messages.indices.contains(repaired.messageIndex),
+              messages[repaired.messageIndex].parts.indices.contains(repaired.partIndex),
+              messages[repaired.messageIndex].parts[repaired.partIndex].id == itemID else {
+            return nil
+        }
+        return repaired
+    }
+
+    /// Apply committed append-only HRP/2 text deltas without rereading or
+    /// remapping the session. Returns false when an affected item is missing or
+    /// is not appendable, which asks the client for one full projection.
+    @discardableResult
+    func applyRelayV2TextDeltas(
+        sessionID: String,
+        deltas: [RelayV2CommittedTextDelta]
+    ) -> Bool {
+        let activeStoredID = sessions?.activeStoredId
+        guard activeStoredID == nil || activeStoredID == sessionID else { return true }
+        guard !deltas.isEmpty else { return true }
+
+        var targets: [(delta: RelayV2CommittedTextDelta, location: RelayV2PartLocation)] = []
+        targets.reserveCapacity(deltas.count)
+        for delta in deltas {
+            guard let location = relayV2PartLocation(for: delta.itemID) else { return false }
+            if !delta.data.isEmpty {
+                switch messages[location.messageIndex].parts[location.partIndex] {
+                case .text, .reasoning, .item:
+                    break
+                case .tools, .warning, .usage:
+                    return false
+                }
+            }
+            targets.append((delta, location))
+        }
+
+        // Every failure condition is checked before mutation, preserving the
+        // prior all-or-fallback behavior without copying the entire array.
+        relayV2TargetedMutationDepth += 1
+        defer { relayV2TargetedMutationDepth -= 1 }
+        for target in targets where !target.delta.data.isEmpty {
+            let location = target.location
+            let part = messages[location.messageIndex].parts[location.partIndex]
+            let replacement: ChatMessagePart
+            switch part {
+            case .text(let id, let text):
+                replacement = .text(id: id, text: text + target.delta.data)
+            case .reasoning(let id, let text):
+                replacement = .reasoning(id: id, text: text + target.delta.data)
+            case .item(let id, var item):
+                var body = item.body.objectValue ?? [:]
+                body["text"] = .string(
+                    (body["text"]?.stringValue ?? "") + target.delta.data
+                )
+                item.body = .object(body)
+                replacement = .item(id: id, item: item)
+            case .tools, .warning, .usage:
+                assertionFailure("Relay V2 append target changed after main-actor preflight")
+                return false
+            }
+            messages[location.messageIndex].parts[location.partIndex] = replacement
+            #if DEBUG
+            relayV2TargetedPartMutationCount += 1
+            #endif
+        }
+        return true
+    }
+
+    /// Apply an HRP/2 projection only after it has committed to the local WAL.
+    /// This keeps the visible transcript and interactive cards downstream of
+    /// replay admission/checkpoint healing instead of rendering raw socket data.
+    func applyRelayV2Projection(
+        sessionID: String,
+        items: [ChatItem],
+        events: [RelayV2StoredEvent]
+    ) {
+        let activeStoredID = sessions?.activeStoredId
+        guard activeStoredID == nil || activeStoredID == sessionID else { return }
+        let persistedIDs = Set(items.map(\.itemID))
+        let optimisticUserItems = messages.compactMap { message -> ChatItem? in
+            guard message.role == .user,
+                  let clientID = message.clientMessageID,
+                  !persistedIDs.contains(clientID) else { return nil }
+            return ChatItem(
+                itemID: clientID,
+                type: .userMessage,
+                status: .inProgress,
+                ord: Int.min,
+                body: ["text": .string(message.text)]
+            )
+        }
+        applyRelayItems(optimisticUserItems + items)
+        for stored in events {
+            switch stored.kind {
+            case "turn.started":
+                if !items.allSatisfy(\.isTerminal) {
+                    setStreaming(true, reason: "relayV2.turn.started")
+                }
+            case "turn.completed":
+                if items.allSatisfy(\.isTerminal) {
+                    setStreaming(false, reason: "relayV2.turn.completed")
+                }
+            case "approval.request":
+                if let event = GatewayEvent(params: .object([
+                    "type": .string(GatewayEventType.approvalRequest.rawValue),
+                    "session_id": .string(sessionID),
+                    "payload": stored.body,
+                ])) {
+                    handleApprovalRequest(event)
+                }
+            case "clarify.request":
+                if let event = GatewayEvent(params: .object([
+                    "type": .string(GatewayEventType.clarifyRequest.rawValue),
+                    "session_id": .string(sessionID),
+                    "payload": stored.body,
+                ])) {
+                    handleClarifyRequest(event)
+                }
+            case "status":
+                if let event = GatewayEvent(params: .object([
+                    "type": .string(GatewayEventType.statusUpdate.rawValue),
+                    "session_id": .string(sessionID),
+                    "payload": stored.body,
+                ])) {
+                    handleStatusUpdate(event)
+                }
+            case "title":
+                Task { [weak self] in await self?.sessions?.refresh() }
+            case "item.started", "item.delta", "item.completed", "checkpoint", "snapshot":
+                break
+            default:
+                break
+            }
+        }
     }
 
     /// Surface a failed `open()`-path transcript seed the same way a failed

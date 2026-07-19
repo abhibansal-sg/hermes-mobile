@@ -151,6 +151,12 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "memory.supermemory": ("supermemory==3.50.0",),
     "memory.mem0": ("mem0ai==2.0.10",),
 
+    # ─── Edge clients ─────────────────────────────────────────────────────
+    # The Mobile Agent Relay code ships in the Hermes distribution, but HPKE
+    # is activated only when the user explicitly enables the mobile plugin.
+    # Keep the exact pin aligned with the `mobile` extra and relay/pyproject.
+    "mobile.relay": ("pyhpke==0.6.5",),
+
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
     "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),
     # brotlicffi gives aiohttp a working 2-arg Decompressor.process() for

@@ -212,7 +212,13 @@ jobs:
       - name: Run e2e tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/e2e/ -v --tb=short
+          # HRP/2 E2E has optional crypto/server dependencies and is owned by
+          # the independently-required hrp2-tests workflow. Excluding it here
+          # prevents a second, dependency-incomplete invocation.
+          python -m pytest tests/e2e/ \
+            --ignore=tests/e2e/test_hrp2_agent_hub.py \
+            --ignore=tests/e2e/test_hrp2_privacy_evidence.py \
+            -v --tb=short
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

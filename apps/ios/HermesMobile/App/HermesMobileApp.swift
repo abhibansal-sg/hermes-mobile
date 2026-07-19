@@ -265,6 +265,13 @@ struct HermesMobileApp: App {
                         environment.stateFlushCoordinator.enterBackground()
                     }
                     environment.connectionStore.handleScenePhase(newPhase)
+                    // Relay v1 has an explicit foreground subscription. Clear it
+                    // as soon as the app leaves active state so a suspended
+                    // client does not retain the live-session delivery hint.
+                    if environment.connectionStore.transportPath == .relay,
+                       let relay = environment.connectionStore.relayCoordinator {
+                        Task { await relay.setForeground(newPhase == .active) }
+                    }
                     environment.appLock.handleScenePhase(newPhase)
                     // UX1: start/stop the 30-second foreground heartbeat so the
                     // session list refreshes without user interaction in the foreground.

@@ -78,6 +78,10 @@ struct RelayItemStore: Sendable, Equatable {
     @discardableResult
     mutating func apply(_ frame: RelayFrame) -> SeqAdmission {
         let admission = classify(seq: frame.seq)
+        // Append deltas are not idempotent by content. A duplicate sequence must
+        // be rejected before touching the payload, not merely before advancing
+        // the watermark.
+        if admission == .duplicate { return admission }
         switch frame.kind {
         case .itemStarted:
             if let item = frame.item { applyStarted(item) }
@@ -118,6 +122,15 @@ struct RelayItemStore: Sendable, Equatable {
     /// snapshot are RETAINED — the snapshot is the resumed baseline, not a delete
     /// list. Idempotent: applying the same snapshot twice is a no-op.
     mutating func reconcile(snapshot: RelaySnapshot) {
+        if snapshot.replace {
+            let retained = Set(snapshot.items.map(\.itemID))
+            itemsByID = itemsByID.filter { retained.contains($0.key) }
+            arrivalOrder.removeAll { !retained.contains($0) }
+        }
+        for itemID in snapshot.tombstoneItemIDs {
+            itemsByID.removeValue(forKey: itemID)
+            arrivalOrder.removeAll { $0 == itemID }
+        }
         for item in snapshot.items {
             track(item.itemID)
             itemsByID[item.itemID] = item

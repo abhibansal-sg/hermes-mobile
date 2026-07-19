@@ -185,7 +185,7 @@ actor RelayClient {
         prompt: String,
         clientMessageID: String? = nil
     ) async throws -> JSONValue {
-        var params: [String: JSONValue] = ["prompt": .string(prompt)]
+        var params: [String: JSONValue] = ["text": .string(prompt)]
         if let sessionID { params["session_id"] = .string(sessionID) }
         if let clientMessageID { params["client_message_id"] = .string(clientMessageID) }
         return try await request(.submit, params: .object(params))
@@ -218,19 +218,33 @@ actor RelayClient {
 
     /// Answer an `approval.request` gate (§5).
     @discardableResult
-    func approve(requestID: String, approved: Bool) async throws -> JSONValue {
+    func approve(
+        sessionID: String,
+        requestID: String,
+        decision: String,
+        resolveAll: Bool = false
+    ) async throws -> JSONValue {
         try await request(.approve, params: .object([
+            "session_id": .string(sessionID),
             "request_id": .string(requestID),
-            "approved": .bool(approved),
+            "decision": .string(decision),
+            "all": .bool(resolveAll),
         ]))
     }
 
     /// Answer a `clarify.request` gate (§5).
     @discardableResult
-    func clarify(requestID: String, response: String) async throws -> JSONValue {
+    func clarify(sessionID: String, requestID: String, text: String) async throws -> JSONValue {
         try await request(.clarify, params: .object([
+            "session_id": .string(sessionID),
             "request_id": .string(requestID),
-            "response": .string(response),
+            "text": .string(text),
+        ]))
+    }
+
+    func foreground(sessionID: String?) async {
+        await notify(.foreground, params: .object([
+            "session_id": sessionID.map(JSONValue.string) ?? .null,
         ]))
     }
 

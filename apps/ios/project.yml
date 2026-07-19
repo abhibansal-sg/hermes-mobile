@@ -44,6 +44,8 @@ targets:
         embed: true
       - target: HermesShare
         embed: true
+      - target: HermesNotificationService
+        embed: true
       # DEBUG-only debug bridge. Linked in all configs by XcodeGen, but its
       # modules compile to nothing in Release (source-level #if DEBUG), so no
       # Offline-first SQLite cache (CONTRACT-OFFLINE-CACHE.md P1/P2).
@@ -61,6 +63,13 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Entitlements/HermesMobile.entitlements
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: true
         INFOPLIST_KEY_UILaunchScreen_Generation: true
+      configs:
+        Debug:
+          HERMES_APNS_ENVIRONMENT: development
+          HERMES_APP_ATTEST_ENVIRONMENT: development
+        Release:
+          HERMES_APNS_ENVIRONMENT: production
+          HERMES_APP_ATTEST_ENVIRONMENT: production
     info:
       path: HermesMobile/Info.plist
       properties:
@@ -114,6 +123,7 @@ targets:
             CFBundleURLSchemes:
               - hermesapp
         ITSAppUsesNonExemptEncryption: false
+        RelayPreviewAccessGroup: $(AppIdentifierPrefix)ai.hermes.app.relay-preview
   HermesWidgets:
     type: app-extension
     platform: iOS
@@ -164,6 +174,32 @@ targets:
               NSExtensionActivationSupportsText: true
               NSExtensionActivationSupportsWebURLWithMaxCount: 1
               NSExtensionActivationSupportsImageWithMaxCount: 4
+  HermesNotificationService:
+    type: app-extension
+    platform: iOS
+    sources:
+      - HermesNotificationService
+      - HermesMobile/Models/JSONValue.swift
+      - HermesMobile/RelayV2/RelayV2Protocol.swift
+      - HermesMobile/RelayV2/RelayV2Crypto.swift
+      - HermesMobile/RelayV2/RelayV2KeyStore.swift
+      - HermesMobile/RelayV2/RelayV2NotificationServiceProcessor.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.hermes.app.notification-service
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_ENTITLEMENTS: Entitlements/HermesNotificationService.entitlements
+        APPLICATION_EXTENSION_API_ONLY: true
+    info:
+      path: HermesNotificationService/Info.plist
+      properties:
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleDisplayName: Hermes Notification Privacy
+        RelayPreviewAccessGroup: $(AppIdentifierPrefix)ai.hermes.app.relay-preview
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
   HermesMobileTests:
     type: bundle.unit-test
     platform: iOS
@@ -176,6 +212,10 @@ targets:
           - WorkRepositoryMigrationTests.swift
           - WorkRepositoryTestSupport.swift
       - path: ../../tests/fixtures/session_status_responses.json
+        buildPhase: resources
+      - path: ../../protocol/hrp2/fixtures/auth-envelope.json
+        buildPhase: resources
+      - path: ../../protocol/hrp2/fixtures/notification-preview.json
         buildPhase: resources
     dependencies:
       - target: HermesMobile

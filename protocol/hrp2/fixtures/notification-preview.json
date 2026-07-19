@@ -1,0 +1,46 @@
+{
+  "aad_hex": "48524e3200000002000200000008617070726f76616c0000000b6e69645f66697874757265000000080000019f7982248000000010636f6c6c617073655f666978747572650000000101",
+  "canonical_descriptor_sha256_hex": "3b2345327decfa7ecfc0012caaa6a8e02f3195b2eb9c92ba5138c68402ec5b22",
+  "canonical_preview_json": "{\"action\":{\"allowed_decisions\":[\"approve_once\",\"deny\"],\"capability\":\"Y2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2M\",\"destructive\":false,\"device_generation\":1,\"device_id\":\"dev_fixture\",\"request_id\":\"req_fixture\",\"session_id\":\"sess_fixture\"},\"body\":\"Run the deployment command?\",\"category\":\"HERMES_APPROVAL\",\"class\":\"approval\",\"expires_at_ms\":1784450000000,\"notification_id\":\"nid_fixture\",\"thread_token\":\"thread_fixture\",\"title\":\"Approval required\",\"v\":2}",
+  "descriptor": {
+    "class": "approval",
+    "collapse_id": "collapse_fixture",
+    "expires_at_ms": 1784450000000,
+    "notification_id": "nid_fixture",
+    "preview_ct": "L4izqimI-1JPDUCDcrGWChnpaSqLMkCb_GxiE5Sr7ema4aN8peQxfuJ1CbWEIRX4M0Aa83ofuyZ0X0jtbHP6XwsPL7fbgGI1MZ91N6fjkxDa6-5yR2_dmO8NCwZ7g-eIkHqJAruQamPzstfGztTCZyqj5qrpxD1tsMmKpD_1xv-9WLRX_7mVcb_5UkZv6srZFfqu6_aDCeN_xoUCfIqPtdvhaThiwo2n0zeWC_SLPf-zJmgAGr3_O_s-1GoHnalEYqO_NfHIWHpQEh0ubS0AF-2VpQZC-qUsudWm4NGfhj4IfzkAc78ls7E1CpFZcbj3ItE2pFGK0XeGg_fg0gyCr9VD6CcZEzRZeLDlrB-W07PgnOXjHV-8nUoAJ4AEaPEyM-p8Gfp7qLrcV2Zg043hB0JTxeM1t_0RAC05-rPvaP43Jb0lC0kDi5oVvyLGJ2c_HtY-0BAhxdnwlnk0OvGUs-9gq3EgLHCg4pnBG1KPn6Op4bNb9qG2aZsuV5lB2RY7iX43u_weji0BHmmoV_2anozrkfC3zZcVD6dkuxBetNF7NFJNJZJ3KcXe0zYbSxAErS_IBID6p-GuPJaSy76GBxhPLTzsBeJMVN9f-zki71i5ez8",
+    "preview_enc": "kaiWTrCBMK3jFdcvK0qCgEOt6loK5Sen_sIYDKaHE0I",
+    "sound": true,
+    "v": 2
+  },
+  "direction": "agent-to-device",
+  "ephemeral_ikm_hex": "6e6f746966792d657068656d6572616c2d696b6d2d3030303030303030303030",
+  "fixture_version": 2,
+  "preview": {
+    "action": {
+      "allowed_decisions": [
+        "approve_once",
+        "deny"
+      ],
+      "capability": "Y2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2M",
+      "destructive": false,
+      "device_generation": 1,
+      "device_id": "dev_fixture",
+      "request_id": "req_fixture",
+      "session_id": "sess_fixture"
+    },
+    "body": "Run the deployment command?",
+    "category": "HERMES_APPROVAL",
+    "class": "approval",
+    "expires_at_ms": 1784450000000,
+    "notification_id": "nid_fixture",
+    "thread_token": "thread_fixture",
+    "title": "Approval required",
+    "v": 2
+  },
+  "purpose": "notification",
+  "recipient_private_key_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "recipient_public_key_hex": "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c",
+  "sender_private_key_hex": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+  "sender_public_key_hex": "5869aff450549732cbaaed5e5df9b30a6da31cb0e5742bad5ad4a1a768f1a67b",
+  "suite": "DHKEM(X25519,HKDF-SHA256)/HKDF-SHA256/ChaCha20Poly1305/Auth"
+}

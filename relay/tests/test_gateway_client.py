@@ -163,6 +163,18 @@ async def test_call_returns_matched_result():
     await client.close()
 
 
+async def test_prompt_submit_forwards_client_message_id_to_gateway_receipt_provider():
+    transport = FakeTransport(responder=echo_responder)
+    client, _ = make_client(transport)
+    await client.connect()
+    await client.prompt_submit(
+        "clisess01", "hi", client_message_id="work-repository-job-1234"
+    )
+    sent = [frame for frame in transport.sent if frame.get("method") == "prompt.submit"][-1]
+    assert sent["params"]["client_message_id"] == "work-repository-job-1234"
+    await client.close()
+
+
 async def test_out_of_order_responses_match_by_id():
     transport = FakeTransport()  # no auto-responder; we control replies
     client, _ = make_client(transport)
@@ -368,6 +380,164 @@ async def test_reconnect_reresumes_owned_sessions():
         await run_task
     except asyncio.CancelledError:
         pass
+
+
+async def test_reconnect_replaces_stale_live_alias_and_reports_it_durably():
+    replacements: list[tuple[str, str]] = []
+
+    def responder(frame):
+        if frame["method"] == "session.resume":
+            assert frame["params"]["session_id"] == "origin"
+            return {
+                "jsonrpc": "2.0",
+                "id": frame["id"],
+                "result": {"session_id": "newlive", "resumed": "origin"},
+            }
+        return echo_responder(frame)
+
+    client, _ = make_client(responder=responder)
+    client._owned_session_callback = lambda origin, live: replacements.append(
+        (origin, live)
+    )
+    client.restore_owned_sessions({"origin": "oldlive"})
+    await client.connect()
+
+    assert replacements == [("origin", "newlive")]
+    assert client.live_id_for("origin") == "newlive"
+    assert client.owns("origin") and client.owns("newlive")
+    assert not client.owns("oldlive")
+    resumed = [
+        frame for frame in client._transport.sent if frame["method"] == "session.resume"
+    ]
+    assert len(resumed) == 1
+    await client.close()
+
+
+async def test_prompt_waits_for_reconnect_resume_and_targets_replacement_live_id():
+    transport = FakeTransport()
+    client, _ = make_client(transport)
+    client.restore_owned_sessions({"origin": "oldlive"})
+
+    connect_task = asyncio.create_task(client.connect())
+    assert await wait_until(
+        lambda: any(frame.get("method") == "session.resume" for frame in transport.sent)
+    )
+    resume = next(
+        frame for frame in transport.sent if frame.get("method") == "session.resume"
+    )
+
+    prompt_task = asyncio.create_task(client.prompt_submit("oldlive", "hello"))
+    await asyncio.sleep(0)
+    assert not any(frame.get("method") == "prompt.submit" for frame in transport.sent)
+
+    transport.push(
+        {
+            "jsonrpc": "2.0",
+            "id": resume["id"],
+            "result": {"session_id": "newlive", "resumed": "origin"},
+        }
+    )
+    await connect_task
+    assert await wait_until(
+        lambda: any(frame.get("method") == "prompt.submit" for frame in transport.sent)
+    )
+    prompt = next(
+        frame for frame in transport.sent if frame.get("method") == "prompt.submit"
+    )
+    assert prompt["params"]["session_id"] == "newlive"
+    transport.push(
+        {"jsonrpc": "2.0", "id": prompt["id"], "result": {"accepted": True}}
+    )
+    assert await prompt_task == {"accepted": True}
+    await client.close()
+
+
+async def test_failed_reconnect_resume_forces_phone_action_to_resume_before_submit():
+    resume_calls = 0
+
+    def responder(frame):
+        nonlocal resume_calls
+        if frame["method"] == "session.resume":
+            resume_calls += 1
+            if resume_calls == 1:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": frame["id"],
+                    "error": {"code": 4001, "message": "restart still loading"},
+                }
+            return {
+                "jsonrpc": "2.0",
+                "id": frame["id"],
+                "result": {"session_id": "newlive", "resumed": "origin"},
+            }
+        return echo_responder(frame)
+
+    client, _ = make_client(responder=responder)
+    client.restore_owned_sessions({"origin": "oldlive"})
+    await client.connect()
+    assert not client.owns("origin")
+    assert not client.owns("oldlive")
+
+    result = await client.prompt_submit("oldlive", "retry safely")
+    assert result == {"accepted": True}
+    assert resume_calls == 2
+    prompts = [
+        frame
+        for frame in client._transport.sent
+        if frame.get("method") == "prompt.submit"
+    ]
+    assert [frame["params"]["session_id"] for frame in prompts] == ["newlive"]
+    await client.close()
+
+
+@pytest.mark.parametrize(
+    ("action", "wire_method"),
+    [
+        ("interrupt", "session.interrupt"),
+        ("approval", "approval.respond"),
+        ("clarify", "clarify.respond"),
+    ],
+)
+async def test_failed_reconnect_resume_fences_every_session_command(
+    action, wire_method
+):
+    resume_calls = 0
+
+    def responder(frame):
+        nonlocal resume_calls
+        if frame["method"] == "session.resume":
+            resume_calls += 1
+            if resume_calls == 1:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": frame["id"],
+                    "error": {"code": 4001, "message": "restart still loading"},
+                }
+            return {
+                "jsonrpc": "2.0",
+                "id": frame["id"],
+                "result": {"session_id": "newlive", "resumed": "origin"},
+            }
+        return echo_responder(frame)
+
+    client, _ = make_client(responder=responder)
+    client.restore_owned_sessions({"origin": "oldlive"})
+    await client.connect()
+
+    if action == "interrupt":
+        result = await client.session_interrupt("oldlive")
+    elif action == "approval":
+        result = await client.approval_respond("oldlive", "req1", "once")
+    else:
+        result = await client.clarify_respond("oldlive", "req1", "answer")
+
+    assert result == {"ok": True}
+    assert resume_calls == 2
+    commands = [
+        frame for frame in client._transport.sent if frame.get("method") == wire_method
+    ]
+    assert [frame["params"]["session_id"] for frame in commands] == ["newlive"]
+    await client.close()
 
 
 async def test_url_reminted_with_rotating_token_on_reconnect():

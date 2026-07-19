@@ -7,6 +7,18 @@ import UIKit  // UIDevice.current.name — the auto-upgrade device-name hint (W3
 #if DEBUG
 #endif
 
+private final class RelayV2WakeObserverToken: @unchecked Sendable {
+    let value: NSObjectProtocol
+
+    init(_ value: NSObjectProtocol) {
+        self.value = value
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(value)
+    }
+}
+
 /// A model pick made on a DRAFT chat (no gateway session yet) — pends until
 /// the draft materializes, then applies session-scoped (ABH-84 follow-up).
 /// `reasoningEffort`/`fast` are nil when untouched (the session then keeps
@@ -29,6 +41,7 @@ struct DraftModelSelection: Codable, Equatable, Sendable {
 @Observable
 final class ConnectionStore {
     private static let log = Logger(subsystem: "HermesMobile", category: "ConnectionStore")
+    static let relayV2PresenceHeartbeatSeconds: TimeInterval = 30
 
     /// Operational WebSocket capability for the current transport generation.
     ///
@@ -480,10 +493,28 @@ final class ConnectionStore {
     /// gateway `client` above is used instead), so the gateway-direct path never
     /// allocates it. Read via ``ensureRelayCoordinator()``.
     private(set) var relayCoordinator: RelaySessionCoordinator?
+    private var relayV2Client: RelayV2Client?
+    private var relayV2WorkRepository: WorkRepository?
+    /// Generation that owns the installed HRP/2 client, repository, and
+    /// SessionStore adapters. A failed/stale setup may disconnect its own
+    /// candidate, but may clear shared bindings only while this token matches.
+    private var relayV2InstallationGeneration: UInt64?
+    @ObservationIgnored private var relayV2WakeObserver: RelayV2WakeObserverToken?
+    @ObservationIgnored private var relayV2PresenceLifecycleTask: Task<Void, Never>?
+    private(set) var relayV2Ready = false
 
     /// Test seam: inject a coordinator wired to a mock relay before `configure`.
     #if DEBUG
     var relayCoordinatorFactory: (() -> RelaySessionCoordinator)?
+    @ObservationIgnored var relayV2PresenceEnqueueForTesting: (
+        @Sendable (Bool, String?) async -> Void
+    )?
+    @ObservationIgnored var relayV2SetupFactoryForTesting: (
+        @MainActor @Sendable (String) async throws -> (RelayV2Client, WorkRepository)
+    )?
+    @ObservationIgnored var relayV2PostAssignmentHookForTesting: (
+        @MainActor @Sendable () async throws -> Void
+    )?
     #endif
 
     /// Lazily build (once) and return the relay bridge for the active chat store.
@@ -577,6 +608,7 @@ final class ConnectionStore {
         if relayCoordinator != nil, transportPath == .relay {
             return relayCoordinator?.isOpen ?? false
         }
+        if transportPath == .relayV2 { return relayV2Ready }
         if case .ready = transportReadiness { return true }
         return false
     }
@@ -1118,6 +1150,21 @@ final class ConnectionStore {
     init(sessionStore: SessionStore, chatStore: ChatStore) {
         self.sessionStore = sessionStore
         self.chatStore = chatStore
+        relayV2WakeObserver = RelayV2WakeObserverToken(NotificationCenter.default.addObserver(
+            forName: .relayV2CommandQueued,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            guard let accountID = notification.object as? String else { return }
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.transportPath == .relayV2,
+                      DefaultsKeys.relayV2AccountIDValue() == accountID,
+                      let client = self.relayV2Client,
+                      let repository = self.relayV2WorkRepository else { return }
+                await client.drainCommands(repository: repository)
+            }
+        })
     }
 
     private static func clearSpotlightSessionIndexForPrivacy() {
@@ -1153,6 +1200,18 @@ final class ConnectionStore {
                 guard isCurrentGeneration(generation) else { return }
             }
             phase = .offline(nil)
+            return
+        }
+        // HRP/2 is a first-class client and does not own a gateway URL/token.
+        // Resume the selected relay account directly from protected identity
+        // storage before considering any legacy direct-gateway bootstrap path.
+        if transportPath == .relayV2,
+           RelayV2Wire.isToken(DefaultsKeys.relayV2AccountIDValue()) {
+            isBootstrapping = true
+            _ = await configureRelayV2(generation: generation)
+            guard isCurrentGeneration(generation) else { return }
+            isBootstrapping = false
+            enterDraftAfterBootstrapConfigure()
             return
         }
         #if DEBUG
@@ -1315,6 +1374,10 @@ final class ConnectionStore {
         let trimmedURL = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
         let previousServerURL = serverURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if transportPath == .relayV2 {
+            return await configureRelayV2(generation: generation)
+        }
 
         // Scheme is restricted to http/https — `URL(string:)` happily accepts
         // `file:`, `javascript:`, `ftp:` etc., and a malformed QR code or a
@@ -1531,6 +1594,403 @@ final class ConnectionStore {
         return nil
     }
 
+    private func configureRelayV2(generation: UInt64) async -> String? {
+        guard isCurrentGeneration(generation) else { return nil }
+        phase = .connecting
+        relayV2Ready = false
+        if let installed = relayV2Client {
+            let installedGeneration = relayV2InstallationGeneration
+            await installed.disconnect()
+            guard isCurrentGeneration(generation) else { return nil }
+            if relayV2InstallationGeneration == installedGeneration {
+                clearRelayV2Installation()
+            }
+        }
+
+        var candidateClient: RelayV2Client?
+        do {
+            let accountID = DefaultsKeys.relayV2AccountIDValue()
+            guard RelayV2Wire.isToken(accountID) else {
+                throw RelayV2ProtocolError.revoked
+            }
+            let cacheNamespace = RelayV2Identifiers.cacheNamespace(accountID: accountID)
+            if serverURLString != cacheNamespace {
+                sessionStore.invalidateGatewayScopeWork()
+            }
+            await paintCacheFirst(serverURLString: cacheNamespace)
+            guard isCurrentGeneration(generation) else { return nil }
+            let client: RelayV2Client
+            let repository: WorkRepository
+            #if DEBUG
+            if let relayV2SetupFactoryForTesting {
+                (client, repository) = try await relayV2SetupFactoryForTesting(accountID)
+            } else {
+                (client, repository) = try await makeRelayV2Setup(accountID: accountID)
+            }
+            #else
+            (client, repository) = try await makeRelayV2Setup(accountID: accountID)
+            #endif
+            candidateClient = client
+            guard isCurrentGeneration(generation) else {
+                await client.disconnect()
+                return nil
+            }
+            relayV2Client = client
+            relayV2WorkRepository = repository
+            relayV2InstallationGeneration = generation
+            await client.setTerminalRevocationHandler { [weak self] accountID in
+                self?.handleRelayV2TerminalRevocation(
+                    accountID: accountID,
+                    generation: generation
+                )
+            }
+            guard isCurrentGeneration(generation),
+                  relayV2InstallationGeneration == generation else {
+                await teardownRelayV2Installation(client, generation: generation)
+                return nil
+            }
+            sessionStore.relayV2SessionsFetch = { [weak client] in
+                guard let client else {
+                    throw RelayV2ProtocolError.transport("Relay v2 is disconnected")
+                }
+                let result = try await client.request(
+                    kind: .sessionList,
+                    params: ["limit": 200]
+                )
+                let sessions = result["sessions"]?.arrayValue?.compactMap {
+                    $0.decoded(as: SessionSummary.self)
+                } ?? []
+                return (sessions, sessions.count)
+            }
+            sessionStore.relayV2TranscriptFetch = { [weak client] sessionID in
+                guard let client else {
+                    throw RelayV2ProtocolError.transport("Relay v2 is disconnected")
+                }
+                let result = try await client.request(
+                    kind: .sessionHistory,
+                    sessionID: sessionID,
+                    params: ["session_id": .string(sessionID), "limit": 5_000]
+                )
+                return result["messages"]?.arrayValue?.compactMap(StoredMessage.init(json:)) ?? []
+            }
+            #if DEBUG
+            try await relayV2PostAssignmentHookForTesting?()
+            #endif
+            guard isCurrentGeneration(generation) else {
+                await teardownRelayV2Installation(client, generation: generation)
+                return nil
+            }
+            try await client.connect()
+            guard isCurrentGeneration(generation) else {
+                await teardownRelayV2Installation(client, generation: generation)
+                return nil
+            }
+            relayV2Ready = true
+            hasConnected = true
+            phase = .connected
+            await sessionStore.refresh()
+            guard isCurrentGeneration(generation) else {
+                await teardownRelayV2Installation(client, generation: generation)
+                return nil
+            }
+            _ = await sessionStore.resumeActiveAfterReconnect()
+            #if canImport(UIKit)
+            if UIApplication.shared.applicationState == .active {
+                startRelayV2PresenceHeartbeat()
+            }
+            #endif
+            queueStore?.wake()
+            Task { await client.drainCommands(repository: repository) }
+            return nil
+        } catch {
+            if let candidateClient {
+                await teardownRelayV2Installation(
+                    candidateClient,
+                    generation: generation
+                )
+            }
+            guard isCurrentGeneration(generation) else { return nil }
+            relayV2Ready = false
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            phase = error as? RelayV2ProtocolError == .revoked ? .needsSetup : .offline(message)
+            return message
+        }
+    }
+
+    private func makeRelayV2Setup(
+        accountID: String
+    ) async throws -> (RelayV2Client, WorkRepository) {
+        guard let identity = try RelayV2KeychainStore().loadIdentity(accountID: accountID),
+              let hubURL = identity.hubURL,
+              let routeID = identity.routeID,
+              let agentRouteID = identity.agentRouteID,
+              let keys = identity.currentKeys else {
+            throw RelayV2ProtocolError.revoked
+        }
+        let hubConfiguration = try RelayV2HubConfiguration(
+            baseURL: hubURL,
+            routeID: routeID,
+            routeSigningPrivateKey: keys.signingPrivateKey
+        )
+        let hub = RelayV2HubTransport(configuration: hubConfiguration)
+        let databaseConfiguration = try RelayV2DatabaseConfiguration.appGroup()
+        let database = try await Task.detached(priority: .userInitiated) {
+            try RelayV2Database(configuration: databaseConfiguration)
+        }.value
+        let repository = try await WorkRepository.openAppGroup(scope: nil)
+        try await database.registerAccount(
+            accountID: accountID,
+            localDeviceID: identity.deviceID,
+            agentRouteID: agentRouteID,
+            deviceRouteID: routeID,
+            currentKeyGeneration: keys.generation,
+            nowMilliseconds: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
+        let client = try RelayV2Client(
+            identity: identity,
+            keyStore: RelayV2KeychainStore(),
+            database: database,
+            hub: hub,
+            workRepository: repository,
+            onProjection: { [weak self] sessionID, items, events in
+                self?.chatStore.applyRelayV2Projection(
+                    sessionID: sessionID,
+                    items: items,
+                    events: events
+                )
+            },
+            onTextDeltas: { [weak self] sessionID, deltas in
+                self?.chatStore.applyRelayV2TextDeltas(
+                    sessionID: sessionID,
+                    deltas: deltas
+                ) ?? true
+            },
+            onSessionBinding: { [weak self] originID, liveID in
+                self?.sessionStore.bindRelayV2Session(
+                    originSessionID: originID,
+                    liveSessionID: liveID
+                )
+                #if canImport(UIKit)
+                if UIApplication.shared.applicationState == .active {
+                    self?.startRelayV2PresenceHeartbeat(clearPreviousSession: true)
+                }
+                #endif
+            },
+            onCommandResolution: { [weak self] clientID, kind, errorCode in
+                self?.chatStore.applyRelayV2CommandResolution(
+                    clientMessageID: clientID,
+                    kind: kind,
+                    errorCode: errorCode
+                )
+            }
+        )
+        return (client, repository)
+    }
+
+    private func teardownRelayV2Installation(
+        _ client: RelayV2Client,
+        generation: UInt64
+    ) async {
+        await client.disconnect()
+        guard relayV2InstallationGeneration == generation else { return }
+        clearRelayV2Installation()
+    }
+
+    private func clearRelayV2Installation() {
+        relayV2Client = nil
+        relayV2WorkRepository = nil
+        relayV2InstallationGeneration = nil
+        relayV2Ready = false
+        sessionStore.relayV2SessionsFetch = nil
+        sessionStore.relayV2TranscriptFetch = nil
+    }
+
+    /// Terminal HRP/2 revocation is not an ordinary transport flap. Remove the
+    /// repository together with readiness so queue observers and direct callers
+    /// cannot append doomed commands after the client has fenced its identity.
+    private func handleRelayV2TerminalRevocation(
+        accountID: String,
+        generation: UInt64
+    ) {
+        guard isCurrentGeneration(generation),
+              relayV2InstallationGeneration == generation,
+              DefaultsKeys.relayV2AccountIDValue() == accountID else { return }
+        relayV2PresenceLifecycleTask?.cancel()
+        relayV2PresenceLifecycleTask = nil
+        clearRelayV2Installation()
+        requireRepairAfterCurrentDeviceRevoked(clearPrivacySurfaces: false)
+    }
+
+    #if DEBUG
+    struct RelayV2InstallationSnapshotForTesting: Sendable {
+        let currentGeneration: UInt64
+        let ownerGeneration: UInt64?
+        let hasClient: Bool
+        let hasRepository: Bool
+        let hasSessionsFetch: Bool
+        let hasTranscriptFetch: Bool
+    }
+
+    func relayV2InstallationSnapshotForTesting() -> RelayV2InstallationSnapshotForTesting {
+        RelayV2InstallationSnapshotForTesting(
+            currentGeneration: connectionGeneration,
+            ownerGeneration: relayV2InstallationGeneration,
+            hasClient: relayV2Client != nil,
+            hasRepository: relayV2WorkRepository != nil,
+            hasSessionsFetch: sessionStore.relayV2SessionsFetch != nil,
+            hasTranscriptFetch: sessionStore.relayV2TranscriptFetch != nil
+        )
+    }
+    #endif
+
+    func enqueueRelayV2Prompt(text: String, sessionID: String?) async throws -> String {
+        guard transportPath == .relayV2,
+              let repository = relayV2WorkRepository else {
+            throw RelayV2ProtocolError.transport("Relay v2 account storage is unavailable")
+        }
+        let accountID = DefaultsKeys.relayV2AccountIDValue()
+        let clientMessageID = RelayV2Identifiers.canonicalUUID()
+        let operationID = "op_\(RelayV2Identifiers.canonicalUUID())"
+        _ = try await repository.enqueueRelayV2Command(
+            operationID: operationID, clientMessageID: clientMessageID,
+            accountID: accountID, sessionID: sessionID, kind: .prompt,
+            payload: ["text": .string(text)].merging(sessionID.map { ["session_id": .string($0)] } ?? [:]) { a, _ in a }
+        )
+        if let client = relayV2Client, relayV2Ready {
+            Task { await client.drainCommands(repository: repository) }
+        }
+        return clientMessageID
+    }
+
+    func openRelayV2Session(_ sessionID: String) async throws -> String {
+        guard transportPath == .relayV2, relayV2Ready, let client = relayV2Client else {
+            throw RelayV2ProtocolError.transport("Relay v2 is disconnected")
+        }
+        _ = try await client.request(
+            kind: .sessionOpen,
+            sessionID: sessionID,
+            params: ["session_id": .string(sessionID)]
+        )
+        let resumed = try await client.request(
+            kind: .sessionResume,
+            sessionID: sessionID,
+            params: ["session_id": .string(sessionID)]
+        )
+        let liveID = resumed["live_session_id"]?.stringValue
+            ?? resumed["origin_session_id"]?.stringValue
+            ?? sessionID
+        #if canImport(UIKit)
+        if UIApplication.shared.applicationState == .active {
+            startRelayV2PresenceHeartbeat(clearPreviousSession: true)
+        }
+        #endif
+        return liveID
+    }
+
+    func requestRelayV2(
+        kind: RelayV2CommandKind,
+        sessionID: String?,
+        params: [String: JSONValue]
+    ) async throws -> JSONValue {
+        guard transportPath == .relayV2, relayV2Ready, let client = relayV2Client else {
+            throw RelayV2ProtocolError.transport("Relay v2 is disconnected")
+        }
+        return try await client.request(kind: kind, sessionID: sessionID, params: params)
+    }
+
+    func refreshRelayV2Presence(foreground: Bool) async {
+        let sessionID = foreground ? sessionStore.activeStoredId : nil
+        #if DEBUG
+        if let relayV2PresenceEnqueueForTesting {
+            await relayV2PresenceEnqueueForTesting(foreground, sessionID)
+            return
+        }
+        #endif
+        guard transportPath == .relayV2,
+              let repository = relayV2WorkRepository else { return }
+        guard !foreground || sessionID != nil else { return }
+        var params: [String: JSONValue] = ["foreground": .bool(foreground)]
+        if let sessionID { params["session_id"] = .string(sessionID) }
+        let accountID = DefaultsKeys.relayV2AccountIDValue()
+        guard RelayV2Wire.isToken(accountID) else { return }
+        do {
+            _ = try await repository.enqueueRelayV2Command(
+                operationID: "op_\(RelayV2Identifiers.canonicalUUID())",
+                clientMessageID: RelayV2Identifiers.canonicalUUID(),
+                accountID: accountID,
+                sessionID: sessionID,
+                kind: .presenceSet,
+                payload: params
+            )
+            if let client = relayV2Client, relayV2Ready {
+                await client.drainCommands(repository: repository)
+            }
+        } catch {
+            // Presence is a bounded lease. A missed best-effort update expires
+            // server-side and must never block foreground/background transitions.
+        }
+    }
+
+    private func startRelayV2PresenceHeartbeat(clearPreviousSession: Bool = false) {
+        replaceRelayV2PresenceLifecycle(
+            foreground: true,
+            clearPreviousSession: clearPreviousSession
+        )
+    }
+
+    private func stopRelayV2PresenceHeartbeat() {
+        replaceRelayV2PresenceLifecycle(foreground: false, clearPreviousSession: false)
+    }
+
+    private func replaceRelayV2PresenceLifecycle(
+        foreground: Bool,
+        clearPreviousSession: Bool
+    ) {
+        let predecessor = relayV2PresenceLifecycleTask
+        predecessor?.cancel()
+        relayV2PresenceLifecycleTask = Task { [weak self] in
+            // A canceled heartbeat may already be inside an enqueue. Wait for
+            // it to finish before appending the replacement command so a stale
+            // foreground=true can never land after a background/session clear.
+            await predecessor?.value
+            guard !Task.isCancelled, let self else { return }
+            if clearPreviousSession {
+                await self.refreshRelayV2Presence(foreground: false)
+                guard !Task.isCancelled else { return }
+            }
+            guard foreground else {
+                await self.refreshRelayV2Presence(foreground: false)
+                return
+            }
+            while !Task.isCancelled {
+                await self.refreshRelayV2Presence(foreground: true)
+                do {
+                    try await Task.sleep(
+                        for: .seconds(Self.relayV2PresenceHeartbeatSeconds)
+                    )
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    #if DEBUG
+    func replaceRelayV2PresenceLifecycleForTesting(
+        foreground: Bool,
+        clearPreviousSession: Bool = false
+    ) {
+        replaceRelayV2PresenceLifecycle(
+            foreground: foreground,
+            clearPreviousSession: clearPreviousSession
+        )
+    }
+
+    func waitForRelayV2PresenceLifecycleForTesting() async {
+        await relayV2PresenceLifecycleTask?.value
+    }
+    #endif
+
     // MARK: - Hydration (ABH-82)
 
     /// Coordinate the post-connect `.hydrating → .connected` transition.
@@ -1725,6 +2185,11 @@ final class ConnectionStore {
         generation ownedGeneration: UInt64? = nil
     ) async {
         let generation = ownedGeneration ?? advanceConnectionGeneration()
+        // Snapshot the HRP/2 owner before the first suspension. A newer
+        // configure may install another client while legacy/relay teardown is
+        // awaiting; that fresh generation must never become this stop's target.
+        let stoppingRelayV2Client = relayV2Client
+        let stoppingRelayV2Generation = relayV2InstallationGeneration
         // S3: tear down the path monitor on every deliberate stop — disconnect
         // (→ needsSetup, no saved config to retry), forget (unpair), and explicit
         // goOffline (a user-chosen offline must NOT silently self-reconnect). A
@@ -1775,10 +2240,19 @@ final class ConnectionStore {
             Self.log.notice("Disconnect clearing Hermes Spotlight session index")
             Self.clearSpotlightSessionIndexForPrivacy()
         }
+        let presenceTask = relayV2PresenceLifecycleTask
+        presenceTask?.cancel()
+        await presenceTask?.value
+        relayV2PresenceLifecycleTask = nil
+        await refreshRelayV2Presence(foreground: false)
         await client.disconnect()
         // Wave-2: tear down the relay bridge too, but ONLY if it was ever built
         // (the gateway-direct default never allocates it — byte-identical path).
         if let relayCoordinator { await relayCoordinator.stop() }
+        if let stoppingRelayV2Client { await stoppingRelayV2Client.disconnect() }
+        if relayV2InstallationGeneration == stoppingRelayV2Generation {
+            clearRelayV2Installation()
+        }
         guard isCurrentGeneration(generation) else { return }
         if let finalPhase { phase = finalPhase }
     }
@@ -1884,9 +2358,14 @@ final class ConnectionStore {
         serverOverride: String? = nil
     ) async {
         let generation = advanceConnectionGeneration()
+        let defaults = UserDefaults.standard
+        // APNs credentials are device-scoped, not gateway cache. Clear them at
+        // admission so even the already-forgotten/no-server branch is a complete
+        // privacy erase.
+        KeychainService.deleteAPNsDeviceTokens(defaults: defaults)
+        defaults.removeObject(forKey: DefaultsKeys.pushLastDeviceTokenDigest)
         // Keep onboarding hidden until every local privacy owner has completed.
         phase = .connecting
-        let defaults = UserDefaults.standard
         let pending = defaults.data(forKey: DefaultsKeys.gatewayCleanupTombstone)
             .flatMap { try? JSONDecoder().decode(GatewayCleanupTombstone.self, from: $0) }
         guard let server = serverOverride
@@ -1935,7 +2414,6 @@ final class ConnectionStore {
         defaults.removeObject(forKey: DefaultsKeys.serverURL)
         defaults.removeObject(forKey: DefaultsKeys.connectionOffline)
         defaults.removeObject(forKey: DefaultsKeys.serverCapabilities)
-        defaults.removeObject(forKey: DefaultsKeys.pushLastDeviceToken)
         defaults.removeObject(forKey: DefaultsKeys.pushLastEvents)
         defaults.removeObject(forKey: DefaultsKeys.pushLastEnv)
         defaults.removeObject(forKey: DefaultsKeys.pushLastRegistrationScope)
@@ -2576,6 +3054,10 @@ final class ConnectionStore {
     /// path is only for the Settings → Devices branch where the UI already knows
     /// from `wasCurrent` that the current install revoked its own token.
     func requireRepairAfterCurrentDeviceRevoked(clearPrivacySurfaces: Bool = true) {
+        KeychainService.deleteAPNsDeviceTokens()
+        UserDefaults.standard.removeObject(
+            forKey: DefaultsKeys.pushLastDeviceTokenDigest
+        )
         advanceConnectionGeneration()
         reconnectTask?.cancel()
         reconnectTask = nil
@@ -2932,6 +3414,15 @@ final class ConnectionStore {
     /// bar) so it doesn't run against a socket iOS is about to kill; otherwise a
     /// no-op — the socket may be killed and we recover on the next foreground.
     func handleScenePhase(_ scenePhase: ScenePhase) {
+        if transportPath == .relayV2 {
+            if scenePhase == .active {
+                startRelayV2PresenceHeartbeat()
+            } else {
+                sessionStore.cancelPrefetch()
+                stopRelayV2PresenceHeartbeat()
+            }
+            return
+        }
         guard scenePhase == .active else {
             // Leaving the foreground: stop any in-flight prefetch sweep.
             sessionStore.cancelPrefetch()

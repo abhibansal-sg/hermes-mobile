@@ -1,0 +1,88 @@
+name: hermes-push-gateway
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: push_gateway
+      POSTGRES_USER: push_gateway
+      POSTGRES_PASSWORD: ${HPG_POSTGRES_PASSWORD:?set HPG_POSTGRES_PASSWORD}
+    volumes:
+      - push-gateway-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U push_gateway -d push_gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  migrate:
+    image: postgres:17-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${HPG_POSTGRES_PASSWORD:?set HPG_POSTGRES_PASSWORD}
+    volumes:
+      - ./migrations/postgresql:/migrations:ro
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        for migration in /migrations/*.sql; do
+          psql -h postgres -U push_gateway -d push_gateway \
+            -v ON_ERROR_STOP=1 -f "$${migration}"
+        done
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  push-gateway:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      HPG_PRODUCTION: "true"
+      HPG_DATABASE_URL: postgresql+psycopg://push_gateway:${HPG_POSTGRES_PASSWORD:?set HPG_POSTGRES_PASSWORD}@postgres:5432/push_gateway
+      HPG_TOKEN_MASTER_KEY_B64: ${HPG_TOKEN_MASTER_KEY_B64:?set HPG_TOKEN_MASTER_KEY_B64}
+      HPG_TOKEN_KEY_VERSION: ${HPG_TOKEN_KEY_VERSION:-1}
+      HPG_CAPABILITY_PEPPER_B64: ${HPG_CAPABILITY_PEPPER_B64:?set HPG_CAPABILITY_PEPPER_B64}
+      HPG_ALLOWED_BUNDLE_IDS: ${HPG_ALLOWED_BUNDLE_IDS:-ai.hermes.app}
+      HPG_APPLE_APP_ID: ${HPG_APPLE_APP_ID:?set HPG_APPLE_APP_ID}
+      HPG_APP_ATTEST_PRODUCTION: ${HPG_APP_ATTEST_PRODUCTION:-true}
+      HPG_APNS_KEY_PATH: /run/secrets/apns_key
+      HPG_APNS_KEY_ID: ${HPG_APNS_KEY_ID:?set HPG_APNS_KEY_ID}
+      HPG_APNS_TEAM_ID: ${HPG_APNS_TEAM_ID:?set HPG_APNS_TEAM_ID}
+      HPG_HUB_ACTIVATION_PRIVATE_KEY_B64: ${HPG_HUB_ACTIVATION_PRIVATE_KEY_B64:-}
+      HPG_ATTESTATION_MAX_CONCURRENCY: ${HPG_ATTESTATION_MAX_CONCURRENCY:-4}
+      HPG_DATABASE_MAX_CONCURRENCY: ${HPG_DATABASE_MAX_CONCURRENCY:-8}
+      HPG_SEND_RETRY_BASE_SECONDS: ${HPG_SEND_RETRY_BASE_SECONDS:-2}
+      HPG_SEND_RETRY_MAX_SECONDS: ${HPG_SEND_RETRY_MAX_SECONDS:-60}
+      HPG_AUTO_CREATE_SCHEMA: "false"
+      # When adding a reverse proxy, set this to its exact container IP or CIDR.
+      # Leaving 127.0.0.1 means public X-Forwarded-* input remains untrusted.
+      FORWARDED_ALLOW_IPS: ${HPG_FORWARDED_ALLOW_IPS:-127.0.0.1}
+    secrets:
+      # Local Compose bind-mounts file secrets: prepare the source as 999:999
+      # mode 0400 as documented. Engines that honor secret metadata also get
+      # the explicit least-privilege mode below.
+      - source: apns_key
+        target: apns_key
+        mode: 0400
+    ports: ["127.0.0.1:8081:8081"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+secrets:
+  apns_key:
+    file: ${HPG_APNS_KEY_FILE:?set HPG_APNS_KEY_FILE}
+
+volumes:
+  push-gateway-db:

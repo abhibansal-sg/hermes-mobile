@@ -49,7 +49,13 @@ from . import plugin_bridge
 from .bus import TOPIC_RELAY_FRAMES, EventBus
 from .gateway_client import GatewayClient
 from .session_state import SessionStore
-from .types import Frame, FrameKind, UpstreamMethod, UpstreamRequest
+from .types import (
+    Frame,
+    FrameKind,
+    ProtocolValidationError,
+    UpstreamMethod,
+    UpstreamRequest,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -381,29 +387,77 @@ class DownstreamServer:
 
     async def _on_upstream_raw(self, conn: PhoneConnection, raw: Any) -> None:
         """Parse one upstream message and dispatch it, replying if it has an id."""
+        request_id: int | str | None = None
         try:
             payload = json.loads(raw)
         except (ValueError, TypeError):
+            await self._send_rpc_error(
+                conn,
+                request_id,
+                numeric_code=-32700,
+                code="INVALID_ARGUMENT",
+                message="Malformed JSON request",
+            )
             return
-        req = UpstreamRequest.from_wire(payload)
+        if isinstance(payload, dict):
+            candidate = payload.get("id")
+            if isinstance(candidate, (int, str)) and not isinstance(candidate, bool):
+                request_id = candidate
+        try:
+            req = UpstreamRequest.from_wire(payload)
+        except ProtocolValidationError:
+            await self._send_rpc_error(
+                conn,
+                request_id,
+                numeric_code=-32602,
+                code="INVALID_ARGUMENT",
+                message="Invalid relay request",
+            )
+            return
         try:
             result = await self.handle_upstream(conn, req)
-        except Exception as exc:  # translate to a JSON-RPC error
+        except Exception:  # translate without exposing exception text/content
             if req.id is not None:
-                await conn._ws.send(
-                    json.dumps(
-                        {
-                            "jsonrpc": "2.0",
-                            "id": req.id,
-                            "error": {"code": -32000, "message": str(exc)},
-                        }
-                    )
+                await self._send_rpc_error(
+                    conn,
+                    req.id,
+                    numeric_code=-32603,
+                    code="INTERNAL",
+                    message="Internal relay error",
+                    correlation_id=uuid.uuid4().hex,
                 )
             return
         if req.id is not None:
             await conn._ws.send(
                 json.dumps({"jsonrpc": "2.0", "id": req.id, "result": result})
             )
+
+    @staticmethod
+    async def _send_rpc_error(
+        conn: PhoneConnection,
+        request_id: int | str | None,
+        *,
+        numeric_code: int,
+        code: str,
+        message: str,
+        correlation_id: str | None = None,
+    ) -> None:
+        data = {"code": code}
+        if correlation_id is not None:
+            data["correlation_id"] = correlation_id
+        await conn._ws.send(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": numeric_code,
+                        "message": message,
+                        "data": data,
+                    },
+                }
+            )
+        )
 
     async def _fanout_loop(self) -> None:
         """Read ``TOPIC_RELAY_FRAMES`` and mirror every frame to every phone.
@@ -511,12 +565,22 @@ class DownstreamServer:
 
         if method in (UpstreamMethod.OPEN, UpstreamMethod.HISTORY):
             sid = p["session_id"]
+            messages = await self._gateway.rest_history(sid)
             # OPEN = user brought this chat on screen -> foreground it (§6).
             # HISTORY = background store sync -> must NOT foreground, else a mere
             # sync would permanently gag that session's completion/error pushes.
             if method == UpstreamMethod.OPEN:
                 conn.set_foreground(sid)
-            return {"session_id": sid, "messages": await self._gateway.rest_history(sid)}
+                snapshot = self._store.replace_history(sid, messages)
+                checkpoint_seq = await conn.send_frame(
+                    Frame(sid=sid, kind=FrameKind.SNAPSHOT, body=snapshot)
+                )
+                return {
+                    "session_id": sid,
+                    "messages": messages,
+                    "checkpoint_seq": checkpoint_seq,
+                }
+            return {"session_id": sid, "messages": messages}
 
         # -- drive (become owner) --------------------------------------------
         if method == UpstreamMethod.SUBMIT:
@@ -549,7 +613,12 @@ class DownstreamServer:
                     # id to a live id — resolve so a repeat submit to the origin
                     # id still drives the live turn.
                     sid = self._gateway.live_id_for(sid)
-                await self._gateway.prompt_submit(sid, text)
+                if cmid is None:
+                    await self._gateway.prompt_submit(sid, text)
+                else:
+                    await self._gateway.prompt_submit(
+                        sid, text, client_message_id=cmid
+                    )
             else:
                 # Brand-new chat: create + own, then drive (§5).
                 sid = await self._gateway.session_create(
@@ -557,7 +626,12 @@ class DownstreamServer:
                     model=p.get("model"),
                     provider=p.get("provider"),
                 )
-                await self._gateway.prompt_submit(sid, text)
+                if cmid is None:
+                    await self._gateway.prompt_submit(sid, text)
+                else:
+                    await self._gateway.prompt_submit(
+                        sid, text, client_message_id=cmid
+                    )
             # Record the resolved (live) id under the client message id BEFORE
             # returning, so a retry that races the RPC result back over a flapped
             # socket is deduped rather than driving a second turn.

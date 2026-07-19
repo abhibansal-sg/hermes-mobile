@@ -379,6 +379,49 @@ enum NotificationService {
             }
         }
 
+        // HRP/2 actions never bypass the relay or require a gateway token. The
+        // NSE provides these opaque fields only after authenticated preview
+        // decryption; enqueue first, then let the normal durable drain attempt
+        // Hub delivery when connectivity is available.
+        if let accountID = action.relayAccountID {
+            guard let requestID = action.requestId,
+                  let capability = action.capability else {
+                postFeedbackNotification(
+                    title: "Couldn't queue response",
+                    body: "Open Hermes to respond to this request."
+                )
+                return
+            }
+            do {
+                try await RelayV2NotificationActionQueue.enqueueApproval(
+                    accountID: accountID,
+                    sessionID: action.sessionId,
+                    requestID: requestID,
+                    approve: approve,
+                    capability: capability,
+                    allowedDecisions: action.allowedDecisions,
+                    deviceID: action.relayDeviceID,
+                    deviceKeyGeneration: action.relayDeviceKeyGeneration,
+                    operationID: action.operationID,
+                    clientMessageID: action.clientMessageID
+                )
+            } catch {
+                postFeedbackNotification(
+                    title: "Couldn't queue response",
+                    body: "Open Hermes to respond to this request."
+                )
+            }
+            return
+        }
+
+        guard DefaultsKeys.legacyDirectActionsAllowed() else {
+            postFeedbackNotification(
+                title: "Open Hermes to respond",
+                body: "This account now uses the secure relay. Review the request in the app."
+            )
+            return
+        }
+
         guard let endpoint = endpointProvider?() else {
             // Not configured (no server/token yet): can't reach the gateway.
             postFeedbackNotification(
@@ -389,6 +432,15 @@ enum NotificationService {
         }
 
         let outcome: RestClient.ApprovalRespondOutcome
+        // The transport can switch while endpoint resolution or biometric auth
+        // suspends. This final fence is intentionally adjacent to the REST send.
+        guard DefaultsKeys.legacyDirectActionsAllowed() else {
+            postFeedbackNotification(
+                title: "Open Hermes to respond",
+                body: "This account now uses the secure relay. Review the request in the app."
+            )
+            return
+        }
         #if DEBUG
         if let sender = approvalActionSender {
             outcome = await sender(endpoint, action, approve)
@@ -419,6 +471,7 @@ enum NotificationService {
     private static func sendApproval(
         endpoint: ActionEndpoint, action: ApprovalActionPayload, approve: Bool
     ) async -> RestClient.ApprovalRespondOutcome {
+        guard DefaultsKeys.legacyDirectActionsAllowed() else { return .failed }
         let rest = RestClient(
             baseURL: endpoint.baseURL, token: endpoint.token, pathStyle: endpoint.pathStyle
         )
@@ -447,6 +500,7 @@ enum NotificationService {
     nonisolated static func decodeClarifyReplyAction(
         from userInfo: [AnyHashable: Any]
     ) -> ClarifyReplyActionPayload? {
+        guard DefaultsKeys.legacyDirectActionsAllowed() else { return nil }
         guard let block = userInfo["hermes"] as? [AnyHashable: Any] else { return nil }
         guard
             let sessionId = (block["session_id"] as? String)?
@@ -472,6 +526,13 @@ enum NotificationService {
         text: String,
         action: ClarifyReplyActionPayload
     ) async {
+        guard DefaultsKeys.legacyDirectActionsAllowed() else {
+            postFeedbackNotification(
+                title: "Open Hermes to reply",
+                body: "This account now uses the secure relay. Answer the question in the app."
+            )
+            return
+        }
         let answer = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !answer.isEmpty else {
             postFeedbackNotification(
@@ -489,6 +550,13 @@ enum NotificationService {
         }
 
         let outcome: RestClient.ApprovalRespondOutcome
+        guard DefaultsKeys.legacyDirectActionsAllowed() else {
+            postFeedbackNotification(
+                title: "Open Hermes to reply",
+                body: "This account now uses the secure relay. Answer the question in the app."
+            )
+            return
+        }
         #if DEBUG
         if let sender = clarifyReplySender {
             outcome = await sender(endpoint, action, answer)
@@ -532,6 +600,7 @@ enum NotificationService {
         action: ClarifyReplyActionPayload,
         answer: String
     ) async -> RestClient.ApprovalRespondOutcome {
+        guard DefaultsKeys.legacyDirectActionsAllowed() else { return .failed }
         let first = await sendClarifyReplyAttempt(
             endpoint: endpoint, style: endpoint.pathStyle, action: action, answer: answer
         )
@@ -676,6 +745,43 @@ enum NotificationService {
         let destructive: Bool
         /// Short target string, surfaced in the "Already handled" feedback.
         let approvalTitle: String?
+        /// Opaque HRP/2 account route. Presence selects the durable Hub outbox;
+        /// no gateway endpoint/token is consulted.
+        let relayAccountID: String?
+        let capability: String?
+        let allowedDecisions: [String]
+        let relayDeviceID: String?
+        let relayDeviceKeyGeneration: UInt32?
+        let operationID: String?
+        let clientMessageID: String?
+
+        init(
+            sessionId: String,
+            requestId: String?,
+            storedSessionId: String?,
+            destructive: Bool,
+            approvalTitle: String?,
+            relayAccountID: String? = nil,
+            capability: String? = nil,
+            allowedDecisions: [String] = [],
+            relayDeviceID: String? = nil,
+            relayDeviceKeyGeneration: UInt32? = nil,
+            operationID: String? = nil,
+            clientMessageID: String? = nil
+        ) {
+            self.sessionId = sessionId
+            self.requestId = requestId
+            self.storedSessionId = storedSessionId
+            self.destructive = destructive
+            self.approvalTitle = approvalTitle
+            self.relayAccountID = relayAccountID
+            self.capability = capability
+            self.allowedDecisions = allowedDecisions
+            self.relayDeviceID = relayDeviceID
+            self.relayDeviceKeyGeneration = relayDeviceKeyGeneration
+            self.operationID = operationID
+            self.clientMessageID = clientMessageID
+        }
     }
 
     /// Decode the approval-action payload from a notification's `userInfo`.
@@ -683,7 +789,18 @@ enum NotificationService {
     nonisolated static func decodeApprovalAction(
         from userInfo: [AnyHashable: Any]
     ) -> ApprovalActionPayload? {
-        guard let block = userInfo["hermes"] as? [AnyHashable: Any] else { return nil }
+        let block: [AnyHashable: Any]
+        if (userInfo["h_v"] as? NSNumber)?.intValue == RelayV2.protocolVersion {
+            guard let verified = verifiedRelayV2Action(from: userInfo) else { return nil }
+            block = verified
+        } else {
+            // An HRP/2 installation must never silently fall back to the legacy
+            // plaintext action dictionary. The Push Gateway is transport-only
+            // in v2 and is not an approval authority.
+            guard DefaultsKeys.legacyDirectActionsAllowed() else { return nil }
+            guard let legacy = userInfo["hermes"] as? [AnyHashable: Any] else { return nil }
+            block = legacy
+        }
         guard
             let sessionId = (block["session_id"] as? String)?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -703,8 +820,72 @@ enum NotificationService {
             // Tolerate both a real JSON bool and a "true"/"1" string, since some
             // APNs JSON paths stringify booleans.
             destructive: boolValue(block["destructive"]),
-            approvalTitle: (title?.isEmpty == false) ? title : nil
+            approvalTitle: (title?.isEmpty == false) ? title : nil,
+            relayAccountID: nonEmpty(block["relay_account_id"] as? String),
+            capability: nonEmpty(block["capability"] as? String),
+            allowedDecisions: (block["allowed_decisions"] as? [String]) ?? [],
+            relayDeviceID: nonEmpty(block["device_id"] as? String),
+            relayDeviceKeyGeneration: (block["device_generation"] as? NSNumber)?.uint32Value,
+            operationID: nonEmpty(block["op_id"] as? String),
+            clientMessageID: nonEmpty(block["client_message_id"] as? String)
         )
+    }
+
+    /// The NSE is not a trust oracle for the main process. Re-open the opaque
+    /// HRN2 descriptor with the preview-only Keychain record and decode the
+    /// action from authenticated plaintext, ignoring the mutable `hermes`
+    /// dictionary copied through notification storage.
+    private nonisolated static func verifiedRelayV2Action(
+        from userInfo: [AnyHashable: Any]
+    ) -> [AnyHashable: Any]? {
+        guard let className = userInfo["class"] as? String,
+              let notificationClass = RelayV2NotificationClass(rawValue: className),
+              notificationClass == .approval,
+              let notificationID = userInfo["nid"] as? String,
+              let enc = userInfo["enc"] as? String,
+              let ct = userInfo["ct"] as? String,
+              let expiry = (userInfo["exp"] as? NSNumber)?.uint64Value,
+              let sound = userInfo["sound"] as? Bool else { return nil }
+        let collapse: String?
+        if userInfo["collapse"] is NSNull || userInfo["collapse"] == nil {
+            collapse = nil
+        } else {
+            guard let value = userInfo["collapse"] as? String else { return nil }
+            collapse = value
+        }
+        guard let descriptor = try? RelayV2NotificationDescriptor(
+            notificationClass: notificationClass,
+            notificationID: notificationID,
+            previewEncapsulatedKey: RelayV2Wire.decodeBase64URL(enc, exactBytes: 32),
+            previewCiphertext: RelayV2Wire.decodeBase64URL(ct, minimumBytes: 16, maximumBytes: 4_096),
+            collapseID: collapse,
+            expiresAtMilliseconds: expiry,
+            sound: sound
+        ), let records = try? RelayV2KeychainStore().loadAllPreviewKeys() else { return nil }
+        let now = UInt64(Date().timeIntervalSince1970 * 1_000)
+        for record in records {
+            for localKey in record.activePrivateKeys(nowMilliseconds: now) {
+              for remoteKey in record.activeAgentAgreementKeys(nowMilliseconds: now) {
+                guard let preview = try? RelayV2Crypto.decryptNotificationPreview(
+                    descriptor: descriptor,
+                    recipientPrivateKey: localKey.privateKey,
+                    senderAgreementPublicKey: remoteKey.publicKey,
+                    nowMilliseconds: now
+                ), preview.category == remoteApprovalCategory,
+                   let action = preview.action,
+                   let data = try? JSONEncoder().encode(action),
+                   var object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    continue
+                }
+                // The Agent authenticates device_id; the phone-local account ID is
+                // derived from the preview key that successfully decrypted it and is
+                // never placed on the wire.
+                object["relay_account_id"] = record.accountID
+                return object
+              }
+            }
+        }
+        return nil
     }
 
     /// Coerce a JSON value (Bool, NSNumber, or "true"/"1" string) to a Bool.

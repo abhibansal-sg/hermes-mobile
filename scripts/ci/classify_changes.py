@@ -11,6 +11,8 @@ Lanes:
 * ``python``      — pytest / ruff / ty / footguns.
 * ``docker_meta`` — Dockerfiles etc.
 * ``frontend``    — TS typecheck matrix + desktop build.
+* ``hrp2``        — Mobile Relay v2 packages, servers, plugin, and evidence.
+* ``ios``         — HermesMobile Xcode project and tests.
 * ``site``        — Docusaurus + generated skill docs.
 * ``scan``        — supply-chain scan (Python files, .pth, setup hooks).
 * ``deps``        — pyproject.toml dependency bounds check.
@@ -23,8 +25,9 @@ Contract — *fail open, never closed*. We may run a lane we didn't need, but
 must never skip one a change could break:
 
 * An empty diff, or any ``.github/`` change, runs everything.
-* ``python`` is a denylist: skipped only when *every* file is provably prose
-  or a frontend-only package; an unrecognized path keeps it on.
+* ``python`` is a denylist: skipped only when *every* file is provably prose,
+  a frontend/iOS-only package, or owned by the independently-required HRP/2
+  lane; an unrecognized path keeps it on.
 * ``skills/`` (incl. ``SKILL.md``) is python-relevant — the skill-doc tests
   read that tree, so a doc-looking edit can still break Python.
 """
@@ -34,12 +37,73 @@ from __future__ import annotations
 import os
 import sys
 
-_FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
+_FRONTEND = (
+    "ui-tui/",
+    "web/",
+    "apps/bootstrap-installer/",
+    "apps/desktop/",
+    "apps/shared/",
+)  # TS typecheck-matrix packages; native apps/ios has a dedicated lane.
+_IOS = ("apps/ios/",)
+_IOS_COMPAT_FIXTURE_FILES = {
+    "tests/fixtures/hrp2/SwiftProducedFixture.swift",
+    "tests/fixtures/hrp2/swift-produced-secure-message.json",
+}
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
-_DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile") # docker setup
+_HRP2_DOCKER_META = (
+    "server/compose.hrp2.yml",
+    "server/compose.hub-only.yml",
+    "server/relay-hub/Dockerfile",
+    "server/relay-hub/.dockerignore",
+    "server/push-gateway/Dockerfile",
+    "server/push-gateway/.dockerignore",
+    "server/push-gateway/compose.example.yml",
+)
+_DOCKER_META = (
+    "docker/",
+    ".hadolint.yaml",
+    ".hadolint.yml",
+    "Dockerfile",
+) + _HRP2_DOCKER_META  # docker setup and deploy manifests
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
-# Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
-_PY_SKIP = ("docs/", "website/") + _FRONTEND
+
+# HRP/2 owns these paths end-to-end in .github/workflows/hrp2-tests.yml. Keeping
+# them out of the general Python shard avoids running the same root/plugin tests
+# twice for a Relay-only PR. Shared root packaging/config files remain Python
+# relevant and are listed separately in _HRP2_SHARED_FILES below.
+_HRP2_OWNED = (
+    "relay/",
+    "server/relay-hub/",
+    "server/push-gateway/",
+    "protocol/hrp2/",
+    "plugins/hermes-mobile/",
+    "tests/plugins/hermes_mobile/",
+    "tests/fixtures/hrp2/",
+)
+_HRP2_OWNED_FILES = {
+    "server/compose.hrp2.yml",
+    "server/compose.hub-only.yml",
+    "tests/e2e/test_hrp2_agent_hub.py",
+    "tests/e2e/test_hrp2_privacy_evidence.py",
+    "tests/test_hrp2_conformance_sources.py",
+    "tests/test_mobile_relay_distribution.py",
+}
+_HRP2_SHARED_FILES = {
+    "MANIFEST.in",
+    "pyproject.toml",
+    "uv.lock",
+    "tools/lazy_deps.py",
+    "hermes_cli/service_manager.py",
+}
+_HRP2_IOS = (
+    "apps/ios/HermesMobile/RelayV2/",
+    "apps/ios/HermesMobileTests/RelayV2Tests.swift",
+    "apps/ios/HermesNotificationService/",
+)
+
+# Prose/frontend/native trees that can't touch Python. skills/ is excluded on
+# purpose. HRP/2-owned paths are handled by their required reusable workflow.
+_PY_SKIP = ("docs/", "website/") + _FRONTEND + _IOS + _HRP2_OWNED
 
 # Supply-chain scan: files that can execute code at install/import time.
 _SCAN_EXTS = (".py", ".pth")
@@ -56,7 +120,13 @@ def _is_docs(p: str) -> bool:
 
 
 def _py_irrelevant(p: str) -> bool:
-    return _is_docs(p) or p in _ROOT_NPM or p.startswith(_PY_SKIP) or p.startswith(_DOCKER_META)
+    return (
+        _is_docs(p)
+        or p in _ROOT_NPM
+        or p in _HRP2_OWNED_FILES
+        or p.startswith(_PY_SKIP)
+        or p.startswith(_DOCKER_META)
+    )
 
 
 def _is_scan(p: str) -> bool:
@@ -67,13 +137,28 @@ def _is_mcp_catalog(p: str) -> bool:
     return p.startswith(_MCP_CATALOG_PATHS) or p in _MCP_CATALOG_FILES
 
 
+def _is_hrp2(p: str) -> bool:
+    return (
+        p.startswith(_HRP2_OWNED)
+        or p in _HRP2_OWNED_FILES
+        or p in _HRP2_SHARED_FILES
+        or p.startswith(_HRP2_IOS)
+    )
+
+
+def _is_ios(p: str) -> bool:
+    return p.startswith(_IOS) or p in _IOS_COMPAT_FIXTURE_FILES
+
+
 def classify(files: list[str]) -> dict[str, bool]:
     """Map changed paths to ``{lane: should_run}``."""
     files = [f.strip() for f in files if f.strip()]
     ret = {
         "python": any(not _py_irrelevant(f) for f in files),
-        "docker_meta":  any(f.startswith(_DOCKER_META) for f in files),
+        "docker_meta": any(f.startswith(_DOCKER_META) for f in files),
         "frontend": any(f.startswith(_FRONTEND) or f in _ROOT_NPM for f in files),
+        "hrp2": any(_is_hrp2(f) for f in files),
+        "ios": any(_is_ios(f) for f in files),
         "site": any(f.startswith(_SITE) for f in files),
         "scan": any(_is_scan(f) for f in files),
         "deps": any(f == "pyproject.toml" for f in files),
@@ -83,6 +168,8 @@ def classify(files: list[str]) -> dict[str, bool]:
         ret["python"] = True
         ret["docker_meta"] = True
         ret["frontend"] = True
+        ret["hrp2"] = True
+        ret["ios"] = True
         ret["site"] = True
         ret["scan"] = True
         ret["deps"] = True
