@@ -33,7 +33,7 @@ struct AgentMessageView: ChatItemContentView {
             ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
                 switch segment {
                 case .prose(let body):
-                    Text(RenderCache.prose(body))
+                    Text(RenderCache.prose(body, linkColor: theme.midground))
                         .font(Self.proseFont)
                         .foregroundStyle(theme.fg)
                         .lineSpacing(Self.proseLineSpacing)
