@@ -104,12 +104,14 @@ struct MessageBubble: View {
     /// and removes the local echo. `nil` hides the action.
     let onDeleteFailedSend: (() -> Void)?
 
-    /// The `tool_call_id` of the todo activity currently mirrored by the Turn
-    /// Dock's task box (Wave 25). When this bubble contains that activity, its
-    /// inline ``TodoCardView`` is suppressed so the same list never renders twice
-    /// (dock + inline). `nil` ⇒ suppress nothing. Folded into `==` so a
-    /// dock-visibility flip re-renders past the `.equatable()` short-circuit.
-    let suppressedTodoToolID: String?
+    /// Whether the Turn Dock is currently showing the task box for this session
+    /// (Wave 25). When true, EVERY inline ``TodoCardView`` in the transcript is
+    /// suppressed — not just the latest — because the dock is the single home for
+    /// the checklist, and the same evolving list is otherwise re-snapshotted inline
+    /// two or three times as the agent updates it (the owner-QA "same list shown
+    /// 2-3x"). `false` ⇒ suppress nothing. Folded into `==` so a dock-visibility
+    /// flip re-renders past the `.equatable()` short-circuit.
+    let suppressTodoCards: Bool
 
     /// Explicit memberwise init so every comparison input can be an immutable
     /// `Sendable` `let` (required for the `nonisolated ==` under Swift 6 strict
@@ -130,7 +132,7 @@ struct MessageBubble: View {
         delivery: QueueStore.SendDelivery = .none,
         onResend: (() -> Void)? = nil,
         onDeleteFailedSend: (() -> Void)? = nil,
-        suppressedTodoToolID: String? = nil
+        suppressTodoCards: Bool = false
     ) {
         self.message = message
         self.onEdit = onEdit
@@ -147,7 +149,7 @@ struct MessageBubble: View {
         self.delivery = delivery
         self.onResend = onResend
         self.onDeleteFailedSend = onDeleteFailedSend
-        self.suppressedTodoToolID = suppressedTodoToolID
+        self.suppressTodoCards = suppressTodoCards
     }
 
     /// Whether this bubble's send is stuck/failed and should show the badge.
@@ -663,14 +665,15 @@ struct MessageBubble: View {
                 )
             }
         case .tools(_, let tools, let collapsed, let turnElapsed):
-            // Wave 25: while the Turn Dock shows the task box for the latest todo
-            // list, drop that todo tool from its cluster so the list never renders
-            // twice (dock + inline). Filtering HERE — the render boundary that
-            // already gates on `!tools.isEmpty` — means a cluster left empty by the
-            // drop cleanly renders nothing (no empty themed box).
-            let visibleTools = suppressedTodoToolID.map { suppressed in
-                tools.filter { !($0.id == suppressed && $0.name == TodoList.toolName) }
-            } ?? tools
+            // Wave 25: while the Turn Dock shows the task box for this session, drop
+            // EVERY todo tool from the cluster — not just the latest — so the one
+            // evolving checklist never renders inline on top of the dock (the
+            // owner-QA "same list shown 2-3x"). Filtering HERE — the render boundary
+            // that already gates on `!tools.isEmpty` — means a cluster left empty by
+            // the drop cleanly renders nothing (no empty themed box).
+            let visibleTools = suppressTodoCards
+                ? tools.filter { $0.name != TodoList.toolName }
+                : tools
             if !visibleTools.isEmpty {
                 ToolClusterView(
                     tools: visibleTools,
@@ -2412,8 +2415,8 @@ extension MessageBubble: Equatable {
             // short-circuit.
             && lhs.delivery == rhs.delivery
             // Wave 25: a dock task-box show/hide flips whether this bubble's
-            // inline todo card is suppressed; it must re-render past A1.
-            && lhs.suppressedTodoToolID == rhs.suppressedTodoToolID
+            // inline todo card(s) are suppressed; it must re-render past A1.
+            && lhs.suppressTodoCards == rhs.suppressTodoCards
     }
 }
 
