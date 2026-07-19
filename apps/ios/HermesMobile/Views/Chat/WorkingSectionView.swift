@@ -18,10 +18,15 @@ import SwiftUI
 //     full tool step list; there is no auto-open churn while the turn works. The
 //     streaming caret in the answer body is the only "working" signal.
 //
-// ADDITIVE: this path fires ONLY for the NEW `.item`-backed parts the relay/mock
-// emits. Legacy `.tools` clusters and lone `.reasoning` runs are NOT
-// working-eligible for a fold (see `WorkingSectionModel.isWorkingEligible`), so
-// the current blob-stream rendering is byte-for-byte unchanged.
+// SINGLE-FOLD CONTRACT (owner QA, 2026-07-19): within ONE agent turn, EVERYTHING
+// before the final answer text — reasoning segments, tool calls (BOTH the new
+// `.item` work items AND the classic `.tools` clusters), and interim narration
+// `.text` segments — folds under ONE working section. The FINAL answer text (the
+// trailing `.text` run after the last work part) renders as the body. This applies
+// to the CLASSIC `ChatMessagePart` path too (old / non-relay sessions), not only
+// the item-layer path — the owner sees old sessions daily and the old anatomy
+// (repeating italic "Thinking ›" rows + boxed tool cards alternating with interim
+// prose) is exactly what this collapses.
 
 // MARK: - Grouping + summary model (pure, deterministically testable)
 
@@ -42,7 +47,7 @@ enum AssistantRenderNode: Identifiable, Equatable {
 /// A single collapsed/sheet step derived from a working run's parts. Pure value
 /// type (Sendable/Equatable) so the humanizer is unit-testable without a View.
 struct WorkingStep: Identifiable, Equatable, Sendable {
-    enum Kind: Equatable, Sendable { case reasoning, tool }
+    enum Kind: Equatable, Sendable { case reasoning, tool, narration }
 
     let id: String
     let kind: Kind
@@ -69,18 +74,20 @@ struct WorkingStep: Identifiable, Equatable, Sendable {
 /// actor hop.
 enum WorkingSectionModel {
 
-    /// Whether a part may belong to a working section: streamed `.reasoning`, or
-    /// an item-backed special render that represents WORK (tool / file change /
-    /// browser / image / error). `.text` / `.usage` / `.warning` break a run, and
-    /// LEGACY `.tools` clusters are deliberately excluded so the old blob-stream
-    /// rendering (`ToolClusterView`) is untouched — the fold is item-model only.
+    /// Whether a part represents WORK — the parts whose LAST occurrence marks the
+    /// fold boundary (everything up to and including it collapses). Streamed
+    /// `.reasoning`, the classic `.tools` cluster, and an item-backed work render
+    /// (tool / file change / browser / image / error) all count. `.text` is NOT
+    /// work — a trailing `.text` run is the final answer body; interim `.text`
+    /// still folds because it sits BEFORE the last work part, not because it is
+    /// eligible itself. `.usage` / `.warning` are footers and never work.
     nonisolated static func isWorkingEligible(_ part: ChatMessagePart) -> Bool {
         switch part {
-        case .reasoning:
+        case .reasoning, .tools:
             return true
         case .item(_, let item):
             return isWorkingItem(item)
-        case .text, .warning, .usage, .tools:
+        case .text, .warning, .usage:
             return false
         }
     }
@@ -97,34 +104,36 @@ enum WorkingSectionModel {
         }
     }
 
-    /// Coalesce the assistant's ordered `parts` into render nodes. A maximal run
-    /// of working-eligible parts folds into ONE `.working` node — but ONLY when it
-    /// carries at least one `.item` (real work). A run of reasoning alone (the
-    /// legacy path, or a pure-thinking turn) decomposes back to individual `.part`
-    /// nodes so `ThinkingView` renders it exactly as today.
+    /// The index of the LAST work part (reasoning / classic tools / item work) in
+    /// the turn — the fold boundary. `nil` when the turn is pure text/usage/warning
+    /// (no work to fold).
+    nonisolated static func lastWorkIndex(in parts: [ChatMessagePart]) -> Int? {
+        parts.lastIndex(where: isWorkingEligible)
+    }
+
+    /// Coalesce the assistant's ordered `parts` into render nodes under the
+    /// SINGLE-FOLD contract: everything up to and including the LAST work part
+    /// folds into ONE `.working` node (reasoning + classic `.tools` + item work +
+    /// any interim narration `.text` caught between them). Everything AFTER the last
+    /// work part — the final answer `.text`, plus `.usage` / `.warning` footers —
+    /// renders as standalone `.part` nodes. A turn with NO work part (pure prose)
+    /// decomposes entirely to `.part` nodes, so a plain answer never grows a fold.
+    ///
+    /// O(n): one `lastIndex` scan + one pass. Streaming stays O(delta)-friendly —
+    /// the fold node's id is pinned to the first part, so its `WorkingSectionView`
+    /// (and its `@State`) keeps identity as later deltas append.
     nonisolated static func renderNodes(from parts: [ChatMessagePart]) -> [AssistantRenderNode] {
-        var nodes: [AssistantRenderNode] = []
-        var run: [ChatMessagePart] = []
-
-        func flush() {
-            guard !run.isEmpty else { return }
-            if run.contains(where: { if case .item = $0 { return true } else { return false } }) {
-                nodes.append(.working(id: run[0].id, parts: run))
-            } else {
-                for part in run { nodes.append(.part(part)) }
-            }
-            run.removeAll(keepingCapacity: true)
+        guard let boundary = lastWorkIndex(in: parts) else {
+            return parts.map(AssistantRenderNode.part)
         }
-
-        for part in parts {
-            if isWorkingEligible(part) {
-                run.append(part)
-            } else {
-                flush()
+        var nodes: [AssistantRenderNode] = []
+        let folded = Array(parts[...boundary])
+        nodes.append(.working(id: folded[0].id, parts: folded))
+        if boundary + 1 < parts.count {
+            for part in parts[(boundary + 1)...] {
                 nodes.append(.part(part))
             }
         }
-        flush()
         return nodes
     }
 
@@ -136,17 +145,83 @@ enum WorkingSectionModel {
         }
     }
 
-    /// Whether any item in the run failed — a failed status OR an `error` item.
-    /// Drives the collapsed section's failure badge so a fold never hides a
-    /// failure (§2).
+    /// Whether any tool in the run failed — a failed status OR an `error` item, in
+    /// EITHER the item-layer parts or the classic `.tools` clusters. Drives the
+    /// collapsed section's failure badge so a fold never hides a failure (§2).
     nonisolated static func runHasFailure(_ parts: [ChatMessagePart]) -> Bool {
-        items(in: parts).contains(where: isFailure)
+        toolUnits(in: parts).contains(where: \.isFailure)
     }
 
     /// A single item is a failure iff its status is `.failed` or its type is
     /// `.error` (a failed tool surfaces as either on the wire).
     nonisolated static func isFailure(_ item: ChatItem) -> Bool {
         item.status == .failed || item.type == .error
+    }
+
+    // MARK: - Unified tool units (item-layer + classic `.tools`)
+
+    /// A single tool-ish work unit flattened from either an item-layer work `.item`
+    /// or one activity of a classic `.tools` cluster, so the live current-tool line
+    /// and the failure badge treat both paths identically.
+    struct WorkUnit: Equatable, Sendable {
+        let summary: String
+        let status: ChatItemStatus
+        let isFailure: Bool
+    }
+
+    /// Flatten a run's tool work (NOT reasoning, NOT narration) into ordered units,
+    /// spanning both the item-layer and the classic `.tools` clusters.
+    nonisolated static func toolUnits(in parts: [ChatMessagePart]) -> [WorkUnit] {
+        var out: [WorkUnit] = []
+        for part in parts {
+            switch part {
+            case .item(_, let item) where isWorkingItem(item):
+                out.append(WorkUnit(
+                    summary: stepSummary(for: item),
+                    status: item.status,
+                    isFailure: isFailure(item)
+                ))
+            case .tools(_, let tools, _, _):
+                for tool in tools {
+                    out.append(WorkUnit(
+                        summary: legacyToolSummary(tool),
+                        status: legacyStatus(tool.state),
+                        isFailure: tool.state == .failed
+                    ))
+                }
+            default:
+                continue
+            }
+        }
+        return out
+    }
+
+    /// The current (most recent) tool unit shown while the turn is live: the last
+    /// still-in-progress unit, else simply the last unit. `nil` when the run has no
+    /// tool work at all (a pure-reasoning fold).
+    nonisolated static func currentWork(in parts: [ChatMessagePart]) -> WorkUnit? {
+        let units = toolUnits(in: parts)
+        return units.last(where: { $0.status == .inProgress }) ?? units.last
+    }
+
+    /// Map a classic `ToolActivity.State` onto the item-layer status vocabulary so
+    /// the live status glyph is shared across both paths.
+    nonisolated static func legacyStatus(_ state: ToolActivity.State) -> ChatItemStatus {
+        switch state {
+        case .running: return .inProgress
+        case .done: return .completed
+        case .failed: return .failed
+        }
+    }
+
+    /// Humanized one-liner for a classic `.tools` activity — prefers the tool's own
+    /// derived `resultSummary`, else humanizes its name against its args preview.
+    nonisolated static func legacyToolSummary(_ tool: ToolActivity) -> String {
+        if let s = tool.resultSummary?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+            return shortTarget(s)
+        }
+        let target = tool.argsSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+        return humanize(name: tool.name, target: target.isEmpty ? nil : target)
     }
 
     /// The tool `body.duration_s` for an item, if present.
@@ -162,8 +237,20 @@ enum WorkingSectionModel {
         settled: TimeInterval?
     ) -> TimeInterval? {
         if let settled, settled > 0 { return settled }
-        let summed = items(in: parts).reduce(into: 0.0) { acc, item in
+        var summed = items(in: parts).reduce(into: 0.0) { acc, item in
             if let d = duration(of: item), d > 0 { acc += d }
+        }
+        // Classic `.tools` clusters carry their own per-activity `durationMs`.
+        for part in parts {
+            if case .tools(_, let tools, _, let turnElapsed) = part {
+                if let turnElapsed, turnElapsed > 0 {
+                    summed += turnElapsed
+                } else {
+                    for tool in tools where (tool.durationMs ?? 0) > 0 {
+                        summed += (tool.durationMs ?? 0) / 1000
+                    }
+                }
+            }
         }
         return summed > 0 ? summed : nil
     }
@@ -252,7 +339,6 @@ enum WorkingSectionModel {
         if let s = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
             return shortTarget(s)
         }
-        let name = item.toolName.lowercased()
         let target = primaryTarget(of: item)
 
         func verb(_ v: String, _ fallback: String) -> String {
@@ -268,30 +354,43 @@ enum WorkingSectionModel {
         default: break
         }
 
-        if name.contains("read") || name.contains("cat") || name.contains("open") || name.contains("view") {
+        return humanize(name: item.toolName, target: target)
+    }
+
+    /// Verb-from-name humanizer shared by the item-layer (`stepSummary`) and the
+    /// classic-tool (`legacyToolSummary`) paths, so both derive the same natural
+    /// language. `name` is passed in its ORIGINAL case (the pretty-name fallback
+    /// preserves it); keyword matching lowercases internally.
+    nonisolated static func humanize(name: String, target: String?) -> String {
+        let lower = name.lowercased()
+        func verb(_ v: String, _ fallback: String) -> String {
+            if let target { return "\(v) \(shortTarget(target))" }
+            return fallback
+        }
+        if lower.contains("read") || lower.contains("cat") || lower.contains("open") || lower.contains("view") {
             return verb("Read", "Read a file")
         }
-        if name.contains("grep") || name.contains("search") || name.contains("find")
-            || name.contains("ripgrep") || name == "rg" {
+        if lower.contains("grep") || lower.contains("search") || lower.contains("find")
+            || lower.contains("ripgrep") || lower == "rg" {
             if let target { return "Grepped for \(shortTarget(target))" }
             return "Searched the codebase"
         }
-        if name.contains("write") || name.contains("create") {
+        if lower.contains("write") || lower.contains("create") {
             return verb("Wrote", "Wrote a file")
         }
-        if name.contains("edit") || name.contains("patch") || name.contains("apply")
-            || name.contains("replace") || name.contains("update") {
+        if lower.contains("edit") || lower.contains("patch") || lower.contains("apply")
+            || lower.contains("replace") || lower.contains("update") {
             return verb("Edited", "Edited a file")
         }
-        if name.contains("list") || name == "ls" {
+        if lower.contains("list") || lower == "ls" {
             return verb("Listed", "Listed files")
         }
-        if name.contains("run") || name.contains("bash") || name.contains("shell")
-            || name.contains("exec") || name.contains("command") || name.contains("terminal") {
+        if lower.contains("run") || lower.contains("bash") || lower.contains("shell")
+            || lower.contains("exec") || lower.contains("command") || lower.contains("terminal") {
             if let target { return "Ran \(shortTarget(target))" }
             return "Ran a command"
         }
-        let pretty = prettifyToolName(item.toolName)
+        let pretty = prettifyToolName(name)
         if let target { return "\(pretty) \(shortTarget(target))" }
         return pretty
     }
@@ -324,9 +423,13 @@ enum WorkingSectionModel {
         shortTarget(firstLine, limit: 60)
     }
 
-    /// Build the ordered step list for a working run: one step per non-empty
-    /// reasoning part (thought-bubble glyph, first line as summary, full text in
-    /// the sheet) and one step per work item (humanized summary + code cards).
+    /// Build the ordered step list for a working run under the single-fold
+    /// contract: one step per non-empty reasoning part (thought-bubble glyph, first
+    /// line as summary, full text in the sheet), one step per work item OR classic
+    /// `.tools` activity (humanized summary + code cards), and one step per interim
+    /// narration `.text` segment (text glyph, first line as summary, full text in
+    /// the sheet). The FINAL answer `.text` never reaches here — it lives in the
+    /// tail nodes that `renderNodes` keeps outside the fold.
     nonisolated static func steps(from parts: [ChatMessagePart]) -> [WorkingStep] {
         var out: [WorkingStep] = []
         for part in parts {
@@ -334,10 +437,7 @@ enum WorkingSectionModel {
             case .reasoning(let id, let text):
                 let cleaned = ThinkingDisplay.cleanedText(text)
                 guard !cleaned.isEmpty else { continue }
-                let firstLine = cleaned
-                    .split(whereSeparator: \.isNewline)
-                    .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
-                    .map(String.init) ?? cleaned
+                let firstLine = firstNonEmptyLine(cleaned)
                 out.append(WorkingStep(
                     id: id,
                     kind: .reasoning,
@@ -365,11 +465,52 @@ enum WorkingSectionModel {
                     output: output,
                     isFailure: isFailure(item)
                 ))
+            case .tools(_, let tools, _, _):
+                for tool in tools {
+                    let summary = legacyToolSummary(tool)
+                    out.append(WorkingStep(
+                        id: tool.id,
+                        kind: .tool,
+                        glyph: tool.state == .failed ? "exclamationmark.triangle" : "terminal",
+                        summary: summary,
+                        title: summary,
+                        body: nil,
+                        command: tool.argsSummary.isEmpty ? nil : tool.argsSummary,
+                        commandLanguage: nil,
+                        output: tool.resultPreview.isEmpty ? nil : tool.resultPreview,
+                        isFailure: tool.state == .failed
+                    ))
+                }
+            case .text(let id, let text):
+                // Interim narration — a `.text` part caught before the last work
+                // part. (The final answer `.text` is in the tail, never here.)
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                let firstLine = firstNonEmptyLine(trimmed)
+                out.append(WorkingStep(
+                    id: id,
+                    kind: .narration,
+                    glyph: "text.alignleft",
+                    summary: shortTarget(firstLine),
+                    title: reasoningTitle(firstLine),
+                    body: trimmed,
+                    command: nil,
+                    commandLanguage: nil,
+                    output: nil,
+                    isFailure: false
+                ))
             default:
                 continue
             }
         }
         return out
+    }
+
+    /// The first non-blank line of a block, used for a step's one-line summary.
+    nonisolated static func firstNonEmptyLine(_ text: String) -> String {
+        text.split(whereSeparator: \.isNewline)
+            .first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty })
+            .map(String.init) ?? text
     }
 }
 
@@ -401,15 +542,19 @@ struct WorkingSectionView: View {
     /// The step the sheet should scroll to on open.
     @State private var focusedStepID: String?
 
-    private var items: [ChatItem] { WorkingSectionModel.items(in: parts) }
+    private var toolUnits: [WorkingSectionModel.WorkUnit] { WorkingSectionModel.toolUnits(in: parts) }
     private var hasFailure: Bool { WorkingSectionModel.runHasFailure(parts) }
     private var durationSeconds: TimeInterval? {
         WorkingSectionModel.runDurationSeconds(parts, settled: settledDuration)
     }
     private var steps: [WorkingStep] { WorkingSectionModel.steps(from: parts) }
     /// While live, reasoning already streams inline (via `ThinkingView`), so the
-    /// expandable list shows only the tool steps to avoid duplicating thoughts.
-    private var toolSteps: [WorkingStep] { steps.filter { $0.kind == .tool } }
+    /// expandable list shows only the non-reasoning steps (tool calls + interim
+    /// narration) to avoid duplicating thoughts.
+    private var nonReasoningSteps: [WorkingStep] { steps.filter { $0.kind != .reasoning } }
+    /// The live current-tool line only belongs when the run actually has tool work;
+    /// a pure-reasoning live fold streams its thoughts inline and needs no line.
+    private var showsCurrentToolLine: Bool { !toolUnits.isEmpty || reasoningRuns.isEmpty }
 
     /// Reasoning runs with renderable (non-empty, cleaned) text, so an empty
     /// reasoning placeholder never mounts an empty `ThinkingView`.
@@ -538,33 +683,35 @@ struct WorkingSectionView: View {
             )
         }
 
-        Button {
-            toggle()
-        } label: {
-            currentToolLine
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(currentToolAccessibilityLabel)
-        .accessibilityValue(isExpanded ? "expanded" : "collapsed")
-        .accessibilityHint("Double-tap to \(isExpanded ? "collapse" : "expand") the full tool timeline")
-        .accessibilityAddTraits(.isButton)
-        .accessibilityIdentifier("workingSectionCurrentTool")
+        if showsCurrentToolLine {
+            Button {
+                toggle()
+            } label: {
+                currentToolLine
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(currentToolAccessibilityLabel)
+            .accessibilityValue(isExpanded ? "expanded" : "collapsed")
+            .accessibilityHint("Double-tap to \(isExpanded ? "collapse" : "expand") the full tool timeline")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityIdentifier("workingSectionCurrentTool")
 
-        if isExpanded {
-            // Reasoning is already visible above while live, so the expanded body
-            // reveals only the tool step list.
-            stepList(toolSteps)
-                .transition(.opacity.combined(with: .move(edge: .top)))
+            if isExpanded {
+                // Reasoning is already visible above while live, so the expanded
+                // body reveals only the tool + interim-narration step list.
+                stepList(nonReasoningSteps)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
     }
 
     /// Chrome-less current-tool line (natural language, no monospace tool name).
     private var currentToolLine: some View {
         HStack(spacing: 8) {
-            if let item = WorkingSectionModel.currentWorkingItem(in: parts) {
-                statusIcon(for: item.status)
+            if let unit = WorkingSectionModel.currentWork(in: parts) {
+                statusIcon(for: unit.status)
                     .frame(width: 16, height: 16)
-                Text(WorkingSectionModel.stepSummary(for: item))
+                Text(unit.summary)
                     .font(.callout)
                     .foregroundStyle(theme.mutedFg)
                     .lineLimit(1)
@@ -587,10 +734,10 @@ struct WorkingSectionView: View {
     }
 
     private var currentToolAccessibilityLabel: String {
-        guard let item = WorkingSectionModel.currentWorkingItem(in: parts) else {
+        guard let unit = WorkingSectionModel.currentWork(in: parts) else {
             return "Working"
         }
-        let base = "Current step: \(WorkingSectionModel.stepSummary(for: item))"
+        let base = "Current step: \(unit.summary)"
         return hasFailure ? "\(base), contains a failed step" : base
     }
 
