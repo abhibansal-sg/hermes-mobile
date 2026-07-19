@@ -158,7 +158,7 @@ final class AttachmentStore {
     /// Server-side cap mirrored from the gateway upload/attach bridge (25 MB).
     /// Enforced client-side so an oversized pick fails fast with a clear message
     /// instead of a round-trip that ends in a 413.
-    static let maxFileAttachmentBytes = 25 * 1024 * 1024
+    nonisolated static let maxFileAttachmentBytes = 25 * 1024 * 1024
 
     /// Human-readable form of ``maxFileAttachmentBytes`` (e.g. "25 MB") for
     /// oversize error messages. Shared by the pre-read size guard (ComposerView)
