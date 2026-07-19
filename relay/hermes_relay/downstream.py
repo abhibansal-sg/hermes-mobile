@@ -561,7 +561,8 @@ class DownstreamServer:
 
         # -- drive (become owner) --------------------------------------------
         if method == UpstreamMethod.SUBMIT:
-            text = p["text"]
+            # The iOS app sends "prompt"; the protocol doc says "text". Accept both.
+            text = p.get("prompt") or p.get("text") or ""
             sid = p.get("session_id")
             cmid = p.get("client_message_id")
             # Idempotent re-drive: a prior submit with this client_message_id
