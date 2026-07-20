@@ -560,7 +560,16 @@ class DownstreamServer:
             # sync would permanently gag that session's completion/error pushes.
             if method == UpstreamMethod.OPEN:
                 conn.set_foreground(sid)
-            return {"session_id": sid, "messages": await self._gateway.rest_history(sid)}
+            messages = await self._gateway.rest_history(sid)
+            if method == UpstreamMethod.HISTORY:
+                # The phone may bound the read with ``limit`` (its history RPC
+                # sends it); the gateway REST path takes no limit, so honor it
+                # here, keeping the MOST RECENT messages (the store-read returns
+                # oldest-first). A missing/invalid limit returns the full list.
+                limit = p.get("limit")
+                if isinstance(limit, int) and limit >= 0:
+                    messages = messages[-limit:] if limit else []
+            return {"session_id": sid, "messages": messages}
 
         # -- drive (become owner) --------------------------------------------
         if method == UpstreamMethod.SUBMIT:
