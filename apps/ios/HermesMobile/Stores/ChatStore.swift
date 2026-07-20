@@ -1516,6 +1516,18 @@ final class ChatStore {
         expireTurnScopedPrompts(includeSecure: false)
     }
 
+    /// R16 (Live Activity lifecycle): invoked by
+    /// `RelaySessionCoordinator.resetItemStoreForSessionSwitch` when the
+    /// projected session is about to change. If a relay turn was being
+    /// mirrored for the OUTGOING session, its Live Activity no longer
+    /// reflects what the user is looking at — end it as a DISCARD (not a
+    /// completion: the turn did not finish, the queue must not drain).
+    /// No-op when nothing was live. Idempotent.
+    func endRelayTurnForSessionSwitch() {
+        guard isStreaming else { return }
+        onTurnDiscarded?()
+    }
+
     /// One ownership decision for live approval/clarify/complete events. APNs is
     /// authoritative after a successful registration for this exact pairing;
     /// otherwise the correlated local request is the explicit fallback.
@@ -4432,6 +4444,15 @@ final class ChatStore {
     /// untouched — the cold-open/force-close paint stays the initial truth
     /// (B15). A relay `userMessage` item ADOPTS the matching optimistic echo in
     /// place (sticky, by `client_message_id` then text) — one bubble, no dupe.
+    /// R16: detect a relay turn that ended in FAILURE — an `item.completed`
+    /// whose `type == .error` and `status == .failed`. Used by
+    /// ``applyRelayItems(_:)`` to route the Live Activity end seam to
+    /// `onTurnDiscarded` (no queue drain) instead of `onTurnComplete`, matching
+    /// the direct path's `handleGatewayError`. Pure + testable.
+    nonisolated static func hasRelayErrorTerminal(_ items: [ChatItem]) -> Bool {
+        items.contains { $0.type == .error && $0.status == .failed }
+    }
+
     func applyRelayItems(_ items: [ChatItem]) {
         var rebuilt: [ChatMessage] = []
         var segmentParts: [ChatMessagePart] = []
@@ -4533,6 +4554,27 @@ final class ChatStore {
         } else if isStreaming {
             turnStartedAt = nil
             activeToolName = nil
+            // R16 (Live Activity lifecycle): the relay projection SETTLED —
+            // every assistant segment finalized — so this is the turn-end
+            // edge on the relay wire. The direct path ends the Live Activity
+            // from `handleMessageComplete`/`handleGatewayError`, but the
+            // relay path (`RelaySessionCoordinator.ingest` → here) NEVER
+            // routes through them, so without this firing the activity's
+            // `startedAt` drove the lock-screen timer ENDLESSLY (the owner's
+            // "timer runs forever on the lock screen" complaint). Match the
+            // direct path: an error terminal (item type `.error`,
+            // status `.failed`) is a DISCARD — the queue must NOT auto-drain
+            // into a session that just errored (parity with
+            // `handleGatewayError`); any other settle is a COMPLETION.
+            // Idempotent: `LiveActivityManager.end()` and the queue drain are
+            // both no-ops when no turn is live, and the `.turnCompleted` frame
+            // arriving next re-settles an already-settled projection (this
+            // branch is gated on `isStreaming`, so it fires exactly once).
+            if Self.hasRelayErrorTerminal(items) {
+                onTurnDiscarded?()
+            } else {
+                onTurnComplete?()
+            }
         }
         setStreaming(nowStreaming, reason: "relayProjection")
     }
