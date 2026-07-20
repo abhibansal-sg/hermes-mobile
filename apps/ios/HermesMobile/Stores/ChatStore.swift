@@ -211,9 +211,12 @@ final class ChatStore {
     // MARK: - Turn dock accessors (Wave 25)
 
     /// The latest todo list for the active session, or `nil` — the single
-    /// evolving checklist the Turn Dock's task box mirrors. Scans the visible
-    /// transcript (`messages`, already scoped to the active session) in reverse
-    /// for the most recent `todo` tool activity that yields a parseable list.
+    /// evolving checklist the Turn Dock's task box mirrors. On the DIRECT
+    /// (gateway) path, scans the visible transcript (`messages`, already scoped
+    /// to the active session) in reverse for the most recent `todo` tool
+    /// activity that yields a parseable list. On the RELAY path (N4/A5), the
+    /// relay's ONE living `.taskList` item bridges into the SAME accessor via
+    /// ``syncRelayTaskList(from:)`` so the dock renders identically either way.
     /// `nil` when the session has no todo activity yet, or the newest one carries
     /// no list (e.g. a mid-run write before its first result).
     ///
@@ -234,13 +237,52 @@ final class ChatStore {
     /// (see ``latestTodoList``).
     var latestTodoToolID: String? { latestTodo?.id }
 
+    /// The relay-path mirror of the dock's todo list (N4/A5): the latest
+    /// `.taskList` item ingested from the relay item store, or `nil` when the
+    /// relay path has produced no task list (or has dropped it via a snapshot
+    /// that omits it). Held APART from the legacy `messages` scan so the two
+    /// paths never corrupt each other; the app is on EXACTLY ONE path at a time,
+    /// so when the relay mirror is populated it is authoritative for the dock
+    /// (the relay's `taskList` item IS the gateway's `todo` tool reframed for the
+    /// relay protocol — same list, same lifecycle, same data — RELAY-PHONE-
+    /// PROTOCOL §2 "taskList semantics"). The convergence wave will eventually
+    /// retire the legacy scan; until then this mirror is a no-op in production
+    /// (the relay item store is not yet wired to a live transport).
+    private var relayLatestTaskList: (id: String, list: TodoList)?
+
+    /// Re-derive the relay-path task-list mirror from the current relay item
+    /// store (N4/A5). Call after each frame batch (or `snapshot`) is folded into
+    /// the `RelayItemStore` so the dock mirror matches the store's authoritative
+    /// state — including CLEARING the mirror when no `.taskList` item remains
+    /// (a snapshot that drops the list, or a session switch to one with no todo
+    /// activity). Idempotent: re-running on an unchanged store is a no-op.
+    ///
+    /// Most-recent `.taskList` item wins; the relay drives ONE living list per
+    /// session on a stable `<sid>:tasks` id, and the store's `items` are already
+    /// in render order (ord ascending, ties by arrival), so a reverse scan
+    /// returns the live one. Items whose body yields no parseable list are
+    /// skipped (mirrors the legacy scan's skip-empty semantics — keeps the prior
+    /// list rather than blanking the dock on a mid-stream delta).
+    func syncRelayTaskList(from store: RelayItemStore) {
+        for item in store.items.reversed() where item.type == .taskList {
+            if let list = item.taskListBody {
+                relayLatestTaskList = (item.itemID, list)
+            }
+            return
+        }
+        relayLatestTaskList = nil
+    }
+
     /// Shared scan behind both dock accessors: the newest todo activity that
-    /// yields a parseable list, with its identity. Reverse order so the list the
-    /// agent is actively updating wins. The parse mirrors
+    /// yields a parseable list, with its identity. Prefers the relay mirror when
+    /// populated (relay path is authoritative when active); otherwise falls back
+    /// to the DIRECT (gateway) path's legacy scan of `messages`. Reverse order so
+    /// the list the agent is actively updating wins. The parse mirrors
     /// `ToolClusterView.toolCard` exactly — structured `tool.todos` first, then
     /// the `resultPreview` JSON fallback — so the dock and the (suppressed)
     /// inline card would derive the identical list.
     private var latestTodo: (id: String, list: TodoList)? {
+        if let relay = relayLatestTaskList { return relay }
         for message in messages.reversed() {
             for tool in message.tools.reversed() where tool.name == TodoList.toolName {
                 if let list = tool.todos.flatMap({ TodoList(todosArray: $0) })

@@ -17,6 +17,7 @@ enum ChatItemType: String, Sendable, Equatable, CaseIterable, Codable {
     case agentMessage   // message.delta/complete — markdown text, streams
     case reasoning      // reasoning.delta/available — collapsible "thinking"
     case toolCall       // GENERIC: ANY tool.start/complete keyed by `name`
+    case taskList       // the `todo` tool — ONE living checklist on a stable id
     case fileChange     // tool.complete.inline_diff present — diff render
     case image          // image_generate / attachment / md image — inline image
     case browser        // browser_* name family — screenshot/snapshot render
@@ -24,7 +25,10 @@ enum ChatItemType: String, Sendable, Equatable, CaseIterable, Codable {
     case usage          // message.complete.usage — turn footer
 
     /// Decode a wire `type`, mapping anything unrecognized to the generic tool
-    /// card (§2 forward-compat rule).
+    /// card (§2 forward-compat rule). `.taskList` is the ONE tool the relay
+    /// does NOT collapse into `.toolCall` (§2 taskList semantics) — it has a
+    /// dedicated render + drives the Turn Dock's task box via the ChatStore
+    /// latest-todo accessor (N4/A5).
     init(wire: String) {
         self = ChatItemType(rawValue: wire) ?? .toolCall
     }
@@ -159,6 +163,19 @@ extension ChatItem {
         (body["usage"] ?? body).decoded(as: UsageStats.self)
     }
 
+    /// The parsed task list for a `.taskList` item (RELAY-PHONE-PROTOCOL §2 —
+    /// the relay-side `todo` tool, ONE living checklist per session driven
+    /// through the normal item lifecycle on a stable `<sid>:tasks` id). Body
+    /// shape: `{ tasks:[{id,text,status}], counts, all_complete }`. Returns
+    /// `nil` for any non-`.taskList` item or a body that yields no parseable
+    /// list (empty / malformed) — so callers fall through to the prior list
+    /// instead of clobbering the dock with nothing, mirroring the legacy
+    /// `latestTodo` scan's skip-empty semantics.
+    var taskListBody: TodoList? {
+        guard type == .taskList, let tasks = body["tasks"]?.arrayValue else { return nil }
+        return TodoList(todosArray: tasks)
+    }
+
     var isTerminal: Bool { status == .completed || status == .failed }
 }
 
@@ -170,8 +187,8 @@ extension ChatItem {
     /// KNOWN text-shaped kinds reuse the EXISTING legacy renderers so nothing
     /// about today's rendering changes: `agentMessage → .text`,
     /// `reasoning → .reasoning`, `usage → .usage`. The NEW special-render kinds
-    /// (`toolCall`/`fileChange`/`image`/`browser`/`error`) route through the
-    /// new item-backed `.item` case, which the render lane draws.
+    /// (`toolCall`/`taskList`/`fileChange`/`image`/`browser`/`error`) route
+    /// through the new item-backed `.item` case, which the render lane draws.
     ///
     /// `userMessage` returns `nil`: it is the right-aligned user bubble (a
     /// separate `ChatMessage`, role `.user`), not an assistant-turn part.
@@ -186,7 +203,7 @@ extension ChatItem {
         case .usage:
             guard let stats = usageStats else { return .item(id: itemID, item: self) }
             return .usage(id: itemID, stats: stats)
-        case .toolCall, .fileChange, .image, .browser, .error:
+        case .toolCall, .taskList, .fileChange, .image, .browser, .error:
             return .item(id: itemID, item: self)
         }
     }
