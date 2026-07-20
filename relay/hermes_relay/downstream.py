@@ -66,6 +66,9 @@ class DownstreamConfig:
     ring_total_bytes: Optional[int] = None
     ack_interval_hint_s: float = 5.0
     max_message_bytes: int = 8 * 1024 * 1024
+    # HTTP health/status path served on the SAME phone-facing port (a plain GET,
+    # not a WS upgrade). ``None`` disables the surface entirely.
+    health_path: Optional[str] = "/healthz"
 
 
 def build_ring(cfg: DownstreamConfig) -> Any:
@@ -284,11 +287,63 @@ class DownstreamServer:
             self._cfg.host,
             self._cfg.port,
             max_size=self._cfg.max_message_bytes,
+            process_request=self._process_request,
         )
         try:
             await self._stop.wait()
         finally:
             await self.close()
+
+    def _process_request(self, connection: Any, request: Any) -> Any:
+        """Serve a plain-HTTP health/status probe on the phone-facing port.
+
+        websockets calls this before the WS handshake for every inbound request.
+        A GET to the configured ``health_path`` is answered with a JSON status
+        body (HTTP 200) and never upgraded; anything else returns ``None`` so the
+        normal WS handshake proceeds. Kept defensive: a probe must never take down
+        the accept loop, so any failure falls through to the WS path.
+        """
+        health = self._cfg.health_path
+        if not health:
+            return None
+        try:
+            from http import HTTPStatus
+
+            raw_path = getattr(request, "path", "") or ""
+            path = raw_path.split("?", 1)[0]
+            if path != health:
+                return None
+            body = json.dumps(self.status(), ensure_ascii=False) + "\n"
+            return connection.respond(HTTPStatus.OK, body)
+        except Exception:  # pragma: no cover - a broken probe must not stall serve
+            _log.debug("health probe failed", exc_info=True)
+            return None
+
+    def status(self) -> dict[str, Any]:
+        """A JSON-serialisable snapshot of the phone-facing server's live state."""
+        conns = [
+            {
+                "conn_id": c.conn_id,
+                "head_seq": c.head_seq,
+                "acked_through": c.acked_through,
+                "foreground": sorted(c.foreground_sessions),
+                "seen_sessions": len(c.seen_sids),
+            }
+            for c in list(self._conns.values())
+        ]
+        owned = getattr(self._gateway, "owned_sessions", None)
+        try:
+            owned_list = sorted(owned) if owned else []
+        except TypeError:  # a non-iterable stand-in (e.g. a bare mock) — skip
+            owned_list = []
+        return {
+            "listen": f"{self._cfg.host}:{self._cfg.port}",
+            "connections": len(conns),
+            "phones": conns,
+            "owned_sessions": owned_list,
+            "ring_ready": self._ring is not None,
+            "serving": self._server is not None,
+        }
 
     def register(self, ws: Any) -> PhoneConnection:
         """Register a new phone socket, returning its :class:`PhoneConnection`."""
@@ -449,10 +504,22 @@ class DownstreamServer:
             text = p["text"]
             sid = p.get("session_id")
             if sid:
-                # Send into an existing (idle/foreign) session: resume to own it
-                # first if we do not already, then drive the turn (§5).
+                # Drive an existing (idle / foreign / terminal) session. Resuming
+                # REACTIVATES it, and the stock gateway may hand back a DISTINCT
+                # live session id (echoing the requested id as ``resumed``). The
+                # turn MUST be submitted to THAT live id, not the origin id — the
+                # R0/E2E finding: prompt.submit to the origin id targets a dormant
+                # session and the turn silently never runs. So take the live id
+                # the resume returns and drive it (§5).
                 if not self._gateway.owns(sid):
-                    await self._gateway.session_resume(sid)
+                    resumed = await self._gateway.session_resume(sid)
+                    if isinstance(resumed, dict):
+                        sid = resumed.get("session_id") or sid
+                else:
+                    # Already owned: a prior resume may have remapped the origin
+                    # id to a live id — resolve so a repeat submit to the origin
+                    # id still drives the live turn.
+                    sid = self._gateway.live_id_for(sid)
                 await self._gateway.prompt_submit(sid, text)
             else:
                 # Brand-new chat: create + own, then drive (§5).
@@ -466,10 +533,14 @@ class DownstreamServer:
             return {"session_id": sid}
 
         if method == UpstreamMethod.RESUME:
-            sid = p["session_id"]
-            result = await self._gateway.session_resume(sid)
-            conn.set_foreground(sid)  # resuming brings it on screen (§6)
-            return {"session_id": sid, "result": result}
+            origin = p["session_id"]
+            result = await self._gateway.session_resume(origin)
+            # Surface the LIVE id (same reactivation semantics as SUBMIT): the
+            # gateway may assign a distinct live id, and the phone must drive/
+            # foreground THAT id, not the origin.
+            live = (result.get("session_id") if isinstance(result, dict) else None) or origin
+            conn.set_foreground(live)  # resuming brings it on screen (§6)
+            return {"session_id": live, "origin": origin, "result": result}
 
         # -- interactive gates + stop (pass-through) -------------------------
         if method == UpstreamMethod.APPROVE:

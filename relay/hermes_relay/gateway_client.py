@@ -132,6 +132,12 @@ class GatewayClient:
         # reconnect and observed by the Notifier for owned-session pushes.
         self._owned: set[str] = set()
 
+        # Origin/requested id -> live id learned at resume time. A stock gateway
+        # may hand a resumed session a DISTINCT live id (echoing the requested id
+        # back as ``resumed``); a submit MUST target the live id, so we remember
+        # the mapping and resolve it in :meth:`live_id_for` (R0/E2E finding).
+        self._live_by_origin: dict[str, str] = {}
+
         # Live token (re-minted on each connect via token_provider, if given).
         self._token: str = config.token
 
@@ -375,10 +381,13 @@ class GatewayClient:
         result = await self._call_result("session.resume", params, timeout=self._cfg.rpc_timeout_s)
         self._owned.add(session_id)
         # If the gateway hands back a distinct live id, own it too so events on
-        # that id are recognised as ours.
+        # that id are recognised as ours, and remember origin->live so a submit
+        # to EITHER id drives the live turn (see :meth:`live_id_for`).
         live = result.get("session_id")
         if live:
             self._owned.add(live)
+            self._live_by_origin[session_id] = live
+            self._live_by_origin[live] = live
         return result
 
     async def rest_history(self, session_id: str) -> list[dict[str, Any]]:
@@ -455,6 +464,16 @@ class GatewayClient:
     def owns(self, session_id: str) -> bool:
         """True iff the relay owns (submitted/resumed-to-drive) this session."""
         return session_id in self._owned
+
+    def live_id_for(self, session_id: str) -> str:
+        """Resolve a requested/origin id to the live id a prior resume assigned.
+
+        Returns ``session_id`` unchanged when no remap is known (the common case
+        where the gateway resumes a session in place). When the gateway assigned
+        a distinct live id at resume time, this lets a repeat submit addressed to
+        the ORIGIN id still target the live turn instead of the dormant origin.
+        """
+        return self._live_by_origin.get(session_id, session_id)
 
     @property
     def owned_sessions(self) -> frozenset[str]:

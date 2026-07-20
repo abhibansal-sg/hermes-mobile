@@ -271,6 +271,36 @@ async def test_create_resume_submit_take_ownership_open_does_not():
     await client.close()
 
 
+async def test_resume_remaps_origin_to_distinct_live_id():
+    """When the gateway assigns a resumed session a DISTINCT live id, the client
+    owns BOTH ids and ``live_id_for`` resolves the origin (and the live id) to the
+    live id — so a submit addressed to either drives the live turn (R0/E2E)."""
+    def remap_responder(frame):
+        method = frame["method"]
+        params = frame.get("params") or {}
+        if method == "session.resume":
+            # Origin "tgsess001" reactivates as a NEW live id "livesess99".
+            result = {"session_id": "livesess99", "resumed": params.get("session_id"),
+                      "message_count": 5}
+        else:
+            result = {"ok": True}
+        return {"jsonrpc": "2.0", "id": frame["id"], "result": result}
+
+    client, _ = make_client(responder=remap_responder)
+    await client.connect()
+
+    result = await client.session_resume("tgsess001")
+    assert result["session_id"] == "livesess99"
+    # both the origin and the live id are owned (events on either are ours)...
+    assert client.owns("tgsess001") and client.owns("livesess99")
+    # ...and BOTH resolve forward to the live id.
+    assert client.live_id_for("tgsess001") == "livesess99"
+    assert client.live_id_for("livesess99") == "livesess99"
+    # an unknown id resolves to itself (no remap known).
+    assert client.live_id_for("neverseen") == "neverseen"
+    await client.close()
+
+
 # ---------------------------------------------------------------------------
 # reconnect + re-resume of owned sessions
 # ---------------------------------------------------------------------------
