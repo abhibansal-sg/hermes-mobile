@@ -253,7 +253,15 @@ final class RelaySessionCoordinator {
     /// `RelayError` only if the optional `open` RPC fails; the socket itself opens
     /// eagerly (the ratified contract has no `ready` handshake — §1).
     func start(url: URL, token: String? = nil, sessionID: String? = nil) async throws {
-        await stop()
+        // QA-1 B1: a `start()` is a (re)dial, NOT a teardown — preserve any
+        // session ops queued on ``waitUntilOpen`` across the pre-connect cleanup
+        // so they DRAIN (resolve `true`) the moment this socket opens, instead
+        // of being failed (`false`) by the cleanup and silently abandoned. The
+        // prior `stop()` here resolved every queued waiter `false`, so a resume /
+        // open that landed while the socket was mid-connect gave up before the
+        // dial it was waiting on completed — the queue-and-drain path behind the
+        // cold-start "Resume Session Failed" alert never bound.
+        await tearDown(preservingOpenWaiters: true)
 
         let client = clientFactory()
         self.client = client
@@ -313,8 +321,20 @@ final class RelaySessionCoordinator {
     }
 
     /// Tear down the socket, cancel the pump/state observers + reconnect driver,
-    /// and clear the render store. Idempotent.
+    /// and clear the render store. Idempotent. A genuine teardown can never bring
+    /// the socket up, so it FAILS every queued ``waitUntilOpen`` waiter (`false`)
+    /// — callers take their silent-retry-on-ready path instead of suspending
+    /// until their bounded timeout.
     func stop() async {
+        await tearDown(preservingOpenWaiters: false)
+    }
+
+    /// Shared cleanup for ``stop()`` (a real teardown) and ``start()`` (a
+    /// (re)dial). They differ ONLY in the queued transport-readiness waiters: a
+    /// teardown fails them (`preservingOpenWaiters: false`), while a dial keeps
+    /// them parked so they drain when the fresh socket opens
+    /// (`preservingOpenWaiters: true`) — the QA-1 B1 queue-and-drain contract.
+    private func tearDown(preservingOpenWaiters: Bool) async {
         reconnectTask?.cancel(); reconnectTask = nil
         reconnectURL = nil; reconnectToken = nil; reconnectAttempt = 0
         pumpTask?.cancel(); pumpTask = nil
@@ -325,9 +345,9 @@ final class RelaySessionCoordinator {
         activeSessionID = nil
         activeStoredSessionID = nil
         phase = .idle
-        // A teardown can never bring the socket up: fail queued waiters so they
-        // take their silent-retry path instead of suspending until timeout.
-        resolveAllOpenWaiters(opened: false)
+        if !preservingOpenWaiters {
+            resolveAllOpenWaiters(opened: false)
+        }
     }
 
     // MARK: Auto-reconnect driver (§4)
