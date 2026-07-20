@@ -235,7 +235,10 @@ fired from is the only wiring that is correct by construction.
   the exact registry `push_engine.notify` reads) and returns
   `{"registered": true}`; a malformed token yields a JSON-RPC error
   (`invalid device token`). Re-registering refreshes env/events (Settings
-  toggles re-POST, same semantics as the gateway REST route).
+  toggles re-POST, same semantics as the gateway REST route). `device_id`
+  (QA-2 R1c) is the phone's stable per-install identity: the registry keeps
+  ONE entry per device — a re-register with a rotated token REPLACES the
+  device's old entry; phones SHOULD send it on every register.
 - **`push.unregister`** — `params`: `{token}`; returns `{"unregistered": bool}`.
 - **Phone duty (foreground hygiene, §6 gate):** the phone sends
   `foreground {session_id: null}` when it leaves the foreground

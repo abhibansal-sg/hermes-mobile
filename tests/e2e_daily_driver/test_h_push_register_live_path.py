@@ -338,3 +338,160 @@ async def test_live_apns_send_attempt_opt_in(tmp_path, monkeypatch, evidence):
                 "for the APNs status (BadDeviceToken/400 means the path works "
                 "end-to-end and the token is stale/wrong-env)",
     })
+
+
+# ---------------------------------------------------------------------------
+# Part 4 — QA-2 R1: device-id dedup over the REAL wire + sandbox-host routing
+# + dead-token eviction in the REAL registry.
+#
+# R1 root cause on main 1fcffe3d5: (a) iOS mis-stamped env production for every
+# dev-signed build (strict-ASCII profile decode → nil → fallback; the sim #if
+# masks it) so sandbox tokens routed to api.push.apple.com → 400 BadDeviceToken;
+# (b) 400s were NEVER evicted (410-only) — the same dead tokens re-hammered on
+# every notify window; (c) dedup was token-string-only and iOS sent no
+# device_id → 5 accumulating entries per phone.
+# ---------------------------------------------------------------------------
+
+
+async def test_push_register_device_id_converges_to_one_entry_over_wire(
+    relay_subprocess, phone_factory, evidence
+):
+    """QA-2 R1c over the REAL phone WS: two registers for ONE device id with
+    ROTATED tokens leave exactly ONE registry entry (the new token). Pre-fix,
+    the second register APPENDED (relay.log-era registry: 5 entries/phone)."""
+    phone = await phone_factory()
+    token_first = "a1" * 32
+    token_rotated = "b2" * 32
+    try:
+        env = await phone.push_register(
+            token_first, env="sandbox", device_id="qa2-device-one",
+        )
+        assert env.get("result") == {"registered": True}, f"first register: {env}"
+        env = await phone.push_register(
+            token_rotated, env="sandbox", device_id="qa2-device-one",
+        )
+        assert env.get("result") == {"registered": True}, f"rotated register: {env}"
+
+        registry = Path(os.environ["HERMES_HOME"]) / "push_tokens.json"
+        entries = json.loads(registry.read_text(encoding="utf-8"))
+        mine = [e for e in entries if e.get("device_id") == "qa2-device-one"]
+        assert len(mine) == 1, f"device dedup failed, entries: {entries}"
+        assert mine[0]["token"] == token_rotated
+        assert mine[0]["env"] == "sandbox"
+
+        evidence("h-device-id-dedup-wire", {
+            "registry": str(registry),
+            "device_id": "qa2-device-one",
+            "entries_for_device": 1,
+            "winning_token_tail": token_rotated[-6:],
+            "replaced_token_tail": token_first[-6:],
+        })
+    finally:
+        await phone.close()
+
+
+class _RecordingAPNsResponse:
+    def __init__(self, status_code: int, text: str = "") -> None:
+        self.status_code = status_code
+        self.text = text
+
+
+async def test_sandbox_token_routes_to_sandbox_host_and_bad_token_evicts(
+    tmp_path, monkeypatch, evidence
+):
+    """QA-2 R1a+b hermetic full path: a token registered env=sandbox through the
+    REAL DownstreamServer RPC is POSTed to api.sandbox.push.apple.com (NOT the
+    production host — the mis-stamp failure), and when APNs answers 400
+    BadDeviceToken the token is EVICTED from the REAL registry file (was
+    410-only: dead tokens re-hammered forever). Only httpx.Client is faked."""
+    pytest.importorskip("jwt", reason="APNs JWT requires PyJWT")
+    pytest.importorskip("cryptography", reason="ES256 signing requires cryptography")
+    pytest.importorskip("httpx", reason="push_engine dials APNs via httpx")
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    key_file = tmp_path / "apns-key.p8"
+    _write_throwaway_p8(key_file)
+    monkeypatch.setenv("HERMES_PUSH_ENABLED", "1")
+    monkeypatch.setenv("HERMES_APNS_KEY_FILE", str(key_file))
+    monkeypatch.setenv("HERMES_APNS_KEY_ID", "TESTKEY123")
+    monkeypatch.setenv("HERMES_APNS_TEAM_ID", "TESTTEAM45")
+    monkeypatch.setenv("HERMES_APNS_TOPIC", "ai.hermes.app")
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    monkeypatch.delenv("HERMES_APNS_USE_SANDBOX", raising=False)
+
+    push = plugin_bridge.import_push_engine()
+    monkeypatch.setattr(push, "_cached_jwt", None, raising=False)
+    monkeypatch.setattr(push, "_cached_jwt_at", 0.0, raising=False)
+
+    # REAL DownstreamServer answers push.register exactly like the service.
+    server = DownstreamServer(
+        DownstreamConfig(), EventBus(), _OwningGateway(), SessionStore(),
+        push_engine=push,
+    )
+    conn = PhoneConnection("phone-r1", _FakeWS(), build_ring(DownstreamConfig()))
+    reg = await server.handle_upstream(
+        conn,
+        UpstreamRequest(
+            method="push.register",
+            params={
+                "token": _DEVICE_TOKEN, "platform": "ios", "env": "sandbox",
+                "events": ["turn_complete"], "device_id": "qa2-phone",
+            },
+            id=1,
+        ),
+    )
+    assert reg == {"registered": True}
+
+    # Fake the HTTP/2 socket at the httpx seam; record the base_url per env and
+    # answer with 400 BadDeviceToken (the exact relay.log signature).
+    import httpx as httpx_mod
+
+    recorded: dict[str, list[str]] = {}
+
+    class _FakeClient:
+        def __init__(self, *args, base_url=None, **kwargs) -> None:
+            self._base_url = base_url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def post(self, path, content=None, headers=None):
+            recorded.setdefault(self._base_url, []).append(path)
+            return _RecordingAPNsResponse(400, '{"reason":"BadDeviceToken"}')
+
+    monkeypatch.setattr(httpx_mod, "Client", _FakeClient)
+
+    accepted = push.notify(
+        "turn_complete", "Hermes finished",
+        "QA-2 R1 sandbox-routing + eviction proof from the isolated relay harness.",
+        {"session_id": "qa2-r1"}, category="HERMES_TURN", expiration=0,
+    )
+    assert accepted == 0
+
+    # (a) The sandbox token went to the SANDBOX host — never production.
+    sandbox_url = f"https://{push._APNS_HOST_SANDBOX}:{push._APNS_PORT}"
+    prod_url = f"https://{push._APNS_HOST_PROD}:{push._APNS_PORT}"
+    assert list(recorded) == [sandbox_url], f"host routing wrong: {recorded}"
+    assert recorded[sandbox_url] == [f"/3/device/{_DEVICE_TOKEN}"]
+    assert prod_url not in recorded
+
+    # (b) 400 BadDeviceToken EVICTED the token from the real registry file.
+    registry = tmp_path / "push_tokens.json"
+    entries = json.loads(registry.read_text(encoding="utf-8"))
+    assert all(e.get("token") != _DEVICE_TOKEN for e in entries), (
+        f"dead token not evicted: {entries}"
+    )
+
+    evidence("h-sandbox-routing-and-eviction", {
+        "registered_env": "sandbox",
+        "apns_host_used": sandbox_url,
+        "production_host_used": False,
+        "apns_status": 400,
+        "apns_reason": "BadDeviceToken",
+        "token_evicted": True,
+        "device_token_tail": _DEVICE_TOKEN[-6:],
+        "transport": "httpx.Client faked at the socket seam (hermetic)",
+    })

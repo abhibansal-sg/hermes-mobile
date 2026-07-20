@@ -199,4 +199,7 @@ SAMPLE_VALUES: dict[str, Any] = {
     "platform": "ios",
     "env": "production",
     "events": ["approval", "turn_complete"],
+    # QA-2 R1c: the phone's stable per-install identity for one-token-per-device
+    # dedup (the relay replaces a device's old entry on a rotated token).
+    "device_id": "conformance-device-1",
 }
