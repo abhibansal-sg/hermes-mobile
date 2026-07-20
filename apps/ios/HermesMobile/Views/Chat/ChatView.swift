@@ -205,11 +205,56 @@ struct ChatView: View {
     /// The inline working row is honest busy-state chrome: it appears only while a
     /// turn is actively running, not while the turn is paused on a human approval,
     /// clarification, sudo, or secret prompt (those have their own user-action UI).
+    ///
+    /// QA-1 B8/A4 — the relay transport suppresses the row while the streaming
+    /// assistant bubble is on screen. The ratified Wave-2.5 design makes the
+    /// bubble's breathing cursor THE working signal ("Streaming caret = the
+    /// working signal … No fat working pill"; WAVE-ROADMAP.md) with the Turn Dock
+    /// the single home for interactive chrome (tasks/approvals/clarifies). The
+    /// relay projection (`ChatStore.applyRelayItems`) marks the assistant bubble
+    /// streaming for as long as ANY relay item is non-terminal, so while that
+    /// cursor renders the tail row is redundant — and unlike the direct path the
+    /// relay never sets the `activeToolName`/`turnStartedAt` event-router
+    /// internals per event, so beside a live turn the row could only ever read a
+    /// dishonest static "Working · 0s" (the owner's IMG_2517/2526 pill). The row
+    /// still shows PRE-FIRST-ITEM — between the relay submit and the first
+    /// rendered item — the honest accepted-and-waiting window, exactly mirroring
+    /// the approved direct path between `send` and `message.start`. Direct
+    /// transport: byte-identical to the approved behavior (desktop-parity tail
+    /// indicator with the honest tool name + ticking elapsed).
+    ///
+    /// Pure + static so the gate is unit-testable without a mounted view — the
+    /// relay suppression was previously untested and regressed on the relay path
+    /// (QA-1 structural gap).
+    static func shouldShowInlineTurnActivity(
+        isStreaming: Bool,
+        hasPendingGate: Bool,
+        isRelayTransport: Bool,
+        lastMessage: ChatMessage?
+    ) -> Bool {
+        guard isStreaming, !hasPendingGate else { return false }
+        // Relay: the streaming assistant bubble IS the working signal (its cursor
+        // breathes while any item is non-terminal) — a tail pill beside it is the
+        // redundant "Working" bar of B8. Show only pre-first-item, when no bubble
+        // renders the cursor yet.
+        if isRelayTransport,
+           let last = lastMessage,
+           last.role == .assistant,
+           last.isStreaming {
+            return false
+        }
+        return true
+    }
+
     private var shouldShowInlineTurnActivity: Bool {
-        chatStore.isStreaming
-            && chatStore.pendingApproval == nil
-            && chatStore.pendingClarification == nil
-            && chatStore.pendingSecurePrompt == nil
+        Self.shouldShowInlineTurnActivity(
+            isStreaming: chatStore.isStreaming,
+            hasPendingGate: chatStore.pendingApproval != nil
+                || chatStore.pendingClarification != nil
+                || chatStore.pendingSecurePrompt != nil,
+            isRelayTransport: connectionStore.transportPath == .relay,
+            lastMessage: chatStore.messages.last
+        )
     }
 
     /// Approximate height reserved at the bottom of the transcript so the last
