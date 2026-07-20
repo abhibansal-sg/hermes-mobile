@@ -382,6 +382,20 @@ final class RelaySessionCoordinator {
         if reconnectAttempt != 0 { reconnectAttempt = 0 }
         store.apply(frame)
         chatStore.applyRelayItems(store.items)
+        // QA-1 B10 / A3: the interactive gate frames are NOT items — the render
+        // store drops them by design — yet they are the sole input of the Turn
+        // Dock's cards. Bridge them into the SAME ChatStore state the direct
+        // gateway event router feeds, so the relay path surfaces the identical
+        // `ApprovalCard` / `ClarifyBanner` in the identical dock. `turn.completed`
+        // settles the turn → expire any pending gate (parity with the direct
+        // path's message.complete expiry — a gate answered elsewhere or abandoned
+        // must not linger inviting a reply against a dead runtime).
+        switch frame.kind {
+        case .approvalRequest: chatStore.applyRelayApprovalRequest(frame)
+        case .clarifyRequest:  chatStore.applyRelayClarifyRequest(frame)
+        case .turnCompleted:   chatStore.expireRelayPendingGates()
+        default: break
+        }
     }
 
     private func applyState(_ state: RelayConnectionState) {
@@ -529,6 +543,15 @@ final class RelaySessionCoordinator {
     private func resetItemStoreForSessionSwitch(to sessionID: String) {
         guard sessionID != activeSessionID else { return }
         store = RelayItemStore()
+        // N4/A5: clear the previous session's task-list mirror so the new
+        // session's dock starts clean (empty store ⇒ mirror cleared, `messages`
+        // untouched — never blanks the transcript, QA-1 B4).
+        chatStore.syncRelayTaskList(from: store)
+        // QA-1 B10: a pending gate belongs to its session's turn — switching
+        // the projected session clears the previous session's card (parity with
+        // the direct path's `reset()` on open; answering session A's card while
+        // viewing B would mis-route the answer).
+        chatStore.expireRelayPendingGates()
     }
 
     func list() async throws -> JSONValue { try await requireClient().list() }
