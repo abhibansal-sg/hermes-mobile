@@ -532,6 +532,20 @@ final class ConnectionStore {
         return created
     }
 
+    /// The composer "+" visibility gate (B9 / A5). On the relay transport the
+    /// attach flows ride the relay WS `attach` RPC (relay → gateway
+    /// `file.attach` / `image.attach_bytes`, bytes inlined — see
+    /// ``AttachmentStore``), so the gateway-REST upload probe NEVER gets to
+    /// hide the menu: a probe against an unreachable — or stock — gateway REST
+    /// 404s the upload route and would pin "+" hidden for the whole build
+    /// (exactly the B9 regression on the owner's relay-mode phone). The relay
+    /// is the source of truth for what the relay transport can do. Direct mode
+    /// keeps the E1 probe gate BYTE-FOR-BYTE: `.unavailable` hides (stock
+    /// gateway), `.unknown`/`.available` show (optimistic).
+    var attachMenuAvailable: Bool {
+        transportPath == .relay || capabilities.upload != .unavailable
+    }
+
     /// The selected transport (Wave-2 convergence). Default `.gatewayDirect`
     /// (OFF) — byte-identical to every existing install. In DEBUG a launch env
     /// override (`HERMES_TRANSPORT=relay`, or the presence of `HERMES_RELAY_URL`)
@@ -3155,6 +3169,17 @@ final class ConnectionStore {
         guard scenePhase == .active else {
             // Leaving the foreground: stop any in-flight prefetch sweep.
             sessionStore.cancelPrefetch()
+            // §6a foreground hygiene (QA-1 B14): declare we are no longer
+            // watching. iOS does not kill the relay WS the instant the app
+            // backgrounds, so without this clear a turn completing seconds
+            // after backgrounding would be §6-gated (user NOT watching, yet
+            // the relay thinks they are) and the banner never fires. The
+            // re-assert on return-to-foreground mirrors this clear.
+            if transportPath == .relay {
+                Task { [weak self] in
+                    await self?.relayCoordinator?.clearForeground()
+                }
+            }
             return
         }
         guard hasConnected else { return }
@@ -3169,6 +3194,12 @@ final class ConnectionStore {
             // spurious reconnect churn. Check the RELAY socket instead.
             if self.transportPath == .relay {
                 dead = !(self.relayCoordinator?.isOpen ?? false)
+                if !dead {
+                    // §6a: the background clear dropped the relay's foreground
+                    // declaration for this socket; re-assert the driven session
+                    // so pushes are gated again while the user is watching.
+                    await self.relayCoordinator?.reassertForeground()
+                }
             } else {
                 #if DEBUG
                 let _liveState = await self.client.state

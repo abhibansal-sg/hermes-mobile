@@ -277,6 +277,34 @@ actor RelayClient {
         try await request(.interrupt, params: .object(["session_id": .string(sessionID)]))
     }
 
+    /// Upload an attachment's INLINED bytes through the relay (B9 / A5). The
+    /// relay translates this onto the gateway's base64 RPCs — `file.attach`
+    /// (arbitrary files → `@file:` ref) or `image.attach_bytes` (photos →
+    /// vision tile) — so attach works IDENTICALLY on relay-only reaches where
+    /// the gateway-REST `POST /api/upload` round-trip is unreachable.
+    ///
+    /// WIRE CONTRACT (docs/RELAY-PHONE-PROTOCOL.md §5, asserted by
+    /// RelayAttachWireTests + tests/e2e_daily_driver/test_h): `kind` +
+    /// `data_url` (a `data:<mime>;base64,<payload>` URL) are REQUIRED;
+    /// `session_id` absent ⇒ the relay creates + owns a new session (like
+    /// SUBMIT) and merges the resolved `session_id` into the gateway result.
+    @discardableResult
+    func attach(
+        sessionID: String?,
+        kind: String,
+        name: String,
+        dataURL: String,
+        timeout: Duration = .seconds(60)
+    ) async throws -> JSONValue {
+        var params: [String: JSONValue] = [
+            "kind": .string(kind),
+            "data_url": .string(dataURL),
+        ]
+        if let sessionID { params["session_id"] = .string(sessionID) }
+        if !name.isEmpty { params["name"] = .string(name) }
+        return try await request(.attach, params: .object(params), timeout: timeout)
+    }
+
     /// Declare the session the phone holds foregrounded (§6 gate). Fire-and-forget:
     /// the relay answers inline (no downstream frame). Called on reconnect so the
     /// relay's Notifier knows the phone is watching and suppresses spurious APNs.
@@ -284,6 +312,37 @@ actor RelayClient {
         let params: JSONValue = sessionID.map { .object(["session_id": .string($0)]) }
             ?? .object(["session_id": .null])
         await notify(.foreground, params: params)
+    }
+
+    // MARK: - Push token registration (§6a)
+
+    /// Register the APNs device token with the RELAY's push registry (§6a).
+    ///
+    /// In relay mode this is the ONLY correct registration path: the relay's
+    /// Notifier fires pushes from the relay process's own token registry, and
+    /// the gateway-direct REST register either can't be reached at all (off-LAN
+    /// relay-only phones) or writes a registry the relay never reads.
+    /// `env` routes the token to the matching APNs host ("sandbox"/"production");
+    /// `events` is the per-event opt-in subset (`nil` = all events).
+    @discardableResult
+    func registerPushToken(
+        _ token: String,
+        env: String,
+        events: [String]?
+    ) async throws -> JSONValue {
+        var params: [String: JSONValue] = [
+            "token": .string(token),
+            "platform": .string("ios"),
+            "env": .string(env),
+        ]
+        if let events { params["events"] = .array(events.map { .string($0) }) }
+        return try await request(.pushRegister, params: .object(params))
+    }
+
+    /// Remove the APNs device token from the relay's push registry (§6a).
+    @discardableResult
+    func unregisterPushToken(_ token: String) async throws -> JSONValue {
+        try await request(.pushUnregister, params: .object(["token": .string(token)]))
     }
 
     // MARK: - Ack (§4)

@@ -173,13 +173,16 @@ struct MessageBubble: View {
                     // cleanly with no gesture competition.
                     userBubble
                 case .assistant:
-                    // Approved design §7: agent turns get NO context menu. Each
-                    // contiguous prose run (`SelectableProseText`) long-presses into
-                    // GENUINE native selection — a first-responding `UITextView` with
-                    // real drag handles + the system edit menu, NOT the old
-                    // `.textSelection` Copy|Share pill (ChatGPT islands: prose selects
-                    // with handles; code/table/image cards are non-selectable and
-                    // bound the selection). Turn actions live on `assistantActionRow`.
+                    // Approved design §7 + QA-1 B11/A6: agent turns get NO context
+                    // menu. Each contiguous prose run renders as ONE selectable
+                    // `UITextView` container (`ProseSelectionContainer`): long-press
+                    // starts genuine native WORD-level selection with drag handles,
+                    // extendable across paragraphs / lists / blockquotes (paragraphs
+                    // are NOT selection walls); exit by tapping away; Copy lives on
+                    // the system edit menu — no Copy|Share pill, no "Done" (N5
+                    // islands rules intact). Code / table / math / image cards stay
+                    // non-selectable islands that split the prose flow. Turn actions
+                    // live on `assistantActionRow`.
                     assistantBody
                 case .system, .tool:
                     metaRow
@@ -704,9 +707,16 @@ struct MessageBubble: View {
     }
 
     /// Render the assistant text as ordered prose / code / math segments (E3
-    /// segmenter): prose runs become inline-markdown `Text`, fenced code becomes
-    /// a `CodeBlockView`, and LaTeX math becomes `MathSegmentView`. The streaming
-    /// cursor is a standalone sibling so code/math cards never get a stray glyph.
+    /// segmenter) laid out as a SELECTABLE PROSE FLOW (QA-1 B11 / A6): every
+    /// contiguous prose run folds into ONE `UITextView`-backed
+    /// ``ProseSelectionContainer`` so long-press starts genuine native
+    /// WORD-level selection with drag handles, extendable across paragraphs /
+    /// lists / blockquotes / alerts — paragraphs are NOT selection walls. Cards
+    /// stay non-selectable islands that split the flow: fenced code →
+    /// `CodeBlockView`, LaTeX → `MathSegmentView`, rich URLs →
+    /// `RichURLEmbedCardView`, GFM tables → `MarkdownTableBlockView`, markdown
+    /// images → `MarkdownImageBlockView` (STR-695). The streaming cursor is a
+    /// standalone sibling so cards never get a stray glyph.
     private func assistantText(_ text: String, showsCursor: Bool) -> some View {
         // Memoized segmentation (RenderCache): a flick-scroll re-realizes this
         // row without changing `text`, so the segment scan is an O(1) cache hit
@@ -719,45 +729,21 @@ struct MessageBubble: View {
         // and on stream completion the bubble renders non-streaming through that
         // same full parse — byte-identical to today.
         let segments = showsCursor ? RenderCache.streamingSegments(text) : RenderCache.segments(text)
+        let flow = proseFlowNodes(segments)
 
         return VStack(alignment: .leading, spacing: Self.segmentSpacing) {
-            // POSITIONAL identity (release audit P1): keying on `\.element.id`
-            // (a content hash) gave every streaming delta a NEW id — ForEach
-            // tore down and rebuilt the prose Text on every flush, breaking
-            // in-progress text selection. Segments are append-only during a
-            // stream, so the offset is the stable identity and SwiftUI diffs
-            // the text in place.
-            ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
-                switch segment {
-                case .prose(let body):
-                    // Serif applies ONLY to prose segments (F3 / Amendment E) —
-                    // never code (`CodeBlockView`, mono) nor the streaming cursor
-                    // (its own `Text` keeps the system face).
-                    //
-                    // ABH-360 extends the prose renderer with a cached GFM block
-                    // pass. Regular paragraphs still flow through the existing
-                    // RenderCache.prose → AttributedString markdown path, while
-                    // tables/task lists/blockquotes/lists become native SwiftUI
-                    // blocks so GFM does not collapse into raw dashes and pipes.
-                    //
-                    // STR-695: markdown images (`![alt](source)`, standalone or
-                    // embedded mid-sentence) are split out here as block-level
-                    // image siblings, matching desktop, so prose images render
-                    // as native tappable images and surrounding paragraphs keep
-                    // their order around them instead of collapsing into inline
-                    // markdown.
-                    chatProseBlocks(body)
-                case .code(let language, let body):
-                    CodeBlockView(language: language, code: body)
-                case .math(let latex, let display):
-                    MathSegmentView(latex: latex, display: display)
-                case .embed(let descriptor):
-                    RichURLEmbedCardView(descriptor: descriptor)
-                }
+            // POSITIONAL identity (release audit P1): keying on a content hash
+            // gave every streaming delta a NEW id — ForEach tore down and
+            // rebuilt the prose view on every flush, breaking in-progress text
+            // selection. Flow nodes are append-only during a stream, so the
+            // offset is the stable identity and the container diffs its
+            // attributed text in place.
+            ForEach(Array(flow.enumerated()), id: \.offset) { _, node in
+                proseFlowNodeView(node)
             }
             // CC-01 / round-2: the breathing streaming cursor is a single
             // standalone sibling for ALL cases (rides prose, tail-is-code, or
-            // no-prose-yet). Keeping it OFF the prose `Text` means the pulse
+            // no-prose-yet). Keeping it OFF the prose container means the pulse
             // animation never re-composites the (large) prose block — only this
             // tiny glyph view animates. It sits just after the segment stack,
             // reading as the live tail of the turn.
@@ -770,45 +756,121 @@ struct MessageBubble: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// A rendered piece of the assistant prose flow (QA-1 B11 / A6): one
+    /// selectable prose container per contiguous prose run, with cards
+    /// (code / math / embed / table / image) as non-selectable islands between
+    /// containers.
+    private enum ProseFlowNode: Equatable {
+        case prose(NSAttributedString)
+        case table(MarkdownTable)
+        case image(alt: String, source: String)
+        case code(language: String?, body: String)
+        case math(latex: String, display: Bool)
+        case embed(RichURLEmbedDescriptor)
+
+        static func == (lhs: ProseFlowNode, rhs: ProseFlowNode) -> Bool {
+            switch (lhs, rhs) {
+            case let (.prose(a), .prose(b)): return a.isEqual(to: b)
+            case let (.table(a), .table(b)): return a == b
+            case let (.image(a1, s1), .image(a2, s2)): return a1 == a2 && s1 == s2
+            case let (.code(l1, b1), .code(l2, b2)): return l1 == l2 && b1 == b2
+            case let (.math(x1, d1), .math(x2, d2)): return x1 == x2 && d1 == d2
+            case let (.embed(a), .embed(b)): return a == b
+            default: return false
+            }
+        }
+    }
+
+    /// Coalesce segments into flow nodes: consecutive `.prose` segments (the D1
+    /// incremental path can split one prose run at a blank line) merge into a
+    /// SINGLE selectable container; a card segment flushes the pending prose
+    /// and renders as its own non-selectable island.
+    private func proseFlowNodes(_ segments: [MessageSegmenter.Segment]) -> [ProseFlowNode] {
+        var nodes: [ProseFlowNode] = []
+        var proseBodies: [String] = []
+
+        func flushProse() {
+            guard !proseBodies.isEmpty else { return }
+            let joined = proseBodies.joined(separator: "\n\n")
+            proseBodies.removeAll(keepingCapacity: true)
+            for piece in RenderCache.proseFlowPieces(
+                body: joined,
+                style: proseFlowStyle,
+                linkColor: theme.midground
+            ) {
+                switch piece {
+                case .prose(let attr): nodes.append(.prose(attr))
+                case .table(let table): nodes.append(.table(table))
+                case .image(let alt, let source): nodes.append(.image(alt: alt, source: source))
+                }
+            }
+        }
+
+        for segment in segments {
+            switch segment {
+            case .prose(let body):
+                proseBodies.append(body)
+            case .code(let language, let body):
+                flushProse()
+                nodes.append(.code(language: language, body: body))
+            case .math(let latex, let display):
+                flushProse()
+                nodes.append(.math(latex: latex, display: display))
+            case .embed(let descriptor):
+                flushProse()
+                nodes.append(.embed(descriptor))
+            }
+        }
+        flushProse()
+        return nodes
+    }
+
+    @ViewBuilder
+    private func proseFlowNodeView(_ node: ProseFlowNode) -> some View {
+        switch node {
+        case .prose(let attr):
+            // Single selectable container per contiguous prose run (B11 / A6):
+            // long-press = native word selection with handles; paragraphs are
+            // not walls; exit by tapping away; Copy lives on the system edit
+            // menu — no Copy|Share pill, no "Done" (N5 islands rules intact).
+            ProseSelectionContainer(text: attr)
+        case .table(let table):
+            MarkdownTableBlockView(table: table)
+        case .image(let alt, let source):
+            // STR-695: markdown images stay native block-level islands
+            // (zoomable lightbox + cache pieces) — image rendering untouched.
+            MarkdownImageBlockView(alt: alt, source: source)
+        case .code(let language, let body):
+            CodeBlockView(language: language, code: body)
+        case .math(let latex, let display):
+            MathSegmentView(latex: latex, display: display)
+        case .embed(let descriptor):
+            RichURLEmbedCardView(descriptor: descriptor)
+        }
+    }
+
+    /// Resolve the prose-container style from the ambient theme. A theme or
+    /// Dynamic-Type change yields new values (and a new `RenderCache` key), so
+    /// the container re-flattens once rather than serving a stale render.
+    private var proseFlowStyle: ProseFlowStyle {
+        let bodyFont = SelectableTextView.font(textStyle: .body, serif: true)
+        return ProseFlowStyle(
+            bodyFont: bodyFont,
+            monoFont: .monospacedSystemFont(ofSize: bodyFont.pointSize, weight: .regular),
+            fg: UIColor(theme.fg),
+            mutedFg: UIColor(theme.mutedFg),
+            linkColor: UIColor(theme.midground),
+            quoteBackground: UIColor(theme.muted).withAlphaComponent(0.18),
+            taskCheckTint: UIColor(theme.statusOK),
+            lineSpacing: Self.proseLineSpacing,
+            paragraphSpacing: Self.segmentSpacing
+        )
+    }
+
     /// Spacing between prose / code segments (UI-C C1 paragraph spacing).
     private static let segmentSpacing: CGFloat = 12
     /// Extra leading between wrapped prose lines (UI-C C1).
     private static let proseLineSpacing: CGFloat = 3.5
-    /// The assistant prose face: serif at body size (F3 / Amendment E — observed
-    /// reference: "Assistant text is full-width serif"). Code + cursor keep the
-    /// system face.
-    private static let proseFont: Font = .system(.body, design: .serif)
-
-    @ViewBuilder
-    private func markdownBlock(_ block: MarkdownBlock) -> some View {
-        switch block {
-        case .paragraph(let text):
-            paragraphText(text)
-        case .table(let table):
-            MarkdownTableBlockView(table: table)
-        case .blockquote(let text):
-            MarkdownBlockquoteView(text: text)
-        case .alert(let alert):
-            MarkdownAlertView(alert: alert)
-        case .taskItems(let items):
-            MarkdownTaskListView(items: items)
-        case .listItems(let items):
-            MarkdownListBlockView(items: items)
-        }
-    }
-
-    private func paragraphText(_ text: String) -> some View {
-        // Agent prose selection island: long-press swaps this paragraph into a
-        // real `UITextView` with native drag handles (approved design §7), instead
-        // of the former `.textSelection` Copy|Share pill.
-        SelectableProseText(
-            attributed: RenderCache.prose(text, linkColor: theme.midground),
-            font: Self.proseFont,
-            color: theme.fg,
-            uiColor: UIColor(theme.fg),
-            lineSpacing: Self.proseLineSpacing
-        )
-    }
 
     // MARK: - STR-695 assistant-prose markdown image blocks
 
@@ -827,26 +889,6 @@ struct MessageBubble: View {
     enum ChatProseLineSplit: Equatable, Sendable {
         case prose(String)
         case image(alt: String, source: String)
-    }
-
-    /// Lay out an assistant prose segment as GFM blocks interspersed with
-    /// markdown image siblings (STR-695). Inline images embedded in prose are
-    /// split out in order so a paragraph like `before ![alt](url) after`
-    /// renders as paragraph / image / paragraph; image entries reuse the
-    /// shipped `MarkdownImageBlockView` (zoomable lightbox + cache pieces);
-    /// everything else routes through the existing `markdownBlock` dispatch.
-    @ViewBuilder
-    private func chatProseBlocks(_ body: String) -> some View {
-        ForEach(Array(Self.chatProseEntries(body).enumerated()), id: \.offset) { _, entry in
-            switch entry {
-            case .blocks(let blocks):
-                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                    markdownBlock(block)
-                }
-            case .image(let alt, let source):
-                MarkdownImageBlockView(alt: alt, source: source)
-            }
-        }
     }
 
     /// Split a prose segment body into GFM-block batches interspersed with
@@ -2577,26 +2619,29 @@ final class SelfSizingTextView: UITextView {
     }
 }
 
-// MARK: - Agent-prose native selection island (owner QA, 2026-07-19)
+// MARK: - Prose-run selection island (file viewer + standalone block views)
 
-/// One contiguous agent-prose run (a paragraph / list-item / blockquote / alert
-/// body) that supports GENUINE native text selection.
+/// One contiguous prose run (a paragraph / list-item / blockquote / alert body)
+/// that supports GENUINE native text selection, used by the standalone GFM
+/// block views (`MarkdownBlockquoteView` / `MarkdownAlertView` /
+/// `MarkdownTaskListView` / `MarkdownListBlockView`) that `FileMarkdownBodyView`
+/// renders in the file viewer.
 ///
-/// The old behavior attached `.textSelection(.enabled)` to agent prose, which on
-/// long-press produced only the small Copy|Share edit-menu pill — NO drag handles.
-/// The approved behavior is long-press → real native selection with drag handles.
-/// SwiftUI `Text` cannot start native selection programmatically, so this view
-/// renders the styled markdown `Text` normally and, on a long-press, swaps ITSELF
-/// for a first-responding ``SelectableTextView`` (a `UITextView`, `isSelectable`,
-/// `becomeFirstResponder`, `selectAll` — the approved fallback) so the real handles
-/// + system edit menu appear immediately; the reader narrows from there. A trailing
-/// "Done" exits. Selection is bounded to THIS run — the surrounding code / table /
-/// image cards are separate views with no selection, so they cleanly island the
-/// selection (approved design §7).
+/// NOTE (QA-1 B11 / A6): assistant CHAT prose no longer uses this per-run
+/// island — the islands bounded selection to a single paragraph (owner QA
+/// IMG_2519: whole-paragraph select-all + "Done" button + no cross-paragraph
+/// extension). Chat prose now folds into one ``ProseSelectionContainer`` per
+/// contiguous run, giving word-level long-press selection across paragraphs.
+/// This island stays for the standalone block views, where bounding selection
+/// to the block is acceptable.
 ///
-/// The long-press uses a min-duration `LongPressGesture` attached with `.gesture`
-/// (default priority), so a drag still belongs to the enclosing `ScrollView` — the
-/// press only fires on a stationary hold and never blocks scrolling.
+/// Long-press swaps the run for a first-responding ``SelectableTextView``
+/// (a `UITextView`, `isSelectable`, `becomeFirstResponder`, `selectAll`) so the
+/// real handles + system edit menu appear immediately; the reader narrows from
+/// there. A trailing "Done" exits. The min-duration `LongPressGesture` is
+/// attached with `.gesture` (default priority), so a drag still belongs to the
+/// enclosing `ScrollView` — the press only fires on a stationary hold and never
+/// blocks scrolling.
 struct SelectableProseText: View {
     /// The styled markdown render shown in normal (non-selecting) mode.
     let attributed: AttributedString
