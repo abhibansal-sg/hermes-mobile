@@ -363,6 +363,30 @@ in relay mode, where that socket is idle.**
 - A8 regression test: replay the recorded stuck-episode frames + a short reseed over a seeded
   cache transcript; assert zero segment loss (`tests/render_conformance` fixture).
 
+### FIX RESULT (lane qa2/transcript2 — root cause CONFIRMED, no correction needed)
+- Verified: `reconcileMessages` rebuilt solely from `incoming` (`ChatStore.swift:3615` on qa2/base);
+  every reseed source is a known-partial TAIL window — relay history honors `limit` with
+  `messages[-limit:]` (`relay/hermes_relay/downstream.py:697-699`), plugin REST serves the 50-row
+  tail; `backfill()` additionally resolved ONLY `connection?.rest`, which is idle/unreachable in
+  relay-only reach, so the post-flap recovery reseed never landed at all.
+- Fix: `ChatStore.ReseedPolicy {replace, union}` on `seed(...)`/`reconcileMessages(...)`. Union
+  updates matched rows in place, appends genuinely-new rows after the newest match, and RETAINS
+  every untagged row the snapshot does not carry (settled history is never evicted — spec R15/A8
+  invariant); `relayProjected` rows are still superseded (the live projection re-renders them from
+  the item store on the next frame — no new duplication vs the pre-existing applyRelayItems merge).
+  An unmatched incoming USER row adopts the same-text echo/projection slot (mirror of
+  `adoptRelayEcho`, cmid-preserving) so the optimistic echo converges instead of doubling.
+  REPLACE remains the default (session-open paints keep session isolation — cache-HIT opens seed
+  WITHOUT a preceding `reset()`). Union callers (all same-session-guarded): `backfill()`
+  (`ChatStore.swift`), phase-2 network seed / skeleton hydration / chain-tip cache+network seeds
+  (`SessionStore.swift`). `backfill()` now resolves the relay `history` RPC on relay transport
+  (R3 residue: recovery over the up transport, mirroring `SessionStore.resolvedTranscriptFetch`).
+- A8 tests (RED on qa2/base 62a826a48 → GREEN with fix, `RenderConformanceTests`): short-snapshot
+  reseed over a seeded cache transcript + recorded stuck-episode frames (mid-conversation segment
+  survives flap→backfill→resume→settle); tail-window shift keeps older loaded rows with zero
+  duplicates; echo↔gateway-row convergence; switch away+back restores the full cached transcript
+  instantly (R3 residue pin); relay backfill runs over the relay transport.
+
 ---
 
 ## R16 — Live Activity lifecycle
