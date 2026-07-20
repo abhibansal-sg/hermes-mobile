@@ -5,6 +5,9 @@ import os
 /// DEBUG-only logger for SessionStore open→painted latency instrumentation
 /// (WhatsApp bar). Absent in Release.
 private let sessionLog = Logger(subsystem: "ai.hermes.HermesMobile", category: "SessionStore")
+
+/// DEBUG-only signpost log for the open→paint fallback chain (QA-1 A7/B2).
+private let sessionSignposts = OSLog(subsystem: "ai.hermes.HermesMobile", category: "SessionStore")
 #endif
 
 /// Pure prompt-history navigation matching desktop's per-session cursor +
@@ -244,7 +247,9 @@ final class SessionStore {
     /// carry an old stored-session intent into the newly configured server.
     func invalidateGatewayScopeWork() {
         openToken = UUID()
-        openRevealToken = nil
+        // A scope teardown replaces the drawer content: drop any pending
+        // dismissal intent from a row that no longer exists (QA-1 B3).
+        pendingDrawerReveal = nil
         cancelEnsureRuntime()
         cancelRuntimeBinding()
         activeRuntimeId = nil
@@ -270,7 +275,7 @@ final class SessionStore {
         searchLoadMoreTask = nil
 
         openToken = UUID()
-        openRevealToken = nil
+        pendingDrawerReveal = nil
         cancelRuntimeBinding()
         warmOpenSnapshots.removeAll()
         warmOpenSnapshotOrder.removeAll()
@@ -3563,21 +3568,28 @@ final class SessionStore {
     /// The accepted transport generation that created `activeRuntimeId`.
     /// Runtime ids are ephemeral and cannot be reused after a reconnect.
     private var activeRuntimeEpoch: UInt64?
-    private var openRevealToken: UUID?
+    /// The drawer's pending DISMISSAL INTENT (QA-1 B3). A drawer row tap hands
+    /// its close here (`open(_:revealOnFirstPaint:)`); it fires on first paint
+    /// or on the 300ms liveness deadline — whichever lands first — EXACTLY
+    /// ONCE. Unlike the old `openRevealToken` gate, a SUPERSEDING open() that
+    /// carries no reveal of its own (cold cache restore, cross-session review,
+    /// land/recovery rotations) no longer clears it: the tap's intent to close
+    /// the drawer survives any token rotation, so the drawer can never be
+    /// stranded open by a reveal-less `open()` landing in the reveal window
+    /// (the reported "sometimes leaves the drawer open" race). Only a NEWER
+    /// drawer tap (a fresh reveal) replaces it; `firePendingDrawerReveal()`
+    /// consumes it.
+    private var pendingDrawerReveal: (@MainActor () -> Void)?
     private static let drawerRevealDeadline: Duration = .milliseconds(300)
 
-    private func makeOpenReveal(
-        token: UUID,
-        callback: @MainActor @escaping () -> Void
-    ) -> @MainActor () -> Void {
-        openRevealToken = token
-        return { [weak self] in
-            guard let self,
-                  self.openToken == token,
-                  self.openRevealToken == token else { return }
-            self.openRevealToken = nil
-            callback()
-        }
+    /// Consume the pending drawer dismissal exactly once (QA-1 B3). Both fire
+    /// edges — first paint (``seedTranscriptCacheFirst``) and the liveness
+    /// deadline armed in ``open(_:)`` — funnel here, so whichever wins closes
+    /// the drawer and the other is a no-op.
+    private func firePendingDrawerReveal() {
+        let reveal = pendingDrawerReveal
+        pendingDrawerReveal = nil
+        reveal?()
     }
 
     /// ABH-372 warm-switch cache: the already-normalized transcript snapshots
@@ -3711,10 +3723,15 @@ final class SessionStore {
         let token = UUID()
         cancelRuntimeBinding()
         openToken = token
-        let reveal = revealOnFirstPaint.map { makeOpenReveal(token: token, callback: $0) }
-        if revealOnFirstPaint == nil {
-            openRevealToken = nil
+        // QA-1 B3: a drawer row tap hands its close here — record the intent.
+        // A reveal-LESS open (cold cache restore, cross-session review, the
+        // recovery path) leaves any pending intent ALIVE: the drawer is still
+        // open and still wants to close, and killing the intent is exactly the
+        // rotation that stranded it before.
+        if let revealOnFirstPaint {
+            pendingDrawerReveal = revealOnFirstPaint
         }
+        let drawerIntentPending = pendingDrawerReveal != nil
         activeRuntimeId = nil          // gates the composer until resume lands
         activeRuntimeEpoch = nil
         activeStoredProfile = selectedProfileID(for: summary)
@@ -3746,12 +3763,16 @@ final class SessionStore {
         ensureRuntimeAttempts = 0
 
         if wasAlreadyActive {
-            reveal?()
-        } else if let reveal {
+            if drawerIntentPending { firePendingDrawerReveal() }
+        } else if drawerIntentPending {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: Self.drawerRevealDeadline)
-                guard let self, self.openToken == token else { return }
-                reveal()
+                // QA-1 B3: NO `openToken` gate here — the dismissal is
+                // intent-based. Any pending drawer close fires on this deadline
+                // regardless of the token rotations that used to kill it; first
+                // paint consuming the intent earlier makes this a no-op. The
+                // drawer can no longer be stranded open past the deadline.
+                self?.firePendingDrawerReveal()
             }
         }
 
@@ -3791,7 +3812,9 @@ final class SessionStore {
                 token: token,
                 workGeneration: transcriptWorkGeneration,
                 transportEpoch: transcriptTransportEpoch,
-                onFirstPaint: wasAlreadyActive ? nil : reveal
+                onFirstPaint: wasAlreadyActive || !drawerIntentPending
+                    ? nil
+                    : { [weak self] in self?.firePendingDrawerReveal() }
             )
         }
         #if DEBUG
@@ -3979,6 +4002,20 @@ final class SessionStore {
             guard let self,
                   let coordinator = self.connection?.relayCoordinator else { return }
             do {
+                // QA-1 B1: queue on the relay phase bridge instead of racing it.
+                // A tap that lands while the socket is still coming up adopts the
+                // session (the `.open` edge re-establishes it) and waits —
+                // bounded — for readiness, instead of failing fast with
+                // `notConnected` and surfacing an "Open Session Failed" alert
+                // over a self-healing condition.
+                if !coordinator.isOpen {
+                    coordinator.adoptPendingSession(summary.id)
+                    guard await coordinator.waitUntilOpen(timeout: .seconds(10)) else {
+                        // Still down when the wait expires: the adopted session
+                        // re-establishes on the next `.open` edge. Silent.
+                        return
+                    }
+                }
                 _ = try await coordinator.resume(summary.id)
                 guard self.openToken == token,
                       self.connectionWorkGeneration == connectionWorkGeneration,
@@ -3994,12 +4031,20 @@ final class SessionStore {
                 self.onActiveRuntimeBound?()
             } catch {
                 // A superseded open (the user tapped another session) is not an
-                // actionable failure — only surface a real relay resume error for
-                // the session still on screen.
+                // actionable failure — never surface it.
                 guard self.openToken == token,
                       self.activeStoredId == summary.id else { return }
                 let message = self.errorMessage(from: error)
                 self.lastError = message
+                // QA-1 B1 (north star): transport-readiness failures are
+                // self-healing — adopt the session so the coordinator's `.open`
+                // re-establishment re-opens it, and NEVER stamp a modal alert.
+                // Only a genuine relay-side rejection (an RPC error answer) is
+                // actionable enough to surface.
+                if Self.isRetryableRelayBindingError(error) {
+                    coordinator.adoptPendingSession(summary.id)
+                    return
+                }
                 self.sessionActionError = SessionActionError(
                     action: "Open Session", message: message
                 )
@@ -4008,6 +4053,32 @@ final class SessionStore {
         #if DEBUG
         lastOpenResumeTask = resumeTask
         #endif
+    }
+
+    /// Transport-readiness failures of a relay session op (QA-1 B1). These are
+    /// SELF-HEALING: the coordinator re-establishes the adopted session on its
+    /// next crossing into `.open`, so they must drain silently once connected —
+    /// never a modal alert (north-star rule). A relay RPC ERROR answer
+    /// (`.rpc(code:message:)` — e.g. session-not-found) is the one actionable
+    /// class and keeps the alert.
+    private static func isRetryableRelayBindingError(_ error: Error) -> Bool {
+        switch error {
+        case RelayError.notConnected: return true
+        case RelayError.timeout: return true
+        case RelayError.transport: return true
+        case RelayError.rpc: return false
+        default:
+            // The gateway client's not-connected / timeout / transport classes
+            // can surface here when a relay-mode call still raced the direct
+            // path; they are equally self-healing via the relay re-open.
+            if error is CancellationError { return true }
+            switch error {
+            case GatewayError.notConnected, GatewayError.timeout, GatewayError.transport:
+                return true
+            default:
+                return false
+            }
+        }
     }
 
     /// Enter a fresh **draft** chat: drop the active session pointers, mark the
@@ -4019,7 +4090,11 @@ final class SessionStore {
         // Supersede any in-flight `open()` so its resume can't reactivate, and any
         // on-demand re-resume so its result can't bind into this fresh draft.
         openToken = UUID()
-        openRevealToken = nil
+        // QA-1 B3: a fresh draft is a NEW navigation — drop any pending drawer
+        // dismissal from a prior tap (the drawer row that starts a draft fires
+        // `onNavigate` itself; a programmatic draft must not inherit a stale
+        // close that could fire later against a re-opened drawer).
+        pendingDrawerReveal = nil
         cancelEnsureRuntime()
         cancelRuntimeBinding()
         isDraft = true
@@ -4351,7 +4426,24 @@ final class SessionStore {
     func resumeActiveAfterReconnect() async -> String? {
         let myConnectionWorkGeneration = connectionWorkGeneration
         let token = openToken
-        guard let storedId = activeStoredId, client != nil || resumeRPC != nil else { return nil }
+        guard let storedId = activeStoredId,
+              client != nil || resumeRPC != nil || connection?.transportPath == .relay else { return nil }
+        // QA-1 B1: on the relay transport the gateway `client` is deliberately
+        // idle (never connected), so the gateway-direct `session.resume` below
+        // can only ever throw "Not connected to the Hermes gateway" — which is
+        // how every relay-mode cold open / reconnect landed a modal "Resume
+        // Session Failed" alert over the painted transcript (a retryable
+        // condition surfaced as an error; north-star violation). Resume over the
+        // relay coordinator instead: it queues on transport readiness and never
+        // alerts. The test seam keeps precedence so unit graphs are unchanged;
+        // the gateway-direct path below stays byte-identical.
+        if resumeRPC == nil, connection?.transportPath == .relay {
+            return await resumeActiveOverRelay(
+                storedId: storedId,
+                token: token,
+                connectionWorkGeneration: myConnectionWorkGeneration
+            )
+        }
         let bindingProfile = activeStoredProfile
         let usingResumeTestSeam = resumeRPC != nil
         guard let bindingEpoch = await currentBindingEpoch(
@@ -4440,6 +4532,69 @@ final class SessionStore {
             let message = errorMessage(from: error)
             lastError = message
             sessionActionError = SessionActionError(action: "Resume Session", message: message)
+            return nil
+        }
+    }
+
+    /// Relay-transport resume (QA-1 B1): re-own `storedId` over the relay
+    /// coordinator, QUEUING on transport readiness instead of racing the phase
+    /// bridge. Never surfaces a modal alert — every failure mode here is
+    /// self-healing: a socket still mid-connect opens moments later, and the
+    /// coordinator's crossing INTO `.open` re-establishes the adopted session
+    /// (its `applyState` re-open), so a retryable condition drains silently
+    /// once connected (north-star rule). Mirrors ``bindRelayRuntime``'s binding
+    /// so the composer unlocks and sends route over the relay.
+    private func resumeActiveOverRelay(
+        storedId: String,
+        token: UUID,
+        connectionWorkGeneration: UInt64
+    ) async -> String? {
+        guard let coordinator = connection?.relayCoordinator else { return nil }
+        // Queue on the relay phase bridge: a cold-start resume that lands before
+        // the socket is open adopts the session (the `.open` edge re-opens it)
+        // and waits — bounded — for readiness, instead of throwing
+        // `notConnected` into the alert channel.
+        if !coordinator.isOpen {
+            coordinator.adoptPendingSession(storedId)
+            guard await coordinator.waitUntilOpen(timeout: .seconds(10)) else {
+                // Still down: the adopted session re-establishes on the next
+                // `.open` edge. Silent by design — never an alert.
+                return nil
+            }
+        }
+        do {
+            _ = try await coordinator.resume(storedId)
+            // SUPERSESSION GUARD: the active session may have changed across the
+            // readiness wait / resume RPC — do not bind a stale resume over a
+            // session the user has since navigated away from (mirrors the
+            // gateway path's `isCurrentRuntimeBinding`).
+            guard openToken == token,
+                  activeStoredId == storedId,
+                  self.connectionWorkGeneration == connectionWorkGeneration else { return nil }
+            // The relay keys its runtime on the STORED session id, so a
+            // successful resume binds `storedId` itself.
+            activeRuntimeId = storedId
+            activeRuntimeEpoch = connection?.transportEpoch
+            ReliabilityDiagnostics.shared.sessionBound(
+                identifier: "\(activeStoredProfile ?? "default")\u{1F}\(storedId)",
+                epoch: activeRuntimeEpoch ?? 0
+            )
+            lastError = nil
+            sessionActionError = nil
+            ensureRuntimeAttempts = 0
+            // Flush anything the composer queued while the runtime was nil
+            // (mirrors the gateway path's `onActiveRuntimeBound`).
+            onActiveRuntimeBound?()
+            return storedId
+        } catch {
+            // Superseded: not an error, never surface.
+            guard openToken == token, activeStoredId == storedId else { return nil }
+            // Retryable transport failures self-heal on the next ready edge:
+            // adopt so the `.open` re-establishment re-opens the session, record
+            // for diagnostics, and NEVER stamp `sessionActionError` (no modal
+            // alert for self-healing conditions — north-star rule).
+            coordinator.adoptPendingSession(storedId)
+            lastError = errorMessage(from: error)
             return nil
         }
     }
@@ -5310,7 +5465,15 @@ final class SessionStore {
         if !paintedFromCache, let cacheStore {
             // `touchSession` bumps `lastAccessedAt` so an actively-opened session
             // never ages out of the eviction horizon.
-            guard let identity = capturedIdentity else { return }
+            guard let identity = capturedIdentity else {
+                // QA-1 B3: an identity-less early-out cannot paint, but it must
+                // still signal — the old silent return left the drawer reveal to
+                // the deadline alone (and when that was token-gated, a rotation
+                // stranded the drawer open).
+                paintFinished = true
+                signalFirstPaint()
+                return
+            }
             try? await cacheStore.touchSession(identity)
             if isCurrentTranscriptOpen(token: token),
                (try? await cacheStore.hasTranscript(identity)) == true,
@@ -5340,6 +5503,15 @@ final class SessionStore {
         Self.logOpenLatency(
             phase: paintedFromCache ? "cache-paint(HIT)" : "cache-miss(reset)",
             storedId: storedId, since: openClock)
+        // QA-1 A7 signpost: the session-switch cache paint must be INSTANT and
+        // can never be blocked by the network refresh below (it runs AFTER this
+        // point). Instrument/console-capturable proof of the cache-first chain.
+        let paintMs = Self.openLatencyMilliseconds(since: openClock)
+        let paintSource = paintedFromCache ? (paintedFromDisk ? "disk" : "memory") : "miss"
+        os_signpost(
+            .event, log: sessionSignposts, name: "transcript-cache-paint",
+            "session=%{public}@ source=%{public}@ ms=%.1f",
+            storedId, paintSource, paintMs)
         #endif
 
         // Phase 1 done — the new session's first frame is on screen. Reveal it:
@@ -5400,6 +5572,15 @@ final class SessionStore {
             Self.logOpenLatency(
                 phase: seedWasSkeleton ? "network-painted(skeleton)" : "network-painted",
                 storedId: storedId, since: openClock)
+            // QA-1 B2 signpost: which transport the authoritative network seed
+            // used — on relay it must be the relay `history` RPC (the gateway
+            // REST path is the 15s-timeout skeleton-forever hole).
+            let networkMs = Self.openLatencyMilliseconds(since: openClock)
+            let seedTransport = connection?.transportPath == .relay ? "relay" : "rest"
+            os_signpost(
+                .event, log: sessionSignposts, name: "transcript-network-seed",
+                "session=%{public}@ transport=%{public}@ ms=%.1f",
+                storedId, seedTransport, networkMs)
             #endif
             // P3 write-through: persist the freshly-fetched transcript so the
             // next open paints it from disk. Fire-and-forget, OFF the UI path.
@@ -5612,6 +5793,16 @@ final class SessionStore {
         sessionLog.debug(
             "open-latency \(phase, privacy: .public) session=\(storedId, privacy: .public) +\(ms, format: .fixed(precision: 1))ms")
     }
+
+    /// Milliseconds since `start` for the open-latency signposts (QA-1 A7/B2).
+    private static func openLatencyMilliseconds(
+        since start: ContinuousClock.Instant
+    ) -> Double {
+        let d = ContinuousClock.now - start
+        let comps = d.components
+        return Double(comps.seconds) * 1000
+            + Double(comps.attoseconds) / 1_000_000_000_000_000
+    }
     #endif
 
     /// ARCH37 STEP 2 — run the pure `toChatMessages` seed normalize OFF the main
@@ -5625,6 +5816,18 @@ final class SessionStore {
         await Task.detached(priority: .userInitiated) {
             ChatStore.toChatMessages(stored)
         }.value
+    }
+
+    /// Decode a relay `history`/`open` RPC result into the stored rows the
+    /// cache/REST seed path consumes (QA-1 B2). The relay answers
+    /// `{"session_id", "messages": […]}` where `messages` is the gateway's
+    /// `GET /api/sessions/{id}/messages` row set PROXIED VERBATIM
+    /// (`relay/hermes_relay/downstream.py` → `rest_history`), so the row shape
+    /// is exactly what `StoredMessage(json:)` / `toChatMessages` already parse
+    /// off gateway REST — one data source, two transports.
+    nonisolated static func relayHistoryMessages(from result: JSONValue) -> [StoredMessage] {
+        guard let rows = result["messages"]?.arrayValue else { return [] }
+        return rows.compactMap(StoredMessage.init(json:))
     }
 
     /// The injected transcript seams, or the default that resolves the live
@@ -5651,6 +5854,41 @@ final class SessionStore {
         if shape == nil {
             if let transcriptFetchWithProfile { return transcriptFetchWithProfile }
             if let transcriptFetch { return { sessionId, _ in try await transcriptFetch(sessionId) } }
+        }
+        // QA-1 B2: on the relay transport the gateway REST URL may be
+        // unreachable from the phone (relay-only reach — off-LAN tailnet relay),
+        // so a cache-miss switch that seeds over `connection.rest` hangs to the
+        // 15s RestClient timeout — skeleton rows "forever". The relay `history`
+        // RPC returns the SAME gateway store rows over the transport that IS up
+        // (relay/hermes_relay/downstream.py: OPEN/HISTORY → rest_history →
+        // `GET /api/sessions/{id}/messages` verbatim). Seed over the relay
+        // instead: the switch paints the moment the relay answers, independent
+        // of gateway-REST reachability. The relay path carries no `shape` tier
+        // (the relay proxies full rows), which only forgoes the skeleton
+        // optimization — never correctness. Test seams above keep precedence.
+        if connection?.transportPath == .relay,
+           let coordinator = connection?.relayCoordinator {
+            let relayRest = connection?.rest
+            return { sessionId, profile in
+                if let profile, !profile.isEmpty {
+                    // The relay history route has no profile-scoped variant yet;
+                    // non-default profile rows keep today's gateway-REST read.
+                    guard let relayRest else { throw RelayError.notConnected }
+                    return try await relayRest.messages(
+                        sessionId: sessionId, profile: profile, shape: shape
+                    )
+                }
+                // Queue on the relay phase bridge (bounded) instead of failing a
+                // cold cache-miss open the instant the socket is mid-connect.
+                guard await coordinator.waitUntilOpen(timeout: .seconds(10)) else {
+                    throw RelayError.notConnected
+                }
+                let result = try await coordinator.history(
+                    sessionID: sessionId,
+                    limit: ChatStore.transcriptOpenWindowLimit
+                )
+                return Self.relayHistoryMessages(from: result)
+            }
         }
         guard let rest = connection?.rest else { return nil }
         // ABH-408: a non-default row opened from the All-profiles rail must use
