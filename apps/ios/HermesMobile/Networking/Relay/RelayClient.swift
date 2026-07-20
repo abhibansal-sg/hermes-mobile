@@ -345,12 +345,15 @@ actor RelayClient {
     /// the gateway-direct REST register either can't be reached at all (off-LAN
     /// relay-only phones) or writes a registry the relay never reads.
     /// `env` routes the token to the matching APNs host ("sandbox"/"production");
-    /// `events` is the per-event opt-in subset (`nil` = all events).
+    /// `events` is the per-event opt-in subset (`nil` = all events); `deviceID`
+    /// (QA-2 R1c) is the phone's stable per-install identity — the relay keeps
+    /// ONE registry entry per device (a rotated token replaces the old one).
     @discardableResult
     func registerPushToken(
         _ token: String,
         env: String,
-        events: [String]?
+        events: [String]?,
+        deviceID: String? = nil
     ) async throws -> JSONValue {
         var params: [String: JSONValue] = [
             "token": .string(token),
@@ -358,6 +361,7 @@ actor RelayClient {
             "env": .string(env),
         ]
         if let events { params["events"] = .array(events.map { .string($0) }) }
+        if let deviceID, !deviceID.isEmpty { params["device_id"] = .string(deviceID) }
         return try await request(.pushRegister, params: .object(params))
     }
 

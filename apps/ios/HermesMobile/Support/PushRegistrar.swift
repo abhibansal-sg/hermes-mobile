@@ -110,7 +110,12 @@ final class PushRegistrar {
     private var currentRegistrationScope: String? {
         guard let endpoint = resolveEndpoint(), let connection else { return nil }
         let deviceId = DefaultsKeys.deviceId(server: connection.serverURLString) ?? "shared"
-        let raw = "\(endpoint.url.absoluteString)|\(deviceId)|\(endpoint.token)"
+        // QA-2 R1: the transport is part of the registration identity — a
+        // successful DIRECT-mode register does NOT prove the RELAY registry
+        // (a different process/registry) and vice versa, so a transport flip
+        // must invalidate the scope and force a re-POST down the new path.
+        let transport = connection.transportPath == .relay ? "relay" : "direct"
+        let raw = "\(endpoint.url.absoluteString)|\(deviceId)|\(endpoint.token)|\(transport)"
         let digest = SHA256.hash(data: Data(raw.utf8)).map {
             String(format: "%02x", $0)
         }.joined()
@@ -399,11 +404,12 @@ final class PushRegistrar {
     /// isn't configured yet. Mirrors `SessionStore`'s token resolution: dev env
     /// override first, then the saved URL + Keychain.
     private func makePoster() -> PushTokenPoster? {
-        guard let endpoint = resolveEndpoint() else { return nil }
+        guard let endpoint = resolveEndpoint(), let connection else { return nil }
         return PushTokenPoster(
             baseURL: endpoint.url,
             token: endpoint.token,
-            pathStyle: endpoint.pathStyle
+            pathStyle: endpoint.pathStyle,
+            deviceID: DefaultsKeys.deviceId(server: connection.serverURLString)
         )
     }
 
@@ -426,10 +432,16 @@ final class PushRegistrar {
         // so the next `enableIfAllowed()` retries instead of silently
         // registering against the wrong registry and being deduped forever.
         return { [weak connection] token, events in
-            guard let coordinator = connection?.relayCoordinator else { return .hardFail }
+            guard let connection, let coordinator = connection.relayCoordinator else {
+                return .hardFail
+            }
             do {
+                // QA-2 R1c: the stable per-install device id lets the relay
+                // registry keep ONE entry per device (rotated tokens replace).
+                let deviceID = DefaultsKeys.deviceId(server: connection.serverURLString)
                 _ = try await coordinator.registerPushToken(
-                    token, env: PushTokenPoster.apnsEnvironment, events: events
+                    token, env: PushTokenPoster.apnsEnvironment, events: events,
+                    deviceID: deviceID
                 )
                 return .success
             } catch {
@@ -530,12 +542,20 @@ struct PushTokenPoster: Sendable {
     private let baseURL: URL
     private let token: String
     private let pathStyle: APIPathStyle
+    /// Stable per-install device identity (QA-2 R1c) sent as `device_id` so
+    /// the gateway registry can keep ONE token per device. `nil` for legacy
+    /// scopes without a device id (token-string-only dedup).
+    private let deviceID: String?
     private let session: URLSession
 
-    init(baseURL: URL, token: String, pathStyle: APIPathStyle = .legacy) {
+    init(
+        baseURL: URL, token: String, pathStyle: APIPathStyle = .legacy,
+        deviceID: String? = nil
+    ) {
         self.baseURL = baseURL
         self.token = token
         self.pathStyle = pathStyle
+        self.deviceID = deviceID
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = Self.timeout
         config.waitsForConnectivity = false
@@ -547,30 +567,75 @@ struct PushTokenPoster: Sendable {
     /// The APNs environment this build registers under: `"sandbox"` for dev-signed
     /// Xcode builds (and the simulator), `"production"` for TestFlight/App Store.
     ///
-    /// Mere PRESENCE of `embedded.mobileprovision` is not a reliable signal:
-    /// TestFlight builds also carry one (with `aps-environment = production`).
-    /// So when a profile exists, read its actual `aps-environment` value —
-    /// the profile is a CMS envelope around a plist, and a plain byte scan
-    /// for the key/value pair is the established lightweight technique. No
-    /// profile at all → App Store → production. Simulator → always sandbox.
+    /// QA-2 R1a (the killer break): the previous implementation decoded
+    /// `embedded.mobileprovision` with `String(data:encoding:.ascii)` — Swift's
+    /// `.ascii` is STRICT (any byte ≥ 0x80 → `nil`) and every SIGNED profile
+    /// carries a binary CMS/PKCS#7 envelope, so the decode ALWAYS returned nil
+    /// and the fallback stamped `"production"` on every dev-signed build.
+    /// Sandbox tokens then routed to `api.push.apple.com` → 400 BadDeviceToken
+    /// on every notify — the phone received NOTHING. The simulator never caught
+    /// it: its `#if` returns "sandbox" before the profile is ever read, so every
+    /// sim/E2E/conformance run saw the correct env. The profile is now parsed
+    /// for real (binary-safe plist extraction — `parseAPNsEnvironment`).
+    ///
+    /// Order: build-flag override (scripts/ios-build.sh stamps release archives
+    /// `HERMES_APS_ENV_PRODUCTION`; an explicit `HERMES_APS_ENVIRONMENT` env at
+    /// build time wins for either action) → real profile entitlement → fail-safe
+    /// sandbox. No profile at all → App Store → production. Simulator → sandbox.
     /// The server registry routes the device token per this value.
     static let apnsEnvironment: String = {
         #if targetEnvironment(simulator)
         return "sandbox"
         #else
+        #if HERMES_APS_ENV_SANDBOX
+        return "sandbox"
+        #elseif HERMES_APS_ENV_PRODUCTION
+        return "production"
+        #endif
         guard let path = Bundle.main.path(forResource: "embedded", ofType: "mobileprovision"),
-              let data = FileManager.default.contents(atPath: path),
-              let text = String(data: data, encoding: .ascii) else {
+              let data = FileManager.default.contents(atPath: path) else {
             return "production"  // no profile = App Store signed
         }
-        // Look for <key>aps-environment</key><string>development|production</string>
-        guard let keyRange = text.range(of: "<key>aps-environment</key>") else {
-            return "production"  // distribution profile without the dev entitlement
+        if let parsed = parseAPNsEnvironment(profileData: data) {
+            return parsed
         }
-        let tail = text[keyRange.upperBound...].prefix(120)
-        return tail.contains("<string>development</string>") ? "sandbox" : "production"
+        // A profile EXISTS but is unreadable. Fail safe to SANDBOX: with the
+        // QA-2 R1b eviction a wrong-host sandbox stamp fails LOUD (400
+        // BadDeviceToken → evicted → re-registered next launch), whereas
+        // mis-stamping production on a dev build was the unrecoverable
+        // silent-deaf case this fix replaces.
+        return "sandbox"
         #endif
     }()
+
+    /// Parse `Entitlements.aps-environment` out of an `embedded.mobileprovision`
+    /// blob: `"sandbox"` for `development`, `"production"` for `production`,
+    /// `nil` when the profile carries no readable plist/entitlement.
+    ///
+    /// The profile is a CMS/PKCS#7 envelope (binary DER bytes) AROUND a plain
+    /// XML plist. Locating the `<?xml … </plist>` span is a BINARY search —
+    /// never a whole-blob string decode, because the DER signature bytes make
+    /// any strict charset decode fail (the exact QA-2 R1a break). Pure and
+    /// `Sendable` so unit tests can feed synthetic signed-profile bytes.
+    static func parseAPNsEnvironment(profileData data: Data) -> String? {
+        let xmlStart = Data("<?xml".utf8)
+        let plistEnd = Data("</plist>".utf8)
+        guard let startRange = data.range(of: xmlStart),
+              let endRange = data.range(of: plistEnd, in: startRange.upperBound..<data.endIndex)
+        else { return nil }
+        let plistData = data.subdata(in: startRange.lowerBound..<endRange.upperBound)
+        guard let root = (try? PropertyListSerialization.propertyList(
+            from: plistData, options: [], format: nil
+        )) as? [String: Any],
+              let entitlements = root["Entitlements"] as? [String: Any],
+              let aps = entitlements["aps-environment"] as? String
+        else { return nil }
+        switch aps {
+        case "development": return "sandbox"
+        case "production": return "production"
+        default: return nil
+        }
+    }
 
     /// `POST /api/push/register {token, platform:"ios", env, events?}`.
     ///
@@ -632,6 +697,10 @@ struct PushTokenPoster: Sendable {
             // ``apnsEnvironment`` below.
             "env": Self.apnsEnvironment,
         ]
+        // QA-2 R1c: stable device identity for one-token-per-device dedup.
+        if let deviceID, !deviceID.isEmpty {
+            body["device_id"] = deviceID
+        }
         // Per-event prefs (F2-A): only POST carries `events`; a DELETE drops the
         // token wholesale. `nil` omits the key (legacy "all events") so a stock
         // registry entry keeps working.
