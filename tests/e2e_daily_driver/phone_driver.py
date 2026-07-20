@@ -217,13 +217,20 @@ class PhoneDriver:
         *,
         env: str = "production",
         events: Optional[list[str]] = None,
+        device_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Register the APNs device token OVER THE RELAY SOCKET (§6a, QA-1 B14):
         the relay's Notifier reads the relay's own registry, so a relay-mode
-        phone must register here, not on gateway-direct REST."""
+        phone must register here, not on gateway-direct REST.
+
+        ``device_id`` (QA-2 R1c) is the phone's stable per-install identity;
+        the relay keeps ONE registry entry per device (a rotated token
+        replaces the old entry)."""
         params: dict[str, Any] = {"token": token, "platform": "ios", "env": env}
         if events is not None:
             params["events"] = events
+        if device_id is not None:
+            params["device_id"] = device_id
         return await self._call("push.register", params)
 
     async def push_unregister(self, token: str) -> dict[str, Any]:
