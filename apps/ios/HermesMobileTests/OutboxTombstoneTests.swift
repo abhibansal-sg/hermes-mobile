@@ -37,11 +37,18 @@ final class OutboxTombstoneTests: XCTestCase {
             observation: observation
         )
         let scope = try WorkScope(serverID: "https://gateway.test", profileID: "default")
+        // Every row in this suite is enqueued with storedSessionID "stored-A";
+        // the active-composer projection (pendingCount/activeItems) shows a
+        // stored-session row only when the focused composer's session MATCHES
+        // — a nil active session sees only nil-session rows (OutboxScoping
+        // contract). Mirror "stored-A" here or the pill projection stays empty
+        // and every `waitUntil { pendingCount == N }` times out (qa2 fix
+        // round: the actor-hop rewrite passed { nil } and wedged 3 tests).
         let queueStore = QueueStore(
             repository: repository,
             observation: observation,
             scopeProvider: { scope },
-            activeSessionProvider: { nil },
+            activeSessionProvider: { "stored-A" },
             connectedProvider: { true }
         )
         return Harness(
