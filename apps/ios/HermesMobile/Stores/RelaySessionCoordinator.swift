@@ -424,6 +424,15 @@ final class RelaySessionCoordinator {
         switch frame.kind {
         case .approvalRequest: chatStore.applyRelayApprovalRequest(frame)
         case .clarifyRequest:  chatStore.applyRelayClarifyRequest(frame)
+        case .turnStarted:
+            // QA-2 R12/R13: a new turn is the authoritative "clear the dock for
+            // a fresh seed" edge — the relay item store accumulates the prior
+            // turn's `taskList` item (stable `<sid>:tasks` id, replaced in
+            // place only when THIS turn emits its own), so without this clear
+            // the next `applyRelayItems` would re-mirror the previous turn's
+            // list and the pill would briefly show stale data when the new
+            // turn starts streaming.
+            chatStore.handleRelayTurnStarted()
         case .turnCompleted:   chatStore.expireRelayPendingGates()
             // QA-2 R12: clear a terminal (all-done/cancelled) task list's
             // ownership so the dock pill dismisses at turn end even though the
