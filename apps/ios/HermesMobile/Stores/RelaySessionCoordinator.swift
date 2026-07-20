@@ -632,4 +632,48 @@ final class RelaySessionCoordinator {
         guard let sid = sessionID ?? activeSessionID else { throw RelayError.notConnected }
         return try await requireClient().interrupt(sid)
     }
+
+    // MARK: Push token registration (§6a)
+
+    /// Register the APNs device token over the relay socket (§6a). The relay
+    /// writes its OWN push registry — the one the relay Notifier reads — so a
+    /// relay-mode phone's token reaches the notifier without any gateway-REST
+    /// reachability or shared-HERMES_HOME coincidence. Throws when the relay
+    /// socket is not open; ``PushRegistrar`` retries on the next launch /
+    /// foreground, exactly like the gateway-direct path.
+    @discardableResult
+    func registerPushToken(
+        _ token: String,
+        env: String,
+        events: [String]?
+    ) async throws -> JSONValue {
+        try await requireClient().registerPushToken(token, env: env, events: events)
+    }
+
+    /// Remove the APNs device token from the relay's push registry (§6a).
+    @discardableResult
+    func unregisterPushToken(_ token: String) async throws -> JSONValue {
+        try await requireClient().unregisterPushToken(token)
+    }
+
+    /// Clear the §6 foreground declaration (the app left the foreground). The
+    /// relay suppresses turn_complete/task_complete/error pushes while a live
+    /// phone WS holds the session foregrounded; iOS does not kill the socket
+    /// the instant the app backgrounds, so without this clear a turn finishing
+    /// seconds after backgrounding would be silently gated. Best-effort:
+    /// fire-and-forget on the client (a closed socket is itself the clear).
+    func clearForeground() async {
+        guard let client else { return }
+        await client.setForeground(nil)
+    }
+
+    /// Re-declare the driven session as foregrounded after returning to the
+    /// foreground (§6a; mirrors :meth:`clearForeground`). When the relay socket
+    /// is NOT up this is a no-op — the `onReady` re-establishment already
+    /// re-asserts foreground on the fresh connection.
+    func reassertForeground() async {
+        guard let client else { return }
+        guard let sid = activeStoredSessionID ?? activeSessionID else { return }
+        await client.setForeground(sid)
+    }
 }
