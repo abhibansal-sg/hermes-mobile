@@ -12,11 +12,15 @@ import SwiftUI
 //     opens the "Thinking" SHEET (timeline rail + bold titles + reasoning text +
 //     embedded command/output code cards). If any tool failed the row carries a
 //     red failure badge so the failure is never hidden behind the fold (§2).
-//   - LIVE (streaming): the reasoning streams inline (via `ThinkingView`) and the
-//     tool timeline collapses to a SINGLE current-tool line (natural-language, no
-//     monospace) that updates as tools start/finish. A manual chevron expands the
-//     full tool step list; there is no auto-open churn while the turn works. The
-//     streaming caret in the answer body is the only "working" signal.
+//   - LIVE (streaming) — RATIFIED Wave-2.5 single-line rule (QA-2 R5/R6/A3):
+//     ONE collapsed line — "Working… ‹per-TURN timer›" with the current tool
+//     inline once it resolves a friendly name — tap to expand the bifurcation
+//     (thinking + tool timeline, the same step list the settled fold shows).
+//     Nothing streams inline while live: no per-reasoning-run accordions (their
+//     per-item 1 s timers and label+body double-print were R5/N4/N6), no
+//     separate current-tool row, no reserved 172 pt thinking window (the R6
+//     bands). The streaming caret in the answer bubble is THE progress signal;
+//     the timer is per-TURN (from `ChatStore.turnStartedAt`), never per item.
 //
 // SINGLE-FOLD CONTRACT (owner QA, 2026-07-19): within ONE agent turn, EVERYTHING
 // before the final answer text — reasoning segments, tool calls (BOTH the new
@@ -167,6 +171,12 @@ enum WorkingSectionModel {
         let summary: String
         let status: ChatItemStatus
         let isFailure: Bool
+        /// Whether the unit's identity is still a RAW wire state token (QA-2
+        /// N2: `tool.generating` / `review.summary` — the relay's pre-resolution
+        /// event name). The live collapsed line reads "Working…" for raw units
+        /// instead of surfacing internal state (C1); the humanized `summary`
+        /// itself falls back to a neutral label, never the raw token.
+        let raw: Bool
     }
 
     /// Flatten a run's tool work (NOT reasoning, NOT narration) into ordered units,
@@ -179,14 +189,17 @@ enum WorkingSectionModel {
                 out.append(WorkUnit(
                     summary: stepSummary(for: item),
                     status: item.status,
-                    isFailure: isFailure(item)
+                    isFailure: isFailure(item),
+                    raw: isRawStateName(item.toolName)
+                        && (item.summary.map(isRawStateName) ?? true)
                 ))
             case .tools(_, let tools, _, _):
                 for tool in tools {
                     out.append(WorkUnit(
                         summary: legacyToolSummary(tool),
                         status: legacyStatus(tool.state),
-                        isFailure: tool.state == .failed
+                        isFailure: tool.state == .failed,
+                        raw: isRawStateName(tool.name)
                     ))
                 }
             default:
@@ -263,9 +276,12 @@ enum WorkingSectionModel {
     }
 
     /// "Worked for 12s" / "Worked for 2m 3s" / "Worked" (no known duration).
+    /// A KNOWN sub-second duration still reads "Worked for 1s" — a turned-on
+    /// duration never rounds down to a bare "Worked" (QA-2 R5: a stamped relay
+    /// turn must show its time).
     nonisolated static func workedLabel(seconds: TimeInterval?) -> String {
         guard let seconds, seconds > 0 else { return "Worked" }
-        let total = Int(seconds.rounded())
+        let total = max(1, Int(seconds.rounded()))
         if total < 60 { return "Worked for \(total)s" }
         return "Worked for \(total / 60)m \(total % 60)s"
     }
@@ -312,6 +328,29 @@ enum WorkingSectionModel {
         return nil
     }
 
+    /// Whether a wire tool name / relay-supplied summary is a RAW internal state
+    /// token rather than a human label — the dotted lowercase event names the
+    /// relay emits before a tool resolves its friendly name (QA-2 N2:
+    /// `tool.generating`, `review.summary` flashed in live rows for ≈1 s with a
+    /// contradictory green ✓). These are never surfaced: the live line reads
+    /// "Working…" and the humanizer falls back to a neutral label. A real tool
+    /// name is snake/kebab-case (no dots); a friendly summary has spaces/case.
+    nonisolated static func isRawStateName(_ raw: String) -> Bool {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return true }
+        guard t.contains(".") else { return false }
+        return t.allSatisfy { $0.isLowercase || $0 == "." || $0 == "_" || $0.isNumber }
+    }
+
+    /// The collapsed LIVE line's label (QA-2 R5/A3, ratified Wave-2.5): plain
+    /// "Working…" until the current tool resolves a friendly humanized summary,
+    /// then the tool inline ("Working… · Read auth.py"). NEVER a raw state name
+    /// (N2) — a raw unit reads as plain "Working…" until it resolves.
+    nonisolated static func liveCollapsedLabel(parts: [ChatMessagePart]) -> String {
+        guard let unit = currentWork(in: parts), !unit.raw else { return "Working…" }
+        return "Working… · \(unit.summary)"
+    }
+
     /// Collapse whitespace/newlines and cap length so a summary stays one line.
     nonisolated static func shortTarget(_ raw: String, limit: Int = 72) -> String {
         let flat = raw
@@ -337,7 +376,10 @@ enum WorkingSectionModel {
     /// `summary`; otherwise derives a verb from the tool name + primary target.
     /// Deterministic — no model calls.
     nonisolated static func stepSummary(for item: ChatItem) -> String {
-        if let s = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+        // A relay `summary` that is still a raw state token (`tool.generating`)
+        // is NOT a label — fall through to the humanizer (QA-2 N2).
+        if let s = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !s.isEmpty, !isRawStateName(s) {
             return shortTarget(s)
         }
         let target = primaryTarget(of: item)
@@ -364,6 +406,13 @@ enum WorkingSectionModel {
     /// preserves it); keyword matching lowercases internally.
     nonisolated static func humanize(name: String, target: String?) -> String {
         let lower = name.lowercased()
+        // A still-raw dotted event name (QA-2 N2) must never reach the UI —
+        // neutral fallback BEFORE the loose keyword matching (a raw name like
+        // `review.summary` would otherwise false-match "view" → "Read …").
+        if isRawStateName(name) {
+            if let target { return "Working on \(shortTarget(target))" }
+            return "Tool step"
+        }
         func verb(_ v: String, _ fallback: String) -> String {
             if let target { return "\(v) \(shortTarget(target))" }
             return fallback
@@ -534,38 +583,26 @@ struct WorkingSectionView: View {
     @Environment(\.hermesTheme) private var theme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    /// Manual expansion of the folded step list. Settled sections start collapsed;
-    /// live sections keep the streaming reasoning visible and start with the tool
-    /// timeline collapsed to the single current-tool line.
+    /// Per-TURN timer tick for the live collapsed line (QA-2 R5: the timer is
+    /// per-turn, never per-item). Same 1 s cadence the settled label derives
+    /// from; `monospacedDigit` keeps the row from jittering as it counts.
+    private static let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    @State private var now = Date()
+
+    /// Manual expansion of the folded step list. Settled AND live sections
+    /// start collapsed (QA-2 R5/A3: a live turn is ONE line until the user
+    /// taps — no auto-open churn, no inline streaming reasoning).
     @State private var isExpanded = false
     /// Presentation of the "Thinking" sheet, opened by tapping a step.
     @State private var showThinkingSheet = false
     /// The step the sheet should scroll to on open.
     @State private var focusedStepID: String?
 
-    private var toolUnits: [WorkingSectionModel.WorkUnit] { WorkingSectionModel.toolUnits(in: parts) }
     private var hasFailure: Bool { WorkingSectionModel.runHasFailure(parts) }
     private var durationSeconds: TimeInterval? {
         WorkingSectionModel.runDurationSeconds(parts, settled: settledDuration)
     }
     private var steps: [WorkingStep] { WorkingSectionModel.steps(from: parts) }
-    /// While live, reasoning already streams inline (via `ThinkingView`), so the
-    /// expandable list shows only the non-reasoning steps (tool calls + interim
-    /// narration) to avoid duplicating thoughts.
-    private var nonReasoningSteps: [WorkingStep] { steps.filter { $0.kind != .reasoning } }
-    /// The live current-tool line only belongs when the run actually has tool work;
-    /// a pure-reasoning live fold streams its thoughts inline and needs no line.
-    private var showsCurrentToolLine: Bool { !toolUnits.isEmpty || reasoningRuns.isEmpty }
-
-    /// Reasoning runs with renderable (non-empty, cleaned) text, so an empty
-    /// reasoning placeholder never mounts an empty `ThinkingView`.
-    private var reasoningRuns: [ReasoningRun] {
-        parts.compactMap { part in
-            guard case .reasoning(let id, let text) = part,
-                  !ThinkingDisplay.cleanedText(text).isEmpty else { return nil }
-            return ReasoningRun(id: id, text: text)
-        }
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -670,60 +707,57 @@ struct WorkingSectionView: View {
         .contentShape(Rectangle())
     }
 
-    // MARK: - Live: streaming reasoning + single current-tool line
+    // MARK: - Live: ONE collapsed working line (ratified Wave-2.5, QA-2 R5/R6)
 
+    /// The ratified live-turn presentation: a SINGLE chrome-less line —
+    /// "Working… · ‹current tool› ‹per-TURN timer› ›" — tap to expand the
+    /// bifurcation (thinking + tool timeline). NOTHING streams inline: the old
+    /// per-reasoning-run `ThinkingView` accordions (per-item 1 s timers, label
+    /// + body double-print — R5/N4/N6), the separate current-tool row, and the
+    /// fixed 172 pt thinking window (the R6 whitespace bands) are gone. The
+    /// streaming caret in the answer bubble remains THE progress signal
+    /// (Wave-2.5 "no fat working pill; the caret is the working signal").
     @ViewBuilder
     private var liveSection: some View {
-        // Reasoning streams inline while the turn works (never behind the fold).
-        ForEach(reasoningRuns) { run in
-            ThinkingView(
-                thinking: run.text,
-                streaming: true,
-                liveTurnStartedAt: liveTurnStartedAt,
-                settledDuration: nil
-            )
+        Button {
+            toggle()
+        } label: {
+            liveCollapsedLine
         }
+        .buttonStyle(.plain)
+        .accessibilityLabel(liveAccessibilityLabel)
+        .accessibilityValue(isExpanded ? "expanded" : "collapsed")
+        .accessibilityHint("Double-tap to \(isExpanded ? "collapse" : "expand") what the assistant is doing")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityIdentifier("workingSectionLive")
+        .onReceive(Self.tick) { now = $0 }
 
-        if showsCurrentToolLine {
-            Button {
-                toggle()
-            } label: {
-                currentToolLine
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(currentToolAccessibilityLabel)
-            .accessibilityValue(isExpanded ? "expanded" : "collapsed")
-            .accessibilityHint("Double-tap to \(isExpanded ? "collapse" : "expand") the full tool timeline")
-            .accessibilityAddTraits(.isButton)
-            .accessibilityIdentifier("workingSectionCurrentTool")
-
-            if isExpanded {
-                // Reasoning is already visible above while live, so the expanded
-                // body reveals only the tool + interim-narration step list.
-                stepList(nonReasoningSteps)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
+        if isExpanded {
+            // Tap-to-expand bifurcation: reasoning steps + the tool timeline
+            // in wire order — the SAME step list the settled fold expands.
+            stepList(steps)
+                .transition(.opacity.combined(with: .move(edge: .top)))
         }
     }
 
-    /// Chrome-less current-tool line (natural language, no monospace tool name).
-    private var currentToolLine: some View {
-        HStack(spacing: 8) {
-            if let unit = WorkingSectionModel.currentWork(in: parts) {
-                statusIcon(for: unit.status)
-                    .frame(width: 16, height: 16)
-                Text(unit.summary)
-                    .font(.callout)
-                    .foregroundStyle(theme.mutedFg)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            } else {
-                Text("Working…")
-                    .font(.callout)
-                    .italic()
-                    .foregroundStyle(theme.mutedFg)
-            }
-            Spacer(minLength: 0)
+    /// Chrome-less collapsed live line: spinner + "Working… · ‹tool›" + the
+    /// per-TURN elapsed label + chevron. No box/border/capsule (the settled
+    /// row's exact visual language, live variant).
+    private var liveCollapsedLine: some View {
+        HStack(spacing: 6) {
+            ProgressView()
+                .controlSize(.mini)
+                .accessibilityHidden(true)
+            Text(WorkingSectionModel.liveCollapsedLabel(parts: parts))
+                .font(.callout)
+                .foregroundStyle(theme.mutedFg)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Text(ThinkingDisplay.elapsedText(startedAt: liveTurnStartedAt, now: now))
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(theme.mutedFg.opacity(0.75))
+                .accessibilityHidden(true)
             if hasFailure { failureBadge }
             Image(systemName: "chevron.right")
                 .font(.caption2)
@@ -734,11 +768,8 @@ struct WorkingSectionView: View {
         .contentShape(Rectangle())
     }
 
-    private var currentToolAccessibilityLabel: String {
-        guard let unit = WorkingSectionModel.currentWork(in: parts) else {
-            return "Working"
-        }
-        let base = "Current step: \(unit.summary)"
+    private var liveAccessibilityLabel: String {
+        let base = "\(WorkingSectionModel.liveCollapsedLabel(parts: parts)), \("elapsed") \(ThinkingDisplay.elapsedText(startedAt: liveTurnStartedAt, now: now))"
         return hasFailure ? "\(base), contains a failed step" : base
     }
 
@@ -749,24 +780,6 @@ struct WorkingSectionView: View {
             .font(.caption2)
             .foregroundStyle(theme.statusError)
             .accessibilityLabel("contains a failed step")
-    }
-
-    @ViewBuilder
-    private func statusIcon(for status: ChatItemStatus) -> some View {
-        switch status {
-        case .inProgress:
-            ProgressView()
-                .controlSize(.small)
-                .accessibilityLabel("Tool running")
-        case .completed:
-            Image(systemName: "checkmark.circle.fill")
-                .foregroundStyle(theme.statusOK)
-                .accessibilityLabel("Tool completed")
-        case .failed:
-            Image(systemName: "xmark.circle.fill")
-                .foregroundStyle(theme.statusError)
-                .accessibilityLabel("Tool failed")
-        }
     }
 }
 
@@ -850,11 +863,4 @@ private struct ThinkingSheet: View {
         }
         .accessibilityElement(children: .combine)
     }
-}
-
-/// A renderable reasoning run inside a working section (`Identifiable` for the
-/// `ForEach`, keyed on the reasoning part's stable id).
-private struct ReasoningRun: Identifiable, Equatable {
-    let id: String
-    let text: String
 }
