@@ -160,6 +160,19 @@ final class ChatStore {
     #if DEBUG
     #endif
     var isStreaming: Bool = false
+
+    /// QA-2 R12 — local-turn watchdog. Armed on every `isStreaming` false→true
+    /// transition; if no relay item batch arrives for ``localTurnStaleTimeout``
+    /// the turn is force-settled so the stop button, the dock task pill and the
+    /// Live Activity can never wedge when the terminal `turn.completed` /
+    /// `message.complete` frame is missed or dropped (owner device-QA: the
+    /// "Tasks 0/0 + red stop stuck for 3m9s" episode that needed a force-close).
+    /// Cancelled on every legitimate settle path (`setStreaming(false)`,
+    /// `cancelStreaming`, `reset`, foreign-teardown). Foreign-mirror silence has
+    /// its OWN watchdog (``foreignMirrorWatchdog``) — this one guards a turn WE
+    /// are driving.
+    private var localTurnWatchdog: Task<Void, Never>?
+    private static let localTurnStaleTimeout: Duration = .seconds(180)
     /// An approval the user must answer, or `nil`.
     var pendingApproval: PendingApproval?
     /// A clarification the user must answer, or `nil`.
@@ -272,14 +285,76 @@ final class ChatStore {
     /// reverse scan returns the live one. Items whose body yields no parseable
     /// list are skipped (mirrors the legacy scan's skip-empty semantics — keeps
     /// the prior list rather than blanking the dock on a mid-stream delta).
+    ///
+    /// QA-2 R13 — SESSION-SCOPE: when a list is found we stamp
+    /// ``taskListOwnerSessionId`` to the active runtime session so the dock can
+    /// prove ownership (the pill never renders for a list a different session
+    /// owns, even if both happen to be live). The owner clears together with
+    /// the mirror — `reset()` (session teardown) and a fresh turn's send both
+    /// drop it so a new session/turn starts with a clean dock.
     private func refreshRelayTaskListMirror(from items: [ChatItem]) {
         for item in items.reversed() where item.type == .taskList {
             if let list = item.taskListBody {
                 relayLatestTaskList = (item.itemID, list)
+                taskListOwnerSessionId = activeSessionId
             }
             return
         }
         relayLatestTaskList = nil
+        taskListOwnerSessionId = nil
+    }
+
+    /// The runtime session id that owns the currently-mirrored task list, or
+    /// `nil` when no list is mirrored. QA-2 R13: the dock's task box is strictly
+    /// session-scoped — a list mirrored for session A must NEVER render while
+    /// session B is active. `reset()` clears this with the mirror on session
+    /// teardown; ``refreshRelayTaskListMirror`` re-stamps it whenever a live
+    /// list lands. Equal to `activeSessionId` for the owning session, so the
+    /// visibility gate is a plain identity check (test A-vs-B, A6).
+    private(set) var taskListOwnerSessionId: String?
+
+    /// Wall clock of the most recent relay item batch applied (QA-2 R12). The
+    /// ``localTurnWatchdog`` reconciles against this — a turn marked streaming
+    /// whose frames have gone silent past ``localTurnStaleTimeout`` is force-
+    /// settled so the stop state and the dock pill can never wedge when the
+    /// terminal frame is missed (owner device-QA: "no force-close ever needed
+    /// to regain control").
+    private(set) var lastRelayItemFrameAt: Date?
+
+    /// QA-2 R12 — the dock's task-box VISIBILITY gate. The list DATA stays in
+    /// ``latestTodoList`` (the dock reads it when this is true, the inline
+    /// transcript keeps rendering the item while false); this gate decides
+    /// whether the dock surface owns the checklist RIGHT NOW. The pill is
+    /// visible exactly when ALL hold:
+    ///   1. a list exists (``latestTodoList`` non-nil);
+    ///   2. the list belongs to the ACTIVE session — a list session A owns
+    ///      never shows for session B (R13/A6);
+    ///   3. a turn is live (``isStreaming``) — the pill is turn-lifecycle-
+    ///      driven, clears the instant the owning turn ends (R12);
+    ///   4. the list is NOT terminal — once every task is completed/cancelled
+    ///      the agent has closed the list and the pill auto-dismisses (R13).
+    /// (1)+(3) together also kill the cross-session resurrection the legacy
+    /// context-free `messages` scan caused: a settled prior turn's cached todo
+    /// activity can't reach the dock because no turn is live to gate it on.
+    var dockShowsTaskBox: Bool {
+        guard let list = latestTodoList, isStreaming else { return false }
+        guard !Self.taskListIsTerminal(list) else { return false }
+        // Owner check: nil-vs-nil (a brand-new session before any list) passes;
+        // any mismatch hides the pill. Belt-and-braces over `reset()`'s mirror
+        // clear — proves ownership independent of the teardown path.
+        let owner = taskListOwnerSessionId
+        let active = activeSessionId
+        if let owner, let active, owner != active { return false }
+        return true
+    }
+
+    /// A task list is terminal when every item is completed or cancelled — the
+    /// agent has finished or abandoned the work and the dock pill should auto-
+    /// dismiss instead of lingering at "N of N" (QA-2 R13: "closed/short-closed
+    /// by the agent").
+    private static func taskListIsTerminal(_ list: TodoList) -> Bool {
+        guard !list.items.isEmpty else { return false }
+        return list.items.allSatisfy { $0.status == .completed || $0.status == .cancelled }
     }
 
     /// Shared scan behind both dock accessors: the newest todo activity that
@@ -661,7 +736,17 @@ final class ChatStore {
     /// collapses to a plain `isStreaming = value` (the whole telemetry block is
     /// `#if DEBUG`), so there is zero hot-path cost and no symbols.
     private func setStreaming(_ value: Bool, reason: String) {
+        let wasStreaming = isStreaming
         isStreaming = value
+        // QA-2 R12 — stop-state wedge kill. Arm on rising edge so a missed
+        // terminal frame can never leave `isStreaming` (and the dock pill, the
+        // red stop button, the Live Activity) stuck forever; cancel on falling
+        // edge so a normal settle never fires a spurious force-clear.
+        if value && !wasStreaming {
+            armLocalTurnWatchdog()
+        } else if !value && wasStreaming {
+            cancelLocalTurnWatchdog()
+        }
         #if DEBUG
         let ev = routingEvent
         let evType = ev?.rawType ?? "-"
@@ -2534,6 +2619,15 @@ final class ChatStore {
                 }
             }
             setStreaming(true, reason: "relay.send")
+            // QA-2 R12/R13 — a new turn starts clean: drop any task list the
+            // PREVIOUS turn left in the relay item store so the dock pill never
+            // re-shows a stale list before this turn emits its own `taskList`.
+            // `dockShowsTaskBox`'s `isStreaming` gate would hide the stale list
+            // anyway, but clearing the owner here is what lets the new turn's
+            // first `taskList` frame repopulate from a blank slate (and the
+            // pill reads the NEW list, not last turn's).
+            relayLatestTaskList = nil
+            taskListOwnerSessionId = nil
             // QA-1 B8: stamp the turn start at submit so the pre-first-item
             // inline activity row's elapsed label ticks from the user's send
             // (the direct path stamps in `beginStreamingMessage`; the relay's
@@ -4460,6 +4554,12 @@ final class ChatStore {
         // gateway path (which never calls `applyRelayItems`) would keep showing
         // the previous session's dock task box.
         relayLatestTaskList = nil
+        // QA-2 R13: drop ownership with the mirror so a stale owner can never
+        // leak into the next session's dock visibility check.
+        taskListOwnerSessionId = nil
+        // QA-2 R12: a session teardown kills any in-flight local turn — cancel
+        // its watchdog so it can never fire-settle into the fresh session.
+        cancelLocalTurnWatchdog()
         // Relay echo adoptions belong to the session being torn down (QA-1):
         // a stale adoption must never re-id a next session's userMessage item
         // onto a prior session's consumed echo row.
@@ -4557,6 +4657,11 @@ final class ChatStore {
     }
 
     func applyRelayItems(_ items: [ChatItem]) {
+        // QA-2 R12 — a live frame batch proves the turn is still progressing;
+        // stamp the wall clock and re-arm the local-turn watchdog so a busy
+        // turn (long tool, slow stream) never falsely fires the force-settle.
+        lastRelayItemFrameAt = Date()
+        if isStreaming { armLocalTurnWatchdog() }
         var rebuilt: [ChatMessage] = []
         var segmentParts: [ChatMessagePart] = []
         var segmentAnchor: String?
@@ -4789,6 +4894,99 @@ final class ChatStore {
             self?.onTurnComplete?()
         }
     }
+
+    // MARK: - QA-2 R12 local-turn watchdog (stop-state wedge kill)
+
+    /// (Re)arm the local-turn staleness watchdog. Called on every `isStreaming`
+    /// false→true transition. If no relay item batch lands within
+    /// ``localTurnStaleTimeout`` the turn is force-settled so the stop button,
+    /// the dock task pill and the Live Activity can never wedge when the
+    /// terminal frame is missed/dropped (owner device-QA: "no force-close ever
+    /// needed to regain control").
+    private func armLocalTurnWatchdog() {
+        cancelLocalTurnWatchdog()
+        localTurnWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: ChatStore.localTurnStaleTimeout)
+            guard let self, !Task.isCancelled, self.isStreaming else { return }
+            self.fireLocalTurnWatchdog()
+        }
+    }
+
+    private func cancelLocalTurnWatchdog() {
+        localTurnWatchdog?.cancel()
+        localTurnWatchdog = nil
+    }
+
+    /// The local turn went silent past the staleness window with no terminal
+    /// frame: force-settle the streaming state so the composer's stop button
+    /// releases, the dock task pill clears, and the Live Activity ends. This is
+    /// the safety net — the normal `turn.completed` / `message.complete` /
+    /// interrupt path settles via `setStreaming(false)` first; this only fires
+    /// when none of those landed in time.
+    private func fireLocalTurnWatchdog() {
+        guard isStreaming else { return }
+        chatLog.warning("local-turn watchdog fired: turn went silent past the staleness window with no terminal frame — force-settling so the stop state and dock pill cannot wedge")
+        // Mirror handleMessageComplete's settle: clear the streaming bubble's
+        // own flag (stops the cursor), clear turn chrome, drop streaming, and
+        // fire onTurnComplete so the Live Activity ends in parity with a real
+        // completion (R16 also depends on this edge firing).
+        mutateStreaming { $0.isStreaming = false }
+        streamingMessageID = nil
+        turnStartedAt = nil
+        activeToolName = nil
+        activeToolCallId = nil
+        setStreaming(false, reason: "localTurnWatchdog")
+        onTurnComplete?()
+    }
+
+    /// QA-2 R12 — relay turn end. Called by `RelaySessionCoordinator.ingest` on
+    /// a `turn.completed` frame. The streaming flag and chrome are cleared by
+    /// the subsequent `applyRelayItems` projection (which sees a non-streaming
+    /// batch); this hook clears any lingering dock task-list ownership so a
+    /// terminal list (all done/cancelled — the agent closed it) dismisses the
+    /// pill at turn end even though the `taskList` item itself persists in the
+    /// relay item store. `dockShowsTaskBox`'s `isStreaming` gate hides the pill
+    /// immediately regardless, but dropping the owner here is what lets a fresh
+    /// turn re-seed the dock from a clean slate.
+    /// QA-2 R12 — relay turn end. Called by `RelaySessionCoordinator.ingest` on
+    /// a `turn.completed` frame. The dock pill is hidden at turn end purely by
+    /// ``dockShowsTaskBox``'s `isStreaming` gate (the projection that follows
+    /// settles `isStreaming` to false) — the list DATA is intentionally kept so
+    /// a resumed turn / the render_conformance bridge contract still sees it,
+    /// and ``handleRelayTurnStarted`` does the cross-turn re-seed. This hook is
+    /// a documented no-op seam kept for future turn-end observability; it must
+    /// NOT drop the mirror (that would break the bridge + the data-persistence
+    /// contract other surfaces depend on).
+    func handleRelayTurnCompleted() {
+        // Intentional no-op: visibility is gated by `dockShowsTaskBox`.
+    }
+
+    /// QA-2 R12/R13 — relay turn start. Called by `RelaySessionCoordinator`
+    /// .ingest on a `turn.started` frame. The relay item store accumulates the
+    /// PRIOR turn's `taskList` item (stable `<sid>:tasks` id, replaced in place
+    /// only when THIS turn emits its own first `taskList` frame), so without
+    /// this clear the next `applyRelayItems` would re-mirror the previous turn's
+    /// list and the dock pill would briefly render stale data the moment the new
+    /// turn flips `isStreaming` true. Clearing here lets the new turn re-seed
+    /// the dock from a blank slate the instant its own `taskList` arrives.
+    func handleRelayTurnStarted() {
+        relayLatestTaskList = nil
+        taskListOwnerSessionId = nil
+    }
+
+    #if DEBUG
+    /// DEBUG test seam: drive the local-turn watchdog's force-settle path
+    /// synchronously without waiting ``localTurnStaleTimeout``. Production code
+    /// never calls this — the watchdog's `Task.sleep` is the only legit trigger.
+    /// Lets the regression test prove a missed-frame turn releases `isStreaming`
+    /// and the dock pill without a force-close (A6/R12).
+    @discardableResult
+    func _debugFireLocalTurnWatchdog() -> Bool {
+        guard isStreaming else { return false }
+        fireLocalTurnWatchdog()
+        return true
+    }
+    #endif
 
     private func teardownForeignStream(preservePlaceholderForReconcile: Bool = false) {
         foreignMirrorWatchdog?.cancel()
