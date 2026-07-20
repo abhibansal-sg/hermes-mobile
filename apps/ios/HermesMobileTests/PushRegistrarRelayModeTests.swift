@@ -176,7 +176,7 @@ final class PushRegistrarRelayModeTests: XCTestCase {
                 relay.deliverResult(id: id, result: .object(["registered": .bool(true)]))
             }
         })
-        let (_, coordinator) = makeRelayConnection(transport)
+        let (connection, coordinator) = makeRelayConnection(transport)
         try await coordinator.start(url: url)
         await waitUntil(coordinator.phase == .open, "relay socket should open")
 
@@ -217,6 +217,7 @@ final class PushRegistrarRelayModeTests: XCTestCase {
         )
 
         await coordinator.stop()
+        _ = connection  // keep the registrar's weak connection alive for the test
     }
 
     /// Direct mode is untouched: the relay overrides must never fire and the
