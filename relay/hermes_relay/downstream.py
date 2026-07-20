@@ -518,6 +518,7 @@ class DownstreamServer:
         * ``approve``   -> approval_respond
         * ``clarify``   -> clarify_respond
         * ``interrupt`` -> session_interrupt
+        * ``attach``    -> file_attach / image_attach_bytes (bytes inlined)
         * ``ack``       -> conn.ack (LOCAL, no gateway hop)
         * ``resync``    -> conn.replay (LOCAL, no gateway hop)
         """
@@ -659,6 +660,48 @@ class DownstreamServer:
             return result
         if method == UpstreamMethod.INTERRUPT:
             return await self._gateway.session_interrupt(p["session_id"])
+
+        # -- attachments (B9/A5): REST-free, bytes inlined by the phone ------
+        if method == UpstreamMethod.ATTACH:
+            # The phone cannot reach the gateway's ``POST /api/upload`` REST
+            # route on a relay-only reach, so it inlines the bytes as a
+            # ``data:<mime>;base64,`` URL and the relay drives the gateway's
+            # base64 RPCs: ``file.attach`` (arbitrary files → ``@file:`` ref)
+            # or ``image.attach_bytes`` (photos → vision tile). Session
+            # resolution mirrors SUBMIT's drive semantics: no ``session_id``
+            # → create (+own); foreign/idle → resume (adopt the LIVE id the
+            # gateway may remap to); already owned → remap through
+            # ``live_id_for`` so the bytes land on the live session, not a
+            # dormant origin id.
+            kind = p.get("kind")
+            if kind not in ("file", "image"):
+                raise ValueError(f"attach: unknown kind {kind!r}")
+            data_url = p.get("data_url") or ""
+            if not data_url:
+                raise ValueError("attach: data_url required")
+            sid = p.get("session_id")
+            if sid:
+                if not self._gateway.owns(sid):
+                    resumed = await self._gateway.session_resume(sid)
+                    if isinstance(resumed, dict):
+                        sid = resumed.get("session_id") or sid
+                else:
+                    sid = self._gateway.live_id_for(sid)
+            else:
+                sid = await self._gateway.session_create(title=p.get("title", "New chat"))
+            name = p.get("name") or ""
+            if kind == "file":
+                result = await self._gateway.file_attach(sid, name=name, data_url=data_url)
+            else:
+                result = await self._gateway.image_attach_bytes(
+                    sid, data_url=data_url, filename=name
+                )
+            # Attaching from the composer is an interactive, on-screen action —
+            # foreground the chat (§6) exactly like SUBMIT/OPEN do.
+            conn.set_foreground(sid)
+            if isinstance(result, dict):
+                return {"session_id": sid, "kind": kind, **result}
+            return {"session_id": sid, "kind": kind, "attached": True}
 
         raise ValueError(f"unknown upstream method: {method!r}")
 

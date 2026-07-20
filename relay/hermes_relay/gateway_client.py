@@ -502,6 +502,41 @@ class GatewayClient:
         """``session.interrupt`` — stop the active turn (pass-through)."""
         return await self._call_result("session.interrupt", {"session_id": session_id})
 
+    # -- attachments (B9/A5: REST-free, bytes inlined) --------------------
+    async def file_attach(
+        self, session_id: str, *, name: str, data_url: str, timeout: float = 90.0
+    ) -> dict[str, Any]:
+        """``file.attach`` — stage a non-image file into the session workspace.
+
+        The phone inlines the bytes as a ``data:<mime>;base64,`` URL (it cannot
+        assume a gateway-visible path), and the gateway materialises the file
+        into ``.hermes/desktop-attachments/``, returning ``{attached, name,
+        path, ref_path, ref_text, uploaded}`` — the ``ref_text`` (``@file:…``)
+        is what the composer appends to the outgoing prompt. Generous timeout:
+        a 25 MB cap file is a ~33 MB base64 payload over this socket.
+        """
+        return await self._call_result(
+            "file.attach",
+            {"session_id": session_id, "name": name, "data_url": data_url},
+            timeout=timeout,
+        )
+
+    async def image_attach_bytes(
+        self, session_id: str, *, data_url: str, filename: str = "", timeout: float = 90.0
+    ) -> dict[str, Any]:
+        """``image.attach_bytes`` — attach a photo from inlined base64 bytes.
+
+        The gateway's handler accepts a ``data:image/…;base64,`` URL as
+        ``content_base64`` (prefix + embedded whitespace tolerated), so the
+        phone's ``data_url`` passes through untouched — NO ``POST /api/upload``
+        REST round-trip, which is exactly what a relay-only phone cannot make.
+        Returns the same shape as ``image.attach`` (``{attached, path, …}``).
+        """
+        params: dict[str, Any] = {"session_id": session_id, "content_base64": data_url}
+        if filename:
+            params["filename"] = filename
+        return await self._call_result("image.attach_bytes", params, timeout=timeout)
+
     # -- reconnect re-establishment --------------------------------------
     async def _reestablish_owned(self) -> None:
         """Re-resume every owned session on a fresh connection (best effort).
