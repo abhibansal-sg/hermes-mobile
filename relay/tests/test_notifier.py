@@ -190,6 +190,106 @@ def test_error_fires_when_absent_and_suppressed_when_foregrounded():
 
 
 # --------------------------------------------------------------------------- #
+# clarify — blocking, always notifies (like approval)                          #
+# --------------------------------------------------------------------------- #
+def _clarify(sid, request_id="c1", turn="t1", question="Which bucket, staging or prod?"):
+    return Frame(
+        sid=sid,
+        kind=FrameKind.CLARIFY_REQUEST,
+        body={"request_id": request_id, "question": question},
+        turn=turn,
+    )
+
+
+def test_clarify_fires_even_when_foregrounded():
+    notifier, push, _, _ = _make(owned=("s1",), foreground=("s1",))
+    desc = notifier.observe(_clarify("s1", question="Which bucket, staging or prod?"))
+    assert desc is not None
+    assert desc["event_type"] == "clarify"
+    assert desc["title"] == "Hermes has a question"
+    assert desc["body"] == "Which bucket, staging or prod?"
+    assert desc["category"] == "HERMES_CLARIFY"
+    assert desc["expiration"] == 0            # blocking -> no store-and-forward window
+    assert len(push.calls) == 1
+    assert notifier.metrics.suppressed_foreground == 0   # bypassed the §6 gate
+
+
+def test_clarify_default_text_and_dedupe_per_request():
+    notifier, push, _, _ = _make(owned=("s1",))
+    assert notifier.observe(Frame(sid="s1", kind=FrameKind.CLARIFY_REQUEST, body={}, turn="t1"))[
+        "body"
+    ] == "Hermes needs your input to continue"
+    # a distinct request rings again; the SAME request id does not.
+    notifier2, push2, _, _ = _make(owned=("s1",))
+    notifier2.observe(_clarify("s1", request_id="cA"))
+    notifier2.observe(_clarify("s1", request_id="cA"))    # dup
+    notifier2.observe(_clarify("s1", request_id="cB"))    # distinct
+    assert [c["event_type"] for c in push2.calls] == ["clarify", "clarify"]
+    assert notifier2.metrics.suppressed_dedupe == 1
+
+
+def test_clarify_unowned_never_pushes():
+    notifier, push, _, _ = _make(owned=(), foreground=())
+    assert notifier.observe(_clarify("s1")) is None
+    assert push.calls == []
+    assert notifier.metrics.skipped_unowned == 1
+
+
+# --------------------------------------------------------------------------- #
+# task_complete — taskList item.completed, foreground-gated                    #
+# --------------------------------------------------------------------------- #
+def _tasklist_completed(sid, item_id="s1:tasks", turn="t1", summary="Tasks 3/3", all_complete=True):
+    return Frame.with_item(
+        sid,
+        FrameKind.ITEM_COMPLETED,
+        Item(
+            item_id,
+            ItemType.TASK_LIST,
+            ItemStatus.COMPLETED,
+            0,
+            summary=summary,
+            body={"tasks": [], "counts": {"total": 3}, "all_complete": all_complete},
+        ),
+        turn,
+    )
+
+
+def test_task_complete_fires_when_phone_absent():
+    notifier, push, _, _ = _make(owned=("s1",), foreground=())
+    desc = notifier.observe(_tasklist_completed("s1", summary="Tasks 3/3"))
+    assert desc is not None
+    assert desc["event_type"] == "task_complete"
+    assert desc["title"] == "Hermes finished its tasks"
+    assert desc["body"] == "Tasks 3/3"
+    assert desc["category"] == "HERMES_TURN"
+    assert desc["expiration"] == 14400        # store-and-forward like turn_complete
+    assert len(push.calls) == 1
+    assert notifier.metrics.fired == 1
+
+
+def test_task_complete_suppressed_when_foregrounded():
+    notifier, push, _, _ = _make(owned=("s1",), foreground=("s1",))
+    assert notifier.observe(_tasklist_completed("s1")) is None
+    assert push.calls == []
+    assert notifier.metrics.suppressed_foreground == 1
+
+
+def test_task_complete_and_turn_complete_both_fire_in_one_turn():
+    """Same turn, distinct event types -> distinct dedupe identities."""
+    notifier, push, _, _ = _make(owned=("s1",), foreground=())
+    notifier.observe(_tasklist_completed("s1", turn="t1"))
+    notifier.observe(_agent_completed("s1", turn="t1", text="all set"))
+    assert {c["event_type"] for c in push.calls} == {"task_complete", "turn_complete"}
+
+
+def test_task_complete_unowned_never_pushes():
+    notifier, push, _, _ = _make(owned=(), foreground=())
+    assert notifier.observe(_tasklist_completed("s1")) is None
+    assert push.calls == []
+    assert notifier.metrics.skipped_unowned == 1
+
+
+# --------------------------------------------------------------------------- #
 # ownership + non-push-worthy                                                  #
 # --------------------------------------------------------------------------- #
 def test_unowned_session_never_pushes():
@@ -303,6 +403,42 @@ async def test_run_pump_observes_bus_frames():
     kinds = sorted(c["event_type"] for c in push.calls)
     assert kinds == ["approval", "turn_complete"]
     assert notifier.metrics.skipped_unowned == 1
+
+
+async def test_run_pump_fires_clarify_and_task_complete():
+    """End-to-end over the bus: a clarify.request and a taskList item.completed
+    both reach the reused push_engine through the run() pump."""
+    bus = EventBus()
+    push = FakePush()
+    gw = FakeGateway({"s1"})
+    notifier = Notifier(
+        NotifierConfig(), bus, gw,  # type: ignore[arg-type]
+        is_foregrounded=lambda sid: sid == "s1",  # foregrounded: gates task, not clarify
+        push_engine=push,
+    )
+    task = asyncio.create_task(notifier.run())
+    for _ in range(100):
+        if bus.subscriber_count(TOPIC_RELAY_FRAMES) == 1:
+            break
+        await asyncio.sleep(0.01)
+
+    bus.publish(TOPIC_RELAY_FRAMES, _clarify("s1", request_id="c1", turn="t1"))
+    # task-complete is suppressed while foregrounded (proves the gate)...
+    bus.publish(TOPIC_RELAY_FRAMES, _tasklist_completed("s1", turn="t1"))
+
+    for _ in range(100):
+        if notifier.metrics.fired >= 1 and notifier.metrics.suppressed_foreground >= 1:
+            break
+        await asyncio.sleep(0.01)
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert [c["event_type"] for c in push.calls] == ["clarify"]  # clarify bypassed the gate
+    assert notifier.metrics.suppressed_foreground == 1           # task_complete gated
 
 
 async def test_run_swallows_observe_errors(monkeypatch):

@@ -413,18 +413,42 @@ class GatewayClient:
         self._owned.add(session_id)
         return await self._call_result("prompt.submit", {"session_id": session_id, "text": text})
 
-    async def approval_respond(self, session_id: str, request_id: str, decision: str) -> dict[str, Any]:
-        """``approval.respond`` — answer an approval gate (pass-through)."""
+    async def approval_respond(
+        self, session_id: str, request_id: str, decision: str, *, resolve_all: bool = False
+    ) -> dict[str, Any]:
+        """``approval.respond`` — answer an approval gate.
+
+        WIRE-SHAPE CORRECTION: the stock gateway's ``approval.respond`` handler
+        reads ``choice`` (one of ``once``/``session``/``always``/``deny``, and
+        maps ``approve``->``once``) and ``all``, and resolves the gate by SESSION
+        key — it does NOT read ``decision`` or ``request_id``. Sending
+        ``decision`` therefore silently defaulted every phone approval to a DENY.
+        We map the phone's ``decision`` onto ``choice`` (``request_id`` is kept
+        for logging/forward-compat but the gateway ignores it).
+        """
         return await self._call_result(
             "approval.respond",
-            {"session_id": session_id, "request_id": request_id, "decision": decision},
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "choice": decision,
+                "all": resolve_all,
+            },
         )
 
     async def clarify_respond(self, session_id: str, request_id: str, text: str) -> dict[str, Any]:
-        """``clarify.respond`` — answer a clarify gate (pass-through)."""
+        """``clarify.respond`` — answer a clarify gate.
+
+        WIRE-SHAPE CORRECTION: the stock gateway's ``clarify.respond`` handler
+        (``_respond(rid, params, "answer")``) matches the pending waiter by
+        ``request_id`` and stores ``params["answer"]`` — it does NOT read
+        ``text``. Sending ``text`` therefore delivered an EMPTY answer to the
+        blocked agent. We send ``answer`` (``session_id`` is kept for symmetry;
+        the gateway resolves by ``request_id``).
+        """
         return await self._call_result(
             "clarify.respond",
-            {"session_id": session_id, "request_id": request_id, "text": text},
+            {"session_id": session_id, "request_id": request_id, "answer": text},
         )
 
     async def session_interrupt(self, session_id: str) -> dict[str, Any]:

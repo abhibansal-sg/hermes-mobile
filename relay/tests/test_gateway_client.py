@@ -301,6 +301,37 @@ async def test_resume_remaps_origin_to_distinct_live_id():
     await client.close()
 
 
+async def test_approval_respond_sends_choice_not_decision():
+    """The stock gateway reads ``choice`` (approve->once) + ``all``; a relay that
+    sent ``decision`` silently defaulted every approval to a DENY (wire-shape fix)."""
+    transport = FakeTransport(responder=echo_responder)
+    client, _ = make_client(transport)
+    await client.connect()
+    await client.approval_respond("sess1", "req7", "always", resolve_all=True)
+    sent = [f for f in transport.sent if f["method"] == "approval.respond"][0]
+    params = sent["params"]
+    assert params["choice"] == "always"   # decision mapped onto the gateway's param
+    assert params["all"] is True
+    assert "decision" not in params       # the ignored-by-gateway key is not sent
+    assert params["session_id"] == "sess1"
+    await client.close()
+
+
+async def test_clarify_respond_sends_answer_not_text():
+    """The stock gateway's clarify.respond stores ``params['answer']`` matched by
+    ``request_id``; a relay that sent ``text`` delivered an EMPTY answer (fix)."""
+    transport = FakeTransport(responder=echo_responder)
+    client, _ = make_client(transport)
+    await client.connect()
+    await client.clarify_respond("sess1", "req9", "use the staging bucket")
+    sent = [f for f in transport.sent if f["method"] == "clarify.respond"][0]
+    params = sent["params"]
+    assert params["answer"] == "use the staging bucket"
+    assert params["request_id"] == "req9"
+    assert "text" not in params
+    await client.close()
+
+
 # ---------------------------------------------------------------------------
 # reconnect + re-resume of owned sessions
 # ---------------------------------------------------------------------------

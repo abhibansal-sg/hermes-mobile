@@ -2,11 +2,14 @@
 
 Observes the relay's frame stream (``TOPIC_RELAY_FRAMES``) and, for sessions the
 :class:`~hermes_relay.gateway_client.GatewayClient` OWNS, fires an APNs push on
-the three push-worthy signals (protocol §6):
+the push-worthy signals (protocol §6):
 
 * ``item.completed`` of an ``agentMessage`` -> ``turn_complete`` push
-* ``approval.request``                      -> ``approval`` push
+* ``approval.request``                      -> ``approval`` push (blocking)
+* ``clarify.request``                       -> ``clarify`` push (blocking)
 * ``item.completed`` of an ``error``        -> ``turn_error`` push
+* ``item.completed`` of a ``taskList``      -> ``task_complete`` push
+  (the reframer only completes a taskList once every task is done)
 
 It fires by REUSING the existing ``plugins/hermes-mobile/push_engine.notify()``
 plumbing (device-token registry + direct HTTP/2 APNs or relay-mode delivery) —
@@ -19,11 +22,11 @@ Two deviations from a naive "gate everything" reading, each matching the
 existing gateway push worker (``push_engine._run_push_work``) that this lane
 mirrors:
 
-* **approval always notifies.** An approval gate is a *blocking* interaction —
-  the turn is stalled until the user answers — so it bypasses the foreground
-  suppression (the gateway path never foreground-gates ``approval.request``).
-* **turn_complete / error are foreground-gated.** A completed turn or an error
-  the user is already watching live is noise (STR-987 attention gate).
+* **approval + clarify always notify.** Both are *blocking* interactions — the
+  turn is stalled until the user answers — so they bypass the foreground
+  suppression (the gateway path never foreground-gates these gates).
+* **turn_complete / task_complete / error are foreground-gated.** A completion
+  or error the user is already watching live is noise (STR-987 attention gate).
 
 Scope: OWNED sessions only. Foreign-session notifications are PARKED (they need
 the broadcast/co-watch track; the relay as a pure client never receives a
@@ -67,16 +70,26 @@ class NotifierConfig:
 
     enabled: bool = True
     # Map relay signal -> push_engine event_type. Defaults are the exact
-    # PUSH_EVENT_KINDS the reused push_engine + iOS action categories expect.
+    # PUSH_EVENT_KINDS the reused push_engine + iOS action categories expect
+    # (``task_complete`` is a relay-local kind push_engine passes through).
     turn_complete_event: str = "turn_complete"
     approval_event: str = "approval"
+    clarify_event: str = "clarify"
     error_event: str = "turn_error"
+    task_complete_event: str = "task_complete"
     # iOS UNNotificationCategory action sets (match the gateway push worker).
     turn_complete_category: str = "HERMES_TURN"
     approval_category: str = "HERMES_APPROVAL"
+    clarify_category: str = "HERMES_CLARIFY"
     error_category: str = "HERMES_ERROR"
+    task_complete_category: str = "HERMES_TURN"
     # Bounded dedupe LRU size (per relay process, across all sessions).
     dedupe_capacity: int = 512
+
+    def blocking_events(self) -> frozenset[str]:
+        """Push kinds that BYPASS the §6 foreground gate (the turn is stalled
+        on the user): approval and clarify are both blocking interactions."""
+        return frozenset({self.approval_event, self.clarify_event})
 
 
 @dataclass
@@ -191,8 +204,9 @@ class Notifier:
             self.metrics.skipped_unowned += 1
             return None
 
-        # approval always notifies; other signals respect the §6 foreground gate.
-        if event_type != self._cfg.approval_event and self._is_foregrounded(sid):
+        # Blocking gates (approval/clarify) always notify — the turn is stalled
+        # on the user; every other signal respects the §6 foreground gate.
+        if event_type not in self._cfg.blocking_events() and self._is_foregrounded(sid):
             self.metrics.suppressed_foreground += 1
             return None
 
@@ -203,12 +217,19 @@ class Notifier:
         kind = frame.kind
         if kind == FrameKind.APPROVAL_REQUEST:
             return self._cfg.approval_event
+        if kind == FrameKind.CLARIFY_REQUEST:
+            return self._cfg.clarify_event
         if kind == FrameKind.ITEM_COMPLETED:
             item_type = (frame.body or {}).get("type")
             if item_type == ItemType.AGENT_MESSAGE:
                 return self._cfg.turn_complete_event
             if item_type == ItemType.ERROR:
                 return self._cfg.error_event
+            # A taskList reaches item.completed ONLY when every task is done
+            # (the reframer emits deltas while work remains) — the task-list-
+            # complete push signal.
+            if item_type == ItemType.TASK_LIST:
+                return self._cfg.task_complete_event
         return None
 
     def _identity(self, event_type: str, frame: Frame) -> tuple[str, str, str]:
@@ -220,8 +241,9 @@ class Notifier:
         turn id, then an empty key.
         """
         body = frame.body or {}
-        if event_type == self._cfg.approval_event:
-            # Approval frames are flat (not item.to_dict()).
+        if event_type in (self._cfg.approval_event, self._cfg.clarify_event):
+            # Approval/clarify frames are flat (not item.to_dict()); each distinct
+            # request id rings once (two gates in one turn each notify).
             key = str(
                 body.get("approval_id")
                 or body.get("request_id")
@@ -305,6 +327,15 @@ class Notifier:
             )
             return title, text, cfg.approval_category, 0
 
+        if event_type == cfg.clarify_event:
+            # A blocking clarify gate — flat body, question verbatim (mirrors the
+            # gateway push worker's "Hermes has a question" banner).
+            text = _safe_text(
+                frame_body.get("question") or frame_body.get("prompt"),
+                "Hermes needs your input to continue",
+            )
+            return "Hermes has a question", text, cfg.clarify_category, 0
+
         content = _item_content(frame_body)
         summary = frame_body.get("summary")
         if event_type == cfg.error_event:
@@ -312,6 +343,16 @@ class Notifier:
                 content.get("message") or content.get("text") or summary, "Turn errored"
             )
             return "Hermes hit an error", text, cfg.error_category, 0
+        if event_type == cfg.task_complete_event:
+            # taskList item.completed: the card summary ("Tasks N/N") is the
+            # human line; store-and-forward like turn_complete.
+            text = _safe_text(summary or content.get("text"), "All tasks complete")
+            return (
+                "Hermes finished its tasks",
+                text,
+                cfg.task_complete_category,
+                _TURN_COMPLETE_EXPIRATION_S,
+            )
         # turn_complete
         text = _safe_text(content.get("text") or summary, "Turn finished")
         return "Hermes finished", text, cfg.turn_complete_category, _TURN_COMPLETE_EXPIRATION_S

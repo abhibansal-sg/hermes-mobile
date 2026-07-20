@@ -52,6 +52,7 @@ the relay assigns from the raw event / tool `name`):
 | `agentMessage` | `message.delta`/`complete` | markdown text, streams |
 | `reasoning` | `reasoning.delta`/`available` | collapsible "thinking" |
 | `toolCall` (GENERIC) | ANY `tool.start`/`tool.complete`, keyed by `name` | collapsed tool card: name + status + summary; body = args/result/duration; covers ALL current + future tools |
+| `taskList` | the `todo` tool (`tool.start`/`tool.complete` with `name=="todo"`) | the agent's structured task list — ONE living card on a stable id (`<sid>:tasks`); body = `{ tasks:[{id,text,status}], counts:{total,pending,in_progress,completed,cancelled}, all_complete }`; status enum `pending`/`in_progress`/`completed`/`cancelled` |
 | `fileChange` | `tool.complete.inline_diff` present | diff render |
 | `image` | `image_generate` result / attachment / md image | inline image (shipped on iOS — STR-695: AsyncImage + retry + lightbox) |
 | `browser` | `browser_*` name family | screenshot/snapshot render |
@@ -64,11 +65,30 @@ Non-item turn signals delivered as frame kinds (not ordered items):
 Rule: a client that receives an unknown `type` renders it as a generic `toolCall`
 card (forward-compatible; new Hermes tools never break the phone).
 
+**Task list (`taskList`) semantics.** The `todo` tool is the ONE tool the relay
+does not collapse into a generic `toolCall`: it carries the agent's task list,
+which is a persistent artifact rather than a one-shot call. The relay gives it a
+stable per-session `item_id` (`<sid>:tasks`) and drives it through the normal
+item lifecycle so a client renders a single card that updates in place:
+- first sighting → `item.started` (the snapshot),
+- each later update while work remains → `item.delta` whose `patch` carries the
+  **full authoritative task list** (`{ tasks, counts, all_complete }`) — a
+  REPLACE of `body.tasks`, not an append,
+- every task `completed`/`cancelled` → `item.completed` (authoritative, and the
+  task-list-complete notification trigger, §6).
+
+`completed`-is-authoritative applies as everywhere else: the gateway lifts the
+full list onto `tool.complete` (top-level `todos`); a `tool.start` may only carry
+a partial merge preview and is never treated as authoritative.
+
 ## 3. Frame kinds (relay → phone)
 
 - `item.started` — `body` = the item skeleton (item_id, type, ord, status=in_progress).
-- `item.delta` — `body` = `{ item_id, patch }` (append text / partial fields).
+- `item.delta` — `body` = `{ item_id, patch }` (append text / partial fields). For a
+  `taskList` item the `patch` is a full-list REPLACE (`{ tasks, counts, all_complete }`),
+  not an append — the phone repaints `body.tasks` from it.
 - `item.completed` — `body` = the FULL authoritative item (status completed/failed).
+  For a `taskList` this frame is emitted ONLY when every task is done/cancelled.
 - `turn.started` / `turn.completed` — turn boundaries (`turn.completed` carries `usage`).
 - `approval.request` / `clarify.request` — interactive gates (phone replies via RPC).
 - `status` — `{ kind, text }` (lifecycle/compacting/etc., non-item chatter).
@@ -96,7 +116,8 @@ card (forward-compatible; new Hermes tools never break the phone).
 | open/read a session (incl. foreign) | store-read | **REST `GET /api/sessions/{id}/messages` ONLY** (`web_server.py:9985`, reads `state.db`) | none (NO reactivation) — R0 CORRECTION: `session.history` RPC is NOT a store-read; it resolves via `_sess_nowait` (in-memory live sessions only, `server.py:1727`) and returns 4001 for a foreign session the phone never owned. Use the REST path for foreign/idle history. |
 | start a NEW chat | create + own | `session.create` → `prompt.submit` | relay becomes owner |
 | send into an idle session (incl. a terminal one) | resume + own + submit | `session.resume` → `prompt.submit` | relay becomes owner; turn continues same sid/history/cwd |
-| answer approval/clarify | pass-through | `approval.respond` / `clarify.respond` | — |
+| answer approval | translate params | `approval.respond` | — — the gateway reads `choice` (`once`/`session`/`always`/`deny`, mapping `approve`→`once`) + `all` and resolves by SESSION key; the relay maps the phone's `decision`→`choice` (a relay that sent `decision` defaulted every approval to DENY) |
+| answer clarify | translate params | `clarify.respond` | — — the gateway matches the pending waiter by `request_id` and stores `params.answer`; the relay maps the phone's `text`→`answer` (a relay that sent `text` delivered an EMPTY answer) |
 | stop | pass-through | `session.interrupt` | — |
 
 Live streaming to the phone works for any session the relay OWNS (i.e. after
@@ -105,10 +126,22 @@ client = PARKED (needs broadcast; see `MOBILE-RELAY-CLIENT-DESIGN.md`).
 
 ## 6. Notifications (relay-fired, phone-off)
 
-Relay observes `item.completed`(agentMessage) / `approval.request` / `error` for
-its OWNED sessions → fires APNs via the existing plumbing (device tokens +
-`relay_client.py`/direct HTTP2), gated to skip when a live phone WS holds the
-session foregrounded. No gateway code. Foreign-session notifications = PARKED.
+Relay observes these signals for its OWNED sessions → fires APNs via the existing
+plumbing (device tokens + `relay_client.py`/direct HTTP2). No gateway code.
+Foreign-session notifications = PARKED.
+
+| signal | push kind | foreground gate |
+|---|---|---|
+| `item.completed`(agentMessage) | `turn_complete` | gated (skip when watched) |
+| `item.completed`(error) | `turn_error` | gated |
+| `item.completed`(taskList) — all tasks done | `task_complete` | gated |
+| `approval.request` | `approval` | BYPASS (blocking gate) |
+| `clarify.request` | `clarify` | BYPASS (blocking gate) |
+
+Blocking gates (`approval`/`clarify`) bypass the foreground gate — the turn is
+stalled on the user, so they always ring; completions/errors are skipped when a
+live phone WS holds the session foregrounded. Each `clarify` request rings once
+(keyed by `request_id`); `task_complete` collapses per turn.
 
 ## 7. What the two build tracks own (against THIS contract)
 
