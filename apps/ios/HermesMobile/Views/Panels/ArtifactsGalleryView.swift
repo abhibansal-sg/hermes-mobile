@@ -41,6 +41,13 @@ struct ArtifactsGalleryView: View {
     /// The image artifact currently presented in the full-screen zoom viewer.
     @State private var selectedImageArtifact: Artifact?
     @State private var selectedCachedImage: UIImage?
+    /// A data URL fetched over the network for an image artifact whose blob wasn't
+    /// cached — passed to the zoom viewer so a cache miss isn't an instant dead
+    /// end (W25 files-phase-1 audit finding).
+    @State private var selectedFetchedDataURL: String?
+    /// A file artifact opened in the native file viewer sheet (non-image, path
+    /// present, source session live).
+    @State private var selectedFileArtifact: Artifact?
 
     // MARK: - Body
 
@@ -61,11 +68,43 @@ struct ArtifactsGalleryView: View {
                 title: artifact.displayName,
                 image: selectedCachedImage,
                 remoteURL: artifact.remoteURL,
-                dataURL: artifact.isDataURL ? artifact.urlOrPath : nil,
-                unavailableMessage: "This image artifact is not available on this device. Close the viewer or try again after opening the source session."
+                dataURL: selectedFetchedDataURL ?? (artifact.isDataURL ? artifact.urlOrPath : nil),
+                unavailableMessage: "This image isn't cached on this device. Open its source session to view it."
             )
             .accessibilityIdentifier("artifactZoomableImageViewer")
         }
+        .sheet(item: $selectedFileArtifact) { artifact in
+            NavigationStack {
+                if let sessionId = liveRuntimeSessionId(for: artifact) {
+                    FileViewerView(
+                        rest: control,
+                        sessionId: sessionId,
+                        path: artifact.urlOrPath,
+                        serverId: serverId,
+                        profileId: profileId
+                    )
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { selectedFileArtifact = nil }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The LIVE runtime session id for `artifact`, or `nil` when its source session
+    /// isn't the one currently open. The file/read endpoints resolve paths against
+    /// a live runtime session's cwd, and the gallery only knows the runtime id for
+    /// the active session — so cross-session file opening degrades to the
+    /// transcript jump (see ``openArtifact``) rather than a guaranteed 404.
+    private func liveRuntimeSessionId(for artifact: Artifact) -> String? {
+        guard let sessions,
+              artifact.sessionId == sessions.activeStoredId,
+              let runtime = sessions.activeRuntimeId,
+              !runtime.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return runtime
     }
 
     // MARK: - Content phases
@@ -195,17 +234,45 @@ struct ArtifactsGalleryView: View {
 
     // MARK: - Open image / source session
 
-    /// Image artifacts open in a full-screen zoom/pan viewer. Other artifacts
-    /// preserve the existing behavior: jump back to the source transcript.
+    /// Routing (W25 files-phase-1 audit):
+    /// * image → full-screen zoom viewer. On a blob-cache miss, attempt a network
+    ///   fetch (its source session must be live) before falling back to the
+    ///   viewer's directional "open the source session" message.
+    /// * non-image FILE with a workspace path whose source session is live → the
+    ///   native file viewer (previously bounced straight to the transcript).
+    /// * everything else (links, cross-session files) → jump to the source
+    ///   transcript, as before.
     private func openArtifact(_ artifact: Artifact) {
         if artifact.kind == "image" {
             Task {
-                selectedCachedImage = await cachedBlobImage(for: artifact)
+                let cached = await cachedBlobImage(for: artifact)
+                selectedCachedImage = cached
+                // Cache miss + no inline/remote source: try to pull the bytes from
+                // the live session so the viewer isn't an instant dead end.
+                if cached == nil, artifact.remoteURL == nil, !artifact.isDataURL {
+                    selectedFetchedDataURL = await fetchImageDataURL(for: artifact)
+                } else {
+                    selectedFetchedDataURL = nil
+                }
                 selectedImageArtifact = artifact
             }
+        } else if artifact.kind == "file",
+                  artifact.isFilesystemPath,
+                  liveRuntimeSessionId(for: artifact) != nil {
+            selectedFileArtifact = artifact
         } else {
             openSourceSession(for: artifact)
         }
+    }
+
+    /// Best-effort network fetch of an image artifact's bytes as a data URL, via
+    /// the session-cwd read path. Returns `nil` when the source session isn't live
+    /// or the read fails — the caller then shows the directional unavailable state.
+    private func fetchImageDataURL(for artifact: Artifact) async -> String? {
+        guard let sessionId = liveRuntimeSessionId(for: artifact) else { return nil }
+        return try? await control.fsReadAsDataURL(
+            sessionId: sessionId, path: artifact.urlOrPath
+        ).dataURL
     }
 
     private func cachedBlobImage(for artifact: Artifact) async -> UIImage? {

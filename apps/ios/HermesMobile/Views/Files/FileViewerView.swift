@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 /// Native read-only text/image viewer for a single file fetched via
 /// `GET /api/fs/read` (Module F4A-A1). Handles all content outcomes:
@@ -69,6 +70,21 @@ struct FileViewerView: View {
     /// the diff fetch resolves) stops overriding their choice.
     @State private var userDidSelectMode = false
 
+    // MARK: - Export state (W25 files-phase-1: Share + Save to Files)
+
+    /// True while file bytes are being fetched/prepared for a Share/Save action.
+    @State private var isPreparingExport = false
+    /// Surfaced when the file can't be fetched/prepared for export.
+    @State private var exportError: String?
+    /// Temp-file URL wrapper driving the Share sheet (`nil` = not presented).
+    @State private var shareURL: IdentifiableFileURL?
+    /// Document + presentation flag driving the "Save to Files" `.fileExporter`.
+    @State private var exportDocument: DataFileDocument?
+    @State private var showExporter = false
+
+    /// Which export affordance the user tapped.
+    private enum ExportAction { case share, save }
+
     // MARK: - Image state machine
 
     enum ImagePhase: Equatable {
@@ -87,6 +103,27 @@ struct FileViewerView: View {
         .toolbar { toolbarContent }
         .background(theme.bg)
         .task(id: path) { await load() }
+        .sheet(item: $shareURL) { payload in
+            FileShareSheet(url: payload.url)
+        }
+        .fileExporter(
+            isPresented: $showExporter,
+            document: exportDocument,
+            contentType: exportContentType,
+            defaultFilename: fileName
+        ) { _ in
+            // Success or user-cancel both just dismiss; a real write error is
+            // rare (user picks the destination) and surfaced by the system UI.
+            exportDocument = nil
+        }
+        .alert("Couldn't Export", isPresented: Binding(
+            get: { exportError != nil },
+            set: { if !$0 { exportError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(exportError ?? "")
+        }
     }
 
     private var fileName: String { (path as NSString).lastPathComponent }
@@ -107,11 +144,28 @@ struct FileViewerView: View {
         if result.isImage {
             imageContent(result)
         } else if result.isBinary {
+            // No inline preview, but no longer a dead end (audit finding): surface
+            // size + type and offer Share / Save to Files, fetching the bytes via
+            // the `format=data_url` read path on demand.
             ContentUnavailableView {
                 Label("Binary file", systemImage: "doc.badge.gearshape")
             } description: {
                 Text(binarySizeLabel(result.size))
+            } actions: {
+                Button {
+                    startExport(.share)
+                } label: {
+                    Label("Share", systemImage: "square.and.arrow.up")
+                }
+                .accessibilityIdentifier("fileViewerBinaryShare")
+                Button {
+                    startExport(.save)
+                } label: {
+                    Label("Save to Files", systemImage: "arrow.down.doc")
+                }
+                .accessibilityIdentifier("fileViewerBinarySave")
             }
+            .disabled(isPreparingExport)
         } else if let text = result.content {
             modeContent(text, truncated: result.truncated)
         } else {
@@ -327,6 +381,29 @@ struct FileViewerView: View {
         }
         ToolbarItem(placement: .topBarTrailing) {
             HStack(spacing: 4) {
+                // Share / Save to Files (audit finding: the viewer was read-only).
+                // Available once the file has loaded, for text, image, AND binary —
+                // bytes are fetched on demand via the REST read path.
+                if phase.value != nil {
+                    Menu {
+                        Button {
+                            startExport(.share)
+                        } label: {
+                            Label("Share…", systemImage: "square.and.arrow.up")
+                        }
+                        Button {
+                            startExport(.save)
+                        } label: {
+                            Label("Save to Files", systemImage: "arrow.down.doc")
+                        }
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                            .accessibilityLabel("Share or save file")
+                    }
+                    .disabled(isPreparingExport)
+                    .accessibilityIdentifier("fileViewerExportMenu")
+                }
+
                 // "Use in Message" — the mention seam (audit finding). Default
                 // no-op; the integrator wires onMentionFile to inject a
                 // @file:<path> token in the composer.
@@ -489,5 +566,155 @@ struct FileViewerView: View {
     /// image.
     private func decodeDataURL(_ dataURL: String) async -> (image: UIImage, data: Data)? {
         await AttachmentBlobCache.decodeDataURL(dataURL)
+    }
+
+    // MARK: - Export (Share + Save to Files)
+
+    /// The UTType used to label an exported/saved file — resolved from the
+    /// server-reported MIME first, then the path extension, defaulting to `.data`.
+    private var exportContentType: UTType {
+        if let mime = phase.value?.mimeType,
+           !mime.isEmpty,
+           let type = UTType(mimeType: mime) {
+            return type
+        }
+        let ext = (path as NSString).pathExtension
+        if !ext.isEmpty, let type = UTType(filenameExtension: ext) {
+            return type
+        }
+        return .data
+    }
+
+    /// Kick off a Share or Save action: fetch the bytes off the main run loop's
+    /// critical path, then present the corresponding UI. Re-entrancy guarded.
+    private func startExport(_ action: ExportAction) {
+        guard !isPreparingExport else { return }
+        Task { await prepareExport(action) }
+    }
+
+    @MainActor
+    private func prepareExport(_ action: ExportAction) async {
+        isPreparingExport = true
+        defer { isPreparingExport = false }
+
+        guard let bytes = await exportBytes() else {
+            exportError = "Couldn't load this file to \(action == .share ? "share" : "save"). "
+                + "It may be too large to fetch or no longer available."
+            return
+        }
+        switch action {
+        case .share:
+            do {
+                let url = try writeTempFile(bytes)
+                shareURL = IdentifiableFileURL(url: url)
+            } catch {
+                exportError = "Couldn't prepare the file: \(error.localizedDescription)"
+            }
+        case .save:
+            exportDocument = DataFileDocument(data: bytes, contentType: exportContentType)
+            showExporter = true
+        }
+    }
+
+    /// Resolve the raw bytes for the current file:
+    /// * text → UTF-8 of the shown content (with the truncation sentinel);
+    /// * image / binary → the original bytes via the `format=data_url` read path
+    ///   (falling back to a re-encoded PNG for an already-decoded image).
+    private func exportBytes() async -> Data? {
+        guard let result = phase.value else { return nil }
+
+        if let text = result.content, !result.isBinary, !result.isImage {
+            let full = result.truncated ? text + "\n[Preview truncated]" : text
+            return full.data(using: .utf8)
+        }
+
+        // Prefer the original bytes: an inline data URL from the initial read, or a
+        // fresh `format=data_url` fetch (images already have this; binaries get it
+        // from the W25 gateway change).
+        if let dataURL = result.dataURL, let data = Self.decodeDataURLToData(dataURL) {
+            return data
+        }
+        if let fetched = try? await rest.fsReadAsDataURL(sessionId: sessionId, path: path),
+           let dataURL = fetched.dataURL,
+           let data = Self.decodeDataURLToData(dataURL) {
+            return data
+        }
+
+        // Last resort for an image the viewer already decoded but whose original
+        // bytes we couldn't re-fetch: re-encode the on-screen bitmap as PNG.
+        if result.isImage, case .loaded(let image) = imagePhase {
+            return image.pngData()
+        }
+        return nil
+    }
+
+    /// Decode a `data:<mime>;base64,<payload>` URL (or a non-base64 `data:` URL)
+    /// to its raw bytes. Unlike ``decodeDataURL`` this does not require the bytes
+    /// to be a decodable image, so it works for arbitrary binary files.
+    static func decodeDataURLToData(_ dataURL: String) -> Data? {
+        guard let commaIndex = dataURL.firstIndex(of: ",") else { return nil }
+        let meta = dataURL[dataURL.startIndex..<commaIndex]
+        let payload = String(dataURL[dataURL.index(after: commaIndex)...])
+        guard meta.hasPrefix("data:") else { return nil }
+        if meta.contains(";base64") {
+            let cleaned = payload.replacingOccurrences(of: "\n", with: "")
+                .replacingOccurrences(of: "\r", with: "")
+            return Data(base64Encoded: cleaned)
+        }
+        return payload.removingPercentEncoding?.data(using: .utf8)
+    }
+
+    /// Write export bytes to a uniquely-named temp file so the Share sheet can
+    /// present it with the real filename (and downstream apps get a proper name).
+    private func writeTempFile(_ data: Data) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hermes-share", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent(fileName.isEmpty ? "file" : fileName)
+        try? FileManager.default.removeItem(at: url)
+        try data.write(to: url, options: .atomic)
+        return url
+    }
+}
+
+// MARK: - Export support types
+
+/// Identifiable wrapper so a prepared temp-file URL can drive `.sheet(item:)`.
+private struct IdentifiableFileURL: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+/// Minimal `UIActivityViewController` bridge for the Share sheet.
+private struct FileShareSheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+/// Byte-backed `FileDocument` for the "Save to Files" `.fileExporter`. Export-only
+/// (the reader init is required by the protocol but the viewer never imports).
+struct DataFileDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.data] }
+
+    var data: Data
+    var contentType: UTType
+
+    init(data: Data, contentType: UTType) {
+        self.data = data
+        self.contentType = contentType
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        data = configuration.file.regularFileContents ?? Data()
+        contentType = .data
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
     }
 }
