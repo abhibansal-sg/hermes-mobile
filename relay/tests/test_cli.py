@@ -203,3 +203,58 @@ def test_resolved_config_builds_relay_config(monkeypatch):
     assert cfg.gateway.token == "t"
     assert cfg.downstream.port == 8802
     assert cfg.downstream.health_path == "/healthz"
+
+
+def _stub_app_run(monkeypatch):
+    """Make main() hermetic: no RelayApp construction, no asyncio.run."""
+    import hermes_relay.__main__ as entry
+
+    built = []
+
+    class _FakeApp:
+        def __init__(self, cfg):
+            built.append(cfg)
+
+        async def run(self):
+            pass
+
+    monkeypatch.setattr(entry, "RelayApp", _FakeApp)
+    monkeypatch.setattr(entry.asyncio, "run", lambda coro: coro.close())
+    return built
+
+
+def test_main_warns_when_dialing_live_gateway(monkeypatch, caplog):
+    """Service mode (9119 + flag) boots, but logs a WARNING that it did so."""
+    import logging
+
+    _stub_app_run(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="hermes_relay"):
+        from hermes_relay.__main__ import main
+
+        main(
+            [
+                "--gateway-port",
+                str(LIVE_GATEWAY_PORT),
+                "--allow-live-gateway",
+                "--token",
+                "t",
+            ]
+        )
+    assert any(
+        rec.levelno == logging.WARNING and str(LIVE_GATEWAY_PORT) in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_main_no_warning_on_isolated_gateway(monkeypatch, caplog):
+    import logging
+
+    _stub_app_run(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="hermes_relay"):
+        from hermes_relay.__main__ import main
+
+        main(["--gateway-port", "9132", "--token", "t"])
+    assert not any(
+        rec.levelno == logging.WARNING and "LIVE gateway" in rec.getMessage()
+        for rec in caplog.records
+    )
