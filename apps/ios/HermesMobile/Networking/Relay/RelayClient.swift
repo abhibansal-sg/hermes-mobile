@@ -217,21 +217,58 @@ actor RelayClient {
     }
 
     /// Answer an `approval.request` gate (§5).
+    ///
+    /// WIRE CONTRACT (docs/RELAY-PHONE-PROTOCOL.md §5, asserted key-for-key by
+    /// tests/conformance): the relay reads `session_id` + `decision` off this
+    /// payload and maps `decision` onto the gateway's `choice` param. The
+    /// relay resolves the gate by SESSION, so `session_id` is REQUIRED — an
+    /// approval without it raises at the relay and surfaces on the phone as an
+    /// opaque RPC error (the silent-deny bug class). `decision` is one of
+    /// `approve`/`once`/`session`/`always`/`deny`; `request_id` is echoed for
+    /// logging/forward-compat (the gateway ignores it for approvals) and `all`
+    /// applies the decision to every matching pending approval.
     @discardableResult
-    func approve(requestID: String, approved: Bool) async throws -> JSONValue {
-        try await request(.approve, params: .object([
-            "request_id": .string(requestID),
-            "approved": .bool(approved),
-        ]))
+    func approve(
+        sessionID: String,
+        requestID: String = "",
+        decision: String,
+        resolveAll: Bool = false
+    ) async throws -> JSONValue {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "decision": .string(decision),
+        ]
+        if !requestID.isEmpty { params["request_id"] = .string(requestID) }
+        if resolveAll { params["all"] = .bool(true) }
+        return try await request(.approve, params: .object(params))
+    }
+
+    /// Convenience for the common approve/deny choice.
+    @discardableResult
+    func approve(sessionID: String, requestID: String = "", approved: Bool) async throws -> JSONValue {
+        try await approve(
+            sessionID: sessionID,
+            requestID: requestID,
+            decision: approved ? "approve" : "deny"
+        )
     }
 
     /// Answer a `clarify.request` gate (§5).
+    ///
+    /// WIRE CONTRACT (asserted by tests/conformance): the relay reads
+    /// `session_id` + `text` and maps `text` onto the gateway's `answer` param;
+    /// the gateway matches the pending waiter by `request_id`, so a clarify
+    /// reply without it 4009s and the agent stays blocked (the empty-answer bug
+    /// class). `session_id` is required by the relay handler; `request_id` MUST
+    /// be the id from the `clarify.request` frame body.
     @discardableResult
-    func clarify(requestID: String, response: String) async throws -> JSONValue {
-        try await request(.clarify, params: .object([
-            "request_id": .string(requestID),
-            "response": .string(response),
-        ]))
+    func clarify(sessionID: String, requestID: String, response: String) async throws -> JSONValue {
+        var params: [String: JSONValue] = [
+            "session_id": .string(sessionID),
+            "text": .string(response),
+        ]
+        if !requestID.isEmpty { params["request_id"] = .string(requestID) }
+        return try await request(.clarify, params: .object(params))
     }
 
     /// Stop the active turn (§5).
