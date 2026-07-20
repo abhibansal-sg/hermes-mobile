@@ -177,6 +177,11 @@ targets:
           - WorkRepositoryTestSupport.swift
       - path: ../../tests/fixtures/session_status_responses.json
         buildPhase: resources
+      # A2/N1 wire conformance: the SAME shared contract fixture the pytest side
+      # (tests/conformance/) asserts against — the XCTest consumer decodes it so
+      # a phone/relay field mismatch fails both test stacks.
+      - path: ../../tests/conformance/wire_contract.json
+        buildPhase: resources
     dependencies:
       - target: HermesMobile
       # GRDB direct link so CacheLayerTests can call DatabaseQueue(configuration:)
