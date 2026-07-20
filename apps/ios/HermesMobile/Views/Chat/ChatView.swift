@@ -864,7 +864,13 @@ struct ChatView: View {
         TurnDockContent.resolve(
             hasApproval: chatStore.pendingApproval != nil,
             hasClarification: chatStore.pendingClarification != nil,
-            hasTasks: chatStore.latestTodoList != nil,
+            // QA-2 R12/R13: mirror the TurnDock's own resolver exactly — the
+            // inline-todo suppression below must agree with the dock about who
+            // owns the checklist. Reading `dockShowsTaskBox` (turn-lifecycle +
+            // session-scoped) keeps the two surfaces byte-aligned: when the
+            // dock pill hides at turn end, inline TodoCards are allowed to
+            // render again for the settled turn.
+            hasTasks: chatStore.dockShowsTaskBox,
             hasQueued: TurnDock.hasQueued(queueStore)
         )
     }
