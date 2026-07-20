@@ -2543,11 +2543,22 @@ async def projects_overview(request: Request) -> List[Dict[str, Any]]:
 
     Proxies ``tui_gateway.server._discover_repos_payload`` (the same merge of
     filesystem-scanned + session-derived git repo roots the desktop uses) and
-    reshapes each entry to ``{id, label, root, session_count}``.
+    reshapes each entry to ``{id, label, root, session_count}``, then UNIONs the
+    explicit ``projects_db`` projects (``pdb.list_projects``) so a freshly
+    created zero-session project is visible immediately.
 
     ``id`` is the repo root path (stable identity, matching how desktop keys
-    project entries). ``session_count`` is the number of sessions whose cwd
-    resolved to that repo root. Junk-filtered (no ~/.hermes, no bare home).
+    project entries — and how ``POST /projects`` keys its return value, the
+    normalized ``primary_path``). ``session_count`` is the number of sessions
+    whose cwd resolved to that repo root. Junk-filtered (no ~/.hermes, no bare
+    home).
+
+    Why the union is needed: ``_discover_repos_payload`` derives roots from
+    session cwds ∪ filesystem-scanned git repos — neither of which sees a brand
+    new project whose folder is empty / has no sessions yet. Without merging
+    ``list_projects``, ``POST /projects`` would create a row the overview never
+    surfaces, so the client lands on the empty detail and the project vanishes
+    on Back until a session actually runs under that root (STR / wave25-b2).
     """
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -2562,7 +2573,7 @@ async def projects_overview(request: Request) -> List[Dict[str, Any]]:
         repos = _discover_repos_payload(db, backfill=False)
     except Exception as exc:
         _log.debug("projects overview: gateway payload unavailable: %s", exc)
-        return []
+        repos = []
 
     out: List[Dict[str, Any]] = []
     seen_roots: set[str] = set()
@@ -2583,7 +2594,106 @@ async def projects_overview(request: Request) -> List[Dict[str, Any]]:
                 "session_count": int(entry.get("sessions") or 0),
             }
         )
+
+    # UNION the explicit projects_db projects that the session/filesystem scan
+    # did not already surface. A newly created project has zero sessions and may
+    # point at an empty/not-yet-existing folder, so it is otherwise invisible.
+    # Its root is the normalized ``primary_path`` — the exact id ``POST
+    # /projects`` returns — so re-opening it hits the same server-owned detail
+    # query path. Defensive: a projects_db read failure must not blank the
+    # (already-built) discovered overview.
+    try:
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing() as conn:
+            db_projects = pdb.list_projects(conn)
+    except Exception as exc:
+        _log.debug("projects overview: projects_db unavailable: %s", exc)
+        db_projects = []
+
+    for project in db_projects or []:
+        root = str(getattr(project, "primary_path", None) or "")
+        if not root:
+            folders = getattr(project, "folders", None) or []
+            root = str(getattr(folders[0], "path", "")) if folders else ""
+        if not root or _is_project_junk(root):
+            continue
+        real = os.path.realpath(root)
+        if real in seen_roots:
+            continue
+        seen_roots.add(real)
+        label = str(
+            getattr(project, "name", None)
+            or os.path.basename(root.rstrip("/\\"))
+            or root
+        )
+        out.append(
+            {
+                "id": root,
+                "label": label,
+                "root": root,
+                "session_count": 0,
+            }
+        )
     return out
+
+
+class CreateProjectBody(BaseModel):
+    """Request body for ``POST /projects``: a project name + its root folder."""
+
+    name: str
+    root: str
+
+
+@router.post("/projects")
+async def create_project_route(body: CreateProjectBody, request: Request) -> Dict[str, Any]:
+    """Create a project from the iOS Projects tab (name + root path).
+
+    ZERO-CORE-PATCH: delegates to the stock
+    ``hermes_cli.projects_db.create_project`` (imported + called, never edited)
+    so mobile project creation is identical to the desktop's. Returns the new
+    project reshaped to the SAME ``{id, label, root, session_count}`` contract
+    as the ``/projects`` overview — ``id`` is the normalized root path, matching
+    how overview entries are keyed — so the client can open it immediately.
+
+    Validation: 401 without a session token, 400 on an empty name / empty root
+    or a root that exists but is not a directory.
+    """
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    name = str(body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Project name is required")
+    raw_root = str(body.root or "").strip()
+    if not raw_root:
+        raise HTTPException(status_code=400, detail="Root folder path is required")
+
+    root = os.path.abspath(os.path.expanduser(raw_root)).rstrip("/\\") or raw_root
+    # Reject a path that exists but is a file — a project root must be a folder.
+    # A not-yet-existing path is allowed (create_project just records it).
+    if os.path.exists(root) and not os.path.isdir(root):
+        raise HTTPException(status_code=400, detail="Root path is not a directory")
+
+    try:
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing() as conn:
+            pdb.create_project(conn, name=name, primary_path=root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - unexpected backend failure
+        _log.debug("create project failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Create project failed: {exc}")
+
+    return {
+        "id": root,
+        "label": name,
+        "root": root,
+        "session_count": 0,
+    }
 
 
 def _flatten_project_sessions(project: Dict[str, Any]) -> List[Dict[str, Any]]:
