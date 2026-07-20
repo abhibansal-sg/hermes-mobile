@@ -211,6 +211,24 @@ class PhoneDriver:
                           "params": {"session_id": session_id}, "id": None})
         await self._ws.send(json.dumps(frame))
 
+    async def push_register(
+        self,
+        token: str,
+        *,
+        env: str = "production",
+        events: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """Register the APNs device token OVER THE RELAY SOCKET (§6a, QA-1 B14):
+        the relay's Notifier reads the relay's own registry, so a relay-mode
+        phone must register here, not on gateway-direct REST."""
+        params: dict[str, Any] = {"token": token, "platform": "ios", "env": env}
+        if events is not None:
+            params["events"] = events
+        return await self._call("push.register", params)
+
+    async def push_unregister(self, token: str) -> dict[str, Any]:
+        return await self._call("push.unregister", {"token": token})
+
     # -- downstream assertions -------------------------------------------
     def frames_for(self, sid: str) -> list[PhoneFrame]:
         return [f for f in self.frames if f.sid == sid]

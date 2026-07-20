@@ -213,8 +213,8 @@ def test_history_limit_is_honored(server_stack, contract):
 
 
 def test_local_control_frames_work(server_stack, contract):
-    """ack/resync/foreground are relay-local; they must consume their params and
-    never touch the gateway."""
+    """ack/resync/foreground/push.* are relay-local; they must consume their
+    params and never touch the gateway."""
     server, conn, gateway = server_stack
     for method in ("ack", "resync", "foreground"):
         params = dict(contract["upstream"]["payloads"][method]["example"])
@@ -223,6 +223,18 @@ def test_local_control_frames_work(server_stack, contract):
     assert server.session_has_live_phone("sess-1")
     _drive(server, conn, "foreground", {"session_id": None})
     assert not server.session_has_live_phone("sess-1")
+    # §6a (QA-1 B14): push.register/push.unregister are relay-local too — the
+    # token lands in the relay's OWN registry (the one the Notifier reads) and
+    # unregister removes it; neither hops the gateway.
+    example = dict(contract["upstream"]["payloads"]["push.register"]["example"])
+    result = _drive(server, conn, "push.register", example)
+    assert result == {"registered": True}
+    token = example["token"]
+    push = server._push_engine()
+    assert token in push.registered_tokens()
+    result = _drive(server, conn, "push.unregister", {"token": token})
+    assert result == {"unregistered": True}
+    assert token not in push.registered_tokens()
     assert not gateway.calls, "local control frames must never hit the gateway"
 
 

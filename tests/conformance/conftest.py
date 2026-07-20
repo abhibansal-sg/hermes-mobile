@@ -189,4 +189,10 @@ SAMPLE_VALUES: dict[str, Any] = {
     "kind": "file",
     "name": "notes.txt",
     "data_url": "data:text/plain;base64,aGVybWVz",
+    # push.register / push.unregister (§6a): a 64-hex APNs-shaped token so the
+    # relay's real push_engine normalizer accepts the behavioral drive.
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "platform": "ios",
+    "env": "production",
+    "events": ["approval", "turn_complete"],
 }

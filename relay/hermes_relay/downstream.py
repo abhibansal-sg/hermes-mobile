@@ -270,12 +270,18 @@ class DownstreamServer:
         gateway: GatewayClient,
         store: SessionStore,
         durable: Optional[DurableState] = None,
+        push_engine: Any = None,
     ) -> None:
         self._cfg = config
         self._bus = bus
         self._gateway = gateway
         self._store = store
         self._durable = durable
+        # Injected push_engine module (plugin_bridge.import_push_engine()); the
+        # ``push.register``/``push.unregister`` token registry RPCs (§6) write
+        # into it. Resolved lazily on first use when not injected; tests inject
+        # a real module under a tmp HERMES_HOME.
+        self._push = push_engine
         self._ring = None  # set in start(): reused ReplayRingManager
         self._conns: dict[str, PhoneConnection] = {}
         self._server = None
@@ -507,6 +513,18 @@ class DownstreamServer:
             await self._server.wait_closed()
             self._server = None
 
+    def _push_engine(self) -> Any:
+        """The reused ``push_engine`` module (lazily resolved, cached).
+
+        ``push.register``/``push.unregister`` write the SAME registry the
+        Notifier's ``push_engine.notify`` reads — one source of tokens for the
+        relay-fired push path. Import failures surface as JSON-RPC errors to
+        the phone (registry unavailable), never as a server crash.
+        """
+        if self._push is None:
+            self._push = plugin_bridge.import_push_engine()
+        return self._push
+
     def _remember_submit(self, cmid: str, sid: str) -> None:
         """Record ``client_message_id -> resolved session_id`` for SUBMIT dedup,
         evicting the oldest entry once the bounded LRU is full."""
@@ -593,6 +611,9 @@ class DownstreamServer:
         * ``attach``    -> file_attach / image_attach_bytes (bytes inlined)
         * ``ack``       -> conn.ack (LOCAL, no gateway hop)
         * ``resync``    -> conn.replay (LOCAL, no gateway hop)
+        * ``push.register``/``push.unregister`` -> the relay's OWN push token
+          registry (LOCAL, no gateway hop; the Notifier reads this same
+          registry — protocol §6)
         """
         method = req.method
         p = req.params
@@ -610,6 +631,40 @@ class DownstreamServer:
             # signal; the passive OPEN/SUBMIT/RESUME tracking is only a fallback.
             conn.set_foreground(p.get("session_id"))
             return None
+        if method == UpstreamMethod.PUSH_REGISTER:
+            # Relay-local APNs token registration (protocol §6). In relay mode
+            # the phone's gateway-direct REST register can never reach the
+            # relay-owned session's notifier (off-LAN phones can't hit the
+            # gateway REST at all; on-LAN ones write the gateway's registry,
+            # a different HERMES_HOME than this process). Registering OVER THE
+            # RELAY SOCKET writes the registry the relay Notifier actually
+            # reads — one transport, one registry, no shared-home coincidence.
+            push = self._push_engine()
+            # The registry's parent may not exist yet in a fresh service env
+            # (the gateway side relies on ~/.hermes already being there);
+            # push_engine swallows persist errors, so create it here or the
+            # register would "succeed" in memory and lose the token on restart.
+            try:
+                from pathlib import Path
+
+                Path(push._registry_path()).parent.mkdir(parents=True, exist_ok=True)
+            except OSError:  # pragma: no cover - best-effort dir hygiene
+                _log.debug("push.register: registry dir create failed", exc_info=True)
+            events = p.get("events")
+            ok = push.register_token(
+                str(p.get("token") or ""),
+                platform=str(p.get("platform") or "ios"),
+                env=str(p.get("env") or ""),
+                events=list(events) if isinstance(events, list) else None,
+                device_id=p.get("device_id"),
+            )
+            if not ok:
+                raise ValueError("invalid device token")
+            _log.info("push.register: device token registered over relay")
+            return {"registered": True}
+        if method == UpstreamMethod.PUSH_UNREGISTER:
+            removed = self._push_engine().unregister_token(str(p.get("token") or ""))
+            return {"unregistered": bool(removed)}
 
         # -- gateway-readiness gate ------------------------------------------
         # Every method below this point hits the gateway. After a relay restart

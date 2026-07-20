@@ -3169,6 +3169,17 @@ final class ConnectionStore {
         guard scenePhase == .active else {
             // Leaving the foreground: stop any in-flight prefetch sweep.
             sessionStore.cancelPrefetch()
+            // §6a foreground hygiene (QA-1 B14): declare we are no longer
+            // watching. iOS does not kill the relay WS the instant the app
+            // backgrounds, so without this clear a turn completing seconds
+            // after backgrounding would be §6-gated (user NOT watching, yet
+            // the relay thinks they are) and the banner never fires. The
+            // re-assert on return-to-foreground mirrors this clear.
+            if transportPath == .relay {
+                Task { [weak self] in
+                    await self?.relayCoordinator?.clearForeground()
+                }
+            }
             return
         }
         guard hasConnected else { return }
@@ -3183,6 +3194,12 @@ final class ConnectionStore {
             // spurious reconnect churn. Check the RELAY socket instead.
             if self.transportPath == .relay {
                 dead = !(self.relayCoordinator?.isOpen ?? false)
+                if !dead {
+                    // §6a: the background clear dropped the relay's foreground
+                    // declaration for this socket; re-assert the driven session
+                    // so pushes are gated again while the user is watching.
+                    await self.relayCoordinator?.reassertForeground()
+                }
             } else {
                 #if DEBUG
                 let _liveState = await self.client.state

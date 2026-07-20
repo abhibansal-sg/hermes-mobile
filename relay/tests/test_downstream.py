@@ -243,7 +243,7 @@ async def test_dropped_then_replayed_reconciles_gap_free():
 # ---------------------------------------------------------------------------
 
 
-def _server():
+def _server(push_engine=None):
     gw = MagicMock()
     gw.session_list = AsyncMock(return_value=[{"id": "s1"}, {"id": "s2"}])
     gw.session_create = AsyncMock(return_value="sNew")
@@ -260,7 +260,9 @@ def _server():
     # foreign-submit tests override session_resume/live_id_for to model a distinct
     # live id.
     gw.live_id_for = MagicMock(side_effect=lambda s: s)
-    srv = DownstreamServer(DownstreamConfig(), EventBus(), gw, SessionStore())
+    srv = DownstreamServer(
+        DownstreamConfig(), EventBus(), gw, SessionStore(), push_engine=push_engine
+    )
     return srv, gw
 
 
@@ -982,3 +984,100 @@ async def test_submit_user_message_new_chat_rides_created_session():
     assert len(users) == 1
     assert users[0].sid == res["session_id"] == "sNew"
     assert store.snapshot("sNew")["items"][0]["body"]["text"] == "hello"
+
+
+# ---------------------------------------------------------------------------
+# QA-1 B14 — push.register / push.unregister (protocol §6a)
+#
+# The relay's Notifier reads the relay process's OWN push registry; in relay
+# mode the phone must register its APNs token OVER THE RELAY SOCKET (gateway-
+# direct REST is unreachable off-LAN and writes a registry the relay never
+# reads). These tests pin the relay-local RPCs against the REAL reused
+# push_engine registry (isolated HERMES_HOME). On qa1/base the methods do not
+# exist -> every test here fails (unknown upstream method / AttributeError).
+# ---------------------------------------------------------------------------
+
+# A 64-hex-char APNs-shaped device token (push_engine normalizes+validates).
+_DEVICE_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+
+@pytest.fixture
+def relay_push_engine(tmp_path, monkeypatch):
+    """The REAL reused push_engine with its registry isolated under tmp."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    push = plugin_bridge.import_push_engine()
+    # Defensive: a stale registry from another test must not leak in.
+    for entry in push.registry_entries():
+        push.unregister_token(entry["token"])
+    return push
+
+
+async def test_push_register_writes_relay_token_registry(relay_push_engine):
+    """push.register lands the token (env+events) in the registry the Notifier
+    reads — the QA-1 B14 'token reaches the notifier' requirement."""
+    srv, _ = _server(push_engine=relay_push_engine)
+    await srv.start()
+    result = await _handle(
+        srv,
+        UpstreamMethod.PUSH_REGISTER,
+        {
+            "token": _DEVICE_TOKEN,
+            "platform": "ios",
+            "env": "production",
+            "events": ["approval", "clarify", "turn_complete"],
+        },
+    )
+    assert result == {"registered": True}
+    entries = relay_push_engine.registry_entries()
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["token"] == _DEVICE_TOKEN
+    assert entry["env"] == "production"
+    assert entry["platform"] == "ios"
+    assert entry["events"] == ["approval", "clarify", "turn_complete"]
+    # The Notifier's recipient lookup sees the token for its event kinds.
+    recipients = relay_push_engine.recipients_for_event("turn_complete")
+    assert _DEVICE_TOKEN in recipients.get("production", [])
+    # An event the phone did NOT opt into is filtered out.
+    assert _DEVICE_TOKEN not in relay_push_engine.recipients_for_event(
+        "turn_error"
+    ).get("production", [])
+
+
+async def test_push_register_invalid_token_raises_jsonrpc_error(relay_push_engine):
+    """A malformed token is rejected with an error (surfaced to the phone as a
+    JSON-RPC -32000), never silently dropped."""
+    srv, _ = _server(push_engine=relay_push_engine)
+    await srv.start()
+    with pytest.raises(ValueError, match="invalid device token"):
+        await _handle(srv, UpstreamMethod.PUSH_REGISTER, {"token": "not-hex!"})
+    assert relay_push_engine.registry_entries() == []
+
+
+async def test_push_unregister_removes_token(relay_push_engine):
+    srv, _ = _server(push_engine=relay_push_engine)
+    await srv.start()
+    await _handle(srv, UpstreamMethod.PUSH_REGISTER, {"token": _DEVICE_TOKEN})
+    assert len(relay_push_engine.registry_entries()) == 1
+    result = await _handle(
+        srv, UpstreamMethod.PUSH_UNREGISTER, {"token": _DEVICE_TOKEN}
+    )
+    assert result == {"unregistered": True}
+    assert relay_push_engine.registry_entries() == []
+    # Unregistering an unknown token reports False, no error.
+    result = await _handle(
+        srv, UpstreamMethod.PUSH_UNREGISTER, {"token": _DEVICE_TOKEN}
+    )
+    assert result == {"unregistered": False}
+
+
+async def test_push_register_is_relay_local_not_gateway_gated(relay_push_engine):
+    """Like ack/resync/foreground, push.register must work while the gateway is
+    NOT ready (relay just restarted, phone reconnects first): a phone coming
+    online must be able to (re-)register its token before the gateway is up."""
+    srv, gw = _server(push_engine=relay_push_engine)
+    gw.wait_ready = AsyncMock(return_value=False)
+    await srv.start()
+    result = await _handle(srv, UpstreamMethod.PUSH_REGISTER, {"token": _DEVICE_TOKEN})
+    assert result == {"registered": True}
+    gw.wait_ready.assert_not_awaited()

@@ -129,9 +129,12 @@ class UpstreamMethod:
     ACK = "ack"               # local: ring.drop acked frames {through}
     RESYNC = "resync"         # local: ring.decide {last_seq} -> replay or snapshot
     FOREGROUND = "foreground"  # local: phone declares the session it now holds foregrounded (§6 gate); null clears
+    PUSH_REGISTER = "push.register"    # local: register the APNs device token in the relay's push registry (§6)
+    PUSH_UNREGISTER = "push.unregister"  # local: remove the APNs device token from the relay's push registry (§6)
 
     ALL = frozenset(
-        {SUBMIT, RESUME, OPEN, LIST, HISTORY, APPROVE, CLARIFY, INTERRUPT, ATTACH, ACK, RESYNC, FOREGROUND}
+        {SUBMIT, RESUME, OPEN, LIST, HISTORY, APPROVE, CLARIFY, INTERRUPT, ATTACH, ACK, RESYNC, FOREGROUND,
+         PUSH_REGISTER, PUSH_UNREGISTER}
     )
 
 
