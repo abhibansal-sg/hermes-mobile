@@ -502,6 +502,23 @@ class GatewayClient:
         """``session.interrupt`` — stop the active turn (pass-through)."""
         return await self._call_result("session.interrupt", {"session_id": session_id})
 
+    async def session_steer(self, session_id: str, text: str) -> dict[str, Any]:
+        """``session.steer`` — inject steering text into the live turn (pass-through).
+
+        QA-2 R11: before this existed the phone had NO relay-path steer — its
+        ``session.steer`` RPC went out over the gateway-DIRECT socket, which is
+        idle in relay mode, so every steer attempt failed with "Not connected".
+        The gateway handler (``server.py`` ``@method("session.steer")``) reads
+        ``text`` and resolves the session off ``session_id``; it returns
+        ``{status: "queued" | "rejected", text}`` which the relay passes through
+        verbatim so the phone maps the disposition exactly as on the direct path
+        (``queued`` → clear the field; ``rejected`` → keep the text and offer
+        queueing instead).
+        """
+        return await self._call_result(
+            "session.steer", {"session_id": session_id, "text": text}
+        )
+
     # -- attachments (B9/A5: REST-free, bytes inlined) --------------------
     async def file_attach(
         self, session_id: str, *, name: str, data_url: str, timeout: float = 90.0

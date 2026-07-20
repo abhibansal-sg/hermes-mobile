@@ -103,6 +103,10 @@ class FakeGateway:
         self.calls.append(("session.interrupt", {"session_id": session_id}))
         return {"status": "ok"}
 
+    async def session_steer(self, session_id: str, text: str) -> dict[str, Any]:
+        self.calls.append(("session.steer", {"session_id": session_id, "text": text}))
+        return {"status": "queued", "text": text}
+
     async def file_attach(
         self, session_id: str, *, name: str, data_url: str, timeout: float = 90.0
     ) -> dict[str, Any]:

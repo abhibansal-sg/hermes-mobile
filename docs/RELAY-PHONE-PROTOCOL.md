@@ -30,7 +30,7 @@ downstream frame from relay → phone is:
 
 Upstream phone → relay frames are ordinary JSON-RPC-2.0 requests (the relay
 translates to gateway RPCs): `submit`, `resume`, `open`, `list`, `history`,
-`approve`, `clarify`, `interrupt`, `ack`, `resync`, `foreground`,
+`approve`, `clarify`, `interrupt`, `steer`, `ack`, `resync`, `foreground`,
 `push.register`, `push.unregister`.
 
 ## 2. The item model (what the phone renders)
@@ -120,6 +120,7 @@ a partial merge preview and is never treated as authoritative.
 | answer approval | translate params | `approval.respond` | — — the gateway reads `choice` (`once`/`session`/`always`/`deny`, mapping `approve`→`once`) + `all` and resolves by SESSION key; the relay maps the phone's `decision`→`choice` (a relay that sent `decision` defaulted every approval to DENY) |
 | answer clarify | translate params | `clarify.respond` | — — the gateway matches the pending waiter by `request_id` and stores `params.answer`; the relay maps the phone's `text`→`answer` (a relay that sent `text` delivered an EMPTY answer) |
 | stop | pass-through | `session.interrupt` | — |
+| steer the live turn (QA-2 R11) | pass-through | `session.steer` | none — the gateway injects `text` into the running turn's next context window (no new turn, no interrupt) and returns `{status: queued\|rejected, text}`; the relay passes the disposition through VERBATIM so the phone maps it identically to the gateway-direct path (`queued` → clear the field; `rejected` → keep the text and offer queueing). Params: `session_id` required, `text` required (empty `text` → gateway 4002). Before this method existed the phone's steer went over the IDLE gateway-direct socket in relay mode and every attempt failed "Not connected". |
 | attach a photo / file (B9/A5) | translate params | `file.attach` (`kind=file`) or `image.attach_bytes` (`kind=image`) | same drive semantics as SUBMIT: `session_id` absent → `session.create` (+own); foreign/idle → `session.resume` (adopt the live id); the resolved `session_id` is merged into the result. REST-FREE by construction: the phone inlines the bytes as a `data:<mime>;base64,` URL in `data_url` — NO `POST /api/upload`, which a relay-only phone cannot reach. Params: `kind` + `data_url` required, `session_id` / `name` optional. |
 | register APNs device token | LOCAL (§6a) | none — relay writes its OWN push registry | notifier becomes able to reach this phone |
 | unregister APNs device token | LOCAL (§6a) | none | phone stops receiving pushes |
@@ -168,6 +169,34 @@ the SAME job on a fresh connection). The contract is a single field:
   (`completed`-is-authoritative), at the cost of a possible duplicate turn on a
   restart-mid-ambiguous-flap — an explicit non-goal bounded by A6's gap-free
   resync guarantee for the transcript.
+
+### 5b. Turn control over the relay — interrupt / steer / queue (QA-2 R11)
+
+A relay-mode phone MUST drive all three turn-control actions over the relay
+socket; the gateway-direct socket is IDLE in relay mode, so any control RPC
+sent over it fails with "Not connected to the Hermes gateway" (the build-115
+bug: stop and steer errored; queue-mode sends vanished).
+
+- **interrupt** (`interrupt`): pass-through → `session.interrupt`. Targets the
+  session the phone is driving (`session_id` required on the wire; the iOS
+  coordinator defaults it to the driven session). The relay holds ownership, so
+  the interrupt always lands on the relay-owned runtime.
+- **steer** (`steer`): pass-through → `session.steer` (see the §5 table row).
+  Disposition pass-through is load-bearing: a `rejected` status tells the phone
+  to keep the user's text and offer queueing — the steer→queue fallback chain.
+- **queue**: there is deliberately NO `queue` upstream method. Queueing is the
+  phone's durable outbox (the protected `work_jobs` repository), NOT a relay
+  concept: a send that must wait (live turn in the destination session, or a
+  failed/ambiguous submit) is written to the outbox — surfacing the outbox pill
+  immediately and durably — and DRAINS as an ordinary §5 `submit` (carrying the
+  §5a `client_message_id`, so an ambiguous-flap retry dedupes into one turn).
+  The phone holds a queued row while its destination session is mid-turn
+  (per-session serialization) and wakes the drain on turn completion; the relay
+  needs no queue state of its own. Removing a queued row writes a durable
+  tombstone (row delete or `.cancelled` state) SYNCHRONOUSLY before the UI
+  confirms the removal, so a force-quit in the removal window can never
+  resurrect the send on the relaunch drain (the claim query admits only
+  live states — a tombstoned row is never claimed).
 
 ## 6. Notifications (relay-fired, phone-off)
 

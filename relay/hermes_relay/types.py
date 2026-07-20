@@ -125,6 +125,7 @@ class UpstreamMethod:
     APPROVE = "approve"        # -> approval.respond (pass-through)
     CLARIFY = "clarify"        # -> clarify.respond (pass-through)
     INTERRUPT = "interrupt"    # -> session.interrupt (pass-through)
+    STEER = "steer"            # -> session.steer (pass-through; QA-2 R11: live-turn steering over relay)
     ATTACH = "attach"         # -> file.attach / image.attach_bytes (bytes inlined as a data: URL; REST-free attach, B9/A5)
     ACK = "ack"               # local: ring.drop acked frames {through}
     RESYNC = "resync"         # local: ring.decide {last_seq} -> replay or snapshot
@@ -133,7 +134,7 @@ class UpstreamMethod:
     PUSH_UNREGISTER = "push.unregister"  # local: remove the APNs device token from the relay's push registry (§6)
 
     ALL = frozenset(
-        {SUBMIT, RESUME, OPEN, LIST, HISTORY, APPROVE, CLARIFY, INTERRUPT, ATTACH, ACK, RESYNC, FOREGROUND,
+        {SUBMIT, RESUME, OPEN, LIST, HISTORY, APPROVE, CLARIFY, INTERRUPT, STEER, ATTACH, ACK, RESYNC, FOREGROUND,
          PUSH_REGISTER, PUSH_UNREGISTER}
     )
 
