@@ -205,11 +205,34 @@ struct ChatView: View {
     /// The inline working row is honest busy-state chrome: it appears only while a
     /// turn is actively running, not while the turn is paused on a human approval,
     /// clarification, sudo, or secret prompt (those have their own user-action UI).
+    ///
+    /// QA-1 A9 render-gate seam: the decision is exposed as a PURE STATIC (the
+    /// same unit-testability pattern as ``transcriptPlaceholder``) so the
+    /// render-conformance suite (`RenderConformanceTests`) can pin the ratified
+    /// relay-path rule — "the streaming cursor IS the working signal; no
+    /// standalone Working pill while a streaming assistant bubble renders"
+    /// (spec A4/B8). The instance property delegates here; behavior is
+    /// byte-identical. NOTE for the B8 fix lane: extend THIS function with the
+    /// relay-path suppression clause; `RenderConformanceTests` calls it directly.
+    static func shouldShowInlineTurnActivity(
+        isStreaming: Bool,
+        hasPendingApproval: Bool,
+        hasPendingClarification: Bool,
+        hasPendingSecurePrompt: Bool
+    ) -> Bool {
+        isStreaming
+            && !hasPendingApproval
+            && !hasPendingClarification
+            && !hasPendingSecurePrompt
+    }
+
     private var shouldShowInlineTurnActivity: Bool {
-        chatStore.isStreaming
-            && chatStore.pendingApproval == nil
-            && chatStore.pendingClarification == nil
-            && chatStore.pendingSecurePrompt == nil
+        Self.shouldShowInlineTurnActivity(
+            isStreaming: chatStore.isStreaming,
+            hasPendingApproval: chatStore.pendingApproval != nil,
+            hasPendingClarification: chatStore.pendingClarification != nil,
+            hasPendingSecurePrompt: chatStore.pendingSecurePrompt != nil
+        )
     }
 
     /// Approximate height reserved at the bottom of the transcript so the last
