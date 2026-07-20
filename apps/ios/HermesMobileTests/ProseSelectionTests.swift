@@ -457,11 +457,6 @@ final class ProseSelectionTests: XCTestCase {
                 collectAccessibilityLabels(subview, depth: depth + 1, into: &acc)
             }
         }
-        if let children = object?.accessibilityChildren {
-            for case let child as NSObject in children {
-                collectAccessibilityLabels(child, depth: depth + 1, into: &acc)
-            }
-        }
         if let elements = object?.accessibilityElements {
             for case let child as NSObject in elements {
                 collectAccessibilityLabels(child, depth: depth + 1, into: &acc)
