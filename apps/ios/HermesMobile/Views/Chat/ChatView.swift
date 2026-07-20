@@ -223,9 +223,12 @@ struct ChatView: View {
     /// transport: byte-identical to the approved behavior (desktop-parity tail
     /// indicator with the honest tool name + ticking elapsed).
     ///
-    /// Pure + static so the gate is unit-testable without a mounted view — the
-    /// relay suppression was previously untested and regressed on the relay path
-    /// (QA-1 structural gap).
+    /// QA-1 A9 render-gate seam: exposed as a PURE STATIC (the same unit-
+    /// testability pattern as ``transcriptPlaceholder``) so BOTH the chrome
+    /// lane's `TranscriptChromeGlowTests` and the render-conformance suite
+    /// (`RenderConformanceTests`, which replays recorded relay frames through
+    /// the real render lane) pin this rule directly. The instance property
+    /// delegates here.
     static func shouldShowInlineTurnActivity(
         isStreaming: Bool,
         hasPendingGate: Bool,

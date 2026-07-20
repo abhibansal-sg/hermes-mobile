@@ -1,0 +1,198 @@
+{
+  "name": "render_submit_stream",
+  "description": "Existing-session turn on top of a cached two-turn history: submit -> turn.started -> agentMessage started/delta*/completed -> usage/turn.completed. The render lane must keep the cached history painted, echo the user prompt, and stream the reply below it (spec B5/B6/B7, A2).",
+  "recorded_by": "tests/e2e_daily_driver/test_z_record_render_fixtures.py",
+  "replayed_by": "apps/ios/HermesMobileTests/RenderConformanceTests.swift",
+  "protocol": "docs/RELAY-PHONE-PROTOCOL.md",
+  "session_id": "render-sess-stream",
+  "submit": {
+    "text": "What is the capital of France?",
+    "session_id": "render-sess-stream"
+  },
+  "cached_history": [
+    {
+      "role": "user",
+      "content": "Earlier question, first turn."
+    },
+    {
+      "role": "assistant",
+      "content": "Earlier answer, first turn."
+    },
+    {
+      "role": "user",
+      "content": "Earlier question, second turn."
+    },
+    {
+      "role": "assistant",
+      "content": "Earlier answer, second turn."
+    }
+  ],
+  "open_result_messages": [
+    {
+      "role": "user",
+      "content": "Earlier question, first turn."
+    },
+    {
+      "role": "assistant",
+      "content": "Earlier answer, first turn."
+    },
+    {
+      "role": "user",
+      "content": "Earlier question, second turn."
+    },
+    {
+      "role": "assistant",
+      "content": "Earlier answer, second turn."
+    }
+  ],
+  "frames": [
+    {
+      "seq": 1,
+      "sid": "render-sess-stream",
+      "turn": "render-sess-stream:t1",
+      "kind": "turn.started",
+      "body": {}
+    },
+    {
+      "seq": 2,
+      "sid": "render-sess-stream",
+      "turn": "render-sess-stream:t1",
+      "kind": "item.started",
+      "body": {
+        "item_id": "render-sess-stream:i1",
+        "type": "agentMessage",
+        "status": "in_progress",
+        "ord": 0,
+        "summary": "",
+        "body": {
+          "text": ""
+        }
+      }
+    },
+    {
+      "seq": 3,
+      "sid": "render-sess-stream",
+      "turn": "render-sess-stream:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-stream:i1",
+        "patch": {
+          "text": "Paris "
+        }
+      }
+    },
+    {
+      "seq": 4,
+      "sid": "render-sess-stream",
+      "turn": "render-sess-stream:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-stream:i1",
+        "patch": {
+          "text": "is "
+        }
+      }
+    },
+    {
+      "seq": 5,
+      "sid": "render-sess-stream",
+      "turn": "render-sess-stream:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-stream:i1",
+        "patch": {
+          "text": "the "
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "sid": "render-sess-stream",
+      "turn": "render-sess-stream:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-stream:i1",
+        "patch": {
+          "text": "capital "
+        }
+      }
+    },
+    {
+      "seq": 7,
+      "sid": "render-sess-stream",
+      "turn": "render-sess-stream:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-stream:i1",
+        "patch": {
+          "text": "of "
+        }
+      }
+    },
+    {
+      "seq": 8,
+      "sid": "render-sess-stream",
+      "turn": "render-sess-stream:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-stream:i1",
+        "patch": {
+          "text": "France."
+        }
+      }
+    },
+    {
+      "seq": 9,
+      "sid": "render-sess-stream",
+      "turn": "render-sess-stream:t1",
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-stream:i1",
+        "type": "agentMessage",
+        "status": "completed",
+        "ord": 0,
+        "summary": "Paris is the capital of France.",
+        "body": {
+          "text": "Paris is the capital of France."
+        }
+      }
+    },
+    {
+      "seq": 10,
+      "sid": "render-sess-stream",
+      "turn": "render-sess-stream:t1",
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-stream:i2",
+        "type": "usage",
+        "status": "completed",
+        "ord": 1,
+        "summary": "7 tokens",
+        "body": {
+          "model": "mock-model",
+          "input": 1,
+          "output": 6,
+          "total": 7
+        }
+      }
+    },
+    {
+      "seq": 11,
+      "sid": "render-sess-stream",
+      "turn": "render-sess-stream:t1",
+      "kind": "turn.completed",
+      "body": {
+        "usage": {
+          "model": "mock-model",
+          "input": 1,
+          "output": 6,
+          "total": 7
+        }
+      }
+    }
+  ],
+  "settled": {
+    "agent_text": "Paris is the capital of France.",
+    "user_prompt": "What is the capital of France?"
+  }
+}

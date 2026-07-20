@@ -302,3 +302,91 @@ class PhoneDriver:
 def fresh_client_message_id() -> str:
     """A stable-enough id for an outbox row (used by A3 dedupe assertions)."""
     return f"cmid-{uuid.uuid4().hex[:12]}"
+
+
+# ---------------------------------------------------------------------------
+# QA-1 A9 render-conformance fixture recording.
+# ---------------------------------------------------------------------------
+# The render gate (apps/ios/HermesMobileTests/RenderConformanceTests.swift)
+# replays REAL relay frame streams through the iOS render lane
+# (RelayItemStore -> ChatStore) and asserts render-model invariants. The
+# fixtures it replays are recorded HERE — the phone driver already captures
+# every downstream frame verbatim, so a fixture is simply the ordered frame
+# log for a session plus the replay metadata the XCTest side needs (the
+# submit that drove the turn, and the cached/REST history the phone's GRDB
+# transcript cache would have painted before any relay frame landed).
+#
+# Fixtures are byte-stable across runs when the scenario uses a FIXED session
+# id + fixed gate request_ids + deterministic mock-gateway scripts: the relay
+# stamps dense seqs from 1 per fresh relay process (the conftest starts one
+# per test), and reframer item ids derive from the session id. The one random
+# element a script may introduce (e.g. the tasklist script's ``todo-<hex>``
+# tool id) is normalized via ``sanitize`` before writing.
+
+
+def render_fixture(
+    driver: PhoneDriver,
+    *,
+    name: str,
+    session_id: str,
+    description: str = "",
+    submit: Optional[dict[str, Any]] = None,
+    cached_history: Optional[list[dict[str, Any]]] = None,
+    open_result_messages: Optional[list[dict[str, Any]]] = None,
+    settled: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Serialize the frames the phone recorded for ``session_id`` as a fixture.
+
+    The frame entries are the EXACT downstream envelopes the relay put on the
+    wire (``{seq, sid, turn, kind, body}``), in arrival order — the XCTest
+    side replays them byte-for-byte through the real decoders.
+    """
+    frames = [
+        {
+            "seq": f.seq,
+            "sid": f.sid,
+            "turn": f.turn,
+            "kind": f.kind,
+            "body": f.body,
+        }
+        for f in driver.frames_for(session_id)
+    ]
+    fixture: dict[str, Any] = {
+        "name": name,
+        "description": description,
+        "recorded_by": "tests/e2e_daily_driver/test_z_record_render_fixtures.py",
+        "replayed_by": "apps/ios/HermesMobileTests/RenderConformanceTests.swift",
+        "protocol": "docs/RELAY-PHONE-PROTOCOL.md",
+        "session_id": session_id,
+        "submit": submit,
+        # The transcript the GRDB cache paints BEFORE any relay frame lands
+        # (seedTranscriptCacheFirst). Relay frames never carry this history,
+        # so the fixture records what the render lane must PRESERVE.
+        "cached_history": cached_history or [],
+        # The relay `open` RPC RESULT carries the same REST history
+        # (downstream.py) — recorded for the contract that the relay path
+        # seeds from it; qa1/base discards it.
+        "open_result_messages": open_result_messages or [],
+        "frames": frames,
+        "settled": settled or {},
+    }
+    return fixture
+
+
+def write_render_fixture(
+    fixture: dict[str, Any],
+    path,
+    *,
+    sanitize: Optional[Any] = None,
+) -> None:
+    """Write a fixture as pretty JSON; ``sanitize(text) -> text`` normalizes
+    any non-deterministic ids (e.g. the tasklist script's random tool id) so
+    the committed fixture is byte-stable across recordings."""
+    text = json.dumps(fixture, indent=2, ensure_ascii=False, sort_keys=False) + "\n"
+    if sanitize is not None:
+        text = sanitize(text)
+    path = __import__("pathlib").Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    _log.info("recorded render fixture %s (%d frames)", path.name,
+              len(fixture.get("frames") or []))

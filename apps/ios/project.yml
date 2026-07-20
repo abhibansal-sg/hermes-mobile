@@ -182,6 +182,19 @@ targets:
       # a phone/relay field mismatch fails both test stacks.
       - path: ../../tests/conformance/wire_contract.json
         buildPhase: resources
+      # QA-1 A9 render conformance: relay frame streams RECORDED by the E2E
+      # harness (tests/e2e_daily_driver/test_z_record_render_fixtures.py) that
+      # RenderConformanceTests replays through RelayItemStore -> ChatStore to
+      # assert render-model invariants — the render half of the gate that runs
+      # together with the wire half (tests/e2e_daily_driver/run_gate.sh).
+      - path: ../../tests/render_conformance/fixtures/render_submit_stream.json
+        buildPhase: resources
+      - path: ../../tests/render_conformance/fixtures/render_approval_gate.json
+        buildPhase: resources
+      - path: ../../tests/render_conformance/fixtures/render_clarify_gate.json
+        buildPhase: resources
+      - path: ../../tests/render_conformance/fixtures/render_tasklist.json
+        buildPhase: resources
     dependencies:
       - target: HermesMobile
       # GRDB direct link so CacheLayerTests can call DatabaseQueue(configuration:)
