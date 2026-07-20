@@ -216,7 +216,9 @@ final class ChatStore {
     /// to the active session) in reverse for the most recent `todo` tool
     /// activity that yields a parseable list. On the RELAY path (N4/A5), the
     /// relay's ONE living `.taskList` item bridges into the SAME accessor via
-    /// ``syncRelayTaskList(from:)`` so the dock renders identically either way.
+    /// ``applyRelayItems(_:)`` (which refreshes the relay mirror on every
+    /// projection; ``syncRelayTaskList(from:)`` is the store-shaped entry
+    /// point) so the dock renders identically either way.
     /// `nil` when the session has no todo activity yet, or the newest one carries
     /// no list (e.g. a mid-run write before its first result).
     ///
@@ -245,26 +247,33 @@ final class ChatStore {
     /// so when the relay mirror is populated it is authoritative for the dock
     /// (the relay's `taskList` item IS the gateway's `todo` tool reframed for the
     /// relay protocol — same list, same lifecycle, same data — RELAY-PHONE-
-    /// PROTOCOL §2 "taskList semantics"). The convergence wave will eventually
-    /// retire the legacy scan; until then this mirror is a no-op in production
-    /// (the relay item store is not yet wired to a live transport).
+    /// PROTOCOL §2 "taskList semantics"). Production wiring: ``applyRelayItems``
+    /// refreshes the mirror from the same reconciled items it projects into the
+    /// transcript (flag-gated — only reached when `transportPath` is `.relay`,
+    /// default OFF, so the gateway blob path is byte-unchanged). The convergence
+    /// wave will eventually retire the legacy scan.
     private var relayLatestTaskList: (id: String, list: TodoList)?
 
     /// Re-derive the relay-path task-list mirror from the current relay item
-    /// store (N4/A5). Call after each frame batch (or `snapshot`) is folded into
-    /// the `RelayItemStore` so the dock mirror matches the store's authoritative
-    /// state — including CLEARING the mirror when no `.taskList` item remains
-    /// (a snapshot that drops the list, or a session switch to one with no todo
-    /// activity). Idempotent: re-running on an unchanged store is a no-op.
-    ///
-    /// Most-recent `.taskList` item wins; the relay drives ONE living list per
-    /// session on a stable `<sid>:tasks` id, and the store's `items` are already
-    /// in render order (ord ascending, ties by arrival), so a reverse scan
-    /// returns the live one. Items whose body yields no parseable list are
-    /// skipped (mirrors the legacy scan's skip-empty semantics — keeps the prior
-    /// list rather than blanking the dock on a mid-stream delta).
+    /// store (N4/A5). The production caller is ``applyRelayItems`` (which passes
+    /// the store's reconciled items on every frame batch); this store-shaped
+    /// entry point stays for callers that hold the store itself. Refreshing
+    /// includes CLEARING the mirror when no `.taskList` item remains (a snapshot
+    /// that drops the list, or a session switch to one with no todo activity).
+    /// Idempotent: re-running on an unchanged store is a no-op.
     func syncRelayTaskList(from store: RelayItemStore) {
-        for item in store.items.reversed() where item.type == .taskList {
+        refreshRelayTaskListMirror(from: store.items)
+    }
+
+    /// Shared scan behind ``syncRelayTaskList(from:)`` and ``applyRelayItems``.
+    /// Most-recent `.taskList` item wins; the relay drives ONE living list per
+    /// session on a stable `<sid>:tasks` id, and the items are already in render
+    /// order (ord ascending, ties by arrival — `RelayItemStore.items`), so a
+    /// reverse scan returns the live one. Items whose body yields no parseable
+    /// list are skipped (mirrors the legacy scan's skip-empty semantics — keeps
+    /// the prior list rather than blanking the dock on a mid-stream delta).
+    private func refreshRelayTaskListMirror(from items: [ChatItem]) {
+        for item in items.reversed() where item.type == .taskList {
             if let list = item.taskListBody {
                 relayLatestTaskList = (item.itemID, list)
             }
@@ -4138,6 +4147,11 @@ final class ChatStore {
         // down (§3.7); never let it bleed into the next session's first seed.
         pendingForeignReconcileID = nil
         pendingReconnectReconcileID = nil
+        // The relay-path task-list mirror belongs to the session being torn down
+        // too (N4/A5): without this, a switch to a session projected via the
+        // gateway path (which never calls `applyRelayItems`) would keep showing
+        // the previous session's dock task box.
+        relayLatestTaskList = nil
         clearAllCompactionIndicators()
         transcriptGeneration = 0
     }
@@ -4202,6 +4216,12 @@ final class ChatStore {
         flushSegment()
 
         messages = rebuilt
+        // N4/A5: the dock's task box reads `latestTodoList`; on the relay path
+        // the ONE living `.taskList` item lives in these reconciled items, NOT
+        // in a `todo` ToolActivity the legacy scan would find — refresh the
+        // relay mirror from the same batch so the dock works identically on
+        // both transports (and clears when the session has no task list).
+        refreshRelayTaskListMirror(from: items)
         setStreaming(rebuilt.contains { $0.isStreaming }, reason: "relayProjection")
     }
 

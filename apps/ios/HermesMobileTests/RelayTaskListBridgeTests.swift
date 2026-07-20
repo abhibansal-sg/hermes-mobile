@@ -240,6 +240,113 @@ final class RelayTaskListBridgeTests: XCTestCase {
         XCTAssertEqual(chat.latestTodoList?.items.first?.content, "Only in relay")
     }
 
+    // MARK: - Production wiring (applyRelayItems is the coordinator's funnel)
+
+    func testApplyRelayItemsPopulatesDockAccessor() {
+        // THE production contract: `RelaySessionCoordinator` projects each frame
+        // batch via `chatStore.applyRelayItems(store.items)`. That call alone —
+        // no separate sync step — must populate the SAME dock accessor the
+        // Turn Dock reads, so the relay path behaves identically to direct.
+        var relayStore = RelayItemStore()
+        relayStore.apply(taskListCompletedFrame(
+            seq: 1, itemID: "s1:tasks", ord: 4,
+            tasks: [("1", "Read auth.py", "completed"),
+                    ("2", "Run migration 35", "in_progress")],
+            allComplete: false
+        ))
+
+        let chat = ChatStore()
+        chat.applyRelayItems(relayStore.items)
+
+        XCTAssertEqual(chat.latestTodoToolID, "s1:tasks")
+        XCTAssertEqual(chat.latestTodoList?.items.count, 2)
+        XCTAssertEqual(chat.latestTodoList?.items[1].content, "Run migration 35")
+        // The same projection must also render the item in the transcript
+        // (a `.item` part inside the assistant bubble), not just feed the dock.
+        let parts = chat.messages.flatMap(\.parts)
+        let hasTaskListItem = parts.contains { part in
+            if case .item(_, let item) = part { return item.type == .taskList }
+            return false
+        }
+        XCTAssertTrue(hasTaskListItem, "taskList item must project into the transcript")
+    }
+
+    func testApplyRelayItemsWithoutTaskListClearsDockAccessor() {
+        // A session switch (coordinator resets the store, then projects the new
+        // session's items) with no taskList must CLEAR a previously populated
+        // mirror — never strand the old session's dock task box.
+        var relayStore = RelayItemStore()
+        relayStore.apply(taskListCompletedFrame(
+            seq: 1, itemID: "s1:tasks", ord: 4,
+            tasks: [("1", "Old", "completed")], allComplete: true
+        ))
+        let chat = ChatStore()
+        chat.applyRelayItems(relayStore.items)
+        XCTAssertNotNil(chat.latestTodoList, "precondition: mirror populated")
+
+        // New session: one agent message item, no taskList.
+        let agentMessage = ChatItem(
+            itemID: "s2:m1", type: .agentMessage, status: .completed, ord: 0,
+            body: ["text": .string("Hello")]
+        )
+        chat.applyRelayItems([agentMessage])
+        XCTAssertNil(chat.latestTodoList, "mirror must clear when the session has no taskList")
+        XCTAssertNil(chat.latestTodoToolID)
+    }
+
+    func testResetClearsRelayTaskListMirror() {
+        // Session teardown (`reset()`) must drop the relay mirror so a next
+        // session seeded via the DIRECT path (which never calls
+        // `applyRelayItems`) does not inherit the previous session's dock box.
+        var relayStore = RelayItemStore()
+        relayStore.apply(taskListCompletedFrame(
+            seq: 1, itemID: "s1:tasks", ord: 4,
+            tasks: [("1", "Old", "completed")], allComplete: true
+        ))
+        let chat = ChatStore()
+        chat.applyRelayItems(relayStore.items)
+        XCTAssertNotNil(chat.latestTodoList, "precondition: mirror populated")
+
+        chat.reset()
+        XCTAssertNil(chat.latestTodoList, "reset() must clear the relay task-list mirror")
+    }
+
+    func testApplyRelayItemsMidStreamDeltaKeepsDockLive() {
+        // Streaming: started → delta(REPLACE) must keep the dock accessor live
+        // with the NEWEST list (the relay's taskList delta is a full-list
+        // replace, §3) — projecting each batch through `applyRelayItems`.
+        // The `started` frame carries the `type`; a delta for an UNSEEN item
+        // would materialize a generic `.toolCall` placeholder (deltas carry no
+        // type), so the realistic relay sequence starts with `started`.
+        var relayStore = RelayItemStore()
+        relayStore.apply(RelayFrame(
+            seq: 1, sid: "s", turn: "t", kind: RelayFrameKind(wire: "item.started"),
+            body: .object([
+                "item_id": .string("s1:tasks"),
+                "type": .string(ChatItemType.taskList.rawValue),
+                "status": .string("in_progress"),
+                "ord": .number(4),
+                "body": .object([
+                    "tasks": .array([
+                        ["id": "1", "text": "First", "status": "in_progress"],
+                    ]),
+                    "all_complete": false,
+                ]),
+            ])
+        ))
+        let chat = ChatStore()
+        chat.applyRelayItems(relayStore.items)
+        XCTAssertEqual(chat.latestTodoList?.items.count, 1)
+
+        relayStore.apply(taskListDeltaFrame(seq: 2, itemID: "s1:tasks", tasks: [
+            ("1", "First", "completed"),
+            ("2", "Second", "in_progress"),
+        ]))
+        chat.applyRelayItems(relayStore.items)
+        XCTAssertEqual(chat.latestTodoList?.items.count, 2, "delta REPLACE updates the dock list")
+        XCTAssertEqual(chat.latestTodoList?.items[1].content, "Second")
+    }
+
     func testRelayItemDecodesFromJSONStringRoundTrip() throws {
         // End-to-end wire JSON → ChatItem, mirroring the canonical decode test
         // for the other item kinds. Pins the body shape the relay emits.
