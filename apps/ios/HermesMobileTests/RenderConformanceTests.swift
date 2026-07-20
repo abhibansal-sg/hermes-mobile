@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import HermesMobile
 
 /// QA-1 A9 — the RENDER half of the device-shaped gate (spec A9; the wire half
@@ -980,5 +981,276 @@ final class RenderConformanceTests: XCTestCase {
         var store = RelayItemStore()
         store.apply([] as [RelayFrame])
         XCTAssertTrue(store.items.isEmpty)
+    }
+
+    // MARK: - QA-2 R4/A2 — instant working mode; Working-pill state deleted
+
+    /// R4/A2: send enters working mode IMMEDIATELY — an optimistic empty
+    /// streaming assistant bubble (the breathing caret) renders the instant the
+    /// user commits, independent of any relay frame, and `isStreaming` (which
+    /// gates the composer's stop button) is true from send. FAILS on qa2/base
+    /// (the send appends nothing; the first frame's projection decides).
+    func testRelaySend_InstantWorkingAffordance_OptimisticCaretBubble() async throws {
+        let fx = try loadFixture("render_submit_stream")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+
+        let ok = await g.chat.send(text: fx.submitText)
+        XCTAssertTrue(ok)
+
+        // NO frames delivered — the affordance is local or nowhere.
+        XCTAssertTrue(g.chat.isStreaming,
+            "spec R4/A2: send → working mode instantly (stop button available)")
+        let last = try XCTUnwrap(g.chat.messages.last)
+        XCTAssertEqual(last.role, .assistant,
+            "spec R4: send appends an optimistic empty streaming assistant bubble")
+        XCTAssertTrue(last.isStreaming)
+        XCTAssertTrue(last.parts.isEmpty, "the caret bubble is empty until the first delta")
+    }
+
+    /// R4/A2: the relay's synthesized TERMINAL `userMessage` first frame must
+    /// NOT settle the turn — streaming is turn-scoped (until `turn.completed`),
+    /// and the caret bubble persists through the accepted-and-waiting window.
+    /// FAILS on qa2/base (`nowStreaming = rebuilt.contains { $0.isStreaming }`
+    /// → false → the bar + stop + cursor die for the entire wait window; fast
+    /// turns showed no affordance at all).
+    func testRelaySend_TerminalUserMessageFrameKeepsTurnStreaming() async throws {
+        let fx = try loadFixture("render_submit_stream")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+
+        _ = await g.chat.send(text: fx.submitText)
+        deliver(g, fx, through: {
+            self.kind($0) == "item.completed" && self.itemType($0) == "userMessage"
+        })
+        await waitUntil { g.chat.messages.contains { $0.role == .user && $0.text == fx.submitText } }
+
+        XCTAssertTrue(g.chat.isStreaming,
+            "spec R4/A2: a terminal userMessage item must not settle a turn-scoped streaming turn")
+        XCTAssertTrue(g.chat.messages.contains {
+            $0.role == .assistant && $0.isStreaming && $0.parts.isEmpty
+        }, "spec R4: the caret bubble survives the terminal userMessage frame")
+    }
+
+    /// A2: the Working pill is IMPOSSIBLE on the relay path — in EVERY phase,
+    /// including the pre-first-item window the QA-1 B8 clause still showed it
+    /// for. That clause (the last state that could flash the pill on relay) is
+    /// deleted; the optimistic caret bubble is the pre-first-item affordance.
+    /// FAILS on qa2/base (the pre-first-item branch returned `true`).
+    func testRelaySend_WorkingPillImpossiblePreFirstItem() async throws {
+        let fx = try loadFixture("render_submit_stream")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        g.chat.messages = cachedRows(fx)
+        _ = await g.chat.send(text: fx.submitText)
+
+        // Pre-first-item: no relay frame yet; the painted tail is the user echo.
+        let last = try XCTUnwrap(g.chat.messages.last(where: { $0.role == .user }))
+        XCTAssertEqual(last.text, fx.submitText)
+        XCTAssertFalse(
+            ChatView.shouldShowInlineTurnActivity(
+                isStreaming: true,
+                hasPendingGate: false,
+                isRelayTransport: true,
+                lastMessage: last
+            ),
+            "spec A2: the relay Working pill is impossible — even pre-first-item (state deleted, not hidden)"
+        )
+    }
+
+    // MARK: - QA-2 R5/R6/A3 — single collapsed live working line
+
+    /// A3: a live turn with reasoning + tool work projects EXACTLY ONE
+    /// assistant row, folding to EXACTLY ONE `.working` node — never the
+    /// build-115 stack (inline thinking rows + separate current-tool row +
+    /// standalone cursor = 3-4 rows, IMG_2532/2545/2546). The single collapsed
+    /// line's label never surfaces the raw pre-resolution tool state (N2).
+    func testReplay_LiveTurnExactlyOneWorkingNode() async throws {
+        let fx = try loadFixture("render_live_fold")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        _ = await g.chat.send(text: fx.submitText)
+
+        // Through the raw-name tool start: reasoning done, tool in progress,
+        // NO agent item yet — the accepted-and-waiting + working window.
+        deliver(g, fx, through: {
+            self.kind($0) == "item.started" && self.itemType($0) == "tool.generating"
+        })
+        // Wait for the REAL projection (the optimistic bubble also matches
+        // `isStreaming` with EMPTY parts — require parts so a frame-processing
+        // hop can't race the assertion).
+        await waitUntil { g.chat.messages.contains {
+            $0.role == .assistant && $0.isStreaming && !$0.parts.isEmpty
+        } }
+
+        XCTAssertTrue(g.chat.isStreaming, "the live turn is streaming (turn-scoped)")
+        let live = try XCTUnwrap(
+            g.chat.messages.first { $0.role == .assistant && $0.isStreaming && !$0.parts.isEmpty },
+            "spec A3: the live turn renders as a streaming assistant row"
+        )
+        let nodes = WorkingSectionModel.renderNodes(from: live.parts)
+        XCTAssertEqual(nodes.count, 1,
+            "spec A3: the live turn folds to a SINGLE working node (no stacked rows)")
+        guard let only = nodes.first, case .working = only else {
+            return XCTFail("spec A3: the single node is the working fold")
+        }
+        XCTAssertEqual(WorkingSectionModel.liveCollapsedLabel(parts: live.parts), "Working…",
+            "spec R5/N2: the raw 'tool.generating' state reads as plain 'Working…' — never the raw token")
+    }
+
+    /// A3: once the tool resolves a friendly summary, the single collapsed line
+    /// carries it inline — "Working… · ‹current tool›" (ratified Wave-2.5).
+    func testReplay_LiveTurnResolvesFriendlyToolInline() async throws {
+        let fx = try loadFixture("render_live_fold")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        _ = await g.chat.send(text: fx.submitText)
+
+        // Through the agentMessage start (the tool completed friendly just
+        // before it — deltas carry no type, so stop on the agent item.started,
+        // NOT the first delta, which is the reasoning delta).
+        deliver(g, fx, through: {
+            self.kind($0) == "item.started" && self.itemType($0) == "agentMessage"
+        })
+        await waitUntil { g.chat.messages.contains {
+            $0.role == .assistant && !$0.parts.isEmpty && $0.isStreaming
+        } }
+
+        let live = try XCTUnwrap(g.chat.messages.first {
+            $0.role == .assistant && !$0.parts.isEmpty && $0.isStreaming
+        })
+        let label = WorkingSectionModel.liveCollapsedLabel(parts: live.parts)
+        XCTAssertEqual(label, "Working… · Asked which direction to take",
+            "spec R5/A3: the resolved tool rides inline on the single Working line")
+        XCTAssertFalse(label.contains("."), "no raw dotted state token in the label")
+    }
+
+    /// N2: `liveCollapsedLabel` NEVER renders a raw internal state name —
+    /// `tool.generating` / `review.summary` read as plain "Working…" until the
+    /// tool resolves (deterministic unit pin, no replay).
+    func testLiveCollapsedLabel_NeverRawStateNames() {
+        let raw = ChatItem(itemID: "t1", type: ChatItemType(wire: "tool.generating"),
+                           rawType: "tool.generating", status: .inProgress, ord: 1,
+                           summary: "tool.generating", body: .null)
+        XCTAssertEqual(
+            WorkingSectionModel.liveCollapsedLabel(parts: [.item(id: "t1", item: raw)]),
+            "Working…",
+            "a raw pre-resolution tool state must read as plain Working…"
+        )
+        XCTAssertTrue(WorkingSectionModel.isRawStateName("tool.generating"))
+        XCTAssertTrue(WorkingSectionModel.isRawStateName("review.summary"))
+        XCTAssertFalse(WorkingSectionModel.isRawStateName("clarify"))
+        XCTAssertFalse(WorkingSectionModel.isRawStateName("Read auth.py"))
+
+        let friendly = ChatItem(itemID: "t2", type: .toolCall, status: .inProgress, ord: 1,
+                                body: ["name": "read", "args": ["path": "auth.py"]])
+        XCTAssertEqual(
+            WorkingSectionModel.liveCollapsedLabel(parts: [.item(id: "t2", item: friendly)]),
+            "Working… · Read auth.py",
+            "a humanized tool name rides inline on the collapsed live line"
+        )
+
+        // A friendly SUMMARY over a still-raw wire name is trusted.
+        let resolved = ChatItem(itemID: "t3", type: ChatItemType(wire: "clarify"),
+                                rawType: "clarify", status: .inProgress, ord: 1,
+                                summary: "Asked which direction to take", body: .null)
+        XCTAssertEqual(
+            WorkingSectionModel.liveCollapsedLabel(parts: [.item(id: "t3", item: resolved)]),
+            "Working… · Asked which direction to take"
+        )
+    }
+
+    /// A3 layout: the LIVE working section renders as ONE line — its measured
+    /// height is a single row (≈32pt), never the build-115 reserved 172pt
+    /// thinking window + stacked rows (the R6 bands of IMG_2533/2538/2542).
+    /// FAILS on qa2/base (the live branch mounted a 172pt ThinkingView).
+    @MainActor
+    func testLiveWorkingSection_RendersOneLineLayout() throws {
+        let raw = ChatItem(itemID: "t1", type: ChatItemType(wire: "tool.generating"),
+                           rawType: "tool.generating", status: .inProgress, ord: 1,
+                           summary: "tool.generating", body: .null)
+        let parts: [ChatMessagePart] = [
+            .reasoning(id: "r1", text: "I need to create a clarification card with four options, where each option is meaningful."),
+            .item(id: "t1", item: raw),
+        ]
+        let renderer = ImageRenderer(content:
+            WorkingSectionView(parts: parts, streaming: true,
+                               liveTurnStartedAt: Date(), settledDuration: nil)
+                .frame(width: 360)
+                .environment(\.hermesTheme, HermesThemePresets.nousLight)
+        )
+        renderer.scale = 2
+        let height = try XCTUnwrap(renderer.uiImage?.size.height,
+            "the live working section must render")
+        XCTAssertLessThan(height, 60,
+            "spec A3/R6: the live working section is ONE line — no 172pt thinking window, no stacked rows (measured \(height)pt)")
+    }
+
+    /// R5/A3: a settled relay turn stamps its per-TURN wall-clock duration so
+    /// the row reads "Worked for Ns" (build 115: a bare "Worked" — relay items
+    /// carry no timestamps and the projection never stamped one; IMG_2532).
+    /// FAILS on qa2/base (`reasoningElapsed` never set on relay rows).
+    func testReplay_SettledRelayTurnStampsDuration() async throws {
+        let fx = try loadFixture("render_live_fold")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        g.chat.messages = cachedRows(fx)
+        _ = await g.chat.send(text: fx.submitText)
+        deliverAll(g, fx)
+
+        let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
+        await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
+
+        let settledRow = try XCTUnwrap(
+            g.chat.messages.first { $0.role == .assistant && $0.text == agentText })
+        XCTAssertNotNil(settledRow.reasoningElapsed,
+            "spec R5/A3: the settle edge stamps the turn's wall-clock duration on the relay row")
+        XCTAssertNotEqual(
+            WorkingSectionModel.workedLabel(seconds: settledRow.reasoningElapsed), "Worked",
+            "spec R5: the settled relay row reads 'Worked for Ns', never a bare 'Worked'"
+        )
+    }
+
+    /// R5: the stamped duration SURVIVES later re-projections — the projection
+    /// rebuilds every tagged row from the (session-accumulating) item store on
+    /// every pass, so the second turn's first frame must not strip the first
+    /// turn's "Worked for Ns". FAILS on qa2/base (never stamped at all).
+    func testReplay_SettledDurationSurvivesSecondTurnReprojection() async throws {
+        let fx = try loadFixture("render_live_fold")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        _ = await g.chat.send(text: fx.submitText)
+        deliverAll(g, fx)
+        let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
+        await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
+
+        // Second turn begins: send + its terminal userMessage frame (seq 14,
+        // dense after the fixture's 13) re-projects the WHOLE session timeline.
+        _ = await g.chat.send(text: "Second prompt.")
+        let secondUserFrame: [String: Any] = [
+            "seq": 14, "sid": fx.sessionID, "turn": NSNull(),
+            "kind": "item.completed",
+            "body": [
+                "item_id": "render-sess-fold:u-2",
+                "type": "userMessage",
+                "status": "completed",
+                "ord": 5,
+                "body": ["text": "Second prompt.", "client_message_id": "render-cmid-fold-2"],
+            ],
+        ]
+        g.transport.deliver(frameText(secondUserFrame))
+        await waitUntil { g.chat.messages.contains { $0.role == .user && $0.text == "Second prompt." } }
+
+        let firstTurnRow = try XCTUnwrap(
+            g.chat.messages.first { $0.role == .assistant && $0.text == agentText })
+        XCTAssertNotNil(firstTurnRow.reasoningElapsed,
+            "spec R5: a later turn's re-projection must not strip the settled turn's stamped duration")
     }
 }

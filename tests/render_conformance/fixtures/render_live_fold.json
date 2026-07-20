@@ -1,0 +1,216 @@
+{
+  "name": "render_live_fold",
+  "description": "Live-turn fold shape (QA-2 R5/R6/A3): submit -> terminal userMessage -> turn.started -> reasoning started/delta/completed -> toolCall started under the RAW pre-resolution wire type 'tool.generating' (N2 flash) then completed as a friendly 'clarify' -> agentMessage started/delta*/completed -> usage -> turn.completed. The live turn must project ONE assistant row folding to ONE working node with a single 'Working…' line (never the raw state name); the settled turn stamps a per-turn duration. Hand-authored to the recorded wire format (RELAY-PHONE-PROTOCOL §2/§4); refreshable via the E2E harness once its mock gateway grows a deterministic reasoning+tool script.",
+  "recorded_by": "hand-authored to docs/RELAY-PHONE-PROTOCOL.md §2/§4 (envelope shape verbatim from render_submit_stream.json)",
+  "replayed_by": "apps/ios/HermesMobileTests/RenderConformanceTests.swift",
+  "protocol": "docs/RELAY-PHONE-PROTOCOL.md",
+  "session_id": "render-sess-fold",
+  "submit": {
+    "text": "Set up trend monitoring for Singapore.",
+    "session_id": "render-sess-fold",
+    "client_message_id": "render-cmid-fold"
+  },
+  "cached_history": [
+    {
+      "role": "user",
+      "content": "Earlier question, settled turn."
+    },
+    {
+      "role": "assistant",
+      "content": "Earlier answer, settled turn."
+    }
+  ],
+  "frames": [
+    {
+      "seq": 1,
+      "sid": "render-sess-fold",
+      "turn": null,
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-fold:u-1",
+        "type": "userMessage",
+        "status": "completed",
+        "ord": 0,
+        "summary": "",
+        "body": {
+          "text": "Set up trend monitoring for Singapore.",
+          "client_message_id": "render-cmid-fold"
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "sid": "render-sess-fold",
+      "turn": "render-sess-fold:t1",
+      "kind": "turn.started",
+      "body": {}
+    },
+    {
+      "seq": 3,
+      "sid": "render-sess-fold",
+      "turn": "render-sess-fold:t1",
+      "kind": "item.started",
+      "body": {
+        "item_id": "render-sess-fold:i1",
+        "type": "reasoning",
+        "status": "in_progress",
+        "ord": 1,
+        "summary": "",
+        "body": {
+          "text": ""
+        }
+      }
+    },
+    {
+      "seq": 4,
+      "sid": "render-sess-fold",
+      "turn": "render-sess-fold:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-fold:i1",
+        "patch": {
+          "text": "I need to create a clarification card with four options, where each option is meaningful."
+        }
+      }
+    },
+    {
+      "seq": 5,
+      "sid": "render-sess-fold",
+      "turn": "render-sess-fold:t1",
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-fold:i1",
+        "type": "reasoning",
+        "status": "completed",
+        "ord": 1,
+        "summary": "I need to create a clarification card with four options, where each option is meaningful.",
+        "body": {
+          "text": "I need to create a clarification card with four options, where each option is meaningful."
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "sid": "render-sess-fold",
+      "turn": "render-sess-fold:t1",
+      "kind": "item.started",
+      "body": {
+        "item_id": "render-sess-fold:i2",
+        "type": "tool.generating",
+        "status": "in_progress",
+        "ord": 2,
+        "summary": "tool.generating",
+        "body": {}
+      }
+    },
+    {
+      "seq": 7,
+      "sid": "render-sess-fold",
+      "turn": "render-sess-fold:t1",
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-fold:i2",
+        "type": "clarify",
+        "status": "completed",
+        "ord": 2,
+        "summary": "Asked which direction to take",
+        "body": {
+          "name": "clarify"
+        }
+      }
+    },
+    {
+      "seq": 8,
+      "sid": "render-sess-fold",
+      "turn": "render-sess-fold:t1",
+      "kind": "item.started",
+      "body": {
+        "item_id": "render-sess-fold:i3",
+        "type": "agentMessage",
+        "status": "in_progress",
+        "ord": 3,
+        "summary": "",
+        "body": {
+          "text": ""
+        }
+      }
+    },
+    {
+      "seq": 9,
+      "sid": "render-sess-fold",
+      "turn": "render-sess-fold:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-fold:i3",
+        "patch": {
+          "text": "Got it — "
+        }
+      }
+    },
+    {
+      "seq": 10,
+      "sid": "render-sess-fold",
+      "turn": "render-sess-fold:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-fold:i3",
+        "patch": {
+          "text": "monitoring set up."
+        }
+      }
+    },
+    {
+      "seq": 11,
+      "sid": "render-sess-fold",
+      "turn": "render-sess-fold:t1",
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-fold:i3",
+        "type": "agentMessage",
+        "status": "completed",
+        "ord": 3,
+        "summary": "Got it — monitoring set up.",
+        "body": {
+          "text": "Got it — monitoring set up."
+        }
+      }
+    },
+    {
+      "seq": 12,
+      "sid": "render-sess-fold",
+      "turn": "render-sess-fold:t1",
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-fold:i4",
+        "type": "usage",
+        "status": "completed",
+        "ord": 4,
+        "summary": "18 tokens",
+        "body": {
+          "model": "mock-model",
+          "input": 4,
+          "output": 14,
+          "total": 18
+        }
+      }
+    },
+    {
+      "seq": 13,
+      "sid": "render-sess-fold",
+      "turn": "render-sess-fold:t1",
+      "kind": "turn.completed",
+      "body": {
+        "usage": {
+          "model": "mock-model",
+          "input": 4,
+          "output": 14,
+          "total": 18
+        }
+      }
+    }
+  ],
+  "settled": {
+    "agent_text": "Got it — monitoring set up.",
+    "user_prompt": "Set up trend monitoring for Singapore."
+  }
+}

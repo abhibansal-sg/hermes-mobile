@@ -82,6 +82,15 @@ struct MessageBubble: View {
     /// for the live inline timer while streaming; settled rows read the duration
     /// stamped on their own message.
     let liveTurnStartedAt: Date?
+    /// QA-2 R5/A3: whether the turn this row belongs to is LIVE at the store
+    /// level (turn-scoped `ChatStore.isStreaming`, true for the LAST assistant
+    /// row while the turn works). The working section selects its live vs.
+    /// settled presentation off `message.isStreaming || liveTurnActive`, so the
+    /// single "Working…" line persists across the brief all-terminal window
+    /// BETWEEN two tool items of a live turn (where every item is momentarily
+    /// terminal but the turn has not settled) — no "Worked ›" flash mid-turn.
+    /// False for every non-last row, so settled turns never light up.
+    let liveTurnActive: Bool
 
     /// Appearance identity (theme + Dynamic Type), folded into `Equatable` (A1) so
     /// a theme/type-size switch re-renders the bubble even though `.equatable()`
@@ -128,6 +137,7 @@ struct MessageBubble: View {
         menuActionsEnabled: Bool = true,
         assistantTurnActionsEnabled: Bool = true,
         liveTurnStartedAt: Date? = nil,
+        liveTurnActive: Bool = false,
         appearance: BubbleAppearance = BubbleAppearance(),
         delivery: QueueStore.SendDelivery = .none,
         onResend: (() -> Void)? = nil,
@@ -145,6 +155,7 @@ struct MessageBubble: View {
         self.menuActionsEnabled = menuActionsEnabled
         self.assistantTurnActionsEnabled = assistantTurnActionsEnabled
         self.liveTurnStartedAt = liveTurnStartedAt
+        self.liveTurnActive = liveTurnActive
         self.appearance = appearance
         self.delivery = delivery
         self.onResend = onResend
@@ -564,7 +575,7 @@ struct MessageBubble: View {
                     case .working(_, let runParts):
                         WorkingSectionView(
                             parts: runParts,
-                            streaming: message.isStreaming,
+                            streaming: message.isStreaming || liveTurnActive,
                             liveTurnStartedAt: liveTurnStartedAt,
                             settledDuration: message.reasoningElapsed
                         )
@@ -2464,6 +2475,7 @@ extension MessageBubble: Equatable {
             && lhs.assistantTurnActionsEnabled == rhs.assistantTurnActionsEnabled
             && lhs.showsUndoLastTurnAction == rhs.showsUndoLastTurnAction
             && lhs.liveTurnStartedAt == rhs.liveTurnStartedAt
+            && lhs.liveTurnActive == rhs.liveTurnActive
             && lhs.appearance == rhs.appearance
             // Delivery state drives the send-failed badge (C1); a transition
             // (in-transit → failed → delivered) must re-render past the A1

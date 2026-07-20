@@ -412,7 +412,11 @@ final class RelaySessionCoordinator {
         // drop reconnects promptly instead of inheriting a stale attempt count.
         if reconnectAttempt != 0 { reconnectAttempt = 0 }
         store.apply(frame)
-        chatStore.applyRelayItems(store.items)
+        // QA-2 R4/A2: `turn.completed` is the authoritative settle the
+        // turn-scoped `relayTurnLive` flag clears on — plumbed through so the
+        // SAME projection that sees the terminal items also ends the turn
+        // (item terminality alone must not, the build-115 bug).
+        chatStore.applyRelayItems(store.items, turnSettled: frame.kind == .turnCompleted)
         // QA-1 B10 / A3: the interactive gate frames are NOT items — the render
         // store drops them by design — yet they are the sole input of the Turn
         // Dock's cards. Bridge them into the SAME ChatStore state the direct

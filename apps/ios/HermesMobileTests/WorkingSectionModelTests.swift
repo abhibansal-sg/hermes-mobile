@@ -356,6 +356,74 @@ final class WorkingSectionModelTests: XCTestCase {
         XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Quantum flux")
     }
 
+    // MARK: - QA-2 N2 — raw state names never reach the UI
+
+    func testIsRawStateNameDetectsDottedEventTokens() {
+        XCTAssertTrue(WorkingSectionModel.isRawStateName("tool.generating"))
+        XCTAssertTrue(WorkingSectionModel.isRawStateName("review.summary"))
+        XCTAssertFalse(WorkingSectionModel.isRawStateName("clarify"))
+        XCTAssertFalse(WorkingSectionModel.isRawStateName("quantum_flux"))
+        XCTAssertFalse(WorkingSectionModel.isRawStateName("Read auth.py"))
+        XCTAssertFalse(WorkingSectionModel.isRawStateName("Asked which direction"))
+    }
+
+    func testStepSummarySkipsRawRelaySummary() {
+        // The build-115 flash: the relay `summary` IS the raw event name while
+        // the tool's friendly name is unresolved — it must fall through to the
+        // humanizer's neutral fallback, never print verbatim.
+        let it = ChatItem(itemID: "t1", type: ChatItemType(wire: "tool.generating"),
+                          rawType: "tool.generating", status: .inProgress, ord: 0,
+                          summary: "tool.generating", body: .null)
+        XCTAssertEqual(WorkingSectionModel.stepSummary(for: it), "Tool step")
+    }
+
+    func testHumanizeRawNameWithTargetIsNeutral() {
+        XCTAssertEqual(
+            WorkingSectionModel.humanize(name: "review.summary", target: "report.md"),
+            "Working on report.md",
+            "a raw dotted name with a target reads neutral — and never false-matches 'view' → 'Read'"
+        )
+        XCTAssertEqual(WorkingSectionModel.humanize(name: "tool.generating", target: nil), "Tool step")
+    }
+
+    func testLiveCollapsedLabelContract() {
+        // Raw in-progress tool → plain "Working…".
+        let raw = ChatItem(itemID: "t1", type: ChatItemType(wire: "tool.generating"),
+                           rawType: "tool.generating", status: .inProgress, ord: 0,
+                           summary: "tool.generating", body: .null)
+        XCTAssertEqual(WorkingSectionModel.liveCollapsedLabel(parts: [.item(id: "t1", item: raw)]),
+                       "Working…")
+        // Friendly resolved tool → inline on the single line.
+        let friendly = ChatItem(itemID: "t2", type: .toolCall, status: .inProgress, ord: 0,
+                                body: ["name": "read", "args": ["path": "auth.py"]])
+        XCTAssertEqual(WorkingSectionModel.liveCollapsedLabel(parts: [.item(id: "t2", item: friendly)]),
+                       "Working… · Read auth.py")
+        // No tool work (pure reasoning) → plain "Working…".
+        XCTAssertEqual(
+            WorkingSectionModel.liveCollapsedLabel(parts: [.reasoning(id: "r1", text: "Thinking…")]),
+            "Working…"
+        )
+    }
+
+    func testWorkUnitCarriesRawFlag() {
+        let raw = ChatItem(itemID: "t1", type: ChatItemType(wire: "tool.generating"),
+                           rawType: "tool.generating", status: .inProgress, ord: 0,
+                           summary: "tool.generating", body: .null)
+        let units = WorkingSectionModel.toolUnits(in: [.item(id: "t1", item: raw)])
+        XCTAssertEqual(units.count, 1)
+        XCTAssertTrue(units[0].raw, "a raw wire type + raw summary marks the unit raw")
+
+        let named = ChatItem(itemID: "t2", type: .toolCall, status: .inProgress, ord: 1,
+                             body: ["name": "read", "args": ["path": "x.py"]])
+        let units2 = WorkingSectionModel.toolUnits(in: [.item(id: "t2", item: named)])
+        XCTAssertFalse(units2[0].raw)
+    }
+
+    func testWorkedLabelSubSecondDurationReadsOneSecond() {
+        XCTAssertEqual(WorkingSectionModel.workedLabel(seconds: 0.4), "Worked for 1s",
+            "a known sub-second turn never rounds down to a bare 'Worked'")
+    }
+
     func testStepSummaryCollapsesAndCapsLongTargets() {
         let long = String(repeating: "x", count: 200)
         let it = ChatItem(itemID: "t1", type: .toolCall, status: .completed, ord: 0,

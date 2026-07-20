@@ -195,6 +195,10 @@ targets:
         buildPhase: resources
       - path: ../../tests/render_conformance/fixtures/render_tasklist.json
         buildPhase: resources
+      # QA-2 R5/R6/A3 live-fold fixture (reasoning + raw-name tool turn);
+      # hand-authored to the recorded wire format (see its recorded_by note).
+      - path: ../../tests/render_conformance/fixtures/render_live_fold.json
+        buildPhase: resources
     dependencies:
       - target: HermesMobile
       # GRDB direct link so CacheLayerTests can call DatabaseQueue(configuration:)
