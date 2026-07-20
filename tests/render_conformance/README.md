@@ -19,6 +19,9 @@ lane, and render-model invariants are asserted against the spec contract.
   result messages. Byte-stable across runs (fixed session ids, fixed gate
   request ids, deterministic mock-gateway scripts, fresh relay per test ⇒
   dense seqs from 1; the tasklist script's one random id is normalized).
+  `render_live_fold.json` (QA-2 R5/R6/A3) is HAND-AUTHORED to the same wire
+  format (the harness's mock gateway has no deterministic reasoning+tool
+  script yet); it carries its provenance in its `recorded_by` field.
 - The XCTest suite itself lives in the iOS test target (XCTest requirement):
   `apps/ios/HermesMobileTests/RenderConformanceTests.swift`, with the fixtures
   bundled into that target via `apps/ios/project.yml`. It replays the frames
@@ -56,6 +59,13 @@ exercises the full echo↔item path.
 | — | session switch never voids a painted transcript | B4/A7 | FAILS (open-path reset wipes `messages`) |
 | — | idle-session open keeps the transcript non-empty | B4/B15 | FAILS (reset + empty snapshot) |
 | — | cold cache paints with zero relay frames | B15 | passes (regression guard) |
+| render_live_fold (QA-2) | send → optimistic caret bubble + streaming instantly, no frames | R4/A2 | FAILS on qa2/base (send appends nothing) |
+| render_live_fold (QA-2) | terminal `userMessage` frame keeps the turn streaming (turn-scoped) | R4/A2 | FAILS (projection clears `isStreaming`) |
+| — (QA-2) | Working pill impossible on relay — every phase incl. pre-first-item | A2 | FAILS (pre-first-item clause returns true) |
+| render_live_fold (QA-2) | live turn = ONE assistant row → ONE working node; raw tool state reads "Working…" | R5/A3/N2 | FAILS (stacked live rows; raw names surface) |
+| render_live_fold (QA-2) | resolved tool rides inline: "Working… · ‹tool›" | R5/A3 | FAILS |
+| — (QA-2) | live working section measures one line (< 60pt), never the 172pt window | R6/A3 | FAILS (172pt ThinkingView) |
+| render_live_fold (QA-2) | settled relay turn stamps "Worked for Ns"; survives the next turn's re-projection | R5/A3 | FAILS (bare "Worked"; relay items carry no timestamps) |
 
 ## Running
 
