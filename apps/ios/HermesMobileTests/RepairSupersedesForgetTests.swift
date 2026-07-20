@@ -267,6 +267,11 @@ final class RepairSupersedesForgetTests: XCTestCase {
     }
 
     func testSeededTranscriptRendersRowsNoPlaceholder() {
+        // QA-1 B4 contract change: an EMPTY transcript at generation > 0 is a
+        // mid-open wipe (the blank-screen race class) unless a seed CONFIRMED
+        // the session is genuinely empty — it now falls back to the skeleton
+        // (cache → skeleton → content, never void) instead of rendering the
+        // void. It still never shows the offline placeholder at generation>0.
         let placeholder = ChatView.transcriptPlaceholder(
             isDraft: false,
             messagesEmpty: true,
@@ -274,8 +279,19 @@ final class RepairSupersedesForgetTests: XCTestCase {
             isGatewayOffline: true,
             loadError: nil
         )
-        XCTAssertEqual(placeholder, .transcript,
-                       "a seeded-then-emptied transcript (generation > 0) never shows the offline placeholder")
+        XCTAssertEqual(placeholder, .skeleton,
+                       "an unconfirmed empty transcript (generation > 0) falls back to the skeleton, never the void")
+        // A seed-confirmed empty session is the honest-empty transcript.
+        let confirmed = ChatView.transcriptPlaceholder(
+            isDraft: false,
+            messagesEmpty: true,
+            transcriptGeneration: 4,
+            transcriptConfirmedEmpty: true,
+            isGatewayOffline: true,
+            loadError: nil
+        )
+        XCTAssertEqual(confirmed, .transcript,
+                       "a seed-confirmed empty session renders the honest empty transcript")
     }
 
     func testDraftGreetingWinsWhenOffline() {

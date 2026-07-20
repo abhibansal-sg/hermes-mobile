@@ -3127,6 +3127,15 @@ final class ChatStore {
     /// mirror reconciliation) so the view can snap to the newest message.
     private(set) var transcriptGeneration = 0
 
+    /// QA-1 B4: `true` once an authoritative seed landed ZERO rows for the
+    /// open session — an HONEST empty transcript (a session with no messages
+    /// yet). Distinguishes that legitimate state from a mid-open wipe, which
+    /// the placeholder must render as the skeleton — never blank. `reset()`
+    /// clears it (a fresh open is unconfirmed until its seed lands); a
+    /// non-empty seed or relay projection clears it; an EMPTY authoritative
+    /// seed sets it.
+    private(set) var transcriptConfirmedEmpty = false
+
     #if DEBUG
     /// DEBUG-ONLY deterministic transcript seed for sim scroll verification
     /// (`HERMES_UITEST_SEED`). Replaces the transcript and bumps
@@ -3208,6 +3217,9 @@ final class ChatStore {
         // teardown + backfill reconcile (which clears the flag before seeding).
         guard !streamingIsForeign else { return }
         cancelStreaming()
+        // QA-1 B4: an authoritative seed is the confirmation of what the open
+        // session actually contains — zero rows IS the (honest) transcript.
+        transcriptConfirmedEmpty = normalized.isEmpty
         // IN-PLACE RECONCILE (contract Batch E §3.7, fixes D9): merge the new
         // seed onto the existing transcript by identity instead of a wholesale
         // `messages = …` replace. A wholesale replace remounts every row (new
@@ -4182,6 +4194,7 @@ final class ChatStore {
         relayEchoAdoptions = [:]
         clearAllCompactionIndicators()
         transcriptGeneration = 0
+        transcriptConfirmedEmpty = false
     }
 
     // MARK: - Wave-2 relay transport projection (RELAY-PHONE-PROTOCOL §2/§7)
@@ -4313,19 +4326,41 @@ final class ChatStore {
         }
         flushSegment()
 
-        // Preserve the settled history (every untagged row) and append the live
-        // relay projection below it — minus any echo rows a userMessage item
-        // adopted this pass (they re-enter tagged, in place).
-        let preserved = messages.filter {
-            !$0.relayProjected && !consumedEchoIDs.contains($0.id)
-        }
-        messages = preserved + rebuilt
         // N4/A5: the dock's task box reads `latestTodoList`; on the relay path
         // the ONE living `.taskList` item lives in these reconciled items, NOT
         // in a `todo` ToolActivity the legacy scan would find — refresh the
         // relay mirror from the same batch so the dock works identically on
         // both transports (and clears when the session has no task list).
+        // Deliberately BEFORE the empty guard: an empty projection must still
+        // clear the stale session's task list so the new dock starts clean.
         refreshRelayTaskListMirror(from: items)
+
+        // QA-1 B4 — BLANK-SCREEN IMPOSSIBLE: an EMPTY relay projection must
+        // never blank a painted transcript. The session-switch store reset no
+        // longer re-projects here at all (RelaySessionCoordinator
+        // `.resetItemStoreForSessionSwitch` resets ONLY the item store), so the
+        // cache paint always survives a switch; this guard is the belt-and-
+        // braces fallback for any other empty projection (e.g. a pre-content
+        // frame on a fresh open). Assigning `messages = []` there raced the
+        // GRDB cache seed (`seedTranscriptCacheFirst`) and, whichever landed
+        // last, left the view EMPTY with a bumped `transcriptGeneration` — a
+        // fully blank screen (the placeholder's skeleton branch requires
+        // generation == 0, so no skeleton either). Fall back to the painted
+        // content instead: cache → skeleton → content, NEVER void. The
+        // switch's own cache seed (or `reset()` on a cache miss) owns the
+        // legitimate content → content transition.
+        guard !rebuilt.isEmpty else { return }
+
+        transcriptConfirmedEmpty = false
+        // QA-1 B5/B6/B7/B13 — MERGED TIMELINE: preserve the settled history
+        // (every untagged row) and append the live relay projection below it —
+        // minus any echo rows a userMessage item adopted this pass (they
+        // re-enter tagged, in place). History + live turn coexist; scrollback
+        // stays intact during and after streaming.
+        let preserved = messages.filter {
+            !$0.relayProjected && !consumedEchoIDs.contains($0.id)
+        }
+        messages = preserved + rebuilt
         setStreaming(rebuilt.contains { $0.isStreaming }, reason: "relayProjection")
     }
 

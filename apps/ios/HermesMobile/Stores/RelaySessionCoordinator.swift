@@ -132,6 +132,73 @@ final class RelaySessionCoordinator {
     private var pumpTask: Task<Void, Never>?
     private var stateTask: Task<Void, Never>?
 
+    // MARK: Transport-ready waiters (QA-1 B1/B2)
+
+    /// Continuations suspended in ``waitUntilOpen(timeout:)``, resolved when the
+    /// socket crosses INTO `.open` (true) or their bounded timeout fires (false).
+    /// Session ops queue on transport readiness through these instead of racing
+    /// the phase bridge and failing fast with `notConnected`.
+    private var openWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var openWaiterTimeouts: [UUID: Task<Void, Never>] = [:]
+
+    /// Suspend until the relay socket reports `.open`, or `timeout` elapses.
+    /// Returns `true` when open. Callers (session resume/open, the transcript
+    /// network seed) use this to QUEUE on the relay phase bridge instead of
+    /// racing it: a cold-start resume that lands mid-connect waits the fraction
+    /// of a second until the socket is up rather than throwing `notConnected`
+    /// into a modal alert channel (QA-1 B1 north-star: retryable conditions
+    /// self-heal silently). Bounded so a genuinely dead relay surfaces as a
+    /// `false` return the caller turns into a silent retry-on-ready, never a
+    /// hang.
+    @discardableResult
+    func waitUntilOpen(timeout: Duration = .seconds(10)) async -> Bool {
+        if phase == .open { return true }
+        let id = UUID()
+        return await withCheckedContinuation { continuation in
+            openWaiters[id] = continuation
+            openWaiterTimeouts[id] = Task { [weak self] in
+                try? await Task.sleep(for: timeout)
+                guard !Task.isCancelled else { return }
+                self?.resolveOpenWaiter(id: id, opened: false)
+            }
+        }
+    }
+
+    private func resolveOpenWaiter(id: UUID, opened: Bool) {
+        openWaiterTimeouts.removeValue(forKey: id)?.cancel()
+        guard let continuation = openWaiters.removeValue(forKey: id) else { return }
+        continuation.resume(returning: opened)
+    }
+
+    /// Resolve every pending ``waitUntilOpen(timeout:)`` with `opened`. Called on
+    /// the crossing into `.open` (true) and on teardown (false).
+    private func resolveAllOpenWaiters(opened: Bool) {
+        let waiters = openWaiters
+        openWaiters.removeAll()
+        for (_, timeout) in openWaiterTimeouts { timeout.cancel() }
+        openWaiterTimeouts.removeAll()
+        for (_, continuation) in waiters { continuation.resume(returning: opened) }
+    }
+
+    /// Adopt `sessionID` as the session to (re-)open the moment the socket is
+    /// ready, WITHOUT issuing the RPC now (QA-1 B1). A cold-start resume /
+    /// session open that arrives before the relay phase bridge is up queues
+    /// here; the crossing INTO `.open` then re-establishes the session (the
+    /// existing `applyState` re-open) — silent queue-and-drain instead of a
+    /// retryable alert. Already open ⇒ fire the re-establishment now (covers
+    /// the race where the phase crossed between the caller's check and adopt).
+    func adoptPendingSession(_ sessionID: String) {
+        guard activeStoredSessionID != sessionID else { return }
+        activeStoredSessionID = sessionID
+        activeSessionID = sessionID
+        if phase == .open, let client {
+            Task {
+                await client.setForeground(sessionID)
+                _ = try? await client.open(sessionID)
+            }
+        }
+    }
+
     // MARK: Reconnect driver state (§4)
 
     /// The URL/token the live session was started with, retained so the auto
@@ -198,6 +265,9 @@ final class RelaySessionCoordinator {
 
         await client.connect(url: url, token: token)
         phase = .open
+        // `start` stamps `.open` directly (the state observer replays the edge
+        // later, but a resume queued on readiness must not wait for the replay).
+        resolveAllOpenWaiters(opened: true)
 
         // Observe connection-state transitions so a drop/failure surfaces.
         stateTask = Task { [weak self] in
@@ -239,6 +309,7 @@ final class RelaySessionCoordinator {
         phase = .connecting
         await client.reconnect(url: url, token: token)
         phase = .open
+        resolveAllOpenWaiters(opened: true)
     }
 
     /// Tear down the socket, cancel the pump/state observers + reconnect driver,
@@ -254,6 +325,9 @@ final class RelaySessionCoordinator {
         activeSessionID = nil
         activeStoredSessionID = nil
         phase = .idle
+        // A teardown can never bring the socket up: fail queued waiters so they
+        // take their silent-retry path instead of suspending until timeout.
+        resolveAllOpenWaiters(opened: false)
     }
 
     // MARK: Auto-reconnect driver (§4)
@@ -336,6 +410,8 @@ final class RelaySessionCoordinator {
         // per connect. Edge-triggered — a redundant same-state yield does not
         // re-fire, and `wake()` coalesces regardless.
         if phase == .open, !wasOpen {
+            // Release every session op queued on transport readiness (QA-1 B1).
+            resolveAllOpenWaiters(opened: true)
             onReady?()
             // Re-establish the session the phone was driving on the fresh
             // connection. The relay's new PhoneConnection has no foreground set
@@ -446,7 +522,10 @@ final class RelaySessionCoordinator {
     /// TAGGED projection rows are dropped by the incoming session's first
     /// projection (it retains only untagged history) and by the open path's
     /// `chat.reset()`; the store reset alone keeps session A's items out of
-    /// session B's projection, so nothing leaks either way.
+    /// session B's projection, so nothing leaks either way. (Defense in depth:
+    /// `ChatStore.applyRelayItems` ALSO treats an empty projection as a no-op
+    /// fallback on `messages`, so a blank screen is impossible even if a future
+    /// caller re-projects an emptied store.)
     private func resetItemStoreForSessionSwitch(to sessionID: String) {
         guard sessionID != activeSessionID else { return }
         store = RelayItemStore()
