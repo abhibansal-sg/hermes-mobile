@@ -3799,6 +3799,14 @@ final class SessionStore {
         // session's rows can't linger), which is the state ChatView renders as the
         // skeleton/placeholder until the network seed lands. The deferred network
         // fetch then reconciles in place over either starting point.
+        // QA-1 B3: the seed's first-paint reveal — consume the pending drawer
+        // dismissal intent when this open carries one. Computed OUTSIDE the
+        // Task (explicit optional type) so the seed closure's inference stays
+        // trivial for the type checker.
+        let firstPaintReveal: (@MainActor () -> Void)? =
+            (wasAlreadyActive || !drawerIntentPending)
+            ? nil
+            : { [weak self] in self?.firePendingDrawerReveal() }
         let seedTask = Task { [weak self] in
             guard let self, self.openToken == token else { return }
             #if DEBUG
@@ -3812,9 +3820,7 @@ final class SessionStore {
                 token: token,
                 workGeneration: transcriptWorkGeneration,
                 transportEpoch: transcriptTransportEpoch,
-                onFirstPaint: wasAlreadyActive || !drawerIntentPending
-                    ? nil
-                    : { [weak self] in self?.firePendingDrawerReveal() }
+                onFirstPaint: firstPaintReveal
             )
         }
         #if DEBUG
