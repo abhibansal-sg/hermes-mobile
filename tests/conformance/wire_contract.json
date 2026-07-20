@@ -99,6 +99,41 @@
           }
         ]
       },
+      "attach": {
+        "kind": "request",
+        "$comment": "Protocol §5 (B9/A5): REST-free attach — the phone inlines the bytes as a data: URL; the relay routes by `kind` onto the gateway's base64 RPCs (file.attach / image.attach_bytes), resolves the session like SUBMIT (absent -> session.create; foreign -> session.resume adopting the live id) and merges session_id into the result. Relay-only phones cannot make the POST /api/upload REST round-trip — that gap hid the composer '+' (B9).",
+        "ios_sends": {
+          "required": ["data_url", "kind"],
+          "optional": ["name", "session_id"]
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": ["data_url", "kind", "name", "session_id", "title"]
+        },
+        "aliases": [],
+        "example": {
+          "session_id": "sess-1",
+          "kind": "file",
+          "name": "notes.txt",
+          "data_url": "data:text/plain;base64,aGVybWVz"
+        },
+        "expect_gateway": [
+          {
+            "rpc": "session.resume",
+            "params": {
+              "session_id": "sess-1"
+            }
+          },
+          {
+            "rpc": "file.attach",
+            "params": {
+              "session_id": "sess-1",
+              "name": "notes.txt",
+              "data_url": "data:text/plain;base64,aGVybWVz"
+            }
+          }
+        ]
+      },
       "clarify": {
         "kind": "request",
         "$comment": "Protocol §5: the phone sends session_id + text; the relay maps text -> the gateway's `answer` param (the gateway stores params[\"answer\"], matched by request_id). Sending `response`/omitting text is the EMPTY-ANSWER bug class.",
