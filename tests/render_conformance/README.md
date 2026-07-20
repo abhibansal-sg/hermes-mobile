@@ -65,7 +65,7 @@ tests/e2e_daily_driver/run_gate.sh
 
 # Render half only (after recording has produced the fixtures):
 scripts/ios-build.sh test -scheme HermesMobile \
-  -destination 'platform=iOS Simulator,name=iPhone 16 Pro' \
+  -destination 'platform=iOS Simulator,name=iPhone Air' \
   -only-testing:HermesMobileTests/RenderConformanceTests
 
 # Refresh the recordings only:
