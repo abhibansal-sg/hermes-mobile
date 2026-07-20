@@ -47,6 +47,10 @@ final class RenderConformanceTests: XCTestCase {
         let name: String
         let sessionID: String
         let submitText: String
+        /// The `client_message_id` the recording harness sent on SUBMIT (the
+        /// phone always sends one; the relay folds it into the synthesized
+        /// `userMessage` item body — the identity the echo adoption reconciles).
+        let submitClientMessageID: String?
         /// The transcript the GRDB cache paints before any relay frame lands.
         let cachedHistory: [(role: String, text: String)]
         /// The recorded downstream envelopes, in arrival order (replayed verbatim).
@@ -68,6 +72,7 @@ final class RenderConformanceTests: XCTestCase {
             name: (raw["name"] as? String) ?? resource,
             sessionID: try XCTUnwrap(raw["session_id"] as? String),
             submitText: (submit["text"] as? String) ?? "",
+            submitClientMessageID: submit["client_message_id"] as? String,
             cachedHistory: cached.compactMap { row in
                 guard let role = row["role"] as? String, let text = row["content"] as? String
                 else { return nil }
@@ -244,6 +249,23 @@ final class RenderConformanceTests: XCTestCase {
 
         let ok = await g.chat.send(text: fx.submitText)
         XCTAssertTrue(ok)
+        // PRODUCTION IDENTITY REPLAY: live, the optimistic echo carries the
+        // `client_message_id` the relay's synthesized `userMessage` item echoes
+        // back (downstream.py folds the SUBMIT's cmid into the item body), and
+        // `adoptRelayEcho` folds the item onto the echo row in place. A static
+        // fixture replay cannot join the live submit's fresh UUID, so re-stamp
+        // the echo with the fixture's recorded cmid before replaying —
+        // reconstructing exactly the identity chain production establishes.
+        if let cmid = fx.submitClientMessageID,
+           let idx = g.chat.messages.firstIndex(where: {
+               $0.role == .user && $0.text == fx.submitText && $0.clientMessageID != nil
+           }) {
+            let echo = g.chat.messages[idx]
+            g.chat.messages[idx] = ChatMessage(
+                id: echo.id, role: .user, clientMessageID: cmid,
+                parts: echo.parts, timestamp: echo.timestamp
+            )
+        }
         deliverAll(g, fx)
         let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
         await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
@@ -554,17 +576,37 @@ final class RenderConformanceTests: XCTestCase {
         XCTAssertNotEqual(state, .transcript,
             "spec B4/A7: an empty transcript that was seeded at least once must fall back to skeleton-or-cache, never the void")
 
-        // The honest terminals stay honest: offline-with-no-cache and a
-        // recoverable load error are named states, not the void.
+        // QA-1 integration reconciliation: the resume lane's blank-screen
+        // contract (ChatView.transcriptPlaceholder + QA1ResumeLaneTests) makes
+        // the skeleton WIN over the named terminals at generation > 0 — an
+        // empty-at-generation state is a mid-open race until an authoritative
+        // seed confirms honest-empty, and offline/load-error surfaces own their
+        // own chrome (connection banner, lastBackfillError retry state). The
+        // named placeholder terminals apply to the PRISTINE (generation == 0)
+        // empty transcript, asserted below.
         XCTAssertEqual(
             ChatView.transcriptPlaceholder(isDraft: false, messagesEmpty: true,
                                            transcriptGeneration: 2, isGatewayOffline: true,
+                                           loadError: nil),
+            .skeleton
+        )
+        XCTAssertEqual(
+            ChatView.transcriptPlaceholder(isDraft: false, messagesEmpty: true,
+                                           transcriptGeneration: 2, isGatewayOffline: false,
+                                           loadError: "boom"),
+            .skeleton
+        )
+        // Pristine terminals stay honest: offline-with-no-cache and a
+        // recoverable load error are named states, not the void.
+        XCTAssertEqual(
+            ChatView.transcriptPlaceholder(isDraft: false, messagesEmpty: true,
+                                           transcriptGeneration: 0, isGatewayOffline: true,
                                            loadError: nil),
             .offlineNoCache
         )
         XCTAssertEqual(
             ChatView.transcriptPlaceholder(isDraft: false, messagesEmpty: true,
-                                           transcriptGeneration: 2, isGatewayOffline: false,
+                                           transcriptGeneration: 0, isGatewayOffline: false,
                                            loadError: "boom"),
             .loadError("boom")
         )
