@@ -16,6 +16,26 @@ import XCTest
 /// responsibility and is covered by the relay pytest cited above.
 @MainActor
 final class SubmitIdempotencyTests: XCTestCase {
+    private struct Harness {
+        let repository: WorkRepository
+        let scope: WorkScope
+        let directory: URL
+    }
+
+    private func makeHarness(scopeServerID: String = "https://gateway.test") throws -> Harness {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SubmitIdempotency-\(UUID().uuidString)", isDirectory: true)
+        let configuration = WorkRepositoryConfiguration(containerURL: directory)
+        let repository = try WorkRepository(
+            configuration: configuration,
+            observation: WorkRepositoryObservation()
+        )
+        return Harness(
+            repository: repository,
+            scope: try WorkScope(serverID: scopeServerID, profileID: "default"),
+            directory: directory
+        )
+    }
 
     private struct AmbiguousFlap: Error {}
 
@@ -24,19 +44,22 @@ final class SubmitIdempotencyTests: XCTestCase {
     /// This is what makes a retry after an app force-close recognizable to the
     /// relay's dedup LRU (A3: "survives app force-close").
     func testClientMessageIDSurvivesProcessRestart() async throws {
-        let test = try makeWorkRepositoryTestConfiguration()
-        defer { try? FileManager.default.removeItem(at: test.directory) }
-        let scope = try workTestScope()
+        let config = try makeHarness()
+        defer { try? FileManager.default.removeItem(at: config.directory) }
 
-        let original = try await WorkRepository(configuration: test.configuration)
-            .enqueue(WorkJobInput(kind: .prompt, scope: scope, text: "survive me",
-                                  storedSessionID: "stored-A"))
+        let original = try await config.repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: config.scope, text: "survive me",
+            storedSessionID: "stored-A"
+        ))
         let cmid = original.clientMessageID
         XCTAssertFalse(cmid.isEmpty, "client_message_id is minted at enqueue (non-optional)")
 
         // Drop the in-memory repository — no close API by design (ARC); a fresh
         // instance against the same on-disk DB models a process restart.
-        let reopened = try WorkRepository(configuration: test.configuration)
+        let reopened = try WorkRepository(
+            configuration: WorkRepositoryConfiguration(containerURL: config.directory),
+            observation: WorkRepositoryObservation()
+        )
         let persisted = try await reopened.job(id: original.jobID)
         XCTAssertEqual(persisted?.clientMessageID, cmid,
                        "the stable id is persisted in work_jobs.client_message_id across a reopen")
@@ -49,22 +72,16 @@ final class SubmitIdempotencyTests: XCTestCase {
     /// next wake resubmits with the SAME id. This is the iOS half the relay LRU
     /// matches against (A3: "no duplicate turn on retry after ambiguous failure").
     func testAmbiguousFlapRetriesWithSameClientMessageID() async throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("SubmitIdempotency-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let repository = try WorkRepository(
-            configuration: WorkRepositoryConfiguration(containerURL: directory),
-            observation: WorkRepositoryObservation()
-        )
-        let scope = try WorkScope(serverID: "https://gateway.test", profileID: "default")
-        let job = try await repository.enqueue(WorkJobInput(
-            kind: .prompt, scope: scope, text: "once only", storedSessionID: "stored-A"
+        let harness = try makeHarness()
+        defer { try? FileManager.default.removeItem(at: harness.directory) }
+        let job = try await harness.repository.enqueue(WorkJobInput(
+            kind: .prompt, scope: harness.scope, text: "once only", storedSessionID: "stored-A"
         ))
 
         var submittedIDs: [String] = []
         var nextAttemptShouldFail = true
-        let processor = OutboxProcessor(repository: repository, dependencies: .init(
-            currentScope: { scope },
+        let processor = OutboxProcessor(repository: harness.repository, dependencies: .init(
+            currentScope: { harness.scope },
             activeStoredSessionID: { "stored-A" },
             isTransportReady: { true },
             createDestination: { _ in XCTFail("existing-session job must not create"); throw AmbiguousFlap() },
@@ -92,7 +109,7 @@ final class SubmitIdempotencyTests: XCTestCase {
         // again with the SAME id so the relay can dedupe if it did.)
         processor.wake()
         await processor.waitUntilIdleForTesting()
-        let retained = try await repository.job(id: job.jobID)
+        let retained = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(retained?.state, .submitting,
                        "an ambiguous flap retains the row in submitting for redrive")
         XCTAssertEqual(retained?.lastErrorCode, "transport_ambiguous")
@@ -104,12 +121,12 @@ final class SubmitIdempotencyTests: XCTestCase {
         // pytest; here we only prove the iOS replay.
         processor.wake()
         await processor.waitUntilIdleForTesting()
-        let completed = try await repository.job(id: job.jobID)
+        let completed = try await harness.repository.job(id: job.jobID)
         XCTAssertEqual(completed?.state, .completed)
         XCTAssertEqual(submittedIDs, [job.clientMessageID, job.clientMessageID],
                        "both attempts carried the SAME stable id — never regenerated")
 
-        let all = try await repository.jobs()
+        let all = try await harness.repository.jobs()
         XCTAssertEqual(all.count, 1, "no duplicate row was created on retry")
     }
 }
