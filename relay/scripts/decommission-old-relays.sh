@@ -3,11 +3,15 @@
 # owned by the ai.hermes.relay launchd service (spec DAILY-DRIVER A7: exactly
 # ONE relay on this Mac, the supervised one).
 #
-# Ownership rule: the service execs exactly "$VENV/bin/python" (ProgramArguments
-# [0] in the plist), so a hermes_relay process is service-owned iff its argv[0]
-# is the service venv's python. Everything else — terminal-launched relays,
-# nohup'd relays (even with PPID 1), stale pre-refusal binaries dialing the live
-# gateway — is a stray and gets SIGTERMed.
+# Ownership rule: launchd is authoritative. The service's PID is read from
+# `launchctl print gui/<uid>/ai.hermes.relay` ("pid = N") — that PID is kept,
+# every OTHER hermes_relay process is a stray and gets SIGTERMed. (argv[0] is
+# NOT a reliable discriminator: on macOS `ps` reports the resolved interpreter
+# — the Homebrew Cellar framework binary — identically for a venv python, a
+# terminal python, and the service python. Only launchd knows which PID it
+# actually spawned.) Everything else — terminal-launched relays, nohup'd
+# relays (even with PPID 1), stale pre-refusal binaries dialing the live
+# gateway — is a stray.
 #
 # Hard rules honored: SIGTERM only — NEVER kill -9 (a mid-turn SIGTERM is the
 # chaos scenario the relay is built to survive; the phone reconnects/resyncs).
@@ -15,17 +19,12 @@
 # Usage:
 #   decommission-old-relays.sh [--dry-run]
 #
-# Overrides (environment — must match install-service.sh or the service itself
-# looks like a stray):
-#   RELAY_SERVICE_VENV  service venv (default /Volumes/MainData/Developer/
-#                       hermes-tmp/venvs/relay-service)
-#
 # Exit codes: 0 = no strays left (or none found); 1 = strays survived SIGTERM
 # past the grace period (reported; never escalated).
 set -euo pipefail
 
-VENV="${RELAY_SERVICE_VENV:-/Volumes/MainData/Developer/hermes-tmp/venvs/relay-service}"
-SERVICE_PY="$VENV/bin/python"
+LABEL="ai.hermes.relay"
+GUI_DOMAIN="gui/$(id -u)"
 GRACE_SECONDS=5
 DRY_RUN=0
 
@@ -38,10 +37,15 @@ case "${1:-}" in
   *) echo "decommission: unknown argument: $1" >&2; exit 2 ;;
 esac
 
-# argv[0] of a pid, i.e. the interpreter launchd/the shell actually execed.
-argv0_of() {
-  ps -p "$1" -o command= 2>/dev/null | awk '{print $1; exit}'
-}
+# The supervised service's PID, per launchd itself (authoritative). Empty when
+# the service is not loaded or not currently running (-> nothing to spare).
+service_pid=""
+if command -v launchctl >/dev/null 2>&1; then
+  service_pid="$(launchctl print "$GUI_DOMAIN/$LABEL" 2>/dev/null \
+    | awk -F'= ' '/^[[:space:]]*pid =/{gsub(/;.*/, "", $2); print $2; exit}' || true)"
+else
+  echo "decommission: WARNING — launchctl unavailable; cannot identify the service PID; every hermes_relay process is treated as a stray." >&2
+fi
 
 strays=()
 service_pids=()
@@ -49,11 +53,7 @@ while IFS= read -r pid; do
   [ -n "$pid" ] || continue
   [ "$pid" = "$$" ] && continue      # never ourselves
   [ "$pid" = "$PPID" ] && continue   # never our own parent shell
-  exe="$(argv0_of "$pid" || true)"
-  if [ -z "$exe" ]; then
-    continue                          # vanished between pgrep and ps
-  fi
-  if [ "$exe" = "$SERVICE_PY" ]; then
+  if [ -n "$service_pid" ] && [ "$pid" = "$service_pid" ]; then
     service_pids+=("$pid")
   else
     strays+=("$pid")
@@ -61,7 +61,7 @@ while IFS= read -r pid; do
 done < <(pgrep -f -- '-m hermes_relay' 2>/dev/null || true)
 
 if [ "${#service_pids[@]}" -gt 0 ]; then
-  echo "decommission: keeping service-owned pid(s): ${service_pids[*]} (exe $SERVICE_PY)"
+  echo "decommission: keeping launchd-service pid(s): ${service_pids[*]} ($LABEL)"
 fi
 
 if [ "${#strays[@]}" -eq 0 ]; then
