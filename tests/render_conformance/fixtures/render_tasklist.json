@@ -7,7 +7,8 @@
   "session_id": "render-sess-tasklist",
   "submit": {
     "text": "Do the three things.",
-    "session_id": "render-sess-tasklist"
+    "session_id": "render-sess-tasklist",
+    "client_message_id": "render-cmid-tasklist"
   },
   "cached_history": [],
   "open_result_messages": [],
@@ -15,12 +16,29 @@
     {
       "seq": 1,
       "sid": "render-sess-tasklist",
+      "turn": null,
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-tasklist:u-f103eb2c1a13549f",
+        "type": "userMessage",
+        "status": "completed",
+        "ord": 0,
+        "summary": "",
+        "body": {
+          "text": "Do the three things.",
+          "client_message_id": "render-cmid-tasklist"
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "sid": "render-sess-tasklist",
       "turn": "render-sess-tasklist:t1",
       "kind": "turn.started",
       "body": {}
     },
     {
-      "seq": 2,
+      "seq": 3,
       "sid": "render-sess-tasklist",
       "turn": "render-sess-tasklist:t1",
       "kind": "item.started",
@@ -28,7 +46,7 @@
         "item_id": "render-sess-tasklist:tasks",
         "type": "taskList",
         "status": "in_progress",
-        "ord": 0,
+        "ord": 1,
         "summary": "Tasks 0/3",
         "body": {
           "tasks": [
@@ -60,7 +78,7 @@
       }
     },
     {
-      "seq": 3,
+      "seq": 4,
       "sid": "render-sess-tasklist",
       "turn": "render-sess-tasklist:t1",
       "kind": "item.delta",
@@ -96,7 +114,7 @@
       }
     },
     {
-      "seq": 4,
+      "seq": 5,
       "sid": "render-sess-tasklist",
       "turn": "render-sess-tasklist:t1",
       "kind": "item.completed",
@@ -104,7 +122,7 @@
         "item_id": "render-sess-tasklist:tasks",
         "type": "taskList",
         "status": "completed",
-        "ord": 0,
+        "ord": 1,
         "summary": "Tasks 3/3",
         "body": {
           "tasks": [
@@ -136,7 +154,7 @@
       }
     },
     {
-      "seq": 5,
+      "seq": 6,
       "sid": "render-sess-tasklist",
       "turn": "render-sess-tasklist:t1",
       "kind": "item.started",
@@ -144,7 +162,7 @@
         "item_id": "render-sess-tasklist:i1",
         "type": "agentMessage",
         "status": "in_progress",
-        "ord": 1,
+        "ord": 2,
         "summary": "",
         "body": {
           "text": ""
@@ -152,7 +170,7 @@
       }
     },
     {
-      "seq": 6,
+      "seq": 7,
       "sid": "render-sess-tasklist",
       "turn": "render-sess-tasklist:t1",
       "kind": "item.delta",
@@ -164,7 +182,7 @@
       }
     },
     {
-      "seq": 7,
+      "seq": 8,
       "sid": "render-sess-tasklist",
       "turn": "render-sess-tasklist:t1",
       "kind": "item.completed",
@@ -172,7 +190,7 @@
         "item_id": "render-sess-tasklist:i1",
         "type": "agentMessage",
         "status": "completed",
-        "ord": 1,
+        "ord": 2,
         "summary": "All tasks done.",
         "body": {
           "text": "All tasks done."
@@ -180,7 +198,7 @@
       }
     },
     {
-      "seq": 8,
+      "seq": 9,
       "sid": "render-sess-tasklist",
       "turn": "render-sess-tasklist:t1",
       "kind": "item.completed",
@@ -188,7 +206,7 @@
         "item_id": "render-sess-tasklist:i2",
         "type": "usage",
         "status": "completed",
-        "ord": 2,
+        "ord": 3,
         "summary": "2 tokens",
         "body": {
           "model": "mock-model",
@@ -199,7 +217,7 @@
       }
     },
     {
-      "seq": 9,
+      "seq": 10,
       "sid": "render-sess-tasklist",
       "turn": "render-sess-tasklist:t1",
       "kind": "turn.completed",

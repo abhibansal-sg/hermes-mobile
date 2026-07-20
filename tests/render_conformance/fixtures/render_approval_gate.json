@@ -7,7 +7,8 @@
   "session_id": "render-sess-approval",
   "submit": {
     "text": "Run the cleanup now.",
-    "session_id": "render-sess-approval"
+    "session_id": "render-sess-approval",
+    "client_message_id": "render-cmid-approval"
   },
   "cached_history": [
     {
@@ -24,12 +25,29 @@
     {
       "seq": 1,
       "sid": "render-sess-approval",
+      "turn": null,
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-approval:u-1cc9648bc2ba5912",
+        "type": "userMessage",
+        "status": "completed",
+        "ord": 0,
+        "summary": "",
+        "body": {
+          "text": "Run the cleanup now.",
+          "client_message_id": "render-cmid-approval"
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "sid": "render-sess-approval",
       "turn": "render-sess-approval:t1",
       "kind": "turn.started",
       "body": {}
     },
     {
-      "seq": 2,
+      "seq": 3,
       "sid": "render-sess-approval",
       "turn": "render-sess-approval:t1",
       "kind": "item.started",
@@ -37,7 +55,7 @@
         "item_id": "render-sess-approval:i1",
         "type": "agentMessage",
         "status": "in_progress",
-        "ord": 0,
+        "ord": 1,
         "summary": "",
         "body": {
           "text": ""
@@ -45,7 +63,7 @@
       }
     },
     {
-      "seq": 3,
+      "seq": 4,
       "sid": "render-sess-approval",
       "turn": "render-sess-approval:t1",
       "kind": "item.delta",
@@ -57,7 +75,7 @@
       }
     },
     {
-      "seq": 4,
+      "seq": 5,
       "sid": "render-sess-approval",
       "turn": "render-sess-approval:t1",
       "kind": "approval.request",
@@ -75,7 +93,7 @@
       }
     },
     {
-      "seq": 5,
+      "seq": 6,
       "sid": "render-sess-approval",
       "turn": "render-sess-approval:t1",
       "kind": "item.delta",
@@ -87,7 +105,7 @@
       }
     },
     {
-      "seq": 6,
+      "seq": 7,
       "sid": "render-sess-approval",
       "turn": "render-sess-approval:t1",
       "kind": "item.delta",
@@ -99,7 +117,7 @@
       }
     },
     {
-      "seq": 7,
+      "seq": 8,
       "sid": "render-sess-approval",
       "turn": "render-sess-approval:t1",
       "kind": "item.completed",
@@ -107,7 +125,7 @@
         "item_id": "render-sess-approval:i1",
         "type": "agentMessage",
         "status": "completed",
-        "ord": 0,
+        "ord": 1,
         "summary": "About to run the tool. Done.",
         "body": {
           "text": "About to run the tool. Done."
@@ -115,7 +133,7 @@
       }
     },
     {
-      "seq": 8,
+      "seq": 9,
       "sid": "render-sess-approval",
       "turn": "render-sess-approval:t1",
       "kind": "item.completed",
@@ -123,7 +141,7 @@
         "item_id": "render-sess-approval:i2",
         "type": "usage",
         "status": "completed",
-        "ord": 1,
+        "ord": 2,
         "summary": "3 tokens",
         "body": {
           "model": "mock-model",
@@ -134,7 +152,7 @@
       }
     },
     {
-      "seq": 9,
+      "seq": 10,
       "sid": "render-sess-approval",
       "turn": "render-sess-approval:t1",
       "kind": "turn.completed",

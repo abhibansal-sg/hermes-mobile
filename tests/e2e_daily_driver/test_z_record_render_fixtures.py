@@ -73,7 +73,8 @@ async def test_record_submit_stream_fixture(mock_gateway, phone_factory, evidenc
     open_messages = (opened.get("result") or {}).get("messages") or []
 
     prompt = "What is the capital of France?"
-    res = await phone.submit(text=prompt, session_id=SID_STREAM)
+    res = await phone.submit(text=prompt, session_id=SID_STREAM,
+                         client_message_id="render-cmid-stream")
     assert "result" in res, f"submit failed: {res}"
     await phone.wait_for(
         "item.completed", sid=SID_STREAM, timeout=15.0,
@@ -93,7 +94,8 @@ async def test_record_submit_stream_fixture(mock_gateway, phone_factory, evidenc
             "history painted, echo the user prompt, and stream the reply "
             "below it (spec B5/B6/B7, A2)."
         ),
-        submit={"text": prompt, "session_id": SID_STREAM},
+        submit={"text": prompt, "session_id": SID_STREAM,
+                "client_message_id": "render-cmid-stream"},
         cached_history=cached,
         open_result_messages=open_messages,
         settled={"agent_text": agent_text, "user_prompt": prompt},
@@ -121,7 +123,8 @@ async def test_record_approval_gate_fixture(mock_gateway, phone_factory, evidenc
     )
     phone = await phone_factory()
     prompt = "Run the cleanup now."
-    res = await phone.submit(text=prompt, session_id=SID_APPROVAL)
+    res = await phone.submit(text=prompt, session_id=SID_APPROVAL,
+                         client_message_id="render-cmid-approval")
     assert "result" in res, f"submit failed: {res}"
 
     gate = await phone.wait_for("approval.request", sid=SID_APPROVAL, timeout=15.0)
@@ -144,7 +147,8 @@ async def test_record_approval_gate_fixture(mock_gateway, phone_factory, evidenc
             ".approval) and round-trip the answer over the relay transport "
             "(spec B10, A3)."
         ),
-        submit={"text": prompt, "session_id": SID_APPROVAL},
+        submit={"text": prompt, "session_id": SID_APPROVAL,
+                "client_message_id": "render-cmid-approval"},
         cached_history=cached,
         settled={"user_prompt": prompt, "answer": "once",
                  "request_id": "appr-render-1"},
@@ -167,7 +171,8 @@ async def test_record_clarify_gate_fixture(mock_gateway, phone_factory, evidence
     )
     phone = await phone_factory()
     prompt = "Set up the deploy."
-    res = await phone.submit(text=prompt, session_id=SID_CLARIFY)
+    res = await phone.submit(text=prompt, session_id=SID_CLARIFY,
+                         client_message_id="render-cmid-clarify")
     assert "result" in res, f"submit failed: {res}"
 
     gate = await phone.wait_for("clarify.request", sid=SID_CLARIFY, timeout=15.0)
@@ -191,7 +196,8 @@ async def test_record_clarify_gate_fixture(mock_gateway, phone_factory, evidence
             "dock .clarify) and round-trip the answer over the relay "
             "transport (spec B10, A3)."
         ),
-        submit={"text": prompt, "session_id": SID_CLARIFY},
+        submit={"text": prompt, "session_id": SID_CLARIFY,
+                "client_message_id": "render-cmid-clarify"},
         cached_history=[],
         settled={"user_prompt": prompt, "answer": "yes",
                  "request_id": "clar-render-1"},
@@ -209,7 +215,8 @@ async def test_record_tasklist_fixture(mock_gateway, phone_factory, evidence):
     _seed_session(mock_gateway, sid=SID_TASKLIST, script="tasklist")
     phone = await phone_factory()
     prompt = "Do the three things."
-    res = await phone.submit(text=prompt, session_id=SID_TASKLIST)
+    res = await phone.submit(text=prompt, session_id=SID_TASKLIST,
+                         client_message_id="render-cmid-tasklist")
     assert "result" in res, f"submit failed: {res}"
     await phone.wait_for(
         "item.completed", sid=SID_TASKLIST, timeout=15.0,
@@ -228,7 +235,8 @@ async def test_record_tasklist_fixture(mock_gateway, phone_factory, evidence):
             "Turn Dock's task box reads (latestTodoList) and resolve the dock "
             "to .tasks (spec A3/A4)."
         ),
-        submit={"text": prompt, "session_id": SID_TASKLIST},
+        submit={"text": prompt, "session_id": SID_TASKLIST,
+                "client_message_id": "render-cmid-tasklist"},
         cached_history=[],
         settled={"user_prompt": prompt, "tasks": 3},
     )

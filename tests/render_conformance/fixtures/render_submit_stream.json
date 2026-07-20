@@ -7,7 +7,8 @@
   "session_id": "render-sess-stream",
   "submit": {
     "text": "What is the capital of France?",
-    "session_id": "render-sess-stream"
+    "session_id": "render-sess-stream",
+    "client_message_id": "render-cmid-stream"
   },
   "cached_history": [
     {
@@ -49,12 +50,29 @@
     {
       "seq": 1,
       "sid": "render-sess-stream",
+      "turn": null,
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-stream:u-eedb3e9107255ca5",
+        "type": "userMessage",
+        "status": "completed",
+        "ord": 0,
+        "summary": "",
+        "body": {
+          "text": "What is the capital of France?",
+          "client_message_id": "render-cmid-stream"
+        }
+      }
+    },
+    {
+      "seq": 2,
+      "sid": "render-sess-stream",
       "turn": "render-sess-stream:t1",
       "kind": "turn.started",
       "body": {}
     },
     {
-      "seq": 2,
+      "seq": 3,
       "sid": "render-sess-stream",
       "turn": "render-sess-stream:t1",
       "kind": "item.started",
@@ -62,22 +80,10 @@
         "item_id": "render-sess-stream:i1",
         "type": "agentMessage",
         "status": "in_progress",
-        "ord": 0,
+        "ord": 1,
         "summary": "",
         "body": {
           "text": ""
-        }
-      }
-    },
-    {
-      "seq": 3,
-      "sid": "render-sess-stream",
-      "turn": "render-sess-stream:t1",
-      "kind": "item.delta",
-      "body": {
-        "item_id": "render-sess-stream:i1",
-        "patch": {
-          "text": "Paris "
         }
       }
     },
@@ -89,7 +95,7 @@
       "body": {
         "item_id": "render-sess-stream:i1",
         "patch": {
-          "text": "is "
+          "text": "Paris "
         }
       }
     },
@@ -101,7 +107,7 @@
       "body": {
         "item_id": "render-sess-stream:i1",
         "patch": {
-          "text": "the "
+          "text": "is "
         }
       }
     },
@@ -113,7 +119,7 @@
       "body": {
         "item_id": "render-sess-stream:i1",
         "patch": {
-          "text": "capital "
+          "text": "the "
         }
       }
     },
@@ -125,7 +131,7 @@
       "body": {
         "item_id": "render-sess-stream:i1",
         "patch": {
-          "text": "of "
+          "text": "capital "
         }
       }
     },
@@ -137,7 +143,7 @@
       "body": {
         "item_id": "render-sess-stream:i1",
         "patch": {
-          "text": "France."
+          "text": "of "
         }
       }
     },
@@ -145,15 +151,11 @@
       "seq": 9,
       "sid": "render-sess-stream",
       "turn": "render-sess-stream:t1",
-      "kind": "item.completed",
+      "kind": "item.delta",
       "body": {
         "item_id": "render-sess-stream:i1",
-        "type": "agentMessage",
-        "status": "completed",
-        "ord": 0,
-        "summary": "Paris is the capital of France.",
-        "body": {
-          "text": "Paris is the capital of France."
+        "patch": {
+          "text": "France."
         }
       }
     },
@@ -163,10 +165,26 @@
       "turn": "render-sess-stream:t1",
       "kind": "item.completed",
       "body": {
+        "item_id": "render-sess-stream:i1",
+        "type": "agentMessage",
+        "status": "completed",
+        "ord": 1,
+        "summary": "Paris is the capital of France.",
+        "body": {
+          "text": "Paris is the capital of France."
+        }
+      }
+    },
+    {
+      "seq": 11,
+      "sid": "render-sess-stream",
+      "turn": "render-sess-stream:t1",
+      "kind": "item.completed",
+      "body": {
         "item_id": "render-sess-stream:i2",
         "type": "usage",
         "status": "completed",
-        "ord": 1,
+        "ord": 2,
         "summary": "7 tokens",
         "body": {
           "model": "mock-model",
@@ -177,7 +195,7 @@
       }
     },
     {
-      "seq": 11,
+      "seq": 12,
       "sid": "render-sess-stream",
       "turn": "render-sess-stream:t1",
       "kind": "turn.completed",
