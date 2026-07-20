@@ -835,17 +835,22 @@ final class RenderConformanceTests: XCTestCase {
         deliver(g, fx, through: {
             self.kind($0) == "item.started" && self.itemType($0) == "tool.generating"
         })
-        await waitUntil { g.chat.messages.contains { $0.role == .assistant && $0.isStreaming } }
+        // Wait for the REAL projection (the optimistic bubble also matches
+        // `isStreaming` with EMPTY parts — require parts so a frame-processing
+        // hop can't race the assertion).
+        await waitUntil { g.chat.messages.contains {
+            $0.role == .assistant && $0.isStreaming && !$0.parts.isEmpty
+        } }
 
         XCTAssertTrue(g.chat.isStreaming, "the live turn is streaming (turn-scoped)")
         let live = try XCTUnwrap(
-            g.chat.messages.first { $0.role == .assistant && $0.isStreaming },
+            g.chat.messages.first { $0.role == .assistant && $0.isStreaming && !$0.parts.isEmpty },
             "spec A3: the live turn renders as a streaming assistant row"
         )
         let nodes = WorkingSectionModel.renderNodes(from: live.parts)
         XCTAssertEqual(nodes.count, 1,
             "spec A3: the live turn folds to a SINGLE working node (no stacked rows)")
-        guard case .working = nodes[0] else {
+        guard let only = nodes.first, case .working = only else {
             return XCTFail("spec A3: the single node is the working fold")
         }
         XCTAssertEqual(WorkingSectionModel.liveCollapsedLabel(parts: live.parts), "Working…",
@@ -861,11 +866,19 @@ final class RenderConformanceTests: XCTestCase {
         _ = try await g.coordinator.open(fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
 
-        // Through the first agent delta: the tool has completed friendly.
-        deliver(g, fx, through: { self.kind($0) == "item.delta" })
-        await waitUntil { g.chat.messages.contains { $0.role == .assistant && !$0.parts.isEmpty && $0.isStreaming } }
+        // Through the agentMessage start (the tool completed friendly just
+        // before it — deltas carry no type, so stop on the agent item.started,
+        // NOT the first delta, which is the reasoning delta).
+        deliver(g, fx, through: {
+            self.kind($0) == "item.started" && self.itemType($0) == "agentMessage"
+        })
+        await waitUntil { g.chat.messages.contains {
+            $0.role == .assistant && !$0.parts.isEmpty && $0.isStreaming
+        } }
 
-        let live = try XCTUnwrap(g.chat.messages.first { $0.role == .assistant && $0.isStreaming })
+        let live = try XCTUnwrap(g.chat.messages.first {
+            $0.role == .assistant && !$0.parts.isEmpty && $0.isStreaming
+        })
         let label = WorkingSectionModel.liveCollapsedLabel(parts: live.parts)
         XCTAssertEqual(label, "Working… · Asked which direction to take",
             "spec R5/A3: the resolved tool rides inline on the single Working line")
