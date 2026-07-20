@@ -2401,47 +2401,23 @@ final class ChatStore {
         // the gateway socket is idle in relay-only mode, so it would throw "Not
         // connected to the Hermes gateway" and strand the deep-link
         // resume-to-send. Submit through the relay coordinator instead; the relay
-        // client owns its own reliability spine (seq/ack/resync). Text-only for
-        // now (attachments still route the gateway-direct upload path); the
-        // default gateway path below is byte-identical. Only engaged while the
-        // relay socket is actually open.
+        // client owns its own reliability spine (seq/ack/resync), and the echoed
+        // user item + assistant stream reconcile back through the item projection,
+        // so no local echo is appended here. Text-only for now (attachments still
+        // route the gateway-direct upload path); the default gateway path below is
+        // byte-identical. Only engaged while the relay socket is actually open.
         if !hasAttachments,
            let connection, connection.transportPath == .relay,
            let coordinator = connection.relayCoordinator, coordinator.isOpen {
-            // OPTIMISTIC USER ECHO (QA-1 B5/B13): render the user's message the
-            // instant they commit — WhatsApp bar — instead of waiting on the
-            // relay. The relay SUBMIT synthesizes a `userMessage` item
-            // (downstream.py) which the projection ADOPTS onto this row in
-            // place (by `client_message_id`), so the echo reconciles into the
-            // settled timeline without duplication — live, after completion,
-            // and across reconnect. `client_message_id` additionally makes an
-            // ambiguous-flap retry dedupe into a single turn at the relay.
-            let clientMessageID = UUID().uuidString
-            sessions?.resetComposerHistoryBrowse(for: sessions?.activeComposerDraftKey)
-            let userMessage = ChatMessage(
-                role: .user, clientMessageID: clientMessageID, text: trimmed
-            )
-            userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
-            messages.append(userMessage)
             setStreaming(true, reason: "relay.send")
             lastError = nil
             lastSendReachedServer = true
             do {
-                let result = try await coordinator.submit(
-                    prompt: trimmed,
-                    sessionID: sessions?.activeStoredId,
-                    clientMessageID: clientMessageID
+                _ = try await coordinator.submit(
+                    prompt: trimmed, sessionID: sessions?.activeStoredId
                 )
-                // Land the new-chat bookkeeping (QA-1 B13): the relay SUBMIT
-                // created/owns the session — adopt its id so the draft becomes
-                // a real row (drawer listing, second send, outbox routing).
-                // Guarded inside to never clobber an already-bound session.
-                if let sid = result["session_id"]?.stringValue {
-                    sessions?.landRelayCreatedSession(storedID: sid)
-                }
                 return true
             } catch {
-                removeLocalEcho(clientMessageID: clientMessageID)
                 setStreaming(false, reason: "relay.sendError")
                 lastError = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
@@ -4176,62 +4152,11 @@ final class ChatStore {
         // gateway path (which never calls `applyRelayItems`) would keep showing
         // the previous session's dock task box.
         relayLatestTaskList = nil
-        // Relay echo adoptions belong to the session being torn down (QA-1):
-        // a stale adoption must never re-id a next session's userMessage item
-        // onto a prior session's consumed echo row.
-        relayEchoAdoptions = [:]
         clearAllCompactionIndicators()
         transcriptGeneration = 0
     }
 
     // MARK: - Wave-2 relay transport projection (RELAY-PHONE-PROTOCOL §2/§7)
-
-    /// A sticky adoption of an optimistic user echo (an UNTAGGED `.user` row
-    /// from the relay send path) by a relay `userMessage` item. Once an item
-    /// adopts an echo, it keeps the echo's identity for the rest of the session
-    /// — the echo row is CONSUMED out of the preserved history on the pass that
-    /// first adopts it, so every later re-projection (the echo row is gone by
-    /// then) resolves the identity from this map instead of re-searching, and
-    /// the bubble never flickers nor duplicates (QA-1 B5/B13).
-    private struct RelayEchoAdoption: Sendable {
-        let id: UUID
-        let clientMessageID: String?
-        let timestamp: Date
-    }
-
-    /// `userMessage` item id → adopted echo identity, per projected session.
-    /// Cleared on `reset()` (session teardown) so a next session never inherits
-    /// a stale adoption.
-    private var relayEchoAdoptions: [String: RelayEchoAdoption] = [:]
-
-    /// Resolve the identity a `userMessage` item projects onto: a prior
-    /// adoption (sticky), else an UNCONSUMED optimistic echo row in the current
-    /// transcript — correlated by `client_message_id` first (deterministic, so
-    /// distinct sends of identical text never collapse), then by text for an
-    /// item without one (a prompt submitted without a cmid). Returns `nil` when
-    /// nothing matches — the item projects onto its own deterministic id (a
-    /// prompt this phone never echoed, e.g. sent by another client).
-    private func adoptRelayEcho(
-        for item: ChatItem, consuming: inout Set<UUID>
-    ) -> RelayEchoAdoption? {
-        if let adopted = relayEchoAdoptions[item.itemID] { return adopted }
-        let itemCMID = item.body["client_message_id"]?.stringValue
-        func matches(_ message: ChatMessage) -> Bool {
-            guard message.role == .user, !message.relayProjected,
-                  !consuming.contains(message.id) else { return false }
-            if let itemCMID { return message.clientMessageID == itemCMID }
-            return message.clientMessageID == nil && message.text == item.textBody
-        }
-        guard let echo = messages.first(where: matches) else { return nil }
-        let adoption = RelayEchoAdoption(
-            id: echo.id,
-            clientMessageID: echo.clientMessageID,
-            timestamp: echo.timestamp
-        )
-        relayEchoAdoptions[item.itemID] = adoption
-        consuming.insert(echo.id)
-        return adoption
-    }
 
     /// Rebuild the visible transcript from the relay item store's reconciled
     /// items (the NEW relay transport path — docs/RELAY-PHONE-PROTOCOL.md §2).
@@ -4250,27 +4175,11 @@ final class ChatStore {
     /// store sorts by `ord`, ties by arrival). Message + part identities are
     /// derived deterministically from the stable relay ids, so re-projecting on
     /// every frame is churn-free (SwiftUI diffs cleanly, no bubble re-creation).
-    ///
-    /// MERGE, NOT REPLACE (QA-1 B5/B6/B7/B13): the projection is the LIVE relay
-    /// content; the UNTAGGED rows already in `messages` (the GRDB cache paint,
-    /// optimistic user echoes, direct-path rows) are the settled HISTORY. The
-    /// rebuilt projection is tagged `relayProjected` and APPENDED below the
-    /// preserved history — cached/settled transcript and the live streaming
-    /// turn COEXIST, scrollback intact during and after streaming. Re-projection
-    /// replaces only tagged rows (idempotent, no duplication); an empty `items`
-    /// (session bound, zero frames yet) therefore leaves the cache paint
-    /// untouched — the cold-open/force-close paint stays the initial truth
-    /// (B15). A relay `userMessage` item ADOPTS the matching optimistic echo in
-    /// place (sticky, by `client_message_id` then text) — one bubble, no dupe.
     func applyRelayItems(_ items: [ChatItem]) {
         var rebuilt: [ChatMessage] = []
         var segmentParts: [ChatMessagePart] = []
         var segmentAnchor: String?
         var segmentStreaming = false
-        // Echo rows adopted by a `userMessage` item THIS pass — consumed out
-        // of the preserved history so the reconcile replaces the echo in place
-        // instead of projecting a second bubble beside it.
-        var consumedEchoIDs: Set<UUID> = []
 
         func flushSegment() {
             guard let anchor = segmentAnchor, !segmentParts.isEmpty else {
@@ -4283,8 +4192,7 @@ final class ChatStore {
                 id: ChatMessage.deterministicID(seedKey: "relay-assistant-\(anchor)"),
                 role: .assistant,
                 parts: segmentParts,
-                isStreaming: segmentStreaming,
-                relayProjected: true
+                isStreaming: segmentStreaming
             ))
             segmentParts = []
             segmentAnchor = nil
@@ -4294,16 +4202,10 @@ final class ChatStore {
         for item in items {
             if item.type == .userMessage {
                 flushSegment()
-                let adoption = adoptRelayEcho(for: item, consuming: &consumedEchoIDs)
                 rebuilt.append(ChatMessage(
-                    id: adoption?.id
-                        ?? ChatMessage.deterministicID(seedKey: "relay-user-\(item.itemID)"),
+                    id: ChatMessage.deterministicID(seedKey: "relay-user-\(item.itemID)"),
                     role: .user,
-                    clientMessageID: adoption?.clientMessageID
-                        ?? item.body["client_message_id"]?.stringValue,
-                    parts: [.text(id: item.itemID, text: item.textBody)],
-                    timestamp: adoption?.timestamp ?? Date(),
-                    relayProjected: true
+                    parts: [.text(id: item.itemID, text: item.textBody)]
                 ))
             } else if let part = item.renderPart {
                 if segmentAnchor == nil { segmentAnchor = item.itemID }
@@ -4313,13 +4215,7 @@ final class ChatStore {
         }
         flushSegment()
 
-        // Preserve the settled history (every untagged row) and append the live
-        // relay projection below it — minus any echo rows a userMessage item
-        // adopted this pass (they re-enter tagged, in place).
-        let preserved = messages.filter {
-            !$0.relayProjected && !consumedEchoIDs.contains($0.id)
-        }
-        messages = preserved + rebuilt
+        messages = rebuilt
         // N4/A5: the dock's task box reads `latestTodoList`; on the relay path
         // the ONE living `.taskList` item lives in these reconciled items, NOT
         // in a `todo` ToolActivity the legacy scan would find — refresh the

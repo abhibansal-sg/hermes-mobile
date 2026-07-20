@@ -374,19 +374,8 @@ final class RelaySessionCoordinator {
         let result = try await requireClient().submit(
             sessionID: target, prompt: prompt, clientMessageID: clientMessageID
         )
-        if let sid = result["session_id"]?.stringValue {
-            activeSessionID = sid
-            // A submit with NO target creates the session at the relay (QA-1
-            // B13): the returned id is BOTH the stored and the live id, so adopt
-            // it as the stored identity too — otherwise `outboxRuntimeID(forStored:)`
-            // never maps the new session and a queued prompt for it would hold
-            // forever instead of draining over the relay. Guarded so a submit
-            // into an open session (stored id bound by start/open/resume) never
-            // clobbers its stable identity with a possibly-distinct live id.
-            if target == nil, activeStoredSessionID == nil { activeStoredSessionID = sid }
-        } else if activeSessionID == nil, let target {
-            activeSessionID = target
-        }
+        if let sid = result["session_id"]?.stringValue { activeSessionID = sid }
+        else if activeSessionID == nil, let target { activeSessionID = target }
         return result
     }
 
@@ -431,25 +420,17 @@ final class RelaySessionCoordinator {
     /// `RelayItemStore.reconcile(snapshot:)` is deliberately additive — items
     /// absent from a snapshot are RETAINED (the snapshot is a resumed baseline,
     /// not a delete list). That is correct for a `resync` of the SAME session,
-    /// but on a session SWITCH it would leak session A's items under session
-    /// B's snapshot, so the projection would render both. Resetting the STORE
-    /// here makes the switch clean and is a no-op re-open/re-resume of the
-    /// already-active session, whose live items must survive a `resync`. Called
-    /// BEFORE the open/resume RPC awaits so any snapshot frames the pump
-    /// delivers during the await land on the fresh store.
-    ///
-    /// QA-1 (B4/B7/B15): deliberately NO `chatStore.applyRelayItems([])` here.
-    /// The projection MERGES (tagged relay rows + untagged history), so the
-    /// incoming session's cache paint (untagged rows) must SURVIVE the switch
-    /// until its own relay content lands — wiping `chatStore.messages` to `[]`
-    /// mid-open was the fully-blank transcript (B4). The previous session's
-    /// TAGGED projection rows are dropped by the incoming session's first
-    /// projection (it retains only untagged history) and by the open path's
-    /// `chat.reset()`; the store reset alone keeps session A's items out of
-    /// session B's projection, so nothing leaks either way.
+    /// but on a session SWITCH it would leak session A's transcript under
+    /// session B's snapshot, so `applyRelayItems` would render both. Resetting
+    /// here (and immediately re-projecting the emptied set) makes the switch
+    /// clean and is a no-op re-open/re-resume of the already-active session,
+    /// whose live items must survive a `resync`. Called BEFORE the open/resume
+    /// RPC awaits so any snapshot frames the pump delivers during the await land
+    /// on the fresh store.
     private func resetItemStoreForSessionSwitch(to sessionID: String) {
         guard sessionID != activeSessionID else { return }
         store = RelayItemStore()
+        chatStore.applyRelayItems(store.items)
     }
 
     func list() async throws -> JSONValue { try await requireClient().list() }

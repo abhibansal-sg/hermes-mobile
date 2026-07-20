@@ -149,12 +149,41 @@ async def test_ws_flap_chaos_byte_identical(mock_gateway, phone_factory, evidenc
         f"agentMessage text diverged:\n  clean={clean_text!r}\n  chaos={chaos_text!r}"
     )
     # Every item type the clean run produced also appears (no lost items), with
-    # an identical authoritative body (no doubled/diverged text).
+    # an identical authoritative body (no doubled/diverged text). The
+    # userMessage type is exempt from the CROSS-RUN body comparison: the two
+    # runs intentionally submit DIFFERENT prompts into different sessions — the
+    # byte-identity invariant covers the AGENT transcript. The user item gets a
+    # sharper flap-specific assertion instead (below): exactly one item on
+    # exactly one item_id, carrying the exact prompt, despite 10 resyncs —
+    # QA-1's relay-synthesized userMessage must survive replays AND snapshot
+    # fallbacks without duplication or loss.
     for itype, h in clean_hashes.items():
         assert itype in chaos_hashes, f"chaos run lost a {itype} item"
+        if itype == "userMessage":
+            continue
         assert chaos_hashes[itype] == h, (
             f"{itype} item body diverged between clean and chaos runs"
         )
+
+    # The chaos run's prompt survived the 10× flap storm as ONE item on ONE id:
+    # a ring replay resends the original frame (same id) and a snapshot
+    # fallback rebuilds the deterministic item — neither may duplicate it.
+    chaos_users = [it for it in chaos_items.values() if it.get("type") == "userMessage"]
+    assert len(chaos_users) == 1, (
+        f"flaps lost or duplicated the userMessage item: {chaos_users!r}"
+    )
+    assert chaos_users[0].get("body", {}).get("text") == "Begin chaos run", (
+        f"userMessage prompt diverged under flaps: {chaos_users[0]!r}"
+    )
+    chaos_user_ids = {
+        f.body["item_id"]
+        for f in chaos_phone.frames_for(chaos_sid)
+        if f.kind == "item.completed" and f.body.get("type") == "userMessage"
+    }
+    assert len(chaos_user_ids) == 1, (
+        f"userMessage emitted under {len(chaos_user_ids)} distinct ids across "
+        f"the flap storm: {sorted(chaos_user_ids)}"
+    )
 
     # The chaos run actually flapped 10× — proves A4 holds under the spec's
     # stated "10× ws_flap" load, not just 1-2 flaps.
@@ -163,6 +192,10 @@ async def test_ws_flap_chaos_byte_identical(mock_gateway, phone_factory, evidenc
         "the script must be slow enough for all 10 flaps to land mid-stream"
     )
 
+    # Agent-transcript byte identity (userMessage exempted by design — the runs
+    # submit different prompts; see the per-type loop above).
+    comparable = {t: h for t, h in clean_hashes.items() if t != "userMessage"}
+    chaos_comparable = {t: h for t, h in chaos_hashes.items() if t != "userMessage"}
     evidence("f-ws-flap-chaos", {
         "clean_session_id": clean_sid,
         "chaos_session_id": chaos_sid,
@@ -170,7 +203,8 @@ async def test_ws_flap_chaos_byte_identical(mock_gateway, phone_factory, evidenc
         "target_flaps": target_flaps,
         "clean_text": clean_text,
         "chaos_text": chaos_text,
-        "byte_identical": clean_text == chaos_text and clean_hashes == chaos_hashes,
+        "byte_identical": clean_text == chaos_text and comparable == chaos_comparable,
+        "user_message_single_id": sorted(chaos_user_ids),
         "clean_item_types": sorted(clean_hashes),
         "chaos_item_types": sorted(chaos_hashes),
         "clean_frames_seen": len(clean_phone.frames_for(clean_sid)),
