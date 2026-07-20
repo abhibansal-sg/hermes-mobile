@@ -764,3 +764,240 @@ final class RelayDeepLinkResumeTests: XCTestCase {
         )
     }
 }
+
+/// QA-1 B8/B12 — the relay working-signal lifecycle.
+///
+/// Build-114 relay QA: the inline "Working" row read a dishonest static
+/// "Working · 0s" for the whole turn because the relay path never drove the
+/// direct-path `turnStartedAt`/`activeToolName` event internals. These pin the
+/// relay turn-chrome lifecycle that makes the row honest in its sole remaining
+/// relay window (pre-first-item) and keeps it out of the cursor phase:
+///
+///  1. relay submit stamps `turnStartedAt` (the pre-first-item row ticks from
+///     the user's send);
+///  2. the first streaming relay item stamps it too (a turn this phone did not
+///     send — mid-turn resume) AND flips the view-model gate OFF (the streaming
+///     bubble's cursor is the working signal — A4);
+///  3. settle clears the chrome so the next turn never inherits a stale start;
+///  4. a failed submit clears the chrome (no stranded "Working" state).
+///
+/// Render-model assertions feed recorded relay frames through the real
+/// RelayItemStore → ChatStore projection and evaluate the production
+/// `ChatView.shouldShowInlineTurnActivity` gate (QA-1 A9's render-level shape).
+/// Same in-process mock relay as `RelayDeepLinkResumeTests` — no live network.
+@MainActor
+final class RelayWorkingSignalLifecycleTests: XCTestCase {
+
+    private typealias MockRelayTransport = RelaySessionCoordinatorTests.MockRelayTransport
+
+    private let relayURL = URL(string: "ws://127.0.0.1:9999/relay")!
+
+    private struct Stores {
+        let connection: ConnectionStore
+        let sessions: SessionStore
+        let chat: ChatStore
+        let inbox: InboxStore
+        let transport: MockRelayTransport
+        let coordinator: RelaySessionCoordinator
+    }
+
+    /// RPC-answering fake relay; `submitError` makes submit fail with a JSON-RPC
+    /// error frame (RelayClient maps it to `RelayError.rpc`).
+    private func makeTransport(submitError: Bool = false) -> MockRelayTransport {
+        MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id else { return }
+            if upstream.method == "submit" {
+                if submitError {
+                    let payload: JSONValue = .object([
+                        "jsonrpc": .string("2.0"), "id": .string(id),
+                        "error": .object(["code": .number(-32000),
+                                          "message": .string("relay rejected")]),
+                    ])
+                    if let data = try? JSONEncoder().encode(payload) {
+                        relay.deliver(String(decoding: data, as: UTF8.self))
+                    }
+                } else {
+                    let sid = (upstream.params["session_id"] as? String) ?? "abc123"
+                    relay.deliverResult(id: id, result: .object(["session_id": .string(sid)]))
+                }
+            } else {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+            }
+        })
+    }
+
+    private func makeStores(submitError: Bool = false) async throws -> Stores {
+        UserDefaults.standard.set(TransportPath.relay.rawValue,
+                                  forKey: DefaultsKeys.transportPath)
+
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        let attachments = AttachmentStore()
+        let inbox = InboxStore()
+        chat.attach(connection: connection, sessions: sessions, attachments: attachments)
+        sessions.attach(connection: connection, chat: chat)
+        inbox.attach(connection: connection)
+
+        let transport = makeTransport(submitError: submitError)
+        let coordinator = RelaySessionCoordinator(
+            chatStore: chat,
+            clientFactory: { RelayClient { _ in transport } }
+        )
+        try await coordinator.start(url: relayURL)
+        connection.relayCoordinatorFactory = { coordinator }
+        _ = connection.ensureRelayCoordinator()
+
+        return Stores(
+            connection: connection, sessions: sessions, chat: chat,
+            inbox: inbox, transport: transport, coordinator: coordinator
+        )
+    }
+
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.transportPath)
+        super.tearDown()
+    }
+
+    private func summary(id: String) -> SessionSummary {
+        SessionSummary(
+            id: id, title: "Session \(id)", preview: nil, startedAt: nil,
+            messageCount: nil, source: nil, lastActive: nil, cwd: nil
+        )
+    }
+
+    private func waitUntil(
+        _ condition: @escaping () -> Bool, timeout: TimeInterval = 2.0
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() && Date() < deadline {
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+
+    /// Open the session the relay-active way (deep-link route → relay resume).
+    private func openSession(_ s: Stores, id: String = "abc123") async {
+        s.sessions.sessions = [summary(id: id)]
+        HermesURLRouter.route(
+            URL(string: "hermesapp://session/\(id)")!,
+            connection: s.connection, sessions: s.sessions,
+            chat: s.chat, inbox: s.inbox
+        )
+        await waitUntil { s.sessions.activeRuntimeId == id }
+    }
+
+    private func agentItemFrame(_ seq: Int, id: String, status: String,
+                                text: String) -> RelayFrame {
+        RelayFrame(seq: seq, sid: "abc123", turn: "t1",
+                   kind: RelayFrameKind(wire: status == "in_progress" ? "item.started" : "item.completed"),
+                   body: .object([
+                       "item_id": .string(id),
+                       "type": .string(ChatItemType.agentMessage.rawValue),
+                       "status": .string(status),
+                       "ord": .number(1),
+                       "body": .object(["text": .string(text)]),
+                   ]))
+    }
+
+    /// The production view-model gate evaluated exactly as `ChatView` does for
+    /// the relay transport.
+    private func workingRowVisible(_ chat: ChatStore) -> Bool {
+        ChatView.shouldShowInlineTurnActivity(
+            isStreaming: chat.isStreaming,
+            hasPendingGate: chat.pendingApproval != nil
+                || chat.pendingClarification != nil
+                || chat.pendingSecurePrompt != nil,
+            isRelayTransport: true,
+            lastMessage: chat.messages.last
+        )
+    }
+
+    // MARK: - (1) submit stamps the turn start
+
+    /// B8 honesty: the relay submit stamps `turnStartedAt` so the pre-first-item
+    /// row's elapsed label ticks from the user's send instead of freezing "0s".
+    /// FAILS on qa1/base (the relay branch never stamped it).
+    func testRelaySendStampsTurnStartForHonestElapsed() async throws {
+        let s = try await makeStores()
+        await openSession(s)
+
+        let ok = await s.chat.send(text: "hello")
+        XCTAssertTrue(ok)
+        XCTAssertTrue(s.chat.isStreaming, "relay send enters the streaming state")
+        XCTAssertNotNil(s.chat.turnStartedAt,
+            "the relay submit must stamp the turn start so the pre-first-item row ticks")
+        // Pre-first-item: nothing streams yet, so the honest row IS visible
+        // (mirrors the approved direct path between send and message.start).
+        XCTAssertTrue(workingRowVisible(s.chat),
+            "pre-first-item relay: the accepted-and-waiting row shows")
+    }
+
+    // MARK: - (2) first item → cursor is the working signal (A4)
+
+    /// Feeding a recorded `item.started` through the real projection flips the
+    /// gate OFF: the streaming assistant bubble now renders the breathing cursor
+    /// (the ratified working signal) — no standalone pill beside it.
+    func testFirstStreamingItemSuppressesWorkingRowForCursor() async throws {
+        let s = try await makeStores()
+        await openSession(s)
+        _ = await s.chat.send(text: "hello")
+
+        s.transport.deliverFrame(agentItemFrame(1, id: "msg-1",
+                                                status: "in_progress", text: ""))
+        await waitUntil { s.chat.messages.last?.isStreaming == true }
+
+        XCTAssertTrue(s.chat.isStreaming)
+        XCTAssertNotNil(s.chat.turnStartedAt,
+            "a turn this phone did NOT send still gets an honest elapsed start")
+        XCTAssertFalse(workingRowVisible(s.chat),
+            "A4: while the relay bubble streams, the cursor is the working signal — no pill")
+    }
+
+    // MARK: - (3) settle clears the chrome for the next turn
+
+    /// The settle transition clears `turnStartedAt` (parity with the direct
+    /// path's `handleMessageComplete`), so a subsequent relay send stamps a
+    /// FRESH start — the next turn never inherits the previous turn's elapsed.
+    func testRelaySettleClearsChromeSoNextTurnStampsFresh() async throws {
+        let s = try await makeStores()
+        await openSession(s)
+        _ = await s.chat.send(text: "hello")
+        let firstStart = s.chat.turnStartedAt
+        XCTAssertNotNil(firstStart)
+
+        s.transport.deliverFrame(agentItemFrame(1, id: "msg-1",
+                                                status: "in_progress", text: ""))
+        await waitUntil { s.chat.messages.last?.isStreaming == true }
+        s.transport.deliverFrame(agentItemFrame(2, id: "msg-1",
+                                                status: "completed", text: "Done."))
+        await waitUntil { !s.chat.isStreaming }
+
+        XCTAssertNil(s.chat.turnStartedAt,
+            "the settled relay projection must clear the turn chrome")
+        XCTAssertFalse(workingRowVisible(s.chat), "idle transcript: no working row")
+
+        // Next turn: a fresh stamp, strictly after the first turn's start.
+        try await Task.sleep(nanoseconds: 5_000_000)
+        _ = await s.chat.send(text: "again")
+        let secondStart = try XCTUnwrap(s.chat.turnStartedAt)
+        XCTAssertGreaterThan(secondStart, firstStart!,
+            "the next relay turn stamps a fresh start — never a stale inherited one")
+    }
+
+    // MARK: - (4) failed submit clears the chrome
+
+    /// A rejected submit must not strand the "Working" state: streaming clears
+    /// AND the just-stamped turn start is dropped.
+    func testRelaySendErrorClearsTurnChrome() async throws {
+        let s = try await makeStores(submitError: true)
+        await openSession(s)
+
+        let ok = await s.chat.send(text: "hello")
+        XCTAssertFalse(ok, "the submit error propagates as a failed send")
+        XCTAssertFalse(s.chat.isStreaming)
+        XCTAssertNil(s.chat.turnStartedAt,
+            "a failed submit must not strand a turn start behind")
+        XCTAssertFalse(workingRowVisible(s.chat))
+    }
+}

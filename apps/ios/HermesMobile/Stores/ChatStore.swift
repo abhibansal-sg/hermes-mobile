@@ -2490,6 +2490,16 @@ final class ChatStore {
             userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
             messages.append(userMessage)
             setStreaming(true, reason: "relay.send")
+            // QA-1 B8: stamp the turn start at submit so the pre-first-item
+            // inline activity row's elapsed label ticks from the user's send
+            // (the direct path stamps in `beginStreamingMessage`; the relay's
+            // first rendered item stamps the same way via `applyRelayItems`,
+            // but the accepted-and-waiting window before ANY item exists would
+            // otherwise read a frozen "0s"). Guarded so a queued-drain re-send
+            // keeps the original turn's start. Deliberately NOT the
+            // `markTurnStartedIfNeeded()` seam: the Live Activity fires on the
+            // first relay item, so a failed submit can never strand it armed.
+            if turnStartedAt == nil { turnStartedAt = Date() }
             lastError = nil
             lastSendReachedServer = true
             do {
@@ -2509,6 +2519,7 @@ final class ChatStore {
             } catch {
                 removeLocalEcho(clientMessageID: clientMessageID)
                 setStreaming(false, reason: "relay.sendError")
+                turnStartedAt = nil
                 lastError = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
                 return false
@@ -4483,7 +4494,23 @@ final class ChatStore {
             !$0.relayProjected && !consumedEchoIDs.contains($0.id)
         }
         messages = preserved + rebuilt
-        setStreaming(rebuilt.contains { $0.isStreaming }, reason: "relayProjection")
+        let nowStreaming = rebuilt.contains { $0.isStreaming }
+        // QA-1 B8: relay turn-lifecycle chrome. `turnStartedAt`/`activeToolName`
+        // are direct-path event-router internals the relay path never updates
+        // per event — left alone, the inline activity row's elapsed label would
+        // inherit a stale prior turn's start on the next relay send. Stamp on
+        // the first streaming projection (parity with `beginStreamingMessage`
+        // → `markTurnStartedIfNeeded`, also firing the Live Activity seam for a
+        // turn this phone did NOT send — e.g. a mid-turn resume) and clear when
+        // the projection settles (parity with `handleMessageComplete`). The
+        // transition read MUST precede `setStreaming` below.
+        if nowStreaming {
+            markTurnStartedIfNeeded()
+        } else if isStreaming {
+            turnStartedAt = nil
+            activeToolName = nil
+        }
+        setStreaming(nowStreaming, reason: "relayProjection")
     }
 
     /// Surface a failed `open()`-path transcript seed the same way a failed
