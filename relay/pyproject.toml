@@ -22,6 +22,15 @@ dependencies = [
     # The reused notifier plumbing (push_engine -> utils) reads YAML config, so a
     # runnable relay needs pyyaml even though the relay itself parses no YAML.
     "pyyaml>=6",
+    # The relay's Notifier REUSES plugins/hermes-mobile/push_engine for APNs
+    # (protocol §6). push_engine mints an ES256 provider JWT per send and is a
+    # hard no-op (PushDependencyError swallowed -> 0 pushes) without PyJWT +
+    # cryptography in THIS venv — the installed launchd service runs the relay
+    # non-editable from this package, so the push deps must be declared here,
+    # not assumed from the gateway's venv. http2 covers the APNs HTTP/2 sender.
+    "pyjwt[crypto]>=2.8",
+    "cryptography>=42",
+    "httpx[http2]>=0.27",
 ]
 
 [project.optional-dependencies]

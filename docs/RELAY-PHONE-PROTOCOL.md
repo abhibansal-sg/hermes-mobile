@@ -30,7 +30,8 @@ downstream frame from relay → phone is:
 
 Upstream phone → relay frames are ordinary JSON-RPC-2.0 requests (the relay
 translates to gateway RPCs): `submit`, `resume`, `open`, `list`, `history`,
-`approve`, `clarify`, `interrupt`, `ack`, `resync`.
+`approve`, `clarify`, `interrupt`, `ack`, `resync`, `foreground`,
+`push.register`, `push.unregister`.
 
 ## 2. The item model (what the phone renders)
 
@@ -119,6 +120,8 @@ a partial merge preview and is never treated as authoritative.
 | answer approval | translate params | `approval.respond` | — — the gateway reads `choice` (`once`/`session`/`always`/`deny`, mapping `approve`→`once`) + `all` and resolves by SESSION key; the relay maps the phone's `decision`→`choice` (a relay that sent `decision` defaulted every approval to DENY) |
 | answer clarify | translate params | `clarify.respond` | — — the gateway matches the pending waiter by `request_id` and stores `params.answer`; the relay maps the phone's `text`→`answer` (a relay that sent `text` delivered an EMPTY answer) |
 | stop | pass-through | `session.interrupt` | — |
+| register APNs device token | LOCAL (§6a) | none — relay writes its OWN push registry | notifier becomes able to reach this phone |
+| unregister APNs device token | LOCAL (§6a) | none | phone stops receiving pushes |
 
 Live streaming to the phone works for any session the relay OWNS (i.e. after
 submit/resume-to-drive). Live mirroring of a session actively driven by ANOTHER
@@ -183,6 +186,39 @@ Blocking gates (`approval`/`clarify`) bypass the foreground gate — the turn is
 stalled on the user, so they always ring; completions/errors are skipped when a
 live phone WS holds the session foregrounded. Each `clarify` request rings once
 (keyed by `request_id`); `task_complete` collapses per turn.
+
+### 6a. Device-token registration over the relay (QA-1 B14)
+
+In relay mode the phone registers its APNs device token **through the relay
+socket**, not gateway-direct REST: the relay's Notifier reads the relay
+process's own push registry, and an off-LAN relay-only phone cannot reach the
+gateway REST at all (and when it can, the gateway's registry is a DIFFERENT
+`HERMES_HOME` than the relay reads). Registering over the transport the push is
+fired from is the only wiring that is correct by construction.
+
+- **`push.register`** — phone → relay JSON-RPC, LOCAL (never hits the gateway,
+  handled before the gateway-readiness gate like `ack`/`resync`/`foreground`).
+  `params`: `{token (hex string, required), platform ("ios"), env
+  ("sandbox"|"production"), events? (subset of approval/clarify/turn_complete/
+  turn_error/background_done; absent = all), device_id?}`. The relay validates
+  and writes the shared `push_engine` registry (`<HERMES_HOME>/push_tokens.json`,
+  the exact registry `push_engine.notify` reads) and returns
+  `{"registered": true}`; a malformed token yields a JSON-RPC error
+  (`invalid device token`). Re-registering refreshes env/events (Settings
+  toggles re-POST, same semantics as the gateway REST route).
+- **`push.unregister`** — `params`: `{token}`; returns `{"unregistered": bool}`.
+- **Phone duty (foreground hygiene, §6 gate):** the phone sends
+  `foreground {session_id: null}` when it leaves the foreground
+  (background/inactive scene phase) so a turn completing seconds after
+  backgrounding pushes instead of being gated by a WS iOS has not killed yet;
+  on reconnect / return to foreground it re-asserts the active session.
+- **Relay service duty:** the supervised launchd service carries the APNs sender
+  env in the plist (`HERMES_PUSH_ENABLED`, `HERMES_APNS_KEY_FILE`, `HERMES_APNS_
+  KEY_ID`, `HERMES_APNS_TEAM_ID`, optional `_TOPIC`/`_USE_SANDBOX`) rendered by
+  `install-service.sh` from `<HERMES_HOME>/apns.env`, plus `HERMES_HOME`
+  matching the gateway's. Without those the Notifier is a documented no-op —
+  the mock-APNs E2E exercises the DECISION logic; the live send additionally
+  requires these creds (owner-provided `.p8` + Key/Team IDs).
 
 ## 7. What the two build tracks own (against THIS contract)
 
