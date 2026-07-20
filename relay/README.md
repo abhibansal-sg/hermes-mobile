@@ -122,8 +122,10 @@ python -m hermes_relay \
 
 CLI flags: `--gateway-url ws://host:port` (or `--gateway-host/--gateway-port`),
 `--token`/`--token-file` (or `HERMES_RELAY_GATEWAY_TOKEN`), `--listen host:port`,
-`--health-path /healthz` / `--no-health`, `--log-level`. The entrypoint **refuses
-gateway port 9119** (the live gateway) outright.
+`--health-path /healthz` / `--no-health`, `--log-level`, `--allow-live-gateway`.
+The entrypoint **refuses gateway port 9119** (the live gateway) **by default**;
+the explicit `--allow-live-gateway` flag lifts that refusal, and exists ONLY for
+the supervised launchd service below — tests and ad-hoc runs must stay on 9126+.
 
 Env equivalents (used by `launch_relay.sh`): `HERMES_RELAY_GATEWAY_TOKEN`,
 `HERMES_RELAY_GATEWAY_URL`, `HERMES_RELAY_GATEWAY_HOST`/`_PORT`,
@@ -141,12 +143,33 @@ curl -s http://127.0.0.1:8788/healthz
 #  "ring_ready":true,"serving":true}
 ```
 
+## Run (supervised service — the ONLY sanctioned path to the live gateway)
+
+For daily-driver use, exactly ONE relay runs on the Mac as the launchd service
+`ai.hermes.relay` (KeepAlive, auto-start at login), dialing the live gateway
+`127.0.0.1:9119` with the dashboard token and serving the phone on
+`0.0.0.0:8788`. `scripts/install-service.sh` manages it:
+
+```bash
+scripts/install-service.sh install      # venv on /Volumes/MainData + render &
+                                        # load ~/Library/LaunchAgents/ai.hermes.relay.plist
+scripts/install-service.sh status       # plist/load/PID + read-only /healthz
+scripts/install-service.sh uninstall    # bootout + remove plist (venv/logs kept)
+scripts/decommission-old-relays.sh      # SIGTERM stray hermes_relay processes
+                                        # (keeps the service's own) — run BEFORE install
+```
+
+Logs: `~/Library/Logs/Hermes/relay.log`. The service passes
+`--allow-live-gateway` — nothing else should.
+
 ## Non-negotiables
 
 - Never touch the `hermes-mobile` product working tree; build only in this
   worktree / a lane worktree on `/Volumes/MainData`.
-- Never touch the live gateway on port **9119**. E2E uses a STOCK isolated
-  gateway on **9126+** with a temp `HERMES_HOME`.
+- Never touch the live gateway on port **9119** from tests or ad-hoc runs —
+  the entrypoint refuses it by default. The only sanctioned path to 9119 is the
+  supervised `ai.hermes.relay` service (`--allow-live-gateway`, see above). E2E
+  uses a STOCK isolated gateway on **9126+** with a temp `HERMES_HOME`.
 - ZERO CORE PATCH: no edits to `tui_gateway/`, `gateway/`, `run_agent.py`,
   `model_tools.py`, or `hermes_cli/` core. The relay is a client that reuses
   `plugins/hermes-mobile` plumbing only.
