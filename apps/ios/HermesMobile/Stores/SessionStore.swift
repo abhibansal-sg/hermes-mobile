@@ -3803,10 +3803,15 @@ final class SessionStore {
         // dismissal intent when this open carries one. Computed OUTSIDE the
         // Task (explicit optional type) so the seed closure's inference stays
         // trivial for the type checker.
-        let firstPaintReveal: (@MainActor () -> Void)? =
-            (wasAlreadyActive || !drawerIntentPending)
-            ? nil
-            : { [weak self] in self?.firePendingDrawerReveal() }
+        let firstPaintReveal: (@MainActor () -> Void)?
+        if wasAlreadyActive || !drawerIntentPending {
+            firstPaintReveal = nil
+        } else {
+            firstPaintReveal = { [weak self] in
+                guard let self else { return }
+                firePendingDrawerReveal()
+            }
+        }
         let seedTask = Task { [weak self] in
             guard let self, self.openToken == token else { return }
             #if DEBUG
