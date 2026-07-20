@@ -286,7 +286,7 @@ final class ClarifyCardNativeTests: XCTestCase {
     /// we set, not the SwiftUI content's height, so it is useless for sizing
     /// assertions). The preference is captured after a full layout pump.
     private struct HeightPreferenceKey: PreferenceKey {
-        static var defaultValue: CGFloat = 0
+        static let defaultValue: CGFloat = 0
         static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
             value = max(value, nextValue())
         }
