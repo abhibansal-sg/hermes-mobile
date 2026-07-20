@@ -159,4 +159,10 @@ SAMPLE_VALUES: dict[str, Any] = {
     "title": "New chat",
     "model": "claude-test",
     "provider": "anthropic",
+    # push.register / push.unregister (§6a): a 64-hex APNs-shaped token so the
+    # relay's real push_engine normalizer accepts the behavioral drive.
+    "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "platform": "ios",
+    "env": "production",
+    "events": ["approval", "turn_complete"],
 }
