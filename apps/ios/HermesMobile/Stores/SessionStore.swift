@@ -4719,6 +4719,13 @@ final class SessionStore {
         searchHasMore = false
         searchGeneration &+= 1
         let generation = searchGeneration
+        // Drop the PREVIOUS query's rows: the remote page below APPENDS (it
+        // merges over the same-query local cache hits), so stale rows left in
+        // place would survive into the new result set (pre-existing bug:
+        // SearchPaginationTests.testNewQueryResetsState). The <2-char branch
+        // above already clears immediately; a query change does too.
+        searchResults = []
+        searchIsPartial = false
 
         searchTask = Task { [weak self] in
             // Debounce.
