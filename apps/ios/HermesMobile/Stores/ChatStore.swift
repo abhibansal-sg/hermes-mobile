@@ -2541,9 +2541,51 @@ final class ChatStore {
                 }
                 return true
             } catch {
+                // QA-2 R11 (queue-send must NEVER disappear): a failed relay
+                // submit — the gateway's 4009 busy reject (the destination
+                // session is mid-turn) OR a transport/RPC failure — falls back
+                // into the durable outbox for a text-only send, exactly as the
+                // direct path queues. The outbox drain is relay-aware
+                // (`submitOutboxPrompt` routes through the coordinator, §5a
+                // `client_message_id` dedup) and HOLDS the row while its
+                // destination session is mid-turn (`busySessionID` gate),
+                // draining on turn completion — so a queue-mode send surfaces
+                // the outbox PILL immediately and delivers after the turn,
+                // instead of the build-115 behavior: echo deleted + error
+                // banner + nothing queued ("message DISAPPEARED"). The
+                // optimistic immediate-path echo is swapped for the outbox
+                // row's echo (distinct `clientMessageID`s — keeping both would
+                // double the bubble when the drain presents its row).
+                // C3: the queue-and-drain is SILENT — no error banner for what
+                // is a self-healing transition. Attachments cannot ride the
+                // outbox (its upload stage is gateway-REST-only; relay attach
+                // lives on the immediate path above), so those keep the
+                // pre-existing echo-removal failure.
                 removeLocalEcho(clientMessageID: clientMessageID)
                 setStreaming(false, reason: "relay.sendError")
                 turnStartedAt = nil
+                if !hasAttachments, let queueStore {
+                    // Thread the ORIGINAL client message id into the outbox row
+                    // (its jobID): if this failure was an AMBIGUOUS transport
+                    // loss — the relay may already have driven the turn — the
+                    // drain resubmits the same id and the relay's §5a dedup
+                    // folds it into one turn (never a double-send).
+                    if let queued = await queueStore.enqueue(
+                        trimmed,
+                        storedSessionId: sessions?.activeStoredId,
+                        wake: false,
+                        clientMessageID: clientMessageID
+                    ) {
+                        presentOutboxEcho(
+                            clientMessageID: queued.clientMessageID,
+                            text: queued.text,
+                            remotePaths: []
+                        )
+                        lastError = nil
+                        queueStore.wake()
+                        return true
+                    }
+                }
                 lastError = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
                 return false
@@ -2971,6 +3013,28 @@ final class ChatStore {
     /// the one streaming, and is `nil` outright during the resume window), or
     /// the visible stream can never be stopped from this device (R1 #2).
     func interrupt() async {
+        // Wave-2 relay transport (QA-2 R11): the gateway `client` is idle in
+        // relay mode, so stop OVER THE RELAY — `coordinator.interrupt` targets
+        // the driven session (the relay owns the running turn; `interruptTarget`
+        // is threaded for an adopted foreign mirror exactly as the direct path
+        // does, defaulting to the coordinator's driven session when nil). This
+        // mirrors the QA-1 B10 relay-aware approve/clarify pattern — interrupt
+        // was the control RPC B10 missed, so every stop attempt in relay mode
+        // threw "Not connected to the Hermes gateway" off the idle direct
+        // socket (the build-115 R11 banner + the never-stopping turn that
+        // wedged the dock). The default gateway path stays byte-identical.
+        if let connection, connection.transportPath == .relay {
+            guard let coordinator = connection.relayCoordinator else {
+                lastError = "Relay not connected"
+                return
+            }
+            do {
+                _ = try await coordinator.interrupt(interruptTarget)
+            } catch {
+                lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+            return
+        }
         guard let client, let sessionId = interruptTarget else { return }
         do {
             _ = try await client.requestRaw(
@@ -3092,6 +3156,37 @@ final class ChatStore {
     func steer(text: String) async -> SteerOutcome {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .rejected }
+        // Wave-2 relay transport (QA-2 R11): steer OVER THE RELAY — the gateway
+        // `client` is idle in relay mode, so the direct `session.steer` RPC
+        // threw "Not connected to the Hermes gateway" on every attempt (and the
+        // relay protocol had NO steer method at all — added in §5b: upstream
+        // `steer` → gateway `session.steer`). The relay passes the gateway's
+        // disposition through VERBATIM, so the status mapping below is
+        // identical to the direct path. Routing follows `interrupt()` exactly
+        // (`interruptTarget`).
+        if let connection, connection.transportPath == .relay {
+            guard let coordinator = connection.relayCoordinator else {
+                return .error("Relay not connected")
+            }
+            do {
+                let result = try await coordinator.steer(
+                    sessionID: interruptTarget, text: trimmed
+                )
+                switch result["status"]?.stringValue {
+                case "queued":   return .queued
+                case "rejected": return .rejected
+                default:
+                    // Defensive parity with the direct path: an unknown status
+                    // is a soft rejection — the user keeps their text.
+                    return .rejected
+                }
+            } catch {
+                let msg = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                lastError = msg
+                return .error(msg)
+            }
+        }
         guard let client, let sessionId = interruptTarget else {
             return .error("No active session")
         }

@@ -330,22 +330,31 @@ final class QueueStore {
         storedSessionId: String? = nil,
         assets: [WorkAssetInput] = [],
         newSession: Bool = false,
-        wake: Bool = false
+        wake: Bool = false,
+        clientMessageID: String? = nil
     ) async -> QueuedPrompt? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !assets.isEmpty, let scope = scopeProvider() else { return nil }
         let outgoing = trimmed.isEmpty ? "Please look at the attached image." : trimmed
         do {
-            let job = try await repository.enqueue(
-                WorkJobInput(
-                    kind: .prompt,
-                    scope: scope,
-                    intentKind: newSession ? .newSession : nil,
-                    text: outgoing,
-                    storedSessionID: storedSessionId
-                ),
-                assets: assets
+            // QA-2 R11: when a send that ALREADY carried a `client_message_id`
+            // falls back into the outbox (an ambiguous relay failure — the RPC
+            // may have driven a turn whose receipt was lost to a socket flap),
+            // the row reuses that SAME id as its job id (the row's
+            // `client_message_id` IS its jobID). The drain then resubmits the
+            // original id and the relay's §5a dedup folds the retry into the
+            // existing turn — never a double-send.
+            var input = WorkJobInput(
+                kind: .prompt,
+                scope: scope,
+                intentKind: newSession ? .newSession : nil,
+                text: outgoing,
+                storedSessionID: storedSessionId
             )
+            if let clientMessageID, let reused = UUID(uuidString: clientMessageID) {
+                input.jobID = reused
+            }
+            let job = try await repository.enqueue(input, assets: assets)
             if wake { processor?.wake() }
             scheduleThresholdReevaluation()
             return QueuedPrompt(job: job)
@@ -358,17 +367,22 @@ final class QueueStore {
         try? await repository.updateQueuedPrompt(id: id.uuidString.lowercased(), text: text)
     }
 
-    func remove(id: UUID) async {
+    /// Remove a job the user cancelled, AWAITING the durable tombstone before
+    /// returning (QA-2 R14). The repository commits the delete/`.cancelled
+    /// tombstone in ONE transaction (`removeCancelledJob`) and publishes the
+    /// observation that drives the row/pill removal only AFTER the commit — so
+    /// the UI can never confirm a removal whose tombstone didn't land, and a
+    /// force-quit the instant the row disappears can no longer resurrect the
+    /// send on the relaunch drain (the build-115 "cleared it, force-closed
+    /// quickly, it SENT anyway" failure: the old fire-and-forget `Task`s let
+    /// the UI race the async write). Returns whether a tombstone was committed.
+    @discardableResult
+    func remove(id: UUID) async -> Bool {
         let key = id.uuidString.lowercased()
         do {
-            guard let job = try await repository.job(id: key) else { return }
-            if job.leaseOwner == nil || job.state.isTerminal || job.state == .failed {
-                try await repository.deleteJob(id: key)
-            } else {
-                try await repository.cancelJob(id: key)
-            }
+            return try await repository.removeCancelledJob(id: key)
         } catch {
-            return
+            return false
         }
     }
 

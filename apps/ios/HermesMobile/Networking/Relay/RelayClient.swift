@@ -48,7 +48,7 @@ enum RelayConnectionState: Sendable, Equatable {
 /// - on reconnect send `resync{last_seq}` and reconcile the returned replay /
 ///   `snapshot` by `item_id` — idempotent + gap-free (§4);
 /// - expose the upstream session ops (submit/resume/open/list/history/approve/
-///   clarify/interrupt) as async methods that map to relay RPCs (§5).
+///   clarify/interrupt/steer) as async methods that map to relay RPCs (§5).
 ///
 /// Reconnect *policy* is intentionally external (as with `HermesGatewayClient`):
 /// the session fails fast and a driver calls `reconnect` again with backoff.
@@ -275,6 +275,28 @@ actor RelayClient {
     @discardableResult
     func interrupt(_ sessionID: String) async throws -> JSONValue {
         try await request(.interrupt, params: .object(["session_id": .string(sessionID)]))
+    }
+
+    /// Inject steering text into the live turn (§5 / §5b, QA-2 R11).
+    ///
+    /// WIRE CONTRACT (docs/RELAY-PHONE-PROTOCOL.md §5b, asserted key-for-key by
+    /// tests/conformance): `session_id` + `text` are REQUIRED; the relay passes
+    /// them to the gateway's `session.steer` and returns its disposition
+    /// VERBATIM — `{status: "queued" | "rejected", text}` — so the phone maps
+    /// it exactly as on the gateway-direct path (`queued` → clear the field;
+    /// `rejected` → keep the text and offer queueing). Before this method
+    /// existed the composer's steer went over the IDLE gateway-direct socket in
+    /// relay mode and every attempt failed "Not connected to the Hermes
+    /// gateway" (the build-115 R11 steer failure).
+    @discardableResult
+    func steer(sessionID: String, text: String) async throws -> JSONValue {
+        try await request(
+            .steer,
+            params: .object([
+                "session_id": .string(sessionID),
+                "text": .string(text),
+            ])
+        )
     }
 
     /// Upload an attachment's INLINED bytes through the relay (B9 / A5). The

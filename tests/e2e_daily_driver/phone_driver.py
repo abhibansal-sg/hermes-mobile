@@ -176,6 +176,13 @@ class PhoneDriver:
     async def interrupt(self, session_id: str) -> dict[str, Any]:
         return await self._call("interrupt", {"session_id": session_id})
 
+    async def steer(self, session_id: str, text: str) -> dict[str, Any]:
+        """QA-2 R11 (§5b): live-turn steering over the relay. Same wire shape
+        as iOS ``RelayClient.steer``: ``session_id`` + ``text``. The response
+        carries the gateway's disposition VERBATIM (``status: queued |
+        rejected``)."""
+        return await self._call("steer", {"session_id": session_id, "text": text})
+
     async def attach(
         self, *, kind: str, data_url: str,
         session_id: Optional[str] = None, name: str = "",

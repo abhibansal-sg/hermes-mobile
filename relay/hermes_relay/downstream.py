@@ -608,6 +608,7 @@ class DownstreamServer:
         * ``approve``   -> approval_respond
         * ``clarify``   -> clarify_respond
         * ``interrupt`` -> session_interrupt
+        * ``steer``     -> session_steer (live-turn steering; QA-2 R11)
         * ``attach``    -> file_attach / image_attach_bytes (bytes inlined)
         * ``ack``       -> conn.ack (LOCAL, no gateway hop)
         * ``resync``    -> conn.replay (LOCAL, no gateway hop)
@@ -798,6 +799,16 @@ class DownstreamServer:
             return result
         if method == UpstreamMethod.INTERRUPT:
             return await self._gateway.session_interrupt(p["session_id"])
+        if method == UpstreamMethod.STEER:
+            # QA-2 R11: live-turn steering over the relay. The phone sends
+            # ``session_id`` + ``text``; the gateway's ``session.steer`` injects
+            # the text into the running turn's next context window and returns
+            # ``{status: queued|rejected, text}`` — passed through verbatim so
+            # the phone maps the disposition identically to the direct path
+            # (``rejected`` keeps the user's text so they can queue it instead).
+            return await self._gateway.session_steer(
+                p["session_id"], str(p.get("text") or "")
+            )
 
         # -- attachments (B9/A5): REST-free, bytes inlined by the phone ------
         if method == UpstreamMethod.ATTACH:

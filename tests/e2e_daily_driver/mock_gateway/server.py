@@ -66,6 +66,15 @@ class MockSession:
     # Attachments staged into this session via file.attach / image.attach_bytes
     # (B9/A5 relay attach round-trip) — white-box test assertions read these.
     attachments: list[dict[str, Any]] = field(default_factory=list)
+    # Turn-control state (QA-2 R11 E2E): whether a script (turn) is currently
+    # running, the interrupts + steers the relay forwarded for this session,
+    # and the event a `longturn` script awaits so `session.interrupt` ends the
+    # turn early — mirroring the stock gateway's 4009-busy-while-running and
+    # interrupt/steer semantics the phone relies on.
+    running: bool = False
+    interrupts: list[dict[str, Any]] = field(default_factory=list)
+    steers: list[dict[str, Any]] = field(default_factory=list)
+    interrupt_event: Optional[asyncio.Event] = None
 
 
 # A script step is a callable that, given the session + a "send event" closure,
@@ -248,11 +257,57 @@ async def _emit_tasklist(sess: MockSession, send: SendFn) -> None:
     })
 
 
+async def _emit_longturn(sess: MockSession, send: SendFn) -> None:
+    """A deliberately LONG turn for QA-2 R11 turn-control E2E: streams one
+    delta every ~50 ms until the text is exhausted OR `session.interrupt`
+    fires (the interrupt event ends the turn early with status "interrupted",
+    exactly the stock gateway's semantics the phone's stop button relies on).
+    Steering text landed via `session.steer` is recorded on the session — the
+    test asserts the live turn received it without a new turn starting.
+    """
+    kwargs = sess.script.kwargs if sess.script else {}
+    text = kwargs.get("text") or " ".join(f"w{i}" for i in range(40))
+    words = text.split()
+    delay = float(kwargs.get("delta_delay_s", 0.05))
+    ev = sess.interrupt_event if sess.interrupt_event is not None else asyncio.Event()
+    sess.interrupt_event = ev
+    await send(sess.sid, {"type": "message.start", "session_id": sess.sid, "payload": None})
+    sent_words: list[str] = []
+    for i, w in enumerate(words):
+        if ev.is_set():
+            break
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=delay)
+            break  # the event fired during the wait — stop streaming
+        except asyncio.TimeoutError:
+            pass
+        sent_words.append(w)
+        await send(sess.sid, {
+            "type": "message.delta", "session_id": sess.sid,
+            "payload": {"text": w + (" " if i != len(words) - 1 else "")},
+        })
+    interrupted = ev.is_set()
+    status = "interrupted" if interrupted else "complete"
+    final_text = " ".join(sent_words)
+    await send(sess.sid, {
+        "type": "message.complete", "session_id": sess.sid,
+        "payload": {
+            "text": final_text,
+            "status": status,
+            "usage": {"model": sess.model, "input": 1,
+                      "output": len(sent_words), "total": len(sent_words) + 1},
+        },
+    })
+    sess.history.append({"role": "user", "content": kwargs.get("last_prompt", "")})
+    sess.history.append({"role": "assistant", "content": final_text})
+
+
 _SCRIPTS = {
     "simple": _emit_simple,
     "approval": _emit_approval,
     "clarify": _emit_clarify,
     "tasklist": _emit_tasklist,
+    "longturn": _emit_longturn,
 }
 
 
@@ -417,6 +472,11 @@ class MockGateway:
             sess = self.sessions.get(sid)
             if sess is None:
                 error = {"code": -32602, "message": f"unknown session {sid}"}
+            elif sess.running:
+                # QA-2 R11 E2E: the stock gateway rejects a second prompt while
+                # a turn runs (4009 "session busy"). The phone's relay-mode send
+                # keys its durable-outbox fallback off exactly this reject.
+                error = {"code": 4009, "message": "session busy — a turn is already running"}
             else:
                 if sess.script is not None:
                     sess.script.kwargs["last_prompt"] = params.get("text", "")
@@ -454,7 +514,34 @@ class MockGateway:
                     ev.set()
             result = {"ok": True}
         elif method == "session.interrupt":
+            sid = params.get("session_id", "")
+            sess = self.sessions.get(sid)
+            if sess is not None:
+                # QA-2 R11 E2E: record the interrupt and trip the live turn's
+                # event so a `longturn` script ends early with status
+                # "interrupted" — the semantics the phone's stop relies on.
+                sess.interrupts.append({"session_id": sid})
+                if sess.interrupt_event is not None:
+                    sess.interrupt_event.set()
             result = {"ok": True}
+        elif method == "session.steer":
+            # QA-2 R11 E2E (§5b): mirrors tui_gateway's `session.steer` —
+            # accepts steering text ONLY while a turn is running (status
+            # "queued", recorded on the session); "rejected" when idle so the
+            # phone keeps the text and offers queueing. The disposition travels
+            # back through the relay VERBATIM.
+            sid = params.get("session_id", "")
+            text = (params.get("text") or "").strip()
+            sess = self.sessions.get(sid)
+            if not text:
+                error = {"code": 4002, "message": "text is required"}
+            elif sess is None:
+                error = {"code": -32602, "message": f"unknown session {sid}"}
+            elif not sess.running:
+                result = {"status": "rejected", "text": text}
+            else:
+                sess.steers.append({"session_id": sid, "text": text})
+                result = {"status": "queued", "text": text}
         elif method == "file.attach":
             # B9/A5: the relay proxies the phone's inlined-bytes attach here
             # (mirrors tui_gateway/server.py @method("file.attach")). Stages a
@@ -519,6 +606,9 @@ class MockGateway:
                 return
             # Each submit gets a fresh wait event (interactive scripts block).
             sess.script.kwargs["_wait_event"] = asyncio.Event()
+            # A fresh interrupt event per turn; `session.interrupt` trips it.
+            sess.interrupt_event = asyncio.Event()
+            sess.running = True
 
             async def send(sid: str, params: dict[str, Any]) -> None:
                 await self._broadcast(sid, params)
@@ -527,6 +617,8 @@ class MockGateway:
                 await sess.script.fn(sess, send)
             except Exception:
                 _log.exception("script %s failed", sess.script.name)
+            finally:
+                sess.running = False
 
 
 # ---------------------------------------------------------------------------
