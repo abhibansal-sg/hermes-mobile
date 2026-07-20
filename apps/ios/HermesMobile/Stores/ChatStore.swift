@@ -3502,6 +3502,14 @@ final class ChatStore {
         // view's isResponding guard is best-effort) cannot duplicate the row.
         if pending != nil {
             appendClarifyAnswerEcho(answer)
+            // The card is consumed the moment the user answers — clear it here
+            // on EVERY path, not only inside the transport branches (qa2 fix
+            // round: both branches already cleared before their RPC, so wired
+            // behavior is unchanged; the unwired/unit path previously left the
+            // card up forever and re-entry re-echoed — ClarifyCardNativeTests
+            // testRespondClarificationEchoesAnswerAsUserMessage /
+            // EchoIsSingleRowEvenIfCalledTwice).
+            pendingClarification = nil
         }
         // Wave-2 relay transport (QA-1 B10): answer OVER THE RELAY —
         // `coordinator.clarify` builds the §5 shape (`session_id` + `text` +
@@ -3509,7 +3517,6 @@ final class ChatStore {
         // `request_id` echo is REQUIRED: the gateway matches the pending
         // waiter by it — without it the reply 4009s and the agent hangs.
         if let connection, connection.transportPath == .relay {
-            pendingClarification = nil
             if let rid = pending?.request.requestId { markRelayGateResolved(rid) }
             guard let coordinator = connection.relayCoordinator else {
                 lastError = "Relay not connected"
@@ -3529,7 +3536,7 @@ final class ChatStore {
         guard let client,
               let sessionId = (clarifySession?.isEmpty == false ? clarifySession : activeSessionId)
         else { return }
-        pendingClarification = nil
+        // (pendingClarification already cleared at the echo site above.)
         var params: [String: JSONValue] = [
             "session_id": .string(sessionId),
             "answer": .string(answer),
