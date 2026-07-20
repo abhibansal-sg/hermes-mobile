@@ -179,6 +179,11 @@ enum RelayUpstreamMethod: String, Sendable, CaseIterable {
     case approve
     case clarify
     case interrupt
+    /// Live-turn steering (QA-2 R11): the relay passes `session_id` + `text` to
+    /// the gateway's `session.steer`, returning its `{status: queued|rejected,
+    /// text}` disposition VERBATIM. Before this existed the phone's steer went
+    /// over the idle gateway-direct socket in relay mode → "Not connected".
+    case steer
     /// Inlined-bytes attachment (B9/A5): the relay drives the gateway's
     /// `file.attach` / `image.attach_bytes` base64 RPCs, so photo/file attach
     /// works on relay-only reaches with no gateway-REST upload round-trip.
