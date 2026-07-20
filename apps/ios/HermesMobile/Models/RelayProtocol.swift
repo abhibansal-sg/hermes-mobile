@@ -182,4 +182,10 @@ enum RelayUpstreamMethod: String, Sendable, CaseIterable {
     case ack
     case resync
     case foreground
+    /// Register this device's APNs token in the RELAY's push registry (§6a) —
+    /// the relay's Notifier reads that same registry, so in relay mode the
+    /// token must land HERE, not on the (possibly unreachable) gateway REST.
+    case pushRegister = "push.register"
+    /// Remove the APNs token from the relay's push registry (§6a).
+    case pushUnregister = "push.unregister"
 }
