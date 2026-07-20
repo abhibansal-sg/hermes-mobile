@@ -407,6 +407,7 @@
             "token"
           ],
           "optional": [
+            "device_id",
             "events"
           ]
         },
