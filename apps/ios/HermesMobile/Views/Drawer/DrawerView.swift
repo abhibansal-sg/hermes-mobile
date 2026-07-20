@@ -1569,8 +1569,16 @@ struct DrawerView: View {
                         Button {
                             // VC-02: bump trigger so sensoryFeedback fires on tap.
                             searchResultFeedbackTrigger = UUID()
-                            sessions.open(searchResult: result)
-                            onNavigate()
+                            // R2 (drawer snap-back): hand the close to
+                            // `open(searchResult:)` as `revealOnFirstPaint` so
+                            // the drawer dismisses forward INTO the new
+                            // session's first painted frame — the same gate
+                            // the row-tap path uses. The old `onNavigate()`
+                            // here fired the close IMMEDIATELY, animating it
+                            // onto the previous session's card before the new
+                            // one painted (the reported snap-back / reversed
+                            // open-motion).
+                            sessions.open(searchResult: result) { onNavigate() }
                         } label: {
                             DrawerSearchResultRow(result: result, query: sessions.searchQuery)
                         }

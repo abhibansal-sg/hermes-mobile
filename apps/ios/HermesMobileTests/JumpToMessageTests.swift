@@ -303,6 +303,49 @@ final class JumpToMessageCacheFirstTests: XCTestCase {
                        "open(searchResult:) must switch to the result's session")
     }
 
+    // MARK: - R2 (drawer snap-back): search-result tap dismisses forward into the session
+
+    /// R2 — the search-result tap used to call `onNavigate()` INLINE at the
+    /// DrawerView call site, animating the drawer close onto the PREVIOUS
+    /// session's card before the new session painted (the "open-motion plays
+    /// reversed" snap-back). The row-tap path already handed its close to
+    /// `open(_:revealOnFirstPaint:)` so it fires on the new session's first
+    /// painted frame. `open(searchResult:)` now takes the same closure and
+    /// defers the close — this test pins that the close is NOT fired
+    /// synchronously (it is gated on first paint / the 300 ms liveness
+    /// deadline), while the session switch itself IS immediate. Before the
+    /// R2 fix, `open(searchResult:)` did not even accept a `revealOnFirstPaint`
+    /// parameter — the close was unconditional and inline.
+    @MainActor
+    func testOpenSearchResultDefersCloseIntoRevealGate() async {
+        let sessionStore = SessionStore()
+        sessionStore.activeStoredId = "session-old"
+
+        let result = SessionSearchResult(
+            id: "session-new", snippet: "fresh",
+            role: "user", source: nil, model: nil, sessionStarted: nil,
+            messageId: 222
+        )
+        sessionStore.sessions = [result.asSessionSummary]
+
+        var closes = 0
+        sessionStore.open(searchResult: result) { closes += 1 }
+
+        XCTAssertEqual(sessionStore.activeStoredId, "session-new",
+                       "the session switch is immediate (the drawer highlight updates on the tap tick)")
+        XCTAssertEqual(closes, 0,
+                       "the close must NOT fire inline — it dismisses forward into the new session's first paint")
+
+        // Liveness: the 300 ms reveal-deadline arms a fallback close so the
+        // drawer can never be stranded open. Await it deterministically.
+        #if DEBUG
+        await sessionStore.waitForPendingOpenForTesting()
+        #endif
+        try? await Task.sleep(for: .milliseconds(420))
+        XCTAssertEqual(closes, 1,
+                       "the close fires on the reveal deadline (liveness fallback) — drawer always dismisses")
+    }
+
     // MARK: - ABH-192 regression: coalesced-turn artifact miss → snippet fallback
 
     /// A tool-bearing assistant row (so the next text-only assistant row coalesces
