@@ -110,6 +110,7 @@ final class PushRegistrarRelayModeTests: XCTestCase {
         DefaultsKeys.pushRegistrationHealthy,
         DefaultsKeys.notificationsDidRequestAuthorization,
         DefaultsKeys.transportPath,
+        DefaultsKeys.deviceIdsByServer,
     ]
 
     override func setUp() async throws {
@@ -274,12 +275,55 @@ final class PushRegistrarRelayModeTests: XCTestCase {
         XCTAssertEqual(reg?.params["platform"] as? String, "ios")
         XCTAssertEqual(reg?.params["env"] as? String, "sandbox")
         XCTAssertEqual(reg?.params["events"] as? [String], ["approval", "turn_complete"])
+        // No device id supplied → the key is ABSENT (legacy relay semantics).
+        XCTAssertNil(reg?.params["device_id"])
+
+        // QA-2 R1c: a supplied device id rides along for one-token-per-device dedup.
+        _ = try await coordinator.registerPushToken(
+            token, env: "sandbox", events: ["approval"], deviceID: "qa2-device-42"
+        )
+        let reg2 = transport.upstreams().last { $0.method == "push.register" }
+        XCTAssertEqual(reg2?.params["device_id"] as? String, "qa2-device-42")
 
         _ = try await coordinator.unregisterPushToken(token)
         let unreg = transport.upstreams().first { $0.method == "push.unregister" }
         XCTAssertEqual(unreg?.params["token"] as? String, token)
 
         await coordinator.stop()
+    }
+
+    /// QA-2 R1c: the registrar's relay register carries the phone's STABLE
+    /// per-install device id (so the relay registry converges to one entry per
+    /// device); without a device id no key is sent.
+    func testRelayRegisterCarriesStableDeviceId() async throws {
+        let transport = MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id else { return }
+            if upstream.method == "push.register" {
+                relay.deliverResult(id: id, result: .object(["registered": .bool(true)]))
+            }
+        })
+        let (connection, coordinator) = makeRelayConnection(transport)
+        DefaultsKeys.setDeviceId("stable-device-7", server: connection.serverURLString)
+        try await coordinator.start(url: url)
+        await waitUntil(coordinator.phase == .open, "relay socket should open")
+
+        registrar.authorizationRequester = { _ in .authorized }
+        registrar.remoteNotificationsRegistrar = {}
+        registrar.ensureRegisteredForPairedGateway()
+        registrar.didRegister(deviceToken: Data([0xde, 0xad, 0xbe, 0xef]))
+
+        await waitUntil(
+            transport.upstreams().contains { $0.method == "push.register" },
+            "the token must be registered over the relay socket (§6a)"
+        )
+        let register = try XCTUnwrap(
+            transport.upstreams().first { $0.method == "push.register" }
+        )
+        XCTAssertEqual(register.params["device_id"] as? String, "stable-device-7")
+        XCTAssertEqual(register.params["token"] as? String, "deadbeef")
+
+        await coordinator.stop()
+        _ = connection  // keep the registrar's weak connection alive for the test
     }
 
     /// Registering while the relay socket is down throws (so PushRegistrar

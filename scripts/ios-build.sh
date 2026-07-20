@@ -25,6 +25,7 @@
 #   scripts/ios-build.sh archive -scheme HermesMobile -archivePath /tmp/x.xcarchive ...
 #   HERMES_BUILD_TIMEOUT=2400 scripts/ios-build.sh archive ...   # watchdog secs (default 1200)
 #   HERMES_BUILD_LOG=/tmp/my.log scripts/ios-build.sh build ...  # full xcodebuild log path
+#   HERMES_APS_ENVIRONMENT=sandbox|production scripts/ios-build.sh ...  # QA-2 R1a: APNs env build flag
 #
 # Auto-injects `-project apps/ios/HermesMobile.xcodeproj` and a per-worktree
 # `-derivedDataPath` unless you pass your own -project/-workspace/-derivedDataPath.
@@ -51,7 +52,7 @@ WEDGE_EXIT=75                                      # distinct rc: wedge detected
 # (default: ABORT before stacking another frozen build on a poisoned daemon).
 
 log(){ printf '[ios-build] %s\n' "$*" >&2; }
-usage(){ sed -n '2,33p' "${BASH_SOURCE[0]}" >&2; }
+usage(){ sed -n '2,31p' "${BASH_SOURCE[0]}" >&2; }
 
 [ "$#" -eq 0 ] && { usage; exit 2; }
 
@@ -191,6 +192,25 @@ for a in "${args[@]}"; do
 done
 $have_proj || args=("-project" "$PROJ" "${args[@]}")
 $have_dd   || args+=("-derivedDataPath" "$DEFAULT_DD")
+
+# ---- QA-2 R1a: deterministic APNs-environment build flag --------------------
+# PushTokenPoster.apnsEnvironment parses embedded.mobileprovision at runtime,
+# but a build-time stamp wins (it is read FIRST via SWIFT_ACTIVE_COMPILATION_
+# CONDITIONS): release ARCHIVES (TestFlight/App Store export) are production;
+# an explicit HERMES_APS_ENVIRONMENT=sandbox|production wins for ANY action
+# (e.g. forcing a dev-signed build to register under production). Dev `build`
+# invocations get no flag and rely on the (now correct) profile parse.
+aps_env="${HERMES_APS_ENVIRONMENT:-}"
+if [ -z "$aps_env" ] && [ "${1:-}" = "archive" ]; then aps_env="production"; fi
+# Single quotes below are DELIBERATE: the literal $(inherited) must reach
+# xcodebuild unexpanded (bash must not command-substitute it).
+# shellcheck disable=SC2016
+case "$aps_env" in
+  sandbox)    args+=('SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) HERMES_APS_ENV_SANDBOX') ;;
+  production) args+=('SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) HERMES_APS_ENV_PRODUCTION') ;;
+  "") ;;
+  *) log "WARNING: HERMES_APS_ENVIRONMENT='$aps_env' is not sandbox|production — ignored." ;;
+esac
 
 # For the `test` action, self-provision live-gateway creds so live XCUITests run
 # instead of XCTSkip'ing (STR-1339). Runs before the build so the exported
