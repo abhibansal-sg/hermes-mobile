@@ -11,10 +11,13 @@ import SwiftUI
 /// Inline-render parity: the body's parsed `TodoList` is handed straight to the
 /// EXISTING `TodoCardView`, so a relay-path checklist looks IDENTICAL to a
 /// direct-path one in the transcript. The Turn Dock's task box mirrors the SAME
-/// list via `ChatStore.latestTodoList` (N4 bridge), and the existing
-/// `dockSuppressesTodoCards` rule hides this inline card while the dock is
-/// showing it — the suppression is keyed off `dockContent == .tasks`, so it
-/// applies to the relay path with no extra wiring.
+/// list via `ChatStore.latestTodoList` (N4 bridge — `applyRelayItems` refreshes
+/// the relay mirror on every projection). In-transcript duplication with the
+/// dock is prevented the same way every other work item is: `.taskList` is a
+/// `WorkingSectionModel` work item, so it renders INSIDE the collapsed working
+/// fold ("Worked for N" → tap → step list), never as a free-standing inline
+/// card beside the dock. (The `dockSuppressesTodoCards` rule itself still
+/// applies to the legacy `.tools` clusters on the direct path, unchanged.)
 ///
 /// While the list streams (`status == .inProgress`) the card still renders so
 /// the user sees the live checklist; once `completed` every task is done.
