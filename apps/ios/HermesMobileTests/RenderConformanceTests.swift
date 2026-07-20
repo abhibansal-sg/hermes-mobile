@@ -712,6 +712,251 @@ final class RenderConformanceTests: XCTestCase {
             "spec B4/B15: opening an idle session must not blank the cache-painted transcript")
     }
 
+    // MARK: - Reseed eviction guard (QA-2 R15/A8, R3 residue)
+
+    /// Build gateway-shaped wire rows (stable `wireId` → deterministic seed ids,
+    /// identical across every refetch — the identity ``reconcileMessages`` keys
+    /// on), modeling what the GRDB cache paints and what a relay-history /
+    /// backfill snapshot returns.
+    private func storedHistory(_ rows: [(role: String, text: String)]) -> [StoredMessage] {
+        rows.enumerated().map { index, row in
+            StoredMessage(
+                role: row.role,
+                content: .string(row.text),
+                timestamp: 1_700_000_000 + Double(index),
+                wireId: index + 1
+            )
+        }
+    }
+
+    /// Assert every row's text appears, IN ORDER, in the rendered texts.
+    private func assertRowsPresent(
+        _ texts: [String], _ rows: [(role: String, text: String)],
+        _ label: String, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        var cursor = 0
+        for row in rows {
+            guard let found = texts[cursor...].firstIndex(of: row.text) else {
+                XCTFail(
+                    "\(label): settled history row lost from the transcript: \(row.role): \(row.text.prefix(48)) — rendered: \(texts.map { String($0.prefix(24)) })",
+                    file: file, line: line)
+                return
+            }
+            cursor = found + 1
+        }
+    }
+
+    /// QA-2 R15 / A8 — THE STUCK-EPISODE SEGMENT DROP. A mid-conversation
+    /// segment vanished after a stuck live turn rode a connection flap: the
+    /// reconnect `backfill()` reconciled a reseed snapshot SHORTER than the
+    /// merged timeline (relay history is a tail window; the relay's per-session
+    /// store holds only what it observed — the snapshot is known-partial), and
+    /// `reconcileMessages` treated the snapshot as the SOLE truth, EVICTING the
+    /// settled rows it did not carry. The cache still had them; switching away
+    /// and back (cache-first reseed) repaired the transcript — the owner's
+    /// exact recovery path.
+    ///
+    /// CONTRACT: the merged view NEVER shows less settled history than the
+    /// store held before the reseed. FAILS on qa2/base (`reconcileMessages`
+    /// does `messages = rebuilt` from the snapshot only — the missing segment
+    /// is evicted).
+    func testReseed_ShortSnapshotNeverEvictsSettledHistory() async throws {
+        let fx = try loadFixture("render_submit_stream")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        g.sessions.activeStoredId = fx.sessionID
+
+        // The GRDB cache painted six settled rows (three turns).
+        let history: [(role: String, text: String)] = [
+            ("user", "q1"), ("assistant", "a1"),
+            ("user", "q2"), ("assistant", "a2"),
+            ("user", "q3"), ("assistant", "a3"),
+        ]
+        let stored = storedHistory(history)
+        g.chat.seed(from: stored)
+        XCTAssertEqual(g.chat.messages.map(\.text), ["q1", "a1", "q2", "a2", "q3", "a3"])
+
+        // A new turn goes live and gets STUCK mid-stream (no turn.completed —
+        // the R11/R12 wedge left it running): recorded fixture frames replayed
+        // byte-for-byte through the production pump, stopped mid-delta.
+        _ = await g.chat.send(text: fx.submitText)
+        deliver(g, fx, through: { self.kind($0) == "item.delta" })
+        await waitUntil { g.chat.isStreaming }
+
+        // Connection flap (IMG_2547 "Not connected" banner) → drop handler
+        // finalizes the stream so the reconnect recovery backfill can run…
+        g.chat.handleConnectionDrop()
+        XCTAssertFalse(g.chat.isStreaming)
+
+        // …and the reconnect backfill lands a SHORT snapshot: the mid-
+        // conversation segment (q2/a2) is absent — the relay's snapshot is
+        // partial, not a deletion list.
+        g.chat.backfillFetch = { _ in Array(stored[0...1]) + Array(stored[4...5]) }
+        await g.chat.backfill()
+
+        // INVARIANT: zero segment loss — every cached row still renders, in
+        // order, even though the snapshot did not carry it.
+        assertRowsPresent(g.chat.messages.map(\.text), history, "R15/A8 short-snapshot reseed")
+
+        // The stream resumes after the flap (relay resync replays the frames)
+        // and the turn settles: history + prompt + reply, nothing dropped.
+        deliverAll(g, fx)
+        let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
+        await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
+        assertRowsPresent(g.chat.messages.map(\.text), history, "R15/A8 post-resume settle")
+        XCTAssertTrue(
+            g.chat.messages.contains { $0.role == .user && $0.text == fx.submitText },
+            "the stuck turn's user prompt survives the flap + reseed + resume"
+        )
+    }
+
+    /// QA-2 R15 / A8 — TAIL-WINDOW SHIFT. Every reseed source on this tree is a
+    /// recent-tail window (relay history honors `limit` with `messages[-limit:]`,
+    /// downstream.py; plugin REST serves the 50-row tail): as the conversation
+    /// grows, the window slides and a reseed EVICTS the older settled rows the
+    /// user had already loaded. FAILS on qa2/base (rows 1–3 evicted by the
+    /// 4–6 snapshot).
+    func testReseed_TailWindowShiftKeepsOlderLoadedHistory() async throws {
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open("render-tail-window")
+        g.sessions.activeStoredId = "render-tail-window"
+
+        let history: [(role: String, text: String)] = [
+            ("user", "q1"), ("assistant", "a1"),
+            ("user", "q2"), ("assistant", "a2"),
+            ("user", "q3"), ("assistant", "a3"),
+        ]
+        let stored = storedHistory(history)
+        g.chat.seed(from: stored)
+
+        // The reconnect/foreground backfill returns only the recent tail
+        // (the window slid after newer turns settled on the gateway).
+        g.chat.backfillFetch = { _ in Array(stored[3...5]) }
+        await g.chat.backfill()
+
+        let texts = g.chat.messages.map(\.text)
+        assertRowsPresent(texts, history, "R15/A8 tail-window shift")
+        XCTAssertEqual(texts.count, history.count,
+                       "the overlapping window rows update in place — no duplicates, no eviction")
+    }
+
+    /// QA-2 R15 guard — the optimistic user echo (runtime id + clientMessageID,
+    /// untagged) must CONVERGE with its own gateway row on a union reseed,
+    /// never double-render. The reseed row adopts the echo's slot exactly like
+    /// `adoptRelayEcho` folds the relay `userMessage` item onto it.
+    func testReseed_OptimisticEchoConvergesWithItsGatewayRow() async throws {
+        let fx = try loadFixture("render_submit_stream")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        g.sessions.activeStoredId = fx.sessionID
+
+        _ = await g.chat.send(text: fx.submitText)
+        deliverAll(g, fx)
+        let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
+        await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
+
+        // The gateway has persisted the turn; the backfill snapshot carries the
+        // authoritative user + assistant rows under their WIRE ids — the echo's
+        // runtime id never matches them.
+        g.chat.backfillFetch = { _ in
+            [
+                StoredMessage(role: "user", content: .string(fx.submitText),
+                              timestamp: 1_700_000_100, wireId: 100),
+                StoredMessage(role: "assistant", content: .string(agentText),
+                              timestamp: 1_700_000_101, wireId: 101),
+            ]
+        }
+        await g.chat.backfill()
+
+        let promptBubbles = g.chat.messages.filter { $0.role == .user && $0.text == fx.submitText }
+        XCTAssertEqual(promptBubbles.count, 1,
+                       "the optimistic echo adopts its gateway row's content in place — exactly one prompt bubble")
+        XCTAssertTrue(g.chat.messages.contains { $0.text == agentText },
+                      "the authoritative reply renders")
+    }
+
+    /// QA-2 R3 residue — the session-switch recovery path: switching away and
+    /// back paints the FULL settled history from the cache INSTANTLY (the
+    /// owner's repair path for R15; QA-1 B2's cache-first phase 1). PIN: green
+    /// before and after the R15 fix — the cross-session cache paint replaces
+    /// (session isolation), and paints everything the cache holds with zero
+    /// relay frames.
+    func testSessionSwitchAwayAndBack_RestoresFullHistoryFromCache() async throws {
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+
+        // Session A: six settled rows painted from the cache.
+        _ = try await g.coordinator.open("render-A")
+        g.sessions.activeStoredId = "render-A"
+        let historyA: [(role: String, text: String)] = [
+            ("user", "qa1"), ("assistant", "aa1"),
+            ("user", "qa2"), ("assistant", "aa2"),
+            ("user", "qa3"), ("assistant", "aa3"),
+        ]
+        let storedA = storedHistory(historyA)
+        g.chat.seed(from: storedA)
+
+        // Away to B: the cross-session cache paint REPLACES (isolation) —
+        // exactly the phase-1 default policy.
+        _ = try await g.coordinator.open("render-B")
+        g.sessions.activeStoredId = "render-B"
+        g.chat.seed(from: storedHistory([("user", "qb1"), ("assistant", "ab1")]))
+        XCTAssertEqual(g.chat.messages.map(\.text), ["qb1", "ab1"])
+
+        // Back to A: the cache paint restores the FULL history immediately —
+        // no relay frames, no network round-trip in the loop.
+        _ = try await g.coordinator.open("render-A")
+        g.sessions.activeStoredId = "render-A"
+        g.chat.seed(from: storedA)
+        XCTAssertEqual(g.chat.messages.map(\.text), historyA.map(\.text),
+                       "switching back paints the entire cached transcript instantly (R3 residue / R15 recovery path)")
+    }
+
+    /// QA-2 R3 residue — the relay recovery backfill must run over the RELAY
+    /// transport (the gateway REST socket is idle/unreachable in relay mode —
+    /// a REST-only `backfill()` fails or hangs to the 15s timeout, so the
+    /// post-flap reconcile never lands). FAILS on qa2/base
+    /// (`resolvedBackfillFetch` resolves only `connection?.rest` — nil here →
+    /// the backfill no-ops and the snapshot never seeds).
+    func testBackfill_RelayTransportRunsOverRelayHistory() async throws {
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open("render-relay-backfill")
+        g.sessions.activeStoredId = "render-relay-backfill"
+
+        // The relay answers `history` with the gateway store rows (proxied
+        // verbatim — the same shape `rest_history` returns downstream).
+        g.transport.script = { upstream, relay in
+            guard let id = upstream.id else { return }
+            if upstream.method == "history" {
+                relay.deliverResult(id: id, result: .object([
+                    "session_id": .string("render-relay-backfill"),
+                    "messages": .array([
+                        .object(["role": .string("user"), "content": .string("rh-q1"),
+                                 "timestamp": .number(1_700_000_000), "id": .number(1)]),
+                        .object(["role": .string("assistant"), "content": .string("rh-a1"),
+                                 "timestamp": .number(1_700_000_001), "id": .number(2)]),
+                    ]),
+                ]))
+            } else {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+            }
+        }
+
+        // NO `backfillFetch` injection: the store must resolve the relay
+        // `history` RPC itself (the production relay wiring under test).
+        await g.chat.backfill()
+
+        let history = g.transport.upstreams().first { $0.method == "history" }
+        XCTAssertNotNil(history, "the recovery backfill must travel over the relay transport in relay mode")
+        XCTAssertEqual(history?.params["session_id"] as? String, "render-relay-backfill")
+        XCTAssertEqual(g.chat.messages.map(\.text), ["rh-q1", "rh-a1"],
+                       "the relay history rows seed the transcript over the up transport")
+    }
+
     /// PIN (green on qa1/base — B15 regression guard): a cold-open transcript
     /// paints from the cache with ZERO relay frames, and the relay render
     /// store never drives the initial paint. Force-close recovery must keep
