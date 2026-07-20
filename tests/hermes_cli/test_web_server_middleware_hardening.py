@@ -131,10 +131,20 @@ def _remove_test_routes() -> None:
 
 @pytest.fixture
 def isolated_app_state():
-    """Snapshot/restore app.state + global auth registries + test routes."""
+    """Snapshot/restore app.state + global auth registries + test routes.
+
+    Snapshots AND clears at setup: some dashboard-auth test files leak
+    ``bound_host`` / ``auth_required`` on the shared module app when the
+    whole directory runs in one process (the canonical runner uses a fresh
+    interpreter per file — scripts/run_tests_parallel.py — so this only
+    matters for combined in-process runs, but being immune costs nothing).
+    """
     prev_host = getattr(web_server.app.state, "bound_host", None)
     prev_port = getattr(web_server.app.state, "bound_port", None)
     prev_required = getattr(web_server.app.state, "auth_required", None)
+    for attr in ("bound_host", "bound_port", "auth_required"):
+        if hasattr(web_server.app.state, attr):
+            delattr(web_server.app.state, attr)
     clear_providers()
     token_auth.clear_token_routes()
     yield
@@ -676,6 +686,19 @@ class TestWsScopesNeverEnterAuthDispatch:
         return probe
 
     def test_ws_scope_never_reaches_auth_dispatch(self):
+        # The probe wires the REAL host_header_middleware, which reads
+        # bound_host off the module app; a value leaked by another file's
+        # combined run would 400 the probe's Host: testserver requests.
+        prev_host = getattr(web_server.app.state, "bound_host", None)
+        if hasattr(web_server.app.state, "bound_host"):
+            del web_server.app.state.bound_host
+        try:
+            self._run_probe_assertions()
+        finally:
+            if prev_host is not None:
+                web_server.app.state.bound_host = prev_host
+
+    def _run_probe_assertions(self):
         seen: list[str] = []
         probe = self._build_probe_app(seen)
         client = TestClient(probe)
