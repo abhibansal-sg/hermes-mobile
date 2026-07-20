@@ -330,22 +330,31 @@ final class QueueStore {
         storedSessionId: String? = nil,
         assets: [WorkAssetInput] = [],
         newSession: Bool = false,
-        wake: Bool = false
+        wake: Bool = false,
+        clientMessageID: String? = nil
     ) async -> QueuedPrompt? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !assets.isEmpty, let scope = scopeProvider() else { return nil }
         let outgoing = trimmed.isEmpty ? "Please look at the attached image." : trimmed
         do {
-            let job = try await repository.enqueue(
-                WorkJobInput(
-                    kind: .prompt,
-                    scope: scope,
-                    intentKind: newSession ? .newSession : nil,
-                    text: outgoing,
-                    storedSessionID: storedSessionId
-                ),
-                assets: assets
+            // QA-2 R11: when a send that ALREADY carried a `client_message_id`
+            // falls back into the outbox (an ambiguous relay failure — the RPC
+            // may have driven a turn whose receipt was lost to a socket flap),
+            // the row reuses that SAME id as its job id (the row's
+            // `client_message_id` IS its jobID). The drain then resubmits the
+            // original id and the relay's §5a dedup folds the retry into the
+            // existing turn — never a double-send.
+            var input = WorkJobInput(
+                kind: .prompt,
+                scope: scope,
+                intentKind: newSession ? .newSession : nil,
+                text: outgoing,
+                storedSessionID: storedSessionId
             )
+            if let clientMessageID, let reused = UUID(uuidString: clientMessageID) {
+                input.jobID = reused
+            }
+            let job = try await repository.enqueue(input, assets: assets)
             if wake { processor?.wake() }
             scheduleThresholdReevaluation()
             return QueuedPrompt(job: job)

@@ -2565,10 +2565,16 @@ final class ChatStore {
                 setStreaming(false, reason: "relay.sendError")
                 turnStartedAt = nil
                 if !hasAttachments, let queueStore {
+                    // Thread the ORIGINAL client message id into the outbox row
+                    // (its jobID): if this failure was an AMBIGUOUS transport
+                    // loss — the relay may already have driven the turn — the
+                    // drain resubmits the same id and the relay's §5a dedup
+                    // folds it into one turn (never a double-send).
                     if let queued = await queueStore.enqueue(
                         trimmed,
                         storedSessionId: sessions?.activeStoredId,
-                        wake: false
+                        wake: false,
+                        clientMessageID: clientMessageID
                     ) {
                         presentOutboxEcho(
                             clientMessageID: queued.clientMessageID,
