@@ -172,6 +172,15 @@ final class WireConformanceTests: XCTestCase {
         _ = try await client.clarify(sessionID: "sess-1", requestID: "clr-1", response: "staging")
         _ = try await client.interrupt("sess-1")
         await client.setForeground("sess-1")
+        // §6a (QA-1 B14): relay-local push token registry RPCs.
+        _ = try await client.registerPushToken(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            env: "production",
+            events: ["approval", "turn_complete"]
+        )
+        _ = try await client.unregisterPushToken(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
 
         // ack needs an advanced watermark; resync reads it. Deliver one frame so
         // the client's store folds seq 1, then flush the ack.
