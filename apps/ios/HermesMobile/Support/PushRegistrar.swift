@@ -249,10 +249,13 @@ final class PushRegistrar {
         }
 
         let registerToken: @MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome
-        if let tokenRegisterOverride {
-            registerToken = tokenRegisterOverride
-        } else if let relayRegister = makeRelayRegisterClosure() {
+        // Relay mode OWNS registration (§6a): the relay branch wins over the
+        // direct-path seams so a relay-mode token can never leak onto the
+        // gateway REST poster (the registry the relay Notifier never reads).
+        if let relayRegister = makeRelayRegisterClosure() {
             registerToken = relayRegister
+        } else if let tokenRegisterOverride {
+            registerToken = tokenRegisterOverride
         } else {
             guard let poster = makePoster() else { return }  // not configured yet
             registerToken = { token, events in
@@ -334,10 +337,10 @@ final class PushRegistrar {
             return
         }
         let registerToken: @MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome
-        if let tokenRegisterOverride {
-            registerToken = tokenRegisterOverride
-        } else if let relayRegister = makeRelayRegisterClosure() {
+        if let relayRegister = makeRelayRegisterClosure() {
             registerToken = relayRegister
+        } else if let tokenRegisterOverride {
+            registerToken = tokenRegisterOverride
         } else {
             guard let poster = makePoster() else { return }
             registerToken = { token, events in
