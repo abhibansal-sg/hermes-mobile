@@ -1,1060 +1,1060 @@
 {
- "$comment": "SINGLE SOURCE OF TRUTH for the Hermes mobile relay wire contract (docs/RELAY-PHONE-PROTOCOL.md). Consumed key-for-key by BOTH the pytest side (tests/conformance/test_*.py, which also re-extracts the real surface from the Swift + Python sources and fails on ANY drift) and the XCTest side (apps/ios/HermesMobileTests/WireConformanceTests.swift, bundled via project.yml). A2/N1 of docs/DAILY-DRIVER-SPEC.md: the prompt/text, decision/choice, text/answer bug class is structurally impossible when this file, the Swift sources, and the relay sources all agree.",
- "version": 1,
- "upstream": {
-  "envelope": {
-   "request": [
-    "jsonrpc",
-    "id",
-    "method",
-    "params"
-   ],
-   "notification": [
-    "jsonrpc",
-    "method",
-    "params"
-   ]
-  },
-  "notifications": [
-   "ack",
-   "resync",
-   "foreground"
-  ],
-  "payloads": {
-   "submit": {
-    "kind": "request",
-    "ios_sends": {
-     "required": [
-      "prompt"
-     ],
-     "optional": [
-      "session_id",
-      "client_message_id"
-     ]
-    },
-    "relay_reads": {
-     "required": [],
-     "optional": [
-      "prompt",
-      "text",
-      "session_id",
-      "client_message_id",
-      "title",
-      "model",
-      "provider"
-     ]
-    },
-    "aliases": [
-     [
-      "prompt",
-      "text"
-     ]
-    ],
-    "example": {
-     "prompt": "Hello from the phone",
-     "session_id": "sess-1",
-     "client_message_id": "cmid-1"
-    },
-    "expect_gateway": [
-     {
-      "rpc": "session.resume",
-      "params_include": {
-       "session_id": "sess-1"
-      }
-     },
-     {
-      "rpc": "prompt.submit",
-      "params": {
-       "session_id": "sess-1",
-       "text": "Hello from the phone"
-      }
-     }
-    ]
-   },
-   "resume": {
-    "kind": "request",
-    "ios_sends": {
-     "required": [
-      "session_id"
-     ],
-     "optional": []
-    },
-    "relay_reads": {
-     "required": [
-      "session_id"
-     ],
-     "optional": []
-    },
-    "aliases": [],
-    "example": {
-     "session_id": "sess-1"
-    },
-    "expect_gateway": [
-     {
-      "rpc": "session.resume",
-      "params_include": {
-       "session_id": "sess-1"
-      }
-     }
-    ]
-   },
-   "open": {
-    "kind": "request",
-    "ios_sends": {
-     "required": [
-      "session_id"
-     ],
-     "optional": []
-    },
-    "relay_reads": {
-     "required": [
-      "session_id"
-     ],
-     "optional": []
-    },
-    "aliases": [],
-    "example": {
-     "session_id": "sess-1"
-    },
-    "expect_gateway": [
-     {
-      "rpc": "rest_history",
-      "params_include": {
-       "session_id": "sess-1"
-      }
-     }
-    ]
-   },
-   "list": {
-    "kind": "request",
-    "ios_sends": {
-     "required": [],
-     "optional": []
-    },
-    "relay_reads": {
-     "required": [],
-     "optional": [
-      "limit"
-     ]
-    },
-    "aliases": [],
-    "example": {},
-    "expect_gateway": [
-     {
-      "rpc": "session.list",
-      "params_include": {}
-     }
-    ]
-   },
-   "history": {
-    "kind": "request",
-    "ios_sends": {
-     "required": [
-      "session_id"
-     ],
-     "optional": [
-      "limit"
-     ]
-    },
-    "relay_reads": {
-     "required": [
-      "session_id"
-     ],
-     "optional": [
-      "limit"
-     ]
-    },
-    "aliases": [],
-    "example": {
-     "session_id": "sess-1",
-     "limit": 50
-    },
-    "expect_gateway": [
-     {
-      "rpc": "rest_history",
-      "params_include": {
-       "session_id": "sess-1"
-      }
-     }
-    ],
-    "expect_result": {
-     "messages_tail": 50
-    }
-   },
-   "approve": {
-    "kind": "request",
-    "$comment": "Protocol §5: the phone sends session_id + decision (once/session/always/deny/approve); the relay maps decision -> the gateway's `choice` param. Sending `approved`/omitting session_id here is the silent-DENY bug class — the relay reads p[\"session_id\"] and p[\"decision\"].",
-    "ios_sends": {
-     "required": [
-      "session_id",
-      "decision"
-     ],
-     "optional": [
-      "request_id",
-      "all"
-     ]
-    },
-    "relay_reads": {
-     "required": [
-      "session_id",
-      "decision"
-     ],
-     "optional": [
-      "request_id",
-      "all"
-     ]
-    },
-    "aliases": [],
-    "example": {
-     "session_id": "sess-1",
-     "request_id": "req-1",
-     "decision": "approve"
-    },
-    "expect_gateway": [
-     {
-      "rpc": "approval.respond",
-      "params": {
-       "session_id": "sess-1",
-       "request_id": "req-1",
-       "choice": "approve",
-       "all": false
-      }
-     }
-    ]
-   },
-   "attach": {
-    "kind": "request",
-    "$comment": "Protocol §5 (B9/A5): REST-free attach — the phone inlines the bytes as a data: URL; the relay routes by `kind` onto the gateway's base64 RPCs (file.attach / image.attach_bytes), resolves the session like SUBMIT (absent -> session.create; foreign -> session.resume adopting the live id) and merges session_id into the result. Relay-only phones cannot make the POST /api/upload REST round-trip — that gap hid the composer '+' (B9).",
-    "ios_sends": {
-     "required": [
-      "data_url",
-      "kind"
-     ],
-     "optional": [
-      "name",
-      "session_id"
-     ]
-    },
-    "relay_reads": {
-     "required": [],
-     "optional": [
-      "data_url",
-      "kind",
-      "name",
-      "session_id",
-      "title"
-     ]
-    },
-    "aliases": [],
-    "example": {
-     "session_id": "sess-1",
-     "kind": "file",
-     "name": "notes.txt",
-     "data_url": "data:text/plain;base64,aGVybWVz"
-    },
-    "expect_gateway": [
-     {
-      "rpc": "session.resume",
-      "params": {
-       "session_id": "sess-1"
-      }
-     },
-     {
-      "rpc": "file.attach",
-      "params": {
-       "session_id": "sess-1",
-       "name": "notes.txt",
-       "data_url": "data:text/plain;base64,aGVybWVz"
-      }
-     }
-    ]
-   },
-   "clarify": {
-    "kind": "request",
-    "$comment": "Protocol §5: the phone sends session_id + text; the relay maps text -> the gateway's `answer` param (the gateway stores params[\"answer\"], matched by request_id). Sending `response`/omitting text is the EMPTY-ANSWER bug class.",
-    "ios_sends": {
-     "required": [
-      "session_id",
-      "text"
-     ],
-     "optional": [
-      "request_id"
-     ]
-    },
-    "relay_reads": {
-     "required": [
-      "session_id",
-      "text"
-     ],
-     "optional": [
-      "request_id"
-     ]
-    },
-    "aliases": [],
-    "example": {
-     "session_id": "sess-1",
-     "request_id": "clr-1",
-     "text": "staging"
-    },
-    "expect_gateway": [
-     {
-      "rpc": "clarify.respond",
-      "params": {
-       "session_id": "sess-1",
-       "request_id": "clr-1",
-       "answer": "staging"
-      }
-     }
-    ]
-   },
-   "interrupt": {
-    "kind": "request",
-    "ios_sends": {
-     "required": [
-      "session_id"
-     ],
-     "optional": []
-    },
-    "relay_reads": {
-     "required": [
-      "session_id"
-     ],
-     "optional": []
-    },
-    "aliases": [],
-    "example": {
-     "session_id": "sess-1"
-    },
-    "expect_gateway": [
-     {
-      "rpc": "session.interrupt",
-      "params_include": {
-       "session_id": "sess-1"
-      }
-     }
-    ]
-   },
-   "ack": {
-    "kind": "notification",
-    "ios_sends": {
-     "required": [
-      "through"
-     ],
-     "optional": []
-    },
-    "relay_reads": {
-     "required": [],
-     "optional": [
-      "through"
-     ]
-    },
-    "aliases": [],
-    "example": {
-     "through": 7
-    },
-    "expect_gateway": []
-   },
-   "resync": {
-    "kind": "notification",
-    "ios_sends": {
-     "required": [
-      "last_seq"
-     ],
-     "optional": []
-    },
-    "relay_reads": {
-     "required": [],
-     "optional": [
-      "last_seq"
-     ]
-    },
-    "aliases": [],
-    "example": {
-     "last_seq": 0
-    },
-    "expect_gateway": []
-   },
-   "foreground": {
-    "kind": "notification",
-    "$comment": "session_id is REQUIRED as a key but its VALUE is nullable (null clears the foreground set, §6).",
-    "ios_sends": {
-     "required": [
-      "session_id"
-     ],
-     "optional": [],
-     "nullable": [
-      "session_id"
-     ]
-    },
-    "relay_reads": {
-     "required": [],
-     "optional": [
-      "session_id"
-     ]
-    },
-    "aliases": [],
-    "example": {
-     "session_id": "sess-1"
-    },
-    "expect_gateway": []
-   },
-   "push.register": {
-    "$comment": "Relay-local (protocol §6a, QA-1 B14): writes the relay's OWN push registry — the one the Notifier reads. Never hops the gateway; works while the gateway is NOT ready (phone reconnects first).",
-    "kind": "request",
-    "aliases": [],
-    "example": {
-     "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-     "platform": "ios",
-     "env": "production",
-     "events": [
-      "approval",
-      "turn_complete"
-     ]
-    },
-    "expect_gateway": [],
-    "ios_sends": {
-     "required": [
-      "env",
-      "platform",
-      "token"
-     ],
-     "optional": [
-      "events"
-     ]
-    },
-    "relay_reads": {
-     "required": [],
-     "optional": [
-      "device_id",
-      "env",
-      "events",
-      "platform",
-      "token"
-     ]
-    }
-   },
-   "push.unregister": {
-    "$comment": "Relay-local (protocol §6a, QA-1 B14): removes the token from the relay's push registry (Settings opt-out). Never hops the gateway.",
-    "kind": "request",
-    "aliases": [],
-    "example": {
-     "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    },
-    "expect_gateway": [],
-    "ios_sends": {
-     "required": [
-      "token"
-     ],
-     "optional": []
-    },
-    "relay_reads": {
-     "required": [],
-     "optional": [
-      "token"
-     ]
-    }
-   },
-   "steer": {
-    "kind": "request",
-    "$comment": "Protocol §5 (QA-2 R11): live-turn steering over the relay. The phone sends session_id + text; the relay passes them to the gateway's session.steer, which returns {status: queued|rejected, text} — passed through verbatim so the phone maps the disposition identically to the gateway-direct path. Before this method existed the phone's steer went over the IDLE gateway-direct socket in relay mode and every attempt failed with 'Not connected'.",
-    "ios_sends": {
-     "required": [
-      "session_id",
-      "text"
-     ],
-     "optional": []
-    },
-    "relay_reads": {
-     "required": [
-      "session_id"
-     ],
-     "optional": [
-      "text"
-     ]
-    },
-    "aliases": [],
-    "example": {
-     "session_id": "sess-1",
-     "text": "also check the staging env"
-    },
-    "expect_gateway": [
-     {
-      "rpc": "session.steer",
-      "params": {
-       "session_id": "sess-1",
-       "text": "also check the staging env"
-      }
-     }
-    ]
-   }
-  }
- },
- "downstream": {
-  "envelope": [
-   "seq",
-   "sid",
-   "turn",
-   "kind",
-   "body"
-  ],
-  "envelope_optional": [
-   "turn"
-  ],
-  "kinds": [
-   "item.started",
-   "item.delta",
-   "item.completed",
-   "turn.started",
-   "turn.completed",
-   "approval.request",
-   "clarify.request",
-   "status",
-   "title",
-   "snapshot"
-  ],
-  "item_shape": {
-   "required": [
-    "item_id",
-    "type"
-   ],
-   "optional": [
-    "status",
-    "ord",
-    "summary",
-    "body"
-   ]
-  },
-  "item_statuses": [
-   "in_progress",
-   "completed",
-   "failed"
-  ],
-  "item_types": {
-   "$comment": "relay_all = relay ItemType.ALL (the types the reframer can emit). ios_native = ChatItemType raw values (decoded natively). generic_fold = relay types iOS intentionally folds to the generic toolCall card (§2 forward-compat rule). When a fold entry gains a native iOS case (e.g. N4 taskList), move it to ios_native and drop it here — the suite fails until the fixture matches the sources either way.",
-   "relay_all": [
-    "userMessage",
-    "agentMessage",
-    "reasoning",
-    "toolCall",
-    "taskList",
-    "fileChange",
-    "image",
-    "browser",
-    "error",
-    "usage"
-   ],
-   "ios_native": [
-    "userMessage",
-    "agentMessage",
-    "reasoning",
-    "toolCall",
-    "taskList",
-    "fileChange",
-    "image",
-    "browser",
-    "error",
-    "usage"
-   ],
-   "generic_fold": []
-  },
-  "body_contract": {
-   "item.started": {
-    "item_frame": true
-   },
-   "item.completed": {
-    "item_frame": true
-   },
-   "item.delta": {
-    "required": [
-     "item_id"
-    ],
-    "optional": [
-     "patch"
-    ],
-    "closed": true
-   },
-   "turn.started": {
-    "required": [],
-    "optional": [],
-    "closed": true
-   },
-   "turn.completed": {
-    "required": [],
-    "optional": [
-     "usage"
-    ],
-    "closed": true
-   },
-   "approval.request": {
-    "passthrough": true,
-    "guaranteed": [
-     "command",
-     "description"
-    ],
-    "reply_rpc": "approve",
-    "reply_identity": "envelope.sid",
-    "ios_reads": [
-     "approval_id",
-     "id",
-     "request_id",
-     "command",
-     "pattern_key",
-     "description",
-     "action",
-     "target",
-     "title",
-     "approval_title"
-    ]
-   },
-   "clarify.request": {
-    "passthrough": true,
-    "guaranteed": [
-     "request_id",
-     "question",
-     "choices"
-    ],
-    "reply_rpc": "clarify",
-    "reply_identity": "body.request_id",
-    "ios_reads": [
-     "question",
-     "choices",
-     "request_id"
-    ]
-   },
-   "status": {
-    "required": [
-     "kind",
-     "text"
-    ],
-    "optional": [],
-    "closed": true
-   },
-   "title": {
-    "required": [
-     "title"
-    ],
-    "optional": [],
-    "closed": true
-   },
-   "snapshot": {
-    "required": [
-     "items"
-    ],
-    "optional": [
-     "cursor"
-    ],
-    "closed": true
-   }
-  },
-  "samples": [
-   {
-    "name": "item.started.agentMessage",
-    "frame": {
-     "seq": 1,
-     "sid": "sess-1",
-     "turn": "sess-1:t1",
-     "kind": "item.started",
-     "body": {
-      "item_id": "sess-1:i1",
-      "type": "agentMessage",
-      "status": "in_progress",
-      "ord": 0,
-      "summary": "",
-      "body": {
-       "text": ""
-      }
-     }
-    }
-   },
-   {
-    "name": "item.delta.text",
-    "frame": {
-     "seq": 2,
-     "sid": "sess-1",
-     "turn": "sess-1:t1",
-     "kind": "item.delta",
-     "body": {
-      "item_id": "sess-1:i1",
-      "patch": {
-       "text": "Hello"
-      }
-     }
-    }
-   },
-   {
-    "name": "item.completed.agentMessage",
-    "frame": {
-     "seq": 3,
-     "sid": "sess-1",
-     "turn": "sess-1:t1",
-     "kind": "item.completed",
-     "body": {
-      "item_id": "sess-1:i1",
-      "type": "agentMessage",
-      "status": "completed",
-      "ord": 0,
-      "summary": "Hello there",
-      "body": {
-       "text": "Hello there"
-      }
-     }
-    }
-   },
-   {
-    "name": "item.completed.taskList.native",
-    "$comment": "taskList is emitted by the relay and decoded natively since N4 (ChatItemType.taskList → TaskListItemView/dock bridge). generic_fold is now empty; the §2 forward-compat rule (unknown type → toolCall card) still holds for future relay types. XCTest asserts the fold matches item_types.generic_fold.",
-    "frame": {
-     "seq": 4,
-     "sid": "sess-1",
-     "turn": "sess-1:t1",
-     "kind": "item.completed",
-     "body": {
-      "item_id": "sess-1:tasks",
-      "type": "taskList",
-      "status": "completed",
-      "ord": 1,
-      "summary": "Tasks 2/2",
-      "body": {
-       "tasks": [
-        {
-         "id": "t1",
-         "text": "First",
-         "status": "completed"
-        },
-        {
-         "id": "t2",
-         "text": "Second",
-         "status": "completed"
-        }
-       ],
-       "counts": {
-        "total": 2,
-        "pending": 0,
-        "in_progress": 0,
-        "completed": 2,
-        "cancelled": 0
-       },
-       "all_complete": true
-      }
-     }
-    }
-   },
-   {
-    "name": "item.completed.usage",
-    "frame": {
-     "seq": 5,
-     "sid": "sess-1",
-     "turn": "sess-1:t1",
-     "kind": "item.completed",
-     "body": {
-      "item_id": "sess-1:i2",
-      "type": "usage",
-      "status": "completed",
-      "ord": 2,
-      "summary": "15 tokens",
-      "body": {
-       "input": 10,
-       "output": 5,
-       "total": 15
-      }
-     }
-    }
-   },
-   {
-    "name": "turn.started",
-    "frame": {
-     "seq": 6,
-     "sid": "sess-1",
-     "turn": "sess-1:t1",
-     "kind": "turn.started",
-     "body": {}
-    }
-   },
-   {
-    "name": "turn.completed.usage",
-    "frame": {
-     "seq": 7,
-     "sid": "sess-1",
-     "turn": "sess-1:t1",
-     "kind": "turn.completed",
-     "body": {
-      "usage": {
-       "input": 10,
-       "output": 5,
-       "total": 15
-      }
-     }
-    }
-   },
-   {
-    "name": "approval.request",
-    "frame": {
-     "seq": 8,
-     "sid": "sess-1",
-     "turn": "sess-1:t1",
-     "kind": "approval.request",
-     "body": {
-      "command": "git push origin main",
-      "description": "Push the release branch",
-      "pattern_keys": [
-       "git_push"
+  "$comment": "SINGLE SOURCE OF TRUTH for the Hermes mobile relay wire contract (docs/RELAY-PHONE-PROTOCOL.md). Consumed key-for-key by BOTH the pytest side (tests/conformance/test_*.py, which also re-extracts the real surface from the Swift + Python sources and fails on ANY drift) and the XCTest side (apps/ios/HermesMobileTests/WireConformanceTests.swift, bundled via project.yml). A2/N1 of docs/DAILY-DRIVER-SPEC.md: the prompt/text, decision/choice, text/answer bug class is structurally impossible when this file, the Swift sources, and the relay sources all agree.",
+  "version": 1,
+  "upstream": {
+    "envelope": {
+      "request": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "notification": [
+        "jsonrpc",
+        "method",
+        "params"
       ]
-     }
-    }
-   },
-   {
-    "name": "clarify.request",
-    "frame": {
-     "seq": 9,
-     "sid": "sess-1",
-     "turn": "sess-1:t1",
-     "kind": "clarify.request",
-     "body": {
-      "question": "Which environment?",
-      "choices": [
-       "staging",
-       "production"
-      ],
-      "request_id": "clr-1",
-      "created_at": 1750000000.0,
-      "expires_at": 1750000300.0,
-      "status": "pending",
-      "revision": 1
-     }
-    }
-   },
-   {
-    "name": "status.thinking",
-    "frame": {
-     "seq": 10,
-     "sid": "sess-1",
-     "turn": "sess-1:t1",
-     "kind": "status",
-     "body": {
-      "kind": "thinking",
-      "text": "Formulating…"
-     }
-    }
-   },
-   {
-    "name": "title",
-    "frame": {
-     "seq": 11,
-     "sid": "sess-1",
-     "turn": null,
-     "kind": "title",
-     "body": {
-      "title": "Release planning"
-     }
-    }
-   },
-   {
-    "name": "snapshot",
-    "frame": {
-     "seq": 12,
-     "sid": "sess-1",
-     "turn": null,
-     "kind": "snapshot",
-     "body": {
-      "items": [
-       {
-        "item_id": "sess-1:i1",
-        "type": "agentMessage",
-        "status": "completed",
-        "ord": 0,
-        "summary": "Hello there",
-        "body": {
-         "text": "Hello there"
+    },
+    "notifications": [
+      "ack",
+      "resync",
+      "foreground"
+    ],
+    "payloads": {
+      "submit": {
+        "kind": "request",
+        "ios_sends": {
+          "required": [
+            "prompt"
+          ],
+          "optional": [
+            "session_id",
+            "client_message_id"
+          ]
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "prompt",
+            "text",
+            "session_id",
+            "client_message_id",
+            "title",
+            "model",
+            "provider"
+          ]
+        },
+        "aliases": [
+          [
+            "prompt",
+            "text"
+          ]
+        ],
+        "example": {
+          "prompt": "Hello from the phone",
+          "session_id": "sess-1",
+          "client_message_id": "cmid-1"
+        },
+        "expect_gateway": [
+          {
+            "rpc": "session.resume",
+            "params_include": {
+              "session_id": "sess-1"
+            }
+          },
+          {
+            "rpc": "prompt.submit",
+            "params": {
+              "session_id": "sess-1",
+              "text": "Hello from the phone"
+            }
+          }
+        ]
+      },
+      "resume": {
+        "kind": "request",
+        "ios_sends": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
+        "aliases": [],
+        "example": {
+          "session_id": "sess-1"
+        },
+        "expect_gateway": [
+          {
+            "rpc": "session.resume",
+            "params_include": {
+              "session_id": "sess-1"
+            }
+          }
+        ]
+      },
+      "open": {
+        "kind": "request",
+        "ios_sends": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
+        "aliases": [],
+        "example": {
+          "session_id": "sess-1"
+        },
+        "expect_gateway": [
+          {
+            "rpc": "rest_history",
+            "params_include": {
+              "session_id": "sess-1"
+            }
+          }
+        ]
+      },
+      "list": {
+        "kind": "request",
+        "ios_sends": {
+          "required": [],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "limit"
+          ]
+        },
+        "aliases": [],
+        "example": {},
+        "expect_gateway": [
+          {
+            "rpc": "session.list",
+            "params_include": {}
+          }
+        ]
+      },
+      "history": {
+        "kind": "request",
+        "ios_sends": {
+          "required": [
+            "session_id"
+          ],
+          "optional": [
+            "limit"
+          ]
+        },
+        "relay_reads": {
+          "required": [
+            "session_id"
+          ],
+          "optional": [
+            "limit"
+          ]
+        },
+        "aliases": [],
+        "example": {
+          "session_id": "sess-1",
+          "limit": 50
+        },
+        "expect_gateway": [
+          {
+            "rpc": "rest_history",
+            "params_include": {
+              "session_id": "sess-1"
+            }
+          }
+        ],
+        "expect_result": {
+          "messages_tail": 50
         }
-       }
-      ],
-      "cursor": 12
-     }
+      },
+      "approve": {
+        "kind": "request",
+        "$comment": "Protocol §5: the phone sends session_id + decision (once/session/always/deny/approve); the relay maps decision -> the gateway's `choice` param. Sending `approved`/omitting session_id here is the silent-DENY bug class — the relay reads p[\"session_id\"] and p[\"decision\"].",
+        "ios_sends": {
+          "required": [
+            "session_id",
+            "decision"
+          ],
+          "optional": [
+            "request_id",
+            "all"
+          ]
+        },
+        "relay_reads": {
+          "required": [
+            "session_id",
+            "decision"
+          ],
+          "optional": [
+            "request_id",
+            "all"
+          ]
+        },
+        "aliases": [],
+        "example": {
+          "session_id": "sess-1",
+          "request_id": "req-1",
+          "decision": "approve"
+        },
+        "expect_gateway": [
+          {
+            "rpc": "approval.respond",
+            "params": {
+              "session_id": "sess-1",
+              "request_id": "req-1",
+              "choice": "approve",
+              "all": false
+            }
+          }
+        ]
+      },
+      "attach": {
+        "kind": "request",
+        "$comment": "Protocol §5 (B9/A5): REST-free attach — the phone inlines the bytes as a data: URL; the relay routes by `kind` onto the gateway's base64 RPCs (file.attach / image.attach_bytes), resolves the session like SUBMIT (absent -> session.create; foreign -> session.resume adopting the live id) and merges session_id into the result. Relay-only phones cannot make the POST /api/upload REST round-trip — that gap hid the composer '+' (B9).",
+        "ios_sends": {
+          "required": [
+            "data_url",
+            "kind"
+          ],
+          "optional": [
+            "name",
+            "session_id"
+          ]
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "data_url",
+            "kind",
+            "name",
+            "session_id",
+            "title"
+          ]
+        },
+        "aliases": [],
+        "example": {
+          "session_id": "sess-1",
+          "kind": "file",
+          "name": "notes.txt",
+          "data_url": "data:text/plain;base64,aGVybWVz"
+        },
+        "expect_gateway": [
+          {
+            "rpc": "session.resume",
+            "params": {
+              "session_id": "sess-1"
+            }
+          },
+          {
+            "rpc": "file.attach",
+            "params": {
+              "session_id": "sess-1",
+              "name": "notes.txt",
+              "data_url": "data:text/plain;base64,aGVybWVz"
+            }
+          }
+        ]
+      },
+      "clarify": {
+        "kind": "request",
+        "$comment": "Protocol §5: the phone sends session_id + text; the relay maps text -> the gateway's `answer` param (the gateway stores params[\"answer\"], matched by request_id). Sending `response`/omitting text is the EMPTY-ANSWER bug class.",
+        "ios_sends": {
+          "required": [
+            "session_id",
+            "text"
+          ],
+          "optional": [
+            "request_id"
+          ]
+        },
+        "relay_reads": {
+          "required": [
+            "session_id",
+            "text"
+          ],
+          "optional": [
+            "request_id"
+          ]
+        },
+        "aliases": [],
+        "example": {
+          "session_id": "sess-1",
+          "request_id": "clr-1",
+          "text": "staging"
+        },
+        "expect_gateway": [
+          {
+            "rpc": "clarify.respond",
+            "params": {
+              "session_id": "sess-1",
+              "request_id": "clr-1",
+              "answer": "staging"
+            }
+          }
+        ]
+      },
+      "interrupt": {
+        "kind": "request",
+        "ios_sends": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
+        "aliases": [],
+        "example": {
+          "session_id": "sess-1"
+        },
+        "expect_gateway": [
+          {
+            "rpc": "session.interrupt",
+            "params_include": {
+              "session_id": "sess-1"
+            }
+          }
+        ]
+      },
+      "ack": {
+        "kind": "notification",
+        "ios_sends": {
+          "required": [
+            "through"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "through"
+          ]
+        },
+        "aliases": [],
+        "example": {
+          "through": 7
+        },
+        "expect_gateway": []
+      },
+      "resync": {
+        "kind": "notification",
+        "ios_sends": {
+          "required": [
+            "last_seq"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "last_seq"
+          ]
+        },
+        "aliases": [],
+        "example": {
+          "last_seq": 0
+        },
+        "expect_gateway": []
+      },
+      "foreground": {
+        "kind": "notification",
+        "$comment": "session_id is REQUIRED as a key but its VALUE is nullable (null clears the foreground set, §6).",
+        "ios_sends": {
+          "required": [
+            "session_id"
+          ],
+          "optional": [],
+          "nullable": [
+            "session_id"
+          ]
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "session_id"
+          ]
+        },
+        "aliases": [],
+        "example": {
+          "session_id": "sess-1"
+        },
+        "expect_gateway": []
+      },
+      "push.register": {
+        "$comment": "Relay-local (protocol §6a, QA-1 B14): writes the relay's OWN push registry — the one the Notifier reads. Never hops the gateway; works while the gateway is NOT ready (phone reconnects first).",
+        "kind": "request",
+        "aliases": [],
+        "example": {
+          "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "platform": "ios",
+          "env": "production",
+          "events": [
+            "approval",
+            "turn_complete"
+          ]
+        },
+        "expect_gateway": [],
+        "ios_sends": {
+          "required": [
+            "env",
+            "platform",
+            "token"
+          ],
+          "optional": [
+            "events"
+          ]
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "device_id",
+            "env",
+            "events",
+            "platform",
+            "token"
+          ]
+        }
+      },
+      "push.unregister": {
+        "$comment": "Relay-local (protocol §6a, QA-1 B14): removes the token from the relay's push registry (Settings opt-out). Never hops the gateway.",
+        "kind": "request",
+        "aliases": [],
+        "example": {
+          "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "expect_gateway": [],
+        "ios_sends": {
+          "required": [
+            "token"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "token"
+          ]
+        }
+      },
+      "steer": {
+        "kind": "request",
+        "$comment": "Protocol §5 (QA-2 R11): live-turn steering over the relay. The phone sends session_id + text; the relay passes them to the gateway's session.steer, which returns {status: queued|rejected, text} — passed through verbatim so the phone maps the disposition identically to the gateway-direct path. Before this method existed the phone's steer went over the IDLE gateway-direct socket in relay mode and every attempt failed with 'Not connected'.",
+        "ios_sends": {
+          "required": [
+            "session_id",
+            "text"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [
+            "session_id"
+          ],
+          "optional": [
+            "text"
+          ]
+        },
+        "aliases": [],
+        "example": {
+          "session_id": "sess-1",
+          "text": "also check the staging env"
+        },
+        "expect_gateway": [
+          {
+            "rpc": "session.steer",
+            "params": {
+              "session_id": "sess-1",
+              "text": "also check the staging env"
+            }
+          }
+        ]
+      }
     }
-   },
-   {
-    "name": "status.heartbeat.connectionScoped",
-    "$comment": "Connection-scoped frame: `turn` legitimately absent-but-null (iOS decodes it optional).",
-    "frame": {
-     "seq": 13,
-     "sid": "",
-     "turn": null,
-     "kind": "status",
-     "body": {
-      "kind": "heartbeat",
-      "text": ""
-     }
-    }
-   }
-  ]
- },
- "gateway": {
-  "$comment": "The relay -> gateway edge (gateway_client.py senders vs tui_gateway/server.py readers). Ground truth is the in-repo gateway source. This edge is where decision/choice and text/answer mismatches silently broke approvals and clarify answers.",
-  "rpcs": {
-   "prompt.submit": {
-    "relay_sends": {
-     "required": [
-      "session_id",
-      "text"
-     ],
-     "optional": []
-    },
-    "gateway_reads": {
-     "required": [],
-     "optional": [
-      "session_id",
-      "text",
-      "truncate_before_user_ordinal"
-     ]
-    }
-   },
-   "approval.respond": {
-    "$comment": "The gateway defaults choice to DENY when absent — a relay that sends `decision` instead of `choice` silently denies every approval. request_id is a declared forward-compat extra: the gateway resolves approvals by SESSION key and ignores it (gateway_client.py keeps it for logging); it must never be an effective key.",
-    "relay_sends": {
-     "required": [
-      "session_id",
-      "request_id",
-      "choice",
-      "all"
-     ],
-     "optional": []
-    },
-    "gateway_reads": {
-     "required": [],
-     "optional": [
-      "session_id",
-      "choice",
-      "all"
-     ],
-     "defaults": {
-      "choice": "deny",
-      "all": false
-     }
-    },
-    "accepted_unread": [
-     "request_id"
-    ]
-   },
-   "clarify.respond": {
-    "$comment": "The gateway matches the pending waiter by request_id and stores params[\"answer\"] — a relay that sends `text` delivers an EMPTY answer. session_id is a declared symmetry extra: the gateway resolves clarify by request_id only.",
-    "relay_sends": {
-     "required": [
-      "session_id",
-      "request_id",
-      "answer"
-     ],
-     "optional": []
-    },
-    "gateway_reads": {
-     "required": [],
-     "optional": [
-      "request_id",
-      "answer"
-     ]
-    },
-    "accepted_unread": [
-     "session_id"
-    ]
-   },
-   "session.list": {
-    "relay_sends": {
-     "required": [
-      "limit"
-     ],
-     "optional": []
-    },
-    "gateway_reads": {
-     "required": [],
-     "optional": [
-      "limit"
-     ]
-    }
-   },
-   "session.create": {
-    "relay_sends": {
-     "required": [
+  },
+  "downstream": {
+    "envelope": [
+      "seq",
+      "sid",
+      "turn",
+      "kind",
+      "body"
+    ],
+    "envelope_optional": [
+      "turn"
+    ],
+    "kinds": [
+      "item.started",
+      "item.delta",
+      "item.completed",
+      "turn.started",
+      "turn.completed",
+      "approval.request",
+      "clarify.request",
+      "status",
       "title",
-      "cols",
-      "source"
-     ],
-     "optional": [
-      "model",
-      "provider"
-     ]
+      "snapshot"
+    ],
+    "item_shape": {
+      "required": [
+        "item_id",
+        "type"
+      ],
+      "optional": [
+        "status",
+        "ord",
+        "summary",
+        "body"
+      ]
     },
-    "gateway_reads": {
-     "required": [],
-     "optional": [
-      "close_on_disconnect",
-      "cols",
-      "cwd",
-      "fast",
-      "messages",
-      "model",
-      "parent_session_id",
-      "profile",
-      "provider",
-      "reasoning_effort",
-      "source",
-      "title"
-     ]
-    }
-   },
-   "session.resume": {
-    "relay_sends": {
-     "required": [
-      "session_id",
-      "cols",
-      "source"
-     ],
-     "optional": []
+    "item_statuses": [
+      "in_progress",
+      "completed",
+      "failed"
+    ],
+    "item_types": {
+      "$comment": "relay_all = relay ItemType.ALL (the types the reframer can emit). ios_native = ChatItemType raw values (decoded natively). generic_fold = relay types iOS intentionally folds to the generic toolCall card (§2 forward-compat rule). When a fold entry gains a native iOS case (e.g. N4 taskList), move it to ios_native and drop it here — the suite fails until the fixture matches the sources either way.",
+      "relay_all": [
+        "userMessage",
+        "agentMessage",
+        "reasoning",
+        "toolCall",
+        "taskList",
+        "fileChange",
+        "image",
+        "browser",
+        "error",
+        "usage"
+      ],
+      "ios_native": [
+        "userMessage",
+        "agentMessage",
+        "reasoning",
+        "toolCall",
+        "taskList",
+        "fileChange",
+        "image",
+        "browser",
+        "error",
+        "usage"
+      ],
+      "generic_fold": []
     },
-    "gateway_reads": {
-     "required": [],
-     "optional": [
-      "close_on_disconnect",
-      "cols",
-      "eager_build",
-      "lazy",
-      "profile",
-      "session_id",
-      "source"
-     ]
-    }
-   },
-   "session.interrupt": {
-    "relay_sends": {
-     "required": [
-      "session_id"
-     ],
-     "optional": []
+    "body_contract": {
+      "item.started": {
+        "item_frame": true
+      },
+      "item.completed": {
+        "item_frame": true
+      },
+      "item.delta": {
+        "required": [
+          "item_id"
+        ],
+        "optional": [
+          "patch"
+        ],
+        "closed": true
+      },
+      "turn.started": {
+        "required": [],
+        "optional": [],
+        "closed": true
+      },
+      "turn.completed": {
+        "required": [],
+        "optional": [
+          "usage"
+        ],
+        "closed": true
+      },
+      "approval.request": {
+        "passthrough": true,
+        "guaranteed": [
+          "command",
+          "description"
+        ],
+        "reply_rpc": "approve",
+        "reply_identity": "envelope.sid",
+        "ios_reads": [
+          "approval_id",
+          "id",
+          "request_id",
+          "command",
+          "pattern_key",
+          "description",
+          "action",
+          "target",
+          "title",
+          "approval_title"
+        ]
+      },
+      "clarify.request": {
+        "passthrough": true,
+        "guaranteed": [
+          "request_id",
+          "question",
+          "choices"
+        ],
+        "reply_rpc": "clarify",
+        "reply_identity": "body.request_id",
+        "ios_reads": [
+          "question",
+          "choices",
+          "request_id"
+        ]
+      },
+      "status": {
+        "required": [
+          "kind",
+          "text"
+        ],
+        "optional": [],
+        "closed": true
+      },
+      "title": {
+        "required": [
+          "title"
+        ],
+        "optional": [],
+        "closed": true
+      },
+      "snapshot": {
+        "required": [
+          "items"
+        ],
+        "optional": [
+          "cursor"
+        ],
+        "closed": true
+      }
     },
-    "gateway_reads": {
-     "required": [],
-     "optional": [
-      "session_id"
-     ]
-    }
-   },
-   "session.steer": {
-    "$comment": "QA-2 R11: the handler reads params.get('text') (4002 when empty — an explicit error, not a silent default) and resolves the session off session_id via the _sess_nowait(params, rid) helper; that helper read is invisible to the AST extractor, so session_id is declared accepted_unread exactly like clarify.respond's symmetry key. Returns {status: queued|rejected, text}; the relay passes the disposition through unchanged.",
-    "relay_sends": {
-     "required": [
-      "session_id",
-      "text"
-     ],
-     "optional": []
-    },
-    "gateway_reads": {
-     "required": [],
-     "optional": [
-      "text"
-     ]
-    },
-    "accepted_unread": [
-     "session_id"
+    "samples": [
+      {
+        "name": "item.started.agentMessage",
+        "frame": {
+          "seq": 1,
+          "sid": "sess-1",
+          "turn": "sess-1:t1",
+          "kind": "item.started",
+          "body": {
+            "item_id": "sess-1:i1",
+            "type": "agentMessage",
+            "status": "in_progress",
+            "ord": 0,
+            "summary": "",
+            "body": {
+              "text": ""
+            }
+          }
+        }
+      },
+      {
+        "name": "item.delta.text",
+        "frame": {
+          "seq": 2,
+          "sid": "sess-1",
+          "turn": "sess-1:t1",
+          "kind": "item.delta",
+          "body": {
+            "item_id": "sess-1:i1",
+            "patch": {
+              "text": "Hello"
+            }
+          }
+        }
+      },
+      {
+        "name": "item.completed.agentMessage",
+        "frame": {
+          "seq": 3,
+          "sid": "sess-1",
+          "turn": "sess-1:t1",
+          "kind": "item.completed",
+          "body": {
+            "item_id": "sess-1:i1",
+            "type": "agentMessage",
+            "status": "completed",
+            "ord": 0,
+            "summary": "Hello there",
+            "body": {
+              "text": "Hello there"
+            }
+          }
+        }
+      },
+      {
+        "name": "item.completed.taskList.native",
+        "$comment": "taskList is emitted by the relay and decoded natively since N4 (ChatItemType.taskList → TaskListItemView/dock bridge). generic_fold is now empty; the §2 forward-compat rule (unknown type → toolCall card) still holds for future relay types. XCTest asserts the fold matches item_types.generic_fold.",
+        "frame": {
+          "seq": 4,
+          "sid": "sess-1",
+          "turn": "sess-1:t1",
+          "kind": "item.completed",
+          "body": {
+            "item_id": "sess-1:tasks",
+            "type": "taskList",
+            "status": "completed",
+            "ord": 1,
+            "summary": "Tasks 2/2",
+            "body": {
+              "tasks": [
+                {
+                  "id": "t1",
+                  "text": "First",
+                  "status": "completed"
+                },
+                {
+                  "id": "t2",
+                  "text": "Second",
+                  "status": "completed"
+                }
+              ],
+              "counts": {
+                "total": 2,
+                "pending": 0,
+                "in_progress": 0,
+                "completed": 2,
+                "cancelled": 0
+              },
+              "all_complete": true
+            }
+          }
+        }
+      },
+      {
+        "name": "item.completed.usage",
+        "frame": {
+          "seq": 5,
+          "sid": "sess-1",
+          "turn": "sess-1:t1",
+          "kind": "item.completed",
+          "body": {
+            "item_id": "sess-1:i2",
+            "type": "usage",
+            "status": "completed",
+            "ord": 2,
+            "summary": "15 tokens",
+            "body": {
+              "input": 10,
+              "output": 5,
+              "total": 15
+            }
+          }
+        }
+      },
+      {
+        "name": "turn.started",
+        "frame": {
+          "seq": 6,
+          "sid": "sess-1",
+          "turn": "sess-1:t1",
+          "kind": "turn.started",
+          "body": {}
+        }
+      },
+      {
+        "name": "turn.completed.usage",
+        "frame": {
+          "seq": 7,
+          "sid": "sess-1",
+          "turn": "sess-1:t1",
+          "kind": "turn.completed",
+          "body": {
+            "usage": {
+              "input": 10,
+              "output": 5,
+              "total": 15
+            }
+          }
+        }
+      },
+      {
+        "name": "approval.request",
+        "frame": {
+          "seq": 8,
+          "sid": "sess-1",
+          "turn": "sess-1:t1",
+          "kind": "approval.request",
+          "body": {
+            "command": "git push origin main",
+            "description": "Push the release branch",
+            "pattern_keys": [
+              "git_push"
+            ]
+          }
+        }
+      },
+      {
+        "name": "clarify.request",
+        "frame": {
+          "seq": 9,
+          "sid": "sess-1",
+          "turn": "sess-1:t1",
+          "kind": "clarify.request",
+          "body": {
+            "question": "Which environment?",
+            "choices": [
+              "staging",
+              "production"
+            ],
+            "request_id": "clr-1",
+            "created_at": 1750000000.0,
+            "expires_at": 1750000300.0,
+            "status": "pending",
+            "revision": 1
+          }
+        }
+      },
+      {
+        "name": "status.thinking",
+        "frame": {
+          "seq": 10,
+          "sid": "sess-1",
+          "turn": "sess-1:t1",
+          "kind": "status",
+          "body": {
+            "kind": "thinking",
+            "text": "Formulating…"
+          }
+        }
+      },
+      {
+        "name": "title",
+        "frame": {
+          "seq": 11,
+          "sid": "sess-1",
+          "turn": null,
+          "kind": "title",
+          "body": {
+            "title": "Release planning"
+          }
+        }
+      },
+      {
+        "name": "snapshot",
+        "frame": {
+          "seq": 12,
+          "sid": "sess-1",
+          "turn": null,
+          "kind": "snapshot",
+          "body": {
+            "items": [
+              {
+                "item_id": "sess-1:i1",
+                "type": "agentMessage",
+                "status": "completed",
+                "ord": 0,
+                "summary": "Hello there",
+                "body": {
+                  "text": "Hello there"
+                }
+              }
+            ],
+            "cursor": 12
+          }
+        }
+      },
+      {
+        "name": "status.heartbeat.connectionScoped",
+        "$comment": "Connection-scoped frame: `turn` legitimately absent-but-null (iOS decodes it optional).",
+        "frame": {
+          "seq": 13,
+          "sid": "",
+          "turn": null,
+          "kind": "status",
+          "body": {
+            "kind": "heartbeat",
+            "text": ""
+          }
+        }
+      }
     ]
-   }
+  },
+  "gateway": {
+    "$comment": "The relay -> gateway edge (gateway_client.py senders vs tui_gateway/server.py readers). Ground truth is the in-repo gateway source. This edge is where decision/choice and text/answer mismatches silently broke approvals and clarify answers.",
+    "rpcs": {
+      "prompt.submit": {
+        "relay_sends": {
+          "required": [
+            "session_id",
+            "text"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "session_id",
+            "text",
+            "truncate_before_user_ordinal"
+          ]
+        }
+      },
+      "approval.respond": {
+        "$comment": "The gateway defaults choice to DENY when absent — a relay that sends `decision` instead of `choice` silently denies every approval. request_id is a declared forward-compat extra: the gateway resolves approvals by SESSION key and ignores it (gateway_client.py keeps it for logging); it must never be an effective key.",
+        "relay_sends": {
+          "required": [
+            "session_id",
+            "request_id",
+            "choice",
+            "all"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "session_id",
+            "choice",
+            "all"
+          ],
+          "defaults": {
+            "choice": "deny",
+            "all": false
+          }
+        },
+        "accepted_unread": [
+          "request_id"
+        ]
+      },
+      "clarify.respond": {
+        "$comment": "The gateway matches the pending waiter by request_id and stores params[\"answer\"] — a relay that sends `text` delivers an EMPTY answer. session_id is a declared symmetry extra: the gateway resolves clarify by request_id only.",
+        "relay_sends": {
+          "required": [
+            "session_id",
+            "request_id",
+            "answer"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "request_id",
+            "answer"
+          ]
+        },
+        "accepted_unread": [
+          "session_id"
+        ]
+      },
+      "session.list": {
+        "relay_sends": {
+          "required": [
+            "limit"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "limit"
+          ]
+        }
+      },
+      "session.create": {
+        "relay_sends": {
+          "required": [
+            "title",
+            "cols",
+            "source"
+          ],
+          "optional": [
+            "model",
+            "provider"
+          ]
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "close_on_disconnect",
+            "cols",
+            "cwd",
+            "fast",
+            "messages",
+            "model",
+            "parent_session_id",
+            "profile",
+            "provider",
+            "reasoning_effort",
+            "source",
+            "title"
+          ]
+        }
+      },
+      "session.resume": {
+        "relay_sends": {
+          "required": [
+            "session_id",
+            "cols",
+            "source"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "close_on_disconnect",
+            "cols",
+            "eager_build",
+            "lazy",
+            "profile",
+            "session_id",
+            "source"
+          ]
+        }
+      },
+      "session.interrupt": {
+        "relay_sends": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "session_id"
+          ]
+        }
+      },
+      "session.steer": {
+        "$comment": "QA-2 R11: the handler reads params.get('text') (4002 when empty — an explicit error, not a silent default) and resolves the session off session_id via the _sess_nowait(params, rid) helper; that helper read is invisible to the AST extractor, so session_id is declared accepted_unread exactly like clarify.respond's symmetry key. Returns {status: queued|rejected, text}; the relay passes the disposition through unchanged.",
+        "relay_sends": {
+          "required": [
+            "session_id",
+            "text"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "text"
+          ]
+        },
+        "accepted_unread": [
+          "session_id"
+        ]
+      }
+    }
   }
- }
 }
