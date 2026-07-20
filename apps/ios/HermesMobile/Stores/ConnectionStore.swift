@@ -501,6 +501,26 @@ final class ConnectionStore {
         // Without this, a prompt the user queued while the relay was mid-connect
         // stays pending until some unrelated wake source fires.
         created.onReady = { [weak self] in self?.queueStore?.wake() }
+        // Bridge relay socket state → the app's `phase` so the banner + composer
+        // reflect the REAL connection, not a stale startup stamp. Without this the
+        // UI is frozen at `.connected` even when the relay drops and recovers.
+        created.onPhaseChange = { [weak self] relayPhase in
+            guard let self else { return }
+            switch relayPhase {
+            case .idle, .connecting:
+                self.phase = .connecting
+            case .open:
+                self.phase = .connected
+            case .closed(let reason):
+                // Intentional teardown (reason == nil) → about to reconnect via
+                // start(); unexpected close → offline with the reason.
+                self.phase = reason == nil ? .connecting : .offline(reason)
+            case .failed:
+                // The coordinator's auto-reconnect driver is armed; surface as
+                // reconnecting so the banner shows "reconnecting" not "offline".
+                self.phase = .reconnecting(attempt: 0)
+            }
+        }
         relayCoordinator = created
         return created
     }
@@ -3067,18 +3087,27 @@ final class ConnectionStore {
 
         Task { [weak self] in
             guard let self, self.isActiveGeneration(generation) else { return }
-            #if DEBUG
-            let _liveState = await self.client.state
-            let socketState = self.clientStateOverrideForScenePhase ?? _liveState
-            #else
-            let socketState = await self.client.state
-            #endif
-            guard self.isActiveGeneration(generation) else { return }
             let dead: Bool
-            switch socketState {
-            case .closed, .failed: dead = true
-            default: dead = false
+            // Wave-2 relay transport: the gateway `client` is IDLE (never
+            // connected) on this path — its state is always `.closed`, which
+            // would make every foreground look like a dead connection and trigger
+            // spurious reconnect churn. Check the RELAY socket instead.
+            if self.transportPath == .relay {
+                dead = !(self.relayCoordinator?.isOpen ?? false)
+            } else {
+                #if DEBUG
+                let _liveState = await self.client.state
+                let socketState = self.clientStateOverrideForScenePhase ?? _liveState
+                #else
+                let socketState = await self.client.state
+                #endif
+                guard self.isActiveGeneration(generation) else { return }
+                switch socketState {
+                case .closed, .failed: dead = true
+                default: dead = false
+                }
             }
+            guard self.isActiveGeneration(generation) else { return }
 
             if dead {
                 // The presentation phase may still be `.connected`; that is

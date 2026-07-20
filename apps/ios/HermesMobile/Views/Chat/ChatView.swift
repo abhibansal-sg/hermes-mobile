@@ -2397,6 +2397,13 @@ struct ChatView: View {
 
     private var isConnected: Bool {
         guard case .connected = connectionStore.phase else { return false }
+        // Wave-2 relay transport: the relay coordinator owns the session and
+        // drives the turn over the relay socket — it does NOT stamp the gateway
+        // `activeRuntimeId` the direct path uses. Gating the composer on that id
+        // would leave it permanently disabled in relay mode. The relay socket
+        // being open (already reflected in `phase == .connected` via the phase
+        // bridge) is the correct readiness signal here.
+        if connectionStore.transportPath == .relay { return true }
         // A fresh draft (chat-as-home) has no runtime yet — `ChatStore.send`
         // creates the gateway session lazily on the first prompt — so the
         // composer must be enabled the moment the gateway is connected.
