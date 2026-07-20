@@ -417,9 +417,13 @@ final class PushRegistrar {
         -> (@MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome)? {
         guard connection?.transportPath == .relay else { return nil }
         if let relayTokenRegisterOverride { return relayTokenRegisterOverride }
-        guard let coordinator = connection?.relayCoordinator else { return nil }
-        return { [weak coordinator] token, events in
-            guard let coordinator else { return .hardFail }
+        // Relay mode ALWAYS owns registration: never fall through to the
+        // gateway-direct poster (its registry is not the one the relay Notifier
+        // reads). A not-yet-created/connected coordinator maps to `.hardFail`
+        // so the next `enableIfAllowed()` retries instead of silently
+        // registering against the wrong registry and being deduped forever.
+        return { [weak connection] token, events in
+            guard let coordinator = connection?.relayCoordinator else { return .hardFail }
             do {
                 _ = try await coordinator.registerPushToken(
                     token, env: PushTokenPoster.apnsEnvironment, events: events
@@ -436,9 +440,8 @@ final class PushRegistrar {
         -> (@MainActor @Sendable (String) async -> PushTokenPoster.Outcome)? {
         guard connection?.transportPath == .relay else { return nil }
         if let relayTokenUnregisterOverride { return relayTokenUnregisterOverride }
-        guard let coordinator = connection?.relayCoordinator else { return nil }
-        return { [weak coordinator] token in
-            guard let coordinator else { return .hardFail }
+        return { [weak connection] token in
+            guard let coordinator = connection?.relayCoordinator else { return .hardFail }
             do {
                 _ = try await coordinator.unregisterPushToken(token)
                 return .success
