@@ -630,7 +630,10 @@ final class RelayTranscriptMergeTests: XCTestCase {
 /// transport's script parks the request (from the client's send task) and the
 /// test waits on it, asserts the pre-ack echo, then answers.
 private final class SubmitPark: @unchecked Sendable {
-    struct Parked { let id: String?; let params: [String: Any] }
+    /// `@unchecked` because the `[String: Any]` params cannot express
+    /// Sendability; every hand-off is serialized by the enclosing NSLock and
+    /// each value is resumed exactly once (same pattern as MockRelayTransport).
+    struct Parked: @unchecked Sendable { let id: String?; let params: [String: Any] }
     private let lock = NSLock()
     private var parked: Parked?
     private var waiter: CheckedContinuation<Parked, Never>?
