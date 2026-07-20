@@ -125,12 +125,13 @@ class UpstreamMethod:
     APPROVE = "approve"        # -> approval.respond (pass-through)
     CLARIFY = "clarify"        # -> clarify.respond (pass-through)
     INTERRUPT = "interrupt"    # -> session.interrupt (pass-through)
+    ATTACH = "attach"         # -> file.attach / image.attach_bytes (bytes inlined as a data: URL; REST-free attach, B9/A5)
     ACK = "ack"               # local: ring.drop acked frames {through}
     RESYNC = "resync"         # local: ring.decide {last_seq} -> replay or snapshot
     FOREGROUND = "foreground"  # local: phone declares the session it now holds foregrounded (§6 gate); null clears
 
     ALL = frozenset(
-        {SUBMIT, RESUME, OPEN, LIST, HISTORY, APPROVE, CLARIFY, INTERRUPT, ACK, RESYNC, FOREGROUND}
+        {SUBMIT, RESUME, OPEN, LIST, HISTORY, APPROVE, CLARIFY, INTERRUPT, ATTACH, ACK, RESYNC, FOREGROUND}
     )
 
 

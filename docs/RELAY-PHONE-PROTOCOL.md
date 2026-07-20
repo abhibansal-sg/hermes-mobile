@@ -119,6 +119,7 @@ a partial merge preview and is never treated as authoritative.
 | answer approval | translate params | `approval.respond` | — — the gateway reads `choice` (`once`/`session`/`always`/`deny`, mapping `approve`→`once`) + `all` and resolves by SESSION key; the relay maps the phone's `decision`→`choice` (a relay that sent `decision` defaulted every approval to DENY) |
 | answer clarify | translate params | `clarify.respond` | — — the gateway matches the pending waiter by `request_id` and stores `params.answer`; the relay maps the phone's `text`→`answer` (a relay that sent `text` delivered an EMPTY answer) |
 | stop | pass-through | `session.interrupt` | — |
+| attach a photo / file (B9/A5) | translate params | `file.attach` (`kind=file`) or `image.attach_bytes` (`kind=image`) | same drive semantics as SUBMIT: `session_id` absent → `session.create` (+own); foreign/idle → `session.resume` (adopt the live id); the resolved `session_id` is merged into the result. REST-FREE by construction: the phone inlines the bytes as a `data:<mime>;base64,` URL in `data_url` — NO `POST /api/upload`, which a relay-only phone cannot reach. Params: `kind` + `data_url` required, `session_id` / `name` optional. |
 
 Live streaming to the phone works for any session the relay OWNS (i.e. after
 submit/resume-to-drive). Live mirroring of a session actively driven by ANOTHER
