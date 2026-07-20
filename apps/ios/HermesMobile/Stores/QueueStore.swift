@@ -358,17 +358,22 @@ final class QueueStore {
         try? await repository.updateQueuedPrompt(id: id.uuidString.lowercased(), text: text)
     }
 
-    func remove(id: UUID) async {
+    /// Remove a job the user cancelled, AWAITING the durable tombstone before
+    /// returning (QA-2 R14). The repository commits the delete/`.cancelled
+    /// tombstone in ONE transaction (`removeCancelledJob`) and publishes the
+    /// observation that drives the row/pill removal only AFTER the commit — so
+    /// the UI can never confirm a removal whose tombstone didn't land, and a
+    /// force-quit the instant the row disappears can no longer resurrect the
+    /// send on the relaunch drain (the build-115 "cleared it, force-closed
+    /// quickly, it SENT anyway" failure: the old fire-and-forget `Task`s let
+    /// the UI race the async write). Returns whether a tombstone was committed.
+    @discardableResult
+    func remove(id: UUID) async -> Bool {
         let key = id.uuidString.lowercased()
         do {
-            guard let job = try await repository.job(id: key) else { return }
-            if job.leaseOwner == nil || job.state.isTerminal || job.state == .failed {
-                try await repository.deleteJob(id: key)
-            } else {
-                try await repository.cancelJob(id: key)
-            }
+            return try await repository.removeCancelledJob(id: key)
         } catch {
-            return
+            return false
         }
     }
 
