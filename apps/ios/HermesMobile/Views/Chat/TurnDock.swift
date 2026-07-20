@@ -53,11 +53,17 @@ struct TurnDock: View {
 
     /// The dock's active surface, derived from the same pure resolver ChatView
     /// uses for inline-card suppression — so the two can never disagree.
+    ///
+    /// QA-2 R12/R13: `hasTasks` reads ``ChatStore.dockShowsTaskBox`` (turn-
+    /// lifecycle-driven + session-scoped), NOT the raw `latestTodoList`. So the
+    /// dock surface tracks the owning turn: visible only while that turn is
+    /// live, cleared at turn end (even with missed frames, via the local-turn
+    /// watchdog), never resurrected in a session that doesn't own the list.
     private var content: TurnDockContent {
         TurnDockContent.resolve(
             hasApproval: chatStore.pendingApproval != nil,
             hasClarification: chatStore.pendingClarification != nil,
-            hasTasks: chatStore.latestTodoList != nil,
+            hasTasks: chatStore.dockShowsTaskBox,
             hasQueued: TurnDock.hasQueued(queueStore)
         )
     }
@@ -85,9 +91,23 @@ struct TurnDock: View {
                         .transition(dockTransition)
                 }
             case .tasks:
+                // QA-2 R12 redesign: a NATIVE CAPSULE pill, width-to-fit and
+                // CENTERED — never the old full-width floating box. When both
+                // a task list AND queued backlog are live, the task capsule and
+                // the queued capsule sit SIDE-BY-SIDE in one centered row (the
+                // owner's "task centered next to pending" requirement). Each
+                // capsule matches the composer's pending-pill height/visual
+                // language (C1/C2). Tapping the task capsule toggles the
+                // native checklist sheet below; tapping the queued capsule
+                // opens the queued-messages sheet.
                 if let todos = chatStore.latestTodoList {
-                    DockTaskBox(todos: todos)
-                        .transition(dockTransition)
+                    DockTaskBox(
+                        todos: todos,
+                        showsQueued: TurnDock.hasQueued(queueStore),
+                        queuedCount: queueStore.pendingCount,
+                        onTapQueued: { showQueuedSheet = true }
+                    )
+                    .transition(dockTransition)
                 }
             case .queued:
                 DockQueuedStrip(count: queueStore.pendingCount) {
@@ -120,23 +140,31 @@ struct TurnDock: View {
 
 // MARK: - Task box
 
-/// A SLIM ONE-LINE PILL (checklist glyph + "X of Y" + current in-progress task
-/// title) that expands IN PLACE to the full checklist. Owner QA redesign:
+/// QA-2 R12 — the dock's task surface, rebuilt to the owner's redesign:
 ///
-///  • Collapsed = a single-line pill in the same visual language as the queued
-///    strip — NOT a tall lighter floating card. Its fill is `theme.muted`, a
-///    subtle wash on the transcript surface, so it reads as part of the transcript
-///    rather than a lighter box hovering over it.
-///  • NO progress bar. The old full-width `theme.midground` progress rule under
-///    the header read as a "mystery blue line"; the "X of Y" count carries the
-///    same information without a coloured rule.
-///  • Expanded = a compact, theme-matched checklist with tight row spacing.
+///  • Collapsed = a NATIVE CAPSULE pill (checklist glyph + "X of Y"), width-to-
+///    fit and CENTERED above the composer. It matches the composer's pending
+///    pill height/visual language (same `Capsule`, same padding, same caption
+///    font) so the two read as one chrome family — never the old full-width
+///    floating box that "hovered" over the transcript (C1/C2).
+///  • When a queued backlog is ALSO live, the queued capsule sits BESIDE the
+///    task capsule in the same centered row ("task centered next to pending").
+///  • NO progress bar, NO coloured rule. The "X of Y" count carries progress.
+///  • Expanded = a compact NATIVE checklist (system material, hairline border,
+///    per-row status glyphs) that drops down below the centered capsule row.
 ///
-/// The expanded rows reuse ``TodoChecklistRow`` — the exact styling the
-/// transcript's ``TodoCardView`` uses — so the dock and the transcript render a
-/// todo item identically.
+/// The expanded rows reuse ``TodoChecklistRow`` — the exact status-glyph styling
+/// the transcript's ``TodoCardView`` uses — so the dock and the transcript
+/// render a todo item identically (pending/in_progress/done/cancelled affordances,
+/// not the radio single-select the old sheet used).
 struct DockTaskBox: View {
     let todos: TodoList
+    /// Whether the queued backlog pill should sit beside the task capsule.
+    let showsQueued: Bool
+    /// The pending-count the queued capsule shows (when `showsQueued`).
+    let queuedCount: Int
+    /// Tap handler for the queued capsule (opens the queued-messages sheet).
+    let onTapQueued: () -> Void
 
     @Environment(\.hermesTheme) private var theme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -148,8 +176,9 @@ struct DockTaskBox: View {
     }
     private var total: Int { todos.items.count }
     /// The task the agent is actively working, if any — shown in the collapsed
-    /// pill. Falls back to the first not-yet-done item so the pill always names
-    /// *something* actionable.
+    /// capsule. Falls back to the first not-yet-done item so the pill always
+    /// names *something* actionable; nil only when every item is terminal (the
+    /// dock surface is already dismissed by then via `dockShowsTaskBox`).
     private var currentTitle: String? {
         todos.items.first { $0.status == .inProgress }?.content
             ?? todos.items.first { $0.status == .pending || $0.status == .other }?.content
@@ -157,53 +186,63 @@ struct DockTaskBox: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            pill
-            if isExpanded { list }
+            // CENTERED capsule row. `Spacer(minLength: 0)` on both sides centers
+            // the width-to-fit capsule group without forcing full-width — the
+            // pill never stretches wider than its content (C2: never wider than
+            // the composer). When the queued capsule is also warranted it sits
+            // in the SAME centered HStack, side-by-side with the task capsule.
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                taskCapsule
+                if showsQueued {
+                    DockQueuedCapsule(count: queuedCount, onTap: onTapQueued)
+                }
+                Spacer(minLength: 0)
+            }
+            if isExpanded {
+                expandedList
+                    .padding(.top, 8)
+            }
         }
-        // Subtle transcript-matched wash (owner QA: "not a lighter box"), hairline
-        // border. Corner radius + horizontal metrics mirror the queued strip so the
-        // two dock surfaces share one visual language.
-        .background(theme.muted, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(theme.border.opacity(0.6), lineWidth: 1)
-        )
         .accessibilityElement(children: .contain)
     }
 
-    private var pill: some View {
+    private var taskCapsule: some View {
         Button {
             withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.86)) {
                 isExpanded.toggle()
             }
         } label: {
-            HStack(spacing: 10) {
+            HStack(spacing: 6) {
                 Image(systemName: "checklist")
-                    .font(.footnote.weight(.semibold))
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(theme.midground)
                 Text("\(doneCount) of \(total)")
-                    .font(.subheadline.weight(.semibold))
+                    .font(.caption.weight(.medium))
                     .foregroundStyle(theme.fg)
                     .monospacedDigit()
-                    .layoutPriority(1)
                 if let currentTitle {
+                    Text("·")
+                        .font(.caption)
+                        .foregroundStyle(theme.mutedFg)
                     Text(currentTitle)
-                        .font(.footnote)
+                        .font(.caption)
                         .foregroundStyle(theme.mutedFg)
                         .lineLimit(1)
                         .truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    Spacer(minLength: 0)
                 }
                 Image(systemName: "chevron.down")
-                    .font(.caption.weight(.semibold))
+                    .font(.caption2.weight(.semibold))
                     .foregroundStyle(theme.mutedFg)
                     .rotationEffect(.degrees(isExpanded ? 180 : 0))
             }
-            .padding(.horizontal, 13)
-            .padding(.vertical, 10)
-            .contentShape(Rectangle())
+            // Same padding language as the composer's pending pill so the two
+            // share one height / visual rhythm.
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(theme.muted, in: Capsule())
+            .overlay(Capsule().strokeBorder(theme.border.opacity(0.6), lineWidth: 1))
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Tasks, \(doneCount) of \(total) done")
@@ -212,23 +251,54 @@ struct DockTaskBox: View {
         .accessibilityAddTraits(.isButton)
     }
 
-    private var list: some View {
+    /// The expanded checklist — a compact NATIVE surface (system material, 13 pt
+    /// corner radius, hairline border) anchored under the centered capsule row.
+    /// Per-row status glyphs come from ``TodoChecklistRow`` so a task renders
+    /// identically here and in the transcript (C1).
+    private var expandedList: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Hairline divider between the pill and the expanded list, matched to the
-            // subtle wash — replaces the old coloured progress rule.
-            Rectangle()
-                .fill(theme.border.opacity(0.6))
-                .frame(height: 1)
-                .padding(.bottom, 2)
-                .accessibilityHidden(true)
             ForEach(todos.items) { item in
                 TodoChecklistRow(item: item)
             }
         }
         .padding(.horizontal, 13)
-        .padding(.top, 8)
-        .padding(.bottom, 11)
+        .padding(.vertical, 11)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.card, in: RoundedRectangle(cornerRadius: 13))
+        .overlay(
+            RoundedRectangle(cornerRadius: 13)
+                .strokeBorder(theme.border.opacity(0.6), lineWidth: 1)
+        )
+    }
+}
+
+/// QA-2 R12 — the queued-backlog capsule that sits BESIDE the task capsule when
+/// both are live. Same native capsule language as the task pill and the
+/// composer's pending pill (C1/C2): width-to-fit, `theme.muted` fill, caption
+/// font, `text.badge.plus` glyph. Tapping opens the queued-messages sheet.
+struct DockQueuedCapsule: View {
+    let count: Int
+    let onTap: () -> Void
+
+    @Environment(\.hermesTheme) private var theme
+
+    var body: some View {
+        Button(action: onTap) {
+            Label("\(count) pending", systemImage: "text.badge.plus")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(theme.mutedFg)
+                .labelStyle(.titleAndIcon)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(theme.muted, in: Capsule())
+                .overlay(Capsule().strokeBorder(theme.border.opacity(0.6), lineWidth: 1))
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(count) queued \(count == 1 ? "message" : "messages")")
+        .accessibilityValue("Sends when reconnected")
+        .accessibilityHint("Opens queued messages")
+        .accessibilityAddTraits(.isButton)
     }
 }
 

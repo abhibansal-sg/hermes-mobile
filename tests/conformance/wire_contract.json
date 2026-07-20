@@ -183,7 +183,7 @@
       },
       "approve": {
         "kind": "request",
-        "$comment": "Protocol \u00a75: the phone sends session_id + decision (once/session/always/deny/approve); the relay maps decision -> the gateway's `choice` param. Sending `approved`/omitting session_id here is the silent-DENY bug class \u2014 the relay reads p[\"session_id\"] and p[\"decision\"].",
+        "$comment": "Protocol §5: the phone sends session_id + decision (once/session/always/deny/approve); the relay maps decision -> the gateway's `choice` param. Sending `approved`/omitting session_id here is the silent-DENY bug class — the relay reads p[\"session_id\"] and p[\"decision\"].",
         "ios_sends": {
           "required": [
             "session_id",
@@ -226,12 +226,24 @@
         "kind": "request",
         "$comment": "Protocol §5 (B9/A5): REST-free attach — the phone inlines the bytes as a data: URL; the relay routes by `kind` onto the gateway's base64 RPCs (file.attach / image.attach_bytes), resolves the session like SUBMIT (absent -> session.create; foreign -> session.resume adopting the live id) and merges session_id into the result. Relay-only phones cannot make the POST /api/upload REST round-trip — that gap hid the composer '+' (B9).",
         "ios_sends": {
-          "required": ["data_url", "kind"],
-          "optional": ["name", "session_id"]
+          "required": [
+            "data_url",
+            "kind"
+          ],
+          "optional": [
+            "name",
+            "session_id"
+          ]
         },
         "relay_reads": {
           "required": [],
-          "optional": ["data_url", "kind", "name", "session_id", "title"]
+          "optional": [
+            "data_url",
+            "kind",
+            "name",
+            "session_id",
+            "title"
+          ]
         },
         "aliases": [],
         "example": {
@@ -259,7 +271,7 @@
       },
       "clarify": {
         "kind": "request",
-        "$comment": "Protocol \u00a75: the phone sends session_id + text; the relay maps text -> the gateway's `answer` param (the gateway stores params[\"answer\"], matched by request_id). Sending `response`/omitting text is the EMPTY-ANSWER bug class.",
+        "$comment": "Protocol §5: the phone sends session_id + text; the relay maps text -> the gateway's `answer` param (the gateway stores params[\"answer\"], matched by request_id). Sending `response`/omitting text is the EMPTY-ANSWER bug class.",
         "ios_sends": {
           "required": [
             "session_id",
@@ -364,7 +376,7 @@
       },
       "foreground": {
         "kind": "notification",
-        "$comment": "session_id is REQUIRED as a key but its VALUE is nullable (null clears the foreground set, \u00a76).",
+        "$comment": "session_id is REQUIRED as a key but its VALUE is nullable (null clears the foreground set, §6).",
         "ios_sends": {
           "required": [
             "session_id"
@@ -387,7 +399,7 @@
         "expect_gateway": []
       },
       "push.register": {
-        "$comment": "Relay-local (protocol \u00a76a, QA-1 B14): writes the relay's OWN push registry \u2014 the one the Notifier reads. Never hops the gateway; works while the gateway is NOT ready (phone reconnects first).",
+        "$comment": "Relay-local (protocol §6a, QA-1 B14): writes the relay's OWN push registry — the one the Notifier reads. Never hops the gateway; works while the gateway is NOT ready (phone reconnects first).",
         "kind": "request",
         "aliases": [],
         "example": {
@@ -407,6 +419,7 @@
             "token"
           ],
           "optional": [
+            "device_id",
             "events"
           ]
         },
@@ -422,7 +435,7 @@
         }
       },
       "push.unregister": {
-        "$comment": "Relay-local (protocol \u00a76a, QA-1 B14): removes the token from the relay's push registry (Settings opt-out). Never hops the gateway.",
+        "$comment": "Relay-local (protocol §6a, QA-1 B14): removes the token from the relay's push registry (Settings opt-out). Never hops the gateway.",
         "kind": "request",
         "aliases": [],
         "example": {
@@ -441,6 +454,39 @@
             "token"
           ]
         }
+      },
+      "steer": {
+        "kind": "request",
+        "$comment": "Protocol §5 (QA-2 R11): live-turn steering over the relay. The phone sends session_id + text; the relay passes them to the gateway's session.steer, which returns {status: queued|rejected, text} — passed through verbatim so the phone maps the disposition identically to the gateway-direct path. Before this method existed the phone's steer went over the IDLE gateway-direct socket in relay mode and every attempt failed with 'Not connected'.",
+        "ios_sends": {
+          "required": [
+            "session_id",
+            "text"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [
+            "session_id"
+          ],
+          "optional": [
+            "text"
+          ]
+        },
+        "aliases": [],
+        "example": {
+          "session_id": "sess-1",
+          "text": "also check the staging env"
+        },
+        "expect_gateway": [
+          {
+            "rpc": "session.steer",
+            "params": {
+              "session_id": "sess-1",
+              "text": "also check the staging env"
+            }
+          }
+        ]
       }
     }
   },
@@ -485,7 +531,7 @@
       "failed"
     ],
     "item_types": {
-      "$comment": "relay_all = relay ItemType.ALL (the types the reframer can emit). ios_native = ChatItemType raw values (decoded natively). generic_fold = relay types iOS intentionally folds to the generic toolCall card (\u00a72 forward-compat rule). When a fold entry gains a native iOS case (e.g. N4 taskList), move it to ios_native and drop it here \u2014 the suite fails until the fixture matches the sources either way.",
+      "$comment": "relay_all = relay ItemType.ALL (the types the reframer can emit). ios_native = ChatItemType raw values (decoded natively). generic_fold = relay types iOS intentionally folds to the generic toolCall card (§2 forward-compat rule). When a fold entry gains a native iOS case (e.g. N4 taskList), move it to ios_native and drop it here — the suite fails until the fixture matches the sources either way.",
       "relay_all": [
         "userMessage",
         "agentMessage",
@@ -657,7 +703,7 @@
       },
       {
         "name": "item.completed.taskList.native",
-        "$comment": "taskList is emitted by the relay and decoded natively since N4 (ChatItemType.taskList \u2192 TaskListItemView/dock bridge). generic_fold is now empty; the \u00a72 forward-compat rule (unknown type \u2192 toolCall card) still holds for future relay types. XCTest asserts the fold matches item_types.generic_fold.",
+        "$comment": "taskList is emitted by the relay and decoded natively since N4 (ChatItemType.taskList → TaskListItemView/dock bridge). generic_fold is now empty; the §2 forward-compat rule (unknown type → toolCall card) still holds for future relay types. XCTest asserts the fold matches item_types.generic_fold.",
         "frame": {
           "seq": 4,
           "sid": "sess-1",
@@ -787,7 +833,7 @@
           "kind": "status",
           "body": {
             "kind": "thinking",
-            "text": "Formulating\u2026"
+            "text": "Formulating…"
           }
         }
       },
@@ -864,7 +910,7 @@
         }
       },
       "approval.respond": {
-        "$comment": "The gateway defaults choice to DENY when absent \u2014 a relay that sends `decision` instead of `choice` silently denies every approval. request_id is a declared forward-compat extra: the gateway resolves approvals by SESSION key and ignores it (gateway_client.py keeps it for logging); it must never be an effective key.",
+        "$comment": "The gateway defaults choice to DENY when absent — a relay that sends `decision` instead of `choice` silently denies every approval. request_id is a declared forward-compat extra: the gateway resolves approvals by SESSION key and ignores it (gateway_client.py keeps it for logging); it must never be an effective key.",
         "relay_sends": {
           "required": [
             "session_id",
@@ -891,7 +937,7 @@
         ]
       },
       "clarify.respond": {
-        "$comment": "The gateway matches the pending waiter by request_id and stores params[\"answer\"] \u2014 a relay that sends `text` delivers an EMPTY answer. session_id is a declared symmetry extra: the gateway resolves clarify by request_id only.",
+        "$comment": "The gateway matches the pending waiter by request_id and stores params[\"answer\"] — a relay that sends `text` delivers an EMPTY answer. session_id is a declared symmetry extra: the gateway resolves clarify by request_id only.",
         "relay_sends": {
           "required": [
             "session_id",
@@ -990,6 +1036,25 @@
             "session_id"
           ]
         }
+      },
+      "session.steer": {
+        "$comment": "QA-2 R11: the handler reads params.get('text') (4002 when empty — an explicit error, not a silent default) and resolves the session off session_id via the _sess_nowait(params, rid) helper; that helper read is invisible to the AST extractor, so session_id is declared accepted_unread exactly like clarify.respond's symmetry key. Returns {status: queued|rejected, text}; the relay passes the disposition through unchanged.",
+        "relay_sends": {
+          "required": [
+            "session_id",
+            "text"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "text"
+          ]
+        },
+        "accepted_unread": [
+          "session_id"
+        ]
       }
     }
   }

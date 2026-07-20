@@ -507,7 +507,20 @@ final class ConnectionStore {
         // analogue of `setTransportReadiness(.ready)`'s wake on the gateway path.
         // Without this, a prompt the user queued while the relay was mid-connect
         // stays pending until some unrelated wake source fires.
-        created.onReady = { [weak self] in self?.queueStore?.wake() }
+        //
+        // QA-2 R1: ALSO re-trigger APNs registration. The launch-time register
+        // attempt can race the socket (coordinator not yet up → `.hardFail` →
+        // nothing retried until the next launch/foreground); the relay-ready
+        // edge is the deterministic re-wake. `enableIfAllowed()` is idempotent:
+        // the registrar's dedupe skips the POST when the relay register already
+        // succeeded, and the transport-scoped registration identity forces a
+        // re-POST when the previous success was on the direct path.
+        created.onReady = { [weak self] in
+            self?.queueStore?.wake()
+            Task { @MainActor in
+                PushRegistrar.shared.enableIfAllowed()
+            }
+        }
         // Bridge relay socket state → the app's `phase` so the banner + composer
         // reflect the REAL connection, not a stale startup stamp. Without this the
         // UI is frozen at `.connected` even when the relay drops and recovers.

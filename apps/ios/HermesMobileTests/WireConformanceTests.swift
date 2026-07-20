@@ -171,6 +171,10 @@ final class WireConformanceTests: XCTestCase {
         )
         _ = try await client.clarify(sessionID: "sess-1", requestID: "clr-1", response: "staging")
         _ = try await client.interrupt("sess-1")
+        // §5b (QA-2 R11): steer builder — the enum case + contract entry landed
+        // with the turncontrol lane but this drive list never exercised the
+        // builder, so the all-methods sweep failed "client never sent steer".
+        _ = try await client.steer(sessionID: "sess-1", text: "slow down and double-check")
         // B9/A5: all four contracted keys (required kind+data_url, optional
         // name+session_id) on the wire in one drive.
         _ = try await client.attach(
@@ -179,10 +183,15 @@ final class WireConformanceTests: XCTestCase {
         )
         await client.setForeground("sess-1")
         // §6a (QA-1 B14): relay-local push token registry RPCs.
+        // R1c: drive device_id too — it is the relay registry's one-token-
+        // per-device dedupe key (optional on the wire, but this sweep drives
+        // EVERY optional so the sent set equals required ∪ optional; the app
+        // always sends it via DefaultsKeys.deviceId).
         _ = try await client.registerPushToken(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             env: "production",
-            events: ["approval", "turn_complete"]
+            events: ["approval", "turn_complete"],
+            deviceID: "device-conformance-1"
         )
         _ = try await client.unregisterPushToken(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

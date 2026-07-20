@@ -48,7 +48,7 @@ enum RelayConnectionState: Sendable, Equatable {
 /// - on reconnect send `resync{last_seq}` and reconcile the returned replay /
 ///   `snapshot` by `item_id` — idempotent + gap-free (§4);
 /// - expose the upstream session ops (submit/resume/open/list/history/approve/
-///   clarify/interrupt) as async methods that map to relay RPCs (§5).
+///   clarify/interrupt/steer) as async methods that map to relay RPCs (§5).
 ///
 /// Reconnect *policy* is intentionally external (as with `HermesGatewayClient`):
 /// the session fails fast and a driver calls `reconnect` again with backoff.
@@ -277,6 +277,28 @@ actor RelayClient {
         try await request(.interrupt, params: .object(["session_id": .string(sessionID)]))
     }
 
+    /// Inject steering text into the live turn (§5 / §5b, QA-2 R11).
+    ///
+    /// WIRE CONTRACT (docs/RELAY-PHONE-PROTOCOL.md §5b, asserted key-for-key by
+    /// tests/conformance): `session_id` + `text` are REQUIRED; the relay passes
+    /// them to the gateway's `session.steer` and returns its disposition
+    /// VERBATIM — `{status: "queued" | "rejected", text}` — so the phone maps
+    /// it exactly as on the gateway-direct path (`queued` → clear the field;
+    /// `rejected` → keep the text and offer queueing). Before this method
+    /// existed the composer's steer went over the IDLE gateway-direct socket in
+    /// relay mode and every attempt failed "Not connected to the Hermes
+    /// gateway" (the build-115 R11 steer failure).
+    @discardableResult
+    func steer(sessionID: String, text: String) async throws -> JSONValue {
+        try await request(
+            .steer,
+            params: .object([
+                "session_id": .string(sessionID),
+                "text": .string(text),
+            ])
+        )
+    }
+
     /// Upload an attachment's INLINED bytes through the relay (B9 / A5). The
     /// relay translates this onto the gateway's base64 RPCs — `file.attach`
     /// (arbitrary files → `@file:` ref) or `image.attach_bytes` (photos →
@@ -323,12 +345,15 @@ actor RelayClient {
     /// the gateway-direct REST register either can't be reached at all (off-LAN
     /// relay-only phones) or writes a registry the relay never reads.
     /// `env` routes the token to the matching APNs host ("sandbox"/"production");
-    /// `events` is the per-event opt-in subset (`nil` = all events).
+    /// `events` is the per-event opt-in subset (`nil` = all events); `deviceID`
+    /// (QA-2 R1c) is the phone's stable per-install identity — the relay keeps
+    /// ONE registry entry per device (a rotated token replaces the old one).
     @discardableResult
     func registerPushToken(
         _ token: String,
         env: String,
-        events: [String]?
+        events: [String]?,
+        deviceID: String? = nil
     ) async throws -> JSONValue {
         var params: [String: JSONValue] = [
             "token": .string(token),
@@ -336,6 +361,7 @@ actor RelayClient {
             "env": .string(env),
         ]
         if let events { params["events"] = .array(events.map { .string($0) }) }
+        if let deviceID, !deviceID.isEmpty { params["device_id"] = .string(deviceID) }
         return try await request(.pushRegister, params: .object(params))
     }
 

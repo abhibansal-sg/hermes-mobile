@@ -253,6 +253,7 @@ def _server(push_engine=None):
     gw.approval_respond = AsyncMock(return_value={"ok": True})
     gw.clarify_respond = AsyncMock(return_value={"ok": True})
     gw.session_interrupt = AsyncMock(return_value={"ok": True})
+    gw.session_steer = AsyncMock(return_value={"status": "queued", "text": "also staging"})
     gw.owns = MagicMock(return_value=False)
     # Gateway-readiness gate: default to ready so upstream RPCs proceed.
     gw.wait_ready = AsyncMock(return_value=True)
@@ -497,6 +498,37 @@ async def test_approve_clarify_interrupt_pass_through():
     gw.clarify_respond.assert_awaited_once_with("s1", "r", "yes")
     await _handle(srv, UpstreamMethod.INTERRUPT, {"session_id": "s1"})
     gw.session_interrupt.assert_awaited_once_with("s1")
+
+
+async def test_steer_pass_through_returns_gateway_disposition_verbatim():
+    """QA-2 R11: the `steer` upstream method routes to the gateway's
+    `session.steer` (before it existed the phone's steer went over the idle
+    gateway-direct socket and failed 'Not connected'), and the gateway's
+    `{status: queued|rejected, text}` disposition is passed through VERBATIM so
+    the phone maps it identically to the direct path (rejected → keep the text
+    and offer queueing)."""
+    srv, gw = _server()
+    await srv.start()
+    result = await _handle(
+        srv, UpstreamMethod.STEER, {"session_id": "s1", "text": "also staging"}
+    )
+    gw.session_steer.assert_awaited_once_with("s1", "also staging")
+    assert result == {"status": "queued", "text": "also staging"}, (
+        "the gateway disposition must pass through unchanged"
+    )
+    # A `rejected` disposition (turn ending) travels verbatim too.
+    gw.session_steer = AsyncMock(return_value={"status": "rejected", "text": "x"})
+    rejected = await _handle(srv, UpstreamMethod.STEER, {"session_id": "s1", "text": "x"})
+    assert rejected["status"] == "rejected"
+
+
+async def test_steer_requires_session_id():
+    """`session_id` is a required read (a miss raises) — the relay drives the
+    gateway by explicit session, never by implicit 'current'."""
+    srv, _gw = _server()
+    await srv.start()
+    with pytest.raises(KeyError):
+        await _handle(srv, UpstreamMethod.STEER, {"text": "no session"})
 
 
 async def test_ack_and_resync_are_local_no_gateway_hop():

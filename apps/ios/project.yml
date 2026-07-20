@@ -10,7 +10,7 @@ settings:
     SWIFT_STRICT_CONCURRENCY: complete
     DEVELOPMENT_TEAM: 6J4Y9NKRQ2
     CODE_SIGN_STYLE: Automatic
-    CURRENT_PROJECT_VERSION: 115
+    CURRENT_PROJECT_VERSION: 116
     MARKETING_VERSION: 1.0.1
 packages:
   # Offline-first cache plus the protected app-group WorkRepository. The share
@@ -194,6 +194,10 @@ targets:
       - path: ../../tests/render_conformance/fixtures/render_clarify_gate.json
         buildPhase: resources
       - path: ../../tests/render_conformance/fixtures/render_tasklist.json
+        buildPhase: resources
+      # QA-2 R5/R6/A3 live-fold fixture (reasoning + raw-name tool turn);
+      # hand-authored to the recorded wire format (see its recorded_by note).
+      - path: ../../tests/render_conformance/fixtures/render_live_fold.json
         buildPhase: resources
     dependencies:
       - target: HermesMobile

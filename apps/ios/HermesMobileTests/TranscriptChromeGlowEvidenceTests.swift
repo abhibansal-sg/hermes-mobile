@@ -163,10 +163,14 @@ final class TranscriptChromeGlowEvidenceTests: XCTestCase {
             lastMessage: relayStreamingMessage),
             "evidence frame 1: relay streaming → no pill")
         let userEcho = ChatMessage(role: .user, parts: [.text(id: "u1", text: "Refactor the auth flow")])
-        XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
+        // QA-2 R4/A2 SUPERSEDES the QA-1 B8 pre-first-item clause: the relay
+        // Working pill is now IMPOSSIBLE in EVERY relay phase — the send's
+        // optimistic caret bubble IS the pre-first-item affordance (the state
+        // that could still flash the pill is deleted, not hidden).
+        XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
             isStreaming: true, hasPendingGate: false, isRelayTransport: true,
             lastMessage: userEcho),
-            "evidence frame 2: relay pre-first-item → honest row")
+            "evidence frame 2: relay pre-first-item → NO pill (the optimistic caret bubble is the affordance)")
 
         // 1. Relay streaming tail: cursor IS the working signal — no pill.
         try renderAndSave(
@@ -177,13 +181,18 @@ final class TranscriptChromeGlowEvidenceTests: XCTestCase {
                                         store: streaming, showBar: false))
         paths.append("qa1-01-relay-streaming-cursor-no-pill.png")
 
-        // 2. Relay pre-first-item tail: the honest accepted-and-waiting row.
+        // 2. Relay pre-first-item tail (QA-2 R4/A2): user echo + the optimistic
+        // EMPTY streaming assistant bubble — its breathing caret renders ≤100 ms
+        // from send, independent of any relay frame. NO Working row (the relay
+        // gate is false in every phase now; the pill state is deleted).
+        let optimisticCaret = ChatMessage(role: .assistant, parts: [], isStreaming: true)
         try renderAndSave(
             name: "qa1-02-relay-pre-first-item-row",
-            caption: "QA-1 B8 · relay PRE-FIRST-ITEM: user echo + honest Working row (gate=true, mirrors approved direct path pre-message.start)",
+            caption: "QA-2 R4/A2 · relay PRE-FIRST-ITEM: user echo + optimistic caret bubble (gate=false — the caret is the accepted-and-waiting affordance, never a pill)",
             width: iphoneWidth, sizeClass: .compact,
-            content: relayStreamingTail(streamingMessage: userEcho,
-                                        store: preFirstItem, showBar: true))
+            content: relayStreamingTail(streamingMessage: optimisticCaret,
+                                        prefixMessages: [userEcho],
+                                        store: preFirstItem, showBar: false))
         paths.append("qa1-02-relay-pre-first-item-row.png")
 
         for name in paths {
@@ -218,12 +227,18 @@ final class TranscriptChromeGlowEvidenceTests: XCTestCase {
     @ViewBuilder
     private func relayStreamingTail(
         streamingMessage: ChatMessage,
+        prefixMessages: [ChatMessage] = [],
         store: ChatStore,
         showBar: Bool
     ) -> some View {
         let sessions = SessionStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: store)
         VStack(alignment: .leading, spacing: 0) {
+            ForEach(prefixMessages) { prefix in
+                MessageBubble(message: prefix)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+            }
             MessageBubble(message: streamingMessage)
                 .padding(.horizontal, 16)
                 .padding(.top, 12)

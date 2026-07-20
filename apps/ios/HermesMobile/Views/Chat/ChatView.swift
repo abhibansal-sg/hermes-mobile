@@ -233,19 +233,20 @@ struct ChatView: View {
         isStreaming: Bool,
         hasPendingGate: Bool,
         isRelayTransport: Bool,
-        lastMessage: ChatMessage?
+        lastMessage: ChatMessage? = nil
     ) -> Bool {
         guard isStreaming, !hasPendingGate else { return false }
-        // Relay: the streaming assistant bubble IS the working signal (its cursor
-        // breathes while any item is non-terminal) — a tail pill beside it is the
-        // redundant "Working" bar of B8. Show only pre-first-item, when no bubble
-        // renders the cursor yet.
-        if isRelayTransport,
-           let last = lastMessage,
-           last.role == .assistant,
-           last.isStreaming {
-            return false
-        }
+        // QA-2 R4/A2 — the Working pill is IMPOSSIBLE on the relay path (state
+        // DELETED, not hidden). The send now appends an optimistic empty
+        // streaming assistant bubble (ChatStore's relay branch), so the
+        // breathing caret IS the working signal from the instant of send —
+        // the pre-first-item window the QA-1 B8 clause still showed the pill
+        // for no longer exists, and that clause (the last state that could
+        // flash the pill on relay) is gone. `lastMessage` is vestigial on the
+        // relay path (kept in the signature for the direct-path callers and
+        // the render gate's call sites). Direct transport below is
+        // byte-identical to the approved behavior.
+        if isRelayTransport { return false }
         return true
     }
 
@@ -864,7 +865,13 @@ struct ChatView: View {
         TurnDockContent.resolve(
             hasApproval: chatStore.pendingApproval != nil,
             hasClarification: chatStore.pendingClarification != nil,
-            hasTasks: chatStore.latestTodoList != nil,
+            // QA-2 R12/R13: mirror the TurnDock's own resolver exactly — the
+            // inline-todo suppression below must agree with the dock about who
+            // owns the checklist. Reading `dockShowsTaskBox` (turn-lifecycle +
+            // session-scoped) keeps the two surfaces byte-aligned: when the
+            // dock pill hides at turn end, inline TodoCards are allowed to
+            // render again for the settled turn.
+            hasTasks: chatStore.dockShowsTaskBox,
             hasQueued: TurnDock.hasQueued(queueStore)
         )
     }
@@ -1118,6 +1125,14 @@ struct ChatView: View {
                         menuActionsEnabled: menuActionsEnabled,
                         assistantTurnActionsEnabled: !chatStore.isStreaming,
                         liveTurnStartedAt: chatStore.turnStartedAt,
+                        // QA-2 R5/A3: the LAST assistant row tracks the store's
+                        // turn-scoped streaming (relay `relayTurnLive`) so the
+                        // working section holds its single "Working…" line for
+                        // the whole turn, including the all-terminal window
+                        // between two tool items.
+                        liveTurnActive: message.role == .assistant
+                            && message.id == lastAssistantId
+                            && chatStore.isStreaming,
                         appearance: BubbleAppearance(themeID: theme.id, colorScheme: colorScheme, typeSize: dynamicTypeSize),
                         delivery: delivery,
                         onResend: deliveryResendHandler(for: delivery),

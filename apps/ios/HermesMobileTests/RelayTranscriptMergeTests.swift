@@ -544,6 +544,13 @@ final class RelayTranscriptMergeTests: XCTestCase {
             agentStartedFrame(2, id: "msg-1", ord: 1),
             agentDeltaFrame(3, id: "msg-1", text: "Hey "),
             agentCompletedFrame(4, id: "msg-1", ord: 1, text: "Hey there!"),
+            // QA-2 R4/A2 contract: `isStreaming` is TURN-scoped — it settles on
+            // the authoritative `turn.completed` frame (the real relay always
+            // sends it; every render_conformance fixture ends with one), NOT on
+            // per-item terminality. The QA-1 shape of this test predated that
+            // contract and stopped at `item.completed`.
+            RelayFrame(seq: 5, sid: "s", turn: "t", kind: .turnCompleted,
+                       body: .object(["usage": .object([:])])),
         ])
 
         let accepted = await sendTask.value
@@ -594,6 +601,11 @@ final class RelayTranscriptMergeTests: XCTestCase {
         transport.deliverFrames([
             userItemFrame(1, id: "u-9", ord: 0, text: "follow-up", clientMessageID: cmid),
             agentCompletedFrame(2, id: "msg-9", ord: 1, text: "Answer."),
+            // QA-2 R4/A2: settle the turn with the authoritative boundary frame
+            // (see the sibling test) — item terminality no longer clears the
+            // store-level `isStreaming`.
+            RelayFrame(seq: 3, sid: "s", turn: "t", kind: .turnCompleted,
+                       body: .object(["usage": .object([:])])),
         ])
 
         let acceptedExisting = await sendTask.value
