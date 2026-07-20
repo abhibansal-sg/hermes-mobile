@@ -58,8 +58,13 @@ final class RelayAttachWireTests: XCTestCase {
 
         func send(_ message: URLSessionWebSocketTask.Message) async throws {
             guard case let .string(text) = message, let upstream = Self.parse(text) else { return }
-            lock.lock(); sent.append(upstream); lock.unlock()
+            record(upstream)   // sync helper: NSLock is unavailable directly in an async context
             script?(upstream, self)
+        }
+
+        private func record(_ upstream: Upstream) {
+            lock.lock(); defer { lock.unlock() }
+            sent.append(upstream)
         }
 
         func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
@@ -204,7 +209,8 @@ final class RelayAttachWireTests: XCTestCase {
                     clientFactory: { RelayClient { _ in transport } }
                 )
             }
-            _ = connection.ensureRelayCoordinator()
+            let coordinator = connection.ensureRelayCoordinator()
+            try await coordinator.start(url: url)
 
             let store = AttachmentStore()
             let result = try await store.attachFile(
@@ -242,7 +248,8 @@ final class RelayAttachWireTests: XCTestCase {
                     clientFactory: { RelayClient { _ in transport } }
                 )
             }
-            _ = connection.ensureRelayCoordinator()
+            let coordinator = connection.ensureRelayCoordinator()
+            try await coordinator.start(url: url)
 
             // One tiny decodable image through the same normalisation the
             // photo picker uses (add(data:) → JPEG ≤ 2048px).
