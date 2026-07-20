@@ -319,12 +319,13 @@ final class QA1ResumeLaneTests: XCTestCase {
     #if DEBUG
     func testRelayResumeRejectionRecordsButNeverAlerts() async throws {
         let (_, sessions, _, coordinator, transport) = makeRelayGraph()
-        transport.script = { [default = defaultScript()] up, relay in
+        let fallback = defaultScript()
+        transport.script = { up, relay in
             guard let id = up.id else { return }
             if up.method == "resume" {
                 relay.deliverError(id: id, code: 4007, message: "session not found")
             } else {
-                default(up, relay)
+                fallback(up, relay)
             }
         }
         try await coordinator.start(url: relayURL)
