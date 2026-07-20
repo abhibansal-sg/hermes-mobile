@@ -44,6 +44,21 @@ final class LiveActivityRelayLifecycleTests: XCTestCase {
         chat.applyRelayItems(store.items)
     }
 
+    /// Settle the current relay turn (finalize the assistant message). The
+    /// projection's streaming→settled edge clears `turnStartedAt`, so a
+    /// subsequent `seedStreamingTurn` re-fires `onTurnStart` (a genuine new
+    /// turn) rather than no-opping on the stale marker.
+    private func settleCurrentTurn(_ chat: ChatStore) {
+        var store = RelayItemStore()
+        store.apply([
+            itemFrame(1, kind: "item.completed", id: "user-1", .userMessage,
+                      status: "completed", ord: 0, body: ["text": "hi"]),
+            itemFrame(2, kind: "item.completed", id: "msg-1", .agentMessage,
+                      status: "completed", ord: 1, body: ["text": "done"]),
+        ])
+        chat.applyRelayItems(store.items)
+    }
+
     // MARK: - Pure helper
 
     func testHasRelayErrorTerminalDetection() {
@@ -130,8 +145,11 @@ final class LiveActivityRelayLifecycleTests: XCTestCase {
         chat.notifyRelayTurnCompleted()    // suppressed
         XCTAssertEqual(completions, 0)
 
-        // A NEW turn starts (first streaming projection resets the latch via
-        // markTurnStartedIfNeeded) and completes normally.
+        // The errored turn settles (projection finalizes), clearing
+        // `turnStartedAt` so the next turn's first streaming projection
+        // re-fires `markTurnStartedIfNeeded` — which resets the latch.
+        settleCurrentTurn(chat)
+        // A NEW turn starts and completes normally.
         seedStreamingTurn(chat)
         chat.notifyRelayTurnCompleted()
         XCTAssertEqual(completions, 1,
