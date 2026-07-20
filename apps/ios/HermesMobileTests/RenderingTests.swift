@@ -1150,8 +1150,8 @@ final class RenderingTests: XCTestCase {
             .appendingPathComponent("apps/ios/HermesMobile/Views/Chat/MessageBubble.swift")
         let codeBlock = repoRoot
             .appendingPathComponent("apps/ios/HermesMobile/Views/Chat/Rendering/CodeBlockView.swift")
-        try XCTAssert(fileExists(at: messageBubble), "MessageBubble.swift missing at \(messageBubble.path)")
-        try XCTAssert(fileExists(at: codeBlock), "CodeBlockView.swift missing at \(codeBlock.path)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: messageBubble.path), "MessageBubble.swift missing at \(messageBubble.path)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: codeBlock.path), "CodeBlockView.swift missing at \(codeBlock.path)")
 
         let bubbleSource = try String(contentsOf: messageBubble, encoding: .utf8)
         let codeSource = try String(contentsOf: codeBlock, encoding: .utf8)
