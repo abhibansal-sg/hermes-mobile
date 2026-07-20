@@ -1368,4 +1368,133 @@ final class ConnectionStoreReconnectTests: XCTestCase {
         XCTAssertEqual(calls, 0, "path-satisfied must be a no-op while connected")
     }
     #endif
+
+    // MARK: - WS-RECONNECT-SOFTEN (b): single-flight reconnect across triggers
+
+    #if DEBUG
+    /// The core single-flight regression: a network-path-satisfied event that
+    /// arrives while the CURRENT reconnect attempt's handshake is already in
+    /// flight must NOT cancel and restart it. Before this guard, an overlapping
+    /// trigger during a flapping path could repeatedly abort an attempt just
+    /// before it would have succeeded — livelocking reconnection during exactly
+    /// the flappy window these triggers exist to help.
+    func testNetworkPathSatisfiedDuringInFlightHandshakeDoesNotRestartAttempt() async {
+        let (connection, _, _) = makeStore()
+        let server = "https://s3-inflight.example:9119"
+        let gate = SuspensionGate()
+        let connectCalls = ResumeCallLog()
+        connection.networkReconnectDebounceOverride = .milliseconds(5)
+        connection.connectRPC = { _, _, _ in
+            await connectCalls.append(server)
+            // Suspend forever (until released) to represent a handshake that is
+            // genuinely still in flight when the network trigger fires.
+            await gate.suspend()
+        }
+        let fake = FakePathMonitor()
+        connection._pathMonitorForTesting = fake
+        connection._startPathMonitorForTesting()
+        connection._seedAndStartReconnect(serverURL: server, token: "tok")
+
+        await gate.waitUntilEntered()
+        XCTAssertEqual(connection.phase, .reconnecting(attempt: 0))
+        var calls = await connectCalls.calls(for: server)
+        XCTAssertEqual(calls, 1)
+
+        // The path "returns" while attempt 0's handshake is still suspended
+        // inside `connectRPC`. Single-flight must leave it alone.
+        fake.emit(.satisfied)
+        await settle()
+
+        calls = await connectCalls.calls(for: server)
+        XCTAssertEqual(
+            calls, 1,
+            "an in-flight handshake must not be cancelled and restarted by an overlapping network-return trigger"
+        )
+        XCTAssertEqual(
+            connection.phase, .reconnecting(attempt: 0),
+            "the in-flight attempt must still be the original attempt 0, not restarted"
+        )
+
+        // Let the original attempt resolve — it must still be able to succeed.
+        await gate.release()
+        await settle()
+        XCTAssertEqual(connection.phase, .connected)
+    }
+
+    /// Control case: a network-path-satisfied event that arrives while the loop
+    /// is PARKED in backoff (no handshake in flight) still resets it to an
+    /// immediate retry — the single-flight guard must not suppress this, only
+    /// an actively in-flight handshake.
+    func testNetworkPathSatisfiedDuringParkedBackoffStillResetsToImmediateRetry() async {
+        let (connection, _, _) = makeStore()
+        let server = "https://s3-parked.example:9119"
+        // A long fixed backoff so the loop is reliably parked in
+        // `Task.sleep` (not connecting) when the path event fires.
+        connection.reconnectBackoffOverride = 30
+        connection.networkReconnectDebounceOverride = .milliseconds(5)
+        let connectCalls = ResumeCallLog()
+        connection.connectRPC = { _, _, _ in
+            await connectCalls.append(server)
+            if await connectCalls.calls(for: server) == 1 {
+                throw URLError(.cannotConnectToHost)
+            }
+        }
+        let fake = FakePathMonitor()
+        connection._pathMonitorForTesting = fake
+        connection._startPathMonitorForTesting()
+        connection._seedAndStartReconnect(serverURL: server, token: "tok")
+
+        // Attempt 0 fires immediately and fails, parking the loop in its
+        // (overridden, 30s) backoff sleep before attempt 1.
+        await settle()
+        var calls = await connectCalls.calls(for: server)
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(connection.phase, .reconnecting(attempt: 1))
+
+        // Network "returns" while parked in backoff — must reset to an
+        // immediate retry rather than waiting out the 30s window.
+        fake.emit(.satisfied)
+        await settle()
+
+        calls = await connectCalls.calls(for: server)
+        XCTAssertEqual(
+            calls, 2,
+            "a network-return while parked in backoff must kick an immediate retry"
+        )
+        XCTAssertEqual(connection.phase, .connected)
+    }
+    #endif
+
+    // MARK: - WS-RECONNECT-SOFTEN (c): capped exponential backoff with jitter
+
+    /// Attempts 1…4 follow `0.5 * 2^attempt` before the cap, each with a
+    /// `[0, 0.5)` jitter term layered on top — i.e. roughly 1s/2s/4s/8s.
+    func testBackoffDelayGrowsExponentiallyBelowCap() {
+        for attempt in 1...4 {
+            let expectedBase = min(0.5 * pow(2.0, Double(attempt)), 8.0)
+            let delay = ConnectionStore.backoffDelay(attempt: attempt)
+            XCTAssertGreaterThanOrEqual(delay, expectedBase, "attempt \(attempt)")
+            XCTAssertLessThan(delay, expectedBase + 0.5, "attempt \(attempt) jitter must stay within [0, 0.5)")
+        }
+    }
+
+    /// The base delay is capped at 8s (not the old 30s) so a client retrying
+    /// against a crash-looping gateway never backs off further than that —
+    /// verified well past the attempt where the cap engages.
+    func testBackoffDelayCapsAtEightSecondsPlusJitter() {
+        for attempt in [5, 6, 10, 20] {
+            let delay = ConnectionStore.backoffDelay(attempt: attempt)
+            XCTAssertGreaterThanOrEqual(delay, 8.0, "attempt \(attempt) must never back off below the 8s cap")
+            XCTAssertLessThan(delay, 8.5, "attempt \(attempt) must never exceed the 8s cap + max jitter")
+        }
+    }
+
+    /// Attempt 0 has no caller-side delay (fired immediately by the reconnect
+    /// loop, not through `backoffDelay`) — but the function itself is still
+    /// well-defined and small for attempt 0, matching `0.5 * 2^0 = 0.5` base.
+    func testBackoffDelayAtAttemptZeroIsSmallBase() {
+        let delay = ConnectionStore.backoffDelay(attempt: 0)
+        XCTAssertGreaterThanOrEqual(delay, 0.5)
+        XCTAssertLessThan(delay, 1.0)
+    }
 }
