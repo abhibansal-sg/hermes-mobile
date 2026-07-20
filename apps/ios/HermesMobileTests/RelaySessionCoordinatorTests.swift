@@ -900,6 +900,30 @@ final class RelayWorkingSignalLifecycleTests: XCTestCase {
                    ]))
     }
 
+    /// The relay's terminal userMessage item — synthesized on SUBMIT and fanned
+    /// out immediately (QA-1). Build 115: projecting this TERMINAL item cleared
+    /// `isStreaming` and killed every working affordance for the whole wait
+    /// window (R4). QA-2 makes streaming turn-scoped: this frame must NOT
+    /// settle the turn.
+    private func userMessageFrame(_ seq: Int, id: String = "u-1") -> RelayFrame {
+        RelayFrame(seq: seq, sid: "abc123", turn: nil,
+                   kind: .itemCompleted,
+                   body: .object([
+                       "item_id": .string(id),
+                       "type": .string(ChatItemType.userMessage.rawValue),
+                       "status": .string("completed"),
+                       "ord": .number(0),
+                       "body": .object(["text": .string("hello")]),
+                   ]))
+    }
+
+    /// `turn.completed` — the AUTHORITATIVE settle the turn-scoped streaming
+    /// flag clears on (QA-2 R4/A2; item terminality alone no longer settles).
+    private func turnCompletedFrame(_ seq: Int) -> RelayFrame {
+        RelayFrame(seq: seq, sid: "abc123", turn: "t1",
+                   kind: .turnCompleted, body: .object([:]))
+    }
+
     /// The production view-model gate evaluated exactly as `ChatView` does for
     /// the relay transport.
     private func workingRowVisible(_ chat: ChatStore) -> Bool {
@@ -927,13 +951,42 @@ final class RelayWorkingSignalLifecycleTests: XCTestCase {
         XCTAssertTrue(s.chat.isStreaming, "relay send enters the streaming state")
         XCTAssertNotNil(s.chat.turnStartedAt,
             "the relay submit must stamp the turn start so the pre-first-item row ticks")
-        // Pre-first-item: nothing streams yet, so the honest row IS visible
-        // (mirrors the approved direct path between send and message.start).
-        XCTAssertTrue(workingRowVisible(s.chat),
-            "pre-first-item relay: the accepted-and-waiting row shows")
+        // QA-2 R4/A2: the instant working affordance is the OPTIMISTIC EMPTY
+        // STREAMING ASSISTANT BUBBLE the send appends (its breathing caret
+        // renders ≤100 ms from send, independent of any frame) — NOT the
+        // standalone Working pill, which can never appear on the relay path
+        // (its pre-first-item state is deleted).
+        let last = try XCTUnwrap(s.chat.messages.last)
+        XCTAssertEqual(last.role, .assistant,
+            "R4: send appends the optimistic streaming assistant bubble")
+        XCTAssertTrue(last.isStreaming)
+        XCTAssertTrue(last.parts.isEmpty, "the optimistic bubble is empty until the first delta")
+        XCTAssertFalse(workingRowVisible(s.chat),
+            "A2: the relay Working pill is impossible — even pre-first-item")
     }
 
     // MARK: - (2) first item → cursor is the working signal (A4)
+
+    /// QA-2 R4/A2 — the relay's synthesized TERMINAL `userMessage` first frame
+    /// must NOT settle the turn: streaming stays true (turn-scoped) and the
+    /// optimistic caret bubble persists through the accepted-and-waiting
+    /// window. FAILS on qa2/base (`nowStreaming = rebuilt.contains {
+    /// $0.isStreaming }` → false → `setStreaming(false, "relayProjection")`).
+    func testTerminalUserMessageFrameDoesNotSettleTheTurn() async throws {
+        let s = try await makeStores()
+        await openSession(s)
+        _ = await s.chat.send(text: "hello")
+
+        s.transport.deliverFrame(userMessageFrame(1))
+        await waitUntil { s.chat.messages.contains { $0.role == .user && $0.text == "hello" } }
+
+        XCTAssertTrue(s.chat.isStreaming,
+            "R4/A2: the terminal userMessage frame must not clear turn-scoped streaming")
+        XCTAssertTrue(s.chat.messages.contains {
+            $0.role == .assistant && $0.isStreaming && $0.parts.isEmpty
+        }, "R4: the optimistic caret bubble persists until the first agent item")
+        XCTAssertFalse(workingRowVisible(s.chat), "A2: still no Working pill on relay")
+    }
 
     /// Feeding a recorded `item.started` through the real projection flips the
     /// gate OFF: the streaming assistant bubble now renders the breathing cursor
@@ -956,9 +1009,11 @@ final class RelayWorkingSignalLifecycleTests: XCTestCase {
 
     // MARK: - (3) settle clears the chrome for the next turn
 
-    /// The settle transition clears `turnStartedAt` (parity with the direct
-    /// path's `handleMessageComplete`), so a subsequent relay send stamps a
-    /// FRESH start — the next turn never inherits the previous turn's elapsed.
+    /// The settle transition (`turn.completed` — QA-2: the AUTHORITATIVE
+    /// settle, not item terminality) clears `turnStartedAt` (parity with the
+    /// direct path's `handleMessageComplete`), so a subsequent relay send
+    /// stamps a FRESH start — the next turn never inherits the previous
+    /// turn's elapsed.
     func testRelaySettleClearsChromeSoNextTurnStampsFresh() async throws {
         let s = try await makeStores()
         await openSession(s)
@@ -971,6 +1026,10 @@ final class RelayWorkingSignalLifecycleTests: XCTestCase {
         await waitUntil { s.chat.messages.last?.isStreaming == true }
         s.transport.deliverFrame(agentItemFrame(2, id: "msg-1",
                                                 status: "completed", text: "Done."))
+        // QA-2: a terminal item alone does NOT settle the turn anymore.
+        XCTAssertTrue(s.chat.isStreaming,
+            "item terminality must not settle a turn-scoped streaming turn")
+        s.transport.deliverFrame(turnCompletedFrame(3))
         await waitUntil { !s.chat.isStreaming }
 
         XCTAssertNil(s.chat.turnStartedAt,
@@ -996,6 +1055,11 @@ final class RelayWorkingSignalLifecycleTests: XCTestCase {
         let ok = await s.chat.send(text: "hello")
         XCTAssertFalse(ok, "the submit error propagates as a failed send")
         XCTAssertFalse(s.chat.isStreaming)
+        XCTAssertFalse(s.chat.relayTurnLive,
+            "a failed submit must un-mark the turn live (QA-2 R4)")
+        XCTAssertFalse(s.chat.messages.contains {
+            $0.role == .assistant && $0.relayProjected && $0.parts.isEmpty
+        }, "a failed submit must not strand the optimistic caret bubble")
         XCTAssertNil(s.chat.turnStartedAt,
             "a failed submit must not strand a turn start behind")
         XCTAssertFalse(workingRowVisible(s.chat))
