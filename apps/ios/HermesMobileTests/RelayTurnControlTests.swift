@@ -23,7 +23,7 @@ final class RelayTurnControlTests: XCTestCase {
     // MARK: - In-process mock relay transport
 
     final class MockRelayTransport: RelayTransport, @unchecked Sendable {
-        struct Upstream: Sendable { let method: String; let id: String?; let params: [String: Any] }
+        struct Upstream { let method: String; let id: String?; let params: [String: Any] }
 
         private let lock = NSLock()
         private var inbox: [URLSessionWebSocketTask.Message] = []
