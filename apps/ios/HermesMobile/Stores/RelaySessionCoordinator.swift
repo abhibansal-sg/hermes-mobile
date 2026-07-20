@@ -667,6 +667,18 @@ final class RelaySessionCoordinator {
         return try await requireClient().interrupt(sid)
     }
 
+    /// Inject steering text into the live turn over the relay (§5b, QA-2 R11).
+    /// Session resolution mirrors `interrupt`: an explicit target wins, else the
+    /// driven session. The relay passes the gateway's disposition through
+    /// VERBATIM — `{status: "queued" | "rejected", text}` — so `ChatStore.steer`
+    /// maps it identically to the gateway-direct path. Wire shape asserted by
+    /// tests/conformance (upstream `steer` payload).
+    @discardableResult
+    func steer(sessionID: String? = nil, text: String) async throws -> JSONValue {
+        guard let sid = sessionID ?? activeSessionID else { throw RelayError.notConnected }
+        return try await requireClient().steer(sessionID: sid, text: text)
+    }
+
     // MARK: Push token registration (§6a)
 
     /// Register the APNs device token over the relay socket (§6a). The relay
