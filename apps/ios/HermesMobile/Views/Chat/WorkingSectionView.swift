@@ -97,7 +97,7 @@ enum WorkingSectionModel {
     /// are excluded defensively so only real work folds.
     nonisolated static func isWorkingItem(_ item: ChatItem) -> Bool {
         switch item.type {
-        case .toolCall, .fileChange, .browser, .image, .error, .reasoning:
+        case .toolCall, .taskList, .fileChange, .browser, .image, .error, .reasoning:
             return true
         case .agentMessage, .usage, .userMessage:
             return false
@@ -290,6 +290,7 @@ enum WorkingSectionModel {
         case .browser: return "safari"
         case .error: return "exclamationmark.triangle"
         case .reasoning: return "bubble.left"
+        case .taskList: return "checklist"
         case .toolCall, .agentMessage, .usage, .userMessage: return "terminal"
         }
     }

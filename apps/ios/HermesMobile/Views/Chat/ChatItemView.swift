@@ -35,13 +35,14 @@ struct DefaultChatItemRenderer: ChatItemRendering {
 
 /// Dispatches a Wave-2 item-backed part to its per-type renderer (`Views/Chat/Items/`).
 ///
-/// The special-render kinds (`toolCall`/`fileChange`/`image`/`browser`/`error`)
-/// are what actually flow through `ChatMessagePart.item`; the text-shaped kinds
-/// (`agentMessage`/`reasoning`/`usage`) normally project onto legacy parts via
-/// `ChatItem.renderPart`, but are dispatched here too so this view can render ANY
-/// item type standalone (previews, tests, and a defensive fallback). An
-/// unrecognized wire `type` has already folded to `.toolCall` upstream, so the
-/// generic `ToolItemCard` is the forward-compat catch-all.
+/// The special-render kinds (`toolCall`/`taskList`/`fileChange`/`image`/
+/// `browser`/`error`) are what actually flow through `ChatMessagePart.item`;
+/// the text-shaped kinds (`agentMessage`/`reasoning`/`usage`) normally project
+/// onto legacy parts via `ChatItem.renderPart`, but are dispatched here too so
+/// this view can render ANY item type standalone (previews, tests, and a
+/// defensive fallback). An unrecognized wire `type` has already folded to
+/// `.toolCall` upstream, so the generic `ToolItemCard` is the forward-compat
+/// catch-all.
 struct ChatItemView: View {
     let item: ChatItem
 
@@ -49,6 +50,8 @@ struct ChatItemView: View {
         switch item.type {
         case .toolCall:
             ToolItemCard(item: item)
+        case .taskList:
+            TaskListItemView(item: item)
         case .fileChange:
             FileChangeItemView(item: item)
         case .image:

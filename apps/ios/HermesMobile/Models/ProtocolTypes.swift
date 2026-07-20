@@ -989,11 +989,17 @@ struct TodoList: Sendable, Equatable {
     }
 
     /// Parse from an already-decoded `todos` array (used when the result is held
-    /// as a structured `JSONValue` rather than a string).
+    /// as a structured `JSONValue` rather than a string). Reads the entry text
+    /// from EITHER field: the gateway's structured todo tool sends
+    /// `{id,content,status}` (legacy/direct path); the relay's `taskList` item
+    /// body sends `{id,text,status}` (RELAY-PHONE-PROTOCOL §2). Both shapes
+    /// carry the same data — the field rename is the only difference — so a
+    /// single tolerant parse covers both and the Turn Dock's accessor returns
+    /// the identical `TodoList` regardless of which path produced it.
     init?(todosArray: [JSONValue]) {
         let parsed: [TodoItem] = todosArray.compactMap { entry in
             guard let object = entry.objectValue else { return nil }
-            let content = object["content"]?.stringValue ?? ""
+            let content = object["content"]?.stringValue ?? object["text"]?.stringValue ?? ""
             guard !content.isEmpty else { return nil }
             let id = object["id"]?.stringValue ?? content
             let status = TodoItem.Status(raw: object["status"]?.stringValue ?? "pending")
