@@ -769,7 +769,8 @@ struct WorkingSectionView: View {
     }
 
     private var liveAccessibilityLabel: String {
-        let base = "\(WorkingSectionModel.liveCollapsedLabel(parts: parts)), \("elapsed") \(ThinkingDisplay.elapsedText(startedAt: liveTurnStartedAt, now: now))"
+        let elapsed = ThinkingDisplay.elapsedText(startedAt: liveTurnStartedAt, now: now)
+        let base = "\(WorkingSectionModel.liveCollapsedLabel(parts: parts)), elapsed \(elapsed)"
         return hasFailure ? "\(base), contains a failed step" : base
     }
 
