@@ -4,11 +4,15 @@ import GRDB
 
 /// Store-level behaviour for the Projects repair:
 ///   • fix (a) — Project detail fetches the plugin `project-sessions` route and
-///     falls back to the legacy `cwd_prefix` path ONLY on a 404 (old gateway).
+///     falls back to the legacy `cwd_prefix` path on a 404 (old gateway) OR a
+///     transient 401/403/5xx/network failure (PROJECTS-401: a gateway
+///     crash-respawn window can race device-token auth), then retries the
+///     whole two-tier fetch once with a short backoff before surfacing a
+///     directional error.
 ///   • fix (c) — cache-first: offline seeds paint the last-known list instead of
 ///     a blank "Not connected" wall, and successful fetches write through.
 ///
-/// The 404-fallback and write-through paths are driven through a real
+/// The fallback/retry and write-through paths are driven through a real
 /// ``RestClient`` wired to a `URLProtocol` stub (the STR-1417
 /// `_restOverrideForTesting` seam), so the actual route selection + decode runs.
 /// Cache paths use a real in-memory ``CacheStore``.
@@ -19,11 +23,16 @@ final class ProjectsStoreTests: XCTestCase {
 
     /// Routes by URL path: the plugin `project-sessions` route, the legacy
     /// `/api/sessions` fallback, and `/projects` (overview GET) are each answered
-    /// from an independently-settable `(body, status)`.
+    /// from an independently-settable `(body, status)`. A route may instead be
+    /// driven by `*Sequence` — one entry per call, by 1-indexed hit count,
+    /// clamped to the last entry once exhausted — so a fix-(a) retry test can
+    /// simulate "401 once, then recovers" across the two calls the retry makes.
     final class RoutingProtocol: URLProtocol, @unchecked Sendable {
         nonisolated(unsafe) static var projectSessions: (Data, Int) = (Data(), 200)
         nonisolated(unsafe) static var legacySessions: (Data, Int) = (Data(), 200)
         nonisolated(unsafe) static var overview: (Data, Int) = (Data("[]".utf8), 200)
+        nonisolated(unsafe) static var projectSessionsSequence: [(Data, Int)]?
+        nonisolated(unsafe) static var legacySessionsSequence: [(Data, Int)]?
         nonisolated(unsafe) static var projectSessionsHits = 0
         nonisolated(unsafe) static var legacySessionsHits = 0
 
@@ -31,6 +40,8 @@ final class ProjectsStoreTests: XCTestCase {
             projectSessions = (Data(), 200)
             legacySessions = (Data(), 200)
             overview = (Data("[]".utf8), 200)
+            projectSessionsSequence = nil
+            legacySessionsSequence = nil
             projectSessionsHits = 0
             legacySessionsHits = 0
         }
@@ -43,10 +54,18 @@ final class ProjectsStoreTests: XCTestCase {
             let (body, status): (Data, Int)
             if path.hasSuffix("/project-sessions") {
                 Self.projectSessionsHits += 1
-                (body, status) = Self.projectSessions
+                if let sequence = Self.projectSessionsSequence, !sequence.isEmpty {
+                    (body, status) = sequence[min(Self.projectSessionsHits, sequence.count) - 1]
+                } else {
+                    (body, status) = Self.projectSessions
+                }
             } else if path.hasSuffix("/sessions") {
                 Self.legacySessionsHits += 1
-                (body, status) = Self.legacySessions
+                if let sequence = Self.legacySessionsSequence, !sequence.isEmpty {
+                    (body, status) = sequence[min(Self.legacySessionsHits, sequence.count) - 1]
+                } else {
+                    (body, status) = Self.legacySessions
+                }
             } else {
                 (body, status) = Self.overview
             }
@@ -84,6 +103,9 @@ final class ProjectsStoreTests: XCTestCase {
         )
         let store = ProjectsStore()
         store.attach(connection: connection)
+        // Zero out the fix-(a) retry backoff so the transient-failure tests
+        // don't burn real wall-clock time on the production 600ms delay.
+        store.projectSessionsRetryDelayOverrideNanoseconds = 0
         if let cache { attach(store, cache: cache) }
         return store
     }
@@ -150,17 +172,101 @@ final class ProjectsStoreTests: XCTestCase {
         XCTAssertEqual(RoutingProtocol.legacySessionsHits, 1)
     }
 
-    func testDetailNon404ErrorDoesNotFallBackAndSurfacesError() async throws {
+    func testDetailNonTransientErrorDoesNotFallBackAndSurfacesError() async throws {
+        // A genuinely malformed request (not an auth race, not "old gateway",
+        // not a 5xx) must propagate honestly — no fallback, no retry.
         let store = try makeConnectedStore()
-        RoutingProtocol.projectSessions = (Data(#"{"detail":"boom"}"#.utf8), 500)
+        RoutingProtocol.projectSessions = (Data(#"{"detail":"bad request"}"#.utf8), 400)
         RoutingProtocol.legacySessions = (sessionsWrapper(ids: ["should-not-appear"], total: 1), 200)
 
         let proj = project("/repo/root")
         await store.refreshSessions(for: proj)
 
-        XCTAssertTrue(store.sessions(for: proj).isEmpty, "a 500 must not silently fall back")
-        XCTAssertNotNil(store.sessionsError(for: proj))
+        XCTAssertTrue(store.sessions(for: proj).isEmpty, "a 400 must not silently fall back")
+        XCTAssertEqual(store.sessionsError(for: proj), "Server returned HTTP 400: {\"detail\":\"bad request\"}")
         XCTAssertEqual(RoutingProtocol.legacySessionsHits, 0)
+        XCTAssertEqual(RoutingProtocol.projectSessionsHits, 1, "no retry for a non-transient failure")
+    }
+
+    // MARK: - fix (a): PROJECTS-401 — 401/403/5xx treated like the 404 fallback
+
+    func testDetail401FallsBackToCwdPrefixLike404() async throws {
+        // Gateway respawn window: the plugin route rejects the still-registering
+        // device token, but the core /api/sessions path (older, always-wired
+        // auth) already accepts it.
+        let store = try makeConnectedStore()
+        RoutingProtocol.projectSessions = (Data(#"{"detail":"Unauthorized"}"#.utf8), 401)
+        RoutingProtocol.legacySessions = (sessionsWrapper(ids: ["legacy1"], total: 1), 200)
+
+        let proj = project("/repo/root")
+        await store.refreshSessions(for: proj)
+
+        XCTAssertEqual(store.sessions(for: proj).map(\.id), ["legacy1"], "401 must fall back to cwd_prefix, like 404")
+        XCTAssertNil(store.sessionsError(for: proj))
+        XCTAssertEqual(RoutingProtocol.legacySessionsHits, 1)
+    }
+
+    func testDetail403FallsBackToCwdPrefixLike404() async throws {
+        let store = try makeConnectedStore()
+        RoutingProtocol.projectSessions = (Data(#"{"detail":"Forbidden"}"#.utf8), 403)
+        RoutingProtocol.legacySessions = (sessionsWrapper(ids: ["legacy1"], total: 1), 200)
+
+        let proj = project("/repo/root")
+        await store.refreshSessions(for: proj)
+
+        XCTAssertEqual(store.sessions(for: proj).map(\.id), ["legacy1"])
+        XCTAssertNil(store.sessionsError(for: proj))
+    }
+
+    func testDetail5xxFallsBackToCwdPrefixLike404() async throws {
+        let store = try makeConnectedStore()
+        RoutingProtocol.projectSessions = (Data(#"{"detail":"boom"}"#.utf8), 503)
+        RoutingProtocol.legacySessions = (sessionsWrapper(ids: ["legacy1"], total: 1), 200)
+
+        let proj = project("/repo/root")
+        await store.refreshSessions(for: proj)
+
+        XCTAssertEqual(store.sessions(for: proj).map(\.id), ["legacy1"])
+        XCTAssertNil(store.sessionsError(for: proj))
+    }
+
+    func testDetailRetriesOnceAfterBothTiersFailTransiently() async throws {
+        // Both the plugin route and its fallback 401 on the first pass (mid
+        // respawn); by the retry a beat later the gateway has finished
+        // wiring device-token auth and both succeed.
+        let store = try makeConnectedStore()
+        RoutingProtocol.projectSessionsSequence = [
+            (Data(#"{"detail":"Unauthorized"}"#.utf8), 401),
+            (Data(#"{"detail":"Unauthorized"}"#.utf8), 401),
+        ]
+        RoutingProtocol.legacySessionsSequence = [
+            (Data(#"{"detail":"Unauthorized"}"#.utf8), 401),
+            (sessionsWrapper(ids: ["recovered"], total: 1), 200),
+        ]
+
+        let proj = project("/repo/root")
+        await store.refreshSessions(for: proj)
+
+        XCTAssertEqual(store.sessions(for: proj).map(\.id), ["recovered"], "the single retry must recover once the respawn window closes")
+        XCTAssertNil(store.sessionsError(for: proj))
+        XCTAssertEqual(RoutingProtocol.projectSessionsHits, 2, "primary route: initial attempt + the one retry")
+        XCTAssertEqual(RoutingProtocol.legacySessionsHits, 2, "fallback route: initial attempt + the one retry")
+    }
+
+    func testDetailGivesUpAfterOneRetryAndShowsDirectionalCopy() async throws {
+        // The respawn window outlasts both the initial attempt and the retry.
+        let store = try makeConnectedStore()
+        RoutingProtocol.projectSessions = (Data(#"{"detail":"Unauthorized"}"#.utf8), 401)
+        RoutingProtocol.legacySessions = (Data(#"{"detail":"Unauthorized"}"#.utf8), 401)
+
+        let proj = project("/repo/root")
+        await store.refreshSessions(for: proj)
+
+        XCTAssertTrue(store.sessions(for: proj).isEmpty)
+        XCTAssertEqual(store.sessionsError(for: proj), "Reconnecting to gateway — retry",
+                        "a still-transient failure after the retry gets directional copy, not raw HTTP")
+        XCTAssertEqual(RoutingProtocol.projectSessionsHits, 2, "exactly one retry — not an unbounded loop")
+        XCTAssertEqual(RoutingProtocol.legacySessionsHits, 2)
     }
 
     // MARK: - fix (c): cache-first detail

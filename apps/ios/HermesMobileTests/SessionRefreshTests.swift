@@ -1119,8 +1119,15 @@ import Testing
 ///    root (case-insensitive, trailing-slash-insensitive).
 /// 3. `ProjectsStore.sessions(for:in:)` correctly filters a session list to
 ///    the ones whose cwd resolves to the project root.
+///
+/// Named `ProjectsStoreModelTests` (not `ProjectsStoreTests`) to avoid
+/// colliding with the XCTest-based `ProjectsStoreTests` in
+/// `ProjectsStoreTests.swift`, which covers the PROJECTS-401 fallback/retry
+/// and cache-first behavior via a real `RestClient` — distinct coverage,
+/// same store, different seam (this file uses the older `sessionsFetch`
+/// closure injection).
 @MainActor
-struct ProjectsStoreTests {
+struct ProjectsStoreModelTests {
 
     // MARK: - Project model decoding
 
@@ -1352,7 +1359,7 @@ struct ProjectsStoreTests {
     }
 }
 
-/// Minimal stub for ProjectsStoreTests: id + optional cwd, everything else nil.
+/// Minimal stub for ProjectsStoreModelTests: id + optional cwd, everything else nil.
 extension SessionSummary {
     static func stub(id: String, cwd: String?) -> SessionSummary {
         SessionSummary(
