@@ -3345,14 +3345,42 @@ final class ChatStore {
     }
     #endif
 
-    func seed(from stored: [StoredMessage]) {
+    /// Whether a transcript seed REPLACES the merged timeline or UNIONs onto it
+    /// (QA-2 R15 — the stuck-episode segment drop).
+    ///
+    ///  - ``replace``: `incoming` is the SOLE truth — existing rows it does not
+    ///    carry are removed. Used by SESSION-OPEN paints (a cache/REST seed for
+    ///    a DIFFERENT session must evict the previous session's rows — that is
+    ///    the session isolation the cache-first open relies on, since a
+    ///    cache-HIT open seeds WITHOUT a preceding `reset()`), and by every
+    ///    caller that does not name a policy.
+    ///  - ``union``: `incoming` is a KNOWN-PARTIAL snapshot. Every reseed source
+    ///    on this tree serves a recent-TAIL window — relay history honors
+    ///    `limit` with `messages[-limit:]` (`relay/hermes_relay/downstream.py`),
+    ///    plugin REST serves the 50-row tail — and the relay's per-session
+    ///    store holds only what it observed since process start. A union reseed
+    ///    UPDATES the rows the snapshot carries IN PLACE and APPENDS genuinely
+    ///    new ones, but NEVER evicts settled history the snapshot merely does
+    ///    not cover: the merged view shows at least the settled history it held
+    ///    before the reseed (spec R15/A8 invariant — "the cache still had it").
+    ///    Only SAME-SESSION reseeds pass `.union` (`backfill()` and the
+    ///    phase-2/hydrate/chain-tip network reconciles in `SessionStore`) —
+    ///    every one guarded on the active session identity, so a union can
+    ///    never bleed across sessions. A genuinely server-deleted row still
+    ///    clears on the next full open (the session-open seed replaces).
+    enum ReseedPolicy: Sendable {
+        case replace
+        case union
+    }
+
+    func seed(from stored: [StoredMessage], policy: ReseedPolicy = .replace) {
         // ARCH37 STEP 2 — normalize on the CURRENT actor (main here, for the
         // synchronous/foreign-mirror callers) then apply. The off-main open/backfill
         // path instead pre-normalizes on its fetch Task and calls `seed(normalized:)`
         // directly (one main-actor hop for the assignment only). Both routes funnel
         // through `seed(normalized:)` so the foreign-mirror bail + in-place reconcile
         // semantics are identical regardless of where the normalize ran.
-        seed(normalized: Self.toChatMessages(stored))
+        seed(normalized: Self.toChatMessages(stored), policy: policy)
     }
 
     /// Apply an ALREADY-NORMALIZED seed (`toChatMessages` output) onto the
@@ -3360,7 +3388,7 @@ final class ChatStore {
     /// actor (ARCH37 Step 2 — the off-main open/backfill path), so this method is the
     /// single MAIN-ACTOR hop that mutates `messages`: the foreign-mirror bail, the
     /// in-place reconcile, the ordinal rebuild, and the `transcriptGeneration` bump.
-    func seed(normalized: [ChatMessage]) {
+    func seed(normalized: [ChatMessage], policy: ReseedPolicy = .replace) {
         // A slow REST seed must never wipe a LIVE adopted foreign mirror
         // (R1 #61): open() the session another client is driving, the foreign
         // `message.start` adopts mid-fetch, then the stale seed lands here and
@@ -3372,7 +3400,12 @@ final class ChatStore {
         cancelStreaming()
         // QA-1 B4: an authoritative seed is the confirmation of what the open
         // session actually contains — zero rows IS the (honest) transcript.
-        transcriptConfirmedEmpty = normalized.isEmpty
+        // A UNION reseed is a KNOWN-PARTIAL snapshot (R15): an empty one proves
+        // nothing about the session — never let it confirm emptiness over a
+        // painted transcript (the placeholder chain must stay honest).
+        if policy == .replace {
+            transcriptConfirmedEmpty = normalized.isEmpty
+        }
         // IN-PLACE RECONCILE (contract Batch E §3.7, fixes D9): merge the new
         // seed onto the existing transcript by identity instead of a wholesale
         // `messages = …` replace. A wholesale replace remounts every row (new
@@ -3382,7 +3415,7 @@ final class ChatStore {
         // restacked. The merge keeps identity for rows whose deterministic ids
         // match across reseeds (no restack), and adopts the foreign placeholder's
         // slot for the reconciled trailing reply (no blink, no count churn).
-        reconcileMessages(with: normalized)
+        reconcileMessages(with: normalized, policy: policy)
         rebuildUserOrdinals()
         transcriptGeneration += 1
     }
@@ -3514,14 +3547,32 @@ final class ChatStore {
     ///     existing row in place. The reply transitions placeholder → finalized
     ///     with zero count churn and a stable identity.
     ///  3. Anything else in `incoming` with no match is a genuinely-new row,
-    ///     inserted in wire order. Existing rows absent from `incoming` are removed.
+    ///     inserted in wire order.
     ///
-    /// The final array is byte-identical in content to `incoming` — only the
-    /// element IDENTITIES are reused where possible. (So every existing test that
-    /// asserts `messages.map(\.text)` after a reconcile still holds.)
-    private func reconcileMessages(with incoming: [ChatMessage]) {
+    /// POLICY (QA-2 R15 — the stuck-episode segment drop):
+    ///  - ``ReseedPolicy/replace`` (default): existing rows absent from
+    ///    `incoming` are REMOVED — the final array is byte-identical in content
+    ///    to `incoming` (so every existing test that asserts
+    ///    `messages.map(\.text)` after a reconcile still holds).
+    ///  - ``ReseedPolicy/union``: `incoming` is a KNOWN-PARTIAL snapshot (the
+    ///    relay's tail-window history / item store observed since process
+    ///    start). Matched rows still update in place and genuinely-new rows
+    ///    still insert — but untagged existing rows the snapshot does NOT carry
+    ///    are RETAINED in their existing position, never evicted: the merged
+    ///    view shows at least the settled history it held before the reseed
+    ///    (spec R15/A8 invariant). The one exception is `relayProjected` rows:
+    ///    the live relay projection re-renders any still-live item from the
+    ///    item store on the next frame (`applyRelayItems`), so a reseed
+    ///    supersedes the stale projection exactly as it did pre-union. A user
+    ///    row the snapshot carries under a wire id the optimistic echo's
+    ///    runtime id never matches ADOPTS the echo's slot (mirror of
+    ///    `adoptRelayEcho`) so the two converge into one bubble.
+    private func reconcileMessages(with incoming: [ChatMessage], policy: ReseedPolicy = .replace) {
         let placeholderID = pendingForeignReconcileID
-        pendingForeignReconcileID = nil
+        // A replace consumes the marker (unmatched rows are evicted anyway); a
+        // union RETAINS it when unconsumed — the retained placeholder row keeps
+        // its adoption slot for a later seed, parity with ABH-278 below.
+        if policy == .replace { pendingForeignReconcileID = nil }
         let reconnectID = pendingReconnectReconcileID
 
         // Fast path: nothing to preserve identity against.
@@ -3543,8 +3594,12 @@ final class ChatStore {
             ? nil
             : incoming.last(where: { $0.role == .assistant })?.id
 
-        var rebuilt: [ChatMessage] = []
-        rebuilt.reserveCapacity(incoming.count)
+        // PASS 1 — fold `incoming` into content-updated rows keyed by their
+        // FINAL id (the existing row's id for matched/adopted rows, the
+        // incoming row's own id for genuinely-new rows), in incoming order.
+        var updatedByID: [UUID: ChatMessage] = [:]
+        var incomingOrder: [UUID] = []
+        var consumedIDs: Set<UUID> = []   // existing ids consumed by an adoption
 
         for newMessage in incoming {
             if var existing = existingByID[newMessage.id] {
@@ -3554,7 +3609,8 @@ final class ChatStore {
                 existing.isStreaming = newMessage.isStreaming
                 existing.timestamp = newMessage.timestamp
                 existing.presentation = newMessage.presentation
-                rebuilt.append(existing)
+                updatedByID[existing.id] = existing
+                incomingOrder.append(existing.id)
             } else if !placeholderConsumed,
                       let placeholder = placeholderRow,
                       newMessage.role == .assistant,
@@ -3563,6 +3619,8 @@ final class ChatStore {
                 // identity + slot (no blink, no restack). Build a new value with
                 // the placeholder's id so the row updates in place.
                 placeholderConsumed = true
+                pendingForeignReconcileID = nil
+                consumedIDs.insert(placeholder.id)
                 let adopted = ChatMessage(
                     id: placeholder.id,
                     role: newMessage.role,
@@ -3571,7 +3629,8 @@ final class ChatStore {
                     timestamp: newMessage.timestamp,
                     presentation: newMessage.presentation
                 )
-                rebuilt.append(adopted)
+                updatedByID[placeholder.id] = adopted
+                incomingOrder.append(placeholder.id)
             } else if !reconnectConsumed,
                       let reconnect = reconnectRow,
                       let reconnectAdoptTargetID,
@@ -3586,6 +3645,7 @@ final class ChatStore {
                 // preserved below and the marker stays armed.
                 reconnectConsumed = true
                 pendingReconnectReconcileID = nil
+                consumedIDs.insert(reconnect.id)
                 let adopted = ChatMessage(
                     id: reconnect.id,
                     role: newMessage.role,
@@ -3594,25 +3654,146 @@ final class ChatStore {
                     timestamp: newMessage.timestamp,
                     presentation: newMessage.presentation
                 )
-                rebuilt.append(adopted)
+                updatedByID[reconnect.id] = adopted
+                incomingOrder.append(reconnect.id)
+            } else if policy == .union, newMessage.role == .user,
+                      let echo = unionEchoAdoptionTarget(for: newMessage, skipping: consumedIDs) {
+                // R15 union: the snapshot carries the user's own prompt under a
+                // gateway wire id the optimistic echo's runtime id (or the relay
+                // projection's `relay-user-…` id) never matches. Absent adoption
+                // the union would RETAIN the echo beside its authoritative twin —
+                // a duplicate bubble. Fold the snapshot row onto the echo's slot
+                // instead (mirror of `adoptRelayEcho`), keeping the echo's
+                // identity + `clientMessageID` + timestamp so the relay
+                // `userMessage` adoption chain stays intact.
+                consumedIDs.insert(echo.id)
+                let adopted = ChatMessage(
+                    id: echo.id,
+                    role: newMessage.role,
+                    clientMessageID: echo.clientMessageID,
+                    parts: newMessage.parts,
+                    isStreaming: newMessage.isStreaming,
+                    timestamp: echo.timestamp,
+                    presentation: newMessage.presentation
+                )
+                updatedByID[echo.id] = adopted
+                incomingOrder.append(echo.id)
             } else {
                 // Genuinely-new row.
-                rebuilt.append(newMessage)
+                updatedByID[newMessage.id] = newMessage
+                incomingOrder.append(newMessage.id)
             }
         }
-        if !reconnectConsumed,
-           let reconnect = reconnectRow,
-           !rebuilt.contains(where: { $0.id == reconnect.id }) {
-            // ABH-278: REST can be a moment behind the resumed turn. Preserve the
-            // interrupted local row instead of evicting the in-flight reply /
-            // warning just because the backfill snapshot does not include it yet.
-            // Keep `pendingReconnectReconcileID` armed so a later seed containing
-            // the final assistant row can still adopt this identity.
-            rebuilt.append(reconnect)
-        } else if reconnectID != nil, reconnectRow == nil {
+
+        if policy == .replace {
+            var rebuilt: [ChatMessage] = []
+            rebuilt.reserveCapacity(incomingOrder.count + 1)
+            for id in incomingOrder {
+                if let row = updatedByID[id] { rebuilt.append(row) }
+            }
+            if !reconnectConsumed,
+               let reconnect = reconnectRow,
+               !rebuilt.contains(where: { $0.id == reconnect.id }) {
+                // ABH-278: REST can be a moment behind the resumed turn. Preserve
+                // the interrupted local row instead of evicting the in-flight
+                // reply / warning just because the backfill snapshot does not
+                // include it yet. Keep `pendingReconnectReconcileID` armed so a
+                // later seed containing the final assistant row can still adopt
+                // this identity.
+                rebuilt.append(reconnect)
+            } else if reconnectID != nil, reconnectRow == nil {
+                pendingReconnectReconcileID = nil
+            }
+            messages = rebuilt
+            return
+        }
+
+        // UNION (QA-2 R15): the snapshot is known-partial — walk the EXISTING
+        // transcript as the spine: matched/adopted ids emit the updated row,
+        // untagged rows the snapshot does not cover are RETAINED in place (the
+        // settled history the cache still holds), and `relayProjected` rows the
+        // snapshot does not cover are superseded (the relay projection re-renders
+        // any still-live item on the next frame). Genuinely-new snapshot rows
+        // slot in right after the newest matched row (they are the fresh tail —
+        // e.g. a turn that settled on the gateway mid-flap) or append when
+        // nothing matched.
+        var rebuilt: [ChatMessage] = []
+        rebuilt.reserveCapacity(messages.count + incomingOrder.count)
+        var emittedIncoming: Set<UUID> = []
+        for existing in messages {
+            if let updated = updatedByID[existing.id] {
+                rebuilt.append(updated)
+                emittedIncoming.insert(existing.id)
+            } else if !existing.relayProjected {
+                // Retained: the partial snapshot does not cover this settled row.
+                rebuilt.append(existing)
+            }
+        }
+        // Splice genuinely-new snapshot rows at their WIRE position relative to
+        // the matched rows: a run BEFORE the first matched row belongs BEFORE
+        // the first matched row's slot (it precedes it on the wire — e.g. the
+        // user-prompt row a snapshot carries ahead of the adopted interrupted
+        // reply); a run after a matched row lands right after that row's slot.
+        // A bare append would invert a new prompt behind its own reply.
+        var newBeforeFirstMatch: [ChatMessage] = []
+        var runsAfterMatch: [UUID: [ChatMessage]] = [:]
+        var lastMatchedID: UUID?
+        for id in incomingOrder {
+            if emittedIncoming.contains(id) {
+                lastMatchedID = id
+            } else if let row = updatedByID[id] {
+                if let anchor = lastMatchedID {
+                    runsAfterMatch[anchor, default: []].append(row)
+                } else {
+                    newBeforeFirstMatch.append(row)
+                }
+            }
+        }
+        var assembled: [ChatMessage] = []
+        assembled.reserveCapacity(rebuilt.count + newBeforeFirstMatch.count)
+        var prependedLeading = false
+        for row in rebuilt {
+            if !prependedLeading, emittedIncoming.contains(row.id) {
+                assembled.append(contentsOf: newBeforeFirstMatch)
+                prependedLeading = true
+            }
+            assembled.append(row)
+            if let run = runsAfterMatch[row.id] {
+                assembled.append(contentsOf: run)
+            }
+        }
+        if !prependedLeading {
+            assembled.append(contentsOf: newBeforeFirstMatch)
+        }
+        rebuilt = assembled
+        if reconnectID != nil, reconnectRow == nil {
             pendingReconnectReconcileID = nil
         }
+        // ABH-278 + foreign placeholder: under a union an unconsumed marker row
+        // is RETAINED by the spine above; both markers stay ARMED so a later
+        // seed carrying the authoritative row can still adopt its identity.
         messages = rebuilt
+    }
+
+    /// The existing user row a UNION reseed's user row adopts onto (QA-2 R15) —
+    /// the optimistic echo (or the relay-projected prompt row) for the SAME
+    /// prompt, whose runtime / relay id the gateway wire id never matches.
+    /// Mirrors `adoptRelayEcho`'s precedence: untagged rows first (the echo
+    /// with a `clientMessageID`, then any untagged same-text row), then a
+    /// tagged relay projection as the fallback. Text match is exact and
+    /// non-empty; `skipping` excludes ids an earlier incoming row already
+    /// adopted so N identical prompts pair up one-to-one.
+    private func unionEchoAdoptionTarget(
+        for incoming: ChatMessage, skipping: Set<UUID>
+    ) -> ChatMessage? {
+        let text = incoming.text
+        guard !text.isEmpty else { return nil }
+        func matches(_ message: ChatMessage) -> Bool {
+            message.role == .user && !skipping.contains(message.id) && message.text == text
+        }
+        return messages.first(where: { matches($0) && !$0.relayProjected && $0.clientMessageID != nil })
+            ?? messages.first(where: { matches($0) && !$0.relayProjected })
+            ?? messages.first(where: { matches($0) })
     }
 
     /// Recompute `userOrdinals` from scratch: each user message's zero-based
@@ -4161,7 +4342,12 @@ final class ChatStore {
             // dropped — the new session runs its own seed). Mirrors the
             // post-await guard in `seedContextUsageFromStatus`.
             guard !isStreaming, storedId == sessions?.activeStoredId else { return }
-            seed(from: stored)
+            // QA-2 R15: a recovery reseed is a KNOWN-PARTIAL snapshot (relay
+            // history tail window / plugin 50-row tail) — union it onto the
+            // merged timeline so settled history the snapshot does not cover
+            // survives (the stuck-episode segment drop). Same-session guard
+            // above keeps the union from ever bleeding across sessions.
+            seed(from: stored, policy: .union)
             noteTranscriptSeedWindow(stored)
             // P3 write-through: the foreground/reconnect reconcile re-fetched the
             // authoritative transcript — persist it so the next open paints from
@@ -4237,6 +4423,30 @@ final class ChatStore {
     /// override `backfillFetch` directly.
     private var resolvedBackfillFetch: ((String) async throws -> [StoredMessage])? {
         if let backfillFetch { return backfillFetch }
+        // QA-2 R15/R3: on the relay transport the gateway REST socket is idle
+        // (relay-only reach — an off-LAN tailnet relay), so a REST backfill
+        // fails or hangs to the RestClient timeout and the post-flap reconcile
+        // NEVER LANDS — the recovery path was dead exactly when the stuck
+        // episode flapped the connection. Run it over the transport that IS
+        // up: the relay `history` RPC proxies `GET /api/sessions/{id}/messages`
+        // verbatim (`relay/hermes_relay/downstream.py` → `rest_history`) — the
+        // SAME gateway store rows the phase-2 open seed already uses
+        // (`SessionStore.resolvedTranscriptFetch`'s relay branch). One data
+        // source, two transports; the caller's union policy keeps the known-
+        // partial tail window from evicting settled history.
+        if connection?.transportPath == .relay,
+           let coordinator = connection?.relayCoordinator {
+            return { sessionId in
+                guard await coordinator.waitUntilOpen(timeout: .seconds(10)) else {
+                    throw RelayError.notConnected
+                }
+                let result = try await coordinator.history(
+                    sessionID: sessionId,
+                    limit: ChatStore.transcriptOpenWindowLimit
+                )
+                return SessionStore.relayHistoryMessages(from: result)
+            }
+        }
         guard let rest = connection?.rest else { return nil }
         // ABH-400: plugin gateways serve only the recent tail window on
         // foreground/reconnect; legacy gateways keep the existing full/delta path.
