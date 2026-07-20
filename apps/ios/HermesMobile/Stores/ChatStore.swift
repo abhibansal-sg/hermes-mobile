@@ -2467,28 +2467,52 @@ final class ChatStore {
         // the gateway socket is idle in relay-only mode, so it would throw "Not
         // connected to the Hermes gateway" and strand the deep-link
         // resume-to-send. Submit through the relay coordinator instead; the relay
-        // client owns its own reliability spine (seq/ack/resync). Text-only for
-        // now (attachments still route the gateway-direct upload path); the
-        // default gateway path below is byte-identical. Only engaged while the
-        // relay socket is actually open.
-        if !hasAttachments,
-           let connection, connection.transportPath == .relay,
+        // client owns its own reliability spine (seq/ack/resync), and the echoed
+        // user item + assistant stream reconcile back through the item
+        // projection. Attachments ride the relay too (B9 / A5): queued images
+        // upload through the relay `attach` RPC (gateway `image.attach_bytes`,
+        // inlined base64 — NO gateway-REST `POST /api/upload`, which a
+        // relay-only phone cannot reach) BEFORE the submit, mirroring the
+        // direct path's upload-then-submit ordering; an image-only send
+        // submits the same default caption as the direct path.
+        // OPTIMISTIC USER ECHO (QA-1 B5/B13): render the user's message the
+        // instant they commit — WhatsApp bar — instead of waiting on the
+        // relay. The relay SUBMIT synthesizes a `userMessage` item
+        // (downstream.py) which the projection ADOPTS onto this row in place
+        // (by `client_message_id`), so the echo reconciles into the settled
+        // timeline without duplication — live, after completion, and across
+        // reconnect. `client_message_id` additionally makes an ambiguous-flap
+        // retry dedupe into a single turn at the relay. The default gateway
+        // path below is byte-identical. Only engaged while the relay socket is
+        // actually open.
+        if let connection, connection.transportPath == .relay,
            let coordinator = connection.relayCoordinator, coordinator.isOpen {
-            // OPTIMISTIC USER ECHO (QA-1 B5/B13): render the user's message the
-            // instant they commit — WhatsApp bar — instead of waiting on the
-            // relay. The relay SUBMIT synthesizes a `userMessage` item
-            // (downstream.py) which the projection ADOPTS onto this row in
-            // place (by `client_message_id`), so the echo reconciles into the
-            // settled timeline without duplication — live, after completion,
-            // and across reconnect. `client_message_id` additionally makes an
-            // ambiguous-flap retry dedupe into a single turn at the relay.
+            // Images-with-no-caption: prompt.submit needs text, so supply the
+            // same default the direct path uses. The echo shows the same text
+            // the relay item will carry, so adoption never pops the bubble.
+            let outgoing = trimmed.isEmpty ? "Please look at the attached image." : trimmed
             let clientMessageID = UUID().uuidString
             sessions?.resetComposerHistoryBrowse(for: sessions?.activeComposerDraftKey)
             let userMessage = ChatMessage(
-                role: .user, clientMessageID: clientMessageID, text: trimmed
+                role: .user, clientMessageID: clientMessageID, text: outgoing
             )
             userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
             messages.append(userMessage)
+            if hasAttachments, let attachments {
+                setStreaming(true, reason: "relay.send.upload")
+                lastError = nil
+                do {
+                    _ = try await attachments.uploadAndAttach(
+                        sessionId: sessions?.activeStoredId, connection: connection
+                    )
+                } catch {
+                    removeLocalEcho(clientMessageID: clientMessageID)
+                    setStreaming(false, reason: "relay.send.uploadFailed")
+                    lastError = (error as? LocalizedError)?.errorDescription
+                        ?? error.localizedDescription
+                    return false
+                }
+            }
             setStreaming(true, reason: "relay.send")
             // QA-1 B8: stamp the turn start at submit so the pre-first-item
             // inline activity row's elapsed label ticks from the user's send
@@ -2504,7 +2528,7 @@ final class ChatStore {
             lastSendReachedServer = true
             do {
                 let result = try await coordinator.submit(
-                    prompt: trimmed,
+                    prompt: outgoing,
                     sessionID: sessions?.activeStoredId,
                     clientMessageID: clientMessageID
                 )
