@@ -17,6 +17,9 @@ CLI flags::
     --health-path PATH                    HTTP health path on the downstream port
     --no-health                           disable the health surface
     --log-level LEVEL
+    --allow-live-gateway                  lift the 9119 refusal (service mode ONLY;
+                                          the supervised ai.hermes.relay launchd
+                                          service passes this — nothing else should)
 
 Environment variables (back-compat with ``scripts/run-relay.sh`` /
 ``launch_relay.sh``):
@@ -24,13 +27,17 @@ Environment variables (back-compat with ``scripts/run-relay.sh`` /
     HERMES_RELAY_GATEWAY_TOKEN     (required unless --token/--token-file given)
     HERMES_RELAY_GATEWAY_URL       ws://host:port (overrides host/port)
     HERMES_RELAY_GATEWAY_HOST      default 127.0.0.1
-    HERMES_RELAY_GATEWAY_PORT      default 9126 (isolated range; NEVER 9119 live)
+    HERMES_RELAY_GATEWAY_PORT      default 9126 (isolated range; 9119 refused
+                                 without --allow-live-gateway)
     HERMES_RELAY_DOWNSTREAM_HOST   default 127.0.0.1
     HERMES_RELAY_DOWNSTREAM_PORT   default 8765
     HERMES_RELAY_HEALTH_PATH       default /healthz
 
-SAFETY: the live production gateway on port 9119 is refused outright — the relay
-is a client of an isolated/stock gateway only.
+SAFETY: the live production gateway on port 9119 is refused by default — the
+relay is normally a client of an isolated/stock gateway only. The explicit
+``--allow-live-gateway`` flag lifts the refusal; it exists solely for the
+supervised ``ai.hermes.relay`` launchd service (spec DAILY-DRIVER N6/A7,
+``relay/scripts/install-service.sh``). Tests and ad-hoc runs must stay on 9126+.
 """
 
 from __future__ import annotations
@@ -67,6 +74,7 @@ class ResolvedConfig:
     downstream_port: int
     health_path: Optional[str]
     log_level: str
+    allow_live_gateway: bool = False
 
 
 def _split_hostport(value: str, *, what: str) -> tuple[Optional[str], Optional[int]]:
@@ -148,10 +156,13 @@ def resolve_config(argv: Optional[list[str]] = None) -> ResolvedConfig:
 
     token = _read_token(args)
 
-    if gw_port == LIVE_GATEWAY_PORT:
+    if gw_port == LIVE_GATEWAY_PORT and not args.allow_live_gateway:
         raise SystemExit(
             f"hermes_relay: refusing to dial the LIVE gateway port {LIVE_GATEWAY_PORT}. "
-            "Point --gateway-port/-url at an isolated/stock gateway."
+            "Tests and ad-hoc runs must point --gateway-port/-url at an isolated "
+            "gateway (9126+). The ONLY sanctioned path to the live gateway is the "
+            "supervised launchd service — relay/scripts/install-service.sh "
+            "(ai.hermes.relay) — which passes --allow-live-gateway."
         )
 
     return ResolvedConfig(
@@ -162,6 +173,7 @@ def resolve_config(argv: Optional[list[str]] = None) -> ResolvedConfig:
         downstream_port=ds_port,
         health_path=health_path,
         log_level=(args.log_level or os.environ.get("HERMES_RELAY_LOG_LEVEL") or "INFO"),
+        allow_live_gateway=args.allow_live_gateway,
     )
 
 
@@ -172,7 +184,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--gateway-url", help="ws://HOST:PORT[/path] of the upstream gateway")
     p.add_argument("--gateway-host", help="upstream gateway host")
-    p.add_argument("--gateway-port", type=int, help="upstream gateway port (NEVER 9119)")
+    p.add_argument(
+        "--gateway-port",
+        type=int,
+        help="upstream gateway port (9119 refused without --allow-live-gateway)",
+    )
+    p.add_argument(
+        "--allow-live-gateway",
+        action="store_true",
+        help=(
+            f"lift the refusal of the LIVE gateway port {LIVE_GATEWAY_PORT}. "
+            "For the supervised ai.hermes.relay launchd service ONLY — "
+            "tests and ad-hoc runs must use an isolated gateway (9126+)."
+        ),
+    )
     p.add_argument("--token", help="gateway ?token= auth (prefer --token-file)")
     p.add_argument("--token-file", help="path to a file containing the gateway token")
     p.add_argument("--listen", help="phone-facing downstream bind, HOST:PORT")
@@ -208,6 +233,13 @@ def main(argv: Optional[list[str]] = None) -> None:
         rc.downstream_port,
         rc.health_path or "off",
     )
+    if rc.gateway_port == LIVE_GATEWAY_PORT:
+        # Only reachable with --allow-live-gateway (service mode, spec N6/A7).
+        log.warning(
+            "dialing the LIVE gateway port %s — --allow-live-gateway service mode "
+            "(supervised launchd service expected)",
+            LIVE_GATEWAY_PORT,
+        )
     app = RelayApp(_to_relay_config(rc))
     try:
         asyncio.run(app.run())
