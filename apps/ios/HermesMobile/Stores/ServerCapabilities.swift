@@ -219,6 +219,13 @@ final class ServerCapabilities {
     func _setDevicesForTesting(_ state: State) {
         devices = state
     }
+
+    /// DEBUG-only test seam: seed `upload` directly, skipping the REST probe,
+    /// so the B9 composer-gating test can pin the stock-gateway verdict
+    /// (`.unavailable`) without standing up a stub gateway. Absent in Release.
+    func _setUploadForTesting(_ state: State) {
+        upload = state
+    }
     #endif
 
     // MARK: - Passive / derived signals

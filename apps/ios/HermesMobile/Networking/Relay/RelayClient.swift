@@ -277,6 +277,34 @@ actor RelayClient {
         try await request(.interrupt, params: .object(["session_id": .string(sessionID)]))
     }
 
+    /// Upload an attachment's INLINED bytes through the relay (B9 / A5). The
+    /// relay translates this onto the gateway's base64 RPCs — `file.attach`
+    /// (arbitrary files → `@file:` ref) or `image.attach_bytes` (photos →
+    /// vision tile) — so attach works IDENTICALLY on relay-only reaches where
+    /// the gateway-REST `POST /api/upload` round-trip is unreachable.
+    ///
+    /// WIRE CONTRACT (docs/RELAY-PHONE-PROTOCOL.md §5, asserted by
+    /// RelayAttachWireTests + tests/e2e_daily_driver/test_h): `kind` +
+    /// `data_url` (a `data:<mime>;base64,<payload>` URL) are REQUIRED;
+    /// `session_id` absent ⇒ the relay creates + owns a new session (like
+    /// SUBMIT) and merges the resolved `session_id` into the gateway result.
+    @discardableResult
+    func attach(
+        sessionID: String?,
+        kind: String,
+        name: String,
+        dataURL: String,
+        timeout: Duration = .seconds(60)
+    ) async throws -> JSONValue {
+        var params: [String: JSONValue] = [
+            "kind": .string(kind),
+            "data_url": .string(dataURL),
+        ]
+        if let sessionID { params["session_id"] = .string(sessionID) }
+        if !name.isEmpty { params["name"] = .string(name) }
+        return try await request(.attach, params: .object(params), timeout: timeout)
+    }
+
     /// Declare the session the phone holds foregrounded (§6 gate). Fire-and-forget:
     /// the relay answers inline (no downstream frame). Called on reconnect so the
     /// relay's Notifier knows the phone is watching and suppresses spurious APNs.

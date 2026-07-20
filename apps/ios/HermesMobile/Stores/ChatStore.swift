@@ -2403,18 +2403,39 @@ final class ChatStore {
         // resume-to-send. Submit through the relay coordinator instead; the relay
         // client owns its own reliability spine (seq/ack/resync), and the echoed
         // user item + assistant stream reconcile back through the item projection,
-        // so no local echo is appended here. Text-only for now (attachments still
-        // route the gateway-direct upload path); the default gateway path below is
-        // byte-identical. Only engaged while the relay socket is actually open.
-        if !hasAttachments,
-           let connection, connection.transportPath == .relay,
+        // so no local echo is appended here. Attachments ride the relay too
+        // (B9 / A5): queued images upload through the relay `attach` RPC
+        // (gateway `image.attach_bytes`, inlined base64 — NO gateway-REST
+        // `POST /api/upload`, which a relay-only phone cannot reach) BEFORE the
+        // submit, mirroring the direct path's upload-then-submit ordering; an
+        // image-only send submits the same default caption as the direct path.
+        // The default gateway path below is byte-identical. Only engaged while
+        // the relay socket is actually open.
+        if let connection, connection.transportPath == .relay,
            let coordinator = connection.relayCoordinator, coordinator.isOpen {
+            if hasAttachments, let attachments {
+                setStreaming(true, reason: "relay.send.upload")
+                lastError = nil
+                do {
+                    _ = try await attachments.uploadAndAttach(
+                        sessionId: sessions?.activeStoredId, connection: connection
+                    )
+                } catch {
+                    setStreaming(false, reason: "relay.send.uploadFailed")
+                    lastError = (error as? LocalizedError)?.errorDescription
+                        ?? error.localizedDescription
+                    return false
+                }
+            }
+            // Images-with-no-caption: prompt.submit needs text, so supply the
+            // same default the direct path uses.
+            let outgoing = trimmed.isEmpty ? "Please look at the attached image." : trimmed
             setStreaming(true, reason: "relay.send")
             lastError = nil
             lastSendReachedServer = true
             do {
                 _ = try await coordinator.submit(
-                    prompt: trimmed, sessionID: sessions?.activeStoredId
+                    prompt: outgoing, sessionID: sessions?.activeStoredId
                 )
                 return true
             } catch {

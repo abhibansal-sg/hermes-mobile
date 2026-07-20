@@ -532,6 +532,20 @@ final class ConnectionStore {
         return created
     }
 
+    /// The composer "+" visibility gate (B9 / A5). On the relay transport the
+    /// attach flows ride the relay WS `attach` RPC (relay → gateway
+    /// `file.attach` / `image.attach_bytes`, bytes inlined — see
+    /// ``AttachmentStore``), so the gateway-REST upload probe NEVER gets to
+    /// hide the menu: a probe against an unreachable — or stock — gateway REST
+    /// 404s the upload route and would pin "+" hidden for the whole build
+    /// (exactly the B9 regression on the owner's relay-mode phone). The relay
+    /// is the source of truth for what the relay transport can do. Direct mode
+    /// keeps the E1 probe gate BYTE-FOR-BYTE: `.unavailable` hides (stock
+    /// gateway), `.unknown`/`.available` show (optimistic).
+    var attachMenuAvailable: Bool {
+        transportPath == .relay || capabilities.upload != .unavailable
+    }
+
     /// The selected transport (Wave-2 convergence). Default `.gatewayDirect`
     /// (OFF) — byte-identical to every existing install. In DEBUG a launch env
     /// override (`HERMES_TRANSPORT=relay`, or the presence of `HERMES_RELAY_URL`)
