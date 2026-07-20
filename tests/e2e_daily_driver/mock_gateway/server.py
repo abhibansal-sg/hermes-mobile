@@ -63,6 +63,9 @@ class MockSession:
     # Index of the next script step to run when submit fires again (the script
     # may emit an interactive gate mid-run; the answer unblocks the rest).
     step: int = 0
+    # Attachments staged into this session via file.attach / image.attach_bytes
+    # (B9/A5 relay attach round-trip) — white-box test assertions read these.
+    attachments: list[dict[str, Any]] = field(default_factory=list)
 
 
 # A script step is a callable that, given the session + a "send event" closure,
@@ -452,6 +455,51 @@ class MockGateway:
             result = {"ok": True}
         elif method == "session.interrupt":
             result = {"ok": True}
+        elif method == "file.attach":
+            # B9/A5: the relay proxies the phone's inlined-bytes attach here
+            # (mirrors tui_gateway/server.py @method("file.attach")). Stages a
+            # deterministic ref so the round-trip is byte-assertable.
+            sid = params.get("session_id", "")
+            sess = self.sessions.get(sid)
+            if sess is None:
+                error = {"code": -32602, "message": f"unknown session {sid}"}
+            else:
+                name = params.get("name") or "attachment.bin"
+                data_url = params.get("data_url") or ""
+                sess.attachments.append({
+                    "kind": "file", "name": name, "data_url": data_url,
+                })
+                result = {
+                    "attached": True,
+                    "name": name,
+                    "path": f"/mock/.hermes/desktop-attachments/{name}",
+                    "ref_path": name,
+                    "ref_text": f"@file:{name}",
+                    "uploaded": True,
+                }
+        elif method == "image.attach_bytes":
+            # Mirrors tui_gateway/server.py @method("image.attach_bytes") — the
+            # base64-image path the relay uses for photos (no REST upload).
+            sid = params.get("session_id", "")
+            sess = self.sessions.get(sid)
+            if sess is None:
+                error = {"code": -32602, "message": f"unknown session {sid}"}
+            else:
+                filename = params.get("filename") or "upload.jpg"
+                content = params.get("content_base64") or ""
+                sess.attachments.append({
+                    "kind": "image", "name": filename, "bytes": len(content),
+                })
+                image_count = len(
+                    [a for a in sess.attachments if a["kind"] == "image"]
+                )
+                result = {
+                    "attached": True,
+                    "path": f"/mock/images/{filename}",
+                    "count": image_count,
+                    "text": f"[User attached image: {filename}]",
+                    "bytes": len(content),
+                }
         else:
             error = {"code": -32601, "message": f"method not found: {method}"}
 

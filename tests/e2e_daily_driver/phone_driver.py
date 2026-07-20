@@ -5,7 +5,7 @@ Speaks the ratified relay<->phone protocol (RELAY-PHONE-PROTOCOL.md):
 * downstream: ``{seq, sid, turn, kind, body}`` frames, demuxed by ``kind``;
 * upstream:   JSON-RPC-2.0 ``{jsonrpc, id, method, params}`` for ``submit``,
   ``approve``, ``clarify``, ``list``, ``history``, ``open``, ``interrupt``,
-  ``ack``, ``resync``, ``foreground``.
+  ``attach``, ``ack``, ``resync``, ``foreground``.
 
 This is the same wire shape the iOS ``RelayClient`` produces. Keeping the driver
 in Python lets us assert byte-identity deterministically (scenario f) and run
@@ -175,6 +175,20 @@ class PhoneDriver:
 
     async def interrupt(self, session_id: str) -> dict[str, Any]:
         return await self._call("interrupt", {"session_id": session_id})
+
+    async def attach(
+        self, *, kind: str, data_url: str,
+        session_id: Optional[str] = None, name: str = "",
+    ) -> dict[str, Any]:
+        """B9/A5: inlined-bytes attach (relay -> gateway file.attach /
+        image.attach_bytes). Same wire shape as the iOS RelayClient.attach:
+        ``kind`` + ``data_url`` required; ``session_id`` absent = new chat."""
+        params: dict[str, Any] = {"kind": kind, "data_url": data_url}
+        if session_id is not None:
+            params["session_id"] = session_id
+        if name:
+            params["name"] = name
+        return await self._call("attach", params, timeout=60.0)
 
     async def ack(self, through: int) -> None:
         # ack is a notification (no id, no response).
