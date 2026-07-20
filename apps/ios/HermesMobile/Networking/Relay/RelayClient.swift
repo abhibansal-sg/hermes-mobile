@@ -286,6 +286,37 @@ actor RelayClient {
         await notify(.foreground, params: params)
     }
 
+    // MARK: - Push token registration (§6a)
+
+    /// Register the APNs device token with the RELAY's push registry (§6a).
+    ///
+    /// In relay mode this is the ONLY correct registration path: the relay's
+    /// Notifier fires pushes from the relay process's own token registry, and
+    /// the gateway-direct REST register either can't be reached at all (off-LAN
+    /// relay-only phones) or writes a registry the relay never reads.
+    /// `env` routes the token to the matching APNs host ("sandbox"/"production");
+    /// `events` is the per-event opt-in subset (`nil` = all events).
+    @discardableResult
+    func registerPushToken(
+        _ token: String,
+        env: String,
+        events: [String]?
+    ) async throws -> JSONValue {
+        var params: [String: JSONValue] = [
+            "token": .string(token),
+            "platform": .string("ios"),
+            "env": .string(env),
+        ]
+        if let events { params["events"] = .array(events.map { .string($0) }) }
+        return try await request(.pushRegister, params: .object(params))
+    }
+
+    /// Remove the APNs device token from the relay's push registry (§6a).
+    @discardableResult
+    func unregisterPushToken(_ token: String) async throws -> JSONValue {
+        try await request(.pushUnregister, params: .object(["token": .string(token)]))
+    }
+
     // MARK: - Ack (§4)
 
     /// Force-send an `ack{through:lastSeq}` if the watermark has advanced since the
