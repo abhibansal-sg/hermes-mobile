@@ -515,9 +515,8 @@ class DownstreamServer:
         while len(self._submit_dedup) > self._submit_dedup_cap:
             self._submit_dedup.popitem(last=False)
 
-    @staticmethod
     def _user_message_item_id(
-        sid: str, cmid: Optional[str], text: str, conn: PhoneConnection
+        self, sid: str, cmid: Optional[str], text: str
     ) -> str:
         """The stable ``item_id`` for the SUBMIT-synthesized ``userMessage`` item.
 
@@ -526,13 +525,23 @@ class DownstreamServer:
         the relay already ran ``prompt_submit`` — maps to the SAME item and the
         fold replaces by id instead of duplicating the bubble (mirrors the
         SUBMIT dedup). WITHOUT one (a client that sends no cmid) the id is
-        salted with the connection + its current seq, so two sends of the
-        identical text stay two distinct items rather than collapsing.
+        salted with the count of PRIOR same-text userMessage items already
+        accumulated for the session: two sends of identical text stay two
+        distinct items, yet a deterministic submit sequence yields identical
+        ids on every run — the E2E flap-chaos scenario (f) compares runs
+        byte-for-byte and a connection/seq-salted id would diverge across the
+        clean and chaos runs.
         """
         if cmid is not None:
             key = f"cmid:{sid}:{cmid}"
         else:
-            key = f"conn:{conn.conn_id}:{conn.head_seq}:{text}"
+            state = self._store.get(sid)
+            same_text = sum(
+                1
+                for it in state.items.values()
+                if it.type == ItemType.USER_MESSAGE and it.body.get("text") == text
+            )
+            key = f"nth:{sid}:{same_text}:{text}"
         return f"{sid}:u-{uuid.uuid5(uuid.NAMESPACE_URL, 'hermes-relay:' + key).hex[:16]}"
 
     def _emit_user_message_item(
@@ -553,7 +562,7 @@ class DownstreamServer:
         so the turn's agent items (allocated later) render BELOW the prompt.
         """
         state = self._store.get(sid)
-        item_id = self._user_message_item_id(sid, cmid, text, conn)
+        item_id = self._user_message_item_id(sid, cmid, text)
         item = state.items.get(item_id)
         if item is None:
             body: dict[str, Any] = {"text": text}
