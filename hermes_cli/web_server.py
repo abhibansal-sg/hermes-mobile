@@ -501,7 +501,14 @@ async def host_header_middleware(request: Request, call_next):
                     ),
                 },
             )
-    return await call_next(request)
+    # N7 hardening: a downstream crash must surface as a 500 JSONResponse,
+    # not escape the middleware stack (Starlette re-raises it from
+    # call_next as an ExceptionGroup that would kill the ASGI worker).
+    from hermes_cli.dashboard_auth.call_guard import guarded_call_next
+
+    return await guarded_call_next(
+        request, call_next, gate="host_header_middleware"
+    )
 
 
 @app.middleware("http")
@@ -568,7 +575,13 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
                                 status_code=404,
                                 content={"detail": "Plugin not found"},
                             )
-    return await call_next(request)
+    # N7 hardening: convert a downstream crash into a 500 JSONResponse so
+    # it can't escape the middleware stack as an ExceptionGroup.
+    from hermes_cli.dashboard_auth.call_guard import guarded_call_next
+
+    return await guarded_call_next(
+        request, call_next, gate="_plugin_api_runtime_gate"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -588,17 +601,31 @@ async def _dashboard_auth_gate(request: Request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Require the session token on all /api/ routes except the public list."""
+    """Require the session token on all /api/ routes except the public list.
+
+    N7 hardening: every ``call_next`` site runs through
+    :func:`guarded_call_next` — a downstream crash (including the
+    ExceptionGroup Starlette's BaseHTTPMiddleware re-raises from call_next)
+    becomes a 500 JSONResponse instead of escaping the middleware stack and
+    killing the ASGI worker. The 401 verdict below is computed BEFORE
+    ``call_next`` and is unchanged.
+    """
+    from hermes_cli.dashboard_auth.call_guard import guarded_call_next
+
     # A request already authenticated by the token-auth seam (a service caller
     # presenting a bearer token on a registered token route) carries
     # ``token_authenticated`` — never bounce it through the cookie/session gate.
     if getattr(request.state, "token_authenticated", False):
-        return await call_next(request)
+        return await guarded_call_next(
+            request, call_next, gate="auth_middleware"
+        )
     # When the OAuth gate is active, cookie-based auth (gated_auth_middleware
     # above) is authoritative.  The legacy _SESSION_TOKEN path is loopback-only
     # and is skipped here so the gate's session attachment isn't overridden.
     if getattr(request.app.state, "auth_required", False):
-        return await call_next(request)
+        return await guarded_call_next(
+            request, call_next, gate="auth_middleware"
+        )
     path = request.url.path
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
         if not _has_valid_session_token(request) and not _has_valid_query_token(request, path):
@@ -606,7 +633,7 @@ async def auth_middleware(request: Request, call_next):
                 status_code=401,
                 content={"detail": "Unauthorized"},
             )
-    return await call_next(request)
+    return await guarded_call_next(request, call_next, gate="auth_middleware")
 
 
 @app.middleware("http")
@@ -618,9 +645,23 @@ async def _token_auth_seam(request: Request, call_next):
     attach the principal + ``token_authenticated`` flag, and let the downstream
     cookie/session gates skip enforcement. Non-token routes pass straight
     through untouched.
+
+    N7 hardening: as the OUTERMOST gate this is the final catch for the whole
+    stack. The delegation itself runs through :func:`guarded_call_next` so a
+    crash anywhere in the token-auth seam (even before its own guarded
+    call_next) becomes a 500 JSONResponse instead of escaping the middleware
+    stack as an ExceptionGroup and killing the ASGI worker. Auth semantics
+    (401 / 503 verdicts inside the seam) are unchanged.
     """
+    from hermes_cli.dashboard_auth.call_guard import guarded_call_next
     from hermes_cli.dashboard_auth.token_auth import token_auth_middleware
-    return await token_auth_middleware(request, call_next)
+
+    async def _run_token_auth(inner_request: Request) -> Response:
+        return await token_auth_middleware(inner_request, call_next)
+
+    return await guarded_call_next(
+        request, _run_token_auth, gate="_token_auth_seam"
+    )
 
 
 # ---------------------------------------------------------------------------

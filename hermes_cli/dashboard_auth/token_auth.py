@@ -48,6 +48,7 @@ from fastapi.responses import JSONResponse, Response
 from hermes_cli.dashboard_auth import list_token_providers
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
 from hermes_cli.dashboard_auth.base import ProviderError, TokenPrincipal
+from hermes_cli.dashboard_auth.call_guard import guarded_call_next, scope_is_http
 
 _log = logging.getLogger(__name__)
 
@@ -204,16 +205,39 @@ async def token_auth_middleware(
     Runs before the cookie/session gates (installed last in ``web_server.py``).
     The cookie gates honour ``request.state.token_authenticated`` and skip
     enforcement, so a token-authed request is never redirected to ``/login``.
+
+    Hardened per the daily-driver spec (N7):
+
+      * WebSocket scopes never traverse this seam. Starlette's
+        BaseHTTPMiddleware already routes non-``http`` scopes around the
+        dispatch; :func:`scope_is_http` pins that exemption locally so a
+        future rewiring as a general ASGI middleware cannot funnel WS
+        handshakes through bearer-token auth (a WS client that drops during
+        an HTTP-shaped auth check would surface ``WebSocketDisconnect`` as
+        an unhandled exception).
+      * Both ``call_next`` sites run through :func:`guarded_call_next`: a
+        downstream failure (including the ExceptionGroup shape Starlette's
+        middleware task group produces) becomes a 500 JSONResponse instead
+        of escaping the middleware stack and killing the ASGI worker. The
+        401 / 503 verdicts above are computed BEFORE ``call_next`` and are
+        byte-for-byte unchanged.
     """
+    if not scope_is_http(request):
+        return await call_next(request)
+
     path = request.url.path
     if not is_token_route(path):
-        return await call_next(request)
+        return await guarded_call_next(
+            request, call_next, gate="token_auth_middleware"
+        )
 
     principal, unreachable = authenticate_token(request)
     if principal is not None:
         request.state.token_principal = principal
         request.state.token_authenticated = True
-        return await call_next(request)
+        return await guarded_call_next(
+            request, call_next, gate="token_auth_middleware"
+        )
 
     if unreachable:
         audit_log(
