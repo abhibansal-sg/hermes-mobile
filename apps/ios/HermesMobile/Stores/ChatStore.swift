@@ -2301,6 +2301,35 @@ final class ChatStore {
         let hasAttachments = includeAttachments && (attachments?.hasPending ?? false)
         guard !trimmed.isEmpty || hasAttachments else { return false }
 
+        // Wave-2 relay transport: when the relay is the active transport, the
+        // gateway-direct `prompt.submit` (below and via the outbox) cannot run —
+        // the gateway socket is idle in relay-only mode, so it would throw "Not
+        // connected to the Hermes gateway" and strand the deep-link
+        // resume-to-send. Submit through the relay coordinator instead; the relay
+        // client owns its own reliability spine (seq/ack/resync), and the echoed
+        // user item + assistant stream reconcile back through the item projection,
+        // so no local echo is appended here. Text-only for now (attachments still
+        // route the gateway-direct upload path); the default gateway path below is
+        // byte-identical. Only engaged while the relay socket is actually open.
+        if !hasAttachments,
+           let connection, connection.transportPath == .relay,
+           let coordinator = connection.relayCoordinator, coordinator.isOpen {
+            setStreaming(true, reason: "relay.send")
+            lastError = nil
+            lastSendReachedServer = true
+            do {
+                _ = try await coordinator.submit(
+                    prompt: trimmed, sessionID: sessions?.activeStoredId
+                )
+                return true
+            } catch {
+                setStreaming(false, reason: "relay.sendError")
+                lastError = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                return false
+            }
+        }
+
         // Production sends enter the protected repository before session
         // creation, upload, local echo, or prompt.submit. Unit-store graphs that
         // do not install an outbox retain the legacy direct path below.
@@ -2450,6 +2479,39 @@ final class ChatStore {
         runtimeSessionID: String,
         remotePaths: [String]
     ) async throws -> OutboxSubmitResult {
+        // Wave-2 relay transport: when the flag is `.relay` the gateway `client`
+        // is idle, so the durable outbox must drain OVER THE RELAY (§5:
+        // `prompt.submit` maps to the relay `submit` RPC into the relay-owned
+        // session). The relay item projection owns the transcript + streaming
+        // state, so this branch deliberately skips the gateway-style local-turn /
+        // streaming bookkeeping — it routes the prompt and maps the RPC result to
+        // a receipt. A returned result (no throw) means the relay accepted the
+        // prompt → an accepted `queued` receipt marks the job completed (no
+        // permanent pending). A transport failure throws, and the outbox retains
+        // the row for the next wake so it delivers once the relay reconnects; the
+        // job's stable identity keeps that retry from creating a second row.
+        // Gated on the coordinator existing first: gateway-direct never allocates
+        // it, so that path skips the flag read and stays byte-identical.
+        if let coordinator = connection?.relayCoordinator,
+           connection?.transportPath == .relay {
+            prepareOutboxSubmission(job: job, remotePaths: remotePaths)
+            lastSendReachedServer = true
+            // Thread the durable row's stable id so an ambiguous-flap retry (the
+            // submit threw after the relay already ran `prompt_submit`, so the
+            // outbox retains the row and the next wake resubmits the SAME job) is
+            // deduped by the relay SUBMIT handler into a single turn — parity with
+            // the gateway path's `client_message_id` (see below).
+            _ = try await coordinator.submit(
+                prompt: job.submissionText,
+                sessionID: runtimeSessionID,
+                clientMessageID: job.clientMessageID
+            )
+            return OutboxSubmitResult(
+                status: "queued",
+                accepted: true,
+                clientMessageID: job.clientMessageID
+            )
+        }
         guard let client else { throw GatewayError.notConnected }
         prepareOutboxSubmission(job: job, remotePaths: remotePaths)
         pendingReconnectReconcileID = nil

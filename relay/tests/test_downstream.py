@@ -365,6 +365,54 @@ async def test_submit_into_owned_session_skips_resume():
     gw.prompt_submit.assert_awaited_once_with("s5", "more")
 
 
+async def test_submit_dedupes_repeat_client_message_id_across_reconnect():
+    """An ambiguous-flap retry (same client_message_id, fresh connection after a
+    reconnect) must NOT drive a second turn — it replays the resolved id."""
+    srv, gw = _server()
+    gw.owns = MagicMock(return_value=True)
+    await srv.start()
+
+    # First drain: runs prompt_submit and records the client_message_id.
+    conn1 = srv.register(FakeWS())
+    res1 = await srv.handle_upstream(
+        conn1,
+        UpstreamRequest(
+            method=UpstreamMethod.SUBMIT,
+            params={"text": "hi", "session_id": "s5", "client_message_id": "cm-1"},
+            id=1,
+        ),
+    )
+    assert res1 == {"session_id": "s5"}
+    gw.prompt_submit.assert_awaited_once_with("s5", "hi")
+
+    # The socket flapped before the phone saw res1; the outbox resubmits the SAME
+    # job on a FRESH connection. prompt_submit must NOT run a second time.
+    gw.prompt_submit.reset_mock()
+    conn2 = srv.register(FakeWS())
+    res2 = await srv.handle_upstream(
+        conn2,
+        UpstreamRequest(
+            method=UpstreamMethod.SUBMIT,
+            params={"text": "hi", "session_id": "s5", "client_message_id": "cm-1"},
+            id=2,
+        ),
+    )
+    gw.prompt_submit.assert_not_awaited()
+    assert res2["session_id"] == "s5"
+    assert res2["deduplicated"] is True
+
+
+async def test_submit_without_client_message_id_never_dedupes():
+    """Absent a client_message_id (legacy/interactive), every submit drives a turn
+    — dedup is opt-in via the id and must not silently swallow real sends."""
+    srv, gw = _server()
+    gw.owns = MagicMock(return_value=True)
+    await srv.start()
+    await _handle(srv, UpstreamMethod.SUBMIT, {"text": "one", "session_id": "s5"})
+    await _handle(srv, UpstreamMethod.SUBMIT, {"text": "two", "session_id": "s5"})
+    assert gw.prompt_submit.await_count == 2
+
+
 async def test_resume_owns_idle_session():
     srv, gw = _server()
     await srv.start()

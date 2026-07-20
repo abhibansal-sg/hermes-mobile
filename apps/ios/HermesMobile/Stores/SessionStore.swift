@@ -3798,6 +3798,23 @@ final class SessionStore {
         // ready handshake succeeds.
         guard bindRuntime else { return }
 
+        // Wave-2 relay transport: when the relay is the active transport, the
+        // gateway-direct `session.resume` RPC below cannot run — the gateway
+        // socket is idle (only the relay client is connected), so it would throw
+        // "Not connected to the Hermes gateway" and strand the deep-link
+        // resume-to-send. Resume + own the session over the relay coordinator
+        // instead, mirroring how the relay item projection already streams its
+        // snapshot, so the composer unlocks and sends route through the relay.
+        // The gateway-direct path (default OFF) is byte-identical below.
+        if let connection, connection.transportPath == .relay {
+            bindRelayRuntime(
+                summary: summary,
+                token: token,
+                connectionWorkGeneration: connectionWorkGeneration
+            )
+            return
+        }
+
         // Slow path: gateway resume — spins up the agent server-side; only
         // prompt submission depends on it.
         let resumeTask = Task { [weak self] in
@@ -3932,6 +3949,55 @@ final class SessionStore {
                 let message = self.errorMessage(from: error)
                 self.lastError = message
                 self.sessionActionError = SessionActionError(action: "Open Session", message: message)
+            }
+        }
+        #if DEBUG
+        lastOpenResumeTask = resumeTask
+        #endif
+    }
+
+    /// Resume + own `summary` over the Wave-2 relay coordinator when the relay is
+    /// the active transport (the gateway-direct `session.resume` in ``open`` is
+    /// skipped — the gateway socket is idle in relay-only mode). Binds the runtime
+    /// id so the composer unlocks and prompt submission routes through the relay,
+    /// exactly as the gateway resume does on the direct path. The relay keys the
+    /// runtime on the stored session id, so a successful resume binds `summary.id`.
+    /// Supersession is guarded by `openToken` (a newer open()/draft cancels the
+    /// stale bind) so a slow relay resume cannot bind into a session the user has
+    /// since navigated away from.
+    private func bindRelayRuntime(
+        summary: SessionSummary,
+        token: UUID,
+        connectionWorkGeneration: UInt64
+    ) {
+        let resumeTask = Task { [weak self] in
+            guard let self,
+                  let coordinator = self.connection?.relayCoordinator else { return }
+            do {
+                _ = try await coordinator.resume(summary.id)
+                guard self.openToken == token,
+                      self.connectionWorkGeneration == connectionWorkGeneration,
+                      self.activeStoredId == summary.id else { return }
+                // Relay runtime bound: the relay keys the live turn on the stored
+                // session id. Unlock the composer and flush anything queued during
+                // the resume window (mirrors the gateway `onActiveRuntimeBound`).
+                self.activeRuntimeId = summary.id
+                self.activeRuntimeEpoch = self.connection?.transportEpoch
+                self.lastError = nil
+                self.sessionActionError = nil
+                self.ensureRuntimeAttempts = 0
+                self.onActiveRuntimeBound?()
+            } catch {
+                // A superseded open (the user tapped another session) is not an
+                // actionable failure — only surface a real relay resume error for
+                // the session still on screen.
+                guard self.openToken == token,
+                      self.activeStoredId == summary.id else { return }
+                let message = self.errorMessage(from: error)
+                self.lastError = message
+                self.sessionActionError = SessionActionError(
+                    action: "Open Session", message: message
+                )
             }
         }
         #if DEBUG

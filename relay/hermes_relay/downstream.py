@@ -41,6 +41,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -264,6 +265,16 @@ class DownstreamServer:
         self._sub = None
         self._fanout_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        # SUBMIT idempotency: client_message_id -> resolved (live) session_id.
+        # The durable outbox retries a submit whose RPC result was lost to a
+        # socket flap AFTER the relay already ran ``prompt_submit`` (the phone
+        # marks the row ``transport_ambiguous`` and the next wake resubmits the
+        # SAME job). This server object outlives any single phone connection, so
+        # the retry — which arrives on a FRESH PhoneConnection after reconnect —
+        # is recognized here and replays the prior result instead of driving a
+        # second turn. Bounded (LRU) so it can never grow without limit.
+        self._submit_dedup: "OrderedDict[str, str]" = OrderedDict()
+        self._submit_dedup_cap = 1024
 
     async def start(self) -> None:
         """Build the reused replay ring and bind the phone-facing WS server."""
@@ -455,6 +466,14 @@ class DownstreamServer:
             await self._server.wait_closed()
             self._server = None
 
+    def _remember_submit(self, cmid: str, sid: str) -> None:
+        """Record ``client_message_id -> resolved session_id`` for SUBMIT dedup,
+        evicting the oldest entry once the bounded LRU is full."""
+        self._submit_dedup[cmid] = sid
+        self._submit_dedup.move_to_end(cmid)
+        while len(self._submit_dedup) > self._submit_dedup_cap:
+            self._submit_dedup.popitem(last=False)
+
     # -- upstream (phone -> relay -> gateway), protocol §5 ---------------
     async def handle_upstream(self, conn: PhoneConnection, req: UpstreamRequest) -> Any:
         """Translate one phone JSON-RPC request and return its JSON-RPC result.
@@ -503,6 +522,16 @@ class DownstreamServer:
         if method == UpstreamMethod.SUBMIT:
             text = p["text"]
             sid = p.get("session_id")
+            cmid = p.get("client_message_id")
+            # Idempotent re-drive: a prior submit with this client_message_id
+            # already ran ``prompt_submit`` but its RPC result was lost to a
+            # socket flap, so the outbox is resubmitting the SAME job. Replay the
+            # resolved session id WITHOUT driving a second turn (§5 dedup).
+            if cmid is not None and cmid in self._submit_dedup:
+                self._submit_dedup.move_to_end(cmid)
+                prior = self._submit_dedup[cmid]
+                conn.set_foreground(prior)  # still the chat on screen (§6)
+                return {"session_id": prior, "deduplicated": True}
             if sid:
                 # Drive an existing (idle / foreign / terminal) session. Resuming
                 # REACTIVATES it, and the stock gateway may hand back a DISTINCT
@@ -529,6 +558,11 @@ class DownstreamServer:
                     provider=p.get("provider"),
                 )
                 await self._gateway.prompt_submit(sid, text)
+            # Record the resolved (live) id under the client message id BEFORE
+            # returning, so a retry that races the RPC result back over a flapped
+            # socket is deduped rather than driving a second turn.
+            if cmid is not None:
+                self._remember_submit(cmid, sid)
             conn.set_foreground(sid)  # driving a chat brings it on screen (§6)
             return {"session_id": sid}
 
