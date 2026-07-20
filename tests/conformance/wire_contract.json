@@ -203,13 +203,14 @@
         "agentMessage",
         "reasoning",
         "toolCall",
+        "taskList",
         "fileChange",
         "image",
         "browser",
         "error",
         "usage"
       ],
-      "generic_fold": ["taskList"]
+      "generic_fold": []
     },
     "body_contract": {
       "item.started": {"item_frame": true},
@@ -281,8 +282,8 @@
         }
       },
       {
-        "name": "item.completed.taskList.genericFold",
-        "$comment": "taskList is emitted by the relay; an iOS build without a native .taskList case folds it to the generic toolCall card (§2 forward-compat). XCTest asserts the fold matches item_types.generic_fold.",
+        "name": "item.completed.taskList.native",
+        "$comment": "taskList is emitted by the relay and decoded natively since N4 (ChatItemType.taskList → TaskListItemView/dock bridge). generic_fold is now empty; the §2 forward-compat rule (unknown type → toolCall card) still holds for future relay types. XCTest asserts the fold matches item_types.generic_fold.",
         "frame": {
           "seq": 4,
           "sid": "sess-1",
