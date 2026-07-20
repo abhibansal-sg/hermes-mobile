@@ -128,8 +128,25 @@ final class AppEnvironment {
                     guard let sessionStore else { throw OutboxProcessorError.destinationUnavailable }
                     return try await sessionStore.createOutboxDestination()
                 },
-                resolveRuntime: { [weak sessionStore] storedID in
-                    await sessionStore?.runtimeForOutboxDestination(storedID)
+                resolveRuntime: { [weak sessionStore, weak connectionStore] storedID in
+                    // Wave-2 relay transport: the durable outbox drains into the
+                    // relay-OWNED session. The relay keys its runtime on the STORED
+                    // session id, so the runtime id for a drain is the job's own
+                    // destination — resolved PER JOB, never collapsed to whatever
+                    // session is currently active. Returning `activeSessionID`
+                    // unconditionally mis-routed every queued row into the on-screen
+                    // session (a prompt queued for A drained into B once the user
+                    // opened B). `outboxRuntimeID(forStored:)` returns the
+                    // destination id only when the relay is driving THAT session,
+                    // else nil to HOLD the row for a later wake — mirroring the
+                    // gateway path's "no runtime mapped ⇒ hold". Gateway-direct is
+                    // unchanged (this branch is never taken with the flag OFF).
+                    if connectionStore?.relayCoordinator != nil,
+                       connectionStore?.transportPath == .relay {
+                        return connectionStore?.relayCoordinator?
+                            .outboxRuntimeID(forStored: storedID)
+                    }
+                    return await sessionStore?.runtimeForOutboxDestination(storedID)
                 },
                 uploadAsset: { [weak connectionStore, weak workRepository] job, snapshot in
                     guard let connectionStore,
@@ -218,6 +235,12 @@ final class AppEnvironment {
             chatStore.attachCache(cacheStore)
             inboxStore.attachCache(cacheStore)
             connectionStore.cacheStore = cacheStore
+            // Cache-first Projects: share the SESSION list's active
+            // (serverId, profileId) partition so a profile/server switch
+            // re-partitions Projects in lockstep. Seeds from disk immediately.
+            projectsStore.attachCache(cacheStore, scope: { [weak sessionStore] in
+                sessionStore?.projectsCacheScope
+            })
         }
         // The inbox accumulates broadcast approval/clarify prompts and answers
         // them against each prompt's own runtime via the gateway client.

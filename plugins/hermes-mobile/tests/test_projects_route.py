@@ -468,3 +468,207 @@ def test_project_sessions_fallback_mirrors_desktop_filtering(client, monkeypatch
     assert cc["cwd_prefix"] == repo_root
     assert cc["exclude_children"] is True
     assert cc["exclude_sources"] == ["cron"]
+
+
+# ---------------------------------------------------------------------------
+# POST /projects — create a project (name + root path) from the iOS tab.
+#
+# The route validates its input and delegates to the stock
+# ``hermes_cli.projects_db.create_project`` (imported + called; ZERO core
+# patch). These tests pin: auth, input validation, the file-not-a-dir reject,
+# and a real create happy-path against an isolated temp projects DB.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def temp_projects_db(monkeypatch, tmp_path):
+    """Point ``projects_db`` at an isolated temp DB for both the route's create
+    and the test's verification, so the happy-path never touches real state."""
+    from hermes_cli import projects_db as pdb
+
+    db_file = tmp_path / "projects.db"
+    monkeypatch.setattr(pdb, "projects_db_path", lambda: db_file)
+    # Drop any per-path init memo so the fresh temp path re-applies the schema.
+    monkeypatch.setattr(pdb, "_INITIALIZED_PATHS", set())
+    return db_file
+
+
+def test_create_project_requires_auth(api_module):
+    """No session token -> 401 (belt-and-suspenders, like the read routes)."""
+    from starlette.testclient import TestClient
+
+    from hermes_cli.web_server import app
+
+    resp = TestClient(app).post(
+        "/api/plugins/hermes-mobile/projects",
+        json={"name": "X", "root": "/tmp/x"},
+    )
+    assert resp.status_code == 401
+
+
+def test_create_project_rejects_empty_name(client, temp_projects_db):
+    resp = client.post(
+        "/api/plugins/hermes-mobile/projects",
+        json={"name": "   ", "root": "/tmp/x"},
+    )
+    assert resp.status_code == 400
+    assert "name" in resp.json()["detail"].lower()
+
+
+def test_create_project_rejects_empty_root(client, temp_projects_db):
+    resp = client.post(
+        "/api/plugins/hermes-mobile/projects",
+        json={"name": "X", "root": "  "},
+    )
+    assert resp.status_code == 400
+    assert "root" in resp.json()["detail"].lower()
+
+
+def test_create_project_rejects_file_root(client, temp_projects_db, tmp_path):
+    """A root that exists but is a FILE (not a directory) is rejected."""
+    file_path = tmp_path / "not-a-dir.txt"
+    file_path.write_text("hi")
+
+    resp = client.post(
+        "/api/plugins/hermes-mobile/projects",
+        json={"name": "X", "root": str(file_path)},
+    )
+    assert resp.status_code == 400
+    assert "director" in resp.json()["detail"].lower()
+
+
+def test_create_project_happy_path_persists_and_returns_contract(
+    client, temp_projects_db, tmp_path
+):
+    """A valid create returns the ``{id, label, root, session_count}`` contract
+    and actually writes a row via the stock ``create_project``."""
+    from hermes_cli import projects_db as pdb
+
+    root = tmp_path / "code" / "widget-app"
+    root.mkdir(parents=True)
+
+    resp = client.post(
+        "/api/plugins/hermes-mobile/projects",
+        json={"name": "Widget App", "root": str(root)},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body.keys()) == {"id", "label", "root", "session_count"}
+    assert body["label"] == "Widget App"
+    assert body["root"] == str(root)
+    assert body["id"] == str(root)
+    assert body["session_count"] == 0
+
+    # The stock backend actually recorded it (verify against the same temp DB).
+    with pdb.connect_closing() as conn:
+        names = [p.name for p in pdb.list_projects(conn)]
+    assert "Widget App" in names
+
+
+def test_create_project_accepts_nonexistent_root(client, temp_projects_db, tmp_path):
+    """A not-yet-created path is allowed (``create_project`` just records it)."""
+    root = tmp_path / "future" / "repo"  # deliberately absent on disk
+
+    resp = client.post(
+        "/api/plugins/hermes-mobile/projects",
+        json={"name": "Future", "root": str(root)},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["root"] == str(root)
+
+
+# ---------------------------------------------------------------------------
+# GET /projects ∪ projects_db — the create/overview round-trip (wave25-b2).
+#
+# ``_discover_repos_payload`` derives roots from session cwds ∪ filesystem git
+# scan; neither sees a brand-new zero-session project. The overview must UNION
+# ``projects_db.list_projects`` so a just-created project is visible on Back.
+# ---------------------------------------------------------------------------
+
+
+def test_overview_includes_zero_session_projects_db_project(
+    client, monkeypatch, temp_projects_db, tmp_path
+):
+    """A projects_db project with no sessions and no filesystem scan hit still
+    surfaces in the overview, keyed by its normalized ``primary_path``."""
+    from hermes_cli import projects_db as pdb
+
+    _patch_discover(monkeypatch, [])  # nothing session/scan-derived
+    root = tmp_path / "code" / "fresh-app"
+    root.mkdir(parents=True)
+    with pdb.connect_closing() as conn:
+        pdb.create_project(conn, name="Fresh App", primary_path=str(root))
+
+    resp = client.get("/api/plugins/hermes-mobile/projects")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    by_root = {e["root"]: e for e in data}
+    assert str(root) in by_root, data
+    entry = by_root[str(root)]
+    assert set(entry.keys()) == {"id", "label", "root", "session_count"}
+    assert entry["id"] == str(root)  # same id POST /projects returns
+    assert entry["label"] == "Fresh App"
+    assert entry["session_count"] == 0
+
+
+def test_create_then_overview_round_trip(
+    client, monkeypatch, temp_projects_db, tmp_path
+):
+    """End-to-end: POST /projects then GET /projects surfaces the new project
+    (the exact bug — created project absent from the overview after Back)."""
+    _patch_discover(monkeypatch, [])
+    root = tmp_path / "future" / "repo"  # not-yet-existing folder
+
+    created = client.post(
+        "/api/plugins/hermes-mobile/projects",
+        json={"name": "Round Trip", "root": str(root)},
+    )
+    assert created.status_code == 200, created.text
+    created_id = created.json()["id"]
+
+    overview = client.get("/api/plugins/hermes-mobile/projects")
+    assert overview.status_code == 200, overview.text
+    ids = {e["id"] for e in overview.json()}
+    assert created_id in ids, overview.json()
+
+
+def test_overview_dedupes_projects_db_root_against_discovered(
+    client, monkeypatch, temp_projects_db, tmp_path
+):
+    """When a projects_db project's root is ALSO a discovered repo, it appears
+    once, and the discovered entry (which carries the real session_count) wins
+    — the union must not duplicate the root."""
+    from hermes_cli import projects_db as pdb
+
+    root = tmp_path / "code" / "widget-app"
+    root.mkdir(parents=True)
+    _patch_discover(
+        monkeypatch,
+        [{"root": str(root), "label": "widget-app", "sessions": 5, "last_active": 0.0}],
+    )
+    with pdb.connect_closing() as conn:
+        pdb.create_project(conn, name="Widget App", primary_path=str(root))
+
+    resp = client.get("/api/plugins/hermes-mobile/projects")
+    assert resp.status_code == 200, resp.text
+    matches = [e for e in resp.json() if e["root"] == str(root)]
+    assert len(matches) == 1, matches
+    assert matches[0]["session_count"] == 5  # discovered entry wins
+
+
+def test_overview_skips_archived_projects_db_project(
+    client, monkeypatch, temp_projects_db, tmp_path
+):
+    """Archived projects_db projects are excluded (list_projects default)."""
+    from hermes_cli import projects_db as pdb
+
+    _patch_discover(monkeypatch, [])
+    root = tmp_path / "code" / "gone"
+    root.mkdir(parents=True)
+    with pdb.connect_closing() as conn:
+        pid = pdb.create_project(conn, name="Gone", primary_path=str(root))
+        pdb.archive_project(conn, pid)
+
+    resp = client.get("/api/plugins/hermes-mobile/projects")
+    assert resp.status_code == 200, resp.text
+    assert str(root) not in {e["root"] for e in resp.json()}

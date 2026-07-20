@@ -254,6 +254,12 @@ def _server():
     gw.clarify_respond = AsyncMock(return_value={"ok": True})
     gw.session_interrupt = AsyncMock(return_value={"ok": True})
     gw.owns = MagicMock(return_value=False)
+    # Gateway-readiness gate: default to ready so upstream RPCs proceed.
+    gw.wait_ready = AsyncMock(return_value=True)
+    # Default: no origin->live remap (gateway resumes in place). Individual
+    # foreign-submit tests override session_resume/live_id_for to model a distinct
+    # live id.
+    gw.live_id_for = MagicMock(side_effect=lambda s: s)
     srv = DownstreamServer(DownstreamConfig(), EventBus(), gw, SessionStore())
     return srv, gw
 
@@ -305,6 +311,53 @@ async def test_submit_into_existing_resumes_to_own_then_submits():
     assert res == {"session_id": "s5"}
 
 
+async def test_submit_into_foreign_session_submits_to_resumed_live_id():
+    """R0/E2E finding: ``session.resume`` on a foreign/idle id may return a
+    DISTINCT live id (origin echoed as ``resumed``). The turn MUST be
+    prompt.submit'd to that LIVE id, not the origin id, or it targets a dormant
+    session and never runs."""
+    srv, gw = _server()
+    gw.owns = MagicMock(return_value=False)
+    gw.session_resume = AsyncMock(
+        return_value={"session_id": "sLive", "resumed": "sOrigin", "message_count": 4}
+    )
+    await srv.start()
+    res = await _handle(srv, UpstreamMethod.SUBMIT, {"text": "go", "session_id": "sOrigin"})
+    # resume the ORIGIN id, but submit to the LIVE id it returned.
+    gw.session_resume.assert_awaited_once_with("sOrigin")
+    gw.prompt_submit.assert_awaited_once_with("sLive", "go")
+    assert res == {"session_id": "sLive"}
+    # the LIVE id is the one brought on screen (§6), not the dormant origin.
+    assert srv.session_has_live_phone("sLive") is True
+    assert srv.session_has_live_phone("sOrigin") is False
+
+
+async def test_repeat_submit_to_origin_id_still_targets_live_id():
+    """A phone that keeps addressing the ORIGIN id after the first (remapping)
+    resume must still drive the LIVE turn: the owned-session branch resolves the
+    origin id through ``live_id_for``."""
+    srv, gw = _server()
+    live_map = {"sOrigin": "sLive", "sLive": "sLive"}
+    gw.live_id_for = MagicMock(side_effect=lambda s: live_map.get(s, s))
+    gw.session_resume = AsyncMock(return_value={"session_id": "sLive", "resumed": "sOrigin"})
+
+    owned = {"flag": False}
+    gw.owns = MagicMock(side_effect=lambda s: owned["flag"])
+    await srv.start()
+
+    # First submit: not owned -> resume remaps origin->live.
+    await _handle(srv, UpstreamMethod.SUBMIT, {"text": "one", "session_id": "sOrigin"})
+    gw.prompt_submit.assert_awaited_once_with("sLive", "one")
+
+    # Now the relay owns the session; a phone still using the ORIGIN id submits
+    # again -> the owned branch resolves it back to the live id.
+    owned["flag"] = True
+    gw.prompt_submit.reset_mock()
+    await _handle(srv, UpstreamMethod.SUBMIT, {"text": "two", "session_id": "sOrigin"})
+    gw.session_resume.assert_awaited_once()  # no SECOND resume for an owned session
+    gw.prompt_submit.assert_awaited_once_with("sLive", "two")
+
+
 async def test_submit_into_owned_session_skips_resume():
     srv, gw = _server()
     gw.owns = MagicMock(return_value=True)
@@ -312,6 +365,98 @@ async def test_submit_into_owned_session_skips_resume():
     await _handle(srv, UpstreamMethod.SUBMIT, {"text": "more", "session_id": "s5"})
     gw.session_resume.assert_not_awaited()
     gw.prompt_submit.assert_awaited_once_with("s5", "more")
+
+
+async def test_submit_dedupes_repeat_client_message_id_across_reconnect():
+    """An ambiguous-flap retry (same client_message_id, fresh connection after a
+    reconnect) must NOT drive a second turn — it replays the resolved id."""
+    srv, gw = _server()
+    gw.owns = MagicMock(return_value=True)
+    await srv.start()
+
+    # First drain: runs prompt_submit and records the client_message_id.
+    conn1 = srv.register(FakeWS())
+    res1 = await srv.handle_upstream(
+        conn1,
+        UpstreamRequest(
+            method=UpstreamMethod.SUBMIT,
+            params={"text": "hi", "session_id": "s5", "client_message_id": "cm-1"},
+            id=1,
+        ),
+    )
+    assert res1 == {"session_id": "s5"}
+    gw.prompt_submit.assert_awaited_once_with("s5", "hi")
+
+    # The socket flapped before the phone saw res1; the outbox resubmits the SAME
+    # job on a FRESH connection. prompt_submit must NOT run a second time.
+    gw.prompt_submit.reset_mock()
+    conn2 = srv.register(FakeWS())
+    res2 = await srv.handle_upstream(
+        conn2,
+        UpstreamRequest(
+            method=UpstreamMethod.SUBMIT,
+            params={"text": "hi", "session_id": "s5", "client_message_id": "cm-1"},
+            id=2,
+        ),
+    )
+    gw.prompt_submit.assert_not_awaited()
+    assert res2["session_id"] == "s5"
+    assert res2["deduplicated"] is True
+
+
+async def test_submit_without_client_message_id_never_dedupes():
+    """Absent a client_message_id (legacy/interactive), every submit drives a turn
+    — dedup is opt-in via the id and must not silently swallow real sends."""
+    srv, gw = _server()
+    gw.owns = MagicMock(return_value=True)
+    await srv.start()
+    await _handle(srv, UpstreamMethod.SUBMIT, {"text": "one", "session_id": "s5"})
+    await _handle(srv, UpstreamMethod.SUBMIT, {"text": "two", "session_id": "s5"})
+    assert gw.prompt_submit.await_count == 2
+
+
+async def test_submit_dedup_lru_evicts_oldest_so_retry_redrives():
+    """The SUBMIT dedup map is BOUNDED (cap 1024, LRU eviction). Once an id is
+    evicted, a late retry with that id is no longer recognized and drives a fresh
+    turn — the bounded window is the contract, not infinite dedup. Correctness is
+    preserved by `completed`-is-authoritative; only duplicate-suppression is
+    bounded. This test pins the bound so a future change cannot silently unbound
+    the table."""
+    srv, gw = _server()
+    gw.owns = MagicMock(return_value=True)
+    await srv.start()
+    cap = srv._submit_dedup_cap
+    assert cap == 1024, "the documented LRU cap (RELAY-PHONE-PROTOCOL.md §5a)"
+
+    # Fill the table past the cap; the OLDEST id ("cm-first") is evicted.
+    for i in range(cap + 1):
+        await _handle(
+            srv,
+            UpstreamMethod.SUBMIT,
+            {"text": "x", "session_id": f"s{i}", "client_message_id": f"cm-{i}"},
+        )
+    assert len(srv._submit_dedup) == cap, "the dedup table never grows past its cap"
+
+    # A retry of the evicted id is NOT recognized: it drives a fresh turn.
+    gw.prompt_submit.reset_mock()
+    res = await _handle(
+        srv,
+        UpstreamMethod.SUBMIT,
+        {"text": "again", "session_id": "sLate", "client_message_id": "cm-first"},
+    )
+    gw.prompt_submit.assert_awaited_once_with("sLate", "again")
+    assert res == {"session_id": "sLate"}, "evicted id is treated as a new submit"
+
+    # A retry of an id still IN the table IS recognized: no second turn.
+    gw.prompt_submit.reset_mock()
+    res2 = await _handle(
+        srv,
+        UpstreamMethod.SUBMIT,
+        {"text": "again", "session_id": "sLate", "client_message_id": f"cm-{cap}"},
+    )
+    gw.prompt_submit.assert_not_awaited()
+    assert res2["deduplicated"] is True
+
 
 
 async def test_resume_owns_idle_session():
@@ -322,11 +467,30 @@ async def test_resume_owns_idle_session():
     assert res["session_id"] == "s5"
 
 
+async def test_resume_surfaces_distinct_live_id():
+    """RESUME shares SUBMIT's reactivation semantics: when the gateway hands back
+    a distinct live id, the phone gets (and foregrounds) the LIVE id, with the
+    origin echoed for reconciliation."""
+    srv, gw = _server()
+    gw.session_resume = AsyncMock(
+        return_value={"session_id": "sLive", "resumed": "sOrigin", "message_count": 3}
+    )
+    await srv.start()
+    conn = srv.register(FakeWS())
+    res = await srv.handle_upstream(
+        conn, UpstreamRequest(UpstreamMethod.RESUME, {"session_id": "sOrigin"}, id=7)
+    )
+    assert res["session_id"] == "sLive"
+    assert res["origin"] == "sOrigin"
+    assert srv.session_has_live_phone("sLive") is True
+    assert srv.session_has_live_phone("sOrigin") is False
+
+
 async def test_approve_clarify_interrupt_pass_through():
     srv, gw = _server()
     await srv.start()
     await _handle(srv, UpstreamMethod.APPROVE, {"session_id": "s1", "request_id": "r", "decision": "allow"})
-    gw.approval_respond.assert_awaited_once_with("s1", "r", "allow")
+    gw.approval_respond.assert_awaited_once_with("s1", "r", "allow", resolve_all=False)
     await _handle(srv, UpstreamMethod.CLARIFY, {"session_id": "s1", "request_id": "r", "text": "yes"})
     gw.clarify_respond.assert_awaited_once_with("s1", "r", "yes")
     await _handle(srv, UpstreamMethod.INTERRUPT, {"session_id": "s1"})
@@ -355,6 +519,36 @@ async def test_unknown_method_raises():
     await srv.start()
     with pytest.raises(ValueError):
         await _handle(srv, "bogus", {})
+
+
+async def test_gateway_readiness_gate_blocks_when_not_ready():
+    """When the gateway is not ready (relay just restarted), upstream RPCs that
+    hit the gateway raise ConnectionError instead of failing with a confusing
+    'gateway not connected' error. Local-only methods (ack/resync/foreground)
+    are unaffected."""
+    srv, gw = _server()
+    gw.wait_ready = AsyncMock(return_value=False)  # gateway not ready
+    await srv.start()
+
+    # Gateway-hitting methods raise ConnectionError
+    with pytest.raises(ConnectionError, match="relay gateway not ready"):
+        await _handle(srv, "list", {})
+    with pytest.raises(ConnectionError, match="relay gateway not ready"):
+        await _handle(srv, "submit", {"text": "hi"})
+    with pytest.raises(ConnectionError, match="relay gateway not ready"):
+        await _handle(srv, "resume", {"session_id": "s1"})
+
+    # Local-only methods still work
+    conn = srv.register(FakeWS())
+    result = await srv.handle_upstream(
+        conn, UpstreamRequest(method="ack", params={"through": 5}, id=1)
+    )
+    assert result is None
+    result = await srv.handle_upstream(
+        conn, UpstreamRequest(method="foreground", params={"session_id": "s1"}, id=2)
+    )
+    assert result is None
+    assert conn.foreground_sessions == {"s1"}
 
 
 # ---------------------------------------------------------------------------
@@ -565,3 +759,98 @@ async def test_submit_and_resume_replace_foreground():
     await srv.handle_upstream(conn, UpstreamRequest(UpstreamMethod.SUBMIT, {"text": "hi", "session_id": "s2"}))
     assert srv.session_has_live_phone("s1") is False
     assert srv.session_has_live_phone("s2") is True
+
+
+# ---------------------------------------------------------------------------
+# health / status surface
+# ---------------------------------------------------------------------------
+
+
+class _FakeRequest:
+    def __init__(self, path, headers=None):
+        self.path = path
+        self.headers = headers or {}
+
+
+class _FakeConn:
+    """Captures a synchronous ``respond(status, body)`` call from process_request."""
+
+    def __init__(self):
+        self.responded = None
+
+    def respond(self, status, body):
+        self.responded = (status, body)
+        return ("RESPONSE", status, body)
+
+
+async def test_status_reports_connections_and_foreground():
+    srv, gw = _server()
+    gw.owned_sessions = frozenset({"sOwned"})
+    await srv.start()
+    conn = srv.register(FakeWS())
+    conn.set_foreground("s1")
+    await conn.send_frame(_status("m"))
+    st = srv.status()
+    assert st["connections"] == 1
+    assert st["ring_ready"] is True
+    assert st["owned_sessions"] == ["sOwned"]
+    phone = st["phones"][0]
+    assert phone["head_seq"] == 1
+    assert phone["foreground"] == ["s1"]
+    # the whole snapshot must be JSON-serialisable (it is the health body).
+    json.dumps(st)
+
+
+async def test_process_request_serves_health_path():
+    srv, gw = _server()
+    gw.owned_sessions = frozenset()
+    await srv.start()
+    c = _FakeConn()
+    from http import HTTPStatus
+
+    out = await srv._process_request(c, _FakeRequest("/healthz?probe=1"))
+    assert out is not None  # a response was produced (handshake short-circuited)
+    status, body = c.responded
+    assert status == HTTPStatus.OK
+    parsed = json.loads(body)
+    assert "connections" in parsed and "listen" in parsed
+
+
+async def test_process_request_rejects_unauthenticated_websocket():
+    srv, _ = _server()
+    srv._cfg.auth_token = "secret"
+    await srv.start()
+    c = _FakeConn()
+    await srv._process_request(c, _FakeRequest("/ws"))
+    from http import HTTPStatus
+    assert c.responded[0] == HTTPStatus.UNAUTHORIZED
+
+
+async def test_process_request_accepts_authenticated_websocket():
+    srv, _ = _server()
+    srv._cfg.auth_token = "secret"
+    await srv.start()
+    c = _FakeConn()
+    request = _FakeRequest("/ws", {"Authorization": "Bearer secret"})
+    assert await srv._process_request(c, request) is None
+    assert c.responded is None
+
+
+async def test_process_request_disabled_when_no_health_path():
+    srv, _ = _server()
+    srv._cfg.health_path = None
+    await srv.start()
+    c = _FakeConn()
+    assert await srv._process_request(c, _FakeRequest("/healthz")) is None
+    assert c.responded is None
+
+
+async def test_disabling_health_does_not_disable_websocket_auth():
+    srv, _ = _server()
+    srv._cfg.health_path = None
+    srv._cfg.auth_token = "secret"
+    await srv.start()
+    c = _FakeConn()
+    await srv._process_request(c, _FakeRequest("/ws"))
+    from http import HTTPStatus
+    assert c.responded[0] == HTTPStatus.UNAUTHORIZED

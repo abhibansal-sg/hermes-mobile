@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, Protocol, runtime_checkable
 
 from .bus import EventBus, TOPIC_GATEWAY_EVENTS
+from .durable_state import DurableState
 from .types import GatewayEvent, RawEvent
 
 # Origin tag stamped on sessions the relay creates/resumes (matches R0 spike).
@@ -119,6 +120,7 @@ class GatewayClient:
         rest_client: Any = None,
         sleep: Optional[Callable[[float], Awaitable[None]]] = None,
         token_provider: Optional[Callable[[], str]] = None,
+        durable: Optional[DurableState] = None,
     ) -> None:
         self._cfg = config
         self._bus = bus
@@ -127,10 +129,23 @@ class GatewayClient:
         self._owns_rest_client = rest_client is None
         self._sleep = sleep or asyncio.sleep
         self._token_provider = token_provider
+        # Durable owned-session store. When provided, the owned set survives a
+        # relay restart: the constructor seeds ``_owned`` from it and every
+        # ownership mutation is mirrored to it. ``None`` (unit tests) keeps the
+        # legacy in-memory-only behaviour.
+        self._durable = durable
 
         # Sessions this relay OWNS (created/resumed here) — re-established on
-        # reconnect and observed by the Notifier for owned-session pushes.
-        self._owned: set[str] = set()
+        # reconnect and observed by the Notifier for owned-session pushes. Seeded
+        # from durable storage so a relay restart re-resumes the phone's sessions
+        # instead of dropping them (the "destination session not active" failure).
+        self._owned: set[str] = set(self._durable.load_owned_sessions()) if self._durable else set()
+
+        # Origin/requested id -> live id learned at resume time. A stock gateway
+        # may hand a resumed session a DISTINCT live id (echoing the requested id
+        # back as ``resumed``); a submit MUST target the live id, so we remember
+        # the mapping and resolve it in :meth:`live_id_for` (R0/E2E finding).
+        self._live_by_origin: dict[str, str] = {}
 
         # Live token (re-minted on each connect via token_provider, if given).
         self._token: str = config.token
@@ -147,6 +162,23 @@ class GatewayClient:
         self._closing = False
         self._run_task: Optional[asyncio.Task[None]] = None
 
+    # -- ownership bookkeeping (mirrored to durable storage) --------------
+    def _mark_owned(self, session_id: str) -> None:
+        """Add ``session_id`` to the owned set and mirror to durable storage."""
+        if not session_id:
+            return
+        self._owned.add(session_id)
+        if self._durable is not None:
+            self._durable.add_owned_session(session_id)
+
+    def _unmark_owned(self, session_id: str) -> None:
+        """Remove ``session_id`` from the owned set and durable storage."""
+        if not session_id:
+            return
+        self._owned.discard(session_id)
+        if self._durable is not None:
+            self._durable.remove_owned_session(session_id)
+
     # -- lifecycle --------------------------------------------------------
     async def connect(self) -> None:
         """Open the WS, authenticate, await ``gateway.ready``, start the reader.
@@ -157,6 +189,22 @@ class GatewayClient:
         :meth:`run`'s job; callers wanting resilience use :meth:`run`.
         """
         await self._connect_once()
+
+    async def wait_ready(self, timeout: float = 10.0) -> bool:
+        """Wait until the gateway connection is ready (``gateway.ready`` received).
+
+        Returns True if ready within ``timeout``, False otherwise. Used by the
+        downstream server to handle the relay-restart timing gap: the phone
+        reconnects to the relay's downstream server immediately, but the relay's
+        gateway connection might not be up yet. Without this, a submit/resume
+        arriving in that window fails with "gateway not connected" and the
+        outbox retains the job with no further wake.
+        """
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def run(self) -> None:
         """Durable connect/serve/reconnect loop with exponential backoff.
@@ -201,6 +249,8 @@ class GatewayClient:
             except Exception:
                 pass
             self._rest_client = None
+        # NOTE: ``_durable`` is shared across lanes (owned by RelayApp); the
+        # client must NOT close it here — RelayApp.close() owns its lifecycle.
 
     async def _connect_once(self) -> None:
         """Open a fresh transport, start its reader, await readiness."""
@@ -355,7 +405,7 @@ class GatewayClient:
         sid = result.get("session_id")
         if not sid:
             raise GatewayRPCError("session.create", {"code": -1, "message": "no session_id in result"})
-        self._owned.add(sid)
+        self._mark_owned(sid)
         return sid
 
     async def session_resume(self, session_id: str, *, cols: Optional[int] = None) -> dict[str, Any]:
@@ -373,12 +423,18 @@ class GatewayClient:
             "source": self._cfg.source,
         }
         result = await self._call_result("session.resume", params, timeout=self._cfg.rpc_timeout_s)
-        self._owned.add(session_id)
+        # Persist the STABLE origin id (what the phone sends); the live id below
+        # is connection-local and re-learned on every reconnect, so it stays
+        # in-memory only.
+        self._mark_owned(session_id)
         # If the gateway hands back a distinct live id, own it too so events on
-        # that id are recognised as ours.
+        # that id are recognised as ours, and remember origin->live so a submit
+        # to EITHER id drives the live turn (see :meth:`live_id_for`).
         live = result.get("session_id")
         if live:
             self._owned.add(live)
+            self._live_by_origin[session_id] = live
+            self._live_by_origin[live] = live
         return result
 
     async def rest_history(self, session_id: str) -> list[dict[str, Any]]:
@@ -401,21 +457,45 @@ class GatewayClient:
         Marks the session owned so reconnect re-establishes it and the Notifier
         treats its completion/approval/error events as push-worthy.
         """
-        self._owned.add(session_id)
+        self._mark_owned(session_id)
         return await self._call_result("prompt.submit", {"session_id": session_id, "text": text})
 
-    async def approval_respond(self, session_id: str, request_id: str, decision: str) -> dict[str, Any]:
-        """``approval.respond`` — answer an approval gate (pass-through)."""
+    async def approval_respond(
+        self, session_id: str, request_id: str, decision: str, *, resolve_all: bool = False
+    ) -> dict[str, Any]:
+        """``approval.respond`` — answer an approval gate.
+
+        WIRE-SHAPE CORRECTION: the stock gateway's ``approval.respond`` handler
+        reads ``choice`` (one of ``once``/``session``/``always``/``deny``, and
+        maps ``approve``->``once``) and ``all``, and resolves the gate by SESSION
+        key — it does NOT read ``decision`` or ``request_id``. Sending
+        ``decision`` therefore silently defaulted every phone approval to a DENY.
+        We map the phone's ``decision`` onto ``choice`` (``request_id`` is kept
+        for logging/forward-compat but the gateway ignores it).
+        """
         return await self._call_result(
             "approval.respond",
-            {"session_id": session_id, "request_id": request_id, "decision": decision},
+            {
+                "session_id": session_id,
+                "request_id": request_id,
+                "choice": decision,
+                "all": resolve_all,
+            },
         )
 
     async def clarify_respond(self, session_id: str, request_id: str, text: str) -> dict[str, Any]:
-        """``clarify.respond`` — answer a clarify gate (pass-through)."""
+        """``clarify.respond`` — answer a clarify gate.
+
+        WIRE-SHAPE CORRECTION: the stock gateway's ``clarify.respond`` handler
+        (``_respond(rid, params, "answer")``) matches the pending waiter by
+        ``request_id`` and stores ``params["answer"]`` — it does NOT read
+        ``text``. Sending ``text`` therefore delivered an EMPTY answer to the
+        blocked agent. We send ``answer`` (``session_id`` is kept for symmetry;
+        the gateway resolves by ``request_id``).
+        """
         return await self._call_result(
             "clarify.respond",
-            {"session_id": session_id, "request_id": request_id, "text": text},
+            {"session_id": session_id, "request_id": request_id, "answer": text},
         )
 
     async def session_interrupt(self, session_id: str) -> dict[str, Any]:
@@ -455,6 +535,16 @@ class GatewayClient:
     def owns(self, session_id: str) -> bool:
         """True iff the relay owns (submitted/resumed-to-drive) this session."""
         return session_id in self._owned
+
+    def live_id_for(self, session_id: str) -> str:
+        """Resolve a requested/origin id to the live id a prior resume assigned.
+
+        Returns ``session_id`` unchanged when no remap is known (the common case
+        where the gateway resumes a session in place). When the gateway assigned
+        a distinct live id at resume time, this lets a repeat submit addressed to
+        the ORIGIN id still target the live turn instead of the dormant origin.
+        """
+        return self._live_by_origin.get(session_id, session_id)
 
     @property
     def owned_sessions(self) -> frozenset[str]:

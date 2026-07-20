@@ -260,6 +260,37 @@ final class UX1PolishTests: XCTestCase {
             "a keyboard shorter than the baseline must not reduce the clearance")
     }
 
+    /// Owner QA §c — the Turn Dock is a floating overlay directly above the composer
+    /// and reserves no inset of its own, so its measured height must be ADDED to the
+    /// bottom clearance (plus the `bottomStack` inter-element spacing) or the dock
+    /// covers the last transcript row. A zero dock height must leave the clearance
+    /// byte-identical to the composer-only value.
+    func testComposerClearanceReservesDockHeight() {
+        let noDock = ChatView.composerClearance(composerHeight: 140, keyboardHeight: 0)
+        let withDock = ChatView.composerClearance(
+            composerHeight: 140, keyboardHeight: 0, dockHeight: 64)
+        XCTAssertEqual(withDock - noDock, 64 + ChatView.bottomStackSpacing, accuracy: 0.001,
+            "a visible dock must reserve its measured height plus the stack spacing")
+        // Zero dock (dock showing nothing) restores the exact composer-only clearance.
+        XCTAssertEqual(
+            ChatView.composerClearance(composerHeight: 140, keyboardHeight: 0, dockHeight: 0),
+            noDock, accuracy: 0.001,
+            "a hidden dock (height 0) must not change the at-rest clearance")
+    }
+
+    /// The dock clearance stacks additively with the keyboard term — an expanded task
+    /// box AND an open keyboard both reserve room, so the last message clears both.
+    func testComposerClearanceStacksDockAndKeyboard() {
+        let baseline = HermesLayoutConstants.controlBottomBaseline
+        let both = ChatView.composerClearance(
+            composerHeight: 140, keyboardHeight: 336, dockHeight: 120)
+        let expected = max(ChatView.composerFloatInset, 140 + ChatView.composerBreathingGap)
+            + (120 + ChatView.bottomStackSpacing)
+            + (336 - baseline)
+        XCTAssertEqual(both, expected, accuracy: 0.001,
+            "dock + keyboard clearances must both be reserved additively")
+    }
+
     /// The at-bottom threshold (drives the streaming auto-stick gate + the pill
     /// visibility) is a positive, modest distance — large enough to absorb sub-row
     /// jitter at the tail, small enough that a reader who scrolled up a screen

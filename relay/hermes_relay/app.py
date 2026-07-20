@@ -28,6 +28,7 @@ from typing import Optional
 
 from .bus import TOPIC_GATEWAY_EVENTS, TOPIC_RELAY_FRAMES, EventBus
 from .downstream import DownstreamConfig, DownstreamServer
+from .durable_state import DurableState
 from .gateway_client import GatewayClient, GatewayConfig
 from .notifier import Notifier, NotifierConfig
 from .reframer import Reframer
@@ -52,19 +53,21 @@ class RelayApp:
         self._cfg = config
         self.bus = EventBus()
         self.store = SessionStore()
+        self.durable = DurableState()
         self._tasks: dict[str, asyncio.Task] = {}
         self._closing = False
 
-        self.gateway = GatewayClient(config.gateway, self.bus)
+        self.gateway = GatewayClient(config.gateway, self.bus, durable=self.durable)
         self.reframer = Reframer(self.bus, self.store)
         self.downstream = DownstreamServer(
-            config.downstream, self.bus, self.gateway, self.store
+            config.downstream, self.bus, self.gateway, self.store, self.durable
         )
         self.notifier = Notifier(
             config.notifier,
             self.bus,
             self.gateway,
             is_foregrounded=self.downstream.session_has_live_phone,
+            durable=self.durable,
         )
 
     async def run(self) -> None:
@@ -128,6 +131,21 @@ class RelayApp:
             if exc is not None:
                 raise exc
 
+    def status(self) -> dict:
+        """A JSON-serialisable snapshot of the whole relay (health surface)."""
+        from . import __version__
+
+        return {
+            "service": "hermes_relay",
+            "version": __version__,
+            "gateway": {
+                "url": self._cfg.gateway.ws_url("REDACTED"),
+                "owned_sessions": sorted(self.gateway.owned_sessions),
+            },
+            "downstream": self.downstream.status(),
+            "closing": self._closing,
+        }
+
     async def close(self) -> None:
         """Idempotent teardown: stop the long-lived lanes, cancel the pumps."""
         if self._closing and not self._tasks:
@@ -155,11 +173,19 @@ class RelayApp:
 
 
 def build_default_config(
-    *, gateway_token: str, gateway_port: int = 9126, downstream_port: int = 8765
+    *,
+    gateway_token: str,
+    gateway_host: str = "127.0.0.1",
+    gateway_port: int = 9126,
+    downstream_host: str = "127.0.0.1",
+    downstream_port: int = 8765,
+    health_path: Optional[str] = "/healthz",
 ) -> RelayConfig:
     """Convenience default config for local/isolated runs (NEVER port 9119)."""
     return RelayConfig(
-        gateway=GatewayConfig(token=gateway_token, port=gateway_port),
-        downstream=DownstreamConfig(port=downstream_port),
+        gateway=GatewayConfig(host=gateway_host, token=gateway_token, port=gateway_port),
+        downstream=DownstreamConfig(
+            host=downstream_host, port=downstream_port, health_path=health_path
+        ),
         notifier=NotifierConfig(),
     )

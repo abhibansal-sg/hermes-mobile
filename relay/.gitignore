@@ -1,0 +1,4 @@
+# Build / editable-install artifacts (never checked in).
+*.egg-info/
+__pycache__/
+.pytest_cache/

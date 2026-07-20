@@ -38,15 +38,18 @@ tail); ``replay_ring.py`` itself is never modified.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from . import plugin_bridge
 from .bus import TOPIC_RELAY_FRAMES, EventBus
 from .gateway_client import GatewayClient
+from .durable_state import DurableState
 from .session_state import SessionStore
 from .types import Frame, FrameKind, UpstreamMethod, UpstreamRequest
 
@@ -66,6 +69,14 @@ class DownstreamConfig:
     ring_total_bytes: Optional[int] = None
     ack_interval_hint_s: float = 5.0
     max_message_bytes: int = 8 * 1024 * 1024
+    # HTTP health/status path served on the SAME phone-facing port (a plain GET,
+    # not a WS upgrade). ``None`` disables the surface entirely.
+    health_path: Optional[str] = "/healthz"
+    # Bearer token gating the health/control routes (healthz + the durable
+    # /attention/pending and /sync/manifest siblings) and the WS handshake. The
+    # iOS client already sends the gateway token as a bearer credential; reuse
+    # it rather than adding a second secret or config surface. Empty disables.
+    auth_token: str = ""
 
 
 def build_ring(cfg: DownstreamConfig) -> Any:
@@ -250,17 +261,29 @@ class DownstreamServer:
         bus: EventBus,
         gateway: GatewayClient,
         store: SessionStore,
+        durable: Optional[DurableState] = None,
     ) -> None:
         self._cfg = config
         self._bus = bus
         self._gateway = gateway
         self._store = store
+        self._durable = durable
         self._ring = None  # set in start(): reused ReplayRingManager
         self._conns: dict[str, PhoneConnection] = {}
         self._server = None
         self._sub = None
         self._fanout_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        # SUBMIT idempotency: client_message_id -> resolved (live) session_id.
+        # The durable outbox retries a submit whose RPC result was lost to a
+        # socket flap AFTER the relay already ran ``prompt_submit`` (the phone
+        # marks the row ``transport_ambiguous`` and the next wake resubmits the
+        # SAME job). This server object outlives any single phone connection, so
+        # the retry — which arrives on a FRESH PhoneConnection after reconnect —
+        # is recognized here and replays the prior result instead of driving a
+        # second turn. Bounded (LRU) so it can never grow without limit.
+        self._submit_dedup: "OrderedDict[str, str]" = OrderedDict()
+        self._submit_dedup_cap = 1024
 
     async def start(self) -> None:
         """Build the reused replay ring and bind the phone-facing WS server."""
@@ -284,11 +307,85 @@ class DownstreamServer:
             self._cfg.host,
             self._cfg.port,
             max_size=self._cfg.max_message_bytes,
+            process_request=self._process_request,
         )
         try:
             await self._stop.wait()
         finally:
             await self.close()
+
+    async def _process_request(self, connection: Any, request: Any) -> Any:
+        """Serve a plain-HTTP health/status probe on the phone-facing port.
+
+        websockets calls this before the WS handshake for every inbound request.
+        A GET to the configured ``health_path`` is answered with a JSON status
+        body (HTTP 200) and never upgraded; anything else returns ``None`` so the
+        normal WS handshake proceeds. Kept defensive: a probe must never take down
+        the accept loop, so any failure falls through to the WS path.
+        """
+        health = self._cfg.health_path
+        try:
+            from http import HTTPStatus
+
+            raw_path = getattr(request, "path", "") or ""
+            path = raw_path.split("?", 1)[0]
+            token = self._cfg.auth_token
+            supplied = (getattr(request, "headers", {}) or {}).get("Authorization", "")
+            if token and not hmac.compare_digest(supplied, f"Bearer {token}"):
+                return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
+            if health and path == health:
+                body = json.dumps(self.status(), ensure_ascii=False) + "\n"
+                return connection.respond(HTTPStatus.OK, body)
+            if path == "/attention/pending" and self._durable is not None:
+                from urllib.parse import parse_qs, urlsplit
+
+                cursor = parse_qs(urlsplit(raw_path).query).get("cursor", [None])[0]
+                body = json.dumps(self._durable.pending_attention(cursor)) + "\n"
+                return connection.respond(HTTPStatus.OK, body)
+            if path == "/sync/manifest" and self._durable is not None:
+                from urllib.parse import parse_qs, urlsplit
+
+                query = parse_qs(urlsplit(raw_path).query)
+                try:
+                    sessions = await self._gateway.session_list(100_000)
+                except Exception:
+                    _log.warning("sync manifest gateway snapshot failed", exc_info=True)
+                    return connection.respond(HTTPStatus.SERVICE_UNAVAILABLE, "Unavailable\n")
+                body = json.dumps(self._durable.sync_manifest(
+                    query.get("profile", ["all"])[0],
+                    query.get("cursor", [None])[0], sessions,
+                )) + "\n"
+                return connection.respond(HTTPStatus.OK, body)
+            return None
+        except Exception:  # pragma: no cover - a broken probe must not stall serve
+            _log.debug("health probe failed", exc_info=True)
+            return None
+
+    def status(self) -> dict[str, Any]:
+        """A JSON-serialisable snapshot of the phone-facing server's live state."""
+        conns = [
+            {
+                "conn_id": c.conn_id,
+                "head_seq": c.head_seq,
+                "acked_through": c.acked_through,
+                "foreground": sorted(c.foreground_sessions),
+                "seen_sessions": len(c.seen_sids),
+            }
+            for c in list(self._conns.values())
+        ]
+        owned = getattr(self._gateway, "owned_sessions", None)
+        try:
+            owned_list = sorted(owned) if owned else []
+        except TypeError:  # a non-iterable stand-in (e.g. a bare mock) — skip
+            owned_list = []
+        return {
+            "listen": f"{self._cfg.host}:{self._cfg.port}",
+            "connections": len(conns),
+            "phones": conns,
+            "owned_sessions": owned_list,
+            "ring_ready": self._ring is not None,
+            "serving": self._server is not None,
+        }
 
     def register(self, ws: Any) -> PhoneConnection:
         """Register a new phone socket, returning its :class:`PhoneConnection`."""
@@ -377,6 +474,8 @@ class DownstreamServer:
 
     async def _dispatch(self, frame: Frame) -> None:
         """Fan one Reframer frame out to every connection (per-connection seq)."""
+        if self._durable is not None:
+            self._durable.observe_frame(frame)
         for conn in list(self._conns.values()):
             try:
                 await conn.send_frame(frame)
@@ -399,6 +498,14 @@ class DownstreamServer:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+
+    def _remember_submit(self, cmid: str, sid: str) -> None:
+        """Record ``client_message_id -> resolved session_id`` for SUBMIT dedup,
+        evicting the oldest entry once the bounded LRU is full."""
+        self._submit_dedup[cmid] = sid
+        self._submit_dedup.move_to_end(cmid)
+        while len(self._submit_dedup) > self._submit_dedup_cap:
+            self._submit_dedup.popitem(last=False)
 
     # -- upstream (phone -> relay -> gateway), protocol §5 ---------------
     async def handle_upstream(self, conn: PhoneConnection, req: UpstreamRequest) -> Any:
@@ -431,6 +538,17 @@ class DownstreamServer:
             conn.set_foreground(p.get("session_id"))
             return None
 
+        # -- gateway-readiness gate ------------------------------------------
+        # Every method below this point hits the gateway. After a relay restart
+        # the phone reconnects to the downstream server immediately, but the
+        # relay's gateway connection might not be up yet. Without this gate a
+        # submit/resume arriving in that window fails with "gateway not
+        # connected" and the outbox retains the job with no further wake. Wait
+        # (bounded) for the gateway to come up; if it doesn't, raise so the
+        # phone's outbox retains the job and retries on the next wake.
+        if not await self._gateway.wait_ready(timeout=10.0):
+            raise ConnectionError("relay gateway not ready")
+
         # -- reads -----------------------------------------------------------
         if method == UpstreamMethod.LIST:
             return {"sessions": await self._gateway.session_list(int(p.get("limit", 200)))}
@@ -442,17 +560,49 @@ class DownstreamServer:
             # sync would permanently gag that session's completion/error pushes.
             if method == UpstreamMethod.OPEN:
                 conn.set_foreground(sid)
-            return {"session_id": sid, "messages": await self._gateway.rest_history(sid)}
+            messages = await self._gateway.rest_history(sid)
+            if method == UpstreamMethod.HISTORY:
+                # The phone may bound the read with ``limit`` (its history RPC
+                # sends it); the gateway REST path takes no limit, so honor it
+                # here, keeping the MOST RECENT messages (the store-read returns
+                # oldest-first). A missing/invalid limit returns the full list.
+                limit = p.get("limit")
+                if isinstance(limit, int) and limit >= 0:
+                    messages = messages[-limit:] if limit else []
+            return {"session_id": sid, "messages": messages}
 
         # -- drive (become owner) --------------------------------------------
         if method == UpstreamMethod.SUBMIT:
-            text = p["text"]
+            # The iOS app sends "prompt"; the protocol doc says "text". Accept both.
+            text = p.get("prompt") or p.get("text") or ""
             sid = p.get("session_id")
+            cmid = p.get("client_message_id")
+            # Idempotent re-drive: a prior submit with this client_message_id
+            # already ran ``prompt_submit`` but its RPC result was lost to a
+            # socket flap, so the outbox is resubmitting the SAME job. Replay the
+            # resolved session id WITHOUT driving a second turn (§5 dedup).
+            if cmid is not None and cmid in self._submit_dedup:
+                self._submit_dedup.move_to_end(cmid)
+                prior = self._submit_dedup[cmid]
+                conn.set_foreground(prior)  # still the chat on screen (§6)
+                return {"session_id": prior, "deduplicated": True}
             if sid:
-                # Send into an existing (idle/foreign) session: resume to own it
-                # first if we do not already, then drive the turn (§5).
+                # Drive an existing (idle / foreign / terminal) session. Resuming
+                # REACTIVATES it, and the stock gateway may hand back a DISTINCT
+                # live session id (echoing the requested id as ``resumed``). The
+                # turn MUST be submitted to THAT live id, not the origin id — the
+                # R0/E2E finding: prompt.submit to the origin id targets a dormant
+                # session and the turn silently never runs. So take the live id
+                # the resume returns and drive it (§5).
                 if not self._gateway.owns(sid):
-                    await self._gateway.session_resume(sid)
+                    resumed = await self._gateway.session_resume(sid)
+                    if isinstance(resumed, dict):
+                        sid = resumed.get("session_id") or sid
+                else:
+                    # Already owned: a prior resume may have remapped the origin
+                    # id to a live id — resolve so a repeat submit to the origin
+                    # id still drives the live turn.
+                    sid = self._gateway.live_id_for(sid)
                 await self._gateway.prompt_submit(sid, text)
             else:
                 # Brand-new chat: create + own, then drive (§5).
@@ -462,24 +612,51 @@ class DownstreamServer:
                     provider=p.get("provider"),
                 )
                 await self._gateway.prompt_submit(sid, text)
+            # Record the resolved (live) id under the client message id BEFORE
+            # returning, so a retry that races the RPC result back over a flapped
+            # socket is deduped rather than driving a second turn.
+            if cmid is not None:
+                self._remember_submit(cmid, sid)
             conn.set_foreground(sid)  # driving a chat brings it on screen (§6)
             return {"session_id": sid}
 
         if method == UpstreamMethod.RESUME:
-            sid = p["session_id"]
-            result = await self._gateway.session_resume(sid)
-            conn.set_foreground(sid)  # resuming brings it on screen (§6)
-            return {"session_id": sid, "result": result}
+            origin = p["session_id"]
+            result = await self._gateway.session_resume(origin)
+            # Surface the LIVE id (same reactivation semantics as SUBMIT): the
+            # gateway may assign a distinct live id, and the phone must drive/
+            # foreground THAT id, not the origin.
+            live = (result.get("session_id") if isinstance(result, dict) else None) or origin
+            conn.set_foreground(live)  # resuming brings it on screen (§6)
+            return {"session_id": live, "origin": origin, "result": result}
 
         # -- interactive gates + stop (pass-through) -------------------------
         if method == UpstreamMethod.APPROVE:
-            return await self._gateway.approval_respond(
-                p["session_id"], p["request_id"], p["decision"]
+            # ``decision`` is the phone's chosen gate answer (once/session/always/
+            # deny/approve); the gateway maps it onto its ``choice`` param. ``all``
+            # (optional) applies the decision to every matching pending approval.
+            result = await self._gateway.approval_respond(
+                p["session_id"],
+                p.get("request_id", ""),
+                p["decision"],
+                resolve_all=bool(p.get("all", False)),
             )
+            if self._durable is not None:
+                self._durable.resolve_attention(
+                    request_id=None if p.get("all") else p.get("request_id") or None,
+                    session_id=p["session_id"], kind="approval",
+                )
+            return result
         if method == UpstreamMethod.CLARIFY:
-            return await self._gateway.clarify_respond(
-                p["session_id"], p["request_id"], p["text"]
+            result = await self._gateway.clarify_respond(
+                p["session_id"], p.get("request_id", ""), p["text"]
             )
+            if self._durable is not None:
+                self._durable.resolve_attention(
+                    request_id=p.get("request_id") or None,
+                    session_id=p["session_id"], kind="clarify",
+                )
+            return result
         if method == UpstreamMethod.INTERRUPT:
             return await self._gateway.session_interrupt(p["session_id"])
 

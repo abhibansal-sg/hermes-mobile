@@ -72,12 +72,16 @@ enum RenderCache {
     private static var proseOrder: [String] = []
     private static let proseLimit = 512
 
-    /// Memoized `MessageBubble.prose`. Keyed on the prose body value. The prose
-    /// builder does NOT bake in any theme colour (the bubble applies
-    /// `.foregroundStyle(theme.fg)` on the `Text`), so the text value is a
-    /// complete key.
-    static func prose(_ text: String) -> AttributedString {
-        if let hit = proseCache[text] {
+    /// Memoized `MessageBubble.prose`. The prose builder does NOT bake in the
+    /// body theme colour (the bubble applies `.foregroundStyle(theme.fg)` on
+    /// the `Text`), but it DOES now bake in `linkColor` for the explicit
+    /// transcript link style (Wave 25 link fixes), so the key includes the
+    /// colour description alongside the text value — mirroring `highlight`'s
+    /// `baseColor`-keyed cache below. A theme switch therefore re-styles links
+    /// once rather than serving a stale tint from a prior theme.
+    static func prose(_ text: String, linkColor: Color = .accentColor) -> AttributedString {
+        let key = "\(linkColor.description)\u{1F}\(text)"
+        if let hit = proseCache[key] {
             #if DEBUG
             hits += 1
             #endif
@@ -86,8 +90,8 @@ enum RenderCache {
         #if DEBUG
         misses += 1
         #endif
-        let value = MessageBubble.prose(text)
-        store(text, value, in: &proseCache, order: &proseOrder, limit: proseLimit)
+        let value = MessageBubble.prose(text, linkColor: linkColor)
+        store(key, value, in: &proseCache, order: &proseOrder, limit: proseLimit)
         return value
     }
 

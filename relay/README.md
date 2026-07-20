@@ -37,16 +37,23 @@ relay/
     bus.py          [DONE]  # EventBus: bounded fan-out pub/sub, 2 topics
     session_state.py[DONE]  # SessionState / SessionStore — resume-as-items accumulator
     plugin_bridge.py[DONE]  # locate + import the reused plugins/hermes-mobile modules
-    gateway_client.py[SKEL] # LANE 1 — durable multiplexing WS client (§5)
-    reframer.py      [SKEL] # LANE 2 — raw events -> item envelope (§2/§3)
-    downstream.py    [SKEL] # LANE 3 — phone WS server + replay ring (§1/§4)
-    notifier.py      [SKEL] # LANE 4 — owned-session APNs observer (§6)
-    app.py           [SKEL] # composition root: wires the 4 lanes on one bus
-    __main__.py      [SKEL] # entrypoint: python -m hermes_relay
+    gateway_client.py[DONE] # LANE 1 — durable multiplexing WS client (§5)
+    reframer.py      [DONE] # LANE 2 — raw events -> item envelope (§2/§3)
+    downstream.py    [DONE] # LANE 3 — phone WS server + replay ring (§1/§4) + health
+    notifier.py      [DONE] # LANE 4 — owned-session APNs observer (§6)
+    app.py           [DONE] # composition root: wires the 4 lanes on one bus + status()
+    __main__.py      [DONE] # entrypoint: python -m hermes_relay (argparse CLI)
+  scripts/
+    run-relay.sh            # canonical launcher (provisions venv, runs the CLI)
+    launch_isolated_gateway.sh  # stock isolated gateway on 9127 (E2E upstream)
+    launch_relay.sh         # env-var launcher co-located with the isolated gateway
   tests/
     test_types.py           # Frame/Item round-trip + seq-stamp guard
     test_session_state.py   # accumulator fold + snapshot
     test_bus.py             # fan-out + drop-oldest overflow
+    test_downstream.py      # seq/ack/replay, upstream RPC, foreign-submit, health
+    test_gateway_client.py  # RPC match, demux, reconnect, resume live-id remap
+    test_cli.py             # CLI>env>default resolution + live-port refusal
 ```
 
 `[DONE]` = implemented shared contract/infra. `[SKEL]` = signatures + docstrings;
@@ -88,25 +95,81 @@ Contracts the lanes rely on (already implemented in `[DONE]` modules):
 
 ## Run (local, isolated — NEVER the live gateway on 9119)
 
+The one-liner launcher provisions the external-volume venv and starts the CLI:
+
+```bash
+# 1) start a STOCK isolated gateway (writes its loopback token to $EVID/.gwtoken)
+scripts/launch_isolated_gateway.sh            # gateway on 127.0.0.1:9127
+
+# 2) start the relay against it (reads the token file, serves the phone on 8788)
+scripts/run-relay.sh                          # downstream ws://127.0.0.1:8788
+```
+
+Or drive `python -m hermes_relay` directly. Every knob is **CLI flag > env var >
+default**:
+
 ```bash
 /opt/homebrew/bin/python3.13 -m venv /Volumes/MainData/Developer/hermes-tmp/venvs/relay
 source /Volumes/MainData/Developer/hermes-tmp/venvs/relay/bin/activate
-pip install -e '.[dev]'         # from relay/
+pip install -e '.[dev]'         # from relay/  (runtime: websockets, httpx, pyyaml)
 pytest                          # unit tests (no network)
 
-# end-to-end against a STOCK isolated gateway on 9126+ with a temp HERMES_HOME
-# (reuse r0-relay-spike/launch_gateway.sh, changing the port to 9126)
-export HERMES_RELAY_GATEWAY_TOKEN=...   # HERMES_DASHBOARD_SESSION_TOKEN of the test gateway
-export HERMES_RELAY_GATEWAY_PORT=9126
-python -m hermes_relay
+python -m hermes_relay \
+  --gateway-url ws://127.0.0.1:9127 \
+  --token-file "$EVID/.gwtoken" \
+  --listen 127.0.0.1:8788
 ```
+
+CLI flags: `--gateway-url ws://host:port` (or `--gateway-host/--gateway-port`),
+`--token`/`--token-file` (or `HERMES_RELAY_GATEWAY_TOKEN`), `--listen host:port`,
+`--health-path /healthz` / `--no-health`, `--log-level`, `--allow-live-gateway`.
+The entrypoint **refuses gateway port 9119** (the live gateway) **by default**;
+the explicit `--allow-live-gateway` flag lifts that refusal, and exists ONLY for
+the supervised launchd service below — tests and ad-hoc runs must stay on 9126+.
+
+Env equivalents (used by `launch_relay.sh`): `HERMES_RELAY_GATEWAY_TOKEN`,
+`HERMES_RELAY_GATEWAY_URL`, `HERMES_RELAY_GATEWAY_HOST`/`_PORT`,
+`HERMES_RELAY_DOWNSTREAM_HOST`/`_PORT`, `HERMES_RELAY_HEALTH_PATH`.
+
+### Health / status surface
+
+The phone-facing port also answers a plain-HTTP **`GET /healthz`** (a normal GET,
+not a WS upgrade) with a JSON status snapshot — connections, per-phone seq/ack
+watermarks + foreground, owned sessions, and ring/serving state:
+
+```bash
+curl -s http://127.0.0.1:8788/healthz
+# {"listen":"127.0.0.1:8788","connections":0,"phones":[],"owned_sessions":[],
+#  "ring_ready":true,"serving":true}
+```
+
+## Run (supervised service — the ONLY sanctioned path to the live gateway)
+
+For daily-driver use, exactly ONE relay runs on the Mac as the launchd service
+`ai.hermes.relay` (KeepAlive, auto-start at login), dialing the live gateway
+`127.0.0.1:9119` with the dashboard token and serving the phone on
+`0.0.0.0:8788`. `scripts/install-service.sh` manages it:
+
+```bash
+scripts/install-service.sh install      # venv on /Volumes/MainData + render &
+                                        # load ~/Library/LaunchAgents/ai.hermes.relay.plist
+scripts/install-service.sh status       # plist/load/PID + read-only /healthz
+scripts/install-service.sh uninstall    # bootout + remove plist (venv/logs kept)
+scripts/decommission-old-relays.sh      # SIGTERM stray hermes_relay processes
+                                        # (keeps the service's own) — run BEFORE install
+```
+
+Logs: `~/Library/Logs/Hermes/relay.log`. The service passes
+`--allow-live-gateway` — nothing else should.
 
 ## Non-negotiables
 
 - Never touch the `hermes-mobile` product working tree; build only in this
   worktree / a lane worktree on `/Volumes/MainData`.
-- Never touch the live gateway on port **9119**. E2E uses a STOCK isolated
-  gateway on **9126+** with a temp `HERMES_HOME`.
+- Never touch the live gateway on port **9119** from tests or ad-hoc runs —
+  the entrypoint refuses it by default. The only sanctioned path to 9119 is the
+  supervised `ai.hermes.relay` service (`--allow-live-gateway`, see above). E2E
+  uses a STOCK isolated gateway on **9126+** with a temp `HERMES_HOME`.
 - ZERO CORE PATCH: no edits to `tui_gateway/`, `gateway/`, `run_agent.py`,
   `model_tools.py`, or `hermes_cli/` core. The relay is a client that reuses
   `plugins/hermes-mobile` plumbing only.

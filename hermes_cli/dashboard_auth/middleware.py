@@ -29,6 +29,7 @@ from hermes_cli.dashboard_auth.base import (
     ProviderError,
     RefreshExpiredError,
 )
+from hermes_cli.dashboard_auth.call_guard import guarded_call_next, scope_is_http
 from hermes_cli.dashboard_auth.cookies import (
     clear_sso_attempt_cookie,
     read_session_cookies,
@@ -303,23 +304,43 @@ async def gated_auth_middleware(
 
     No-op pass-through in loopback mode so the legacy auth_middleware can
     handle those binds via ``_SESSION_TOKEN``.
+
+    Hardened per the daily-driver spec (N7): WebSocket scopes never enter
+    the gate (Starlette's BaseHTTPMiddleware routes non-``http`` scopes
+    around the dispatch; :func:`scope_is_http` pins that exemption here),
+    and every ``call_next`` site runs through :func:`guarded_call_next` so
+    a downstream failure becomes a 500 JSONResponse instead of escaping the
+    middleware stack as an ExceptionGroup and killing the ASGI worker. The
+    401 / 503 / redirect verdicts computed before ``call_next`` are
+    unchanged.
     """
-    if not getattr(request.app.state, "auth_required", False):
+    if not scope_is_http(request):
         return await call_next(request)
+
+    if not getattr(request.app.state, "auth_required", False):
+        return await guarded_call_next(
+            request, call_next, gate="gated_auth_middleware"
+        )
 
     # A request already authenticated by the token-auth seam (a service caller
     # on a registered token route) carries ``token_authenticated`` — it is NOT
     # a cookie session and must not be bounced to /login. Pass it through; the
     # seam already attached ``request.state.token_principal``.
     if getattr(request.state, "token_authenticated", False):
-        return await call_next(request)
+        return await guarded_call_next(
+            request, call_next, gate="gated_auth_middleware"
+        )
 
     path = request.url.path
     if _path_is_public(path):
-        return await call_next(request)
+        return await guarded_call_next(
+            request, call_next, gate="gated_auth_middleware"
+        )
 
     if _device_token_auth(request):
-        return await call_next(request)
+        return await guarded_call_next(
+            request, call_next, gate="gated_auth_middleware"
+        )
 
     at, _rt = read_session_cookies(request)
     provider_hint = read_session_provider(request)
@@ -419,7 +440,13 @@ async def gated_auth_middleware(
         if refreshed is not None:
             new_session, refreshing_provider = refreshed
             request.state.session = new_session
-            response = await call_next(request)
+            # Guarded: a downstream crash must surface as a 500 JSONResponse,
+            # NOT escape the middleware stack. The rotated cookies are still
+            # persisted below even on the 500 fallback — skipping them would
+            # replay a rotated refresh token and trip reuse detection.
+            response = await guarded_call_next(
+                request, call_next, gate="gated_auth_middleware"
+            )
             # Persist the ROTATED tokens. Portal rotates the refresh token on
             # every refresh and runs reuse-detection, so writing the new RT
             # back is mandatory: a stale RT cookie would replay a rotated
@@ -466,7 +493,9 @@ async def gated_auth_middleware(
         return response
 
     request.state.session = session
-    response = await call_next(request)
+    response = await guarded_call_next(
+        request, call_next, gate="gated_auth_middleware"
+    )
     if not provider_hint and session.provider:
         from hermes_cli.dashboard_auth.cookies import detect_https
         from hermes_cli.dashboard_auth.prefix import prefix_from_request

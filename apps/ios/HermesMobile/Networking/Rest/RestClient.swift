@@ -74,12 +74,17 @@ struct RestClient: Sendable {
     /// Defaults to `.legacy` so an un-migrated construction site keeps today's
     /// behavior; ``ConnectionStore`` passes the probed style.
     let pathStyle: APIPathStyle
+    /// Relay-only control plane for durable attention/manifest reads.
+    let relayControlBaseURL: URL?
 
     /// - Parameters:
     ///   - baseURL: The gateway base, e.g. `https://host[:port]`.
     ///   - token: The session token sent as `X-Hermes-Session-Token`.
     ///   - pathStyle: Path family for the mobile endpoint group.
-    init(baseURL: URL, token: String, pathStyle: APIPathStyle = .legacy) {
+    init(
+        baseURL: URL, token: String, pathStyle: APIPathStyle = .legacy,
+        relayControlBaseURL: URL? = nil
+    ) {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = Self.timeout
         config.waitsForConnectivity = false
@@ -88,6 +93,7 @@ struct RestClient: Sendable {
             token: token,
             session: URLSession(configuration: config),
             pathStyle: pathStyle,
+            relayControlBaseURL: relayControlBaseURL,
             usesInjectedUploadSession: false
         )
     }
@@ -99,13 +105,15 @@ struct RestClient: Sendable {
         baseURL: URL,
         token: String,
         session: URLSession,
-        pathStyle: APIPathStyle = .legacy
+        pathStyle: APIPathStyle = .legacy,
+        relayControlBaseURL: URL? = nil
     ) {
         self.init(
             baseURL: baseURL,
             token: token,
             session: session,
             pathStyle: pathStyle,
+            relayControlBaseURL: relayControlBaseURL,
             usesInjectedUploadSession: true
         )
     }
@@ -115,12 +123,14 @@ struct RestClient: Sendable {
         token: String,
         session: URLSession,
         pathStyle: APIPathStyle,
+        relayControlBaseURL: URL?,
         usesInjectedUploadSession: Bool
     ) {
         self.baseURL = baseURL
         self.token = token
         self.session = session
         self.pathStyle = pathStyle
+        self.relayControlBaseURL = relayControlBaseURL
         self.usesInjectedUploadSession = usesInjectedUploadSession
     }
 
@@ -131,6 +141,7 @@ struct RestClient: Sendable {
             token: token,
             session: session,
             pathStyle: style,
+            relayControlBaseURL: relayControlBaseURL,
             usesInjectedUploadSession: usesInjectedUploadSession
         )
     }
@@ -242,6 +253,61 @@ struct RestClient: Sendable {
         }
         let wrapper = try decode(Wrapper.self, from: data, context: "sessionsWithTotal")
         return (wrapper.sessions, wrapper.total)
+    }
+
+    /// `GET {mobileAPIPrefix}/project-sessions?project_id=<root>` — the plugin's
+    /// hydrated per-project session list, and the CORRECT data source for Project
+    /// detail.
+    ///
+    /// The plugin route folds worktree cwds under the git-common repo root with
+    /// the exact same machinery the `/projects` overview COUNT uses, so the
+    /// returned list matches that count. The stock `GET /api/sessions?cwd_prefix=`
+    /// path (``sessionsWithTotal(cwdPrefix:)``) cannot: a project's `root` is the
+    /// folded git-common repo root, while its sessions run in WORKTREES whose cwds
+    /// are siblings of that root — the `cwd_prefix` LIKE never matches, so the
+    /// detail list comes back empty even though the count is > 0.
+    ///
+    /// Throws `RestError.badStatus(404, …)` on an older gateway that predates the
+    /// plugin route; the caller (``ProjectsStore/refreshSessions(for:)``) then
+    /// falls back to the legacy `cwd_prefix` path.
+    ///
+    /// The wire response is `{"project_id": …, "sessions": [...], "total": N}`.
+    /// A project `root` is arbitrary user-filesystem text, so it is encoded via
+    /// `URLQueryItem`/`URLComponents` with the same literal-`+` hardening as
+    /// ``sessionsWithTotal`` (FastAPI/Starlette decode a raw `+` as a space).
+    func projectSessions(
+        projectId: String
+    ) async throws -> (sessions: [SessionSummary], total: Int?) {
+        var components = URLComponents()
+        components.queryItems = [URLQueryItem(name: "project_id", value: projectId)]
+        let rawQuery = (components.percentEncodedQuery ?? "")
+            .replacingOccurrences(of: "+", with: "%2B")
+        let path = "\(mobileAPIPrefix)/project-sessions?\(rawQuery)"
+        let data = try await get(path: path)
+        struct Wrapper: Decodable {
+            let sessions: [SessionSummary]
+            let total: Int?
+        }
+        let wrapper = try decode(Wrapper.self, from: data, context: "projectSessions")
+        return (wrapper.sessions, wrapper.total)
+    }
+
+    /// `POST {mobileAPIPrefix}/projects` — create a project (name + root path).
+    ///
+    /// The plugin route validates the input and delegates to the stock
+    /// `hermes_cli.projects_db.create_project` (ZERO core patch — the plugin
+    /// imports and calls it). The response is a single ``Project`` entry in the
+    /// same `{id, label, root, session_count}` contract as the overview list, so
+    /// the caller can open the new project immediately.
+    func createProject(name: String, root: String) async throws -> Project {
+        var request = makeRequest(path: "\(mobileAPIPrefix)/projects", method: "POST")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encodeBody(
+            .object(["name": .string(name), "root": .string(root)]),
+            context: "createProject"
+        )
+        let data = try await perform(request)
+        return try decode(Project.self, from: data, context: "createProject", strategy: .useDefaultKeys)
     }
 
     /// `GET /api/plugins/hermes-mobile/sessions?...&updated_since=cursor` —
@@ -592,6 +658,22 @@ struct RestClient: Sendable {
 
     func get(path: String) async throws -> Data {
         try await perform(makeRequest(path: path, method: "GET"))
+    }
+
+    func getRelayControl(path: String) async throws -> Data {
+        guard let relayControlBaseURL else {
+            throw RestError.badStatus(404, body: "relay control plane unavailable")
+        }
+        let parts = path.split(separator: "?", maxSplits: 1)
+        var url = relayControlBaseURL.appendingPathComponent(String(parts[0]).trimmingCharacters(in: CharacterSet(charactersIn: "/")))
+        if parts.count == 2, var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            components.percentEncodedQuery = String(parts[1])
+            url = components.url ?? url
+        }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: Self.timeout)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        return try await perform(request)
     }
 
     /// JSON-encode a ``JSONValue`` request body, mapping failures to ``RestError``.

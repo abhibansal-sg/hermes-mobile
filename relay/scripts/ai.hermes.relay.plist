@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ai.hermes.relay — TEMPLATE rendered by relay/scripts/install-service.sh.
+
+  The single sanctioned path from the phone relay to the LIVE gateway (spec
+  DAILY-DRIVER N6 / A7): exactly ONE relay on this Mac, supervised by launchd,
+  KeepAlive, auto-start at login, logging to ~/Library/Logs/Hermes/relay.log.
+
+  install-service.sh substitutes the __TOKENS__ below and writes the result to
+  ~/Library/LaunchAgents/ai.hermes.relay.plist (plutil -lint validated). Do NOT
+  load this template directly — launchd needs absolute paths, not tokens.
+
+  Tokens (all absolute paths; ~ is expanded by the install script):
+    __VENV__        service venv on the external volume (relay pip-installed)
+    __REPO_ROOT__   repo containing plugins/hermes-mobile (HERMES_REPO_ROOT)
+    __TOKEN_FILE__  gateway dashboard token (default ~/.hermes/dashboard.token)
+    __LOG_FILE__    stdout+stderr sink (default ~/Library/Logs/Hermes/relay.log)
+    __LISTEN__      phone-facing downstream bind (default 0.0.0.0:8788)
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.hermes.relay</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__VENV__/bin/python</string>
+		<string>-m</string>
+		<string>hermes_relay</string>
+		<string>--gateway-host</string>
+		<string>127.0.0.1</string>
+		<string>--gateway-port</string>
+		<string>9119</string>
+		<string>--allow-live-gateway</string>
+		<string>--listen</string>
+		<string>__LISTEN__</string>
+		<string>--token-file</string>
+		<string>__TOKEN_FILE__</string>
+		<string>--log-level</string>
+		<string>INFO</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HERMES_REPO_ROOT</key>
+		<string>__REPO_ROOT__</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>__REPO_ROOT__</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>StandardOutPath</key>
+	<string>__LOG_FILE__</string>
+	<key>StandardErrorPath</key>
+	<string>__LOG_FILE__</string>
+</dict>
+</plist>

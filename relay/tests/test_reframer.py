@@ -333,6 +333,214 @@ def test_failed_tool_becomes_error_item():
 
 
 # --------------------------------------------------------------------------- #
+# tasks / todos — dedicated taskList item (snapshot + updates on a stable id)
+# --------------------------------------------------------------------------- #
+
+
+def _todos(*triples):
+    """Build the gateway's ``{id,content,status}`` todo list from (id,text,status)."""
+    return [{"id": i, "content": c, "status": s} for (i, c, s) in triples]
+
+
+def test_todo_complete_is_tasklist_not_generic_tool_call():
+    rf = _rf()
+    frames = _drive(
+        rf,
+        [_ev("tool.complete", tool_id="tc9", name="todo",
+             todos=_todos(("1", "Write code", "in_progress"), ("2", "Test", "pending")))],
+    )
+    item = _first(frames, FrameKind.ITEM_STARTED)  # not-all-done -> started snapshot
+    assert item.body["type"] == ItemType.TASK_LIST
+    assert item.body["item_id"] == "s1:tasks"          # STABLE id, not the tool_id
+    assert item.body["item_id"] != "tc9"
+    # content normalized to text; status carried through.
+    assert item.body["body"]["tasks"] == [
+        {"id": "1", "text": "Write code", "status": "in_progress"},
+        {"id": "2", "text": "Test", "status": "pending"},
+    ]
+    assert item.body["body"]["counts"]["total"] == 2
+    assert item.body["body"]["all_complete"] is False
+    assert item.body["status"] == ItemStatus.IN_PROGRESS
+
+
+def test_todo_start_then_complete_snapshot_then_delta_same_id():
+    rf = _rf()
+    frames = _drive(
+        rf,
+        [
+            _ev("tool.start", tool_id="t1", name="todo",
+                args={"todos": _todos(("1", "A", "pending"))}),
+            _ev("tool.complete", tool_id="t1", name="todo",
+                todos=_todos(("1", "A", "completed"), ("2", "B", "in_progress"))),
+        ],
+    )
+    started = _first(frames, FrameKind.ITEM_STARTED)
+    delta = _first(frames, FrameKind.ITEM_DELTA)
+    assert started.body["item_id"] == "s1:tasks"
+    assert delta.body["item_id"] == "s1:tasks"          # update lands on same card
+    # the delta carries the FULL authoritative list (a replace, not an append).
+    assert [t["id"] for t in delta.body["patch"]["tasks"]] == ["1", "2"]
+    # store snapshot reflects the authoritative complete, not the partial start.
+    items = rf._store.get("s1").ordered_items()
+    tasklists = [it for it in items if it.type == ItemType.TASK_LIST]
+    assert len(tasklists) == 1
+    assert [t["status"] for t in tasklists[0].body["tasks"]] == ["completed", "in_progress"]
+
+
+def test_todo_completed_is_authoritative_over_partial_start():
+    """tool.start args may be a PARTIAL merge; the complete's full list wins."""
+    rf = _rf()
+    _drive(
+        rf,
+        [
+            _ev("tool.start", tool_id="t1", name="todo",
+                args={"todos": _todos(("2", "only the merged one", "in_progress"))}),
+            _ev("tool.complete", tool_id="t1", name="todo",
+                todos=_todos(("1", "First", "completed"), ("2", "Second", "in_progress"))),
+        ],
+    )
+    snap = rf._store.get("s1").ordered_items()[0]
+    assert [t["id"] for t in snap.body["tasks"]] == ["1", "2"]
+    assert snap.body["tasks"][0]["text"] == "First"
+
+
+def test_todo_all_complete_emits_item_completed():
+    rf = _rf()
+    frames = _drive(
+        rf,
+        [_ev("tool.complete", tool_id="t1", name="todo",
+             todos=_todos(("1", "A", "completed"), ("2", "B", "cancelled")))],
+    )
+    completed = _first(frames, FrameKind.ITEM_COMPLETED)
+    assert completed.body["type"] == ItemType.TASK_LIST
+    assert completed.body["status"] == ItemStatus.COMPLETED
+    assert completed.body["body"]["all_complete"] is True
+    # no lingering started/delta for an already-complete first sighting.
+    assert FrameKind.ITEM_STARTED not in _kinds(frames)
+
+
+def test_todo_updates_share_stable_id_across_turns():
+    rf = _rf()
+    _drive(
+        rf,
+        [
+            # turn 1
+            _ev("message.start"),
+            _ev("tool.complete", tool_id="a", name="todo",
+                todos=_todos(("1", "A", "in_progress"))),
+            _ev("message.complete", text="done turn 1"),
+            # turn 2 — a fresh todo call updates the SAME task card
+            _ev("message.start"),
+            _ev("tool.complete", tool_id="b", name="todo",
+                todos=_todos(("1", "A", "completed"), ("2", "C", "in_progress"))),
+        ],
+    )
+    tasklists = [it for it in rf._store.get("s1").ordered_items()
+                 if it.type == ItemType.TASK_LIST]
+    assert len(tasklists) == 1                       # ONE living card, not two
+    assert tasklists[0].item_id == "s1:tasks"
+    assert [t["id"] for t in tasklists[0].body["tasks"]] == ["1", "2"]
+
+
+def test_todo_reopen_after_complete_rematerializes_in_progress():
+    rf = _rf()
+    frames = _drive(
+        rf,
+        [
+            _ev("tool.complete", tool_id="a", name="todo",
+                todos=_todos(("1", "A", "completed"))),                     # all done
+            _ev("tool.complete", tool_id="b", name="todo",
+                todos=_todos(("1", "A", "completed"), ("2", "B", "pending"))),  # reopened
+        ],
+    )
+    kinds = _kinds(frames)
+    assert kinds.count(FrameKind.ITEM_COMPLETED) >= 1   # first call completed it
+    # the reopen re-materializes the card in_progress via item.started.
+    reopened = [f for f in frames if f.kind == FrameKind.ITEM_STARTED
+                and f.body["item_id"] == "s1:tasks"]
+    assert reopened and reopened[-1].body["status"] == ItemStatus.IN_PROGRESS
+    snap = rf._store.get("s1").ordered_items()[0]
+    assert snap.status == ItemStatus.IN_PROGRESS
+    assert snap.body["all_complete"] is False
+
+
+def test_todo_reemit_identical_complete_across_turns_is_idempotent():
+    """A later turn re-writing the SAME already-complete list emits no 2nd completion.
+
+    The taskList id is cross-turn stable (``s1:tasks``) but the Notifier dedupes
+    task_complete per-turn, so a duplicate item.completed on a fresh turn would
+    fire a second "Hermes finished its tasks" push for zero new work. Agents
+    defensively re-write the identical TodoWrite list across turns, so
+    completion must be idempotent: no change -> no frame.
+    """
+    rf = _rf()
+    done = _todos(("1", "A", "completed"))
+    frames = _drive(
+        rf,
+        [
+            # turn 1 — first all-complete sighting -> item.completed
+            _ev("message.start"),
+            _ev("tool.complete", tool_id="a", name="todo", todos=done),
+            _ev("message.complete", text="done turn 1"),
+            # turn 2 — IDENTICAL already-complete list re-emitted (new turn)
+            _ev("message.start"),
+            _ev("tool.complete", tool_id="b", name="todo", todos=done),
+            _ev("message.complete", text="done turn 2"),
+        ],
+    )
+    tasklist_completions = [
+        f for f in frames
+        if f.kind == FrameKind.ITEM_COMPLETED
+        and f.body.get("type") == ItemType.TASK_LIST
+    ]
+    assert len(tasklist_completions) == 1  # exactly one push-worthy completion
+    # store still holds a single, authoritative completed card.
+    tasklists = [it for it in rf._store.get("s1").ordered_items()
+                 if it.type == ItemType.TASK_LIST]
+    assert len(tasklists) == 1
+    assert tasklists[0].status == ItemStatus.COMPLETED
+    assert [t["id"] for t in tasklists[0].body["tasks"]] == ["1"]
+
+
+def test_todo_complete_re_emitted_with_changed_taskset_fires_again():
+    """A genuinely NEW all-complete list (different tasks) DOES re-complete."""
+    rf = _rf()
+    frames = _drive(
+        rf,
+        [
+            _ev("message.start"),
+            _ev("tool.complete", tool_id="a", name="todo",
+                todos=_todos(("1", "A", "completed"))),
+            _ev("message.complete"),
+            # turn 2 — a new task was added and also finished: real new completion.
+            _ev("message.start"),
+            _ev("tool.complete", tool_id="b", name="todo",
+                todos=_todos(("1", "A", "completed"), ("2", "B", "completed"))),
+            _ev("message.complete"),
+        ],
+    )
+    tasklist_completions = [
+        f for f in frames
+        if f.kind == FrameKind.ITEM_COMPLETED
+        and f.body.get("type") == ItemType.TASK_LIST
+    ]
+    assert len(tasklist_completions) == 2  # changed set -> a second completion fires
+
+
+def test_todo_tolerates_malformed_entries():
+    rf = _rf()
+    frames = _drive(
+        rf,
+        [_ev("tool.complete", tool_id="t1", name="todo",
+             todos=[{"id": "1", "content": "ok", "status": "pending"}, "junk", 42, {}])],
+    )
+    item = _first(frames, FrameKind.ITEM_STARTED)
+    tasks = item.body["body"]["tasks"]
+    assert len(tasks) == 2  # the dict entries survive; scalars dropped
+    assert tasks[0] == {"id": "1", "text": "ok", "status": "pending"}
+
+
+# --------------------------------------------------------------------------- #
 # forward-compat: unknown top-level event is never dropped
 # --------------------------------------------------------------------------- #
 

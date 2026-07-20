@@ -271,6 +271,67 @@ async def test_create_resume_submit_take_ownership_open_does_not():
     await client.close()
 
 
+async def test_resume_remaps_origin_to_distinct_live_id():
+    """When the gateway assigns a resumed session a DISTINCT live id, the client
+    owns BOTH ids and ``live_id_for`` resolves the origin (and the live id) to the
+    live id — so a submit addressed to either drives the live turn (R0/E2E)."""
+    def remap_responder(frame):
+        method = frame["method"]
+        params = frame.get("params") or {}
+        if method == "session.resume":
+            # Origin "tgsess001" reactivates as a NEW live id "livesess99".
+            result = {"session_id": "livesess99", "resumed": params.get("session_id"),
+                      "message_count": 5}
+        else:
+            result = {"ok": True}
+        return {"jsonrpc": "2.0", "id": frame["id"], "result": result}
+
+    client, _ = make_client(responder=remap_responder)
+    await client.connect()
+
+    result = await client.session_resume("tgsess001")
+    assert result["session_id"] == "livesess99"
+    # both the origin and the live id are owned (events on either are ours)...
+    assert client.owns("tgsess001") and client.owns("livesess99")
+    # ...and BOTH resolve forward to the live id.
+    assert client.live_id_for("tgsess001") == "livesess99"
+    assert client.live_id_for("livesess99") == "livesess99"
+    # an unknown id resolves to itself (no remap known).
+    assert client.live_id_for("neverseen") == "neverseen"
+    await client.close()
+
+
+async def test_approval_respond_sends_choice_not_decision():
+    """The stock gateway reads ``choice`` (approve->once) + ``all``; a relay that
+    sent ``decision`` silently defaulted every approval to a DENY (wire-shape fix)."""
+    transport = FakeTransport(responder=echo_responder)
+    client, _ = make_client(transport)
+    await client.connect()
+    await client.approval_respond("sess1", "req7", "always", resolve_all=True)
+    sent = [f for f in transport.sent if f["method"] == "approval.respond"][0]
+    params = sent["params"]
+    assert params["choice"] == "always"   # decision mapped onto the gateway's param
+    assert params["all"] is True
+    assert "decision" not in params       # the ignored-by-gateway key is not sent
+    assert params["session_id"] == "sess1"
+    await client.close()
+
+
+async def test_clarify_respond_sends_answer_not_text():
+    """The stock gateway's clarify.respond stores ``params['answer']`` matched by
+    ``request_id``; a relay that sent ``text`` delivered an EMPTY answer (fix)."""
+    transport = FakeTransport(responder=echo_responder)
+    client, _ = make_client(transport)
+    await client.connect()
+    await client.clarify_respond("sess1", "req9", "use the staging bucket")
+    sent = [f for f in transport.sent if f["method"] == "clarify.respond"][0]
+    params = sent["params"]
+    assert params["answer"] == "use the staging bucket"
+    assert params["request_id"] == "req9"
+    assert "text" not in params
+    await client.close()
+
+
 # ---------------------------------------------------------------------------
 # reconnect + re-resume of owned sessions
 # ---------------------------------------------------------------------------
@@ -395,3 +456,56 @@ async def test_foreign_history_via_rest_no_ws_no_ownership():
     assert transport.methods_sent() == []
     assert not client.owns("tgsess001")
     await client.close()
+
+
+async def test_owned_sessions_survive_relay_restart(tmp_path):
+    """A relay RESTART (fresh GatewayClient on the same DurableState) must
+    re-seed its owned set from disk and re-resume the phone's sessions — the
+    'destination session not active' failure happened because the in-memory
+    _owned set was lost on restart, so the relay never re-drove the session."""
+    from hermes_relay.durable_state import DurableState
+
+    durable_path = tmp_path / "state.sqlite3"
+
+    # --- First relay process: phone drives a session, ownership is persisted ---
+    t1 = FakeTransport(responder=echo_responder)
+    bus1 = EventBus()
+    cfg = GatewayConfig(token="tok", port=9126, connect_timeout_s=0.5,
+                        backoff_initial_s=0.0, backoff_max_s=0.0)
+    durable1 = DurableState(durable_path)
+    client1 = GatewayClient(cfg, bus1, connector=one_shot_connector(t1),
+                            sleep=_noop_sleep, durable=durable1)
+    await client1.connect()
+    await client1.session_resume("phone-session")   # phone opens/drives a chat
+    assert client1.owns("phone-session")
+    assert "phone-session" in durable1.load_owned_sessions()
+    await client1.close()   # relay process exits
+
+    # --- Second relay process: fresh client, SAME durable DB ---
+    resumed_ids: list[str] = []
+
+    def tracking_responder(frame):
+        if frame["method"] == "session.resume":
+            resumed_ids.append(str((frame.get("params") or {}).get("session_id")))
+        return echo_responder(frame)
+
+    t2 = FakeTransport(responder=tracking_responder)
+    bus2 = EventBus()
+    durable2 = DurableState(durable_path)
+    client2 = GatewayClient(cfg, bus2, connector=one_shot_connector(t2),
+                            sleep=_noop_sleep, durable=durable2)
+    # The owned set is re-seeded from disk at construction — BEFORE any reconnect.
+    assert client2.owns("phone-session")
+
+    run_task = asyncio.create_task(client2.run())
+    await wait_until(lambda: client2._transport is t2 and client2._ready.is_set())
+    # run() re-establishes every durable-owned session on the fresh connection.
+    await wait_until(lambda: "phone-session" in resumed_ids)
+    assert "phone-session" in resumed_ids
+
+    await client2.close()
+    run_task.cancel()
+    try:
+        await run_task
+    except asyncio.CancelledError:
+        pass
