@@ -4719,6 +4719,13 @@ final class SessionStore {
         searchHasMore = false
         searchGeneration &+= 1
         let generation = searchGeneration
+        // Drop the PREVIOUS query's rows: the remote page below APPENDS (it
+        // merges over the same-query local cache hits), so stale rows left in
+        // place would survive into the new result set (pre-existing bug:
+        // SearchPaginationTests.testNewQueryResetsState). The <2-char branch
+        // above already clears immediately; a query change does too.
+        searchResults = []
+        searchIsPartial = false
 
         searchTask = Task { [weak self] in
             // Debounce.
@@ -4912,7 +4919,7 @@ final class SessionStore {
     /// ``pendingMessageJump`` so ChatView scrolls to that exact row once the
     /// transcript loads — instead of the query-text ``pendingSearchScroll``
     /// match. An exact-id jump is stricter and preferred when available.
-    func open(searchResult result: SessionSearchResult) {
+    func open(searchResult result: SessionSearchResult, revealOnFirstPaint: (@MainActor () -> Void)? = nil) {
         let summary = sessions.first(where: { $0.id == result.id }) ?? result.asSessionSummary
         // Remember the query so ChatView scrolls to its first occurrence once
         // the transcript loads (jump-to-match). Captured BEFORE clearSearch()
@@ -4932,7 +4939,13 @@ final class SessionStore {
         // session SWITCH, so arm the new jump/search AFTER the open. The
         // cache→network seed is async (Task), so this synchronous assignment
         // still lands before the first `transcriptGeneration` bump.
-        open(summary)
+        // R2 (drawer snap-back): hand the close in as `revealOnFirstPaint`
+        // instead of firing it inline at the call site, so the drawer dismisses
+        // FORWARD into the new session's first painted frame (parity with the
+        // row-tap path). The old call site fired `onNavigate()` immediately,
+        // animating the close onto the PREVIOUS session's card before the new
+        // session painted — the "open-motion plays reversed" snap-back.
+        open(summary, revealOnFirstPaint: revealOnFirstPaint)
         // An exact message-id jump (ABH-192) takes precedence over the
         // query-text match; only set pendingSearchScroll when there is no id.
         pendingMessageJump = jumpTarget
@@ -5604,7 +5617,12 @@ final class SessionStore {
                 transportEpoch: transportEpoch
             ) else { return }
             rememberWarmOpenSnapshot(normalized, for: storedId)
-            chat.seed(normalized: normalized)
+            // QA-2 R15: the network reseed is the SAME session (supersession
+            // guards above) and a KNOWN-PARTIAL snapshot — relay history honors
+            // `limit` with `messages[-limit:]` (downstream.py), plugin REST
+            // serves the 50-row tail. Union it so settled history the window
+            // does not cover survives (the stuck-episode segment drop).
+            chat.seed(normalized: normalized, policy: .union)
             chat.noteTranscriptSeedWindow(stored)
             #if DEBUG
             Self.logOpenLatency(
@@ -5708,7 +5726,10 @@ final class SessionStore {
                 token: token, workGeneration: workGeneration, transportEpoch: transportEpoch
             ) else { return }
             rememberWarmOpenSnapshot(normalized, for: storedId)
-            chat.seed(normalized: normalized)
+            // QA-2 R15: hydration reconciles the SAME session's full rows over
+            // the skeleton paint — union so any settled row painted since (or a
+            // live relay turn's untagged history) survives the enrichment.
+            chat.seed(normalized: normalized, policy: .union)
             chat.noteTranscriptSeedWindow(full)
             // Overwrite the intermediate skeleton cache with the full payload.
             if let cacheStore, let identity = cacheIdentity(storedId, profile: cacheProfile) {
@@ -5769,7 +5790,10 @@ final class SessionStore {
                     workGeneration: workGeneration
                 ) else { return }
                 rememberWarmOpenSnapshot(normalized, for: storedId)
-                chat.seed(normalized: normalized)
+                // QA-2 R15: the chain-tip seed reconciles over already-painted
+                // content of the SAME session (no reset here by design) — union
+                // so rows the cached window does not cover are retained.
+                chat.seed(normalized: normalized, policy: .union)
                 chat.noteTranscriptSeedWindow(cachedWindow)
                 paintedFromCache = true
             }
@@ -5789,7 +5813,10 @@ final class SessionStore {
                 transportEpoch: transportEpoch
             ) else { return }
             rememberWarmOpenSnapshot(normalized, for: storedId)
-            chat.seed(normalized: normalized)
+            // QA-2 R15: same-session network reconcile — union (the snapshot is
+            // a known-partial tail window; never evict settled history it does
+            // not cover).
+            chat.seed(normalized: normalized, policy: .union)
             chat.noteTranscriptSeedWindow(stored)
             if let cacheStore, let identity = capturedIdentity {
                 Task { [weak self] in

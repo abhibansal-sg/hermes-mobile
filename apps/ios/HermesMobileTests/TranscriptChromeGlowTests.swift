@@ -423,25 +423,26 @@ final class TranscriptChromeGlowTests: XCTestCase {
             lastMessage: partless))
     }
 
-    /// Relay pre-first-item window: between the relay submit (streaming set) and
-    /// the first rendered item, the last row is the optimistic user echo (or the
-    /// settled history tail) — the row SHOWS there, mirroring the approved
-    /// direct path between `send` and `message.start`.
-    func testInlineActivityGateRelayShowsPreFirstItem() {
-        XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
+    /// QA-2 R4/A2 (supersedes the QA-1 B8 pre-first-item clause): the Working
+    /// pill is IMPOSSIBLE on the relay path in EVERY phase — pre-first-item
+    /// included. The relay send appends an optimistic empty streaming assistant
+    /// bubble, so the breathing caret is the accepted-and-waiting affordance;
+    /// the state that could still flash the pill (the old pre-first-item
+    /// branch) is deleted, not hidden. Direct transport above is unchanged.
+    func testInlineActivityGateRelayNeverShowsWorkingPill() {
+        XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
             isStreaming: true, hasPendingGate: false, isRelayTransport: true,
             lastMessage: userEcho()),
-            "relay: honest accepted-and-waiting row above the user echo, pre-first-item")
-        XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
+            "relay pre-first-item above the user echo → no pill (caret bubble affordance)")
+        XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
             isStreaming: true, hasPendingGate: false, isRelayTransport: true,
             lastMessage: nil),
-            "relay: pre-first-item with no painted rows still shows the row")
-        // A SETTLED assistant tail (prior turn's history) is not a live cursor —
-        // the row shows until the new turn's first item lands.
+            "relay pre-first-item with no painted rows → no pill")
+        // A SETTLED assistant tail (prior turn's history) — no pill either.
         let settled = ChatMessage(role: .assistant,
                                   parts: [.text(id: "old", text: "Earlier answer.")],
                                   isStreaming: false)
-        XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
+        XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
             isStreaming: true, hasPendingGate: false, isRelayTransport: true,
             lastMessage: settled))
     }

@@ -728,13 +728,24 @@ actor CacheStore {
                     """, arguments: [scope.serverId, scope.profileId, sessionId, ordinal,
                                       wireId, message.role, message.timestamp, data])
                 if let text = Self.searchableText(message), !text.isEmpty {
+                    // Skip rows the write-through path already indexed
+                    // (saveTranscript inserts the FTS row as it caches the
+                    // message): re-inserting would double every hit for a
+                    // backfilled session. messageKey is the stable per-message
+                    // identity both writers share (wireId, or "o:\<ordinal\>").
+                    let messageKey = wireId.map(String.init) ?? "o:\(ordinal)"
                     try db.execute(sql: """
                         INSERT INTO transcript_fts
                         (serverId,profileId,sessionId,messageKey,wireId,ordinal,role,content)
-                        VALUES (?,?,?,?,?,?,?,?)
+                        SELECT ?,?,?,?,?,?,?,?
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM transcript_fts
+                            WHERE serverId=? AND profileId=? AND sessionId=? AND messageKey=?
+                        )
                         """, arguments: [scope.serverId, scope.profileId, sessionId,
-                                          wireId.map(String.init) ?? "o:\(ordinal)", wireId,
-                                          ordinal, message.role, text])
+                                          messageKey, wireId,
+                                          ordinal, message.role, text,
+                                          scope.serverId, scope.profileId, sessionId, messageKey])
                 }
             }
             let complete = rows.count < batchSize

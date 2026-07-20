@@ -23,23 +23,36 @@ struct ApprovalCard: View {
     /// ABH review P1.
     @State private var isResponding = false
 
+    /// Cap the description scroll so a long approval body never grows the card
+    /// past the safe area (R10 parity with the clarify card). ~4 lines at
+    /// callout; the rest scrolls inside the card.
+    private let descriptionMaxHeight: CGFloat = 108
+
     var body: some View {
         let request = approval.request
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 6) {
+            HStack(alignment: .top, spacing: 6) {
                 Image(systemName: "lock.shield")
+                    .font(.subheadline)
                     .foregroundStyle(theme.midground)
                     .accessibilityHidden(true)
                 Text(request.title)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(theme.fg)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
             }
 
             if let description = request.descriptionText, !description.isEmpty {
-                Text(description)
-                    .font(.callout)
-                    .foregroundStyle(theme.fg)
-                    .fixedSize(horizontal: false, vertical: true)
+                ScrollView {
+                    Text(description)
+                        .font(.callout)
+                        .foregroundStyle(theme.fg)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: descriptionMaxHeight)
             }
 
             if let target = request.target, !target.isEmpty {
@@ -87,11 +100,14 @@ struct ApprovalCard: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(theme.card, in: RoundedRectangle(cornerRadius: 14))
+        .gateCardSurface(theme: theme, cornerRadius: 18)
         .overlay(
-            RoundedRectangle(cornerRadius: 14)
-                .strokeBorder(theme.border, lineWidth: 1)
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(theme.border.opacity(0.6), lineWidth: 0.5)
         )
+        // R9 parity: dismiss the composer keyboard on appear so the approval
+        // card + keyboard + composer never stack (same contract as ClarifyBanner).
+        .onAppear { KeyboardDismissal.resign() }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Tool approval request: \(request.title)")
     }

@@ -856,6 +856,45 @@ actor WorkRepository {
         await publishObservation()
     }
 
+    /// Atomically remove a job the user cancelled from the outbox (QA-2 R14):
+    /// ONE write transaction reads the row, decides, and commits the durable
+    /// tombstone — an unleased / terminal / failed row is HARD-DELETED, a row
+    /// under an in-flight lease is set `.cancelled` (the lease's submit can no
+    /// longer complete the row: `allowedTransitions[.cancelled]` is empty, and
+    /// `claimNextJob` never claims a cancelled row, so the relaunch drain can
+    /// never resurrect it). Folding read + decide + write into a single
+    /// transaction closes the old `remove`'s TOCTOU — a drain claim landing
+    /// between the separate read and delete could let the submit land
+    /// server-side while the completion transition silently failed. Returns
+    /// whether a tombstone was committed (false when no such job exists);
+    /// callers await this BEFORE the UI confirms the removal, so a force-quit
+    /// anywhere after the row visually disappears can never lose the cancel
+    /// (the build-115 "cleared it, force-closed, it SENT anyway" failure).
+    @discardableResult
+    func removeCancelledJob(id: String, now: Date = Date()) async throws -> Bool {
+        let removed = try await database.write { db -> Bool in
+            guard var job = try WorkJob.fetchOne(db, key: id) else { return false }
+            if job.leaseOwner == nil || job.state.isTerminal || job.state == .failed {
+                return try WorkJob.deleteOne(db, key: id)
+            }
+            guard !job.state.isTerminal else { return true }
+            job.state = .cancelled
+            job.leaseOwner = nil
+            job.leaseExpiresAt = nil
+            job.updatedAt = now.timeIntervalSince1970
+            try job.update(db)
+            return true
+        }
+        if removed {
+            let paths = try await database.write { db in
+                try Self.deleteUnreferencedAssetRows(db)
+            }
+            removeAssetFiles(paths)
+        }
+        await publishObservation()
+        return removed
+    }
+
     func jobAssets(jobID: String) throws -> [WorkJobAssetSnapshot] {
         try database.read { db in
             let links = try WorkJobAsset

@@ -412,7 +412,11 @@ final class RelaySessionCoordinator {
         // drop reconnects promptly instead of inheriting a stale attempt count.
         if reconnectAttempt != 0 { reconnectAttempt = 0 }
         store.apply(frame)
-        chatStore.applyRelayItems(store.items)
+        // QA-2 R4/A2: `turn.completed` is the authoritative settle the
+        // turn-scoped `relayTurnLive` flag clears on — plumbed through so the
+        // SAME projection that sees the terminal items also ends the turn
+        // (item terminality alone must not, the build-115 bug).
+        chatStore.applyRelayItems(store.items, turnSettled: frame.kind == .turnCompleted)
         // QA-1 B10 / A3: the interactive gate frames are NOT items — the render
         // store drops them by design — yet they are the sole input of the Turn
         // Dock's cards. Bridge them into the SAME ChatStore state the direct
@@ -424,8 +428,39 @@ final class RelaySessionCoordinator {
         switch frame.kind {
         case .approvalRequest: chatStore.applyRelayApprovalRequest(frame)
         case .clarifyRequest:  chatStore.applyRelayClarifyRequest(frame)
-        case .turnCompleted:   chatStore.expireRelayPendingGates()
+        case .turnStarted:
+            // QA-2 R12/R13: a new turn is the authoritative "clear the dock for
+            // a fresh seed" edge — the relay item store accumulates the prior
+            // turn's `taskList` item (stable `<sid>:tasks` id, replaced in
+            // place only when THIS turn emits its own), so without this clear
+            // the next `applyRelayItems` would re-mirror the previous turn's
+            // list and the pill would briefly show stale data when the new
+            // turn starts streaming.
+            chatStore.handleRelayTurnStarted()
+        case .turnCompleted:
+            chatStore.expireRelayPendingGates()
+            // R16 (Live Activity lifecycle): the relay wire's EXPLICIT turn
+            // boundary. The direct path ends the lock-screen Live Activity
+            // from `handleMessageComplete`; the relay path never flows
+            // through it, so without this firing the activity's `startedAt`
+            // drove the elapsed timer ENDLESSLY (owner's "timer runs forever
+            // on the lock screen" complaint). Idempotent: routes to
+            // `LiveActivityManager.end()` (no-op when nothing is live) + the
+            // queue-drain pipeline (no-op when no turn was live).
+            chatStore.notifyRelayTurnCompleted()
+            // QA-2 R12: clear a terminal (all-done/cancelled) task list's
+            // ownership so the dock pill dismisses at turn end even though the
+            // `taskList` item itself persists in the relay item store.
+            chatStore.handleRelayTurnCompleted()
         default: break
+        }
+        // R16: a failed `.error` item is a turn TERMINAL on the relay wire
+        // (parity with the direct path's `error` event → `handleGatewayError`).
+        // Fire the DISCARD seam — not a completion, so the queue does NOT
+        // auto-drain into a session that just errored. Only item-bearing
+        // frames carry a `ChatItem`; delta/approval/etc. frames have `nil`.
+        if let item = frame.item, item.type == .error, item.status == .failed {
+            chatStore.notifyRelayTurnDiscarded()
         }
     }
 
@@ -586,6 +621,11 @@ final class RelaySessionCoordinator {
         // the direct path's `reset()` on open; answering session A's card while
         // viewing B would mis-route the answer).
         chatStore.expireRelayPendingGates()
+        // R16: a relay turn mirrored for the outgoing session's Live Activity
+        // must end when the user switches away — otherwise the lock-screen
+        // timer keeps counting a turn the user is no longer viewing (and may
+        // never see complete on this surface). No-op when no turn was live.
+        chatStore.endRelayTurnForSessionSwitch()
     }
 
     func list() async throws -> JSONValue { try await requireClient().list() }
@@ -667,6 +707,18 @@ final class RelaySessionCoordinator {
         return try await requireClient().interrupt(sid)
     }
 
+    /// Inject steering text into the live turn over the relay (§5b, QA-2 R11).
+    /// Session resolution mirrors `interrupt`: an explicit target wins, else the
+    /// driven session. The relay passes the gateway's disposition through
+    /// VERBATIM — `{status: "queued" | "rejected", text}` — so `ChatStore.steer`
+    /// maps it identically to the gateway-direct path. Wire shape asserted by
+    /// tests/conformance (upstream `steer` payload).
+    @discardableResult
+    func steer(sessionID: String? = nil, text: String) async throws -> JSONValue {
+        guard let sid = sessionID ?? activeSessionID else { throw RelayError.notConnected }
+        return try await requireClient().steer(sessionID: sid, text: text)
+    }
+
     // MARK: Push token registration (§6a)
 
     /// Register the APNs device token over the relay socket (§6a). The relay
@@ -679,9 +731,12 @@ final class RelaySessionCoordinator {
     func registerPushToken(
         _ token: String,
         env: String,
-        events: [String]?
+        events: [String]?,
+        deviceID: String? = nil
     ) async throws -> JSONValue {
-        try await requireClient().registerPushToken(token, env: env, events: events)
+        try await requireClient().registerPushToken(
+            token, env: env, events: events, deviceID: deviceID
+        )
     }
 
     /// Remove the APNs device token from the relay's push registry (§6a).

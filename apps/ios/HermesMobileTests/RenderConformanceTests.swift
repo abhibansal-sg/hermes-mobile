@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import HermesMobile
 
 /// QA-1 A9 — the RENDER half of the device-shaped gate (spec A9; the wire half
@@ -712,6 +713,251 @@ final class RenderConformanceTests: XCTestCase {
             "spec B4/B15: opening an idle session must not blank the cache-painted transcript")
     }
 
+    // MARK: - Reseed eviction guard (QA-2 R15/A8, R3 residue)
+
+    /// Build gateway-shaped wire rows (stable `wireId` → deterministic seed ids,
+    /// identical across every refetch — the identity ``reconcileMessages`` keys
+    /// on), modeling what the GRDB cache paints and what a relay-history /
+    /// backfill snapshot returns.
+    private func storedHistory(_ rows: [(role: String, text: String)]) -> [StoredMessage] {
+        rows.enumerated().map { index, row in
+            StoredMessage(
+                role: row.role,
+                content: .string(row.text),
+                timestamp: 1_700_000_000 + Double(index),
+                wireId: index + 1
+            )
+        }
+    }
+
+    /// Assert every row's text appears, IN ORDER, in the rendered texts.
+    private func assertRowsPresent(
+        _ texts: [String], _ rows: [(role: String, text: String)],
+        _ label: String, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        var cursor = 0
+        for row in rows {
+            guard let found = texts[cursor...].firstIndex(of: row.text) else {
+                XCTFail(
+                    "\(label): settled history row lost from the transcript: \(row.role): \(row.text.prefix(48)) — rendered: \(texts.map { String($0.prefix(24)) })",
+                    file: file, line: line)
+                return
+            }
+            cursor = found + 1
+        }
+    }
+
+    /// QA-2 R15 / A8 — THE STUCK-EPISODE SEGMENT DROP. A mid-conversation
+    /// segment vanished after a stuck live turn rode a connection flap: the
+    /// reconnect `backfill()` reconciled a reseed snapshot SHORTER than the
+    /// merged timeline (relay history is a tail window; the relay's per-session
+    /// store holds only what it observed — the snapshot is known-partial), and
+    /// `reconcileMessages` treated the snapshot as the SOLE truth, EVICTING the
+    /// settled rows it did not carry. The cache still had them; switching away
+    /// and back (cache-first reseed) repaired the transcript — the owner's
+    /// exact recovery path.
+    ///
+    /// CONTRACT: the merged view NEVER shows less settled history than the
+    /// store held before the reseed. FAILS on qa2/base (`reconcileMessages`
+    /// does `messages = rebuilt` from the snapshot only — the missing segment
+    /// is evicted).
+    func testReseed_ShortSnapshotNeverEvictsSettledHistory() async throws {
+        let fx = try loadFixture("render_submit_stream")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        g.sessions.activeStoredId = fx.sessionID
+
+        // The GRDB cache painted six settled rows (three turns).
+        let history: [(role: String, text: String)] = [
+            ("user", "q1"), ("assistant", "a1"),
+            ("user", "q2"), ("assistant", "a2"),
+            ("user", "q3"), ("assistant", "a3"),
+        ]
+        let stored = storedHistory(history)
+        g.chat.seed(from: stored)
+        XCTAssertEqual(g.chat.messages.map(\.text), ["q1", "a1", "q2", "a2", "q3", "a3"])
+
+        // A new turn goes live and gets STUCK mid-stream (no turn.completed —
+        // the R11/R12 wedge left it running): recorded fixture frames replayed
+        // byte-for-byte through the production pump, stopped mid-delta.
+        _ = await g.chat.send(text: fx.submitText)
+        deliver(g, fx, through: { self.kind($0) == "item.delta" })
+        await waitUntil { g.chat.isStreaming }
+
+        // Connection flap (IMG_2547 "Not connected" banner) → drop handler
+        // finalizes the stream so the reconnect recovery backfill can run…
+        g.chat.handleConnectionDrop()
+        XCTAssertFalse(g.chat.isStreaming)
+
+        // …and the reconnect backfill lands a SHORT snapshot: the mid-
+        // conversation segment (q2/a2) is absent — the relay's snapshot is
+        // partial, not a deletion list.
+        g.chat.backfillFetch = { _ in Array(stored[0...1]) + Array(stored[4...5]) }
+        await g.chat.backfill()
+
+        // INVARIANT: zero segment loss — every cached row still renders, in
+        // order, even though the snapshot did not carry it.
+        assertRowsPresent(g.chat.messages.map(\.text), history, "R15/A8 short-snapshot reseed")
+
+        // The stream resumes after the flap (relay resync replays the frames)
+        // and the turn settles: history + prompt + reply, nothing dropped.
+        deliverAll(g, fx)
+        let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
+        await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
+        assertRowsPresent(g.chat.messages.map(\.text), history, "R15/A8 post-resume settle")
+        XCTAssertTrue(
+            g.chat.messages.contains { $0.role == .user && $0.text == fx.submitText },
+            "the stuck turn's user prompt survives the flap + reseed + resume"
+        )
+    }
+
+    /// QA-2 R15 / A8 — TAIL-WINDOW SHIFT. Every reseed source on this tree is a
+    /// recent-tail window (relay history honors `limit` with `messages[-limit:]`,
+    /// downstream.py; plugin REST serves the 50-row tail): as the conversation
+    /// grows, the window slides and a reseed EVICTS the older settled rows the
+    /// user had already loaded. FAILS on qa2/base (rows 1–3 evicted by the
+    /// 4–6 snapshot).
+    func testReseed_TailWindowShiftKeepsOlderLoadedHistory() async throws {
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open("render-tail-window")
+        g.sessions.activeStoredId = "render-tail-window"
+
+        let history: [(role: String, text: String)] = [
+            ("user", "q1"), ("assistant", "a1"),
+            ("user", "q2"), ("assistant", "a2"),
+            ("user", "q3"), ("assistant", "a3"),
+        ]
+        let stored = storedHistory(history)
+        g.chat.seed(from: stored)
+
+        // The reconnect/foreground backfill returns only the recent tail
+        // (the window slid after newer turns settled on the gateway).
+        g.chat.backfillFetch = { _ in Array(stored[3...5]) }
+        await g.chat.backfill()
+
+        let texts = g.chat.messages.map(\.text)
+        assertRowsPresent(texts, history, "R15/A8 tail-window shift")
+        XCTAssertEqual(texts.count, history.count,
+                       "the overlapping window rows update in place — no duplicates, no eviction")
+    }
+
+    /// QA-2 R15 guard — the optimistic user echo (runtime id + clientMessageID,
+    /// untagged) must CONVERGE with its own gateway row on a union reseed,
+    /// never double-render. The reseed row adopts the echo's slot exactly like
+    /// `adoptRelayEcho` folds the relay `userMessage` item onto it.
+    func testReseed_OptimisticEchoConvergesWithItsGatewayRow() async throws {
+        let fx = try loadFixture("render_submit_stream")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        g.sessions.activeStoredId = fx.sessionID
+
+        _ = await g.chat.send(text: fx.submitText)
+        deliverAll(g, fx)
+        let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
+        await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
+
+        // The gateway has persisted the turn; the backfill snapshot carries the
+        // authoritative user + assistant rows under their WIRE ids — the echo's
+        // runtime id never matches them.
+        g.chat.backfillFetch = { _ in
+            [
+                StoredMessage(role: "user", content: .string(fx.submitText),
+                              timestamp: 1_700_000_100, wireId: 100),
+                StoredMessage(role: "assistant", content: .string(agentText),
+                              timestamp: 1_700_000_101, wireId: 101),
+            ]
+        }
+        await g.chat.backfill()
+
+        let promptBubbles = g.chat.messages.filter { $0.role == .user && $0.text == fx.submitText }
+        XCTAssertEqual(promptBubbles.count, 1,
+                       "the optimistic echo adopts its gateway row's content in place — exactly one prompt bubble")
+        XCTAssertTrue(g.chat.messages.contains { $0.text == agentText },
+                      "the authoritative reply renders")
+    }
+
+    /// QA-2 R3 residue — the session-switch recovery path: switching away and
+    /// back paints the FULL settled history from the cache INSTANTLY (the
+    /// owner's repair path for R15; QA-1 B2's cache-first phase 1). PIN: green
+    /// before and after the R15 fix — the cross-session cache paint replaces
+    /// (session isolation), and paints everything the cache holds with zero
+    /// relay frames.
+    func testSessionSwitchAwayAndBack_RestoresFullHistoryFromCache() async throws {
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+
+        // Session A: six settled rows painted from the cache.
+        _ = try await g.coordinator.open("render-A")
+        g.sessions.activeStoredId = "render-A"
+        let historyA: [(role: String, text: String)] = [
+            ("user", "qa1"), ("assistant", "aa1"),
+            ("user", "qa2"), ("assistant", "aa2"),
+            ("user", "qa3"), ("assistant", "aa3"),
+        ]
+        let storedA = storedHistory(historyA)
+        g.chat.seed(from: storedA)
+
+        // Away to B: the cross-session cache paint REPLACES (isolation) —
+        // exactly the phase-1 default policy.
+        _ = try await g.coordinator.open("render-B")
+        g.sessions.activeStoredId = "render-B"
+        g.chat.seed(from: storedHistory([("user", "qb1"), ("assistant", "ab1")]))
+        XCTAssertEqual(g.chat.messages.map(\.text), ["qb1", "ab1"])
+
+        // Back to A: the cache paint restores the FULL history immediately —
+        // no relay frames, no network round-trip in the loop.
+        _ = try await g.coordinator.open("render-A")
+        g.sessions.activeStoredId = "render-A"
+        g.chat.seed(from: storedA)
+        XCTAssertEqual(g.chat.messages.map(\.text), historyA.map(\.text),
+                       "switching back paints the entire cached transcript instantly (R3 residue / R15 recovery path)")
+    }
+
+    /// QA-2 R3 residue — the relay recovery backfill must run over the RELAY
+    /// transport (the gateway REST socket is idle/unreachable in relay mode —
+    /// a REST-only `backfill()` fails or hangs to the 15s timeout, so the
+    /// post-flap reconcile never lands). FAILS on qa2/base
+    /// (`resolvedBackfillFetch` resolves only `connection?.rest` — nil here →
+    /// the backfill no-ops and the snapshot never seeds).
+    func testBackfill_RelayTransportRunsOverRelayHistory() async throws {
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open("render-relay-backfill")
+        g.sessions.activeStoredId = "render-relay-backfill"
+
+        // The relay answers `history` with the gateway store rows (proxied
+        // verbatim — the same shape `rest_history` returns downstream).
+        g.transport.script = { upstream, relay in
+            guard let id = upstream.id else { return }
+            if upstream.method == "history" {
+                relay.deliverResult(id: id, result: .object([
+                    "session_id": .string("render-relay-backfill"),
+                    "messages": .array([
+                        .object(["role": .string("user"), "content": .string("rh-q1"),
+                                 "timestamp": .number(1_700_000_000), "id": .number(1)]),
+                        .object(["role": .string("assistant"), "content": .string("rh-a1"),
+                                 "timestamp": .number(1_700_000_001), "id": .number(2)]),
+                    ]),
+                ]))
+            } else {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+            }
+        }
+
+        // NO `backfillFetch` injection: the store must resolve the relay
+        // `history` RPC itself (the production relay wiring under test).
+        await g.chat.backfill()
+
+        let history = g.transport.upstreams().first { $0.method == "history" }
+        XCTAssertNotNil(history, "the recovery backfill must travel over the relay transport in relay mode")
+        XCTAssertEqual(history?.params["session_id"] as? String, "render-relay-backfill")
+        XCTAssertEqual(g.chat.messages.map(\.text), ["rh-q1", "rh-a1"],
+                       "the relay history rows seed the transcript over the up transport")
+    }
+
     /// PIN (green on qa1/base — B15 regression guard): a cold-open transcript
     /// paints from the cache with ZERO relay frames, and the relay render
     /// store never drives the initial paint. Force-close recovery must keep
@@ -735,5 +981,276 @@ final class RenderConformanceTests: XCTestCase {
         var store = RelayItemStore()
         store.apply([] as [RelayFrame])
         XCTAssertTrue(store.items.isEmpty)
+    }
+
+    // MARK: - QA-2 R4/A2 — instant working mode; Working-pill state deleted
+
+    /// R4/A2: send enters working mode IMMEDIATELY — an optimistic empty
+    /// streaming assistant bubble (the breathing caret) renders the instant the
+    /// user commits, independent of any relay frame, and `isStreaming` (which
+    /// gates the composer's stop button) is true from send. FAILS on qa2/base
+    /// (the send appends nothing; the first frame's projection decides).
+    func testRelaySend_InstantWorkingAffordance_OptimisticCaretBubble() async throws {
+        let fx = try loadFixture("render_submit_stream")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+
+        let ok = await g.chat.send(text: fx.submitText)
+        XCTAssertTrue(ok)
+
+        // NO frames delivered — the affordance is local or nowhere.
+        XCTAssertTrue(g.chat.isStreaming,
+            "spec R4/A2: send → working mode instantly (stop button available)")
+        let last = try XCTUnwrap(g.chat.messages.last)
+        XCTAssertEqual(last.role, .assistant,
+            "spec R4: send appends an optimistic empty streaming assistant bubble")
+        XCTAssertTrue(last.isStreaming)
+        XCTAssertTrue(last.parts.isEmpty, "the caret bubble is empty until the first delta")
+    }
+
+    /// R4/A2: the relay's synthesized TERMINAL `userMessage` first frame must
+    /// NOT settle the turn — streaming is turn-scoped (until `turn.completed`),
+    /// and the caret bubble persists through the accepted-and-waiting window.
+    /// FAILS on qa2/base (`nowStreaming = rebuilt.contains { $0.isStreaming }`
+    /// → false → the bar + stop + cursor die for the entire wait window; fast
+    /// turns showed no affordance at all).
+    func testRelaySend_TerminalUserMessageFrameKeepsTurnStreaming() async throws {
+        let fx = try loadFixture("render_submit_stream")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+
+        _ = await g.chat.send(text: fx.submitText)
+        deliver(g, fx, through: {
+            self.kind($0) == "item.completed" && self.itemType($0) == "userMessage"
+        })
+        await waitUntil { g.chat.messages.contains { $0.role == .user && $0.text == fx.submitText } }
+
+        XCTAssertTrue(g.chat.isStreaming,
+            "spec R4/A2: a terminal userMessage item must not settle a turn-scoped streaming turn")
+        XCTAssertTrue(g.chat.messages.contains {
+            $0.role == .assistant && $0.isStreaming && $0.parts.isEmpty
+        }, "spec R4: the caret bubble survives the terminal userMessage frame")
+    }
+
+    /// A2: the Working pill is IMPOSSIBLE on the relay path — in EVERY phase,
+    /// including the pre-first-item window the QA-1 B8 clause still showed it
+    /// for. That clause (the last state that could flash the pill on relay) is
+    /// deleted; the optimistic caret bubble is the pre-first-item affordance.
+    /// FAILS on qa2/base (the pre-first-item branch returned `true`).
+    func testRelaySend_WorkingPillImpossiblePreFirstItem() async throws {
+        let fx = try loadFixture("render_submit_stream")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        g.chat.messages = cachedRows(fx)
+        _ = await g.chat.send(text: fx.submitText)
+
+        // Pre-first-item: no relay frame yet; the painted tail is the user echo.
+        let last = try XCTUnwrap(g.chat.messages.last(where: { $0.role == .user }))
+        XCTAssertEqual(last.text, fx.submitText)
+        XCTAssertFalse(
+            ChatView.shouldShowInlineTurnActivity(
+                isStreaming: true,
+                hasPendingGate: false,
+                isRelayTransport: true,
+                lastMessage: last
+            ),
+            "spec A2: the relay Working pill is impossible — even pre-first-item (state deleted, not hidden)"
+        )
+    }
+
+    // MARK: - QA-2 R5/R6/A3 — single collapsed live working line
+
+    /// A3: a live turn with reasoning + tool work projects EXACTLY ONE
+    /// assistant row, folding to EXACTLY ONE `.working` node — never the
+    /// build-115 stack (inline thinking rows + separate current-tool row +
+    /// standalone cursor = 3-4 rows, IMG_2532/2545/2546). The single collapsed
+    /// line's label never surfaces the raw pre-resolution tool state (N2).
+    func testReplay_LiveTurnExactlyOneWorkingNode() async throws {
+        let fx = try loadFixture("render_live_fold")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        _ = await g.chat.send(text: fx.submitText)
+
+        // Through the raw-name tool start: reasoning done, tool in progress,
+        // NO agent item yet — the accepted-and-waiting + working window.
+        deliver(g, fx, through: {
+            self.kind($0) == "item.started" && self.itemType($0) == "tool.generating"
+        })
+        // Wait for the REAL projection (the optimistic bubble also matches
+        // `isStreaming` with EMPTY parts — require parts so a frame-processing
+        // hop can't race the assertion).
+        await waitUntil { g.chat.messages.contains {
+            $0.role == .assistant && $0.isStreaming && !$0.parts.isEmpty
+        } }
+
+        XCTAssertTrue(g.chat.isStreaming, "the live turn is streaming (turn-scoped)")
+        let live = try XCTUnwrap(
+            g.chat.messages.first { $0.role == .assistant && $0.isStreaming && !$0.parts.isEmpty },
+            "spec A3: the live turn renders as a streaming assistant row"
+        )
+        let nodes = WorkingSectionModel.renderNodes(from: live.parts)
+        XCTAssertEqual(nodes.count, 1,
+            "spec A3: the live turn folds to a SINGLE working node (no stacked rows)")
+        guard let only = nodes.first, case .working = only else {
+            return XCTFail("spec A3: the single node is the working fold")
+        }
+        XCTAssertEqual(WorkingSectionModel.liveCollapsedLabel(parts: live.parts), "Working…",
+            "spec R5/N2: the raw 'tool.generating' state reads as plain 'Working…' — never the raw token")
+    }
+
+    /// A3: once the tool resolves a friendly summary, the single collapsed line
+    /// carries it inline — "Working… · ‹current tool›" (ratified Wave-2.5).
+    func testReplay_LiveTurnResolvesFriendlyToolInline() async throws {
+        let fx = try loadFixture("render_live_fold")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        _ = await g.chat.send(text: fx.submitText)
+
+        // Through the agentMessage start (the tool completed friendly just
+        // before it — deltas carry no type, so stop on the agent item.started,
+        // NOT the first delta, which is the reasoning delta).
+        deliver(g, fx, through: {
+            self.kind($0) == "item.started" && self.itemType($0) == "agentMessage"
+        })
+        await waitUntil { g.chat.messages.contains {
+            $0.role == .assistant && !$0.parts.isEmpty && $0.isStreaming
+        } }
+
+        let live = try XCTUnwrap(g.chat.messages.first {
+            $0.role == .assistant && !$0.parts.isEmpty && $0.isStreaming
+        })
+        let label = WorkingSectionModel.liveCollapsedLabel(parts: live.parts)
+        XCTAssertEqual(label, "Working… · Asked which direction to take",
+            "spec R5/A3: the resolved tool rides inline on the single Working line")
+        XCTAssertFalse(label.contains("."), "no raw dotted state token in the label")
+    }
+
+    /// N2: `liveCollapsedLabel` NEVER renders a raw internal state name —
+    /// `tool.generating` / `review.summary` read as plain "Working…" until the
+    /// tool resolves (deterministic unit pin, no replay).
+    func testLiveCollapsedLabel_NeverRawStateNames() {
+        let raw = ChatItem(itemID: "t1", type: ChatItemType(wire: "tool.generating"),
+                           rawType: "tool.generating", status: .inProgress, ord: 1,
+                           summary: "tool.generating", body: .null)
+        XCTAssertEqual(
+            WorkingSectionModel.liveCollapsedLabel(parts: [.item(id: "t1", item: raw)]),
+            "Working…",
+            "a raw pre-resolution tool state must read as plain Working…"
+        )
+        XCTAssertTrue(WorkingSectionModel.isRawStateName("tool.generating"))
+        XCTAssertTrue(WorkingSectionModel.isRawStateName("review.summary"))
+        XCTAssertFalse(WorkingSectionModel.isRawStateName("clarify"))
+        XCTAssertFalse(WorkingSectionModel.isRawStateName("Read auth.py"))
+
+        let friendly = ChatItem(itemID: "t2", type: .toolCall, status: .inProgress, ord: 1,
+                                body: ["name": "read", "args": ["path": "auth.py"]])
+        XCTAssertEqual(
+            WorkingSectionModel.liveCollapsedLabel(parts: [.item(id: "t2", item: friendly)]),
+            "Working… · Read auth.py",
+            "a humanized tool name rides inline on the collapsed live line"
+        )
+
+        // A friendly SUMMARY over a still-raw wire name is trusted.
+        let resolved = ChatItem(itemID: "t3", type: ChatItemType(wire: "clarify"),
+                                rawType: "clarify", status: .inProgress, ord: 1,
+                                summary: "Asked which direction to take", body: .null)
+        XCTAssertEqual(
+            WorkingSectionModel.liveCollapsedLabel(parts: [.item(id: "t3", item: resolved)]),
+            "Working… · Asked which direction to take"
+        )
+    }
+
+    /// A3 layout: the LIVE working section renders as ONE line — its measured
+    /// height is a single row (≈32pt), never the build-115 reserved 172pt
+    /// thinking window + stacked rows (the R6 bands of IMG_2533/2538/2542).
+    /// FAILS on qa2/base (the live branch mounted a 172pt ThinkingView).
+    @MainActor
+    func testLiveWorkingSection_RendersOneLineLayout() throws {
+        let raw = ChatItem(itemID: "t1", type: ChatItemType(wire: "tool.generating"),
+                           rawType: "tool.generating", status: .inProgress, ord: 1,
+                           summary: "tool.generating", body: .null)
+        let parts: [ChatMessagePart] = [
+            .reasoning(id: "r1", text: "I need to create a clarification card with four options, where each option is meaningful."),
+            .item(id: "t1", item: raw),
+        ]
+        let renderer = ImageRenderer(content:
+            WorkingSectionView(parts: parts, streaming: true,
+                               liveTurnStartedAt: Date(), settledDuration: nil)
+                .frame(width: 360)
+                .environment(\.hermesTheme, HermesThemePresets.nousLight)
+        )
+        renderer.scale = 2
+        let height = try XCTUnwrap(renderer.uiImage?.size.height,
+            "the live working section must render")
+        XCTAssertLessThan(height, 60,
+            "spec A3/R6: the live working section is ONE line — no 172pt thinking window, no stacked rows (measured \(height)pt)")
+    }
+
+    /// R5/A3: a settled relay turn stamps its per-TURN wall-clock duration so
+    /// the row reads "Worked for Ns" (build 115: a bare "Worked" — relay items
+    /// carry no timestamps and the projection never stamped one; IMG_2532).
+    /// FAILS on qa2/base (`reasoningElapsed` never set on relay rows).
+    func testReplay_SettledRelayTurnStampsDuration() async throws {
+        let fx = try loadFixture("render_live_fold")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        g.chat.messages = cachedRows(fx)
+        _ = await g.chat.send(text: fx.submitText)
+        deliverAll(g, fx)
+
+        let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
+        await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
+
+        let settledRow = try XCTUnwrap(
+            g.chat.messages.first { $0.role == .assistant && $0.text == agentText })
+        XCTAssertNotNil(settledRow.reasoningElapsed,
+            "spec R5/A3: the settle edge stamps the turn's wall-clock duration on the relay row")
+        XCTAssertNotEqual(
+            WorkingSectionModel.workedLabel(seconds: settledRow.reasoningElapsed), "Worked",
+            "spec R5: the settled relay row reads 'Worked for Ns', never a bare 'Worked'"
+        )
+    }
+
+    /// R5: the stamped duration SURVIVES later re-projections — the projection
+    /// rebuilds every tagged row from the (session-accumulating) item store on
+    /// every pass, so the second turn's first frame must not strip the first
+    /// turn's "Worked for Ns". FAILS on qa2/base (never stamped at all).
+    func testReplay_SettledDurationSurvivesSecondTurnReprojection() async throws {
+        let fx = try loadFixture("render_live_fold")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        _ = await g.chat.send(text: fx.submitText)
+        deliverAll(g, fx)
+        let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
+        await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
+
+        // Second turn begins: send + its terminal userMessage frame (seq 14,
+        // dense after the fixture's 13) re-projects the WHOLE session timeline.
+        _ = await g.chat.send(text: "Second prompt.")
+        let secondUserFrame: [String: Any] = [
+            "seq": 14, "sid": fx.sessionID, "turn": NSNull(),
+            "kind": "item.completed",
+            "body": [
+                "item_id": "render-sess-fold:u-2",
+                "type": "userMessage",
+                "status": "completed",
+                "ord": 5,
+                "body": ["text": "Second prompt.", "client_message_id": "render-cmid-fold-2"],
+            ],
+        ]
+        g.transport.deliver(frameText(secondUserFrame))
+        await waitUntil { g.chat.messages.contains { $0.role == .user && $0.text == "Second prompt." } }
+
+        let firstTurnRow = try XCTUnwrap(
+            g.chat.messages.first { $0.role == .assistant && $0.text == agentText })
+        XCTAssertNotNil(firstTurnRow.reasoningElapsed,
+            "spec R5: a later turn's re-projection must not strip the settled turn's stamped duration")
     }
 }

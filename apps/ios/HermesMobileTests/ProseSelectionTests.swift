@@ -327,6 +327,11 @@ final class ProseSelectionTests: XCTestCase {
         let controller = UIHostingController(rootView: ProseSelectionContainer(text: first)
             .frame(width: 320, alignment: .topLeading))
         controller.view.frame = CGRect(x: 0, y: 0, width: 320, height: 400)
+        // iOS 26 lazy platform-view instantiation: the representable mounts its
+        // UITextView only once attached to a window (see hostedRoot).
+        if let window = attachToWindow(controller) {
+            attachedWindows.append(window)
+        }
         pumpLayout(controller)
         guard let textView = allTextViews(in: controller.view).first else {
             return XCTFail("container must mount its UITextView")
@@ -409,10 +414,24 @@ final class ProseSelectionTests: XCTestCase {
             .environment(environment.sessionStore)
     }
 
+    /// Windows attached for the current test — held so the representables stay
+    /// instantiated until teardown (a released UIWindow detaches its root).
+    private var attachedWindows: [UIWindow] = []
+
     private func hostedRoot<V: View>(_ view: V, width: CGFloat = 360) -> UIView {
         let controller = UIHostingController(rootView: view.frame(width: width, alignment: .topLeading))
         controller.view.frame = CGRect(x: 0, y: 0, width: width, height: 900)
         controller.view.backgroundColor = .white
+        // iOS 26 instantiates `UIViewRepresentable` platform views LAZILY —
+        // `ProseSelectionContainer`'s UITextView is created only once the
+        // hosting view is attached to a live window (the same contract
+        // ClarifyCardNativeTests' onAppear assertions rely on). Without the
+        // attach the hierarchy walk finds zero text views even though the
+        // bubble's SwiftUI tree is intact (qa2 fix round: pre-existing
+        // red on the four hierarchy tests).
+        if let window = attachToWindow(controller) {
+            attachedWindows.append(window)
+        }
         pumpLayout(controller)
         return controller.view
     }
