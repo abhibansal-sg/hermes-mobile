@@ -433,6 +433,27 @@ final class ChatStore {
     /// and exposed (read-only) to drive the elapsed-time turn activity bar.
     /// `nil` whenever no turn is in flight.
     private(set) var turnStartedAt: Date?
+    /// QA-2 R4/A2 — TURN-SCOPED relay streaming. The relay's submit handler fans
+    /// out a **terminal** `userMessage` item immediately; the old projection
+    /// derived `isStreaming` purely from item terminality
+    /// (`rebuilt.contains { $0.isStreaming }`), so that first frame cleared the
+    /// submit-time streaming flag and killed the cursor + stop button for the
+    /// ENTIRE accepted-and-waiting window (fast turns showed NO working
+    /// affordance at all — "the reply just appears later"). This flag makes
+    /// `isStreaming` turn-scoped instead: true from the relay send until the
+    /// turn settles via `turn.completed` (plumbed as `applyRelayItems`'
+    /// `turnSettled:` argument) or is discarded (`cancelStreaming`), independent
+    /// of per-item terminality. Never set on the direct path.
+    private(set) var relayTurnLive = false
+    /// QA-2 R5/A3 — settled relay turn durations, keyed by the settled assistant
+    /// row's id. The relay projection REBUILDS every tagged row from the item
+    /// store on every pass (items accumulate for the session), so a duration
+    /// captured once on the settle edge must live OUTSIDE the rebuilt rows to
+    /// survive later re-projections — without this, the second send's first
+    /// frame would strip the prior turn's "Worked for Ns" back to a bare
+    /// "Worked" (relay items carry no timestamps; IMG_2532). Cleared with the
+    /// session (`reset()`).
+    private var relaySettledElapsed: [UUID: TimeInterval] = [:]
     /// Name of the tool currently executing in the in-flight turn, surfaced in
     /// the turn activity bar. `nil` when no tool is running. Set on `tool.start`
     /// and cleared on that tool's `tool.complete` / turn completion.
@@ -2498,6 +2519,25 @@ final class ChatStore {
             )
             userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
             messages.append(userMessage)
+            // QA-2 R4/A2 — INSTANT WORKING AFFORDANCE: append an optimistic
+            // EMPTY streaming assistant bubble the instant the user commits —
+            // the breathing caret (`MessageBubble.needsStandaloneCursor`)
+            // renders ≤100 ms from send, independent of ANY relay frame (the
+            // accepted-and-waiting window before the first item is otherwise
+            // blank). It is tagged `relayProjected` so the very first
+            // `applyRelayItems` pass replaces it in place — with the SAME id
+            // (`relay-assistant-of-<echo>` matches the per-turn re-key in
+            // `applyRelayItems`), so SwiftUI morphs the caret bubble into the
+            // streaming reply instead of popping the view identity. `relayTurnLive`
+            // makes `isStreaming` turn-scoped (see its doc): the stop button and
+            // the caret persist for the WHOLE turn, not just between deltas.
+            messages.append(ChatMessage(
+                id: Self.relayOptimisticAssistantID(forEcho: userMessage.id),
+                role: .assistant,
+                isStreaming: true,
+                relayProjected: true
+            ))
+            relayTurnLive = true
             if hasAttachments, let attachments {
                 setStreaming(true, reason: "relay.send.upload")
                 lastError = nil
@@ -2507,6 +2547,7 @@ final class ChatStore {
                     )
                 } catch {
                     removeLocalEcho(clientMessageID: clientMessageID)
+                    abandonRelayTurnAffordance()
                     setStreaming(false, reason: "relay.send.uploadFailed")
                     lastError = (error as? LocalizedError)?.errorDescription
                         ?? error.localizedDescription
@@ -2542,6 +2583,7 @@ final class ChatStore {
                 return true
             } catch {
                 removeLocalEcho(clientMessageID: clientMessageID)
+                abandonRelayTurnAffordance()
                 setStreaming(false, reason: "relay.sendError")
                 turnStartedAt = nil
                 lastError = (error as? LocalizedError)?.errorDescription
@@ -2772,6 +2814,36 @@ final class ChatStore {
         }) else { return }
         let removed = messages.remove(at: index)
         userOrdinals[removed.id] = nil
+    }
+
+    /// The stable id of a relay turn's assistant row, derived from the turn's
+    /// USER row id — stable across echo adoption (adoption preserves the echo's
+    /// id) and across every re-projection, so the optimistic caret bubble the
+    /// send appends (`relayOptimisticAssistantID(forEcho:)`) and the real
+    /// streaming segment `applyRelayItems` rebuilds share ONE identity: the
+    /// caret morphs into the reply in place (no SwiftUI view-identity pop at
+    /// the first item, none at settle). QA-2 R4/A2.
+    static func relayAssistantID(forUserRowID userRowID: UUID) -> UUID {
+        ChatMessage.deterministicID(seedKey: "relay-assistant-of-\(userRowID.uuidString)")
+    }
+
+    /// The optimistic empty streaming assistant bubble's id at send time —
+    /// derived from the optimistic user ECHO's id, which `adoptRelayEcho`
+    /// preserves when the relay's synthesized `userMessage` item lands, so this
+    /// equals `relayAssistantID(forUserRowID:)` for the same turn. QA-2 R4/A2.
+    static func relayOptimisticAssistantID(forEcho echoID: UUID) -> UUID {
+        relayAssistantID(forUserRowID: echoID)
+    }
+
+    /// Tear down the optimistic relay-turn affordance on a FAILED send: drop the
+    /// empty streaming assistant bubble and un-mark the turn live, so a rejected
+    /// submit never strands a breathing caret + stop button over a dead turn.
+    /// QA-2 R4/A2 (mirror of the direct path's failed-send cleanup).
+    private func abandonRelayTurnAffordance() {
+        relayTurnLive = false
+        messages.removeAll {
+            $0.role == .assistant && $0.relayProjected && $0.parts.isEmpty
+        }
     }
 
     private func presentOutboxEcho(
@@ -4432,7 +4504,16 @@ final class ChatStore {
     /// untouched — the cold-open/force-close paint stays the initial truth
     /// (B15). A relay `userMessage` item ADOPTS the matching optimistic echo in
     /// place (sticky, by `client_message_id` then text) — one bubble, no dupe.
-    func applyRelayItems(_ items: [ChatItem]) {
+    /// `turnSettled` (QA-2 R4/A2): the coordinator passes `true` when the frame
+    /// that drove this projection is `turn.completed` — the authoritative
+    /// turn-end the turn-scoped `relayTurnLive` flag clears on. Without it the
+    /// terminal-item window would either strand streaming true forever (if the
+    /// flag ignored item state entirely) or kill it at the first terminal frame
+    /// (the build-115 bug). Item terminality still drives the PER-ROW
+    /// `isStreaming` (the caret leaves a finished bubble); the STORE-level flag
+    /// is turn-scoped.
+    func applyRelayItems(_ items: [ChatItem], turnSettled: Bool = false) {
+        if turnSettled { relayTurnLive = false }
         var rebuilt: [ChatMessage] = []
         var segmentParts: [ChatMessagePart] = []
         var segmentAnchor: String?
@@ -4483,6 +4564,63 @@ final class ChatStore {
         }
         flushSegment()
 
+        // QA-2 R4/A2 — STABLE PER-TURN ASSISTANT IDENTITY: re-key every rebuilt
+        // assistant row off the turn's USER row id (stable across echo adoption
+        // and every re-projection) instead of the first agent item's id. The
+        // optimistic caret bubble the send appends carries
+        // `relayOptimisticAssistantID(forEcho:)` — the SAME derivation off the
+        // echo id adoption preserves — so the first real segment inherits the
+        // bubble's identity and SwiftUI morphs caret → streaming reply in place
+        // (no view-identity pop at first item, none at settle). Turns with no
+        // user row (a mid-turn resume snapshot) keep the anchor-derived id.
+        var lastUserRowID: UUID?
+        for index in rebuilt.indices {
+            if rebuilt[index].role == .user {
+                lastUserRowID = rebuilt[index].id
+            } else if rebuilt[index].role == .assistant, let userRowID = lastUserRowID {
+                let seg = rebuilt[index]
+                rebuilt[index] = ChatMessage(
+                    id: Self.relayAssistantID(forUserRowID: userRowID),
+                    role: .assistant,
+                    parts: seg.parts,
+                    isStreaming: seg.isStreaming,
+                    reasoningElapsed: seg.reasoningElapsed,
+                    timestamp: seg.timestamp,
+                    relayProjected: true
+                )
+            }
+        }
+
+        // QA-2 R4/A2 — OPTIMISTIC CARET RETENTION: while the turn is live
+        // (`relayTurnLive`) and the CURRENT turn has no agent items yet (the
+        // accepted-and-waiting window — the relay's first frame is the terminal
+        // `userMessage`), keep an empty streaming assistant bubble at the tail
+        // so the breathing caret + stop button persist from send to first
+        // delta, independent of item terminality. Reuses the existing
+        // optimistic row's id when present (send created it), else derives it
+        // from the turn's user row. The first real agent item replaces it in
+        // place (same id, above) on the next pass.
+        if relayTurnLive {
+            var hasAgentItemThisTurn = false
+            for item in items.reversed() {
+                if item.type == .userMessage { break }
+                if item.renderPart != nil { hasAgentItemThisTurn = true; break }
+            }
+            if !hasAgentItemThisTurn {
+                let optimisticID = messages.first(where: {
+                    $0.role == .assistant && $0.relayProjected && $0.parts.isEmpty
+                })?.id
+                    ?? lastUserRowID.map(Self.relayAssistantID(forUserRowID:))
+                    ?? ChatMessage.deterministicID(seedKey: "relay-assistant-optimistic")
+                rebuilt.append(ChatMessage(
+                    id: optimisticID,
+                    role: .assistant,
+                    isStreaming: true,
+                    relayProjected: true
+                ))
+            }
+        }
+
         // N4/A5: the dock's task box reads `latestTodoList`; on the relay path
         // the ONE living `.taskList` item lives in these reconciled items, NOT
         // in a `todo` ToolActivity the legacy scan would find — refresh the
@@ -4509,16 +4647,16 @@ final class ChatStore {
         guard !rebuilt.isEmpty else { return }
 
         transcriptConfirmedEmpty = false
-        // QA-1 B5/B6/B7/B13 — MERGED TIMELINE: preserve the settled history
-        // (every untagged row) and append the live relay projection below it —
-        // minus any echo rows a userMessage item adopted this pass (they
-        // re-enter tagged, in place). History + live turn coexist; scrollback
-        // stays intact during and after streaming.
-        let preserved = messages.filter {
-            !$0.relayProjected && !consumedEchoIDs.contains($0.id)
-        }
-        messages = preserved + rebuilt
-        let nowStreaming = rebuilt.contains { $0.isStreaming }
+        // QA-2 R4/A2 — TURN-SCOPED STREAMING: `isStreaming` is true from the
+        // relay send (`relayTurnLive`) until the turn settles via
+        // `turn.completed`, independent of per-item terminality. The build-115
+        // bug derived it SOLELY from item state — the relay's synthesized
+        // TERMINAL `userMessage` first frame projected `nowStreaming == false`
+        // and killed the cursor + stop button for the entire accepted-and-
+        // waiting window (fast turns showed no affordance at all). Item
+        // terminality still drives each rebuilt ROW's `isStreaming` (the caret
+        // leaves a finished bubble); the STORE flag is turn-scoped.
+        let nowStreaming = relayTurnLive || rebuilt.contains { $0.isStreaming }
         // QA-1 B8: relay turn-lifecycle chrome. `turnStartedAt`/`activeToolName`
         // are direct-path event-router internals the relay path never updates
         // per event — left alone, the inline activity row's elapsed label would
@@ -4531,9 +4669,49 @@ final class ChatStore {
         if nowStreaming {
             markTurnStartedIfNeeded()
         } else if isStreaming {
+            // QA-2 R5/A3 — SETTLE EDGE: capture the turn's wall-clock duration
+            // BEFORE clearing the timer, and persist it keyed by the settled
+            // assistant row's stable per-turn id — the projection rebuilds
+            // every tagged row from the (session-accumulating) item store on
+            // every pass, so the settled "Worked for Ns" label (re-stamped
+            // below) survives later turns' re-projections. Relay items carry no
+            // timestamps; build 115 settled relay rows read a bare "Worked"
+            // (IMG_2532). Mirrors the direct path's completion-time stamp.
+            if let started = turnStartedAt {
+                let elapsed = Date().timeIntervalSince(started)
+                // The settled row is THIS turn's assistant row — the last
+                // assistant AFTER the last user row (a turn that settled with
+                // zero agent items must not re-stamp the previous turn's row).
+                let lastUserIdx = rebuilt.lastIndex(where: { $0.role == .user }) ?? -1
+                if let settledIdx = rebuilt.lastIndex(where: { $0.role == .assistant }),
+                   settledIdx > lastUserIdx {
+                    relaySettledElapsed[rebuilt[settledIdx].id] = elapsed
+                }
+            }
             turnStartedAt = nil
             activeToolName = nil
         }
+        // QA-2 R5/A3: re-stamp settled relay turns' captured durations on every
+        // pass (the rows are rebuilt fresh from items each time), so a settled
+        // turn keeps reading "Worked for Ns" after the store has cleared
+        // `turnStartedAt` and after subsequent turns re-project the timeline.
+        if !relaySettledElapsed.isEmpty {
+            for index in rebuilt.indices
+            where rebuilt[index].role == .assistant
+                && !rebuilt[index].isStreaming
+                && rebuilt[index].reasoningElapsed == nil {
+                rebuilt[index].reasoningElapsed = relaySettledElapsed[rebuilt[index].id]
+            }
+        }
+        // QA-1 B5/B6/B7/B13 — MERGED TIMELINE: preserve the settled history
+        // (every untagged row) and append the live relay projection below it —
+        // minus any echo rows a userMessage item adopted this pass (they
+        // re-enter tagged, in place). History + live turn coexist; scrollback
+        // stays intact during and after streaming.
+        let preserved = messages.filter {
+            !$0.relayProjected && !consumedEchoIDs.contains($0.id)
+        }
+        messages = preserved + rebuilt
         setStreaming(nowStreaming, reason: "relayProjection")
     }
 
@@ -4555,6 +4733,13 @@ final class ChatStore {
         turnStartedAt = nil
         activeToolName = nil
         activeToolCallId = nil
+        // QA-2 R4/A2: a wholesale reset/discard ends the turn-scoped relay
+        // live flag too (reset/open-seed/draft/connection-drop all funnel
+        // here) — never let it strand `isStreaming` true into the next
+        // session. The settled-duration stamps belong to the torn-down
+        // session's rows; drop them with it.
+        relayTurnLive = false
+        relaySettledElapsed = [:]
         setStreaming(false, reason: "cancelStreaming")
         mirroringRuntimeId = nil
         streamingIsForeign = false
