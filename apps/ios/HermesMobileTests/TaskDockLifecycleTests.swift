@@ -119,10 +119,13 @@ final class TaskDockLifecycleTests: XCTestCase {
         XCTAssertFalse(chat.dockShowsTaskBox, "R13: terminal list must auto-dismiss")
     }
 
-    func testHandleRelayTurnCompletedClearsTerminalListOwnership() {
-        // R12: turn.completed with a terminal list drops ownership so a fresh
-        // turn re-seeds the dock clean (the `taskList` item itself persists in
-        // the relay item store, but the owner is released).
+    func testHandleRelayTurnCompletedKeepsDataForBridgeContract() {
+        // R12: the dock pill is hidden at turn end by the `dockShowsTaskBox`
+        // visibility gate (isStreaming settles false), NOT by dropping the list
+        // data — the bridge DATA persists so a resumed turn / the render-
+        // conformance contract still observes it. `handleRelayTurnCompleted` is
+        // an intentional no-op seam; the cross-turn re-seed is `turn.started`'s
+        // job. Asserting the data survives here pins that contract.
         let chat = bareChat()
         chat.applyRelayItems([ChatItem(
             itemID: "s1:tasks", type: .taskList, status: .completed, ord: 4,
@@ -132,29 +135,10 @@ final class TaskDockLifecycleTests: XCTestCase {
             ]
         )])
         chat.isStreaming = true
+        XCTAssertNotNil(chat.latestTodoList, "precondition: list data present mid-turn")
         chat.handleRelayTurnCompleted()
-        // After turn-completed the mirror is cleared for a terminal list…
-        XCTAssertNil(chat.latestTodoList, "terminal list mirror cleared on turn.completed")
-    }
-
-    func testHandleRelayTurnCompletedKeepsNonTerminalList() {
-        // A turn that ends mid-list (NOT all done) keeps the list DATA — the
-        // dock's `isStreaming` gate hides the pill anyway, but the data stays so
-        // a resumed turn reuses it. Only TERMINAL lists are agent-closed here.
-        let chat = bareChat()
-        chat.applyRelayItems([ChatItem(
-            itemID: "s1:tasks", type: .taskList, status: .inProgress, ord: 4,
-            body: [
-                "tasks": [
-                    ["id": "1", "text": "Done", "status": "completed"],
-                    ["id": "2", "text": "Pending", "status": "pending"],
-                ],
-                "all_complete": false,
-            ]
-        )])
-        chat.isStreaming = true
-        chat.handleRelayTurnCompleted()
-        XCTAssertNotNil(chat.latestTodoList, "non-terminal list survives turn.completed")
+        XCTAssertNotNil(chat.latestTodoList,
+                        "R12: turn.completed keeps the list data (visibility gate hides the pill)")
     }
 
     // MARK: - R13: strict session-scoping (A vs B / A6)
@@ -257,18 +241,19 @@ final class TaskDockLifecycleTests: XCTestCase {
     // MARK: - R12: new turn re-seeds the dock clean (no stale list)
 
     func testRelaySendClearsStaleMirrorForFreshTurn() {
-        // The relay send path clears the mirror so a NEW turn never re-shows the
-        // PREVIOUS turn's task list before its own `taskList` arrives. We can't
-        // call `send(text:)` here (no real coordinator), but the same clearing
-        // runs through `reset()`'s R12 path; verify the contract directly by
-        // re-applying a fresh task list after a clear.
+        // The relay send path + `turn.started` clear the mirror so a NEW turn
+        // never re-shows the PREVIOUS turn's task list before its own `taskList`
+        // arrives. We can't call `send(text:)` here (no real coordinator), but
+        // the same clearing runs through `handleRelayTurnStarted` (the frame the
+        // coordinator delivers at the new-turn boundary); verify the contract
+        // directly by re-applying a fresh task list after the clear.
         let chat = bareChat()
         chat.applyRelayItems([ChatItem(
             itemID: "sOld:tasks", type: .taskList, status: .completed, ord: 2,
             body: ["tasks": [["id": "1", "text": "Old", "status": "completed"]], "all_complete": true]
         )])
-        chat.handleRelayTurnCompleted()
-        XCTAssertNil(chat.latestTodoList, "previous turn's terminal list cleared")
+        chat.handleRelayTurnStarted()  // new turn boundary clears the mirror
+        XCTAssertNil(chat.latestTodoList, "previous turn's list cleared at the new-turn edge")
 
         // A new turn emits its own task list → dock re-seeds from the new data.
         chat.applyRelayItems([ChatItem(
