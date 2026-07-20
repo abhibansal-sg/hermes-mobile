@@ -567,6 +567,16 @@ class DownstreamServer:
             # RELAY SOCKET writes the registry the relay Notifier actually
             # reads — one transport, one registry, no shared-home coincidence.
             push = self._push_engine()
+            # The registry's parent may not exist yet in a fresh service env
+            # (the gateway side relies on ~/.hermes already being there);
+            # push_engine swallows persist errors, so create it here or the
+            # register would "succeed" in memory and lose the token on restart.
+            try:
+                from pathlib import Path
+
+                Path(push._registry_path()).parent.mkdir(parents=True, exist_ok=True)
+            except OSError:  # pragma: no cover - best-effort dir hygiene
+                _log.debug("push.register: registry dir create failed", exc_info=True)
             events = p.get("events")
             ok = push.register_token(
                 str(p.get("token") or ""),
