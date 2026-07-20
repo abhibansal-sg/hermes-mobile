@@ -54,8 +54,15 @@ final class QA1ResumeLaneTests: XCTestCase {
         func send(_ message: URLSessionWebSocketTask.Message) async throws {
             guard case let .string(text) = message,
                   let upstream = Self.parse(text) else { return }
-            lock.lock(); sent.append(upstream); lock.unlock()
+            recordUpstream(upstream)
             script?(upstream, self)
+        }
+
+        /// NSLock is unavailable from async contexts (Swift 6 strict) — the
+        /// `send(_:)` above is async, so hop the critical section through a
+        /// synchronous helper.
+        private func recordUpstream(_ upstream: Upstream) {
+            lock.lock(); sent.append(upstream); lock.unlock()
         }
 
         func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
