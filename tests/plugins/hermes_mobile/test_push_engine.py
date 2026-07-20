@@ -914,16 +914,20 @@ def test_notify_live_activity_prunes_on_410(monkeypatch, isolated_home):
 
 
 @requires_crypto
-def test_notify_live_activity_does_not_prune_on_bad_device_token(
+def test_notify_live_activity_prunes_on_bad_device_token(
     monkeypatch, isolated_home
 ):
+    """QA-2 R1 contract change (supersedes the QA-1 410-only rule): a Live
+    Activity token APNs rejects with 400 BadDeviceToken is dead forever and is
+    pruned — re-sending it on every progress tick was the same re-hammer loop
+    as the alert path (relay.log: same dead tokens on every notify window)."""
     _arm_push(monkeypatch, isolated_home)
     pn.register_live_activity_token("sess-1", _VALID_TOKEN)
     fake = _FakeConn(status_code=400, text='{"reason":"BadDeviceToken"}')
     import httpx
     monkeypatch.setattr(httpx, "Client", lambda **kw: fake)
     assert pn.notify_live_activity("sess-1", {"phase": "x"}) is False
-    assert pn.live_activity_token_for("sess-1") == (_VALID_TOKEN, "production")
+    assert pn.live_activity_token_for("sess-1") is None
 
 
 # ===========================================================================
@@ -1376,3 +1380,265 @@ def test_time_sensitive_notify_keeps_zero_apns_expiration(monkeypatch, isolated_
         category="HERMES_APPROVAL",
     ) == 1
     assert fake.calls[0]["headers"]["apns-expiration"] == "0"
+
+
+# ---------------------------------------------------------------------------
+# QA-2 R1 — per-env APNs routing, dead-token eviction (400 BadDeviceToken +
+# 410 Unregistered), and one-token-per-device dedup.
+#
+# Root cause on main 1fcffe3d5: eviction was 410-ONLY (400 BadDeviceToken was
+# logged and re-hammered forever — relay.log showed the same three dead tokens
+# on every notify window), and dedup was token-string-only (iOS sent no
+# device_id, so every re-sign/reinstall appended → 5 entries per phone).
+# The env routing itself already existed (QA-1 B14) — those tests PIN it.
+# ---------------------------------------------------------------------------
+
+def test_apns_reason_parses_reason_json():
+    """Pure parser: APNs error bodies are {"reason": "..."}; anything else → None."""
+    assert pn._apns_reason('{"reason":"BadDeviceToken"}') == "BadDeviceToken"
+    assert pn._apns_reason('{"reason":"Unregistered"}') == "Unregistered"
+    assert pn._apns_reason("") is None
+    assert pn._apns_reason("<html>nope</html>") is None
+    assert pn._apns_reason('["array"]') is None
+    assert pn._apns_reason('{"reason":""}') is None
+    assert pn._apns_reason('{"other":"x"}') is None
+
+
+def test_is_dead_token_eviction_matrix():
+    """The eviction decision: 410 always; 400 ONLY for BadDeviceToken/Unregistered.
+
+    TopicDisallowed/BadPath/MissingTopic are server CONFIG errors — the token
+    is fine and must be KEPT; 429/5xx are transient.
+    """
+    # Dead — evict.
+    assert pn._is_dead_token(410, None) is True
+    assert pn._is_dead_token(410, "Unregistered") is True
+    assert pn._is_dead_token(400, "BadDeviceToken") is True
+    assert pn._is_dead_token(400, "Unregistered") is True
+    # Alive — keep.
+    assert pn._is_dead_token(400, "TopicDisallowed") is False
+    assert pn._is_dead_token(400, "BadPath") is False
+    assert pn._is_dead_token(400, "MissingTopic") is False
+    assert pn._is_dead_token(400, None) is False  # unparseable body: keep
+    assert pn._is_dead_token(403, "TopicDisallowed") is False
+    assert pn._is_dead_token(405, "MethodNotAllowed") is False
+    assert pn._is_dead_token(429, "TooManyRequests") is False
+    assert pn._is_dead_token(500, "InternalServerError") is False
+
+
+class _PerTokenFakeConn:
+    """httpx.Client stand-in scripted per device-token path (QA-2 R1)."""
+
+    def __init__(self, responses):
+        self._responses = responses  # {"/3/device/<token>": (status, text)}
+        self.posts = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def post(self, path, content=None, headers=None):
+        self.posts.append(path)
+        status, text = self._responses.get(path, (200, ""))
+        return _FakeResp(status, text)
+
+
+@requires_crypto
+def test_notify_evicts_400_bad_device_token_and_410_keeps_config_errors(
+    monkeypatch, isolated_home
+):
+    """QA-2 R1 killer regression: a 400 BadDeviceToken evicts exactly like 410;
+    a 400 TopicDisallowed (server misconfig, token fine) must NOT evict."""
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    monkeypatch.delenv("HERMES_APNS_USE_SANDBOX", raising=False)
+    _arm_push(monkeypatch, isolated_home)
+
+    dead_410 = "d1" * 32
+    dead_bad = "d2" * 32
+    misconfigured = "d3" * 32
+    healthy = "d4" * 32
+    for tok in (dead_410, dead_bad, misconfigured, healthy):
+        assert pn.register_token(tok, env="production")
+
+    conn = _PerTokenFakeConn({
+        f"/3/device/{dead_410}": (410, '{"reason":"Unregistered"}'),
+        f"/3/device/{dead_bad}": (400, '{"reason":"BadDeviceToken"}'),
+        f"/3/device/{misconfigured}": (400, '{"reason":"TopicDisallowed"}'),
+        f"/3/device/{healthy}": (200, ""),
+    })
+    import httpx
+    monkeypatch.setattr(httpx, "Client", lambda **kw: conn)
+
+    accepted = pn.notify("turn_complete", "Hermes finished", "Your turn finished", {})
+    assert accepted == 1
+
+    remaining = pn.registered_tokens()
+    assert dead_410 not in remaining       # 410 Unregistered → evicted (pre-existing)
+    assert dead_bad not in remaining       # QA-2 R1: 400 BadDeviceToken → evicted
+    assert misconfigured in remaining      # config error: token fine → KEPT
+    assert healthy in remaining
+
+
+@requires_crypto
+def test_notify_bad_device_token_eviction_is_logged(monkeypatch, isolated_home, caplog):
+    """A1 evidence contract: every eviction lands in the log with token tail + reason."""
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    _arm_push(monkeypatch, isolated_home)
+    dead = "ab" * 32
+    pn.register_token(dead, env="sandbox")
+
+    conn = _PerTokenFakeConn({f"/3/device/{dead}": (400, '{"reason":"BadDeviceToken"}')})
+    import httpx
+    monkeypatch.setattr(httpx, "Client", lambda **kw: conn)
+
+    with caplog.at_level(logging.INFO, logger=pn._log.name):
+        assert pn.notify("turn_complete", "Hermes finished", "done", {}) == 0
+    eviction_logs = [
+        r.getMessage() for r in caplog.records
+        if "evicting dead token" in r.getMessage()
+    ]
+    assert eviction_logs, f"no eviction logged; records: {[r.getMessage() for r in caplog.records]}"
+    assert any("BadDeviceToken" in msg and dead[-6:] in msg for msg in eviction_logs)
+    assert pn.registered_tokens() == []
+
+
+@requires_crypto
+def test_notify_routes_sandbox_and_production_tokens_to_distinct_hosts(
+    monkeypatch, isolated_home
+):
+    """PIN (pre-existing QA-1 B14 behavior): one notify() sends each token to
+    its OWN env's APNs host — sandbox and production entries in one registry."""
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    monkeypatch.delenv("HERMES_APNS_USE_SANDBOX", raising=False)
+    _arm_push(monkeypatch, isolated_home)
+
+    sandbox_token = "ab" * 32
+    prod_token = "cd" * 32
+    pn.register_token(sandbox_token, env="sandbox")
+    pn.register_token(prod_token, env="production")
+
+    conns = {}
+
+    def fake_client(**kwargs):
+        base = kwargs.get("base_url")
+        if base not in conns:
+            conns[base] = _PerTokenFakeConn({})
+        return conns[base]
+
+    import httpx
+    monkeypatch.setattr(httpx, "Client", fake_client)
+
+    assert pn.notify("turn_complete", "Hermes finished", "done", {}) == 2
+
+    sandbox_url = f"https://{pn._APNS_HOST_SANDBOX}:{pn._APNS_PORT}"
+    prod_url = f"https://{pn._APNS_HOST_PROD}:{pn._APNS_PORT}"
+    assert set(conns) == {sandbox_url, prod_url}
+    assert conns[sandbox_url].posts == [f"/3/device/{sandbox_token}"]
+    assert conns[prod_url].posts == [f"/3/device/{prod_token}"]
+
+
+# -- device-id dedup: ONE token per device (QA-2 R1c) -----------------------
+
+def test_register_device_id_replaces_rotated_token(isolated_home):
+    """Same device_id + a NEW token REPLACES the old entry (APNs token rotation
+    on reinstall/re-sign) instead of appending — the registry converges to one
+    row per device."""
+    first = "aa" * 32
+    second = "bb" * 32
+    assert pn.register_token(first, env="sandbox", device_id="device-ONE") is True
+    assert pn.register_token(second, env="production", device_id="device-ONE") is True
+
+    entries = pn.registry_entries()
+    assert len(entries) == 1, f"expected 1 entry per device, got {entries}"
+    assert entries[0]["token"] == second
+    assert entries[0]["env"] == "production"     # refreshed, not stale
+    assert entries[0]["device_id"] == "device-ONE"
+    assert pn.registered_tokens() == [second]
+
+
+def test_register_same_token_with_device_id_collapses_legacy_duplicates(isolated_home):
+    """Re-registering an EXISTING token with a device_id collapses any stale
+    duplicate rows for that device (pre-dedup accumulation → the phone's 5
+    entries converge on its next register)."""
+    token = "cc" * 32
+    stale = "dd" * 32
+    registry = isolated_home / "push_tokens.json"
+    registry.write_text(json.dumps([
+        {"token": token, "platform": "ios", "env": "production", "device_id": "dev-X",
+         "registered_at": 1.0},
+        {"token": stale, "platform": "ios", "env": "production", "device_id": "dev-X",
+         "registered_at": 2.0},
+    ]))
+
+    assert pn.register_token(token, env="sandbox", device_id="dev-X") is True
+    entries = pn.registry_entries()
+    assert len(entries) == 1
+    assert entries[0]["token"] == token
+    assert entries[0]["env"] == "sandbox"         # env refreshed on re-register
+    assert entries[0]["device_id"] == "dev-X"
+
+
+def test_register_distinct_devices_with_ids_keep_separate_entries(isolated_home):
+    """Different device_ids never collapse into each other (two phones stay two
+    entries)."""
+    assert pn.register_token("aa" * 32, device_id="phone-1") is True
+    assert pn.register_token("bb" * 32, device_id="phone-2") is True
+    entries = pn.registry_entries()
+    assert {e["device_id"] for e in entries} == {"phone-1", "phone-2"}
+    assert len(entries) == 2
+
+
+def test_register_without_device_id_keeps_legacy_token_only_dedup(isolated_home):
+    """Legacy clients (no device_id) keep the token-string-only semantics:
+    distinct tokens APPEND (no identity to dedup on)."""
+    assert pn.register_token("aa" * 32) is True
+    assert pn.register_token("bb" * 32) is True
+    assert len(pn.registered_tokens()) == 2
+
+
+@requires_crypto
+def test_live_activity_evicts_400_bad_device_token(monkeypatch, isolated_home):
+    """QA-2 R1: the Live Activity send path prunes on 400 BadDeviceToken too
+    (was 410-only) — a dead activity token re-sent every progress tick was the
+    same re-hammer loop."""
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    _arm_push(monkeypatch, isolated_home)
+    token = "11" * 32
+    assert pn.register_live_activity_token("sess-dead", token, env="sandbox")
+
+    conn = _PerTokenFakeConn({f"/3/device/{token}": (400, '{"reason":"BadDeviceToken"}')})
+    import httpx
+    monkeypatch.setattr(httpx, "Client", lambda **kw: conn)
+
+    ok = pn.notify_live_activity(
+        "sess-dead",
+        {"phase": "tool", "toolName": "edit_file", "elapsedSeconds": 3,
+         "needsApproval": False},
+    )
+    assert ok is False
+    assert pn.live_activity_token_for("sess-dead") is None  # pruned
+
+
+@requires_crypto
+def test_manifest_invalidation_evicts_400_bad_device_token(monkeypatch, isolated_home):
+    """QA-2 R1: the manifest-invalidation silent-push path prunes dead tokens
+    with the same rule (was 410-only)."""
+    monkeypatch.delenv("HERMES_MOBILE_RELAY_URL", raising=False)
+    _arm_push(monkeypatch, isolated_home)
+    dead = "22" * 32
+    alive = "33" * 32
+    pn.register_token(dead, env="sandbox")
+    pn.register_token(alive, env="sandbox")
+
+    conn = _PerTokenFakeConn({
+        f"/3/device/{dead}": (400, '{"reason":"BadDeviceToken"}'),
+        f"/3/device/{alive}": (200, ""),
+    })
+    import httpx
+    monkeypatch.setattr(httpx, "Client", lambda **kw: conn)
+
+    accepted = pn._notify_direct_manifest_invalidation("all", 7, "test")
+    assert accepted == 1
+    assert pn.registered_tokens() == [alive]

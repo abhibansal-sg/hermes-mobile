@@ -1260,6 +1260,10 @@ class PushRegisterBody(BaseModel):
     # Per-event opt-in subset of ["approval","clarify","turn_complete"].
     # None/absent → all events (legacy entries keep working).
     events: Optional[List[str]] = None
+    # Stable per-install device identity (QA-2 R1c): lets the registry keep
+    # ONE token per device (a re-register with a rotated token replaces the
+    # device's old entry). Absent → legacy token-string-only dedup.
+    device_id: Optional[str] = None
 
 
 class NotifyBody(BaseModel):
@@ -1550,9 +1554,13 @@ async def register_push_token(body: PushRegisterBody, request: Request) -> Dict[
     if not _has_dashboard_api_auth(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
     engine = _plugin_module("push_engine")
+    # QA-2 R1c: the client's own stable device id wins (it survives re-pair
+    # and is the identity iOS sends over the relay socket too); the
+    # request-state device identity is the legacy fallback.
+    device_id = (body.device_id or "").strip() or _request_device_id(request)
     if not engine.register_token(
         body.token, platform=body.platform, env=body.env, events=body.events,
-        device_id=_request_device_id(request),
+        device_id=device_id,
     ):
         raise HTTPException(status_code=400, detail="Invalid device token")
     try:

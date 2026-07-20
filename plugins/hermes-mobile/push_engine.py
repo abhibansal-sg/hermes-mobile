@@ -594,6 +594,15 @@ def register_token(
     :data:`PUSH_EVENT_KINDS`); ``None`` means "all events" (legacy default).
     On re-register the stored prefs are replaced with the new value so the app
     can change its Notification toggles by re-POSTing.
+
+    ``device_id`` (QA-2 R1c) is the client's STABLE per-install identity.
+    Dedup is two-tier: an exact token match refreshes in place; otherwise,
+    when a ``device_id`` is supplied and an existing entry carries that same
+    id, that entry's token is REPLACED (APNs rotates tokens on
+    reinstall/restore/re-sign — the device keeps exactly ONE entry). A same
+    ``device_id`` refresh also collapses any stale duplicate entries stamped
+    with that id (pre-dedup legacy rows). Entries without a ``device_id``
+    (legacy clients) keep token-string-only semantics.
     """
     normalized = _normalize_token(token)
     if normalized is None:
@@ -603,19 +612,30 @@ def register_token(
     with _registry_lock:
         entries = _load_registry()
         now = time.time()
+        matched: Optional[Dict[str, Any]] = None
         for entry in entries:
             if _normalize_token(entry.get("token", "")) == normalized:
-                entry["platform"] = platform
-                entry["env"] = environment
-                entry["registered_at"] = now
-                if normalized_events is None:
-                    entry.pop("events", None)
-                else:
-                    entry["events"] = normalized_events
-                if device_id:
-                    entry["device_id"] = device_id
-                _save_registry(entries)
-                return True
+                matched = entry
+                break
+        if matched is not None:
+            matched["platform"] = platform
+            matched["env"] = environment
+            matched["registered_at"] = now
+            if normalized_events is None:
+                matched.pop("events", None)
+            else:
+                matched["events"] = normalized_events
+            if device_id:
+                matched["device_id"] = device_id
+                # One token per device: this token now owns the device, so
+                # drop any OTHER entries stamped with the same device_id
+                # (stale duplicates accumulated before device-id dedup).
+                entries = [
+                    e for e in entries
+                    if e is matched or e.get("device_id") != device_id
+                ]
+            _save_registry(entries)
+            return True
         new_entry: Dict[str, Any] = {
             "token": normalized, "platform": platform, "env": environment,
             "registered_at": now,
@@ -624,6 +644,19 @@ def register_token(
             new_entry["events"] = normalized_events
         if device_id:
             new_entry["device_id"] = device_id
+            # Same device, NEW (rotated) token — replace the device's old
+            # entry so the registry converges to one row per device instead
+            # of appending forever (QA-2 R1c: 5 accumulating entries).
+            for idx, entry in enumerate(entries):
+                if entry.get("device_id") == device_id:
+                    entries[idx] = new_entry
+                    _save_registry(entries)
+                    _log.info(
+                        "push registry: device …%s rotated its token — "
+                        "replaced the old entry (one token per device)",
+                        device_id[-6:],
+                    )
+                    return True
         entries.append(new_entry)
         _save_registry(entries)
     return True
@@ -705,7 +738,16 @@ def recipients_for_event(event_kind: str) -> Dict[str, List[str]]:
 
 
 def _drop_tokens(tokens: List[str]) -> None:
-    """Prune the given tokens from the registry (called on 410 Unregistered)."""
+    """Prune the given tokens from the registry.
+
+    Called when APNs declares a token permanently dead: HTTP ``410`` (any
+    reason, canonically ``Unregistered``) OR HTTP ``400`` with reason
+    ``BadDeviceToken`` (QA-2 R1: a token APNs will never accept again — most
+    commonly an env mismatch, e.g. a sandbox token posted to the production
+    host, or a rotated/reinstalled token). Other 4xx reasons
+    (``TopicDisallowed``/``BadPath``/``MissingTopic``…) are SERVER-side config
+    problems — the token itself is fine, so they must NOT evict.
+    """
     drop = {t for t in (_normalize_token(t) for t in tokens) if t}
     if not drop:
         return
@@ -717,6 +759,46 @@ def _drop_tokens(tokens: List[str]) -> None:
         ]
         if len(kept) != len(entries):
             _save_registry(kept)
+
+
+# APNs rejection reasons that mean "this exact token will NEVER deliver"
+# (vs. request/config errors where the token is fine and retrying later —
+# or fixing the server config — would succeed). ``BadDeviceToken`` arrives
+# as HTTP 400 and is the signature of an env-mismatched or rotated token;
+# ``Unregistered`` canonically arrives as HTTP 410 but is matched by reason
+# too so a status-code drift can't keep a dead token alive forever.
+_EVICTABLE_APNS_REASONS = frozenset({"BadDeviceToken", "Unregistered"})
+
+
+def _apns_reason(response_text: str) -> Optional[str]:
+    """Parse the APNs error body ``{"reason": "..."}``; ``None`` when absent.
+
+    APNs answers non-200s with a small JSON document naming the reason. Never
+    raises: an unparseable/non-dict/missing-reason body yields ``None`` and the
+    caller falls back to status-code-only handling.
+    """
+    try:
+        parsed = json.loads(response_text)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(parsed, dict):
+        reason = parsed.get("reason")
+        if isinstance(reason, str) and reason:
+            return reason
+    return None
+
+
+def _is_dead_token(status: int, reason: Optional[str]) -> bool:
+    """True when APNs declared the token permanently undeliverable (QA-2 R1).
+
+    410 regardless of reason (canonical ``Unregistered``), or a 400 whose
+    parsed reason is in :data:`_EVICTABLE_APNS_REASONS`. Every other non-200
+    keeps the token: TopicDisallowed/BadPath/MissingTopic are config errors,
+    429/5xx are transient.
+    """
+    if status == 410:
+        return True
+    return reason in _EVICTABLE_APNS_REASONS
 
 
 # ---------------------------------------------------------------------------
@@ -887,7 +969,7 @@ def live_activity_device_for(session_id: str) -> Optional[str]:
 
 
 def _drop_la_token(session_id: str) -> None:
-    """Prune a session's LA token (called on 410 Unregistered)."""
+    """Prune a session's LA token (called on 410 Unregistered / 400 BadDeviceToken)."""
     with _la_registry_lock:
         entries = _load_la_registry()
         if entries.pop(session_id, None) is not None:
@@ -1054,8 +1136,19 @@ def _notify_direct_apns(
                         continue
                     if status == 200:
                         accepted += 1
-                    elif status == 410:
+                        continue
+                    # QA-2 R1: evict permanently-dead tokens — 410 Unregistered
+                    # AND 400 BadDeviceToken (env-mismatched / rotated tokens
+                    # that previously re-hammered forever). Other non-200s are
+                    # logged and KEPT (transient/config errors).
+                    reason = _apns_reason(text)
+                    if _is_dead_token(status, reason):
                         stale.append(device_token)
+                        _log.info(
+                            "push notify: evicting dead token …%s (APNs %s%s)",
+                            device_token[-6:], status,
+                            f" {reason}" if reason else "",
+                        )
                     else:
                         _log.info("push notify: APNs %s for token …%s: %s",
                                   status, device_token[-6:], text[:200])
@@ -1064,7 +1157,8 @@ def _notify_direct_apns(
 
     if stale:
         _drop_tokens(stale)
-        _log.info("push notify: pruned %d unregistered token(s)", len(stale))
+        _log.info("push notify: pruned %d dead token(s) (410/400 BadDeviceToken)",
+                  len(stale))
 
     return accepted
 
@@ -1100,12 +1194,20 @@ def _notify_direct_manifest_invalidation(
             ) as conn:
                 for token in tokens:
                     try:
-                        status, _text = _send_one(
+                        status, text = _send_one(
                             conn, device_token=token, headers=headers, body=encoded
                         )
                         accepted += status == 200
-                        if status == 410:
+                        # QA-2 R1: same eviction rule as the alert path —
+                        # 410 Unregistered AND 400 BadDeviceToken.
+                        reason = _apns_reason(text)
+                        if _is_dead_token(status, reason):
                             stale.append(token)
+                            _log.info(
+                                "manifest invalidation: evicting dead token …%s (APNs %s%s)",
+                                token[-6:], status,
+                                f" {reason}" if reason else "",
+                            )
                     except Exception:
                         _log.warning(
                             "manifest invalidation failed for one token", exc_info=True
@@ -1154,10 +1256,11 @@ def notify(
     """Send an alert push to every registered device token.
 
     Silent no-op (returns 0) unless push is enabled AND the APNs key file
-    exists. Tokens that APNs rejects with ``410 Unregistered`` are pruned from
-    the registry. Returns the count of pushes accepted (HTTP 200). In relay
-    mode, returns 1 only when background relay delivery was kicked off; relay
-    delivery failures are surfaced via relay warnings/failure counters.
+    exists. Tokens APNs declares permanently dead — ``410 Unregistered`` or
+    ``400 BadDeviceToken`` — are pruned from the registry (QA-2 R1). Returns
+    the count of pushes accepted (HTTP 200). In relay mode, returns 1 only
+    when background relay delivery was kicked off; relay delivery failures
+    are surfaced via relay warnings/failure counters.
 
     ``event_type`` is also used as the per-event preference key (one of
     :data:`PUSH_EVENT_KINDS` — ``approval``/``clarify``/``turn_complete``):
@@ -1229,8 +1332,9 @@ def notify_live_activity(
 
     Targets the activity's push token registered for this session. Silent
     no-op (returns False) unless push is armed AND a token is registered. The
-    token is pruned only on APNs ``410 Unregistered``, matching alert-token
-    pruning semantics. Returns True iff APNs accepted the push (HTTP 200). In
+    token is pruned on APNs ``410 Unregistered`` or ``400 BadDeviceToken``,
+    matching alert-token pruning semantics (QA-2 R1). Returns True iff APNs
+    accepted the push (HTTP 200). In
     relay mode, returns True only when background relay delivery was kicked off;
     relay delivery failures are surfaced via relay warnings/failure counters.
 
@@ -1306,9 +1410,13 @@ def notify_live_activity(
 
     if status == 200:
         return True
-    if status == 410:
+    # QA-2 R1: evict on 410 Unregistered AND 400 BadDeviceToken — a dead
+    # activity token re-sent every progress tick is the same re-hammer bug.
+    reason = _apns_reason(text)
+    if _is_dead_token(status, reason):
         _drop_la_token(session_id)
-        _log.info("live activity: pruned dead token for session %s", session_id)
+        _log.info("live activity: pruned dead token for session %s (APNs %s%s)",
+                  session_id, status, f" {reason}" if reason else "")
         return False
     _log.info("live activity: APNs %s for session %s: %s",
               status, session_id, text[:200])
