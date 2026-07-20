@@ -26,7 +26,7 @@ mkdir -p "$EVIDENCE_ROOT"
 if [ ! -x "$PYTHON" ]; then
   echo "run_gate.sh: e2e venv python not found at $PYTHON" >&2
   echo "  create it with: /opt/homebrew/bin/python3.13 -m venv /Volumes/MainData/Developer/hermes-tmp/e2e-venv" >&2
-  echo "  then: $PYTHON -m pip install websockets httpx pyyaml pytest pytest-asyncio psutil" >&2
+  echo "  then: $PYTHON -m pip install websockets 'httpx[http2]' pyyaml pytest pytest-asyncio psutil 'pyjwt[crypto]'  # pyjwt+cryptography+h2: scenario (h) armed-APNs path" >&2
   exit 2
 fi
 
