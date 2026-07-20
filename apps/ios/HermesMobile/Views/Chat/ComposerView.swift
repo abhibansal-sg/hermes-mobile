@@ -182,13 +182,16 @@ struct ComposerView: View {
         UIImagePickerController.isSourceTypeAvailable(.camera)
     }
 
-    /// Whether the gateway supports `POST /api/upload`. The attach ("+") flow —
-    /// photo / camera / scan — all funnel through upload, so when the server is
-    /// known NOT to support it (stock gateway, E1) the whole menu has nothing to
-    /// offer and the "+" button is hidden. `.unknown`/`.available` keep it shown
-    /// (optimistic until a probe proves otherwise).
+    /// Whether the attach ("+") menu is offered. Direct mode: whether the
+    /// gateway supports `POST /api/upload` — when the server is known NOT to
+    /// support it (stock gateway, E1) the whole menu has nothing to offer and
+    /// the "+" button is hidden; `.unknown`/`.available` keep it shown
+    /// (optimistic until a probe proves otherwise). Relay mode: ALWAYS shown
+    /// (B9) — the attach flows ride the relay `attach` RPC, never the probed
+    /// gateway-REST upload route, so the probe verdict must not hide the menu
+    /// (see ``ConnectionStore/attachMenuAvailable``).
     private var uploadSupported: Bool {
-        connection.capabilities.upload != .unavailable
+        connection.attachMenuAvailable
     }
 
     /// Whether the gateway supports the F4A file endpoints (`GET /api/fs/list` /

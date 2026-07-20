@@ -71,10 +71,23 @@ def _enum_block(source: str, name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _swift_upstream_raw_values() -> dict[str, str]:
+    """``RelayUpstreamMethod`` case name -> WIRE raw value, declaration order.
+
+    Cases without an explicit raw value use their case name as the wire name
+    (every pre-§6a method); ``push.register``/``push.unregister`` (§6a) carry
+    explicit dotted raw values distinct from their case names.
+    """
+    block = _enum_block(_read(_RELAY_PROTOCOL), "RelayUpstreamMethod")
+    out: dict[str, str] = {}
+    for m in re.finditer(r'^\s*case\s+(\w+)(?:\s*=\s*"([^"]+)")?', block, flags=re.M):
+        out[m.group(1)] = m.group(2) or m.group(1)
+    return out
+
+
 def swift_upstream_methods() -> list[str]:
     """The ``RelayUpstreamMethod`` raw values (every upstream RPC the phone can send)."""
-    block = _enum_block(_read(_RELAY_PROTOCOL), "RelayUpstreamMethod")
-    return re.findall(r"^\s*case\s+(\w+)", block, flags=re.M)
+    return list(_swift_upstream_raw_values().values())
 
 
 def _func_blocks(source: str) -> list[tuple[str, str]]:
@@ -100,12 +113,16 @@ def swift_upstream_sends() -> dict[str, dict[str, list[str]]]:
     — ``params["k"] =`` assignments, which in this client are all if-guarded).
     """
     source = _read(_RELAY_CLIENT)
+    wire_names = _swift_upstream_raw_values()
     sends: dict[str, dict[str, set[str]]] = {}
     for _func_name, body in _func_blocks(source):
         call = _METHOD_CALL.search(body)
         if not call:
             continue  # a convenience wrapper that never builds a wire payload
-        method = call.group(1)
+        # ``request(.pushRegister, ...)`` captures the CASE name; key by the
+        # WIRE name so the map lines up with the relay's UpstreamMethod.ALL and
+        # the fixture (identical for every pre-§6a method).
+        method = wire_names.get(call.group(1), call.group(1))
         required = {
             k
             for k in _KEY_IN_DICT.findall(body)

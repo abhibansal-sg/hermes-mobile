@@ -20,6 +20,9 @@ import SwiftUI
 /// scroll and a streaming flush only pays for the genuinely-new tail text.
 /// A fourth cache covers the ABH-360 GFM block pass (tables/task lists/
 /// blockquotes/lists) before paragraph text falls through to inline markdown.
+/// A fifth (QA-1 B11) caches the prose-flow flatten — the merge of a contiguous
+/// prose run into its single selectable `UITextView` container payload — so
+/// scroll re-realization never re-bridges markdown runs to `NSAttributedString`.
 ///
 /// **Invalidation by construction.** Every cache is keyed on the *input value*
 /// (the exact text / code+language+colour). Identical input always maps to
@@ -116,6 +119,37 @@ enum RenderCache {
         #endif
         let value = MessageBubble.markdownBlocks(text)
         store(text, value, in: &markdownBlockCache, order: &markdownBlockOrder, limit: markdownBlockLimit)
+        return value
+    }
+
+    // MARK: - Prose flow pieces (QA-1 B11 single selectable container)
+
+    private static var proseFlowCache: [String: [ProseFlowBuilder.Piece]] = [:]
+    private static var proseFlowOrder: [String] = []
+    private static let proseFlowLimit = 256
+
+    /// Memoized `ProseFlowBuilder.pieces` — the flatten of one contiguous prose
+    /// run into its selectable container payload + card islands (QA-1 B11).
+    /// The flattener bakes the resolved theme style (fonts + colours) into the
+    /// attributed payloads, so the key carries the style fingerprint + link
+    /// colour description alongside the body — a theme switch re-flattens once
+    /// rather than serving a stale tint. Keeps the round-2 contract: a
+    /// flick-scroll re-realization of an unchanged row is an O(1) dictionary
+    /// lookup, never an O(n) re-bridge of the whole prose run; a streaming
+    /// flush pays only for the genuinely-new tail text (new key).
+    static func proseFlowPieces(body: String, style: ProseFlowStyle, linkColor: Color) -> [ProseFlowBuilder.Piece] {
+        let key = "\(style.cacheKey)\u{1F}\(linkColor.description)\u{1F}\(body)"
+        if let hit = proseFlowCache[key] {
+            #if DEBUG
+            hits += 1
+            #endif
+            return hit
+        }
+        #if DEBUG
+        misses += 1
+        #endif
+        let value = ProseFlowBuilder.pieces(body: body, style: style, linkColor: linkColor)
+        store(key, value, in: &proseFlowCache, order: &proseFlowOrder, limit: proseFlowLimit)
         return value
     }
 
@@ -403,6 +437,7 @@ enum RenderCache {
         segmentCache.removeAll(); segmentOrder.removeAll()
         proseCache.removeAll(); proseOrder.removeAll()
         markdownBlockCache.removeAll(); markdownBlockOrder.removeAll()
+        proseFlowCache.removeAll(); proseFlowOrder.removeAll()
         highlightCache.removeAll(); highlightOrder.removeAll()
         resetStreaming()
         streamingTailParseChars = 0

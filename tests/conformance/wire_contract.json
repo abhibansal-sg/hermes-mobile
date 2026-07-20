@@ -3,83 +3,206 @@
   "version": 1,
   "upstream": {
     "envelope": {
-      "request": ["jsonrpc", "id", "method", "params"],
-      "notification": ["jsonrpc", "method", "params"]
+      "request": [
+        "jsonrpc",
+        "id",
+        "method",
+        "params"
+      ],
+      "notification": [
+        "jsonrpc",
+        "method",
+        "params"
+      ]
     },
-    "notifications": ["ack", "resync", "foreground"],
+    "notifications": [
+      "ack",
+      "resync",
+      "foreground"
+    ],
     "payloads": {
       "submit": {
         "kind": "request",
         "ios_sends": {
-          "required": ["prompt"],
-          "optional": ["session_id", "client_message_id"]
+          "required": [
+            "prompt"
+          ],
+          "optional": [
+            "session_id",
+            "client_message_id"
+          ]
         },
         "relay_reads": {
           "required": [],
-          "optional": ["prompt", "text", "session_id", "client_message_id", "title", "model", "provider"]
+          "optional": [
+            "prompt",
+            "text",
+            "session_id",
+            "client_message_id",
+            "title",
+            "model",
+            "provider"
+          ]
         },
-        "aliases": [["prompt", "text"]],
+        "aliases": [
+          [
+            "prompt",
+            "text"
+          ]
+        ],
         "example": {
           "prompt": "Hello from the phone",
           "session_id": "sess-1",
           "client_message_id": "cmid-1"
         },
         "expect_gateway": [
-          {"rpc": "session.resume", "params_include": {"session_id": "sess-1"}},
-          {"rpc": "prompt.submit", "params": {"session_id": "sess-1", "text": "Hello from the phone"}}
+          {
+            "rpc": "session.resume",
+            "params_include": {
+              "session_id": "sess-1"
+            }
+          },
+          {
+            "rpc": "prompt.submit",
+            "params": {
+              "session_id": "sess-1",
+              "text": "Hello from the phone"
+            }
+          }
         ]
       },
       "resume": {
         "kind": "request",
-        "ios_sends": {"required": ["session_id"], "optional": []},
-        "relay_reads": {"required": ["session_id"], "optional": []},
+        "ios_sends": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
         "aliases": [],
-        "example": {"session_id": "sess-1"},
+        "example": {
+          "session_id": "sess-1"
+        },
         "expect_gateway": [
-          {"rpc": "session.resume", "params_include": {"session_id": "sess-1"}}
+          {
+            "rpc": "session.resume",
+            "params_include": {
+              "session_id": "sess-1"
+            }
+          }
         ]
       },
       "open": {
         "kind": "request",
-        "ios_sends": {"required": ["session_id"], "optional": []},
-        "relay_reads": {"required": ["session_id"], "optional": []},
+        "ios_sends": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
         "aliases": [],
-        "example": {"session_id": "sess-1"},
+        "example": {
+          "session_id": "sess-1"
+        },
         "expect_gateway": [
-          {"rpc": "rest_history", "params_include": {"session_id": "sess-1"}}
+          {
+            "rpc": "rest_history",
+            "params_include": {
+              "session_id": "sess-1"
+            }
+          }
         ]
       },
       "list": {
         "kind": "request",
-        "ios_sends": {"required": [], "optional": []},
-        "relay_reads": {"required": [], "optional": ["limit"]},
+        "ios_sends": {
+          "required": [],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "limit"
+          ]
+        },
         "aliases": [],
         "example": {},
         "expect_gateway": [
-          {"rpc": "session.list", "params_include": {}}
+          {
+            "rpc": "session.list",
+            "params_include": {}
+          }
         ]
       },
       "history": {
         "kind": "request",
-        "ios_sends": {"required": ["session_id"], "optional": ["limit"]},
-        "relay_reads": {"required": ["session_id"], "optional": ["limit"]},
+        "ios_sends": {
+          "required": [
+            "session_id"
+          ],
+          "optional": [
+            "limit"
+          ]
+        },
+        "relay_reads": {
+          "required": [
+            "session_id"
+          ],
+          "optional": [
+            "limit"
+          ]
+        },
         "aliases": [],
-        "example": {"session_id": "sess-1", "limit": 50},
+        "example": {
+          "session_id": "sess-1",
+          "limit": 50
+        },
         "expect_gateway": [
-          {"rpc": "rest_history", "params_include": {"session_id": "sess-1"}}
+          {
+            "rpc": "rest_history",
+            "params_include": {
+              "session_id": "sess-1"
+            }
+          }
         ],
-        "expect_result": {"messages_tail": 50}
+        "expect_result": {
+          "messages_tail": 50
+        }
       },
       "approve": {
         "kind": "request",
-        "$comment": "Protocol §5: the phone sends session_id + decision (once/session/always/deny/approve); the relay maps decision -> the gateway's `choice` param. Sending `approved`/omitting session_id here is the silent-DENY bug class — the relay reads p[\"session_id\"] and p[\"decision\"].",
+        "$comment": "Protocol \u00a75: the phone sends session_id + decision (once/session/always/deny/approve); the relay maps decision -> the gateway's `choice` param. Sending `approved`/omitting session_id here is the silent-DENY bug class \u2014 the relay reads p[\"session_id\"] and p[\"decision\"].",
         "ios_sends": {
-          "required": ["session_id", "decision"],
-          "optional": ["request_id", "all"]
+          "required": [
+            "session_id",
+            "decision"
+          ],
+          "optional": [
+            "request_id",
+            "all"
+          ]
         },
         "relay_reads": {
-          "required": ["session_id", "decision"],
-          "optional": ["request_id", "all"]
+          "required": [
+            "session_id",
+            "decision"
+          ],
+          "optional": [
+            "request_id",
+            "all"
+          ]
         },
         "aliases": [],
         "example": {
@@ -99,16 +222,61 @@
           }
         ]
       },
-      "clarify": {
+      "attach": {
         "kind": "request",
-        "$comment": "Protocol §5: the phone sends session_id + text; the relay maps text -> the gateway's `answer` param (the gateway stores params[\"answer\"], matched by request_id). Sending `response`/omitting text is the EMPTY-ANSWER bug class.",
+        "$comment": "Protocol §5 (B9/A5): REST-free attach — the phone inlines the bytes as a data: URL; the relay routes by `kind` onto the gateway's base64 RPCs (file.attach / image.attach_bytes), resolves the session like SUBMIT (absent -> session.create; foreign -> session.resume adopting the live id) and merges session_id into the result. Relay-only phones cannot make the POST /api/upload REST round-trip — that gap hid the composer '+' (B9).",
         "ios_sends": {
-          "required": ["session_id", "text"],
-          "optional": ["request_id"]
+          "required": ["data_url", "kind"],
+          "optional": ["name", "session_id"]
         },
         "relay_reads": {
-          "required": ["session_id", "text"],
-          "optional": ["request_id"]
+          "required": [],
+          "optional": ["data_url", "kind", "name", "session_id", "title"]
+        },
+        "aliases": [],
+        "example": {
+          "session_id": "sess-1",
+          "kind": "file",
+          "name": "notes.txt",
+          "data_url": "data:text/plain;base64,aGVybWVz"
+        },
+        "expect_gateway": [
+          {
+            "rpc": "session.resume",
+            "params": {
+              "session_id": "sess-1"
+            }
+          },
+          {
+            "rpc": "file.attach",
+            "params": {
+              "session_id": "sess-1",
+              "name": "notes.txt",
+              "data_url": "data:text/plain;base64,aGVybWVz"
+            }
+          }
+        ]
+      },
+      "clarify": {
+        "kind": "request",
+        "$comment": "Protocol \u00a75: the phone sends session_id + text; the relay maps text -> the gateway's `answer` param (the gateway stores params[\"answer\"], matched by request_id). Sending `response`/omitting text is the EMPTY-ANSWER bug class.",
+        "ios_sends": {
+          "required": [
+            "session_id",
+            "text"
+          ],
+          "optional": [
+            "request_id"
+          ]
+        },
+        "relay_reads": {
+          "required": [
+            "session_id",
+            "text"
+          ],
+          "optional": [
+            "request_id"
+          ]
         },
         "aliases": [],
         "example": {
@@ -129,44 +297,164 @@
       },
       "interrupt": {
         "kind": "request",
-        "ios_sends": {"required": ["session_id"], "optional": []},
-        "relay_reads": {"required": ["session_id"], "optional": []},
+        "ios_sends": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
         "aliases": [],
-        "example": {"session_id": "sess-1"},
+        "example": {
+          "session_id": "sess-1"
+        },
         "expect_gateway": [
-          {"rpc": "session.interrupt", "params_include": {"session_id": "sess-1"}}
+          {
+            "rpc": "session.interrupt",
+            "params_include": {
+              "session_id": "sess-1"
+            }
+          }
         ]
       },
       "ack": {
         "kind": "notification",
-        "ios_sends": {"required": ["through"], "optional": []},
-        "relay_reads": {"required": [], "optional": ["through"]},
+        "ios_sends": {
+          "required": [
+            "through"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "through"
+          ]
+        },
         "aliases": [],
-        "example": {"through": 7},
+        "example": {
+          "through": 7
+        },
         "expect_gateway": []
       },
       "resync": {
         "kind": "notification",
-        "ios_sends": {"required": ["last_seq"], "optional": []},
-        "relay_reads": {"required": [], "optional": ["last_seq"]},
+        "ios_sends": {
+          "required": [
+            "last_seq"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "last_seq"
+          ]
+        },
         "aliases": [],
-        "example": {"last_seq": 0},
+        "example": {
+          "last_seq": 0
+        },
         "expect_gateway": []
       },
       "foreground": {
         "kind": "notification",
-        "$comment": "session_id is REQUIRED as a key but its VALUE is nullable (null clears the foreground set, §6).",
-        "ios_sends": {"required": ["session_id"], "optional": [], "nullable": ["session_id"]},
-        "relay_reads": {"required": [], "optional": ["session_id"]},
+        "$comment": "session_id is REQUIRED as a key but its VALUE is nullable (null clears the foreground set, \u00a76).",
+        "ios_sends": {
+          "required": [
+            "session_id"
+          ],
+          "optional": [],
+          "nullable": [
+            "session_id"
+          ]
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "session_id"
+          ]
+        },
         "aliases": [],
-        "example": {"session_id": "sess-1"},
+        "example": {
+          "session_id": "sess-1"
+        },
         "expect_gateway": []
+      },
+      "push.register": {
+        "$comment": "Relay-local (protocol \u00a76a, QA-1 B14): writes the relay's OWN push registry \u2014 the one the Notifier reads. Never hops the gateway; works while the gateway is NOT ready (phone reconnects first).",
+        "kind": "request",
+        "aliases": [],
+        "example": {
+          "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "platform": "ios",
+          "env": "production",
+          "events": [
+            "approval",
+            "turn_complete"
+          ]
+        },
+        "expect_gateway": [],
+        "ios_sends": {
+          "required": [
+            "env",
+            "platform",
+            "token"
+          ],
+          "optional": [
+            "events"
+          ]
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "device_id",
+            "env",
+            "events",
+            "platform",
+            "token"
+          ]
+        }
+      },
+      "push.unregister": {
+        "$comment": "Relay-local (protocol \u00a76a, QA-1 B14): removes the token from the relay's push registry (Settings opt-out). Never hops the gateway.",
+        "kind": "request",
+        "aliases": [],
+        "example": {
+          "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "expect_gateway": [],
+        "ios_sends": {
+          "required": [
+            "token"
+          ],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "token"
+          ]
+        }
       }
     }
   },
   "downstream": {
-    "envelope": ["seq", "sid", "turn", "kind", "body"],
-    "envelope_optional": ["turn"],
+    "envelope": [
+      "seq",
+      "sid",
+      "turn",
+      "kind",
+      "body"
+    ],
+    "envelope_optional": [
+      "turn"
+    ],
     "kinds": [
       "item.started",
       "item.delta",
@@ -180,12 +468,24 @@
       "snapshot"
     ],
     "item_shape": {
-      "required": ["item_id", "type"],
-      "optional": ["status", "ord", "summary", "body"]
+      "required": [
+        "item_id",
+        "type"
+      ],
+      "optional": [
+        "status",
+        "ord",
+        "summary",
+        "body"
+      ]
     },
-    "item_statuses": ["in_progress", "completed", "failed"],
+    "item_statuses": [
+      "in_progress",
+      "completed",
+      "failed"
+    ],
     "item_types": {
-      "$comment": "relay_all = relay ItemType.ALL (the types the reframer can emit). ios_native = ChatItemType raw values (decoded natively). generic_fold = relay types iOS intentionally folds to the generic toolCall card (§2 forward-compat rule). When a fold entry gains a native iOS case (e.g. N4 taskList), move it to ios_native and drop it here — the suite fails until the fixture matches the sources either way.",
+      "$comment": "relay_all = relay ItemType.ALL (the types the reframer can emit). ios_native = ChatItemType raw values (decoded natively). generic_fold = relay types iOS intentionally folds to the generic toolCall card (\u00a72 forward-compat rule). When a fold entry gains a native iOS case (e.g. N4 taskList), move it to ios_native and drop it here \u2014 the suite fails until the fixture matches the sources either way.",
       "relay_all": [
         "userMessage",
         "agentMessage",
@@ -213,28 +513,93 @@
       "generic_fold": []
     },
     "body_contract": {
-      "item.started": {"item_frame": true},
-      "item.completed": {"item_frame": true},
-      "item.delta": {"required": ["item_id"], "optional": ["patch"], "closed": true},
-      "turn.started": {"required": [], "optional": [], "closed": true},
-      "turn.completed": {"required": [], "optional": ["usage"], "closed": true},
+      "item.started": {
+        "item_frame": true
+      },
+      "item.completed": {
+        "item_frame": true
+      },
+      "item.delta": {
+        "required": [
+          "item_id"
+        ],
+        "optional": [
+          "patch"
+        ],
+        "closed": true
+      },
+      "turn.started": {
+        "required": [],
+        "optional": [],
+        "closed": true
+      },
+      "turn.completed": {
+        "required": [],
+        "optional": [
+          "usage"
+        ],
+        "closed": true
+      },
       "approval.request": {
         "passthrough": true,
-        "guaranteed": ["command", "description"],
+        "guaranteed": [
+          "command",
+          "description"
+        ],
         "reply_rpc": "approve",
         "reply_identity": "envelope.sid",
-        "ios_reads": ["approval_id", "id", "request_id", "command", "pattern_key", "description", "action", "target", "title", "approval_title"]
+        "ios_reads": [
+          "approval_id",
+          "id",
+          "request_id",
+          "command",
+          "pattern_key",
+          "description",
+          "action",
+          "target",
+          "title",
+          "approval_title"
+        ]
       },
       "clarify.request": {
         "passthrough": true,
-        "guaranteed": ["request_id", "question", "choices"],
+        "guaranteed": [
+          "request_id",
+          "question",
+          "choices"
+        ],
         "reply_rpc": "clarify",
         "reply_identity": "body.request_id",
-        "ios_reads": ["question", "choices", "request_id"]
+        "ios_reads": [
+          "question",
+          "choices",
+          "request_id"
+        ]
       },
-      "status": {"required": ["kind", "text"], "optional": [], "closed": true},
-      "title": {"required": ["title"], "optional": [], "closed": true},
-      "snapshot": {"required": ["items"], "optional": ["cursor"], "closed": true}
+      "status": {
+        "required": [
+          "kind",
+          "text"
+        ],
+        "optional": [],
+        "closed": true
+      },
+      "title": {
+        "required": [
+          "title"
+        ],
+        "optional": [],
+        "closed": true
+      },
+      "snapshot": {
+        "required": [
+          "items"
+        ],
+        "optional": [
+          "cursor"
+        ],
+        "closed": true
+      }
     },
     "samples": [
       {
@@ -250,7 +615,9 @@
             "status": "in_progress",
             "ord": 0,
             "summary": "",
-            "body": {"text": ""}
+            "body": {
+              "text": ""
+            }
           }
         }
       },
@@ -261,7 +628,12 @@
           "sid": "sess-1",
           "turn": "sess-1:t1",
           "kind": "item.delta",
-          "body": {"item_id": "sess-1:i1", "patch": {"text": "Hello"}}
+          "body": {
+            "item_id": "sess-1:i1",
+            "patch": {
+              "text": "Hello"
+            }
+          }
         }
       },
       {
@@ -277,13 +649,15 @@
             "status": "completed",
             "ord": 0,
             "summary": "Hello there",
-            "body": {"text": "Hello there"}
+            "body": {
+              "text": "Hello there"
+            }
           }
         }
       },
       {
         "name": "item.completed.taskList.native",
-        "$comment": "taskList is emitted by the relay and decoded natively since N4 (ChatItemType.taskList → TaskListItemView/dock bridge). generic_fold is now empty; the §2 forward-compat rule (unknown type → toolCall card) still holds for future relay types. XCTest asserts the fold matches item_types.generic_fold.",
+        "$comment": "taskList is emitted by the relay and decoded natively since N4 (ChatItemType.taskList \u2192 TaskListItemView/dock bridge). generic_fold is now empty; the \u00a72 forward-compat rule (unknown type \u2192 toolCall card) still holds for future relay types. XCTest asserts the fold matches item_types.generic_fold.",
         "frame": {
           "seq": 4,
           "sid": "sess-1",
@@ -297,10 +671,24 @@
             "summary": "Tasks 2/2",
             "body": {
               "tasks": [
-                {"id": "t1", "text": "First", "status": "completed"},
-                {"id": "t2", "text": "Second", "status": "completed"}
+                {
+                  "id": "t1",
+                  "text": "First",
+                  "status": "completed"
+                },
+                {
+                  "id": "t2",
+                  "text": "Second",
+                  "status": "completed"
+                }
               ],
-              "counts": {"total": 2, "pending": 0, "in_progress": 0, "completed": 2, "cancelled": 0},
+              "counts": {
+                "total": 2,
+                "pending": 0,
+                "in_progress": 0,
+                "completed": 2,
+                "cancelled": 0
+              },
               "all_complete": true
             }
           }
@@ -319,13 +707,23 @@
             "status": "completed",
             "ord": 2,
             "summary": "15 tokens",
-            "body": {"input": 10, "output": 5, "total": 15}
+            "body": {
+              "input": 10,
+              "output": 5,
+              "total": 15
+            }
           }
         }
       },
       {
         "name": "turn.started",
-        "frame": {"seq": 6, "sid": "sess-1", "turn": "sess-1:t1", "kind": "turn.started", "body": {}}
+        "frame": {
+          "seq": 6,
+          "sid": "sess-1",
+          "turn": "sess-1:t1",
+          "kind": "turn.started",
+          "body": {}
+        }
       },
       {
         "name": "turn.completed.usage",
@@ -334,7 +732,13 @@
           "sid": "sess-1",
           "turn": "sess-1:t1",
           "kind": "turn.completed",
-          "body": {"usage": {"input": 10, "output": 5, "total": 15}}
+          "body": {
+            "usage": {
+              "input": 10,
+              "output": 5,
+              "total": 15
+            }
+          }
         }
       },
       {
@@ -347,7 +751,9 @@
           "body": {
             "command": "git push origin main",
             "description": "Push the release branch",
-            "pattern_keys": ["git_push"]
+            "pattern_keys": [
+              "git_push"
+            ]
           }
         }
       },
@@ -360,7 +766,10 @@
           "kind": "clarify.request",
           "body": {
             "question": "Which environment?",
-            "choices": ["staging", "production"],
+            "choices": [
+              "staging",
+              "production"
+            ],
             "request_id": "clr-1",
             "created_at": 1750000000.0,
             "expires_at": 1750000300.0,
@@ -376,12 +785,23 @@
           "sid": "sess-1",
           "turn": "sess-1:t1",
           "kind": "status",
-          "body": {"kind": "thinking", "text": "Formulating…"}
+          "body": {
+            "kind": "thinking",
+            "text": "Formulating\u2026"
+          }
         }
       },
       {
         "name": "title",
-        "frame": {"seq": 11, "sid": "sess-1", "turn": null, "kind": "title", "body": {"title": "Release planning"}}
+        "frame": {
+          "seq": 11,
+          "sid": "sess-1",
+          "turn": null,
+          "kind": "title",
+          "body": {
+            "title": "Release planning"
+          }
+        }
       },
       {
         "name": "snapshot",
@@ -398,7 +818,9 @@
                 "status": "completed",
                 "ord": 0,
                 "summary": "Hello there",
-                "body": {"text": "Hello there"}
+                "body": {
+                  "text": "Hello there"
+                }
               }
             ],
             "cursor": 12
@@ -413,7 +835,10 @@
           "sid": "",
           "turn": null,
           "kind": "status",
-          "body": {"kind": "heartbeat", "text": ""}
+          "body": {
+            "kind": "heartbeat",
+            "text": ""
+          }
         }
       }
     ]
@@ -422,36 +847,149 @@
     "$comment": "The relay -> gateway edge (gateway_client.py senders vs tui_gateway/server.py readers). Ground truth is the in-repo gateway source. This edge is where decision/choice and text/answer mismatches silently broke approvals and clarify answers.",
     "rpcs": {
       "prompt.submit": {
-        "relay_sends": {"required": ["session_id", "text"], "optional": []},
-        "gateway_reads": {"required": [], "optional": ["session_id", "text", "truncate_before_user_ordinal"]}
+        "relay_sends": {
+          "required": [
+            "session_id",
+            "text"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "session_id",
+            "text",
+            "truncate_before_user_ordinal"
+          ]
+        }
       },
       "approval.respond": {
-        "$comment": "The gateway defaults choice to DENY when absent — a relay that sends `decision` instead of `choice` silently denies every approval. request_id is a declared forward-compat extra: the gateway resolves approvals by SESSION key and ignores it (gateway_client.py keeps it for logging); it must never be an effective key.",
-        "relay_sends": {"required": ["session_id", "request_id", "choice", "all"], "optional": []},
-        "gateway_reads": {"required": [], "optional": ["session_id", "choice", "all"], "defaults": {"choice": "deny", "all": false}},
-        "accepted_unread": ["request_id"]
+        "$comment": "The gateway defaults choice to DENY when absent \u2014 a relay that sends `decision` instead of `choice` silently denies every approval. request_id is a declared forward-compat extra: the gateway resolves approvals by SESSION key and ignores it (gateway_client.py keeps it for logging); it must never be an effective key.",
+        "relay_sends": {
+          "required": [
+            "session_id",
+            "request_id",
+            "choice",
+            "all"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "session_id",
+            "choice",
+            "all"
+          ],
+          "defaults": {
+            "choice": "deny",
+            "all": false
+          }
+        },
+        "accepted_unread": [
+          "request_id"
+        ]
       },
       "clarify.respond": {
-        "$comment": "The gateway matches the pending waiter by request_id and stores params[\"answer\"] — a relay that sends `text` delivers an EMPTY answer. session_id is a declared symmetry extra: the gateway resolves clarify by request_id only.",
-        "relay_sends": {"required": ["session_id", "request_id", "answer"], "optional": []},
-        "gateway_reads": {"required": [], "optional": ["request_id", "answer"]},
-        "accepted_unread": ["session_id"]
+        "$comment": "The gateway matches the pending waiter by request_id and stores params[\"answer\"] \u2014 a relay that sends `text` delivers an EMPTY answer. session_id is a declared symmetry extra: the gateway resolves clarify by request_id only.",
+        "relay_sends": {
+          "required": [
+            "session_id",
+            "request_id",
+            "answer"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "request_id",
+            "answer"
+          ]
+        },
+        "accepted_unread": [
+          "session_id"
+        ]
       },
       "session.list": {
-        "relay_sends": {"required": ["limit"], "optional": []},
-        "gateway_reads": {"required": [], "optional": ["limit"]}
+        "relay_sends": {
+          "required": [
+            "limit"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "limit"
+          ]
+        }
       },
       "session.create": {
-        "relay_sends": {"required": ["title", "cols", "source"], "optional": ["model", "provider"]},
-        "gateway_reads": {"required": [], "optional": ["close_on_disconnect", "cols", "cwd", "fast", "messages", "model", "parent_session_id", "profile", "provider", "reasoning_effort", "source", "title"]}
+        "relay_sends": {
+          "required": [
+            "title",
+            "cols",
+            "source"
+          ],
+          "optional": [
+            "model",
+            "provider"
+          ]
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "close_on_disconnect",
+            "cols",
+            "cwd",
+            "fast",
+            "messages",
+            "model",
+            "parent_session_id",
+            "profile",
+            "provider",
+            "reasoning_effort",
+            "source",
+            "title"
+          ]
+        }
       },
       "session.resume": {
-        "relay_sends": {"required": ["session_id", "cols", "source"], "optional": []},
-        "gateway_reads": {"required": [], "optional": ["close_on_disconnect", "cols", "eager_build", "lazy", "profile", "session_id", "source"]}
+        "relay_sends": {
+          "required": [
+            "session_id",
+            "cols",
+            "source"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "close_on_disconnect",
+            "cols",
+            "eager_build",
+            "lazy",
+            "profile",
+            "session_id",
+            "source"
+          ]
+        }
       },
       "session.interrupt": {
-        "relay_sends": {"required": ["session_id"], "optional": []},
-        "gateway_reads": {"required": [], "optional": ["session_id"]}
+        "relay_sends": {
+          "required": [
+            "session_id"
+          ],
+          "optional": []
+        },
+        "gateway_reads": {
+          "required": [],
+          "optional": [
+            "session_id"
+          ]
+        }
       }
     }
   }

@@ -243,7 +243,7 @@ async def test_dropped_then_replayed_reconciles_gap_free():
 # ---------------------------------------------------------------------------
 
 
-def _server():
+def _server(push_engine=None):
     gw = MagicMock()
     gw.session_list = AsyncMock(return_value=[{"id": "s1"}, {"id": "s2"}])
     gw.session_create = AsyncMock(return_value="sNew")
@@ -260,7 +260,9 @@ def _server():
     # foreign-submit tests override session_resume/live_id_for to model a distinct
     # live id.
     gw.live_id_for = MagicMock(side_effect=lambda s: s)
-    srv = DownstreamServer(DownstreamConfig(), EventBus(), gw, SessionStore())
+    srv = DownstreamServer(
+        DownstreamConfig(), EventBus(), gw, SessionStore(), push_engine=push_engine
+    )
     return srv, gw
 
 
@@ -854,3 +856,228 @@ async def test_disabling_health_does_not_disable_websocket_auth():
     await srv._process_request(c, _FakeRequest("/ws"))
     from http import HTTPStatus
     assert c.responded[0] == HTTPStatus.UNAUTHORIZED
+
+
+# ---------------------------------------------------------------------------
+# SUBMIT synthesizes the completed ``userMessage`` item (QA-1 B5/B13)
+# ---------------------------------------------------------------------------
+# The relay reframer maps ONLY agent events; nothing ever emitted a userMessage
+# item (FrameKind USER_MESSAGE existed with zero emitters), so the phone had no
+# wire item to reconcile its optimistic user echo against and cold-resume
+# snapshots omitted the prompt entirely. SUBMIT now synthesizes a completed
+# ``userMessage`` item: folded into the SessionStore (snapshots carry the
+# prompt) and published like any reframer frame (the phone reconciles the echo
+# onto it by item id). The item id is DETERMINISTIC per client_message_id so an
+# ambiguous-flap retry (same cmid on a fresh connection) replaces the item
+# instead of emitting a duplicate; without a cmid the id is per-submit-unique
+# so two sends of identical text stay two distinct items.
+
+
+def _submit_env():
+    """A DownstreamServer with a captured bus subscription + store handle."""
+    bus = EventBus()
+    store = SessionStore()
+    gw = MagicMock()
+    gw.session_create = AsyncMock(return_value="sNew")
+    gw.session_resume = AsyncMock(return_value={"ok": True})
+    gw.prompt_submit = AsyncMock(return_value={"turn": "t1"})
+    gw.owns = MagicMock(return_value=False)
+    gw.live_id_for = MagicMock(side_effect=lambda s: s)
+    gw.wait_ready = AsyncMock(return_value=True)
+    srv = DownstreamServer(DownstreamConfig(), bus, gw, store)
+    sub = bus.subscribe(TOPIC_RELAY_FRAMES)
+    return srv, gw, store, sub
+
+
+def _drained(sub):
+    """Non-blocking drain of a subscription's pending frames."""
+    out = []
+    while not sub._q.empty():
+        out.append(sub._q.get_nowait())
+    return out
+
+
+async def test_submit_synthesizes_completed_user_message_item():
+    srv, gw, store, sub = _submit_env()
+    await srv.start()
+    res = await _handle(
+        srv, UpstreamMethod.SUBMIT,
+        {"prompt": "hello", "session_id": "s5", "client_message_id": "cmid-1"},
+    )
+    frames = _drained(sub)
+    user_frames = [f for f in frames if f.body.get("type") == ItemType.USER_MESSAGE]
+    assert len(user_frames) == 1, "SUBMIT must emit exactly one userMessage item (B5/B13)"
+    frame = user_frames[0]
+    assert frame.kind == FrameKind.ITEM_COMPLETED      # the prompt is complete on arrival
+    assert frame.sid == res["session_id"] == "s5"
+    assert frame.body["body"]["text"] == "hello"
+    assert frame.body["body"]["client_message_id"] == "cmid-1"
+    assert frame.body["status"] == ItemStatus.COMPLETED
+    # Folded into the accumulator: cold-resume snapshots carry the prompt.
+    snap = store.snapshot("s5")
+    assert [it["type"] for it in snap["items"]] == [ItemType.USER_MESSAGE]
+    assert snap["items"][0]["body"]["text"] == "hello"
+    gw.prompt_submit.assert_awaited_once_with("s5", "hello")
+
+
+async def test_submit_user_message_ord_precedes_the_turn_items():
+    """The user item allocates its ord at SUBMIT, so the reframer's agent items
+    for the turn sort AFTER it (user bubble above the reply)."""
+    srv, gw, store, sub = _submit_env()
+    await srv.start()
+    await _handle(srv, UpstreamMethod.SUBMIT, {"prompt": "hi", "session_id": "s5"})
+    state = store.get("s5")
+    user_ord = next(
+        it.ord for it in state.ordered_items() if it.type == ItemType.USER_MESSAGE
+    )
+    later_ord = state.allocate_ord()
+    assert later_ord > user_ord
+
+
+async def test_submit_user_message_idempotent_across_cmid_retry():
+    """A flap-ambiguous retry (same client_message_id, fresh connection) hits
+    the dedup path: no second turn, no second item, same item id + ord — the
+    userMessage is re-published (heals the fresh phone connection) but folds
+    onto the same id."""
+    srv, gw, store, sub = _submit_env()
+    await srv.start()
+    params = {"prompt": "hi", "session_id": "s5", "client_message_id": "cmid-9"}
+    await _handle(srv, UpstreamMethod.SUBMIT, params)
+    state = store.get("s5")
+    first_items = [(it.item_id, it.ord) for it in state.ordered_items()]
+
+    _drained(sub)  # drop the first submit's frames; count the retry's
+    res2 = await _handle(srv, UpstreamMethod.SUBMIT, params)
+    assert res2.get("deduplicated") is True
+    assert [(it.item_id, it.ord) for it in state.ordered_items()] == first_items, \
+        "retry keeps ONE item on the same id/ord"
+    gw.prompt_submit.assert_awaited_once()
+    retry_frames = _drained(sub)
+    retry_users = [f for f in retry_frames if f.body.get("type") == ItemType.USER_MESSAGE]
+    assert len(retry_users) == 1, "retry re-publishes the user item (heal), exactly once"
+    assert retry_users[0].body["item_id"] == first_items[0][0]
+
+
+async def test_submit_user_message_distinct_ids_without_cmid():
+    """Without a client_message_id the id must be per-submit unique: two sends
+    of identical text are two distinct items, never collapsed."""
+    srv, gw, store, sub = _submit_env()
+    await srv.start()
+    await _handle(srv, UpstreamMethod.SUBMIT, {"prompt": "same text", "session_id": "s5"})
+    await _handle(srv, UpstreamMethod.SUBMIT, {"prompt": "same text", "session_id": "s5"})
+    users = [
+        it for it in store.get("s5").ordered_items() if it.type == ItemType.USER_MESSAGE
+    ]
+    assert len(users) == 2
+    assert users[0].item_id != users[1].item_id
+    assert gw.prompt_submit.await_count == 2
+
+
+async def test_submit_user_message_new_chat_rides_created_session():
+    """Brand-new chat (no session_id): the userMessage item rides on the
+    CREATED session id the SUBMIT result returns (B13 snapshot fidelity)."""
+    srv, gw, store, sub = _submit_env()
+    await srv.start()
+    res = await _handle(srv, UpstreamMethod.SUBMIT, {"prompt": "hello", "title": "T"})
+    frames = _drained(sub)
+    users = [f for f in frames if f.body.get("type") == ItemType.USER_MESSAGE]
+    assert len(users) == 1
+    assert users[0].sid == res["session_id"] == "sNew"
+    assert store.snapshot("sNew")["items"][0]["body"]["text"] == "hello"
+
+
+# ---------------------------------------------------------------------------
+# QA-1 B14 — push.register / push.unregister (protocol §6a)
+#
+# The relay's Notifier reads the relay process's OWN push registry; in relay
+# mode the phone must register its APNs token OVER THE RELAY SOCKET (gateway-
+# direct REST is unreachable off-LAN and writes a registry the relay never
+# reads). These tests pin the relay-local RPCs against the REAL reused
+# push_engine registry (isolated HERMES_HOME). On qa1/base the methods do not
+# exist -> every test here fails (unknown upstream method / AttributeError).
+# ---------------------------------------------------------------------------
+
+# A 64-hex-char APNs-shaped device token (push_engine normalizes+validates).
+_DEVICE_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+
+@pytest.fixture
+def relay_push_engine(tmp_path, monkeypatch):
+    """The REAL reused push_engine with its registry isolated under tmp."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    push = plugin_bridge.import_push_engine()
+    # Defensive: a stale registry from another test must not leak in.
+    for entry in push.registry_entries():
+        push.unregister_token(entry["token"])
+    return push
+
+
+async def test_push_register_writes_relay_token_registry(relay_push_engine):
+    """push.register lands the token (env+events) in the registry the Notifier
+    reads — the QA-1 B14 'token reaches the notifier' requirement."""
+    srv, _ = _server(push_engine=relay_push_engine)
+    await srv.start()
+    result = await _handle(
+        srv,
+        UpstreamMethod.PUSH_REGISTER,
+        {
+            "token": _DEVICE_TOKEN,
+            "platform": "ios",
+            "env": "production",
+            "events": ["approval", "clarify", "turn_complete"],
+        },
+    )
+    assert result == {"registered": True}
+    entries = relay_push_engine.registry_entries()
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["token"] == _DEVICE_TOKEN
+    assert entry["env"] == "production"
+    assert entry["platform"] == "ios"
+    assert entry["events"] == ["approval", "clarify", "turn_complete"]
+    # The Notifier's recipient lookup sees the token for its event kinds.
+    recipients = relay_push_engine.recipients_for_event("turn_complete")
+    assert _DEVICE_TOKEN in recipients.get("production", [])
+    # An event the phone did NOT opt into is filtered out.
+    assert _DEVICE_TOKEN not in relay_push_engine.recipients_for_event(
+        "turn_error"
+    ).get("production", [])
+
+
+async def test_push_register_invalid_token_raises_jsonrpc_error(relay_push_engine):
+    """A malformed token is rejected with an error (surfaced to the phone as a
+    JSON-RPC -32000), never silently dropped."""
+    srv, _ = _server(push_engine=relay_push_engine)
+    await srv.start()
+    with pytest.raises(ValueError, match="invalid device token"):
+        await _handle(srv, UpstreamMethod.PUSH_REGISTER, {"token": "not-hex!"})
+    assert relay_push_engine.registry_entries() == []
+
+
+async def test_push_unregister_removes_token(relay_push_engine):
+    srv, _ = _server(push_engine=relay_push_engine)
+    await srv.start()
+    await _handle(srv, UpstreamMethod.PUSH_REGISTER, {"token": _DEVICE_TOKEN})
+    assert len(relay_push_engine.registry_entries()) == 1
+    result = await _handle(
+        srv, UpstreamMethod.PUSH_UNREGISTER, {"token": _DEVICE_TOKEN}
+    )
+    assert result == {"unregistered": True}
+    assert relay_push_engine.registry_entries() == []
+    # Unregistering an unknown token reports False, no error.
+    result = await _handle(
+        srv, UpstreamMethod.PUSH_UNREGISTER, {"token": _DEVICE_TOKEN}
+    )
+    assert result == {"unregistered": False}
+
+
+async def test_push_register_is_relay_local_not_gateway_gated(relay_push_engine):
+    """Like ack/resync/foreground, push.register must work while the gateway is
+    NOT ready (relay just restarted, phone reconnects first): a phone coming
+    online must be able to (re-)register its token before the gateway is up."""
+    srv, gw = _server(push_engine=relay_push_engine)
+    gw.wait_ready = AsyncMock(return_value=False)
+    await srv.start()
+    result = await _handle(srv, UpstreamMethod.PUSH_REGISTER, {"token": _DEVICE_TOKEN})
+    assert result == {"registered": True}
+    gw.wait_ready.assert_not_awaited()

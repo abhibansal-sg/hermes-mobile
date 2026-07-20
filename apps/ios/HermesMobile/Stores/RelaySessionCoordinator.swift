@@ -132,6 +132,84 @@ final class RelaySessionCoordinator {
     private var pumpTask: Task<Void, Never>?
     private var stateTask: Task<Void, Never>?
 
+    // MARK: Transport-ready waiters (QA-1 B1/B2)
+
+    /// Continuations suspended in ``waitUntilOpen(timeout:)``, resolved when the
+    /// socket crosses INTO `.open` (true) or their bounded timeout fires (false).
+    /// Session ops queue on transport readiness through these instead of racing
+    /// the phase bridge and failing fast with `notConnected`.
+    private var openWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var openWaiterTimeouts: [UUID: Task<Void, Never>] = [:]
+
+    #if DEBUG
+    /// Test-only count of readiness edges (each crossing INTO `.open` the state
+    /// observer applies — see ``applyState``). A render/conformance harness that
+    /// sends the instant `start()` returns can race the observer's buffered
+    /// `.connecting → .open` replay, whose transient `.connecting` blip flips
+    /// `isOpen` false; awaiting `readinessEdgeCount` growth deterministically
+    /// parks the harness until that replay has settled instead of wall-clock
+    /// sleeping (QA-1 A9 gate determinism). Zero release-build footprint.
+    private(set) var readinessEdgeCount = 0
+    #endif
+
+    /// Suspend until the relay socket reports `.open`, or `timeout` elapses.
+    /// Returns `true` when open. Callers (session resume/open, the transcript
+    /// network seed) use this to QUEUE on the relay phase bridge instead of
+    /// racing it: a cold-start resume that lands mid-connect waits the fraction
+    /// of a second until the socket is up rather than throwing `notConnected`
+    /// into a modal alert channel (QA-1 B1 north-star: retryable conditions
+    /// self-heal silently). Bounded so a genuinely dead relay surfaces as a
+    /// `false` return the caller turns into a silent retry-on-ready, never a
+    /// hang.
+    @discardableResult
+    func waitUntilOpen(timeout: Duration = .seconds(10)) async -> Bool {
+        if phase == .open { return true }
+        let id = UUID()
+        return await withCheckedContinuation { continuation in
+            openWaiters[id] = continuation
+            openWaiterTimeouts[id] = Task { [weak self] in
+                try? await Task.sleep(for: timeout)
+                guard !Task.isCancelled else { return }
+                self?.resolveOpenWaiter(id: id, opened: false)
+            }
+        }
+    }
+
+    private func resolveOpenWaiter(id: UUID, opened: Bool) {
+        openWaiterTimeouts.removeValue(forKey: id)?.cancel()
+        guard let continuation = openWaiters.removeValue(forKey: id) else { return }
+        continuation.resume(returning: opened)
+    }
+
+    /// Resolve every pending ``waitUntilOpen(timeout:)`` with `opened`. Called on
+    /// the crossing into `.open` (true) and on teardown (false).
+    private func resolveAllOpenWaiters(opened: Bool) {
+        let waiters = openWaiters
+        openWaiters.removeAll()
+        for (_, timeout) in openWaiterTimeouts { timeout.cancel() }
+        openWaiterTimeouts.removeAll()
+        for (_, continuation) in waiters { continuation.resume(returning: opened) }
+    }
+
+    /// Adopt `sessionID` as the session to (re-)open the moment the socket is
+    /// ready, WITHOUT issuing the RPC now (QA-1 B1). A cold-start resume /
+    /// session open that arrives before the relay phase bridge is up queues
+    /// here; the crossing INTO `.open` then re-establishes the session (the
+    /// existing `applyState` re-open) — silent queue-and-drain instead of a
+    /// retryable alert. Already open ⇒ fire the re-establishment now (covers
+    /// the race where the phase crossed between the caller's check and adopt).
+    func adoptPendingSession(_ sessionID: String) {
+        guard activeStoredSessionID != sessionID else { return }
+        activeStoredSessionID = sessionID
+        activeSessionID = sessionID
+        if phase == .open, let client {
+            Task {
+                await client.setForeground(sessionID)
+                _ = try? await client.open(sessionID)
+            }
+        }
+    }
+
     // MARK: Reconnect driver state (§4)
 
     /// The URL/token the live session was started with, retained so the auto
@@ -186,7 +264,15 @@ final class RelaySessionCoordinator {
     /// `RelayError` only if the optional `open` RPC fails; the socket itself opens
     /// eagerly (the ratified contract has no `ready` handshake — §1).
     func start(url: URL, token: String? = nil, sessionID: String? = nil) async throws {
-        await stop()
+        // QA-1 B1: a `start()` is a (re)dial, NOT a teardown — preserve any
+        // session ops queued on ``waitUntilOpen`` across the pre-connect cleanup
+        // so they DRAIN (resolve `true`) the moment this socket opens, instead
+        // of being failed (`false`) by the cleanup and silently abandoned. The
+        // prior `stop()` here resolved every queued waiter `false`, so a resume /
+        // open that landed while the socket was mid-connect gave up before the
+        // dial it was waiting on completed — the queue-and-drain path behind the
+        // cold-start "Resume Session Failed" alert never bound.
+        await tearDown(preservingOpenWaiters: true)
 
         let client = clientFactory()
         self.client = client
@@ -198,6 +284,9 @@ final class RelaySessionCoordinator {
 
         await client.connect(url: url, token: token)
         phase = .open
+        // `start` stamps `.open` directly (the state observer replays the edge
+        // later, but a resume queued on readiness must not wait for the replay).
+        resolveAllOpenWaiters(opened: true)
 
         // Observe connection-state transitions so a drop/failure surfaces.
         stateTask = Task { [weak self] in
@@ -239,11 +328,24 @@ final class RelaySessionCoordinator {
         phase = .connecting
         await client.reconnect(url: url, token: token)
         phase = .open
+        resolveAllOpenWaiters(opened: true)
     }
 
     /// Tear down the socket, cancel the pump/state observers + reconnect driver,
-    /// and clear the render store. Idempotent.
+    /// and clear the render store. Idempotent. A genuine teardown can never bring
+    /// the socket up, so it FAILS every queued ``waitUntilOpen`` waiter (`false`)
+    /// — callers take their silent-retry-on-ready path instead of suspending
+    /// until their bounded timeout.
     func stop() async {
+        await tearDown(preservingOpenWaiters: false)
+    }
+
+    /// Shared cleanup for ``stop()`` (a real teardown) and ``start()`` (a
+    /// (re)dial). They differ ONLY in the queued transport-readiness waiters: a
+    /// teardown fails them (`preservingOpenWaiters: false`), while a dial keeps
+    /// them parked so they drain when the fresh socket opens
+    /// (`preservingOpenWaiters: true`) — the QA-1 B1 queue-and-drain contract.
+    private func tearDown(preservingOpenWaiters: Bool) async {
         reconnectTask?.cancel(); reconnectTask = nil
         reconnectURL = nil; reconnectToken = nil; reconnectAttempt = 0
         pumpTask?.cancel(); pumpTask = nil
@@ -254,6 +356,9 @@ final class RelaySessionCoordinator {
         activeSessionID = nil
         activeStoredSessionID = nil
         phase = .idle
+        if !preservingOpenWaiters {
+            resolveAllOpenWaiters(opened: false)
+        }
     }
 
     // MARK: Auto-reconnect driver (§4)
@@ -308,6 +413,20 @@ final class RelaySessionCoordinator {
         if reconnectAttempt != 0 { reconnectAttempt = 0 }
         store.apply(frame)
         chatStore.applyRelayItems(store.items)
+        // QA-1 B10 / A3: the interactive gate frames are NOT items — the render
+        // store drops them by design — yet they are the sole input of the Turn
+        // Dock's cards. Bridge them into the SAME ChatStore state the direct
+        // gateway event router feeds, so the relay path surfaces the identical
+        // `ApprovalCard` / `ClarifyBanner` in the identical dock. `turn.completed`
+        // settles the turn → expire any pending gate (parity with the direct
+        // path's message.complete expiry — a gate answered elsewhere or abandoned
+        // must not linger inviting a reply against a dead runtime).
+        switch frame.kind {
+        case .approvalRequest: chatStore.applyRelayApprovalRequest(frame)
+        case .clarifyRequest:  chatStore.applyRelayClarifyRequest(frame)
+        case .turnCompleted:   chatStore.expireRelayPendingGates()
+        default: break
+        }
     }
 
     private func applyState(_ state: RelayConnectionState) {
@@ -336,6 +455,11 @@ final class RelaySessionCoordinator {
         // per connect. Edge-triggered — a redundant same-state yield does not
         // re-fire, and `wake()` coalesces regardless.
         if phase == .open, !wasOpen {
+            // Release every session op queued on transport readiness (QA-1 B1).
+            resolveAllOpenWaiters(opened: true)
+            #if DEBUG
+            readinessEdgeCount += 1
+            #endif
             onReady?()
             // Re-establish the session the phone was driving on the fresh
             // connection. The relay's new PhoneConnection has no foreground set
@@ -374,8 +498,19 @@ final class RelaySessionCoordinator {
         let result = try await requireClient().submit(
             sessionID: target, prompt: prompt, clientMessageID: clientMessageID
         )
-        if let sid = result["session_id"]?.stringValue { activeSessionID = sid }
-        else if activeSessionID == nil, let target { activeSessionID = target }
+        if let sid = result["session_id"]?.stringValue {
+            activeSessionID = sid
+            // A submit with NO target creates the session at the relay (QA-1
+            // B13): the returned id is BOTH the stored and the live id, so adopt
+            // it as the stored identity too — otherwise `outboxRuntimeID(forStored:)`
+            // never maps the new session and a queued prompt for it would hold
+            // forever instead of draining over the relay. Guarded so a submit
+            // into an open session (stored id bound by start/open/resume) never
+            // clobbers its stable identity with a possibly-distinct live id.
+            if target == nil, activeStoredSessionID == nil { activeStoredSessionID = sid }
+        } else if activeSessionID == nil, let target {
+            activeSessionID = target
+        }
         return result
     }
 
@@ -420,17 +555,37 @@ final class RelaySessionCoordinator {
     /// `RelayItemStore.reconcile(snapshot:)` is deliberately additive — items
     /// absent from a snapshot are RETAINED (the snapshot is a resumed baseline,
     /// not a delete list). That is correct for a `resync` of the SAME session,
-    /// but on a session SWITCH it would leak session A's transcript under
-    /// session B's snapshot, so `applyRelayItems` would render both. Resetting
-    /// here (and immediately re-projecting the emptied set) makes the switch
-    /// clean and is a no-op re-open/re-resume of the already-active session,
-    /// whose live items must survive a `resync`. Called BEFORE the open/resume
-    /// RPC awaits so any snapshot frames the pump delivers during the await land
-    /// on the fresh store.
+    /// but on a session SWITCH it would leak session A's items under session
+    /// B's snapshot, so the projection would render both. Resetting the STORE
+    /// here makes the switch clean and is a no-op re-open/re-resume of the
+    /// already-active session, whose live items must survive a `resync`. Called
+    /// BEFORE the open/resume RPC awaits so any snapshot frames the pump
+    /// delivers during the await land on the fresh store.
+    ///
+    /// QA-1 (B4/B7/B15): deliberately NO `chatStore.applyRelayItems([])` here.
+    /// The projection MERGES (tagged relay rows + untagged history), so the
+    /// incoming session's cache paint (untagged rows) must SURVIVE the switch
+    /// until its own relay content lands — wiping `chatStore.messages` to `[]`
+    /// mid-open was the fully-blank transcript (B4). The previous session's
+    /// TAGGED projection rows are dropped by the incoming session's first
+    /// projection (it retains only untagged history) and by the open path's
+    /// `chat.reset()`; the store reset alone keeps session A's items out of
+    /// session B's projection, so nothing leaks either way. (Defense in depth:
+    /// `ChatStore.applyRelayItems` ALSO treats an empty projection as a no-op
+    /// fallback on `messages`, so a blank screen is impossible even if a future
+    /// caller re-projects an emptied store.)
     private func resetItemStoreForSessionSwitch(to sessionID: String) {
         guard sessionID != activeSessionID else { return }
         store = RelayItemStore()
-        chatStore.applyRelayItems(store.items)
+        // N4/A5: clear the previous session's task-list mirror so the new
+        // session's dock starts clean (empty store ⇒ mirror cleared, `messages`
+        // untouched — never blanks the transcript, QA-1 B4).
+        chatStore.syncRelayTaskList(from: store)
+        // QA-1 B10: a pending gate belongs to its session's turn — switching
+        // the projected session clears the previous session's card (parity with
+        // the direct path's `reset()` on open; answering session A's card while
+        // viewing B would mis-route the answer).
+        chatStore.expireRelayPendingGates()
     }
 
     func list() async throws -> JSONValue { try await requireClient().list() }
@@ -478,9 +633,81 @@ final class RelaySessionCoordinator {
         return try await requireClient().clarify(sessionID: sid, requestID: requestID, response: response)
     }
 
+    /// Attach inlined bytes through the relay (B9 / A5). The relay drives the
+    /// gateway's base64 RPCs — `file.attach` (`kind: "file"`, arbitrary bytes →
+    /// `@file:` ref) or `image.attach_bytes` (`kind: "image"`, photo → vision
+    /// tile) — so photo/camera/file attach works IDENTICALLY on the relay
+    /// transport, with no gateway-REST `POST /api/upload` round-trip (the
+    /// relay-only reach the direct attach flow cannot make).
+    ///
+    /// Session resolution mirrors `submit`: a `nil` target passes `nil` on the
+    /// wire and the relay CREATES + owns a new chat, returning its id — so an
+    /// image-first send in a brand-new chat attaches, then submits to the SAME
+    /// session (the returned `session_id` is adopted as `activeSessionID`,
+    /// which a following `submit(sessionID: nil)` targets). Wire shape is
+    /// asserted by RelayAttachWireTests + tests/e2e_daily_driver/test_h.
+    @discardableResult
+    func attach(
+        sessionID: String? = nil,
+        kind: String,
+        name: String,
+        dataURL: String
+    ) async throws -> JSONValue {
+        let target = sessionID ?? activeSessionID
+        let result = try await requireClient().attach(
+            sessionID: target, kind: kind, name: name, dataURL: dataURL
+        )
+        if let sid = result["session_id"]?.stringValue { activeSessionID = sid }
+        return result
+    }
+
     @discardableResult
     func interrupt(_ sessionID: String? = nil) async throws -> JSONValue {
         guard let sid = sessionID ?? activeSessionID else { throw RelayError.notConnected }
         return try await requireClient().interrupt(sid)
+    }
+
+    // MARK: Push token registration (§6a)
+
+    /// Register the APNs device token over the relay socket (§6a). The relay
+    /// writes its OWN push registry — the one the relay Notifier reads — so a
+    /// relay-mode phone's token reaches the notifier without any gateway-REST
+    /// reachability or shared-HERMES_HOME coincidence. Throws when the relay
+    /// socket is not open; ``PushRegistrar`` retries on the next launch /
+    /// foreground, exactly like the gateway-direct path.
+    @discardableResult
+    func registerPushToken(
+        _ token: String,
+        env: String,
+        events: [String]?
+    ) async throws -> JSONValue {
+        try await requireClient().registerPushToken(token, env: env, events: events)
+    }
+
+    /// Remove the APNs device token from the relay's push registry (§6a).
+    @discardableResult
+    func unregisterPushToken(_ token: String) async throws -> JSONValue {
+        try await requireClient().unregisterPushToken(token)
+    }
+
+    /// Clear the §6 foreground declaration (the app left the foreground). The
+    /// relay suppresses turn_complete/task_complete/error pushes while a live
+    /// phone WS holds the session foregrounded; iOS does not kill the socket
+    /// the instant the app backgrounds, so without this clear a turn finishing
+    /// seconds after backgrounding would be silently gated. Best-effort:
+    /// fire-and-forget on the client (a closed socket is itself the clear).
+    func clearForeground() async {
+        guard let client else { return }
+        await client.setForeground(nil)
+    }
+
+    /// Re-declare the driven session as foregrounded after returning to the
+    /// foreground (§6a; mirrors :meth:`clearForeground`). When the relay socket
+    /// is NOT up this is a no-op — the `onReady` re-establishment already
+    /// re-asserts foreground on the fresh connection.
+    func reassertForeground() async {
+        guard let client else { return }
+        guard let sid = activeStoredSessionID ?? activeSessionID else { return }
+        await client.setForeground(sid)
     }
 }

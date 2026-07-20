@@ -17,6 +17,13 @@
     __TOKEN_FILE__  gateway dashboard token (default ~/.hermes/dashboard.token)
     __LOG_FILE__    stdout+stderr sink (default ~/Library/Logs/Hermes/relay.log)
     __LISTEN__      phone-facing downstream bind (default 0.0.0.0:8788)
+    __HERMES_HOME__ the relay's HERMES_HOME — MUST match the gateway's so the
+                    push token registry (push_tokens.json) is shared; default
+                    ~/.hermes (override: RELAY_HERMES_HOME).
+    __PUSH_ENV_BLOCK__  the APNs sender environment block (QA-1 B14): rendered
+                    by install-service.sh from ~/.hermes/apns.env / env vars.
+                    Empty when no APNs creds exist -> the Notifier stays a
+                    documented no-op until the owner fills apns.env + reinstalls.
 -->
 <plist version="1.0">
 <dict>
@@ -43,9 +50,11 @@
 	<dict>
 		<key>HERMES_REPO_ROOT</key>
 		<string>__REPO_ROOT__</string>
+		<key>HERMES_HOME</key>
+		<string>__HERMES_HOME__</string>
 		<key>PATH</key>
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-	</dict>
+__PUSH_ENV_BLOCK__	</dict>
 	<key>WorkingDirectory</key>
 	<string>__REPO_ROOT__</string>
 	<key>RunAtLoad</key>

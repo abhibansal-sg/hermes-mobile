@@ -205,11 +205,59 @@ struct ChatView: View {
     /// The inline working row is honest busy-state chrome: it appears only while a
     /// turn is actively running, not while the turn is paused on a human approval,
     /// clarification, sudo, or secret prompt (those have their own user-action UI).
+    ///
+    /// QA-1 B8/A4 — the relay transport suppresses the row while the streaming
+    /// assistant bubble is on screen. The ratified Wave-2.5 design makes the
+    /// bubble's breathing cursor THE working signal ("Streaming caret = the
+    /// working signal … No fat working pill"; WAVE-ROADMAP.md) with the Turn Dock
+    /// the single home for interactive chrome (tasks/approvals/clarifies). The
+    /// relay projection (`ChatStore.applyRelayItems`) marks the assistant bubble
+    /// streaming for as long as ANY relay item is non-terminal, so while that
+    /// cursor renders the tail row is redundant — and unlike the direct path the
+    /// relay never sets the `activeToolName`/`turnStartedAt` event-router
+    /// internals per event, so beside a live turn the row could only ever read a
+    /// dishonest static "Working · 0s" (the owner's IMG_2517/2526 pill). The row
+    /// still shows PRE-FIRST-ITEM — between the relay submit and the first
+    /// rendered item — the honest accepted-and-waiting window, exactly mirroring
+    /// the approved direct path between `send` and `message.start`. Direct
+    /// transport: byte-identical to the approved behavior (desktop-parity tail
+    /// indicator with the honest tool name + ticking elapsed).
+    ///
+    /// QA-1 A9 render-gate seam: exposed as a PURE STATIC (the same unit-
+    /// testability pattern as ``transcriptPlaceholder``) so BOTH the chrome
+    /// lane's `TranscriptChromeGlowTests` and the render-conformance suite
+    /// (`RenderConformanceTests`, which replays recorded relay frames through
+    /// the real render lane) pin this rule directly. The instance property
+    /// delegates here.
+    static func shouldShowInlineTurnActivity(
+        isStreaming: Bool,
+        hasPendingGate: Bool,
+        isRelayTransport: Bool,
+        lastMessage: ChatMessage?
+    ) -> Bool {
+        guard isStreaming, !hasPendingGate else { return false }
+        // Relay: the streaming assistant bubble IS the working signal (its cursor
+        // breathes while any item is non-terminal) — a tail pill beside it is the
+        // redundant "Working" bar of B8. Show only pre-first-item, when no bubble
+        // renders the cursor yet.
+        if isRelayTransport,
+           let last = lastMessage,
+           last.role == .assistant,
+           last.isStreaming {
+            return false
+        }
+        return true
+    }
+
     private var shouldShowInlineTurnActivity: Bool {
-        chatStore.isStreaming
-            && chatStore.pendingApproval == nil
-            && chatStore.pendingClarification == nil
-            && chatStore.pendingSecurePrompt == nil
+        Self.shouldShowInlineTurnActivity(
+            isStreaming: chatStore.isStreaming,
+            hasPendingGate: chatStore.pendingApproval != nil
+                || chatStore.pendingClarification != nil
+                || chatStore.pendingSecurePrompt != nil,
+            isRelayTransport: connectionStore.transportPath == .relay,
+            lastMessage: chatStore.messages.last
+        )
     }
 
     /// Approximate height reserved at the bottom of the transcript so the last
@@ -911,6 +959,7 @@ struct ChatView: View {
                 isDraft: isDraft,
                 messagesEmpty: chatStore.messages.isEmpty,
                 transcriptGeneration: chatStore.transcriptGeneration,
+                transcriptConfirmedEmpty: chatStore.transcriptConfirmedEmpty,
                 isGatewayOffline: isGatewayOffline,
                 loadError: chatStore.lastBackfillError
             ) {
@@ -2381,15 +2430,26 @@ struct ChatView: View {
         isDraft: Bool,
         messagesEmpty: Bool,
         transcriptGeneration: Int,
+        transcriptConfirmedEmpty: Bool = false,
         isGatewayOffline: Bool,
         loadError: String?
     ) -> TranscriptPlaceholder {
         if isDraft && messagesEmpty { return .draftGreeting }
-        // Only the pristine, never-seeded empty transcript gets a placeholder; a
-        // seeded-then-emptied transcript (generation > 0) renders normally.
-        guard messagesEmpty && transcriptGeneration == 0 else { return .transcript }
-        // Offline wins over any stale backfill error: a never-cached session that
-        // could not reach the gateway is an honest empty, not a load failure.
+        guard messagesEmpty else { return .transcript }
+        // QA-1 B4 — BLANK-SCREEN IMPOSSIBLE (fallback chain: cache → skeleton →
+        // content, never void). An empty transcript at generation > 0 renders
+        // rows ONLY when an authoritative seed CONFIRMED the session really has
+        // no content (`transcriptConfirmedEmpty`). Any other empty-at-generation
+        // state is a mid-open wipe (the B4 race class: the relay render store
+        // reset blanking the painted transcript after the cache seed bumped the
+        // generation) — fall back to the skeleton instead of the void.
+        if transcriptGeneration > 0 {
+            return transcriptConfirmedEmpty ? .transcript : .skeleton
+        }
+        // Only the pristine, never-seeded empty transcript gets a placeholder;
+        // offline wins over any stale backfill error: a never-cached session
+        // that could not reach the gateway is an honest empty, not a load
+        // failure.
         if isGatewayOffline { return .offlineNoCache }
         if let loadError { return .loadError(loadError) }
         return .skeleton

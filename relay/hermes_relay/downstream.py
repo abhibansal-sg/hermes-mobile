@@ -51,7 +51,15 @@ from .bus import TOPIC_RELAY_FRAMES, EventBus
 from .gateway_client import GatewayClient
 from .durable_state import DurableState
 from .session_state import SessionStore
-from .types import Frame, FrameKind, UpstreamMethod, UpstreamRequest
+from .types import (
+    Frame,
+    FrameKind,
+    Item,
+    ItemStatus,
+    ItemType,
+    UpstreamMethod,
+    UpstreamRequest,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -262,12 +270,18 @@ class DownstreamServer:
         gateway: GatewayClient,
         store: SessionStore,
         durable: Optional[DurableState] = None,
+        push_engine: Any = None,
     ) -> None:
         self._cfg = config
         self._bus = bus
         self._gateway = gateway
         self._store = store
         self._durable = durable
+        # Injected push_engine module (plugin_bridge.import_push_engine()); the
+        # ``push.register``/``push.unregister`` token registry RPCs (§6) write
+        # into it. Resolved lazily on first use when not injected; tests inject
+        # a real module under a tmp HERMES_HOME.
+        self._push = push_engine
         self._ring = None  # set in start(): reused ReplayRingManager
         self._conns: dict[str, PhoneConnection] = {}
         self._server = None
@@ -499,6 +513,18 @@ class DownstreamServer:
             await self._server.wait_closed()
             self._server = None
 
+    def _push_engine(self) -> Any:
+        """The reused ``push_engine`` module (lazily resolved, cached).
+
+        ``push.register``/``push.unregister`` write the SAME registry the
+        Notifier's ``push_engine.notify`` reads — one source of tokens for the
+        relay-fired push path. Import failures surface as JSON-RPC errors to
+        the phone (registry unavailable), never as a server crash.
+        """
+        if self._push is None:
+            self._push = plugin_bridge.import_push_engine()
+        return self._push
+
     def _remember_submit(self, cmid: str, sid: str) -> None:
         """Record ``client_message_id -> resolved session_id`` for SUBMIT dedup,
         evicting the oldest entry once the bounded LRU is full."""
@@ -506,6 +532,70 @@ class DownstreamServer:
         self._submit_dedup.move_to_end(cmid)
         while len(self._submit_dedup) > self._submit_dedup_cap:
             self._submit_dedup.popitem(last=False)
+
+    def _user_message_item_id(
+        self, sid: str, cmid: Optional[str], text: str
+    ) -> str:
+        """The stable ``item_id`` for the SUBMIT-synthesized ``userMessage`` item.
+
+        With a ``client_message_id`` the id derives from ``(sid, cmid)`` ALONE,
+        so an ambiguous-flap retry — which arrives on a FRESH connection after
+        the relay already ran ``prompt_submit`` — maps to the SAME item and the
+        fold replaces by id instead of duplicating the bubble (mirrors the
+        SUBMIT dedup). WITHOUT one (a client that sends no cmid) the id is
+        salted with the count of PRIOR same-text userMessage items already
+        accumulated for the session: two sends of identical text stay two
+        distinct items, yet a deterministic submit sequence yields identical
+        ids on every run — the E2E flap-chaos scenario (f) compares runs
+        byte-for-byte and a connection/seq-salted id would diverge across the
+        clean and chaos runs.
+        """
+        if cmid is not None:
+            key = f"cmid:{sid}:{cmid}"
+        else:
+            state = self._store.get(sid)
+            same_text = sum(
+                1
+                for it in state.items.values()
+                if it.type == ItemType.USER_MESSAGE and it.body.get("text") == text
+            )
+            key = f"nth:{sid}:{same_text}:{text}"
+        return f"{sid}:u-{uuid.uuid5(uuid.NAMESPACE_URL, 'hermes-relay:' + key).hex[:16]}"
+
+    def _emit_user_message_item(
+        self, conn: PhoneConnection, sid: str, cmid: Optional[str], text: str
+    ) -> None:
+        """Synthesize, fold, and fan out a COMPLETED ``userMessage`` item for the
+        prompt this SUBMIT just drove (QA-1 B5/B13).
+
+        The Reframer maps ONLY agent events — without this the relay emits no
+        user item anywhere, so the phone has nothing on the wire to reconcile
+        its optimistic user echo against (the bubble never lands live) and a
+        cold-resume snapshot omits the prompt entirely. The item is folded into
+        the SessionStore (snapshots carry it) and published exactly like a
+        Reframer frame (the fan-out stamps per-connection seq and rings it).
+        Idempotent per ``item_id``: a retry re-publishes the SAME item (healing
+        a fresh phone connection whose store lacks it) without allocating a
+        second ord or duplicating the bubble. The ord is allocated at SUBMIT,
+        so the turn's agent items (allocated later) render BELOW the prompt.
+        """
+        state = self._store.get(sid)
+        item_id = self._user_message_item_id(sid, cmid, text)
+        item = state.items.get(item_id)
+        if item is None:
+            body: dict[str, Any] = {"text": text}
+            if cmid is not None:
+                body["client_message_id"] = cmid
+            item = Item(
+                item_id=item_id,
+                type=ItemType.USER_MESSAGE,
+                status=ItemStatus.COMPLETED,
+                ord=state.allocate_ord(),
+                body=body,
+            )
+        frame = Frame.with_item(sid=sid, kind=FrameKind.ITEM_COMPLETED, item=item)
+        state.apply(frame)
+        self._bus.publish(TOPIC_RELAY_FRAMES, frame)
 
     # -- upstream (phone -> relay -> gateway), protocol §5 ---------------
     async def handle_upstream(self, conn: PhoneConnection, req: UpstreamRequest) -> Any:
@@ -518,8 +608,12 @@ class DownstreamServer:
         * ``approve``   -> approval_respond
         * ``clarify``   -> clarify_respond
         * ``interrupt`` -> session_interrupt
+        * ``attach``    -> file_attach / image_attach_bytes (bytes inlined)
         * ``ack``       -> conn.ack (LOCAL, no gateway hop)
         * ``resync``    -> conn.replay (LOCAL, no gateway hop)
+        * ``push.register``/``push.unregister`` -> the relay's OWN push token
+          registry (LOCAL, no gateway hop; the Notifier reads this same
+          registry — protocol §6)
         """
         method = req.method
         p = req.params
@@ -537,6 +631,40 @@ class DownstreamServer:
             # signal; the passive OPEN/SUBMIT/RESUME tracking is only a fallback.
             conn.set_foreground(p.get("session_id"))
             return None
+        if method == UpstreamMethod.PUSH_REGISTER:
+            # Relay-local APNs token registration (protocol §6). In relay mode
+            # the phone's gateway-direct REST register can never reach the
+            # relay-owned session's notifier (off-LAN phones can't hit the
+            # gateway REST at all; on-LAN ones write the gateway's registry,
+            # a different HERMES_HOME than this process). Registering OVER THE
+            # RELAY SOCKET writes the registry the relay Notifier actually
+            # reads — one transport, one registry, no shared-home coincidence.
+            push = self._push_engine()
+            # The registry's parent may not exist yet in a fresh service env
+            # (the gateway side relies on ~/.hermes already being there);
+            # push_engine swallows persist errors, so create it here or the
+            # register would "succeed" in memory and lose the token on restart.
+            try:
+                from pathlib import Path
+
+                Path(push._registry_path()).parent.mkdir(parents=True, exist_ok=True)
+            except OSError:  # pragma: no cover - best-effort dir hygiene
+                _log.debug("push.register: registry dir create failed", exc_info=True)
+            events = p.get("events")
+            ok = push.register_token(
+                str(p.get("token") or ""),
+                platform=str(p.get("platform") or "ios"),
+                env=str(p.get("env") or ""),
+                events=list(events) if isinstance(events, list) else None,
+                device_id=p.get("device_id"),
+            )
+            if not ok:
+                raise ValueError("invalid device token")
+            _log.info("push.register: device token registered over relay")
+            return {"registered": True}
+        if method == UpstreamMethod.PUSH_UNREGISTER:
+            removed = self._push_engine().unregister_token(str(p.get("token") or ""))
+            return {"unregistered": bool(removed)}
 
         # -- gateway-readiness gate ------------------------------------------
         # Every method below this point hits the gateway. After a relay restart
@@ -585,6 +713,11 @@ class DownstreamServer:
                 self._submit_dedup.move_to_end(cmid)
                 prior = self._submit_dedup[cmid]
                 conn.set_foreground(prior)  # still the chat on screen (§6)
+                # Re-emit the userMessage item: the retry arrives on a FRESH
+                # phone connection whose render store may lack it (the original
+                # frame was lost to the flap). Idempotent — same item_id folds
+                # onto the same row (no second bubble, no second ord).
+                self._emit_user_message_item(conn, prior, cmid, text)
                 return {"session_id": prior, "deduplicated": True}
             if sid:
                 # Drive an existing (idle / foreign / terminal) session. Resuming
@@ -612,6 +745,12 @@ class DownstreamServer:
                     provider=p.get("provider"),
                 )
                 await self._gateway.prompt_submit(sid, text)
+            # Emit the prompt itself as a completed ``userMessage`` item (QA-1
+            # B5/B13): the Reframer maps only AGENT events, so without this the
+            # phone has no wire item to reconcile its optimistic echo against
+            # and snapshots omit the prompt. Rides on the RESOLVED (live /
+            # created) sid so the item lands on the session the turn drives.
+            self._emit_user_message_item(conn, sid, cmid, text)
             # Record the resolved (live) id under the client message id BEFORE
             # returning, so a retry that races the RPC result back over a flapped
             # socket is deduped rather than driving a second turn.
@@ -659,6 +798,48 @@ class DownstreamServer:
             return result
         if method == UpstreamMethod.INTERRUPT:
             return await self._gateway.session_interrupt(p["session_id"])
+
+        # -- attachments (B9/A5): REST-free, bytes inlined by the phone ------
+        if method == UpstreamMethod.ATTACH:
+            # The phone cannot reach the gateway's ``POST /api/upload`` REST
+            # route on a relay-only reach, so it inlines the bytes as a
+            # ``data:<mime>;base64,`` URL and the relay drives the gateway's
+            # base64 RPCs: ``file.attach`` (arbitrary files → ``@file:`` ref)
+            # or ``image.attach_bytes`` (photos → vision tile). Session
+            # resolution mirrors SUBMIT's drive semantics: no ``session_id``
+            # → create (+own); foreign/idle → resume (adopt the LIVE id the
+            # gateway may remap to); already owned → remap through
+            # ``live_id_for`` so the bytes land on the live session, not a
+            # dormant origin id.
+            kind = p.get("kind")
+            if kind not in ("file", "image"):
+                raise ValueError(f"attach: unknown kind {kind!r}")
+            data_url = p.get("data_url") or ""
+            if not data_url:
+                raise ValueError("attach: data_url required")
+            sid = p.get("session_id")
+            if sid:
+                if not self._gateway.owns(sid):
+                    resumed = await self._gateway.session_resume(sid)
+                    if isinstance(resumed, dict):
+                        sid = resumed.get("session_id") or sid
+                else:
+                    sid = self._gateway.live_id_for(sid)
+            else:
+                sid = await self._gateway.session_create(title=p.get("title", "New chat"))
+            name = p.get("name") or ""
+            if kind == "file":
+                result = await self._gateway.file_attach(sid, name=name, data_url=data_url)
+            else:
+                result = await self._gateway.image_attach_bytes(
+                    sid, data_url=data_url, filename=name
+                )
+            # Attaching from the composer is an interactive, on-screen action —
+            # foreground the chat (§6) exactly like SUBMIT/OPEN do.
+            conn.set_foreground(sid)
+            if isinstance(result, dict):
+                return {"session_id": sid, "kind": kind, **result}
+            return {"session_id": sid, "kind": kind, "attached": True}
 
         raise ValueError(f"unknown upstream method: {method!r}")
 
