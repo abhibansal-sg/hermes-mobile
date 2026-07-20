@@ -4779,11 +4779,17 @@ final class ChatStore {
     /// relay item store. `dockShowsTaskBox`'s `isStreaming` gate hides the pill
     /// immediately regardless, but dropping the owner here is what lets a fresh
     /// turn re-seed the dock from a clean slate.
+    /// QA-2 R12 — relay turn end. Called by `RelaySessionCoordinator.ingest` on
+    /// a `turn.completed` frame. The dock pill is hidden at turn end purely by
+    /// ``dockShowsTaskBox``'s `isStreaming` gate (the projection that follows
+    /// settles `isStreaming` to false) — the list DATA is intentionally kept so
+    /// a resumed turn / the render_conformance bridge contract still sees it,
+    /// and ``handleRelayTurnStarted`` does the cross-turn re-seed. This hook is
+    /// a documented no-op seam kept for future turn-end observability; it must
+    /// NOT drop the mirror (that would break the bridge + the data-persistence
+    /// contract other surfaces depend on).
     func handleRelayTurnCompleted() {
-        if let list = relayLatestTaskList?.list, Self.taskListIsTerminal(list) {
-            relayLatestTaskList = nil
-            taskListOwnerSessionId = nil
-        }
+        // Intentional no-op: visibility is gated by `dockShowsTaskBox`.
     }
 
     /// QA-2 R12/R13 — relay turn start. Called by `RelaySessionCoordinator`
