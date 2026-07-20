@@ -84,6 +84,16 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
     /// streaming never reassigns it.
     var timestamp: Date
     var presentation: Presentation
+    /// Wave-2 relay projection marker (QA-1 transcript family B5/B6/B7/B13).
+    /// `true` ONLY on rows synthesized by `ChatStore.applyRelayItems` — the
+    /// relay's reconciled item projection. The relay projection MERGES with the
+    /// painted transcript: UNTAGGED rows (the GRDB cache seed, optimistic user
+    /// echoes, direct-path rows) are the settled history the live relay turn
+    /// appends below, so history + live turn COEXIST instead of the projection
+    /// replacing the transcript. A re-projection replaces only tagged rows, so
+    /// streaming never duplicates nor wipes the scrollback, and an empty-store
+    /// projection (session open, zero frames) leaves the cache paint intact.
+    var relayProjected: Bool
 
     /// Seed convenience init: materializes scalar seed content into deterministic
     /// `parts` (reasoning → tools → text → warning → usage), the same fixed
@@ -106,7 +116,8 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
         usage: UsageStats? = nil,
         warning: String? = nil,
         timestamp: Date = Date(),
-        presentation: Presentation = .normal
+        presentation: Presentation = .normal,
+        relayProjected: Bool = false
     ) {
         self.id = id
         self.role = role
@@ -115,6 +126,7 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
         self.reasoningElapsed = reasoningElapsed
         self.timestamp = timestamp
         self.presentation = presentation
+        self.relayProjected = relayProjected
 
         if !parts.isEmpty {
             // Caller supplied an already-ordered part list (e.g. the future seed

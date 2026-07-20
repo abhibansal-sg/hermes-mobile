@@ -436,3 +436,40 @@ cached transcript paints with zero relay frames; live frames append, never repla
 | B9 | attach gated behind direct-mode capability check / relay-ready gating | **CONFIRMED**: `uploadSupported` ← gateway-REST probe; unknown-mount → legacy path → 404 → `.unavailable`, persisted |
 | B10 | relay gate frames decode but UI mapping direct-only | **CONFIRMED both directions**: frames dropped at RelayItemStore:109-111 + no bridge to `pendingApproval/pendingClarification`; answers hardwired to gateway client |
 | B14 | token never registers with relay session / service env lacks APNs creds | **CONFIRMED BOTH**: plist carries no APNs env → `is_armed()` false → zero sends; no relay push.register method → relay-only phones can't register tokens |
+
+---
+
+## LANE STATUS — transcript family (2026-07-20, branch qa1/transcript)
+
+**Family-1 root cause CONFIRMED exactly as above** (all four seams code-verified
+on qa1/base): the wholesale `messages = rebuilt` replace (ChatStore:4218), the
+open-path wipe via `resetItemStoreForSessionSwitch` → `applyRelayItems([])`
+(RSC:430-434), zero `userMessage` emitters in the relay (`FrameKind.USER_MESSAGE`
+unused; reframer maps only agent events), and the discarded submit result
+(ChatStore:2416). Fixed in commits `40ad925ac` (relay SUBMIT emits the completed
+userMessage item; deterministic cmid-keyed id; folded + fanned out like a
+reframer frame), `93e7fee8a` (iOS merged-timeline projection — tagged
+`relayProjected` rows append below untagged history; optimistic echo on relay
+send with cmid; sticky echo adoption by cmid-then-text; switch reset no longer
+blanks the paint; `SessionStore.landRelayCreatedSession` lands the relay-created
+id for B13) and render-gate tests `cde13013e`
+(RelayTranscriptMergeTests: FAILS on base, PASSES with the fix).
+
+Two refinements to the fix outline, landed:
+- Outline step 2 said "reconcile when a relay userMessage item arrives" — the
+  relay now ALSO carries `client_message_id` in the item body so the echo
+  adoption correlates by cmid FIRST (distinct sends of identical text never
+  collapse); text is the fallback for cmid-less items.
+- Outline step 4 (route relay sends through the durable outbox) is DEFERRED as
+  debt: `createOutboxDestination()` is gateway-`session.create`-bound, so
+  outbox routing would break the relay new-chat flow without a relay-aware
+  destination path. The direct relay submit now carries a fresh cmid per send
+  (flap-dedup identity for the relay side; outbox drain already passed its job
+  cmid). Residual limitation: a failed direct relay send is not retried
+  durably — the echo is removed and the error surfaced; the user re-sends.
+
+Inter-lane notes: the B4 placeholder hole (ChatView:2389 `messagesEmpty &&
+generation>0` → empty `.transcript`) is left for the B4 lane; this lane removes
+its trigger on the relay path (the switch reset no longer blanks `messages`).
+The B8 lane owns the TurnActivityBar suppression; `setStreaming` semantics on
+the projection are unchanged.

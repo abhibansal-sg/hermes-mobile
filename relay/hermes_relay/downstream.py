@@ -51,7 +51,15 @@ from .bus import TOPIC_RELAY_FRAMES, EventBus
 from .gateway_client import GatewayClient
 from .durable_state import DurableState
 from .session_state import SessionStore
-from .types import Frame, FrameKind, UpstreamMethod, UpstreamRequest
+from .types import (
+    Frame,
+    FrameKind,
+    Item,
+    ItemStatus,
+    ItemType,
+    UpstreamMethod,
+    UpstreamRequest,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -507,6 +515,70 @@ class DownstreamServer:
         while len(self._submit_dedup) > self._submit_dedup_cap:
             self._submit_dedup.popitem(last=False)
 
+    def _user_message_item_id(
+        self, sid: str, cmid: Optional[str], text: str
+    ) -> str:
+        """The stable ``item_id`` for the SUBMIT-synthesized ``userMessage`` item.
+
+        With a ``client_message_id`` the id derives from ``(sid, cmid)`` ALONE,
+        so an ambiguous-flap retry — which arrives on a FRESH connection after
+        the relay already ran ``prompt_submit`` — maps to the SAME item and the
+        fold replaces by id instead of duplicating the bubble (mirrors the
+        SUBMIT dedup). WITHOUT one (a client that sends no cmid) the id is
+        salted with the count of PRIOR same-text userMessage items already
+        accumulated for the session: two sends of identical text stay two
+        distinct items, yet a deterministic submit sequence yields identical
+        ids on every run — the E2E flap-chaos scenario (f) compares runs
+        byte-for-byte and a connection/seq-salted id would diverge across the
+        clean and chaos runs.
+        """
+        if cmid is not None:
+            key = f"cmid:{sid}:{cmid}"
+        else:
+            state = self._store.get(sid)
+            same_text = sum(
+                1
+                for it in state.items.values()
+                if it.type == ItemType.USER_MESSAGE and it.body.get("text") == text
+            )
+            key = f"nth:{sid}:{same_text}:{text}"
+        return f"{sid}:u-{uuid.uuid5(uuid.NAMESPACE_URL, 'hermes-relay:' + key).hex[:16]}"
+
+    def _emit_user_message_item(
+        self, conn: PhoneConnection, sid: str, cmid: Optional[str], text: str
+    ) -> None:
+        """Synthesize, fold, and fan out a COMPLETED ``userMessage`` item for the
+        prompt this SUBMIT just drove (QA-1 B5/B13).
+
+        The Reframer maps ONLY agent events — without this the relay emits no
+        user item anywhere, so the phone has nothing on the wire to reconcile
+        its optimistic user echo against (the bubble never lands live) and a
+        cold-resume snapshot omits the prompt entirely. The item is folded into
+        the SessionStore (snapshots carry it) and published exactly like a
+        Reframer frame (the fan-out stamps per-connection seq and rings it).
+        Idempotent per ``item_id``: a retry re-publishes the SAME item (healing
+        a fresh phone connection whose store lacks it) without allocating a
+        second ord or duplicating the bubble. The ord is allocated at SUBMIT,
+        so the turn's agent items (allocated later) render BELOW the prompt.
+        """
+        state = self._store.get(sid)
+        item_id = self._user_message_item_id(sid, cmid, text)
+        item = state.items.get(item_id)
+        if item is None:
+            body: dict[str, Any] = {"text": text}
+            if cmid is not None:
+                body["client_message_id"] = cmid
+            item = Item(
+                item_id=item_id,
+                type=ItemType.USER_MESSAGE,
+                status=ItemStatus.COMPLETED,
+                ord=state.allocate_ord(),
+                body=body,
+            )
+        frame = Frame.with_item(sid=sid, kind=FrameKind.ITEM_COMPLETED, item=item)
+        state.apply(frame)
+        self._bus.publish(TOPIC_RELAY_FRAMES, frame)
+
     # -- upstream (phone -> relay -> gateway), protocol §5 ---------------
     async def handle_upstream(self, conn: PhoneConnection, req: UpstreamRequest) -> Any:
         """Translate one phone JSON-RPC request and return its JSON-RPC result.
@@ -585,6 +657,11 @@ class DownstreamServer:
                 self._submit_dedup.move_to_end(cmid)
                 prior = self._submit_dedup[cmid]
                 conn.set_foreground(prior)  # still the chat on screen (§6)
+                # Re-emit the userMessage item: the retry arrives on a FRESH
+                # phone connection whose render store may lack it (the original
+                # frame was lost to the flap). Idempotent — same item_id folds
+                # onto the same row (no second bubble, no second ord).
+                self._emit_user_message_item(conn, prior, cmid, text)
                 return {"session_id": prior, "deduplicated": True}
             if sid:
                 # Drive an existing (idle / foreign / terminal) session. Resuming
@@ -612,6 +689,12 @@ class DownstreamServer:
                     provider=p.get("provider"),
                 )
                 await self._gateway.prompt_submit(sid, text)
+            # Emit the prompt itself as a completed ``userMessage`` item (QA-1
+            # B5/B13): the Reframer maps only AGENT events, so without this the
+            # phone has no wire item to reconcile its optimistic echo against
+            # and snapshots omit the prompt. Rides on the RESOLVED (live /
+            # created) sid so the item lands on the session the turn drives.
+            self._emit_user_message_item(conn, sid, cmid, text)
             # Record the resolved (live) id under the client message id BEFORE
             # returning, so a retry that races the RPC result back over a flapped
             # socket is deduped rather than driving a second turn.
