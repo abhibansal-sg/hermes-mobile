@@ -911,6 +911,7 @@ struct ChatView: View {
                 isDraft: isDraft,
                 messagesEmpty: chatStore.messages.isEmpty,
                 transcriptGeneration: chatStore.transcriptGeneration,
+                transcriptConfirmedEmpty: chatStore.transcriptConfirmedEmpty,
                 isGatewayOffline: isGatewayOffline,
                 loadError: chatStore.lastBackfillError
             ) {
@@ -2381,15 +2382,26 @@ struct ChatView: View {
         isDraft: Bool,
         messagesEmpty: Bool,
         transcriptGeneration: Int,
+        transcriptConfirmedEmpty: Bool = false,
         isGatewayOffline: Bool,
         loadError: String?
     ) -> TranscriptPlaceholder {
         if isDraft && messagesEmpty { return .draftGreeting }
-        // Only the pristine, never-seeded empty transcript gets a placeholder; a
-        // seeded-then-emptied transcript (generation > 0) renders normally.
-        guard messagesEmpty && transcriptGeneration == 0 else { return .transcript }
-        // Offline wins over any stale backfill error: a never-cached session that
-        // could not reach the gateway is an honest empty, not a load failure.
+        guard messagesEmpty else { return .transcript }
+        // QA-1 B4 — BLANK-SCREEN IMPOSSIBLE (fallback chain: cache → skeleton →
+        // content, never void). An empty transcript at generation > 0 renders
+        // rows ONLY when an authoritative seed CONFIRMED the session really has
+        // no content (`transcriptConfirmedEmpty`). Any other empty-at-generation
+        // state is a mid-open wipe (the B4 race class: the relay render store
+        // reset blanking the painted transcript after the cache seed bumped the
+        // generation) — fall back to the skeleton instead of the void.
+        if transcriptGeneration > 0 {
+            return transcriptConfirmedEmpty ? .transcript : .skeleton
+        }
+        // Only the pristine, never-seeded empty transcript gets a placeholder;
+        // offline wins over any stale backfill error: a never-cached session
+        // that could not reach the gateway is an honest empty, not a load
+        // failure.
         if isGatewayOffline { return .offlineNoCache }
         if let loadError { return .loadError(loadError) }
         return .skeleton
