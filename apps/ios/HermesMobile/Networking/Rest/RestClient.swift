@@ -635,9 +635,20 @@ struct RestClient: Sendable {
         // percent-encodes "?" and the server would see a literal-path 404.
         let parts = path.split(separator: "?", maxSplits: 1)
         let purePath = String(parts[0])
-        var url = baseURL.appendingPathComponent(
-            purePath.hasPrefix("/") ? String(purePath.dropFirst()) : purePath
-        )
+        // Callers pass a PRE-ENCODED path (webhook names etc. run
+        // addingPercentEncoding first). appendingPathComponent re-encoded the
+        // "%" of those escapes ("a%20b" → "a%2520b"), so the gateway saw a
+        // literal percent-20 in the path. Concatenate onto the base string so
+        // the already-valid escapes survive verbatim; URL(string:) fails only
+        // on a malformed URL, which the appendingPathComponent fallback still
+        // handles (by re-encoding, as before).
+        let baseString = baseURL.absoluteString
+        let trimmedBase = baseString.hasSuffix("/") ? String(baseString.dropLast()) : baseString
+        let pathWithSlash = purePath.hasPrefix("/") ? purePath : "/\(purePath)"
+        var url = URL(string: trimmedBase + pathWithSlash)
+            ?? baseURL.appendingPathComponent(
+                purePath.hasPrefix("/") ? String(purePath.dropFirst()) : purePath
+            )
         if parts.count == 2,
            var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
             components.percentEncodedQuery = String(parts[1])
