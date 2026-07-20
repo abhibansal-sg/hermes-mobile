@@ -141,6 +141,17 @@ final class RelaySessionCoordinator {
     private var openWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
     private var openWaiterTimeouts: [UUID: Task<Void, Never>] = [:]
 
+    #if DEBUG
+    /// Test-only count of readiness edges (each crossing INTO `.open` the state
+    /// observer applies — see ``applyState``). A render/conformance harness that
+    /// sends the instant `start()` returns can race the observer's buffered
+    /// `.connecting → .open` replay, whose transient `.connecting` blip flips
+    /// `isOpen` false; awaiting `readinessEdgeCount` growth deterministically
+    /// parks the harness until that replay has settled instead of wall-clock
+    /// sleeping (QA-1 A9 gate determinism). Zero release-build footprint.
+    private(set) var readinessEdgeCount = 0
+    #endif
+
     /// Suspend until the relay socket reports `.open`, or `timeout` elapses.
     /// Returns `true` when open. Callers (session resume/open, the transcript
     /// network seed) use this to QUEUE on the relay phase bridge instead of
@@ -446,6 +457,9 @@ final class RelaySessionCoordinator {
         if phase == .open, !wasOpen {
             // Release every session op queued on transport readiness (QA-1 B1).
             resolveAllOpenWaiters(opened: true)
+            #if DEBUG
+            readinessEdgeCount += 1
+            #endif
             onReady?()
             // Re-establish the session the phone was driving on the fresh
             // connection. The relay's new PhoneConnection has no foreground set

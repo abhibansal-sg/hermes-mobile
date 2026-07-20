@@ -116,7 +116,17 @@ final class RenderConformanceTests: XCTestCase {
         }
         let coordinator = connection.ensureRelayCoordinator()
         XCTAssertEqual(connection.transportPath, .relay)
+        let edgesBefore = coordinator.readinessEdgeCount
         try await coordinator.start(url: relayURL)
+        // A9 determinism: `start()` stamps `.open` optimistically, but the state
+        // observer then replays the buffered `.connecting → .open` pair the socket
+        // yielded, transiently regressing `isOpen` to false mid-replay. A send
+        // racing that window skips the relay branch and returns false — the A9
+        // gate's one residual flake. Await the readiness EDGE (the replay's
+        // `.open` crossing) so the phase is stably open before any test sends —
+        // event-driven off the observer, not a wall-clock sleep, so the gate is
+        // byte-reproducible.
+        await waitUntil { coordinator.readinessEdgeCount > edgesBefore }
         return Graph(chat: chat, sessions: sessions, connection: connection,
                      transport: transport, coordinator: coordinator)
     }
