@@ -1126,4 +1126,105 @@ final class RenderingTests: XCTestCase {
         }
         XCTAssertEqual(descriptor.id, expectedID, file: file, line: line)
     }
+
+    // MARK: - Selection-island source contract (N5)
+
+    /// N5 regression guard: markdown **table cells** and **code-block bodies**
+    /// must NOT attach `.perfTextSelection()` / `.textSelection(.enabled)`.
+    ///
+    /// Approved design §7 — prose selects with native drag handles; code/table/
+    /// image cards are deliberately non-selectable so they cleanly bound the
+    /// selection island (no escaped drag, no Copy|Share edit-menu pill on cards).
+    /// Card copy is covered by each card's own Copy button + whole-bubble actions.
+    ///
+    /// This is a static source contract because SwiftUI affords no runtime
+    /// introspection of `.textSelection` from a unit test; pinning the source
+    /// keeps a future refactor from silently restoring the old pill on cards.
+    func testSelectionIsland_CardsAreNotSelectable_SourceContract() throws {
+        let repoRoot = resolveRepoRootFromTestFile()
+        guard let repoRoot else {
+            throw XCTSkip("Selection-island source audit skipped: repo root not resolvable from test bundle (sources not co-located)")
+        }
+
+        let messageBubble = repoRoot
+            .appendingPathComponent("apps/ios/HermesMobile/Views/Chat/MessageBubble.swift")
+        let codeBlock = repoRoot
+            .appendingPathComponent("apps/ios/HermesMobile/Views/Chat/Rendering/CodeBlockView.swift")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: messageBubble.path), "MessageBubble.swift missing at \(messageBubble.path)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: codeBlock.path), "CodeBlockView.swift missing at \(codeBlock.path)")
+
+        let bubbleSource = try String(contentsOf: messageBubble, encoding: .utf8)
+        let codeSource = try String(contentsOf: codeBlock, encoding: .utf8)
+
+        // The `cellView(...)` body is what renders every markdown table cell.
+        let cellViewBody = try extractFunctionBody("cellView", from: bubbleSource)
+        XCTAssertFalse(
+            cellViewBody.contains(".perfTextSelection()"),
+            "N5 violation: markdown table cellView re-introduced .perfTextSelection() — cards must NOT be selectable (approved design §7)"
+        )
+        XCTAssertFalse(
+            cellViewBody.contains(".textSelection(.enabled)"),
+            "N5 violation: markdown table cellView re-introduced .textSelection(.enabled) — cards must NOT be selectable (approved design §7)"
+        )
+
+        // The `codeBody` view is what renders every fenced code block's text.
+        let codeBodyBody = try extractFunctionBody("codeBody", from: codeSource)
+        XCTAssertFalse(
+            codeBodyBody.contains(".perfTextSelection()"),
+            "N5 violation: CodeBlockView.codeBody re-introduced .perfTextSelection() — cards must NOT be selectable (approved design §7)"
+        )
+        XCTAssertFalse(
+            codeBodyBody.contains(".textSelection(.enabled)"),
+            "N5 violation: CodeBlockView.codeBody re-introduced .textSelection(.enabled) — cards must NOT be selectable (approved design §7)"
+        )
+    }
+
+    /// Walk up from this test file's source path to the repo root (the dir that
+    /// contains `apps/ios/`). Returns nil when not running beside the sources.
+    private func resolveRepoRootFromTestFile() -> URL? {
+        let url = URL(fileURLWithPath: #filePath)
+        var cursor = url.deletingLastPathComponent()
+        for _ in 0..<10 {
+            let candidate = cursor.appendingPathComponent("apps/ios")
+            if FileManager.default.fileExists(atPath: candidate.path) { return cursor }
+            cursor = cursor.deletingLastPathComponent()
+        }
+        return nil
+    }
+
+    /// Extract the brace-balanced body of a Swift `private func <name>(` or
+    /// `var <name>:` declaration whose body opens with `{` and closes with the
+    /// matching `}`. Throws if the declaration cannot be located.
+    private func extractFunctionBody(_ name: String, from source: String) throws -> String {
+        // Match either `func name(` or `var name:` (codeBody is a computed var).
+        let pattern = "(?:func[ \\t]+\(NSRegularExpression.escapedPattern(for: name))\\b|[ \\t]+var[ \\t]+\(NSRegularExpression.escapedPattern(for: name))\\s*:)"
+        let regex = try NSRegularExpression(pattern: pattern, options: [])
+        let full = NSRange(source.startIndex..<source.endIndex, in: source)
+        guard let match = regex.firstMatch(in: source, options: [], range: full) else {
+            throw NSError(domain: "SelectionIslandContract", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "decl \(name) not found"])
+        }
+        // Find the opening `{` at/after the declaration.
+        var idx = source.index(source.startIndex, offsetBy: match.range.lowerBound)
+        while idx < source.endIndex, source[idx] != "{" { idx = source.index(after: idx) }
+        guard idx < source.endIndex else {
+            throw NSError(domain: "SelectionIslandContract", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "opening brace for \(name) not found"])
+        }
+        // Brace-balanced scan (naive — respects neither strings nor comments, but
+        // sufficient for these short, brace-clean view-builder bodies).
+        let start = idx
+        var depth = 0
+        while idx < source.endIndex {
+            let ch = source[idx]
+            if ch == "{" { depth += 1 }
+            else if ch == "}" {
+                depth -= 1
+                if depth == 0 { return String(source[start...idx]) }
+            }
+            idx = source.index(after: idx)
+        }
+        throw NSError(domain: "SelectionIslandContract", code: 3,
+                      userInfo: [NSLocalizedDescriptionKey: "unbalanced braces for \(name)"])
+    }
 }

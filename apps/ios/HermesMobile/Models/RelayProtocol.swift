@@ -181,4 +181,5 @@ enum RelayUpstreamMethod: String, Sendable, CaseIterable {
     case interrupt
     case ack
     case resync
+    case foreground
 }

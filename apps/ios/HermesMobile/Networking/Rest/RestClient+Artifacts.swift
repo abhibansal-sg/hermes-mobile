@@ -101,6 +101,14 @@ struct Artifact: Decodable, Identifiable, Sendable, Equatable {
         return URL(string: urlOrPath)
     }
 
+    /// `true` when the locator is a workspace filesystem path (not a data URL and
+    /// not an http(s) URL) — i.e. something the session-cwd file reader can open.
+    /// Used to route non-image file artifacts into the native file viewer instead
+    /// of bouncing back to the transcript (W25 files-phase-1 audit finding).
+    var isFilesystemPath: Bool {
+        !isDataURL && remoteURL == nil && !urlOrPath.isEmpty
+    }
+
     /// ABH-192 (coalesced-turn jump fallback): a prose fragment likely to appear
     /// in ``ChatMessage/text`` — used as ``SessionStore/pendingMessageJumpSnippet``
     /// so the S2 substring-search fallback can land inside the right coalesced

@@ -1392,6 +1392,11 @@ final class SessionStore {
         return CacheScope(serverId: serverURL, profileId: activeProfile)
     }
 
+    /// The active `(serverId, profileId)` cache partition, exposed so the
+    /// composition root can hand ``ProjectsStore`` the SAME scope the session
+    /// list uses (a profile/server switch then re-partitions both in lockstep).
+    var projectsCacheScope: CacheScope? { currentCacheScope }
+
     func cacheIdentity(_ sessionId: String, profile: String? = nil) -> CacheIdentity? {
         guard let scope = currentCacheScope else { return nil }
         let actual = profile?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3798,6 +3803,23 @@ final class SessionStore {
         // ready handshake succeeds.
         guard bindRuntime else { return }
 
+        // Wave-2 relay transport: when the relay is the active transport, the
+        // gateway-direct `session.resume` RPC below cannot run — the gateway
+        // socket is idle (only the relay client is connected), so it would throw
+        // "Not connected to the Hermes gateway" and strand the deep-link
+        // resume-to-send. Resume + own the session over the relay coordinator
+        // instead, mirroring how the relay item projection already streams its
+        // snapshot, so the composer unlocks and sends route through the relay.
+        // The gateway-direct path (default OFF) is byte-identical below.
+        if let connection, connection.transportPath == .relay {
+            bindRelayRuntime(
+                summary: summary,
+                token: token,
+                connectionWorkGeneration: connectionWorkGeneration
+            )
+            return
+        }
+
         // Slow path: gateway resume — spins up the agent server-side; only
         // prompt submission depends on it.
         let resumeTask = Task { [weak self] in
@@ -3932,6 +3954,55 @@ final class SessionStore {
                 let message = self.errorMessage(from: error)
                 self.lastError = message
                 self.sessionActionError = SessionActionError(action: "Open Session", message: message)
+            }
+        }
+        #if DEBUG
+        lastOpenResumeTask = resumeTask
+        #endif
+    }
+
+    /// Resume + own `summary` over the Wave-2 relay coordinator when the relay is
+    /// the active transport (the gateway-direct `session.resume` in ``open`` is
+    /// skipped — the gateway socket is idle in relay-only mode). Binds the runtime
+    /// id so the composer unlocks and prompt submission routes through the relay,
+    /// exactly as the gateway resume does on the direct path. The relay keys the
+    /// runtime on the stored session id, so a successful resume binds `summary.id`.
+    /// Supersession is guarded by `openToken` (a newer open()/draft cancels the
+    /// stale bind) so a slow relay resume cannot bind into a session the user has
+    /// since navigated away from.
+    private func bindRelayRuntime(
+        summary: SessionSummary,
+        token: UUID,
+        connectionWorkGeneration: UInt64
+    ) {
+        let resumeTask = Task { [weak self] in
+            guard let self,
+                  let coordinator = self.connection?.relayCoordinator else { return }
+            do {
+                _ = try await coordinator.resume(summary.id)
+                guard self.openToken == token,
+                      self.connectionWorkGeneration == connectionWorkGeneration,
+                      self.activeStoredId == summary.id else { return }
+                // Relay runtime bound: the relay keys the live turn on the stored
+                // session id. Unlock the composer and flush anything queued during
+                // the resume window (mirrors the gateway `onActiveRuntimeBound`).
+                self.activeRuntimeId = summary.id
+                self.activeRuntimeEpoch = self.connection?.transportEpoch
+                self.lastError = nil
+                self.sessionActionError = nil
+                self.ensureRuntimeAttempts = 0
+                self.onActiveRuntimeBound?()
+            } catch {
+                // A superseded open (the user tapped another session) is not an
+                // actionable failure — only surface a real relay resume error for
+                // the session still on screen.
+                guard self.openToken == token,
+                      self.activeStoredId == summary.id else { return }
+                let message = self.errorMessage(from: error)
+                self.lastError = message
+                self.sessionActionError = SessionActionError(
+                    action: "Open Session", message: message
+                )
             }
         }
         #if DEBUG
@@ -5741,6 +5812,19 @@ final class ProjectsStore {
     /// ``attach(connection:)`` is called by the composition root.
     private var connection: ConnectionStore?
 
+    // MARK: - Offline cache (cache-first projects)
+
+    /// The shared cache actor, injected by ``attachCache(_:scope:)``. `nil` until
+    /// wired (or when the cache failed to open) — every cache path then no-ops
+    /// and the store runs network-only, byte-identical to before.
+    private var cacheStore: CacheStore?
+
+    /// Supplies the ACTIVE `(serverId, profileId)` cache partition. Sourced from
+    /// ``SessionStore`` so Projects share the same scope as the session list
+    /// (a profile/server switch re-partitions both). `nil` before there is a
+    /// connection.
+    private var cacheScopeProvider: (() -> CacheScope?)?
+
     init() {}
 
     /// Inject the connection store (REST access). Called once by
@@ -5748,6 +5832,30 @@ final class ProjectsStore {
     /// attach-pattern the other stores use (``SessionStore/attach`` etc.).
     func attach(connection: ConnectionStore) {
         self.connection = connection
+    }
+
+    /// Inject the offline cache + its scope provider, and immediately seed the
+    /// in-memory list from disk so a cold/offline launch paints projects instead
+    /// of a blank "Not connected" wall (the network refresh write-through then
+    /// repaints). Mirrors the session-list cache-first pattern.
+    func attachCache(_ cache: CacheStore, scope: @escaping () -> CacheScope?) {
+        self.cacheStore = cache
+        self.cacheScopeProvider = scope
+        Task { await seedFromCache() }
+    }
+
+    /// Paint ``projects`` from the on-disk snapshot when nothing is loaded yet.
+    /// No-op once a (possibly empty) network result has landed — the cache never
+    /// clobbers fresher server data.
+    func seedFromCache() async {
+        guard projects == nil,
+              let cache = cacheStore,
+              let scope = cacheScopeProvider?() else { return }
+        if let cached = try? await cache.loadProjects(scope: scope),
+           !cached.isEmpty,
+           projects == nil {
+            projects = cached
+        }
     }
 
     // MARK: - Fetch
@@ -5761,7 +5869,10 @@ final class ProjectsStore {
     /// UI doesn't flicker on a transient network blip.
     func refresh() async {
         guard let rest = connection?.rest else {
-            loadError = "Not connected"
+            // Offline: paint from disk so cold launch shows the last-known
+            // projects instead of a blank "Not connected" list.
+            await seedFromCache()
+            if projects == nil { loadError = "Not connected" }
             return
         }
         isLoading = true
@@ -5778,15 +5889,99 @@ final class ProjectsStore {
             )
             projects = decoded
             loadError = nil
+            // Write-through: persist the fresh list so the next cold/offline
+            // launch paints instantly.
+            writeThroughProjects(decoded)
         } catch {
             // Preserve the last successful list so the UI doesn't blank out
             // on a transient failure — only surface the error when there is no
-            // cached data to show.
+            // cached data to show. Seed from disk first so a transient network
+            // failure at cold launch still paints the last-known list.
+            if projects == nil { await seedFromCache() }
             if projects == nil {
                 loadError = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
             }
         }
+    }
+
+    /// Persist the freshly-fetched projects overview to the on-disk snapshot.
+    private func writeThroughProjects(_ projects: [Project]) {
+        guard let cache = cacheStore, let scope = cacheScopeProvider?() else { return }
+        Task { try? await cache.saveProjects(projects, scope: scope) }
+    }
+
+    // MARK: - Create (cache-first project creation)
+
+    /// The outcome of a create-project attempt: the created ``Project`` on
+    /// success (so the caller can open it), or a human-readable error message.
+    enum CreateResult: Sendable, Equatable {
+        case created(Project)
+        case failure(String)
+    }
+
+    /// Create a project via the plugin `POST /projects` route, then refresh the
+    /// overview so the new project appears in the list. Never throws — failures
+    /// come back as ``CreateResult/failure`` for the sheet to surface.
+    func createProject(name: String, root: String) async -> CreateResult {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedRoot = root.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return .failure("Project name is required.") }
+        guard !trimmedRoot.isEmpty else { return .failure("Root folder path is required.") }
+        guard let rest = connection?.rest else { return .failure("Not connected") }
+        do {
+            let project = try await rest.createProject(name: trimmedName, root: trimmedRoot)
+            await refresh()
+            return .created(project)
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription
+                ?? error.localizedDescription
+            return .failure(message)
+        }
+    }
+
+    /// Testing seam: overrides the retry backoff in ``refreshSessions(for:)``
+    /// so unit tests don't burn wall-clock time on the real delay. `nil` (the
+    /// production default) uses ``projectSessionsRetryDelayNanoseconds``.
+    var projectSessionsRetryDelayOverrideNanoseconds: UInt64?
+
+    /// Delay before the single automatic retry in ``refreshSessions(for:)``.
+    /// Short and fixed (not exponential) — this covers a sub-second gateway
+    /// respawn window (PROJECTS-401), not a sustained outage; the manual
+    /// "Retry" affordance in the detail view's error row handles anything
+    /// longer.
+    private static let projectSessionsRetryDelayNanoseconds: UInt64 = 600_000_000
+
+    /// `true` for a failure the gateway can recover from within the same
+    /// respawn window: a 401/403 (device-token auth racing plugin-route
+    /// registration during a crash-respawn — PROJECTS-401), any 5xx, or a
+    /// transport-level failure (timeout / dropped connection). Treated
+    /// exactly like the legacy "gateway too old" 404 — fall back to the
+    /// `cwd_prefix` path, and retry the whole two-tier fetch once.
+    ///
+    /// NOT transient: 4xx other than 401/403/404 (a genuinely malformed
+    /// request) and decode failures (a real contract mismatch) — those
+    /// propagate immediately so the designed error state stays honest.
+    static func isTransientProjectSessionsFailure(_ error: Error) -> Bool {
+        switch error {
+        case RestError.badStatus(let status, _):
+            return status == 401 || status == 403 || status == 404 || (500...599).contains(status)
+        case RestError.network:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// The detail view's error row copy for `error`. Transient failures (see
+    /// ``isTransientProjectSessionsFailure(_:)``) get directional copy — the
+    /// user should just retry, a raw "HTTP 401" is not actionable — everything
+    /// else keeps its specific message.
+    static func projectSessionsErrorMessage(for error: Error) -> String {
+        guard isTransientProjectSessionsFailure(error) else {
+            return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+        return "Reconnecting to gateway — retry"
     }
 
     /// Fetch a project's sessions from the server with `cwd_prefix=project.root`
@@ -5805,23 +6000,85 @@ final class ProjectsStore {
             fetch = { try await sessionsFetch(project) }
         } else {
             guard let rest = connection?.rest else {
-                projectSessionsErrorById[project.id] = "Not connected"
+                // Offline: paint from the per-project cache snapshot if we have
+                // one, so cold-launch detail isn't a blank "Not connected" wall.
+                await seedProjectSessionsFromCache(for: project)
+                if projectSessionsById[project.id] == nil {
+                    projectSessionsErrorById[project.id] = "Not connected"
+                }
                 return
             }
-            fetch = { try await rest.sessionsWithTotal(cwdPrefix: project.root) }
+            // Primary: the plugin's folded project-sessions route (matches the
+            // count). Fall back to the legacy cwd_prefix path on a 404 (gateway
+            // too old to serve the plugin route) OR a transient failure — a
+            // 401/403/5xx/timeout observed during a gateway crash-respawn
+            // window (PROJECTS-401: device-token auth can race plugin-route
+            // registration on a fresh process). A non-transient failure
+            // propagates so the designed error state is honest.
+            fetch = {
+                do {
+                    return try await rest.projectSessions(projectId: project.id)
+                } catch let error where Self.isTransientProjectSessionsFailure(error) {
+                    return try await rest.sessionsWithTotal(cwdPrefix: project.root)
+                }
+            }
         }
+        // Seed instantly from the per-project cache snapshot so the detail view
+        // paints before the network returns (write-through repaints on success).
+        await seedProjectSessionsFromCache(for: project)
         projectSessionsLoadingIds.insert(project.id)
         defer { projectSessionsLoadingIds.remove(project.id) }
         do {
-            let result = try await fetch()
+            let result = try await fetchProjectSessionsWithRetry(fetch)
             projectSessionsById[project.id] = result.sessions
             projectSessionsErrorById[project.id] = nil
+            writeThroughProjectSessions(result.sessions, for: project)
         } catch {
             if projectSessionsById[project.id] == nil {
-                projectSessionsErrorById[project.id] = (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
+                projectSessionsErrorById[project.id] = Self.projectSessionsErrorMessage(for: error)
             }
         }
+    }
+
+    /// Runs `fetch` (which already carries the 404/transient → `cwd_prefix`
+    /// fallback above); on a transient failure from THAT combined attempt,
+    /// waits one short fixed backoff and retries the whole thing exactly
+    /// once before giving up. Covers the case where a gateway respawn window
+    /// outlasts both the primary and fallback request in the same call.
+    private func fetchProjectSessionsWithRetry(
+        _ fetch: () async throws -> (sessions: [SessionSummary], total: Int?)
+    ) async throws -> (sessions: [SessionSummary], total: Int?) {
+        do {
+            return try await fetch()
+        } catch {
+            guard Self.isTransientProjectSessionsFailure(error) else { throw error }
+            let delay = projectSessionsRetryDelayOverrideNanoseconds ?? Self.projectSessionsRetryDelayNanoseconds
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            return try await fetch()
+        }
+    }
+
+    /// Paint `project`'s detail list from the on-disk snapshot when nothing is in
+    /// memory yet. No-op when a cache/scope isn't wired, the snapshot is missing,
+    /// or an in-memory list already exists (never clobber fresher data).
+    private func seedProjectSessionsFromCache(for project: Project) async {
+        guard projectSessionsById[project.id] == nil,
+              let cache = cacheStore,
+              let scope = cacheScopeProvider?() else { return }
+        if let cached = try? await cache.loadProjectSessions(scope: scope, projectId: project.id),
+           !cached.isEmpty,
+           projectSessionsById[project.id] == nil {
+            projectSessionsById[project.id] = cached
+        }
+    }
+
+    /// Persist `project`'s freshly-fetched sessions to the on-disk snapshot.
+    private func writeThroughProjectSessions(_ sessions: [SessionSummary], for project: Project) {
+        guard let cache = cacheStore, let scope = cacheScopeProvider?() else { return }
+        let projectId = project.id
+        Task { try? await cache.saveProjectSessions(sessions, scope: scope, projectId: projectId) }
     }
 
     /// The server-scoped session list for `project`, or `[]` if it hasn't

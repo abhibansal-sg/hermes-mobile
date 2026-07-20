@@ -78,7 +78,22 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         NSAppTransportSecurity:
+          # Existing: relaxes ATS for local-network / IP-literal gateway dials
+          # (RFC1918, .local, link-local). Also covers a Tailscale IP-literal
+          # relay URL like ws://100.x.y.z:8790 — ATS is not enforced on IP
+          # literals, so the numeric tailnet address needs no exception.
           NSAllowsLocalNetworking: true
+          # Wave-2 relay (dev/QA): the relay's downstream is plain ws:// over
+          # Tailscale (Tailscale already encrypts the tunnel). ATS blocks non-TLS
+          # loads to a PUBLIC FQDN, and the tailnet MagicDNS name below is a public
+          # `.ts.net` host, so a NARROW per-host exception is required to let the
+          # phone dial it by name. Scoped to this one owner tailnet host only —
+          # NSAllowsArbitraryLoads stays OFF. Prefer the IP-literal relay URL in
+          # production; this entry only enables the MagicDNS-name convenience.
+          NSExceptionDomains:
+            abbhinnavs-mac-studio.tailec61ab.ts.net:
+              NSExceptionAllowsInsecureHTTPLoads: true
+              NSIncludesSubdomains: false
         NSLocalNetworkUsageDescription: Hermes Agent connects to your own gateway server on your local network or tailnet.
         NSCameraUsageDescription: Capture a photo to send to Hermes Agent.
         NSPhotoLibraryUsageDescription: Attach photos from your library to Hermes Agent conversations.
@@ -161,6 +176,11 @@ targets:
           - WorkRepositoryMigrationTests.swift
           - WorkRepositoryTestSupport.swift
       - path: ../../tests/fixtures/session_status_responses.json
+        buildPhase: resources
+      # A2/N1 wire conformance: the SAME shared contract fixture the pytest side
+      # (tests/conformance/) asserts against — the XCTest consumer decodes it so
+      # a phone/relay field mismatch fails both test stacks.
+      - path: ../../tests/conformance/wire_contract.json
         buildPhase: resources
     dependencies:
       - target: HermesMobile

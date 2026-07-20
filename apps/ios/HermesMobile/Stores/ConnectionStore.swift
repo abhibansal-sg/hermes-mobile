@@ -69,6 +69,13 @@ final class ConnectionStore {
     var phase: Phase = .connecting {
         didSet {
             notifyReadinessWaiters()
+            // N3/A1 fast-path trace: the composer is interactive exactly when
+            // `phase == .connected` (ChatView.isConnected gates on it). The first
+            // such crossing defines the composer_interactive milestone
+            // (ConnectTrace.mark is first-occurrence, so reconnects don't overwrite).
+            if case .connected = phase {
+                ConnectTrace.shared.mark(.composerInteractive)
+            }
             switch phase {
             case .needsSetup, .offline:
                 resolveAllTransportReadinessWaiters(with: false)
@@ -474,6 +481,118 @@ final class ConnectionStore {
     /// The single, long-lived gateway client.
     let client = HermesGatewayClient()
 
+    /// Wave-2 relay transport bridge (docs/RELAY-PHONE-PROTOCOL.md). Owns the
+    /// live `RelayClient` and projects its item stream into the transcript. Only
+    /// created when ``transportPath`` resolves to `.relay` (default OFF = the
+    /// gateway `client` above is used instead), so the gateway-direct path never
+    /// allocates it. Read via ``ensureRelayCoordinator()``.
+    private(set) var relayCoordinator: RelaySessionCoordinator?
+
+    /// Test seam: inject a coordinator wired to a mock relay before `configure`.
+    #if DEBUG
+    var relayCoordinatorFactory: (() -> RelaySessionCoordinator)?
+    #endif
+
+    /// Lazily build (once) and return the relay bridge for the active chat store.
+    @discardableResult
+    func ensureRelayCoordinator() -> RelaySessionCoordinator {
+        if let relayCoordinator { return relayCoordinator }
+        #if DEBUG
+        let created = relayCoordinatorFactory?() ?? RelaySessionCoordinator(chatStore: chatStore)
+        #else
+        let created = RelaySessionCoordinator(chatStore: chatStore)
+        #endif
+        // When the relay socket comes up (initial connect OR a reconnect after a
+        // drop/flap), drain the durable outbox over the relay — the relay
+        // analogue of `setTransportReadiness(.ready)`'s wake on the gateway path.
+        // Without this, a prompt the user queued while the relay was mid-connect
+        // stays pending until some unrelated wake source fires.
+        created.onReady = { [weak self] in self?.queueStore?.wake() }
+        // Bridge relay socket state → the app's `phase` so the banner + composer
+        // reflect the REAL connection, not a stale startup stamp. Without this the
+        // UI is frozen at `.connected` even when the relay drops and recovers.
+        created.onPhaseChange = { [weak self] relayPhase in
+            guard let self else { return }
+            switch relayPhase {
+            case .idle, .connecting:
+                self.phase = .connecting
+            case .open:
+                self.phase = .connected
+            case .closed(let reason):
+                // Intentional teardown (reason == nil) → about to reconnect via
+                // start(); unexpected close → offline with the reason.
+                self.phase = reason == nil ? .connecting : .offline(reason)
+            case .failed:
+                // The coordinator's auto-reconnect driver is armed; surface as
+                // reconnecting so the banner shows "reconnecting" not "offline".
+                self.phase = .reconnecting(attempt: 0)
+            }
+        }
+        relayCoordinator = created
+        return created
+    }
+
+    /// The selected transport (Wave-2 convergence). Default `.gatewayDirect`
+    /// (OFF) — byte-identical to every existing install. In DEBUG a launch env
+    /// override (`HERMES_TRANSPORT=relay`, or the presence of `HERMES_RELAY_URL`)
+    /// forces `.relay` for the simulator E2E WITHOUT a Settings round-trip; the
+    /// override is DEBUG-only so a release build can never be flipped by env.
+    var transportPath: TransportPath {
+        #if DEBUG
+        let env = ProcessInfo.processInfo.environment
+        if env["HERMES_TRANSPORT"]?.lowercased() == "relay" || env["HERMES_RELAY_URL"] != nil {
+            return .relay
+        }
+        #endif
+        return DefaultsKeys.transportPathValue()
+    }
+
+    /// The relay WS URL to dial when ``transportPath`` is `.relay`. Precedence:
+    /// (1) in DEBUG the `HERMES_RELAY_URL` env var wins (the simulator E2E points
+    /// the app at the isolated relay without a Settings round-trip); (2) an
+    /// explicit relay URL the user typed in Settings (`DefaultsKeys.relayURLOverride`)
+    /// — the on-device equivalent of the env var, so the phone can dial a relay
+    /// that is not co-located with the gateway (e.g. a Mac on the tailnet); (3)
+    /// otherwise derive from the gateway base URL (http→ws, https→wss) with the
+    /// ratified `/relay` path (§1).
+    func relayURL(forGateway gatewayURL: URL) -> URL? {
+        #if DEBUG
+        if let raw = ProcessInfo.processInfo.environment["HERMES_RELAY_URL"],
+           let override = URL(string: raw) {
+            return override
+        }
+        #endif
+        if let raw = DefaultsKeys.relayURLOverrideValue(),
+           let override = URL(string: raw) {
+            return override
+        }
+        var components = URLComponents(url: gatewayURL, resolvingAgainstBaseURL: false)
+        components?.scheme = gatewayURL.scheme == "https" ? "wss" : "ws"
+        components?.path = "/relay"
+        components?.queryItems = nil
+        return components?.url
+    }
+
+    /// HTTP sibling of the relay WebSocket, used only for relay-owned truth.
+    func relayControlURL(forGateway gatewayURL: URL) -> URL? {
+        guard transportPath == .relay,
+              let relayURL = relayURL(forGateway: gatewayURL),
+              var components = URLComponents(url: relayURL, resolvingAgainstBaseURL: false)
+        else { return nil }
+        components.scheme = relayURL.scheme == "wss" ? "https" : "http"
+        components.path = ""
+        components.queryItems = nil
+        return components.url
+    }
+
+    /// Test seam mirroring ``connectRPC``: when set, the relay-transport branch of
+    /// `configure` calls this instead of `relayCoordinator.start` so a test can
+    /// assert the relay path was selected without a live socket. `nil` in
+    /// production.
+    #if DEBUG
+    var relayConnectHook: ((_ relayURL: URL, _ token: String) async throws -> Void)?
+    #endif
+
     /// The accepted transport generation. Runtime bindings use this value to
     /// reject work produced by a prior socket after reconnect.
     private(set) var transportEpoch: UInt64 = 0
@@ -485,6 +604,18 @@ final class ConnectionStore {
     /// while no presentation-grace window is masking a dropped transport.
     var isTransportReady: Bool {
         guard !isInGrace else { return false }
+        // Wave-2 relay transport: the durable outbox drains OVER THE RELAY on this
+        // path (the gateway `client` is idle), so admission must track the RELAY
+        // socket, not the one-shot `transportReadiness` the initial configure
+        // stamped. `relayCoordinator.isOpen` closes the drain gate the instant the
+        // relay drops (a flap) and reopens it on reconnect — so a send during the
+        // flap enqueues quietly and drains once the relay is live again, rather
+        // than churning failed submits against a dead socket. Gated on the
+        // coordinator existing first: the gateway-direct default NEVER allocates
+        // it, so that path does not even read the flag and stays byte-identical.
+        if relayCoordinator != nil, transportPath == .relay {
+            return relayCoordinator?.isOpen ?? false
+        }
         if case .ready = transportReadiness { return true }
         return false
     }
@@ -509,7 +640,8 @@ final class ConnectionStore {
         #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
         return RestClient(
-            baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
+            baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle,
+            relayControlBaseURL: relayControlURL(forGateway: url)
         )
     }
 
@@ -635,6 +767,11 @@ final class ConnectionStore {
         setTransportReadiness(.unconfigured, resolveWaiters: true)
         sessionStore.transportDidBecomeUnavailable()
         sessionStore.invalidateConnectionWork()
+        // WS-RECONNECT-SOFTEN (a): a genuinely new connection lifecycle (fresh
+        // bootstrap/configure, explicit reconnect-to-new-server) deserves an
+        // unthrottled first forced capability re-probe; only repeated attempts
+        // WITHIN the same lifecycle's reconnect loop should be throttled.
+        lastForcedCapabilitiesProbeAt = nil
         return connectionGeneration
     }
 
@@ -686,6 +823,25 @@ final class ConnectionStore {
         case .connecting, .hydrating, .connected, .reconnecting:
             return false
         }
+    }
+
+    /// `true` while the reconnect loop's `client.connect(...)` handshake for
+    /// the CURRENT attempt is actively in flight — i.e. `beginTransportAttempt()`
+    /// has reserved an epoch but it has not yet been accepted or failed.
+    ///
+    /// WS-RECONNECT-SOFTEN (b) — single-flight reconnect across triggers: a
+    /// foreground wake, a network-path-satisfied event, and the loop's own
+    /// backoff timer can all want to "kick" a fresh attempt. Cancelling and
+    /// restarting the loop while a handshake is genuinely mid-flight aborts
+    /// that handshake and restarts from attempt 0 — if two triggers fire in
+    /// close succession (e.g. a flapping path during a foreground app-switch)
+    /// this can repeatedly abort an attempt just before it would have
+    /// succeeded, livelocking reconnection during exactly the flappy window
+    /// these triggers exist to help. Callers that want to reset a PARKED loop
+    /// (idling in backoff) still may; only an in-flight handshake is protected.
+    private var isReconnectHandshakeInFlight: Bool {
+        if case .connecting = transportReadiness { return true }
+        return false
     }
 
     private func beginTransportAttempt() {
@@ -786,6 +942,29 @@ final class ConnectionStore {
     /// failure) so a later legitimate retry is never permanently suppressed.
     private var autoUpgradeIssueTasks: [String: Task<IssuedDevice, Error>] = [:]
 
+    /// WS-RECONNECT-SOFTEN (a) — delay before `recoverActiveSession`'s
+    /// background capability/profile/auto-upgrade burst fires after a
+    /// (re)connect, so it lands slightly AFTER the user-visible hydration
+    /// calls (model refresh, session resume, transcript backfill, session-list
+    /// refresh) rather than in the exact same instant. Nothing on the
+    /// user-visible path awaits this task, so the delay is invisible to the
+    /// user; it only spreads out the REST load a just-recovered gateway sees.
+    private static let backgroundCapabilityBurstStagger: Duration = .milliseconds(300)
+
+    /// WS-RECONNECT-SOFTEN (a) — minimum spacing between FORCED capability
+    /// re-probes across reconnects. A forced re-probe fires 5 concurrent REST
+    /// calls (`pluginMount`, then `upload`/`fs`/`profiles`/`devices`) — needed
+    /// once per genuine drop (the gateway may have restarted on a different
+    /// build), but firing it on EVERY attempt of a rapid reconnect crash-loop
+    /// piles five requests onto a server that is already struggling to come
+    /// up. See the throttle at the `recoverActiveSession` call site.
+    private static let capabilitiesReprobeMinInterval: Duration = .seconds(20)
+
+    /// The `ContinuousClock` instant of the last FORCED capabilities re-probe
+    /// this connection generation issued, or `nil` before the first one.
+    /// Reset alongside every other per-connection generation state.
+    private var lastForcedCapabilitiesProbeAt: ContinuousClock.Instant?
+
     /// Injectable connect implementation (tests). When non-nil the reconnect
     /// loop calls this closure instead of `client.connect(...)` — the same
     /// pattern as `SessionStore.resumeRPC`. Defaults to `nil`; the live path
@@ -830,6 +1009,21 @@ final class ConnectionStore {
     /// expiry tests don't burn real wall-clock time. `nil` = the named windows.
     /// Pattern mirrors `reconnectBackoffOverride`.
     var graceWindowOverride: Duration?
+
+    /// Injectable stagger override (tests, WS-RECONNECT-SOFTEN a). When non-nil,
+    /// `recoverActiveSession`'s background capability-probe burst sleeps this long
+    /// instead of `backgroundCapabilityBurstStagger` before firing, so a test can
+    /// drive it to `.zero` (fire immediately, deterministic ordering) or an
+    /// unreachably long value (prove it never fires within the test's window).
+    /// `nil` = the real 300ms stagger.
+    var backgroundCapabilityBurstStaggerOverride: Duration?
+
+    /// Injectable throttle override (tests, WS-RECONNECT-SOFTEN a). When non-nil,
+    /// replaces `capabilitiesReprobeMinInterval` — the minimum spacing between
+    /// FORCED capability re-probes across reconnects — so a test can prove
+    /// suppression (a large value) or the always-force baseline (`.zero`)
+    /// without waiting out the real 20s window. `nil` = the real interval.
+    var capabilitiesReprobeMinIntervalOverride: Duration?
 
     /// Injectable liveness probe (tests). When non-nil, replaces the live
     /// `client.probeLiveness()` call in `handleScenePhase` with this closure's
@@ -1187,6 +1381,10 @@ final class ConnectionStore {
         // (configure() still owns persistence after a verified connect).
         self.serverURLString = trimmed
         await sessionStore.paintFromCache()
+        // N3/A1 fast-path trace: the cached drawer/transcript is painted from DISK
+        // here — never sequenced behind a network call (paintFromCache is a GRDB
+        // read). This is the cache_paint milestone.
+        ConnectTrace.shared.mark(.cachePaint)
     }
 
     // MARK: - Configure
@@ -1272,39 +1470,68 @@ final class ConnectionStore {
         let previousToken = KeychainService.loadToken(server: trimmedURL)
         let isSavedTokenReuse = issuedDeviceId == nil && previousToken == trimmedToken
 
-        do {
-            #if DEBUG
-            if let statusRPC {
-                try await statusRPC(url, trimmedToken)
-            } else {
+        // N3/A1 connect fast-path (relay): relay readiness is the WS socket, not a
+        // gateway REST round-trip — the ratified relay contract has NO REST
+        // handshake (RelayClient §1). Gating the socket open behind `probe.status()`
+        // would put a blocking status round-trip in front of interactivity, so on
+        // the relay path we validate auth in the BACKGROUND (still routing a 401/403
+        // to the D3 re-pair flow) and let the socket connect proceed immediately.
+        // The gateway-direct path keeps the fail-fast probe, byte-unchanged.
+        if transportPath == .relay {
+            probeRelayAuthInBackground(url: url, token: trimmedToken, generation: generation)
+        } else {
+            do {
+                #if DEBUG
+                if let statusRPC {
+                    try await statusRPC(url, trimmedToken)
+                } else {
+                    let probe = RestClient(baseURL: url, token: trimmedToken)
+                    _ = try await probe.status()
+                }
+                #else
                 let probe = RestClient(baseURL: url, token: trimmedToken)
                 _ = try await probe.status()
+                #endif
+            } catch {
+                guard isCurrentGeneration(generation) else { return nil }
+                // An auth rejection on a probe means this token is no longer valid —
+                // surface the re-pair affordance rather than a generic offline error
+                // (D3 RE-PAIR FLOW). This covers both an explicit re-auth attempt and
+                // a bootstrap of a now-revoked saved token.
+                if Self.isAuthFailure(error) {
+                    reauthRequired = true
+                    requireTransportReauthentication()
+                    phase = .needsSetup
+                    return Self.reauthMessage
+                }
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                phase = .offline(message)
+                return message
             }
-            #else
-            let probe = RestClient(baseURL: url, token: trimmedToken)
-            _ = try await probe.status()
-            #endif
-        } catch {
-            guard isCurrentGeneration(generation) else { return nil }
-            // An auth rejection on a probe means this token is no longer valid —
-            // surface the re-pair affordance rather than a generic offline error
-            // (D3 RE-PAIR FLOW). This covers both an explicit re-auth attempt and
-            // a bootstrap of a now-revoked saved token.
-            if Self.isAuthFailure(error) {
-                reauthRequired = true
-                requireTransportReauthentication()
-                phase = .needsSetup
-                return Self.reauthMessage
-            }
-            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            phase = .offline(message)
-            return message
         }
         guard isCurrentGeneration(generation) else { return nil }
 
         do {
             beginTransportAttempt()
-            if let connectRPC {
+            // Wave-2 convergence: when the transport flag is `.relay`, dial the
+            // relay WS through the RelayClient bridge INSTEAD of the gateway-direct
+            // socket — decoded item frames stream into the transcript via the item
+            // layer. The gateway `client` stays idle. `.gatewayDirect` (default,
+            // OFF) is the original branch below, byte-unchanged.
+            if transportPath == .relay {
+                guard let relayURL = relayURL(forGateway: url) else {
+                    throw RelayError.transport("Could not derive a relay URL for \(trimmedURL)")
+                }
+                #if DEBUG
+                if let relayConnectHook {
+                    try await relayConnectHook(relayURL, trimmedToken)
+                } else {
+                    try await ensureRelayCoordinator().start(url: relayURL, token: trimmedToken)
+                }
+                #else
+                try await ensureRelayCoordinator().start(url: relayURL, token: trimmedToken)
+                #endif
+            } else if let connectRPC {
                 try await connectRPC(url, trimmedToken, connectionMode)
             } else {
                 try await client.connect(baseURL: url, token: trimmedToken, mode: connectionMode)
@@ -1317,9 +1544,18 @@ final class ConnectionStore {
             return message
         }
         guard isCurrentGeneration(generation) else { return nil }
+        // N3/A1 fast-path trace: the transport socket is up. Relay: `start()`
+        // returned after the WS resumed (`.open`); gateway-direct: `connect`
+        // returned after `gateway.ready`.
+        ConnectTrace.shared.mark(.socketOpen)
         // `HermesGatewayClient.connect` returns only after `gateway.ready`, so
         // this is the first point at which operational RPC admission is allowed.
         acceptCurrentTransport()
+        // N3/A1 fast-path trace: operational RPC admission is now allowed
+        // (transport epoch accepted). On the relay path this coincides with
+        // socket_open (the relay has no ready handshake) — the delta honestly
+        // reads ~0 there.
+        ConnectTrace.shared.mark(.transportReady)
 
         let switchedServers = !previousServerURL.isEmpty && previousServerURL != trimmedURL
         if switchedServers {
@@ -1417,8 +1653,52 @@ final class ConnectionStore {
         // probe; both are raced against `hydrationTimeout` so a slow or hung
         // probe can never strand the loading screen. On completion (whichever
         // wins) we land on a fresh new-chat draft and reveal the connected UI.
+        //
+        // N3/A1 note (relay): on the relay path the `onPhaseChange` bridge already
+        // flips `phase` to `.connected` the instant the socket reports `.open`
+        // (well before this hydration race resolves), so the REST hydration here
+        // does NOT gate composer interactivity — it only back-fills the drawer +
+        // model chip in the background. The single blocking status round-trip that
+        // DID gate interactivity was the pre-connect `probe.status()`, removed for
+        // the relay path above (see `probeRelayAuthInBackground`).
         startHydration(generation: generation)
         return nil
+    }
+
+    /// N3/A1 connect fast-path (relay): validate gateway auth WITHOUT gating the
+    /// relay socket open on the round-trip. The relay transport's readiness is the
+    /// WS socket (no REST handshake), so a blocking `probe.status()` before the
+    /// socket would be a gratuitous status round-trip in front of interactivity.
+    /// This runs the same REST probe in the background and preserves the D3 re-pair
+    /// flow: on a 401/403 the token is dead → `reauthRequired` + `.needsSetup`,
+    /// exactly as the blocking probe did. Any OTHER (transient) REST failure is
+    /// deliberately ignored — on the relay path the WS socket is the transport
+    /// authority, so a gateway REST blip must not knock an interactive relay session
+    /// offline. The gateway-direct path never calls this (it keeps the fail-fast
+    /// blocking probe in `configure`).
+    private func probeRelayAuthInBackground(url: URL, token: String, generation: UInt64) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                #if DEBUG
+                if let statusRPC {
+                    try await statusRPC(url, token)
+                } else {
+                    let probe = RestClient(baseURL: url, token: token)
+                    _ = try await probe.status()
+                }
+                #else
+                let probe = RestClient(baseURL: url, token: token)
+                _ = try await probe.status()
+                #endif
+            } catch {
+                guard self.isCurrentGeneration(generation) else { return }
+                guard Self.isAuthFailure(error) else { return }
+                self.reauthRequired = true
+                self.requireTransportReauthentication()
+                self.phase = .needsSetup
+            }
+        }
     }
 
     // MARK: - Hydration (ABH-82)
@@ -1666,6 +1946,9 @@ final class ConnectionStore {
             Self.clearSpotlightSessionIndexForPrivacy()
         }
         await client.disconnect()
+        // Wave-2: tear down the relay bridge too, but ONLY if it was ever built
+        // (the gateway-direct default never allocates it — byte-identical path).
+        if let relayCoordinator { await relayCoordinator.stop() }
         guard isCurrentGeneration(generation) else { return }
         if let finalPhase { phase = finalPhase }
     }
@@ -2268,6 +2551,15 @@ final class ConnectionStore {
             // backoff. Reset it so the next attempt fires immediately now that
             // the path is back — same kick `handleScenePhase` performs on
             // foreground. The loop keeps its backoff schedule on further failures.
+            //
+            // WS-RECONNECT-SOFTEN (b) single-flight: but NOT while a handshake
+            // is already actively in flight — a flapping path can otherwise
+            // fire this debounced trigger again just as the in-flight attempt
+            // is about to resolve, cancelling and restarting it from attempt 0
+            // forever. Let the in-flight attempt run to completion; if it
+            // fails, the loop's own retry picks up the (now-healthy) path on
+            // its next try.
+            guard !isReconnectHandshakeInFlight else { return }
             reconnectTask?.cancel()
             reconnectTask = nil
             startReconnectLoop(generation: connectionGeneration)
@@ -2281,8 +2573,11 @@ final class ConnectionStore {
     /// Exponential-backoff reconnect loop. Attempt 0 fires immediately (no
     /// pre-delay) so a foreground wake or an initial drop reconnects without
     /// any added latency. Subsequent attempts wait
-    /// `min(0.5 * 2^attempt, 30)s + jitter(0…0.5s)` before retrying. On
-    /// success, re-resumes the active session and backfills the transcript.
+    /// `min(0.5 * 2^attempt, 8)s + jitter(0…0.5s)` before retrying — i.e.
+    /// roughly 1s/2s/4s/8s/8s/… (WS-RECONNECT-SOFTEN c: capped low so a
+    /// crash-looping gateway isn't hammered by a persistent client, while
+    /// still recovering fast for the common transient blip). On success,
+    /// re-resumes the active session and backfills the transcript.
     private func startReconnectLoop(generation: UInt64) {
         guard isActiveGeneration(generation), reconnectTask == nil else { return }
         reconnectTask = Task { [weak self] in
@@ -2432,10 +2727,14 @@ final class ConnectionStore {
         }
     }
 
-    /// Backoff in seconds for `attempt` ≥ 1: `min(0.5 * 2^attempt, 30) + jitter`.
-    /// Attempt 0 is handled by the caller (immediate, no delay).
+    /// Backoff in seconds for `attempt` ≥ 1: `min(0.5 * 2^attempt, 8) + jitter`.
+    /// Attempt 0 is handled by the caller (immediate, no delay). Produces
+    /// ~1s/2s/4s/8s/8s/… (WS-RECONNECT-SOFTEN c) — capped at 8s (not the
+    /// previous 30s) so sustained failures against a crash-looping gateway
+    /// still retry promptly for the user without ever exceeding a gentle
+    /// worst-case request rate.
     static func backoffDelay(attempt: Int) -> Double {
-        let base = min(0.5 * pow(2.0, Double(attempt)), 30.0)
+        let base = min(0.5 * pow(2.0, Double(attempt)), 8.0)
         let jitter = Double.random(in: 0...0.5)
         return base + jitter
     }
@@ -2750,8 +3049,42 @@ final class ConnectionStore {
         if let rest {
             Task { [weak self] in
                 guard let self, self.isActiveGeneration(generation) else { return }
+                // WS-RECONNECT-SOFTEN (a): stagger this burst behind the
+                // user-visible hydration below it (model refresh, session
+                // resume, transcript backfill, session-list refresh all run
+                // un-awaited by this task) — nothing on the happy path waits on
+                // it, so the delay is invisible to the user.
+                #if DEBUG
+                let stagger = self.backgroundCapabilityBurstStaggerOverride ?? Self.backgroundCapabilityBurstStagger
+                #else
+                let stagger = Self.backgroundCapabilityBurstStagger
+                #endif
+                if stagger > .zero {
+                    try? await Task.sleep(for: stagger)
+                }
+                guard self.isActiveGeneration(generation) else { return }
+                // Throttle repeated FORCED re-probes: a reconnect crash-loop
+                // (the gateway flapping every few seconds) would otherwise pile
+                // 5 concurrent REST calls onto the server on EVERY attempt.
+                // `force: false` still probes once per genuinely new server URL
+                // (the in-memory/disk cache short-circuit only applies to a
+                // server already probed this app version) — the throttle only
+                // suppresses the *forced* re-probe of an already-known URL.
+                #if DEBUG
+                let minInterval = self.capabilitiesReprobeMinIntervalOverride ?? Self.capabilitiesReprobeMinInterval
+                #else
+                let minInterval = Self.capabilitiesReprobeMinInterval
+                #endif
+                let now = ContinuousClock.now
+                let shouldForce: Bool
+                if let last = self.lastForcedCapabilitiesProbeAt, now - last < minInterval {
+                    shouldForce = false
+                } else {
+                    shouldForce = true
+                    self.lastForcedCapabilitiesProbeAt = now
+                }
                 await self.capabilities.probe(
-                    serverURL: self.serverURLString, rest: rest, force: true
+                    serverURL: self.serverURLString, rest: rest, force: shouldForce
                 )
                 guard self.isActiveGeneration(generation) else { return }
                 // Capability-dependent settles run BEHIND the probe but OFF the
@@ -2829,18 +3162,27 @@ final class ConnectionStore {
 
         Task { [weak self] in
             guard let self, self.isActiveGeneration(generation) else { return }
-            #if DEBUG
-            let _liveState = await self.client.state
-            let socketState = self.clientStateOverrideForScenePhase ?? _liveState
-            #else
-            let socketState = await self.client.state
-            #endif
-            guard self.isActiveGeneration(generation) else { return }
             let dead: Bool
-            switch socketState {
-            case .closed, .failed: dead = true
-            default: dead = false
+            // Wave-2 relay transport: the gateway `client` is IDLE (never
+            // connected) on this path — its state is always `.closed`, which
+            // would make every foreground look like a dead connection and trigger
+            // spurious reconnect churn. Check the RELAY socket instead.
+            if self.transportPath == .relay {
+                dead = !(self.relayCoordinator?.isOpen ?? false)
+            } else {
+                #if DEBUG
+                let _liveState = await self.client.state
+                let socketState = self.clientStateOverrideForScenePhase ?? _liveState
+                #else
+                let socketState = await self.client.state
+                #endif
+                guard self.isActiveGeneration(generation) else { return }
+                switch socketState {
+                case .closed, .failed: dead = true
+                default: dead = false
+                }
             }
+            guard self.isActiveGeneration(generation) else { return }
 
             if dead {
                 // The presentation phase may still be `.connected`; that is

@@ -1232,12 +1232,26 @@ struct TodoCardView: View {
     }
 
     private func row(for item: TodoItem) -> some View {
+        TodoChecklistRow(item: item)
+    }
+}
+
+/// One checklist row — a status glyph + the item content — shared by the
+/// transcript's ``TodoCardView`` and the Turn Dock's task box (Wave 25) so both
+/// surfaces render a todo item identically. Completed/cancelled items are struck
+/// through and dimmed; the glyph mapping matches the desktop checklist.
+struct TodoChecklistRow: View {
+    let item: TodoItem
+
+    @Environment(\.hermesTheme) private var theme
+
+    var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            glyph(for: item.status)
+            Self.glyph(for: item.status, theme: theme)
                 .frame(width: 16, height: 16)
             Text(item.content)
                 .font(.caption)
-                .foregroundStyle(textColor(for: item.status))
+                .foregroundStyle(Self.textColor(for: item.status, theme: theme))
                 .strikethrough(item.status == .completed || item.status == .cancelled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -1245,7 +1259,7 @@ struct TodoCardView: View {
     }
 
     @ViewBuilder
-    private func glyph(for status: TodoItem.Status) -> some View {
+    static func glyph(for status: TodoItem.Status, theme: HermesTheme) -> some View {
         switch status {
         case .completed:
             Image(systemName: "checkmark.circle.fill")
@@ -1262,7 +1276,7 @@ struct TodoCardView: View {
         }
     }
 
-    private func textColor(for status: TodoItem.Status) -> Color {
+    static func textColor(for status: TodoItem.Status, theme: HermesTheme) -> Color {
         switch status {
         case .completed, .cancelled: return theme.mutedFg
         default: return theme.fg

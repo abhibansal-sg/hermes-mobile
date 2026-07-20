@@ -1,3 +1,4 @@
+import SafariServices
 import SwiftUI
 
 /// The conversation surface: a scrolling transcript with auto-scroll, banners
@@ -103,6 +104,14 @@ struct ChatView: View {
     /// (desktop `--composer-measured-height` analog). Floors at `composerFloatInset`
     /// so the UX1 gate (≥120) holds and a pre-measurement frame never under-clears.
     @State private var composerHeight: CGFloat = ChatView.composerFloatInset
+    /// The MEASURED height of the Turn Dock's active surface (0 when the dock shows
+    /// nothing), measured the same way the composer is. Added to the transcript's
+    /// bottom clearance so the dock — which, like the composer, is a floating overlay
+    /// above the scroll surface and reserves NO layout inset of its own — never
+    /// covers the last message (owner QA §c: the transcript bottom inset previously
+    /// measured only the composer, so the taller dock surfaces sat on top of the
+    /// final row).
+    @State private var dockHeight: CGFloat = 0
     /// The live software-keyboard height (0 at rest), observed explicitly via
     /// `KeyboardHeightReader`. Added to the transcript's bottom clearance so the
     /// content rises WITH the keyboard by construction — not by SwiftUI inferring a
@@ -170,6 +179,16 @@ struct ChatView: View {
     }
     @State private var exportedTranscript: ExportedTranscript?
 
+    /// The URL awaiting the in-app Safari sheet (Wave 25 link fix #1). Wrapped
+    /// in an `Identifiable` item (bare `URL` has no stable identity SwiftUI can
+    /// key a `.sheet(item:)` off) so each tapped link presents its own sheet
+    /// instance even if the same URL is tapped twice in a row.
+    private struct InAppSafariItem: Identifiable {
+        let id = UUID()
+        let url: URL
+    }
+    @State private var presentedSafariURL: InAppSafariItem?
+
     /// The live biometric backend injected into the secure prompt (F4A-A2). A
     /// stateless `LAContextAuthenticator` (the F2 seam); falls back to the device
     /// passcode when biometrics are unavailable so the user is never locked out.
@@ -226,15 +245,28 @@ struct ChatView: View {
     ///    bottom-anchored (`defaultScrollAnchor(.bottom)`), growing this spacer
     ///    pushes the content up by exactly the keyboard height → the transcript
     ///    rises WITH the composer, deterministically.
+    ///  • Turn Dock present: ADD the measured dock height plus the `bottomStack`'s
+    ///    inter-element spacing, because the dock sits in the SAME floating overlay
+    ///    stack directly ABOVE the composer and reserves no inset of its own. Without
+    ///    this term the dock (approval / clarify / task box / queued strip) covers the
+    ///    last transcript row (owner QA §c). Zero when the dock shows nothing, so the
+    ///    at-rest full-bleed layout is byte-identical when no surface is up.
     static func composerClearance(
         composerHeight: CGFloat,
         keyboardHeight: CGFloat,
+        dockHeight: CGFloat = 0,
         baseline: CGFloat = HermesLayoutConstants.controlBottomBaseline
     ) -> CGFloat {
         let resting = max(composerFloatInset, composerHeight + composerBreathingGap)
         let keyboardClearance = max(0, keyboardHeight - baseline)
-        return resting + keyboardClearance
+        let dockClearance = dockHeight > 0 ? dockHeight + bottomStackSpacing : 0
+        return resting + dockClearance + keyboardClearance
     }
+
+    /// The vertical spacing between elements in `bottomStack`'s VStack (dock →
+    /// composer). Shared with `composerClearance` so the reserved dock clearance
+    /// matches the on-screen gap exactly.
+    static let bottomStackSpacing: CGFloat = 8
 
     /// Distance (pts) from the content's true bottom within which the transcript is
     /// considered "at bottom" — drives the streaming auto-stick gate and the
@@ -648,6 +680,25 @@ struct ChatView: View {
                         )
                     }
                 }
+                // In-app Safari (Wave 25 link fix #1): every `openURL` call
+                // anywhere below this point in the chat surface — a tapped
+                // transcript link, a rich-embed card's "Open" button — is
+                // intercepted here. http/https links present a dismissable
+                // in-app `SFSafariViewController` sheet instead of switching to
+                // the system Safari app; any other scheme (mailto:, tel:,
+                // custom app schemes, …) falls through to the system's default
+                // handling unchanged.
+                .environment(\.openURL, OpenURLAction { url in
+                    guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+                        return .systemAction
+                    }
+                    presentedSafariURL = InAppSafariItem(url: url)
+                    return .handled
+                })
+                .sheet(item: $presentedSafariURL) { item in
+                    InAppSafariView(url: item.url)
+                        .ignoresSafeArea()
+                }
         }
     }
 
@@ -757,13 +808,52 @@ struct ChatView: View {
     /// backing is painted BEHIND the composer on ALL OS versions so the composer
     /// floats over a clean substrate while the transcript's `EdgeFadeMask`
     /// dissolves the scrolling text above it (see `TranscriptEdgeEffect`).
+    /// The Turn Dock's active surface (Wave 25) — one interactive element at a
+    /// time, by priority (approval > clarify > tasks > queued). Shared with the
+    /// inline-todo suppression below so the dock and the transcript never
+    /// disagree about who owns the task list.
+    private var dockContent: TurnDockContent {
+        TurnDockContent.resolve(
+            hasApproval: chatStore.pendingApproval != nil,
+            hasClarification: chatStore.pendingClarification != nil,
+            hasTasks: chatStore.latestTodoList != nil,
+            hasQueued: TurnDock.hasQueued(queueStore)
+        )
+    }
+
+    /// Whether the transcript must suppress ALL its inline ``TodoCardView``s —
+    /// true ONLY while the dock is actually showing the task box (`.tasks`), so the
+    /// checklist is never hidden when the dock isn't rendering it (e.g. an approval
+    /// preempts the task box). The dock is the single home for the checklist:
+    /// suppressing every todo card (not just the latest) is what stops the one
+    /// evolving list from re-snapshotting inline 2-3x above the dock (owner QA §d).
+    private var dockSuppressesTodoCards: Bool {
+        dockContent == .tasks
+    }
+
     @ViewBuilder
     private func bottomStack(proxy: ScrollViewProxy) -> some View {
-        VStack(spacing: 8) {
+        VStack(spacing: Self.bottomStackSpacing) {
             banners
             if isCompact && !atBottom {
                 scrollToBottomPill(proxy: proxy)
             }
+            // Wave 25: the Turn Dock — the single home for interactive elements
+            // (approval / clarify / tasks / queued), attached directly above the
+            // frozen composer.
+            //
+            // Measure the dock's active-surface height so the transcript's bottom
+            // clearance reserves room for it the same way it does for the composer
+            // (owner QA §c). The dock is a floating overlay above the scroll surface,
+            // so without this the taller surfaces cover the last message. Collapses
+            // to 0 when the dock shows nothing (EmptyView), restoring the exact
+            // composer-only clearance.
+            TurnDock(chatStore: chatStore, queueStore: queueStore, themeStore: themeStore)
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.size.height
+                } action: { height in
+                    if abs(height - dockHeight) > 0.5 { dockHeight = height }
+                }
             ComposerView(
                 chatStore: chatStore,
                 attachmentStore: attachmentStore,
@@ -922,6 +1012,15 @@ struct ChatView: View {
                 let lastAssistantId = allRows.last(where: { $0.element.role == .assistant })?.element.id
                 let windowStart = max(0, allRows.count - windowSize)
                 let rows = Array(allRows[windowStart...])
+                // PERF (Wave 25): hoist the dock/inline-todo suppression flag to a
+                // SINGLE evaluation for the whole transcript. `dockSuppressesTodoCards`
+                // resolves `dockContent` (which touches `chatStore.latestTodoList`, an
+                // unmemoized O(messages × tools) reverse scan with no early return in the
+                // common no-todo case), and its value is identical for every row.
+                // Evaluating it inside the `ForEach` body made it O(rows × messages ×
+                // tools) per streaming flush; binding it once here makes it
+                // O(messages × tools) — one scan per body eval.
+                let suppressTodoCards = dockSuppressesTodoCards
                 if chatStore.isLoadingJumpTarget {
                     transcriptStatusChip(
                         "Loading earlier messages…",
@@ -973,7 +1072,8 @@ struct ChatView: View {
                         appearance: BubbleAppearance(themeID: theme.id, colorScheme: colorScheme, typeSize: dynamicTypeSize),
                         delivery: delivery,
                         onResend: deliveryResendHandler(for: delivery),
-                        onDeleteFailedSend: deliveryDeleteHandler(for: delivery, clientMessageID: message.clientMessageID)
+                        onDeleteFailedSend: deliveryDeleteHandler(for: delivery, clientMessageID: message.clientMessageID),
+                        suppressTodoCards: suppressTodoCards
                     )
                     // A1 (scarf): settled bubbles short-circuit their body — only the
                     // streaming bubble (whose `message` changed) re-evaluates. Drops the
@@ -1002,22 +1102,12 @@ struct ChatView: View {
                         ))
                         .id("hermes.chat.auto-compaction-indicator")
                 }
-                // ABH-83: Inline approval card — rendered as ADDITIVE transcript
-                // content after the last message when there is a pending approval
-                // for the current session. This is pure additive content: it does
-                // not touch any scroll/anchor/keyboard machinery. The existing
-                // re-pin-on-settle (BottomEdgeScroll / pendingLandOnNewest /
-                // scrollToBottomIfNeeded) naturally keeps this card visible when
-                // it appears at the tail, exactly like a new message row.
-                // The card disappears when pendingApproval is cleared (respondApproval
-                // sets it nil, expireTurnScopedPrompts sets it nil on turn end /
-                // session switch) — no manual lifecycle needed.
-                if let approval = chatStore.pendingApproval {
-                    ApprovalCard(approval: approval, chatStore: chatStore)
-                        .padding(.top, Self.intraTurnGap)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
-                        .id("inline-approval-\(approval.id)")
-                }
+                // Wave 25: the pending-approval card is no longer injected inline
+                // here — it now lives in the Turn Dock (attached above the
+                // composer), the single home for interactive elements. See
+                // `bottomStack` → `TurnDock`. Its lifecycle is unchanged
+                // (pendingApproval cleared by respondApproval / turn end / session
+                // switch); only its mount point moved.
                 // Session context line (STR-1029 §4): a small, muted,
                 // desktop-parity line at the transcript edge that surfaces the
                 // attached workspace/cwd when one exists. Reuses
@@ -1062,7 +1152,8 @@ struct ChatView: View {
                 Color.clear
                     .frame(height: Self.composerClearance(
                         composerHeight: composerHeight,
-                        keyboardHeight: keyboardHeight))
+                        keyboardHeight: keyboardHeight,
+                        dockHeight: dockHeight))
                     .accessibilityHidden(true)
                 // True content-end anchor (1pt) — search-jump target.
                 Color.clear
@@ -1617,10 +1708,10 @@ struct ChatView: View {
                 )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            if let clarification = chatStore.pendingClarification {
-                ClarifyBanner(clarification: clarification, chatStore: chatStore)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
+            // Wave 25: the clarify card moved into the Turn Dock (attached above
+            // the composer) for one consistent home alongside approval / tasks /
+            // queued. See `bottomStack` → `TurnDock`. Its design and respond
+            // wiring are unchanged.
             if let deviceLimitAdvisory = connectionStore.deviceLimitAdvisory {
                 deviceLimitAdvisoryBanner(deviceLimitAdvisory)
                     .transition(.move(edge: .top).combined(with: .opacity))
@@ -2306,6 +2397,13 @@ struct ChatView: View {
 
     private var isConnected: Bool {
         guard case .connected = connectionStore.phase else { return false }
+        // Wave-2 relay transport: the relay coordinator owns the session and
+        // drives the turn over the relay socket — it does NOT stamp the gateway
+        // `activeRuntimeId` the direct path uses. Gating the composer on that id
+        // would leave it permanently disabled in relay mode. The relay socket
+        // being open (already reflected in `phase == .connected` via the phase
+        // bridge) is the correct readiness signal here.
+        if connectionStore.transportPath == .relay { return true }
         // A fresh draft (chat-as-home) has no runtime yet — `ChatStore.send`
         // creates the gateway session lazily on the first prompt — so the
         // composer must be enabled the moment the gateway is connected.

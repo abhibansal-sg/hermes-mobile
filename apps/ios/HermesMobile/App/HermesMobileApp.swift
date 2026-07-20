@@ -170,6 +170,10 @@ struct HermesMobileApp: App {
                 }
                 .animation(.spring(response: 0.3, dampingFraction: 0.85), value: sharedInboxToast)
                 .task {
+                    // N3/A1 connect fast-path: stamp cold-open start so the
+                    // cold-open → cache paint → socket open → transport ready →
+                    // composer interactive sequence is measurable from the log.
+                    ConnectTrace.shared.begin()
                     Task { await AttachmentBlobCache.shared.performMaintenance() }
                     #if DEBUG
                     // DEBUG-only main-thread hitch logger (HERMES_PERF_LOG=1). Cheap,
@@ -207,8 +211,16 @@ struct HermesMobileApp: App {
                     // launch await. This is a cheap disk read; bootstrap() re-runs
                     // the same latched paint, which collapses onto this one.
                     await environment.connectionStore.paintDrawerCacheFirst()
-                    await environment.inboxStore.hydrateCachedGateway()
+                    // N3/A1 connect fast-path: start the connect (bootstrap) the
+                    // instant the cache is painted — do NOT serialize it behind the
+                    // inbox cache hydrate. The hydrate is a disk read independent
+                    // of the connection, so run it concurrently and rejoin before
+                    // the network `refresh()` (which needs the connection up).
+                    let inboxHydrate = Task { @MainActor in
+                        await environment.inboxStore.hydrateCachedGateway()
+                    }
                     await environment.connectionStore.bootstrap()
+                    await inboxHydrate.value
                     await environment.inboxStore.refresh()
                     // A notification response may have arrived while the process
                     // was being created. Keep it buffered until the complete

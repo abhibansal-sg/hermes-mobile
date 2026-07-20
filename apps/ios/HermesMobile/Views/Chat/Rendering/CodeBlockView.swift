@@ -168,7 +168,12 @@ struct CodeBlockView: View {
     private var codeBody: some View {
         ScrollView(.horizontal, showsIndicators: true) {
             Text(highlighted)
-                .perfTextSelection()
+                // Selection island (N5): code cards are deliberately NON-selectable.
+                // The header `copyButton` is the one copy affordance; attaching
+                // `.textSelection` here re-introduces the Copy|Share edit-menu pill
+                // on a long-press and lets a drag escape the card, breaking the
+                // prose-only selection island (approved design §7 — code/table/
+                // image cards bound selection; prose selects with handles).
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
                 .fixedSize(horizontal: true, vertical: true)

@@ -208,6 +208,101 @@ final class ChatStore {
     /// `HermesGatewayClient.requestRaw` through `undoRollbackRequest`.
     var undoRollbackRPC: ((String, JSONValue, Duration) async throws -> JSONValue)?
 
+    // MARK: - Turn dock accessors (Wave 25)
+
+    /// The latest todo list for the active session, or `nil` — the single
+    /// evolving checklist the Turn Dock's task box mirrors. On the DIRECT
+    /// (gateway) path, scans the visible transcript (`messages`, already scoped
+    /// to the active session) in reverse for the most recent `todo` tool
+    /// activity that yields a parseable list. On the RELAY path (N4/A5), the
+    /// relay's ONE living `.taskList` item bridges into the SAME accessor via
+    /// ``applyRelayItems(_:)`` (which refreshes the relay mirror on every
+    /// projection; ``syncRelayTaskList(from:)`` is the store-shaped entry
+    /// point) so the dock renders identically either way.
+    /// `nil` when the session has no todo activity yet, or the newest one carries
+    /// no list (e.g. a mid-run write before its first result).
+    ///
+    /// The dock renders THIS; while it shows the task box the transcript
+    /// suppresses EVERY inline `TodoCardView` for the session — not just the one
+    /// backing this list (owner QA §d). The dock is the single home for the
+    /// checklist, and because the agent rewrites the one evolving list across
+    /// several `todo` tool calls, suppressing only the latest still left the
+    /// earlier snapshots of the same list rendering inline 2-3×. The suppression
+    /// rule therefore lives in `ChatView.dockSuppressesTodoCards` as a pure
+    /// `dockContent == .tasks` flag, not a per-`tool_call_id` match.
+    var latestTodoList: TodoList? { latestTodo?.list }
+
+    /// The `tool_call_id` of the activity backing ``latestTodoList`` — the
+    /// identity of the newest todo list (exposed for tests and callers that need
+    /// to key on the active list). NOTE: inline-card suppression no longer keys on
+    /// this; the dock suppresses all todo cards wholesale while the task box is up
+    /// (see ``latestTodoList``).
+    var latestTodoToolID: String? { latestTodo?.id }
+
+    /// The relay-path mirror of the dock's todo list (N4/A5): the latest
+    /// `.taskList` item ingested from the relay item store, or `nil` when the
+    /// relay path has produced no task list (or has dropped it via a snapshot
+    /// that omits it). Held APART from the legacy `messages` scan so the two
+    /// paths never corrupt each other; the app is on EXACTLY ONE path at a time,
+    /// so when the relay mirror is populated it is authoritative for the dock
+    /// (the relay's `taskList` item IS the gateway's `todo` tool reframed for the
+    /// relay protocol — same list, same lifecycle, same data — RELAY-PHONE-
+    /// PROTOCOL §2 "taskList semantics"). Production wiring: ``applyRelayItems``
+    /// refreshes the mirror from the same reconciled items it projects into the
+    /// transcript (flag-gated — only reached when `transportPath` is `.relay`,
+    /// default OFF, so the gateway blob path is byte-unchanged). The convergence
+    /// wave will eventually retire the legacy scan.
+    private var relayLatestTaskList: (id: String, list: TodoList)?
+
+    /// Re-derive the relay-path task-list mirror from the current relay item
+    /// store (N4/A5). The production caller is ``applyRelayItems`` (which passes
+    /// the store's reconciled items on every frame batch); this store-shaped
+    /// entry point stays for callers that hold the store itself. Refreshing
+    /// includes CLEARING the mirror when no `.taskList` item remains (a snapshot
+    /// that drops the list, or a session switch to one with no todo activity).
+    /// Idempotent: re-running on an unchanged store is a no-op.
+    func syncRelayTaskList(from store: RelayItemStore) {
+        refreshRelayTaskListMirror(from: store.items)
+    }
+
+    /// Shared scan behind ``syncRelayTaskList(from:)`` and ``applyRelayItems``.
+    /// Most-recent `.taskList` item wins; the relay drives ONE living list per
+    /// session on a stable `<sid>:tasks` id, and the items are already in render
+    /// order (ord ascending, ties by arrival — `RelayItemStore.items`), so a
+    /// reverse scan returns the live one. Items whose body yields no parseable
+    /// list are skipped (mirrors the legacy scan's skip-empty semantics — keeps
+    /// the prior list rather than blanking the dock on a mid-stream delta).
+    private func refreshRelayTaskListMirror(from items: [ChatItem]) {
+        for item in items.reversed() where item.type == .taskList {
+            if let list = item.taskListBody {
+                relayLatestTaskList = (item.itemID, list)
+            }
+            return
+        }
+        relayLatestTaskList = nil
+    }
+
+    /// Shared scan behind both dock accessors: the newest todo activity that
+    /// yields a parseable list, with its identity. Prefers the relay mirror when
+    /// populated (relay path is authoritative when active); otherwise falls back
+    /// to the DIRECT (gateway) path's legacy scan of `messages`. Reverse order so
+    /// the list the agent is actively updating wins. The parse mirrors
+    /// `ToolClusterView.toolCard` exactly — structured `tool.todos` first, then
+    /// the `resultPreview` JSON fallback — so the dock and the (suppressed)
+    /// inline card would derive the identical list.
+    private var latestTodo: (id: String, list: TodoList)? {
+        if let relay = relayLatestTaskList { return relay }
+        for message in messages.reversed() {
+            for tool in message.tools.reversed() where tool.name == TodoList.toolName {
+                if let list = tool.todos.flatMap({ TodoList(todosArray: $0) })
+                    ?? TodoList(resultJSON: tool.resultPreview) {
+                    return (tool.id, list)
+                }
+            }
+        }
+        return nil
+    }
+
     /// Whether the most recent `send(text:)` call actually dispatched
     /// `prompt.submit` to the server, vs. refusing before ever asking (empty
     /// text, no connection, no resolvable runtime, attachment-upload
@@ -2301,6 +2396,35 @@ final class ChatStore {
         let hasAttachments = includeAttachments && (attachments?.hasPending ?? false)
         guard !trimmed.isEmpty || hasAttachments else { return false }
 
+        // Wave-2 relay transport: when the relay is the active transport, the
+        // gateway-direct `prompt.submit` (below and via the outbox) cannot run —
+        // the gateway socket is idle in relay-only mode, so it would throw "Not
+        // connected to the Hermes gateway" and strand the deep-link
+        // resume-to-send. Submit through the relay coordinator instead; the relay
+        // client owns its own reliability spine (seq/ack/resync), and the echoed
+        // user item + assistant stream reconcile back through the item projection,
+        // so no local echo is appended here. Text-only for now (attachments still
+        // route the gateway-direct upload path); the default gateway path below is
+        // byte-identical. Only engaged while the relay socket is actually open.
+        if !hasAttachments,
+           let connection, connection.transportPath == .relay,
+           let coordinator = connection.relayCoordinator, coordinator.isOpen {
+            setStreaming(true, reason: "relay.send")
+            lastError = nil
+            lastSendReachedServer = true
+            do {
+                _ = try await coordinator.submit(
+                    prompt: trimmed, sessionID: sessions?.activeStoredId
+                )
+                return true
+            } catch {
+                setStreaming(false, reason: "relay.sendError")
+                lastError = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                return false
+            }
+        }
+
         // Production sends enter the protected repository before session
         // creation, upload, local echo, or prompt.submit. Unit-store graphs that
         // do not install an outbox retain the legacy direct path below.
@@ -2450,6 +2574,39 @@ final class ChatStore {
         runtimeSessionID: String,
         remotePaths: [String]
     ) async throws -> OutboxSubmitResult {
+        // Wave-2 relay transport: when the flag is `.relay` the gateway `client`
+        // is idle, so the durable outbox must drain OVER THE RELAY (§5:
+        // `prompt.submit` maps to the relay `submit` RPC into the relay-owned
+        // session). The relay item projection owns the transcript + streaming
+        // state, so this branch deliberately skips the gateway-style local-turn /
+        // streaming bookkeeping — it routes the prompt and maps the RPC result to
+        // a receipt. A returned result (no throw) means the relay accepted the
+        // prompt → an accepted `queued` receipt marks the job completed (no
+        // permanent pending). A transport failure throws, and the outbox retains
+        // the row for the next wake so it delivers once the relay reconnects; the
+        // job's stable identity keeps that retry from creating a second row.
+        // Gated on the coordinator existing first: gateway-direct never allocates
+        // it, so that path skips the flag read and stays byte-identical.
+        if let coordinator = connection?.relayCoordinator,
+           connection?.transportPath == .relay {
+            prepareOutboxSubmission(job: job, remotePaths: remotePaths)
+            lastSendReachedServer = true
+            // Thread the durable row's stable id so an ambiguous-flap retry (the
+            // submit threw after the relay already ran `prompt_submit`, so the
+            // outbox retains the row and the next wake resubmits the SAME job) is
+            // deduped by the relay SUBMIT handler into a single turn — parity with
+            // the gateway path's `client_message_id` (see below).
+            _ = try await coordinator.submit(
+                prompt: job.submissionText,
+                sessionID: runtimeSessionID,
+                clientMessageID: job.clientMessageID
+            )
+            return OutboxSubmitResult(
+                status: "queued",
+                accepted: true,
+                clientMessageID: job.clientMessageID
+            )
+        }
         guard let client else { throw GatewayError.notConnected }
         prepareOutboxSubmission(job: job, remotePaths: remotePaths)
         pendingReconnectReconcileID = nil
@@ -3990,8 +4147,82 @@ final class ChatStore {
         // down (§3.7); never let it bleed into the next session's first seed.
         pendingForeignReconcileID = nil
         pendingReconnectReconcileID = nil
+        // The relay-path task-list mirror belongs to the session being torn down
+        // too (N4/A5): without this, a switch to a session projected via the
+        // gateway path (which never calls `applyRelayItems`) would keep showing
+        // the previous session's dock task box.
+        relayLatestTaskList = nil
         clearAllCompactionIndicators()
         transcriptGeneration = 0
+    }
+
+    // MARK: - Wave-2 relay transport projection (RELAY-PHONE-PROTOCOL §2/§7)
+
+    /// Rebuild the visible transcript from the relay item store's reconciled
+    /// items (the NEW relay transport path — docs/RELAY-PHONE-PROTOCOL.md §2).
+    ///
+    /// ADDITIVE + flag-gated: ONLY ``RelaySessionCoordinator`` (reached when the
+    /// `transportPath` flag is `.relay`, default OFF) calls this. The gateway blob
+    /// path never does, so today's streaming rendering is byte-unchanged.
+    ///
+    /// Projection (§2): each `userMessage` item becomes its own right-aligned
+    /// `.user` bubble and flushes the assistant segment before it; every other
+    /// item projects via ``ChatItem/renderPart`` into an ordered assistant
+    /// message — text/reasoning/usage reuse the legacy renderers, the special
+    /// kinds (`toolCall`/`fileChange`/`image`/`browser`/`error`) route through
+    /// `.item` for `ChatItemView`. A non-terminal trailing item keeps the
+    /// assistant bubble streaming. `items` MUST already be in render order (the
+    /// store sorts by `ord`, ties by arrival). Message + part identities are
+    /// derived deterministically from the stable relay ids, so re-projecting on
+    /// every frame is churn-free (SwiftUI diffs cleanly, no bubble re-creation).
+    func applyRelayItems(_ items: [ChatItem]) {
+        var rebuilt: [ChatMessage] = []
+        var segmentParts: [ChatMessagePart] = []
+        var segmentAnchor: String?
+        var segmentStreaming = false
+
+        func flushSegment() {
+            guard let anchor = segmentAnchor, !segmentParts.isEmpty else {
+                segmentParts = []
+                segmentAnchor = nil
+                segmentStreaming = false
+                return
+            }
+            rebuilt.append(ChatMessage(
+                id: ChatMessage.deterministicID(seedKey: "relay-assistant-\(anchor)"),
+                role: .assistant,
+                parts: segmentParts,
+                isStreaming: segmentStreaming
+            ))
+            segmentParts = []
+            segmentAnchor = nil
+            segmentStreaming = false
+        }
+
+        for item in items {
+            if item.type == .userMessage {
+                flushSegment()
+                rebuilt.append(ChatMessage(
+                    id: ChatMessage.deterministicID(seedKey: "relay-user-\(item.itemID)"),
+                    role: .user,
+                    parts: [.text(id: item.itemID, text: item.textBody)]
+                ))
+            } else if let part = item.renderPart {
+                if segmentAnchor == nil { segmentAnchor = item.itemID }
+                segmentParts.append(part)
+                if !item.isTerminal { segmentStreaming = true }
+            }
+        }
+        flushSegment()
+
+        messages = rebuilt
+        // N4/A5: the dock's task box reads `latestTodoList`; on the relay path
+        // the ONE living `.taskList` item lives in these reconciled items, NOT
+        // in a `todo` ToolActivity the legacy scan would find — refresh the
+        // relay mirror from the same batch so the dock works identically on
+        // both transports (and clears when the session has no task list).
+        refreshRelayTaskListMirror(from: items)
+        setStreaming(rebuilt.contains { $0.isStreaming }, reason: "relayProjection")
     }
 
     /// Surface a failed `open()`-path transcript seed the same way a failed
