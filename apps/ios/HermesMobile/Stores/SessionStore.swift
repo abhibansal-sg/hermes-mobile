@@ -4105,6 +4105,33 @@ final class SessionStore {
         }
     }
 
+    /// Adopt a session the RELAY created on submit (QA-1 B13 — brand-new chat).
+    ///
+    /// The relay SUBMIT handler creates + owns the session when the phone sends
+    /// with no session id (a draft) and returns its id in the RPC result. The
+    /// gateway-direct `createDraftSession()` path cannot run in relay mode (the
+    /// gateway client is idle), so this is the relay equivalent of its
+    /// bookkeeping half: clear the draft, bind the stored + runtime ids (the
+    /// relay keys its runtime on the STORED id), and refresh the drawer so the
+    /// new row appears. Guarded to ONLY adopt when nothing is bound yet: a
+    /// submit into an existing session echoes an id the pointers must NOT be
+    /// overwritten with (the relay may echo a DISTINCT live id after a
+    /// resume-remap — the stored id stays the phone's identity), and a deduped
+    /// retry (`deduplicated: true`) must not churn the pointers.
+    func landRelayCreatedSession(storedID: String) {
+        guard isDraft || activeStoredId == nil else { return }
+        isDraft = false
+        activeStoredId = storedID
+        activeRuntimeId = storedID
+        activeRuntimeEpoch = connection?.transportEpoch
+        ensureRuntimeAttempts = 0
+        lastError = nil
+        sessionActionError = nil
+        // Surface the new row in the drawer; never block the turn on it
+        // (mirrors `createDraftSession`'s background refresh).
+        Task { [weak self] in await self?.refresh() }
+    }
+
     /// Eagerly create a brand-new session **now** and activate it with an empty
     /// transcript, so `activeRuntimeId` is non-nil the instant this returns.
     ///
