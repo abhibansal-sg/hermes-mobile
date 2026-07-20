@@ -1450,6 +1450,72 @@ final class ChatStore {
         pendingClarification = PendingClarification(sessionId: sessionId, request: request)
     }
 
+    // MARK: - Wave-2 relay gate bridge (QA-1 B10 / A3)
+    //
+    // The relay delivers `approval.request` / `clarify.request` as downstream
+    // FRAMES (body = the gateway's raw payload dict, passed through verbatim by
+    // the reframer). They are NOT items — `RelayItemStore` drops them by design
+    // — so without this bridge the Turn Dock's resolver (whose SOLE inputs are
+    // `pendingApproval` / `pendingClarification`, set today only by the gateway
+    // event router above) resolves `.none` forever on the relay path: no card,
+    // nothing tappable (build 114 device QA, B10). Folding the frames into the
+    // SAME state makes the relay path render the identical `ApprovalCard` /
+    // `ClarifyBanner` in the identical dock — the card views are transport-
+    // agnostic once this state is set.
+
+    /// Ids of gates already ANSWERED or expired by a settled turn. Item frames
+    /// have per-kind idempotency in `RelayItemStore`, but gates are ONE-SHOT: a
+    /// `resync` after a socket flap replays ring frames the phone already dealt
+    /// with, and re-folding an answered gate would resurrect a dead card. The
+    /// bridge suppresses by id instead. Bounded (drop-all past 256 — replay
+    /// windows are short, and a dropped key at worst re-surfaces a card that
+    /// the next `turn.completed` clears); `reset()` drops the set with the
+    /// session it belongs to.
+    private var resolvedRelayGateIDs: Set<String> = []
+
+    private func markRelayGateResolved(_ id: String) {
+        guard !id.isEmpty else { return }
+        resolvedRelayGateIDs.insert(id)
+        if resolvedRelayGateIDs.count > 256 { resolvedRelayGateIDs.removeAll() }
+    }
+
+    /// Relay analogue of `handleApprovalRequest`: fold a decoded
+    /// `approval.request` frame into the SAME `pendingApproval` the Turn Dock's
+    /// `ApprovalCard` reads. `sessionId` is the frame's `sid` — the responder
+    /// answers against THAT session even when the gate was mirrored from a
+    /// foreign turn (same semantics as the direct router's `event.sessionId`).
+    func applyRelayApprovalRequest(_ frame: RelayFrame) {
+        let request = ApprovalRequestPayload(payload: frame.body)
+        guard !resolvedRelayGateIDs.contains(request.id) else { return }
+        pendingApproval = PendingApproval(id: request.id, sessionId: frame.sid, request: request)
+        onApprovalChange?(true)
+    }
+
+    /// Relay analogue of `handleClarifyRequest`: fold a decoded
+    /// `clarify.request` frame into the SAME `pendingClarification` the dock's
+    /// `ClarifyBanner` reads (options tappable + custom answer). The body's
+    /// `request_id` is retained on the payload: the answer MUST echo it — the
+    /// gateway matches the pending waiter by it (`_respond`, server.py:5059);
+    /// a reply without it 4009s and the agent hangs.
+    func applyRelayClarifyRequest(_ frame: RelayFrame) {
+        let request = ClarifyRequestPayload(payload: frame.body)
+        if let rid = request.requestId, resolvedRelayGateIDs.contains(rid) { return }
+        pendingClarification = PendingClarification(sessionId: frame.sid, request: request)
+    }
+
+    /// Relay analogue of the direct path's message.complete expiry (R1
+    /// #51/#52): a `turn.completed` frame — or a projected-session switch —
+    /// ends the turn the pending gate belonged to, so the card is stale and
+    /// answering it would target a dead runtime. Marks the ids resolved FIRST
+    /// so a resync replay of the settled turn's gate frames cannot resurrect
+    /// the card. Secure prompts are left to their own RPC lifecycle (none
+    /// exist on the relay wire today), matching the direct complete path.
+    func expireRelayPendingGates() {
+        if let id = pendingApproval?.id { markRelayGateResolved(id) }
+        if let rid = pendingClarification?.request.requestId { markRelayGateResolved(rid) }
+        expireTurnScopedPrompts(includeSecure: false)
+    }
+
     /// One ownership decision for live approval/clarify/complete events. APNs is
     /// authoritative after a successful registration for this exact pairing;
     /// otherwise the correlated local request is the explicit fallback.
@@ -3035,6 +3101,35 @@ final class ChatStore {
         // approvals (broadcast from another client's turn) that is a foreign
         // runtime id, not our own.
         let approvalSession = pendingApproval?.sessionId
+        // Wave-2 relay transport (QA-1 B10): the gateway `client` is idle in
+        // relay mode, so answer OVER THE RELAY — `coordinator.approve` builds
+        // the ratified §5 wire shape (`session_id` + `decision` [+ `request_id`
+        // / `all`]; the relay maps decision→the gateway's `choice`). Same
+        // optimistic clear as the direct path below; the relay resolves the
+        // gate by session, so a nil/empty `approvalSession` falls back to the
+        // coordinator's driven session exactly as `respondApproval` does to
+        // `activeSessionId`. The default gateway path stays byte-identical.
+        if let connection, connection.transportPath == .relay {
+            let requestId = pendingApproval?.id ?? ""
+            pendingApproval = nil
+            onApprovalChange?(false)
+            markRelayGateResolved(requestId)
+            guard let coordinator = connection.relayCoordinator else {
+                lastError = "Relay not connected"
+                return
+            }
+            do {
+                _ = try await coordinator.approve(
+                    sessionID: approvalSession?.isEmpty == false ? approvalSession : nil,
+                    requestID: requestId,
+                    decision: approve ? "approve" : "deny",
+                    resolveAll: all
+                )
+            } catch {
+                lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+            return
+        }
         guard let client,
               let sessionId = (approvalSession?.isEmpty == false ? approvalSession : activeSessionId)
         else { return }
@@ -3064,6 +3159,29 @@ final class ChatStore {
     func respondClarification(_ answer: String) async {
         let pending = pendingClarification
         let clarifySession = pending?.sessionId
+        // Wave-2 relay transport (QA-1 B10): answer OVER THE RELAY —
+        // `coordinator.clarify` builds the §5 shape (`session_id` + `text` +
+        // `request_id`; the relay maps text→the gateway's `answer`). The
+        // `request_id` echo is REQUIRED: the gateway matches the pending
+        // waiter by it — without it the reply 4009s and the agent hangs.
+        if let connection, connection.transportPath == .relay {
+            pendingClarification = nil
+            if let rid = pending?.request.requestId { markRelayGateResolved(rid) }
+            guard let coordinator = connection.relayCoordinator else {
+                lastError = "Relay not connected"
+                return
+            }
+            do {
+                _ = try await coordinator.clarify(
+                    sessionID: clarifySession?.isEmpty == false ? clarifySession : nil,
+                    requestID: pending?.request.requestId ?? "",
+                    response: answer
+                )
+            } catch {
+                lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+            return
+        }
         guard let client,
               let sessionId = (clarifySession?.isEmpty == false ? clarifySession : activeSessionId)
         else { return }
@@ -4160,6 +4278,10 @@ final class ChatStore {
         userOrdinals = [:]
         pendingApproval = nil
         pendingClarification = nil
+        // The relay gate-suppression set belongs to the session being torn
+        // down (QA-1 B10) — never let it leak into the next session and
+        // suppress a legitimately new gate that reuses a request id space.
+        resolvedRelayGateIDs.removeAll()
         // A transient secure prompt belongs to the session being torn down; drop
         // it (no value is held here — see PendingSecurePrompt). The view's
         // `@State` value clears itself on dismissal.
