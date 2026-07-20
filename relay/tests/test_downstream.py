@@ -415,6 +415,50 @@ async def test_submit_without_client_message_id_never_dedupes():
     assert gw.prompt_submit.await_count == 2
 
 
+async def test_submit_dedup_lru_evicts_oldest_so_retry_redrives():
+    """The SUBMIT dedup map is BOUNDED (cap 1024, LRU eviction). Once an id is
+    evicted, a late retry with that id is no longer recognized and drives a fresh
+    turn — the bounded window is the contract, not infinite dedup. Correctness is
+    preserved by `completed`-is-authoritative; only duplicate-suppression is
+    bounded. This test pins the bound so a future change cannot silently unbound
+    the table."""
+    srv, gw = _server()
+    gw.owns = MagicMock(return_value=True)
+    await srv.start()
+    cap = srv._submit_dedup_cap
+    assert cap == 1024, "the documented LRU cap (RELAY-PHONE-PROTOCOL.md §5a)"
+
+    # Fill the table past the cap; the OLDEST id ("cm-first") is evicted.
+    for i in range(cap + 1):
+        await _handle(
+            srv,
+            UpstreamMethod.SUBMIT,
+            {"text": "x", "session_id": f"s{i}", "client_message_id": f"cm-{i}"},
+        )
+    assert len(srv._submit_dedup) == cap, "the dedup table never grows past its cap"
+
+    # A retry of the evicted id is NOT recognized: it drives a fresh turn.
+    gw.prompt_submit.reset_mock()
+    res = await _handle(
+        srv,
+        UpstreamMethod.SUBMIT,
+        {"text": "again", "session_id": "sLate", "client_message_id": "cm-first"},
+    )
+    gw.prompt_submit.assert_awaited_once_with("sLate", "again")
+    assert res == {"session_id": "sLate"}, "evicted id is treated as a new submit"
+
+    # A retry of an id still IN the table IS recognized: no second turn.
+    gw.prompt_submit.reset_mock()
+    res2 = await _handle(
+        srv,
+        UpstreamMethod.SUBMIT,
+        {"text": "again", "session_id": "sLate", "client_message_id": f"cm-{cap}"},
+    )
+    gw.prompt_submit.assert_not_awaited()
+    assert res2["deduplicated"] is True
+
+
+
 async def test_resume_owns_idle_session():
     srv, gw = _server()
     await srv.start()
