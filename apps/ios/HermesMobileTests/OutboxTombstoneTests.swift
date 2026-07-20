@@ -95,7 +95,7 @@ final class OutboxTombstoneTests: XCTestCase {
             kind: .prompt, scope: harness.scope, text: "mid-submit cancel", storedSessionID: "stored-A"
         ))
         // The drain claims (leases) the row — simulating a submit in flight.
-        let claimed = try harness.repository.claimNextJob(
+        let claimed = try await harness.repository.claimNextJob(
             scope: harness.scope,
             owner: "drain-owner",
             now: Date(),
@@ -110,7 +110,7 @@ final class OutboxTombstoneTests: XCTestCase {
         XCTAssertEqual(persisted?.state, .cancelled, "a leased row is tombstoned, not deleted mid-flight")
         XCTAssertNil(persisted?.leaseOwner, "the tombstone releases the lease")
         // A different claimant (the relaunch drain) can never pick it up.
-        let reclaimed = try harness.repository.claimNextJob(
+        let reclaimed = try await harness.repository.claimNextJob(
             scope: harness.scope,
             owner: "relaunch-drain",
             now: Date(),
@@ -144,7 +144,8 @@ final class OutboxTombstoneTests: XCTestCase {
 
         // -- "relaunch": a brand-new repository over the same durable directory.
         let relaunched = try makeHarness(directory: directory)
-        let surviving = try await relaunched.repository.job(id: survivingJobID(in: relaunched))
+        let survivingID = await survivingJobID(in: relaunched)
+        let surviving = try await relaunched.repository.job(id: survivingID)
         _ = surviving
         var submitCalls = 0
         let processor = OutboxProcessor(repository: relaunched.repository, dependencies: .init(
@@ -191,7 +192,7 @@ final class OutboxTombstoneTests: XCTestCase {
             uploadAsset: { _, _ in throw OutboxProcessorError.destinationUnavailable },
             willSubmit: { _, _ in },
             submit: { job, _, _ in
-                submitted.append(job.text)
+                submitted.append(job.text ?? "")
                 return OutboxSubmitResult(status: "queued", accepted: true)
             }
         ))
@@ -214,7 +215,7 @@ final class OutboxTombstoneTests: XCTestCase {
         await harness.queueStore.removeAll()
 
         await waitUntil { harness.queueStore.pendingCount == 0 }
-        let reclaimed = try harness.repository.claimNextJob(
+        let reclaimed = try await harness.repository.claimNextJob(
             scope: harness.scope, owner: "relaunch-drain", now: Date(), leaseDuration: 120
         )
         XCTAssertNil(reclaimed, "no cleared row survives to a relaunch claim")
@@ -233,7 +234,7 @@ final class OutboxTombstoneTests: XCTestCase {
     /// The first job id the repository holds (any state) — used to prove the
     /// relaunch store sees NO live row; returns a synthesized missing id when
     /// the store is empty (the expected case).
-    private func survivingJobID(in harness: Harness) -> String {
-        (try? harness.repository.jobs(scope: harness.scope).first?.jobID) ?? "missing-\(UUID().uuidString)"
+    private func survivingJobID(in harness: Harness) async -> String {
+        (try? await harness.repository.jobs(scope: harness.scope).first?.jobID) ?? "missing-\(UUID().uuidString)"
     }
 }
