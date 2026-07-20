@@ -124,6 +124,47 @@ Live streaming to the phone works for any session the relay OWNS (i.e. after
 submit/resume-to-drive). Live mirroring of a session actively driven by ANOTHER
 client = PARKED (needs broadcast; see `MOBILE-RELAY-CLIENT-DESIGN.md`).
 
+### 5a. SUBMIT idempotency — `client_message_id` (A3)
+
+A queued send must never drive two turns even when the RPC result is lost to a
+socket flap (the phone marks the outbox row `transport_ambiguous` and resubmits
+the SAME job on a fresh connection). The contract is a single field:
+
+- **Field:** `client_message_id` (string, optional) on the `submit` RPC `params`.
+- **Origin:** minted ONCE when the durable outbox row is created (the row's stable
+  job id; persisted in the `work_jobs.client_message_id` NOT-NULL column) and
+  NEVER regenerated — the same id is replayed on every retry of that row.
+  Interactive/legacy sends that do not allocate an outbox row simply OMIT the
+  field. The iOS submit path threads `job.clientMessageID` on both the relay
+  branch (`RelayClient.submit(clientMessageID:)` → params.`client_message_id`)
+  and the gateway-direct branch (`prompt.submit` params.`client_message_id`).
+- **Relay handling (`downstream.handle_upstream`, SUBMIT):**
+  1. Read `cmid = params.get("client_message_id")`.
+  2. If `cmid` is present AND already in the server-scoped bounded LRU
+     (`_submit_dedup`, cap 1024) → the prior submit already ran `prompt_submit`;
+     replay the resolved live `session_id` WITHOUT driving a second turn and
+     return `{"session_id": <live>, "deduplicated": true}`. The phone's outbox
+     treats a `deduplicated` receipt with a matching `client_message_id` as
+     accepted and transitions the row to `completed` (no second row is created).
+  3. Otherwise run the normal submit path (create/resume + `prompt_submit`) and,
+     BEFORE returning, record `_remember_submit(cmid, resolved_live_sid)` so a
+     retry that races the RPC result back over a flapped socket is deduped.
+  4. Absent the field → the dedup check and the remember are both skipped
+     (legacy/interactive sends must NOT be silently swallowed); behavior is
+     exactly the pre-idempotency path.
+- **Scope + bound:** the dedup map lives on the `DownstreamServer` (it outlives
+  any single phone connection, so a retry on a FRESH socket after reconnect is
+  still recognized). It is a bounded LRU — when full, the oldest entry is
+  evicted, so the table can never grow without limit. A retry whose id was
+  evicted simply drives a fresh turn (correctness is preserved by `completed`-
+  is-authoritative; only the duplicate-suppression window is bounded).
+- **Persistence note:** the dedup map is IN-MEMORY and lives for the relay
+  process lifetime. A relay *restart* (not a phone reconnect) loses it; the
+  outbox still drains correctly because the gateway is the system of record
+  (`completed`-is-authoritative), at the cost of a possible duplicate turn on a
+  restart-mid-ambiguous-flap — an explicit non-goal bounded by A6's gap-free
+  resync guarantee for the transcript.
+
 ## 6. Notifications (relay-fired, phone-off)
 
 Relay observes these signals for its OWNED sessions → fires APNs via the existing
