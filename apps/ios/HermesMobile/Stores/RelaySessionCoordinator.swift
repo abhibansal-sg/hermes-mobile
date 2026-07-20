@@ -586,6 +586,11 @@ final class RelaySessionCoordinator {
         // the direct path's `reset()` on open; answering session A's card while
         // viewing B would mis-route the answer).
         chatStore.expireRelayPendingGates()
+        // R16: a relay turn mirrored for the outgoing session's Live Activity
+        // must end when the user switches away — otherwise the lock-screen
+        // timer keeps counting a turn the user is no longer viewing (and may
+        // never see complete on this surface). No-op when no turn was live.
+        chatStore.endRelayTurnForSessionSwitch()
     }
 
     func list() async throws -> JSONValue { try await requireClient().list() }
