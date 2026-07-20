@@ -4786,6 +4786,19 @@ final class ChatStore {
         }
     }
 
+    /// QA-2 R12/R13 — relay turn start. Called by `RelaySessionCoordinator`
+    /// .ingest on a `turn.started` frame. The relay item store accumulates the
+    /// PRIOR turn's `taskList` item (stable `<sid>:tasks` id, replaced in place
+    /// only when THIS turn emits its own first `taskList` frame), so without
+    /// this clear the next `applyRelayItems` would re-mirror the previous turn's
+    /// list and the dock pill would briefly render stale data the moment the new
+    /// turn flips `isStreaming` true. Clearing here lets the new turn re-seed
+    /// the dock from a blank slate the instant its own `taskList` arrives.
+    func handleRelayTurnStarted() {
+        relayLatestTaskList = nil
+        taskListOwnerSessionId = nil
+    }
+
     #if DEBUG
     /// DEBUG test seam: drive the local-turn watchdog's force-settle path
     /// synchronously without waiting ``localTurnStaleTimeout``. Production code

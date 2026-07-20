@@ -283,6 +283,29 @@ final class TaskDockLifecycleTests: XCTestCase {
         XCTAssertTrue(chat.dockShowsTaskBox, "fresh turn's list re-seeds the dock")
     }
 
+    func testHandleRelayTurnStartedClearsPriorList() {
+        // R12/R13: `turn.started` is the authoritative "new turn" edge — the
+        // dock must drop the previous turn's list so the pill never flashes
+        // stale data when the new turn begins streaming. The relay item store
+        // still holds the old `<sid>:tasks` item until the new turn emits its
+        // own, so this clear is what prevents a stale re-mirror on the next
+        // `applyRelayItems`.
+        let chat = bareChat()
+        chat.applyRelayItems([ChatItem(
+            itemID: "s1:tasks", type: .taskList, status: .inProgress, ord: 4,
+            body: [
+                "tasks": [["id": "1", "text": "Previous turn", "status": "in_progress"]],
+                "all_complete": false,
+            ]
+        )])
+        chat.isStreaming = true
+        XCTAssertTrue(chat.dockShowsTaskBox, "precondition: pill visible for prior turn")
+
+        chat.handleRelayTurnStarted()
+        XCTAssertNil(chat.latestTodoList, "turn.started clears the prior list mirror")
+        XCTAssertFalse(chat.dockShowsTaskBox, "pill hidden until the new turn emits its own list")
+    }
+
     // MARK: - Frame stamping (observability for the watchdog)
 
     func testApplyRelayItemsStampsFrameArrival() {
