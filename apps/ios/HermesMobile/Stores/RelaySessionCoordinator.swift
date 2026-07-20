@@ -425,6 +425,10 @@ final class RelaySessionCoordinator {
         case .approvalRequest: chatStore.applyRelayApprovalRequest(frame)
         case .clarifyRequest:  chatStore.applyRelayClarifyRequest(frame)
         case .turnCompleted:   chatStore.expireRelayPendingGates()
+            // QA-2 R12: clear a terminal (all-done/cancelled) task list's
+            // ownership so the dock pill dismisses at turn end even though the
+            // `taskList` item itself persists in the relay item store.
+            chatStore.handleRelayTurnCompleted()
         default: break
         }
     }
