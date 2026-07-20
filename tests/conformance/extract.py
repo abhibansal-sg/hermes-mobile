@@ -77,13 +77,13 @@ def swift_upstream_methods() -> list[str]:
     return re.findall(r"^\s*case\s+(\w+)", block, flags=re.M)
 
 
-def _func_blocks(source: str) -> dict[str, str]:
-    """Map func-name -> full brace-balanced body for top-level/actor funcs."""
-    out: dict[str, str] = {}
+def _func_blocks(source: str) -> list[tuple[str, str]]:
+    """(func-name, full brace-balanced body) pairs — overloads appear more than
+    once, so this is a list, not a map."""
+    out: list[tuple[str, str]] = []
     for m in re.finditer(r"\bfunc\s+(\w+)\s*\(", source):
-        name = m.group(1)
         try:
-            out[name] = _brace_block(source, m.start())
+            out.append((m.group(1), _brace_block(source, m.start())))
         except ValueError:
             continue
     return out
@@ -100,11 +100,11 @@ def swift_upstream_sends() -> dict[str, dict[str, list[str]]]:
     — ``params["k"] =`` assignments, which in this client are all if-guarded).
     """
     source = _read(_RELAY_CLIENT)
-    sends: dict[str, dict[str, list[str]]] = {}
-    for _func_name, body in _func_blocks(source).items():
+    sends: dict[str, dict[str, set[str]]] = {}
+    for _func_name, body in _func_blocks(source):
         call = _METHOD_CALL.search(body)
         if not call:
-            continue
+            continue  # a convenience wrapper that never builds a wire payload
         method = call.group(1)
         required = {
             k
@@ -112,12 +112,16 @@ def swift_upstream_sends() -> dict[str, dict[str, list[str]]]:
             if k not in _RPC_ENVELOPE_KEYS
         }
         optional = set(_KEY_ASSIGN.findall(body)) - _RPC_ENVELOPE_KEYS
-        # A key built unconditionally in the literal is required, not optional.
-        sends[method] = {
-            "required": sorted(required - optional),
-            "optional": sorted(optional - required),
+        slot = sends.setdefault(method, {"required": set(), "optional": set()})
+        slot["required"] |= required - optional
+        slot["optional"] |= optional - required
+    return {
+        method: {
+            "required": sorted(v["required"]),
+            "optional": sorted(v["optional"] - v["required"]),
         }
-    return sends
+        for method, v in sends.items()
+    }
 
 
 def _coding_keys(enum_block: str) -> list[str]:

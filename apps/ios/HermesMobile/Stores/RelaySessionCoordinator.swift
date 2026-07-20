@@ -439,14 +439,43 @@ final class RelaySessionCoordinator {
         try await requireClient().history(sessionID: sessionID, limit: limit)
     }
 
+    /// Answer an approval gate over the relay (§5). The relay resolves the gate
+    /// by SESSION, so the session id is REQUIRED on the wire — it defaults to
+    /// the session this coordinator is driving, or pass the gate's own session
+    /// explicitly (e.g. an inbox item from another chat). `decision` is one of
+    /// `approve`/`once`/`session`/`always`/`deny` (mapped to the gateway's
+    /// `choice` by the relay); the wire shape is asserted by tests/conformance.
     @discardableResult
-    func approve(requestID: String, approved: Bool) async throws -> JSONValue {
-        try await requireClient().approve(requestID: requestID, approved: approved)
+    func approve(
+        sessionID: String? = nil,
+        requestID: String = "",
+        decision: String,
+        resolveAll: Bool = false
+    ) async throws -> JSONValue {
+        guard let sid = sessionID ?? activeSessionID else { throw RelayError.notConnected }
+        return try await requireClient().approve(
+            sessionID: sid, requestID: requestID, decision: decision, resolveAll: resolveAll
+        )
     }
 
+    /// Convenience for the common approve/deny choice.
     @discardableResult
-    func clarify(requestID: String, response: String) async throws -> JSONValue {
-        try await requireClient().clarify(requestID: requestID, response: response)
+    func approve(sessionID: String? = nil, requestID: String = "", approved: Bool) async throws -> JSONValue {
+        try await approve(
+            sessionID: sessionID,
+            requestID: requestID,
+            decision: approved ? "approve" : "deny"
+        )
+    }
+
+    /// Answer a clarify gate over the relay (§5). `requestID` MUST be the id
+    /// from the `clarify.request` frame body — the gateway routes the answer by
+    /// it; the relay additionally requires the session id (defaults to the
+    /// driven session). Wire shape asserted by tests/conformance.
+    @discardableResult
+    func clarify(sessionID: String? = nil, requestID: String, response: String) async throws -> JSONValue {
+        guard let sid = sessionID ?? activeSessionID else { throw RelayError.notConnected }
+        return try await requireClient().clarify(sessionID: sid, requestID: requestID, response: response)
     }
 
     @discardableResult
