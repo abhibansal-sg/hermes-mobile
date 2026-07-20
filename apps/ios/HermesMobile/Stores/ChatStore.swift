@@ -3002,6 +3002,20 @@ final class ChatStore {
         }
     }
 
+    /// QA-2 R8 / N3 — append the user's clarify answer as a local user row.
+    /// See `respondClarification`. The echo is NOT outbox-tracked (no
+    /// `clientMessageID`): the answer is delivered by the gate RPC, not the
+    /// durable submit path, so there is nothing to retry/cancel. Untagged +
+    /// non-relay-projected so `applyRelayItems` preserves it across live
+    /// projections and the direct-path reconcile never evicts a fresh row.
+    private func appendClarifyAnswerEcho(_ answer: String) {
+        let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let message = ChatMessage(role: .user, text: trimmed)
+        userOrdinals[message.id] = messages.lazy.filter { $0.role == .user }.count
+        messages.append(message)
+    }
+
     private func presentOutboxEcho(
         clientMessageID: String,
         text: String,
@@ -3475,6 +3489,20 @@ final class ChatStore {
     func respondClarification(_ answer: String) async {
         let pending = pendingClarification
         let clarifySession = pending?.sessionId
+        // QA-2 R8 / N3: echo the user's answer as a local user row BEFORE the
+        // card clears, so the transcript shows what the user picked. The
+        // pre-QA-2 path cleared the card + emitted the RPC but appended nothing
+        // — on the relay path no `userMessage` item is synthesized for clarify
+        // answers (only prompts), so the card vanished with no answer bubble
+        // (IMG_2535/2540, docs/qa2-root-causes.md N3). Mirrored on BOTH
+        // transports (relay + direct): an untagged local user row is preserved
+        // by `applyRelayItems` (relayProjected=false, no consumed echo id), and
+        // the direct path's reconcile never evicts a fresh user row. Guarded on
+        // `pending != nil` so a re-entrant call after the card cleared (the
+        // view's isResponding guard is best-effort) cannot duplicate the row.
+        if pending != nil {
+            appendClarifyAnswerEcho(answer)
+        }
         // Wave-2 relay transport (QA-1 B10): answer OVER THE RELAY —
         // `coordinator.clarify` builds the §5 shape (`session_id` + `text` +
         // `request_id`; the relay maps text→the gateway's `answer`). The
