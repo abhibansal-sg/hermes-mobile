@@ -171,6 +171,12 @@ final class WireConformanceTests: XCTestCase {
         )
         _ = try await client.clarify(sessionID: "sess-1", requestID: "clr-1", response: "staging")
         _ = try await client.interrupt("sess-1")
+        // B9/A5: all four contracted keys (required kind+data_url, optional
+        // name+session_id) on the wire in one drive.
+        _ = try await client.attach(
+            sessionID: "sess-1", kind: "file", name: "notes.txt",
+            dataURL: "data:text/plain;base64,aGVybWVz"
+        )
         await client.setForeground("sess-1")
 
         // ack needs an advanced watermark; resync reads it. Deliver one frame so
