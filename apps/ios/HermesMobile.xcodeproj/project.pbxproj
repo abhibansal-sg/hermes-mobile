@@ -188,6 +188,7 @@
 		69E12C83BE295765E63EF317 /* RestClient+PendingAttention.swift in Sources */ = {isa = PBXBuildFile; fileRef = C687EFF53ECC56E45EB67825 /* RestClient+PendingAttention.swift */; };
 		6A943BB02927739C8FF3FE8F /* HermesShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5B995D6441FF0AE876F8CD2 /* HermesShortcuts.swift */; };
 		6AB9BA91EDF1BCBE9EA659B2 /* AutomationRunsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91263AEDF08EC71362354006 /* AutomationRunsView.swift */; };
+		6BADF83C435B9AFD10A57ECE /* NativeChromeSnapshotEvidenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A9A2702EB18BDA9C853C43F /* NativeChromeSnapshotEvidenceTests.swift */; };
 		6C5FB71D6F6894596241A06F /* TransferHTTPPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE21294EEA33F0F96DCCDFE6 /* TransferHTTPPolicy.swift */; };
 		6CBA55FC56D9AFC9ABD3EF56 /* mermaid.min.js in Resources */ = {isa = PBXBuildFile; fileRef = 1D92C08C1F691BE85AF3F104 /* mermaid.min.js */; };
 		6CC5189D1EEC12F42502B5B5 /* LiveTurnReentryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D60C402379D90E4C5FA2B45 /* LiveTurnReentryTests.swift */; };
@@ -656,6 +657,7 @@
 		6A02BE5F1EA2BAEFCC179BA3 /* RelayTestPushStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayTestPushStoreTests.swift; sourceTree = "<group>"; };
 		6A60E8ABAAC1CD00A2F23FBF /* CodeBlockView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeBlockView.swift; sourceTree = "<group>"; };
 		6A8705BA6768729726A7B366 /* LocalDesktopManualTokenUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalDesktopManualTokenUITests.swift; sourceTree = "<group>"; };
+		6A9A2702EB18BDA9C853C43F /* NativeChromeSnapshotEvidenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeChromeSnapshotEvidenceTests.swift; sourceTree = "<group>"; };
 		6A9FA328FF7771B7CD32DCE4 /* ThinkingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThinkingView.swift; sourceTree = "<group>"; };
 		6AD01EEBEF175202F52D4ADE /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		6AED0A12B048B9FFDDAEF815 /* ChatStoreF4ATests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStoreF4ATests.swift; sourceTree = "<group>"; };
@@ -1490,6 +1492,7 @@
 				8AA521BAE97F978D5A41E459 /* MessageBubbleAutolinkTests.swift */,
 				BD558422C711DA2EE477416E /* ModelPresetTests.swift */,
 				91783596F715067340C9BD03 /* ModelVisibilityTests.swift */,
+				6A9A2702EB18BDA9C853C43F /* NativeChromeSnapshotEvidenceTests.swift */,
 				8B456DE252548BBBD1652B4A /* NotificationActionTests.swift */,
 				B494FC6E0C430EDF861C9CCC /* NotificationAuthorityTests.swift */,
 				2A4B80A66F0D951BFBB59175 /* NotificationLaunchCoordinatorTests.swift */,
@@ -2194,6 +2197,7 @@
 				8792F44A6964947E526C906E /* MessageBubbleAutolinkTests.swift in Sources */,
 				2E4A1D17D38871699001F38B /* ModelPresetTests.swift in Sources */,
 				8A35BD2C992D49EC3F5725DD /* ModelVisibilityTests.swift in Sources */,
+				6BADF83C435B9AFD10A57ECE /* NativeChromeSnapshotEvidenceTests.swift in Sources */,
 				322388C6174076A828D9D6A1 /* NotificationActionTests.swift in Sources */,
 				02E8ECC22CEF35CB8160655B /* NotificationAuthorityTests.swift in Sources */,
 				46FD95A1476338EA385BC525 /* NotificationLaunchCoordinatorTests.swift in Sources */,
