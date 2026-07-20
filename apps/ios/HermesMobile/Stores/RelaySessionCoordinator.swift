@@ -98,6 +98,12 @@ final class RelaySessionCoordinator {
     /// not exercise the outbox. Reconnect POLICY stays external (§4) — this hook
     /// only reacts to a connection that has already come up.
     var onReady: (() -> Void)?
+    /// Fired on EVERY relay connection-state transition so ``ConnectionStore``
+    /// can mirror it to ``phase`` (the banner + composer read ``phase``, not the
+    /// coordinator's internal state). Without this bridge the UI is frozen at
+    /// whatever ``phase`` was stamped at startup — the relay can drop and recover
+    /// invisibly, leaving the user "not sure if it's connected."
+    var onPhaseChange: ((Phase) -> Void)?
 
     /// The session whose item stream is currently projected into ``ChatStore``.
     private(set) var activeSessionID: String?
@@ -328,6 +334,9 @@ final class RelaySessionCoordinator {
             // coarse app-level trigger.
             scheduleReconnect()
         }
+        // Mirror EVERY relay transition to the app's connection state so the
+        // banner + composer reflect the real socket, not a stale startup stamp.
+        onPhaseChange?(phase)
         // Crossing INTO `.open` is the relay's readiness edge — kick the outbox so
         // a prompt queued while disconnected drains now, over the relay. Both the
         // initial connect and a reconnect surface here as a buffered
