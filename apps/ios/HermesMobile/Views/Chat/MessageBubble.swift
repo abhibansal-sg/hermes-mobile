@@ -1843,7 +1843,12 @@ struct MarkdownTableBlockView: View {
             .frame(maxHeight: .infinity, alignment: .top)
             .background(background)
             .overlay(Rectangle().stroke(theme.border.opacity(0.72), lineWidth: 0.5))
-            .perfTextSelection()
+            // Selection island (N5): table cards are deliberately NON-selectable.
+            // The whole-bubble "Copy message" action + per-card copy buttons cover
+            // copy; making cells text-selectable would surface the old
+            // `.textSelection` Copy|Share pill on a long-press and let a drag
+            // escape the card boundary, breaking the prose-only selection island
+            // (approved design §7 — code/table/image cards bound selection).
     }
 
     /// Resolve one concrete width per column before SwiftUI lays out the grid.
