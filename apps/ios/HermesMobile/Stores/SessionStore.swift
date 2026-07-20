@@ -4912,7 +4912,7 @@ final class SessionStore {
     /// ``pendingMessageJump`` so ChatView scrolls to that exact row once the
     /// transcript loads — instead of the query-text ``pendingSearchScroll``
     /// match. An exact-id jump is stricter and preferred when available.
-    func open(searchResult result: SessionSearchResult) {
+    func open(searchResult result: SessionSearchResult, revealOnFirstPaint: (@MainActor () -> Void)? = nil) {
         let summary = sessions.first(where: { $0.id == result.id }) ?? result.asSessionSummary
         // Remember the query so ChatView scrolls to its first occurrence once
         // the transcript loads (jump-to-match). Captured BEFORE clearSearch()
@@ -4932,7 +4932,13 @@ final class SessionStore {
         // session SWITCH, so arm the new jump/search AFTER the open. The
         // cache→network seed is async (Task), so this synchronous assignment
         // still lands before the first `transcriptGeneration` bump.
-        open(summary)
+        // R2 (drawer snap-back): hand the close in as `revealOnFirstPaint`
+        // instead of firing it inline at the call site, so the drawer dismisses
+        // FORWARD into the new session's first painted frame (parity with the
+        // row-tap path). The old call site fired `onNavigate()` immediately,
+        // animating the close onto the PREVIOUS session's card before the new
+        // session painted — the "open-motion plays reversed" snap-back.
+        open(summary, revealOnFirstPaint: revealOnFirstPaint)
         // An exact message-id jump (ABH-192) takes precedence over the
         // query-text match; only set pendingSearchScroll when there is no id.
         pendingMessageJump = jumpTarget
