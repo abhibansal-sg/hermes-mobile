@@ -359,6 +359,158 @@ final class TranscriptChromeGlowTests: XCTestCase {
         XCTAssertEqual(MessageBubble.userBubbleCompactWidthFraction, 0.78, accuracy: 0.001)
     }
 
+    // MARK: - QA-1 B8/A4: inline working-row gate (transport-aware)
+    //
+    // Build-114 relay-mode device QA (B8): the tail "Working" row returned on
+    // the relay path — tripped at submit (`ChatStore.send` sets streaming before
+    // any renderable item) and held for the whole turn, rendering a dishonest
+    // static "Working · 0s" pill over the transcript tail. The ratified Wave-2.5
+    // design (WAVE-ROADMAP.md) makes the streaming bubble's breathing cursor THE
+    // working signal with the Turn Dock the single home for interactive chrome;
+    // A4 requires NO standalone working pill on the relay path. These pin the
+    // transport-aware gate: the direct transport keeps the approved desktop-
+    // parity tail indicator BYTE-IDENTICAL; the relay transport suppresses the
+    // row while the streaming assistant bubble renders the cursor, showing it
+    // only pre-first-item (the honest accepted-and-waiting window between the
+    // relay submit and the first rendered item).
+
+    private func streamingAssistantBubble() -> ChatMessage {
+        ChatMessage(role: .assistant,
+                    parts: [.text(id: "p1", text: "Partial reply…")],
+                    isStreaming: true)
+    }
+
+    private func userEcho() -> ChatMessage {
+        ChatMessage(role: .user, parts: [.text(id: "u1", text: "hello")])
+    }
+
+    /// Direct transport: the approved behavior is unchanged — the tail indicator
+    /// shows for the whole active turn, including beside the streaming bubble
+    /// (desktop-parity "Still thinking" / tool-name row). This is the regression
+    /// guard that the relay fix did NOT touch the approved direct path.
+    func testInlineActivityGateDirectTransportUnchangedDuringStreaming() {
+        XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
+            isStreaming: true, hasPendingGate: false, isRelayTransport: false,
+            lastMessage: streamingAssistantBubble()),
+            "direct path keeps the tail indicator beside the streaming bubble")
+        XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
+            isStreaming: true, hasPendingGate: false, isRelayTransport: false,
+            lastMessage: userEcho()),
+            "direct path shows the pre-first-token indicator above the user echo")
+        XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
+            isStreaming: true, hasPendingGate: false, isRelayTransport: false,
+            lastMessage: nil))
+    }
+
+    /// B8 regression (FAILS on qa1/base — the old gate was transport-blind and
+    /// returned `true` here): on the relay transport the row is suppressed while
+    /// the streaming assistant bubble renders the working cursor.
+    func testInlineActivityGateRelaySuppressedWhileCursorRenders() {
+        XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
+            isStreaming: true, hasPendingGate: false, isRelayTransport: true,
+            lastMessage: streamingAssistantBubble()),
+            "relay: the streaming bubble's cursor IS the working signal — no redundant pill (A4)")
+    }
+
+    /// A freshly-created streaming bubble with NO parts yet still renders the
+    /// standalone cursor (`MessageBubble.needsStandaloneCursor`), so the row is
+    /// suppressed for it too — the relay's first `item.started` projects exactly
+    /// such a bubble.
+    func testInlineActivityGateRelaySuppressedForPartlessStreamingBubble() {
+        let partless = ChatMessage(role: .assistant, parts: [], isStreaming: true)
+        XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
+            isStreaming: true, hasPendingGate: false, isRelayTransport: true,
+            lastMessage: partless))
+    }
+
+    /// Relay pre-first-item window: between the relay submit (streaming set) and
+    /// the first rendered item, the last row is the optimistic user echo (or the
+    /// settled history tail) — the row SHOWS there, mirroring the approved
+    /// direct path between `send` and `message.start`.
+    func testInlineActivityGateRelayShowsPreFirstItem() {
+        XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
+            isStreaming: true, hasPendingGate: false, isRelayTransport: true,
+            lastMessage: userEcho()),
+            "relay: honest accepted-and-waiting row above the user echo, pre-first-item")
+        XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
+            isStreaming: true, hasPendingGate: false, isRelayTransport: true,
+            lastMessage: nil),
+            "relay: pre-first-item with no painted rows still shows the row")
+        // A SETTLED assistant tail (prior turn's history) is not a live cursor —
+        // the row shows until the new turn's first item lands.
+        let settled = ChatMessage(role: .assistant,
+                                  parts: [.text(id: "old", text: "Earlier answer.")],
+                                  isStreaming: false)
+        XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
+            isStreaming: true, hasPendingGate: false, isRelayTransport: true,
+            lastMessage: settled))
+    }
+
+    /// Dock priority wins on BOTH transports: a turn paused on an approval /
+    /// clarification / secure prompt shows its user-action UI in the dock, never
+    /// the busy row (the row would lie about progress while waiting on a human).
+    func testInlineActivityGatePendingGatesSuppressBothTransports() {
+        for relay in [false, true] {
+            XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
+                isStreaming: true, hasPendingGate: true, isRelayTransport: relay,
+                lastMessage: streamingAssistantBubble()))
+            XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
+                isStreaming: true, hasPendingGate: true, isRelayTransport: relay,
+                lastMessage: userEcho()))
+        }
+    }
+
+    /// Not streaming → never shows, on either transport, regardless of tail.
+    func testInlineActivityGateIdleNeverShows() {
+        for relay in [false, true] {
+            XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
+                isStreaming: false, hasPendingGate: false, isRelayTransport: relay,
+                lastMessage: streamingAssistantBubble()))
+            XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
+                isStreaming: false, hasPendingGate: false, isRelayTransport: relay,
+                lastMessage: nil))
+        }
+    }
+
+    // MARK: - QA-1 B12/A4: no reserved space for empty dock / suppressed pill
+    //
+    // The dead space above the composer (IMG_2521) was the inline working row
+    // itself (its ~37pt body + the 6pt intra-turn pad, inside the scroll
+    // content) rendering over the relay-wiped transcript — NOT the clearance
+    // spacer, which is the approved full-bleed value (UX1 pins the floor ≥120).
+    // With B8's relay suppression removing the row, the resting gap must equal
+    // the approved direct-path geometry: composer clearance + NOTHING for an
+    // empty dock. These pin that an empty dock reserves zero.
+
+    /// An empty Turn Dock (`TurnDockContent.none` → `EmptyView`) must reserve no
+    /// clearance: dockHeight 0 adds nothing to the spacer, so the resting gap on
+    /// the relay path (no dock, no pill) is byte-identical to the approved
+    /// composer-only full-bleed clearance.
+    func testEmptyDockReservesNoComposerClearance() {
+        XCTAssertEqual(
+            TurnDockContent.resolve(hasApproval: false, hasClarification: false,
+                                    hasTasks: false, hasQueued: false),
+            .none,
+            "no pending surfaces → the dock shows nothing")
+        let noDock = ChatView.composerClearance(composerHeight: 90, keyboardHeight: 0)
+        let emptyDock = ChatView.composerClearance(composerHeight: 90, keyboardHeight: 0,
+                                                   dockHeight: 0)
+        XCTAssertEqual(emptyDock, noDock, accuracy: 0.001,
+            "an empty dock must add zero reserved clearance")
+        XCTAssertEqual(noDock, ChatView.composerFloatInset, accuracy: 0.001,
+            "resting clearance stays the approved full-bleed floor (composer frozen)")
+    }
+
+    /// A live dock surface (approval/clarify/tasks) DOES reserve its measured
+    /// height — the ratified dock behavior is unchanged by B8/B12 (the dock is
+    /// the one home for interactive chrome and must keep clearing the last row).
+    func testLiveDockStillReservesItsHeight() {
+        let rest = ChatView.composerClearance(composerHeight: 90, keyboardHeight: 0)
+        let withDock = ChatView.composerClearance(composerHeight: 90, keyboardHeight: 0,
+                                                  dockHeight: 120)
+        XCTAssertEqual(withDock, rest + 120 + ChatView.bottomStackSpacing, accuracy: 0.001)
+    }
+
     // MARK: - Helpers
 
     private func makeSummary(
