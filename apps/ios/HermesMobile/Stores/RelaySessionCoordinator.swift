@@ -679,9 +679,12 @@ final class RelaySessionCoordinator {
     func registerPushToken(
         _ token: String,
         env: String,
-        events: [String]?
+        events: [String]?,
+        deviceID: String? = nil
     ) async throws -> JSONValue {
-        try await requireClient().registerPushToken(token, env: env, events: events)
+        try await requireClient().registerPushToken(
+            token, env: env, events: events, deviceID: deviceID
+        )
     }
 
     /// Remove the APNs device token from the relay's push registry (§6a).
