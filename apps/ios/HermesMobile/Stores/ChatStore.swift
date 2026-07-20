@@ -208,6 +208,50 @@ final class ChatStore {
     /// `HermesGatewayClient.requestRaw` through `undoRollbackRequest`.
     var undoRollbackRPC: ((String, JSONValue, Duration) async throws -> JSONValue)?
 
+    // MARK: - Turn dock accessors (Wave 25)
+
+    /// The latest todo list for the active session, or `nil` — the single
+    /// evolving checklist the Turn Dock's task box mirrors. Scans the visible
+    /// transcript (`messages`, already scoped to the active session) in reverse
+    /// for the most recent `todo` tool activity that yields a parseable list.
+    /// `nil` when the session has no todo activity yet, or the newest one carries
+    /// no list (e.g. a mid-run write before its first result).
+    ///
+    /// The dock renders THIS; while it shows the task box the transcript
+    /// suppresses EVERY inline `TodoCardView` for the session — not just the one
+    /// backing this list (owner QA §d). The dock is the single home for the
+    /// checklist, and because the agent rewrites the one evolving list across
+    /// several `todo` tool calls, suppressing only the latest still left the
+    /// earlier snapshots of the same list rendering inline 2-3×. The suppression
+    /// rule therefore lives in `ChatView.dockSuppressesTodoCards` as a pure
+    /// `dockContent == .tasks` flag, not a per-`tool_call_id` match.
+    var latestTodoList: TodoList? { latestTodo?.list }
+
+    /// The `tool_call_id` of the activity backing ``latestTodoList`` — the
+    /// identity of the newest todo list (exposed for tests and callers that need
+    /// to key on the active list). NOTE: inline-card suppression no longer keys on
+    /// this; the dock suppresses all todo cards wholesale while the task box is up
+    /// (see ``latestTodoList``).
+    var latestTodoToolID: String? { latestTodo?.id }
+
+    /// Shared scan behind both dock accessors: the newest todo activity that
+    /// yields a parseable list, with its identity. Reverse order so the list the
+    /// agent is actively updating wins. The parse mirrors
+    /// `ToolClusterView.toolCard` exactly — structured `tool.todos` first, then
+    /// the `resultPreview` JSON fallback — so the dock and the (suppressed)
+    /// inline card would derive the identical list.
+    private var latestTodo: (id: String, list: TodoList)? {
+        for message in messages.reversed() {
+            for tool in message.tools.reversed() where tool.name == TodoList.toolName {
+                if let list = tool.todos.flatMap({ TodoList(todosArray: $0) })
+                    ?? TodoList(resultJSON: tool.resultPreview) {
+                    return (tool.id, list)
+                }
+            }
+        }
+        return nil
+    }
+
     /// Whether the most recent `send(text:)` call actually dispatched
     /// `prompt.submit` to the server, vs. refusing before ever asking (empty
     /// text, no connection, no resolvable runtime, attachment-upload
