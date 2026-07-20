@@ -4,17 +4,20 @@ import XCTest
 
 /// R16 — Live Activity lifecycle on the RELAY path.
 ///
-/// The relay wire (`RelaySessionCoordinator.ingest` → `ChatStore.applyRelayItems`)
-/// never flows through `handleMessageComplete` / `handleGatewayError`, so the
-/// `onTurnComplete` / `onTurnDiscarded` seams that end the lock-screen Live
-/// Activity on the direct path must be fired at the relay projection's
-/// streaming-settle edge (and on session switch). These tests pin that
-/// contract: a relay turn that streams then settles fires `onTurnComplete`
-/// exactly once; an errored relay turn fires `onTurnDiscarded` instead (no
-/// queue drain); a session switch mid-turn discards the outgoing turn's
-/// activity. Before the R16 fix these tests FAILED — the relay settle edge
-/// cleared `turnStartedAt` but never fired the end seam, so the activity's
-/// `startedAt` drove the lock-screen timer forever.
+/// The relay wire (`RelaySessionCoordinator.ingest`) never flows through
+/// `handleMessageComplete` / `handleGatewayError`, so the `onTurnComplete` /
+/// `onTurnDiscarded` seams that END the lock-screen Live Activity on the direct
+/// path must be fired explicitly at the relay's explicit turn boundaries:
+///  - `.turnCompleted` frame  → `notifyRelayTurnCompleted()` → `onTurnComplete`
+///  - failed `.error` item    → `notifyRelayTurnDiscarded()` → `onTurnDiscarded`
+///  - session switch mid-turn → `endRelayTurnForSessionSwitch()` → `onTurnDiscarded`
+///
+/// Before the R16 fix NONE of these fired on the relay path, so the activity's
+/// `startedAt` drove the lock-screen elapsed timer ENDLESSLY (owner's
+/// "timer runs forever on the lock screen" complaint). These tests pin the
+/// contract at the ChatStore seam (the coordinator's call into ChatStore),
+/// which is exactly where ActivityKit's `end()` is ultimately reached via
+/// `AppEnvironment`'s wiring.
 @MainActor
 final class LiveActivityRelayLifecycleTests: XCTestCase {
 
@@ -28,30 +31,17 @@ final class LiveActivityRelayLifecycleTests: XCTestCase {
         ]))
     }
 
-    /// Frames for a normal turn: user prompt → assistant in-progress →
-    /// assistant completed.
-    private func streamingThenSettledFrames() -> [RelayFrame] {
-        [
+    /// Seed a streaming relay turn (user prompt + in-progress assistant) so the
+    /// Live Activity is started (`onTurnStart` fired, `turnStartedAt` set).
+    private func seedStreamingTurn(_ chat: ChatStore) {
+        var store = RelayItemStore()
+        store.apply([
             itemFrame(1, kind: "item.completed", id: "user-1", .userMessage,
                       status: "completed", ord: 0, body: ["text": "hi"]),
             itemFrame(2, kind: "item.started", id: "msg-1", .agentMessage,
                       status: "in_progress", ord: 1, body: ["text": ""]),
-            itemFrame(3, kind: "item.completed", id: "msg-1", .agentMessage,
-                      status: "completed", ord: 1, body: ["text": "hello back"]),
-        ]
-    }
-
-    /// Frames for an errored turn: user prompt → assistant in-progress →
-    /// a FAILED `.error` item (parity with the direct path's `error` event).
-    private func streamingThenErrorFrames() -> [RelayFrame] {
-        [
-            itemFrame(1, kind: "item.completed", id: "user-1", .userMessage,
-                      status: "completed", ord: 0, body: ["text": "hi"]),
-            itemFrame(2, kind: "item.started", id: "msg-1", .agentMessage,
-                      status: "in_progress", ord: 1, body: ["text": ""]),
-            itemFrame(3, kind: "item.completed", id: "err-1", .error,
-                      status: "failed", ord: 2, body: ["text": "agent crashed"]),
-        ]
+        ])
+        chat.applyRelayItems(store.items)
     }
 
     // MARK: - Pure helper
@@ -65,24 +55,21 @@ final class LiveActivityRelayLifecycleTests: XCTestCase {
             itemID: "m", type: .agentMessage, status: .completed, ord: 1,
             body: ["text": "ok"]
         )
-        // Pure decision: only a failed .error item is a turn-error terminal.
         XCTAssertTrue(ChatStore.hasRelayErrorTerminal([errItem]))
         XCTAssertTrue(ChatStore.hasRelayErrorTerminal([okItem, errItem]))
         XCTAssertFalse(ChatStore.hasRelayErrorTerminal([okItem]))
         XCTAssertFalse(ChatStore.hasRelayErrorTerminal([]))
-        // A `.error` item still IN PROGRESS is not yet a terminal — the turn
-        // could yet stream more frames behind it.
         let inProgressErr = ChatItem(
             itemID: "e2", type: .error, status: .inProgress, ord: 1,
             body: ["text": "boom"]
         )
-        XCTAssertFalse(ChatStore.hasRelayErrorTerminal([inProgressErr]))
+        XCTAssertFalse(ChatStore.hasRelayErrorTerminal([inProgressErr]),
+                       "an in-progress .error item is not yet a turn-error terminal")
     }
 
-    // MARK: - Happy-path settle fires onTurnComplete
+    // MARK: - .turnCompleted fires onTurnComplete
 
-    func testRelaySettleFiresOnTurnComplete() {
-        var store = RelayItemStore()
+    func testRelayTurnCompletedFiresOnTurnComplete() {
         let chat = ChatStore()
         var starts = 0
         var completions = 0
@@ -91,70 +78,64 @@ final class LiveActivityRelayLifecycleTests: XCTestCase {
         chat.onTurnComplete = { completions += 1 }
         chat.onTurnDiscarded = { discards += 1 }
 
-        let frames = streamingThenSettledFrames()
-        // Apply through the in-progress item — turn is streaming, LA started.
-        store.apply(Array(frames.prefix(2)))
-        chat.applyRelayItems(store.items)
-        XCTAssertTrue(chat.isStreaming, "in-progress trailing item keeps the turn streaming")
+        seedStreamingTurn(chat)
+        XCTAssertTrue(chat.isStreaming)
         XCTAssertEqual(starts, 1, "the first streaming projection starts the Live Activity")
 
-        // Settle: the assistant message completes. The turn is no longer
-        // streaming — the Live Activity MUST end here (R16). Before the fix
-        // this fired nothing and the lock-screen timer counted forever.
-        store.apply(Array(frames.suffix(1)))
-        chat.applyRelayItems(store.items)
-        XCTAssertFalse(chat.isStreaming, "after the completion lands the turn settles")
+        // The relay's .turnCompleted frame → coordinator → notifyRelayTurnCompleted.
+        chat.notifyRelayTurnCompleted()
 
         XCTAssertEqual(completions, 1,
-                       "relay turn settle must fire onTurnComplete exactly once (R16)")
+                       "relay .turnCompleted must fire onTurnComplete (R16) — the direct path's handleMessageComplete is never called on relay")
         XCTAssertEqual(discards, 0,
-                       "a happy-path relay settle is a completion, never a discard")
-        XCTAssertEqual(starts, 1, "start fires once per turn (idempotent on re-projection)")
+                       "a happy-path relay completion is never a discard")
     }
 
-    // MARK: - Settle is not re-fired on subsequent re-projections
+    // MARK: - Failed .error item fires onTurnDiscarded AND suppresses the trailing completion
 
-    func testRelaySettleFiresOnceAcrossReprojection() {
-        var store = RelayItemStore()
-        let chat = ChatStore()
-        var completions = 0
-        chat.onTurnComplete = { completions += 1 }
-
-        let frames = streamingThenSettledFrames()
-        store.apply(frames)
-        chat.applyRelayItems(store.items)
-        XCTAssertEqual(completions, 1, "settle fires on the streaming→settled edge")
-
-        // Re-projecting the SAME settled snapshot must not re-fire — the
-        // branch is gated on the PRIOR `isStreaming` (already false here).
-        chat.applyRelayItems(store.items)
-        chat.applyRelayItems(store.items)
-        XCTAssertEqual(completions, 1, "re-projection of an already-settled turn is a no-op")
-    }
-
-    // MARK: - Errored relay turn fires onTurnDiscarded (no queue drain)
-
-    func testRelayErrorSettleFiresOnTurnDiscardedNotComplete() {
-        var store = RelayItemStore()
+    func testRelayErrorFiresDiscardAndSuppressesCompletion() {
         let chat = ChatStore()
         var completions = 0
         var discards = 0
         chat.onTurnComplete = { completions += 1 }
         chat.onTurnDiscarded = { discards += 1 }
 
-        let frames = streamingThenErrorFrames()
-        store.apply(Array(frames.prefix(2)))
-        chat.applyRelayItems(store.items)
+        seedStreamingTurn(chat)
         XCTAssertTrue(chat.isStreaming)
 
-        store.apply(Array(frames.suffix(1)))
-        chat.applyRelayItems(store.items)
-        XCTAssertFalse(chat.isStreaming, "the failed `.error` terminal settles the turn")
-
+        // A failed .error item arrives (coordinator → notifyRelayTurnDiscarded).
+        chat.notifyRelayTurnDiscarded()
         XCTAssertEqual(discards, 1,
                        "an errored relay turn is a discard (parity with handleGatewayError)")
         XCTAssertEqual(completions, 0,
                        "the queue must not auto-drain into a session that just errored")
+
+        // The relay emits .turnCompleted even for errored turns. It MUST NOT
+        // fire a spurious completion (the latch suppresses it).
+        chat.notifyRelayTurnCompleted()
+        XCTAssertEqual(completions, 0,
+                       "the trailing .turnCompleted after an error must NOT fire onTurnComplete")
+        XCTAssertEqual(discards, 1)
+    }
+
+    // MARK: - The error latch does not leak into the NEXT turn
+
+    func testRelayErrorLatchClearsOnNextTurnStart() {
+        let chat = ChatStore()
+        var completions = 0
+        chat.onTurnComplete = { completions += 1 }
+
+        seedStreamingTurn(chat)
+        chat.notifyRelayTurnDiscarded()    // errored turn latches the suppression
+        chat.notifyRelayTurnCompleted()    // suppressed
+        XCTAssertEqual(completions, 0)
+
+        // A NEW turn starts (first streaming projection resets the latch via
+        // markTurnStartedIfNeeded) and completes normally.
+        seedStreamingTurn(chat)
+        chat.notifyRelayTurnCompleted()
+        XCTAssertEqual(completions, 1,
+                       "the next (healthy) turn's completion fires normally — the error latch cleared on turn start")
     }
 
     // MARK: - Session switch mid-turn discards the outgoing activity
@@ -164,22 +145,26 @@ final class LiveActivityRelayLifecycleTests: XCTestCase {
         var discards = 0
         chat.onTurnDiscarded = { discards += 1 }
 
-        // Seed a streaming relay turn.
-        var store = RelayItemStore()
-        store.apply(Array(streamingThenSettledFrames().prefix(2)))
-        chat.applyRelayItems(store.items)
+        seedStreamingTurn(chat)
         XCTAssertTrue(chat.isStreaming)
         XCTAssertEqual(discards, 0, "no discard while the turn is live and projected")
 
         // R16 seam: switching the projected session while a turn is live ends
         // the outgoing session's Live Activity (it no longer reflects what the
-        // user is looking at). No-op when nothing is live.
+        // user is looking at).
         chat.endRelayTurnForSessionSwitch()
         XCTAssertEqual(discards, 1,
                        "switching away mid-turn ends the outgoing Live Activity (R16)")
 
-        // Idempotent guard: when no turn is live, the switch seam is a no-op.
+        // Idempotent: a second call within the same switch is a no-op.
         chat.endRelayTurnForSessionSwitch()
-        XCTAssertEqual(discards, 1, "the switch discard is a no-op when nothing is streaming")
+        XCTAssertEqual(discards, 1, "the switch discard is idempotent")
+
+        // And it's a no-op when no turn is live at all.
+        let idle = ChatStore()
+        var idleDiscards = 0
+        idle.onTurnDiscarded = { idleDiscards += 1 }
+        idle.endRelayTurnForSessionSwitch()
+        XCTAssertEqual(idleDiscards, 0, "the switch discard is a no-op when nothing is streaming")
     }
 }

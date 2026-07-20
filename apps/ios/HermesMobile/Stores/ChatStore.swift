@@ -1102,6 +1102,11 @@ final class ChatStore {
     private func markTurnStartedIfNeeded() {
         guard turnStartedAt == nil else { return }
         turnStartedAt = Date()
+        // R16: a new turn clears the prior turn's error-terminal latch so the
+        // next `.turnCompleted` (a happy-path completion) fires `onTurnComplete`
+        // normally. Without this, a turn that errored would suppress the
+        // completion seam of the NEXT (healthy) turn too.
+        relayTurnTerminatedByError = false
         onTurnStart?()
     }
 
@@ -1522,9 +1527,12 @@ final class ChatStore {
     /// mirrored for the OUTGOING session, its Live Activity no longer
     /// reflects what the user is looking at — end it as a DISCARD (not a
     /// completion: the turn did not finish, the queue must not drain).
-    /// No-op when nothing was live. Idempotent.
+    /// Idempotent: gated on `turnStartedAt` (the live-turn marker) which it
+    /// clears, so a second call within the same switch is a no-op.
     func endRelayTurnForSessionSwitch() {
-        guard isStreaming else { return }
+        guard turnStartedAt != nil else { return }
+        turnStartedAt = nil
+        activeToolName = nil
         onTurnDiscarded?()
     }
 
@@ -4554,29 +4562,53 @@ final class ChatStore {
         } else if isStreaming {
             turnStartedAt = nil
             activeToolName = nil
-            // R16 (Live Activity lifecycle): the relay projection SETTLED —
-            // every assistant segment finalized — so this is the turn-end
-            // edge on the relay wire. The direct path ends the Live Activity
-            // from `handleMessageComplete`/`handleGatewayError`, but the
-            // relay path (`RelaySessionCoordinator.ingest` → here) NEVER
-            // routes through them, so without this firing the activity's
-            // `startedAt` drove the lock-screen timer ENDLESSLY (the owner's
-            // "timer runs forever on the lock screen" complaint). Match the
-            // direct path: an error terminal (item type `.error`,
-            // status `.failed`) is a DISCARD — the queue must NOT auto-drain
-            // into a session that just errored (parity with
-            // `handleGatewayError`); any other settle is a COMPLETION.
-            // Idempotent: `LiveActivityManager.end()` and the queue drain are
-            // both no-ops when no turn is live, and the `.turnCompleted` frame
-            // arriving next re-settles an already-settled projection (this
-            // branch is gated on `isStreaming`, so it fires exactly once).
-            if Self.hasRelayErrorTerminal(items) {
-                onTurnDiscarded?()
-            } else {
-                onTurnComplete?()
-            }
+            // R16 NOTE: the Live Activity END seam for relay turns is NOT
+            // fired here. The projection-settle edge is an unreliable signal
+            // — a snapshot fed all-at-once never transitions through
+            // streaming, and a relay `.error` item leaves the assistant
+            // segment `in_progress` (so the projection keeps streaming). The
+            // relay wire carries an EXPLICIT turn boundary (`.turnCompleted`)
+            // and explicit failure items (`.error`/status `.failed`); the
+            // coordinator fires those via `notifyRelayTurnCompleted()` /
+            // `notifyRelayTurnDiscarded()`. See
+            // `RelaySessionCoordinator.ingest`.
         }
         setStreaming(nowStreaming, reason: "relayProjection")
+    }
+
+    // MARK: - R16 relay turn-lifecycle seams
+
+    /// R16: per-relay-turn latch. Set by ``notifyRelayTurnDiscarded()`` when a
+    /// failed `.error` item arrives, so the subsequent `.turnCompleted` frame
+    /// (which the relay emits even for errored turns) does NOT fire
+    /// ``notifyRelayTurnCompleted()`` and auto-drain the queue into a session
+    /// that just errored (parity with the direct path's `handleGatewayError`,
+    /// which fires `onTurnDiscarded` — never `onTurnComplete`). Reset on the
+    /// next turn's start (``markTurnStartedIfNeeded``).
+    private var relayTurnTerminatedByError = false
+
+    /// R16: fire the turn-COMPLETE Live Activity end seam from the relay
+    /// coordinator's `.turnCompleted` handler. The relay path never flows
+    /// through `handleMessageComplete` (which fires this on the direct
+    /// path), so without it the activity's `startedAt` drove the lock-screen
+    /// timer ENDLESSLY (owner's R16 complaint). Suppressed when the turn
+    /// already errored (see ``relayTurnTerminatedByError``). Idempotent: the
+    /// closures route to `LiveActivityManager.end()` (no-op when nothing is
+    /// live) and the queue-drain pipeline (no-op when no turn was live).
+    func notifyRelayTurnCompleted() {
+        guard !relayTurnTerminatedByError else { return }
+        onTurnComplete?()
+    }
+
+    /// R16: fire the turn-DISCARD Live Activity end seam when the relay
+    /// ingests a failed `.error` item — parity with the direct path's
+    /// `handleGatewayError` (a discard, NOT a completion, so the queue does
+    /// not auto-drain into a session that just errored). Idempotent. Latches
+    /// ``relayTurnTerminatedByError`` so the trailing `.turnCompleted` does
+    /// not fire a spurious completion.
+    func notifyRelayTurnDiscarded() {
+        relayTurnTerminatedByError = true
+        onTurnDiscarded?()
     }
 
     /// Surface a failed `open()`-path transcript seed the same way a failed

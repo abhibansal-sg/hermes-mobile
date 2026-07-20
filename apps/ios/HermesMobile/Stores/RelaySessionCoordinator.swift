@@ -424,8 +424,26 @@ final class RelaySessionCoordinator {
         switch frame.kind {
         case .approvalRequest: chatStore.applyRelayApprovalRequest(frame)
         case .clarifyRequest:  chatStore.applyRelayClarifyRequest(frame)
-        case .turnCompleted:   chatStore.expireRelayPendingGates()
+        case .turnCompleted:
+            chatStore.expireRelayPendingGates()
+            // R16 (Live Activity lifecycle): the relay wire's EXPLICIT turn
+            // boundary. The direct path ends the lock-screen Live Activity
+            // from `handleMessageComplete`; the relay path never flows
+            // through it, so without this firing the activity's `startedAt`
+            // drove the elapsed timer ENDLESSLY (owner's "timer runs forever
+            // on the lock screen" complaint). Idempotent: routes to
+            // `LiveActivityManager.end()` (no-op when nothing is live) + the
+            // queue-drain pipeline (no-op when no turn was live).
+            chatStore.notifyRelayTurnCompleted()
         default: break
+        }
+        // R16: a failed `.error` item is a turn TERMINAL on the relay wire
+        // (parity with the direct path's `error` event → `handleGatewayError`).
+        // Fire the DISCARD seam — not a completion, so the queue does NOT
+        // auto-drain into a session that just errored. Only item-bearing
+        // frames carry a `ChatItem`; delta/approval/etc. frames have `nil`.
+        if let item = frame.item, item.type == .error, item.status == .failed {
+            chatStore.notifyRelayTurnDiscarded()
         }
     }
 
