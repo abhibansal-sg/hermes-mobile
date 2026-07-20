@@ -69,6 +69,13 @@ final class ConnectionStore {
     var phase: Phase = .connecting {
         didSet {
             notifyReadinessWaiters()
+            // N3/A1 fast-path trace: the composer is interactive exactly when
+            // `phase == .connected` (ChatView.isConnected gates on it). The first
+            // such crossing defines the composer_interactive milestone
+            // (ConnectTrace.mark is first-occurrence, so reconnects don't overwrite).
+            if case .connected = phase {
+                ConnectTrace.shared.mark(.composerInteractive)
+            }
             switch phase {
             case .needsSetup, .offline:
                 resolveAllTransportReadinessWaiters(with: false)
@@ -1374,6 +1381,10 @@ final class ConnectionStore {
         // (configure() still owns persistence after a verified connect).
         self.serverURLString = trimmed
         await sessionStore.paintFromCache()
+        // N3/A1 fast-path trace: the cached drawer/transcript is painted from DISK
+        // here — never sequenced behind a network call (paintFromCache is a GRDB
+        // read). This is the cache_paint milestone.
+        ConnectTrace.shared.mark(.cachePaint)
     }
 
     // MARK: - Configure
@@ -1459,33 +1470,44 @@ final class ConnectionStore {
         let previousToken = KeychainService.loadToken(server: trimmedURL)
         let isSavedTokenReuse = issuedDeviceId == nil && previousToken == trimmedToken
 
-        do {
-            #if DEBUG
-            if let statusRPC {
-                try await statusRPC(url, trimmedToken)
-            } else {
+        // N3/A1 connect fast-path (relay): relay readiness is the WS socket, not a
+        // gateway REST round-trip — the ratified relay contract has NO REST
+        // handshake (RelayClient §1). Gating the socket open behind `probe.status()`
+        // would put a blocking status round-trip in front of interactivity, so on
+        // the relay path we validate auth in the BACKGROUND (still routing a 401/403
+        // to the D3 re-pair flow) and let the socket connect proceed immediately.
+        // The gateway-direct path keeps the fail-fast probe, byte-unchanged.
+        if transportPath == .relay {
+            probeRelayAuthInBackground(url: url, token: trimmedToken, generation: generation)
+        } else {
+            do {
+                #if DEBUG
+                if let statusRPC {
+                    try await statusRPC(url, trimmedToken)
+                } else {
+                    let probe = RestClient(baseURL: url, token: trimmedToken)
+                    _ = try await probe.status()
+                }
+                #else
                 let probe = RestClient(baseURL: url, token: trimmedToken)
                 _ = try await probe.status()
+                #endif
+            } catch {
+                guard isCurrentGeneration(generation) else { return nil }
+                // An auth rejection on a probe means this token is no longer valid —
+                // surface the re-pair affordance rather than a generic offline error
+                // (D3 RE-PAIR FLOW). This covers both an explicit re-auth attempt and
+                // a bootstrap of a now-revoked saved token.
+                if Self.isAuthFailure(error) {
+                    reauthRequired = true
+                    requireTransportReauthentication()
+                    phase = .needsSetup
+                    return Self.reauthMessage
+                }
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                phase = .offline(message)
+                return message
             }
-            #else
-            let probe = RestClient(baseURL: url, token: trimmedToken)
-            _ = try await probe.status()
-            #endif
-        } catch {
-            guard isCurrentGeneration(generation) else { return nil }
-            // An auth rejection on a probe means this token is no longer valid —
-            // surface the re-pair affordance rather than a generic offline error
-            // (D3 RE-PAIR FLOW). This covers both an explicit re-auth attempt and
-            // a bootstrap of a now-revoked saved token.
-            if Self.isAuthFailure(error) {
-                reauthRequired = true
-                requireTransportReauthentication()
-                phase = .needsSetup
-                return Self.reauthMessage
-            }
-            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            phase = .offline(message)
-            return message
         }
         guard isCurrentGeneration(generation) else { return nil }
 
@@ -1522,9 +1544,18 @@ final class ConnectionStore {
             return message
         }
         guard isCurrentGeneration(generation) else { return nil }
+        // N3/A1 fast-path trace: the transport socket is up. Relay: `start()`
+        // returned after the WS resumed (`.open`); gateway-direct: `connect`
+        // returned after `gateway.ready`.
+        ConnectTrace.shared.mark(.socketOpen)
         // `HermesGatewayClient.connect` returns only after `gateway.ready`, so
         // this is the first point at which operational RPC admission is allowed.
         acceptCurrentTransport()
+        // N3/A1 fast-path trace: operational RPC admission is now allowed
+        // (transport epoch accepted). On the relay path this coincides with
+        // socket_open (the relay has no ready handshake) — the delta honestly
+        // reads ~0 there.
+        ConnectTrace.shared.mark(.transportReady)
 
         let switchedServers = !previousServerURL.isEmpty && previousServerURL != trimmedURL
         if switchedServers {
@@ -1622,8 +1653,52 @@ final class ConnectionStore {
         // probe; both are raced against `hydrationTimeout` so a slow or hung
         // probe can never strand the loading screen. On completion (whichever
         // wins) we land on a fresh new-chat draft and reveal the connected UI.
+        //
+        // N3/A1 note (relay): on the relay path the `onPhaseChange` bridge already
+        // flips `phase` to `.connected` the instant the socket reports `.open`
+        // (well before this hydration race resolves), so the REST hydration here
+        // does NOT gate composer interactivity — it only back-fills the drawer +
+        // model chip in the background. The single blocking status round-trip that
+        // DID gate interactivity was the pre-connect `probe.status()`, removed for
+        // the relay path above (see `probeRelayAuthInBackground`).
         startHydration(generation: generation)
         return nil
+    }
+
+    /// N3/A1 connect fast-path (relay): validate gateway auth WITHOUT gating the
+    /// relay socket open on the round-trip. The relay transport's readiness is the
+    /// WS socket (no REST handshake), so a blocking `probe.status()` before the
+    /// socket would be a gratuitous status round-trip in front of interactivity.
+    /// This runs the same REST probe in the background and preserves the D3 re-pair
+    /// flow: on a 401/403 the token is dead → `reauthRequired` + `.needsSetup`,
+    /// exactly as the blocking probe did. Any OTHER (transient) REST failure is
+    /// deliberately ignored — on the relay path the WS socket is the transport
+    /// authority, so a gateway REST blip must not knock an interactive relay session
+    /// offline. The gateway-direct path never calls this (it keeps the fail-fast
+    /// blocking probe in `configure`).
+    private func probeRelayAuthInBackground(url: URL, token: String, generation: UInt64) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                #if DEBUG
+                if let statusRPC {
+                    try await statusRPC(url, token)
+                } else {
+                    let probe = RestClient(baseURL: url, token: token)
+                    _ = try await probe.status()
+                }
+                #else
+                let probe = RestClient(baseURL: url, token: token)
+                _ = try await probe.status()
+                #endif
+            } catch {
+                guard self.isCurrentGeneration(generation) else { return }
+                guard Self.isAuthFailure(error) else { return }
+                self.reauthRequired = true
+                self.requireTransportReauthentication()
+                self.phase = .needsSetup
+            }
+        }
     }
 
     // MARK: - Hydration (ABH-82)
