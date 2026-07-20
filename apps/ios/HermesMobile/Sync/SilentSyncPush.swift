@@ -64,6 +64,13 @@ actor ManifestInvalidationCoordinator: SilentSyncCoordinating {
         inFlight[invalidation.scope] = task
         let result = await task.value
         inFlight[invalidation.scope] = nil
+        // The coalescing task above is unstructured, so the CALLER's
+        // cancellation never reaches it — honor the caller here: a cancelled
+        // background window reports .failed (and does NOT record the commit
+        // high-water, so the next wake re-checks) even if the fetch itself
+        // finished. Pre-existing bug pinned by
+        // SilentSyncPushTests.testCancellationAndFailureReturnFailed.
+        if Task.isCancelled { return .failed }
         if result != .failed {
             committed[invalidation.scope] = max(committed[invalidation.scope] ?? -1, invalidation.revision)
         }
