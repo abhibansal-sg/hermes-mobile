@@ -179,6 +179,10 @@ enum RelayUpstreamMethod: String, Sendable, CaseIterable {
     case approve
     case clarify
     case interrupt
+    /// Inlined-bytes attachment (B9/A5): the relay drives the gateway's
+    /// `file.attach` / `image.attach_bytes` base64 RPCs, so photo/file attach
+    /// works on relay-only reaches with no gateway-REST upload round-trip.
+    case attach
     case ack
     case resync
     case foreground

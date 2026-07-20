@@ -478,6 +478,34 @@ final class RelaySessionCoordinator {
         return try await requireClient().clarify(sessionID: sid, requestID: requestID, response: response)
     }
 
+    /// Attach inlined bytes through the relay (B9 / A5). The relay drives the
+    /// gateway's base64 RPCs — `file.attach` (`kind: "file"`, arbitrary bytes →
+    /// `@file:` ref) or `image.attach_bytes` (`kind: "image"`, photo → vision
+    /// tile) — so photo/camera/file attach works IDENTICALLY on the relay
+    /// transport, with no gateway-REST `POST /api/upload` round-trip (the
+    /// relay-only reach the direct attach flow cannot make).
+    ///
+    /// Session resolution mirrors `submit`: a `nil` target passes `nil` on the
+    /// wire and the relay CREATES + owns a new chat, returning its id — so an
+    /// image-first send in a brand-new chat attaches, then submits to the SAME
+    /// session (the returned `session_id` is adopted as `activeSessionID`,
+    /// which a following `submit(sessionID: nil)` targets). Wire shape is
+    /// asserted by RelayAttachWireTests + tests/e2e_daily_driver/test_h.
+    @discardableResult
+    func attach(
+        sessionID: String? = nil,
+        kind: String,
+        name: String,
+        dataURL: String
+    ) async throws -> JSONValue {
+        let target = sessionID ?? activeSessionID
+        let result = try await requireClient().attach(
+            sessionID: target, kind: kind, name: name, dataURL: dataURL
+        )
+        if let sid = result["session_id"]?.stringValue { activeSessionID = sid }
+        return result
+    }
+
     @discardableResult
     func interrupt(_ sessionID: String? = nil) async throws -> JSONValue {
         guard let sid = sessionID ?? activeSessionID else { throw RelayError.notConnected }
