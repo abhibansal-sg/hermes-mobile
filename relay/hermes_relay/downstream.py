@@ -72,6 +72,11 @@ class DownstreamConfig:
     # HTTP health/status path served on the SAME phone-facing port (a plain GET,
     # not a WS upgrade). ``None`` disables the surface entirely.
     health_path: Optional[str] = "/healthz"
+    # Bearer token gating the health/control routes (healthz + the durable
+    # /attention/pending and /sync/manifest siblings) and the WS handshake. The
+    # iOS client already sends the gateway token as a bearer credential; reuse
+    # it rather than adding a second secret or config surface. Empty disables.
+    auth_token: str = ""
 
 
 def build_ring(cfg: DownstreamConfig) -> Any:
@@ -319,8 +324,6 @@ class DownstreamServer:
         the accept loop, so any failure falls through to the WS path.
         """
         health = self._cfg.health_path
-        if not health:
-            return None
         try:
             from http import HTTPStatus
 

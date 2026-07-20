@@ -723,8 +723,9 @@ async def test_submit_and_resume_replace_foreground():
 
 
 class _FakeRequest:
-    def __init__(self, path):
+    def __init__(self, path, headers=None):
         self.path = path
+        self.headers = headers or {}
 
 
 class _FakeConn:
