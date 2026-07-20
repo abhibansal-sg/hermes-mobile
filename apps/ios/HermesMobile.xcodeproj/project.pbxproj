@@ -184,6 +184,7 @@
 		683EFB986A388E2825D3C5C6 /* SpeechPlayerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C97414BD0BE36C7EED1127F1 /* SpeechPlayerTests.swift */; };
 		691AF81561E55CE70053E70B /* SessionArchiveLoadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DDEB01DDD7FC16A9058F4B9 /* SessionArchiveLoadTests.swift */; };
 		69A16C151EE6B9A2124EAEC7 /* ChatStoreBatchETests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2EE77CE417159EB455B8A2F7 /* ChatStoreBatchETests.swift */; };
+		69E0A1C7C76A30334C01C666 /* GateCardSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F82B53AF3C26716C9696955 /* GateCardSurface.swift */; };
 		69E12C83BE295765E63EF317 /* RestClient+PendingAttention.swift in Sources */ = {isa = PBXBuildFile; fileRef = C687EFF53ECC56E45EB67825 /* RestClient+PendingAttention.swift */; };
 		6A943BB02927739C8FF3FE8F /* HermesShortcuts.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5B995D6441FF0AE876F8CD2 /* HermesShortcuts.swift */; };
 		6AB9BA91EDF1BCBE9EA659B2 /* AutomationRunsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91263AEDF08EC71362354006 /* AutomationRunsView.swift */; };
@@ -348,6 +349,7 @@
 		C53464C19CA782DC0733804F /* RelayClientMockTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59A25349A5B27D150C92F6D4 /* RelayClientMockTests.swift */; };
 		C6D2C333F4C6018FBF06469B /* PersonalityPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6943AD6463728580313BF5F /* PersonalityPickerView.swift */; };
 		C7DE33A87721BC2C1D2D5243 /* AppEnvironment.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CF0F581A5621F1198AC0DB6 /* AppEnvironment.swift */; };
+		C85F88E3B4CB083303B1E6C5 /* ClarifyCardNativeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20F121ADC71600514CB7EC24 /* ClarifyCardNativeTests.swift */; };
 		C8F89938056257F79B7A7671 /* QA1ColdOpenRelayUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9611BE55EA1F49970C540F3 /* QA1ColdOpenRelayUITests.swift */; };
 		C8FDBABB61DF3EEAC609590C /* DeepLinkRouterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E11A41924097383D37603684 /* DeepLinkRouterTests.swift */; };
 		CA20E9A1FCE72F9675645BB7 /* ModelVisibilityEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE0A41AACA4BA9CEA9C51001 /* ModelVisibilityEditorView.swift */; };
@@ -552,6 +554,7 @@
 		20857E3EC1F683FEE1AFB203 /* SearchPaginationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchPaginationTests.swift; sourceTree = "<group>"; };
 		20D320FFC594DB49727B2728 /* GatewayForgetCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayForgetCoordinatorTests.swift; sourceTree = "<group>"; };
 		20EB0665F7B449305DB0FF7F /* DocumentScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentScanner.swift; sourceTree = "<group>"; };
+		20F121ADC71600514CB7EC24 /* ClarifyCardNativeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClarifyCardNativeTests.swift; sourceTree = "<group>"; };
 		21AD4AC7AF06BCB46483CDD1 /* ToolRowDismissPruneTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolRowDismissPruneTests.swift; sourceTree = "<group>"; };
 		222B7A7863F530D4EFE2FC9B /* ArtifactsGalleryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArtifactsGalleryView.swift; sourceTree = "<group>"; };
 		22C028DF3C7C7CB7A5B0B9D8 /* ChromePill.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChromePill.swift; sourceTree = "<group>"; };
@@ -663,6 +666,7 @@
 		6E5BFB5F47DD010FB7C121ED /* SilentSyncPush.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SilentSyncPush.swift; sourceTree = "<group>"; };
 		6E96D188E143CDC9D384C6BF /* WorkRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkRepository.swift; sourceTree = "<group>"; };
 		6F1DA6BB5402B8CE81F0C2B1 /* WorkingDirectoryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkingDirectoryTests.swift; sourceTree = "<group>"; };
+		6F82B53AF3C26716C9696955 /* GateCardSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GateCardSurface.swift; sourceTree = "<group>"; };
 		6F9A5EB4D80876E99BA6B4CF /* ProseSelectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProseSelectionTests.swift; sourceTree = "<group>"; };
 		6FA642A8294F998AD8405915 /* ChatStoreBatchBTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatStoreBatchBTests.swift; sourceTree = "<group>"; };
 		704D657E978543CEE9FEDD16 /* HermesURLRouter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesURLRouter.swift; sourceTree = "<group>"; };
@@ -1448,6 +1452,7 @@
 				98F403BB4273ED23955F5A8A /* ChatStoreReconnectReconcileTests.swift */,
 				FDE99B5373A56D4136876F8A /* ChatStoreSeedParityTests.swift */,
 				68FE68FEF7EBE9085415F0AB /* ChatStoreTests.swift */,
+				20F121ADC71600514CB7EC24 /* ClarifyCardNativeTests.swift */,
 				F816897C109673E09F25F776 /* ComposerAttachGatingTests.swift */,
 				E5491004B66DD32103ED6785 /* ConnectFastPathTests.swift */,
 				B5FC4CB256C94EE327FABE26 /* ConnectionOfflineModeTests.swift */,
@@ -1696,6 +1701,7 @@
 				0346A7AF6A3646150E131961 /* ClarifyBanner.swift */,
 				92DE4B65A72D9E11D7A795D6 /* ComposerView.swift */,
 				CEB90654C53490C9790A3E36 /* CrossSessionBanner.swift */,
+				6F82B53AF3C26716C9696955 /* GateCardSurface.swift */,
 				58000204CCD3A63CD435D6B2 /* MessageBubble.swift */,
 				B558AD78A5E22F45999FB942 /* RecordingControls.swift */,
 				0B493ECAAA09AFD2AA200978 /* SecurePromptView.swift */,
@@ -2151,6 +2157,7 @@
 				48A803D958FB0EC221C1CB28 /* ChatStoreReconnectReconcileTests.swift in Sources */,
 				D240AECBED85AA6D2B161A83 /* ChatStoreSeedParityTests.swift in Sources */,
 				B3B55C5E612E81959DEBB852 /* ChatStoreTests.swift in Sources */,
+				C85F88E3B4CB083303B1E6C5 /* ClarifyCardNativeTests.swift in Sources */,
 				951D227A8BF64A1FDB00E794 /* ComposerAttachGatingTests.swift in Sources */,
 				F06B9078C4A2C0F938524754 /* ConnectFastPathTests.swift in Sources */,
 				1FD49AE972BBAA80B573DE2D /* ConnectionOfflineModeTests.swift in Sources */,
@@ -2344,6 +2351,7 @@
 				736C0658B86BF3B65F299F45 /* FileViewerMarkdown.swift in Sources */,
 				0CA7B0BF8545AB5C8E461B95 /* FileViewerMode.swift in Sources */,
 				A7D750D48A76745831A30416 /* FileViewerView.swift in Sources */,
+				69E0A1C7C76A30334C01C666 /* GateCardSurface.swift in Sources */,
 				11CC00C5E9D4EBB5319915FF /* GatewayEvent.swift in Sources */,
 				1AE73FED337E66196610BB86 /* GatewayForgetCoordinator.swift in Sources */,
 				9789BF602C6B31308B21F74B /* GatewayStatusView.swift in Sources */,
