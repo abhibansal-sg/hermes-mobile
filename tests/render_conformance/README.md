@@ -66,6 +66,11 @@ exercises the full echo↔item path.
 | render_live_fold (QA-2) | resolved tool rides inline: "Working… · ‹tool›" | R5/A3 | FAILS |
 | — (QA-2) | live working section measures one line (< 60pt), never the 172pt window | R6/A3 | FAILS (172pt ThinkingView) |
 | render_live_fold (QA-2) | settled relay turn stamps "Worked for Ns"; survives the next turn's re-projection | R5/A3 | FAILS (bare "Worked"; relay items carry no timestamps) |
+| render_live_fold (QA-3) | merged labeled+timer working line present ≤100 ms from send with relay frames held 10 s; per-turn timer ticks locally through the blackout | S2/A1 | FAILS on qa3/base (line gated on the first relay item frame — appeared ~35 s late, IMG_2578) |
+| — (QA-3) | ONE working affordance in every phase (send / work-parts / text-streaming); phase B never stacks a second surface | S3/A1 | FAILS (fold spinner line + bare caret stacked, IMG_2578/2587/2591) |
+| — (QA-3) | phase A and phase B bubbles render the SAME single line (item arrival only updates the status text) | S2/S3 | FAILS (bare glyph → stacked lines, ~22 pt → ~64 pt) |
+| — (QA-3) | cursor breathe is a pure function of time — two renders 350 ms apart differ; never stranded static by a remount | S1/A10 | FAILS (@State + repeatForever rendered steady off-transaction) |
+| hand-authored frame (QA-3) | settled duration reconciles to the relay's `turn.completed` `duration_s` | S2/A1 | FAILS (frame duration ignored; local ~0 s stamped) |
 
 ## Running
 
