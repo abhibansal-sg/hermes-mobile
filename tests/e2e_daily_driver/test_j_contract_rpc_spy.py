@@ -602,13 +602,26 @@ async def test_i14_reconcile_rpc_budget(
 
     # Reconnect: a fresh socket resyncs with the OLD connection's watermark —
     # the relay answers from its LOCAL store snapshot, zero gateway hops.
+    # Since R4 L6 the store knows EVERY session an OPEN/HISTORY seeded (the
+    # foreign-prompt user rows ride the snapshot), so a fresh-connection
+    # resync delivers one snapshot per store-known session — both A and B
+    # here (pre-L6 the store knew only streamed sessions, exactly one in
+    # this scenario). The property THIS wave's relay pins: A's snapshot
+    # arrives carrying items, at zero gateway cost. The ≤1-snapshot-of-the-
+    # visible-session narrowing is the R3/W2d reconcile rewire (I14's phone-
+    # side budget); the phone reconciles every snapshot by item_id.
     reads_before = len(mock_gateway.rest_reads)
     phone2 = await phone_factory()
     watermark = max((f.seq for f in phone.frames), default=0)
     await phone2.resync(last_seq=watermark)
-    snaps2 = await phone2.wait_for("snapshot", timeout=10.0)
-    assert snaps2.sid == a_sid, f"I14: reconnect snapshot sid {snaps2.sid}"
+    snaps2 = await phone2.wait_for("snapshot", sid=a_sid, timeout=10.0)
     assert snaps2.body.get("items"), "I14: reconnect snapshot carried no items"
+    await asyncio.sleep(0.3)  # let any sibling snapshots land for the record
+    resync_snap_sids = sorted({f.sid for f in phone2.frames_of_kind("snapshot")})
+    assert a_sid in resync_snap_sids and b_sid in resync_snap_sids, (
+        f"I14/L6: resync snapshots must cover both OPEN-seeded sessions; "
+        f"got {resync_snap_sids} (a={a_sid}, b={b_sid})"
+    )
     assert len(mock_gateway.rest_reads) == reads_before, (
         "I14: reconnect resync hit the gateway — it must be relay-local"
     )
@@ -619,6 +632,7 @@ async def test_i14_reconcile_rpc_budget(
         "reads_on_warm_switchback": 0,
         "gateway_hops_on_resync": 0,
         "gap_fills_on_payload_turn_end": 0,
+        "resync_snapshot_sids": resync_snap_sids,
         "total_rest_reads": len(mock_gateway.rest_reads),
     })
 

@@ -717,25 +717,29 @@ class DownstreamServer:
         deterministic per ``(sid, nth-user-row, text)`` so a repeated seed of
         the same batch converges on the same ids (contract I21); the
         empty-store gate means a store is seeded at most once per relay
-        lifetime anyway.
+        lifetime anyway. A history with NO user rows creates no store entry
+        at all (RR4: the store must not grow for sessions with nothing to
+        seed — a snapshot set is keyed by store membership).
         """
-        state = self._store.get(sid)
-        if state.items:
-            return  # the stream already owns this session — cache is seed only
-        nth = 0
+        rows: list[str] = []
         for row in messages:
             if not isinstance(row, dict) or row.get("role") != "user":
                 continue
             content = row.get("content")
             if not isinstance(content, str) or not content:
                 content = row.get("text")  # some REST shapes key the text field
-            if not isinstance(content, str) or not content:
-                continue
+            if isinstance(content, str) and content:
+                rows.append(content)
+        if not rows:
+            return
+        state = self._store.get(sid)
+        if state.items:
+            return  # the stream already owns this session — cache is seed only
+        for nth, content in enumerate(rows):
             item_id = (
                 f"{sid}:h-"
                 f"{uuid.uuid5(uuid.NAMESPACE_URL, f'hermes-relay:hist:{sid}:{nth}:{content}').hex[:16]}"
             )
-            nth += 1
             stripped = content.strip()
             item = Item(
                 item_id=item_id,
