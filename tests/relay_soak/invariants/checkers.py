@@ -53,16 +53,22 @@ class TurnTerminalTracker:
     """Folds a frame log into per-(session, turn) terminal state.
 
     A turn is *working* from its ``turn.started`` and *terminal* on its
-    ``turn.completed`` OR an ``error`` item completing under it. I1 fails if any
-    session we drove has a turn that started but never reached a terminal state,
-    or a driven session with NO terminal turn at all (the turn the phone
-    submitted vanished — the S8 "dead turn" class).
+    ``turn.completed`` OR an ``error`` item completing under it. A phone that
+    flapped may legitimately MISS the ``turn.completed`` frame yet still recover
+    the completed turn via a resync ``snapshot`` (snapshots carry items, not
+    turn-lifecycle frames) — so a snapshot holding a COMPLETED ``agentMessage``
+    (or an error item) also counts as terminal. I1 fails if a driven session
+    shows NONE of these (the submitted turn vanished — the S8 "dead turn" class)
+    or has a started turn with no terminal evidence.
     """
 
     def __init__(self) -> None:
-        self.started: dict[str, set[str]] = {}    # sid -> {turn_id}
-        self.terminal: dict[str, dict[str, str]] = {}  # sid -> {turn_id: status}
-        self.driven: set[str] = set()             # sids the phone submitted to
+        self.started: dict[str, set[str]] = {}       # sid -> {turn_id}
+        self.completed: dict[str, set[str]] = {}     # sid -> {turn_id} turn.completed
+        self.errored: dict[str, set[str]] = {}       # sid -> {turn_id} error item
+        self.snapshot_terminal: set[str] = set()     # sids healed by a snapshot
+        self.statuses: dict[str, set[str]] = {}      # sid -> {status}
+        self.driven: set[str] = set()                # sids the phone submitted to
 
     def mark_driven(self, sid: str) -> None:
         if sid:
@@ -79,10 +85,23 @@ class TurnTerminalTracker:
             if kind == _TURN_STARTED and turn:
                 self.started.setdefault(sid, set()).add(turn)
             elif kind == _TURN_COMPLETED and turn:
-                status = body.get("status", "completed")
-                self.terminal.setdefault(sid, {})[turn] = status
+                self.completed.setdefault(sid, set()).add(turn)
+                self.statuses.setdefault(sid, set()).add(body.get("status", "completed"))
             elif kind == _ITEM_COMPLETED and body.get("type") == "error" and turn:
-                self.terminal.setdefault(sid, {}).setdefault(turn, "error")
+                self.errored.setdefault(sid, set()).add(turn)
+                self.statuses.setdefault(sid, set()).add("error")
+            elif kind == "snapshot":
+                # A snapshot carrying a COMPLETED agentMessage / an error item
+                # proves the session reached a terminal state even when the phone
+                # never saw the turn.completed frame (flap + snapshot heal).
+                for it in body.get("items", []):
+                    if (it.get("type") == "agentMessage"
+                            and it.get("status") == "completed"):
+                        self.snapshot_terminal.add(sid)
+                        self.statuses.setdefault(sid, set()).add("completed")
+                    elif it.get("type") == "error":
+                        self.snapshot_terminal.add(sid)
+                        self.statuses.setdefault(sid, set()).add("error")
         return self
 
     def report(self) -> dict[str, Any]:
@@ -90,23 +109,34 @@ class TurnTerminalTracker:
         per_session: dict[str, Any] = {}
         for sid in sorted(self.driven):
             started = self.started.get(sid, set())
-            terminal = self.terminal.get(sid, {})
-            nonterminal = sorted(started - set(terminal))
+            completed = self.completed.get(sid, set())
+            errored = self.errored.get(sid, set())
+            snap = sid in self.snapshot_terminal
+            has_terminal = bool(completed or errored or snap)
             per_session[sid] = {
-                "started": len(started), "terminal": len(terminal),
-                "nonterminal_turns": nonterminal,
-                "statuses": sorted(set(terminal.values())),
+                "started": len(started),
+                "completed_frames": len(completed),
+                "error_frames": len(errored),
+                "snapshot_terminal": snap,
+                "statuses": sorted(self.statuses.get(sid, set())),
             }
-            if not terminal:
+            if not has_terminal:
                 violations.append(
-                    f"I1: session {sid} was driven but reached NO terminal turn "
-                    f"(started={len(started)}) — lost/dead turn"
+                    f"I1: session {sid} was driven but reached NO terminal state "
+                    f"(started={len(started)}, no turn.completed/error/snapshot) "
+                    f"— lost/dead turn"
                 )
-            if nonterminal:
-                violations.append(
-                    f"I1: session {sid} has {len(nonterminal)} non-terminal turn(s) "
-                    f"(eternal-working): {nonterminal[:5]}"
-                )
+                continue
+            # Eternal-working: a started turn with no terminal evidence. When a
+            # snapshot proves the session completed it covers every started turn
+            # (the snapshot is the authoritative end-state of the session).
+            if not snap:
+                nonterminal = sorted(started - completed - errored)
+                if nonterminal:
+                    violations.append(
+                        f"I1: session {sid} has {len(nonterminal)} non-terminal "
+                        f"turn(s) (eternal-working): {nonterminal[:5]}"
+                    )
         return {
             "invariant": "I1",
             "ok": not violations,

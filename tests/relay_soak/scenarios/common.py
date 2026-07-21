@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Optional
 
+import tests.relay_soak.soak_params as soak_params
 from tests.relay_soak.invariants.transcript import (  # noqa: F401
     agent_messages,
     diff_transcripts,
@@ -24,6 +25,52 @@ from tests.relay_soak.invariants.transcript import (  # noqa: F401
     transcript_hash,
     user_message_ids,
 )
+
+
+# ---------------------------------------------------------------------------
+# Verdict assembly — one JSON shape per scenario for run_soak.sh to aggregate.
+# ---------------------------------------------------------------------------
+
+
+def build_verdict(scenario: str, reports: list[dict[str, Any]],
+                  **extra: Any) -> dict[str, Any]:
+    """Assemble a scenario verdict from invariant reports.
+
+    ``ok`` is True iff every report's ``ok`` is True (a report without an ``ok``
+    key is informational and never fails the scenario). Each report is keyed by
+    its ``invariant`` (I1..I8) so the report shows a per-invariant pass/fail.
+    """
+    invariants: dict[str, Any] = {}
+    for r in reports:
+        key = r.get("invariant") or r.get("name") or "info"
+        invariants[key] = r
+    ok = all(bool(r.get("ok", True)) for r in reports)
+    return {
+        "scenario": scenario,
+        "ok": ok,
+        "mode": soak_params.mode(),
+        "scale": soak_params.scale(),
+        "seed": soak_params.seed(),
+        "invariants": invariants,
+        **extra,
+    }
+
+
+def violations_of(verdict: dict[str, Any]) -> list[str]:
+    """Every violation string across all invariant reports in a verdict."""
+    out: list[str] = []
+    for r in verdict.get("invariants", {}).values():
+        out.extend(r.get("violations") or [])
+    return out
+
+
+def assert_verdict(verdict: dict[str, Any]) -> None:
+    """Assert a scenario verdict is green; the message lists every violation."""
+    v = violations_of(verdict)
+    assert verdict["ok"], (
+        f"scenario {verdict['scenario']} FAILED "
+        f"({len(v)} violation(s)):\n  " + "\n  ".join(v)
+    )
 
 # Deterministic default prompts (the scripted gateway's fixed outputs). A
 # scenario may override ``text`` but must use the SAME text for its clean

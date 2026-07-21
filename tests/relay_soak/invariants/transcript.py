@@ -101,16 +101,29 @@ def user_message_ids(frames: Iterable[Any], sid: str | None = None) -> set[str]:
 
 
 def diff_transcripts(
-    ref: dict[str, dict[str, Any]], cand: dict[str, dict[str, Any]]
+    ref: dict[str, dict[str, Any]], cand: dict[str, dict[str, Any]],
+    *, exclude_types: frozenset[str] = frozenset({"userMessage"}),
 ) -> dict[str, Any]:
     """Structured comparison of a candidate transcript against a reference.
 
-    Returns ``{identical, ref_agent, cand_agent, missing_types, extra_types,
-    body_mismatches}`` for evidence. Content-keyed (not item_id-keyed) so a
-    deterministic script run under torture compares equal to a clean run.
+    Returns ``{identical, hash_match, comparable_hash_match, ref_agent,
+    cand_agent, missing_types, extra_types, …}`` for evidence. Content-keyed
+    (not item_id-keyed) so a deterministic script run under torture compares
+    equal to a clean run.
+
+    ``userMessage`` is EXCLUDED from the cross-run hash by default: the relay
+    embeds the per-submit ``client_message_id`` in the userMessage body, so two
+    runs of the same script intentionally carry different userMessage bodies
+    (mirrors test_f_ws_flap_chaos.py's exemption). UserMessage integrity is I4's
+    job (exactly-one-id-per-prompt), not I2's. ``identical`` is therefore the
+    AGENT transcript: agent texts match AND the non-excluded items hash-match.
     """
-    ref_by_hash = {_item_hash(it): it for it in ref.values()}
-    cand_by_hash = {_item_hash(it): it for it in cand.values()}
+    def _comparable(items: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        return {k: v for k, v in items.items()
+                if v.get("type") not in exclude_types}
+
+    ref_cmp = _comparable(ref)
+    cand_cmp = _comparable(cand)
 
     ref_types = sorted({it.get("type") for it in ref.values()})
     cand_types = sorted({it.get("type") for it in cand.values()})
@@ -118,17 +131,20 @@ def diff_transcripts(
     ref_agent = agent_messages(ref)
     cand_agent = agent_messages(cand)
 
+    comparable_hash_match = transcript_hash(ref_cmp) == transcript_hash(cand_cmp)
+    ref_by_hash = {_item_hash(it) for it in ref_cmp.values()}
+    cand_by_hash = {_item_hash(it) for it in cand_cmp.values()}
+
     return {
-        "identical": (transcript_hash(ref) == transcript_hash(cand)
-                      and ref_agent == cand_agent),
+        "identical": comparable_hash_match and ref_agent == cand_agent,
         "hash_match": transcript_hash(ref) == transcript_hash(cand),
+        "comparable_hash_match": comparable_hash_match,
         "ref_agent": ref_agent,
         "cand_agent": cand_agent,
         "missing_types": sorted(set(ref_types) - set(cand_types)),
         "extra_types": sorted(set(cand_types) - set(ref_types)),
         "ref_item_count": len(ref),
         "cand_item_count": len(cand),
-        "ref_hashes": sorted(ref_by_hash),
-        "cand_only_hashes": sorted(set(cand_by_hash) - set(ref_by_hash)),
-        "ref_only_hashes": sorted(set(ref_by_hash) - set(cand_by_hash)),
+        "cand_only_hashes": sorted(cand_by_hash - ref_by_hash),
+        "ref_only_hashes": sorted(ref_by_hash - cand_by_hash),
     }
