@@ -10,7 +10,7 @@ import XCTest
 /// path must be fired explicitly at the relay's explicit turn boundaries:
 ///  - `.turnCompleted` frame  → `notifyRelayTurnCompleted()` → `onTurnComplete`
 ///  - failed `.error` item    → `notifyRelayTurnDiscarded()` → `onTurnDiscarded`
-///  - session switch mid-turn → `endRelayTurnForSessionSwitch()` → `onTurnDiscarded`
+///  - session switch mid-turn → write-gate move (`relayWriteGateMoved`) → `onTurnDiscarded`
 ///
 /// Before the R16 fix NONE of these fired on the relay path, so the activity's
 /// `startedAt` drove the lock-screen elapsed timer ENDLESSLY (owner's
@@ -167,22 +167,23 @@ final class LiveActivityRelayLifecycleTests: XCTestCase {
         XCTAssertTrue(chat.isStreaming)
         XCTAssertEqual(discards, 0, "no discard while the turn is live and projected")
 
-        // R16 seam: switching the projected session while a turn is live ends
-        // the outgoing session's Live Activity (it no longer reflects what the
-        // user is looking at).
-        chat.endRelayTurnForSessionSwitch()
+        // R1 seam (contract I2): the write-gate MOVES to another session —
+        // the outgoing session's Live Activity ends as a discard (it no
+        // longer reflects what the user is looking at; its entry keeps
+        // folding frames — nothing stream-side is torn down).
+        chat.relayWriteGateMoved(toSession: "other-session", items: [])
         XCTAssertEqual(discards, 1,
-                       "switching away mid-turn ends the outgoing Live Activity (R16)")
+                       "switching away mid-turn ends the outgoing Live Activity (R16/I2)")
 
-        // Idempotent: a second call within the same switch is a no-op.
-        chat.endRelayTurnForSessionSwitch()
+        // Idempotent: the outgoing turn's chrome is already gone.
+        chat.relayWriteGateMoved(toSession: "other-session", items: [])
         XCTAssertEqual(discards, 1, "the switch discard is idempotent")
 
         // And it's a no-op when no turn is live at all.
         let idle = ChatStore()
         var idleDiscards = 0
         idle.onTurnDiscarded = { idleDiscards += 1 }
-        idle.endRelayTurnForSessionSwitch()
+        idle.relayWriteGateMoved(toSession: "other-session", items: [])
         XCTAssertEqual(idleDiscards, 0, "the switch discard is a no-op when nothing is streaming")
     }
 }
