@@ -36,20 +36,66 @@ import extract  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
+def _relay_ahead(contract) -> dict:
+    """The R4 Wave-1 ratchet (relay-first surfaces awaiting iOS glue).
+
+    ROUND4-LEAN-PLAN.md §c sequencing: the relay lanes deploy ONCE, ahead of
+    the iOS waves (additive; old iOS unaffected). A method the relay
+    implements before its iOS builder exists lives in ``relay_ahead.methods``
+    instead of ``upstream.payloads``: the relay surface is held to it (the
+    reads/behavioral tests below cover it), while the Swift surface still
+    equals ``upstream.payloads`` exactly — so the XCTest consumer (which reads
+    ``upstream.payloads`` alone) stays green until the iOS adoption lane. The
+    section MUST be empty at the Wave-4 exit (relay-only tree).
+    """
+    return dict(contract.get("relay_ahead", {}).get("methods", {}))
+
+
 def test_upstream_method_sets_agree_across_all_surfaces(contract):
     swift = set(extract.swift_upstream_methods())
     from hermes_relay.types import UpstreamMethod
 
     relay = set(UpstreamMethod.ALL)
     fixture = set(contract["upstream"]["payloads"])
+    ahead = set(_relay_ahead(contract))
     assert swift == fixture, (
         f"Swift RelayUpstreamMethod != fixture: "
         f"swift-only={swift - fixture}, fixture-only={fixture - swift}"
     )
-    assert relay == fixture, (
-        f"relay UpstreamMethod.ALL != fixture: "
-        f"relay-only={relay - fixture}, fixture-only={fixture - relay}"
+    assert relay == fixture | ahead, (
+        f"relay UpstreamMethod.ALL != fixture + relay_ahead: "
+        f"relay-only={relay - fixture - ahead}, "
+        f"declared-only={fixture | ahead - relay}"
     )
+    # RATCHET (double-acting): a relay_ahead method Swift has ALREADY adopted
+    # is a stale entry — this fails the moment the iOS builder lands, forcing
+    # the adopter to MOVE the spec into upstream.payloads and delete it from
+    # relay_ahead (the XCTest method-set equality then holds again naturally).
+    adopted = swift & ahead
+    assert not adopted, (
+        f"iOS now implements {sorted(adopted)} — MOVE each spec from "
+        f"relay_ahead.methods into upstream.payloads (with real ios_sends) "
+        f"and DELETE it from relay_ahead (R4 Wave-1 ratchet; the section must "
+        f"be empty at the Wave-4 exit)"
+    )
+
+
+def test_relay_ahead_specs_are_pending_not_phantom(contract):
+    """Hygiene for the ratchet: a relay_ahead method is relay-real (present in
+    UpstreamMethod.ALL), genuinely pre-adoption (no iOS sends declared), and
+    fully specified (example + gateway mapping for the behavioral tests)."""
+    from hermes_relay.types import UpstreamMethod
+
+    for method, spec in _relay_ahead(contract).items():
+        assert method in UpstreamMethod.ALL, (
+            f"relay_ahead.{method} is not in UpstreamMethod.ALL — a phantom, "
+            f"not a relay-first surface"
+        )
+        assert spec["ios_sends"] == {"required": [], "optional": []}, (
+            f"relay_ahead.{method} declares ios_sends — an adopted method "
+            f"belongs in upstream.payloads, not the ratchet"
+        )
+        assert spec.get("example"), f"relay_ahead.{method} has no example payload"
 
 
 def test_fixture_ios_sends_match_swift_builders(contract):
@@ -69,7 +115,11 @@ def test_fixture_ios_sends_match_swift_builders(contract):
 
 def test_fixture_relay_reads_match_downstream_ast(contract):
     reads = extract.relay_upstream_reads()
-    for method, spec in contract["upstream"]["payloads"].items():
+    # The relay side is held to the FULL surface — adopted methods AND the
+    # relay_ahead ratchet entries (the relay implements those already).
+    specs = dict(contract["upstream"]["payloads"])
+    specs.update(_relay_ahead(contract))
+    for method, spec in specs.items():
         want = spec["relay_reads"]
         got = reads.get(method, {"required": [], "optional": []})
         assert got["required"] == sorted(want["required"]), (
@@ -169,11 +219,28 @@ def test_ios_shaped_payloads_drive_relay_without_silent_failure(server_stack, co
         if spec["expect_gateway"]:
             assert gateway.calls, f"{method}: expected a gateway hop, none recorded"
 
+    # relay_ahead methods have no Swift builder yet — drive the fixture EXAMPLE
+    # through the real handler with the same silent-failure kill.
+    for method, spec in _relay_ahead(contract).items():
+        try:
+            _drive(server, conn, method, dict(spec["example"]))
+        except (KeyError, TypeError) as exc:
+            raise AssertionError(
+                f"{method} (relay_ahead): example payload {sorted(spec['example'])} "
+                f"BREAKS the relay: {exc!r}."
+            ) from exc
+        if spec["expect_gateway"]:
+            assert gateway.calls, f"{method}: expected a gateway hop, none recorded"
+
 
 def test_fixture_examples_map_to_the_right_gateway_params(server_stack, contract):
     """The semantic mapping: decision->choice, text->answer, prompt->text. A
     regression that sends the phone's key straight through (or drops it) fails."""
-    for method, spec in contract["upstream"]["payloads"].items():
+    # Adopted methods first, then the relay_ahead ratchet entries (their
+    # examples drive last, so the per-RPC recorded params are theirs).
+    specs = dict(contract["upstream"]["payloads"])
+    specs.update(_relay_ahead(contract))
+    for method, spec in specs.items():
         if not spec["expect_gateway"]:
             continue
         server, conn, gateway = server_stack

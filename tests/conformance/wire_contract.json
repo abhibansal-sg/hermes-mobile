@@ -1,6 +1,6 @@
 {
   "$comment": "SINGLE SOURCE OF TRUTH for the Hermes mobile relay wire contract (docs/RELAY-PHONE-PROTOCOL.md). Consumed key-for-key by BOTH the pytest side (tests/conformance/test_*.py, which also re-extracts the real surface from the Swift + Python sources and fails on ANY drift) and the XCTest side (apps/ios/HermesMobileTests/WireConformanceTests.swift, bundled via project.yml). A2/N1 of docs/DAILY-DRIVER-SPEC.md: the prompt/text, decision/choice, text/answer bug class is structurally impossible when this file, the Swift sources, and the relay sources all agree.",
-  "version": 1,
+  "version": 2,
   "upstream": {
     "envelope": {
       "request": [
@@ -41,7 +41,9 @@
             "client_message_id",
             "title",
             "model",
-            "provider"
+            "provider",
+            "cwd",
+            "truncate_before_user_ordinal"
           ]
         },
         "aliases": [
@@ -134,7 +136,11 @@
         "relay_reads": {
           "required": [],
           "optional": [
-            "limit"
+            "limit",
+            "cwd_prefix",
+            "exclude_source",
+            "min_messages",
+            "order"
           ]
         },
         "aliases": [],
@@ -584,7 +590,8 @@
         "optional": [
           "usage",
           "duration_s",
-          "started_at"
+          "started_at",
+          "reason"
         ],
         "closed": true
       },
@@ -900,7 +907,9 @@
             "session_id",
             "text"
           ],
-          "optional": []
+          "optional": [
+            "truncate_before_user_ordinal"
+          ]
         },
         "gateway_reads": {
           "required": [],
@@ -964,14 +973,25 @@
           "required": [
             "limit"
           ],
-          "optional": []
+          "optional": [
+            "cwd_prefix",
+            "exclude_source",
+            "min_messages",
+            "order"
+          ]
         },
         "gateway_reads": {
           "required": [],
           "optional": [
             "limit"
           ]
-        }
+        },
+        "accepted_unread": [
+          "cwd_prefix",
+          "exclude_source",
+          "min_messages",
+          "order"
+        ]
       },
       "session.create": {
         "relay_sends": {
@@ -982,7 +1002,8 @@
           ],
           "optional": [
             "model",
-            "provider"
+            "provider",
+            "cwd"
           ]
         },
         "gateway_reads": {
@@ -1056,6 +1077,58 @@
         },
         "accepted_unread": [
           "session_id"
+        ]
+      }
+    }
+  },
+  "relay_ahead": {
+    "$comment": "R4 Wave-1 ratchet (relay deploys first; plan §c sequencing): surfaces the relay implements AHEAD of the iOS glue. The pytest conformance treats these as relay-only (relay UpstreamMethod.ALL == upstream.payloads KEYS UNION relay_ahead.methods; the Swift surface must equal upstream.payloads exactly — the XCTest consumer, which reads upstream.payloads alone, stays green until the iOS adoption lane). RATCHET: the moment Swift implements a method here, test_upstream_method_sets_agree_across_all_surfaces FAILS and the adopter MUST move the spec into upstream.payloads and delete it here. This section MUST be EMPTY at the Wave-4 exit (relay-only tree). The optional params these lanes add to EXISTING methods (submit: cwd + truncate_before_user_ordinal; list: cwd_prefix/exclude_source/min_messages/order) ride the host method's relay_reads — they need no Swift builder until iOS sends them (optional on the wire, RR5).",
+    "methods": {
+      "branch": {
+        "kind": "request",
+        "$comment": "R4 L2 (B13): conversation branch = seeded create — session.create(+cwd/title/model/provider) -> prompt.submit(seed) -> the SUBMIT-style completed userMessage synthesis; returns {session_id: <new>, origin}. Before L2 branch raised unknown-method in relay mode (dead — a silent regression vs the direct seam X4/X7 delete). iOS adoption: the B13 branch UI rides a RelayClient.branch builder in a Wave-2 lane; until then this spec lives HERE, not under upstream.payloads (which the XCTest consumer compares key-for-key against RelayUpstreamMethod).",
+        "ios_sends": {
+          "required": [],
+          "optional": []
+        },
+        "relay_reads": {
+          "required": [],
+          "optional": [
+            "client_message_id",
+            "cwd",
+            "model",
+            "prompt",
+            "provider",
+            "session_id",
+            "text",
+            "title",
+            "truncate_before_user_ordinal"
+          ]
+        },
+        "aliases": [
+          [
+            "prompt",
+            "text"
+          ]
+        ],
+        "example": {
+          "session_id": "sess-1",
+          "text": "fork the conversation here"
+        },
+        "expect_gateway": [
+          {
+            "rpc": "session.create",
+            "params": {
+              "title": "Branch — sess-1"
+            }
+          },
+          {
+            "rpc": "prompt.submit",
+            "params": {
+              "session_id": "sess-new",
+              "text": "fork the conversation here"
+            }
+          }
         ]
       }
     }

@@ -60,3 +60,42 @@ def test_store_lazy_create_and_drop():
     assert "s1" in store
     assert store.drop("s1") is True
     assert store.drop("s1") is False
+
+
+# ---------------------------------------------------------------------------
+# R4 L6 — phone-origin prompt markers (SessionStore transient mapping state)
+# ---------------------------------------------------------------------------
+# The DownstreamServer marks a prompt it is about to drive; the Reframer
+# consumes the mark on message.start{prompt} and skips its foreign-turn
+# emission — exactly one user row per turn regardless of emitter ordering.
+
+
+def test_local_prompt_marker_take_is_one_shot():
+    store = SessionStore()
+    store.mark_local_prompt("s1", "hello")
+    assert store.take_local_prompt("s1", "hello") is True
+    assert store.take_local_prompt("s1", "hello") is False  # consumed
+
+
+def test_local_prompt_marker_is_session_and_text_scoped():
+    store = SessionStore()
+    store.mark_local_prompt("s1", "hello")
+    assert store.take_local_prompt("s2", "hello") is False   # per-session
+    assert store.take_local_prompt("s1", "other text") is False  # per-text
+    assert store.take_local_prompt("s1", "hello") is True
+
+
+def test_local_prompt_marker_expires(monkeypatch):
+    import hermes_relay.session_state as ss
+
+    monkeypatch.setattr(ss, "_LOCAL_PROMPT_TTL_S", -1.0)  # expire immediately
+    store = SessionStore()
+    store.mark_local_prompt("s1", "hello")
+    assert store.take_local_prompt("s1", "hello") is False
+
+
+def test_drop_clears_local_prompt_markers():
+    store = SessionStore()
+    store.mark_local_prompt("s1", "hello")
+    store.drop("s1")
+    assert store.take_local_prompt("s1", "hello") is False
