@@ -148,6 +148,15 @@ final class AppEnvironment {
                     }
                     return await sessionStore?.runtimeForOutboxDestination(storedID)
                 },
+                relayCreatesOnSubmit: { [weak connectionStore] in
+                    // R2 / D10: in relay mode a NEW-SESSION outbox row mints its
+                    // destination at submit-nil (the relay fuses create + prompt),
+                    // so the processor skips the gateway `creatingDestination` →
+                    // `session.create` state — dead here, the gateway socket is
+                    // idle. False in direct mode ⇒ the create path stays.
+                    connectionStore?.relayCoordinator != nil
+                        && connectionStore?.transportPath == .relay
+                },
                 uploadAsset: { [weak connectionStore, weak workRepository] job, snapshot in
                     guard let connectionStore,
                           let rest = connectionStore.rest,
