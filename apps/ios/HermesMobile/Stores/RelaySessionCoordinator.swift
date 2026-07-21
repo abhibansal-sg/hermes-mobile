@@ -743,6 +743,10 @@ final class RelaySessionCoordinator {
         clientMessageID: String? = nil
     ) async throws -> JSONValue {
         let target = sessionID ?? activeSessionID
+        // Sending to a session IS driving it: first-touch its entry (the
+        // deep-link resume-to-send and `bindRuntime: false` opens bind the
+        // session here, not via open/resume — contract §1.3 first-touch).
+        if let target { touchEntry(target) }
         let result = try await requireClient().submit(
             sessionID: target, prompt: prompt, clientMessageID: clientMessageID
         )
@@ -880,10 +884,14 @@ final class RelaySessionCoordinator {
         dataURL: String
     ) async throws -> JSONValue {
         let target = sessionID ?? activeSessionID
+        if let target { touchEntry(target) }   // attach drives the session too
         let result = try await requireClient().attach(
             sessionID: target, kind: kind, name: name, dataURL: dataURL
         )
-        if let sid = result["session_id"]?.stringValue { activeSessionID = sid }
+        if let sid = result["session_id"]?.stringValue {
+            touchEntry(sid)
+            activeSessionID = sid
+        }
         return result
     }
 
