@@ -22,6 +22,7 @@ keep the Reframer and DownstreamServer lanes from colliding on item bookkeeping.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -117,23 +118,81 @@ def _merge_patch(item: Item, patch: dict[str, Any]) -> None:
             item.body[key] = val
 
 
+# Bounded accumulated-state registry (I6, soak T7). A relay that serves one
+# phone for days streams through UNBOUNDEDLY many sessions; a lazy-create map
+# with no eviction grows ~1-2 KiB per session forever — sub-threshold per hour
+# (the soak measured ~8 MiB/h at marathon intensity) yet monotonic, i.e. a leak
+# by the I6 contract. Cap the registry LRU instead: the least-recently-USED
+# COMPLETED session states evict first. This is safe because:
+# * the replay RING (per-connection, downstream.py) covers the reconnect window
+#   without the store; the store only backs ring-MISS (FALLBACK) snapshots;
+# * a phone reconciles snapshots by item_id as a UNION (QA-1 B5/B13), so a
+#   session whose accumulated state was evicted heals the phone with whatever
+#   live frames follow — it never VOIDS the phone's own copy;
+# * genuinely cold reads go to the gateway REST (downstream.py OPEN/HISTORY ->
+#   rest_history), never through this store (the R0 correction).
+# States with an IN_PROGRESS item are NEVER evicted (a mid-stream turn's
+# snapshot must stay foldable). Override the cap with the environment for
+# tests / exotic deployments; 0 disables eviction (the legacy unbounded
+# behavior).
+DEFAULT_SESSION_STORE_CAPACITY = 4096
+
+
+def _session_store_capacity() -> int:
+    import os
+
+    raw = os.environ.get("HERMES_RELAY_SESSION_STORE_CAPACITY", "")
+    try:
+        return max(0, int(raw)) if raw.strip() else DEFAULT_SESSION_STORE_CAPACITY
+    except ValueError:
+        return DEFAULT_SESSION_STORE_CAPACITY
+
+
 class SessionStore:
     """Registry of :class:`SessionState` keyed by session id.
 
     A thin lazy-create map so the Reframer and DownstreamServer share one view
     of accumulated items. No locking: the relay runs a single asyncio loop and
-    all folds happen on it.
+    all folds happen on it. LRU-bounded (see the module note on I6): completed
+    session states beyond ``capacity`` evict least-recently-used first; states
+    holding an IN_PROGRESS item are pinned until the turn completes.
     """
 
-    def __init__(self) -> None:
-        self._states: dict[str, SessionState] = {}
+    def __init__(self, capacity: Optional[int] = None) -> None:
+        # OrderedDict = LRU: most-recently-used at the TAIL.
+        self._states: "OrderedDict[str, SessionState]" = OrderedDict()
+        self.capacity = (
+            _session_store_capacity() if capacity is None else max(0, int(capacity))
+        )
 
     def get(self, sid: str) -> SessionState:
         st = self._states.get(sid)
         if st is None:
             st = SessionState(sid=sid)
             self._states[sid] = st
+            self._evict_if_over_capacity()
+        else:
+            self._states.move_to_end(sid)  # touch: now most-recently-used
         return st
+
+    def _evict_if_over_capacity(self) -> None:
+        """Evict LRU COMPLETED states while over ``capacity`` (0 = unbounded).
+
+        States with any IN_PROGRESS item are pinned (a snapshot mid-turn must
+        stay foldable); if the window over capacity is entirely pinned, stop —
+        memory is then held by live turns, which is legitimate working set.
+        """
+        cap = self.capacity
+        if cap <= 0 or len(self._states) <= cap:
+            return
+        for sid in list(self._states):  # oldest (LRU) first
+            if len(self._states) <= cap:
+                return
+            st = self._states[sid]
+            if any(it.status == ItemStatus.IN_PROGRESS
+                   for it in st.items.values()):
+                continue  # pinned: a turn is mid-stream on this session
+            del self._states[sid]
 
     def apply(self, frame: Frame) -> None:
         self.get(frame.sid).apply(frame)
