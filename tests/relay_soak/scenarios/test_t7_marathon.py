@@ -109,10 +109,14 @@ async def test_t7_marathon(mock_gateway, relay, phone_factory, evidence):
             # Everything the checkers below read is tail-local: the last 5
             # driven sessions' frames (driven[-5:]), the live tail for max-seq
             # ack/churn, and wait_terminal on UNIQUE sids. Compact to: frames
-            # of the last 64 driven sessions + the last 2048 frames. The relay
-            # under test is untouched — I6 measures the relay's OWN RSS, which
-            # the external sampler tracked flat (30-33 MiB) on the killed run.
-            if i % 300 == 0 and len(phone.frames) > 4096:
+            # of the last 64 driven sessions + the last 2048 frames. Compact
+            # cadence is 60 turns (NOT 300 — at ~1000 frames/s the coarser
+            # cadence let peaks of ~60 k frames / ~600 MiB build between
+            # compactions; the watchdog caught exactly that sawtooth). The
+            # relay under test is untouched — I6 measures the relay's OWN RSS,
+            # which the external sampler tracked flat (30-33 MiB) on the
+            # killed run.
+            if i % 60 == 0 and len(phone.frames) > 4096:
                 keep_sids = set(driven[-64:])
                 n = len(phone.frames)
                 tail_from = max(0, n - 2048)
