@@ -286,13 +286,25 @@ enum WorkingSectionModel {
         return "Worked for \(total / 60)m \(total % 60)s"
     }
 
+    /// QA-3 S8/A4 — the settled fold label for a turn the LIVENESS fallback
+    /// ended instead of a real completion: a dead turn (no frames + no
+    /// completion past the liveness window) whose stuck items were
+    /// force-settled — a prior turn a newer turn superseded (IMG_2591's
+    /// eternal double-working), or the watchdog's silent resync recovered
+    /// nothing. Muted "Interrupted" — HONEST, and never an error banner (C3).
+    /// No duration: a dead turn has no honest end-to-end time.
+    nonisolated static func settledLabel(seconds: TimeInterval?, interrupted: Bool) -> String {
+        interrupted ? "Interrupted" : workedLabel(seconds: seconds)
+    }
+
     /// VoiceOver label for the collapsed capsule: the worked label plus an
     /// explicit failure clause when the section hid a failed step.
     nonisolated static func summaryAccessibilityLabel(
         seconds: TimeInterval?,
-        hasFailure: Bool
+        hasFailure: Bool,
+        interrupted: Bool = false
     ) -> String {
-        let base = workedLabel(seconds: seconds)
+        let base = settledLabel(seconds: seconds, interrupted: interrupted)
         return hasFailure ? "\(base), contains a failed step" : base
     }
 
@@ -579,6 +591,10 @@ struct WorkingSectionView: View {
     var liveTurnStartedAt: Date?
     /// Settled turn duration stamped on the message, for the "Worked for N" label.
     var settledDuration: TimeInterval?
+    /// QA-3 S8/A4 — the turn ended via the LIVENESS fallback (dead turn
+    /// force-settled), not a real completion: the settled fold reads a muted
+    /// "Interrupted" instead of "Worked" (honest, never an error banner — C3).
+    var interrupted: Bool = false
 
     @Environment(\.hermesTheme) private var theme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -640,7 +656,9 @@ struct WorkingSectionView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(
-            WorkingSectionModel.summaryAccessibilityLabel(seconds: durationSeconds, hasFailure: hasFailure)
+            WorkingSectionModel.summaryAccessibilityLabel(
+                seconds: durationSeconds, hasFailure: hasFailure, interrupted: interrupted
+            )
         )
         .accessibilityValue(isExpanded ? "expanded" : "collapsed")
         .accessibilityHint("Double-tap to \(isExpanded ? "collapse" : "expand") what the assistant did")
@@ -657,7 +675,7 @@ struct WorkingSectionView: View {
     /// chevron. No box, border, gradient, or capsule (approved design §1).
     private var workedLabelRow: some View {
         HStack(spacing: 6) {
-            Text(WorkingSectionModel.workedLabel(seconds: durationSeconds))
+            Text(WorkingSectionModel.settledLabel(seconds: durationSeconds, interrupted: interrupted))
                 .font(.callout)
                 .foregroundStyle(theme.mutedFg)
                 .monospacedDigit()

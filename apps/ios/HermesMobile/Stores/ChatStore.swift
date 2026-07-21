@@ -173,6 +173,38 @@ final class ChatStore {
     /// are driving.
     private var localTurnWatchdog: Task<Void, Never>?
     private static let localTurnStaleTimeout: Duration = .seconds(180)
+    /// QA-3 S8/A4 — per-turn LIVENESS fallback (kills eternal double-working,
+    /// IMG_2591). The QA-2 watchdog was per-STORE and re-armed by ANY item
+    /// batch — a dead turn 1 stayed "Working…" forever while turn 2's frames
+    /// kept re-arming, and even when it fired, the next projection re-derived
+    /// streaming from the still-`.inProgress` items. Liveness is now PER-TURN
+    /// and two-stage, keyed off ``turnLivenessBaseline`` (refreshed ONLY by
+    /// CURRENT-turn frames — `noteTurnLivenessFrame(isCurrentTurn:)` from the
+    /// coordinator's ingest):
+    ///   stage 1 — ``turnLivenessResyncAfter`` of silence: a SILENT
+    ///     `resync{last_seq}` (snapshot when the gap exceeds the ring). A
+    ///     dropped terminal frame heals here; the user sees nothing (C3).
+    ///   stage 2 — ``localTurnStaleTimeout`` of silence: the turn is DEAD
+    ///     (the resync recovered nothing, so the authority has nothing more).
+    ///     The coordinator settles the stuck items locally (muted
+    ///     "Interrupted" fold, never an error banner) and the live flag
+    ///     clears. Eternal-working is unreachable by construction.
+    private static let turnLivenessResyncAfter: Duration = .seconds(45)
+    /// The watchdog's evaluation cadence (chunked sleep; staleness is computed
+    /// off ``turnLivenessBaseline`` at each wake, so a frame landing mid-sleep
+    /// simply defers the next stage instead of firing late-and-wrong).
+    private static let turnLivenessTick: Duration = .seconds(5)
+    /// Per-turn latch: stage 1 fires at most once per turn (reset on turn
+    /// start / settle).
+    private var turnLivenessResyncFired = false
+    /// The current turn's last CURRENT-turn frame (turn start until the first
+    /// frame). `nil` outside a turn.
+    private var turnLivenessBaseline: ContinuousClock.Instant?
+    #if DEBUG
+    /// DEBUG observability for the liveness tests: how many stage-1 silent
+    /// resyncs the watchdog (or the `_debug` seam) has fired.
+    private(set) var turnLivenessResyncCount = 0
+    #endif
     /// An approval the user must answer, or `nil`.
     var pendingApproval: PendingApproval?
     /// A clarification the user must answer, or `nil`.
@@ -1213,6 +1245,11 @@ final class ChatStore {
         // normally. Without this, a turn that errored would suppress the
         // completion seam of the NEXT (healthy) turn too.
         relayTurnTerminatedByError = false
+        // QA-3 S8/A4: a fresh turn starts with a clean liveness slate (covers
+        // turns this phone did NOT send — a mid-turn resume projection; the
+        // driven-send path resets at `relayTurnLive = true`).
+        resetTurnLivenessState()
+        turnLivenessBaseline = ContinuousClock.now
         onTurnStart?()
     }
 
@@ -2643,6 +2680,11 @@ final class ChatStore {
                 relayProjected: true
             ))
             relayTurnLive = true
+            // QA-3 S8/A4: the driven turn's liveness clock starts at send —
+            // silence is measured from here until the first CURRENT-turn frame
+            // (the stage-1 silent resync and the stage-2 settle key off it).
+            resetTurnLivenessState()
+            turnLivenessBaseline = ContinuousClock.now
             if hasAttachments, let attachments {
                 setStreaming(true, reason: "relay.send.upload")
                 lastError = nil
@@ -4982,16 +5024,33 @@ final class ChatStore {
         // (the build-115 bug). Item terminality still drives the PER-ROW
         // `isStreaming` (the caret leaves a finished bubble); the STORE-level flag
         // is turn-scoped.
-        if turnSettled { relayTurnLive = false }
-        // QA-2 R12 — a live frame batch proves the turn is still progressing;
-        // stamp the wall clock and re-arm the local-turn watchdog so a busy
-        // turn (long tool, slow stream) never falsely fires the force-settle.
+        if turnSettled {
+            relayTurnLive = false
+            resetTurnLivenessState()   // QA-3 S8/A4: the turn settled — its liveness state dies with it
+        }
+        // QA-2 R12 — a live frame batch proves SOMETHING is progressing; stamp
+        // the wall clock (observability). QA-3 S8/A4: the liveness watchdog is
+        // NO LONGER re-armed here — it is per-TURN now, refreshed only by
+        // CURRENT-turn frames via `noteTurnLivenessFrame(isCurrentTurn:)` from
+        // the coordinator's ingest (re-arming on ANY batch was the re-arm-by-
+        // other-turn bug that kept IMG_2591's dead turn "working" forever).
         lastRelayItemFrameAt = Date()
-        if isStreaming { armLocalTurnWatchdog() }
+        // QA-3 S8/A4 — PRIOR-TURN LIVENESS: the last `userMessage` item bounds
+        // the CURRENT turn (the relay allocates its ord at SUBMIT, before any
+        // of that turn's agent items, so render order is strictly
+        // [U1,A1…][U2,A2…]). A still-`.inProgress` item BEFORE that boundary
+        // belongs to a turn a NEWER turn already superseded — it can never
+        // legitimately complete now, so settle it deterministically (muted
+        // "Interrupted" fold) instead of rendering "Working…" forever.
+        // Stateless + idempotent: every projection self-heals, and any late
+        // authoritative frame (item.completed / snapshot) replaces the item by
+        // id and restores the honest state.
+        let lastUserMessageIndex = items.lastIndex { $0.type == .userMessage }
         var rebuilt: [ChatMessage] = []
         var segmentParts: [ChatMessagePart] = []
         var segmentAnchor: String?
         var segmentStreaming = false
+        var segmentInterrupted = false
         // Echo rows adopted by a `userMessage` item THIS pass — consumed out
         // of the preserved history so the reconcile replaces the echo in place
         // instead of projecting a second bubble beside it.
@@ -5002,6 +5061,7 @@ final class ChatStore {
                 segmentParts = []
                 segmentAnchor = nil
                 segmentStreaming = false
+                segmentInterrupted = false
                 return
             }
             rebuilt.append(ChatMessage(
@@ -5009,14 +5069,16 @@ final class ChatStore {
                 role: .assistant,
                 parts: segmentParts,
                 isStreaming: segmentStreaming,
+                interrupted: segmentInterrupted && !segmentStreaming,
                 relayProjected: true
             ))
             segmentParts = []
             segmentAnchor = nil
             segmentStreaming = false
+            segmentInterrupted = false
         }
 
-        for item in items {
+        for (index, item) in items.enumerated() {
             if item.type == .userMessage {
                 flushSegment()
                 let adoption = adoptRelayEcho(for: item, consuming: &consumedEchoIDs)
@@ -5033,7 +5095,17 @@ final class ChatStore {
             } else if let part = item.renderPart {
                 if segmentAnchor == nil { segmentAnchor = item.itemID }
                 segmentParts.append(part)
-                if !item.isTerminal { segmentStreaming = true }
+                if !item.isTerminal {
+                    if let lastUserMessageIndex, index < lastUserMessageIndex {
+                        // A prior turn's stuck item — settled, muted (A4).
+                        segmentInterrupted = true
+                    } else {
+                        segmentStreaming = true
+                    }
+                } else if item.locallyInterrupted {
+                    // The watchdog's stage-2 settle marked this item terminal.
+                    segmentInterrupted = true
+                }
             }
         }
         flushSegment()
@@ -5058,6 +5130,7 @@ final class ChatStore {
                     role: .assistant,
                     parts: seg.parts,
                     isStreaming: seg.isStreaming,
+                    interrupted: seg.interrupted,
                     reasoningElapsed: seg.reasoningElapsed,
                     timestamp: seg.timestamp,
                     relayProjected: true
@@ -5259,6 +5332,7 @@ final class ChatStore {
         // session's rows; drop them with it.
         relayTurnLive = false
         relaySettledElapsed = [:]
+        resetTurnLivenessState()   // QA-3 S8/A4: the torn-down turn's liveness state dies with it
         setStreaming(false, reason: "cancelStreaming")
         mirroringRuntimeId = nil
         streamingIsForeign = false
@@ -5327,18 +5401,44 @@ final class ChatStore {
 
     // MARK: - QA-2 R12 local-turn watchdog (stop-state wedge kill)
 
-    /// (Re)arm the local-turn staleness watchdog. Called on every `isStreaming`
-    /// false→true transition. If no relay item batch lands within
-    /// ``localTurnStaleTimeout`` the turn is force-settled so the stop button,
-    /// the dock task pill and the Live Activity can never wedge when the
-    /// terminal frame is missed/dropped (owner device-QA: "no force-close ever
-    /// needed to regain control").
+    /// QA-3 S8/A4 — a CURRENT-turn frame just landed (the coordinator's ingest
+    /// classifies each frame — frames of a SUPERSEDED turn never call this with
+    /// `true`, so a dead prior turn's late frames cannot refresh the clock, and
+    /// a dead current turn's silence is never masked by another turn's traffic
+    /// — the IMG_2591 re-arm-by-other-turn bug). Refresh the silence baseline
+    /// and re-arm the two-stage watchdog.
+    func noteTurnLivenessFrame(isCurrentTurn: Bool) {
+        guard isCurrentTurn else { return }
+        turnLivenessBaseline = ContinuousClock.now
+        if isStreaming { armLocalTurnWatchdog() }
+    }
+
+    /// (Re)arm the per-turn liveness watchdog (QA-3 S8/A4; QA-2 R12's wedge
+    /// kill, reworked per-turn). Armed on every `isStreaming` false→true
+    /// transition and on every CURRENT-turn frame. Evaluates in
+    /// ``turnLivenessTick`` chunks off ``turnLivenessBaseline`` (so a frame
+    /// landing mid-sleep defers the stages instead of firing late):
+    ///   stage 1 at ``turnLivenessResyncAfter`` of silence — one SILENT
+    ///     `resync{last_seq}` (self-heals a dropped terminal frame);
+    ///   stage 2 at ``localTurnStaleTimeout`` of silence — the turn is dead:
+    ///     settle it locally (muted "Interrupted"), never an error banner.
     private func armLocalTurnWatchdog() {
         cancelLocalTurnWatchdog()
+        if turnLivenessBaseline == nil { turnLivenessBaseline = ContinuousClock.now }
         localTurnWatchdog = Task { [weak self] in
-            try? await Task.sleep(for: ChatStore.localTurnStaleTimeout)
-            guard let self, !Task.isCancelled, self.isStreaming else { return }
-            self.fireLocalTurnWatchdog()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: ChatStore.turnLivenessTick)
+                guard let self, !Task.isCancelled else { return }
+                guard self.isStreaming else { return }
+                let idle = self.turnLivenessBaseline.map { $0.duration(to: ContinuousClock.now) } ?? .zero
+                if idle >= ChatStore.localTurnStaleTimeout {
+                    self.fireTurnLivenessSettle()
+                    return
+                }
+                if idle >= ChatStore.turnLivenessResyncAfter, !self.turnLivenessResyncFired {
+                    self.fireTurnLivenessResync()
+                }
+            }
         }
     }
 
@@ -5347,26 +5447,62 @@ final class ChatStore {
         localTurnWatchdog = nil
     }
 
-    /// The local turn went silent past the staleness window with no terminal
-    /// frame: force-settle the streaming state so the composer's stop button
-    /// releases, the dock task pill clears, and the Live Activity ends. This is
-    /// the safety net — the normal `turn.completed` / `message.complete` /
-    /// interrupt path settles via `setStreaming(false)` first; this only fires
-    /// when none of those landed in time.
-    private func fireLocalTurnWatchdog() {
+    /// QA-3 S8/A4 stage 1 — the current turn went silent past
+    /// ``turnLivenessResyncAfter``: ask the relay for a `resync{last_seq}`
+    /// replay (a snapshot when the gap exceeds the ring). SILENT and
+    /// idempotent — a dropped `item.completed` / `turn.completed` heals here
+    /// and the turn settles naturally; the user sees nothing (C3). Latched:
+    /// fires at most once per turn (reset on turn start / settle).
+    private func fireTurnLivenessResync() {
+        guard isStreaming, !turnLivenessResyncFired else { return }
+        turnLivenessResyncFired = true
+        #if DEBUG
+        turnLivenessResyncCount += 1
+        #endif
+        chatLog.warning("turn-liveness stage 1: current turn silent past the resync window — requesting a SILENT resync{last_seq} to recover dropped frames (self-healing, never surfaced — C3)")
+        guard connection?.transportPath == .relay,
+              let coordinator = connection?.relayCoordinator else { return }
+        Task { await coordinator.requestLivenessResync() }
+    }
+
+    /// QA-3 S8/A4 stage 2 — the current turn went silent past
+    /// ``localTurnStaleTimeout`` with no completion even after the stage-1
+    /// resync: the turn is DEAD (gateway turn died / submit never ran / the
+    /// authority has nothing more). Settle it: the coordinator locally
+    /// terminals the stuck items (muted "Interrupted" fold — C3, never an
+    /// error banner) and the live flag clears, so eternal double-working is
+    /// unreachable. Mirrors `handleMessageComplete`'s chrome teardown + fires
+    /// `onTurnComplete` so the Live Activity ends in parity with a real
+    /// completion (R16 depends on this edge). The normal `turn.completed` /
+    /// `message.complete` / interrupt paths settle via `setStreaming(false)`
+    /// first; this fires only when none of those landed in time.
+    private func fireTurnLivenessSettle() {
         guard isStreaming else { return }
-        chatLog.warning("local-turn watchdog fired: turn went silent past the staleness window with no terminal frame — force-settling so the stop state and dock pill cannot wedge")
-        // Mirror handleMessageComplete's settle: clear the streaming bubble's
-        // own flag (stops the cursor), clear turn chrome, drop streaming, and
-        // fire onTurnComplete so the Live Activity ends in parity with a real
-        // completion (R16 also depends on this edge firing).
-        mutateStreaming { $0.isStreaming = false }
-        streamingMessageID = nil
+        chatLog.warning("turn-liveness stage 2: turn silent past the settle window with no completion even after the silent resync — settling as INTERRUPTED so eternal double-working is impossible (C3: no error surface)")
+        if connection?.transportPath == .relay, let coordinator = connection?.relayCoordinator {
+            // Locally settle the dead turn's stuck items; the re-projection
+            // folds them as muted "Interrupted" rows and clears the turn-scoped
+            // live flag.
+            coordinator.settleStaleTurnLocally()
+        }
+        // Belt and braces (direct path, or a projection that still reads
+        // streaming): force the settle exactly like the QA-2 wedge kill did.
+        if isStreaming {
+            mutateStreaming { $0.isStreaming = false }
+            streamingMessageID = nil
+            setStreaming(false, reason: "turnLivenessSettle")
+        }
         turnStartedAt = nil
         activeToolName = nil
         activeToolCallId = nil
-        setStreaming(false, reason: "localTurnWatchdog")
+        resetTurnLivenessState()
         onTurnComplete?()
+    }
+
+    /// Reset the per-turn liveness state (turn start / every settle path).
+    private func resetTurnLivenessState() {
+        turnLivenessResyncFired = false
+        turnLivenessBaseline = nil
     }
 
     /// QA-2 R12 — relay turn end. Called by `RelaySessionCoordinator.ingest` on
@@ -5405,15 +5541,24 @@ final class ChatStore {
     }
 
     #if DEBUG
-    /// DEBUG test seam: drive the local-turn watchdog's force-settle path
+    /// DEBUG test seam: drive the liveness watchdog's stage-2 SETTLE path
     /// synchronously without waiting ``localTurnStaleTimeout``. Production code
-    /// never calls this — the watchdog's `Task.sleep` is the only legit trigger.
+    /// never calls this — the watchdog's tick loop is the only legit trigger.
     /// Lets the regression test prove a missed-frame turn releases `isStreaming`
-    /// and the dock pill without a force-close (A6/R12).
+    /// and the dock pill without a force-close (A6/R12, QA-3 A4).
     @discardableResult
     func _debugFireLocalTurnWatchdog() -> Bool {
         guard isStreaming else { return false }
-        fireLocalTurnWatchdog()
+        fireTurnLivenessSettle()
+        return true
+    }
+
+    /// DEBUG test seam: drive the liveness watchdog's stage-1 SILENT RESYNC
+    /// synchronously without waiting ``turnLivenessResyncAfter`` (QA-3 A4).
+    @discardableResult
+    func _debugFireTurnLivenessResync() -> Bool {
+        guard isStreaming else { return false }
+        fireTurnLivenessResync()
         return true
     }
     #endif

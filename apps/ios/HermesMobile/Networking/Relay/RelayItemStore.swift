@@ -153,6 +153,34 @@ struct RelayItemStore: Sendable, Equatable {
         if let cursor = snapshot.cursor, cursor > lastSeq { lastSeq = cursor }
     }
 
+    // MARK: - Liveness settle (QA-3 S8/A4)
+
+    /// Force-settle every still-`.inProgress` item to terminal, marked
+    /// ``ChatItem/locallyInterrupted`` so the render lane folds them as muted
+    /// "Interrupted" sections (never an error banner — C3). Called by the
+    /// coordinator when the per-turn liveness watchdog concludes a turn is
+    /// DEAD (no frames + no completion past the settle window, and the silent
+    /// `resync` recovered nothing — so the authority has nothing more either).
+    ///
+    /// PROVISIONAL, not destructive: the settle is local render state. Any
+    /// later authoritative frame heals it — `applyCompleted` and
+    /// `reconcile(snapshot:)` REPLACE the item by id (clearing the marker), and
+    /// a delta against a locally-settled item is ignored exactly like a delta
+    /// after a real `completed` (the `isTerminal` guard). Returns `true` when
+    /// at least one item was settled (the caller re-projects only then).
+    @discardableResult
+    mutating func settleInProgressLocally() -> Bool {
+        var settled = false
+        for (id, item) in itemsByID where item.status == .inProgress {
+            var updated = item
+            updated.status = .completed
+            updated.locallyInterrupted = true
+            itemsByID[id] = updated
+            settled = true
+        }
+        return settled
+    }
+
     // MARK: - Lifecycle folds
 
     private mutating func track(_ id: String) {
