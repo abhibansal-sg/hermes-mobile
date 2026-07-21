@@ -244,6 +244,30 @@ private func workTestScope(
     try WorkScope(serverID: serverID, profileID: profileID)
 }
 
+/// Hermetic `.hermesOpenSessionsIntent` post recorder (fix-round 1, A11/A5).
+/// An inverted `expectation(forNotification:)` + wall-clock `fulfillment` wait
+/// observes the SHARED `NotificationCenter.default` across the whole window —
+/// any post landing in it (even from unrelated main-actor work interleaved
+/// during the drain's awaits) fulfills it, which made the S9 tie pin flaky.
+/// Scoped add/remove around exactly the drain call + a lock-protected count
+/// makes the assertion synchronous and window-free.
+final class IntentPostRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded = 0
+
+    func record() {
+        lock.lock()
+        recorded += 1
+        lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
+    }
+}
+
 final class AppIntentWorkRepositoryTests: XCTestCase {
     func testRapidInvocationsAreIndependentAndFIFO() async throws {
         let test = try makeWorkRepositoryTestConfiguration()
@@ -391,12 +415,14 @@ final class AppIntentWorkRepositoryTests: XCTestCase {
         //    (in-flight load). The drawer row tap stamps the gesture epoch + time.
         sessions.recordDrawerUserGesture(now: queueTime.addingTimeInterval(60))
 
-        // 3. Foreground transition fires drainDurable.
-        let openedSessions = expectation(
-            forNotification: .hermesOpenSessionsIntent,
-            object: nil
-        )
-        openedSessions.isInverted = true
+        // 3. Foreground transition fires drainDurable. Observe posts scoped
+        //    EXACTLY to the drain call (fix-round 1: the shared-center inverted
+        //    expectation's wall-clock window was non-hermetic — see
+        //    IntentPostRecorder).
+        let posts = IntentPostRecorder()
+        let token = NotificationCenter.default.addObserver(
+            forName: .hermesOpenSessionsIntent, object: nil, queue: nil
+        ) { _ in posts.record() }
 
         let suite = "S9-race-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -409,9 +435,11 @@ final class AppIntentWorkRepositoryTests: XCTestCase {
             queue: queue,
             defaults: defaults
         )
+        NotificationCenter.default.removeObserver(token)
 
         // 4. The drawer must NOT re-open: no hermesOpenSessionsIntent posted.
-        await fulfillment(of: [openedSessions], timeout: 0.3)
+        XCTAssertEqual(posts.count, 0,
+                       "a gesture newer than the queued intent drops the open — the drawer never re-opens over the user's navigation")
 
         // 5. The job is still marked complete — it was handled by deliberately
         //    not re-opening, so it doesn't re-drain next foreground.
@@ -428,6 +456,22 @@ final class AppIntentWorkRepositoryTests: XCTestCase {
     /// user just chose. The legitimate widget-tap path has its queue time
     /// strictly AFTER any prior in-app gesture, so it still fires (proven by
     /// the next test).
+    ///
+    /// DETERMINISM (fix-round 1, A11/A5): the tie is constructed at an INTEGER
+    /// second (`Date().timeIntervalSince1970.rounded(.down)`) — exact in
+    /// Double AND bitwise-stable across the drain's `Date(timeIntervalSince1970:
+    /// job.createdAt)` reconstruction (the SQLite REAL stores the Double
+    /// verbatim; integer seconds < 2^53 survive the 1970↔2001 epoch arithmetic
+    /// with no rounding). A wall-clock `Date()` tie was ~50% FLAKY on an
+    /// identical commit: that reconstruction rounds ±1 ulp (~0.2 µs at today's
+    /// epoch magnitude) and the direction depends on the run-instant's mantissa
+    /// bits — when it rounded UP, `queuedAt` compared strictly GREATER than the
+    /// gesture stamp, the `>=` gate missed, the epoch gate (1 > 1) missed too,
+    /// and the open posted. The observation is a recorder scoped EXACTLY to the
+    /// drain call — the prior inverted `expectation(forNotification:)` + 0.3 s
+    /// wait observed the SHARED NotificationCenter across a wall-clock window
+    /// (non-hermetic), and its failure mode (fulfilled during the drain await)
+    /// is the one this scoping removes.
     @MainActor
     func testOpenSessionsDroppedWhenGestureTiesQueueTimestamp() async throws {
         let test = try makeWorkRepositoryTestConfiguration()
@@ -442,33 +486,25 @@ final class AppIntentWorkRepositoryTests: XCTestCase {
         )
         let sessions = SessionStore()
 
-        // Park a job "now" so the wall-clock comparison cannot tell it apart
-        // from a user gesture that happens "now" too.
-        let now = Date()
+        // Park a job at a fresh INTEGER-second instant and stamp the user's
+        // gesture with the SAME value: an exact tie the drain's timestamp
+        // reconstruction reproduces bit-for-bit (see the note above).
+        let stamp = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
         let parked = try await repository.enqueueAppIntent(
-            kind: .openSessions, now: now
+            kind: .openSessions, now: stamp
         )
-        // No gesture yet — epoch is 0, gesture timestamp is distantPast.
+        // Gesture at the same instant — epoch 0 → 1 (the `>=` tie is "the user
+        // acted"; the epoch arms the capture-then-await guard besides).
+        sessions.recordDrawerUserGesture(now: stamp)
 
-        let openedSessions = expectation(
-            forNotification: .hermesOpenSessionsIntent,
-            object: nil
-        )
-        openedSessions.isInverted = true
+        let posts = IntentPostRecorder()
+        let token = NotificationCenter.default.addObserver(
+            forName: .hermesOpenSessionsIntent, object: nil, queue: nil
+        ) { _ in posts.record() }
 
-        // Inject the user's gesture IMMEDIATELY before drainDurable so it lands
-        // synchronously on the main actor while the drain is between its
-        // capture and the post (closeActive awaits on the main actor, yielding
-        // the executor; the gesture bumps the epoch on that yield).
         let suite = "S9-epoch-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
-
-        // Bump BEFORE drainDurable's openSessions branch runs but AFTER the
-        // job was queued. The wall-clock comparison ties (both `now`); the
-        // epoch comparison catches it: epoch captured by drainDurable (0) is
-        // strictly less than the gestured epoch (1).
-        sessions.recordDrawerUserGesture(now: now)
 
         await PendingIntentRouter.drainDurable(
             repository: repository,
@@ -477,10 +513,13 @@ final class AppIntentWorkRepositoryTests: XCTestCase {
             queue: queue,
             defaults: defaults
         )
+        NotificationCenter.default.removeObserver(token)
 
-        await fulfillment(of: [openedSessions], timeout: 0.3)
+        XCTAssertEqual(posts.count, 0,
+                       "a same-timestamp gesture ties (>=): the open-intent is dropped — the drawer never re-opens over the load the user just chose")
         let completed = try await repository.job(id: parked.jobID)
-        XCTAssertEqual(completed?.state, .completed)
+        XCTAssertEqual(completed?.state, .completed,
+                       "dropped AND completed — it never re-drains on a later foreground")
     }
 
     /// Sanity: a fresh `.openSessions` App Intent whose queue time is at-or-after
@@ -508,10 +547,10 @@ final class AppIntentWorkRepositoryTests: XCTestCase {
         // The widget tap is MORE RECENT (just now) — it queued the openSessions.
         let parked = try await repository.enqueueAppIntent(kind: .openSessions)
 
-        let openedSessions = expectation(
-            forNotification: .hermesOpenSessionsIntent,
-            object: nil
-        )
+        let posts = IntentPostRecorder()
+        let token = NotificationCenter.default.addObserver(
+            forName: .hermesOpenSessionsIntent, object: nil, queue: nil
+        ) { _ in posts.record() }
 
         let suite = "S9-fresh-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -524,8 +563,10 @@ final class AppIntentWorkRepositoryTests: XCTestCase {
             queue: queue,
             defaults: defaults
         )
+        NotificationCenter.default.removeObserver(token)
 
-        await fulfillment(of: [openedSessions], timeout: 1.0)
+        XCTAssertEqual(posts.count, 1,
+                       "the fresh widget-tap intent fires EXACTLY once — the gate is precise, not a blanket suppression")
         let completed = try await repository.job(id: parked.jobID)
         XCTAssertEqual(completed?.state, .completed)
     }

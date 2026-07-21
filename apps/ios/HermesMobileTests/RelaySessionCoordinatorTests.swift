@@ -313,8 +313,21 @@ final class RelaySessionCoordinatorTests: XCTestCase {
     /// session's "Working… · ToolCall 7s" row rendered in a brand-new chat that
     /// made zero backend requests — pure client-state leak). The draft surface
     /// is provably empty for the duration of the suppression.
+    ///
+    /// Fix-round 1 (A7): the lane-time version delivered frames WITHOUT binding
+    /// a session and then asserted `activeSessionID == "s"` — but the id is set
+    /// ONLY by a real bind (`open`/`resume`/`start(sessionID:)`), never by raw
+    /// frame delivery, so that assertion was deterministically RED (a test bug,
+    /// not a product regression — the suppression guard itself worked). The
+    /// test now mirrors production: the user was IN session "s" (bound via
+    /// `open`) when they tapped New Chat. The second batch carries FRESH seqs
+    /// so the store's accumulation assertion observes real new items (a
+    /// re-delivery of the same seqs is a below-watermark duplicate by design).
     func testSuppressProjectionForDraftKeepsTranscriptEmptyWhileForeignTurnStreams() async throws {
-        let transport = MockRelayTransport()
+        let transport = MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id else { return }
+            relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+        })
         let chat = ChatStore()
         let coordinator = RelaySessionCoordinator(
             chatStore: chat,
@@ -322,12 +335,14 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         )
         try await coordinator.start(url: url)
 
-        // Drive a turn for session "A" so the store has items + the transcript
-        // is non-empty (the prior chat state).
+        // Bind session "s" (the session the user was in before New Chat) and
+        // drive its turn so the store has items + the transcript is non-empty.
+        _ = try await coordinator.open("s")
+        XCTAssertEqual(coordinator.activeSessionID, "s")
         transport.deliverFrames(sampleTurn())
         await waitUntil { chat.messages.count >= 2 }
         let preDraftCount = chat.messages.count
-        XCTAssertGreaterThan(preDraftCount, 0, "session A's turn must paint before the draft")
+        XCTAssertGreaterThan(preDraftCount, 0, "session s's turn must paint before the draft")
         XCTAssertFalse(coordinator.projectionSuppressed)
 
         // Enter a New Chat: park the projection. The previous session's
@@ -338,9 +353,15 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         chat.reset()
         XCTAssertEqual(chat.messages.count, 0, "draft surface starts empty")
 
-        // More frames for session A's in-flight turn arrive (the pump is
-        // session-agnostic; the coordinator's store is still scoped to A).
-        transport.deliverFrames(sampleTurn())
+        // MORE frames for session s's in-flight turn arrive (fresh seqs, above
+        // the watermark; the pump is session-agnostic).
+        transport.deliverFrames([
+            itemFrame(6, kind: "item.started", id: "tool-2", .toolCall,
+                      status: "in_progress", ord: 3, body: ["name": "write_file"]),
+            RelayFrame(seq: 7, sid: "s", turn: "t", kind: .itemDelta,
+                       body: .object(["item_id": .string("tool-2"),
+                                      "patch": .object(["text": .string("still working…")])])),
+        ])
         try? await Task.sleep(for: .milliseconds(50))
 
         XCTAssertEqual(
@@ -348,12 +369,12 @@ final class RelaySessionCoordinatorTests: XCTestCase {
             0,
             "S11: the previous session's in-flight frames must NOT leak onto the draft surface"
         )
-        XCTAssertGreaterThan(
-            coordinator.store.items.count,
-            0,
-            "S11: the store still accumulates the foreign session's items for fast resume"
+        XCTAssertTrue(
+            coordinator.store.items.contains { $0.itemID == "tool-2" },
+            "S11: the store still accumulates the foreign session's NEW items for fast resume"
         )
-        XCTAssertEqual(coordinator.activeSessionID, "s", "activeSessionID retained for reconnect/outbox routing")
+        XCTAssertEqual(coordinator.activeSessionID, "s",
+                       "S11: the bind is RETAINED across suppression for reconnect/outbox routing")
 
         await coordinator.stop()
     }
