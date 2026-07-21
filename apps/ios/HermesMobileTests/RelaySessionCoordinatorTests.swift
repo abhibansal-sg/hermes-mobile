@@ -235,7 +235,10 @@ final class RelaySessionCoordinatorTests: XCTestCase {
     // MARK: - (3) Coordinator streams into ChatStore + routes ops
 
     func testCoordinatorStreamsFramesIntoTranscript() async throws {
-        let transport = MockRelayTransport()
+        let transport = MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id else { return }
+            relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+        })
         let chat = ChatStore()
         let coordinator = RelaySessionCoordinator(
             chatStore: chat,
@@ -243,6 +246,9 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         )
 
         try await coordinator.start(url: url)
+        // Production shape: frames project only for a session the phone
+        // drives — open binds the write-gate before the turn streams (R1).
+        _ = try await coordinator.open("s")
         transport.deliverFrames(sampleTurn())
 
         await waitUntil { chat.messages.count == 2 && chat.messages.last?.role == .assistant }
@@ -255,11 +261,11 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.phase, .idle)
     }
 
-    /// Switching the projected session via `open` must NOT leak the previous
-    /// session's items. `RelayItemStore.reconcile(snapshot:)` retains items
-    /// absent from the snapshot, so without a reset on switch, session B's
-    /// snapshot would fold on top of session A's and the transcript would render
-    /// both. The coordinator clears the render store on a session switch.
+    /// Switching the projected session via `open` moves the WRITE-GATE — the
+    /// transcript shows ONLY the new session's content, while the outgoing
+    /// session's items stay PARKED in their own entry (R1: the old reset-on-
+    /// switch dance deleted; the leak is now impossible by construction, I1/I2,
+    /// and switch-back repaints from the warm entry with zero refetch, I14).
     func testOpenDifferentSessionDoesNotLeakPreviousSessionItems() async throws {
         // Each `open` delivers a snapshot scoped to the opened session id.
         let transport = MockRelayTransport(script: { upstream, relay in
@@ -289,41 +295,32 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         try await coordinator.start(url: url)
 
         _ = try await coordinator.open("A")
-        await waitUntil { coordinator.store.items.map(\.itemID) == ["A-item"] }
+        await waitUntil { coordinator.store(forSession: "A")?.items.map(\.itemID) == ["A-item"] }
 
         _ = try await coordinator.open("B")
-        // The store must hold ONLY session B's item — A's must be gone.
-        await waitUntil { coordinator.store.items.map(\.itemID) == ["B-item"] }
-        XCTAssertEqual(coordinator.store.items.map(\.itemID), ["B-item"],
-                       "opening session B must not retain session A's items")
+        // The write-gate moved to B: its snapshot folds into B's entry and
+        // projects — B's store holds ONLY B's item.
+        await waitUntil { coordinator.store(forSession: "B")?.items.map(\.itemID) == ["B-item"] }
         XCTAssertFalse(chat.messages.contains { $0.text.contains("hello from A") },
-                       "transcript must not still show session A's projected content")
+                       "transcript must not show session A's content while B holds the write-gate")
         XCTAssertEqual(coordinator.activeSessionID, "B")
+        // R1/I14: A's entry is PARKED, never torn down — its items survive the
+        // switch for a zero-refetch switch-back (the old reset dance deleted).
+        XCTAssertEqual(coordinator.store(forSession: "A")?.items.map(\.itemID), ["A-item"],
+                       "the outgoing session's entry keeps its items, parked for fast switch-back")
 
         await coordinator.stop()
     }
 
-    // MARK: - S11 (QA-3): New-Chat draft surface must not leak the previous session's in-flight turn
+    // MARK: - R1 (contract I6): a draft is the ABSENCE of a session — structural isolation
 
-    /// S11: when the user enters a New Chat (startDraft →
-    /// `suppressProjectionForDraft`), the coordinator keeps driving the previous
-    /// session for reconnect/outbox routing BUT the item→transcript projection
-    /// is parked. Frames that arrive for the previous session's in-flight turn
-    /// MUST NOT paint onto the now-empty draft surface (IMG_2594: another
-    /// session's "Working… · ToolCall 7s" row rendered in a brand-new chat that
-    /// made zero backend requests — pure client-state leak). The draft surface
-    /// is provably empty for the duration of the suppression.
-    ///
-    /// Fix-round 1 (A7): the lane-time version delivered frames WITHOUT binding
-    /// a session and then asserted `activeSessionID == "s"` — but the id is set
-    /// ONLY by a real bind (`open`/`resume`/`start(sessionID:)`), never by raw
-    /// frame delivery, so that assertion was deterministically RED (a test bug,
-    /// not a product regression — the suppression guard itself worked). The
-    /// test now mirrors production: the user was IN session "s" (bound via
-    /// `open`) when they tapped New Chat. The second batch carries FRESH seqs
-    /// so the store's accumulation assertion observes real new items (a
-    /// re-delivery of the same seqs is a below-watermark duplicate by design).
-    func testSuppressProjectionForDraftKeepsTranscriptEmptyWhileForeignTurnStreams() async throws {
+    /// R1 (replaces the S11 suppression pin): New Chat moves the write-gate
+    /// OFF (`enterDraft`) — a draft holds NO session, so nothing from any
+    /// session can project onto it, structurally (no suppression flag exists
+    /// to fail — IMG_2594 is unreachable by construction, contract I6). The
+    /// previous session's PARKED entry keeps folding its own frames for a
+    /// fast re-open (I14).
+    func testEnterDraftKeepsTranscriptEmptyWhilePreviousTurnStreams() async throws {
         let transport = MockRelayTransport(script: { upstream, relay in
             guard let id = upstream.id else { return }
             relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
@@ -335,26 +332,23 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         )
         try await coordinator.start(url: url)
 
-        // Bind session "s" (the session the user was in before New Chat) and
-        // drive its turn so the store has items + the transcript is non-empty.
+        // The user was IN session "s" (bound via `open`) when they tapped
+        // New Chat; its turn painted the transcript.
         _ = try await coordinator.open("s")
         XCTAssertEqual(coordinator.activeSessionID, "s")
         transport.deliverFrames(sampleTurn())
         await waitUntil { chat.messages.count >= 2 }
-        let preDraftCount = chat.messages.count
-        XCTAssertGreaterThan(preDraftCount, 0, "session s's turn must paint before the draft")
-        XCTAssertFalse(coordinator.projectionSuppressed)
 
-        // Enter a New Chat: park the projection. The previous session's
-        // in-flight turn is still streaming (more frames below).
-        coordinator.suppressProjectionForDraft()
-        XCTAssertTrue(coordinator.projectionSuppressed)
-        // Clear the chat surface the way `startDraft` does — a draft is empty.
+        // Enter a New Chat: the write-gate moves OFF — the draft holds no
+        // session. `startDraft` clears the surface the same way.
+        coordinator.enterDraft()
         chat.reset()
+        XCTAssertNil(coordinator.activeSessionID, "R1/I6: a draft holds no session")
         XCTAssertEqual(chat.messages.count, 0, "draft surface starts empty")
 
-        // MORE frames for session s's in-flight turn arrive (fresh seqs, above
-        // the watermark; the pump is session-agnostic).
+        // MORE frames for session s's in-flight turn arrive (fresh seqs,
+        // above the watermark). They fold into s's PARKED entry — never the
+        // draft surface.
         transport.deliverFrames([
             itemFrame(6, kind: "item.started", id: "tool-2", .toolCall,
                       status: "in_progress", ord: 3, body: ["name": "write_file"]),
@@ -364,27 +358,21 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         ])
         try? await Task.sleep(for: .milliseconds(50))
 
-        XCTAssertEqual(
-            chat.messages.count,
-            0,
-            "S11: the previous session's in-flight frames must NOT leak onto the draft surface"
-        )
+        XCTAssertEqual(chat.messages.count, 0,
+            "R1/I6: the previous session's in-flight frames can never reach the draft surface")
         XCTAssertTrue(
-            coordinator.store.items.contains { $0.itemID == "tool-2" },
-            "S11: the store still accumulates the foreign session's NEW items for fast resume"
-        )
-        XCTAssertEqual(coordinator.activeSessionID, "s",
-                       "S11: the bind is RETAINED across suppression for reconnect/outbox routing")
+            coordinator.store(forSession: "s")?.items.contains { $0.itemID == "tool-2" } ?? false,
+            "R1/I14: the parked entry keeps folding for a zero-refetch re-open")
 
         await coordinator.stop()
     }
 
-    /// S11: a real-session bind (resume/open) MUST clear the suppression flag so
-    /// the resumed session's items paint again. Covers the same-session re-open
-    /// after a draft (resetItemStoreForSessionSwitch is id-guarded, so without
-    /// the explicit re-projection in `resumeProjection` the items in the store
-    /// would never paint until the next frame).
-    func testResumeProjectionRepaintsAfterDraft() async throws {
+    /// R1 (replaces the `resumeProjection` pin): re-opening a session after a
+    /// draft repaints from the PARKED entry — the write-gate move projects
+    /// the entry's accumulated items (structural; the old explicit
+    /// re-projection flag deleted). Covers the same-session re-open: the
+    /// items folded before the draft paint the moment the gate returns.
+    func testGateMoveRepaintsParkedEntryAfterDraft() async throws {
         let transport = MockRelayTransport(script: { upstream, relay in
             // open(A) → deliver A's snapshot, then ack.
             if upstream.method == "open",
@@ -406,12 +394,9 @@ final class RelaySessionCoordinatorTests: XCTestCase {
                 relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
                 return
             }
-            // resume(A) → ack only. The store already holds A's items from the
-            // initial open; resumeProjection() re-applies them. (Production
-            // resume re-delivers a snapshot via the pump; for THIS test we
-            // prove the explicit re-projection closes the same-session
-            // re-open gap that resetItemStoreForSessionSwitch's id-guard
-            // leaves open.)
+            // resume(A) → ack only. A's entry already holds the items from
+            // the initial open; the write-gate move re-projects them (no
+            // snapshot redelivery needed — zero refetch, I14).
             if upstream.method == "resume", let id = upstream.id {
                 relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
             }
@@ -423,35 +408,31 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         )
         try await coordinator.start(url: url)
 
-        // Open A so the store has its snapshot, then park for a draft.
+        // Open A so its entry has the snapshot, then enter a draft.
         _ = try await coordinator.open("A")
-        await waitUntil { coordinator.store.items.map(\.itemID) == ["A-item"] }
+        await waitUntil { coordinator.store(forSession: "A")?.items.map(\.itemID) == ["A-item"] }
         await waitUntil { chat.messages.contains { $0.text.contains("hello from A") } }
 
-        coordinator.suppressProjectionForDraft()
+        coordinator.enterDraft()
         chat.reset()
         XCTAssertEqual(chat.messages.count, 0)
 
         // resume(A) is what SessionStore.bindRelayRuntime calls after a draft
-        // when the user re-opens the same session. It MUST clear the flag and
-        // re-project.
+        // when the user re-opens the same session: the write-gate moves back
+        // and the parked entry repaints — no frame, no refetch.
         _ = try await coordinator.resume("A")
-        XCTAssertFalse(coordinator.projectionSuppressed, "resume must clear the draft-suppression flag")
         await waitUntil { chat.messages.contains { $0.text.contains("hello from A") } }
-        XCTAssertGreaterThan(
-            chat.messages.count,
-            0,
-            "S11: resume after a draft must repaint the session's accumulated items"
-        )
+        XCTAssertGreaterThan(chat.messages.count, 0,
+            "R1/I14: resume after a draft repaints from the parked entry (zero refetch)")
 
         await coordinator.stop()
     }
 
-    /// S11: frames that arrive WHILE suppressed must still update the store —
-    /// when the user later opens the SAME session, those items must already be
-    /// there (no gap in the timeline). Suppression is projection-only, not a
-    /// store freeze.
-    func testSuppressedFramesStillAccumulateInStoreForFastResume() async throws {
+    /// R1 (replaces the suppressed-accumulation pin): turn-bearing frames
+    /// that arrive while NO session holds the write-gate (drafting, never
+    /// opened) fold into their own parked entry — but nothing projects:
+    /// there is no active entry to admit them (contract I6).
+    func testFramesWhileDraftingFoldWithoutProjecting() async throws {
         let transport = MockRelayTransport()
         let chat = ChatStore()
         let coordinator = RelaySessionCoordinator(
@@ -460,18 +441,20 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         )
         try await coordinator.start(url: url)
 
-        coordinator.suppressProjectionForDraft()
+        coordinator.enterDraft()
         chat.reset()
 
-        // Deliver frames WHILE suppressed.
+        // Deliver frames WHILE drafting (turn-bearing: the relay forwards
+        // only turns bound to this connection — they fold, never project).
         transport.deliverFrames(sampleTurn())
         try? await Task.sleep(for: .milliseconds(50))
 
-        XCTAssertEqual(chat.messages.count, 0, "no projection while suppressed")
+        XCTAssertEqual(chat.messages.count, 0,
+            "R1/I6: nothing projects while no session holds the write-gate")
         XCTAssertEqual(
-            coordinator.store.items.map(\.itemID),
+            coordinator.store(forSession: "s")?.items.map(\.itemID),
             ["user-1", "msg-1", "tool-1"],
-            "S11: suppressed frames still accumulate in the store for fast resume"
+            "R1/I14: the frames park in their session's entry for a later open"
         )
 
         await coordinator.stop()

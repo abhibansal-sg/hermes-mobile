@@ -310,12 +310,14 @@ final class ChatStore {
     /// wave will eventually retire the legacy scan.
     private var relayLatestTaskList: (id: String, list: TodoList)?
 
-    /// Re-derive the relay-path task-list mirror from the current relay item
-    /// store (N4/A5). The production caller is ``applyRelayItems`` (which passes
-    /// the store's reconciled items on every frame batch); this store-shaped
-    /// entry point stays for callers that hold the store itself. Refreshing
-    /// includes CLEARING the mirror when no `.taskList` item remains (a snapshot
-    /// that drops the list, or a session switch to one with no todo activity).
+    /// Re-derive the relay-path task-list mirror from a relay item store
+    /// (N4/A5). The live projection caller is ``applyRelayItems`` (which passes
+    /// the ACTIVE entry's reconciled items on every frame batch — R1: the
+    /// mirror only ever sees the active session's store, so another session's
+    /// list never mirrors, contract I15); this store-shaped entry point stays
+    /// for callers/tests that hold a store directly. Refreshing includes
+    /// CLEARING the mirror when no `.taskList` item remains (a snapshot that
+    /// drops the list, or a session switch to one with no todo activity).
     /// Idempotent: re-running on an unchanged store is a no-op.
     func syncRelayTaskList(from store: RelayItemStore) {
         refreshRelayTaskListMirror(from: store.items)
@@ -339,7 +341,11 @@ final class ChatStore {
         for item in items.reversed() where item.type == .taskList {
             if let list = item.taskListBody {
                 relayLatestTaskList = (item.itemID, list)
-                taskListOwnerSessionId = activeSessionId
+                // R1: the owner is the session at the WRITE-GATE (the
+                // coordinator's own record, moved atomically on switch —
+                // SessionStore's `activeRuntimeId` trails the gate move, so
+                // keying on it raced the switch-back projection; I15).
+                taskListOwnerSessionId = relayWriteGateSessionID ?? activeSessionId
             }
             return
         }
@@ -1632,10 +1638,31 @@ final class ChatStore {
     /// session it belongs to.
     private var resolvedRelayGateIDs: Set<String> = []
 
+    /// R1 (contract I12, amendment G1): gates PARK per session. The slots the
+    /// views read (``pendingApproval`` / ``pendingClarification``) expose ONLY
+    /// the gate owned by the session at the relay write-gate; gates for
+    /// background sessions park in these maps and MOVE into the slot when
+    /// their session takes the write-gate (``relayWriteGateMoved``) — the
+    /// card leaves the screen with its session and re-appears on switch-back.
+    /// ONLY turn end (any reason) or an explicit answer expires a gate,
+    /// exactly once; a switch MOVES it — there is no expire-on-switch.
+    private var parkedRelayApprovals: [String: PendingApproval] = [:]
+    private var parkedRelayClarifications: [String: PendingClarification] = [:]
+    /// Ids of gates folded in from the relay wire (slot OR parked) — what
+    /// distinguishes a relay gate the write-gate MOVES from a direct-path
+    /// gate (whose slot lifetime — cleared on `reset()` — is unchanged).
+    private var relayOwnedGateIDs: Set<String> = []
+    /// The session holding the relay write-gate (contract I2) — set by
+    /// ``relayWriteGateMoved(toSession:items:)``. A gate frame folds into the
+    /// SLOT only when its `sid` matches; any other sid parks.
+    private var relayWriteGateSessionID: String?
+
     private func markRelayGateResolved(_ id: String) {
         guard !id.isEmpty else { return }
         resolvedRelayGateIDs.insert(id)
+        relayOwnedGateIDs.remove(id)
         if resolvedRelayGateIDs.count > 256 { resolvedRelayGateIDs.removeAll() }
+        if relayOwnedGateIDs.count > 256 { relayOwnedGateIDs.removeAll() }
     }
 
     /// Relay analogue of `handleApprovalRequest`: fold a decoded
@@ -1646,8 +1673,17 @@ final class ChatStore {
     func applyRelayApprovalRequest(_ frame: RelayFrame) {
         let request = ApprovalRequestPayload(payload: frame.body)
         guard !resolvedRelayGateIDs.contains(request.id) else { return }
-        pendingApproval = PendingApproval(id: request.id, sessionId: frame.sid, request: request)
-        onApprovalChange?(true)
+        let gate = PendingApproval(id: request.id, sessionId: frame.sid, request: request)
+        relayOwnedGateIDs.insert(request.id)
+        // I12: the active session's gate takes the slot the views read; a
+        // background session's gate PARKS until its session holds the
+        // write-gate — never dropped because the session is unfocused.
+        if frame.sid == relayWriteGateSessionID || relayWriteGateSessionID == nil {
+            pendingApproval = gate
+            onApprovalChange?(true)
+        } else {
+            parkedRelayApprovals[frame.sid] = gate
+        }
     }
 
     /// Relay analogue of `handleClarifyRequest`: fold a decoded
@@ -1659,35 +1695,120 @@ final class ChatStore {
     func applyRelayClarifyRequest(_ frame: RelayFrame) {
         let request = ClarifyRequestPayload(payload: frame.body)
         if let rid = request.requestId, resolvedRelayGateIDs.contains(rid) { return }
-        pendingClarification = PendingClarification(sessionId: frame.sid, request: request)
+        let gate = PendingClarification(sessionId: frame.sid, request: request)
+        if let rid = request.requestId { relayOwnedGateIDs.insert(rid) }
+        if frame.sid == relayWriteGateSessionID || relayWriteGateSessionID == nil {
+            pendingClarification = gate
+        } else {
+            parkedRelayClarifications[frame.sid] = gate
+        }
     }
 
-    /// Relay analogue of the direct path's message.complete expiry (R1
-    /// #51/#52): a `turn.completed` frame — or a projected-session switch —
-    /// ends the turn the pending gate belonged to, so the card is stale and
-    /// answering it would target a dead runtime. Marks the ids resolved FIRST
-    /// so a resync replay of the settled turn's gate frames cannot resurrect
-    /// the card. Secure prompts are left to their own RPC lifecycle (none
-    /// exist on the relay wire today), matching the direct complete path.
-    func expireRelayPendingGates() {
-        if let id = pendingApproval?.id { markRelayGateResolved(id) }
-        if let rid = pendingClarification?.request.requestId { markRelayGateResolved(rid) }
-        expireTurnScopedPrompts(includeSecure: false)
+    /// Relay turn-end expiry, PER SESSION (contract I12/I21, amendment G1):
+    /// expire the gate owned by `sessionID` — the slot's, when that session
+    /// holds the write-gate, or its PARKED copy — and mark its id resolved so
+    /// a resync replay cannot resurrect the card. Turn end (ANY reason) or an
+    /// explicit answer are the ONLY edges that expire a gate, exactly once —
+    /// a switch MOVES it (``relayWriteGateMoved``); there is no
+    /// expire-on-switch. A background session's `turn.completed` expires ITS
+    /// OWN parked gate and touches nothing on the active session (I1/I2).
+    func expireRelayPendingGates(sessionID: String) {
+        if let approval = pendingApproval, approval.sessionId == sessionID {
+            markRelayGateResolved(approval.id)
+            pendingApproval = nil
+            onApprovalChange?(false)
+        }
+        if let parked = parkedRelayApprovals.removeValue(forKey: sessionID) {
+            markRelayGateResolved(parked.id)
+        }
+        if let clarify = pendingClarification, clarify.sessionId == sessionID {
+            if let rid = clarify.request.requestId { markRelayGateResolved(rid) }
+            pendingClarification = nil
+        }
+        if let parked = parkedRelayClarifications.removeValue(forKey: sessionID) {
+            if let rid = parked.request.requestId { markRelayGateResolved(rid) }
+        }
     }
 
-    /// R16 (Live Activity lifecycle): invoked by
-    /// `RelaySessionCoordinator.resetItemStoreForSessionSwitch` when the
-    /// projected session is about to change. If a relay turn was being
-    /// mirrored for the OUTGOING session, its Live Activity no longer
-    /// reflects what the user is looking at — end it as a DISCARD (not a
-    /// completion: the turn did not finish, the queue must not drain).
-    /// Idempotent: gated on `turnStartedAt` (the live-turn marker) which it
-    /// clears, so a second call within the same switch is a no-op.
-    func endRelayTurnForSessionSwitch() {
-        guard turnStartedAt != nil else { return }
-        turnStartedAt = nil
-        activeToolName = nil
-        onTurnDiscarded?()
+    /// R1 (contract I2, amendment G1): the relay WRITE-GATE moved to
+    /// `sessionID` (`nil` = draft — the ABSENCE of a session). Atomically
+    /// moves everything the contract moves with the gate:
+    ///  (a) GATE MEMBERSHIP — the slot's relay gate parks under its own sid
+    ///      and the incoming session's parked gate takes the slot: the card
+    ///      LEAVES with its session and RE-APPEARS on switch-back; only turn
+    ///      end or an explicit answer expires it (expire-on-switch deletes
+    ///      outright — amendment G1);
+    ///  (b) LIVE-ACTIVITY OWNERSHIP — the outgoing session's mirrored LA ends
+    ///      as a DISCARD (the user stopped watching; its entry keeps folding
+    ///      frames — nothing stream-side is torn down);
+    ///  (c) PER-TURN TIMER — the outgoing turn's chrome clears;
+    ///  (d) PROJECTION — the incoming entry's items repaint (warm, ZERO
+    ///      refetch — I14); an empty entry is a no-op: the cache paint owns
+    ///      the first frame, never void (QA-1 B4).
+    func relayWriteGateMoved(toSession sessionID: String?, items: [ChatItem]) {
+        relayWriteGateSessionID = sessionID
+        // (a) park the outgoing relay gate / unpark the incoming one.
+        if let approval = pendingApproval, relayOwnedGateIDs.contains(approval.id),
+           approval.sessionId != sessionID {
+            parkedRelayApprovals[approval.sessionId] = approval
+            pendingApproval = nil
+            onApprovalChange?(false)
+        }
+        if let clarify = pendingClarification,
+           let rid = clarify.request.requestId, relayOwnedGateIDs.contains(rid),
+           clarify.sessionId != sessionID {
+            parkedRelayClarifications[clarify.sessionId] = clarify
+            pendingClarification = nil
+        }
+        if let sessionID {
+            if let parked = parkedRelayApprovals.removeValue(forKey: sessionID) {
+                pendingApproval = parked
+                onApprovalChange?(true)
+            }
+            if let parked = parkedRelayClarifications.removeValue(forKey: sessionID) {
+                pendingClarification = parked
+            }
+        }
+        // (b)+(c) the outgoing turn's LA ownership + chrome move off (discard).
+        if turnStartedAt != nil {
+            turnStartedAt = nil
+            activeToolName = nil
+            onTurnDiscarded?()
+        }
+        relayTurnLive = false
+        resetTurnLivenessState()
+        // (d) warm repaint from the incoming entry (empty ⇒ the cache paint
+        // owns the first frame — never void, QA-1 B4).
+        if !items.isEmpty {
+            applyRelayItems(items)
+        } else {
+            setStreaming(false, reason: "relayWriteGateMoved")
+        }
+    }
+
+    /// R1 write-through eviction (contract §1.2 / RR4): a settled background
+    /// entry persists its transcript BEFORE the coordinator drops it, so the
+    /// next open paints from disk (I3: the cache is a seed) and the relay
+    /// snapshot reconciles over it (I14).
+    func relayEntryEvictedWriteThrough(sessionID: String, items: [ChatItem]) {
+        sessions?.persistRelayEntryWriteThrough(sessionID: sessionID, items: items)
+    }
+
+    /// R1/I6: a nil-target SUBMIT created the session at the relay — the
+    /// draft BECOMES that session atomically. Unlike a switch this is the
+    /// SAME user turn adopting its home: NO discard, NO chrome teardown (the
+    /// turn chrome stamped at send now belongs to the created session). Only
+    /// the write-gate identity moves — projection goes live and any parked
+    /// gate for the new sid takes the slot.
+    func relayCreatedSessionAdopted(_ sessionID: String) {
+        relayWriteGateSessionID = sessionID
+        if let parked = parkedRelayApprovals.removeValue(forKey: sessionID) {
+            pendingApproval = parked
+            onApprovalChange?(true)
+        }
+        if let parked = parkedRelayClarifications.removeValue(forKey: sessionID) {
+            pendingClarification = parked
+        }
     }
 
     /// One ownership decision for live approval/clarify/complete events. APNs is
@@ -4926,12 +5047,24 @@ final class ChatStore {
         cancelStreaming()
         messages = []
         userOrdinals = [:]
+        // R1/I12 (amendment G1): relay gates MOVE with their session — park
+        // them before the wholesale clear so a switch-back re-shows the card
+        // (the direct-path gate keeps its reset lifetime — this branch only
+        // touches relay-owned gates).
+        if let approval = pendingApproval, relayOwnedGateIDs.contains(approval.id) {
+            parkedRelayApprovals[approval.sessionId] = approval
+        }
+        if let clarify = pendingClarification,
+           let rid = clarify.request.requestId, relayOwnedGateIDs.contains(rid) {
+            parkedRelayClarifications[clarify.sessionId] = clarify
+        }
         pendingApproval = nil
         pendingClarification = nil
-        // The relay gate-suppression set belongs to the session being torn
-        // down (QA-1 B10) — never let it leak into the next session and
-        // suppress a legitimately new gate that reuses a request id space.
-        resolvedRelayGateIDs.removeAll()
+        // The relay gate-suppression set is NOT cleared here (R1/I12): an
+        // ANSWERED gate's resync re-delivery must stay suppressed across
+        // switches for every session the phone drives — the set belongs to
+        // the process lifetime, not one session's teardown (bounded:
+        // drop-all past 256 in `markRelayGateResolved`).
         // A transient secure prompt belongs to the session being torn down; drop
         // it (no value is held here — see PendingSecurePrompt). The view's
         // `@State` value clears itself on dismissal.
@@ -5017,26 +5150,25 @@ final class ChatStore {
             return adopted
         }
         let itemCMID = item.body["client_message_id"]?.stringValue
-        // QA-3 S6/A2: a cmid-carrying item matches its echo by cmid FIRST
-        // (deterministic, so identical texts never collapse), then falls back
-        // to an exact-text match on a cmid-LESS row — the GRDB cache paint of
-        // the gateway's persisted prompt carries NO client_message_id
-        // (`toChatMessages` maps none), so when the in-memory echo was lost
-        // (a session switch / store rebuild before this item re-landed — S6's
-        // prompt-vanish), the cache-painted twin still adopts and the prompt
-        // renders ONCE, in place, instead of beside a relay-id duplicate.
-        // The cmid pass scans the WHOLE transcript before any text match so a
-        // same-text cache row sitting ABOVE the real echo never wins the
-        // adoption (two sends of identical text must pair one-to-one).
+        // Adoption matches by CMID (contract I8, amendment G4): an item
+        // carrying a `client_message_id` adopts its echo by cmid OR NOT AT
+        // ALL — a FOREIGN-cmid item (a desktop-originated turn whose prompt
+        // text equals a cache-painted row) never consumes the cmid-less
+        // cache twin: the cache row + the foreign user row are TWO rows
+        // (wire truth). The deleted text FALLBACK for cmid-bearing items was
+        // the I8 violation (base consumed the twin — the fuzzy adoption R1
+        // deletes). A cmid-LESS item (a resync snapshot's copy of a turn
+        // this phone painted from the GRDB cache, which carries no cmid —
+        // `toChatMessages` maps none) still adopts the same-text cmid-less
+        // paint row so the reconciled turn renders ONCE, in place (QA-3
+        // S4/A2 — the IMG_2579 duplication stays dead; that paint row has no
+        // other identity to union on).
         func eligible(_ message: ChatMessage) -> Bool {
             message.role == .user && !message.relayProjected && !consuming.contains(message.id)
         }
         let echo: ChatMessage?
-        if let itemCMID,
-           let cmidMatch = messages.first(where: {
-               eligible($0) && $0.clientMessageID == itemCMID
-           }) {
-            echo = cmidMatch
+        if let itemCMID {
+            echo = messages.first(where: { eligible($0) && $0.clientMessageID == itemCMID })
         } else {
             echo = messages.first(where: {
                 eligible($0) && $0.clientMessageID == nil && $0.text == item.textBody
@@ -5278,12 +5410,11 @@ final class ChatStore {
         refreshRelayTaskListMirror(from: items)
 
         // QA-1 B4 — BLANK-SCREEN IMPOSSIBLE: an EMPTY relay projection must
-        // never blank a painted transcript. The session-switch store reset no
-        // longer re-projects here at all (RelaySessionCoordinator
-        // `.resetItemStoreForSessionSwitch` resets ONLY the item store), so the
-        // cache paint always survives a switch; this guard is the belt-and-
-        // braces fallback for any other empty projection (e.g. a pre-content
-        // frame on a fresh open). Assigning `messages = []` there raced the
+        // never blank a painted transcript. R1's write-gate move re-projects
+        // the incoming entry only when it HAS items (an empty entry leaves the
+        // cache paint intact — the switch never voids, contract I2); this
+        // guard is the belt-and-braces fallback for any other empty projection
+        // (e.g. a pre-content frame on a fresh open). Assigning `messages = []` there raced the
         // GRDB cache seed (`seedTranscriptCacheFirst`) and, whichever landed
         // last, left the view EMPTY with a bumped `transcriptGeneration` — a
         // fully blank screen (the placeholder's skeleton branch requires
@@ -5660,28 +5791,6 @@ final class ChatStore {
     private func resetTurnLivenessState() {
         turnLivenessResyncFired = false
         turnLivenessBaseline = nil
-    }
-
-    /// QA-2 R12 — relay turn end. Called by `RelaySessionCoordinator.ingest` on
-    /// a `turn.completed` frame. The streaming flag and chrome are cleared by
-    /// the subsequent `applyRelayItems` projection (which sees a non-streaming
-    /// batch); this hook clears any lingering dock task-list ownership so a
-    /// terminal list (all done/cancelled — the agent closed it) dismisses the
-    /// pill at turn end even though the `taskList` item itself persists in the
-    /// relay item store. `dockShowsTaskBox`'s `isStreaming` gate hides the pill
-    /// immediately regardless, but dropping the owner here is what lets a fresh
-    /// turn re-seed the dock from a clean slate.
-    /// QA-2 R12 — relay turn end. Called by `RelaySessionCoordinator.ingest` on
-    /// a `turn.completed` frame. The dock pill is hidden at turn end purely by
-    /// ``dockShowsTaskBox``'s `isStreaming` gate (the projection that follows
-    /// settles `isStreaming` to false) — the list DATA is intentionally kept so
-    /// a resumed turn / the render_conformance bridge contract still sees it,
-    /// and ``handleRelayTurnStarted`` does the cross-turn re-seed. This hook is
-    /// a documented no-op seam kept for future turn-end observability; it must
-    /// NOT drop the mirror (that would break the bridge + the data-persistence
-    /// contract other surfaces depend on).
-    func handleRelayTurnCompleted() {
-        // Intentional no-op: visibility is gated by `dockShowsTaskBox`.
     }
 
     /// QA-2 R12/R13 — relay turn start. Called by `RelaySessionCoordinator`
