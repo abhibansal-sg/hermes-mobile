@@ -29,9 +29,9 @@ downstream frame from relay → phone is:
 - `body` — kind-specific payload.
 
 Upstream phone → relay frames are ordinary JSON-RPC-2.0 requests (the relay
-translates to gateway RPCs): `submit`, `resume`, `open`, `list`, `history`,
-`approve`, `clarify`, `interrupt`, `steer`, `ack`, `resync`, `foreground`,
-`push.register`, `push.unregister`.
+translates to gateway RPCs): `submit`, `branch`, `resume`, `open`, `list`,
+`history`, `approve`, `clarify`, `interrupt`, `steer`, `ack`, `resync`,
+`foreground`, `push.register`, `push.unregister`.
 
 ## 2. The item model (what the phone renders)
 
@@ -149,8 +149,10 @@ forever; fixed by the above.)
 |---|---|---|---|
 | list all sessions | pass-through | `session.list` | none (read) — R4 L1 (GAP-1): `params` optionally carry `order` (e.g. `recent` — the drawer default), `cwd_prefix` (project-scoped list, B10), `exclude_source` (drop e.g. `cron` rows) and `min_messages` alongside `limit`; each is forwarded to `session.list` only when present, so a bare `{limit}` call is the byte-identical pre-L1 RPC. This is the parity that lets the drawer ride the relay and the REST session list delete (X7). |
 | open/read a session (incl. foreign) | store-read | **REST `GET /api/sessions/{id}/messages` ONLY** (`web_server.py:9985`, reads `state.db`) | none (NO reactivation) — R0 CORRECTION: `session.history` RPC is NOT a store-read; it resolves via `_sess_nowait` (in-memory live sessions only, `server.py:1727`) and returns 4001 for a foreign session the phone never owned. Use the REST path for foreign/idle history. |
-| start a NEW chat | create + own | `session.create` → `prompt.submit` | relay becomes owner |
+| start a NEW chat | create + own | `session.create` → `prompt.submit` | relay becomes owner. R4 L2 (B10): `params.cwd` (optional) threads the project working directory into `session.create` so a new-session-in-a-project binds to that project — the surviving projects fix after L5-lean (projects themselves stay on the control REST). |
+| branch a conversation (B13) | create + seed + own | `session.create` → `prompt.submit` (seed) | relay becomes owner — R4 L2: new `branch` method = a SEEDED create. Params: `text`/`prompt` (the seed) required; `session_id` (origin, echoed as `origin` in the result), `title`, `model`, `provider`, `cwd`, `truncate_before_user_ordinal`, `client_message_id` optional. The seed prompt is emitted as a completed `userMessage` item exactly like SUBMIT's. Result: `{session_id: <new>, origin: <origin>}`. Before L2 branch was DEAD in relay mode (unknown method) — a silent regression vs the direct seam the contract deletes in X4/X7. |
 | send into an idle session (incl. a terminal one) | resume + own + submit | `session.resume` → `prompt.submit` | relay becomes owner; turn continues same sid/history/cwd |
+| regenerate / edit-and-resend (B13) | pass-through param | `prompt.submit` with `truncate_before_user_ordinal` | — R4 L2: `submit` params optionally carry `truncate_before_user_ordinal` (the gateway already accepted it; the relay dropped it as an unknown param pre-L2). Absent ⇒ the byte-identical pre-L2 RPC. |
 | answer approval | translate params | `approval.respond` | — — the gateway reads `choice` (`once`/`session`/`always`/`deny`, mapping `approve`→`once`) + `all` and resolves by SESSION key; the relay maps the phone's `decision`→`choice` (a relay that sent `decision` defaulted every approval to DENY) |
 | answer clarify | translate params | `clarify.respond` | — — the gateway matches the pending waiter by `request_id` and stores `params.answer`; the relay maps the phone's `text`→`answer` (a relay that sent `text` delivered an EMPTY answer) |
 | stop | pass-through | `session.interrupt` | — |

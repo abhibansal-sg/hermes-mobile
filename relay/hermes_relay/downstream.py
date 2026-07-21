@@ -601,9 +601,12 @@ class DownstreamServer:
     async def handle_upstream(self, conn: PhoneConnection, req: UpstreamRequest) -> Any:
         """Translate one phone JSON-RPC request and return its JSON-RPC result.
 
-        * ``list``      -> gateway.session_list
+        * ``list``      -> gateway.session_list (L1: +order/cwd_prefix/
+          exclude_source/min_messages pass-through)
         * ``open``/``history`` -> gateway.rest_history (store-read; R0 correction)
         * ``submit``    -> session_create/resume (+own) -> prompt_submit
+          (L2: +truncate_before_user_ordinal, +cwd on create)
+        * ``branch``    -> session_create (+cwd) -> prompt_submit seed (L2, B13)
         * ``resume``    -> session_resume (own idle/foreign)
         * ``approve``   -> approval_respond
         * ``clarify``   -> clarify_respond
@@ -741,6 +744,13 @@ class DownstreamServer:
             text = p.get("prompt") or p.get("text") or ""
             sid = p.get("session_id")
             cmid = p.get("client_message_id")
+            # R4 L2 (B13): regenerate/edit-and-resend rides SUBMIT with the
+            # gateway's own truncate point — forwarded only when the phone
+            # sends it, so an ordinary send is the byte-identical pre-L2 call.
+            submit_kwargs: dict[str, Any] = {}
+            truncate = p.get("truncate_before_user_ordinal")
+            if isinstance(truncate, int) and not isinstance(truncate, bool):
+                submit_kwargs["truncate_before_user_ordinal"] = truncate
             # Idempotent re-drive: a prior submit with this client_message_id
             # already ran ``prompt_submit`` but its RPC result was lost to a
             # socket flap, so the outbox is resubmitting the SAME job. Replay the
@@ -772,15 +782,20 @@ class DownstreamServer:
                     # id to a live id — resolve so a repeat submit to the origin
                     # id still drives the live turn.
                     sid = self._gateway.live_id_for(sid)
-                await self._gateway.prompt_submit(sid, text)
+                await self._gateway.prompt_submit(sid, text, **submit_kwargs)
             else:
-                # Brand-new chat: create + own, then drive (§5).
+                # Brand-new chat: create + own, then drive (§5). R4 L2 (B10):
+                # ``cwd`` threads a project working directory into the created
+                # session (the surviving projects fix — L5-lean dropped the
+                # relay projects path; projects stay on the control REST).
+                cwd = p.get("cwd")
                 sid = await self._gateway.session_create(
                     title=p.get("title", "New chat"),
                     model=p.get("model"),
                     provider=p.get("provider"),
+                    cwd=cwd if isinstance(cwd, str) and cwd else None,
                 )
-                await self._gateway.prompt_submit(sid, text)
+                await self._gateway.prompt_submit(sid, text, **submit_kwargs)
             # Emit the prompt itself as a completed ``userMessage`` item (QA-1
             # B5/B13): the Reframer maps only AGENT events, so without this the
             # phone has no wire item to reconcile its optimistic echo against
@@ -794,6 +809,35 @@ class DownstreamServer:
                 self._remember_submit(cmid, sid)
             conn.set_foreground(sid)  # driving a chat brings it on screen (§6)
             return {"session_id": sid}
+
+        if method == UpstreamMethod.BRANCH:
+            # R4 L2 (B13): conversation BRANCH = a SEEDED create. Before L2 this
+            # was DEAD in relay mode (handle_upstream raised unknown-method) — a
+            # silent functional regression vs the gateway-direct seam, which the
+            # contract deletes in X4/X7. Create the new session (optionally in
+            # the origin's project via ``cwd``), drive the seed prompt into it
+            # with the same userMessage synthesis as SUBMIT, and return the new
+            # id. Optional params ride through exactly like SUBMIT's (truncate
+            # for branch-from-a-point, title/model/provider/cwd on create).
+            origin = p.get("session_id")
+            text = p.get("prompt") or p.get("text") or ""
+            cwd = p.get("cwd")
+            submit_kwargs: dict[str, Any] = {}
+            truncate = p.get("truncate_before_user_ordinal")
+            if isinstance(truncate, int) and not isinstance(truncate, bool):
+                submit_kwargs["truncate_before_user_ordinal"] = truncate
+            sid = await self._gateway.session_create(
+                title=p.get("title") or f"Branch — {origin or 'new chat'}",
+                model=p.get("model"),
+                provider=p.get("provider"),
+                cwd=cwd if isinstance(cwd, str) and cwd else None,
+            )
+            await self._gateway.prompt_submit(sid, text, **submit_kwargs)
+            self._emit_user_message_item(
+                conn, sid, p.get("client_message_id"), text
+            )
+            conn.set_foreground(sid)  # the branched chat comes on screen (§6)
+            return {"session_id": sid, "origin": origin}
 
         if method == UpstreamMethod.RESUME:
             origin = p["session_id"]

@@ -105,10 +105,6 @@ async def test_l1_list_filter_params_pass_through():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=L2 + "SUBMIT must pass "
-                   "truncate_before_user_ordinal through to prompt.submit "
-                   "(DS:720-724 drops unknown params today). Wave-1 L2 flips "
-                   "this; remove the marker when green.")
 async def test_l2_submit_passes_truncate_before_user_ordinal():
     srv, gw = _server()
     gw.owns = MagicMock(return_value=True)
@@ -127,10 +123,6 @@ async def test_l2_submit_passes_truncate_before_user_ordinal():
     )
 
 
-@pytest.mark.xfail(strict=True, reason=L2 + "the SUBMIT create branch must "
-                   "accept cwd and thread it into session.create (B10 "
-                   "new-session-in-project gap; DS:759-763 takes title/model/"
-                   "provider only). Wave-1 L2 flips this; remove when green.")
 async def test_l2_create_branch_accepts_cwd():
     srv, gw = _server()
     await srv.start()
@@ -146,11 +138,6 @@ async def test_l2_create_branch_accepts_cwd():
     )
 
 
-@pytest.mark.xfail(strict=True, reason=L2 + "a `branch` upstream method "
-                   "(seeded create: session.create + seed message) must exist "
-                   "(B13 branch is DEAD in relay mode today — handle_upstream "
-                   "raises unknown method). Wave-1 L2 flips this; remove when "
-                   "green.")
 async def test_l2_branch_method_seeds_new_session():
     srv, gw = _server()
     await srv.start()

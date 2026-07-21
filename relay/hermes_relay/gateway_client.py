@@ -415,9 +415,16 @@ class GatewayClient:
 
     async def session_create(
         self, *, title: str, model: Optional[str] = None, provider: Optional[str] = None,
-        cols: Optional[int] = None,
+        cols: Optional[int] = None, cwd: Optional[str] = None,
     ) -> str:
-        """``session.create`` — new owned session; returns its session_id."""
+        """``session.create`` — new owned session; returns its session_id.
+
+        R4 L2 (B10 projects gap): ``cwd`` threads a project working directory
+        into the created session so a new-session-in-a-project binds to that
+        project (the surviving projects fix after L5-lean dropped the relay
+        projects path — projects themselves stay on the control REST). Optional:
+        absent, the RPC is the byte-identical pre-L2 call.
+        """
         params: dict[str, Any] = {
             "title": title,
             "cols": cols if cols is not None else self._cfg.cols,
@@ -427,6 +434,8 @@ class GatewayClient:
             params["model"] = model
         if provider is not None:
             params["provider"] = provider
+        if cwd is not None:
+            params["cwd"] = cwd
         result = await self._call_result("session.create", params)
         sid = result.get("session_id")
         if not sid:
@@ -477,14 +486,28 @@ class GatewayClient:
         data = resp.json()
         return list(data.get("messages") or [])
 
-    async def prompt_submit(self, session_id: str, text: str) -> dict[str, Any]:
+    async def prompt_submit(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        truncate_before_user_ordinal: Optional[int] = None,
+    ) -> dict[str, Any]:
         """``prompt.submit`` — become owner of ``session_id`` and drive a turn.
 
         Marks the session owned so reconnect re-establishes it and the Notifier
         treats its completion/approval/error events as push-worthy.
+
+        R4 L2 (B13 dead-feature restoration): ``truncate_before_user_ordinal``
+        regenerates/edits from an earlier point — the gateway already accepts
+        it; the relay dropped it as an unknown param pre-L2. Optional: absent,
+        the RPC is the byte-identical two-key pre-L2 call.
         """
         self._mark_owned(session_id)
-        return await self._call_result("prompt.submit", {"session_id": session_id, "text": text})
+        params: dict[str, Any] = {"session_id": session_id, "text": text}
+        if truncate_before_user_ordinal is not None:
+            params["truncate_before_user_ordinal"] = truncate_before_user_ordinal
+        return await self._call_result("prompt.submit", params)
 
     async def approval_respond(
         self, session_id: str, request_id: str, decision: str, *, resolve_all: bool = False
