@@ -113,11 +113,43 @@ exercises the full echo↔item path.
 | — (QA-3) | cursor breathe is a pure function of time — two renders 350 ms apart differ; never stranded static by a remount | S1/A10 | FAILS (@State + repeatForever rendered steady off-transaction) |
 | hand-authored frame (QA-3) | settled duration reconciles to the relay's `turn.completed` `duration_s` | S2/A1 | FAILS (frame duration ignored; local ~0 s stamped) |
 
+### Round-4 W0a contract invariants (store-level replay)
+
+`apps/ios/HermesMobileTests/ContractInvariantsW0aTests.swift` replays
+SYNTHESIZED relay frame sequences (inline, byte-stable by construction — no
+fixture files) through the same real render lane and asserts the
+`docs/INTERACTION-CONTRACT.md` §4 invariants **I1, I2, I6, I7 (STORE layer
+only — ord monotone + userMessage-before-agent-items incl. foreign turns),
+I8, I9, I10 (injected VIRTUAL CLOCK — no wall-clock sleeps; stages advanced
+through the same DEBUG seams `TurnLivenessTests` pins), I15, I21, I23
+(pending-gate recovery across restart, amendment G3)**. The I7/I19
+void-geometry properties are render-layer and live in W0b (amendment A1).
+
+**These encode the contract TARGET, not today's behavior:** on `r4/base`
+(main @ c44e7f8d9) the suite runs RED exactly where the current wiring
+violates the contract — the RED matrix is recorded at
+`/Volumes/MainData/Developer/hermes-tmp/evidence/round4/w0a-red-matrix.md`
+and is the fail-before evidence each Wave-2 rewire lane (R1–R5) flips green
+while landing its own deletions. Tests expected GREEN on base are PINS
+guarding already-fixed behavior (S4/S6/S8/S11/R16) through the rewires; the
+I9 reason-dependent halves are RED-BY-DESIGN until relay lane L3
+(amendment I9-gate).
+
+**NOT wired into `run_gate.sh` yet** (the plan's sequencing principle: every
+intermediate tree passes the EXISTING gate — the RED-by-design tests would
+break it mid-migration). Standalone run below; the suite joins the gate when
+the Wave-2 exit (all 23 invariants green) lands.
+
 ## Running
 
 ```sh
 # The whole gate (wire + render), one entry script:
 tests/e2e_daily_driver/run_gate.sh
+
+# Round-4 W0a contract invariants (standalone; RED on base by design):
+scripts/ios-build.sh test -scheme HermesMobile \
+  -destination 'platform=iOS Simulator,name=iPhone Air' \
+  -only-testing:HermesMobileTests/ContractInvariantsW0aTests
 
 # Render half only (after recording has produced the fixtures):
 scripts/ios-build.sh test -scheme HermesMobile \
