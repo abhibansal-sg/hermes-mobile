@@ -115,6 +115,13 @@ echo
 # --- run (niced — QA-3 swarm shares this machine) --------------------------
 # Relay-under-test resolution is via env: SOAK_RELAY_SOURCE points conftest's
 # sys.path + plugin dir at the source; SOAK_PYTHON runs the relay subprocess.
+# H7 (soak consolidation): snapshot the run-* dirs that exist BEFORE this
+# pytest starts so the post-run summarizer can pick THIS run's dir. Summarizing
+# "the freshest dir" raced: a sibling lane finishing mid-run wrote its SUMMARY
+# into this lane's in-flight dir (observed: an empty scenarios_run=0 SUMMARY in
+# run-20260721-130921-soak-seed34) and stole the sibling's own summarize.
+PRE_RUNS="$(mktemp "${TMPDIR:-/tmp}/soak_preruns.XXXXXX")"
+ls -d "$EVIDENCE"/run-* 2>/dev/null > "$PRE_RUNS" || true
 set +e
 ( cd "$HARNESS_ROOT" && \
   SOAK_MODE="$MODE" \
@@ -125,8 +132,19 @@ set +e
 PYTEST_RC=$?
 set -e
 
-# --- summarize the freshest run dir ----------------------------------------
-RUN_DIR="$(ls -dt "$EVIDENCE"/run-* 2>/dev/null | head -1 || true)"
+# --- summarize THIS run's dir (H7) -----------------------------------------
+# The freshest run-* dir NOT in the pre-run snapshot is the one this pytest
+# created. Fallback to the freshest overall if nothing new appeared (pytest
+# died before creating its dir).
+RUN_DIR=""
+while IFS= read -r d; do
+  [[ -z "$d" ]] && continue
+  if ! grep -qxF "$d" "$PRE_RUNS"; then RUN_DIR="$d"; break; fi
+done < <(ls -dt "$EVIDENCE"/run-* 2>/dev/null)
+if [[ -z "$RUN_DIR" ]]; then
+  RUN_DIR="$(ls -dt "$EVIDENCE"/run-* 2>/dev/null | head -1 || true)"
+fi
+rm -f "$PRE_RUNS"
 if [[ -n "$RUN_DIR" ]]; then
   "$VENV/bin/python" "$SCRIPT_DIR/summarize.py" "$RUN_DIR" || true
 fi
