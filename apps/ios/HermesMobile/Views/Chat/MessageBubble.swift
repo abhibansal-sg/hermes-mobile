@@ -2573,10 +2573,10 @@ struct StreamingCursor: View {
         streaming: Bool,
         reduceMotion: Bool
     ) -> Double {
-        // SCRATCH-RED: build-116 strand — the pulse only kicked off
-        // onAppear edges; a fresh render/re-projection never animates.
-        _ = (streaming, reduceMotion, date)
-        return 1.0
+        guard streaming, !reduceMotion else { return 1.0 }
+        let t = date.timeIntervalSinceReferenceDate
+        let phase = (sin(2 * Double.pi * t / breathePeriodSeconds) + 1) / 2   // 0…1
+        return minOpacity + (1 - minOpacity) * phase
     }
 
     var body: some View {
