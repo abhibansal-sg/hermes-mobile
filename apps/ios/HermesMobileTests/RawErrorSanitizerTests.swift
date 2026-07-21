@@ -85,7 +85,7 @@ final class RawErrorSanitizerTests: XCTestCase {
     func testErrorItemViewShowsHumanLineNotRawPayload() {
         let item = ChatItem(
             itemID: "e1", type: .error, status: .failed, ord: 0,
-            body: ["text": Self.rawAuth403]
+            body: .object(["text": .string(Self.rawAuth403)])
         )
         let shown = ErrorItemView.displayMessage(for: item)
         XCTAssertEqual(shown, RawErrorSanitizer.authLine)
