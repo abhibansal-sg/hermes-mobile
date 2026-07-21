@@ -115,33 +115,6 @@ enum WorkingSectionModel {
         parts.lastIndex(where: isWorkingEligible)
     }
 
-    /// QA-3 S2/S3/A1 — the SINGLE-AFFORDANCE decision for the caret slot. The
-    /// ratified design: ONE working surface — the breathing cursor line (glyph
-    /// + inline status + per-turn timer). While the turn is live and the answer
-    /// text has not started:
-    ///  • NO work part yet (the optimistic send-time bubble has zero parts —
-    ///    nothing folds): the caret slot renders the MERGED working line itself
-    ///    → `true`. This is the S2 fix — the labeled, timed affordance exists
-    ///    from SEND, driven by local state, never gated on the first relay item
-    ///    frame (build 116 showed a bare textless cursor there until the model's
-    ///    first item, ~35 s later in IMG_2578).
-    ///  • work parts present (a fold exists): `false` — the fold's own live
-    ///    line IS the cursor line now (its spinner replaced by the breathing
-    ///    glyph); a separate standalone cursor beside it was the S3 dual-
-    ///    affordance bug (IMG_2578/2587/2591).
-    ///  • answer text present: `false` — the caret rides the prose tail.
-    /// Settled turns: always `false`. Pure + `nonisolated static` so the render
-    /// gate pins the rule directly (the same seam pattern as
-    /// `ChatView.shouldShowInlineTurnActivity`).
-    nonisolated static func preItemWorkingLineVisible(
-        parts: [ChatMessagePart],
-        streamingLive: Bool
-    ) -> Bool {
-        guard streamingLive else { return false }
-        guard parts.lastTextPartID == nil else { return false }
-        return lastWorkIndex(in: parts) == nil
-    }
-
     /// Coalesce the assistant's ordered `parts` into render nodes under the
     /// SINGLE-FOLD contract: everything up to and including the LAST work part
     /// folds into ONE `.working` node (reasoning + classic `.tools` + item work +
@@ -767,24 +740,14 @@ struct WorkingSectionView: View {
         }
     }
 
-    /// Chrome-less collapsed live line: BREATHING CURSOR GLYPH + "Working… ·
-    /// ‹tool›" + the per-TURN elapsed label + chevron. No box/border/capsule
-    /// (the settled row's exact visual language, live variant).
-    ///
-    /// QA-3 S3/A1 — THE LINE IS THE CURSOR: the ratified owner design is ONE
-    /// working affordance — the pulsing cursor, typing the status word, keeping
-    /// the per-turn timer. Build 116 rendered a `ProgressView` spinner here AND
-    /// a separate bare `StreamingCursor` beside it (dual affordance, IMG_2578/
-    /// 2587/2591). The spinner is replaced by the SAME breathing glyph the
-    /// prose-tail caret uses — one animation owner, one pulse, one line. The
-    /// pre-first-item line (MessageBubble's merged slot) renders this very view
-    /// with EMPTY parts: the glyph breathes, the label reads "Working…", the
-    /// timer ticks from the local turn start, and — nothing to expand yet — the
-    /// chevron is absent (it returns with the first expandable step).
+    /// Chrome-less collapsed live line: spinner + "Working… · ‹tool›" + the
+    /// per-TURN elapsed label + chevron. No box/border/capsule (the settled
+    /// row's exact visual language, live variant).
     private var liveCollapsedLine: some View {
         HStack(spacing: 6) {
-            StreamingCursor(isStreaming: streaming, leadingSpace: false)
-                .font(.callout)
+            ProgressView()
+                .controlSize(.mini)
+                .accessibilityHidden(true)
             Text(WorkingSectionModel.liveCollapsedLabel(parts: parts))
                 .font(.callout)
                 .foregroundStyle(theme.mutedFg)
@@ -796,12 +759,10 @@ struct WorkingSectionView: View {
                 .foregroundStyle(theme.mutedFg.opacity(0.75))
                 .accessibilityHidden(true)
             if hasFailure { failureBadge }
-            if !steps.isEmpty {
-                Image(systemName: "chevron.right")
-                    .font(.caption2)
-                    .foregroundStyle(theme.mutedFg)
-                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
-            }
+            Image(systemName: "chevron.right")
+                .font(.caption2)
+                .foregroundStyle(theme.mutedFg)
+                .rotationEffect(.degrees(isExpanded ? 90 : 0))
         }
         .padding(.vertical, 6)
         .contentShape(Rectangle())
