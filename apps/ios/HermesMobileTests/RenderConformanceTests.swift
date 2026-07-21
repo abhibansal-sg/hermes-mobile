@@ -57,6 +57,33 @@ final class RenderConformanceTests: XCTestCase {
         /// The recorded downstream envelopes, in arrival order (replayed verbatim).
         let frames: [[String: Any]]
         let settled: [String: Any]
+        /// QA-3 incident extensions (ADDITIVE; absent/empty on the QA-1/QA-2
+        /// fixtures — the format stays backward-compatible). The driver's local
+        /// actions on the shared t_ms clock (`switch_to` / `resync` /
+        /// `enter_draft`…): the S6 session switch and the S11 New-Chat entry
+        /// have NO downstream frame, so the replay performs them as local
+        /// store calls at the recorded instant.
+        let scriptSteps: [[String: Any]]
+        /// Secondary sessions' streams (S6: the switched-to session's paint
+        /// metadata + frames on the shared clock).
+        let extraSessions: [String: ExtraSession]
+    }
+
+    /// A secondary session recorded beside the primary (QA-3 S6): its cache
+    /// paint, its `open` RPC result messages, and its downstream frames.
+    struct ExtraSession {
+        let sessionID: String
+        let cachedHistory: [(role: String, text: String)]
+        let openResultMessages: [[String: Any]]
+        let frames: [[String: Any]]
+    }
+
+    private static func historyRows(_ raw: [[String: Any]]) -> [(role: String, text: String)] {
+        raw.compactMap { row in
+            guard let role = row["role"] as? String, let text = row["content"] as? String
+            else { return nil }
+            return (role, text)
+        }
     }
 
     private func loadFixture(_ resource: String) throws -> Fixture {
@@ -69,19 +96,64 @@ final class RenderConformanceTests: XCTestCase {
         let frames = try XCTUnwrap(raw["frames"] as? [[String: Any]], "\(resource): frames")
         let cached = (raw["cached_history"] as? [[String: Any]]) ?? []
         let submit = (raw["submit"] as? [String: Any]) ?? [:]
+        // QA-3 incident extensions — parsed only when present; the QA-1/QA-2
+        // fixtures carry neither key and load exactly as before.
+        let scriptSteps = (raw["script"] as? [[String: Any]]) ?? []
+        var extraSessions: [String: ExtraSession] = [:]
+        if let extras = raw["extra_sessions"] as? [String: [String: Any]] {
+            for (sid, meta) in extras {
+                extraSessions[sid] = ExtraSession(
+                    sessionID: sid,
+                    cachedHistory: Self.historyRows(
+                        (meta["cached_history"] as? [[String: Any]]) ?? []),
+                    openResultMessages: (meta["open_result_messages"] as? [[String: Any]]) ?? [],
+                    frames: (meta["frames"] as? [[String: Any]]) ?? []
+                )
+            }
+        }
         return Fixture(
             name: (raw["name"] as? String) ?? resource,
             sessionID: try XCTUnwrap(raw["session_id"] as? String),
             submitText: (submit["text"] as? String) ?? "",
             submitClientMessageID: submit["client_message_id"] as? String,
-            cachedHistory: cached.compactMap { row in
-                guard let role = row["role"] as? String, let text = row["content"] as? String
-                else { return nil }
-                return (role, text)
-            },
+            cachedHistory: Self.historyRows(cached),
             frames: frames,
-            settled: (raw["settled"] as? [String: Any]) ?? [:]
+            settled: (raw["settled"] as? [String: Any]) ?? [:],
+            scriptSteps: scriptSteps,
+            extraSessions: extraSessions
         )
+    }
+
+    // MARK: - QA-3 timing-aware replay helpers (ordering/liveness lanes)
+
+    /// The per-frame arrival offset in ms (the recorder's `t_ms`; nil on the
+    /// pre-QA-3 fixtures, which carry no timing — the ordering/liveness lanes
+    /// key their silence windows off these).
+    private func frameTMs(_ fx: Fixture) -> [Double?] {
+        fx.frames.map { ($0["t_ms"] as? NSNumber)?.doubleValue }
+    }
+
+    /// Replay the recorded frames through the real pump with their ARRIVAL
+    /// GAPS preserved (scaled down — the gate must not sit through the 2.5 s
+    /// S8 silence window at wall-clock speed; a lane testing a real-time
+    /// watchdog passes `scale: 1` and a matching timeout). Gaps are capped so
+    /// a single fixture can never stall the suite.
+    private func deliverTimed(
+        _ g: Graph, _ fx: Fixture,
+        scale: Double = 0.02, capMs: Double = 80
+    ) async {
+        var previous: Double?
+        for frame in fx.frames {
+            let tMs = (frame["t_ms"] as? NSNumber)?.doubleValue
+            if let t = tMs, let prev = previous {
+                let gapMs = min(max(0, (t - prev) * scale), capMs)
+                if gapMs > 0 {
+                    try? await Task.sleep(for: .milliseconds(gapMs))
+                }
+            }
+            previous = tMs ?? previous
+            g.transport.deliver(frameText(frame))
+        }
     }
 
     // MARK: - Relay store graph (flag ON, mock transport, RPC-answering script)
@@ -1252,5 +1324,236 @@ final class RenderConformanceTests: XCTestCase {
             g.chat.messages.first { $0.role == .assistant && $0.text == agentText })
         XCTAssertNotNil(firstTurnRow.reasoningElapsed,
             "spec R5: a later turn's re-projection must not strip the settled turn's stamped duration")
+    }
+
+    // MARK: - QA-3 S2/S3/S1 — the single merged breathing-cursor working line
+
+    /// S2/A1: send → the SINGLE merged working affordance (breathing cursor +
+    /// inline "Working…" status + per-turn timer) renders from LOCAL send state
+    /// with ZERO relay frames delivered — an INFINITE artificial delay, the
+    /// spec's "frames delayed 10 s" made stronger. Build 116 showed only a bare
+    /// textless cursor here; the labeled, timed affordance waited for the
+    /// model's first item (~35 s in IMG_2578 — the owner's "working appeared
+    /// ~35s after send"). FAILS on qa3/base (the pre-item slot rendered a bare
+    /// `StreamingCursor` — no label, no timer, no seam).
+    func testRelaySend_MergedWorkingAffordanceBeforeAnyFrame() async throws {
+        let fx = try loadFixture("render_qa3_delayed_start")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+
+        let ok = await g.chat.send(text: fx.submitText)
+        XCTAssertTrue(ok)
+
+        // NO frames delivered — the affordance is local or nowhere.
+        let startedAt = try XCTUnwrap(g.chat.turnStartedAt,
+            "spec S2/A1: the per-turn timer starts LOCALLY at send")
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 5,
+            "the timer start is the send instant, not a later frame")
+        XCTAssertTrue(g.chat.isStreaming, "send → working mode (stop button live)")
+
+        // The optimistic caret bubble is the live row — empty parts, streaming.
+        let live = try XCTUnwrap(g.chat.messages.last)
+        XCTAssertEqual(live.role, .assistant)
+        XCTAssertTrue(live.isStreaming)
+        XCTAssertTrue(live.parts.isEmpty, "zero parts until the first frame")
+
+        // The caret slot renders the MERGED line (the S2 fix), and its label is
+        // the honest pre-first-item status with the timer from the local start.
+        XCTAssertTrue(
+            WorkingSectionModel.preItemWorkingLineVisible(parts: live.parts, streamingLive: true),
+            "spec S2/A1: send → the merged labeled+timed working line, no frames required"
+        )
+        XCTAssertEqual(WorkingSectionModel.liveCollapsedLabel(parts: live.parts), "Working…")
+
+        // The merged line renders as ONE line (glyph + status + timer), height
+        // of a single chrome-less row — never a stacked/boxed surface.
+        let renderer = ImageRenderer(content:
+            WorkingSectionView(parts: [], streaming: true,
+                               liveTurnStartedAt: startedAt, settledDuration: nil)
+                .frame(width: 360)
+                .environment(\.hermesTheme, HermesThemePresets.nousLight)
+        )
+        renderer.scale = 2
+        let height = try XCTUnwrap(renderer.uiImage?.size.height,
+            "the merged pre-item working line must render")
+        XCTAssertLessThan(height, 60,
+            "spec A1: the merged working line is ONE line at send time")
+
+        // When the first frames DO land late, the line persists and updates —
+        // item arrival changes the status text, never mounts a second surface.
+        deliver(g, fx, through: {
+            self.kind($0) == "item.completed" && self.itemType($0) == "userMessage"
+        })
+        await waitUntil { g.chat.messages.contains { $0.role == .user && $0.text == fx.submitText } }
+        XCTAssertTrue(g.chat.isStreaming, "the turn stays live after the late userMessage frame")
+        XCTAssertTrue(g.chat.messages.contains {
+            $0.role == .assistant && $0.isStreaming && $0.parts.isEmpty
+        }, "the caret bubble (now the merged line) survives the late frame")
+    }
+
+    /// S3/A3: once the first work parts land with no answer text yet, the live
+    /// turn renders EXACTLY ONE working surface — the fold's own line, which
+    /// now IS the breathing-cursor line (its `ProgressView` spinner replaced by
+    /// the breathing glyph). The separate bare standalone cursor the build-116
+    /// caret slot mounted beside it (the IMG_2578/2587/2591 dual-affordance
+    /// stack) is suppressed by the single-affordance seam. FAILS on qa3/base
+    /// (`preItemWorkingLineVisible` absent; the view stacked both surfaces).
+    func testReplay_SingleAffordanceFoldIsTheCursorLine() async throws {
+        let fx = try loadFixture("render_live_fold")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        _ = await g.chat.send(text: fx.submitText)
+
+        // Through the raw-name tool start: reasoning + in-progress tool, NO
+        // agent text yet — the exact dual-affordance window of IMG_2578/2587.
+        deliver(g, fx, through: {
+            self.kind($0) == "item.started" && self.itemType($0) == "tool.generating"
+        })
+        await waitUntil { g.chat.messages.contains {
+            $0.role == .assistant && $0.isStreaming && !$0.parts.isEmpty
+        } }
+
+        let live = try XCTUnwrap(g.chat.messages.first {
+            $0.role == .assistant && $0.isStreaming && !$0.parts.isEmpty
+        })
+        XCTAssertEqual(live.parts.lastTextPartID, nil, "no answer text yet — the dual-affordance window")
+
+        // The single-affordance seam: the caret slot mounts NO standalone
+        // cursor beside the fold…
+        XCTAssertFalse(
+            WorkingSectionModel.preItemWorkingLineVisible(parts: live.parts, streamingLive: true),
+            "spec S3: with the fold live, no second surface in the caret slot"
+        )
+        // …and the fold is exactly ONE node (the sole working surface).
+        let nodes = WorkingSectionModel.renderNodes(from: live.parts)
+        XCTAssertEqual(nodes.count, 1, "spec S3/A3: one fold node — one affordance")
+
+        // That sole line renders as one chrome-less row (< 60 pt) with the
+        // breathing glyph in the spinner's former place.
+        let renderer = ImageRenderer(content:
+            WorkingSectionView(parts: live.parts, streaming: true,
+                               liveTurnStartedAt: Date(), settledDuration: nil)
+                .frame(width: 360)
+                .environment(\.hermesTheme, HermesThemePresets.nousLight)
+        )
+        renderer.scale = 2
+        let height = try XCTUnwrap(renderer.uiImage?.size.height)
+        XCTAssertLessThan(height, 60,
+            "spec S3/A3: the cursor-fold live line stays ONE line")
+    }
+
+    /// S1/A10: the breathe SURVIVES re-projection — two renders of the same
+    /// streaming cursor at different instants produce DIFFERENT pixels (the
+    /// pulse is a function of the clock, so any mount/re-projection resumes
+    /// mid-phase instead of stranding static — the motionless bar of
+    /// IMG_2577/2585/2587), while a SETTLED cursor renders byte-identical
+    /// static frames (the same paused/static branch Reduce Motion takes —
+    /// `\.accessibilityReduceMotion` is read-only and cannot be injected in a
+    /// test environment; the Reduce-Motion branch itself is pinned by
+    /// `testStreamingCursorStaticWhenSettledOrReduceMotion`). FAILS on
+    /// qa3/base (the onAppear-kicked `repeatForever` @State: a fresh mount
+    /// without an `isStreaming` edge never started the pulse — re-render the
+    /// component and both frames are identical at full opacity).
+    @MainActor
+    func testStreamingCursor_BreatheSurvivesRemount_Snapshot() async throws {
+        func renderCursor(streaming: Bool) -> Data? {
+            let renderer = ImageRenderer(content:
+                StreamingCursor(isStreaming: streaming)
+                    .font(.body)
+                    .frame(width: 40, height: 28)
+                    .environment(\.hermesTheme, HermesThemePresets.nousLight)
+            )
+            renderer.scale = 2
+            return renderer.uiImage?.pngData()
+        }
+
+        let frameA = try XCTUnwrap(renderCursor(streaming: true))
+        try await Task.sleep(for: .milliseconds(350))   // ~0.29 of the 1.2 s period
+        let frameB = try XCTUnwrap(renderCursor(streaming: true))
+        XCTAssertNotEqual(frameA, frameB,
+            "spec S1/A10: the breathe is clock-driven — a fresh render at any instant shows the live phase, never a stranded static glyph")
+
+        // Settled (and Reduce Motion, same branch): static full-opacity
+        // frames, byte-identical across time.
+        let calmA = try XCTUnwrap(renderCursor(streaming: false))
+        try await Task.sleep(for: .milliseconds(120))
+        let calmB = try XCTUnwrap(renderCursor(streaming: false))
+        XCTAssertEqual(calmA, calmB,
+            "spec A10: a non-streaming cursor renders static (the Reduce Motion path)")
+    }
+
+    // MARK: - QA-3 incident-fixture contract (loader backward-compat + shapes)
+
+    /// The five QA-3 incident fixtures load through the extended loader with
+    /// their timing/script/extra-session metadata intact, AND the pre-QA-3
+    /// fixtures load with the new fields empty — the additive format stays
+    /// backward-compatible (the ordering lane's S4/S6 replays, the liveness
+    /// lane's S8 replay and the S11 scoping test consume these same files).
+    /// Also pins the recorded incident SHAPES the recorder asserts on the
+    /// Python side, so a re-recording that loses the incident (e.g. the
+    /// silence gap collapsing) fails here too.
+    func testQA3IncidentFixtures_LoadWithExtensions_ShapesPinned() throws {
+        // S2 — the recorded silence gap between the submit-time userMessage
+        // item and the late turn.started (IMG_2578's ~35 s, recorded at 1.5 s).
+        let delayed = try loadFixture("render_qa3_delayed_start")
+        let tms = frameTMs(delayed)
+        XCTAssertTrue(tms.allSatisfy { $0 != nil },
+            "the S2 fixture carries per-frame t_ms (its gap IS the incident)")
+        let firstUserIdx = try XCTUnwrap(delayed.frames.firstIndex {
+            self.kind($0).hasPrefix("item.") && self.itemType($0) == "userMessage"
+        })
+        let startedIdx = try XCTUnwrap(delayed.frames.firstIndex { self.kind($0) == "turn.started" })
+        XCTAssertLessThan(firstUserIdx, startedIdx,
+            "spec S2: the userMessage item lands at submit, BEFORE the late turn.started")
+        let gap = try XCTUnwrap(tms[startedIdx]) - XCTUnwrap(tms[firstUserIdx])
+        XCTAssertGreaterThanOrEqual(gap, 900,
+            "spec S2: the recording preserves the late-first-item silence window")
+
+        // S4 — a cumulative snapshot redelivery on the reconnect socket.
+        let reorder = try loadFixture("render_qa3_reconnect_reorder")
+        XCTAssertEqual(
+            reorder.scriptSteps.compactMap { $0["action"] as? String },
+            ["open", "resync", "submit"],
+            "the S4 fixture records the reconnect: open -> resync -> live turn")
+        XCTAssertTrue(reorder.frames.contains { self.kind($0) == "snapshot" },
+            "spec S4: the reconnect redelivery arrives as a cumulative snapshot")
+
+        // S6 — switch markers + the switched-to session's paint metadata.
+        let switchFx = try loadFixture("render_qa3_session_switch")
+        let switchActions = switchFx.scriptSteps.compactMap { $0["action"] as? String }
+        XCTAssertEqual(switchActions.filter { $0 == "switch_to" }.count, 2,
+            "spec S6: the fixture records switch-away AND return")
+        let bSession = try XCTUnwrap(switchFx.extraSessions["render-sess-qa3-switch-b"],
+            "spec S6: the switched-to session's paint metadata rides along")
+        XCTAssertFalse(bSession.cachedHistory.isEmpty)
+        XCTAssertTrue(bSession.frames.isEmpty, "B is idle — zero frames")
+
+        // S8 — NO turn.completed anywhere; the redelivered items stay
+        // in-progress (the eternal-working incident).
+        let dead = try loadFixture("render_qa3_dead_turn")
+        XCTAssertFalse(dead.frames.contains { self.kind($0) == "turn.completed" },
+            "spec S8: the dead-turn fixture carries no completion — that is the incident")
+        XCTAssertEqual(dead.settled["completed"] as? Bool, false)
+        XCTAssertTrue(frameTMs(dead).allSatisfy { $0 != nil },
+            "the liveness lane keys its silence window off the recorded t_ms")
+
+        // S11 — the draft-entry marker (no wire frame — a local store call).
+        let draft = try loadFixture("render_qa3_draft_interleave")
+        let enterDraft = draft.scriptSteps.first { ($0["action"] as? String) == "enter_draft" }
+        XCTAssertNotNil(enterDraft, "spec S11: the draft entry is a recorded script step")
+        let draftAt = try XCTUnwrap((enterDraft?["at_t_ms"] as? NSNumber)?.doubleValue)
+        XCTAssertGreaterThan(draftAt, 0, "the draft entry lands mid-stream")
+        let lastFrameT = try XCTUnwrap(frameTMs(draft).compactMap { $0 }.last)
+        XCTAssertLessThan(draftAt, lastFrameT,
+                          "the draft entry precedes the turn's final frame (the leak window)")
+
+        // BACKWARD COMPAT — a pre-QA-3 fixture loads with the extensions empty.
+        let legacy = try loadFixture("render_submit_stream")
+        XCTAssertTrue(legacy.scriptSteps.isEmpty)
+        XCTAssertTrue(legacy.extraSessions.isEmpty)
+        XCTAssertTrue(frameTMs(legacy).allSatisfy { $0 == nil },
+            "pre-QA-3 fixtures carry no t_ms — the loader degrades gracefully")
     }
 }

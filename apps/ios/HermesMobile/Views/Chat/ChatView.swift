@@ -273,11 +273,21 @@ struct ChatView: View {
     // the MEASURED composer (desktop `--composer-measured-height`) but never drops
     // below this so the UX1 gate (≥120) holds and a pre-measurement first frame
     // never under-clears the last message.
-    static let composerFloatInset: CGFloat = 140
+    // QA-3 S1/A10 (compact chrome, C2): 140 → 126 — the old floor left a ~40 pt
+    // dead band between the transcript's last row (the session project/CWD line)
+    // and the top of the ~100 pt glass composer (IMG_2577 "too much vertical
+    // gap"). 126 keeps the UX1 ≥120 clearance of glass card + home indicator
+    // while tightening the resting band to ~compact-chrome proportion; a
+    // measured composer taller than 116 pt still wins (measured + gap), so the
+    // floor only ever governs short/pre-measurement composers.
+    static let composerFloatInset: CGFloat = 126
 
     /// The breathing room between the last message and the top of the floating
     /// composer (resting). Pure constant so the clearance composition is testable.
-    static let composerBreathingGap: CGFloat = 16
+    /// QA-3 S1/A10 (compact chrome, C2): 16 → 10 — the ratified compact-chrome
+    /// proportion; the dead band between the CWD line and the composer read as
+    /// slack at 16 pt on top of the floor.
+    static let composerBreathingGap: CGFloat = 10
 
     /// The TOTAL bottom clearance reserved below the last message, COMPOSED from the
     /// measured composer height, the live keyboard height, and a breathing gap —
