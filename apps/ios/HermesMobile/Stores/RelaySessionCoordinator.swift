@@ -416,7 +416,19 @@ final class RelaySessionCoordinator {
         // turn-scoped `relayTurnLive` flag clears on — plumbed through so the
         // SAME projection that sees the terminal items also ends the turn
         // (item terminality alone must not, the build-115 bug).
-        chatStore.applyRelayItems(store.items, turnSettled: frame.kind == .turnCompleted)
+        //
+        // QA-3 S2/A1: `turn.completed` additionally carries the relay's
+        // authoritative turn wall-clock (`body.duration_s`, reframer-measured
+        // from the turn open) — the settled "Worked for Ns" label reconciles
+        // to it (the live per-turn timer starts LOCALLY at send). Absent on
+        // older relays → the projection falls back to the local measurement.
+        chatStore.applyRelayItems(
+            store.items,
+            turnSettled: frame.kind == .turnCompleted,
+            serverTurnDuration: frame.kind == .turnCompleted
+                ? frame.body["duration_s"]?.doubleValue
+                : nil
+        )
         // QA-1 B10 / A3: the interactive gate frames are NOT items — the render
         // store drops them by design — yet they are the sole input of the Turn
         // Dock's cards. Bridge them into the SAME ChatStore state the direct
