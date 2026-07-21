@@ -105,7 +105,10 @@ final class RelaySessionCoordinator {
     /// invisibly, leaving the user "not sure if it's connected."
     var onPhaseChange: ((Phase) -> Void)?
 
-    /// The session whose item stream is currently projected into ``ChatStore``.
+    /// The session whose entry currently holds the WRITE-GATE (contract I2):
+    /// the ONLY session whose item stream may project into ``ChatStore``.
+    /// `nil` while drafting — a draft is the ABSENCE of a session (contract
+    /// I6); with no active entry nothing can project, structurally.
     private(set) var activeSessionID: String?
     /// The STORED (durable/origin) id of the session the coordinator is currently
     /// driving — set whenever a session is opened/resumed/started by its stored
@@ -116,50 +119,48 @@ final class RelaySessionCoordinator {
     /// relay only when its destination IS the session the relay is driving, so a
     /// prompt queued for A never leaks into B just because B is now on screen.
     private(set) var activeStoredSessionID: String?
-    /// The render-lane reconciled item set (mirrors the client store; the source
-    /// of truth the transcript is projected from).
-    private(set) var store = RelayItemStore()
+    // MARK: - Session entry map (R1, contract §1.2 — one store per session)
 
-    /// S11 (QA-3): projection parking for the New-Chat draft surface. ``startDraft``
-    /// opens a draft chat (no session id) but does NOT touch this coordinator's
-    /// ``activeSessionID``/``activeStoredSessionID`` — the relay pump keeps
-    /// ingesting the PREVIOUS session's frames and ``applyRelayItems`` would
-    /// project them onto the now-empty draft transcript (IMG_2594: another
-    /// session's "Working… · ToolCall 7s" row rendered in a brand-new chat that
-    /// made zero backend requests — pure client-state leak). Set by
-    /// ``suppressProjectionForDraft()`` (SessionStore.startDraft), cleared by
-    /// ``resumeProjection()`` (every real-session bind: ``resume``/``open``/
-    /// ``start``). While set, ``ingest(_:)`` still applies frames to ``store``
-    /// (so the previous session's items accumulate for a fast resume and
-    /// reconnect-resync) but skips EVERY ``chatStore`` side-effect (projection,
-    /// gate frames, task-list mirror, turn lifecycle). The draft surface is
-    /// provably empty for the duration of the draft.
-    private(set) var projectionSuppressed: Bool = false
+    /// One render-lane reconciled item store PER SESSION (the D3 kill: the old
+    /// single shared store folded ANY `sid` into one transcript). Frames route
+    /// to the entry named by `frame.sid` (contract I1); only the ACTIVE entry
+    /// — the one holding the write-gate (contract I2) — projects into
+    /// ``ChatStore``. Background sessions keep folding into their OWN entry:
+    /// nothing stream-side is cancelled, reset, or torn down on a switch, so
+    /// switch-back repaints from the warm entry with ZERO refetch (I14).
+    private struct SessionEntry: Sendable {
+        var store: RelayItemStore
+        /// Monotonic last-touch stamp — the LRU eviction order (RR4).
+        var touch: UInt64
+    }
+    private var entries: [String: SessionEntry] = [:]
+    private var lruClock: UInt64 = 0
+    /// Bounded LRU cap (contract §1.2): eviction writes through to `CacheStore`
+    /// first and drops only SETTLED, non-active entries (RR4 — the map never
+    /// grows unbounded nor resurrects stale entries).
+    private static let maxEntries = 8
 
-    /// S11: park projection for a draft. Idempotent — calling on an already-
-    /// suppressed coordinator is a no-op. The coordinator's ``activeSessionID``
-    /// is RETAINED so reconnect-resync and durable-outbox routing keep working
-    /// for the previous session while the user drafts.
-    func suppressProjectionForDraft() {
-        projectionSuppressed = true
+    /// The render-lane reconciled item view, reconciled to the entry map
+    /// (R1; RR7): the UNION of every parked entry's items — the read-only
+    /// observation surface (tests, the resync watermark). The REDUCER unit is
+    /// the per-session entry (``store(forSession:)``); the render AUTHORITY is
+    /// the active entry alone (write-gate, I2).
+    var store: RelayItemStore {
+        RelayItemStore.merged(entries.values.map(\.store))
     }
 
-    /// S11: resume projection. Called by every real-session bind path
-    /// (``resume``/``open``/``start``). Clears the suppression flag and re-applies
-    /// the current ``store`` so the resumed session's accumulated live items paint
-    /// immediately instead of waiting for the next frame (the snapshot re-delivered
-    /// by the relay's open/resume RPC is the natural refresh, but a same-session
-    /// re-open after a draft does not re-deliver — `resetItemStoreForSessionSwitch`
-    /// guards on id-change — so the explicit re-projection closes that gap).
-    func resumeProjection() {
-        let wasSuppressed = projectionSuppressed
-        projectionSuppressed = false
-        guard wasSuppressed else { return }
-        // Re-project the current store so a same-session re-open after a draft
-        // paints immediately. A foreign-session or empty store is a no-op
-        // (`applyRelayItems` already guards empty projections).
-        chatStore.applyRelayItems(store.items, turnSettled: false)
+    /// One parked session's reconciled items — the zero-refetch switch-back
+    /// read (I14), and the per-session unit the W0a oracle observes.
+    func store(forSession sessionID: String) -> RelayItemStore? {
+        entries[sessionID]?.store
     }
+
+    /// The session holding the write-gate: the stable STORED id when bound
+    /// (the relay keys its runtime on the stored session id, which may differ
+    /// from the live id a `submit` remaps ``activeSessionID`` to), else the
+    /// live id. Frames whose `sid` matches fold into the active entry and
+    /// project; every other sid folds into its own entry in silence.
+    private var activeWriteGateSessionID: String? { activeStoredSessionID ?? activeSessionID }
 
     private let chatStore: ChatStore
     private let clientFactory: @Sendable () -> RelayClient
@@ -241,8 +242,8 @@ final class RelaySessionCoordinator {
     /// the race where the phase crossed between the caller's check and adopt).
     func adoptPendingSession(_ sessionID: String) {
         guard activeStoredSessionID != sessionID else { return }
-        activeStoredSessionID = sessionID
-        activeSessionID = sessionID
+        touchEntry(sessionID)
+        moveWriteGate(to: sessionID)
         if phase == .open, let client {
             Task {
                 await client.setForeground(sessionID)
@@ -320,7 +321,7 @@ final class RelaySessionCoordinator {
         reconnectURL = url
         reconnectToken = token
         reconnectAttempt = 0
-        store = RelayItemStore()
+        entries.removeAll(); lruClock = 0
         phase = .connecting
 
         await client.connect(url: url, token: token)
@@ -346,12 +347,12 @@ final class RelaySessionCoordinator {
         }
 
         if let sessionID {
-            activeSessionID = sessionID
-            activeStoredSessionID = sessionID
+            // The write-gate moves at INTENT, pre-await (contract I4): snapshot
+            // frames the pump delivers during the open await land on the fresh
+            // entry and project.
+            touchEntry(sessionID)
+            moveWriteGate(to: sessionID)
             _ = try await client.open(sessionID)
-            // S11: a real session bind resumes projection (clears any draft-
-            // surface parking from a prior `suppressProjectionForDraft`).
-            resumeProjection()
         }
     }
 
@@ -396,7 +397,7 @@ final class RelaySessionCoordinator {
         stateTask?.cancel(); stateTask = nil
         if let client { await client.disconnect() }
         client = nil
-        store = RelayItemStore()
+        entries.removeAll(); lruClock = 0
         activeSessionID = nil
         activeStoredSessionID = nil
         phase = .idle
@@ -455,22 +456,59 @@ final class RelaySessionCoordinator {
         // A live frame proves the stream resumed: clear the backoff so a later
         // drop reconnects promptly instead of inheriting a stale attempt count.
         if reconnectAttempt != 0 { reconnectAttempt = 0 }
-        store.apply(frame)
-        // S11 (QA-3): when projection is parked for a New-Chat draft, apply the
-        // frame to the store (previous session's items keep accumulating for
-        // fast resume + reconnect-resync) but skip EVERY chatStore side-effect.
-        // The draft surface has no live turn, no gate, no task list — projecting
-        // the previous session's items onto it is the cross-session leak
-        // (IMG_2594). Resume on the next real-session bind re-applies the
-        // current store. (The per-turn liveness note below is one such
-        // side-effect — it must not fire against a parked draft.)
-        guard !projectionSuppressed else { return }
+        route(frame)
+    }
+
+    /// Route one downstream frame by the `sid` the relay STAMPED on it — the
+    /// whole leak-prevention substrate (contract I1): the client never guesses
+    /// "active session"; it routes by the stamped id. The frame folds into the
+    /// entry named by its sid; an entry is CREATED on first touch when the
+    /// session is KNOWN (opened/resumed/adopted/created by this phone) or the
+    /// frame is TURN-BEARING — the relay forwards only turns bound to this
+    /// connection, so a turn-naming frame for a locally-unknown sid is a
+    /// background turn of a session the phone drives: fold it into its own
+    /// entry for a zero-refetch switch-back (I14) instead of losing it to a
+    /// refetch. A frame that names NO turn and NO known session is
+    /// UNATTRIBUTABLE: DROPPED — never folded into the active session, no
+    /// phantom entry created (I1).
+    ///
+    /// Only the ACTIVE entry (the write-gate, I2) projects into the
+    /// transcript; a background entry folds in silence — its `turn.completed`
+    /// still expires ITS OWN gate (amendment G1: turn end expires a gate, a
+    /// switch never does), and nothing it does can touch the active session.
+    private func route(_ frame: RelayFrame) {
+        let sid = frame.sid
+        if entries[sid] == nil {
+            guard frame.turn != nil else { return }   // unattributable ⇒ drop (I1)
+            entries[sid] = SessionEntry(store: RelayItemStore(), touch: 0)
+        }
+        entries[sid]!.store.apply(frame)
+        lruClock += 1
+        entries[sid]!.touch = lruClock
+        evictSettledInactiveEntries()
+
+        guard sid == activeWriteGateSessionID else {
+            // BACKGROUND entry: fold-only. The turn-end seam fires for ITS OWN
+            // session — that session's gate expires (amendment G1) — and by
+            // construction touches nothing on the active session (I1/I2).
+            if frame.kind == .turnCompleted {
+                chatStore.expireRelayPendingGates(sessionID: sid)
+            }
+            return
+        }
+        projectActiveEntry(frame, items: entries[sid]!.store.items)
+    }
+
+    /// Project the ACTIVE entry's items + fire its turn-lifecycle seams — the
+    /// body of the old session-agnostic ingest, now scoped to the one session
+    /// the write-gate admits (contract I2).
+    private func projectActiveEntry(_ frame: RelayFrame, items: [ChatItem]) {
         // QA-3 S8/A4 — per-turn liveness: refresh the silence clock ONLY for
         // frames of the CURRENT turn. Frames of a superseded turn (late tool
         // results) must never mask a dead current turn's silence, nor keep a
         // dead prior turn's rows "live" — the IMG_2591 re-arm-by-other-turn
         // bug that left "Working… · ToolCall 5s" up forever.
-        chatStore.noteTurnLivenessFrame(isCurrentTurn: frameBelongsToCurrentTurn(frame))
+        chatStore.noteTurnLivenessFrame(isCurrentTurn: frameBelongsToCurrentTurn(frame, items: items))
         // QA-2 R4/A2: `turn.completed` is the authoritative settle the
         // turn-scoped `relayTurnLive` flag clears on — plumbed through so the
         // SAME projection that sees the terminal items also ends the turn
@@ -482,7 +520,7 @@ final class RelaySessionCoordinator {
         // to it (the live per-turn timer starts LOCALLY at send). Absent on
         // older relays → the projection falls back to the local measurement.
         chatStore.applyRelayItems(
-            store.items,
+            items,
             turnSettled: frame.kind == .turnCompleted,
             serverTurnDuration: frame.kind == .turnCompleted
                 ? frame.body["duration_s"]?.doubleValue
@@ -491,11 +529,13 @@ final class RelaySessionCoordinator {
         // QA-1 B10 / A3: the interactive gate frames are NOT items — the render
         // store drops them by design — yet they are the sole input of the Turn
         // Dock's cards. Bridge them into the SAME ChatStore state the direct
-        // gateway event router feeds, so the relay path surfaces the identical
-        // `ApprovalCard` / `ClarifyBanner` in the identical dock. `turn.completed`
-        // settles the turn → expire any pending gate (parity with the direct
-        // path's message.complete expiry — a gate answered elsewhere or abandoned
-        // must not linger inviting a reply against a dead runtime).
+        // gateway event router feeds (parked PER SESSION there — contract I12:
+        // the active session's gate takes the slot, a background session's
+        // gate parks until its session holds the write-gate). `turn.completed`
+        // settles the turn → expire that session's pending gate (parity with
+        // the direct path's message.complete expiry — a gate answered
+        // elsewhere or abandoned must not linger inviting a reply against a
+        // dead runtime).
         switch frame.kind {
         case .approvalRequest: chatStore.applyRelayApprovalRequest(frame)
         case .clarifyRequest:  chatStore.applyRelayClarifyRequest(frame)
@@ -509,7 +549,7 @@ final class RelaySessionCoordinator {
             // turn starts streaming.
             chatStore.handleRelayTurnStarted()
         case .turnCompleted:
-            chatStore.expireRelayPendingGates()
+            chatStore.expireRelayPendingGates(sessionID: frame.sid)
             // R16 (Live Activity lifecycle): the relay wire's EXPLICIT turn
             // boundary. The direct path ends the lock-screen Live Activity
             // from `handleMessageComplete`; the relay path never flows
@@ -519,10 +559,6 @@ final class RelaySessionCoordinator {
             // `LiveActivityManager.end()` (no-op when nothing is live) + the
             // queue-drain pipeline (no-op when no turn was live).
             chatStore.notifyRelayTurnCompleted()
-            // QA-2 R12: clear a terminal (all-done/cancelled) task list's
-            // ownership so the dock pill dismisses at turn end even though the
-            // `taskList` item itself persists in the relay item store.
-            chatStore.handleRelayTurnCompleted()
         default: break
         }
         // R16: a failed `.error` item is a turn TERMINAL on the relay wire
@@ -543,14 +579,13 @@ final class RelaySessionCoordinator {
     /// SUBMIT, before that turn's agent items, so render order is strictly
     /// `[U1,A1…][U2,A2…]` — anything before the last userMessage is a prior
     /// turn's late traffic and must not refresh the clock).
-    private func frameBelongsToCurrentTurn(_ frame: RelayFrame) -> Bool {
+    private func frameBelongsToCurrentTurn(_ frame: RelayFrame, items: [ChatItem]) -> Bool {
         switch frame.kind {
         case .turnStarted, .turnCompleted, .snapshot,
              .approvalRequest, .clarifyRequest, .status, .title:
             return true
         case .itemStarted, .itemDelta, .itemCompleted:
             guard let item = frame.item else { return true }
-            let items = store.items
             guard let lastUserIdx = items.lastIndex(where: { $0.type == .userMessage }),
                   let itemIdx = items.lastIndex(where: { $0.itemID == item.itemID })
             else { return true }   // no known turn boundary — treat as current
@@ -558,6 +593,61 @@ final class RelaySessionCoordinator {
         case .unknown:
             return false
         }
+    }
+
+    // MARK: - Write-gate + entry lifecycle (contract I2 / §1.2)
+
+    /// Move the WRITE-GATE (contract I2): a session switch atomically moves
+    /// (projected sid, gate membership, per-turn timer, Live Activity
+    /// ownership) — delegated to ``ChatStore/relayWriteGateMoved(toSession:
+    /// items:)``. The outgoing entry is NOT reset or cancelled: it keeps
+    /// folding its own frames (a parked entry — zero-refetch switch-back,
+    /// I14). `nil` = the draft surface: the ABSENCE of a session (I6) — no
+    /// entry projects, no suppression flag exists to fail.
+    private func moveWriteGate(to sessionID: String?) {
+        activeSessionID = sessionID
+        activeStoredSessionID = sessionID
+        chatStore.relayWriteGateMoved(
+            toSession: sessionID,
+            items: sessionID.flatMap { entries[$0]?.store.items } ?? []
+        )
+    }
+
+    /// Draft surface (contract I6): the write-gate moves OFF. Replaces the S11
+    /// `projectionSuppressed` flag — parked entries keep folding, and nothing
+    /// can project because no session is active (structural isolation; the
+    /// durable outbox re-routes the moment a real session binds).
+    func enterDraft() {
+        moveWriteGate(to: nil)
+    }
+
+    /// First-touch the entry for a session this phone intentionally drives
+    /// (open/resume/adopt/submit-create) — as opposed to entries a
+    /// turn-bearing frame creates in the background (``route``).
+    private func touchEntry(_ sessionID: String) {
+        lruClock += 1
+        if entries[sessionID] != nil {
+            entries[sessionID]!.touch = lruClock
+        } else {
+            entries[sessionID] = SessionEntry(store: RelayItemStore(), touch: lruClock)
+        }
+    }
+
+    /// Bounded LRU (≤8 — contract §1.2 / RR4): when the map outgrows the cap,
+    /// evict the least-recently-touched entry that is SETTLED (no
+    /// `.inProgress` items) AND not the active entry — writing through to
+    /// `CacheStore` FIRST (I3: the cache is a seed), so the next open paints
+    /// from disk and the relay snapshot reconciles over it (I14). An all-live
+    /// map holds (bounded by live turns — a running turn is never evicted).
+    private func evictSettledInactiveEntries() {
+        guard entries.count > Self.maxEntries else { return }
+        let active = activeWriteGateSessionID
+        let victim = entries
+            .filter { $0.key != active && $0.value.store.items.allSatisfy(\.isTerminal) }
+            .min { $0.value.touch < $1.value.touch }
+        guard let (sid, entry) = victim else { return }
+        chatStore.relayEntryEvictedWriteThrough(sessionID: sid, items: entry.store.items)
+        entries[sid] = nil
     }
 
     // MARK: - QA-3 S8/A4 turn liveness fallback
@@ -582,8 +672,9 @@ final class RelaySessionCoordinator {
     /// double-working is unreachable past this point; any later authoritative
     /// frame (item.completed / snapshot) replaces the items by id and heals.
     func settleStaleTurnLocally() {
-        store.settleInProgressLocally()
-        chatStore.applyRelayItems(store.items, turnSettled: true)
+        guard let sid = activeWriteGateSessionID, entries[sid] != nil else { return }
+        entries[sid]!.store.settleInProgressLocally()
+        chatStore.applyRelayItems(entries[sid]!.store.items, turnSettled: true)
     }
 
     private func applyState(_ state: RelayConnectionState) {
@@ -658,13 +749,23 @@ final class RelaySessionCoordinator {
         if let sid = result["session_id"]?.stringValue {
             activeSessionID = sid
             // A submit with NO target creates the session at the relay (QA-1
-            // B13): the returned id is BOTH the stored and the live id, so adopt
-            // it as the stored identity too — otherwise `outboxRuntimeID(forStored:)`
-            // never maps the new session and a queued prompt for it would hold
-            // forever instead of draining over the relay. Guarded so a submit
-            // into an open session (stored id bound by start/open/resume) never
-            // clobbers its stable identity with a possibly-distinct live id.
-            if target == nil, activeStoredSessionID == nil { activeStoredSessionID = sid }
+            // B13 / contract I6): the returned id is BOTH the stored and the
+            // live id — adopt it ATOMICALLY: the entry appears and the
+            // write-gate moves to it, so the draft surface becomes a real
+            // session in one motion (projection live, drawer row, outbox
+            // affinity maps via `outboxRuntimeID(forStored:)`, foreground
+            // follows). Guarded so a submit into an open session (stored id
+            // bound by start/open/resume) never clobbers its stable identity
+            // with a possibly-distinct live id.
+            if target == nil, activeStoredSessionID == nil {
+                touchEntry(sid)
+                activeStoredSessionID = sid
+                // NOT `moveWriteGate`: this is the SAME user turn adopting its
+                // home (the draft BECOMES this session), not a switch — the
+                // turn chrome stamped at send belongs to the created session;
+                // nothing is discarded (contract I6 atomic adoption).
+                chatStore.relayCreatedSessionAdopted(sid)
+            }
         } else if activeSessionID == nil, let target {
             activeSessionID = target
         }
@@ -683,77 +784,34 @@ final class RelaySessionCoordinator {
         activeStoredSessionID == storedID ? storedID : nil
     }
 
-    /// Resume + own an idle/terminal session, then adopt it as active.
+    /// Resume + own an idle/terminal session: the write-gate MOVES to its
+    /// entry (contract I2 — the projection, gate membership, per-turn timer
+    /// and Live Activity ownership move atomically at INTENT, pre-await, so
+    /// snapshot frames the pump delivers during the RPC await project; the
+    /// outgoing entry is NOT reset — it keeps folding for a zero-refetch
+    /// switch-back, I14). R1 deleted the old `resetItemStoreForSessionSwitch`
+    /// dance here: per-session entries make the cross-session leak
+    /// impossible by construction (I1), its gate-expiry-on-switch deletes
+    /// OUTRIGHT (amendment G1 — gates MOVE with their session), and its
+    /// task-list/LA clears move to the write-gate seam.
     @discardableResult
     func resume(_ sessionID: String) async throws -> JSONValue {
         let client = try requireClient()
-        resetItemStoreForSessionSwitch(to: sessionID)
+        touchEntry(sessionID)
+        moveWriteGate(to: sessionID)
         let result = try await client.resumeSession(sessionID)
-        activeSessionID = sessionID
-        activeStoredSessionID = sessionID
-        // S11: a real session bind resumes projection (clears any draft-
-        // surface parking from a prior `suppressProjectionForDraft`).
-        resumeProjection()
         return result
     }
 
-    /// Open/read a session; its `snapshot` streams into the transcript.
+    /// Open/read a session; its `snapshot` streams into its entry and (the
+    /// entry holding the write-gate) into the transcript.
     @discardableResult
     func open(_ sessionID: String) async throws -> JSONValue {
         let client = try requireClient()
-        resetItemStoreForSessionSwitch(to: sessionID)
+        touchEntry(sessionID)
+        moveWriteGate(to: sessionID)
         let result = try await client.open(sessionID)
-        activeSessionID = sessionID
-        activeStoredSessionID = sessionID
-        // S11: a real session bind resumes projection (clears any draft-
-        // surface parking from a prior `suppressProjectionForDraft`).
-        resumeProjection()
         return result
-    }
-
-    /// Clear the render-lane item store when the projected session is about to
-    /// CHANGE, so the incoming session's `snapshot` reconciles onto a clean
-    /// baseline instead of folding on top of the previous session's items.
-    ///
-    /// `RelayItemStore.reconcile(snapshot:)` is deliberately additive — items
-    /// absent from a snapshot are RETAINED (the snapshot is a resumed baseline,
-    /// not a delete list). That is correct for a `resync` of the SAME session,
-    /// but on a session SWITCH it would leak session A's items under session
-    /// B's snapshot, so the projection would render both. Resetting the STORE
-    /// here makes the switch clean and is a no-op re-open/re-resume of the
-    /// already-active session, whose live items must survive a `resync`. Called
-    /// BEFORE the open/resume RPC awaits so any snapshot frames the pump
-    /// delivers during the await land on the fresh store.
-    ///
-    /// QA-1 (B4/B7/B15): deliberately NO `chatStore.applyRelayItems([])` here.
-    /// The projection MERGES (tagged relay rows + untagged history), so the
-    /// incoming session's cache paint (untagged rows) must SURVIVE the switch
-    /// until its own relay content lands — wiping `chatStore.messages` to `[]`
-    /// mid-open was the fully-blank transcript (B4). The previous session's
-    /// TAGGED projection rows are dropped by the incoming session's first
-    /// projection (it retains only untagged history) and by the open path's
-    /// `chat.reset()`; the store reset alone keeps session A's items out of
-    /// session B's projection, so nothing leaks either way. (Defense in depth:
-    /// `ChatStore.applyRelayItems` ALSO treats an empty projection as a no-op
-    /// fallback on `messages`, so a blank screen is impossible even if a future
-    /// caller re-projects an emptied store.)
-    private func resetItemStoreForSessionSwitch(to sessionID: String) {
-        guard sessionID != activeSessionID else { return }
-        store = RelayItemStore()
-        // N4/A5: clear the previous session's task-list mirror so the new
-        // session's dock starts clean (empty store ⇒ mirror cleared, `messages`
-        // untouched — never blanks the transcript, QA-1 B4).
-        chatStore.syncRelayTaskList(from: store)
-        // QA-1 B10: a pending gate belongs to its session's turn — switching
-        // the projected session clears the previous session's card (parity with
-        // the direct path's `reset()` on open; answering session A's card while
-        // viewing B would mis-route the answer).
-        chatStore.expireRelayPendingGates()
-        // R16: a relay turn mirrored for the outgoing session's Live Activity
-        // must end when the user switches away — otherwise the lock-screen
-        // timer keeps counting a turn the user is no longer viewing (and may
-        // never see complete on this surface). No-op when no turn was live.
-        chatStore.endRelayTurnForSessionSwitch()
     }
 
     func list() async throws -> JSONValue { try await requireClient().list() }
