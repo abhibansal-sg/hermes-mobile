@@ -13,14 +13,24 @@ struct ErrorItemView: ChatItemContentView {
         self.item = item
     }
 
-    /// The visible message: the full error body when present, otherwise the
-    /// one-line summary, otherwise an honest fallback.
-    private var message: String {
+    /// The visible message for an `error` item: the full error body when
+    /// present, otherwise the one-line summary, otherwise an honest fallback.
+    /// QA-3 S5/C3: a raw provider error (the upstream `HTTP 403: {"code":
+    /// ...}` shape the gateway surfaces verbatim — IMG_2583) is humanized to
+    /// one honest line, never shown raw — the transcript twin of the relay
+    /// notifier's push sanitizer (`RawErrorSanitizer`, mirror of
+    /// `_humanize_raw_error`). Pure + `nonisolated` so the contract is unit-
+    /// tested without a SwiftUI view.
+    nonisolated static func displayMessage(for item: ChatItem) -> String {
         let text = item.textBody
-        if !text.isEmpty { return text }
-        if let summary = item.summary, !summary.isEmpty { return summary }
+        if !text.isEmpty { return RawErrorSanitizer.displayText(text) }
+        if let summary = item.summary, !summary.isEmpty {
+            return RawErrorSanitizer.displayText(summary)
+        }
         return "An error occurred."
     }
+
+    private var message: String { Self.displayMessage(for: item) }
 
     /// A short headline shown above a multi-line body, when the summary adds
     /// context the body doesn't already start with.
