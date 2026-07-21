@@ -382,9 +382,35 @@ class GatewayClient:
         return resp.get("result") or {}
 
     # -- session ops (protocol §5) ---------------------------------------
-    async def session_list(self, limit: int = 200) -> list[dict[str, Any]]:
-        """``session.list`` — all sessions, every origin (no ownership)."""
-        result = await self._call_result("session.list", {"limit": limit})
+    async def session_list(
+        self,
+        limit: int = 200,
+        *,
+        order: Optional[str] = None,
+        cwd_prefix: Optional[str] = None,
+        exclude_source: Optional[str] = None,
+        min_messages: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """``session.list`` — all sessions, every origin (no ownership).
+
+        R4 L1 (GAP-1 session LIST parity): the drawer needs the SAME filters
+        the gateway REST list exposes — recency ordering, a cwd prefix (the
+        project-scoped session list, B10), a source exclusion (drop e.g. cron
+        sessions) and a minimum-message bound (hide never-driven sessions).
+        Each filter is OPTIONAL and only sent when supplied, so a bare
+        ``session_list(n)`` call is byte-identical to the pre-L1 RPC (old
+        gateways that read ``limit`` alone are unaffected — additive, §2).
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if order is not None:
+            params["order"] = order
+        if cwd_prefix is not None:
+            params["cwd_prefix"] = cwd_prefix
+        if exclude_source is not None:
+            params["exclude_source"] = exclude_source
+        if min_messages is not None:
+            params["min_messages"] = min_messages
+        result = await self._call_result("session.list", params)
         return list(result.get("sessions") or [])
 
     async def session_create(

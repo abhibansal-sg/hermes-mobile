@@ -696,7 +696,26 @@ class DownstreamServer:
 
         # -- reads -----------------------------------------------------------
         if method == UpstreamMethod.LIST:
-            return {"sessions": await self._gateway.session_list(int(p.get("limit", 200)))}
+            # R4 L1 (GAP-1, the central blocker): the phone's drawer / project
+            # session list rides THIS RPC, so the gateway REST list's filters
+            # must pass through — recency order (the drawer default), a cwd
+            # prefix (project-scoped list, B10), a source exclusion and a
+            # minimum-message bound. Each is OPTIONAL: absent params are never
+            # sent, so a pre-L1 phone (limit only) drives the byte-identical
+            # pre-L1 gateway call.
+            filters: dict[str, Any] = {}
+            for key in ("order", "cwd_prefix", "exclude_source"):
+                val = p.get(key)
+                if isinstance(val, str) and val:
+                    filters[key] = val
+            min_messages = p.get("min_messages")
+            if isinstance(min_messages, int) and not isinstance(min_messages, bool):
+                filters["min_messages"] = min_messages
+            return {
+                "sessions": await self._gateway.session_list(
+                    int(p.get("limit", 200)), **filters
+                )
+            }
 
         if method in (UpstreamMethod.OPEN, UpstreamMethod.HISTORY):
             sid = p["session_id"]

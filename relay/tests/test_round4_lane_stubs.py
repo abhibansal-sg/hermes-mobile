@@ -74,10 +74,6 @@ L6 = "R4 L6 RED-BY-DESIGN: "
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=L1 + "LIST must pass order/cwd_prefix/"
-                   "exclude_source/min_messages/limit through to the gateway "
-                   "session.list (downstream.py:698-699 forwards limit only). "
-                   "Wave-1 L1 flips this; remove the marker when green.")
 async def test_l1_list_filter_params_pass_through():
     srv, gw = _server()
     await srv.start()

@@ -147,7 +147,7 @@ forever; fixed by the above.)
 
 | phone intent | relay action | gateway RPC | ownership effect |
 |---|---|---|---|
-| list all sessions | pass-through | `session.list` | none (read) |
+| list all sessions | pass-through | `session.list` | none (read) — R4 L1 (GAP-1): `params` optionally carry `order` (e.g. `recent` — the drawer default), `cwd_prefix` (project-scoped list, B10), `exclude_source` (drop e.g. `cron` rows) and `min_messages` alongside `limit`; each is forwarded to `session.list` only when present, so a bare `{limit}` call is the byte-identical pre-L1 RPC. This is the parity that lets the drawer ride the relay and the REST session list delete (X7). |
 | open/read a session (incl. foreign) | store-read | **REST `GET /api/sessions/{id}/messages` ONLY** (`web_server.py:9985`, reads `state.db`) | none (NO reactivation) — R0 CORRECTION: `session.history` RPC is NOT a store-read; it resolves via `_sess_nowait` (in-memory live sessions only, `server.py:1727`) and returns 4001 for a foreign session the phone never owned. Use the REST path for foreign/idle history. |
 | start a NEW chat | create + own | `session.create` → `prompt.submit` | relay becomes owner |
 | send into an idle session (incl. a terminal one) | resume + own + submit | `session.resume` → `prompt.submit` | relay becomes owner; turn continues same sid/history/cwd |
