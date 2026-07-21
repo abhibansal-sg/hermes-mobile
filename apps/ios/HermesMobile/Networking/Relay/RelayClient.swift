@@ -22,8 +22,21 @@ enum RelayError: Error, LocalizedError, Sendable {
         switch self {
         case .notConnected: return "Not connected to the relay"
         case .timeout(let method): return "Relay request timed out: \(method)"
-        case .rpc(let code, let message): return "Relay error \(code): \(message)"
-        case .transport(let message): return "Relay connection error: \(message)"
+        case .rpc(_, let message):
+            // QA-3 S5/C3: the relay's RPC error frames interpolate `str(exc)`
+            // (downstream.py) — a failed upstream call can carry the provider's
+            // RAW error text (e.g. `HTTP 403: {"code": ...}`), which these
+            // descriptions feed into `ChatStore.lastError` banners. A raw shape
+            // becomes one honest human line; otherwise the message is kept but
+            // the numeric JSON-RPC code is dropped (C3: no raw error codes to
+            // the user — it is never user-actionable).
+            if let human = RawErrorSanitizer.humanizeIfRawError(message) {
+                return human
+            }
+            return "Relay request failed: \(message)"
+        case .transport(let message):
+            return RawErrorSanitizer.humanizeIfRawError(message)
+                ?? "Relay connection error: \(message)"
         }
     }
 }

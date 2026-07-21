@@ -257,6 +257,7 @@ final class SessionStore {
         activeStoredId = nil
         activeStoredProfile = nil
         chat?.reset()
+        transcriptPaintedStoredId = nil
     }
 
     /// Remove every in-memory surface owned by a forgotten gateway.
@@ -3582,6 +3583,55 @@ final class SessionStore {
     private var pendingDrawerReveal: (@MainActor () -> Void)?
     private static let drawerRevealDeadline: Duration = .milliseconds(300)
 
+    /// S9 (QA-3, 3rd recurrence): a monotonic epoch + wall-clock stamp of the
+    /// most recent USER drawer gesture. Bumped by ``recordDrawerUserGesture``
+    /// on every gesture that takes control of navigation (drawer row tap →
+    /// `open(_:revealOnFirstPaint:)`, search-result tap, "New chat" →
+    /// `startDraft`). The dismissal latch (`pendingDrawerReveal`) is a one-shot
+    /// consumed at first-paint/300ms — but programmatic RE-OPEN edges
+    /// (``PendingIntentRouter/drainDurable`` over a parked `.openSessions` App
+    /// Intent, legacy `drain`, the notification route) are unserialized against
+    /// it: a foreground transition that re-drains an older open-intent AFTER
+    /// the tap-close fires re-opens the drawer over the in-flight load
+    /// (last-writer-wins = the intent, not the user). The epoch lets those
+    /// open-intents detect that the user has since taken control — they carry
+    /// their queue `createdAt` and drop themselves when the user gestured at
+    /// or after that instant. The user's in-app gesture always wins.
+    private var drawerUserGestureEpoch: UInt64 = 0
+    private var drawerUserGestureAt: Date = .distantPast
+
+    /// Record a user-initiated drawer navigation gesture (row tap, search-result
+    /// tap, "New chat" draft). The wall-clock stamp is compared against a
+    /// programmatic open-intent's queue time so an intent queued BEFORE the
+    /// gesture is dropped; the epoch lets an in-flight intent that captured the
+    /// value before an await detect the bump after it. Test-injectable `now`
+    /// keeps the regression deterministic.
+    func recordDrawerUserGesture(now: Date = Date()) {
+        drawerUserGestureEpoch &+= 1
+        drawerUserGestureAt = now
+    }
+
+    /// Read the current gesture epoch. Programmatic open-intent paths capture
+    /// this BEFORE their first await so a user gesture that lands during the
+    /// await is detectable after it (`drawerUserGestureEpochAdvanced(since:)`).
+    func currentDrawerUserGestureEpoch() -> UInt64 {
+        drawerUserGestureEpoch
+    }
+
+    /// True iff a user drawer gesture landed strictly after `epoch` was
+    /// captured. Used by open-intent paths that capture-then-await.
+    func drawerUserGestureEpochAdvanced(since epoch: UInt64) -> Bool {
+        drawerUserGestureEpoch > epoch
+    }
+
+    /// True iff a user drawer gesture landed at or after `queuedAt`. Used by
+    /// ``PendingIntentRouter/drainDurable`` to drop a `.openSessions` App Intent
+    /// whose queue time PREDATES the user's more recent in-app navigation —
+    /// exactly the tap-during-in-flight-load race (S9).
+    func drawerUserGestureHappenedSince(_ queuedAt: Date) -> Bool {
+        drawerUserGestureAt >= queuedAt
+    }
+
     /// Consume the pending drawer dismissal exactly once (QA-1 B3). Both fire
     /// edges — first paint (``seedTranscriptCacheFirst``) and the liveness
     /// deadline armed in ``open(_:)`` — funnel here, so whichever wins closes
@@ -3603,12 +3653,85 @@ final class SessionStore {
     private var warmOpenSnapshotOrder: [String] = []
     private static let warmOpenSnapshotLimit = 6
 
+    /// QA-3 S7/A3 — the stored session id whose transcript the chat view
+    /// currently holds: stamped on every successful paint / reset this store
+    /// drives. A re-open of the SAME session (a row re-tap, a notification
+    /// deep-link onto the active chat) must NEVER re-run the first-frame cache
+    /// paint over it — the cached copy is a known-partial tail window, and
+    /// painting it `.replace` over the full in-memory transcript truncated the
+    /// timeline to the window: the eager bottom-anchored VStack then rendered
+    /// the surviving tail at the bottom with PURE VOID above on scroll-up
+    /// (IMG_2589/2590). Provenance-keyed (not `activeStoredId`-keyed) so a
+    /// superseded in-flight open can never masquerade as a same-session
+    /// repaint. `nil` = the transcript holds no session (draft/reset/empty).
+    private var transcriptPaintedStoredId: String?
+
     private func cachedWarmOpenSnapshot(for storedId: String) -> [ChatMessage]? {
         warmOpenSnapshots[storedId]
     }
 
+    /// QA-3 S6/A2 — DURABLE OPTIMISTIC ECHOES: optimistic user echoes keyed by
+    /// stored session id. `ChatStore.send` (relay branch) and `presentOutboxEcho`
+    /// persist each echo here; the warm snapshot carries it so a session switch
+    /// away and back (or any store rebuild that repaints from the warm/disk
+    /// cache) re-renders the prompt BEFORE the relay's `userMessage` item
+    /// re-lands — the S6 prompt-vanish (IMG_2585/2591: working rows with no
+    /// prompt above them). ``markEchoReconciled(storedId:clientMessageID:text:)``
+    /// purges an echo once the relay projection adopts it (or the user deletes
+    /// a failed send), so a repaint never re-presents a second bubble beside
+    /// the reconciled row.
+    private var pendingDurableEchoes: [String: [ChatMessage]] = [:]
+
+    /// Persist an optimistic echo into the session-keyed warm snapshot the
+    /// switch-and-back paint reads. No-op without a stored session id (a
+    /// draft send binds its echo once the relay-created session id lands —
+    /// ChatStore re-calls this after `landRelayCreatedSession`).
+    func persistDurableEcho(storedId: String?, echo: ChatMessage) {
+        guard let storedId, !storedId.isEmpty else { return }
+        var pending = pendingDurableEchoes[storedId] ?? []
+        pending.removeAll {
+            ($0.clientMessageID != nil && $0.clientMessageID == echo.clientMessageID)
+                || $0.id == echo.id
+        }
+        pending.append(echo)
+        pendingDurableEchoes[storedId] = pending
+        // Fold the echo into the warm snapshot NOW when one exists (it leads
+        // the repaint); otherwise the next `rememberWarmOpenSnapshot` for the
+        // session folds every still-pending echo in (self-healing on the
+        // session's next paint).
+        if var snapshot = warmOpenSnapshots[storedId] {
+            snapshot.removeAll {
+                ($0.clientMessageID != nil && $0.clientMessageID == echo.clientMessageID)
+                    || $0.id == echo.id
+            }
+            snapshot.append(echo)
+            warmOpenSnapshots[storedId] = snapshot
+        }
+    }
+
+    /// Drop a durable echo once it is reconciled — the relay `userMessage`
+    /// adoption consumed its row (`adoptRelayEcho`), or the user deleted a
+    /// failed send (`removeLocalEcho`). Idempotent; text-keyed only for
+    /// cmid-less echoes (a distinct send of identical text carries its own
+    /// cmid and must survive).
+    func markEchoReconciled(storedId: String?, clientMessageID: String?, text: String) {
+        guard let storedId, !storedId.isEmpty else { return }
+        func isThisEcho(_ message: ChatMessage) -> Bool {
+            if let clientMessageID { return message.clientMessageID == clientMessageID }
+            return message.clientMessageID == nil && message.text == text
+        }
+        if var pending = pendingDurableEchoes[storedId] {
+            pending.removeAll(where: isThisEcho)
+            pendingDurableEchoes[storedId] = pending.isEmpty ? nil : pending
+        }
+        if var snapshot = warmOpenSnapshots[storedId] {
+            snapshot.removeAll(where: isThisEcho)
+            warmOpenSnapshots[storedId] = snapshot
+        }
+    }
+
     private func rememberWarmOpenSnapshot(_ normalized: [ChatMessage], for storedId: String) {
-        warmOpenSnapshots[storedId] = normalized
+        warmOpenSnapshots[storedId] = mergedWarmSnapshot(normalized, for: storedId)
         warmOpenSnapshotOrder.removeAll { $0 == storedId }
         warmOpenSnapshotOrder.append(storedId)
         if warmOpenSnapshotOrder.count > Self.warmOpenSnapshotLimit {
@@ -3618,6 +3741,52 @@ final class SessionStore {
             }
             warmOpenSnapshotOrder.removeFirst(overflow)
         }
+    }
+
+    /// QA-3 S7/A3 — warm snapshots are written from KNOWN-PARTIAL seeds (every
+    /// seed source is a recent-tail window), so an OVERWRITE would degrade the
+    /// warm copy to the window: a same-process re-open of a session the user
+    /// had backward-paged would repaint only the tail (their loaded scrollback
+    /// gone). Merge instead: `incoming` is the spine; unmatched EXISTING rows
+    /// that precede the first matched row are the previously-loaded older
+    /// history — PREPEND them (unmatched TRAILING rows are superseded content
+    /// — an old streaming row, a since-deleted row — and drop). Then re-append
+    /// any still-pending durable echo the incoming window does not cover
+    /// (S6): a network seed that lands before the gateway persists the prompt
+    /// must not lose it from the warm copy.
+    private func mergedWarmSnapshot(
+        _ incoming: [ChatMessage], for storedId: String
+    ) -> [ChatMessage] {
+        let existing = warmOpenSnapshots[storedId] ?? []
+        var merged: [ChatMessage]
+        if existing.isEmpty {
+            merged = incoming
+        } else {
+            let incomingIDs = Set(incoming.map(\.id))
+            if let firstMatch = existing.firstIndex(where: { incomingIDs.contains($0.id) }) {
+                // Rows before the first match are previously-loaded older
+                // history (backward paging) the window does not cover —
+                // prepend them.
+                merged = Array(existing.prefix(firstMatch)) + incoming
+            } else {
+                // No overlap (an empty reconcile, or a window that slid past
+                // every loaded row): keep the existing spine and append the
+                // genuinely-new incoming rows — NEVER drop loaded history
+                // (R15 union contract: the merged view never shows less
+                // settled history than the snapshot held before).
+                let existingIDs = Set(existing.map(\.id))
+                merged = existing + incoming.filter { !existingIDs.contains($0.id) }
+            }
+        }
+        for echo in pendingDurableEchoes[storedId] ?? [] {
+            let covered = merged.contains {
+                ($0.clientMessageID != nil && $0.clientMessageID == echo.clientMessageID)
+                    || $0.id == echo.id
+                    || ($0.role == .user && $0.clientMessageID == nil && $0.text == echo.text)
+            }
+            if !covered { merged.append(echo) }
+        }
+        return merged
     }
 
     #if DEBUG
@@ -3730,6 +3899,15 @@ final class SessionStore {
         // rotation that stranded it before.
         if let revealOnFirstPaint {
             pendingDrawerReveal = revealOnFirstPaint
+            // S9 (QA-3): a drawer row tap is a USER gesture that takes control
+            // of navigation — the drawer will close on first paint / 300ms
+            // deadline. Stamp the epoch + wall-clock so a programmatic open
+            // intent (drainDurable over a parked `.openSessions` App Intent,
+            // re-drained on the foreground transition that accompanies the
+            // tap-during-in-flight-load race) can detect that the user acted
+            // AFTER it was queued and drop itself instead of re-opening the
+            // drawer over the in-flight load.
+            recordDrawerUserGesture()
         }
         let drawerIntentPending = pendingDrawerReveal != nil
         activeRuntimeId = nil          // gates the composer until resume lands
@@ -4106,6 +4284,12 @@ final class SessionStore {
         // `onNavigate` itself; a programmatic draft must not inherit a stale
         // close that could fire later against a re-opened drawer).
         pendingDrawerReveal = nil
+        // S9 (QA-3): "New chat" is a USER drawer navigation gesture — the same
+        // 3rd-recurrence race applies (drainDurable re-opening the drawer over
+        // a fresh draft). Stamp the epoch so a stale `.openSessions` App Intent
+        // drained on the foreground transition drops itself instead of
+        // clobbering the draft surface.
+        recordDrawerUserGesture()
         cancelEnsureRuntime()
         cancelRuntimeBinding()
         isDraft = true
@@ -4116,9 +4300,20 @@ final class SessionStore {
         resetComposerHistoryBrowse()
         chat?.reset()
         chat?.seed(from: [])  // empty IS the (draft) transcript
+        transcriptPaintedStoredId = nil   // a draft holds no stored session
         // A draft has NO session: drop the previous session's hot-swap state
         // (else the pill shows the LAST chat's model) and any stale draft pick.
         connection?.clearSessionState()
+        // S11 (QA-3): park the relay coordinator's item→transcript projection
+        // so the previous session's in-flight turn does NOT leak onto the empty
+        // draft surface. startDraft does not touch the coordinator's
+        // activeSessionID (a draft has no session id), so without this park the
+        // pump's next applyRelayItems would paint the previous session's live
+        // "Working… · ToolCall Ns" rows onto the draft chat (IMG_2594). The
+        // coordinator keeps driving the previous session for reconnect-resync
+        // and durable-outbox routing; only the projection onto the chat surface
+        // is suspended until a real session binds (resume/open/start clear it).
+        connection?.relayCoordinator?.suppressProjectionForDraft()
         // ABH-351: capture the cwd for the new-session-in-project flow. An
         // explicit non-empty path seeds the draft so the materializing
         // session.create carries it; nil/empty = the gateway default.
@@ -4320,6 +4515,7 @@ final class SessionStore {
             let seeded = response["messages"]?.arrayValue?
                 .compactMap(StoredMessage.init(json:)) ?? []
             chat?.seed(from: seeded)
+            transcriptPaintedStoredId = storedId
             lastError = nil
             Task { [weak self] in await self?.refresh() }
             return (runtimeId, storedId)
@@ -5336,6 +5532,7 @@ final class SessionStore {
         activeStoredId = nil
         activeStoredProfile = nil
         chat?.reset()
+        transcriptPaintedStoredId = nil
     }
 
     /// Injectable seam for the session-list fetch. `nil` resolves the live
@@ -5499,9 +5696,34 @@ final class SessionStore {
         // reconciles any tail/delta afterward.
         var paintedFromCache = false
         var paintedFromDisk = false
-        if isCurrentTranscriptOpen(token: token),
+        // QA-3 S7/A3 — VOID SCROLLBACK IMPOSSIBLE: when the transcript ALREADY
+        // holds THIS session (a row re-tap, a notification deep-link onto the
+        // active chat, a re-open of the same session), its in-memory rows ARE
+        // the truth — backward-paged history, a live turn, an optimistic echo
+        // included. Re-running the first-frame cache paint over it painted the
+        // KNOWN-PARTIAL cached tail window `.replace` (warm snapshot 5504 /
+        // disk `cached.suffix(windowLimit)` 5540), truncating the full
+        // transcript to the window — the eager bottom-anchored VStack then
+        // rendered the surviving tail at the bottom with PURE VOID above on
+        // scroll-up (IMG_2589/2590). Skip phase 1 entirely: the phase-2
+        // network seed (below) reconciles server-side deltas in place with a
+        // `.union` policy, so nothing newer is lost and nothing older is
+        // evicted. Provenance-keyed off `transcriptPaintedStoredId` (stamped
+        // on every paint/reset this store drives) — NEVER off `activeStoredId`,
+        // which open() re-points synchronously on the tap tick before this
+        // task runs.
+        let sameSessionRepaint = (transcriptPaintedStoredId == storedId)
+        if sameSessionRepaint {
+            paintedFromCache = true        // content already painted — phase 2
+            paintedRows = chat.messages.count   // still reconciles deltas
+            #if DEBUG
+            Self.logOpenLatency(
+                phase: "same-session(skip-paint)", storedId: storedId, since: openClock)
+            #endif
+        } else if isCurrentTranscriptOpen(token: token),
            let cached = cachedWarmOpenSnapshot(for: storedId) {
             chat.seed(normalized: Array(cached.suffix(ChatStore.transcriptOpenWindowLimit)))
+            transcriptPaintedStoredId = storedId
             paintedRows = cached.count
             paintedFromCache = true
             #if DEBUG
@@ -5538,6 +5760,7 @@ final class SessionStore {
                 guard isCurrentTranscriptOpen(token: token) else { return }
                 rememberWarmOpenSnapshot(normalized, for: storedId)
                 chat.seed(normalized: normalized)  // in-place reconcile — FIRST frame
+                transcriptPaintedStoredId = storedId
                 paintedRows = cachedWindow.count
                 chat.noteTranscriptSeedWindow(cachedWindow)
                 paintedFromCache = true
@@ -5548,6 +5771,10 @@ final class SessionStore {
             // Cache miss (or no cache): empty the transcript so ChatView shows the
             // skeleton, not a stale prior session's rows, while the network loads.
             chat.reset()
+            // QA-3 S7: the honest empty state belongs to THIS session (the
+            // skeleton, not a stale provenance) — a re-tap of it must not
+            // re-run the miss-reset over whatever phase 2 paints next.
+            transcriptPaintedStoredId = storedId
         }
         paintFinished = true
         #if DEBUG
@@ -5684,6 +5911,7 @@ final class SessionStore {
             // "Loading…" spinner (R1 #79).
             if !paintedFromCache {
                 chat.reset()
+                transcriptPaintedStoredId = storedId
                 let description = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
                 chat.noteTranscriptLoadFailure(description)
@@ -5767,6 +5995,7 @@ final class SessionStore {
         guard let chat else { return }
         guard let storedId, let fetch = resolvedTranscriptFetch() else {
             chat.reset()
+            transcriptPaintedStoredId = nil
             return
         }
         let capturedIdentity = cacheIdentity(storedId, profile: cacheProfile)
@@ -5795,6 +6024,7 @@ final class SessionStore {
                 // so rows the cached window does not cover are retained.
                 chat.seed(normalized: normalized, policy: .union)
                 chat.noteTranscriptSeedWindow(cachedWindow)
+                transcriptPaintedStoredId = storedId
                 paintedFromCache = true
             }
         }
@@ -5818,6 +6048,7 @@ final class SessionStore {
             // not cover).
             chat.seed(normalized: normalized, policy: .union)
             chat.noteTranscriptSeedWindow(stored)
+            transcriptPaintedStoredId = storedId
             if let cacheStore, let identity = capturedIdentity {
                 Task { [weak self] in
                     guard let self,
@@ -5837,7 +6068,10 @@ final class SessionStore {
             ) else { return }
             // A valid cache paint remains readable when reconciliation fails.
             // Only an empty miss needs the recoverable error presentation.
-            if !paintedFromCache { chat.reset() }
+            if !paintedFromCache {
+                chat.reset()
+                transcriptPaintedStoredId = storedId
+            }
             let description = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
             if !paintedFromCache { chat.noteTranscriptLoadFailure(description) }
@@ -6333,6 +6567,23 @@ final class ProjectsStore {
         defer { projectSessionsLoadingIds.remove(project.id) }
         do {
             let result = try await fetchProjectSessionsWithRetry(fetch)
+            // S10 (QA-3): never accept a fallback `[]` as authoritative when
+            // the project overview's `sessionCount > 0`. The overview count
+            // comes from the same `_build_project_tree` machinery that folds
+            // worktrees, so a non-zero count is authoritative — a `[]` here
+            // means the detail query's cwd_prefix path missed worktree cwds
+            // (the server fix in `_cwd_prefix_clause` closes this; this is the
+            // iOS-side defensive backstop while the relay/plugin propagates).
+            // Treat an empty-list-when-count>0 as a transient failure so the
+            // detail surfaces a "Reconnecting to gateway — retry" state rather
+            // than a lying "No sessions yet" (IMG_2593). Preserve any prior
+            // non-empty list so the UI doesn't flicker to empty on a blip.
+            if result.sessions.isEmpty && project.sessionCount > 0 {
+                if projectSessionsById[project.id] == nil {
+                    projectSessionsErrorById[project.id] = Self.projectSessionsEmptyButCountedMessage
+                }
+                return
+            }
             projectSessionsById[project.id] = result.sessions
             projectSessionsErrorById[project.id] = nil
             writeThroughProjectSessions(result.sessions, for: project)
@@ -6342,6 +6593,12 @@ final class ProjectsStore {
             }
         }
     }
+
+    /// S10: surfaced copy when the detail fetch returned `[]` but the project
+    /// overview's `sessionCount > 0`. Same directional copy as a transient
+    /// failure — the user should retry; a lying "No sessions yet" is not
+    /// actionable. Distinct constant so a test can pin the contract.
+    static let projectSessionsEmptyButCountedMessage = "Reconnecting to gateway — retry"
 
     /// Runs `fetch` (which already carries the 404/transient → `cwd_prefix`
     /// fallback above); on a transient failure from THAT combined attempt,

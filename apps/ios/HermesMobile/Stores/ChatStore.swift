@@ -172,7 +172,50 @@ final class ChatStore {
     /// its OWN watchdog (``foreignMirrorWatchdog``) — this one guards a turn WE
     /// are driving.
     private var localTurnWatchdog: Task<Void, Never>?
-    private static let localTurnStaleTimeout: Duration = .seconds(180)
+    /// Stage-2 settle window (fix-round 1): sized MATERIALLY above the worst-case
+    /// OPAQUE-TOOL duration — a single long bash/build tool with no incremental
+    /// output and no gateway heartbeat emits ZERO frames for its whole run, so
+    /// nothing refreshes the silence clock while the turn is genuinely alive.
+    /// 180 s false-positived on exactly that shape (the settle is healed by any
+    /// late frame — `RelayItemStore.applyDelta` resurrects locally-settled items
+    /// replace-not-drop — but the transient "Interrupted" fold on a healthy turn
+    /// is still wrong). 480 s keeps eternal-working bounded while a healthy
+    /// slow turn essentially never trips it; a genuinely dead turn still heals
+    /// at stage 1 (45 s silent resync) whenever the authority merely dropped a
+    /// terminal frame.
+    private static let localTurnStaleTimeout: Duration = .seconds(480)
+    /// QA-3 S8/A4 — per-turn LIVENESS fallback (kills eternal double-working,
+    /// IMG_2591). The QA-2 watchdog was per-STORE and re-armed by ANY item
+    /// batch — a dead turn 1 stayed "Working…" forever while turn 2's frames
+    /// kept re-arming, and even when it fired, the next projection re-derived
+    /// streaming from the still-`.inProgress` items. Liveness is now PER-TURN
+    /// and two-stage, keyed off ``turnLivenessBaseline`` (refreshed ONLY by
+    /// CURRENT-turn frames — `noteTurnLivenessFrame(isCurrentTurn:)` from the
+    /// coordinator's ingest):
+    ///   stage 1 — ``turnLivenessResyncAfter`` of silence: a SILENT
+    ///     `resync{last_seq}` (snapshot when the gap exceeds the ring). A
+    ///     dropped terminal frame heals here; the user sees nothing (C3).
+    ///   stage 2 — ``localTurnStaleTimeout`` of silence: the turn is DEAD
+    ///     (the resync recovered nothing, so the authority has nothing more).
+    ///     The coordinator settles the stuck items locally (muted
+    ///     "Interrupted" fold, never an error banner) and the live flag
+    ///     clears. Eternal-working is unreachable by construction.
+    private static let turnLivenessResyncAfter: Duration = .seconds(45)
+    /// The watchdog's evaluation cadence (chunked sleep; staleness is computed
+    /// off ``turnLivenessBaseline`` at each wake, so a frame landing mid-sleep
+    /// simply defers the next stage instead of firing late-and-wrong).
+    private static let turnLivenessTick: Duration = .seconds(5)
+    /// Per-turn latch: stage 1 fires at most once per turn (reset on turn
+    /// start / settle).
+    private var turnLivenessResyncFired = false
+    /// The current turn's last CURRENT-turn frame (turn start until the first
+    /// frame). `nil` outside a turn.
+    private var turnLivenessBaseline: ContinuousClock.Instant?
+    #if DEBUG
+    /// DEBUG observability for the liveness tests: how many stage-1 silent
+    /// resyncs the watchdog (or the `_debug` seam) has fired.
+    private(set) var turnLivenessResyncCount = 0
+    #endif
     /// An approval the user must answer, or `nil`.
     var pendingApproval: PendingApproval?
     /// A clarification the user must answer, or `nil`.
@@ -1213,6 +1256,11 @@ final class ChatStore {
         // normally. Without this, a turn that errored would suppress the
         // completion seam of the NEXT (healthy) turn too.
         relayTurnTerminatedByError = false
+        // QA-3 S8/A4: a fresh turn starts with a clean liveness slate (covers
+        // turns this phone did NOT send — a mid-turn resume projection; the
+        // driven-send path resets at `relayTurnLive = true`).
+        resetTurnLivenessState()
+        turnLivenessBaseline = ContinuousClock.now
         onTurnStart?()
     }
 
@@ -2624,6 +2672,20 @@ final class ChatStore {
             )
             userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
             messages.append(userMessage)
+            // QA-3 S6/A2 — DURABLE ECHO: the optimistic echo existed only in
+            // the in-memory transcript, so a session switch (the transcript
+            // reseeds for the other session) or any store rebuild dropped it
+            // — the sent prompt vanished from view until the relay's next
+            // snapshot re-projected its `userMessage` item (IMG_2585/2591:
+            // working rows rendering with NO prompt above them). Persist it
+            // into the session-keyed warm snapshot the switch-and-back cache
+            // paint reads, so the prompt repaints BEFORE any relay frame
+            // lands, and stays until the `userMessage` adoption reconciles it
+            // (`markEchoReconciled`). A draft send keys the echo once the
+            // relay-created session id lands (below).
+            sessions?.persistDurableEcho(
+                storedId: sessions?.activeStoredId, echo: userMessage
+            )
             // QA-2 R4/A2 — INSTANT WORKING AFFORDANCE: append an optimistic
             // EMPTY streaming assistant bubble the instant the user commits —
             // the breathing caret (`MessageBubble.needsStandaloneCursor`)
@@ -2643,6 +2705,11 @@ final class ChatStore {
                 relayProjected: true
             ))
             relayTurnLive = true
+            // QA-3 S8/A4: the driven turn's liveness clock starts at send —
+            // silence is measured from here until the first CURRENT-turn frame
+            // (the stage-1 silent resync and the stage-2 settle key off it).
+            resetTurnLivenessState()
+            turnLivenessBaseline = ContinuousClock.now
             if hasAttachments, let attachments {
                 setStreaming(true, reason: "relay.send.upload")
                 lastError = nil
@@ -2693,6 +2760,11 @@ final class ChatStore {
                 // Guarded inside to never clobber an already-bound session.
                 if let sid = result["session_id"]?.stringValue {
                     sessions?.landRelayCreatedSession(storedID: sid)
+                    // QA-3 S6/A2: the draft send's echo had no stored session
+                    // to key under at append time — bind it now that the
+                    // relay-created session id has landed, so a switch-away
+                    // and back repaints the prompt here too.
+                    sessions?.persistDurableEcho(storedId: sid, echo: userMessage)
                 }
                 return true
             } catch {
@@ -2970,6 +3042,14 @@ final class ChatStore {
         }) else { return }
         let removed = messages.remove(at: index)
         userOrdinals[removed.id] = nil
+        // QA-3 S6/A2: a deliberately-removed echo (the failed-send delete, or
+        // the immediate→outbox swap at 2719/2735) must not resurrect from the
+        // durable warm snapshot on the next repaint.
+        sessions?.markEchoReconciled(
+            storedId: sessions?.activeStoredId,
+            clientMessageID: clientMessageID,
+            text: removed.text
+        )
     }
 
     /// The stable id of a relay turn's assistant row, derived from the turn's
@@ -3046,6 +3126,15 @@ final class ChatStore {
         )
         userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
         messages.append(userMessage)
+        // QA-3 S6/A2: the outbox echo is the user's ONLY record of a queued
+        // prompt (its turn may not run for a while — the relay HOLDS the row
+        // while the destination session is mid-turn) — make it durable across
+        // a session switch / store rebuild exactly like the immediate-path
+        // echo. The durable outbox ROW survives regardless; this keeps the
+        // PROMPT rendered until the relay `userMessage` adoption reconciles.
+        sessions?.persistDurableEcho(
+            storedId: sessions?.activeStoredId, echo: userMessage
+        )
     }
 
     /// Build the local echo text for a just-sent user row after mobile has already
@@ -4916,15 +5005,44 @@ final class ChatStore {
     private func adoptRelayEcho(
         for item: ChatItem, consuming: inout Set<UUID>
     ) -> RelayEchoAdoption? {
-        if let adopted = relayEchoAdoptions[item.itemID] { return adopted }
-        let itemCMID = item.body["client_message_id"]?.stringValue
-        func matches(_ message: ChatMessage) -> Bool {
-            guard message.role == .user, !message.relayProjected,
-                  !consuming.contains(message.id) else { return false }
-            if let itemCMID { return message.clientMessageID == itemCMID }
-            return message.clientMessageID == nil && message.text == item.textBody
+        if let adopted = relayEchoAdoptions[item.itemID] {
+            // QA-3 S4: the sticky contract assumed the echo row was gone from
+            // `messages` after the pass that first adopted it — true until the
+            // R15 union backfill FOLDED the gateway wire row onto the echo's
+            // slot as an UNTAGGED row, resurrecting an unconsumed twin. Re-mark
+            // it consumed on EVERY pass so the twin (and its assistant run, in
+            // `applyRelayItems`) never survives beside the rebuilt copy — the
+            // second half of the IMG_2579 orphan-answer duplication.
+            consuming.insert(adopted.id)
+            return adopted
         }
-        guard let echo = messages.first(where: matches) else { return nil }
+        let itemCMID = item.body["client_message_id"]?.stringValue
+        // QA-3 S6/A2: a cmid-carrying item matches its echo by cmid FIRST
+        // (deterministic, so identical texts never collapse), then falls back
+        // to an exact-text match on a cmid-LESS row — the GRDB cache paint of
+        // the gateway's persisted prompt carries NO client_message_id
+        // (`toChatMessages` maps none), so when the in-memory echo was lost
+        // (a session switch / store rebuild before this item re-landed — S6's
+        // prompt-vanish), the cache-painted twin still adopts and the prompt
+        // renders ONCE, in place, instead of beside a relay-id duplicate.
+        // The cmid pass scans the WHOLE transcript before any text match so a
+        // same-text cache row sitting ABOVE the real echo never wins the
+        // adoption (two sends of identical text must pair one-to-one).
+        func eligible(_ message: ChatMessage) -> Bool {
+            message.role == .user && !message.relayProjected && !consuming.contains(message.id)
+        }
+        let echo: ChatMessage?
+        if let itemCMID,
+           let cmidMatch = messages.first(where: {
+               eligible($0) && $0.clientMessageID == itemCMID
+           }) {
+            echo = cmidMatch
+        } else {
+            echo = messages.first(where: {
+                eligible($0) && $0.clientMessageID == nil && $0.text == item.textBody
+            })
+        }
+        guard let echo else { return nil }
         let adoption = RelayEchoAdoption(
             id: echo.id,
             clientMessageID: echo.clientMessageID,
@@ -4932,6 +5050,16 @@ final class ChatStore {
         )
         relayEchoAdoptions[item.itemID] = adoption
         consuming.insert(echo.id)
+        // QA-3 S6/A2: the durable echo (the session-keyed warm snapshot the
+        // send write-through persists so a switch-and-back repaints it) is
+        // now reconciled — purge it so a later repaint never re-presents a
+        // second bubble beside the adopted row. The projection targets the
+        // active session (the coordinator parks it on drafts — S11).
+        sessions?.markEchoReconciled(
+            storedId: sessions?.activeStoredId,
+            clientMessageID: adoption.clientMessageID,
+            text: echo.text
+        )
         return adoption
     }
 
@@ -4973,7 +5101,11 @@ final class ChatStore {
         items.contains { $0.type == .error && $0.status == .failed }
     }
 
-    func applyRelayItems(_ items: [ChatItem], turnSettled: Bool = false) {
+    func applyRelayItems(
+        _ items: [ChatItem],
+        turnSettled: Bool = false,
+        serverTurnDuration: TimeInterval? = nil
+    ) {
         // `turnSettled` (QA-2 R4/A2): the coordinator passes `true` when the frame
         // that drove this projection is `turn.completed` — the authoritative
         // turn-end the turn-scoped `relayTurnLive` flag clears on. Without it the
@@ -4982,16 +5114,43 @@ final class ChatStore {
         // (the build-115 bug). Item terminality still drives the PER-ROW
         // `isStreaming` (the caret leaves a finished bubble); the STORE-level flag
         // is turn-scoped.
-        if turnSettled { relayTurnLive = false }
-        // QA-2 R12 — a live frame batch proves the turn is still progressing;
-        // stamp the wall clock and re-arm the local-turn watchdog so a busy
-        // turn (long tool, slow stream) never falsely fires the force-settle.
+        //
+        // `serverTurnDuration` (QA-3 S2/A1): the relay's authoritative turn
+        // wall-clock (`turn.completed` body `duration_s`, reframer-measured from
+        // the turn open). The per-turn timer STARTS LOCALLY at send
+        // (`turnStartedAt`) — the affordance renders ≤100 ms from send, never
+        // gated on a frame — and RECONCILES to this server value on settle, so
+        // the "Worked for Ns" label reads the turn's true duration even when the
+        // phone's local start is skewed (queued-drain re-send) or absent (a
+        // mid-turn resume this phone did not send — those now stamp the settled
+        // duration from the server with NO local start at all).
+        if turnSettled {
+            relayTurnLive = false
+            resetTurnLivenessState()   // QA-3 S8/A4: the turn settled — its liveness state dies with it
+        }
+        // QA-2 R12 — a live frame batch proves SOMETHING is progressing; stamp
+        // the wall clock (observability). QA-3 S8/A4: the liveness watchdog is
+        // NO LONGER re-armed here — it is per-TURN now, refreshed only by
+        // CURRENT-turn frames via `noteTurnLivenessFrame(isCurrentTurn:)` from
+        // the coordinator's ingest (re-arming on ANY batch was the re-arm-by-
+        // other-turn bug that kept IMG_2591's dead turn "working" forever).
         lastRelayItemFrameAt = Date()
-        if isStreaming { armLocalTurnWatchdog() }
+        // QA-3 S8/A4 — PRIOR-TURN LIVENESS: the last `userMessage` item bounds
+        // the CURRENT turn (the relay allocates its ord at SUBMIT, before any
+        // of that turn's agent items, so render order is strictly
+        // [U1,A1…][U2,A2…]). A still-`.inProgress` item BEFORE that boundary
+        // belongs to a turn a NEWER turn already superseded — it can never
+        // legitimately complete now, so settle it deterministically (muted
+        // "Interrupted" fold) instead of rendering "Working…" forever.
+        // Stateless + idempotent: every projection self-heals, and any late
+        // authoritative frame (item.completed / snapshot) replaces the item by
+        // id and restores the honest state.
+        let lastUserMessageIndex = items.lastIndex { $0.type == .userMessage }
         var rebuilt: [ChatMessage] = []
         var segmentParts: [ChatMessagePart] = []
         var segmentAnchor: String?
         var segmentStreaming = false
+        var segmentInterrupted = false
         // Echo rows adopted by a `userMessage` item THIS pass — consumed out
         // of the preserved history so the reconcile replaces the echo in place
         // instead of projecting a second bubble beside it.
@@ -5002,6 +5161,7 @@ final class ChatStore {
                 segmentParts = []
                 segmentAnchor = nil
                 segmentStreaming = false
+                segmentInterrupted = false
                 return
             }
             rebuilt.append(ChatMessage(
@@ -5009,14 +5169,16 @@ final class ChatStore {
                 role: .assistant,
                 parts: segmentParts,
                 isStreaming: segmentStreaming,
+                interrupted: segmentInterrupted && !segmentStreaming,
                 relayProjected: true
             ))
             segmentParts = []
             segmentAnchor = nil
             segmentStreaming = false
+            segmentInterrupted = false
         }
 
-        for item in items {
+        for (index, item) in items.enumerated() {
             if item.type == .userMessage {
                 flushSegment()
                 let adoption = adoptRelayEcho(for: item, consuming: &consumedEchoIDs)
@@ -5033,7 +5195,17 @@ final class ChatStore {
             } else if let part = item.renderPart {
                 if segmentAnchor == nil { segmentAnchor = item.itemID }
                 segmentParts.append(part)
-                if !item.isTerminal { segmentStreaming = true }
+                if !item.isTerminal {
+                    if let lastUserMessageIndex, index < lastUserMessageIndex {
+                        // A prior turn's stuck item — settled, muted (A4).
+                        segmentInterrupted = true
+                    } else {
+                        segmentStreaming = true
+                    }
+                } else if item.locallyInterrupted {
+                    // The watchdog's stage-2 settle marked this item terminal.
+                    segmentInterrupted = true
+                }
             }
         }
         flushSegment()
@@ -5058,6 +5230,7 @@ final class ChatStore {
                     role: .assistant,
                     parts: seg.parts,
                     isStreaming: seg.isStreaming,
+                    interrupted: seg.interrupted,
                     reasoningElapsed: seg.reasoningElapsed,
                     timestamp: seg.timestamp,
                     relayProjected: true
@@ -5151,8 +5324,16 @@ final class ChatStore {
             // below) survives later turns' re-projections. Relay items carry no
             // timestamps; build 115 settled relay rows read a bare "Worked"
             // (IMG_2532). Mirrors the direct path's completion-time stamp.
-            if let started = turnStartedAt {
-                let elapsed = Date().timeIntervalSince(started)
+            //
+            // QA-3 S2/A1 — SERVER RECONCILIATION: the authoritative duration is
+            // the relay's `turn.completed` `duration_s` when it carries one;
+            // the local `turnStartedAt` measurement is the fallback (and the
+            // LIVE timer's source while the turn runs). Server-wins means a
+            // mid-turn resume (no local start) still stamps an honest settled
+            // duration.
+            let elapsed = serverTurnDuration
+                ?? turnStartedAt.map { Date().timeIntervalSince($0) }
+            if let elapsed {
                 // The settled row is THIS turn's assistant row — the last
                 // assistant AFTER the last user row (a turn that settled with
                 // zero agent items must not re-stamp the previous turn's row).
@@ -5192,8 +5373,57 @@ final class ChatStore {
         // minus any echo rows a userMessage item adopted this pass (they
         // re-enter tagged, in place). History + live turn coexist; scrollback
         // stays intact during and after streaming.
+        //
+        // QA-3 S4/A2 — CONSUME CACHE-PAINTED ASSISTANT TWINS: adoption only
+        // consumes USER rows (`adoptRelayEcho`), but a reconnect resync /
+        // mid-turn open delivers a snapshot of ALL accumulated items, so the
+        // rebuilt tail re-projects EVERY turn the session ever ran — including
+        // turns the GRDB cache / network seed already painted UNTAGGED. With
+        // only the user twins consumed, the preserved history still held every
+        // cache-painted ANSWER `[A1…An]` above a rebuilt `[U1',A1'…Un',An']`
+        // tail: each answer rendered TWICE, and the orphan cache copy sat
+        // ABOVE the rebuilt user rows — the answer visibly preceding the
+        // prompt that asked it (IMG_2579-2582: the same exchange in two
+        // orders at two scroll positions of one view; switching away "fixed"
+        // it because the cache paint alone is ordered). The rebuilt copy is
+        // AUTHORITATIVE (the relay item store is the live truth), so for each
+        // user row a `userMessage` item adopted/consumed this pass, consume
+        // the untagged assistant run that FOLLOWS it in the current
+        // transcript — its settled cache-painted answer for that same turn.
+        // Guarded on the rebuilt turn actually CARRYING an assistant segment:
+        // a snapshot with the prompt's `userMessage` but no agent items yet
+        // (a turn that errored pre-item, or a snapshot raced by its first
+        // item) must not evaporate the cache answer before the relay copy
+        // exists. Turns the item store does not carry at all (prompt sent by
+        // another client) keep every preserved row — untouched.
+        var consumedHistoryIDs = consumedEchoIDs
+        // Rebuilt user rows whose turn carries an assistant segment. Adopted
+        // user rows re-enter under the echo's id (== the consumed id), so the
+        // rebuilt row id and the consumed id are the same key.
+        var rebuiltHasAssistantAfter: [UUID: Bool] = [:]
+        var rebuiltCurrentUser: UUID?
+        for row in rebuilt {
+            if row.role == .user {
+                rebuiltCurrentUser = row.id
+                rebuiltHasAssistantAfter[row.id] = false
+            } else if row.role == .assistant, let userRowID = rebuiltCurrentUser {
+                rebuiltHasAssistantAfter[userRowID] = true
+            }
+        }
+        var inTwinRun = false
+        for message in messages {
+            if message.role == .user {
+                // A consumed user row starts its twin run only when the
+                // rebuilt turn carries the authoritative answer copy.
+                inTwinRun = !message.relayProjected
+                    && consumedEchoIDs.contains(message.id)
+                    && rebuiltHasAssistantAfter[message.id] == true
+            } else if inTwinRun, !message.relayProjected {
+                consumedHistoryIDs.insert(message.id)
+            }
+        }
         let preserved = messages.filter {
-            !$0.relayProjected && !consumedEchoIDs.contains($0.id)
+            !$0.relayProjected && !consumedHistoryIDs.contains($0.id)
         }
         messages = preserved + rebuilt
         setStreaming(nowStreaming, reason: "relayProjection")
@@ -5259,6 +5489,7 @@ final class ChatStore {
         // session's rows; drop them with it.
         relayTurnLive = false
         relaySettledElapsed = [:]
+        resetTurnLivenessState()   // QA-3 S8/A4: the torn-down turn's liveness state dies with it
         setStreaming(false, reason: "cancelStreaming")
         mirroringRuntimeId = nil
         streamingIsForeign = false
@@ -5327,18 +5558,44 @@ final class ChatStore {
 
     // MARK: - QA-2 R12 local-turn watchdog (stop-state wedge kill)
 
-    /// (Re)arm the local-turn staleness watchdog. Called on every `isStreaming`
-    /// false→true transition. If no relay item batch lands within
-    /// ``localTurnStaleTimeout`` the turn is force-settled so the stop button,
-    /// the dock task pill and the Live Activity can never wedge when the
-    /// terminal frame is missed/dropped (owner device-QA: "no force-close ever
-    /// needed to regain control").
+    /// QA-3 S8/A4 — a CURRENT-turn frame just landed (the coordinator's ingest
+    /// classifies each frame — frames of a SUPERSEDED turn never call this with
+    /// `true`, so a dead prior turn's late frames cannot refresh the clock, and
+    /// a dead current turn's silence is never masked by another turn's traffic
+    /// — the IMG_2591 re-arm-by-other-turn bug). Refresh the silence baseline
+    /// and re-arm the two-stage watchdog.
+    func noteTurnLivenessFrame(isCurrentTurn: Bool) {
+        guard isCurrentTurn else { return }
+        turnLivenessBaseline = ContinuousClock.now
+        if isStreaming { armLocalTurnWatchdog() }
+    }
+
+    /// (Re)arm the per-turn liveness watchdog (QA-3 S8/A4; QA-2 R12's wedge
+    /// kill, reworked per-turn). Armed on every `isStreaming` false→true
+    /// transition and on every CURRENT-turn frame. Evaluates in
+    /// ``turnLivenessTick`` chunks off ``turnLivenessBaseline`` (so a frame
+    /// landing mid-sleep defers the stages instead of firing late):
+    ///   stage 1 at ``turnLivenessResyncAfter`` of silence — one SILENT
+    ///     `resync{last_seq}` (self-heals a dropped terminal frame);
+    ///   stage 2 at ``localTurnStaleTimeout`` of silence — the turn is dead:
+    ///     settle it locally (muted "Interrupted"), never an error banner.
     private func armLocalTurnWatchdog() {
         cancelLocalTurnWatchdog()
+        if turnLivenessBaseline == nil { turnLivenessBaseline = ContinuousClock.now }
         localTurnWatchdog = Task { [weak self] in
-            try? await Task.sleep(for: ChatStore.localTurnStaleTimeout)
-            guard let self, !Task.isCancelled, self.isStreaming else { return }
-            self.fireLocalTurnWatchdog()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: ChatStore.turnLivenessTick)
+                guard let self, !Task.isCancelled else { return }
+                guard self.isStreaming else { return }
+                let idle = self.turnLivenessBaseline.map { $0.duration(to: ContinuousClock.now) } ?? .zero
+                if idle >= ChatStore.localTurnStaleTimeout {
+                    self.fireTurnLivenessSettle()
+                    return
+                }
+                if idle >= ChatStore.turnLivenessResyncAfter, !self.turnLivenessResyncFired {
+                    self.fireTurnLivenessResync()
+                }
+            }
         }
     }
 
@@ -5347,26 +5604,62 @@ final class ChatStore {
         localTurnWatchdog = nil
     }
 
-    /// The local turn went silent past the staleness window with no terminal
-    /// frame: force-settle the streaming state so the composer's stop button
-    /// releases, the dock task pill clears, and the Live Activity ends. This is
-    /// the safety net — the normal `turn.completed` / `message.complete` /
-    /// interrupt path settles via `setStreaming(false)` first; this only fires
-    /// when none of those landed in time.
-    private func fireLocalTurnWatchdog() {
+    /// QA-3 S8/A4 stage 1 — the current turn went silent past
+    /// ``turnLivenessResyncAfter``: ask the relay for a `resync{last_seq}`
+    /// replay (a snapshot when the gap exceeds the ring). SILENT and
+    /// idempotent — a dropped `item.completed` / `turn.completed` heals here
+    /// and the turn settles naturally; the user sees nothing (C3). Latched:
+    /// fires at most once per turn (reset on turn start / settle).
+    private func fireTurnLivenessResync() {
+        guard isStreaming, !turnLivenessResyncFired else { return }
+        turnLivenessResyncFired = true
+        #if DEBUG
+        turnLivenessResyncCount += 1
+        #endif
+        chatLog.warning("turn-liveness stage 1: current turn silent past the resync window — requesting a SILENT resync{last_seq} to recover dropped frames (self-healing, never surfaced — C3)")
+        guard connection?.transportPath == .relay,
+              let coordinator = connection?.relayCoordinator else { return }
+        Task { await coordinator.requestLivenessResync() }
+    }
+
+    /// QA-3 S8/A4 stage 2 — the current turn went silent past
+    /// ``localTurnStaleTimeout`` with no completion even after the stage-1
+    /// resync: the turn is DEAD (gateway turn died / submit never ran / the
+    /// authority has nothing more). Settle it: the coordinator locally
+    /// terminals the stuck items (muted "Interrupted" fold — C3, never an
+    /// error banner) and the live flag clears, so eternal double-working is
+    /// unreachable. Mirrors `handleMessageComplete`'s chrome teardown + fires
+    /// `onTurnComplete` so the Live Activity ends in parity with a real
+    /// completion (R16 depends on this edge). The normal `turn.completed` /
+    /// `message.complete` / interrupt paths settle via `setStreaming(false)`
+    /// first; this fires only when none of those landed in time.
+    private func fireTurnLivenessSettle() {
         guard isStreaming else { return }
-        chatLog.warning("local-turn watchdog fired: turn went silent past the staleness window with no terminal frame — force-settling so the stop state and dock pill cannot wedge")
-        // Mirror handleMessageComplete's settle: clear the streaming bubble's
-        // own flag (stops the cursor), clear turn chrome, drop streaming, and
-        // fire onTurnComplete so the Live Activity ends in parity with a real
-        // completion (R16 also depends on this edge firing).
-        mutateStreaming { $0.isStreaming = false }
-        streamingMessageID = nil
+        chatLog.warning("turn-liveness stage 2: turn silent past the settle window with no completion even after the silent resync — settling as INTERRUPTED so eternal double-working is impossible (C3: no error surface)")
+        if connection?.transportPath == .relay, let coordinator = connection?.relayCoordinator {
+            // Locally settle the dead turn's stuck items; the re-projection
+            // folds them as muted "Interrupted" rows and clears the turn-scoped
+            // live flag.
+            coordinator.settleStaleTurnLocally()
+        }
+        // Belt and braces (direct path, or a projection that still reads
+        // streaming): force the settle exactly like the QA-2 wedge kill did.
+        if isStreaming {
+            mutateStreaming { $0.isStreaming = false }
+            streamingMessageID = nil
+            setStreaming(false, reason: "turnLivenessSettle")
+        }
         turnStartedAt = nil
         activeToolName = nil
         activeToolCallId = nil
-        setStreaming(false, reason: "localTurnWatchdog")
+        resetTurnLivenessState()
         onTurnComplete?()
+    }
+
+    /// Reset the per-turn liveness state (turn start / every settle path).
+    private func resetTurnLivenessState() {
+        turnLivenessResyncFired = false
+        turnLivenessBaseline = nil
     }
 
     /// QA-2 R12 — relay turn end. Called by `RelaySessionCoordinator.ingest` on
@@ -5405,15 +5698,24 @@ final class ChatStore {
     }
 
     #if DEBUG
-    /// DEBUG test seam: drive the local-turn watchdog's force-settle path
+    /// DEBUG test seam: drive the liveness watchdog's stage-2 SETTLE path
     /// synchronously without waiting ``localTurnStaleTimeout``. Production code
-    /// never calls this — the watchdog's `Task.sleep` is the only legit trigger.
+    /// never calls this — the watchdog's tick loop is the only legit trigger.
     /// Lets the regression test prove a missed-frame turn releases `isStreaming`
-    /// and the dock pill without a force-close (A6/R12).
+    /// and the dock pill without a force-close (A6/R12, QA-3 A4).
     @discardableResult
     func _debugFireLocalTurnWatchdog() -> Bool {
         guard isStreaming else { return false }
-        fireLocalTurnWatchdog()
+        fireTurnLivenessSettle()
+        return true
+    }
+
+    /// DEBUG test seam: drive the liveness watchdog's stage-1 SILENT RESYNC
+    /// synchronously without waiting ``turnLivenessResyncAfter`` (QA-3 A4).
+    @discardableResult
+    func _debugFireTurnLivenessResync() -> Bool {
+        guard isStreaming else { return false }
+        fireTurnLivenessResync()
         return true
     }
     #endif

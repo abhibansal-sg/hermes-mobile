@@ -409,7 +409,12 @@ final class PushRegistrar {
             baseURL: endpoint.url,
             token: endpoint.token,
             pathStyle: endpoint.pathStyle,
-            deviceID: DefaultsKeys.deviceId(server: connection.serverURLString)
+            // QA-3 S13: always send a device id so the relay registry's
+            // device-keyed dedup converges. The v2 issued id wins when present;
+            // otherwise the per-install fallback (identifierForVendor-stable)
+            // keys the registration from day one instead of writing a null-id
+            // row that QA-2's eviction can never reach.
+            deviceID: DefaultsKeys.pushRegistrationDeviceId(server: connection.serverURLString)
         )
     }
 
@@ -436,9 +441,14 @@ final class PushRegistrar {
                 return .hardFail
             }
             do {
-                // QA-2 R1c: the stable per-install device id lets the relay
-                // registry keep ONE entry per device (rotated tokens replace).
-                let deviceID = DefaultsKeys.deviceId(server: connection.serverURLString)
+                // QA-2 R1c + QA-3 S13: the stable device id lets the relay
+                // registry keep ONE entry per device (rotated tokens replace,
+                // null-id legacy rows evict). The v2 issued id wins when
+                // present; otherwise the per-install fallback keys the row so
+                // build 117 never writes the null-id entry that broke fan-out.
+                let deviceID = DefaultsKeys.pushRegistrationDeviceId(
+                    server: connection.serverURLString
+                )
                 _ = try await coordinator.registerPushToken(
                     token, env: PushTokenPoster.apnsEnvironment, events: events,
                     deviceID: deviceID

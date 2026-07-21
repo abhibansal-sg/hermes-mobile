@@ -10,7 +10,7 @@ settings:
     SWIFT_STRICT_CONCURRENCY: complete
     DEVELOPMENT_TEAM: 6J4Y9NKRQ2
     CODE_SIGN_STYLE: Automatic
-    CURRENT_PROJECT_VERSION: 116
+    CURRENT_PROJECT_VERSION: 117
     MARKETING_VERSION: 1.0.1
 packages:
   # Offline-first cache plus the protected app-group WorkRepository. The share
@@ -198,6 +198,26 @@ targets:
       # QA-2 R5/R6/A3 live-fold fixture (reasoning + raw-name tool turn);
       # hand-authored to the recorded wire format (see its recorded_by note).
       - path: ../../tests/render_conformance/fixtures/render_live_fold.json
+        buildPhase: resources
+      # QA-3 round-3 incident fixtures (S2/S4/S6/S8/S11), recorded by the E2E
+      # harness's phone driver with the additive t_ms/script/extra_sessions
+      # extensions (backward-compatible with the QA-1/QA-2 format). Consumed
+      # by the renderjury lane's S2/A1 tests now and by the ordering
+      # (S4/S6), liveness (S8) and S11 lanes' replays.
+      - path: ../../tests/render_conformance/fixtures/render_qa3_delayed_start.json
+        buildPhase: resources
+      - path: ../../tests/render_conformance/fixtures/render_qa3_reconnect_reorder.json
+        buildPhase: resources
+      - path: ../../tests/render_conformance/fixtures/render_qa3_session_switch.json
+        buildPhase: resources
+      - path: ../../tests/render_conformance/fixtures/render_qa3_dead_turn.json
+        buildPhase: resources
+      - path: ../../tests/render_conformance/fixtures/render_qa3_draft_interleave.json
+        buildPhase: resources
+      # QA-3 S8/A4 liveness fixture (dead turn 1 + live turn 2 — the IMG_2591
+      # eternal double-working set piece); hand-authored from the forensics
+      # chronology to the recorded wire format (see its recorded_by note).
+      - path: ../../tests/render_conformance/fixtures/render_dead_turn_liveness.json
         buildPhase: resources
     dependencies:
       - target: HermesMobile

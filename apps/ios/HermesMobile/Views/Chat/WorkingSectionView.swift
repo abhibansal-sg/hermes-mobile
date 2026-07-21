@@ -12,15 +12,24 @@ import SwiftUI
 //     opens the "Thinking" SHEET (timeline rail + bold titles + reasoning text +
 //     embedded command/output code cards). If any tool failed the row carries a
 //     red failure badge so the failure is never hidden behind the fold (§2).
-//   - LIVE (streaming) — RATIFIED Wave-2.5 single-line rule (QA-2 R5/R6/A3):
-//     ONE collapsed line — "Working… ‹per-TURN timer›" with the current tool
-//     inline once it resolves a friendly name — tap to expand the bifurcation
-//     (thinking + tool timeline, the same step list the settled fold shows).
-//     Nothing streams inline while live: no per-reasoning-run accordions (their
-//     per-item 1 s timers and label+body double-print were R5/N4/N6), no
-//     separate current-tool row, no reserved 172 pt thinking window (the R6
-//     bands). The streaming caret in the answer bubble is THE progress signal;
-//     the timer is per-TURN (from `ChatStore.turnStartedAt`), never per item.
+//   - LIVE (streaming) — RATIFIED Wave-2.5 single-line rule (QA-2 R5/R6/A3),
+//     reworked to the QA-3 S2/S3/A1 MERGED CURSOR LINE: ONE chrome-less line
+//     that IS the streaming caret — "▌ (softly breathing) Working… · ‹current
+//     tool› ‹per-TURN timer› ›" — tap to expand the bifurcation (thinking +
+//     tool timeline, the same step list the settled fold shows). The breathing
+//     cursor is the leading glyph of this very line (no spinner — the QA-2
+//     `ProgressView` + a SECOND standalone caret stacked beneath it was the
+//     S3 double-affordance), and `MessageBubble` renders this line with ZERO
+//     parts from SEND — the affordance appears on local send state ≤100 ms
+//     (S2), never gated on the first relay item; item arrival only updates the
+//     status text. Once the answer text streams, the glyph hands the pulse to
+//     the prose-tail `StreamingCursor` (exactly one glyph breathes at any
+//     instant) while the line keeps status + timer. Nothing streams inline
+//     while live: no per-reasoning-run accordions (their per-item 1 s timers
+//     and label+body double-print were R5/N4/N6), no separate current-tool
+//     row, no reserved 172 pt thinking window (the R6 bands). The timer is
+//     per-TURN (from `ChatStore.turnStartedAt`, stamped locally at send and
+//     reconciled to the relay's `turn.completed` duration), never per item.
 //
 // SINGLE-FOLD CONTRACT (owner QA, 2026-07-19): within ONE agent turn, EVERYTHING
 // before the final answer text — reasoning segments, tool calls (BOTH the new
@@ -31,6 +40,70 @@ import SwiftUI
 // the item-layer path — the owner sees old sessions daily and the old anatomy
 // (repeating italic "Thinking ›" rows + boxed tool cards alternating with interim
 // prose) is exactly what this collapses.
+
+// MARK: - Breathing cursor (approved StreamingCursor spec, QA-3 S1/S2/S3)
+
+/// The soft opacity breathe behind the streaming cursor glyph — the approved
+/// StreamingCursor spec: theme-bound, a soft 1.0 → 0.25 opacity breathing at a
+/// 1.2 s period (0.6 s ease each direction, the cosine curve's shape matching
+/// the former `easeInOut(0.6).repeatForever(autoreverses)`).
+///
+/// QA-3 S1: the pulse is a PURE FUNCTION OF WALL-CLOCK TIME, not a `@State`
+/// kicked by `onAppear` + `withAnimation(.repeatForever)`. That old pattern
+/// stranded the cursor STATIC whenever the row remounted mid-turn (the
+/// optimistic caret bubble is re-derived on every `applyRelayItems` pass, and
+/// an animation-nil transaction or a view-identity change resets `@State`
+/// without re-firing `onAppear`) — the motionless blue bar the owner
+/// photographed (IMG_2577/2585/2587). A time-driven pulse has no state to
+/// strand: any remount renders the correct phase for "now" and keeps
+/// breathing. Deterministic + unit-testable (every value pinned by
+/// `RenderConformanceTests.testCursorBreathe_*`).
+enum CursorBreathe {
+    /// Full breathe period (0.6 s dim-down + 0.6 s brighten-up, autoreverse
+    /// parity with the ratified spec).
+    nonisolated static let period: TimeInterval = 1.2
+    /// The dim trough of the breathe (1.0 peak → 0.25 trough).
+    nonisolated static let minOpacity: Double = 0.25
+
+    /// Glyph opacity at an instant. Settled (`streaming == false`) or Reduce
+    /// Motion reads a steady full-opacity glyph — honest presence, no pulse.
+    nonisolated static func opacity(
+        at date: Date,
+        streaming: Bool = true,
+        reduceMotion: Bool = false
+    ) -> Double {
+        guard streaming, !reduceMotion else { return 1.0 }
+        let t = date.timeIntervalSinceReferenceDate
+        let phase = t.truncatingRemainder(dividingBy: period) / period   // 0 ..< 1
+        // Cosine ease: 0 at phase 0 (peak), 1 at phase 0.5 (trough), back to 0
+        // at phase 1 — the smooth easeInOut-ish autoreverse shape.
+        let eased = (1 - cos(2 * .pi * phase)) / 2
+        return 1.0 - (1.0 - minOpacity) * eased
+    }
+}
+
+/// The breathing ▌ glyph as a standalone live-working element (the prose-tail
+/// `StreamingCursor` in MessageBubble shares `CursorBreathe`). Stateless — the
+/// caller supplies the clock `date` (a `TimelineView` context) so one timeline
+/// drives the whole working line (glyph + per-turn timer) at once.
+struct BreathingCursorGlyph: View {
+    /// The frame date from the enclosing `TimelineView` — the pulse phase.
+    var date: Date
+    /// Whether the owning turn is streaming (settled ⇒ steady glyph).
+    var streaming: Bool = true
+
+    @Environment(\.hermesTheme) private var theme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Text("▌")
+            .foregroundColor(theme.midground)
+            .opacity(CursorBreathe.opacity(at: date,
+                                           streaming: streaming,
+                                           reduceMotion: reduceMotion))
+            .accessibilityHidden(true)
+    }
+}
 
 // MARK: - Grouping + summary model (pure, deterministically testable)
 
@@ -113,6 +186,33 @@ enum WorkingSectionModel {
     /// (no work to fold).
     nonisolated static func lastWorkIndex(in parts: [ChatMessagePart]) -> Int? {
         parts.lastIndex(where: isWorkingEligible)
+    }
+
+    /// QA-3 S2/S3/A1 — the SINGLE-AFFORDANCE decision for the caret slot. The
+    /// ratified design: ONE working surface — the breathing cursor line (glyph
+    /// + inline status + per-turn timer). While the turn is live and the answer
+    /// text has not started:
+    ///  • NO work part yet (the optimistic send-time bubble has zero parts —
+    ///    nothing folds): the caret slot renders the MERGED working line itself
+    ///    → `true`. This is the S2 fix — the labeled, timed affordance exists
+    ///    from SEND, driven by local state, never gated on the first relay item
+    ///    frame (build 116 showed a bare textless cursor there until the model's
+    ///    first item, ~35 s later in IMG_2578).
+    ///  • work parts present (a fold exists): `false` — the fold's own live
+    ///    line IS the cursor line now (its spinner replaced by the breathing
+    ///    glyph); a separate standalone cursor beside it was the S3 dual-
+    ///    affordance bug (IMG_2578/2587/2591).
+    ///  • answer text present: `false` — the caret rides the prose tail.
+    /// Settled turns: always `false`. Pure + `nonisolated static` so the render
+    /// gate pins the rule directly (the same seam pattern as
+    /// `ChatView.shouldShowInlineTurnActivity`).
+    nonisolated static func preItemWorkingLineVisible(
+        parts: [ChatMessagePart],
+        streamingLive: Bool
+    ) -> Bool {
+        guard streamingLive else { return false }
+        guard parts.lastTextPartID == nil else { return false }
+        return lastWorkIndex(in: parts) == nil
     }
 
     /// Coalesce the assistant's ordered `parts` into render nodes under the
@@ -286,13 +386,25 @@ enum WorkingSectionModel {
         return "Worked for \(total / 60)m \(total % 60)s"
     }
 
+    /// QA-3 S8/A4 — the settled fold label for a turn the LIVENESS fallback
+    /// ended instead of a real completion: a dead turn (no frames + no
+    /// completion past the liveness window) whose stuck items were
+    /// force-settled — a prior turn a newer turn superseded (IMG_2591's
+    /// eternal double-working), or the watchdog's silent resync recovered
+    /// nothing. Muted "Interrupted" — HONEST, and never an error banner (C3).
+    /// No duration: a dead turn has no honest end-to-end time.
+    nonisolated static func settledLabel(seconds: TimeInterval?, interrupted: Bool) -> String {
+        interrupted ? "Interrupted" : workedLabel(seconds: seconds)
+    }
+
     /// VoiceOver label for the collapsed capsule: the worked label plus an
     /// explicit failure clause when the section hid a failed step.
     nonisolated static func summaryAccessibilityLabel(
         seconds: TimeInterval?,
-        hasFailure: Bool
+        hasFailure: Bool,
+        interrupted: Bool = false
     ) -> String {
-        let base = workedLabel(seconds: seconds)
+        let base = settledLabel(seconds: seconds, interrupted: interrupted)
         return hasFailure ? "\(base), contains a failed step" : base
     }
 
@@ -579,15 +691,21 @@ struct WorkingSectionView: View {
     var liveTurnStartedAt: Date?
     /// Settled turn duration stamped on the message, for the "Worked for N" label.
     var settledDuration: TimeInterval?
+    /// QA-3 S2/S3/A1: whether the live line LEADS with the breathing cursor
+    /// glyph — i.e. whether this line currently owns "the" working pulse. True
+    /// while no answer text flows (the pre-text window: the line IS the caret);
+    /// false once the answer streams, when the prose-tail `StreamingCursor`
+    /// owns the pulse and this line keeps the status + timer only. Exactly one
+    /// glyph breathes at any instant — never two stacked affordances (S3).
+    var showsCursorGlyph: Bool = true
+
+    /// QA-3 S8/A4 — the turn ended via the LIVENESS fallback (dead turn
+    /// force-settled), not a real completion: the settled fold reads a muted
+    /// "Interrupted" instead of "Worked" (honest, never an error banner — C3).
+    var interrupted: Bool = false
 
     @Environment(\.hermesTheme) private var theme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    /// Per-TURN timer tick for the live collapsed line (QA-2 R5: the timer is
-    /// per-turn, never per-item). Same 1 s cadence the settled label derives
-    /// from; `monospacedDigit` keeps the row from jittering as it counts.
-    private static let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-    @State private var now = Date()
 
     /// Manual expansion of the folded step list. Settled AND live sections
     /// start collapsed (QA-2 R5/A3: a live turn is ONE line until the user
@@ -640,7 +758,9 @@ struct WorkingSectionView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(
-            WorkingSectionModel.summaryAccessibilityLabel(seconds: durationSeconds, hasFailure: hasFailure)
+            WorkingSectionModel.summaryAccessibilityLabel(
+                seconds: durationSeconds, hasFailure: hasFailure, interrupted: interrupted
+            )
         )
         .accessibilityValue(isExpanded ? "expanded" : "collapsed")
         .accessibilityHint("Double-tap to \(isExpanded ? "collapse" : "expand") what the assistant did")
@@ -657,7 +777,7 @@ struct WorkingSectionView: View {
     /// chevron. No box, border, gradient, or capsule (approved design §1).
     private var workedLabelRow: some View {
         HStack(spacing: 6) {
-            Text(WorkingSectionModel.workedLabel(seconds: durationSeconds))
+            Text(WorkingSectionModel.settledLabel(seconds: durationSeconds, interrupted: interrupted))
                 .font(.callout)
                 .foregroundStyle(theme.mutedFg)
                 .monospacedDigit()
@@ -707,32 +827,54 @@ struct WorkingSectionView: View {
         .contentShape(Rectangle())
     }
 
-    // MARK: - Live: ONE collapsed working line (ratified Wave-2.5, QA-2 R5/R6)
+    // MARK: - Live: ONE merged breathing-cursor working line (QA-3 S2/S3/A1)
 
-    /// The ratified live-turn presentation: a SINGLE chrome-less line —
-    /// "Working… · ‹current tool› ‹per-TURN timer› ›" — tap to expand the
-    /// bifurcation (thinking + tool timeline). NOTHING streams inline: the old
-    /// per-reasoning-run `ThinkingView` accordions (per-item 1 s timers, label
-    /// + body double-print — R5/N4/N6), the separate current-tool row, and the
-    /// fixed 172 pt thinking window (the R6 whitespace bands) are gone. The
-    /// streaming caret in the answer bubble remains THE progress signal
-    /// (Wave-2.5 "no fat working pill; the caret is the working signal").
+    /// The ratified live-turn presentation, reworked for QA-3 S2/S3/A1: a
+    /// SINGLE chrome-less line that IS the streaming cursor —
+    /// "▌ (breathing) Working… · ‹current tool› ‹per-TURN timer› ›" — tap to
+    /// expand the bifurcation (thinking + tool timeline). The QA-2 live line
+    /// led with a `ProgressView` spinner and a SECOND affordance — the bare
+    /// standalone caret — stacked beneath it (IMG_2578/2587/2591, S3): the
+    /// spinner is GONE (no `ProgressView` anywhere in the working line) and the
+    /// breathing caret moved INTO this line's leading edge, so the fold and the
+    /// caret are one surface. `MessageBubble` renders this same view with ZERO
+    /// parts from SEND (the pre-first-frame window — S2: the labeled+timed
+    /// affordance no longer waits on the first relay item), so item arrival
+    /// only updates the status text; it never mounts a second surface.
+    ///
+    /// The line drives off a single `TimelineView` — the glyph's breathe and
+    /// the per-turn timer tick share ONE clock (stateless; survives
+    /// re-projection — see `CursorBreathe`). NOTHING streams inline: the old
+    /// per-reasoning-run accordions, the separate current-tool row, and the
+    /// fixed 172 pt thinking window remain gone (R5/R6).
     @ViewBuilder
     private var liveSection: some View {
-        Button {
-            toggle()
-        } label: {
-            liveCollapsedLine
+        let hasSteps = !steps.isEmpty
+        TimelineView(.animation(minimumInterval: 1.0 / 20.0, paused: !streaming)) { context in
+            Group {
+                if hasSteps {
+                    Button {
+                        toggle()
+                    } label: {
+                        liveCollapsedLine(now: context.date, hasSteps: true)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(liveAccessibilityLabel(now: context.date))
+                    .accessibilityValue(isExpanded ? "expanded" : "collapsed")
+                    .accessibilityHint("Double-tap to \(isExpanded ? "collapse" : "expand") what the assistant is doing")
+                    .accessibilityAddTraits(.isButton)
+                } else {
+                    // Pre-first-item window: nothing to expand yet — the line is
+                    // presence-only (breathing caret + "Working…" + timer). It
+                    // becomes tappable the moment the first work part lands.
+                    liveCollapsedLine(now: context.date, hasSteps: false)
+                        .accessibilityLabel(liveAccessibilityLabel(now: context.date))
+                }
+            }
+            .accessibilityIdentifier("workingSectionLive")
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(liveAccessibilityLabel)
-        .accessibilityValue(isExpanded ? "expanded" : "collapsed")
-        .accessibilityHint("Double-tap to \(isExpanded ? "collapse" : "expand") what the assistant is doing")
-        .accessibilityAddTraits(.isButton)
-        .accessibilityIdentifier("workingSectionLive")
-        .onReceive(Self.tick) { now = $0 }
 
-        if isExpanded {
+        if isExpanded, hasSteps {
             // Tap-to-expand bifurcation: reasoning steps + the tool timeline
             // in wire order — the SAME step list the settled fold expands.
             stepList(steps)
@@ -740,14 +882,16 @@ struct WorkingSectionView: View {
         }
     }
 
-    /// Chrome-less collapsed live line: spinner + "Working… · ‹tool›" + the
-    /// per-TURN elapsed label + chevron. No box/border/capsule (the settled
-    /// row's exact visual language, live variant).
-    private var liveCollapsedLine: some View {
+    /// Chrome-less collapsed live line: the breathing cursor glyph (when this
+    /// line owns the pulse) + "Working… · ‹tool›" + the per-TURN elapsed label
+    /// + chevron (only when expandable). No spinner, no box/border/capsule —
+    /// the settled row's exact visual language, live variant.
+    private func liveCollapsedLine(now: Date, hasSteps: Bool) -> some View {
         HStack(spacing: 6) {
-            ProgressView()
-                .controlSize(.mini)
-                .accessibilityHidden(true)
+            if showsCursorGlyph {
+                BreathingCursorGlyph(date: now, streaming: streaming)
+                    .font(.callout)
+            }
             Text(WorkingSectionModel.liveCollapsedLabel(parts: parts))
                 .font(.callout)
                 .foregroundStyle(theme.mutedFg)
@@ -759,16 +903,18 @@ struct WorkingSectionView: View {
                 .foregroundStyle(theme.mutedFg.opacity(0.75))
                 .accessibilityHidden(true)
             if hasFailure { failureBadge }
-            Image(systemName: "chevron.right")
-                .font(.caption2)
-                .foregroundStyle(theme.mutedFg)
-                .rotationEffect(.degrees(isExpanded ? 90 : 0))
+            if hasSteps {
+                Image(systemName: "chevron.right")
+                    .font(.caption2)
+                    .foregroundStyle(theme.mutedFg)
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+            }
         }
         .padding(.vertical, 6)
         .contentShape(Rectangle())
     }
 
-    private var liveAccessibilityLabel: String {
+    private func liveAccessibilityLabel(now: Date) -> String {
         let elapsed = ThinkingDisplay.elapsedText(startedAt: liveTurnStartedAt, now: now)
         let base = "\(WorkingSectionModel.liveCollapsedLabel(parts: parts)), elapsed \(elapsed)"
         return hasFailure ? "\(base), contains a failed step" : base

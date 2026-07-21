@@ -636,6 +636,179 @@ final class RelayTranscriptMergeTests: XCTestCase {
         XCTAssertTrue(store.items.first?.isTerminal ?? false)
         XCTAssertEqual(store.items.first?.body["client_message_id"]?.stringValue, "c-1")
     }
+
+    // MARK: - QA-3 S4/A2 — strict chronological merge under snapshot re-projection
+
+    /// Cache-painted settled turns (untagged rows, the GRDB paint) + a resync
+    /// SNAPSHOT that covers those same turns (the relay session store
+    /// accumulates ALL items; every reconnect resync re-delivers them — the
+    /// 10:46:31/10:47:18 WS re-opens in relay.log, the IMG_2579-2582 minute).
+    /// The rebuilt copy is authoritative: the untagged twins must be CONSUMED,
+    /// never duplicated. FAILS on qa3/base (only USER twins were consumed —
+    /// the answers survived above the rebuilt prompts: the answer rendering
+    /// ABOVE the prompt that asked it).
+    func testResyncSnapshotOverCachedTurnsConsumesAssistantTwins() {
+        let chat = ChatStore()
+        // The GRDB cache paint: two settled turns, untagged, deterministic ids.
+        chat.messages = [
+            ("q1", ChatRole.user), ("a1", .assistant),
+            ("q2", .user), ("a2", .assistant),
+        ].enumerated().map { index, row in
+            ChatMessage(
+                id: ChatMessage.deterministicID(seedKey: "cache-\(index)"),
+                role: row.1, text: row.0
+            )
+        }
+
+        // The resync snapshot re-projects every accumulated item.
+        chat.applyRelayItems([
+            userItem("u-1", ord: 0, text: "q1"),
+            agentItem("msg-1", ord: 1, text: "a1"),
+            userItem("u-2", ord: 2, text: "q2"),
+            agentItem("msg-2", ord: 3, text: "a2"),
+        ])
+
+        let texts = chat.messages.map(\.text)
+        XCTAssertEqual(texts, ["q1", "a1", "q2", "a2"],
+                       "one copy per row, strictly chronological — no orphan answer above its prompt (S4)")
+        for (prompt, answer) in [("q1", "a1"), ("q2", "a2")] {
+            let p = texts.firstIndex(of: prompt)!
+            let a = texts.firstIndex(of: answer)!
+            XCTAssertLessThan(p, a, "the answer never renders before its prompt")
+        }
+    }
+
+    /// The FULL owner incident chain (IMG_2579): echo + live turn 3 settled →
+    /// connection flap → the union backfill paints the gateway rows under
+    /// their WIRE ids (untagged) → reconnect resync re-projects everything.
+    /// Pre-fix, the union-painted assistant twins survived above the rebuilt
+    /// prompts (orphan answers + duplication at two scroll positions of one
+    /// view; switching away "fixed" it). Post-fix: single copy, strict order.
+    func testOrphanAnswerChain_EchoUnionBackfillThenResync() {
+        let chat = ChatStore()
+        // Settled turns painted from the gateway wire (deterministic wire ids).
+        let wire: [StoredMessage] = [
+            StoredMessage(role: "user", content: .string("wq1"),
+                          timestamp: 1_700_000_001, wireId: 1),
+            StoredMessage(role: "assistant", content: .string("wa1"),
+                          timestamp: 1_700_000_002, wireId: 2),
+            StoredMessage(role: "user", content: .string("wq2"),
+                          timestamp: 1_700_000_003, wireId: 3),
+            StoredMessage(role: "assistant", content: .string("wa2"),
+                          timestamp: 1_700_000_004, wireId: 4),
+        ]
+        chat.seed(from: wire)
+        let echoID = appendEcho(chat, text: "third?", clientMessageID: "cmid-3")
+
+        // Turn 3 streams live; the userMessage item adopts the echo.
+        var store = RelayItemStore()
+        store.apply(userItemFrame(1, id: "u-3", ord: 0, text: "third?", clientMessageID: "cmid-3"))
+        store.apply(agentCompletedFrame(2, id: "msg-3", ord: 1, text: "answer3"))
+        chat.applyRelayItems(store.items)
+        XCTAssertEqual(chat.messages.filter { $0.text == "third?" }.count, 1)
+
+        // The flap: the reconnect backfill union-paints the gateway rows for
+        // ALL THREE turns under their wire ids (turn 3 now persisted).
+        chat.seed(from: wire + [
+            StoredMessage(role: "user", content: .string("third?"),
+                          timestamp: 1_700_000_005, wireId: 5),
+            StoredMessage(role: "assistant", content: .string("answer3"),
+                          timestamp: 1_700_000_006, wireId: 6),
+        ], policy: .union)
+
+        // The resync snapshot re-projects the whole session (same item ids the
+        // store already holds — the relay re-sends its accumulated items).
+        chat.applyRelayItems([
+            userItem("u-1", ord: 0, text: "wq1"),
+            agentItem("msg-1", ord: 1, text: "wa1"),
+            userItem("u-2", ord: 2, text: "wq2"),
+            agentItem("msg-2", ord: 3, text: "wa2"),
+            store.items.first { $0.itemID == "u-3" }!,
+            store.items.first { $0.itemID == "msg-3" }!,
+        ])
+
+        let texts = chat.messages.map(\.text)
+        for text in ["wq1", "wa1", "wq2", "wa2", "third?", "answer3"] {
+            XCTAssertEqual(texts.filter({ $0 == text }).count, 1,
+                           "exactly one copy of \(text) after the resync — pre-fix it doubled")
+        }
+        XCTAssertEqual(texts, ["wq1", "wa1", "wq2", "wa2", "third?", "answer3"],
+                       "strict chronological order — no orphan answer above its prompt (S4/IMG_2579)")
+        XCTAssertTrue(chat.messages.contains { $0.id == echoID && $0.text == "third?" },
+                      "the echo keeps its identity through the whole chain")
+    }
+
+    /// A snapshot carrying a turn's `userMessage` but NO agent items (a turn
+    /// that errored pre-item, or a snapshot raced by its first item) must NOT
+    /// consume the cache-painted answer — there is no authoritative copy yet.
+    /// PIN (green before and after): the consumption is guarded on the rebuilt
+    /// turn actually carrying an assistant segment.
+    func testConsumptionGuard_TurnWithoutAgentItemsKeepsCacheAnswer() {
+        let chat = ChatStore()
+        chat.messages = [
+            ChatMessage(id: ChatMessage.deterministicID(seedKey: "g-u"),
+                        role: .user, text: "q1"),
+            ChatMessage(id: ChatMessage.deterministicID(seedKey: "g-a"),
+                        role: .assistant, text: "a1"),
+        ]
+
+        chat.applyRelayItems([userItem("u-1", ord: 0, text: "q1")])
+
+        XCTAssertTrue(chat.messages.contains { $0.text == "a1" },
+                      "the cache answer survives until the relay copy exists")
+    }
+
+    /// QA-3 S6 residue — when the in-memory echo was LOST (a session switch /
+    /// store rebuild before the item re-landed) and only the cache-painted
+    /// gateway row remains (cmid-LESS — `toChatMessages` maps none), a
+    /// cmid-carrying `userMessage` item must still adopt it BY TEXT instead of
+    /// projecting a second bubble under its relay id. FAILS on qa3/base
+    /// (cmid-bearing items matched cmid ONLY — the cache row never adopted).
+    func testAdoptionFallsBackToTextForCacheRowWhenEchoLost() {
+        let chat = ChatStore()
+        let cacheRow = ChatMessage(
+            id: ChatMessage.deterministicID(seedKey: "cache-u"),
+            role: .user, text: "hello"
+        )
+        chat.messages = [cacheRow]
+
+        chat.applyRelayItems([
+            userItem("u-1", ord: 0, text: "hello", clientMessageID: "cmid-lost"),
+            agentItem("msg-1", ord: 1, text: "hi"),
+        ])
+
+        let prompts = chat.messages.filter { $0.text == "hello" }
+        XCTAssertEqual(prompts.count, 1,
+                       "cache-painted prompt adopts — never a second relay-id bubble (S6)")
+        XCTAssertEqual(prompts.first?.id, cacheRow.id, "adopted in place")
+        let texts = chat.messages.map(\.text)
+        XCTAssertLessThan(texts.firstIndex(of: "hello")!, texts.firstIndex(of: "hi")!,
+                          "the answer renders AFTER its adopted prompt")
+    }
+
+    /// PIN: a cmid match wins over a same-text cmid-less row REGARDLESS of row
+    /// order — two sends of identical text must pair one-to-one, the echo
+    /// first. Guards the adoption refactor's precedence.
+    func testAdoptionPrefersClientMessageIDOverSameTextCacheRow() {
+        let chat = ChatStore()
+        let cacheRow = ChatMessage(
+            id: ChatMessage.deterministicID(seedKey: "other-client"),
+            role: .user, text: "hello"
+        )
+        let echoID = appendEcho(chat, text: "hello", clientMessageID: "cmid-1")
+        chat.messages.insert(cacheRow, at: 0)   // cache row sits ABOVE the echo
+
+        chat.applyRelayItems([
+            userItem("u-1", ord: 0, text: "hello", clientMessageID: "cmid-1"),
+            agentItem("msg-1", ord: 1, text: "hi"),
+        ])
+
+        let adopted = chat.messages.filter { $0.text == "hello" }
+        XCTAssertEqual(adopted.count, 2, "the other client's same-text row survives")
+        XCTAssertTrue(adopted.contains { $0.id == echoID },
+                      "the cmid item adopted the ECHO, not the same-text cache row above it")
+        XCTAssertTrue(adopted.contains { $0.id == cacheRow.id })
+    }
 }
 
 /// Thread-safe one-shot park for a single upstream submit RPC: the mock
