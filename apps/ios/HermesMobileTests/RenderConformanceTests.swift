@@ -1112,11 +1112,14 @@ final class RenderConformanceTests: XCTestCase {
             ],
         ]
         g.transport.deliver(frameText(snapshot))
-        // The snapshot projection is synchronous off the pump; wait for the
-        // re-projected tail only (holds on base AND fixed — the invariants
-        // below are what FAIL on qa3/base, with clean assertion messages).
+        // Synchronize on the snapshot projection LANDING: the pump applies it
+        // asynchronously, and the cached turns' rows flip from untagged to
+        // relayProjected when the re-projection rebuilds them (pre-snapshot
+        // they are the cache-painted untagged rows). Without this wait the
+        // assertions race the pump and can pass on the PRE-snapshot state —
+        // on qa3/base that masked the duplication (false green).
         await waitUntil {
-            self.g_chat_messages(g).contains { $0.text == agentText && $0.relayProjected }
+            self.g_chat_messages(g).contains { $0.text == "cq1" && $0.relayProjected }
         }
 
         let texts = g.chat.messages.map(\.text)
