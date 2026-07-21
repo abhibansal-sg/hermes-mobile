@@ -1438,6 +1438,12 @@ final class RenderConformanceTests: XCTestCase {
     /// + bare caret (~64 pt) at B; the merged line is one ~32 pt row in both.
     @MainActor
     func testMergedLine_PhaseAAndBRenderOneSurface() throws {
+        // `MessageBubble` reads the stores off the environment — supply a
+        // disconnected graph (the geometry never touches the socket).
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+
         func bubbleHeight(_ message: ChatMessage) throws -> CGFloat {
             let renderer = ImageRenderer(content:
                 MessageBubble(
@@ -1447,6 +1453,9 @@ final class RenderConformanceTests: XCTestCase {
                 )
                 .frame(width: 360)
                 .environment(\.hermesTheme, HermesThemePresets.nousLight)
+                .environment(connection)
+                .environment(sessions)
+                .environment(chat)
             )
             renderer.scale = 2
             return try XCTUnwrap(renderer.uiImage?.size.height,
