@@ -74,6 +74,14 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
     /// streaming bubble before its first delta lands.
     var parts: [ChatMessagePart]
     var isStreaming: Bool
+    /// QA-3 S8/A4 — the turn behind this row ended by the LIVENESS fallback,
+    /// not a real completion: a dead turn (no frames + no completion past the
+    /// liveness window) whose stuck items were force-settled (a prior turn a
+    /// newer turn superseded, or the watchdog's silent resync recovered
+    /// nothing). `true` ONLY on relay-projected rows. The working section
+    /// folds it as a muted "Interrupted" line — honest, never an error banner
+    /// (C3). `isStreaming` is `false` whenever this is set.
+    var interrupted: Bool
     /// Settled reasoning wall-clock seconds, captured from the turn's existing
     /// start timestamp when `message.complete` arrives. Live rendering continues
     /// to read ``ChatStore.turnStartedAt`` directly; this preserves the completed
@@ -112,6 +120,7 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
         thinking: String = "",
         tools: [ToolActivity] = [],
         isStreaming: Bool = false,
+        interrupted: Bool = false,
         reasoningElapsed: TimeInterval? = nil,
         usage: UsageStats? = nil,
         warning: String? = nil,
@@ -123,6 +132,7 @@ struct ChatMessage: Identifiable, Sendable, Equatable {
         self.role = role
         self.clientMessageID = clientMessageID
         self.isStreaming = isStreaming
+        self.interrupted = interrupted
         self.reasoningElapsed = reasoningElapsed
         self.timestamp = timestamp
         self.presentation = presentation

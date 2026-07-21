@@ -2211,4 +2211,38 @@ final class RenderConformanceTests: XCTestCase {
         XCTAssertTrue(frameTMs(legacy).allSatisfy { $0 == nil },
             "pre-QA-3 fixtures carry no t_ms — the loader degrades gracefully")
     }
+    // MARK: - QA-3 S8/A4 liveness replay (eternal double-working, killed)
+
+    /// The round-3 set piece (IMG_2591, the "??" Aheli session): turn 1's tool
+    /// NEVER completes, then turn 2 submits and streams. The render lane must
+    /// self-heal turn 1 the moment turn 2's `userMessage` bounds the new
+    /// current turn — turn 1 folds to a muted "Interrupted" non-streaming row
+    /// and exactly ONE working surface remains. The watchdog's time-driven
+    /// stages are pinned by `TurnLivenessTests`; this replay pins the
+    /// DETERMINISTIC render half through the real frame pump. FAILS on
+    /// qa3/base (turn 1 keeps `isStreaming` — two working rows forever).
+    func testReplay_DeadTurnSelfHealsWhenSecondTurnStreams() async throws {
+        let fx = try loadFixture("render_dead_turn_liveness")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        g.chat.messages = cachedRows(fx)
+        let ok = await g.chat.send(text: fx.submitText)
+        XCTAssertTrue(ok, "relay submit must be accepted")
+        deliverAll(g, fx)
+
+        await waitUntil { g.chat.messages.contains { $0.interrupted } }
+        let assistants = g.chat.messages.filter { $0.role == .assistant && $0.relayProjected }
+        XCTAssertEqual(
+            assistants.filter({ $0.isStreaming }).count, 1,
+            "spec A4: exactly ONE live working row — never the eternal double-working"
+        )
+        let deadTurnRow = try XCTUnwrap(assistants.first { $0.interrupted })
+        XCTAssertFalse(deadTurnRow.isStreaming,
+            "spec A4: the dead turn's stuck row settles (muted Interrupted fold)")
+        // History + both user rows intact; the second prompt renders.
+        assertHistoryPresent(g.chat.messages.map { $0.text }, fx)
+        XCTAssertTrue(g.chat.messages.contains { $0.role == .user && $0.text == "??" })
+        XCTAssertNil(g.chat.lastError, "C3: the self-heal is silent — no error surface")
+    }
 }

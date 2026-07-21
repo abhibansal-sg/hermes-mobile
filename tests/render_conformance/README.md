@@ -22,6 +22,11 @@ lane, and render-model invariants are asserted against the spec contract.
   `render_live_fold.json` (QA-2 R5/R6/A3) is HAND-AUTHORED to the same wire
   format (the harness's mock gateway has no deterministic reasoning+tool
   script yet); it carries its provenance in its `recorded_by` field.
+  `render_dead_turn_liveness.json` (QA-3 S8/A4) is HAND-AUTHORED from the
+  round-3 forensics chronology (IMG_2591: dead turn 1 + live turn 2 — the
+  eternal double-working set piece); a dead turn is not deterministically
+  recordable against the isolated gateway without fault injection, so its
+  `recorded_by` carries that provenance.
 - The XCTest suite itself lives in the iOS test target (XCTest requirement):
   `apps/ios/HermesMobileTests/RenderConformanceTests.swift`, with the fixtures
   bundled into that target via `apps/ios/project.yml`. It replays the frames

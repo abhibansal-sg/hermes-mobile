@@ -491,3 +491,112 @@ async def test_run_swallows_observe_errors(monkeypatch):
         await task
     except asyncio.CancelledError:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# QA-3 S5/C3 — no raw error codes ever surface (error-theater kill)            #
+# --------------------------------------------------------------------------- #
+# Owner forensics IMG_2583: a background session's turn COMPLETED carrying the
+# upstream provider's OAuth failure verbatim as its final agentMessage text
+# (`HTTP 403: {"code":"unauthenticated:bad-credentials","error":"The OAuth2
+# access token could not be validated."}`). The reframer emits that as a normal
+# agentMessage completion, so the turn_complete branch forwarded the raw JSON
+# to APNs and the lock screen showed error theater. These tests pin: raw-error
+# terminal text is humanized under the error treatment (never verbatim), and
+# ordinary prose is NEVER false-positived.
+
+_RAW_AUTH_403 = (
+    'HTTP 403: {"code":"unauthenticated:bad-credentials",'
+    '"error":"The OAuth2 access token could not be validated."}'
+)
+
+
+def test_turn_complete_humanizes_raw_provider_error():
+    notifier, push, _, _ = _make(owned=("s1",), foreground=())
+    desc = notifier.observe(_agent_completed("s1", text=_RAW_AUTH_403))
+    assert desc is not None
+    # error treatment, NOT the verbatim turn_complete body
+    assert desc["title"] == "Hermes hit an error"
+    assert desc["category"] == "HERMES_ERROR"
+    assert desc["body"] == (
+        "Auth for this session's provider has expired — re-authentication is needed."
+    )
+    # never verbatim: no raw code/JSON leaks into the banner
+    for needle in ("HTTP 403", "unauthenticated", "bad-credentials", "{", "OAuth2"):
+        assert needle not in desc["body"]
+    assert len(push.calls) == 1
+    assert push.calls[0]["body"] == desc["body"]
+
+
+def test_turn_complete_humanizes_generic_provider_error():
+    notifier, _, _, _ = _make(owned=("s1",), foreground=())
+    desc = notifier.observe(_agent_completed("s1", text="HTTP 500: upstream exploded"))
+    assert desc is not None
+    assert desc["title"] == "Hermes hit an error"
+    assert desc["body"] == "The provider returned an error — open the session for details."
+    assert "HTTP 500" not in desc["body"]
+
+
+def test_turn_complete_humanizes_bare_json_error_payload():
+    notifier, _, _, _ = _make(owned=("s1",), foreground=())
+    desc = notifier.observe(
+        _agent_completed("s1", text='{"code":"rate_limited","error":"quota exceeded"}')
+    )
+    assert desc is not None
+    assert desc["title"] == "Hermes hit an error"
+    assert desc["body"] == "The provider returned an error — open the session for details."
+
+
+def test_turn_complete_ordinary_prose_unchanged():
+    # The classifier must NEVER fire on honest agent prose — including prose
+    # that mentions a SUCCESS status code or braces.
+    notifier, _, _, _ = _make(owned=("s1",), foreground=())
+    prose = "The endpoint returned HTTP 200: OK, so the smoke test passed."
+    desc = notifier.observe(_agent_completed("s1", text=prose))
+    assert desc is not None
+    assert desc["title"] == "Hermes finished"
+    assert desc["body"] == prose
+    jsonish = 'The config looked like {"model": "qwen"} and worked fine'
+    desc2 = notifier.observe(_agent_completed("s1", item_id="m2", turn="t2", text=jsonish))
+    assert desc2 is not None
+    assert desc2["title"] == "Hermes finished"
+    assert desc2["body"] == jsonish
+
+
+def test_error_event_humanizes_raw_message_too():
+    notifier, _, _, _ = _make(owned=("s1",), foreground=())
+    desc = notifier.observe(_error_completed("s1", message=_RAW_AUTH_403))
+    assert desc is not None
+    assert desc["event_type"] == "turn_error"
+    assert desc["body"] == (
+        "Auth for this session's provider has expired — re-authentication is needed."
+    )
+    for needle in ("HTTP 403", "{"):
+        assert needle not in desc["body"]
+
+
+def test_error_event_human_message_unchanged():
+    notifier, _, _, _ = _make(owned=("s1",), foreground=())
+    desc = notifier.observe(_error_completed("s1", message="Boom: the tool exploded"))
+    assert desc is not None
+    assert desc["body"] == "Boom: the tool exploded"
+
+
+def test_raw_error_classifier_unit():
+    from hermes_relay.notifier import _humanize_raw_error
+
+    assert _humanize_raw_error(_RAW_AUTH_403) == (
+        "Auth for this session's provider has expired — re-authentication is needed."
+    )
+    assert _humanize_raw_error("HTTP 401: unauthorized") == (
+        "Auth for this session's provider has expired — re-authentication is needed."
+    )
+    assert _humanize_raw_error("HTTP 502: bad gateway") == (
+        "The provider returned an error — open the session for details."
+    )
+    # non-raw shapes -> None (leave untouched)
+    assert _humanize_raw_error("HTTP 200: OK") is None
+    assert _humanize_raw_error("All good, shipped it.") is None
+    assert _humanize_raw_error('{"model": "qwen"}') is None
+    assert _humanize_raw_error("") is None
+    assert _humanize_raw_error(None) is None
