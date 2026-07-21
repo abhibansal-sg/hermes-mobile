@@ -290,12 +290,6 @@ async def test_l4_http_clarify_one_shot():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=L6 + "a non-phone turn's "
-                   "message.start prompt text must emit a completed "
-                   "userMessage item (reframer MESSAGE_START emits turn."
-                   "started only — desktop-originated prompts have no user "
-                   "row on the wire, D11's render half). Wave-1 L6 flips "
-                   "this; remove when green.")
 async def test_l6_message_start_prompt_emits_user_message_item():
     r = Reframer(EventBus(), SessionStore())
     frames = r.reframe(GatewayEvent(
@@ -315,12 +309,6 @@ async def test_l6_message_start_prompt_emits_user_message_item():
     assert users[0].body.get("status") == "completed"
 
 
-@pytest.mark.xfail(strict=True, reason=L6 + "OPEN/HISTORY seed must fold the "
-                   "rest_history USER rows into the SessionStore as "
-                   "userMessage items (so a resync snapshot carries the "
-                   "foreign prompt; today OPEN returns the rows to the phone "
-                   "and folds nothing — a snapshot fallback drops them). "
-                   "Wave-1 L6 flips this; remove when green.")
 async def test_l6_open_history_seed_folds_user_rows_into_store():
     srv, gw = _server()
     gw.rest_history = AsyncMock(return_value=[

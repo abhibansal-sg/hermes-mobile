@@ -14,7 +14,9 @@ The raw -> item mapping (grounded in the R0 fixture AND the gateway's own
 
 | raw event (``type``)               | -> frame(s)                                       |
 |------------------------------------|---------------------------------------------------|
-| ``message.start`` (payload null)   | ``turn.started`` (opens a turn; no item yet)      |
+| ``message.start`` (payload null /  | ``turn.started`` (opens a turn) + — R4 L6 — a     |
+|   ``.prompt``)                     | completed ``userMessage`` when ``prompt`` is      |
+|                                    | present and NOT phone-marked (foreign turn row)   |
 | ``message.delta`` (``.text``)      | lazy ``item.started`` agentMessage + ``item.delta``|
 | ``message.complete`` (``.text,     | ``item.completed`` agentMessage (authoritative) + |
 |   .usage,.status``)                |   ``usage`` item + ``turn.completed`` (reason +   |
@@ -280,10 +282,42 @@ class Reframer:
         state = self._store.get(sid)
 
         if event.type == RawEvent.MESSAGE_START:
-            # Pure turn boundary. The agentMessage item is created lazily at the
+            # Turn boundary. The agentMessage item is created lazily at the
             # first message.delta so it sorts *after* any reasoning/tool items
             # that stream first within the turn.
-            return self._ensure_turn(sid)
+            frames = self._ensure_turn(sid)
+            # R4 L6 (amendment G2 — the wire half of the X5 foreign-mirror
+            # deletion): a NON-phone turn carries its prompt on
+            # ``message.start{prompt}``; emit it as a COMPLETED ``userMessage``
+            # item so desktop-originated turns get a user row on the wire
+            # (D11's render half — the reframer maps agent events only, so
+            # without this a foreign prompt never renders). Phone-driven turns
+            # ALREADY have their user row — the DownstreamServer's SUBMIT
+            # synthesis (cmid-keyed, the optimistic-echo adopter, contract I8):
+            # those mark the prompt on the shared SessionStore BEFORE driving
+            # it, and we skip the emission on a marker hit — exactly one user
+            # row per turn regardless of which emitter lands first. The ord
+            # allocated here precedes the turn's agent items (contract I7).
+            # Gateways that emit message.start without a prompt (the stock
+            # shape today) never trigger this path — additive, RR5-safe.
+            prompt = event.payload.get("prompt")
+            if (
+                isinstance(prompt, str)
+                and prompt
+                and not self._store.take_local_prompt(sid, prompt)
+            ):
+                item = Item(
+                    item_id=self._new_item_id(sid),
+                    type=ItemType.USER_MESSAGE,
+                    status=ItemStatus.COMPLETED,
+                    ord=state.allocate_ord(),
+                    summary=_one_line(prompt),
+                    body={"text": prompt},
+                )
+                frames.append(
+                    Frame.with_item(sid, FrameKind.ITEM_COMPLETED, item, ctx.current_turn)
+                )
+            return frames
 
         if event.type == RawEvent.MESSAGE_DELTA:
             text = _text(event.payload)

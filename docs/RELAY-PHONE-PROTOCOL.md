@@ -49,7 +49,7 @@ the relay assigns from the raw event / tool `name`):
 
 | type | source | render note |
 |---|---|---|
-| `userMessage` | the submitted prompt | right-aligned bubble |
+| `userMessage` | the submitted prompt (relay-synthesized on SUBMIT/branch, cmid-keyed — §5a) AND — R4 L6 — a NON-phone turn's prompt: relay-emitted from `message.start{prompt}` (live foreign turns) and folded from the `rest_history` user rows when OPEN/HISTORY seeds an empty store (so a resync snapshot carries foreign prompts) | right-aligned bubble. Exactly ONE row per turn regardless of origin: phone-driven turns mark the prompt before driving it and the reframer skips its emission on a marker hit (contract I8 — the cmid-keyed row is the echo adopter). Foreign rows carry no `client_message_id`. Gateways that emit `message.start` without a prompt (the stock shape today) never trigger the live path — the history seed covers persisted turns; adding `prompt` to `message.start` is a follow-up additive gateway change. |
 | `agentMessage` | `message.delta`/`complete` | markdown text, streams |
 | `reasoning` | `reasoning.delta`/`available` | collapsible "thinking" |
 | `toolCall` (GENERIC) | ANY `tool.start`/`tool.complete`, keyed by `name` | collapsed tool card: name + status + summary; body = args/result/duration; covers ALL current + future tools |
@@ -110,7 +110,11 @@ a partial merge preview and is never treated as authoritative.
 - `status` — `{ kind, text }` (lifecycle/compacting/etc., non-item chatter).
 - `title` — session title changed.
 - `snapshot` — reply to `resync`/`open`: `{ items:[...full items...], cursor }` — the
-  resume-as-items payload (relay-built from its accumulated state).
+  resume-as-items payload (relay-built from its accumulated state). Since R4
+  (L6) it also carries foreign turns' `userMessage` rows: OPEN/HISTORY seeds
+  the `rest_history` USER rows into the accumulated state when a store is
+  still empty (seed-only — a stream-touched store is never reseeded), so a
+  FALLBACK snapshot no longer drops foreign prompts.
 
 ## 4. Seq / ack / replay (reliability spine — lives entirely in the relay)
 

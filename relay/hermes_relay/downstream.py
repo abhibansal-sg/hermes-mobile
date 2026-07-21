@@ -701,6 +701,52 @@ class DownstreamServer:
         state.apply(frame)
         self._bus.publish(TOPIC_RELAY_FRAMES, frame)
 
+    def _seed_history_user_rows(self, sid: str, messages: list) -> None:
+        """R4 L6 — fold ``rest_history`` USER rows into the store as completed
+        ``userMessage`` items when seeding an EMPTY store (OPEN/HISTORY on a
+        session the stream has not touched since relay startup).
+
+        The reframer maps agent events only, so a foreign turn's prompt has no
+        item in the accumulated state — a resync FALLBACK snapshot would drop
+        it (the phone's cold-open paint has it from its own read; the snapshot
+        fallback did not). Seeding closes that hole: the snapshot now carries
+        foreign prompts in the same item shape as the SUBMIT-synthesized rows.
+
+        Seed, never co-author (contract I3): a NON-empty store is never
+        reseeded — once the stream has spoken, it alone writes. Item ids are
+        deterministic per ``(sid, nth-user-row, text)`` so a repeated seed of
+        the same batch converges on the same ids (contract I21); the
+        empty-store gate means a store is seeded at most once per relay
+        lifetime anyway.
+        """
+        state = self._store.get(sid)
+        if state.items:
+            return  # the stream already owns this session — cache is seed only
+        nth = 0
+        for row in messages:
+            if not isinstance(row, dict) or row.get("role") != "user":
+                continue
+            content = row.get("content")
+            if not isinstance(content, str) or not content:
+                content = row.get("text")  # some REST shapes key the text field
+            if not isinstance(content, str) or not content:
+                continue
+            item_id = (
+                f"{sid}:h-"
+                f"{uuid.uuid5(uuid.NAMESPACE_URL, f'hermes-relay:hist:{sid}:{nth}:{content}').hex[:16]}"
+            )
+            nth += 1
+            stripped = content.strip()
+            item = Item(
+                item_id=item_id,
+                type=ItemType.USER_MESSAGE,
+                status=ItemStatus.COMPLETED,
+                ord=state.allocate_ord(),
+                summary=stripped.splitlines()[0][:120] if stripped else "",
+                body={"text": content},
+            )
+            state.apply(Frame.with_item(sid=sid, kind=FrameKind.ITEM_COMPLETED, item=item))
+
     # -- upstream (phone -> relay -> gateway), protocol §5 ---------------
     async def handle_upstream(self, conn: PhoneConnection, req: UpstreamRequest) -> Any:
         """Translate one phone JSON-RPC request and return its JSON-RPC result.
@@ -840,6 +886,10 @@ class DownstreamServer:
                 limit = p.get("limit")
                 if isinstance(limit, int) and limit >= 0:
                     messages = messages[-limit:] if limit else []
+            # R4 L6: fold the history's USER rows into the store (seed, not
+            # co-author — empty store only) so a resync snapshot carries
+            # foreign prompts.
+            self._seed_history_user_rows(sid, messages)
             return {"session_id": sid, "messages": messages}
 
         # -- drive (become owner) --------------------------------------------
@@ -886,6 +936,11 @@ class DownstreamServer:
                     # id to a live id — resolve so a repeat submit to the origin
                     # id still drives the live turn.
                     sid = self._gateway.live_id_for(sid)
+                # R4 L6: mark the prompt phone-origin BEFORE the await so the
+                # reframer's message.start emission skips it under either
+                # ordering (the SUBMIT synthesis below is this turn's user row).
+                if text:
+                    self._store.mark_local_prompt(sid, text)
                 await self._gateway.prompt_submit(sid, text, **submit_kwargs)
             else:
                 # Brand-new chat: create + own, then drive (§5). R4 L2 (B10):
@@ -899,6 +954,8 @@ class DownstreamServer:
                     provider=p.get("provider"),
                     cwd=cwd if isinstance(cwd, str) and cwd else None,
                 )
+                if text:
+                    self._store.mark_local_prompt(sid, text)  # R4 L6 (see above)
                 await self._gateway.prompt_submit(sid, text, **submit_kwargs)
             # Emit the prompt itself as a completed ``userMessage`` item (QA-1
             # B5/B13): the Reframer maps only AGENT events, so without this the
@@ -936,6 +993,8 @@ class DownstreamServer:
                 provider=p.get("provider"),
                 cwd=cwd if isinstance(cwd, str) and cwd else None,
             )
+            if text:
+                self._store.mark_local_prompt(sid, text)  # R4 L6 (see SUBMIT)
             await self._gateway.prompt_submit(sid, text, **submit_kwargs)
             self._emit_user_message_item(
                 conn, sid, p.get("client_message_id"), text
