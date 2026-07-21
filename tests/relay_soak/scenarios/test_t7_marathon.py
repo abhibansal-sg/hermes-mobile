@@ -101,6 +101,29 @@ async def test_t7_marathon(mock_gateway, relay, phone_factory, evidence):
 
             i += 1
             await asyncio.sleep(rng.uniform(0.05, 0.3))  # keep it gentle
+
+            # H8 (soak consolidation): keep the driver's frame log BOUNDED.
+            # The log is append-only; at marathon intensity it grew ~100 MiB/min
+            # (2.9 GiB in 28 min on the first 3 h run — an OOM risk to the QA-3
+            # swarm sharing this 36 GiB box; the run was killed on that basis).
+            # Everything the checkers below read is tail-local: the last 5
+            # driven sessions' frames (driven[-5:]), the live tail for max-seq
+            # ack/churn, and wait_terminal on UNIQUE sids. Compact to: frames
+            # of the last 64 driven sessions + the last 2048 frames. The relay
+            # under test is untouched — I6 measures the relay's OWN RSS, which
+            # the external sampler tracked flat (30-33 MiB) on the killed run.
+            if i % 300 == 0 and len(phone.frames) > 4096:
+                keep_sids = set(driven[-64:])
+                n = len(phone.frames)
+                tail_from = max(0, n - 2048)
+                keep = [j for j in range(n)
+                        if j >= tail_from or phone.frames[j].sid in keep_sids]
+                phone.frames[:] = [phone.frames[j] for j in keep]
+                # Keep SoakPhoneDriver's parallel generation tag list in sync
+                # (index-aligned with frames); absent on a plain PhoneDriver.
+                gens = getattr(phone, "_frame_gen", None)
+                if isinstance(gens, list) and len(gens) == n:
+                    gens[:] = [gens[j] for j in keep]
     finally:
         sampler.stop()
 
