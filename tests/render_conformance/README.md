@@ -66,6 +66,9 @@ exercises the full echo↔item path.
 | render_live_fold (QA-2) | resolved tool rides inline: "Working… · ‹tool›" | R5/A3 | FAILS |
 | — (QA-2) | live working section measures one line (< 60pt), never the 172pt window | R6/A3 | FAILS (172pt ThinkingView) |
 | render_live_fold (QA-2) | settled relay turn stamps "Worked for Ns"; survives the next turn's re-projection | R5/A3 | FAILS (bare "Worked"; relay items carry no timestamps) |
+| render_submit_stream + hand-authored resync snapshot (QA-3) | reconnect resync re-projection over cache-painted turns: single copy per row, strict chronological order, answer never before prompt | S4/A2 | FAILS on qa3/base (untagged assistant twins never consumed — orphan answers above rebuilt prompts, IMG_2579-2582) |
+| — (QA-3, warm-snapshot paint) | optimistic echo durable across session switch + store rebuild until the `userMessage` adoption reconciles it | S6/A2 | FAILS on qa3/base (echo in-memory only — lost on switch, IMG_2585/2591) |
+| — (QA-3, cache-first repaint) | same-session repaint never truncates the transcript to the cached tail window (backward-paged scrollback survives; void impossible) | S7/A3 | FAILS on qa3/base (`.replace` paint of the 50-row suffix evicts loaded history, IMG_2589/2590) |
 
 ## Running
 
