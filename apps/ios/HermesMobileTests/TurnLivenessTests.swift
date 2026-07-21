@@ -294,15 +294,17 @@ final class TurnLivenessTests: XCTestCase {
                        _ status: String, _ ord: Int, _ body: JSONValue = .null) -> RelayFrame {
             RelayFrame(
                 seq: seq, sid: "s", turn: "t", kind: RelayFrameKind(wire: kind),
-                body: ["item_id": id, "type": type, "status": status,
-                       "ord": ord, "summary": "", "body": body]
+                body: .object([
+                    "item_id": .string(id), "type": .string(type), "status": .string(status),
+                    "ord": .number(Double(ord)), "summary": .string(""), "body": body,
+                ])
             )
         }
 
         var store = RelayItemStore()
         store.apply(itemFrame(1, "item.started", "x1", "toolCall", "in_progress", 0))
         store.apply(itemFrame(2, "item.completed", "x2", "agentMessage", "completed", 1,
-                              ["text": "done"]))
+                              .object(["text": .string("done")])))
 
         XCTAssertTrue(store.settleInProgressLocally())
         XCTAssertEqual(store.itemsByID["x1"]?.status, .completed)
@@ -320,11 +322,11 @@ final class TurnLivenessTests: XCTestCase {
         // A delta against a locally-settled item is ignored (terminal guard).
         var store2 = RelayItemStore()
         store2.apply(itemFrame(1, "item.started", "y1", "agentMessage", "in_progress", 0,
-                               ["text": "hel"]))
+                               .object(["text": .string("hel")])))
         store2.settleInProgressLocally()
         store2.apply(RelayFrame(
             seq: 2, sid: "s", turn: "t", kind: .itemDelta,
-            body: ["item_id": "y1", "patch": ["text": "lo"]]
+            body: .object(["item_id": .string("y1"), "patch": .object(["text": .string("lo")])])
         ))
         XCTAssertEqual(store2.itemsByID["y1"]?.body["text"]?.stringValue, "hel",
                        "deltas after a local settle are ignored exactly like after a real completed")
