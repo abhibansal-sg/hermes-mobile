@@ -243,6 +243,36 @@ bug: stop and steer errored; queue-mode sends vanished).
   resurrect the send on the relaunch drain (the claim query admits only
   live states — a tombstoned row is never claimed).
 
+### 5c. Cold-tap gate answers — HTTP control sibling (R4 L4, B6/B7, GAP-10)
+
+A notification banner APPROVE/DENY/REPLY tap fires while the phone holds NO
+relay socket — and on a GW-UNREACH topology (the daily-driver phone's) the
+gateway REST answer route is unreachable too, so the agent stays blocked until
+the user opens the app. The relay already owns these sessions and holds a live
+gateway RPC path, so the phone-facing port's existing HTTP control sibling
+(`relayControlURL`; the `/attention/pending` + `/sync/manifest` routes already
+live there) gains two one-shot answers:
+
+- **`GET /approve?session_id=…&request_id=…&decision=…[&all=…]`** → gateway
+  `approval.respond` — same `decision`→`choice` translation and durable
+  resolution as the WS `approve` method (§5).
+- **`GET /clarify?session_id=…&request_id=…&text=…`** → gateway
+  `clarify.respond` — same `text`→`answer` translation as the WS `clarify`
+  method (§5).
+
+Params ride the QUERY STRING (URL-encoded): the port's websockets handshake
+parser rejects non-GET methods BEFORE the HTTP hook runs — a POST never
+reaches the handler on websockets>=14 — so the query string (this port's house
+style) is the transport that actually survives. A JSON body is additionally
+honored when the request object exposes one (query keys win on conflict). Same
+bearer auth as every route on the port. Responses are JSON:
+`{"ok": true, "result": …}` on success; `{"ok": false, "error": …}` with
+**400** (missing/invalid params), **502** (gateway answer failed — sanitized,
+§6b) or **503** (relay gateway not ready — the answer waits up to 5 s for the
+gateway first, mirroring the WS readiness gate). The phone's notification
+endpoint resolver prefers this route when a relay control URL is configured
+and falls back to gateway REST for co-located setups (contract B6/B7, lane L4).
+
 ## 6. Notifications (relay-fired, phone-off)
 
 Relay observes these signals for its OWNED sessions → fires APNs via the existing

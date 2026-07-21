@@ -370,10 +370,114 @@ class DownstreamServer:
                     query.get("cursor", [None])[0], sessions,
                 )) + "\n"
                 return connection.respond(HTTPStatus.OK, body)
+            if path in ("/approve", "/clarify"):
+                # R4 L4 (GAP-10, B6/B7): one-shot gate answer over the HTTP
+                # control sibling — the cold notification banner action path.
+                return await self._answer_gate_http(connection, request, raw_path, path)
             return None
         except Exception:  # pragma: no cover - a broken probe must not stall serve
             _log.debug("health probe failed", exc_info=True)
             return None
+
+    async def _answer_gate_http(
+        self, connection: Any, request: Any, raw_path: str, path: str
+    ) -> Any:
+        """One-shot ``/approve`` / ``/clarify`` answer on the phone-facing port.
+
+        R4 L4 — the cold-tap gap (GAP-10, B6/B7): a notification banner
+        APPROVE/DENY/REPLY action fires while the phone holds NO relay socket,
+        and on the daily-driver's GW-UNREACH topology the gateway REST answer
+        is unreachable too — the agent stays blocked until the user opens the
+        app. The relay already owns these sessions and holds a live gateway
+        RPC path: answer through it (the same ``approval_respond`` /
+        ``clarify_respond`` translation as the WS methods, durable-resolution
+        included, §5).
+
+        Wire shape: params ride the QUERY STRING
+        (``/approve?session_id=…&request_id=…&decision=…``,
+        ``/clarify?session_id=…&request_id=…&text=…`` — URL-encoded). This
+        port's websockets handshake parser rejects non-GET methods BEFORE
+        ``process_request`` runs (a POST never reaches here on the deployed
+        websockets>=14), so the query string — this port's existing
+        ``/attention/pending`` + ``/sync/manifest`` house style — is the
+        transport that actually survives to this handler. A JSON body is
+        ALSO honored when the request object exposes one (harness fakes;
+        forward-compat if a websockets version grows body support): query
+        keys win on conflict. Same bearer auth as every route on this port.
+        Responses are JSON: ``{"ok": true, "result": …}`` on success;
+        ``{"ok": false, "error": …}`` with 400 (missing/invalid params), 502
+        (gateway answer failed — sanitized, §6b: no raw codes) or 503 (relay
+        gateway not ready). A probe here must never stall the accept loop.
+        """
+        from http import HTTPStatus
+        from urllib.parse import parse_qs, urlsplit
+
+        params: dict[str, Any] = {
+            key: values[0] for key, values in parse_qs(urlsplit(raw_path).query).items()
+        }
+        body = getattr(request, "body", None)
+        if isinstance(body, (bytes, bytearray)):
+            body = bytes(body).decode("utf-8", errors="replace")
+        if isinstance(body, str) and body.strip():
+            try:
+                parsed = json.loads(body)
+            except ValueError:
+                return connection.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    json.dumps({"ok": False, "error": "invalid JSON body"}) + "\n",
+                )
+            if isinstance(parsed, dict):
+                params.update(parsed)
+
+        if not await self._gateway.wait_ready(timeout=5.0):
+            return connection.respond(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                json.dumps({"ok": False, "error": "relay gateway not ready"}) + "\n",
+            )
+        try:
+            if path == "/approve":
+                sid = str(params["session_id"])
+                request_id = str(params.get("request_id") or "")
+                decision = str(params["decision"])
+                raw_all = params.get("all", False)
+                resolve_all = (
+                    raw_all
+                    if isinstance(raw_all, bool)
+                    else str(raw_all).lower() in ("1", "true", "yes")
+                )
+                result = await self._gateway.approval_respond(
+                    sid, request_id, decision, resolve_all=resolve_all
+                )
+                if self._durable is not None:
+                    self._durable.resolve_attention(
+                        request_id=None if resolve_all else request_id or None,
+                        session_id=sid, kind="approval",
+                    )
+            else:  # /clarify
+                sid = str(params["session_id"])
+                request_id = str(params.get("request_id") or "")
+                text = str(params.get("text") or "")
+                result = await self._gateway.clarify_respond(sid, request_id, text)
+                if self._durable is not None:
+                    self._durable.resolve_attention(
+                        request_id=request_id or None,
+                        session_id=sid, kind="clarify",
+                    )
+        except KeyError as exc:
+            return connection.respond(
+                HTTPStatus.BAD_REQUEST,
+                json.dumps({"ok": False, "error": f"missing required param {exc}"}) + "\n",
+            )
+        except Exception:
+            _log.warning("HTTP gate answer (%s) failed", path, exc_info=True)
+            return connection.respond(
+                HTTPStatus.BAD_GATEWAY,
+                json.dumps({"ok": False, "error": "gateway answer failed"}) + "\n",
+            )
+        return connection.respond(
+            HTTPStatus.OK,
+            json.dumps({"ok": True, "result": result}, ensure_ascii=False) + "\n",
+        )
 
     def status(self) -> dict[str, Any]:
         """A JSON-serialisable snapshot of the phone-facing server's live state."""

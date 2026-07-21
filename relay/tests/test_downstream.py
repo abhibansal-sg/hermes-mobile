@@ -891,6 +891,153 @@ async def test_disabling_health_does_not_disable_websocket_auth():
 
 
 # ---------------------------------------------------------------------------
+# R4 L4 — one-shot HTTP gate answers on the phone-facing port (GAP-10, B6/B7)
+# ---------------------------------------------------------------------------
+# Cold notification banner actions fire with NO relay socket up, and on a
+# GW-UNREACH topology the gateway REST answer is unreachable too — the agent
+# stays blocked. The phone-facing port's HTTP control sibling answers through
+# the relay's own live gateway path. Params ride the QUERY STRING: the
+# websockets>=14 handshake parser rejects non-GET methods BEFORE process_request
+# runs (proven against the real parser below), so the query string — this port's
+# /attention/pending + /sync/manifest house style — is the deployed transport.
+
+
+async def test_http_approve_query_answers_gate():
+    srv, gw = _server()
+    await srv.start()
+    c = _FakeConn()
+    from http import HTTPStatus
+
+    await srv._process_request(
+        c, _FakeRequest("/approve?session_id=sA&request_id=req-1&decision=once")
+    )
+    status, body = c.responded
+    assert status == HTTPStatus.OK
+    assert json.loads(body)["ok"] is True
+    gw.approval_respond.assert_awaited_once_with("sA", "req-1", "once", resolve_all=False)
+
+
+async def test_http_clarify_query_answers_gate():
+    srv, gw = _server()
+    await srv.start()
+    c = _FakeConn()
+    from http import HTTPStatus
+
+    from urllib.parse import quote
+
+    await srv._process_request(
+        c,
+        _FakeRequest(
+            f"/clarify?session_id=sC&request_id=req-2&text={quote('take the red one')}"
+        ),
+    )
+    status, body = c.responded
+    assert status == HTTPStatus.OK
+    assert json.loads(body)["ok"] is True
+    gw.clarify_respond.assert_awaited_once_with("sC", "req-2", "take the red one")
+
+
+async def test_http_approve_all_flag_maps_to_resolve_all():
+    srv, gw = _server()
+    await srv.start()
+    c = _FakeConn()
+    await srv._process_request(
+        c, _FakeRequest("/approve?session_id=sA&decision=always&all=true")
+    )
+    gw.approval_respond.assert_awaited_once_with("sA", "", "always", resolve_all=True)
+
+
+async def test_http_gate_answer_missing_params_is_400():
+    srv, gw = _server()
+    await srv.start()
+    c = _FakeConn()
+    from http import HTTPStatus
+
+    await srv._process_request(c, _FakeRequest("/approve?request_id=req-1"))
+    status, body = c.responded
+    assert status == HTTPStatus.BAD_REQUEST
+    assert json.loads(body)["ok"] is False
+    gw.approval_respond.assert_not_awaited()
+
+
+async def test_http_gate_answer_is_auth_gated():
+    srv, _ = _server()
+    srv._cfg.auth_token = "secret"
+    await srv.start()
+    c = _FakeConn()
+    from http import HTTPStatus
+
+    await srv._process_request(c, _FakeRequest("/approve?session_id=sA&decision=once"))
+    assert c.responded[0] == HTTPStatus.UNAUTHORIZED
+    # ... and admitted with the bearer token (same secret the WS uses).
+    c2 = _FakeConn()
+    req = _FakeRequest(
+        "/approve?session_id=sA&request_id=r&decision=once",
+        {"Authorization": "Bearer secret"},
+    )
+    await srv._process_request(c2, req)
+    assert c2.responded[0] == HTTPStatus.OK
+
+
+async def test_http_gate_answer_gateway_failure_is_sanitized_502():
+    srv, gw = _server()
+    gw.approval_respond = AsyncMock(side_effect=RuntimeError("gateway 4009 raw code"))
+    await srv.start()
+    c = _FakeConn()
+    from http import HTTPStatus
+
+    await srv._process_request(
+        c, _FakeRequest("/approve?session_id=sA&request_id=r&decision=once")
+    )
+    status, body = c.responded
+    assert status == HTTPStatus.BAD_GATEWAY
+    parsed = json.loads(body)
+    assert parsed["ok"] is False
+    # I17 / §6b: the raw gateway error never reaches the cold-tap caller.
+    assert "4009" not in parsed["error"]
+
+
+async def test_http_approve_get_survives_real_websockets_parser():
+    """The deployed-transport proof: drive the REAL ``serve()`` and answer a
+    gate over a raw GET with query params. websockets>=14 rejects non-GET
+    methods before ``process_request`` ever runs — a POST body transport would
+    die in the handshake parser; this test pins that the query transport lands.
+    """
+    srv, gw = _server()
+    srv._cfg.port = 0  # OS-assigned ephemeral port (never a live relay port)
+    serve_task = asyncio.get_event_loop().create_task(srv.serve())
+    try:
+        # Bound the bind wait instead of sleeping blind.
+        for _ in range(200):
+            if srv._server is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert srv._server is not None, "server never bound"
+        port = srv._server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"GET /approve?session_id=sA&request_id=req-1&decision=once HTTP/1.1\r\n"
+            b"Host: relay\r\nConnection: close\r\n\r\n"
+        )
+        await writer.drain()
+        raw = await asyncio.wait_for(reader.read(65536), timeout=10)
+        writer.close()
+        head, _, body = raw.partition(b"\r\n\r\n")
+        assert b" 200 " in head.split(b"\r\n", 1)[0], f"status line: {head[:80]!r}"
+        assert json.loads(body.decode("utf-8"))["ok"] is True
+        gw.approval_respond.assert_awaited_once_with(
+            "sA", "req-1", "once", resolve_all=False
+        )
+    finally:
+        await srv.close()
+        serve_task.cancel()
+        try:
+            await serve_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+# ---------------------------------------------------------------------------
 # SUBMIT synthesizes the completed ``userMessage`` item (QA-1 B5/B13)
 # ---------------------------------------------------------------------------
 # The relay reframer maps ONLY agent events; nothing ever emitted a userMessage

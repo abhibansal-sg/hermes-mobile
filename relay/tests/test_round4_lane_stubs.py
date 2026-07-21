@@ -209,24 +209,35 @@ async def test_l3_turn_completed_reason_error():
 
 
 class _FakeHTTPConnection:
-    """The `connection.respond(status, body)` surface _process_request uses."""
+    """The `connection.respond(status, body)` surface _process_request uses.
+
+    ``respond`` is SYNC — the real websockets>=14 ``ServerConnection.respond``
+    builds and RETURNS a Response (it is not a coroutine); every existing
+    route in ``_process_request`` calls it un-awaited. (The original W0b fake
+    had it async, which never ran under the production call style — aligning
+    it with the real API is the adaptation the stub docstring sanctions.)
+    """
 
     def __init__(self) -> None:
         self.responded: list[tuple] = []
 
-    async def respond(self, status, body: str):
+    def respond(self, status, body: str):
         self.responded.append((status, body))
+        return ("responded", status, body)
 
 
 class _FakeHTTPRequest:
-    """A POST request on the phone-facing port.
+    """A gate-answer request on the phone-facing port.
 
     Exposes the surface the existing _process_request reads (``path``,
-    ``headers``) plus a JSON ``body``. The L4 implementer defines the exact
-    body-read mechanism the websockets version permits and adapts this fake
-    when turning the stub green — the pinned BEHAVIOR is: POST /approve (or
-    /clarify) on the downstream port answers 200 and forwards the answer to
-    the gateway.
+    ``headers``) plus a JSON ``body``. L4 IMPLEMENTER'S NOTE (W1): the pinned
+    behavior — /approve (or /clarify) on the downstream port answers 200 and
+    forwards the answer to the gateway — is implemented with query-string
+    params as the REAL transport (websockets>=14 rejects non-GET methods
+    before process_request runs — a POST never reaches the handler) and this
+    JSON ``body`` honored as a fallback when a request object exposes one
+    (which this fake does). No fake adaptation was needed; protocol §5c
+    documents the wire shape.
     """
 
     def __init__(self, path: str, body: str) -> None:
@@ -235,11 +246,6 @@ class _FakeHTTPRequest:
         self.body = body.encode("utf-8")
 
 
-@pytest.mark.xfail(strict=True, reason=L4 + "the phone-facing port must serve "
-                   "one-shot POST /approve → gateway approval.respond "
-                   "(downstream._process_request serves healthz/attention/"
-                   "manifest only and returns None for /approve today). "
-                   "Wave-1 L4 flips this; remove when green.")
 async def test_l4_http_approve_one_shot():
     import json
 
@@ -260,10 +266,6 @@ async def test_l4_http_approve_one_shot():
     assert call.args[0] == "sA" and call.args[1] == "req-1" and call.args[2] == "once"
 
 
-@pytest.mark.xfail(strict=True, reason=L4 + "the phone-facing port must serve "
-                   "one-shot POST /clarify → gateway clarify.respond (absent "
-                   "today — cold-tap answers are dead on GW-UNREACH). Wave-1 "
-                   "L4 flips this; remove when green.")
 async def test_l4_http_clarify_one_shot():
     import json
 
