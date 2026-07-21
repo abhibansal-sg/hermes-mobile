@@ -17,13 +17,27 @@ alive through the whole storm and every unknown method returned a clean error.
 The relay + an isolated subprocess gateway (event injection needs a signal-able
 gateway) are started ONCE (module fixture) and reused across all hypothesis
 examples, so the fuzz is cheap per case. NEVER the live gateway.
+
+Two phases (soak mode runs BOTH; short mode runs only the hypothesis phase so the
+CI gate stays seconds-fast):
+
+* ``test_t6_fuzz`` — the hypothesis ``@given`` phase: 40 derandomized cases drawn
+  from the same corpus strategy below.
+* ``test_t6_sustain`` — a wall-clock soak phase: keeps drawing from the SAME
+  strategy and firing cases for the full ``duration_s`` budget (the spec's
+  "15 min budget" / 30 min soak), liveness-probing every ~50 cases. This is what
+  makes the soak-mode duration real — hypothesis's ``max_examples`` alone caps at
+  40 cases and ignores ``duration_s``, which would make a soak run finish in
+  seconds rather than minutes.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import random
 import socket
+import time
 
 import pytest
 import websockets
@@ -162,31 +176,81 @@ async def _inject_event(gw, etype: str) -> None:
         pass
 
 
+async def _fire_case(env: dict, case: tuple) -> None:
+    """Apply one (kind, payload) fuzz case to the relay-under-test."""
+    kind, payload = case
+    url, token = env["url"], env["token"]
+    if kind in ("RAW", "OVERSIZE"):
+        await _send_raw(url, token, payload)
+    elif kind == "UNKNOWN":
+        await _send_unknown(url, token, payload, env["checker"])
+    elif kind == "EVENT":
+        await _inject_event(env["gw"], payload)
+
+
+# Mirror _case_strategy's union with a plain Random so the soak phase draws from
+# the SAME corpus (seeded by SOAK_SEED) without going through hypothesis.
+def _draw_case(rng: random.Random) -> tuple:
+    arm = rng.choice(["RAW", "UNKNOWN", "OVERSIZE", "EVENT"])
+    if arm == "RAW":
+        if rng.random() < 0.5:
+            return ("RAW", rng.choice(_TRUNCATED))
+        return ("RAW", "".join(rng.choice("abc {}\x00\t\"\\") for _ in range(rng.randint(0, 120))))
+    if arm == "UNKNOWN":
+        return ("UNKNOWN", json.dumps({
+            "jsonrpc": "2.0", "id": rng.randint(1000, 999999),
+            "method": rng.choice(_UNKNOWN_METHODS), "params": {},
+        }))
+    if arm == "OVERSIZE":
+        return ("OVERSIZE", "X" * (9 * 1024 * 1024))
+    return ("EVENT", rng.choice([
+        "message.delta", "tool.complete", "bogus.unknown.type",
+        "item.started", "", "message.complete", "error",
+        "approval.request", "weird::type",
+    ]))
+
+
 _CASES_SEEN = {"n": 0}
+
+
+def _apply_case_sync(env: dict, case: tuple) -> None:
+    _CASES_SEEN["n"] += 1
+    asyncio.run(_fire_case(env, case))
+    if _CASES_SEEN["n"] % 5 == 0:
+        asyncio.run(env["checker"].probe_alive(f"after-{_CASES_SEEN['n']}"))
 
 
 @settings(max_examples=40, deadline=None, derandomize=True,
           suppress_health_check=list(HealthCheck))
 @given(case=_case_strategy())
 def test_t6_fuzz(case, fuzz_env):
-    """Fire one fuzz case at the relay; it must stay alive throughout."""
-    kind, payload = case
-    _CASES_SEEN["n"] += 1
+    """Phase 1 — hypothesis ``@given`` phase: 40 corpus cases (always runs)."""
+    _apply_case_sync(fuzz_env, case)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(soak_params.mode() != "soak",
+                    reason="sustained fuzz budget is the soak-mode contract")
+async def test_t6_sustain(fuzz_env):
+    """Phase 2 — sustained soak: fire the corpus for the full ``duration_s``.
+
+    Hypothesis's ``max_examples`` caps the @given phase at 40 cases and ignores
+    ``duration_s`` — without this loop a soak run would finish in seconds. The
+    spec's "T6 fuzz (15 min budget)" is realized HERE: we draw from the same
+    corpus strategy and hammer the relay for the resolved soak duration, probing
+    liveness every ~50 cases so a crash is localized to a narrow window.
+    """
+    p = soak_params.params("t6_fuzz")
+    rng = random.Random(p.seed ^ 0xF6)
     checker = fuzz_env["checker"]
-    url, token = fuzz_env["url"], fuzz_env["token"]
-
-    if kind == "RAW":
-        asyncio.run(_send_raw(url, token, payload))
-    elif kind == "OVERSIZE":
-        asyncio.run(_send_raw(url, token, payload))
-    elif kind == "UNKNOWN":
-        asyncio.run(_send_unknown(url, token, payload, checker))
-    elif kind == "EVENT":
-        asyncio.run(_inject_event(fuzz_env["gw"], payload))
-
-    # Probe liveness every few cases so a crash is localized quickly.
-    if _CASES_SEEN["n"] % 5 == 0:
-        asyncio.run(checker.probe_alive(f"after-{_CASES_SEEN['n']}"))
+    deadline = time.monotonic() + p.duration_s
+    while time.monotonic() < deadline:
+        # Fire a burst of ~50 cases per liveness probe so the storm is dense but
+        # a dead relay is caught within one burst.
+        for _ in range(50):
+            await _fire_case(fuzz_env, _draw_case(rng))
+            _CASES_SEEN["n"] += 1
+        await checker.probe_alive(f"sustain-{_CASES_SEEN['n']}")
 
 
 def test_t6_verdict(fuzz_env, evidence):
