@@ -138,3 +138,17 @@ What the OWNER reads as "the working affordance" is a SECOND element: the collap
 - 10:49:04 — APNs fan-out to 3 tokens (2 production-host, 1 sandbox-host) = IMG_2583 banner (S5+S13).
 - 11:18:38 / 11:25:28 / 11:27:03 — WS connection opens; 11:25:28 lands inside IMG_2585's 5s-young turn (S6 prompt-vanish trigger).
 - 11:28:01 / 11:29:15 — Aheli session (…ad9133) fetches at IMG_2591 time (S8 double-working); NO fetches at 11:30 (IMG_2594 new chat made zero backend requests → S11 leak is pure client state).
+
+---
+
+## FIX STATUS — S1/S2/S3 lane (qa3/working, 2026-07-21)
+
+**Root causes CONFIRMED as diagnosed** (verified at file:line on 2e19b923f), with one refinement: the dual-affordance also holds in phase C unless the fold hands the pulse to the prose-tail caret — the fix guarantees EXACTLY ONE breathing glyph at any instant (fold glyph while no answer text; prose-tail caret once text flows).
+
+Fixed on `qa3/working` (commits 420b0f163 / f8ae92dbd / 6a90e778d / 51be5db4f + tests):
+- **S2/S3 (A1):** `MessageBubble.assistantBody` now renders the working section (`WorkingSectionView`) as the bubble's SOLE content while the turn is live and no answer text flows — from SEND, zero parts, local state only. The fold's `ProgressView` spinner is DELETED; the breathing cursor is the line's leading glyph (fold = cursor line). Pure contracts `MessageBubble.showsStandaloneWorkingLine` / `workingAffordanceCount` pin one surface per phase; two surfaces are unreachable by construction (the merged line and the ForEach fold are mutually exclusive branches).
+- **S1 breathe (A10):** `CursorBreathe` — stateless pure opacity curve (1.0 → 0.25, 1.2 s cosine period = ratified easeInOut-0.6-autoreverses), driven by `TimelineView` in both `StreamingCursor` and `BreathingCursorGlyph`. No `@State`/`repeatForever` to strand static on remount; Reduce Motion = steady full opacity.
+- **S1 gap (A10):** `ChatView.composerFloatInset` 140 → 120 (UX1 floor), `composerBreathingGap` 16 → 8; ~20-28 pt dead band removed at rest; keyboard/dock composition unchanged.
+- **Timer reconciliation (A1):** relay reframer stamps `duration_s`/`started_at` on `turn.completed` (measured from turn open); coordinator threads it into `applyRelayItems(serverTurnDuration:)`; settle edge adopts server value, local `turnStartedAt` is fallback (also stamps honest durations for mid-turn resumes with no local start). Documented in RELAY-PHONE-PROTOCOL.md.
+
+Tests (extend, not fork): `RenderConformanceTests` — A1 flagship with relay frames held 10 s (affordance ≤100 ms from send; local timer reads ≥9 s through the blackout; one surface in phases A/B/C, zero settled); one-affordance contract matrix; fail-before/pass-after geometry (phase A ≡ phase B single line); static-cursor render pin; server-reconciliation replay (duration_s 42.0 → "Worked for 42s"). `TranscriptChromeGlowTests` — clearance pins. `relay/tests/test_reframer.py` — duration_s + per-turn reset. RED proof: the base-compilable subset fails on qa3/base (evidence/daily-driver-qa3/working-lane/red-on-base-*).
