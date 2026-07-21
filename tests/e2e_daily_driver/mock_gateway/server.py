@@ -302,12 +302,61 @@ async def _emit_longturn(sess: MockSession, send: SendFn) -> None:
     sess.history.append({"role": "assistant", "content": final_text})
 
 
+async def _emit_delayed_first(sess: MockSession, send: SendFn) -> None:
+    """QA-3 S2 incident shape: the model's first item is LATE.
+
+    Sleeps ``first_item_delay_s`` (default 1.5) BEFORE ``message.start`` — the
+    relay synthesizes the ``userMessage`` item at SUBMIT (downstream.py
+    allocates its ord there), so the phone sees the echoed user item instantly
+    and then SITS IN SILENCE until the delay elapses and the turn's first agent
+    frame lands. This is the deterministic stand-in for the ~35 s model
+    time-to-first-token of IMG_2578: build 116's labeled working affordance
+    only appeared with that first frame. The recorded fixture's per-frame
+    ``t_ms`` captures the gap; the XCTest side can also simply NOT deliver the
+    late frames (an infinite delay — the stronger A1 assertion).
+    """
+    kwargs = sess.script.kwargs if sess.script else {}
+    delay = float(kwargs.get("first_item_delay_s", 1.5))
+    await asyncio.sleep(delay)
+    await _emit_simple(sess, send)
+
+
+async def _emit_hang_mid_turn(sess: MockSession, send: SendFn) -> None:
+    """QA-3 S8 incident shape: the turn goes silent and NEVER completes.
+
+    Emits ``message.start`` + ONE ``tool.start`` (a bash tool that never
+    returns a ``tool.complete``), then sleeps ``hang_s`` (default 2.5) and
+    returns WITHOUT ``message.complete`` — the gateway turn "died" (lost
+    terminal frame / gateway never ran it after the flap, per the S8 relay-log
+    reconciliation). The relay's per-session store keeps the tool item
+    ``in_progress`` indefinitely; a phone ``resync`` re-delivers the same
+    in-progress items — exactly the re-arm-the-watchdog-by-unrelated-frames
+    trap that made build 116's working rows eternal (IMG_2591). ``running``
+    flips back to False when the script returns (the gateway considers the turn
+    gone), but NO terminal event is ever emitted on the wire.
+    """
+    kwargs = sess.script.kwargs if sess.script else {}
+    hang_s = float(kwargs.get("hang_s", 2.5))
+    tool_id = "tool-deadturn-1"
+    await send(sess.sid, {"type": "message.start", "session_id": sess.sid, "payload": None})
+    await send(sess.sid, {
+        "type": "tool.start", "session_id": sess.sid,
+        "payload": {"tool_id": tool_id, "name": "bash",
+                    "args": {"command": "pytest tests/ -x"}},
+    })
+    # The turn dies mid-tool: silence, then the script exits with no
+    # message.complete. The recorder captures the silence window via t_ms.
+    await asyncio.sleep(hang_s)
+
+
 _SCRIPTS = {
     "simple": _emit_simple,
     "approval": _emit_approval,
     "clarify": _emit_clarify,
     "tasklist": _emit_tasklist,
     "longturn": _emit_longturn,
+    "delayed_first": _emit_delayed_first,
+    "hang_mid_turn": _emit_hang_mid_turn,
 }
 
 

@@ -519,4 +519,120 @@ final class WorkingSectionModelTests: XCTestCase {
         XCTAssertEqual(WorkingSectionModel.glyph(for: .image), "photo")
         XCTAssertEqual(WorkingSectionModel.glyph(for: .reasoning), "bubble.left")
     }
+
+    // MARK: - QA-3 S2/S3/A1 — the single merged working-affordance decision
+
+    /// S2/A1: at SEND — the optimistic bubble has ZERO parts and no relay frame
+    /// has landed — the caret slot renders the merged working line (breathing
+    /// glyph + "Working…" + per-turn timer) from local state. Build 116 showed
+    /// a bare textless cursor here until the model's first item (~35 s late in
+    /// IMG_2578): the labeled affordance was gated on the first work part.
+    func testPreItemWorkingLineVisibleAtSendWithZeroParts() {
+        XCTAssertTrue(
+            WorkingSectionModel.preItemWorkingLineVisible(parts: [], streamingLive: true),
+            "spec S2/A1: send → the merged labeled+timed working line renders instantly from local state (zero parts, no frames)"
+        )
+    }
+
+    /// S3: once work parts land with no answer text yet, the FOLD's live line
+    /// IS the affordance — the separate standalone cursor beside it was the
+    /// dual-affordance bug (spinner line + bare bar stacked, IMG_2578/2587/
+    /// 2591). The caret slot must be suppressed.
+    func testPreItemWorkingLineSuppressedWhenFoldExists() {
+        let parts: [ChatMessagePart] = [
+            .reasoning(id: "r1", text: "Let me look at the transform code."),
+            item("t1", .toolCall, status: .inProgress,
+                 body: ["name": "read", "args": ["path": "proxy.py"]]),
+        ]
+        XCTAssertFalse(
+            WorkingSectionModel.preItemWorkingLineVisible(parts: parts, streamingLive: true),
+            "spec S3: with a working fold live and no answer text, the caret slot mounts no second surface — the fold line is the cursor line"
+        )
+        // …and the fold is EXACTLY ONE node (the single affordance surface).
+        let nodes = WorkingSectionModel.renderNodes(from: parts)
+        XCTAssertEqual(nodes.count, 1, "spec S3/A3: one fold node — one working surface")
+        guard case .working = nodes[0] else {
+            return XCTFail("the single node is the working fold")
+        }
+    }
+
+    /// S3: once the answer text streams, the caret rides the prose tail — no
+    /// pre-item line (the fold's live line above the prose remains the single
+    /// ratified QA-2 working surface; the prose-tail glyph is the text caret,
+    /// not a second affordance).
+    func testPreItemWorkingLineSuppressedWhenAnswerTextStreams() {
+        let parts: [ChatMessagePart] = [
+            item("t1", .toolCall, body: ["name": "read", "args": ["path": "x.py"]]),
+            .text(id: "txt1", text: "The proxy transform is "),
+        ]
+        XCTAssertFalse(
+            WorkingSectionModel.preItemWorkingLineVisible(parts: parts, streamingLive: true),
+            "the caret rides the streaming prose tail — no pre-item line"
+        )
+        // Pure-text turns never grow the line either.
+        XCTAssertFalse(WorkingSectionModel.preItemWorkingLineVisible(
+            parts: [.text(id: "t", text: "Answer…")], streamingLive: true))
+    }
+
+    /// Settled turns never render the live line — the settled "Worked for Ns"
+    /// fold owns the presentation.
+    func testPreItemWorkingLineNeverOnSettledTurns() {
+        XCTAssertFalse(WorkingSectionModel.preItemWorkingLineVisible(parts: [], streamingLive: false))
+        XCTAssertFalse(WorkingSectionModel.preItemWorkingLineVisible(
+            parts: [item("t1", .toolCall, body: ["name": "read"])], streamingLive: false))
+    }
+
+    /// S2/A1: the merged line's label with zero parts is plain "Working…" —
+    /// the honest pre-first-item status (no tool to humanize yet), and the
+    /// per-turn timer derives from the local `turnStartedAt` stamped at send.
+    func testMergedLineLabelAndTimerAtSend() {
+        XCTAssertEqual(WorkingSectionModel.liveCollapsedLabel(parts: []), "Working…")
+        let start = Date().addingTimeInterval(-3)
+        let elapsed = ThinkingDisplay.elapsedText(startedAt: start, now: Date())
+        XCTAssertEqual(elapsed, "3s", "the merged line's timer ticks from the local turn start")
+        XCTAssertEqual(ThinkingDisplay.elapsedText(startedAt: nil, now: Date()), "0s")
+    }
+
+    /// S1/A10: the cursor breathe is a pure function of the clock — the old
+    /// onAppear-kicked `repeatForever` @State stranded a static glyph on any
+    /// remount/re-projection without an `isStreaming` edge (the motionless bar
+    /// of IMG_2577/2585/2587; `applyRelayItems` rebuilds the caret row on every
+    /// pass). A time-driven opacity can never strand: any mount renders the
+    /// correct phase for "now".
+    func testStreamingCursorBreatheIsPureClockDriven() {
+        let t0 = Date(timeIntervalSinceReferenceDate: 1_000_000)
+        // Range: the pulse lives in [minOpacity, 1].
+        for k in 0..<24 {
+            let t = t0.addingTimeInterval(Double(k) * 0.05)
+            let o = StreamingCursor.breatheOpacity(at: t, streaming: true, reduceMotion: false)
+            XCTAssertGreaterThanOrEqual(o, StreamingCursor.minOpacity - 1e-9)
+            XCTAssertLessThanOrEqual(o, 1.0 + 1e-9)
+        }
+        // Peaks and troughs ~half a period apart differ by (almost) the full
+        // swing — the breathe is visibly moving, not a static mid-value.
+        // sin peak at t where phase=1: t = period/4 from a zero crossing; sample
+        // a dense grid and take max/min to be phase-agnostic.
+        var maxO = 0.0, minO = 1.0
+        for k in 0..<240 {
+            let o = StreamingCursor.breatheOpacity(
+                at: t0.addingTimeInterval(Double(k) * 0.005), streaming: true, reduceMotion: false)
+            maxO = max(maxO, o); minO = min(minO, o)
+        }
+        XCTAssertEqual(maxO, 1.0, accuracy: 1e-6, "the breathe reaches full opacity")
+        XCTAssertEqual(minO, StreamingCursor.minOpacity, accuracy: 1e-3, "the breathe dims to the ratified trough")
+        // Period: exactly the ratified 1.2 s cycle (0.6 s easeInOut each way).
+        XCTAssertEqual(StreamingCursor.breathePeriodSeconds, 1.2, accuracy: 1e-9)
+        let a = StreamingCursor.breatheOpacity(at: t0, streaming: true, reduceMotion: false)
+        let b = StreamingCursor.breatheOpacity(at: t0.addingTimeInterval(1.2), streaming: true, reduceMotion: false)
+        XCTAssertEqual(a, b, accuracy: 1e-9, "the breathe repeats every 1.2 s")
+    }
+
+    /// S1/A10: settled and Reduce Motion render STATIC at full opacity — an
+    /// honest motionless glyph, never a mid-pulse freeze.
+    func testStreamingCursorStaticWhenSettledOrReduceMotion() {
+        let t = Date(timeIntervalSinceReferenceDate: 1_234_567.89)
+        XCTAssertEqual(StreamingCursor.breatheOpacity(at: t, streaming: false, reduceMotion: false), 1.0)
+        XCTAssertEqual(StreamingCursor.breatheOpacity(at: t, streaming: true, reduceMotion: true), 1.0)
+        XCTAssertEqual(StreamingCursor.breatheOpacity(at: t, streaming: false, reduceMotion: true), 1.0)
+    }
 }
