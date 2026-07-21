@@ -66,6 +66,18 @@ _log = logging.getLogger("soak.conftest")
 RELAY_PYTHON = os.environ.get("SOAK_PYTHON", sys.executable)
 RELAY_SOURCE = Path(os.environ.get("SOAK_RELAY_SOURCE", str(_ROOT))).resolve()
 
+# Make the relay-under-test importable IN-PROCESS (the I7 notifier drive imports
+# hermes_relay.Reframer/Notifier). Inserting the source's relay/ at sys.path[0]
+# resolves hermes_relay to the tree under test regardless of any venv install,
+# which is what makes the harness re-soak ANY relay source. Point the plugin
+# bridge at the same tree's plugins/hermes-mobile.
+_RELAY_PKG = str(RELAY_SOURCE / "relay")
+if _RELAY_PKG not in sys.path:
+    sys.path.insert(0, _RELAY_PKG)
+os.environ.setdefault(
+    "HERMES_RELAY_PLUGIN_DIR", str(RELAY_SOURCE / "plugins" / "hermes-mobile")
+)
+
 
 # ---------------------------------------------------------------------------
 # Session-scoped run context.

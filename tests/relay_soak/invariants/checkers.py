@@ -420,13 +420,36 @@ class NotifyRecorder:
         fg_at_call = set(self.foreground)
         descriptor = self.notifier.observe(frame)
         sid = _g(frame, "sid", "sid") or ""
+        # Classify the frame ourselves so a SUPPRESSED decision (descriptor is
+        # None) still records WHICH signal was held back (turn_complete, etc.).
+        event_type = ((descriptor or {}).get("event_type")
+                      or self._classify_frame(frame))
         self.decisions.append({
             "sid": sid,
             "kind": _g(frame, "kind", "kind"),
             "foreground_at_decision": sid in fg_at_call,
             "fired": descriptor is not None,
-            "event_type": (descriptor or {}).get("event_type"),
+            "event_type": event_type,
         })
+
+    @staticmethod
+    def _classify_frame(frame: Any) -> Optional[str]:
+        """Mirror the relay Notifier's _classify for evidence (frame -> kind)."""
+        kind = _g(frame, "kind", "kind")
+        body = _g(frame, "body", "body") or {}
+        if kind == "approval.request":
+            return "approval"
+        if kind == "clarify.request":
+            return "clarify"
+        if kind == _ITEM_COMPLETED:
+            itype = body.get("type")
+            if itype == "agentMessage":
+                return "turn_complete"
+            if itype == "error":
+                return "turn_error"
+            if itype == "taskList":
+                return "task_complete"
+        return None
 
     def report(self) -> dict[str, Any]:
         violations: list[str] = []
