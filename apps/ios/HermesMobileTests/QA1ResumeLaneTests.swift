@@ -269,6 +269,9 @@ final class QA1ResumeLaneTests: XCTestCase {
         sessions.open(summary("stored-A"), bindRuntime: false)
 
         let runtimeId = await sessions.resumeActiveAfterReconnect()
+        // The re-establishment (setForeground+open) is a best-effort Task —
+        // wait for its RPC to land on the socket before pinning the wire.
+        await waitUntil { transport.upstreams().contains { $0.method == "resume" || $0.method == "open" } }
 
         XCTAssertEqual(runtimeId, "stored-A", "relay resume must bind the stored id")
         XCTAssertEqual(sessions.activeRuntimeId, "stored-A")
@@ -359,6 +362,7 @@ final class QA1ResumeLaneTests: XCTestCase {
         // self-heal on the reconnect driver). The QA-1 north star stands:
         // NEVER a modal alert over the self-healing transport condition.
         XCTAssertEqual(runtimeId, "stored-E", "the relay bind is local — the stored id IS the runtime id")
+        await waitUntil { transport.upstreams().contains { $0.method == "open" } }
         XCTAssertNil(
             sessions.sessionActionError,
             "relay resume failures self-heal on the next ready edge — never an alert"
@@ -514,7 +518,7 @@ final class QA1ResumeLaneTests: XCTestCase {
             if up.method == "resume" || up.method == "open" {
                 relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
                 let sid = (up.params["session_id"] as? String) ?? "stored-miss"
-                let item: [String: Any] = ["item_id": "\(sid):a1", "type": "text",
+                let item: [String: Any] = ["item_id": "\(sid):a1", "type": "agentMessage",
                                            "status": "completed", "ord": 1, "summary": "",
                                            "body": ["text": "RELAY-SEEDED"]]
                 let body: [String: Any] = ["items": [item]]
