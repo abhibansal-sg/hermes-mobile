@@ -55,7 +55,7 @@
       "turn": "render-sess-qa3-delay:t1",
       "kind": "turn.started",
       "body": {},
-      "t_ms": 1502
+      "t_ms": 1503
     },
     {
       "seq": 3,
@@ -72,7 +72,7 @@
           "text": ""
         }
       },
-      "t_ms": 1502
+      "t_ms": 1503
     },
     {
       "seq": 4,
@@ -98,7 +98,7 @@
           "text": "proxy "
         }
       },
-      "t_ms": 1511
+      "t_ms": 1513
     },
     {
       "seq": 6,
@@ -111,7 +111,7 @@
           "text": "transform "
         }
       },
-      "t_ms": 1524
+      "t_ms": 1523
     },
     {
       "seq": 7,
@@ -137,7 +137,7 @@
           "text": "optimal "
         }
       },
-      "t_ms": 1546
+      "t_ms": 1544
     },
     {
       "seq": 9,
@@ -150,7 +150,7 @@
           "text": "given "
         }
       },
-      "t_ms": 1556
+      "t_ms": 1555
     },
     {
       "seq": 10,
@@ -163,7 +163,7 @@
           "text": "its "
         }
       },
-      "t_ms": 1568
+      "t_ms": 1565
     },
     {
       "seq": 11,
@@ -176,7 +176,7 @@
           "text": "inputs."
         }
       },
-      "t_ms": 1579
+      "t_ms": 1576
     },
     {
       "seq": 12,
@@ -193,7 +193,7 @@
           "text": "The proxy transform is optimal given its inputs."
         }
       },
-      "t_ms": 1590
+      "t_ms": 1587
     },
     {
       "seq": 13,
@@ -213,7 +213,7 @@
           "total": 9
         }
       },
-      "t_ms": 1590
+      "t_ms": 1587
     },
     {
       "seq": 14,
@@ -226,9 +226,11 @@
           "input": 1,
           "output": 8,
           "total": 9
-        }
+        },
+        "duration_s": 0.085,
+        "started_at": 1784620151.298581
       },
-      "t_ms": 1592
+      "t_ms": 1589
     }
   ],
   "settled": {
