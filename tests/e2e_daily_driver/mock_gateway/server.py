@@ -395,6 +395,12 @@ class MockGateway:
         self.rpc_log: list[dict[str, Any]] = []
         # Tracks every approval.respond / clarify.respond the relay forwarded.
         self.respond_log: list[dict[str, Any]] = []
+        # R4 W0b wire-spy: one entry per inbound WS connection (I13: bg/fg
+        # cycles ⇒ the relay keeps its ONE gateway socket — zero reconnects)
+        # and per REST transcript read (I14: the reconcile budget — history
+        # reads are REST, so they never appear in rpc_log).
+        self.connect_events: list[float] = []
+        self.rest_reads: list[dict[str, Any]] = []
 
     # -- lifecycle --------------------------------------------------------
     async def start(self) -> None:
@@ -432,6 +438,7 @@ class MockGateway:
             sid = path[len("/api/sessions/"):-len("/messages")]
             sess = self.sessions.get(sid)
             msgs = list(sess.history) if sess else []
+            self.rest_reads.append({"t": time.monotonic(), "session_id": sid})
             body = json.dumps({"session_id": sid, "messages": msgs}) + "\n"
             return conn.respond(HTTPStatus.OK, body)
         if path == "/healthz":
@@ -441,6 +448,7 @@ class MockGateway:
     # -- WS ---------------------------------------------------------------
     async def _handle(self, ws: WebSocketServerProtocol) -> None:
         self._conns.add(ws)
+        self.connect_events.append(time.monotonic())
         # On connect the stock gateway pushes gateway.ready — emit it.
         await self._send_event(ws, {"type": "gateway.ready", "session_id": None, "payload": {}})
         try:

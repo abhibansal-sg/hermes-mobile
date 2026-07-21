@@ -67,6 +67,15 @@ class PhoneDriver:
         self._pending: dict[int, "asyncio.Future[dict[str, Any]]"] = {}
         self.frames: list[PhoneFrame] = []
         self.sent: list[dict[str, Any]] = []
+        # R4 W0b (contract RPC-spy scenarios): EVERY RPC response observed on the
+        # wire (success OR error), and the ids this driver locally CANCELLED —
+        # the I4 cancel-spy (a superseded open/resume must be RPC-cancelled, not
+        # merely result-fenced, contract I4 / amendment W0-determinism) and the
+        # I17 no-error-theater assertion (zero ``error`` responses surfaced to
+        # the phone across a flap) both read these. Additive: the pre-R4
+        # scenarios read only ``frames`` / ``sent`` and are unaffected.
+        self.responses: list[dict[str, Any]] = []
+        self.cancelled: list[dict[str, Any]] = []
         self._reader: Optional[asyncio.Task] = None
         self._closed = asyncio.Event()
 
@@ -103,9 +112,13 @@ class PhoneDriver:
                         msg = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if "id" in msg and msg["id"] in self._pending:
-                        fut = self._pending.pop(msg["id"])
-                        if not fut.done():
+                    if "id" in msg:
+                        # Record every response (spy), then resolve if awaited.
+                        # A response for a CANCELLED rpc (I4) lands here with no
+                        # pending future — observed on the wire, never applied.
+                        self.responses.append(msg)
+                        fut = self._pending.pop(msg["id"], None)
+                        if fut is not None and not fut.done():
                             fut.set_result(msg)
                     elif "kind" in msg:
                         # downstream frame
@@ -124,6 +137,51 @@ class PhoneDriver:
         self.sent.append({"method": method, "params": params, "id": rid})
         await self._ws.send(json.dumps(frame))
         return await asyncio.wait_for(fut, timeout=timeout)
+
+    # -- detached RPCs + cancel-spy (R4 W0b, contract I4) --------------------
+    def send_request(self, method: str, params: dict[str, Any]) -> int:
+        """Fire an upstream RPC WITHOUT awaiting its result; return its id.
+
+        The frame write is scheduled as a task so the caller can fire a second
+        request one tick later (the I4 supersede pattern) and then cancel the
+        first with :meth:`cancel_call` — exactly the iOS ``RelayClient`` epoch
+        discipline the contract requires (superseded open/resume RPC-cancelled,
+        not merely result-fenced). Pair with :meth:`await_response`.
+        """
+        assert self._ws is not None, "phone not connected"
+        self._id += 1
+        rid = self._id
+        frame = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+        self._pending[rid] = asyncio.get_event_loop().create_future()
+        self.sent.append({"method": method, "params": params, "id": rid})
+        asyncio.create_task(self._ws.send(json.dumps(frame)))
+        return rid
+
+    async def await_response(self, rid: int, *, timeout: float = 30.0) -> dict[str, Any]:
+        """Await the response for a :meth:`send_request` id."""
+        fut = self._pending.get(rid)
+        if fut is None:
+            # Already resolved into ``responses`` (or cancelled) — replay it.
+            for msg in reversed(self.responses):
+                if msg.get("id") == rid:
+                    return msg
+            raise KeyError(f"no pending or recorded response for id {rid}")
+        return await asyncio.wait_for(fut, timeout=timeout)
+
+    def cancel_call(self, rid: int) -> bool:
+        """Locally CANCEL an in-flight RPC (the I4 cancel-spy primitive).
+
+        Mirrors ``URLSessionTask.cancel()`` on the iOS RelayClient: the pending
+        future is dropped so a late response is observed on the wire (it stays
+        in ``responses``) but NEVER applied. Returns True iff a live call was
+        cancelled (a stale id / already-resolved call returns False).
+        """
+        fut = self._pending.pop(rid, None)
+        if fut is not None and not fut.done():
+            fut.cancel()
+            self.cancelled.append({"id": rid, "t": time.monotonic()})
+            return True
+        return False
 
     # The ratified protocol methods. Each maps 1:1 to the iOS RelayClient call.
     async def submit(
