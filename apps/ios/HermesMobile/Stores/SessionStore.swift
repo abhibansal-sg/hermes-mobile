@@ -3805,6 +3805,15 @@ final class SessionStore {
     /// exercising the drawer reveal deadline.
     var beforeOpenSeedForTesting: (() async -> Void)?
 
+    /// DEBUG-only cancel-spy for contract **I4** (ROUND-4 W2d / R3): the number
+    /// of in-flight relay session-bind RPCs (resume/open) that were
+    /// RPC-CANCELLED because a newer `open()`/draft superseded them at the
+    /// intent tick — the XCTest analogue of the W0b e2e cancel-spy
+    /// (`phone.cancelled`). A superseded op that merely RESULT-FENCES (the old
+    /// `openToken` guard after the RPC runs to completion) never increments
+    /// this. Zero release-build footprint.
+    private(set) var supersededRelayRPCCancellations = 0
+
     /// DEBUG-only: await the most recently spawned open-seed Task, then yield
     /// once so any main-actor mutations it enqueued have a chance to propagate.
     /// Call this in tests INSTEAD OF (or after) `settle()` to deterministically
