@@ -59,9 +59,39 @@ def _port_free(port: int) -> bool:
         s.close()
 
 
+def _lane_bounds() -> tuple[int, int]:
+    """The isolated port sub-band this run is allowed to allocate from.
+
+    The full isolated band is 9140-9160 (constants). When several soak lanes run
+    concurrently on the same box (the spec assigns each lane a 4-port slice:
+    churn-flap 9140-43, interleave-kill 9144-47, gateway-abuse 9148-51,
+    fuzz-ring 9152-55, marathon 9156-59), a lane pins ITS slice with
+    ``SOAK_PORT_LO`` / ``SOAK_PORT_HI`` so the allocator never reaches into a
+    sibling lane's band (the bare ``_port_free`` probe is collision-safe once a
+    sibling has bound, but can't defend a slice the sibling hasn't bound yet).
+    Defaults to the whole isolated band (single-lane / CI behavior unchanged).
+    The band is always clamped inside [ISOLATED_PORT_BASE, ISOLATED_PORT_MAX]
+    and a forbidden port (live 9119/8788, QA-3 9130-9139) can never be returned.
+    """
+    import os
+
+    def _opt(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    lo = max(_opt("SOAK_PORT_LO", ISOLATED_PORT_BASE), ISOLATED_PORT_BASE)
+    hi = min(_opt("SOAK_PORT_HI", ISOLATED_PORT_MAX), ISOLATED_PORT_MAX)
+    if hi < lo:
+        lo, hi = ISOLATED_PORT_BASE, ISOLATED_PORT_MAX
+    return lo, hi
+
+
 def alloc_isolated_port(reserved: set[int]) -> int:
-    """Pick a free port in 9140-9160 not in ``reserved`` (process-global)."""
-    for port in range(ISOLATED_PORT_BASE, ISOLATED_PORT_MAX + 1):
+    """Pick a free port in the run's isolated sub-band, not in ``reserved``."""
+    lo, hi = _lane_bounds()
+    for port in range(lo, hi + 1):
         assert_isolated_port(port)
         if port in reserved:
             continue
@@ -69,8 +99,8 @@ def alloc_isolated_port(reserved: set[int]) -> int:
             reserved.add(port)
             return port
     raise RuntimeError(
-        f"no free isolated port in {ISOLATED_PORT_BASE}-{ISOLATED_PORT_MAX} "
-        f"(reserved={sorted(reserved)})"
+        f"no free isolated port in {lo}-{hi} "
+        f"(reserved={sorted(reserved & set(range(lo, hi + 1)))})"
     )
 
 
