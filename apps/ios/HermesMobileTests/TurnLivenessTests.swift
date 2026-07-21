@@ -18,9 +18,12 @@ import XCTest
 ///     banner — C3). The moment turn 2's `userMessage` lands, turn 1 heals.
 ///  2. TWO-STAGE WATCHDOG (per-turn silence clock, refreshed ONLY by current-
 ///     turn frames): stage 1 at 45 s of silence — one silent `resync{last_seq}`
-///     (self-heals a dropped terminal frame); stage 2 at 180 s — the dead
+///     (self-heals a dropped terminal frame); stage 2 at 480 s — the dead
 ///     turn's stuck items are locally settled (Interrupted) and the live flag
-///     clears.
+///     clears. The settle is PROVISIONAL: a late frame against a locally-settled
+///     item RESURRECTS it (replace-not-drop — fix-round 1), so a false-positive
+///     settle on a healthy-but-frame-silent slow turn (one long opaque tool) is
+///     lossless.
 ///
 /// Tests drive frames through the REAL render lane (RelayClient pump →
 /// coordinator ingest → ChatStore projection) over the in-process fake relay;
@@ -129,7 +132,17 @@ final class TurnLivenessTests: XCTestCase {
         _ = await g.chat.send(text: "turn one prompt")
 
         deliverStuckTurn1(g)
-        await waitUntil { self.assistantRows(g.chat).contains { $0.isStreaming } }
+        // Fix-round 1: gate on the REAL precondition — the stuck item has
+        // actually landed in the render store. The streaming-ROW wait was
+        // satisfied PREMATURELY by send's optimistic caret row (tagged,
+        // parts=0, streaming) before the pump ingested the frames, so the
+        // stage-2 DEBUG settle below raced frame ingestion and flipped
+        // nothing. The caret is not the turn's items.
+        await waitUntil {
+            g.coordinator.store.items.contains {
+                $0.itemID == "\(self.sessionID):a1" && $0.status == .inProgress
+            }
+        }
         XCTAssertTrue(g.chat.isStreaming, "turn 1 live while its tool runs")
 
         // Turn 2 arrives (the owner's "??"): its userMessage bounds the new
@@ -204,7 +217,17 @@ final class TurnLivenessTests: XCTestCase {
         _ = await g.chat.send(text: "turn one prompt")
 
         deliverStuckTurn1(g)
-        await waitUntil { self.assistantRows(g.chat).contains { $0.isStreaming } }
+        // Fix-round 1: gate on the REAL precondition — the stuck item has
+        // actually landed in the render store. The streaming-ROW wait was
+        // satisfied PREMATURELY by send's optimistic caret row (tagged,
+        // parts=0, streaming) before the pump ingested the frames, so the
+        // stage-2 DEBUG settle below raced frame ingestion and flipped
+        // nothing. The caret is not the turn's items.
+        await waitUntil {
+            g.coordinator.store.items.contains {
+                $0.itemID == "\(self.sessionID):a1" && $0.status == .inProgress
+            }
+        }
 
         // Stage 1 (production: 45 s of silence; synchronous via the DEBUG seam).
         let fired = g.chat._debugFireTurnLivenessResync()
@@ -241,7 +264,17 @@ final class TurnLivenessTests: XCTestCase {
         _ = await g.chat.send(text: "turn one prompt")
 
         deliverStuckTurn1(g)
-        await waitUntil { self.assistantRows(g.chat).contains { $0.isStreaming } }
+        // Fix-round 1: gate on the REAL precondition — the stuck item has
+        // actually landed in the render store. The streaming-ROW wait was
+        // satisfied PREMATURELY by send's optimistic caret row (tagged,
+        // parts=0, streaming) before the pump ingested the frames, so the
+        // stage-2 DEBUG settle below raced frame ingestion and flipped
+        // nothing. The caret is not the turn's items.
+        await waitUntil {
+            g.coordinator.store.items.contains {
+                $0.itemID == "\(self.sessionID):a1" && $0.status == .inProgress
+            }
+        }
 
         g.chat._debugFireTurnLivenessResync()          // stage 1: silent resync (recovers nothing here)
         let settled = g.chat._debugFireLocalTurnWatchdog()   // stage 2: settle
@@ -271,7 +304,17 @@ final class TurnLivenessTests: XCTestCase {
         _ = await g.chat.send(text: "turn one prompt")
 
         deliverStuckTurn1(g)
-        await waitUntil { self.assistantRows(g.chat).contains { $0.isStreaming } }
+        // Fix-round 1: gate on the REAL precondition — the stuck item has
+        // actually landed in the render store. The streaming-ROW wait was
+        // satisfied PREMATURELY by send's optimistic caret row (tagged,
+        // parts=0, streaming) before the pump ingested the frames, so the
+        // stage-2 DEBUG settle below raced frame ingestion and flipped
+        // nothing. The caret is not the turn's items.
+        await waitUntil {
+            g.coordinator.store.items.contains {
+                $0.itemID == "\(self.sessionID):a1" && $0.status == .inProgress
+            }
+        }
         g.chat._debugFireTurnLivenessResync()
         _ = g.chat._debugFireLocalTurnWatchdog()
         XCTAssertTrue(assistantRows(g.chat).first?.interrupted == true)
@@ -285,6 +328,60 @@ final class TurnLivenessTests: XCTestCase {
         let row = try XCTUnwrap(assistantRows(g.chat).first)
         XCTAssertFalse(row.interrupted, "the authoritative completion heals the provisional settle")
         XCTAssertFalse(row.isStreaming)
+    }
+
+    /// Fix-round 1 (Gate-3): a HEALTHY but frame-silent slow turn — one long
+    /// opaque tool with no incremental output and no heartbeat — can outlive
+    /// the stage-2 silence window. Even if the watchdog false-positives on it,
+    /// the settle must be LOSSLESS: the first frame that lands proves liveness,
+    /// resurrects the item (replace-not-drop in `RelayItemStore.applyDelta`),
+    /// re-lights the streaming row, and the turn continues to its honest
+    /// completion. Pre-fix the late delta hit the terminal guard and was
+    /// DROPPED — streamed content in the window was silently lost until the
+    /// wholesale `completed` replace.
+    func testLateDeltaAfterFalseSettleResurrectsTheTurnLosslessly() async throws {
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(sessionID)
+        _ = await g.chat.send(text: "turn one prompt")
+
+        deliverStuckTurn1(g)
+        // Fix-round 1: gate on the REAL precondition — the stuck item has
+        // actually landed in the render store. The streaming-ROW wait was
+        // satisfied PREMATURELY by send's optimistic caret row (tagged,
+        // parts=0, streaming) before the pump ingested the frames, so the
+        // stage-2 DEBUG settle below raced frame ingestion and flipped
+        // nothing. The caret is not the turn's items.
+        await waitUntil {
+            g.coordinator.store.items.contains {
+                $0.itemID == "\(self.sessionID):a1" && $0.status == .inProgress
+            }
+        }
+
+        g.chat._debugFireTurnLivenessResync()          // stage 1: silent resync (recovers nothing here)
+        _ = g.chat._debugFireLocalTurnWatchdog()       // stage 2: the false-positive settle
+        XCTAssertFalse(g.chat.isStreaming)
+        XCTAssertTrue(assistantRows(g.chat).first?.interrupted == true)
+
+        // The turn was alive after all: the opaque tool finally emits output.
+        g.transport.deliver(envelope("item.delta",
+            ["item_id": "\(sessionID):a1", "patch": ["text": "tool output"]],
+            turn: "\(sessionID):t1"))
+
+        await waitUntil { g.chat.isStreaming }
+        let live = try XCTUnwrap(assistantRows(g.chat).first)
+        XCTAssertTrue(live.isStreaming, "the late delta resurrects the turn — streaming resumes")
+        XCTAssertFalse(live.interrupted, "the Interrupted fold clears the moment liveness is proven")
+
+        // And the turn completes honestly: the authoritative truth wins.
+        g.transport.deliver(envelope("item.completed",
+            itemBody("\(sessionID):a1", "toolCall", "completed", 1, ["name": "shell"]),
+            turn: "\(sessionID):t1"))
+        g.transport.deliver(envelope("turn.completed", [:], turn: "\(sessionID):t1"))
+        await waitUntil { !g.chat.isStreaming }
+        let settled = try XCTUnwrap(assistantRows(g.chat).first)
+        XCTAssertFalse(settled.interrupted)
+        XCTAssertFalse(settled.isStreaming)
     }
 
     // MARK: - Item store settle semantics (pure)
@@ -319,7 +416,11 @@ final class TurnLivenessTests: XCTestCase {
         store.apply(itemFrame(3, "item.completed", "x1", "toolCall", "completed", 0))
         XCTAssertFalse(store.itemsByID["x1"]?.locallyInterrupted == true)
 
-        // A delta against a locally-settled item is ignored (terminal guard).
+        // REPLACE-NOT-DROP (fix-round 1, Gate-3): a delta against a LOCALLY
+        // settled item proves the turn was alive after all (the stage-2 settle
+        // false-positived on a healthy-but-frame-silent slow turn) — it
+        // RESURRECTS the item: marker cleared, re-opened to .inProgress, patch
+        // merged onto the pre-settle body so no streamed content is lost.
         var store2 = RelayItemStore()
         store2.apply(itemFrame(1, "item.started", "y1", "agentMessage", "in_progress", 0,
                                .object(["text": .string("hel")])))
@@ -328,8 +429,27 @@ final class TurnLivenessTests: XCTestCase {
             seq: 2, sid: "s", turn: "t", kind: .itemDelta,
             body: .object(["item_id": .string("y1"), "patch": .object(["text": .string("lo")])])
         ))
-        XCTAssertEqual(store2.itemsByID["y1"]?.body["text"]?.stringValue, "hel",
-                       "deltas after a local settle are ignored exactly like after a real completed")
+        XCTAssertEqual(store2.itemsByID["y1"]?.status, .inProgress,
+                       "a late delta resurrects the provisionally-settled item")
+        XCTAssertFalse(store2.itemsByID["y1"]?.locallyInterrupted == true,
+                       "resurrection clears the Interrupted marker")
+        XCTAssertEqual(store2.itemsByID["y1"]?.body["text"]?.stringValue, "hello",
+                       "the delta merges onto the pre-settle body — content is not lost")
+
+        // The terminal guard still holds for an AUTHORITATIVE terminal: a delta
+        // after a real `completed` from the wire is stale and dropped.
+        var store3 = RelayItemStore()
+        store3.apply(itemFrame(1, "item.started", "z1", "agentMessage", "in_progress", 0,
+                               .object(["text": .string("hel")])))
+        store3.apply(itemFrame(2, "item.completed", "z1", "agentMessage", "completed", 0,
+                               .object(["text": .string("done")])))
+        store3.apply(RelayFrame(
+            seq: 3, sid: "s", turn: "t", kind: .itemDelta,
+            body: .object(["item_id": .string("z1"), "patch": .object(["text": .string("LO")])])
+        ))
+        XCTAssertEqual(store3.itemsByID["z1"]?.body["text"]?.stringValue, "done",
+                       "deltas after an authoritative completed are still dropped")
+        XCTAssertEqual(store3.itemsByID["z1"]?.status, .completed)
     }
 
     // MARK: - Fold label (pure)
