@@ -11,7 +11,9 @@ import GRDB
 ///
 /// Invariants covered here (plan W0a, amended): **I1, I2, I6, I7 (STORE layer
 /// only — ord monotone + userMessage-before-agent-items incl. foreign turns),
-/// I8, I9 (reason-dependent halves RED-BY-DESIGN until relay lane L3 —
+/// I8, I12 (gate MOVES with its session, never expires on switch — amendment
+/// G1; added at W2b, R1's delete of expire-on-switch), I9 (reason-dependent
+/// halves RED-BY-DESIGN until relay lane L3 —
 /// amendment I9-gate), I10 (virtual clock — amendment W0-determinism), I15,
 /// I21, I23 (pending-gate recovery across restart — amendment G3)**. The
 /// I7/I19 VOID-GEOMETRY properties are RENDER-layer and live in W0b
@@ -931,6 +933,71 @@ final class ContractInvariantsW0aTests: XCTestCase {
         await waitUntil { g.transport.upstreams().contains { $0.method == "resync" } }
         XCTAssertEqual(g.chat.turnLivenessResyncCount, 1)
         XCTAssertNil(g.chat.lastError, "C3: silent")
+    }
+
+    // MARK: - I12 — Gate cards per session (switch MOVES, never expires — G1)
+
+    /// I12 (amendment G1): a gate parks on the OWNING session's entry; a
+    /// switch A→B takes the card off the screen (it never renders on B) and
+    /// switching BACK to A re-shows it — with NO intervening turn end or
+    /// answer — because a switch MOVES the gate with the write-gate. ONLY
+    /// turn end (any reason) or an explicit answer expires it, exactly once.
+    /// FAILS on r4/base: `resetItemStoreForSessionSwitch` fires
+    /// `expireRelayPendingGates()` on every switch (RSC:748-751 — deleted
+    /// OUTRIGHT in R1, amendment G1: expiry-on-switch ceases to exist), so
+    /// the switch-back finds the card expired.
+    func testI12_GateMovesWithSession_SwitchNeverExpires() async throws {
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open("w0a-i12-A")
+        g.sessions.activeRuntimeId = "w0a-i12-A"
+
+        // A's turn raises a clarify gate.
+        var a = Frames("w0a-i12-A")
+        deliver(g, [
+            a.userCompleted(id: "w0a-i12-A:u1", ord: 0, text: "A-q"),
+            a.turnStarted("w0a-i12-A:t1"),
+            a.clarifyRequest(requestID: "r-i12", question: "Which way?",
+                             choices: ["left", "right"], turn: "w0a-i12-A:t1"),
+        ])
+        await waitUntil { g.chat.pendingClarification != nil }
+        XCTAssertEqual(g.chat.pendingClarification?.sessionId, "w0a-i12-A",
+            "I12: the gate parks under its owning session's sid")
+
+        // Switch to B: the card LEAVES the screen with A's session — it must
+        // never render on B's surface.
+        _ = try await g.coordinator.open("w0a-i12-B")
+        g.sessions.activeRuntimeId = "w0a-i12-B"
+        g.chat.messages = [ChatMessage(role: .user, text: "B-q")]
+        await pumpSettle()
+        XCTAssertNil(g.chat.pendingClarification,
+            "I12: a gate for A never shows while B is on screen (parked on A's entry, not expired)")
+
+        // Switch BACK to A with no intervening turn end or answer ⇒ the card
+        // is STILL present — the switches moved it, never expired it.
+        _ = try await g.coordinator.open("w0a-i12-A")
+        g.sessions.activeRuntimeId = "w0a-i12-A"
+        await pumpSettle()
+        let card = try XCTUnwrap(g.chat.pendingClarification,
+            "I12/G1: switch A→B→A with no turn end or answer ⇒ the card is STILL present (base expires it on the switch — RSC:748-751)")
+        XCTAssertEqual(card.request.requestId, "r-i12")
+        XCTAssertEqual(card.sessionId, "w0a-i12-A")
+
+        // The answer routes by the gate's (session_id, request_id) — I18 —
+        // and expires the gate exactly once.
+        await g.chat.respondClarification("left")
+        let clarify = g.transport.upstreams().first { $0.method == "clarify" }
+        XCTAssertEqual(clarify?.params["session_id"] as? String, "w0a-i12-A",
+            "I12/I18: the answer targets the gate's session regardless of the screen")
+        XCTAssertEqual(clarify?.params["request_id"] as? String, "r-i12")
+        XCTAssertNil(g.chat.pendingClarification, "answered ⇒ expired exactly once")
+
+        // A resync replay of the answered gate never re-raises it.
+        deliver(g, [a.clarifyRequest(requestID: "r-i12", question: "Which way?",
+                                     choices: ["left", "right"], turn: "w0a-i12-A:t1")])
+        await pumpSettle()
+        XCTAssertNil(g.chat.pendingClarification,
+            "I12/I21: the resolved-id set suppresses resync re-delivery")
     }
 
     // MARK: - I15 — taskList scoping
