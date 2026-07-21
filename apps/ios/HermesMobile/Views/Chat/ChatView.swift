@@ -273,21 +273,18 @@ struct ChatView: View {
     // the MEASURED composer (desktop `--composer-measured-height`) but never drops
     // below this so the UX1 gate (≥120) holds and a pre-measurement first frame
     // never under-clears the last message.
-    // QA-3 S1/A10 (compact chrome, C2): 140 → 126 — the old floor left a ~40 pt
-    // dead band between the transcript's last row (the session project/CWD line)
-    // and the top of the ~100 pt glass composer (IMG_2577 "too much vertical
-    // gap"). 126 keeps the UX1 ≥120 clearance of glass card + home indicator
-    // while tightening the resting band to ~compact-chrome proportion; a
-    // measured composer taller than 116 pt still wins (measured + gap), so the
-    // floor only ever governs short/pre-measurement composers.
-    static let composerFloatInset: CGFloat = 126
+    // QA-3 S1/A10: 140 → 120 — the CWD/session-context row to composer distance
+    // read as a dead band (owner: "too much vertical gap"). 120 is the ratified
+    // UX1 floor (exactly clears the glass composer); the extra 20 pt of resting
+    // clearance was void, not breathing room (compact chrome, C2).
+    static let composerFloatInset: CGFloat = 120
 
     /// The breathing room between the last message and the top of the floating
     /// composer (resting). Pure constant so the clearance composition is testable.
-    /// QA-3 S1/A10 (compact chrome, C2): 16 → 10 — the ratified compact-chrome
-    /// proportion; the dead band between the CWD line and the composer read as
-    /// slack at 16 pt on top of the floor.
-    static let composerBreathingGap: CGFloat = 10
+    /// QA-3 S1/A10: 16 → 8 — with the measured-composer clearance the 16 pt pad
+    /// stacked on top of the composer's own internal bottom padding; 8 pt keeps
+    /// the full-bleed read without the dead band (compact chrome, C2).
+    static let composerBreathingGap: CGFloat = 8
 
     /// The TOTAL bottom clearance reserved below the last message, COMPOSED from the
     /// measured composer height, the live keyboard height, and a breathing gap —
@@ -297,7 +294,7 @@ struct ChatView: View {
     ///
     ///  • At rest (`keyboardHeight == 0`): `composerHeight + breathingGap`, floored
     ///    at `composerFloatInset` — i.e. the measured composer plus breathing room,
-    ///    never less than the proven 140 floor. Identical full-bleed feel to today.
+    ///    never less than the proven 120 floor. Identical full-bleed feel to today.
     ///  • Keyboard up: ADD the keyboard region above the home-indicator baseline the
     ///    composer already reserves (`controlBottomBaseline`), so the last message
     ///    clears BOTH the risen composer AND the keyboard. Because the transcript is
@@ -1215,7 +1212,7 @@ struct ChatView: View {
                 // SCROLL P0 REBUILD — the height is now COMPOSED + DETERMINISTIC
                 // (`Self.composerClearance`): the MEASURED composer height + the live
                 // KEYBOARD height + a breathing gap, replacing the fixed 140 estimate.
-                // At rest it equals the measured composer + breathing (≥140 floor —
+                // At rest it equals the measured composer + breathing (≥120 floor —
                 // identical full-bleed feel). When the keyboard opens it GROWS by the
                 // keyboard region; because the ScrollView is bottom-anchored
                 // (`defaultScrollAnchor(.bottom)`), growing this spacer pushes the
@@ -1267,7 +1264,7 @@ struct ChatView: View {
             // Bottom inset: the floating composer (ABH-79 Task 3) is an overlay,
             // not a safeAreaInset, so the ScrollView's content must itself reserve
             // space below the last message or it will scroll under the glass card.
-            // `composerFloatInset` (≈140pt) clears the composer height + home
+            // `composerFloatInset` (≈120pt) clears the composer height + home
             // indicator + breathing room. It is now contributed by the
             // composer-clearance SPACER element ABOVE the `bottomAnchor` (inside the
             // LazyVStack) rather than a `.padding(.bottom)` BELOW the anchor — so the
