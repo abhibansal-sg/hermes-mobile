@@ -429,7 +429,20 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")   // reuse the reply stream
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        // No open/resume: a fresh chat has no session yet.
+        // No open/resume: a fresh chat has no session yet. The relay CREATES
+        // it on the nil-target SUBMIT — mint the fixture's session id so the
+        // recorded reply stream carries the stamped sid of the session the
+        // send created (R1/I1: frames route by the stamped sid).
+        let createdSid = fx.sessionID
+        g.transport.script = { upstream, relay in
+            guard let id = upstream.id else { return }
+            if upstream.method == "submit" {
+                let sid = (upstream.params["session_id"] as? String) ?? createdSid
+                relay.deliverResult(id: id, result: .object(["session_id": .string(sid)]))
+            } else {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+            }
+        }
 
         let ok = await g.chat.send(text: "hello")
         XCTAssertTrue(ok, "a new-chat relay send must be accepted")

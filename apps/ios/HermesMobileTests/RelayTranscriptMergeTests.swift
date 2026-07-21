@@ -43,20 +43,20 @@ final class RelayTranscriptMergeTests: XCTestCase {
         ]))
     }
 
-    private func agentStartedFrame(_ seq: Int, id: String, ord: Int) -> RelayFrame {
+    private func agentStartedFrame(_ seq: Int, id: String, ord: Int, sid: String = "s") -> RelayFrame {
         itemFrame(seq, kind: "item.started", id: id, .agentMessage,
-                  status: "in_progress", ord: ord, body: ["text": ""])
+                  status: "in_progress", ord: ord, body: ["text": ""], sid: sid)
     }
 
-    private func agentDeltaFrame(_ seq: Int, id: String, text: String) -> RelayFrame {
-        RelayFrame(seq: seq, sid: "s", turn: "t", kind: .itemDelta,
+    private func agentDeltaFrame(_ seq: Int, id: String, text: String, sid: String = "s") -> RelayFrame {
+        RelayFrame(seq: seq, sid: sid, turn: "t", kind: .itemDelta,
                    body: .object(["item_id": .string(id),
                                   "patch": .object(["text": .string(text)])]))
     }
 
-    private func agentCompletedFrame(_ seq: Int, id: String, ord: Int, text: String) -> RelayFrame {
+    private func agentCompletedFrame(_ seq: Int, id: String, ord: Int, text: String, sid: String = "s") -> RelayFrame {
         itemFrame(seq, kind: "item.completed", id: id, .agentMessage,
-                  status: "completed", ord: ord, body: ["text": .string(text)])
+                  status: "completed", ord: ord, body: ["text": .string(text)], sid: sid)
     }
 
     /// The SUBMIT-synthesized `userMessage` item (QA-1: the relay emits one so
@@ -539,17 +539,19 @@ final class RelayTranscriptMergeTests: XCTestCase {
             id: parkedSubmit.id ?? "1",
             result: .object(["session_id": .string("new-sid")])
         )
+        // R1/I1: frames carry the sid the relay STAMPS — the created session
+        // the submit just adopted (the relay keys the turn on it).
         transport.deliverFrames([
-            userItemFrame(1, id: "u-1", ord: 0, text: "hello", clientMessageID: cmid),
-            agentStartedFrame(2, id: "msg-1", ord: 1),
-            agentDeltaFrame(3, id: "msg-1", text: "Hey "),
-            agentCompletedFrame(4, id: "msg-1", ord: 1, text: "Hey there!"),
+            userItemFrame(1, id: "u-1", ord: 0, text: "hello", clientMessageID: cmid, sid: "new-sid"),
+            agentStartedFrame(2, id: "msg-1", ord: 1, sid: "new-sid"),
+            agentDeltaFrame(3, id: "msg-1", text: "Hey ", sid: "new-sid"),
+            agentCompletedFrame(4, id: "msg-1", ord: 1, text: "Hey there!", sid: "new-sid"),
             // QA-2 R4/A2 contract: `isStreaming` is TURN-scoped — it settles on
             // the authoritative `turn.completed` frame (the real relay always
             // sends it; every render_conformance fixture ends with one), NOT on
             // per-item terminality. The QA-1 shape of this test predated that
             // contract and stopped at `item.completed`.
-            RelayFrame(seq: 5, sid: "s", turn: "t", kind: .turnCompleted,
+            RelayFrame(seq: 5, sid: "new-sid", turn: "t", kind: .turnCompleted,
                        body: .object(["usage": .object([:])])),
         ])
 
@@ -598,13 +600,14 @@ final class RelayTranscriptMergeTests: XCTestCase {
                        "submit targets the active stored session")
         transport.deliverResult(id: parkedSubmit.id ?? "1",
                                 result: .object(["session_id": .string("existing-1")]))
+        // R1/I1: frames carry the driven session's stamped sid.
         transport.deliverFrames([
-            userItemFrame(1, id: "u-9", ord: 0, text: "follow-up", clientMessageID: cmid),
-            agentCompletedFrame(2, id: "msg-9", ord: 1, text: "Answer."),
+            userItemFrame(1, id: "u-9", ord: 0, text: "follow-up", clientMessageID: cmid, sid: "existing-1"),
+            agentCompletedFrame(2, id: "msg-9", ord: 1, text: "Answer.", sid: "existing-1"),
             // QA-2 R4/A2: settle the turn with the authoritative boundary frame
             // (see the sibling test) — item terminality no longer clears the
             // store-level `isStreaming`.
-            RelayFrame(seq: 3, sid: "s", turn: "t", kind: .turnCompleted,
+            RelayFrame(seq: 3, sid: "existing-1", turn: "t", kind: .turnCompleted,
                        body: .object(["usage": .object([:])])),
         ])
 
@@ -758,17 +761,20 @@ final class RelayTranscriptMergeTests: XCTestCase {
                       "the cache answer survives until the relay copy exists")
     }
 
-    /// QA-3 S6 residue — when the in-memory echo was LOST (a session switch /
-    /// store rebuild before the item re-landed) and only the cache-painted
-    /// gateway row remains (cmid-LESS — `toChatMessages` maps none), a
-    /// cmid-carrying `userMessage` item must still adopt it BY TEXT instead of
-    /// projecting a second bubble under its relay id. FAILS on qa3/base
-    /// (cmid-bearing items matched cmid ONLY — the cache row never adopted).
-    func testAdoptionFallsBackToTextForCacheRowWhenEchoLost() {
+    /// QA-3 S6 residue, R1/contract-I8 shape — when the in-memory echo was
+    /// LOST (a session switch before the item re-landed), the S6 durable-echo
+    /// machinery repaints the prompt WITH its cmid (the warm snapshot carries
+    /// the echo row, cmid included — `persistDurableEcho`), so a cmid-carrying
+    /// `userMessage` item adopts it BY CMID — never a second relay-id bubble.
+    /// (The pre-R1 text FALLBACK for cmid-bearing items deleted: a FOREIGN
+    /// cmid must never consume a same-text cmid-less twin — contract I8/G4,
+    /// pinned by `testAdoptionNeverConsumesCmidLessTwinOnForeignCmid` below
+    /// and W0a `testI8_ForeignCMIDNeverAdoptsCacheTwinByText`.)
+    func testAdoptionReconcilesDurableEchoRepaintByCmidWhenInMemoryEchoLost() {
         let chat = ChatStore()
         let cacheRow = ChatMessage(
             id: ChatMessage.deterministicID(seedKey: "cache-u"),
-            role: .user, text: "hello"
+            role: .user, clientMessageID: "cmid-lost", text: "hello"
         )
         chat.messages = [cacheRow]
 
@@ -779,11 +785,40 @@ final class RelayTranscriptMergeTests: XCTestCase {
 
         let prompts = chat.messages.filter { $0.text == "hello" }
         XCTAssertEqual(prompts.count, 1,
-                       "cache-painted prompt adopts — never a second relay-id bubble (S6)")
+                       "the durable echo repaint adopts by cmid — never a second relay-id bubble (S6)")
         XCTAssertEqual(prompts.first?.id, cacheRow.id, "adopted in place")
         let texts = chat.messages.map(\.text)
         XCTAssertLessThan(texts.firstIndex(of: "hello")!, texts.firstIndex(of: "hi")!,
                           "the answer renders AFTER its adopted prompt")
+    }
+
+    /// R1/I8 (amendment G4): a cmid-carrying item whose cmid matches NO row
+    /// (a foreign/desktop turn whose prompt text equals a cache-painted row)
+    /// must NEVER fall back to a text match — the cmid-less cache twin
+    /// survives and the item projects under its own relay id: TWO rows, wire
+    /// truth. Base's fuzzy fall-through consumed the twin (the I8 violation
+    /// R1 deletes; W0a `testI8_ForeignCMIDNeverAdoptsCacheTwinByText` pins it
+    /// end-to-end through the coordinator).
+    func testAdoptionNeverConsumesCmidLessTwinOnForeignCmid() {
+        let chat = ChatStore()
+        let cacheRow = ChatMessage(
+            id: ChatMessage.deterministicID(seedKey: "cache-u"),
+            role: .user, text: "hello"
+        )
+        chat.messages = [cacheRow]
+
+        chat.applyRelayItems([
+            userItem("u-1", ord: 0, text: "hello", clientMessageID: "foreign-cmid"),
+            agentItem("msg-1", ord: 1, text: "hi"),
+        ])
+
+        let prompts = chat.messages.filter { $0.text == "hello" }
+        XCTAssertEqual(prompts.count, 2,
+                       "a foreign-cmid item never adopts the same-text cache twin (I8/G4)")
+        XCTAssertTrue(prompts.contains { $0.id == cacheRow.id && $0.clientMessageID == nil },
+                      "the untagged cache twin survives")
+        XCTAssertTrue(prompts.contains { $0.relayProjected },
+                      "the foreign prompt renders as its own wire-true row")
     }
 
     /// PIN: a cmid match wins over a same-text cmid-less row REGARDLESS of row
