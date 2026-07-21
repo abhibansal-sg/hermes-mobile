@@ -180,7 +180,7 @@ final class ProjectsStoreTests: XCTestCase {
         )
         XCTAssertEqual(
             store.sessionsError(for: proj),
-            SessionStore.projectSessionsEmptyButCountedMessage,
+            ProjectsStore.projectSessionsEmptyButCountedMessage,
             "a count>0 empty list must surface the retry state, not a lying No-sessions-yet"
         )
     }
