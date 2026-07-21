@@ -3730,6 +3730,34 @@ final class SessionStore {
         }
     }
 
+    /// R1 write-through eviction (contract §1.2 / RR4): persist a SETTLED
+    /// background entry's transcript before the coordinator drops it from the
+    /// bounded LRU map — the next open paints from disk (I3: the cache is a
+    /// seed) and the relay snapshot reconciles over it (I14). Text rows only
+    /// (user + agent): the cache paints a seed the stream supersedes by
+    /// item-id union, never a co-author. Fire-and-forget, off the UI path;
+    /// `CacheStore` no-ops cron sessions (never transcript-cached).
+    func persistRelayEntryWriteThrough(sessionID: String, items: [ChatItem]) {
+        guard let cacheStore, let identity = cacheIdentity(sessionID) else { return }
+        var wireId = 0
+        let now = Date().timeIntervalSince1970
+        let stored: [StoredMessage] = items.compactMap { item in
+            let role: String
+            switch item.type {
+            case .userMessage:   role = "user"
+            case .agentMessage:  role = "assistant"
+            default: return nil
+            }
+            let text = item.textBody
+            guard !text.isEmpty else { return nil }
+            wireId += 1
+            return StoredMessage(role: role, content: .string(text),
+                                 timestamp: now, wireId: wireId)
+        }
+        guard !stored.isEmpty else { return }
+        Task { try? await cacheStore.saveTranscript(identity: identity, messages: stored) }
+    }
+
     private func rememberWarmOpenSnapshot(_ normalized: [ChatMessage], for storedId: String) {
         warmOpenSnapshots[storedId] = mergedWarmSnapshot(normalized, for: storedId)
         warmOpenSnapshotOrder.removeAll { $0 == storedId }
@@ -4304,16 +4332,14 @@ final class SessionStore {
         // A draft has NO session: drop the previous session's hot-swap state
         // (else the pill shows the LAST chat's model) and any stale draft pick.
         connection?.clearSessionState()
-        // S11 (QA-3): park the relay coordinator's item→transcript projection
-        // so the previous session's in-flight turn does NOT leak onto the empty
-        // draft surface. startDraft does not touch the coordinator's
-        // activeSessionID (a draft has no session id), so without this park the
-        // pump's next applyRelayItems would paint the previous session's live
-        // "Working… · ToolCall Ns" rows onto the draft chat (IMG_2594). The
-        // coordinator keeps driving the previous session for reconnect-resync
-        // and durable-outbox routing; only the projection onto the chat surface
-        // is suspended until a real session binds (resume/open/start clear it).
-        connection?.relayCoordinator?.suppressProjectionForDraft()
+        // R1 (contract I6): a draft is the ABSENCE of a session — the relay
+        // write-gate moves OFF. No entry is active, so no frame from any
+        // session can project onto the draft surface (structural: the S11
+        // `projectionSuppressed` flag this replaces cannot exist to fail —
+        // IMG_2594 is unreachable by construction). The previous session's
+        // parked entry keeps folding its own frames for a fast re-open (I14);
+        // the durable outbox re-routes the moment a real session binds.
+        connection?.relayCoordinator?.enterDraft()
         // ABH-351: capture the cwd for the new-session-in-project flow. An
         // explicit non-empty path seeds the draft so the materializing
         // session.create carries it; nil/empty = the gateway default.
