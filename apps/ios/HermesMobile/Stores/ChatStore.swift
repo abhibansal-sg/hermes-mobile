@@ -172,7 +172,18 @@ final class ChatStore {
     /// its OWN watchdog (``foreignMirrorWatchdog``) — this one guards a turn WE
     /// are driving.
     private var localTurnWatchdog: Task<Void, Never>?
-    private static let localTurnStaleTimeout: Duration = .seconds(180)
+    /// Stage-2 settle window (fix-round 1): sized MATERIALLY above the worst-case
+    /// OPAQUE-TOOL duration — a single long bash/build tool with no incremental
+    /// output and no gateway heartbeat emits ZERO frames for its whole run, so
+    /// nothing refreshes the silence clock while the turn is genuinely alive.
+    /// 180 s false-positived on exactly that shape (the settle is healed by any
+    /// late frame — `RelayItemStore.applyDelta` resurrects locally-settled items
+    /// replace-not-drop — but the transient "Interrupted" fold on a healthy turn
+    /// is still wrong). 480 s keeps eternal-working bounded while a healthy
+    /// slow turn essentially never trips it; a genuinely dead turn still heals
+    /// at stage 1 (45 s silent resync) whenever the authority merely dropped a
+    /// terminal frame.
+    private static let localTurnStaleTimeout: Duration = .seconds(480)
     /// QA-3 S8/A4 — per-turn LIVENESS fallback (kills eternal double-working,
     /// IMG_2591). The QA-2 watchdog was per-STORE and re-armed by ANY item
     /// batch — a dead turn 1 stayed "Working…" forever while turn 2's frames
