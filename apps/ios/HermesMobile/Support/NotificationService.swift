@@ -264,9 +264,9 @@ enum NotificationService {
     enum Tap: Sendable, Equatable {
         /// An approval / clarification needs the user — open its session (and
         /// surface the inbox if the session can't be located).
-        case attention(sessionId: String)
+        case attention(sessionId: String, storedSessionId: String? = nil)
         /// A long turn finished — open its session.
-        case turnComplete(sessionId: String)
+        case turnComplete(sessionId: String, storedSessionId: String? = nil)
     }
 
     /// The app-supplied sink that routes a decoded tap into the live store graph.
@@ -626,12 +626,21 @@ enum NotificationService {
             !sessionId.isEmpty
         else { return nil }
 
+        // QA-3 S12: the push payload may carry the persistent STORED session id
+        // the relay resolved at drive time. When present, the tap router opens
+        // that id directly (SessionStore.open is keyed by the stored id) instead
+        // of relying on the inbox's runtime→stored map, which is empty for an
+        // ordinary (non-attention) turn_complete of a compressed/old session.
+        let storedSessionId = (custom["stored_session_id"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .flatMap { $0.isEmpty ? nil : $0 }
+
         let eventType = (custom["event_type"] as? String)?.lowercased() ?? ""
         switch eventType {
         case "approval", "clarify":
-            return .attention(sessionId: sessionId)
+            return .attention(sessionId: sessionId, storedSessionId: storedSessionId)
         case "turn_complete":
-            return .turnComplete(sessionId: sessionId)
+            return .turnComplete(sessionId: sessionId, storedSessionId: storedSessionId)
         default:
             // No `event_type` (the F2-S remote payload routes by `aps.category`
             // instead of a flat event_type). Fall back to the APNs category so a
@@ -639,13 +648,13 @@ enum NotificationService {
             // as "attention", and HERMES_TURN as "open the session".
             switch apsCategory(in: userInfo) {
             case remoteApprovalCategory, remoteClarifyCategory:
-                return .attention(sessionId: sessionId)
+                return .attention(sessionId: sessionId, storedSessionId: storedSessionId)
             case remoteTurnCategory:
-                return .turnComplete(sessionId: sessionId)
+                return .turnComplete(sessionId: sessionId, storedSessionId: storedSessionId)
             default:
                 // A session id is present but no event_type / category — treat as
                 // plain "open the session" (older / local notifications).
-                return .turnComplete(sessionId: sessionId)
+                return .turnComplete(sessionId: sessionId, storedSessionId: storedSessionId)
             }
         }
     }
