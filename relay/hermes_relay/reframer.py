@@ -17,7 +17,8 @@ The raw -> item mapping (grounded in the R0 fixture AND the gateway's own
 | ``message.start`` (payload null)   | ``turn.started`` (opens a turn; no item yet)      |
 | ``message.delta`` (``.text``)      | lazy ``item.started`` agentMessage + ``item.delta``|
 | ``message.complete`` (``.text,     | ``item.completed`` agentMessage (authoritative) + |
-|   .usage``)                        |   ``usage`` item + ``turn.completed`` (usage)     |
+|   .usage,.status``)                |   ``usage`` item + ``turn.completed`` (reason +   |
+|                                    |   usage; reason=interrupted iff status is)        |
 | ``reasoning.delta`` (``.text``)    | lazy ``item.started`` reasoning + ``item.delta``  |
 | ``reasoning.available`` (``.text``)| ``item.completed`` reasoning (authoritative)      |
 | ``thinking.delta`` (``.text``)     | ``status`` frame ``{kind:"thinking"}`` (ephemeral)|
@@ -28,7 +29,9 @@ The raw -> item mapping (grounded in the R0 fixture AND the gateway's own
 | ``tool.*`` with ``name=="todo"``   | dedicated ``taskList`` item on a STABLE id —      |
 |   (``.todos`` full list on complete)|  started (snapshot) / delta (update) / completed  |
 |                                     |  (all tasks done); NOT a generic toolCall         |
-| ``error`` (``.message``)           | ``item.completed`` error (status=failed)          |
+| ``error`` (``.message``)           | ``item.completed`` error (status=failed) +        |
+|                                    |   ``turn.completed{reason:error}`` iff a turn was |
+|                                    |   open (R4 L3 settle edge)                        |
 | ``status.update`` (``.kind,.text``)| ``status`` frame (non-item chatter)               |
 | ``session.title``/``title``        | ``title`` frame                                   |
 | ``approval.request``               | ``approval.request`` frame (interactive gate)     |
@@ -233,6 +236,42 @@ class Reframer:
         ctx.item_seq += 1
         return f"{sid}:i{ctx.item_seq}"
 
+    def _turn_completed_frame(
+        self, sid: str, ctx: _Ctx, reason: str, usage: Any = None
+    ) -> Frame:
+        """Build the turn's ``turn.completed`` settle edge AND close the turn.
+
+        R4 L3 (contract I9 — stopped ≠ completed): the ``reason`` is wire-truth
+        the phone's drain split keys on — ``completed`` may drain the queue;
+        ``interrupted`` (user stop) / ``error`` hold it. ``usage`` rides only
+        when the gateway supplied it; ``duration_s``/``started_at`` are the
+        QA-3 S2/A1 authoritative per-turn wall-clock the phone's timer settles
+        onto (relay-measured from the turn open — an old phone ignores all of
+        these additive keys, protocol §2 forward-compat). Closing the turn
+        here (the next content event opens a fresh one) is shared by the
+        normal-completion and error-end paths so both settle identically.
+        """
+        body: dict[str, Any] = {"reason": reason}
+        if isinstance(usage, dict) and usage:
+            body["usage"] = usage
+        if ctx.turn_started_mono:
+            body["duration_s"] = round(
+                max(0.0, time.monotonic() - ctx.turn_started_mono), 3
+            )
+            body["started_at"] = ctx.turn_started_wall
+        frame = Frame(
+            sid=sid,
+            kind=FrameKind.TURN_COMPLETED,
+            body=body,
+            turn=ctx.current_turn,
+        )
+        ctx.current_turn = None
+        ctx.text_item = None
+        ctx.reasoning_item = None
+        ctx.turn_started_mono = 0.0
+        ctx.turn_started_wall = 0.0
+        return frame
+
     # -- message (agentMessage) ------------------------------------------
     def _reframe_message(self, event: GatewayEvent) -> list[Frame]:
         """message.start/delta/complete -> agentMessage item lifecycle + turn."""
@@ -302,31 +341,14 @@ class Reframer:
             )
             frames.append(Frame.with_item(sid, FrameKind.ITEM_COMPLETED, usage_item, ctx.current_turn))
 
-        # QA-3 S2/A1 — authoritative per-turn timing for the phone's per-turn
-        # timer: it starts LOCALLY on the phone at send and reconciles onto
-        # this `duration_s` at settle (relay-measured from the turn open, so a
-        # mid-turn resume the phone did not send still settles honest). Additive
-        # body keys — an old phone ignores them (protocol §2 forward-compat).
-        body: dict[str, Any] = {"usage": usage} if isinstance(usage, dict) else {}
-        if ctx.turn_started_mono:
-            body["duration_s"] = round(
-                max(0.0, time.monotonic() - ctx.turn_started_mono), 3
-            )
-            body["started_at"] = ctx.turn_started_wall
-        frames.append(
-            Frame(
-                sid=sid,
-                kind=FrameKind.TURN_COMPLETED,
-                body=body,
-                turn=ctx.current_turn,
-            )
-        )
-        # Close the turn — the next content event opens a fresh one.
-        ctx.current_turn = None
-        ctx.text_item = None
-        ctx.reasoning_item = None
-        ctx.turn_started_mono = 0.0
-        ctx.turn_started_wall = 0.0
+        # R4 L3 (contract I9): the terminal STATUS the gateway stamps on the
+        # completed message decides the reason — ``interrupted`` for a turn
+        # ended by ``session.interrupt`` (the relay-observable user stop),
+        # ``completed`` otherwise. Additive body key — an old phone ignores it
+        # until W2e's drain split consumes it (protocol §2 forward-compat).
+        status = str(event.payload.get("status") or "")
+        reason = "interrupted" if status == "interrupted" else "completed"
+        frames.append(self._turn_completed_frame(sid, ctx, reason, usage))
         return frames
 
     # -- reasoning -------------------------------------------------------
@@ -584,11 +606,21 @@ class Reframer:
 
     # -- error -----------------------------------------------------------
     def _reframe_error(self, event: GatewayEvent) -> list[Frame]:
-        """error -> error item (never hidden in a collapse, protocol §2)."""
+        """error -> error item (never hidden in a collapse, protocol §2).
+
+        R4 L3 (contract I9): an error that ENDS a live turn also emits the
+        ``turn.completed{reason: error}`` settle edge — before L3 the phone's
+        settle never fired off the wire truth for an error-ended turn (it
+        leaned on the ``relayTurnTerminatedByError`` latch W2e deletes). An
+        error with NO turn open (a stray/session-level failure) keeps the
+        pre-L3 behavior: the error item alone, opened onto a fresh turn — no
+        spurious settle edge for a turn that never ran.
+        """
         sid = event.session_id or ""
         state = self._store.get(sid)
-        frames = self._ensure_turn(sid)
         ctx = self._ctx_for(sid)
+        had_turn = ctx.current_turn is not None
+        frames = self._ensure_turn(sid)
         message = str(event.payload.get("message") or event.payload.get("text") or "error")
         item = Item(
             item_id=self._new_item_id(sid),
@@ -599,6 +631,8 @@ class Reframer:
             body={"message": message},
         )
         frames.append(Frame.with_item(sid, FrameKind.ITEM_COMPLETED, item, ctx.current_turn))
+        if had_turn:
+            frames.append(self._turn_completed_frame(sid, ctx, "error"))
         return frames
 
     # -- status ----------------------------------------------------------

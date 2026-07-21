@@ -96,7 +96,16 @@ a partial merge preview and is never treated as authoritative.
   from the turn open) and `started_at` (epoch). The phone's per-turn timer
   starts LOCALLY at send and reconciles its settled "Worked for Ns" label onto
   `duration_s`; absent on older relays → the phone falls back to its own
-  measurement (additive keys, §2 forward-compat).
+  measurement (additive keys, §2 forward-compat). Since R4 (L3, contract I9 —
+  *stopped ≠ completed*) `turn.completed` also carries `reason`:
+  `completed` (normal end — the phone's queue may drain), `interrupted` (the
+  turn ended via `session.interrupt` — the gateway stamps `status:interrupted`
+  on the completed message; the queue HOLDS), or `error` (a gateway `error`
+  event ended the turn — the settle edge is emitted alongside the error item,
+  queue HOLDS). Absent on pre-L3 relays → the phone falls back to its local
+  `settling` mark / error latch until W2e consumes the wire truth (RR5 compat
+  branch, additive key). An error with NO live turn emits the error item alone
+  — no spurious settle edge.
 - `approval.request` / `clarify.request` — interactive gates (phone replies via RPC).
 - `status` — `{ kind, text }` (lifecycle/compacting/etc., non-item chatter).
 - `title` — session title changed.

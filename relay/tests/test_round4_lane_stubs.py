@@ -172,10 +172,6 @@ def _reframe_turn(payload_extra: dict | None = None) -> list:
         type="message.complete", session_id="s1", payload=payload))
 
 
-@pytest.mark.xfail(strict=True, reason=L3 + "turn.completed must stamp "
-                   "reason='completed' on normal completion (reframer.py:"
-                   "310-323 emits usage/duration only). Wave-1 L3 flips this; "
-                   "remove when green.")
 async def test_l3_turn_completed_reason_completed():
     frames = _reframe_turn()
     tc = [f for f in frames if f.kind == FrameKind.TURN_COMPLETED]
@@ -185,11 +181,6 @@ async def test_l3_turn_completed_reason_completed():
     )
 
 
-@pytest.mark.xfail(strict=True, reason=L3 + "turn.completed must stamp "
-                   "reason='interrupted' when the gateway completes the turn "
-                   "with status=interrupted (the shape session.interrupt "
-                   "earns; the reframer never reads payload.status). Wave-1 "
-                   "L3 flips this; remove when green.")
 async def test_l3_turn_completed_reason_interrupted():
     frames = _reframe_turn({"status": "interrupted"})
     tc = [f for f in frames if f.kind == FrameKind.TURN_COMPLETED]
@@ -199,12 +190,6 @@ async def test_l3_turn_completed_reason_interrupted():
     )
 
 
-@pytest.mark.xfail(strict=True, reason=L3 + "a gateway `error` event ending "
-                   "the turn must yield turn.completed with reason='error' "
-                   "(today _reframe_error emits the error item only — no "
-                   "turn.completed at all, so the phone's settle edge never "
-                   "fires off the wire truth). Wave-1 L3 flips this; remove "
-                   "when green.")
 async def test_l3_turn_completed_reason_error():
     r = Reframer(EventBus(), SessionStore())
     r.reframe(GatewayEvent(type="message.start", session_id="s1", payload={}))
