@@ -543,10 +543,29 @@ struct MessageBubble: View {
         // directly in wire order, no `assistantRenderParts` indirection.
         let parts = message.parts
         let lastTextPartID = parts.lastTextPartID
-        // A freshly-created streaming bubble has no `.text` part yet; show a
-        // standalone cursor so the turn reads as in-progress (the prior model
-        // injected an empty streaming text placeholder for this).
-        let needsStandaloneCursor = message.isStreaming && lastTextPartID == nil
+        let streamingLive = message.isStreaming || liveTurnActive
+        let nodes = WorkingSectionModel.renderNodes(from: parts)
+        // QA-3 S3/A1 — ONE WORKING AFFORDANCE. The owner's ratified design: the
+        // pulsing cursor IS the working signal — it breathes, carries the status
+        // word ("Working…", then the humanized tool) and the per-turn timer, and
+        // taps expand the bifurcation. Build 116 stacked TWO surfaces inside the
+        // same bubble once the first work part landed with no answer text yet:
+        // the fold's live spinner line (WorkingSectionView) AND a bare standalone
+        // cursor (IMG_2578/2587/2591). The merge: the fold's live line IS the
+        // cursor line (its spinner replaced by the breathing glyph), so while a
+        // `.working` fold exists it owns the affordance and NO standalone cursor
+        // mounts beside it. Pre-first-item (the optimistic caret bubble has zero
+        // parts — nothing folds yet), the standalone slot renders the SAME merged
+        // line (breathing glyph + "Working…" + per-turn timer from the LOCAL
+        // `turnStartedAt`) — that is also the S2/A1 fix: the labeled, timed
+        // affordance renders at SEND from local state, no longer gated on the
+        // first relay item frame (the ~35 s model time-to-first-item of
+        // IMG_2578, where the bare caret had neither label nor timer). The rule
+        // is the pure `WorkingSectionModel.preItemWorkingLineVisible` seam the
+        // render gate pins.
+        let needsMergedWorkingLine = WorkingSectionModel.preItemWorkingLineVisible(
+            parts: parts, streamingLive: streamingLive
+        )
 
         // CC-05/CC-07: bump part spacing from 8 → 10 for consistent vertical
         // rhythm that matches the user bubble's ~9pt vertical breathing room.
@@ -568,24 +587,38 @@ struct MessageBubble: View {
                 // file/browser/image/error ITEM parts fold into one collapsed
                 // working section (owner spec). Standalone parts (text/usage/
                 // warning, legacy reasoning/tools) render exactly as before.
-                ForEach(WorkingSectionModel.renderNodes(from: parts)) { node in
+                ForEach(nodes) { node in
                     switch node {
                     case .part(let part):
                         assistantPart(part, showsCursor: message.isStreaming && part.id == lastTextPartID)
                     case .working(_, let runParts):
                         WorkingSectionView(
                             parts: runParts,
-                            streaming: message.isStreaming || liveTurnActive,
+                            streaming: streamingLive,
                             liveTurnStartedAt: liveTurnStartedAt,
                             settledDuration: message.reasoningElapsed
                         )
                     }
                 }
-                if needsStandaloneCursor {
-                    // CC-01: standalone cursor inherits the pulse animation.
-                    StreamingCursor(isStreaming: message.isStreaming)
-                        .font(.body)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                if needsMergedWorkingLine {
+                    // QA-3 S2/S3/A1: the PRE-FIRST-ITEM merged working line —
+                    // the SAME single surface the fold shows once work parts
+                    // land (breathing cursor glyph + inline "Working…" status +
+                    // per-turn timer from the local `turnStartedAt`). Rendered
+                    // from SEND on the optimistic empty bubble (zero parts ⇒
+                    // nothing folds yet), so the labeled, timed affordance is
+                    // local-state-driven — never gated on the first relay item
+                    // frame. When the first work part arrives, the fold's live
+                    // line (same component, same layout) takes over in place;
+                    // no second surface ever mounts. Empty `parts` ⇒ label
+                    // "Working…", no steps, no chevron, nothing to expand yet.
+                    WorkingSectionView(
+                        parts: [],
+                        streaming: true,
+                        liveTurnStartedAt: liveTurnStartedAt,
+                        settledDuration: nil
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             // A11y: combine ONLY on settled turns. Streaming bubbles keep their
@@ -1788,7 +1821,10 @@ struct MessageBubble: View {
     }
 }
 
-private extension Array where Element == ChatMessagePart {
+/// Internal (was file-private; QA-3 S3 lifted the single-affordance decision
+/// into `WorkingSectionModel.preItemWorkingLineVisible`, which keys off the
+/// same "has answer text started" question the tail-caret rule asks).
+extension Array where Element == ChatMessagePart {
     var lastTextPartID: String? {
         for part in reversed() {
             if case .text(let id, _) = part { return id }
@@ -2489,53 +2525,72 @@ extension MessageBubble: Equatable {
 
 // MARK: - Streaming cursor (reusable themed component)
 
-/// The single breathing cursor glyph for the streaming tail — the ChatGPT-style
-/// "I'm working" signal in the transcript (approved design §8). Extracted from
-/// `MessageBubble` (round-2 ROOT D: lifted off the prose `Text` so the pulse never
-/// re-composites the prose block) into ONE reusable component used by both the
-/// standalone-cursor and tail-of-prose call sites, so the caret can be restyled in
-/// a single place. Reads the theme from the environment (`\.hermesTheme`) and
-/// takes `isStreaming` as its only parameter; visual behavior is byte-identical to
-/// the former inline `cursorView` (▌ U+258C in `theme.midground`, easeInOut 0.6s
-/// breathe 1.0→0.25 repeatForever autoreverses, easeOut 0.15s completion snap).
+/// The single breathing cursor glyph — the ChatGPT-style "I'm working" signal in
+/// the transcript (approved design §8). Extracted from `MessageBubble` (round-2
+/// ROOT D: lifted off the prose `Text` so the pulse never re-composites the prose
+/// block) into ONE reusable component used by BOTH the tail-of-prose caret and —
+/// QA-3 S1/S3/A10 — the merged live working line (`WorkingSectionView.liveSection`
+/// + the pre-first-item line), so the breathe has a SINGLE owner and the caret can
+/// be restyled in one place. Reads the theme from the environment (`\.hermesTheme`).
+///
+/// QA-3 S1/A10 — RESILIENT BREATHE: the pulse is a PURE FUNCTION OF WALL-CLOCK
+/// TIME driven by `TimelineView(.animation)`, not an `onAppear`-kicked
+/// `withAnimation(.repeatForever)` `@State`. The old pattern stranded a STATIC
+/// glyph whenever the row remounted or re-projected without an `isStreaming`
+/// EDGE — exactly what the relay projection does: `applyRelayItems` rebuilds the
+/// optimistic caret bubble's row on every pass (the pre-item window re-key), and
+/// a remount with `isStreaming` already true never re-fired `onAppear`'s kick →
+/// the motionless blue bar of IMG_2577/2585/2587. A time-driven opacity can
+/// never strand: any mount, remount, or transaction renders the correct phase
+/// for "now" by construction. Visually identical to the ratified breathe
+/// (▌ U+258C in `theme.midground`, 1.0→0.25 over 0.6 s and back — the sinusoid's
+/// 1.2 s period IS the old `easeInOut(0.6).repeatForever(autoreverses)` cycle);
+/// settled / Reduce-Motion renders static at full opacity.
 struct StreamingCursor: View {
-    /// Whether the owning turn is still streaming. Drives the pulse animation; a
-    /// settled cursor snaps back to full opacity.
+    /// Whether the owning turn is still streaming. Drives the pulse; a settled
+    /// cursor is static at full opacity.
     let isStreaming: Bool
+    /// Tail-of-prose carets render with a leading space (the glyph sits right
+    /// after the last word); line-leading uses (the merged working line) pass
+    /// `false` so the glyph leads the row flush.
+    var leadingSpace: Bool = true
 
     @Environment(\.hermesTheme) private var theme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    /// Opacity driven by a repeating breathe animation while the turn streams.
-    @State private var cursorPulseOpacity: Double = 1.0
+    /// Full breathe cycle in seconds: 0.6 s dim + 0.6 s bright — the exact
+    /// cadence of the ratified `easeInOut(0.6).repeatForever(autoreverses)`.
+    nonisolated static let breathePeriodSeconds: Double = 1.2
+    /// The dim trough of the breathe (ratified: 1.0 → 0.25).
+    nonisolated static let minOpacity: Double = 0.25
 
-    var body: some View {
-        Text(" ▌")
-            .foregroundColor(theme.midground)
-            .opacity(isStreaming ? cursorPulseOpacity : 1.0)
-            .onAppear {
-                guard isStreaming else { return }
-                startCursorPulse()
-            }
-            .onChange(of: isStreaming) { _, streaming in
-                if streaming {
-                    startCursorPulse()
-                } else {
-                    // Turn complete: snap back to full opacity.
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        cursorPulseOpacity = 1.0
-                    }
-                }
-            }
+    /// The breathe opacity at an instant — pure, so the curve is unit-pinnable
+    /// and the `TimelineView` body is a stateless function of the clock.
+    /// `streaming == false` OR Reduce Motion → static full opacity (honest
+    /// settled glyph; no motion the user asked away).
+    nonisolated static func breatheOpacity(
+        at date: Date,
+        streaming: Bool,
+        reduceMotion: Bool
+    ) -> Double {
+        guard streaming, !reduceMotion else { return 1.0 }
+        let t = date.timeIntervalSinceReferenceDate
+        let phase = (sin(2 * Double.pi * t / breathePeriodSeconds) + 1) / 2   // 0…1
+        return minOpacity + (1 - minOpacity) * phase
     }
 
-    /// Kick off the repeating breathe animation for the streaming cursor.
-    private func startCursorPulse() {
-        withAnimation(
-            .easeInOut(duration: 0.6)
-            .repeatForever(autoreverses: true)
-        ) {
-            cursorPulseOpacity = 0.25
+    var body: some View {
+        // `paused` when settled / Reduce Motion: the schedule stops and the
+        // body renders once at full opacity — zero animation cost at rest.
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0,
+                                paused: !isStreaming || reduceMotion)) { context in
+            Text(leadingSpace ? " ▌" : "▌")
+                .foregroundColor(theme.midground)
+                .opacity(Self.breatheOpacity(at: context.date,
+                                             streaming: isStreaming,
+                                             reduceMotion: reduceMotion))
         }
+        .accessibilityHidden(true)
     }
 }
 
