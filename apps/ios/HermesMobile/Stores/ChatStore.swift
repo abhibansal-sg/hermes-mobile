@@ -341,7 +341,11 @@ final class ChatStore {
         for item in items.reversed() where item.type == .taskList {
             if let list = item.taskListBody {
                 relayLatestTaskList = (item.itemID, list)
-                taskListOwnerSessionId = activeSessionId
+                // R1: the owner is the session at the WRITE-GATE (the
+                // coordinator's own record, moved atomically on switch —
+                // SessionStore's `activeRuntimeId` trails the gate move, so
+                // keying on it raced the switch-back projection; I15).
+                taskListOwnerSessionId = relayWriteGateSessionID ?? activeSessionId
             }
             return
         }
