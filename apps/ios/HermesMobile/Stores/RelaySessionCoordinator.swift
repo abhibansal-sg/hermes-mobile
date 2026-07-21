@@ -487,6 +487,29 @@ final class RelaySessionCoordinator {
         entries[sid]!.touch = lruClock
         evictSettledInactiveEntries()
 
+        // Gate frames are NOT items (the store drops them by design) — they
+        // bridge to ChatStore regardless of focus: dropping a one-shot
+        // request for an unfocused session is UNRECOVERABLE (I12). ChatStore
+        // slots the active session's gate and parks any other sid's. For the
+        // active session the gate also refreshes the liveness clock (the
+        // agent is waiting on the USER — a resync must not false-settle a
+        // turn parked on an unanswered gate).
+        switch frame.kind {
+        case .approvalRequest:
+            chatStore.applyRelayApprovalRequest(frame)
+            if sid == activeWriteGateSessionID {
+                chatStore.noteTurnLivenessFrame(isCurrentTurn: true)
+            }
+            return
+        case .clarifyRequest:
+            chatStore.applyRelayClarifyRequest(frame)
+            if sid == activeWriteGateSessionID {
+                chatStore.noteTurnLivenessFrame(isCurrentTurn: true)
+            }
+            return
+        default: break
+        }
+
         guard sid == activeWriteGateSessionID else {
             // BACKGROUND entry: fold-only. The turn-end seam fires for ITS OWN
             // session — that session's gate expires (amendment G1) — and by
@@ -526,19 +549,13 @@ final class RelaySessionCoordinator {
                 ? frame.body["duration_s"]?.doubleValue
                 : nil
         )
-        // QA-1 B10 / A3: the interactive gate frames are NOT items — the render
-        // store drops them by design — yet they are the sole input of the Turn
-        // Dock's cards. Bridge them into the SAME ChatStore state the direct
-        // gateway event router feeds (parked PER SESSION there — contract I12:
-        // the active session's gate takes the slot, a background session's
-        // gate parks until its session holds the write-gate). `turn.completed`
-        // settles the turn → expire that session's pending gate (parity with
-        // the direct path's message.complete expiry — a gate answered
-        // elsewhere or abandoned must not linger inviting a reply against a
-        // dead runtime).
+        // QA-1 B10 / A3: gate frames bridge in `route` (they park per-session
+        // on ChatStore for BOTH the active and background entries — contract
+        // I12, never dropped because unfocused). `turn.completed` settles the
+        // turn → expire that session's pending gate (parity with the direct
+        // path's message.complete expiry — a gate answered elsewhere or
+        // abandoned must not linger inviting a reply against a dead runtime).
         switch frame.kind {
-        case .approvalRequest: chatStore.applyRelayApprovalRequest(frame)
-        case .clarifyRequest:  chatStore.applyRelayClarifyRequest(frame)
         case .turnStarted:
             // QA-2 R12/R13: a new turn is the authoritative "clear the dock for
             // a fresh seed" edge — the relay item store accumulates the prior
