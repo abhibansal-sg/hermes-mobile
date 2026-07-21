@@ -257,6 +257,7 @@ final class SessionStore {
         activeStoredId = nil
         activeStoredProfile = nil
         chat?.reset()
+        transcriptPaintedStoredId = nil
     }
 
     /// Remove every in-memory surface owned by a forgotten gateway.
@@ -3603,12 +3604,85 @@ final class SessionStore {
     private var warmOpenSnapshotOrder: [String] = []
     private static let warmOpenSnapshotLimit = 6
 
+    /// QA-3 S7/A3 — the stored session id whose transcript the chat view
+    /// currently holds: stamped on every successful paint / reset this store
+    /// drives. A re-open of the SAME session (a row re-tap, a notification
+    /// deep-link onto the active chat) must NEVER re-run the first-frame cache
+    /// paint over it — the cached copy is a known-partial tail window, and
+    /// painting it `.replace` over the full in-memory transcript truncated the
+    /// timeline to the window: the eager bottom-anchored VStack then rendered
+    /// the surviving tail at the bottom with PURE VOID above on scroll-up
+    /// (IMG_2589/2590). Provenance-keyed (not `activeStoredId`-keyed) so a
+    /// superseded in-flight open can never masquerade as a same-session
+    /// repaint. `nil` = the transcript holds no session (draft/reset/empty).
+    private var transcriptPaintedStoredId: String?
+
     private func cachedWarmOpenSnapshot(for storedId: String) -> [ChatMessage]? {
         warmOpenSnapshots[storedId]
     }
 
+    /// QA-3 S6/A2 — DURABLE OPTIMISTIC ECHOES: optimistic user echoes keyed by
+    /// stored session id. `ChatStore.send` (relay branch) and `presentOutboxEcho`
+    /// persist each echo here; the warm snapshot carries it so a session switch
+    /// away and back (or any store rebuild that repaints from the warm/disk
+    /// cache) re-renders the prompt BEFORE the relay's `userMessage` item
+    /// re-lands — the S6 prompt-vanish (IMG_2585/2591: working rows with no
+    /// prompt above them). ``markEchoReconciled(storedId:clientMessageID:text:)``
+    /// purges an echo once the relay projection adopts it (or the user deletes
+    /// a failed send), so a repaint never re-presents a second bubble beside
+    /// the reconciled row.
+    private var pendingDurableEchoes: [String: [ChatMessage]] = [:]
+
+    /// Persist an optimistic echo into the session-keyed warm snapshot the
+    /// switch-and-back paint reads. No-op without a stored session id (a
+    /// draft send binds its echo once the relay-created session id lands —
+    /// ChatStore re-calls this after `landRelayCreatedSession`).
+    func persistDurableEcho(storedId: String?, echo: ChatMessage) {
+        guard let storedId, !storedId.isEmpty else { return }
+        var pending = pendingDurableEchoes[storedId] ?? []
+        pending.removeAll {
+            ($0.clientMessageID != nil && $0.clientMessageID == echo.clientMessageID)
+                || $0.id == echo.id
+        }
+        pending.append(echo)
+        pendingDurableEchoes[storedId] = pending
+        // Fold the echo into the warm snapshot NOW when one exists (it leads
+        // the repaint); otherwise the next `rememberWarmOpenSnapshot` for the
+        // session folds every still-pending echo in (self-healing on the
+        // session's next paint).
+        if var snapshot = warmOpenSnapshots[storedId] {
+            snapshot.removeAll {
+                ($0.clientMessageID != nil && $0.clientMessageID == echo.clientMessageID)
+                    || $0.id == echo.id
+            }
+            snapshot.append(echo)
+            warmOpenSnapshots[storedId] = snapshot
+        }
+    }
+
+    /// Drop a durable echo once it is reconciled — the relay `userMessage`
+    /// adoption consumed its row (`adoptRelayEcho`), or the user deleted a
+    /// failed send (`removeLocalEcho`). Idempotent; text-keyed only for
+    /// cmid-less echoes (a distinct send of identical text carries its own
+    /// cmid and must survive).
+    func markEchoReconciled(storedId: String?, clientMessageID: String?, text: String) {
+        guard let storedId, !storedId.isEmpty else { return }
+        func isThisEcho(_ message: ChatMessage) -> Bool {
+            if let clientMessageID { return message.clientMessageID == clientMessageID }
+            return message.clientMessageID == nil && message.text == text
+        }
+        if var pending = pendingDurableEchoes[storedId] {
+            pending.removeAll(where: isThisEcho)
+            pendingDurableEchoes[storedId] = pending.isEmpty ? nil : pending
+        }
+        if var snapshot = warmOpenSnapshots[storedId] {
+            snapshot.removeAll(where: isThisEcho)
+            warmOpenSnapshots[storedId] = snapshot
+        }
+    }
+
     private func rememberWarmOpenSnapshot(_ normalized: [ChatMessage], for storedId: String) {
-        warmOpenSnapshots[storedId] = normalized
+        warmOpenSnapshots[storedId] = mergedWarmSnapshot(normalized, for: storedId)
         warmOpenSnapshotOrder.removeAll { $0 == storedId }
         warmOpenSnapshotOrder.append(storedId)
         if warmOpenSnapshotOrder.count > Self.warmOpenSnapshotLimit {
@@ -3618,6 +3692,39 @@ final class SessionStore {
             }
             warmOpenSnapshotOrder.removeFirst(overflow)
         }
+    }
+
+    /// QA-3 S7/A3 — warm snapshots are written from KNOWN-PARTIAL seeds (every
+    /// seed source is a recent-tail window), so an OVERWRITE would degrade the
+    /// warm copy to the window: a same-process re-open of a session the user
+    /// had backward-paged would repaint only the tail (their loaded scrollback
+    /// gone). Merge instead: `incoming` is the spine; unmatched EXISTING rows
+    /// that precede the first matched row are the previously-loaded older
+    /// history — PREPEND them (unmatched TRAILING rows are superseded content
+    /// — an old streaming row, a since-deleted row — and drop). Then re-append
+    /// any still-pending durable echo the incoming window does not cover
+    /// (S6): a network seed that lands before the gateway persists the prompt
+    /// must not lose it from the warm copy.
+    private func mergedWarmSnapshot(
+        _ incoming: [ChatMessage], for storedId: String
+    ) -> [ChatMessage] {
+        let existing = warmOpenSnapshots[storedId] ?? []
+        var merged = incoming
+        if !existing.isEmpty {
+            let incomingIDs = Set(incoming.map(\.id))
+            if let firstMatch = existing.firstIndex(where: { incomingIDs.contains($0.id) }) {
+                merged = Array(existing.prefix(firstMatch)) + incoming
+            }
+        }
+        for echo in pendingDurableEchoes[storedId] ?? [] {
+            let covered = merged.contains {
+                ($0.clientMessageID != nil && $0.clientMessageID == echo.clientMessageID)
+                    || $0.id == echo.id
+                    || ($0.role == .user && $0.clientMessageID == nil && $0.text == echo.text)
+            }
+            if !covered { merged.append(echo) }
+        }
+        return merged
     }
 
     #if DEBUG
@@ -4116,6 +4223,7 @@ final class SessionStore {
         resetComposerHistoryBrowse()
         chat?.reset()
         chat?.seed(from: [])  // empty IS the (draft) transcript
+        transcriptPaintedStoredId = nil   // a draft holds no stored session
         // A draft has NO session: drop the previous session's hot-swap state
         // (else the pill shows the LAST chat's model) and any stale draft pick.
         connection?.clearSessionState()
@@ -4320,6 +4428,7 @@ final class SessionStore {
             let seeded = response["messages"]?.arrayValue?
                 .compactMap(StoredMessage.init(json:)) ?? []
             chat?.seed(from: seeded)
+            transcriptPaintedStoredId = storedId
             lastError = nil
             Task { [weak self] in await self?.refresh() }
             return (runtimeId, storedId)
@@ -5336,6 +5445,7 @@ final class SessionStore {
         activeStoredId = nil
         activeStoredProfile = nil
         chat?.reset()
+        transcriptPaintedStoredId = nil
     }
 
     /// Injectable seam for the session-list fetch. `nil` resolves the live
@@ -5499,9 +5609,34 @@ final class SessionStore {
         // reconciles any tail/delta afterward.
         var paintedFromCache = false
         var paintedFromDisk = false
-        if isCurrentTranscriptOpen(token: token),
+        // QA-3 S7/A3 — VOID SCROLLBACK IMPOSSIBLE: when the transcript ALREADY
+        // holds THIS session (a row re-tap, a notification deep-link onto the
+        // active chat, a re-open of the same session), its in-memory rows ARE
+        // the truth — backward-paged history, a live turn, an optimistic echo
+        // included. Re-running the first-frame cache paint over it painted the
+        // KNOWN-PARTIAL cached tail window `.replace` (warm snapshot 5504 /
+        // disk `cached.suffix(windowLimit)` 5540), truncating the full
+        // transcript to the window — the eager bottom-anchored VStack then
+        // rendered the surviving tail at the bottom with PURE VOID above on
+        // scroll-up (IMG_2589/2590). Skip phase 1 entirely: the phase-2
+        // network seed (below) reconciles server-side deltas in place with a
+        // `.union` policy, so nothing newer is lost and nothing older is
+        // evicted. Provenance-keyed off `transcriptPaintedStoredId` (stamped
+        // on every paint/reset this store drives) — NEVER off `activeStoredId`,
+        // which open() re-points synchronously on the tap tick before this
+        // task runs.
+        let sameSessionRepaint = (transcriptPaintedStoredId == storedId)
+        if sameSessionRepaint {
+            paintedFromCache = true        // content already painted — phase 2
+            paintedRows = chat.messages.count   // still reconciles deltas
+            #if DEBUG
+            Self.logOpenLatency(
+                phase: "same-session(skip-paint)", storedId: storedId, since: openClock)
+            #endif
+        } else if isCurrentTranscriptOpen(token: token),
            let cached = cachedWarmOpenSnapshot(for: storedId) {
             chat.seed(normalized: Array(cached.suffix(ChatStore.transcriptOpenWindowLimit)))
+            transcriptPaintedStoredId = storedId
             paintedRows = cached.count
             paintedFromCache = true
             #if DEBUG
@@ -5538,6 +5673,7 @@ final class SessionStore {
                 guard isCurrentTranscriptOpen(token: token) else { return }
                 rememberWarmOpenSnapshot(normalized, for: storedId)
                 chat.seed(normalized: normalized)  // in-place reconcile — FIRST frame
+                transcriptPaintedStoredId = storedId
                 paintedRows = cachedWindow.count
                 chat.noteTranscriptSeedWindow(cachedWindow)
                 paintedFromCache = true
@@ -5548,6 +5684,10 @@ final class SessionStore {
             // Cache miss (or no cache): empty the transcript so ChatView shows the
             // skeleton, not a stale prior session's rows, while the network loads.
             chat.reset()
+            // QA-3 S7: the honest empty state belongs to THIS session (the
+            // skeleton, not a stale provenance) — a re-tap of it must not
+            // re-run the miss-reset over whatever phase 2 paints next.
+            transcriptPaintedStoredId = storedId
         }
         paintFinished = true
         #if DEBUG
@@ -5684,6 +5824,7 @@ final class SessionStore {
             // "Loading…" spinner (R1 #79).
             if !paintedFromCache {
                 chat.reset()
+                transcriptPaintedStoredId = storedId
                 let description = (error as? LocalizedError)?.errorDescription
                     ?? error.localizedDescription
                 chat.noteTranscriptLoadFailure(description)
@@ -5767,6 +5908,7 @@ final class SessionStore {
         guard let chat else { return }
         guard let storedId, let fetch = resolvedTranscriptFetch() else {
             chat.reset()
+            transcriptPaintedStoredId = nil
             return
         }
         let capturedIdentity = cacheIdentity(storedId, profile: cacheProfile)
@@ -5795,6 +5937,7 @@ final class SessionStore {
                 // so rows the cached window does not cover are retained.
                 chat.seed(normalized: normalized, policy: .union)
                 chat.noteTranscriptSeedWindow(cachedWindow)
+                transcriptPaintedStoredId = storedId
                 paintedFromCache = true
             }
         }
@@ -5818,6 +5961,7 @@ final class SessionStore {
             // not cover).
             chat.seed(normalized: normalized, policy: .union)
             chat.noteTranscriptSeedWindow(stored)
+            transcriptPaintedStoredId = storedId
             if let cacheStore, let identity = capturedIdentity {
                 Task { [weak self] in
                     guard let self,
@@ -5837,7 +5981,10 @@ final class SessionStore {
             ) else { return }
             // A valid cache paint remains readable when reconciliation fails.
             // Only an empty miss needs the recoverable error presentation.
-            if !paintedFromCache { chat.reset() }
+            if !paintedFromCache {
+                chat.reset()
+                transcriptPaintedStoredId = storedId
+            }
             let description = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
             if !paintedFromCache { chat.noteTranscriptLoadFailure(description) }
