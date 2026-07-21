@@ -120,6 +120,47 @@ final class RelaySessionCoordinator {
     /// of truth the transcript is projected from).
     private(set) var store = RelayItemStore()
 
+    /// S11 (QA-3): projection parking for the New-Chat draft surface. ``startDraft``
+    /// opens a draft chat (no session id) but does NOT touch this coordinator's
+    /// ``activeSessionID``/``activeStoredSessionID`` — the relay pump keeps
+    /// ingesting the PREVIOUS session's frames and ``applyRelayItems`` would
+    /// project them onto the now-empty draft transcript (IMG_2594: another
+    /// session's "Working… · ToolCall 7s" row rendered in a brand-new chat that
+    /// made zero backend requests — pure client-state leak). Set by
+    /// ``suppressProjectionForDraft()`` (SessionStore.startDraft), cleared by
+    /// ``resumeProjection()`` (every real-session bind: ``resume``/``open``/
+    /// ``start``). While set, ``ingest(_:)`` still applies frames to ``store``
+    /// (so the previous session's items accumulate for a fast resume and
+    /// reconnect-resync) but skips EVERY ``chatStore`` side-effect (projection,
+    /// gate frames, task-list mirror, turn lifecycle). The draft surface is
+    /// provably empty for the duration of the draft.
+    private(set) var projectionSuppressed: Bool = false
+
+    /// S11: park projection for a draft. Idempotent — calling on an already-
+    /// suppressed coordinator is a no-op. The coordinator's ``activeSessionID``
+    /// is RETAINED so reconnect-resync and durable-outbox routing keep working
+    /// for the previous session while the user drafts.
+    func suppressProjectionForDraft() {
+        projectionSuppressed = true
+    }
+
+    /// S11: resume projection. Called by every real-session bind path
+    /// (``resume``/``open``/``start``). Clears the suppression flag and re-applies
+    /// the current ``store`` so the resumed session's accumulated live items paint
+    /// immediately instead of waiting for the next frame (the snapshot re-delivered
+    /// by the relay's open/resume RPC is the natural refresh, but a same-session
+    /// re-open after a draft does not re-deliver — `resetItemStoreForSessionSwitch`
+    /// guards on id-change — so the explicit re-projection closes that gap).
+    func resumeProjection() {
+        let wasSuppressed = projectionSuppressed
+        projectionSuppressed = false
+        guard wasSuppressed else { return }
+        // Re-project the current store so a same-session re-open after a draft
+        // paints immediately. A foreign-session or empty store is a no-op
+        // (`applyRelayItems` already guards empty projections).
+        chatStore.applyRelayItems(store.items, turnSettled: false)
+    }
+
     private let chatStore: ChatStore
     private let clientFactory: @Sendable () -> RelayClient
     /// Injectable backoff sleep between reconnect attempts. Defaults to
@@ -308,6 +349,9 @@ final class RelaySessionCoordinator {
             activeSessionID = sessionID
             activeStoredSessionID = sessionID
             _ = try await client.open(sessionID)
+            // S11: a real session bind resumes projection (clears any draft-
+            // surface parking from a prior `suppressProjectionForDraft`).
+            resumeProjection()
         }
     }
 
@@ -412,6 +456,14 @@ final class RelaySessionCoordinator {
         // drop reconnects promptly instead of inheriting a stale attempt count.
         if reconnectAttempt != 0 { reconnectAttempt = 0 }
         store.apply(frame)
+        // S11 (QA-3): when projection is parked for a New-Chat draft, apply the
+        // frame to the store (previous session's items keep accumulating for
+        // fast resume + reconnect-resync) but skip EVERY chatStore side-effect.
+        // The draft surface has no live turn, no gate, no task list — projecting
+        // the previous session's items onto it is the cross-session leak
+        // (IMG_2594). Resume on the next real-session bind re-applies the
+        // current store.
+        guard !projectionSuppressed else { return }
         // QA-2 R4/A2: `turn.completed` is the authoritative settle the
         // turn-scoped `relayTurnLive` flag clears on — plumbed through so the
         // SAME projection that sees the terminal items also ends the turn
@@ -569,6 +621,9 @@ final class RelaySessionCoordinator {
         let result = try await client.resumeSession(sessionID)
         activeSessionID = sessionID
         activeStoredSessionID = sessionID
+        // S11: a real session bind resumes projection (clears any draft-
+        // surface parking from a prior `suppressProjectionForDraft`).
+        resumeProjection()
         return result
     }
 
@@ -580,6 +635,9 @@ final class RelaySessionCoordinator {
         let result = try await client.open(sessionID)
         activeSessionID = sessionID
         activeStoredSessionID = sessionID
+        // S11: a real session bind resumes projection (clears any draft-
+        // surface parking from a prior `suppressProjectionForDraft`).
+        resumeProjection()
         return result
     }
 
