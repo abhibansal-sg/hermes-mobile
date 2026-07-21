@@ -1086,6 +1086,51 @@ async def test_push_register_invalid_token_raises_jsonrpc_error(relay_push_engin
     assert relay_push_engine.registry_entries() == []
 
 
+async def test_push_register_carries_device_id_to_registry(relay_push_engine):
+    """QA-3 S13: the device_id the phone now sends (always non-empty after the
+    per-install-id iOS fix) reaches the registry, so device-keyed dedup can
+    converge and null-id legacy rows can be evicted. The masked log line records
+    presence (or absence) without exposing the id."""
+    srv, _ = _server(push_engine=relay_push_engine)
+    await srv.start()
+    result = await _handle(
+        srv,
+        UpstreamMethod.PUSH_REGISTER,
+        {
+            "token": _DEVICE_TOKEN,
+            "platform": "ios",
+            "env": "sandbox",
+            "device_id": "phone-install-42",
+        },
+    )
+    assert result == {"registered": True}
+    entries = relay_push_engine.registry_entries()
+    assert len(entries) == 1
+    assert entries[0]["device_id"] == "phone-install-42"
+
+
+async def test_push_register_logs_absent_device_id_as_none(
+    relay_push_engine, caplog
+):
+    """QA-3 S13: a missing device_id is logged as <none> (masked) so a
+    non-converging registry is diagnosable from the relay log alone — the
+    root cause of the build-116 3-token fan-out."""
+    import logging as _logging
+
+    srv, _ = _server(push_engine=relay_push_engine)
+    await srv.start()
+    with caplog.at_level(_logging.INFO):
+        await _handle(
+            srv,
+            UpstreamMethod.PUSH_REGISTER,
+            {"token": _DEVICE_TOKEN, "platform": "ios", "env": "sandbox"},
+        )
+    assert any(
+        "device_id=<none>" in rec.getMessage() and "push.register" in rec.getMessage()
+        for rec in caplog.records
+    ), f"expected masked <none> log line, got {[r.getMessage() for r in caplog.records]}"
+
+
 async def test_push_unregister_removes_token(relay_push_engine):
     srv, _ = _server(push_engine=relay_push_engine)
     await srv.start()

@@ -92,6 +92,46 @@ final class NotificationActionTests: XCTestCase {
         XCTAssertNil(NotificationService.decodeTap(from: userInfo))
     }
 
+    // MARK: - QA-3 S12: stored_session_id deep-link payload
+
+    func testDecodeTapCarriesStoredSessionIdWhenPresent() {
+        // The relay resolves live→origin at drive time and stamps the stored id
+        // in the hermes block; decodeTap must surface it so the router can open
+        // the owning session directly instead of dumping to the Inbox.
+        let userInfo: [AnyHashable: Any] = [
+            "aps": ["category": "HERMES_TURN"],
+            "hermes": ["session_id": "live-9", "stored_session_id": "origin-stored-9"],
+        ]
+        XCTAssertEqual(
+            NotificationService.decodeTap(from: userInfo),
+            .turnComplete(sessionId: "live-9", storedSessionId: "origin-stored-9")
+        )
+    }
+
+    func testDecodeTapStoredSessionIdNilWhenAbsent() {
+        let userInfo: [AnyHashable: Any] = [
+            "aps": ["category": "HERMES_TURN"],
+            "hermes": ["session_id": "live-9"],
+        ]
+        XCTAssertEqual(
+            NotificationService.decodeTap(from: userInfo),
+            .turnComplete(sessionId: "live-9", storedSessionId: nil)
+        )
+    }
+
+    func testDecodeTapBlankStoredSessionIdTreatedAsNil() {
+        // A whitespace-only stored id must not route a tap at an empty/garbage
+        // stored id — fall back to the runtime id / inbox map instead.
+        let userInfo: [AnyHashable: Any] = [
+            "aps": ["category": "HERMES_APPROVAL"],
+            "hermes": ["session_id": "rt", "stored_session_id": "   "],
+        ]
+        XCTAssertEqual(
+            NotificationService.decodeTap(from: userInfo),
+            .attention(sessionId: "rt", storedSessionId: nil)
+        )
+    }
+
     // MARK: - decodeApprovalAction (the hermes block)
 
     func testDecodeApprovalActionFullBlock() throws {
@@ -366,6 +406,68 @@ final class PushTapRoutingTests: XCTestCase {
         XCTAssertEqual(readinessCalls, 1)
         XCTAssertEqual(refreshCalls, 1)
         XCTAssertEqual(s.sessions.activeStoredId, "stored-attention")
+        XCTAssertEqual(s.inbox.presentationRequestToken, 0)
+    }
+
+    // MARK: - QA-3 S12: stored_session_id deep-link
+
+    func testTapWithStoredSessionIdOpensOwningSessionDirectly() async {
+        // The relay's stored id is in the payload but the runtime id is NOT in
+        // the inbox map (an ordinary turn_complete of a compressed session) and
+        // the session is already loaded. The tap MUST open the stored-id
+        // session synchronously, without falling through to the Inbox.
+        let s = makeStores()
+        s.sessions.sessions = [summary(id: "origin-stored-9")]
+        // No inbox mapping for the runtime id (the precondition that was broken).
+        XCTAssertNil(s.inbox.storedSessionId(forRuntime: "live-9"))
+
+        var readinessCalls = 0
+        var refreshCalls = 0
+        s.connection.sessionRefreshReadinessOverride = {
+            readinessCalls += 1
+            return true
+        }
+        s.sessions.sessionsFetch = {
+            refreshCalls += 1
+            return ([self.summary(id: "origin-stored-9")], 1)
+        }
+
+        HermesURLRouter.routePushTap(
+            .turnComplete(sessionId: "live-9", storedSessionId: "origin-stored-9"),
+            sessions: s.sessions,
+            inbox: s.inbox,
+            connection: s.connection
+        )
+
+        XCTAssertEqual(s.sessions.activeStoredId, "origin-stored-9")
+        XCTAssertEqual(readinessCalls, 0, "stored-id hit must not enter readiness machinery")
+        XCTAssertEqual(refreshCalls, 0)
+        XCTAssertEqual(s.inbox.presentationRequestToken, 0,
+                       "must not dump to the Inbox when the stored id resolves")
+    }
+
+    func testTapWithStoredSessionIdColdOpensAfterRefresh() async {
+        // Cold launch: session list empty; the stored id lets us target the
+        // right session once the refresh lands, instead of guessing the runtime
+        // id (which never matches a stored-id list).
+        let s = makeStores()
+        var refreshCalls = 0
+        s.connection.sessionRefreshReadinessOverride = { true }
+        s.sessions.sessionsFetch = {
+            refreshCalls += 1
+            return ([self.summary(id: "origin-stored-cold")], 1)
+        }
+
+        HermesURLRouter.routePushTap(
+            .turnComplete(sessionId: "live-cold", storedSessionId: "origin-stored-cold"),
+            sessions: s.sessions,
+            inbox: s.inbox,
+            connection: s.connection
+        )
+
+        await waitUntil { s.sessions.activeStoredId == "origin-stored-cold" }
+        XCTAssertEqual(refreshCalls, 1)
+        XCTAssertEqual(s.sessions.activeStoredId, "origin-stored-cold")
         XCTAssertEqual(s.inbox.presentationRequestToken, 0)
     }
 }
