@@ -79,3 +79,19 @@ scripts/ios-build.sh test -scheme HermesMobile \
   both are done.
 - `accepted_unread` (gateway edge): only for documented forward-compat extras;
   an effective (silent-default) key is never allowed there.
+- **Relay-first surface (R4 Wave-1 ratchet):** ROUND4-LEAN-PLAN.md §c deploys
+  the relay lanes AHEAD of the iOS glue (additive; old iOS unaffected). A
+  method the relay implements before its iOS builder exists goes under the
+  fixture's top-level `relay_ahead.methods` (full spec: reads/example/
+  expect_gateway, empty `ios_sends`) — NOT under `upstream.payloads`, which
+  the XCTest consumer compares key-for-key against `RelayUpstreamMethod`.
+  pytest holds the RELAY side to it (`UpstreamMethod.ALL` ==
+  `upstream.payloads` KEYS ∪ `relay_ahead.methods`; the reads + behavioral
+  tests cover the entries) while the Swift surface still equals
+  `upstream.payloads` exactly. **Double-acting ratchet:** the moment Swift
+  implements a relay_ahead method, `test_upstream_method_sets_agree…` FAILS
+  and the adopter MOVES the spec into `upstream.payloads` (with real
+  `ios_sends`) and DELETES it from `relay_ahead`. The section must be EMPTY
+  at the Wave-4 exit (relay-only tree). Optional params these lanes add to
+  EXISTING methods ride the host method's `relay_reads` (no Swift builder
+  needed until iOS sends them). `branch` (R4 L2) is the first entry.

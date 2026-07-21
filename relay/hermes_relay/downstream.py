@@ -856,11 +856,18 @@ class DownstreamServer:
             # minimum-message bound. Each is OPTIONAL: absent params are never
             # sent, so a pre-L1 phone (limit only) drives the byte-identical
             # pre-L1 gateway call.
+            # Explicit per-key reads (the conformance AST extractor keys off
+            # literal ``p.get("…")`` sites — the contract mirrors live code).
             filters: dict[str, Any] = {}
-            for key in ("order", "cwd_prefix", "exclude_source"):
-                val = p.get(key)
-                if isinstance(val, str) and val:
-                    filters[key] = val
+            order = p.get("order")
+            if isinstance(order, str) and order:
+                filters["order"] = order
+            cwd_prefix = p.get("cwd_prefix")
+            if isinstance(cwd_prefix, str) and cwd_prefix:
+                filters["cwd_prefix"] = cwd_prefix
+            exclude_source = p.get("exclude_source")
+            if isinstance(exclude_source, str) and exclude_source:
+                filters["exclude_source"] = exclude_source
             min_messages = p.get("min_messages")
             if isinstance(min_messages, int) and not isinstance(min_messages, bool):
                 filters["min_messages"] = min_messages
