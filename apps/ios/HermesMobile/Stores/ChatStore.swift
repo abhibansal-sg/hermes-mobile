@@ -2624,6 +2624,20 @@ final class ChatStore {
             )
             userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
             messages.append(userMessage)
+            // QA-3 S6/A2 — DURABLE ECHO: the optimistic echo existed only in
+            // the in-memory transcript, so a session switch (the transcript
+            // reseeds for the other session) or any store rebuild dropped it
+            // — the sent prompt vanished from view until the relay's next
+            // snapshot re-projected its `userMessage` item (IMG_2585/2591:
+            // working rows rendering with NO prompt above them). Persist it
+            // into the session-keyed warm snapshot the switch-and-back cache
+            // paint reads, so the prompt repaints BEFORE any relay frame
+            // lands, and stays until the `userMessage` adoption reconciles it
+            // (`markEchoReconciled`). A draft send keys the echo once the
+            // relay-created session id lands (below).
+            sessions?.persistDurableEcho(
+                storedId: sessions?.activeStoredId, echo: userMessage
+            )
             // QA-2 R4/A2 — INSTANT WORKING AFFORDANCE: append an optimistic
             // EMPTY streaming assistant bubble the instant the user commits —
             // the breathing caret (`MessageBubble.needsStandaloneCursor`)
@@ -2693,6 +2707,11 @@ final class ChatStore {
                 // Guarded inside to never clobber an already-bound session.
                 if let sid = result["session_id"]?.stringValue {
                     sessions?.landRelayCreatedSession(storedID: sid)
+                    // QA-3 S6/A2: the draft send's echo had no stored session
+                    // to key under at append time — bind it now that the
+                    // relay-created session id has landed, so a switch-away
+                    // and back repaints the prompt here too.
+                    sessions?.persistDurableEcho(storedId: sid, echo: userMessage)
                 }
                 return true
             } catch {
@@ -2970,6 +2989,14 @@ final class ChatStore {
         }) else { return }
         let removed = messages.remove(at: index)
         userOrdinals[removed.id] = nil
+        // QA-3 S6/A2: a deliberately-removed echo (the failed-send delete, or
+        // the immediate→outbox swap at 2719/2735) must not resurrect from the
+        // durable warm snapshot on the next repaint.
+        sessions?.markEchoReconciled(
+            storedId: sessions?.activeStoredId,
+            clientMessageID: clientMessageID,
+            text: removed.text
+        )
     }
 
     /// The stable id of a relay turn's assistant row, derived from the turn's
@@ -3046,6 +3073,15 @@ final class ChatStore {
         )
         userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
         messages.append(userMessage)
+        // QA-3 S6/A2: the outbox echo is the user's ONLY record of a queued
+        // prompt (its turn may not run for a while — the relay HOLDS the row
+        // while the destination session is mid-turn) — make it durable across
+        // a session switch / store rebuild exactly like the immediate-path
+        // echo. The durable outbox ROW survives regardless; this keeps the
+        // PROMPT rendered until the relay `userMessage` adoption reconciles.
+        sessions?.persistDurableEcho(
+            storedId: sessions?.activeStoredId, echo: userMessage
+        )
     }
 
     /// Build the local echo text for a just-sent user row after mobile has already
@@ -4918,13 +4954,32 @@ final class ChatStore {
     ) -> RelayEchoAdoption? {
         if let adopted = relayEchoAdoptions[item.itemID] { return adopted }
         let itemCMID = item.body["client_message_id"]?.stringValue
-        func matches(_ message: ChatMessage) -> Bool {
-            guard message.role == .user, !message.relayProjected,
-                  !consuming.contains(message.id) else { return false }
-            if let itemCMID { return message.clientMessageID == itemCMID }
-            return message.clientMessageID == nil && message.text == item.textBody
+        // QA-3 S6/A2: a cmid-carrying item matches its echo by cmid FIRST
+        // (deterministic, so identical texts never collapse), then falls back
+        // to an exact-text match on a cmid-LESS row — the GRDB cache paint of
+        // the gateway's persisted prompt carries NO client_message_id
+        // (`toChatMessages` maps none), so when the in-memory echo was lost
+        // (a session switch / store rebuild before this item re-landed — S6's
+        // prompt-vanish), the cache-painted twin still adopts and the prompt
+        // renders ONCE, in place, instead of beside a relay-id duplicate.
+        // The cmid pass scans the WHOLE transcript before any text match so a
+        // same-text cache row sitting ABOVE the real echo never wins the
+        // adoption (two sends of identical text must pair one-to-one).
+        func eligible(_ message: ChatMessage) -> Bool {
+            message.role == .user && !message.relayProjected && !consuming.contains(message.id)
         }
-        guard let echo = messages.first(where: matches) else { return nil }
+        let echo: ChatMessage?
+        if let itemCMID,
+           let cmidMatch = messages.first(where: {
+               eligible($0) && $0.clientMessageID == itemCMID
+           }) {
+            echo = cmidMatch
+        } else {
+            echo = messages.first(where: {
+                eligible($0) && $0.clientMessageID == nil && $0.text == item.textBody
+            })
+        }
+        guard let echo else { return nil }
         let adoption = RelayEchoAdoption(
             id: echo.id,
             clientMessageID: echo.clientMessageID,
@@ -4932,6 +4987,16 @@ final class ChatStore {
         )
         relayEchoAdoptions[item.itemID] = adoption
         consuming.insert(echo.id)
+        // QA-3 S6/A2: the durable echo (the session-keyed warm snapshot the
+        // send write-through persists so a switch-and-back repaints it) is
+        // now reconciled — purge it so a later repaint never re-presents a
+        // second bubble beside the adopted row. The projection targets the
+        // active session (the coordinator parks it on drafts — S11).
+        sessions?.markEchoReconciled(
+            storedId: sessions?.activeStoredId,
+            clientMessageID: adoption.clientMessageID,
+            text: echo.text
+        )
         return adoption
     }
 
@@ -5192,8 +5257,57 @@ final class ChatStore {
         // minus any echo rows a userMessage item adopted this pass (they
         // re-enter tagged, in place). History + live turn coexist; scrollback
         // stays intact during and after streaming.
+        //
+        // QA-3 S4/A2 — CONSUME CACHE-PAINTED ASSISTANT TWINS: adoption only
+        // consumes USER rows (`adoptRelayEcho`), but a reconnect resync /
+        // mid-turn open delivers a snapshot of ALL accumulated items, so the
+        // rebuilt tail re-projects EVERY turn the session ever ran — including
+        // turns the GRDB cache / network seed already painted UNTAGGED. With
+        // only the user twins consumed, the preserved history still held every
+        // cache-painted ANSWER `[A1…An]` above a rebuilt `[U1',A1'…Un',An']`
+        // tail: each answer rendered TWICE, and the orphan cache copy sat
+        // ABOVE the rebuilt user rows — the answer visibly preceding the
+        // prompt that asked it (IMG_2579-2582: the same exchange in two
+        // orders at two scroll positions of one view; switching away "fixed"
+        // it because the cache paint alone is ordered). The rebuilt copy is
+        // AUTHORITATIVE (the relay item store is the live truth), so for each
+        // user row a `userMessage` item adopted/consumed this pass, consume
+        // the untagged assistant run that FOLLOWS it in the current
+        // transcript — its settled cache-painted answer for that same turn.
+        // Guarded on the rebuilt turn actually CARRYING an assistant segment:
+        // a snapshot with the prompt's `userMessage` but no agent items yet
+        // (a turn that errored pre-item, or a snapshot raced by its first
+        // item) must not evaporate the cache answer before the relay copy
+        // exists. Turns the item store does not carry at all (prompt sent by
+        // another client) keep every preserved row — untouched.
+        var consumedHistoryIDs = consumedEchoIDs
+        // Rebuilt user rows whose turn carries an assistant segment. Adopted
+        // user rows re-enter under the echo's id (== the consumed id), so the
+        // rebuilt row id and the consumed id are the same key.
+        var rebuiltHasAssistantAfter: [UUID: Bool] = [:]
+        var rebuiltCurrentUser: UUID?
+        for row in rebuilt {
+            if row.role == .user {
+                rebuiltCurrentUser = row.id
+                rebuiltHasAssistantAfter[row.id] = false
+            } else if row.role == .assistant, let userRowID = rebuiltCurrentUser {
+                rebuiltHasAssistantAfter[userRowID] = true
+            }
+        }
+        var inTwinRun = false
+        for message in messages {
+            if message.role == .user {
+                // A consumed user row starts its twin run only when the
+                // rebuilt turn carries the authoritative answer copy.
+                inTwinRun = !message.relayProjected
+                    && consumedEchoIDs.contains(message.id)
+                    && rebuiltHasAssistantAfter[message.id] == true
+            } else if inTwinRun, !message.relayProjected {
+                consumedHistoryIDs.insert(message.id)
+            }
+        }
         let preserved = messages.filter {
-            !$0.relayProjected && !consumedEchoIDs.contains($0.id)
+            !$0.relayProjected && !consumedHistoryIDs.contains($0.id)
         }
         messages = preserved + rebuilt
         setStreaming(nowStreaming, reason: "relayProjection")
