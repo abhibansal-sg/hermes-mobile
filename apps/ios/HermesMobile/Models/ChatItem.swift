@@ -65,6 +65,15 @@ struct ChatItem: Sendable, Equatable, Identifiable, Codable {
     /// Type-specific payload (args/result/text/diff/usage/…), kept untyped and
     /// projected by the accessors below.
     var body: JSONValue
+    /// QA-3 S8/A4 — LOCAL liveness settle marker (NEVER a wire field, hence not
+    /// in ``CodingKeys``). Set by ``RelayItemStore/settleInProgressLocally()``
+    /// when the per-turn liveness watchdog force-settles a dead turn's stuck
+    /// `.inProgress` items: they become terminal for the render lane and the
+    /// projection folds them as a MUTED "Interrupted" section (never an error
+    /// banner — C3). Provisional by design: any later authoritative frame for
+    /// the item (`item.completed` / a `snapshot` reconcile) REPLACES the whole
+    /// item by id and clears this, so the truth always heals the local settle.
+    var locallyInterrupted: Bool
 
     var id: String { itemID }
 
@@ -75,7 +84,8 @@ struct ChatItem: Sendable, Equatable, Identifiable, Codable {
         status: ChatItemStatus,
         ord: Int,
         summary: String? = nil,
-        body: JSONValue = .null
+        body: JSONValue = .null,
+        locallyInterrupted: Bool = false
     ) {
         self.itemID = itemID
         self.type = type
@@ -84,6 +94,7 @@ struct ChatItem: Sendable, Equatable, Identifiable, Codable {
         self.ord = ord
         self.summary = summary
         self.body = body
+        self.locallyInterrupted = locallyInterrupted
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -102,6 +113,8 @@ struct ChatItem: Sendable, Equatable, Identifiable, Codable {
         self.ord = try c.decodeIfPresent(Int.self, forKey: .ord) ?? 0
         self.summary = try c.decodeIfPresent(String.self, forKey: .summary)
         self.body = try c.decodeIfPresent(JSONValue.self, forKey: .body) ?? .null
+        // Local-only liveness marker — never decoded from the wire.
+        self.locallyInterrupted = false
     }
 
     func encode(to encoder: Encoder) throws {

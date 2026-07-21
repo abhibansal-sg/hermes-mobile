@@ -577,7 +577,8 @@ struct MessageBubble: View {
                             parts: runParts,
                             streaming: message.isStreaming || liveTurnActive,
                             liveTurnStartedAt: liveTurnStartedAt,
-                            settledDuration: message.reasoningElapsed
+                            settledDuration: message.reasoningElapsed,
+                            interrupted: message.interrupted
                         )
                     }
                 }

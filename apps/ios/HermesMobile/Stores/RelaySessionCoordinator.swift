@@ -412,6 +412,12 @@ final class RelaySessionCoordinator {
         // drop reconnects promptly instead of inheriting a stale attempt count.
         if reconnectAttempt != 0 { reconnectAttempt = 0 }
         store.apply(frame)
+        // QA-3 S8/A4 — per-turn liveness: refresh the silence clock ONLY for
+        // frames of the CURRENT turn. Frames of a superseded turn (late tool
+        // results) must never mask a dead current turn's silence, nor keep a
+        // dead prior turn's rows "live" — the IMG_2591 re-arm-by-other-turn
+        // bug that left "Working… · ToolCall 5s" up forever.
+        chatStore.noteTurnLivenessFrame(isCurrentTurn: frameBelongsToCurrentTurn(frame))
         // QA-2 R4/A2: `turn.completed` is the authoritative settle the
         // turn-scoped `relayTurnLive` flag clears on — plumbed through so the
         // SAME projection that sees the terminal items also ends the turn
@@ -462,6 +468,57 @@ final class RelaySessionCoordinator {
         if let item = frame.item, item.type == .error, item.status == .failed {
             chatStore.notifyRelayTurnDiscarded()
         }
+    }
+
+    /// QA-3 S8/A4 — whether a just-folded frame belongs to the CURRENT (latest)
+    /// turn, for the per-turn liveness clock. Turn-boundary frames, snapshots
+    /// (an authoritative baseline) and active gates refresh the clock; an ITEM
+    /// frame refreshes it only when the item sits at/after the last
+    /// `userMessage` item (the relay allocates the userMessage's ord at
+    /// SUBMIT, before that turn's agent items, so render order is strictly
+    /// `[U1,A1…][U2,A2…]` — anything before the last userMessage is a prior
+    /// turn's late traffic and must not refresh the clock).
+    private func frameBelongsToCurrentTurn(_ frame: RelayFrame) -> Bool {
+        switch frame.kind {
+        case .turnStarted, .turnCompleted, .snapshot,
+             .approvalRequest, .clarifyRequest, .status, .title:
+            return true
+        case .itemStarted, .itemDelta, .itemCompleted:
+            guard let item = frame.item else { return true }
+            let items = store.items
+            guard let lastUserIdx = items.lastIndex(where: { $0.type == .userMessage }),
+                  let itemIdx = items.lastIndex(where: { $0.itemID == item.itemID })
+            else { return true }   // no known turn boundary — treat as current
+            return itemIdx >= lastUserIdx
+        case .unknown:
+            return false
+        }
+    }
+
+    // MARK: - QA-3 S8/A4 turn liveness fallback
+
+    /// Stage 1 — the ChatStore liveness watchdog detected the driven turn went
+    /// silent past the resync window. Ask the relay for a `resync{last_seq}`
+    /// replay (a snapshot when the gap exceeds the ring): a dropped terminal
+    /// frame heals here and the turn settles naturally. SILENT + idempotent +
+    /// best-effort (nothing to do when the socket is down — the auto-reconnect
+    /// driver already resyncs on re-open); the user sees nothing (C3).
+    func requestLivenessResync() async {
+        guard phase == .open, let client else { return }
+        await client.resync()
+    }
+
+    /// Stage 2 — the watchdog concluded the driven turn is DEAD (silent past
+    /// the settle window even after the stage-1 resync, so the authority has
+    /// nothing more). Locally settle every stuck `.inProgress` item (marked
+    /// ``ChatItem/locallyInterrupted`` → the projection folds them as muted
+    /// "Interrupted" rows, never an error banner — C3) and re-project with
+    /// `turnSettled: true` so the turn-scoped live flag clears. Eternal
+    /// double-working is unreachable past this point; any later authoritative
+    /// frame (item.completed / snapshot) replaces the items by id and heals.
+    func settleStaleTurnLocally() {
+        store.settleInProgressLocally()
+        chatStore.applyRelayItems(store.items, turnSettled: true)
     }
 
     private func applyState(_ state: RelayConnectionState) {
