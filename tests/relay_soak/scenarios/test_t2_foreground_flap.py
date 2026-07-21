@@ -245,22 +245,46 @@ async def test_t2_foreground_flap(mock_gateway, relay, phone_factory, evidence):
     i7 = await _inproc_i7(mock_gateway.gw, p, rng)
 
     # --- wire foreground storm (relay must stay healthy, turns drain) ---
+    # SOAK SCALES WITH duration: hammer the §6 foreground gate (set-REPLACE /
+    # reconnect single-flight) at high frequency for the WHOLE window while
+    # turns stream, proving the relay stays alive and keeps completing turns
+    # under SUSTAINED foreground churn (spec T2 is a 15-min storm, not one
+    # turn). A dedicated ``flap_sid`` is flapped foreground/background for the
+    # entire window; concurrently a fresh session is driven per iteration so the
+    # storm lands mid-turn (the reconnect single-flight path under churn).
     phone = await phone_factory()
-    sid = await mock_gateway.create_session(
+    flap_sid = await mock_gateway.create_session(
         script="simple",
-        text="Foreground flap storm on the wire must not break the relay.",
+        text="Foreground flap target session held for the whole window.",
         delta_delay_s=0.03,
     )
     stop = asyncio.Event()
     flap_task = asyncio.create_task(foreground_flap_loop(
-        phone, sid, stop=stop, rng=rng, lo_s=0.01, hi_s=0.08))
-    await asyncio.sleep(0.02)
-    await phone.submit(text="wire flap turn", session_id=sid,
-                       client_message_id="cmid-t2-wire")
-    try:
-        await common.wait_terminal(phone, sid, timeout=20.0)
-    except asyncio.TimeoutError:
-        pass
+        phone, flap_sid, stop=stop, rng=rng, lo_s=0.01, hi_s=0.08))
+
+    driven: list[str] = []
+    completed_inline = 0
+    deadline = asyncio.get_event_loop().time() + p.duration_s
+    while asyncio.get_event_loop().time() < deadline:
+        sid = await mock_gateway.create_session(
+            script="simple",
+            text="Foreground flap storm on the wire must not break the relay.",
+            delta_delay_s=0.02,
+        )
+        for _ in range(25):
+            try:
+                await phone.submit(text="wire flap turn", session_id=sid,
+                                   client_message_id=f"cmid-t2-{len(driven)}")
+                break
+            except Exception:  # noqa: BLE001
+                await asyncio.sleep(0.05)
+        driven.append(sid)
+        try:
+            await common.wait_terminal(phone, sid, timeout=5.0)
+            completed_inline += 1
+        except asyncio.TimeoutError:
+            pass  # final resync(0) below heals; I1 checks the terminal state
+
     stop.set()
     try:
         flaps = await asyncio.wait_for(flap_task, timeout=5.0)
@@ -268,14 +292,24 @@ async def test_t2_foreground_flap(mock_gateway, relay, phone_factory, evidence):
         flap_task.cancel()
         flaps = -1
 
-    # Relay alive + the driven turn reached a terminal state (I1).
+    # Relay alive + every driven turn reached a terminal state (I1). Let
+    # in-flight turns drain, then a cold snapshot heals any turn the phone
+    # missed mid-flap (exactly T1's heal) before we fold the terminal state.
+    await asyncio.sleep(2.0)
     url = f"http://127.0.0.1:{relay.downstream_port}/healthz"
     async with httpx.AsyncClient() as c:
         status = (await c.get(url, timeout=5.0)).json()
     tracker = TurnTerminalTracker()
-    tracker.mark_driven(sid)
+    for sid in driven:
+        tracker.mark_driven(sid)
+    try:
+        await phone.resync(0)
+    except Exception:  # noqa: BLE001
+        pass
+    await asyncio.sleep(0.5)
     tracker.fold(phone.frames)
     i1 = tracker.report()
+    i1["completed_inline"] = completed_inline
     if not status.get("serving", True):
         i1["violations"].append("I7/wire: relay not serving after flap storm")
         i1["ok"] = False
@@ -283,6 +317,7 @@ async def test_t2_foreground_flap(mock_gateway, relay, phone_factory, evidence):
     verdict = common.build_verdict(
         "T2_foreground_flap", [i7, i1],
         duration_s=round(p.duration_s, 2), wire_flaps=flaps,
+        turns_driven=len(driven), completed_inline=completed_inline,
         healthz_connections=status.get("connections"),
     )
     evidence("verdict", verdict)
