@@ -1,0 +1,315 @@
+{
+  "name": "render_qa3_reconnect_reorder",
+  "description": "S4 incident: a RECONNECTED socket resyncs and the relay re-delivers ALL accumulated items (two settled turns: U1,A1,U2,A2) cumulatively, then the phone drives a third turn. On device this cumulative re-projection landed on top of GRDB-cache-painted untagged assistant rows the merge never consumed -> the duplicated answer ABOVE its prompt (IMG_2579-2582). The ordering lane seeds the untagged cache paint (cached_history), replays the redelivery + live turn, and asserts single-copy strict chronological order. Per-frame t_ms separates the redelivery burst from the live turn.",
+  "recorded_by": "tests/e2e_daily_driver/test_z_record_render_fixtures.py",
+  "replayed_by": "apps/ios/HermesMobileTests/RenderConformanceTests.swift",
+  "protocol": "docs/RELAY-PHONE-PROTOCOL.md",
+  "session_id": "render-sess-qa3-reorder",
+  "submit": {
+    "text": "Third question, third turn.",
+    "session_id": "render-sess-qa3-reorder",
+    "client_message_id": "render-cmid-qa3-reorder-3"
+  },
+  "cached_history": [
+    {
+      "role": "user",
+      "content": "First question, first turn."
+    },
+    {
+      "role": "assistant",
+      "content": "First answer, first turn."
+    },
+    {
+      "role": "user",
+      "content": "Second question, second turn."
+    },
+    {
+      "role": "assistant",
+      "content": "Second answer, second turn."
+    }
+  ],
+  "open_result_messages": [
+    {
+      "role": "user",
+      "content": "First question, first turn."
+    },
+    {
+      "role": "assistant",
+      "content": "First answer, first turn."
+    },
+    {
+      "role": "user",
+      "content": "Second question, second turn."
+    },
+    {
+      "role": "assistant",
+      "content": "Second answer, second turn."
+    },
+    {
+      "role": "user",
+      "content": "First question, first turn."
+    },
+    {
+      "role": "assistant",
+      "content": "Third answer, third turn."
+    },
+    {
+      "role": "user",
+      "content": "Second question, second turn."
+    },
+    {
+      "role": "assistant",
+      "content": "Third answer, third turn."
+    }
+  ],
+  "frames": [
+    {
+      "seq": 1,
+      "sid": "render-sess-qa3-reorder",
+      "turn": null,
+      "kind": "snapshot",
+      "body": {
+        "items": [
+          {
+            "item_id": "render-sess-qa3-reorder:u-df9e6057409e5510",
+            "type": "userMessage",
+            "status": "completed",
+            "ord": 0,
+            "summary": "",
+            "body": {
+              "text": "First question, first turn.",
+              "client_message_id": "render-cmid-qa3-reorder-1"
+            }
+          },
+          {
+            "item_id": "render-sess-qa3-reorder:i1",
+            "type": "agentMessage",
+            "status": "completed",
+            "ord": 1,
+            "summary": "Third answer, third turn.",
+            "body": {
+              "text": "Third answer, third turn."
+            }
+          },
+          {
+            "item_id": "render-sess-qa3-reorder:i2",
+            "type": "usage",
+            "status": "completed",
+            "ord": 2,
+            "summary": "5 tokens",
+            "body": {
+              "model": "mock-model",
+              "input": 1,
+              "output": 4,
+              "total": 5
+            }
+          },
+          {
+            "item_id": "render-sess-qa3-reorder:u-41ed8fc2b09659b7",
+            "type": "userMessage",
+            "status": "completed",
+            "ord": 3,
+            "summary": "",
+            "body": {
+              "text": "Second question, second turn.",
+              "client_message_id": "render-cmid-qa3-reorder-2"
+            }
+          },
+          {
+            "item_id": "render-sess-qa3-reorder:i3",
+            "type": "agentMessage",
+            "status": "completed",
+            "ord": 4,
+            "summary": "Third answer, third turn.",
+            "body": {
+              "text": "Third answer, third turn."
+            }
+          },
+          {
+            "item_id": "render-sess-qa3-reorder:i4",
+            "type": "usage",
+            "status": "completed",
+            "ord": 5,
+            "summary": "5 tokens",
+            "body": {
+              "model": "mock-model",
+              "input": 1,
+              "output": 4,
+              "total": 5
+            }
+          }
+        ],
+        "cursor": 0
+      },
+      "t_ms": 0
+    },
+    {
+      "seq": 2,
+      "sid": "render-sess-qa3-reorder",
+      "turn": null,
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-qa3-reorder:u-7bbc8ed6646a5d24",
+        "type": "userMessage",
+        "status": "completed",
+        "ord": 6,
+        "summary": "",
+        "body": {
+          "text": "Third question, third turn.",
+          "client_message_id": "render-cmid-qa3-reorder-3"
+        }
+      },
+      "t_ms": 22
+    },
+    {
+      "seq": 3,
+      "sid": "render-sess-qa3-reorder",
+      "turn": "render-sess-qa3-reorder:t3",
+      "kind": "turn.started",
+      "body": {},
+      "t_ms": 23
+    },
+    {
+      "seq": 4,
+      "sid": "render-sess-qa3-reorder",
+      "turn": "render-sess-qa3-reorder:t3",
+      "kind": "item.started",
+      "body": {
+        "item_id": "render-sess-qa3-reorder:i5",
+        "type": "agentMessage",
+        "status": "in_progress",
+        "ord": 7,
+        "summary": "",
+        "body": {
+          "text": ""
+        }
+      },
+      "t_ms": 23
+    },
+    {
+      "seq": 5,
+      "sid": "render-sess-qa3-reorder",
+      "turn": "render-sess-qa3-reorder:t3",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-qa3-reorder:i5",
+        "patch": {
+          "text": "Third "
+        }
+      },
+      "t_ms": 23
+    },
+    {
+      "seq": 6,
+      "sid": "render-sess-qa3-reorder",
+      "turn": "render-sess-qa3-reorder:t3",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-qa3-reorder:i5",
+        "patch": {
+          "text": "answer, "
+        }
+      },
+      "t_ms": 33
+    },
+    {
+      "seq": 7,
+      "sid": "render-sess-qa3-reorder",
+      "turn": "render-sess-qa3-reorder:t3",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-qa3-reorder:i5",
+        "patch": {
+          "text": "third "
+        }
+      },
+      "t_ms": 44
+    },
+    {
+      "seq": 8,
+      "sid": "render-sess-qa3-reorder",
+      "turn": "render-sess-qa3-reorder:t3",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-qa3-reorder:i5",
+        "patch": {
+          "text": "turn."
+        }
+      },
+      "t_ms": 54
+    },
+    {
+      "seq": 9,
+      "sid": "render-sess-qa3-reorder",
+      "turn": "render-sess-qa3-reorder:t3",
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-qa3-reorder:i5",
+        "type": "agentMessage",
+        "status": "completed",
+        "ord": 7,
+        "summary": "Third answer, third turn.",
+        "body": {
+          "text": "Third answer, third turn."
+        }
+      },
+      "t_ms": 65
+    },
+    {
+      "seq": 10,
+      "sid": "render-sess-qa3-reorder",
+      "turn": "render-sess-qa3-reorder:t3",
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-qa3-reorder:i6",
+        "type": "usage",
+        "status": "completed",
+        "ord": 8,
+        "summary": "5 tokens",
+        "body": {
+          "model": "mock-model",
+          "input": 1,
+          "output": 4,
+          "total": 5
+        }
+      },
+      "t_ms": 65
+    },
+    {
+      "seq": 11,
+      "sid": "render-sess-qa3-reorder",
+      "turn": "render-sess-qa3-reorder:t3",
+      "kind": "turn.completed",
+      "body": {
+        "usage": {
+          "model": "mock-model",
+          "input": 1,
+          "output": 4,
+          "total": 5
+        }
+      },
+      "t_ms": 66
+    }
+  ],
+  "settled": {
+    "agent_text": "Third answer, third turn.",
+    "user_prompt": "Third question, third turn.",
+    "turns_redelivered": 2
+  },
+  "script": [
+    {
+      "action": "open",
+      "session_id": "render-sess-qa3-reorder",
+      "at_t_ms": 0
+    },
+    {
+      "action": "resync",
+      "last_seq": 5
+    },
+    {
+      "action": "submit",
+      "session_id": "render-sess-qa3-reorder",
+      "client_message_id": "render-cmid-qa3-reorder-3"
+    }
+  ]
+}

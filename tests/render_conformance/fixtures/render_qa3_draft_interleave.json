@@ -1,0 +1,205 @@
+{
+  "name": "render_qa3_draft_interleave",
+  "description": "S11 incident: session A streams (per-frame t_ms) while the user enters New Chat mid-stream (script marker enter_draft — NO wire frame; startDraft is a local store call that failed to park the  projection) and A's frames keep arriving (IMG_2594: another session's Working/ToolCall rows painted into the empty new chat). The S11 lane replays frames to the marker, calls local startDraft, delivers the rest, and asserts the draft shows zero relayProjected rows.",
+  "recorded_by": "tests/e2e_daily_driver/test_z_record_render_fixtures.py",
+  "replayed_by": "apps/ios/HermesMobileTests/RenderConformanceTests.swift",
+  "protocol": "docs/RELAY-PHONE-PROTOCOL.md",
+  "session_id": "render-sess-qa3-interleave",
+  "submit": {
+    "text": "Stream while I draft.",
+    "session_id": "render-sess-qa3-interleave",
+    "client_message_id": "render-cmid-qa3-interleave"
+  },
+  "cached_history": [],
+  "open_result_messages": [],
+  "frames": [
+    {
+      "seq": 1,
+      "sid": "render-sess-qa3-interleave",
+      "turn": null,
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-qa3-interleave:u-a1a9cfd622975378",
+        "type": "userMessage",
+        "status": "completed",
+        "ord": 0,
+        "summary": "",
+        "body": {
+          "text": "Stream while I draft.",
+          "client_message_id": "render-cmid-qa3-interleave"
+        }
+      },
+      "t_ms": 0
+    },
+    {
+      "seq": 2,
+      "sid": "render-sess-qa3-interleave",
+      "turn": "render-sess-qa3-interleave:t1",
+      "kind": "turn.started",
+      "body": {},
+      "t_ms": 1
+    },
+    {
+      "seq": 3,
+      "sid": "render-sess-qa3-interleave",
+      "turn": "render-sess-qa3-interleave:t1",
+      "kind": "item.started",
+      "body": {
+        "item_id": "render-sess-qa3-interleave:i1",
+        "type": "agentMessage",
+        "status": "in_progress",
+        "ord": 1,
+        "summary": "",
+        "body": {
+          "text": ""
+        }
+      },
+      "t_ms": 1
+    },
+    {
+      "seq": 4,
+      "sid": "render-sess-qa3-interleave",
+      "turn": "render-sess-qa3-interleave:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-qa3-interleave:i1",
+        "patch": {
+          "text": "alpha "
+        }
+      },
+      "t_ms": 1
+    },
+    {
+      "seq": 5,
+      "sid": "render-sess-qa3-interleave",
+      "turn": "render-sess-qa3-interleave:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-qa3-interleave:i1",
+        "patch": {
+          "text": "beta "
+        }
+      },
+      "t_ms": 301
+    },
+    {
+      "seq": 6,
+      "sid": "render-sess-qa3-interleave",
+      "turn": "render-sess-qa3-interleave:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-qa3-interleave:i1",
+        "patch": {
+          "text": "gamma "
+        }
+      },
+      "t_ms": 602
+    },
+    {
+      "seq": 7,
+      "sid": "render-sess-qa3-interleave",
+      "turn": "render-sess-qa3-interleave:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-qa3-interleave:i1",
+        "patch": {
+          "text": "delta "
+        }
+      },
+      "t_ms": 906
+    },
+    {
+      "seq": 8,
+      "sid": "render-sess-qa3-interleave",
+      "turn": "render-sess-qa3-interleave:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-qa3-interleave:i1",
+        "patch": {
+          "text": "epsilon "
+        }
+      },
+      "t_ms": 1205
+    },
+    {
+      "seq": 9,
+      "sid": "render-sess-qa3-interleave",
+      "turn": "render-sess-qa3-interleave:t1",
+      "kind": "item.delta",
+      "body": {
+        "item_id": "render-sess-qa3-interleave:i1",
+        "patch": {
+          "text": "zeta."
+        }
+      },
+      "t_ms": 1506
+    },
+    {
+      "seq": 10,
+      "sid": "render-sess-qa3-interleave",
+      "turn": "render-sess-qa3-interleave:t1",
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-qa3-interleave:i1",
+        "type": "agentMessage",
+        "status": "completed",
+        "ord": 1,
+        "summary": "alpha beta gamma delta epsilon zeta.",
+        "body": {
+          "text": "alpha beta gamma delta epsilon zeta."
+        }
+      },
+      "t_ms": 1814
+    },
+    {
+      "seq": 11,
+      "sid": "render-sess-qa3-interleave",
+      "turn": "render-sess-qa3-interleave:t1",
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-qa3-interleave:i2",
+        "type": "usage",
+        "status": "completed",
+        "ord": 2,
+        "summary": "7 tokens",
+        "body": {
+          "model": "mock-model",
+          "input": 1,
+          "output": 6,
+          "total": 7
+        }
+      },
+      "t_ms": 1814
+    },
+    {
+      "seq": 12,
+      "sid": "render-sess-qa3-interleave",
+      "turn": "render-sess-qa3-interleave:t1",
+      "kind": "turn.completed",
+      "body": {
+        "usage": {
+          "model": "mock-model",
+          "input": 1,
+          "output": 6,
+          "total": 7
+        }
+      },
+      "t_ms": 1816
+    }
+  ],
+  "settled": {
+    "agent_text": "alpha beta gamma delta epsilon zeta.",
+    "user_prompt": "Stream while I draft."
+  },
+  "script": [
+    {
+      "action": "submit",
+      "session_id": "render-sess-qa3-interleave",
+      "at_t_ms": 0
+    },
+    {
+      "action": "enter_draft",
+      "at_t_ms": 314
+    }
+  ]
+}

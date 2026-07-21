@@ -28,6 +28,32 @@ lane, and render-model invariants are asserted against the spec contract.
   byte-for-byte through the production decoders (no live network — the
   coordinator's `RelayClient` runs over the in-process fake relay).
 
+### QA-3 incident fixtures (round-3 device QA, build 116)
+
+The round-3 bugs are ORDERING / LIVENESS / SCOPING shaped — they live in the
+frames' ARRIVAL TIMES and the driver's local actions, which the raw
+arrival-ordered envelopes discarded. `test_z_record_render_fixtures.py`
+records five more fixtures with BACKWARD-COMPATIBLE additive extensions to
+the same wire format (`render_fixture(..., timing=True, script_steps=...,
+extra_sessions=...)`); the pre-QA-3 fixtures re-record byte-identically and
+the loader ignores absent keys:
+
+| Fixture | Incident | New keys | Consumed by |
+|---|---|---|---|
+| render_qa3_delayed_start | S2: submit → userMessage → ~1.5 s silence → late first frame (IMG_2578's 35 s; the merged working line must render at SEND) | per-frame `t_ms` | renderjury lane (A1, `testRelaySend_MergedWorkingAffordanceBeforeAnyFrame`) |
+| render_qa3_reconnect_reorder | S4: reconnect socket resyncs a persisted watermark → cumulative `snapshot` of two settled turns + live turn 3 (the answer-above-prompt duplicate of IMG_2579-2582) | `t_ms`, `script` (open/resync/submit) | ordering lane (A2) |
+| render_qa3_session_switch | S6: turn live in A → switch to B mid-stream → return (IMG_2585's vanished prompt) | `t_ms`, `script` (switch_to ×2), `extra_sessions` (B's paint) | ordering lane (A2) |
+| render_qa3_dead_turn | S8: tool starts, turn dies, NO completion; resync redelivers the same in-progress items (IMG_2591's eternal double-working) | `t_ms`, `script` (resync); `settled.completed=false` | liveness lane (A4) |
+| render_qa3_draft_interleave | S11: A streams while New Chat is entered mid-stream — `enter_draft` is a `script` step, NO wire frame (IMG_2594's leaked rows) | `t_ms`, `script` (enter_draft) | S11 lane (A7) |
+
+The XCTest loader exposes the extensions via `Fixture.scriptSteps` /
+`Fixture.extraSessions` / `frameTMs(_:)`, plus a scaled `deliverTimed(_:)_`
+replay helper (a real-time watchdog lane passes `scale: 1`).
+`testQA3IncidentFixtures_LoadWithExtensions_ShapesPinned` pins both the
+loader's backward-compat (pre-QA-3 fixtures load with the extensions empty)
+and the recorded incident SHAPES (the silence gap, the snapshot redelivery,
+the absence of `turn.completed`, the markers).
+
 ## Recording (extend, don't fork)
 
 The fixtures are recorded by the E2E harness itself:

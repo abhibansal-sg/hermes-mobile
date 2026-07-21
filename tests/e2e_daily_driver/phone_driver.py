@@ -348,23 +348,60 @@ def render_fixture(
     cached_history: Optional[list[dict[str, Any]]] = None,
     open_result_messages: Optional[list[dict[str, Any]]] = None,
     settled: Optional[dict[str, Any]] = None,
+    timing: bool = False,
+    t0: Optional[float] = None,
+    script_steps: Optional[list[dict[str, Any]]] = None,
+    extra_sessions: Optional[dict[str, dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Serialize the frames the phone recorded for ``session_id`` as a fixture.
 
     The frame entries are the EXACT downstream envelopes the relay put on the
     wire (``{seq, sid, turn, kind, body}``), in arrival order — the XCTest
     side replays them byte-for-byte through the real decoders.
+
+    QA-3 (renderjury lane) — BACKWARD-COMPATIBLE incident extensions. The
+    pre-QA-3 fields are unchanged byte-for-byte; the new keys are emitted ONLY
+    when the corresponding argument is given, so the five QA-1/QA-2 fixtures
+    re-record exactly as before and the existing loader ignores absent keys:
+
+    * ``timing=True`` adds ``t_ms`` (int, milliseconds since ``t0`` — the
+      first recorded frame of ``session_id`` unless a shared ``t0`` is passed)
+      to every frame. The QA-3 incidents are ORDERING/LIVENESS shaped: the
+      S2 late-first-item gap, the S8 silence window, the S6 switch-away/return
+      interleave only exist in the frames' ARRIVAL TIMES, which the raw
+      arrival-ordered envelopes discarded. A shared ``t0`` keeps multi-session
+      fixtures on ONE clock so the interleave is reconstructible.
+    * ``script_steps`` records the driver's local actions (open/submit/resync/
+      enter_draft…) as ``{action, session_id?, at_t_ms, …}`` — e.g. the S11
+      New-Chat entry has NO wire frame (that is the bug: ``startDraft`` never
+      parks the projection), so the XCTest side replays it as a local store
+      call at the recorded instant.
+    * ``extra_sessions`` maps a secondary sid to its own ``{cached_history,
+      open_result_messages, submit, frames}`` (frames with ``t_ms`` on the
+      shared clock when ``timing``) — the S6 session-switch fixture carries the
+      switched-to session's stream beside the primary's.
     """
-    frames = [
-        {
-            "seq": f.seq,
-            "sid": f.sid,
-            "turn": f.turn,
-            "kind": f.kind,
-            "body": f.body,
-        }
-        for f in driver.frames_for(session_id)
-    ]
+    frames_t0 = t0
+    if timing and frames_t0 is None:
+        primary = driver.frames_for(session_id)
+        frames_t0 = primary[0].t if primary else None
+
+    def _frame_dicts(sid: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for f in driver.frames_for(sid):
+            d: dict[str, Any] = {
+                "seq": f.seq,
+                "sid": f.sid,
+                "turn": f.turn,
+                "kind": f.kind,
+                "body": f.body,
+            }
+            if timing and frames_t0 is not None:
+                d["t_ms"] = int(round((f.t - frames_t0) * 1000))
+            out.append(d)
+        return out
+
+    frames = _frame_dicts(session_id)
     fixture: dict[str, Any] = {
         "name": name,
         "description": description,
@@ -384,6 +421,18 @@ def render_fixture(
         "frames": frames,
         "settled": settled or {},
     }
+    if script_steps:
+        fixture["script"] = script_steps
+    if extra_sessions:
+        fixture["extra_sessions"] = {
+            sid: {
+                "cached_history": meta.get("cached_history") or [],
+                "open_result_messages": meta.get("open_result_messages") or [],
+                "submit": meta.get("submit"),
+                "frames": _frame_dicts(sid),
+            }
+            for sid, meta in extra_sessions.items()
+        }
     return fixture
 
 
