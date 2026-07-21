@@ -55,7 +55,21 @@ def _delegate_from_json(col: str = "model_config") -> str:
 
 def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     prefix = cwd_prefix.rstrip("/\\") or cwd_prefix
-    return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
+    # S10 (QA-3): ALSO match sessions whose ``git_repo_root`` IS the prefix.
+    # A project's ``root`` is the folded git-common repo root, but its sessions
+    # may run in linked WORKTREES whose cwds are siblings of that root (e.g.
+    # ``<repo>/.worktrees/<name>`` or ``/Volumes/.../worktrees/<name>``) — a
+    # cwd-only LIKE never matches those cwds, so the project detail came back
+    # ``SESSIONS 0`` for actively-developed worktree projects (IMG_2593).
+    # ``git_repo_root`` is the canonical common root persisted by
+    # ``_persist_session_git_meta`` (``update_session_cwd`` writes it), so an
+    # exact match folds every worktree cwd back to its repo root. Sessions that
+    # have not yet been probed (``git_repo_root`` NULL/empty) still match via
+    # the cwd LIKE, preserving the existing behavior for un-probed rows.
+    return (
+        "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ? OR s.git_repo_root = ?)",
+        [prefix, f"{prefix}/%", f"{prefix}\\%", prefix],
+    )
 
 
 # A child session counts as a /branch (kept visible, never cascade-deleted) if

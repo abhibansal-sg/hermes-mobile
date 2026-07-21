@@ -2076,6 +2076,58 @@ class TestCounts:
 
         assert db.session_count(cwd_prefix="/repo") == 2
 
+    def test_cwd_prefix_folds_worktree_cwds_via_git_repo_root(self, db):
+        """S10 (QA-3): a project's `root` is the folded git-common repo root,
+        but its sessions may run in linked WORKTREES whose cwds are siblings of
+        that root (e.g. ``/Volumes/.../worktrees/<name>``). The cwd-only LIKE
+        never matches those cwds, so the project detail came back SESSIONS 0 for
+        actively-developed worktree projects (IMG_2593). The fix extends the
+        clause to OR-match ``git_repo_root = prefix`` — the canonical common
+        root persisted by ``_persist_session_git_meta``. This must hold for both
+        ``session_count`` and ``list_sessions_rich`` so the count and the list
+        agree.
+        """
+        # In-repo sessions (cwd under the prefix) — match the OLD way.
+        db.create_session("s_inrepo_a", "cli", cwd="/Volumes/MainData/Developer/products/hermes-mobile")
+        db.create_session("s_inrepo_b", "cli", cwd="/Volumes/MainData/Developer/products/hermes-mobile/apps/ios")
+        # Worktree session — cwd is a SIBLING of the prefix, BUT its
+        # git_repo_root IS the prefix. The OLD cwd-only clause misses this.
+        db.create_session("s_worktree", "cli", cwd="/Volumes/MainData/Developer/hermes-tmp/worktrees/qa3-navigation")
+        db.update_session_cwd(
+            "s_worktree",
+            "/Volumes/MainData/Developer/hermes-tmp/worktrees/qa3-navigation",
+            git_branch="qa3/navigation",
+            git_repo_root="/Volumes/MainData/Developer/products/hermes-mobile",
+        )
+        # Unrelated repo — must NOT match.
+        db.create_session("s_other", "cli", cwd="/Users/me/other-project")
+        db.update_session_cwd(
+            "s_other",
+            "/Users/me/other-project",
+            git_branch="main",
+            git_repo_root="/Users/me/other-project",
+        )
+
+        prefix = "/Volumes/MainData/Developer/products/hermes-mobile"
+
+        # Count: in-repo (2) + worktree (1, folded via git_repo_root) = 3.
+        assert db.session_count(cwd_prefix=prefix) == 3
+
+        rows = db.list_sessions_rich(cwd_prefix=prefix, limit=100)
+        ids = {r["id"] for r in rows}
+        assert ids == {"s_inrepo_a", "s_inrepo_b", "s_worktree"}, (
+            f"worktree session must fold via git_repo_root; got {ids}"
+        )
+
+    def test_cwd_prefix_unprobed_sessions_still_match_via_cwd(self, db):
+        """S10 sanity: sessions whose ``git_repo_root`` has not yet been probed
+        (NULL/empty — ``_persist_session_git_meta`` runs on a daemon thread)
+        must still match via the cwd LIKE, preserving the pre-fix behavior."""
+        db.create_session("s1", "cli", cwd="/repo/sub/dir")
+        # No update_session_cwd → git_repo_root stays NULL.
+        assert db.session_count(cwd_prefix="/repo") == 1
+        assert len(db.list_sessions_rich(cwd_prefix="/repo")) == 1
+
     def test_message_count_total(self, db):
         assert db.message_count() == 0
         db.create_session(session_id="s1", source="cli")
