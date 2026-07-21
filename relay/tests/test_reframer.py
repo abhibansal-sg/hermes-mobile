@@ -776,3 +776,81 @@ def test_run_pump_publishes_frames_to_relay_topic():
     assert FrameKind.TURN_STARTED in kinds
     assert FrameKind.ITEM_COMPLETED in kinds
     assert FrameKind.TURN_COMPLETED in kinds
+
+
+# ---------------------------------------------------------------------------
+# R4 L6 — foreign userMessage emission from message.start{prompt} (amendment
+# G2: the wire half that makes the X5 foreign-mirror deletion possible)
+# ---------------------------------------------------------------------------
+
+
+def test_message_start_prompt_emits_foreign_user_message_item():
+    """A non-phone turn's prompt gains a completed userMessage row (D11's
+    render half — the reframer maps agent events only)."""
+    rf = Reframer(EventBus(), SessionStore())
+    frames = rf.reframe(GatewayEvent(
+        type="message.start", session_id="s1",
+        payload={"prompt": "prompt from the desktop client"},
+    ))
+    users = [
+        f for f in frames
+        if f.kind == FrameKind.ITEM_COMPLETED
+        and f.body.get("type") == ItemType.USER_MESSAGE
+    ]
+    assert len(users) == 1
+    assert users[0].body["body"]["text"] == "prompt from the desktop client"
+    assert users[0].body["status"] == ItemStatus.COMPLETED
+    # I7: the user row sorts first in its turn — turn boundary, then the row.
+    assert frames[0].kind == FrameKind.TURN_STARTED
+    # The item is folded into the store (a resync snapshot carries it).
+    snap = rf._store.snapshot("s1")
+    assert [it["type"] for it in snap["items"]] == [ItemType.USER_MESSAGE]
+
+
+def test_message_start_without_prompt_emits_no_user_row():
+    """The stock gateway shape (message.start, no prompt) changes nothing."""
+    rf = Reframer(EventBus(), SessionStore())
+    frames = rf.reframe(_ev("message.start"))
+    assert [f.kind for f in frames] == [FrameKind.TURN_STARTED]
+
+
+def test_message_start_prompt_skips_emission_for_phone_marked_prompt():
+    """A phone-driven turn already has its cmid-keyed user row (the SUBMIT
+    synthesis); the store marker suppresses the foreign emission so each turn
+    gets exactly ONE user row regardless of which emitter lands first."""
+    store = SessionStore()
+    rf = Reframer(EventBus(), store)
+    store.mark_local_prompt("s1", "hello from this phone")
+    frames = rf.reframe(GatewayEvent(
+        type="message.start", session_id="s1",
+        payload={"prompt": "hello from this phone"},
+    ))
+    assert not [f for f in frames if f.body.get("type") == ItemType.USER_MESSAGE]
+
+
+def test_local_prompt_marker_is_consumed_once():
+    """The marker covers ONE turn: a later foreign turn carrying the same
+    text (after the local turn completed) gets its row."""
+    store = SessionStore()
+    rf = Reframer(EventBus(), store)
+    store.mark_local_prompt("s1", "dup text")
+    first = rf.reframe(GatewayEvent(
+        type="message.start", session_id="s1", payload={"prompt": "dup text"}))
+    assert not [f for f in first if f.body.get("type") == ItemType.USER_MESSAGE]
+    # Close the local turn.
+    rf.reframe(GatewayEvent(
+        type="message.complete", session_id="s1", payload={"text": "done"}))
+    # Foreign turn, same text: marker consumed -> the row emits.
+    second = rf.reframe(GatewayEvent(
+        type="message.start", session_id="s1", payload={"prompt": "dup text"}))
+    assert [f for f in second if f.body.get("type") == ItemType.USER_MESSAGE]
+
+
+def test_local_prompt_marker_is_session_scoped():
+    """A marker for session A never suppresses session B's foreign row."""
+    store = SessionStore()
+    rf = Reframer(EventBus(), store)
+    store.mark_local_prompt("s1", "same text")
+    frames = rf.reframe(GatewayEvent(
+        type="message.start", session_id="s2", payload={"prompt": "same text"}))
+    assert [f for f in frames if f.body.get("type") == ItemType.USER_MESSAGE]

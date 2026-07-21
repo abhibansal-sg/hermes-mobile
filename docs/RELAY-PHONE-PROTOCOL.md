@@ -29,9 +29,9 @@ downstream frame from relay → phone is:
 - `body` — kind-specific payload.
 
 Upstream phone → relay frames are ordinary JSON-RPC-2.0 requests (the relay
-translates to gateway RPCs): `submit`, `resume`, `open`, `list`, `history`,
-`approve`, `clarify`, `interrupt`, `steer`, `ack`, `resync`, `foreground`,
-`push.register`, `push.unregister`.
+translates to gateway RPCs): `submit`, `branch`, `resume`, `open`, `list`,
+`history`, `approve`, `clarify`, `interrupt`, `steer`, `ack`, `resync`,
+`foreground`, `push.register`, `push.unregister`.
 
 ## 2. The item model (what the phone renders)
 
@@ -49,7 +49,7 @@ the relay assigns from the raw event / tool `name`):
 
 | type | source | render note |
 |---|---|---|
-| `userMessage` | the submitted prompt | right-aligned bubble |
+| `userMessage` | the submitted prompt (relay-synthesized on SUBMIT/branch, cmid-keyed — §5a) AND — R4 L6 — a NON-phone turn's prompt: relay-emitted from `message.start{prompt}` (live foreign turns) and folded from the `rest_history` user rows when OPEN/HISTORY seeds an empty store (so a resync snapshot carries foreign prompts) | right-aligned bubble. Exactly ONE row per turn regardless of origin: phone-driven turns mark the prompt before driving it and the reframer skips its emission on a marker hit (contract I8 — the cmid-keyed row is the echo adopter). Foreign rows carry no `client_message_id`. Gateways that emit `message.start` without a prompt (the stock shape today) never trigger the live path — the history seed covers persisted turns; adding `prompt` to `message.start` is a follow-up additive gateway change. |
 | `agentMessage` | `message.delta`/`complete` | markdown text, streams |
 | `reasoning` | `reasoning.delta`/`available` | collapsible "thinking" |
 | `toolCall` (GENERIC) | ANY `tool.start`/`tool.complete`, keyed by `name` | collapsed tool card: name + status + summary; body = args/result/duration; covers ALL current + future tools |
@@ -96,12 +96,25 @@ a partial merge preview and is never treated as authoritative.
   from the turn open) and `started_at` (epoch). The phone's per-turn timer
   starts LOCALLY at send and reconciles its settled "Worked for Ns" label onto
   `duration_s`; absent on older relays → the phone falls back to its own
-  measurement (additive keys, §2 forward-compat).
+  measurement (additive keys, §2 forward-compat). Since R4 (L3, contract I9 —
+  *stopped ≠ completed*) `turn.completed` also carries `reason`:
+  `completed` (normal end — the phone's queue may drain), `interrupted` (the
+  turn ended via `session.interrupt` — the gateway stamps `status:interrupted`
+  on the completed message; the queue HOLDS), or `error` (a gateway `error`
+  event ended the turn — the settle edge is emitted alongside the error item,
+  queue HOLDS). Absent on pre-L3 relays → the phone falls back to its local
+  `settling` mark / error latch until W2e consumes the wire truth (RR5 compat
+  branch, additive key). An error with NO live turn emits the error item alone
+  — no spurious settle edge.
 - `approval.request` / `clarify.request` — interactive gates (phone replies via RPC).
 - `status` — `{ kind, text }` (lifecycle/compacting/etc., non-item chatter).
 - `title` — session title changed.
 - `snapshot` — reply to `resync`/`open`: `{ items:[...full items...], cursor }` — the
-  resume-as-items payload (relay-built from its accumulated state).
+  resume-as-items payload (relay-built from its accumulated state). Since R4
+  (L6) it also carries foreign turns' `userMessage` rows: OPEN/HISTORY seeds
+  the `rest_history` USER rows into the accumulated state when a store is
+  still empty (seed-only — a stream-touched store is never reseeded), so a
+  FALLBACK snapshot no longer drops foreign prompts.
 
 ## 4. Seq / ack / replay (reliability spine — lives entirely in the relay)
 
@@ -147,10 +160,12 @@ forever; fixed by the above.)
 
 | phone intent | relay action | gateway RPC | ownership effect |
 |---|---|---|---|
-| list all sessions | pass-through | `session.list` | none (read) |
+| list all sessions | pass-through | `session.list` | none (read) — R4 L1 (GAP-1): `params` optionally carry `order` (e.g. `recent` — the drawer default), `cwd_prefix` (project-scoped list, B10), `exclude_source` (drop e.g. `cron` rows) and `min_messages` alongside `limit`; each is forwarded to `session.list` only when present, so a bare `{limit}` call is the byte-identical pre-L1 RPC. This is the parity that lets the drawer ride the relay and the REST session list delete (X7). |
 | open/read a session (incl. foreign) | store-read | **REST `GET /api/sessions/{id}/messages` ONLY** (`web_server.py:9985`, reads `state.db`) | none (NO reactivation) — R0 CORRECTION: `session.history` RPC is NOT a store-read; it resolves via `_sess_nowait` (in-memory live sessions only, `server.py:1727`) and returns 4001 for a foreign session the phone never owned. Use the REST path for foreign/idle history. |
-| start a NEW chat | create + own | `session.create` → `prompt.submit` | relay becomes owner |
+| start a NEW chat | create + own | `session.create` → `prompt.submit` | relay becomes owner. R4 L2 (B10): `params.cwd` (optional) threads the project working directory into `session.create` so a new-session-in-a-project binds to that project — the surviving projects fix after L5-lean (projects themselves stay on the control REST). |
+| branch a conversation (B13) | create + seed + own | `session.create` → `prompt.submit` (seed) | relay becomes owner — R4 L2: new `branch` method = a SEEDED create. Params: `text`/`prompt` (the seed) required; `session_id` (origin, echoed as `origin` in the result), `title`, `model`, `provider`, `cwd`, `truncate_before_user_ordinal`, `client_message_id` optional. The seed prompt is emitted as a completed `userMessage` item exactly like SUBMIT's. Result: `{session_id: <new>, origin: <origin>}`. Before L2 branch was DEAD in relay mode (unknown method) — a silent regression vs the direct seam the contract deletes in X4/X7. |
 | send into an idle session (incl. a terminal one) | resume + own + submit | `session.resume` → `prompt.submit` | relay becomes owner; turn continues same sid/history/cwd |
+| regenerate / edit-and-resend (B13) | pass-through param | `prompt.submit` with `truncate_before_user_ordinal` | — R4 L2: `submit` params optionally carry `truncate_before_user_ordinal` (the gateway already accepted it; the relay dropped it as an unknown param pre-L2). Absent ⇒ the byte-identical pre-L2 RPC. |
 | answer approval | translate params | `approval.respond` | — — the gateway reads `choice` (`once`/`session`/`always`/`deny`, mapping `approve`→`once`) + `all` and resolves by SESSION key; the relay maps the phone's `decision`→`choice` (a relay that sent `decision` defaulted every approval to DENY) |
 | answer clarify | translate params | `clarify.respond` | — — the gateway matches the pending waiter by `request_id` and stores `params.answer`; the relay maps the phone's `text`→`answer` (a relay that sent `text` delivered an EMPTY answer) |
 | stop | pass-through | `session.interrupt` | — |
@@ -231,6 +246,36 @@ bug: stop and steer errored; queue-mode sends vanished).
   confirms the removal, so a force-quit in the removal window can never
   resurrect the send on the relaunch drain (the claim query admits only
   live states — a tombstoned row is never claimed).
+
+### 5c. Cold-tap gate answers — HTTP control sibling (R4 L4, B6/B7, GAP-10)
+
+A notification banner APPROVE/DENY/REPLY tap fires while the phone holds NO
+relay socket — and on a GW-UNREACH topology (the daily-driver phone's) the
+gateway REST answer route is unreachable too, so the agent stays blocked until
+the user opens the app. The relay already owns these sessions and holds a live
+gateway RPC path, so the phone-facing port's existing HTTP control sibling
+(`relayControlURL`; the `/attention/pending` + `/sync/manifest` routes already
+live there) gains two one-shot answers:
+
+- **`GET /approve?session_id=…&request_id=…&decision=…[&all=…]`** → gateway
+  `approval.respond` — same `decision`→`choice` translation and durable
+  resolution as the WS `approve` method (§5).
+- **`GET /clarify?session_id=…&request_id=…&text=…`** → gateway
+  `clarify.respond` — same `text`→`answer` translation as the WS `clarify`
+  method (§5).
+
+Params ride the QUERY STRING (URL-encoded): the port's websockets handshake
+parser rejects non-GET methods BEFORE the HTTP hook runs — a POST never
+reaches the handler on websockets>=14 — so the query string (this port's house
+style) is the transport that actually survives. A JSON body is additionally
+honored when the request object exposes one (query keys win on conflict). Same
+bearer auth as every route on the port. Responses are JSON:
+`{"ok": true, "result": …}` on success; `{"ok": false, "error": …}` with
+**400** (missing/invalid params), **502** (gateway answer failed — sanitized,
+§6b) or **503** (relay gateway not ready — the answer waits up to 5 s for the
+gateway first, mirroring the WS readiness gate). The phone's notification
+endpoint resolver prefers this route when a relay control URL is configured
+and falls back to gateway REST for co-located setups (contract B6/B7, lane L4).
 
 ## 6. Notifications (relay-fired, phone-off)
 

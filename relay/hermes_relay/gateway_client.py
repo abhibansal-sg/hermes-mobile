@@ -382,16 +382,49 @@ class GatewayClient:
         return resp.get("result") or {}
 
     # -- session ops (protocol §5) ---------------------------------------
-    async def session_list(self, limit: int = 200) -> list[dict[str, Any]]:
-        """``session.list`` — all sessions, every origin (no ownership)."""
-        result = await self._call_result("session.list", {"limit": limit})
+    async def session_list(
+        self,
+        limit: int = 200,
+        *,
+        order: Optional[str] = None,
+        cwd_prefix: Optional[str] = None,
+        exclude_source: Optional[str] = None,
+        min_messages: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """``session.list`` — all sessions, every origin (no ownership).
+
+        R4 L1 (GAP-1 session LIST parity): the drawer needs the SAME filters
+        the gateway REST list exposes — recency ordering, a cwd prefix (the
+        project-scoped session list, B10), a source exclusion (drop e.g. cron
+        sessions) and a minimum-message bound (hide never-driven sessions).
+        Each filter is OPTIONAL and only sent when supplied, so a bare
+        ``session_list(n)`` call is byte-identical to the pre-L1 RPC (old
+        gateways that read ``limit`` alone are unaffected — additive, §2).
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if order is not None:
+            params["order"] = order
+        if cwd_prefix is not None:
+            params["cwd_prefix"] = cwd_prefix
+        if exclude_source is not None:
+            params["exclude_source"] = exclude_source
+        if min_messages is not None:
+            params["min_messages"] = min_messages
+        result = await self._call_result("session.list", params)
         return list(result.get("sessions") or [])
 
     async def session_create(
         self, *, title: str, model: Optional[str] = None, provider: Optional[str] = None,
-        cols: Optional[int] = None,
+        cols: Optional[int] = None, cwd: Optional[str] = None,
     ) -> str:
-        """``session.create`` — new owned session; returns its session_id."""
+        """``session.create`` — new owned session; returns its session_id.
+
+        R4 L2 (B10 projects gap): ``cwd`` threads a project working directory
+        into the created session so a new-session-in-a-project binds to that
+        project (the surviving projects fix after L5-lean dropped the relay
+        projects path — projects themselves stay on the control REST). Optional:
+        absent, the RPC is the byte-identical pre-L2 call.
+        """
         params: dict[str, Any] = {
             "title": title,
             "cols": cols if cols is not None else self._cfg.cols,
@@ -401,6 +434,8 @@ class GatewayClient:
             params["model"] = model
         if provider is not None:
             params["provider"] = provider
+        if cwd is not None:
+            params["cwd"] = cwd
         result = await self._call_result("session.create", params)
         sid = result.get("session_id")
         if not sid:
@@ -451,14 +486,28 @@ class GatewayClient:
         data = resp.json()
         return list(data.get("messages") or [])
 
-    async def prompt_submit(self, session_id: str, text: str) -> dict[str, Any]:
+    async def prompt_submit(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        truncate_before_user_ordinal: Optional[int] = None,
+    ) -> dict[str, Any]:
         """``prompt.submit`` — become owner of ``session_id`` and drive a turn.
 
         Marks the session owned so reconnect re-establishes it and the Notifier
         treats its completion/approval/error events as push-worthy.
+
+        R4 L2 (B13 dead-feature restoration): ``truncate_before_user_ordinal``
+        regenerates/edits from an earlier point — the gateway already accepts
+        it; the relay dropped it as an unknown param pre-L2. Optional: absent,
+        the RPC is the byte-identical two-key pre-L2 call.
         """
         self._mark_owned(session_id)
-        return await self._call_result("prompt.submit", {"session_id": session_id, "text": text})
+        params: dict[str, Any] = {"session_id": session_id, "text": text}
+        if truncate_before_user_ordinal is not None:
+            params["truncate_before_user_ordinal"] = truncate_before_user_ordinal
+        return await self._call_result("prompt.submit", params)
 
     async def approval_respond(
         self, session_id: str, request_id: str, decision: str, *, resolve_all: bool = False
