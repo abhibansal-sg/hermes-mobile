@@ -52,10 +52,15 @@ async def test_smoke_clean_turn(mock_gateway, relay, phone_factory, evidence):
     assert i1["ok"], f"I1 failed: {i1['violations']}"
     assert i3["ok"], f"I3 failed: {i3['violations']}"
 
-    evidence("smoke", {
-        "reference_agent": agent,
-        "candidate_agent": common.agent_messages(cand),
-        "I1": i1, "I3": i3,
-        "frames": len(phone.frames),
-        "generations": phone.generation,
-    })
+    i2 = {
+        "invariant": "I2", "ok": common.agent_messages(cand) == ["Second smoke turn."],
+        "violations": [] if common.agent_messages(cand) == ["Second smoke turn."]
+        else ["I2: candidate transcript did not match the driven prompt"],
+        "reference_agent": agent, "candidate_agent": common.agent_messages(cand),
+    }
+    verdict = common.build_verdict(
+        "T0_smoke", [i1, i2, i3],
+        frames=len(phone.frames), generations=phone.generation,
+    )
+    evidence("verdict", verdict)
+    common.assert_verdict(verdict)
