@@ -199,6 +199,21 @@ targets:
       # hand-authored to the recorded wire format (see its recorded_by note).
       - path: ../../tests/render_conformance/fixtures/render_live_fold.json
         buildPhase: resources
+      # QA-3 round-3 incident fixtures (S2/S4/S6/S8/S11), recorded by the E2E
+      # harness's phone driver with the additive t_ms/script/extra_sessions
+      # extensions (backward-compatible with the QA-1/QA-2 format). Consumed
+      # by the renderjury lane's S2/A1 tests now and by the ordering
+      # (S4/S6), liveness (S8) and S11 lanes' replays.
+      - path: ../../tests/render_conformance/fixtures/render_qa3_delayed_start.json
+        buildPhase: resources
+      - path: ../../tests/render_conformance/fixtures/render_qa3_reconnect_reorder.json
+        buildPhase: resources
+      - path: ../../tests/render_conformance/fixtures/render_qa3_session_switch.json
+        buildPhase: resources
+      - path: ../../tests/render_conformance/fixtures/render_qa3_dead_turn.json
+        buildPhase: resources
+      - path: ../../tests/render_conformance/fixtures/render_qa3_draft_interleave.json
+        buildPhase: resources
     dependencies:
       - target: HermesMobile
       # GRDB direct link so CacheLayerTests can call DatabaseQueue(configuration:)
