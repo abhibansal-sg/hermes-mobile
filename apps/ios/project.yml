@@ -214,6 +214,11 @@ targets:
         buildPhase: resources
       - path: ../../tests/render_conformance/fixtures/render_qa3_draft_interleave.json
         buildPhase: resources
+      # QA-3 S8/A4 liveness fixture (dead turn 1 + live turn 2 — the IMG_2591
+      # eternal double-working set piece); hand-authored from the forensics
+      # chronology to the recorded wire format (see its recorded_by note).
+      - path: ../../tests/render_conformance/fixtures/render_dead_turn_liveness.json
+        buildPhase: resources
     dependencies:
       - target: HermesMobile
       # GRDB direct link so CacheLayerTests can call DatabaseQueue(configuration:)
