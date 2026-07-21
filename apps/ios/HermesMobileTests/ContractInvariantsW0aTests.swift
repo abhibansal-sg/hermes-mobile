@@ -488,6 +488,133 @@ final class ContractInvariantsW0aTests: XCTestCase {
             "I6: the immediately-following send targets the NEW id")
     }
 
+    // MARK: - I5 / I11 — drift-abort split (amendment S4, iOS-internal half)
+
+    /// Build + attach a durable outbox to the graph so the drift-split's
+    /// "convert to a durable queue row against the PINNED id" branch has a
+    /// QueueStore to land in (the base ``makeGraph`` attaches none).
+    private func attachOutbox(_ g: Graph) throws -> QueueStore {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("W0a-Outbox-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let observation = WorkRepositoryObservation()
+        let repository = try WorkRepository(
+            configuration: WorkRepositoryConfiguration(containerURL: directory),
+            observation: observation
+        )
+        let scope = try WorkScope(serverID: Self.serverURL, profileID: "default")
+        let queueStore = QueueStore(
+            repository: repository,
+            observation: observation,
+            scopeProvider: { scope },
+            activeSessionProvider: { nil },
+            connectedProvider: { true }
+        )
+        g.chat.attachOutbox(queueStore)
+        return queueStore
+    }
+
+    /// I11 (amendment S4, EXISTING-pin branch): a send pinned to an existing
+    /// session whose target DRIFTS mid-pipeline (the user navigates A→B while
+    /// the submit is in flight) and whose submit is busy-rejected (the
+    /// authoritative gateway 4009) becomes a durable queue row against the
+    /// PINNED id A — never redirected to the drifted-to session B. FAILS on
+    /// r4/base: the catch enqueued against `sessions?.activeStoredId` (now B),
+    /// redirecting the row to the wrong session.
+    func testI11_ExistingPinDrift_EnqueuesAgainstPinnedID_NeverRedirected() async throws {
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        let queueStore = try attachOutbox(g)
+        _ = try await g.coordinator.open("w0a-i11-A")
+        g.sessions.activeStoredId = "w0a-i11-A"
+        g.sessions.activeRuntimeId = "w0a-i11-A"
+
+        // A is BUSY: the relay rejects the submit with 4009. Mid-await the user
+        // navigates A→B (the drift).
+        let sessions = g.sessions
+        g.transport.script = { upstream, relay in
+            guard let id = upstream.id else { return }
+            if upstream.method == "submit" {
+                Task { @MainActor in
+                    sessions.activeStoredId = "w0a-i11-B"   // drift mid-await
+                    let payload: [String: Any] = ["jsonrpc": "2.0", "id": id,
+                        "error": ["code": 4009, "message": "session busy"]]
+                    if let data = try? JSONSerialization.data(withJSONObject: payload) {
+                        relay.deliver(String(decoding: data, as: UTF8.self))
+                    }
+                }
+            } else {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+            }
+        }
+
+        let accepted = await g.chat.send(text: "queued against A")
+        XCTAssertTrue(accepted, "I11/S4: a busy-rejected existing-session send queues (no error theater)")
+        // `items` is the UNSCOPED durable queue (pendingCount/activeItems filter
+        // by active-session affinity — irrelevant here: the whole point of S4 is
+        // the row targets the PINNED id no matter where the user navigated).
+        await waitUntil { queueStore.items.count >= 1 }
+        let rows = queueStore.items
+        XCTAssertEqual(rows.count, 1, "I11: exactly one durable row")
+        XCTAssertEqual(rows.first?.storedSessionId, "w0a-i11-A",
+            "I11/S4: the row enqueues against the PINNED id A — never redirected to the drifted-to session B")
+        XCTAssertNil(g.chat.lastError, "I17: the queue-and-drain is silent — no banner (C3)")
+    }
+
+    /// I5/I11 (amendment S4, NIL-pin branch): drift mid-CREATE on a draft (nil
+    /// target) — the relay mints an orphan the user already left, so the phone
+    /// DROPS the optimistic echo and CLOSES the orphan locally (no wire close
+    /// RPC); nothing is attributed to any session. FAILS on r4/base: the draft
+    /// send fell back to the retained `activeSessionID` (never a nil target) and
+    /// adopted the minted id regardless of the drift.
+    func testI5_NilPinDrift_DropsEcho_ClosesOrphan() async throws {
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open("w0a-i5-A")
+        g.sessions.activeStoredId = "w0a-i5-A"
+        g.sessions.activeRuntimeId = "w0a-i5-A"
+
+        // New Chat — the draft has no session (nil pin).
+        g.sessions.startDraft()
+        XCTAssertNil(g.sessions.activeStoredId, "precondition: the draft holds no stored id")
+
+        // The relay mints an orphan on the nil-target submit; mid-await the user
+        // navigates to B (the drift).
+        let sessions = g.sessions
+        let createdSessionID = Self.createdSessionID
+        g.transport.script = { upstream, relay in
+            guard let id = upstream.id else { return }
+            if upstream.method == "submit" {
+                let sid = (upstream.params["session_id"] as? String) ?? createdSessionID
+                Task { @MainActor in
+                    sessions.activeStoredId = "w0a-i5-B"   // drift mid-create
+                    relay.deliverResult(id: id, result: .object(["session_id": .string(sid)]))
+                }
+            } else {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+            }
+        }
+
+        _ = await g.chat.send(text: "orphan turn")
+        await pumpSettle()
+
+        // The submit went out NIL-target (the relay created the orphan) — no
+        // fallback to the previously-driven session (D2).
+        let submits = g.transport.upstreams().filter { $0.method == "submit" }
+        XCTAssertEqual(submits.count, 1)
+        XCTAssertNil(submits.first?.params["session_id"] as? String,
+            "I5: the draft submitted a nil target on the wire")
+
+        // The optimistic echo DROPPED — nothing attributed to any session.
+        XCTAssertFalse(g.chat.messages.contains { $0.text == "orphan turn" },
+            "I5/I11 S4 nil-pin: the optimistic echo drops on draft drift — never redirected")
+        // The minted orphan was NOT adopted as the active session.
+        XCTAssertNotEqual(g.coordinator.activeStoredSessionID, Self.createdSessionID,
+            "I5/I11 S4 nil-pin: the orphan is closed locally, never adopted as the stored identity")
+        XCTAssertEqual(g.sessions.activeStoredId, "w0a-i5-B",
+            "I5/I11 S4 nil-pin: the session pointers stay where the user went (B), not the orphan")
+    }
+
     // MARK: - I7 — Chronology (STORE layer only; void geometry is W0b)
 
     /// I7 STORE layer: the rendered timeline is a stable chronological merge
