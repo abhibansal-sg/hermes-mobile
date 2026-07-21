@@ -74,10 +74,6 @@ L6 = "R4 L6 RED-BY-DESIGN: "
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=L1 + "LIST must pass order/cwd_prefix/"
-                   "exclude_source/min_messages/limit through to the gateway "
-                   "session.list (downstream.py:698-699 forwards limit only). "
-                   "Wave-1 L1 flips this; remove the marker when green.")
 async def test_l1_list_filter_params_pass_through():
     srv, gw = _server()
     await srv.start()
@@ -109,10 +105,6 @@ async def test_l1_list_filter_params_pass_through():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=L2 + "SUBMIT must pass "
-                   "truncate_before_user_ordinal through to prompt.submit "
-                   "(DS:720-724 drops unknown params today). Wave-1 L2 flips "
-                   "this; remove the marker when green.")
 async def test_l2_submit_passes_truncate_before_user_ordinal():
     srv, gw = _server()
     gw.owns = MagicMock(return_value=True)
@@ -131,10 +123,6 @@ async def test_l2_submit_passes_truncate_before_user_ordinal():
     )
 
 
-@pytest.mark.xfail(strict=True, reason=L2 + "the SUBMIT create branch must "
-                   "accept cwd and thread it into session.create (B10 "
-                   "new-session-in-project gap; DS:759-763 takes title/model/"
-                   "provider only). Wave-1 L2 flips this; remove when green.")
 async def test_l2_create_branch_accepts_cwd():
     srv, gw = _server()
     await srv.start()
@@ -150,11 +138,6 @@ async def test_l2_create_branch_accepts_cwd():
     )
 
 
-@pytest.mark.xfail(strict=True, reason=L2 + "a `branch` upstream method "
-                   "(seeded create: session.create + seed message) must exist "
-                   "(B13 branch is DEAD in relay mode today — handle_upstream "
-                   "raises unknown method). Wave-1 L2 flips this; remove when "
-                   "green.")
 async def test_l2_branch_method_seeds_new_session():
     srv, gw = _server()
     await srv.start()
@@ -189,10 +172,6 @@ def _reframe_turn(payload_extra: dict | None = None) -> list:
         type="message.complete", session_id="s1", payload=payload))
 
 
-@pytest.mark.xfail(strict=True, reason=L3 + "turn.completed must stamp "
-                   "reason='completed' on normal completion (reframer.py:"
-                   "310-323 emits usage/duration only). Wave-1 L3 flips this; "
-                   "remove when green.")
 async def test_l3_turn_completed_reason_completed():
     frames = _reframe_turn()
     tc = [f for f in frames if f.kind == FrameKind.TURN_COMPLETED]
@@ -202,11 +181,6 @@ async def test_l3_turn_completed_reason_completed():
     )
 
 
-@pytest.mark.xfail(strict=True, reason=L3 + "turn.completed must stamp "
-                   "reason='interrupted' when the gateway completes the turn "
-                   "with status=interrupted (the shape session.interrupt "
-                   "earns; the reframer never reads payload.status). Wave-1 "
-                   "L3 flips this; remove when green.")
 async def test_l3_turn_completed_reason_interrupted():
     frames = _reframe_turn({"status": "interrupted"})
     tc = [f for f in frames if f.kind == FrameKind.TURN_COMPLETED]
@@ -216,12 +190,6 @@ async def test_l3_turn_completed_reason_interrupted():
     )
 
 
-@pytest.mark.xfail(strict=True, reason=L3 + "a gateway `error` event ending "
-                   "the turn must yield turn.completed with reason='error' "
-                   "(today _reframe_error emits the error item only — no "
-                   "turn.completed at all, so the phone's settle edge never "
-                   "fires off the wire truth). Wave-1 L3 flips this; remove "
-                   "when green.")
 async def test_l3_turn_completed_reason_error():
     r = Reframer(EventBus(), SessionStore())
     r.reframe(GatewayEvent(type="message.start", session_id="s1", payload={}))
@@ -241,24 +209,35 @@ async def test_l3_turn_completed_reason_error():
 
 
 class _FakeHTTPConnection:
-    """The `connection.respond(status, body)` surface _process_request uses."""
+    """The `connection.respond(status, body)` surface _process_request uses.
+
+    ``respond`` is SYNC — the real websockets>=14 ``ServerConnection.respond``
+    builds and RETURNS a Response (it is not a coroutine); every existing
+    route in ``_process_request`` calls it un-awaited. (The original W0b fake
+    had it async, which never ran under the production call style — aligning
+    it with the real API is the adaptation the stub docstring sanctions.)
+    """
 
     def __init__(self) -> None:
         self.responded: list[tuple] = []
 
-    async def respond(self, status, body: str):
+    def respond(self, status, body: str):
         self.responded.append((status, body))
+        return ("responded", status, body)
 
 
 class _FakeHTTPRequest:
-    """A POST request on the phone-facing port.
+    """A gate-answer request on the phone-facing port.
 
     Exposes the surface the existing _process_request reads (``path``,
-    ``headers``) plus a JSON ``body``. The L4 implementer defines the exact
-    body-read mechanism the websockets version permits and adapts this fake
-    when turning the stub green — the pinned BEHAVIOR is: POST /approve (or
-    /clarify) on the downstream port answers 200 and forwards the answer to
-    the gateway.
+    ``headers``) plus a JSON ``body``. L4 IMPLEMENTER'S NOTE (W1): the pinned
+    behavior — /approve (or /clarify) on the downstream port answers 200 and
+    forwards the answer to the gateway — is implemented with query-string
+    params as the REAL transport (websockets>=14 rejects non-GET methods
+    before process_request runs — a POST never reaches the handler) and this
+    JSON ``body`` honored as a fallback when a request object exposes one
+    (which this fake does). No fake adaptation was needed; protocol §5c
+    documents the wire shape.
     """
 
     def __init__(self, path: str, body: str) -> None:
@@ -267,11 +246,6 @@ class _FakeHTTPRequest:
         self.body = body.encode("utf-8")
 
 
-@pytest.mark.xfail(strict=True, reason=L4 + "the phone-facing port must serve "
-                   "one-shot POST /approve → gateway approval.respond "
-                   "(downstream._process_request serves healthz/attention/"
-                   "manifest only and returns None for /approve today). "
-                   "Wave-1 L4 flips this; remove when green.")
 async def test_l4_http_approve_one_shot():
     import json
 
@@ -292,10 +266,6 @@ async def test_l4_http_approve_one_shot():
     assert call.args[0] == "sA" and call.args[1] == "req-1" and call.args[2] == "once"
 
 
-@pytest.mark.xfail(strict=True, reason=L4 + "the phone-facing port must serve "
-                   "one-shot POST /clarify → gateway clarify.respond (absent "
-                   "today — cold-tap answers are dead on GW-UNREACH). Wave-1 "
-                   "L4 flips this; remove when green.")
 async def test_l4_http_clarify_one_shot():
     import json
 
@@ -320,12 +290,6 @@ async def test_l4_http_clarify_one_shot():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=L6 + "a non-phone turn's "
-                   "message.start prompt text must emit a completed "
-                   "userMessage item (reframer MESSAGE_START emits turn."
-                   "started only — desktop-originated prompts have no user "
-                   "row on the wire, D11's render half). Wave-1 L6 flips "
-                   "this; remove when green.")
 async def test_l6_message_start_prompt_emits_user_message_item():
     r = Reframer(EventBus(), SessionStore())
     frames = r.reframe(GatewayEvent(
@@ -345,12 +309,6 @@ async def test_l6_message_start_prompt_emits_user_message_item():
     assert users[0].body.get("status") == "completed"
 
 
-@pytest.mark.xfail(strict=True, reason=L6 + "OPEN/HISTORY seed must fold the "
-                   "rest_history USER rows into the SessionStore as "
-                   "userMessage items (so a resync snapshot carries the "
-                   "foreign prompt; today OPEN returns the rows to the phone "
-                   "and folds nothing — a snapshot fallback drops them). "
-                   "Wave-1 L6 flips this; remove when green.")
 async def test_l6_open_history_seed_folds_user_rows_into_store():
     srv, gw = _server()
     gw.rest_history = AsyncMock(return_value=[
