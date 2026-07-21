@@ -466,21 +466,23 @@ final class RelaySessionCoordinator {
         // side-effect — it must not fire against a parked draft.)
         guard !projectionSuppressed else { return }
         // R5/W2e (contract I9/B1): a local STOP settled the current turn — its
-        // LATE frames (crossed the interrupt in flight; a resync ring replay)
-        // keep the seq spine honest (folded above) but project NOTHING and
-        // never refresh the liveness clock: the local settlement is the render
-        // truth until the authoritative boundary arrives. Boundary frames fall
-        // through: a snapshot is an authoritative re-baseline (clears the mark
-        // — server truth wins, I3), `turn.started` / `turn.completed` drive the
-        // turn state machine below.
+        // LATE ITEM frames (crossed the interrupt in flight; a resync ring
+        // replay) keep the seq spine honest (folded above) but project NOTHING
+        // and never refresh the liveness clock: the local settlement is the
+        // render truth until the authoritative boundary arrives. Everything
+        // else falls through: a snapshot is an authoritative re-baseline
+        // (clears the mark — server truth wins, I3); `turn.started` /
+        // `turn.completed` drive the turn state machine below; a gate that
+        // arrives in the stop→completion window still parks and is expired
+        // (and resolved-marked — I12/I23) by the turn boundary as usual.
         if chatStore.relayTurnSettling {
             switch frame.kind {
             case .snapshot:
                 chatStore.noteAuthoritativeRebaseline()
-            case .turnStarted, .turnCompleted:
-                break
-            default:
+            case .itemStarted, .itemDelta, .itemCompleted:
                 return
+            default:
+                break
             }
         }
         // QA-3 S8/A4 — per-turn liveness: refresh the silence clock ONLY for
