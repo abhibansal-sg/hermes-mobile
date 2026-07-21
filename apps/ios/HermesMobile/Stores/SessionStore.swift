@@ -3777,7 +3777,15 @@ final class SessionStore {
         Task { try? await cacheStore.saveTranscript(identity: identity, messages: stored) }
     }
 
-    private func rememberWarmOpenSnapshot(_ normalized: [ChatMessage], for storedId: String) {
+    /// Record the normalized rows of a session this process has already seen,
+    /// so a re-open paints from warm memory (ABH-372) before touching disk.
+    /// Internal (not private) as a contract-suite seam: store-level tests
+    /// simulate a cache paint by registering it here — the paint provenance
+    /// (`transcriptPaintedStoredId`) is stamped only by paints this store
+    /// drives, so a test that seeds ChatStore directly must also register the
+    /// warm snapshot for `open()`'s phase-1 to see the HIT (a paint+miss
+    /// co-existence is impossible in production — paint only comes from HITs).
+    func rememberWarmOpenSnapshot(_ normalized: [ChatMessage], for storedId: String) {
         warmOpenSnapshots[storedId] = mergedWarmSnapshot(normalized, for: storedId)
         warmOpenSnapshotOrder.removeAll { $0 == storedId }
         warmOpenSnapshotOrder.append(storedId)
