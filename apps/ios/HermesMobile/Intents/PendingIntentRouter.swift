@@ -61,8 +61,36 @@ enum PendingIntentRouter {
         for job in jobs {
             switch job.intentKind {
             case .openSessions:
-                await sessions.closeActive()
-                NotificationCenter.default.post(name: .hermesOpenSessionsIntent, object: nil)
+                // S9 (QA-3, 3rd recurrence): the dismissal latch is a one-shot
+                // consumed at first-paint/300ms, but THIS re-open edge is
+                // unserialized against it. A foreground transition (background
+                // → foreground to check a stuck turn) re-drains durable
+                // `.openSessions` jobs that were queued by an OLDER gesture
+                // (widget tap, Siri, Handoff, legacy `importLegacyWork`); the
+                // job's `createdAt` predates the user's more recent in-app
+                // drawer navigation (row tap during in-flight load, or "New
+                // chat"). Last writer would otherwise win = the intent re-opens
+                // the drawer over the load the user just chose. Drop the open
+                // (and the clobbering `closeActive`) when the user gestured at
+                // or after the intent's queue time; the job is still marked
+                // complete so it doesn't redrain next foreground. The user's
+                // gesture wins, the drawer always dismisses into the session.
+                let queuedAt = Date(timeIntervalSince1970: job.createdAt)
+                let gestureEpochAtStart = sessions.currentDrawerUserGestureEpoch()
+                let userGestureSinceQueue = sessions.drawerUserGestureHappenedSince(queuedAt)
+                if !userGestureSinceQueue {
+                    // The wall-clock comparison can miss if the gesture and the
+                    // queue are within the same timestamp tick (or the job was
+                    // queued milliseconds before the gesture); re-check the
+                    // monotonic epoch AFTER `closeActive`'s await too, so a
+                    // gesture that lands during the await is also caught.
+                    await sessions.closeActive()
+                    if sessions.drawerUserGestureEpochAdvanced(since: gestureEpochAtStart) {
+                        try? await repository.completeNavigationAppIntent(id: job.jobID)
+                        continue
+                    }
+                    NotificationCenter.default.post(name: .hermesOpenSessionsIntent, object: nil)
+                }
                 try? await repository.completeNavigationAppIntent(id: job.jobID)
             case .newSession:
                 sessions.startDraft()

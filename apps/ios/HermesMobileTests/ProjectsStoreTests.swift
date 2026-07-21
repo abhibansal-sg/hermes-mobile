@@ -157,6 +157,48 @@ final class ProjectsStoreTests: XCTestCase {
         XCTAssertEqual(RoutingProtocol.legacySessionsHits, 0, "must not hit the legacy path when the plugin route serves")
     }
 
+    /// S10 (QA-3): a fetch that SUCCEEDS with `[]` while the project overview's
+    /// `sessionCount > 0` must NOT be accepted as authoritative — the server's
+    /// detail query missed worktree cwds (the cwd_prefix LIKE cannot fold them;
+    /// IMG_2593 "SESSIONS 0"). Treat it as a transient failure: surface the
+    /// directional "Reconnecting to gateway — retry" state instead of a lying
+    /// "No sessions yet". The server-side `_cwd_prefix_clause` fix closes the
+    /// actual data hole; this is the iOS-side defensive backstop.
+    func testDetailEmptyListWhenCountPositiveSurfacesRetryNotLyingEmpty() async throws {
+        let store = try makeConnectedStore()
+        // The plugin route "succeeds" but with an empty list — the worktree
+        // cwd-prefix miss. The overview count (4) is authoritative.
+        RoutingProtocol.projectSessions = (sessionsWrapper(ids: [], total: 0), 200)
+        RoutingProtocol.legacySessions = (sessionsWrapper(ids: [], total: 0), 200)
+
+        let proj = project("/Volumes/MainData/Developer/products/hermes-mobile", count: 4)
+        await store.refreshSessions(for: proj)
+
+        XCTAssertTrue(
+            store.sessions(for: proj).isEmpty,
+            "an empty list must not be stored as the authoritative detail when count > 0"
+        )
+        XCTAssertEqual(
+            store.sessionsError(for: proj),
+            ProjectsStore.projectSessionsEmptyButCountedMessage,
+            "a count>0 empty list must surface the retry state, not a lying No-sessions-yet"
+        )
+    }
+
+    /// S10 sanity: a project whose overview count is genuinely 0 (a brand-new
+    /// project with no sessions yet) must still show the honest empty state —
+    /// the count-positive gate is precise, not a blanket suppression.
+    func testDetailEmptyListWhenCountZeroStoresEmptyWithoutError() async throws {
+        let store = try makeConnectedStore()
+        RoutingProtocol.projectSessions = (sessionsWrapper(ids: [], total: 0), 200)
+
+        let proj = project("/brand/new/project", count: 0)
+        await store.refreshSessions(for: proj)
+
+        XCTAssertTrue(store.sessions(for: proj).isEmpty)
+        XCTAssertNil(store.sessionsError(for: proj), "count==0 + empty list is the honest empty state")
+    }
+
     func testDetailFallsBackToCwdPrefixOn404() async throws {
         let store = try makeConnectedStore()
         // Old gateway: plugin route 404s, legacy cwd_prefix path answers.
