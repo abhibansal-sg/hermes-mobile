@@ -420,21 +420,16 @@ final class RelaySessionCoordinator {
         reconnectToken = token
         phase = .connecting
         // A fresh connection cycle: establishment is per-connection (the new
-        // PhoneConnection has no foreground) — invalidate so the rebind below
-        // re-establishes exactly once.
+        // PhoneConnection has no foreground) — invalidate so the genuine
+        // `.open` edge rebinds the driven session exactly once. The readiness
+        // edge itself (waiter resolve + `onReady`) is owned by the OBSERVER
+        // here — exactly like the `scheduleReconnect` auto-driver: the new
+        // socket's real `.connecting → .open` cycle flows through
+        // `stateChanges` (unlike `start()`'s buffered replay, which is stale
+        // relative to start's direct stamps and is skipped in `applyState`).
         establishedSessionID = nil
         currentTurnDeliveredPayload = false
         await client.reconnect(url: url, token: token)
-        phase = .open
-        resolveAllOpenWaiters(opened: true)
-        // Readiness edge (direct stamp — the observer's buffered replay is
-        // stale, see `applyState`): outbox wake + APNs re-wake, then rebind
-        // the driven session on the fresh connection (I14: exactly once).
-        #if DEBUG
-        readinessEdgeCount += 1
-        #endif
-        onReady?()
-        reestablishDrivenSession()
     }
 
     /// Tear down the socket, cancel the pump/state observers + reconnect driver,
