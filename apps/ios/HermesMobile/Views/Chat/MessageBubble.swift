@@ -543,10 +543,23 @@ struct MessageBubble: View {
         // directly in wire order, no `assistantRenderParts` indirection.
         let parts = message.parts
         let lastTextPartID = parts.lastTextPartID
-        // A freshly-created streaming bubble has no `.text` part yet; show a
-        // standalone cursor so the turn reads as in-progress (the prior model
-        // injected an empty streaming text placeholder for this).
-        let needsStandaloneCursor = message.isStreaming && lastTextPartID == nil
+        // QA-3 S2/S3/A1 — ONE merged working affordance. While the turn is
+        // live and no answer text flows yet, the bubble's SOLE content is the
+        // merged working line — breathing cursor + inline status + per-turn
+        // timer (tap to expand) — rendered with whatever parts exist (ZERO in
+        // the send→first-frame window). This replaces the build-116 stack of
+        // a bare standalone caret beside a separate spinner/"Working… 35s"
+        // fold line (S3: two affordances), and it renders from SEND — the
+        // labeled+timed affordance is no longer gated on the first relay item
+        // frame (S2: it appeared ~35s late, reading the honest timer on a
+        // line that waited on the model's first item). The fold and the caret
+        // are the SAME surface now; item arrival only updates the line's
+        // status text, never mounts a second one.
+        let mergedWorkingLine = Self.showsStandaloneWorkingLine(
+            isStreaming: message.isStreaming,
+            liveTurnActive: liveTurnActive,
+            parts: parts
+        )
 
         // CC-05/CC-07: bump part spacing from 8 → 10 for consistent vertical
         // rhythm that matches the user bubble's ~9pt vertical breathing room.
@@ -563,29 +576,44 @@ struct MessageBubble: View {
         return VStack(alignment: .leading, spacing: 10) {
             // --- Prose / parts container (combine target) ---
             VStack(alignment: .leading, spacing: 10) {
-                // Wave-2 item dispatch (RELAY-PHONE-PROTOCOL §2): coalesce the
-                // ordered parts into render nodes so consecutive reasoning + tool/
-                // file/browser/image/error ITEM parts fold into one collapsed
-                // working section (owner spec). Standalone parts (text/usage/
-                // warning, legacy reasoning/tools) render exactly as before.
-                ForEach(WorkingSectionModel.renderNodes(from: parts)) { node in
-                    switch node {
-                    case .part(let part):
-                        assistantPart(part, showsCursor: message.isStreaming && part.id == lastTextPartID)
-                    case .working(_, let runParts):
-                        WorkingSectionView(
-                            parts: runParts,
-                            streaming: message.isStreaming || liveTurnActive,
-                            liveTurnStartedAt: liveTurnStartedAt,
-                            settledDuration: message.reasoningElapsed
-                        )
+                if mergedWorkingLine {
+                    // THE single working affordance (phases A + B: no answer
+                    // text yet). Owns the breathing cursor glyph; renders from
+                    // send with ZERO parts (the optimistic caret bubble) and
+                    // keeps identity as work parts land — only the status text
+                    // changes; the line never forks into two surfaces (S3).
+                    WorkingSectionView(
+                        parts: parts,
+                        streaming: true,
+                        liveTurnStartedAt: liveTurnStartedAt,
+                        settledDuration: message.reasoningElapsed,
+                        showsCursorGlyph: true
+                    )
+                } else {
+                    // Wave-2 item dispatch (RELAY-PHONE-PROTOCOL §2): coalesce
+                    // the ordered parts into render nodes so consecutive
+                    // reasoning + tool/file/browser/image/error ITEM parts
+                    // fold into one collapsed working section (owner spec).
+                    // Standalone parts (text/usage/warning, legacy
+                    // reasoning/tools) render exactly as before.
+                    ForEach(WorkingSectionModel.renderNodes(from: parts)) { node in
+                        switch node {
+                        case .part(let part):
+                            assistantPart(part, showsCursor: message.isStreaming && part.id == lastTextPartID)
+                        case .working(_, let runParts):
+                            WorkingSectionView(
+                                parts: runParts,
+                                streaming: message.isStreaming || liveTurnActive,
+                                liveTurnStartedAt: liveTurnStartedAt,
+                                settledDuration: message.reasoningElapsed,
+                                // Phase C: the fold runs beside flowing answer
+                                // text — the prose-tail `StreamingCursor` owns
+                                // the pulse, the fold keeps status + timer only
+                                // (exactly one glyph breathes at any instant).
+                                showsCursorGlyph: false
+                            )
+                        }
                     }
-                }
-                if needsStandaloneCursor {
-                    // CC-01: standalone cursor inherits the pulse animation.
-                    StreamingCursor(isStreaming: message.isStreaming)
-                        .font(.body)
-                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             // A11y: combine ONLY on settled turns. Streaming bubbles keep their
@@ -661,6 +689,55 @@ struct MessageBubble: View {
     ) -> Bool {
         guard !messageIsStreaming, assistantTurnActionsEnabled else { return false }
         return hasRenderedText || hasTurnActions
+    }
+
+    /// QA-3 S2/S3/A1 — the merged working-line contract (pure, unit-pinned by
+    /// `RenderConformanceTests`). TRUE iff the bubble renders the SINGLE
+    /// merged working line (breathing cursor + inline status + per-turn timer)
+    /// as its sole content — the pre-answer-text live window:
+    ///  • phase A (send → first frame): ZERO parts — the optimistic caret
+    ///    bubble; the line reads "Working… ‹local timer›" from SEND, driven by
+    ///    local send state, never a relay frame (S2);
+    ///  • phase B (work parts, no answer text yet): the line carries the SAME
+    ///    parts the fold would — item arrival only updates the status text;
+    ///    NO second standalone caret mounts beside it (the S3 double
+    ///    affordance: build 116 stacked a bare caret under the spinner line).
+    /// FALSE once answer text flows (phase C): the `renderNodes` ForEach takes
+    /// over — the fold keeps status + timer beside the prose and the
+    /// prose-tail `StreamingCursor` owns the pulse — and FALSE when settled.
+    nonisolated static func showsStandaloneWorkingLine(
+        isStreaming: Bool,
+        liveTurnActive: Bool,
+        parts: [ChatMessagePart]
+    ) -> Bool {
+        guard isStreaming || liveTurnActive else { return false }
+        return parts.lastTextPartID == nil
+    }
+
+    /// QA-3 S3/A1 — the one-affordance invariant (pure, unit-pinned): the
+    /// number of WORKING-LINE surfaces this bubble renders. Must be ≤ 1 in
+    /// EVERY phase (build 116 returned 2 in phase B — the fold's spinner line
+    /// + the standalone caret). The standalone line and the fold are mutually
+    /// exclusive by `showsStandaloneWorkingLine` + the single-fold contract
+    /// (`renderNodes` emits at most ONE `.working` node), so two surfaces are
+    /// unreachable by construction. The prose-tail typing caret is NOT a
+    /// working-line surface (it is the text's insertion point).
+    nonisolated static func workingAffordanceCount(
+        isStreaming: Bool,
+        liveTurnActive: Bool,
+        parts: [ChatMessagePart]
+    ) -> Int {
+        if showsStandaloneWorkingLine(
+            isStreaming: isStreaming, liveTurnActive: liveTurnActive, parts: parts
+        ) { return 1 }
+        let foldNodes = WorkingSectionModel.renderNodes(from: parts)
+            .reduce(into: 0) { count, node in
+                if case .working = node { count += 1 }
+            }
+        // A fold only renders as a LIVE working line when the turn is live;
+        // settled it is the "Worked for N" row — not a working affordance.
+        let live = isStreaming || liveTurnActive
+        return live ? foldNodes : 0
     }
 
     @ViewBuilder
@@ -1401,11 +1478,13 @@ struct MessageBubble: View {
 
     // MARK: - CC-01: Streaming cursor
     //
-    // The breathing cursor glyph now lives in the reusable `StreamingCursor`
-    // component (bottom of this file) so both call sites share ONE themed view
-    // and the visual can be restyled in a single place. The former `cursorView`
-    // computed property + `cursorPulseOpacity` state + `startCursorPulse()` moved
-    // there verbatim (byte-identical behavior).
+    // The breathing cursor glyph lives in the reusable `StreamingCursor`
+    // component (bottom of this file) for the prose-tail call site; the merged
+    // working line's leading glyph is `BreathingCursorGlyph` (WorkingSectionView).
+    // Both share the ONE pure `CursorBreathe` curve so the visual restyles from a
+    // single place (QA-3 S1: the pulse is now a stateless function of wall-clock
+    // time — the former `cursorPulseOpacity` @State + `startCursorPulse()`
+    // repeatForever pattern stranded the cursor static on row remounts).
 
     private func usageFooter(_ usage: UsageStats) -> some View {
         Text(Self.usageLine(usage))
@@ -2492,49 +2571,42 @@ extension MessageBubble: Equatable {
 /// The single breathing cursor glyph for the streaming tail — the ChatGPT-style
 /// "I'm working" signal in the transcript (approved design §8). Extracted from
 /// `MessageBubble` (round-2 ROOT D: lifted off the prose `Text` so the pulse never
-/// re-composites the prose block) into ONE reusable component used by both the
-/// standalone-cursor and tail-of-prose call sites, so the caret can be restyled in
-/// a single place. Reads the theme from the environment (`\.hermesTheme`) and
-/// takes `isStreaming` as its only parameter; visual behavior is byte-identical to
-/// the former inline `cursorView` (▌ U+258C in `theme.midground`, easeInOut 0.6s
-/// breathe 1.0→0.25 repeatForever autoreverses, easeOut 0.15s completion snap).
+/// re-composites the prose block) into ONE reusable component for the
+/// tail-of-prose call site (the merged working line's leading glyph is
+/// `BreathingCursorGlyph`, sharing the same `CursorBreathe` curve — QA-3 S3), so
+/// the caret can be restyled in a single place. Reads the theme from the
+/// environment (`\.hermesTheme`) and takes `isStreaming` as its only parameter.
+///
+/// QA-3 S1: the pulse is now STATELESS — a `TimelineView` drives the opacity off
+/// the wall clock through the pure `CursorBreathe` curve (visual behavior
+/// unchanged: ▌ U+258C in `theme.midground`, 1.0 → 0.25 soft breathe, 1.2 s
+/// period = the ratified easeInOut-0.6-autoreverses shape). The prior
+/// `@State` + `onAppear` + `withAnimation(.repeatForever)` pattern stranded the
+/// cursor STATIC whenever the row remounted mid-stream (the streaming bubble is
+/// re-derived on every `applyRelayItems` pass; a view-identity change or an
+/// animation-nil transaction resets `@State` without re-firing `onAppear`) —
+/// the motionless bare bar the owner photographed (IMG_2577/2585/2587). A
+/// time-driven pulse has no state to strand: any remount keeps breathing at the
+/// correct phase. Settled reads a steady full-opacity glyph.
 struct StreamingCursor: View {
     /// Whether the owning turn is still streaming. Drives the pulse animation; a
-    /// settled cursor snaps back to full opacity.
+    /// settled cursor reads steady full opacity.
     let isStreaming: Bool
 
     @Environment(\.hermesTheme) private var theme
-
-    /// Opacity driven by a repeating breathe animation while the turn streams.
-    @State private var cursorPulseOpacity: Double = 1.0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        Text(" ▌")
-            .foregroundColor(theme.midground)
-            .opacity(isStreaming ? cursorPulseOpacity : 1.0)
-            .onAppear {
-                guard isStreaming else { return }
-                startCursorPulse()
-            }
-            .onChange(of: isStreaming) { _, streaming in
-                if streaming {
-                    startCursorPulse()
-                } else {
-                    // Turn complete: snap back to full opacity.
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        cursorPulseOpacity = 1.0
-                    }
-                }
-            }
-    }
-
-    /// Kick off the repeating breathe animation for the streaming cursor.
-    private func startCursorPulse() {
-        withAnimation(
-            .easeInOut(duration: 0.6)
-            .repeatForever(autoreverses: true)
-        ) {
-            cursorPulseOpacity = 0.25
+        // One clock for the glyph: 20 fps is imperceptibly smooth for a soft
+        // opacity breathe and re-composites only this tiny Text — the pulse
+        // never touches the (large) prose block (round-2 ROOT D preserved).
+        TimelineView(.animation(minimumInterval: 1.0 / 20.0,
+                                paused: !isStreaming || reduceMotion)) { context in
+            Text(" ▌")
+                .foregroundColor(theme.midground)
+                .opacity(CursorBreathe.opacity(at: context.date,
+                                               streaming: isStreaming,
+                                               reduceMotion: reduceMotion))
         }
     }
 }
