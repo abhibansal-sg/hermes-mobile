@@ -236,6 +236,52 @@ enum DefaultsKeys {
         }
     }
 
+    // MARK: - Push registration device id fallback (QA-3 S13)
+    //
+    // The relay push registry dedups by `device_id` (one row per device). Build
+    // 116's relay registration plumbed `device_id` only when a v2 pairing had
+    // issued one (`DefaultsKeys.deviceId(server:)`) — but a relay-only phone on
+    // a pre-v2 shared-token pairing never completes the auto-upgrade, so the
+    // field was `nil`, the registry row carried no id, and QA-2's device-keyed
+    // eviction could never converge (fan-out kept hitting stale null-id rows
+    // Apple 200s into the void). The per-install fallback below mints ONE
+    // stable id per install the FIRST time a registration needs it, so every
+    // registration from day one is keyed. The v2 issued id still wins when it
+    // exists (it is the server's authoritative per-device identity).
+
+    /// The single per-install push device id (a minted UUID, persisted the first
+    /// time a registration needs a device id and no v2 id is on record). NOT
+    /// secret — it identifies the install for dedup, nothing more. Stable across
+    /// launches; rotates on app delete+reinstall (acceptable: APNs rotates the
+    /// token on reinstall too, and the registry's device-keyed replace handles
+    /// that rotation in place).
+    static let pushDeviceInstallId = "hermes.pushDeviceInstallId"
+
+    /// Read (or lazily mint) the per-install fallback device id. Idempotent:
+    /// the minted id is persisted on first read so every subsequent call
+    /// returns the same value.
+    static func pushDeviceInstallIdValue(_ defaults: UserDefaults = .standard) -> String {
+        if let existing = defaults.string(forKey: pushDeviceInstallId)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !existing.isEmpty {
+            return existing
+        }
+        let minted = UUID().uuidString
+        defaults.set(minted, forKey: pushDeviceInstallId)
+        return minted
+    }
+
+    /// The `device_id` to stamp on a push registration for `server`: the v2
+    /// issued id when one exists, else the per-install fallback (always
+    /// non-empty). Callers MUST use this — not the bare `deviceId(server:)` —
+    /// so the relay registry converges to one row per device.
+    static func pushRegistrationDeviceId(server: String, _ defaults: UserDefaults = .standard) -> String {
+        if let v2 = deviceId(server: server, defaults) {
+            return v2
+        }
+        return pushDeviceInstallIdValue(defaults)
+    }
+
     // MARK: File browser / @-mentions (F4A-A1)
     //
     // A1's disjoint DefaultsKeys block (A2 adds its detail-toggle /

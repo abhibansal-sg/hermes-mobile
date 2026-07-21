@@ -111,6 +111,7 @@ final class PushRegistrarRelayModeTests: XCTestCase {
         DefaultsKeys.notificationsDidRequestAuthorization,
         DefaultsKeys.transportPath,
         DefaultsKeys.deviceIdsByServer,
+        DefaultsKeys.pushDeviceInstallId,
     ]
 
     override func setUp() async throws {
@@ -324,6 +325,52 @@ final class PushRegistrarRelayModeTests: XCTestCase {
 
         await coordinator.stop()
         _ = connection  // keep the registrar's weak connection alive for the test
+    }
+
+    /// QA-3 S13: when no v2 device id has been issued (relay-only phone on a
+    /// pre-v2 shared-token pairing — exactly the build-116 install), the
+    /// registrar MUST still send a non-empty device_id (the per-install
+    /// fallback) so the relay registry can dedup by device from day one.
+    /// This is the fix that makes QA-2's device-keyed eviction converge.
+    func testRelayRegisterSendsPerInstallDeviceIdWhenNoV2Id() async throws {
+        let transport = MockRelayTransport(script: { upstream, relay in
+            guard let id = upstream.id else { return }
+            if upstream.method == "push.register" {
+                relay.deliverResult(id: id, result: .object(["registered": .bool(true)]))
+            }
+        })
+        let (connection, coordinator) = makeRelayConnection(transport)
+        // Precondition: no v2 device id on record (the build-116 install state).
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.deviceIdsByServer)
+        XCTAssertNil(DefaultsKeys.deviceId(server: connection.serverURLString))
+
+        try await coordinator.start(url: url)
+        await waitUntil(coordinator.phase == .open, "relay socket should open")
+
+        registrar.authorizationRequester = { _ in .authorized }
+        registrar.remoteNotificationsRegistrar = {}
+        registrar.ensureRegisteredForPairedGateway()
+        registrar.didRegister(deviceToken: Data([0xde, 0xad, 0xbe, 0xef]))
+
+        await waitUntil(
+            transport.upstreams().contains { $0.method == "push.register" },
+            "the token must be registered over the relay socket (§6a)"
+        )
+        let register = try XCTUnwrap(
+            transport.upstreams().first { $0.method == "push.register" }
+        )
+        // The device_id MUST be present and non-empty — never null like build 116.
+        let sentDeviceId = try XCTUnwrap(register.params["device_id"] as? String)
+        XCTAssertFalse(sentDeviceId.isEmpty, "relay register must carry a device id even without a v2 id")
+        // The fallback is persisted and stable across a second registration, so
+        // a re-register after a transient socket failure keys to the SAME id.
+        XCTAssertEqual(
+            UserDefaults.standard.string(forKey: DefaultsKeys.pushDeviceInstallId),
+            sentDeviceId
+        )
+
+        await coordinator.stop()
+        _ = connection
     }
 
     /// Registering while the relay socket is down throws (so PushRegistrar
