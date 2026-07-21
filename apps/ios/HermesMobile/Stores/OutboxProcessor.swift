@@ -61,6 +61,15 @@ final class OutboxProcessor {
         var busySessionID: () -> String? = { nil }
         var createDestination: (WorkJob) async throws -> OutboxDestination
         var resolveRuntime: (String) async -> String?
+        /// R2 / D10: when true (relay transport), a NEW-SESSION row mints its
+        /// destination at SUBMIT — the relay CREATE-on-nil-SUBMIT fuses create +
+        /// prompt (downstream.py:759-763) — so the processor skips the gateway
+        /// ``creatingDestination`` → `session.create` state entirely (dead in
+        /// relay-only mode: the gateway socket is idle). The submit carries an
+        /// empty runtime id (submit-nil) and the relay's cmid dedup makes a
+        /// retry idempotent. Default false ⇒ gateway-direct create path kept
+        /// byte-identical.
+        var relayCreatesOnSubmit: () -> Bool = { false }
         var uploadAsset: (WorkJob, WorkJobAssetSnapshot) async throws -> OutboxUploadedAsset
         var willSubmit: (WorkJob, [String]) -> Void
         var submit: (WorkJob, String, [String]) async throws -> OutboxSubmitResult
@@ -221,7 +230,9 @@ final class OutboxProcessor {
             let resume: WorkJobState
             if job.destinationSessionID == nil && job.storedSessionID == nil
                 && Self.requiresNewDestination(job) {
-                resume = .creatingDestination
+                // R2 / D10: relay mints the destination at submit-nil; resume
+                // straight to submitting (skip the gateway session.create state).
+                resume = dependencies.relayCreatesOnSubmit() ? .submitting : .creatingDestination
             } else if assets.contains(where: { $0.link.state != "uploaded" }) {
                 resume = .uploading
             } else {
@@ -230,6 +241,9 @@ final class OutboxProcessor {
             let destinationID: String?
             if resume == .creatingDestination {
                 destinationID = nil
+            } else if job.destinationSessionID == nil && job.storedSessionID == nil
+                && Self.requiresNewDestination(job) && dependencies.relayCreatesOnSubmit() {
+                destinationID = nil   // R2/D10: relay mints at submit-nil
             } else {
                 guard let resolved = job.destinationSessionID
                     ?? job.storedSessionID
@@ -250,9 +264,17 @@ final class OutboxProcessor {
         if job.state == .queued {
             if job.destinationSessionID == nil && job.storedSessionID == nil
                 && Self.requiresNewDestination(job) {
-                job = try await repository.transitionJob(
-                    id: job.jobID, from: .queued, to: .creatingDestination, owner: owner
-                )
+                if dependencies.relayCreatesOnSubmit() {
+                    // R2 / D10: relay mints the destination at submit-nil; skip
+                    // the gateway session.create state, go straight to submitting.
+                    job = try await repository.transitionJob(
+                        id: job.jobID, from: .queued, to: .submitting, owner: owner
+                    )
+                } else {
+                    job = try await repository.transitionJob(
+                        id: job.jobID, from: .queued, to: .creatingDestination, owner: owner
+                    )
+                }
             } else {
                 let assets = try await repository.jobAssets(jobID: job.jobID)
                 let next: WorkJobState = assets.isEmpty ? .submitting : .uploading
@@ -318,8 +340,17 @@ final class OutboxProcessor {
         }
 
         guard job.state == .submitting else { return false }
-        guard let destinationID = job.destinationSessionID ?? job.storedSessionID,
-              let runtimeID = await dependencies.resolveRuntime(destinationID) else {
+        let runtimeID: String
+        if let destinationID = job.destinationSessionID ?? job.storedSessionID,
+           let resolved = await dependencies.resolveRuntime(destinationID) {
+            runtimeID = resolved
+        } else if job.destinationSessionID == nil && job.storedSessionID == nil
+            && Self.requiresNewDestination(job) && dependencies.relayCreatesOnSubmit() {
+            // R2 / D10: relay new-session row — no destination yet; the empty
+            // runtime id signals submit-nil and the relay CREATE-on-nil-SUBMIT
+            // mints the session during the submit itself (downstream.py:759-763).
+            runtimeID = ""
+        } else {
             throw OutboxProcessorError.destinationUnavailable
         }
         let remotePaths = try await repository.jobAssets(jobID: job.jobID).compactMap(\.link.remotePath)
