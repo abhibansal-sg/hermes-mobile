@@ -610,7 +610,17 @@ final class ChatStore {
     var notificationForegroundOverride: Bool?
     #endif
 
-    init() {}
+    init() {
+        // I23 (amendment G3): reload the DURABLE resolved-gate record so a
+        // gate ANSWERED (or turn-ended) before a force-close stays DOWN on
+        // cold-open resume — the resync ring replays it; the in-memory set
+        // alone died with the process (the W0a RED).
+        if let persisted = UserDefaults.standard.stringArray(
+            forKey: Self.resolvedRelayGateIDsDefaultsKey
+        ) {
+            resolvedRelayGateIDs = Set(persisted)
+        }
+    }
 
     /// Wire up the store graph. Called exactly once by `AppEnvironment`.
     func attach(connection: ConnectionStore, sessions: SessionStore, attachments: AttachmentStore) {
@@ -1251,11 +1261,14 @@ final class ChatStore {
     private func markTurnStartedIfNeeded() {
         guard turnStartedAt == nil else { return }
         turnStartedAt = Date()
-        // R16: a new turn clears the prior turn's error-terminal latch so the
-        // next `.turnCompleted` (a happy-path completion) fires `onTurnComplete`
-        // normally. Without this, a turn that errored would suppress the
-        // completion seam of the NEXT (healthy) turn too.
-        relayTurnTerminatedByError = false
+        // R5: a new turn clears the prior turn's settle state — the compat
+        // error-item flag, the id-less settle latch, and any lingering
+        // local-STOP mark — so this turn's `turn.completed` fires its seam
+        // normally. (The per-turn-ID latch is NOT cleared: replays of the
+        // prior turn's boundary frames must stay suppressed — I21.)
+        relayTurnSawErrorItem = false
+        relayTurnSettleLatched = false
+        relayTurnSettling = false
         // QA-3 S8/A4: a fresh turn starts with a clean liveness slate (covers
         // turns this phone did NOT send — a mid-turn resume projection; the
         // driven-send path resets at `relayTurnLive = true`).
@@ -1632,11 +1645,31 @@ final class ChatStore {
     /// session it belongs to.
     private var resolvedRelayGateIDs: Set<String> = []
 
+    /// I23 (amendment G3): the DURABLE mirror key. The in-memory set is
+    /// session-scoped (``reset()`` drops it); the durable record survives a
+    /// kill in ANY session — cold-open suppression of an answered gate is
+    /// exactly its purpose. Same 256 bound (drop-all). W2e design call (RED
+    /// matrix flip map): phone-side durability instead of relay-side ring
+    /// withholding — the store-level oracle cannot observe the relay ring,
+    /// and the phone's own record is the local authority regardless.
+    private static let resolvedRelayGateIDsDefaultsKey = "relay.resolvedGateIDs.v1"
+
     private func markRelayGateResolved(_ id: String) {
         guard !id.isEmpty else { return }
         resolvedRelayGateIDs.insert(id)
         if resolvedRelayGateIDs.count > 256 { resolvedRelayGateIDs.removeAll() }
+        UserDefaults.standard.set(
+            Array(resolvedRelayGateIDs), forKey: Self.resolvedRelayGateIDsDefaultsKey
+        )
     }
+
+    #if DEBUG
+    /// DEBUG/test seam: drop the DURABLE resolved-gate record (I23) — contract
+    /// suites clear it in teardown so persisted state never leaks across runs.
+    static func _debugClearDurableResolvedGates() {
+        UserDefaults.standard.removeObject(forKey: resolvedRelayGateIDsDefaultsKey)
+    }
+    #endif
 
     /// Relay analogue of `handleApprovalRequest`: fold a decoded
     /// `approval.request` frame into the SAME `pendingApproval` the Turn Dock's
@@ -2705,6 +2738,10 @@ final class ChatStore {
                 relayProjected: true
             ))
             relayTurnLive = true
+            // R5: a new send starts a fresh turn — any lingering local-STOP
+            // mark belongs to the turn the user just stopped; its frames
+            // must not gate THIS turn's stream.
+            relayTurnSettling = false
             // QA-3 S8/A4: the driven turn's liveness clock starts at send —
             // silence is measured from here until the first CURRENT-turn frame
             // (the stage-1 silent resync and the stage-2 settle key off it).
@@ -3317,6 +3354,11 @@ final class ChatStore {
                 lastError = "Relay not connected"
                 return
             }
+            // R5 (contract B1/I9): LOCAL SETTLEMENT FIRST — the UI settles the
+            // instant the tap lands; the interrupt RPC goes out second. The
+            // settling mark gates this turn's late frames to no-ops and (pre-L3
+            // compat) distinguishes the stop on a reason-less `turn.completed`.
+            settleLocalStopFirst()
             do {
                 _ = try await coordinator.interrupt(interruptTarget)
             } catch {
@@ -3339,6 +3381,38 @@ final class ChatStore {
     /// runtime when one is live, else the local active session. Factored out
     /// so the routing fact (R1 #2) is directly assertable in tests.
     var interruptTarget: String? { mirroringRuntimeId ?? activeSessionId }
+
+    /// R5 (contract B1/I9): local STOP settlement FIRST — the UI settles the
+    /// INSTANT the tap lands, before the interrupt RPC leaves: mark the turn
+    /// settling (the coordinator gates this turn's late frames to no-ops),
+    /// finalize the partial text (keep a non-empty streaming row, drop the
+    /// empty optimistic caret bubble), and clear the busy/stop affordance.
+    /// The authoritative `turn.completed{reason:interrupted}` settles the
+    /// entry afterwards (Live Activity end, queue HOLD — the L3 wire-truth
+    /// split); until then this mark + the settling state carry the stop.
+    private func settleLocalStopFirst() {
+        guard isStreaming || relayTurnLive else { return }
+        relayTurnSettling = true
+        relayTurnLive = false
+        // Finalize the partial text in place: a non-empty streaming row keeps
+        // its content and freezes; the empty optimistic caret bubble drops
+        // (nothing to keep — B1 "keep non-empty, drop empty caret").
+        var index = messages.count - 1
+        while index >= 0 {
+            if messages[index].relayProjected,
+               messages[index].role == .assistant,
+               messages[index].isStreaming {
+                if messages[index].parts.isEmpty {
+                    messages.remove(at: index)
+                } else {
+                    messages[index].isStreaming = false
+                }
+            }
+            index -= 1
+        }
+        streamingMessageID = nil
+        setStreaming(false, reason: "interrupt.localSettle")
+    }
 
     // MARK: - Manual context compression
 
@@ -4931,7 +5005,15 @@ final class ChatStore {
         // The relay gate-suppression set belongs to the session being torn
         // down (QA-1 B10) — never let it leak into the next session and
         // suppress a legitimately new gate that reuses a request id space.
+        // (The DURABLE I23 mirror intentionally survives — a kill in ANY
+        // session must keep an answered gate down on cold open.)
         resolvedRelayGateIDs.removeAll()
+        // R5/I21: the settled-turn latch belongs to the torn-down session too
+        // (turn ids carry the session id, but drop them with the session).
+        settledRelayTurnIDs.removeAll()
+        relayTurnSettleLatched = false
+        relayTurnSawErrorItem = false
+        relayTurnSettling = false
         // A transient secure prompt belongs to the session being torn down; drop
         // it (no value is held here — see PendingSecurePrompt). The view's
         // `@State` value clears itself on dismissal.
@@ -5164,12 +5246,17 @@ final class ChatStore {
                 segmentInterrupted = false
                 return
             }
+            let segmentID = ChatMessage.deterministicID(seedKey: "relay-assistant-\(anchor)")
             rebuilt.append(ChatMessage(
-                id: ChatMessage.deterministicID(seedKey: "relay-assistant-\(anchor)"),
+                id: segmentID,
                 role: .assistant,
                 parts: segmentParts,
                 isStreaming: segmentStreaming,
                 interrupted: segmentInterrupted && !segmentStreaming,
+                // I21: a re-projection inherits the prior row's timestamp —
+                // never a fresh `Date()` — so a resync replay converges to
+                // the byte-identical transcript.
+                timestamp: messages.first(where: { $0.id == segmentID })?.timestamp ?? Date(),
                 relayProjected: true
             ))
             segmentParts = []
@@ -5182,14 +5269,21 @@ final class ChatStore {
             if item.type == .userMessage {
                 flushSegment()
                 let adoption = adoptRelayEcho(for: item, consuming: &consumedEchoIDs)
+                let userRowID = adoption?.id
+                    ?? ChatMessage.deterministicID(seedKey: "relay-user-\(item.itemID)")
                 rebuilt.append(ChatMessage(
-                    id: adoption?.id
-                        ?? ChatMessage.deterministicID(seedKey: "relay-user-\(item.itemID)"),
+                    id: userRowID,
                     role: .user,
                     clientMessageID: adoption?.clientMessageID
                         ?? item.body["client_message_id"]?.stringValue,
                     parts: [.text(id: item.itemID, text: item.textBody)],
-                    timestamp: adoption?.timestamp ?? Date(),
+                    // I21: the adopted echo's timestamp on first adoption, the
+                    // prior projection's thereafter — NEVER a fresh `Date()` —
+                    // so a resync replay (the echo already consumed) converges
+                    // to the byte-identical transcript.
+                    timestamp: adoption?.timestamp
+                        ?? messages.first(where: { $0.id == userRowID })?.timestamp
+                        ?? Date(),
                     relayProjected: true
                 ))
             } else if let part = item.renderPart {
@@ -5225,14 +5319,18 @@ final class ChatStore {
                 lastUserRowID = rebuilt[index].id
             } else if rebuilt[index].role == .assistant, let userRowID = lastUserRowID {
                 let seg = rebuilt[index]
+                let assistantID = Self.relayAssistantID(forUserRowID: userRowID)
                 rebuilt[index] = ChatMessage(
-                    id: Self.relayAssistantID(forUserRowID: userRowID),
+                    id: assistantID,
                     role: .assistant,
                     parts: seg.parts,
                     isStreaming: seg.isStreaming,
                     interrupted: seg.interrupted,
                     reasoningElapsed: seg.reasoningElapsed,
-                    timestamp: seg.timestamp,
+                    // I21: inherit the prior projection's timestamp under the
+                    // FINAL (re-keyed) id — a replay converges byte-identical.
+                    timestamp: messages.first(where: { $0.id == assistantID })?.timestamp
+                        ?? seg.timestamp,
                     relayProjected: true
                 )
             }
@@ -5429,39 +5527,95 @@ final class ChatStore {
         setStreaming(nowStreaming, reason: "relayProjection")
     }
 
-    // MARK: - R16 relay turn-lifecycle seams
+    // MARK: - R5 relay turn-end semantics (contract I9/I21 — L3 wire-truth reason)
 
-    /// R16: per-relay-turn latch. Set by ``notifyRelayTurnDiscarded()`` when a
-    /// failed `.error` item arrives, so the subsequent `.turnCompleted` frame
-    /// (which the relay emits even for errored turns) does NOT fire
-    /// ``notifyRelayTurnCompleted()`` and auto-drain the queue into a session
-    /// that just errored (parity with the direct path's `handleGatewayError`,
-    /// which fires `onTurnDiscarded` — never `onTurnComplete`). Reset on the
-    /// next turn's start (``markTurnStartedIfNeeded``).
-    private var relayTurnTerminatedByError = false
+    /// R5/W2e (contract I9/B1): the local-STOP mark. `interrupt()` settles the
+    /// UI FIRST (partial text finalized, busy/stop affordance cleared) and
+    /// marks the current turn settling; the coordinator gates LATE item frames
+    /// of the turn (crossed the interrupt in flight; a resync ring replay) to
+    /// no-ops until the authoritative `turn.completed` settles it. Cleared on
+    /// that settle, the next turn start, a new send, an authoritative snapshot
+    /// re-baseline, and any wholesale teardown. ALSO the pre-L3 COMPAT input
+    /// that distinguishes a user stop on a reason-less `turn.completed`
+    /// (deleted with the compat branch in W3b — RR5).
+    private(set) var relayTurnSettling = false
 
-    /// R16: fire the turn-COMPLETE Live Activity end seam from the relay
-    /// coordinator's `.turnCompleted` handler. The relay path never flows
-    /// through `handleMessageComplete` (which fires this on the direct
-    /// path), so without it the activity's `startedAt` drove the lock-screen
-    /// timer ENDLESSLY (owner's R16 complaint). Suppressed when the turn
-    /// already errored (see ``relayTurnTerminatedByError``). Idempotent: the
-    /// closures route to `LiveActivityManager.end()` (no-op when nothing is
-    /// live) and the queue-drain pipeline (no-op when no turn was live).
-    func notifyRelayTurnCompleted() {
-        guard !relayTurnTerminatedByError else { return }
-        onTurnComplete?()
+    /// R5/W2e (contract I9, L3 consume): a failed `.error` item arrived for
+    /// the current turn. Wire-truth `reason:error` on `turn.completed` (lane
+    /// L3) supersedes it; this flag is the COMPAT input for a pre-L3 relay's
+    /// reason-less `turn.completed` (RR5) — the signal the deleted
+    /// `relayTurnTerminatedByError` latch carried. Deleted with the compat
+    /// branch in W3b.
+    private var relayTurnSawErrorItem = false
+
+    /// I21: turn ids whose settle seam already fired. A resync replay /
+    /// snapshot re-delivery re-emits the settled turn's `turn.completed` (and
+    /// `.error` item); the seam fires ONCE per turn (the double drain / double
+    /// LA-end the W0a RED matrix recorded). Bounded: drop-all past 64 — replay
+    /// windows are short and a dropped key at worst re-fires one idempotent
+    /// LA end.
+    private var settledRelayTurnIDs: Set<String> = []
+
+    /// Id-less settle latch (frames without a `turn`): one seam per turn.
+    private var relayTurnSettleLatched = false
+
+    /// R5: the ONE relay turn-end seam (contract I9 — `turn.completed{reason}`
+    /// is the sole completion edge; stopped ≠ completed). `completed` ⇒ the
+    /// queue MAY drain (`onTurnComplete` → drain pipeline); `interrupted`
+    /// (user stop) / `error` ⇒ the queue HOLDS (`onTurnDiscarded` → Live
+    /// Activity end only). Latched once per turn (I21). The watchdog's
+    /// PROVISIONAL stage-2 settle does NOT route through here — a late
+    /// authoritative `turn.completed` must still fire its honest seam
+    /// (a frame-silent turn resurrects; contract I10).
+    private func settleRelayTurn(_ turnID: String?, completed: Bool) {
+        if let turnID, !turnID.isEmpty {
+            guard settledRelayTurnIDs.insert(turnID).inserted else { return }
+            if settledRelayTurnIDs.count > 64 { settledRelayTurnIDs.removeAll() }
+        } else {
+            guard !relayTurnSettleLatched else { return }
+            relayTurnSettleLatched = true
+        }
+        relayTurnSettling = false
+        relayTurnSawErrorItem = false
+        if completed { onTurnComplete?() } else { onTurnDiscarded?() }
     }
 
-    /// R16: fire the turn-DISCARD Live Activity end seam when the relay
-    /// ingests a failed `.error` item — parity with the direct path's
-    /// `handleGatewayError` (a discard, NOT a completion, so the queue does
-    /// not auto-drain into a session that just errored). Idempotent. Latches
-    /// ``relayTurnTerminatedByError`` so the trailing `.turnCompleted` does
-    /// not fire a spurious completion.
-    func notifyRelayTurnDiscarded() {
-        relayTurnTerminatedByError = true
-        onTurnDiscarded?()
+    /// R5 (contract I9, lane L3): fire the turn-end seam from the relay
+    /// coordinator's `.turnCompleted` handler, split on the relay's
+    /// wire-truth `reason`: `completed` ⇒ drain; `interrupted` / `error` ⇒
+    /// HOLD (stopped ≠ completed). The relay path never flows through
+    /// `handleMessageComplete` (direct path), so this seam is the Live
+    /// Activity's only end edge on relay reach (R16).
+    func notifyRelayTurnCompleted(turnID: String?, reason: String?) {
+        let completed: Bool
+        if let reason, !reason.isEmpty {
+            completed = (reason == "completed")   // wire truth (L3)
+        } else {
+            // COMPAT — pre-L3 relay (RR5): no `reason` on the wire; fall back
+            // to the local signals the deleted `relayTurnTerminatedByError`
+            // latch carried (user stop via the settling mark, error via the
+            // error-item flag). W3b deletes this branch once every relay
+            // stamps reason.
+            completed = !relayTurnSettling && !relayTurnSawErrorItem
+        }
+        settleRelayTurn(turnID, completed: completed)
+    }
+
+    /// R5: a failed `.error` item is a turn TERMINAL (parity with the direct
+    /// path's `handleGatewayError`): fire the DISCARD seam — the queue does
+    /// NOT drain into a session that just errored. The trailing
+    /// `.turnCompleted` (the relay emits one even for errored turns) is
+    /// suppressed by the once-per-turn latch (I21).
+    func notifyRelayTurnDiscarded(turnID: String?) {
+        relayTurnSawErrorItem = true
+        settleRelayTurn(turnID, completed: false)
+    }
+
+    /// R5 (contract I3/I9): a `snapshot` is an authoritative re-baseline — it
+    /// supersedes a local-STOP settlement (the server truth wins; the stopped
+    /// turn's items re-project exactly as the snapshot carries them).
+    func noteAuthoritativeRebaseline() {
+        relayTurnSettling = false
     }
 
     /// Surface a failed `open()`-path transcript seed the same way a failed
@@ -5489,6 +5643,12 @@ final class ChatStore {
         // session's rows; drop them with it.
         relayTurnLive = false
         relaySettledElapsed = [:]
+        // R5: the torn-down turn's settle state dies with it (a new turn's
+        // `turn.completed` must fire its seam; a lingering local-stop mark
+        // would gate the NEXT turn's frames).
+        relayTurnSettling = false
+        relayTurnSawErrorItem = false
+        relayTurnSettleLatched = false
         resetTurnLivenessState()   // QA-3 S8/A4: the torn-down turn's liveness state dies with it
         setStreaming(false, reason: "cancelStreaming")
         mirroringRuntimeId = nil
@@ -5628,11 +5788,9 @@ final class ChatStore {
     /// authority has nothing more). Settle it: the coordinator locally
     /// terminals the stuck items (muted "Interrupted" fold — C3, never an
     /// error banner) and the live flag clears, so eternal double-working is
-    /// unreachable. Mirrors `handleMessageComplete`'s chrome teardown + fires
-    /// `onTurnComplete` so the Live Activity ends in parity with a real
-    /// completion (R16 depends on this edge). The normal `turn.completed` /
-    /// `message.complete` / interrupt paths settle via `setStreaming(false)`
-    /// first; this fires only when none of those landed in time.
+    /// unreachable. The normal `turn.completed` / `message.complete` /
+    /// interrupt paths settle via `setStreaming(false)` first; this fires
+    /// only when none of those landed in time.
     private func fireTurnLivenessSettle() {
         guard isStreaming else { return }
         chatLog.warning("turn-liveness stage 2: turn silent past the settle window with no completion even after the silent resync — settling as INTERRUPTED so eternal double-working is impossible (C3: no error surface)")
@@ -5653,7 +5811,16 @@ final class ChatStore {
         activeToolName = nil
         activeToolCallId = nil
         resetTurnLivenessState()
-        onTurnComplete?()
+        // R5 (contract I10/B4 — Matrix B §4 gap): a PROVISIONAL watchdog
+        // settle ends the Live Activity + gates ONLY — it never drains the
+        // queue: the turn may still be live on the gateway (a frame-silent
+        // tool) and a late frame resurrects it, after which the honest
+        // `turn.completed{reason}` fires the real seam. Base fired
+        // `onTurnComplete` here — a false-positive settle drained a queued
+        // prompt into the still-running turn (4009 churn). The settle does
+        // NOT latch the turn (``settleRelayTurn`` is NOT called): the
+        // authoritative completion must still fire its seam.
+        onTurnDiscarded?()
     }
 
     /// Reset the per-turn liveness state (turn start / every settle path).
