@@ -459,6 +459,16 @@ final class ContractReconcileW2dTests: XCTestCase {
         s.chat.seed(normalized: [tail, echo])
         XCTAssertEqual(s.chat.messages.count, 2)
         let echoID = echo.id
+        // Production-faithful drive (integration fix): a cache paint is one
+        // the STORE records — every paint the store drives stamps the
+        // `transcriptPaintedStoredId` provenance, and open()'s phase-1 keys
+        // HIT/miss off it. A direct `chat.seed` bypasses that, so register
+        // the warm snapshot exactly as the disk-HIT path does; otherwise
+        // open()'s cache-MISS reset wipes the paint before the snapshot
+        // arrives — a paint+miss state that never co-exists in production
+        // (paint only ever comes from a HIT) and that defeats the in-place
+        // adoption this test pins (I3/I8).
+        s.sessions.rememberWarmOpenSnapshot([tail, echo], for: "w2d-i3-open")
 
         // Open: the resume snapshot (carrying the same cmid) is the sole
         // authoritative seed — no history RPC may race it.
