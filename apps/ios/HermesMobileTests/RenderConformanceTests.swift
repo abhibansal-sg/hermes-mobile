@@ -208,6 +208,10 @@ final class RenderConformanceTests: XCTestCase {
     override func tearDown() {
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.transportPath)
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+        // W2e/I23 hygiene: the DURABLE answered-gate record persists across
+        // stores by design — clear it so a rid this suite answered (the
+        // fixture gates) never suppresses the next test's re-delivery.
+        ChatStore._debugClearDurableResolvedGates()
         super.tearDown()
     }
 
