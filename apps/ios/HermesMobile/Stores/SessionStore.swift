@@ -3582,6 +3582,55 @@ final class SessionStore {
     private var pendingDrawerReveal: (@MainActor () -> Void)?
     private static let drawerRevealDeadline: Duration = .milliseconds(300)
 
+    /// S9 (QA-3, 3rd recurrence): a monotonic epoch + wall-clock stamp of the
+    /// most recent USER drawer gesture. Bumped by ``recordDrawerUserGesture``
+    /// on every gesture that takes control of navigation (drawer row tap →
+    /// `open(_:revealOnFirstPaint:)`, search-result tap, "New chat" →
+    /// `startDraft`). The dismissal latch (`pendingDrawerReveal`) is a one-shot
+    /// consumed at first-paint/300ms — but programmatic RE-OPEN edges
+    /// (``PendingIntentRouter/drainDurable`` over a parked `.openSessions` App
+    /// Intent, legacy `drain`, the notification route) are unserialized against
+    /// it: a foreground transition that re-drains an older open-intent AFTER
+    /// the tap-close fires re-opens the drawer over the in-flight load
+    /// (last-writer-wins = the intent, not the user). The epoch lets those
+    /// open-intents detect that the user has since taken control — they carry
+    /// their queue `createdAt` and drop themselves when the user gestured at
+    /// or after that instant. The user's in-app gesture always wins.
+    private var drawerUserGestureEpoch: UInt64 = 0
+    private var drawerUserGestureAt: Date = .distantPast
+
+    /// Record a user-initiated drawer navigation gesture (row tap, search-result
+    /// tap, "New chat" draft). The wall-clock stamp is compared against a
+    /// programmatic open-intent's queue time so an intent queued BEFORE the
+    /// gesture is dropped; the epoch lets an in-flight intent that captured the
+    /// value before an await detect the bump after it. Test-injectable `now`
+    /// keeps the regression deterministic.
+    func recordDrawerUserGesture(now: Date = Date()) {
+        drawerUserGestureEpoch &+= 1
+        drawerUserGestureAt = now
+    }
+
+    /// Read the current gesture epoch. Programmatic open-intent paths capture
+    /// this BEFORE their first await so a user gesture that lands during the
+    /// await is detectable after it (`drawerUserGestureEpochAdvanced(since:)`).
+    func currentDrawerUserGestureEpoch() -> UInt64 {
+        drawerUserGestureEpoch
+    }
+
+    /// True iff a user drawer gesture landed strictly after `epoch` was
+    /// captured. Used by open-intent paths that capture-then-await.
+    func drawerUserGestureEpochAdvanced(since epoch: UInt64) -> Bool {
+        drawerUserGestureEpoch > epoch
+    }
+
+    /// True iff a user drawer gesture landed at or after `queuedAt`. Used by
+    /// ``PendingIntentRouter/drainDurable`` to drop a `.openSessions` App Intent
+    /// whose queue time PREDATES the user's more recent in-app navigation —
+    /// exactly the tap-during-in-flight-load race (S9).
+    func drawerUserGestureHappenedSince(_ queuedAt: Date) -> Bool {
+        drawerUserGestureAt >= queuedAt
+    }
+
     /// Consume the pending drawer dismissal exactly once (QA-1 B3). Both fire
     /// edges — first paint (``seedTranscriptCacheFirst``) and the liveness
     /// deadline armed in ``open(_:)`` — funnel here, so whichever wins closes
@@ -3730,6 +3779,15 @@ final class SessionStore {
         // rotation that stranded it before.
         if let revealOnFirstPaint {
             pendingDrawerReveal = revealOnFirstPaint
+            // S9 (QA-3): a drawer row tap is a USER gesture that takes control
+            // of navigation — the drawer will close on first paint / 300ms
+            // deadline. Stamp the epoch + wall-clock so a programmatic open
+            // intent (drainDurable over a parked `.openSessions` App Intent,
+            // re-drained on the foreground transition that accompanies the
+            // tap-during-in-flight-load race) can detect that the user acted
+            // AFTER it was queued and drop itself instead of re-opening the
+            // drawer over the in-flight load.
+            recordDrawerUserGesture()
         }
         let drawerIntentPending = pendingDrawerReveal != nil
         activeRuntimeId = nil          // gates the composer until resume lands
@@ -4106,6 +4164,12 @@ final class SessionStore {
         // `onNavigate` itself; a programmatic draft must not inherit a stale
         // close that could fire later against a re-opened drawer).
         pendingDrawerReveal = nil
+        // S9 (QA-3): "New chat" is a USER drawer navigation gesture — the same
+        // 3rd-recurrence race applies (drainDurable re-opening the drawer over
+        // a fresh draft). Stamp the epoch so a stale `.openSessions` App Intent
+        // drained on the foreground transition drops itself instead of
+        // clobbering the draft surface.
+        recordDrawerUserGesture()
         cancelEnsureRuntime()
         cancelRuntimeBinding()
         isDraft = true
@@ -4119,6 +4183,16 @@ final class SessionStore {
         // A draft has NO session: drop the previous session's hot-swap state
         // (else the pill shows the LAST chat's model) and any stale draft pick.
         connection?.clearSessionState()
+        // S11 (QA-3): park the relay coordinator's item→transcript projection
+        // so the previous session's in-flight turn does NOT leak onto the empty
+        // draft surface. startDraft does not touch the coordinator's
+        // activeSessionID (a draft has no session id), so without this park the
+        // pump's next applyRelayItems would paint the previous session's live
+        // "Working… · ToolCall Ns" rows onto the draft chat (IMG_2594). The
+        // coordinator keeps driving the previous session for reconnect-resync
+        // and durable-outbox routing; only the projection onto the chat surface
+        // is suspended until a real session binds (resume/open/start clear it).
+        connection?.relayCoordinator?.suppressProjectionForDraft()
         // ABH-351: capture the cwd for the new-session-in-project flow. An
         // explicit non-empty path seeds the draft so the materializing
         // session.create carries it; nil/empty = the gateway default.
@@ -6333,6 +6407,23 @@ final class ProjectsStore {
         defer { projectSessionsLoadingIds.remove(project.id) }
         do {
             let result = try await fetchProjectSessionsWithRetry(fetch)
+            // S10 (QA-3): never accept a fallback `[]` as authoritative when
+            // the project overview's `sessionCount > 0`. The overview count
+            // comes from the same `_build_project_tree` machinery that folds
+            // worktrees, so a non-zero count is authoritative — a `[]` here
+            // means the detail query's cwd_prefix path missed worktree cwds
+            // (the server fix in `_cwd_prefix_clause` closes this; this is the
+            // iOS-side defensive backstop while the relay/plugin propagates).
+            // Treat an empty-list-when-count>0 as a transient failure so the
+            // detail surfaces a "Reconnecting to gateway — retry" state rather
+            // than a lying "No sessions yet" (IMG_2593). Preserve any prior
+            // non-empty list so the UI doesn't flicker to empty on a blip.
+            if result.sessions.isEmpty && project.sessionCount > 0 {
+                if projectSessionsById[project.id] == nil {
+                    projectSessionsErrorById[project.id] = Self.projectSessionsEmptyButCountedMessage
+                }
+                return
+            }
             projectSessionsById[project.id] = result.sessions
             projectSessionsErrorById[project.id] = nil
             writeThroughProjectSessions(result.sessions, for: project)
@@ -6342,6 +6433,12 @@ final class ProjectsStore {
             }
         }
     }
+
+    /// S10: surfaced copy when the detail fetch returned `[]` but the project
+    /// overview's `sessionCount > 0`. Same directional copy as a transient
+    /// failure — the user should retry; a lying "No sessions yet" is not
+    /// actionable. Distinct constant so a test can pin the contract.
+    static let projectSessionsEmptyButCountedMessage = "Reconnecting to gateway — retry"
 
     /// Runs `fetch` (which already carries the 404/transient → `cwd_prefix`
     /// fallback above); on a transient failure from THAT combined attempt,
