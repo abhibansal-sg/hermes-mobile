@@ -634,6 +634,7 @@ def register_token(
                     e for e in entries
                     if e is matched or e.get("device_id") != device_id
                 ]
+                entries = _evict_null_device_id_legacy(entries, platform=platform)
             _save_registry(entries)
             return True
         new_entry: Dict[str, Any] = {
@@ -650,6 +651,7 @@ def register_token(
             for idx, entry in enumerate(entries):
                 if entry.get("device_id") == device_id:
                     entries[idx] = new_entry
+                    entries = _evict_null_device_id_legacy(entries, platform=platform)
                     _save_registry(entries)
                     _log.info(
                         "push registry: device …%s rotated its token — "
@@ -658,8 +660,53 @@ def register_token(
                     )
                     return True
         entries.append(new_entry)
+        if device_id:
+            # QA-3 S13: a successful device_id-keyed registration converges the
+            # registry by evicting legacy null-device_id rows for this platform
+            # — the pre-device-id-dedup rows that QA-2's eviction could never
+            # reach (they have no device_id to match). Fan-out then posts to
+            # exactly one token per device instead of N stale ones Apple 200s
+            # into the void.
+            entries = _evict_null_device_id_legacy(entries, platform=platform)
         _save_registry(entries)
     return True
+
+
+def _evict_null_device_id_legacy(
+    entries: List[Dict[str, Any]], *, platform: str
+) -> List[Dict[str, Any]]:
+    """Drop legacy entries with no ``device_id`` for ``platform`` (QA-3 S13).
+
+    Rows stamped without a ``device_id`` predate the device-id dedup protocol
+    (or were written by a client that never sent one — the build-116 phone
+    before the per-install-id iOS fix). They survive QA-2's device-keyed
+    eviction because that path only removes rows whose ``device_id`` *matches*
+    — null-id rows match nothing, so fan-out keeps posting to them (Apple
+    returns 200 for a stale token into the void, so they never age out).
+
+    A real device that is still active re-registers on every launch with a
+    device_id (after the iOS per-install-id fix), so once ANY device_id-keyed
+    registration lands for a platform, the null-id rows for that platform are
+    definitionally superseded and safe to drop. Logged for diagnosability.
+    """
+    if not entries:
+        return entries
+    kept: List[Dict[str, Any]] = []
+    evicted = 0
+    for entry in entries:
+        same_platform = entry.get("platform", "ios") == platform
+        has_device_id = bool(entry.get("device_id"))
+        if same_platform and not has_device_id:
+            evicted += 1
+            continue
+        kept.append(entry)
+    if evicted:
+        _log.info(
+            "push registry: evicted %d legacy null-device_id %s entr%s "
+            "(device_id-keyed registration converges the registry)",
+            evicted, platform, "y" if evicted == 1 else "ies",
+        )
+    return kept
 
 
 def unregister_token(token: str) -> bool:
