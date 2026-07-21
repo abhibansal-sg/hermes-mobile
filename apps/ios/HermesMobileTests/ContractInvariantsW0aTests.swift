@@ -97,6 +97,9 @@ final class ContractInvariantsW0aTests: XCTestCase {
     override func tearDown() {
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.transportPath)
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+        // I23 durability hygiene: the answered-gate record persists across
+        // stores BY DESIGN — clear it so no run's state leaks into the next.
+        ChatStore._debugClearDurableResolvedGates()
         super.tearDown()
     }
 
@@ -828,6 +831,52 @@ final class ContractInvariantsW0aTests: XCTestCase {
         XCTAssertEqual(discards.value, 1, "I9: [error, turn.completed] ⇒ exactly one discard")
         XCTAssertEqual(drains.value, 0, "I9: [error, turn.completed] ⇒ zero drains")
         XCTAssertNil(g.chat.lastError, "C3: the relay error surfaces via the item fold, never raw")
+    }
+
+    /// I9 **compat branch (RR5 — deleted in W3b):** a pre-L3 relay stamps NO
+    /// `reason` on `turn.completed`; the phone falls back to the local signals
+    /// the deleted `relayTurnTerminatedByError` latch carried — a user STOP
+    /// (the `settling` mark) ⇒ discard + queue HOLD. Pins the compat semantics
+    /// so nothing removes the branch before W3b ships the relay-side ratchet.
+    /// (The reasonless HAPPY path — no stop, no error ⇒ drain — is pinned by
+    /// `testI21_FixtureReplayConverges_TranscriptAndSideEffects`'s `d1 == 1`.)
+    func testI9_PreL3Compat_ReasonlessStopThenCompletion_HoldsQueue() async throws {
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open("w0a-i9c-A")
+        g.sessions.activeStoredId = "w0a-i9c-A"
+        g.sessions.activeRuntimeId = "w0a-i9c-A"
+
+        let drains = Counter()
+        let discards = Counter()
+        g.chat.onTurnComplete = { drains.value += 1 }
+        g.chat.onTurnDiscarded = { discards.value += 1 }
+
+        _ = await g.chat.send(text: "stop then reasonless completion")
+        let echo = try XCTUnwrap(g.chat.messages.first { $0.text == "stop then reasonless completion" })
+        let cmid = try XCTUnwrap(echo.clientMessageID)
+        var f = Frames("w0a-i9c-A")
+        deliver(g, [
+            f.userCompleted(id: "w0a-i9c-A:u1", ord: 0,
+                            text: "stop then reasonless completion", cmid: cmid),
+            f.turnStarted("w0a-i9c-A:t1"),
+            f.agentStarted(id: "w0a-i9c-A:a1", ord: 1, turn: "w0a-i9c-A:t1"),
+            f.agentDelta(id: "w0a-i9c-A:a1", "partial"),
+        ])
+        await waitUntil {
+            g.chat.messages.contains { $0.role == .assistant && $0.text == "partial" }
+        }
+        await g.chat.interrupt()   // local settlement: the settling mark arms
+
+        // Pre-L3 wire: `turn.completed` WITHOUT `reason` — the compat branch
+        // reads the settling mark ⇒ discard, queue HOLD.
+        deliver(g, [f.turnCompleted("w0a-i9c-A:t1")])
+        await pumpSettle()
+
+        XCTAssertEqual(discards.value, 1,
+            "I9 compat: a stopped turn's reasonless completion discards (LA ends)")
+        XCTAssertEqual(drains.value, 0,
+            "I9 compat: …and the queue HOLDS — the settling mark carries the stop the deleted latch used to")
     }
 
     // MARK: - I10 — Liveness (injected virtual clock; no wall-clock sleeps)
