@@ -4399,7 +4399,12 @@ final class SessionStore {
     /// overwritten with (the relay may echo a DISTINCT live id after a
     /// resume-remap — the stored id stays the phone's identity), and a deduped
     /// retry (`deduplicated: true`) must not churn the pointers.
-    func landRelayCreatedSession(storedID: String) {
+    ///
+    /// R2 (contract I8/G4): the draft send's optimistic echo had no stored
+    /// session to key under at append time (a draft has no id), so it is
+    /// RE-HOMED onto the created session HERE, at adoption — one identity,
+    /// persisted once, never re-keyed by a second call after the fact.
+    func landRelayCreatedSession(storedID: String, echo: ChatMessage? = nil) {
         guard isDraft || activeStoredId == nil else { return }
         isDraft = false
         activeStoredId = storedID
@@ -4408,6 +4413,7 @@ final class SessionStore {
         ensureRuntimeAttempts = 0
         lastError = nil
         sessionActionError = nil
+        if let echo { persistDurableEcho(storedId: storedID, echo: echo) }
         // Surface the new row in the drawer; never block the turn on it
         // (mirrors `createDraftSession`'s background refresh).
         Task { [weak self] in await self?.refresh() }
