@@ -1448,36 +1448,40 @@ final class RenderConformanceTests: XCTestCase {
     /// streaming cursor at different instants produce DIFFERENT pixels (the
     /// pulse is a function of the clock, so any mount/re-projection resumes
     /// mid-phase instead of stranding static — the motionless bar of
-    /// IMG_2577/2585/2587), while Reduce Motion renders byte-identical static
-    /// frames. FAILS on qa3/base (the onAppear-kicked `repeatForever` @State:
-    /// a fresh mount without an `isStreaming` edge never started the pulse —
-    /// re-render the component and both frames are identical at full opacity).
+    /// IMG_2577/2585/2587), while a SETTLED cursor renders byte-identical
+    /// static frames (the same paused/static branch Reduce Motion takes —
+    /// `\.accessibilityReduceMotion` is read-only and cannot be injected in a
+    /// test environment; the Reduce-Motion branch itself is pinned by
+    /// `testStreamingCursorStaticWhenSettledOrReduceMotion`). FAILS on
+    /// qa3/base (the onAppear-kicked `repeatForever` @State: a fresh mount
+    /// without an `isStreaming` edge never started the pulse — re-render the
+    /// component and both frames are identical at full opacity).
     @MainActor
     func testStreamingCursor_BreatheSurvivesRemount_Snapshot() async throws {
-        func renderCursor(reduceMotion: Bool) -> Data? {
+        func renderCursor(streaming: Bool) -> Data? {
             let renderer = ImageRenderer(content:
-                StreamingCursor(isStreaming: true)
+                StreamingCursor(isStreaming: streaming)
                     .font(.body)
                     .frame(width: 40, height: 28)
                     .environment(\.hermesTheme, HermesThemePresets.nousLight)
-                    .environment(\.accessibilityReduceMotion, reduceMotion)
             )
             renderer.scale = 2
             return renderer.uiImage?.pngData()
         }
 
-        let frameA = try XCTUnwrap(renderCursor(reduceMotion: false))
+        let frameA = try XCTUnwrap(renderCursor(streaming: true))
         try await Task.sleep(for: .milliseconds(350))   // ~0.29 of the 1.2 s period
-        let frameB = try XCTUnwrap(renderCursor(reduceMotion: false))
+        let frameB = try XCTUnwrap(renderCursor(streaming: true))
         XCTAssertNotEqual(frameA, frameB,
             "spec S1/A10: the breathe is clock-driven — a fresh render at any instant shows the live phase, never a stranded static glyph")
 
-        // Reduce Motion: static full-opacity frames, byte-identical across time.
-        let calmA = try XCTUnwrap(renderCursor(reduceMotion: true))
+        // Settled (and Reduce Motion, same branch): static full-opacity
+        // frames, byte-identical across time.
+        let calmA = try XCTUnwrap(renderCursor(streaming: false))
         try await Task.sleep(for: .milliseconds(120))
-        let calmB = try XCTUnwrap(renderCursor(reduceMotion: true))
+        let calmB = try XCTUnwrap(renderCursor(streaming: false))
         XCTAssertEqual(calmA, calmB,
-            "spec A10: Reduce Motion renders the cursor static")
+            "spec A10: a non-streaming cursor renders static (the Reduce Motion path)")
     }
 
     // MARK: - QA-3 incident-fixture contract (loader backward-compat + shapes)
