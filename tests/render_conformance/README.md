@@ -140,11 +140,50 @@ intermediate tree passes the EXISTING gate — the RED-by-design tests would
 break it mid-migration). Standalone run below; the suite joins the gate when
 the Wave-2 exit (all 23 invariants green) lands.
 
+## ROUND-4 W2d — R3 single reconcile owner (I3 / I14 / I4-cancel)
+
+`apps/ios/HermesMobileTests/ContractReconcileW2dTests.swift` extends this
+suite (same `MockRelayTransport` harness) with the R3 rewire's oracles. The
+RPC-SPY is `transport.upstreams()` — the XCTest analogue of the W0b e2e
+cancel-spy (`phone.cancelled` / `rest_reads`) that pins the relay HALF of the
+same invariants in `test_j_contract_rpc_spy.py`; the tests here pin the
+PHONE-side budget. Budget unit: a "transcript read" is an `open` / `resume` /
+`history` upstream (each costs the gateway one REST read through the relay);
+`resync` is relay-LOCAL (ring/store snapshot, zero gateway hops).
+
+| Test | Contract | Status on r4/base (RED matrix) |
+|---|---|---|
+| `testI14_ColdOpenRelay_CostsExactlyOneTranscriptRead` | I14/A1 | FAILS — 3 reads `[history, resume, open]` (the D6 triple-fetch: phase-2 seed + bind resume + `.open`-edge replay re-establish) |
+| `testI14_TapActiveSession_CostsZeroRPCs` | I14/A12 | FAILS — 2 reads `[resume, history]` |
+| `testI14_WarmSwitchBack_CostsAtMostOneRead` | I14 | FAILS — 2 reads (≤1 after R3; zero once R1's entry map lands — W2b) |
+| `testI14_TurnEndWithStreamedPayload_CostsZeroGapFillReads` | I14 | passes (PIN — shouldHydrate-false) |
+| `testI14_TurnEndWithEmptyStream_FiresOneRelayLocalResync` | I14 | FAILS — 0 resyncs (gap-fill-once absent) |
+| `testI4_SupersededOpen_IsRPCCancelled_NotResultFenced` | I4 | FAILS — cancel-spy 0 (openToken fences the RESULT only; the RPC runs to completion) |
+| `testI3_CachePaintIsSeed_StreamIsAuthority_EchoAdoptsInPlace` | I3/I8 | FAILS — the phase-1 cache-miss reset races (and wipes) the snapshot projection; echo adoption RED-by-design (fuzzy adoption, R1/G4) |
+
+The R3 rewire (W2d) flips the budget + cancel tests GREEN with its same-lane
+deletions: phase-2 network seed relay branch (`resolvedTranscriptFetch` → nil
+on relay), the relay `history` backfill branch (`backfill()` → relay-local
+`requestLivenessResync`), the `resumeActiveOverRelay` double-resume
+(coordinator owns the single reconcile; the bind is local), gap-fill-once
+(`currentTurnDeliveredPayload` → one resync on a payload-less turn end),
+warm-rebind zero-RPC, the `.open`-edge establishment dedup
+(`establishedSessionID`), and I4 RPC-cancel at the epoch bump
+(`cancelSupersededOpenWork` → `CancellationError` through
+`RelayClient.request`'s cancellation handler).
+
+RED evidence: `/Volumes/MainData/Developer/hermes-tmp/evidence/round4/w2d-red-run.log`.
+
 ## Running
 
 ```sh
 # The whole gate (wire + render), one entry script:
 tests/e2e_daily_driver/run_gate.sh
+
+# Round-4 W2d R3 reconcile budget + cancel-spy (RED on base by design):
+scripts/ios-build.sh test -scheme HermesMobile \
+  -destination 'platform=iOS Simulator,name=iPhone Air' \
+  -only-testing:HermesMobileTests/ContractReconcileW2dTests
 
 # Round-4 W0a contract invariants (standalone; RED on base by design):
 scripts/ios-build.sh test -scheme HermesMobile \
