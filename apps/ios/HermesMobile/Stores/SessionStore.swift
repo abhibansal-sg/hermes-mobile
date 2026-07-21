@@ -3709,11 +3709,24 @@ final class SessionStore {
         _ incoming: [ChatMessage], for storedId: String
     ) -> [ChatMessage] {
         let existing = warmOpenSnapshots[storedId] ?? []
-        var merged = incoming
-        if !existing.isEmpty {
+        var merged: [ChatMessage]
+        if existing.isEmpty {
+            merged = incoming
+        } else {
             let incomingIDs = Set(incoming.map(\.id))
             if let firstMatch = existing.firstIndex(where: { incomingIDs.contains($0.id) }) {
+                // Rows before the first match are previously-loaded older
+                // history (backward paging) the window does not cover —
+                // prepend them.
                 merged = Array(existing.prefix(firstMatch)) + incoming
+            } else {
+                // No overlap (an empty reconcile, or a window that slid past
+                // every loaded row): keep the existing spine and append the
+                // genuinely-new incoming rows — NEVER drop loaded history
+                // (R15 union contract: the merged view never shows less
+                // settled history than the snapshot held before).
+                let existingIDs = Set(existing.map(\.id))
+                merged = existing + incoming.filter { !existingIDs.contains($0.id) }
             }
         }
         for echo in pendingDurableEchoes[storedId] ?? [] {

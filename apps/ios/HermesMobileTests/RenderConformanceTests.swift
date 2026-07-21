@@ -213,9 +213,12 @@ final class RenderConformanceTests: XCTestCase {
         let cache = try makeInMemoryCache()
         g.chat.attachCache(cache)
         g.sessions.attachCache(cache)
+        // makeGraph does not attach the connection to the SessionStore (the
+        // frame-replay tests never needed it) — the cache-first paint lane
+        // resolves its CacheIdentity off `currentCacheScope`, which reads
+        // `connection.serverURLString`; attach + bind the server URL.
+        g.sessions.attach(connection: g.connection, chat: g.chat)
         g.connection.serverURLString = Self.qa3ServerURL
-        UserDefaults.standard.set(
-            DefaultsKeys.allProfilesScope, forKey: DefaultsKeys.activeProfile)
         g.sessions.transcriptFetchShaped = { _, _, _ in [] }
         return cache
     }
@@ -1055,6 +1058,22 @@ final class RenderConformanceTests: XCTestCase {
 
         // The recorded live turn streams + settles below the cached history.
         _ = await g.chat.send(text: fx.submitText)
+        // PRODUCTION IDENTITY REPLAY (same as testReplay_UserBubbleExactlyOnce…):
+        // the live submit mints a fresh UUID cmid the static fixture cannot
+        // know; re-stamp the echo with the fixture's recorded cmid so the
+        // fixture's `userMessage` item adopts it — the identity chain
+        // production establishes (downstream.py folds the SUBMIT cmid into
+        // the synthesized item).
+        if let cmid = fx.submitClientMessageID,
+           let idx = g.chat.messages.firstIndex(where: {
+               $0.role == .user && $0.text == fx.submitText && $0.clientMessageID != nil
+           }) {
+            let echo = g.chat.messages[idx]
+            g.chat.messages[idx] = ChatMessage(
+                id: echo.id, role: .user, clientMessageID: cmid,
+                parts: echo.parts, timestamp: echo.timestamp
+            )
+        }
         deliverAll(g, fx)
         let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
         await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
@@ -1127,6 +1146,8 @@ final class RenderConformanceTests: XCTestCase {
     /// and the `userMessage` adoption reconciles it into exactly one bubble.
     /// FAILS on qa3/base (the warm snapshot never carried the echo).
     func testReplay_EchoDurableAcrossSessionSwitchAndBack() async throws {
+        UserDefaults.standard.set(
+            DefaultsKeys.allProfilesScope, forKey: DefaultsKeys.activeProfile)
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
         let cache = try await stageCacheFirstOpen(g)
@@ -1201,6 +1222,8 @@ final class RenderConformanceTests: XCTestCase {
     /// (the in-memory transcript IS the truth; the phase-2 union reconciles
     /// deltas). FAILS on qa3/base (the 10 backward-paged rows are evicted).
     func testRepaint_SameSessionNeverTruncatesToCachedWindow() async throws {
+        UserDefaults.standard.set(
+            DefaultsKeys.allProfilesScope, forKey: DefaultsKeys.activeProfile)
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
         let cache = try await stageCacheFirstOpen(g)
@@ -1215,6 +1238,10 @@ final class RenderConformanceTests: XCTestCase {
                           content: .string("m\(i)"),
                           timestamp: 1_700_000_000 + Double(i), wireId: i)
         }
+        // Phase-2 network reconcile returns the SAME 50-row tail window the
+        // cache holds (the realistic shape — an authoritative tail fetch),
+        // so the paging cursor stays honest.
+        g.sessions.transcriptFetchShaped = { _, _, _ in Array(rows[10...]) }
         try await cache.saveTranscript(
             identity: try qa3CacheIdentity(g, "render-void"), messages: rows)
 
