@@ -138,8 +138,10 @@ enum WorkingSectionModel {
         streamingLive: Bool
     ) -> Bool {
         guard streamingLive else { return false }
-        guard parts.lastTextPartID == nil else { return false }
-        return lastWorkIndex(in: parts) == nil
+        // SCRATCH-RED: build-116 rule — the caret slot mounted a bare cursor
+        // whenever no answer text existed, IGNORING the live fold (the S3
+        // dual-affordance decision the QA-3 fix deletes).
+        return parts.lastTextPartID == nil
     }
 
     /// Coalesce the assistant's ordered `parts` into render nodes under the
