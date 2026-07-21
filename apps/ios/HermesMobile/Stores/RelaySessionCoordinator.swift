@@ -254,6 +254,23 @@ final class RelaySessionCoordinator {
         for (_, continuation) in waiters { continuation.resume(returning: opened) }
     }
 
+    /// Rebind the driven session on a FRESH connection (the relay's new
+    /// PhoneConnection has no foreground set and no seen_sids — without this
+    /// the Notifier fires spurious APNs and the resync snapshot is empty).
+    /// EXACTLY ONCE per connection cycle: ``establishedSessionID`` guards it
+    /// (set by the bind RPC itself — `resume`/`open`/`adoptCreatedSession` —
+    /// or by the first rebind; invalidated at every genuine connection-cycle
+    /// start). Best-effort: a failure is non-fatal.
+    private func reestablishDrivenSession() {
+        guard let sid = activeStoredSessionID ?? activeSessionID, let client,
+              establishedSessionID != sid else { return }
+        establishedSessionID = sid
+        Task {
+            await client.setForeground(sid)
+            _ = try? await client.open(sid)
+        }
+    }
+
     /// Adopt `sessionID` as the session to (re-)open the moment the socket is
     /// ready, WITHOUT issuing the RPC now (QA-1 B1). A cold-start resume /
     /// session open that arrives before the relay phase bridge is up queues
@@ -351,6 +368,14 @@ final class RelaySessionCoordinator {
         // `start` stamps `.open` directly (the state observer replays the edge
         // later, but a resume queued on readiness must not wait for the replay).
         resolveAllOpenWaiters(opened: true)
+        // The readiness edge side-effects fire HERE (integration, I14): the
+        // observer's buffered `.connecting → .open` replay is stale relative
+        // to this direct stamp and no longer produces an edge — start owns the
+        // initial-connect readiness itself (outbox wake + APNs re-wake).
+        #if DEBUG
+        readinessEdgeCount += 1
+        #endif
+        onReady?()
 
         // Observe connection-state transitions so a drop/failure surfaces.
         stateTask = Task { [weak self] in
@@ -375,6 +400,7 @@ final class RelaySessionCoordinator {
             touchEntry(sessionID)
             moveWriteGate(to: sessionID)
             _ = try await client.open(sessionID)
+            establishedSessionID = sessionID   // R3: this open IS the rebind — the replayed edge must not re-open it
         }
     }
 
@@ -393,9 +419,22 @@ final class RelaySessionCoordinator {
         reconnectURL = url
         reconnectToken = token
         phase = .connecting
+        // A fresh connection cycle: establishment is per-connection (the new
+        // PhoneConnection has no foreground) — invalidate so the rebind below
+        // re-establishes exactly once.
+        establishedSessionID = nil
+        currentTurnDeliveredPayload = false
         await client.reconnect(url: url, token: token)
         phase = .open
         resolveAllOpenWaiters(opened: true)
+        // Readiness edge (direct stamp — the observer's buffered replay is
+        // stale, see `applyState`): outbox wake + APNs re-wake, then rebind
+        // the driven session on the fresh connection (I14: exactly once).
+        #if DEBUG
+        readinessEdgeCount += 1
+        #endif
+        onReady?()
+        reestablishDrivenSession()
     }
 
     /// Tear down the socket, cancel the pump/state observers + reconnect driver,
@@ -772,7 +811,19 @@ final class RelaySessionCoordinator {
         let wasOpen = (phase == .open)
         switch state {
         case .idle:          phase = .idle
-        case .connecting:    phase = .connecting
+        case .connecting:
+            // A `.connecting` delivered while we are ALREADY `.open` is the
+            // buffered initial-connect state replay: `start()` / `reconnect(url:)`
+            // stamp `.connecting → .open` directly before this observer drains
+            // the socket's buffered pair. A genuine connection cycle can never
+            // reach `.connecting` from `.open` without a `.failed` / `.closed`
+            // in between (a socket does not re-dial while established), so
+            // applying it here would (a) flicker the mirrored UI phase and
+            // (b) invalidate `establishedSessionID`, letting the replayed
+            // `.open` below re-establish a session a bind RPC already
+            // established — the duplicate `open` read contract I14 forbids.
+            guard phase != .open else { break }
+            phase = .connecting
         case .open:          phase = .open
         case .closed(let r): phase = .closed(reason: r)
         case .failed(let m):
@@ -814,16 +865,10 @@ final class RelaySessionCoordinator {
             // non-fatal — the resync already ran inside client.reconnect.
             // R3 (I14): EXACTLY ONCE per connection — skip when this session
             // was already established on the current connection (the bind RPC
-            // or a prior edge fired it); the marker resets on every non-`.open`
-            // transition, so a genuine reconnect still re-establishes.
-            if let sid = activeStoredSessionID ?? activeSessionID, let client,
-               establishedSessionID != sid {
-                establishedSessionID = sid
-                Task {
-                    await client.setForeground(sid)
-                    _ = try? await client.open(sid)
-                }
-            }
+            // or a prior edge fired it); the marker resets on every genuine
+            // connection-cycle start, so a genuine reconnect still
+            // re-establishes.
+            reestablishDrivenSession()
         }
     }
 
