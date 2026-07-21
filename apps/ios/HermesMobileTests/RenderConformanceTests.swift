@@ -1,5 +1,6 @@
 import XCTest
 import SwiftUI
+import GRDB
 @testable import HermesMobile
 
 /// QA-1 A9 — the RENDER half of the device-shaped gate (spec A9; the wire half
@@ -206,6 +207,7 @@ final class RenderConformanceTests: XCTestCase {
 
     override func tearDown() {
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.transportPath)
+        UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
         super.tearDown()
     }
 
@@ -247,6 +249,50 @@ final class RenderConformanceTests: XCTestCase {
         fx.cachedHistory.map { row in
             ChatMessage(role: row.role == "user" ? .user : .assistant, text: row.text)
         }
+    }
+
+    // MARK: - QA-3 cache harness (in-memory CacheStore, hermetic open())
+
+    private static let qa3ServerURL = "https://qa3.render.test:9443"
+
+    private func makeInMemoryCache() throws -> CacheStore {
+        var config = Configuration()
+        config.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+        }
+        let queue = try DatabaseQueue(configuration: config)
+        return try CacheStore(testDB: queue)
+    }
+
+    private func qa3Summary(_ id: String, messageCount: Int? = 3) -> SessionSummary {
+        SessionSummary(
+            id: id, title: "T-\(id)", preview: nil, startedAt: 1_000,
+            messageCount: messageCount, source: nil, lastActive: nil, cwd: nil
+        )
+    }
+
+    private func qa3CacheIdentity(_ g: Graph, _ sessionId: String) throws -> CacheIdentity {
+        // Resolve the identity the OPEN path itself resolves (profile fold
+        // included) — a hand-built identity can mismatch the store's profile
+        // selection and silently miss the cache.
+        try XCTUnwrap(g.sessions.cacheIdentity(sessionId))
+    }
+
+    /// Attach an in-memory transcript cache + a no-op network fetch (phase 2
+    /// reconciles empty) so `open(summary, bindRuntime: false)` exercises the
+    /// REAL cache-first paint lane hermetically. Returns the cache for staging.
+    private func stageCacheFirstOpen(_ g: Graph) async throws -> CacheStore {
+        let cache = try makeInMemoryCache()
+        g.chat.attachCache(cache)
+        g.sessions.attachCache(cache)
+        // makeGraph does not attach the connection to the SessionStore (the
+        // frame-replay tests never needed it) — the cache-first paint lane
+        // resolves its CacheIdentity off `currentCacheScope`, which reads
+        // `connection.serverURLString`; attach + bind the server URL.
+        g.sessions.attach(connection: g.connection, chat: g.chat)
+        g.connection.serverURLString = Self.qa3ServerURL
+        g.sessions.transcriptFetchShaped = { _, _, _ in [] }
+        return cache
     }
 
     /// Assert every cached-history row's text appears, IN ORDER, in the
@@ -1053,6 +1099,281 @@ final class RenderConformanceTests: XCTestCase {
         var store = RelayItemStore()
         store.apply([] as [RelayFrame])
         XCTAssertTrue(store.items.isEmpty)
+    }
+
+    // MARK: - QA-3 S4/A2 — resync snapshot re-projection: single copy, strict order
+
+    /// THE S4 DEVICE INCIDENT (IMG_2579-2582): the SAME exchange rendered in
+    /// TWO orders at two scroll positions of one view. The relay session store
+    /// accumulates ALL items; the 10:46-47 WS reconnect flap (relay.log opens
+    /// at 10:46:31 + 10:47:18) re-delivered a snapshot covering turns the GRDB
+    /// cache had already painted untagged. The merge consumed only the USER
+    /// twins — every cache-painted ANSWER survived above the rebuilt prompts:
+    /// an orphan answer preceding the prompt that asked it, plus a correct
+    /// copy at the tail. Replayed from the recorded `render_submit_stream`
+    /// turn + a hand-authored resync snapshot envelope in the same wire format
+    /// (provenance: correlated to relay.log 10:47:19-10:49:02 `/messages`
+    /// fetches bracketing the IMG_2579-2583 captures). FAILS on qa3/base.
+    func testReplay_ResyncSnapshotNeverDuplicatesNorInvertsTimeline() async throws {
+        let fx = try loadFixture("render_submit_stream")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        g.sessions.activeStoredId = fx.sessionID
+
+        // Two settled turns painted the way the GRDB cache paints (wire ids).
+        let cachedTurns: [(role: String, text: String)] = [
+            ("user", "cq1"), ("assistant", "ca1"),
+            ("user", "cq2"), ("assistant", "ca2"),
+        ]
+        g.chat.seed(from: storedHistory(cachedTurns))
+
+        // The recorded live turn streams + settles below the cached history.
+        _ = await g.chat.send(text: fx.submitText)
+        // PRODUCTION IDENTITY REPLAY (same as testReplay_UserBubbleExactlyOnce…):
+        // the live submit mints a fresh UUID cmid the static fixture cannot
+        // know; re-stamp the echo with the fixture's recorded cmid so the
+        // fixture's `userMessage` item adopts it — the identity chain
+        // production establishes (downstream.py folds the SUBMIT cmid into
+        // the synthesized item).
+        if let cmid = fx.submitClientMessageID,
+           let idx = g.chat.messages.firstIndex(where: {
+               $0.role == .user && $0.text == fx.submitText && $0.clientMessageID != nil
+           }) {
+            let echo = g.chat.messages[idx]
+            g.chat.messages[idx] = ChatMessage(
+                id: echo.id, role: .user, clientMessageID: cmid,
+                parts: echo.parts, timestamp: echo.timestamp
+            )
+        }
+        deliverAll(g, fx)
+        let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
+        await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
+
+        // The reconnect resync re-delivers EVERY accumulated item — including
+        // the two cache-painted turns — under the SAME item ids the store
+        // already holds (the relay re-sends its accumulated items verbatim).
+        var fixtureUserItemID = ""
+        var fixtureAgentItemID = ""
+        for frame in fx.frames where kind(frame) == "item.completed" {
+            let body = frame["body"] as? [String: Any]
+            let id = (body?["item_id"] as? String) ?? ""
+            if itemType(frame) == "userMessage" { fixtureUserItemID = id }
+            if itemType(frame) == "agentMessage" { fixtureAgentItemID = id }
+        }
+        func snapshotItem(_ id: String, _ type: String, _ ord: Int, _ text: String,
+                          _ cmid: String? = nil) -> [String: Any] {
+            var body: [String: Any] = ["text": text]
+            if let cmid { body["client_message_id"] = cmid }
+            return ["item_id": id, "type": type, "status": "completed",
+                    "ord": ord, "body": body]
+        }
+        let snapshot: [String: Any] = [
+            "seq": 900, "sid": fx.sessionID, "turn": NSNull(), "kind": "snapshot",
+            "body": [
+                "cursor": 900,
+                "items": [
+                    snapshotItem("snap-u1", "userMessage", 0, "cq1"),
+                    snapshotItem("snap-a1", "agentMessage", 1, "ca1"),
+                    snapshotItem("snap-u2", "userMessage", 2, "cq2"),
+                    snapshotItem("snap-a2", "agentMessage", 3, "ca2"),
+                    snapshotItem(fixtureUserItemID, "userMessage", 4, fx.submitText,
+                                 fx.submitClientMessageID),
+                    snapshotItem(fixtureAgentItemID, "agentMessage", 5, agentText),
+                ],
+            ],
+        ]
+        g.transport.deliver(frameText(snapshot))
+        // Synchronize on the snapshot projection LANDING: the pump applies it
+        // asynchronously, and the cached turns' rows flip from untagged to
+        // relayProjected when the re-projection rebuilds them (pre-snapshot
+        // they are the cache-painted untagged rows). Without this wait the
+        // assertions race the pump and can pass on the PRE-snapshot state —
+        // on qa3/base that masked the duplication (false green).
+        await waitUntil {
+            self.g_chat_messages(g).contains { $0.text == "cq1" && $0.relayProjected }
+        }
+
+        let texts = g.chat.messages.map(\.text)
+        for text in ["cq1", "ca1", "cq2", "ca2", fx.submitText, agentText] {
+            XCTAssertEqual(texts.filter({ $0 == text }).count, 1,
+                           "S4/A2: exactly one copy of '\(text)' after the resync — pre-fix every answer doubled")
+        }
+        XCTAssertEqual(texts, ["cq1", "ca1", "cq2", "ca2", fx.submitText, agentText],
+                       "S4/A2: strictly chronological — no orphan answer above its prompt (IMG_2579)")
+        let promptIndex = texts.firstIndex(of: fx.submitText)!
+        let answerIndex = texts.firstIndex(of: agentText)!
+        XCTAssertLessThan(promptIndex, answerIndex,
+                          "the answer NEVER renders before the prompt that asked it")
+    }
+
+    /// `waitUntil` cannot close over `g` in a sending context — tiny accessor.
+    private func g_chat_messages(_ g: Graph) -> [ChatMessage] { g.chat.messages }
+
+    // MARK: - QA-3 S6/A2 — the optimistic echo is durable across a session switch
+
+    /// THE S6 DEVICE INCIDENT (IMG_2585/2591): a sent prompt vanished — working
+    /// rows rendering with NO prompt above them. The optimistic echo existed
+    /// only in the in-memory transcript; a session switch reseeded it away and
+    /// nothing repainted it before the relay's next snapshot. The echo is now
+    /// write-through persisted into the session-keyed warm snapshot, so a
+    /// switch away and back repaints the prompt BEFORE any relay frame lands,
+    /// and the `userMessage` adoption reconciles it into exactly one bubble.
+    /// FAILS on qa3/base (the warm snapshot never carried the echo).
+    func testReplay_EchoDurableAcrossSessionSwitchAndBack() async throws {
+        UserDefaults.standard.set(
+            DefaultsKeys.allProfilesScope, forKey: DefaultsKeys.activeProfile)
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        let cache = try await stageCacheFirstOpen(g)
+
+        // Session A paints two settled rows from the disk cache.
+        let rowsA = storedHistory([("user", "prior-q"), ("assistant", "prior-a")])
+        try await cache.saveSessionList([qa3Summary("render-dur-A")], scope: CacheScope(
+            serverId: Self.qa3ServerURL, profileId: DefaultsKeys.allProfilesScope))
+        try await cache.saveTranscript(
+            identity: try qa3CacheIdentity(g, "render-dur-A"), messages: rowsA)
+
+        g.sessions.open(qa3Summary("render-dur-A"), bindRuntime: false)
+        await g.sessions.waitForPendingOpenForTesting()
+        XCTAssertEqual(g.chat.messages.map(\.text), ["prior-q", "prior-a"])
+
+        // The user sends; the echo + optimistic bubble render instantly.
+        _ = await g.chat.send(text: "durable?")
+        await waitUntil {
+            g.chat.messages.contains { $0.role == .user && $0.text == "durable?" }
+        }
+        let cmid = try XCTUnwrap(
+            g.chat.messages.first { $0.text == "durable?" }?.clientMessageID)
+
+        // Switch away to B (the transcript reseeds) — then back to A.
+        g.sessions.open(qa3Summary("render-dur-B"), bindRuntime: false)
+        await g.sessions.waitForPendingOpenForTesting()
+        XCTAssertFalse(g.chat.messages.contains { $0.text == "durable?" },
+                       "precondition: B's paint replaced the transcript")
+
+        g.sessions.open(qa3Summary("render-dur-A"), bindRuntime: false)
+        await g.sessions.waitForPendingOpenForTesting()
+
+        // NO relay frame has re-landed yet — the prompt must repaint anyway.
+        XCTAssertTrue(
+            g.chat.messages.contains { $0.role == .user && $0.text == "durable?" },
+            "S6/A2: the optimistic echo survives a session switch + store rebuild (repainted from the durable warm snapshot before any relay frame)")
+        assertRowsPresent(g.chat.messages.map(\.text),
+                          [("user", "prior-q"), ("assistant", "prior-a")],
+                          "S6: settled history intact after the switch-back")
+
+        // The relay's `userMessage` item lands: the echo reconciles in place —
+        // exactly one bubble, the answer strictly after the prompt.
+        g.transport.deliverFrames([
+            userItemFrameLocal(1, id: "u-dur", ord: 0, text: "durable?",
+                               clientMessageID: cmid, sid: "render-dur-A"),
+            agentCompletedFrameLocal(2, id: "msg-dur", ord: 1, text: "still here.",
+                                     sid: "render-dur-A"),
+            RelayFrame(seq: 3, sid: "render-dur-A", turn: "t-dur", kind: .turnCompleted,
+                       body: .object(["usage": .object([:])])),
+        ])
+        await waitUntil {
+            g.chat.messages.filter { $0.text == "durable?" }.count == 1
+                && g.chat.messages.contains { $0.text == "still here." }
+        }
+        let texts = g.chat.messages.map(\.text)
+        XCTAssertEqual(texts.filter { $0 == "durable?" }.count, 1,
+                       "echo + userMessage item = one bubble after reconcile")
+        XCTAssertLessThan(texts.firstIndex(of: "durable?")!,
+                          texts.firstIndex(of: "still here.")!,
+                          "the answer never renders before its prompt")
+    }
+
+    // MARK: - QA-3 S7/A3 — scrollback never truncates to the cached window (void impossible)
+
+    /// THE S7 DEVICE INCIDENT (IMG_2589/2590): scrolling up hit PURE VOID. A
+    /// re-open of the ALREADY-ACTIVE session (a row re-tap, a notification
+    /// deep-link) re-ran the first-frame cache paint, which `.replace`d the
+    /// full in-memory transcript with the cached TAIL WINDOW (every cache
+    /// source is a 50-row suffix) — the eager bottom-anchored VStack then
+    /// rendered the surviving tail at the bottom with void above. The paint
+    /// is now provenance-keyed: a same-session repaint skips phase 1 entirely
+    /// (the in-memory transcript IS the truth; the phase-2 union reconciles
+    /// deltas). FAILS on qa3/base (the 10 backward-paged rows are evicted).
+    func testRepaint_SameSessionNeverTruncatesToCachedWindow() async throws {
+        UserDefaults.standard.set(
+            DefaultsKeys.allProfilesScope, forKey: DefaultsKeys.activeProfile)
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        let cache = try await stageCacheFirstOpen(g)
+        try await cache.saveSessionList([qa3Summary("render-void", messageCount: 60)],
+                                        scope: CacheScope(
+                                            serverId: Self.qa3ServerURL,
+                                            profileId: DefaultsKeys.allProfilesScope))
+
+        // The disk cache holds 60 rows; the open window is the 50-row suffix.
+        let rows: [StoredMessage] = (1...60).map { i in
+            StoredMessage(role: i.isMultiple(of: 2) ? "assistant" : "user",
+                          content: .string("m\(i)"),
+                          timestamp: 1_700_000_000 + Double(i), wireId: i)
+        }
+        // Phase-2 network reconcile returns the SAME 50-row tail window the
+        // cache holds (the realistic shape — an authoritative tail fetch),
+        // so the paging cursor stays honest.
+        g.sessions.transcriptFetchShaped = { _, _, _ in Array(rows[10...]) }
+        try await cache.saveTranscript(
+            identity: try qa3CacheIdentity(g, "render-void"), messages: rows)
+
+        g.sessions.open(qa3Summary("render-void", messageCount: 60), bindRuntime: false)
+        await g.sessions.waitForPendingOpenForTesting()
+        XCTAssertEqual(g.chat.messages.count, 50, "the open window is the 50-row tail")
+        XCTAssertTrue(g.chat.transcriptHasMoreBefore,
+                      "the reader can page backward past the window")
+        XCTAssertEqual(g.chat.messages.first?.text, "m11")
+
+        // The reader pages backward: 10 older rows prepend (loadEarlierTranscript
+        // does exactly `seed(normalized: older + messages)`).
+        let older = ChatStore.toChatMessages(Array(rows[0..<10]))
+        g.chat.seed(normalized: older + g.chat.messages)
+        XCTAssertEqual(g.chat.messages.count, 60, "the full loaded transcript")
+
+        // Re-tap the SAME session (deep-link / drawer re-tap).
+        g.sessions.open(qa3Summary("render-void", messageCount: 60), bindRuntime: false)
+        await g.sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(g.chat.messages.count, 60,
+                       "S7/A3: a same-session repaint must NEVER truncate the transcript to the cached window — the scrollback the reader loaded stays loaded (pre-fix: 50, void on scroll-up)")
+        XCTAssertEqual(g.chat.messages.first?.text, "m1",
+                       "the backward-paged head survives the repaint")
+        XCTAssertEqual(g.chat.messages.last?.text, "m60",
+                       "the tail is undisturbed")
+    }
+
+    // MARK: - QA-3 frame builders (sid-parameterized for the durability replay)
+
+    private func userItemFrameLocal(
+        _ seq: Int, id: String, ord: Int, text: String,
+        clientMessageID: String?, sid: String
+    ) -> RelayFrame {
+        var body: [String: JSONValue] = ["text": .string(text)]
+        if let clientMessageID { body["client_message_id"] = .string(clientMessageID) }
+        return RelayFrame(seq: seq, sid: sid, turn: "t-dur", kind: .itemCompleted,
+                          body: .object([
+                            "item_id": .string(id),
+                            "type": .string(ChatItemType.userMessage.rawValue),
+                            "status": .string("completed"),
+                            "ord": .number(Double(ord)),
+                            "body": .object(body),
+                          ]))
+    }
+
+    private func agentCompletedFrameLocal(
+        _ seq: Int, id: String, ord: Int, text: String, sid: String
+    ) -> RelayFrame {
+        RelayFrame(seq: seq, sid: sid, turn: "t-dur", kind: .itemCompleted,
+                   body: .object([
+                    "item_id": .string(id),
+                    "type": .string(ChatItemType.agentMessage.rawValue),
+                    "status": .string("completed"),
+                    "ord": .number(Double(ord)),
+                    "body": .object(["text": .string(text)]),
+                   ]))
     }
 
     // MARK: - QA-2 R4/A2 — instant working mode; Working-pill state deleted
