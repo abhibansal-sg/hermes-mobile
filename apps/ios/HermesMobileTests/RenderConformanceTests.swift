@@ -199,8 +199,11 @@ final class RenderConformanceTests: XCTestCase {
         )
     }
 
-    private func qa3CacheIdentity(_ sessionId: String) -> CacheIdentity {
-        CacheIdentity(serverId: Self.qa3ServerURL, profileId: "default", sessionId: sessionId)
+    private func qa3CacheIdentity(_ g: Graph, _ sessionId: String) throws -> CacheIdentity {
+        // Resolve the identity the OPEN path itself resolves (profile fold
+        // included) — a hand-built identity can mismatch the store's profile
+        // selection and silently miss the cache.
+        try XCTUnwrap(g.sessions.cacheIdentity(sessionId))
     }
 
     /// Attach an in-memory transcript cache + a no-op network fetch (phase 2
@@ -1133,7 +1136,7 @@ final class RenderConformanceTests: XCTestCase {
         try await cache.saveSessionList([qa3Summary("render-dur-A")], scope: CacheScope(
             serverId: Self.qa3ServerURL, profileId: DefaultsKeys.allProfilesScope))
         try await cache.saveTranscript(
-            identity: qa3CacheIdentity("render-dur-A"), messages: rowsA)
+            identity: try qa3CacheIdentity(g, "render-dur-A"), messages: rowsA)
 
         g.sessions.open(qa3Summary("render-dur-A"), bindRuntime: false)
         await g.sessions.waitForPendingOpenForTesting()
@@ -1213,7 +1216,7 @@ final class RenderConformanceTests: XCTestCase {
                           timestamp: 1_700_000_000 + Double(i), wireId: i)
         }
         try await cache.saveTranscript(
-            identity: qa3CacheIdentity("render-void"), messages: rows)
+            identity: try qa3CacheIdentity(g, "render-void"), messages: rows)
 
         g.sessions.open(qa3Summary("render-void", messageCount: 60), bindRuntime: false)
         await g.sessions.waitForPendingOpenForTesting()
