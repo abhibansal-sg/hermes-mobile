@@ -80,7 +80,7 @@
           "text": "two "
         }
       },
-      "t_ms": 251
+      "t_ms": 250
     },
     {
       "seq": 6,
@@ -106,7 +106,7 @@
           "text": "four "
         }
       },
-      "t_ms": 760
+      "t_ms": 752
     },
     {
       "seq": 8,
@@ -119,7 +119,7 @@
           "text": "five "
         }
       },
-      "t_ms": 1008
+      "t_ms": 1002
     },
     {
       "seq": 9,
@@ -132,7 +132,7 @@
           "text": "six "
         }
       },
-      "t_ms": 1259
+      "t_ms": 1254
     },
     {
       "seq": 10,
@@ -145,7 +145,7 @@
           "text": "seven "
         }
       },
-      "t_ms": 1517
+      "t_ms": 1504
     },
     {
       "seq": 11,
@@ -158,7 +158,7 @@
           "text": "eight."
         }
       },
-      "t_ms": 1764
+      "t_ms": 1756
     },
     {
       "seq": 12,
@@ -175,7 +175,7 @@
           "text": "One two three four five six seven eight."
         }
       },
-      "t_ms": 2016
+      "t_ms": 2007
     },
     {
       "seq": 13,
@@ -195,7 +195,7 @@
           "total": 9
         }
       },
-      "t_ms": 2016
+      "t_ms": 2009
     },
     {
       "seq": 14,
@@ -209,10 +209,10 @@
           "output": 8,
           "total": 9
         },
-        "duration_s": 2.014,
-        "started_at": 1784620151.972121
+        "duration_s": 2.007,
+        "started_at": 1784620363.433975
       },
-      "t_ms": 2019
+      "t_ms": 2011
     }
   ],
   "settled": {
@@ -228,12 +228,12 @@
     {
       "action": "switch_to",
       "session_id": "render-sess-qa3-switch-b",
-      "at_t_ms": 523
+      "at_t_ms": 526
     },
     {
       "action": "switch_to",
       "session_id": "render-sess-qa3-switch-a",
-      "at_t_ms": 927
+      "at_t_ms": 931
     }
   ],
   "extra_sessions": {

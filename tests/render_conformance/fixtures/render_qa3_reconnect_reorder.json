@@ -167,7 +167,7 @@
       "turn": "render-sess-qa3-reorder:t3",
       "kind": "turn.started",
       "body": {},
-      "t_ms": 23
+      "t_ms": 24
     },
     {
       "seq": 4,
@@ -184,7 +184,7 @@
           "text": ""
         }
       },
-      "t_ms": 23
+      "t_ms": 24
     },
     {
       "seq": 5,
@@ -197,7 +197,7 @@
           "text": "Third "
         }
       },
-      "t_ms": 23
+      "t_ms": 24
     },
     {
       "seq": 6,
@@ -287,8 +287,8 @@
           "output": 4,
           "total": 5
         },
-        "duration_s": 0.043,
-        "started_at": 1784620151.734004
+        "duration_s": 0.042,
+        "started_at": 1784620363.194627
       },
       "t_ms": 67
     }

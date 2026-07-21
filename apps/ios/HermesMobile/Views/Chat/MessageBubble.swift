@@ -610,8 +610,8 @@ struct MessageBubble: View {
                                 // text — the prose-tail `StreamingCursor` owns
                                 // the pulse, the fold keeps status + timer only
                                 // (exactly one glyph breathes at any instant).
-                                interrupted: message.interrupted,
-                                showsCursorGlyph: false
+                                showsCursorGlyph: false,
+                                interrupted: message.interrupted
                             )
                         }
                     }

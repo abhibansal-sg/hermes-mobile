@@ -80,7 +80,7 @@
           "text": "beta "
         }
       },
-      "t_ms": 301
+      "t_ms": 302
     },
     {
       "seq": 6,
@@ -106,7 +106,7 @@
           "text": "delta "
         }
       },
-      "t_ms": 903
+      "t_ms": 902
     },
     {
       "seq": 8,
@@ -132,7 +132,7 @@
           "text": "zeta."
         }
       },
-      "t_ms": 1504
+      "t_ms": 1505
     },
     {
       "seq": 10,
@@ -149,7 +149,7 @@
           "text": "alpha beta gamma delta epsilon zeta."
         }
       },
-      "t_ms": 1805
+      "t_ms": 1806
     },
     {
       "seq": 11,
@@ -169,7 +169,7 @@
           "total": 7
         }
       },
-      "t_ms": 1805
+      "t_ms": 1806
     },
     {
       "seq": 12,
@@ -184,9 +184,9 @@
           "total": 7
         },
         "duration_s": 1.805,
-        "started_at": 1784620157.761177
+        "started_at": 1784620369.114309
       },
-      "t_ms": 1807
+      "t_ms": 1809
     }
   ],
   "settled": {
@@ -201,7 +201,7 @@
     },
     {
       "action": "enter_draft",
-      "at_t_ms": 315
+      "at_t_ms": 314
     }
   ]
 }
