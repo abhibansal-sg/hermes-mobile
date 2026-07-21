@@ -68,6 +68,16 @@ final class TurnLivenessTests: XCTestCase {
         let sessions = SessionStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
         chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        // Fix-round: wire the session store to the connection EXACTLY like
+        // production (and `ContractReconcileW2dTests.makeStores`). Without this
+        // `sessions.connection` is nil, so `SessionStore.open` never takes the
+        // relay branch (`if let connection, connection.transportPath == .relay`)
+        // — the relay write-gate is never moved, frames fold into a
+        // turn-bearing-created entry but never project, and a turn-nil user row
+        // is dropped as unattributable. The send-based tests masked this because
+        // `submit` synchronously re-establishes the gate; this completed-prior-turn
+        // test sends nothing, so it needs the faithful graph.
+        sessions.attach(connection: connection, chat: chat)
         connection.relayCoordinatorFactory = {
             RelaySessionCoordinator(chatStore: chat, clientFactory: { RelayClient { _ in transport } })
         }
@@ -222,6 +232,11 @@ final class TurnLivenessTests: XCTestCase {
 
         await waitUntil { self.assistantRows(g.chat).count >= 2 }
         let rows = assistantRows(g.chat)
+        // Fix-round hardening: assert the count BEFORE indexing so a regression
+        // fails cleanly instead of crashing the test process with an
+        // index-out-of-range (the completed prior turn + the live turn = 2 rows).
+        XCTAssertEqual(rows.count, 2, "a completed prior turn + a live turn project exactly two assistant rows")
+        guard rows.count >= 2 else { return }
         XCTAssertFalse(rows[0].interrupted, "a normally-completed prior turn is Worked, not Interrupted")
         XCTAssertFalse(rows[0].isStreaming)
         XCTAssertTrue(rows[1].isStreaming)
