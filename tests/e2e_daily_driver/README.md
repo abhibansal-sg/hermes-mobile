@@ -37,6 +37,14 @@ Everything is hermetic by default:
 | e | `test_e_relay_sigterm_resync.py` | A6 | SIGTERM relay mid-session → restart → phone resync gap-free → queued submit drains. |
 | f | `test_f_ws_flap_chaos.py` | A4 | 10× WS kill mid-turn → final transcript byte-identical to a clean run. |
 | g | `test_g_notifier_apns.py` | A8 | mock-APNs: turn_complete/task_complete suppressed when foregrounded; approval/clarify bypass gate. |
+| j | `test_j_contract_rpc_spy.py` | R4 contract I4/I5/I11/I12/I13/I14/I17 | Round-4 INTERACTION-CONTRACT wire oracles: draft nil-target on the wire + create/adoption (I5/I6); S4 drift split — existing-pin row drains once to the PINNED id w/ cmid dedup, nil-pin echo drop + orphan isolation (I11); gate MOVES with the session and survives switches, post-switch answer routes by (sid, request_id) (I12/G1/I18); 20× bg/fg cycles ⇒ zero gateway connects, dense seq spine (I13); reconcile budget — 1 read/open, 0 warm switch-back, relay-local resync, 0 gap-fills (I14); flap ops retry once open, zero surfaced errors (I17); cancel-spy — superseded open RPC-cancelled, foreground ends on B (I4). |
+
+R4 W0b also adds the RENDER-layer I7/I19 void-geometry UI tests
+(`apps/ios/HermesMobileUITests/VoidGeometryUITests.swift`, driven by
+`scripts/r4-void-evidence.sh` against this harness's mock gateway + worktree
+relay) and the RED-BY-DESIGN relay lane stubs
+(`relay/tests/test_round4_lane_stubs.py`, L1–L4 + L6; L5 dropped — see
+`evidence/round4/w0b-red-matrix.md`).
 
 ## Run
 
