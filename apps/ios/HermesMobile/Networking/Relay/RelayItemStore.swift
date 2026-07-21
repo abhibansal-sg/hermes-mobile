@@ -47,6 +47,25 @@ struct RelayItemStore: Sendable, Equatable {
             .map(\.element)
     }
 
+    /// Read-only UNION of per-session stores (R1: the coordinator's `store`
+    /// accessor reconciled to the session-entry map — observation surface
+    /// only; the per-session store remains the reducer unit). Items keep their
+    /// per-store arrival order; the `items` view sorts by `ord` as always.
+    /// (Cross-session item-id collisions — impossible in the fixture stream,
+    /// improbable on the wire where ids are session-scoped — keep the first
+    /// arrival; the union is never fed back into a reducer.)
+    static func merged(_ stores: [RelayItemStore]) -> RelayItemStore {
+        var union = RelayItemStore()
+        for store in stores {
+            for id in store.arrivalOrder where union.itemsByID[id] == nil {
+                union.itemsByID[id] = store.itemsByID[id]
+                union.arrivalOrder.append(id)
+            }
+            union.lastSeq = max(union.lastSeq, store.lastSeq)
+        }
+        return union
+    }
+
     // MARK: - Seq admission (§4)
 
     /// How an incoming `seq` relates to what the store has already folded in.

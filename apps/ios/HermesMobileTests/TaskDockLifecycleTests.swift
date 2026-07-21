@@ -119,13 +119,15 @@ final class TaskDockLifecycleTests: XCTestCase {
         XCTAssertFalse(chat.dockShowsTaskBox, "R13: terminal list must auto-dismiss")
     }
 
-    func testHandleRelayTurnCompletedKeepsDataForBridgeContract() {
+    func testTurnEndProjectionKeepsListDataForBridgeContract() {
         // R12: the dock pill is hidden at turn end by the `dockShowsTaskBox`
         // visibility gate (isStreaming settles false), NOT by dropping the list
         // data — the bridge DATA persists so a resumed turn / the render-
-        // conformance contract still observes it. `handleRelayTurnCompleted` is
-        // an intentional no-op seam; the cross-turn re-seed is `turn.started`'s
-        // job. Asserting the data survives here pins that contract.
+        // conformance contract still observes it. R1 deleted the
+        // `handleRelayTurnCompleted` no-op seam outright: nothing clears the
+        // mirror at turn end (structurally), the cross-turn re-seed is
+        // `turn.started`'s job. Asserting the data survives the turn-settled
+        // projection pins that contract.
         let chat = bareChat()
         chat.applyRelayItems([ChatItem(
             itemID: "s1:tasks", type: .taskList, status: .completed, ord: 4,
@@ -136,7 +138,13 @@ final class TaskDockLifecycleTests: XCTestCase {
         )])
         chat.isStreaming = true
         XCTAssertNotNil(chat.latestTodoList, "precondition: list data present mid-turn")
-        chat.handleRelayTurnCompleted()
+        chat.applyRelayItems([ChatItem(
+            itemID: "s1:tasks", type: .taskList, status: .completed, ord: 4,
+            body: [
+                "tasks": [["id": "1", "text": "Done", "status": "completed"]],
+                "all_complete": true,
+            ]
+        )], turnSettled: true)
         XCTAssertNotNil(chat.latestTodoList,
                         "R12: turn.completed keeps the list data (visibility gate hides the pill)")
     }
