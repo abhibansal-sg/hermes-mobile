@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
@@ -364,19 +365,35 @@ class Notifier:
             text = _safe_text(
                 content.get("message") or content.get("text") or summary, "Turn errored"
             )
-            return "Hermes hit an error", text, cfg.error_category, 0
+            return "Hermes hit an error", _humanize_raw_error(text) or text, cfg.error_category, 0
         if event_type == cfg.task_complete_event:
             # taskList item.completed: the card summary ("Tasks N/N") is the
             # human line; store-and-forward like turn_complete.
             text = _safe_text(summary or content.get("text"), "All tasks complete")
             return (
                 "Hermes finished its tasks",
-                text,
+                _humanize_raw_error(text) or text,
                 cfg.task_complete_category,
                 _TURN_COMPLETE_EXPIRATION_S,
             )
-        # turn_complete
-        text = _safe_text(content.get("text") or summary, "Turn finished")
+        # turn_complete — QA-3 S5/C3: a turn can COMPLETE carrying an upstream
+        # provider error as its final message text (the gateway surfaces the
+        # llm-proxy OAuth failure verbatim: `HTTP 403: {"code": ...}`). The
+        # reframer emits a normal `agentMessage` completion for it (NOT an
+        # `error` item), so this branch — not error_event — forwarded the raw
+        # JSON to APNs and the lock screen showed error theater (IMG_2583).
+        # Classify the terminal text: a raw-error shape becomes ONE honest
+        # human line under the error treatment, never verbatim.
+        raw = content.get("text") or summary
+        humanized = _humanize_raw_error(_safe_text(raw, ""))
+        if humanized:
+            return (
+                "Hermes hit an error",
+                humanized,
+                cfg.error_category,
+                _TURN_COMPLETE_EXPIRATION_S,
+            )
+        text = _safe_text(raw, "Turn finished")
         return "Hermes finished", text, cfg.turn_complete_category, _TURN_COMPLETE_EXPIRATION_S
 
 
@@ -407,3 +424,44 @@ def _safe_text(value: Any, default: str, *, max_chars: int = 240) -> str:
     if len(first_line) > max_chars:
         first_line = first_line[: max_chars - 1].rstrip() + "…"
     return first_line
+
+
+# QA-3 S5/C3 — raw-error classifier. A turn that completes carrying an upstream
+# provider failure as its text (owner forensics IMG_2583: `HTTP 403: {"code":
+# "unauthenticated:bad-credentials","error":"The OAuth2 access token could not
+# be validated."}`) must NEVER reach the lock screen verbatim — that is error
+# theater. Two raw shapes are detected:
+#
+# 1. a provider HTTP error line — `HTTP 4xx:` / `HTTP 5xx:` prefix (a SUCCESS
+#    code like `HTTP 200:` in agent prose is NOT an error and never matches);
+# 2. a bare JSON error payload — a `{...}` first line carrying a `"code"` or
+#    `"error"` key.
+#
+# Returns ONE honest human line (auth-shaped failures get an auth line), or
+# `None` when the text is ordinary prose. The iOS twin (`RawErrorSanitizer` in
+# HermesMobile/Support) implements the identical rules so in-transcript renders
+# and push bodies agree word-for-word.
+_HTTP_ERROR_PREFIX = re.compile(r"^\s*HTTP\s+[45]\d\d\s*:", re.IGNORECASE)
+_AUTH_HINTS = (
+    "unauthenticated", "bad-credentials", "bad_credentials", "oauth",
+    "access token", "api key", "api_key", "401", "403",
+)
+
+
+def _humanize_raw_error(text: str) -> Optional[str]:
+    """Map a raw-error terminal text to a human line, or ``None`` if not raw."""
+    if not isinstance(text, str):
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    first_line = stripped.splitlines()[0].strip()
+    is_raw = bool(_HTTP_ERROR_PREFIX.match(first_line))
+    if not is_raw and first_line.startswith("{") and first_line.endswith("}"):
+        is_raw = '"code"' in first_line or '"error"' in first_line
+    if not is_raw:
+        return None
+    lowered = stripped.lower()
+    if any(hint in lowered for hint in _AUTH_HINTS):
+        return "Auth for this session's provider has expired — re-authentication is needed."
+    return "The provider returned an error — open the session for details."
