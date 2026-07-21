@@ -5048,7 +5048,11 @@ final class ChatStore {
         items.contains { $0.type == .error && $0.status == .failed }
     }
 
-    func applyRelayItems(_ items: [ChatItem], turnSettled: Bool = false) {
+    func applyRelayItems(
+        _ items: [ChatItem],
+        turnSettled: Bool = false,
+        serverTurnDuration: TimeInterval? = nil
+    ) {
         // `turnSettled` (QA-2 R4/A2): the coordinator passes `true` when the frame
         // that drove this projection is `turn.completed` — the authoritative
         // turn-end the turn-scoped `relayTurnLive` flag clears on. Without it the
@@ -5057,6 +5061,16 @@ final class ChatStore {
         // (the build-115 bug). Item terminality still drives the PER-ROW
         // `isStreaming` (the caret leaves a finished bubble); the STORE-level flag
         // is turn-scoped.
+        //
+        // `serverTurnDuration` (QA-3 S2/A1): the relay's authoritative turn
+        // wall-clock (`turn.completed` body `duration_s`, reframer-measured from
+        // the turn open). The per-turn timer STARTS LOCALLY at send
+        // (`turnStartedAt`) — the affordance renders ≤100 ms from send, never
+        // gated on a frame — and RECONCILES to this server value on settle, so
+        // the "Worked for Ns" label reads the turn's true duration even when the
+        // phone's local start is skewed (queued-drain re-send) or absent (a
+        // mid-turn resume this phone did not send — those now stamp the settled
+        // duration from the server with NO local start at all).
         if turnSettled { relayTurnLive = false }
         // QA-2 R12 — a live frame batch proves the turn is still progressing;
         // stamp the wall clock and re-arm the local-turn watchdog so a busy
@@ -5226,8 +5240,16 @@ final class ChatStore {
             // below) survives later turns' re-projections. Relay items carry no
             // timestamps; build 115 settled relay rows read a bare "Worked"
             // (IMG_2532). Mirrors the direct path's completion-time stamp.
-            if let started = turnStartedAt {
-                let elapsed = Date().timeIntervalSince(started)
+            //
+            // QA-3 S2/A1 — SERVER RECONCILIATION: the authoritative duration is
+            // the relay's `turn.completed` `duration_s` when it carries one;
+            // the local `turnStartedAt` measurement is the fallback (and the
+            // LIVE timer's source while the turn runs). Server-wins means a
+            // mid-turn resume (no local start) still stamps an honest settled
+            // duration.
+            let elapsed = serverTurnDuration
+                ?? turnStartedAt.map { Date().timeIntervalSince($0) }
+            if let elapsed {
                 // The settled row is THIS turn's assistant row — the last
                 // assistant AFTER the last user row (a turn that settled with
                 // zero agent items must not re-stamp the previous turn's row).

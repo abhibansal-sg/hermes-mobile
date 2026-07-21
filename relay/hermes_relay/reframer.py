@@ -55,6 +55,7 @@ no gateway dependency, no I/O.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -107,6 +108,13 @@ class _Ctx:
     current_turn: Optional[str] = None
     text_item: Optional[str] = None
     reasoning_item: Optional[str] = None
+    # QA-3 S2/A1 — authoritative per-turn wall-clock for the phone's per-turn
+    # timer reconciliation: the phone's live timer starts LOCALLY at send and
+    # settles onto the turn.completed `duration_s` (measured here, from the
+    # turn open). monotonic for the duration (clock-skew-proof), wall for the
+    # `started_at` echo.
+    turn_started_mono: float = 0.0
+    turn_started_wall: float = 0.0
     # For id-LESS tools only: name -> the synthesized item_id assigned at
     # tool.start, so the matching tool.complete lands on the SAME card. Tools
     # that carry a real ``tool_id`` never touch this map (they correlate on it).
@@ -206,6 +214,11 @@ class Reframer:
             return []
         ctx.turn_seq += 1
         ctx.current_turn = f"{sid}:t{ctx.turn_seq}"
+        # QA-3 S2/A1: open the turn's authoritative wall-clock (the phone's
+        # settled "Worked for Ns" reconciles onto the turn.completed
+        # `duration_s` measured from here).
+        ctx.turn_started_mono = time.monotonic()
+        ctx.turn_started_wall = time.time()
         return [Frame(sid=sid, kind=FrameKind.TURN_STARTED, body={}, turn=ctx.current_turn)]
 
     def _ctx_for(self, sid: str) -> _Ctx:
@@ -289,11 +302,22 @@ class Reframer:
             )
             frames.append(Frame.with_item(sid, FrameKind.ITEM_COMPLETED, usage_item, ctx.current_turn))
 
+        # QA-3 S2/A1 — authoritative per-turn timing for the phone's per-turn
+        # timer: it starts LOCALLY on the phone at send and reconciles onto
+        # this `duration_s` at settle (relay-measured from the turn open, so a
+        # mid-turn resume the phone did not send still settles honest). Additive
+        # body keys — an old phone ignores them (protocol §2 forward-compat).
+        body: dict[str, Any] = {"usage": usage} if isinstance(usage, dict) else {}
+        if ctx.turn_started_mono:
+            body["duration_s"] = round(
+                max(0.0, time.monotonic() - ctx.turn_started_mono), 3
+            )
+            body["started_at"] = ctx.turn_started_wall
         frames.append(
             Frame(
                 sid=sid,
                 kind=FrameKind.TURN_COMPLETED,
-                body={"usage": usage} if isinstance(usage, dict) else {},
+                body=body,
                 turn=ctx.current_turn,
             )
         )
@@ -301,6 +325,8 @@ class Reframer:
         ctx.current_turn = None
         ctx.text_item = None
         ctx.reasoning_item = None
+        ctx.turn_started_mono = 0.0
+        ctx.turn_started_wall = 0.0
         return frames
 
     # -- reasoning -------------------------------------------------------

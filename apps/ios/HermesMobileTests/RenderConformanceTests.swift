@@ -1647,6 +1647,340 @@ final class RenderConformanceTests: XCTestCase {
             "spec R5: a later turn's re-projection must not strip the settled turn's stamped duration")
     }
 
+    // MARK: - QA-3 S1/S2/S3 — ONE merged breathing-cursor working line (A1/A10)
+
+    /// Whether any part is an answer-text part (the phase-C boundary; mirrors
+    /// `MessageBubble`'s private `lastTextPartID` scan for test purposes).
+    private func hasTextPart(_ parts: [ChatMessagePart]) -> Bool {
+        parts.contains { if case .text = $0 { return true }; return false }
+    }
+
+    /// S2/A1 flagship — the labeled+timed working affordance appears ON SEND,
+    /// driven by LOCAL send state, with ALL relay frames held for 10 s (the
+    /// device saw ~35 s: build 116's line was gated on the first relay item
+    /// frame — IMG_2578 appeared already reading 35 s). ONE affordance in every
+    /// phase (S3): the merged line at send (zero parts), the SAME line updated
+    /// when work items land, the fold beside the prose once the answer flows,
+    /// and nothing once settled. The per-turn timer starts locally at send and
+    /// keeps ticking through the whole frame blackout.
+    func testRelaySend_MergedWorkingLine_FramesDelayed10s() async throws {
+        let fx = try loadFixture("render_live_fold")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        // HOLD the submit ack: zero downstream traffic for the whole blackout
+        // (the 10 s frame delay of spec A1 — unbounded in principle; frames
+        // never arrive until this test releases them).
+        g.transport.script = { upstream, relay in
+            guard let id = upstream.id else { return }
+            if upstream.method == "submit" { return }   // answered after the blackout
+            relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+        }
+        _ = try await g.coordinator.open(fx.sessionID)
+
+        let t0 = ContinuousClock.now
+        let sendTask = Task { await g.chat.send(text: fx.submitText) }
+        // ≤100 ms from send: the affordance is up off LOCAL state — no frame
+        // has been answered, let alone delivered.
+        await waitUntil(timeout: .milliseconds(100)) {
+            g.chat.isStreaming && g.chat.messages.last?.role == .assistant
+        }
+        let appearedIn = ContinuousClock.now - t0
+        XCTAssertLessThanOrEqual(appearedIn, .milliseconds(100),
+            "spec S2/A1: the working affordance appears ≤100 ms from send (local state)")
+
+        let bubble = try XCTUnwrap(g.chat.messages.last)
+        XCTAssertEqual(bubble.role, .assistant)
+        XCTAssertTrue(bubble.isStreaming)
+        XCTAssertTrue(bubble.parts.isEmpty, "zero relay frames have landed")
+        XCTAssertNotNil(g.chat.turnStartedAt,
+            "spec S2/A1: the per-turn timer starts LOCALLY at send")
+        XCTAssertTrue(
+            MessageBubble.showsStandaloneWorkingLine(
+                isStreaming: true, liveTurnActive: true, parts: []),
+            "the merged line renders at send with zero parts")
+        XCTAssertEqual(
+            MessageBubble.workingAffordanceCount(
+                isStreaming: true, liveTurnActive: true, parts: []),
+            1, "spec S3/A1: exactly ONE working affordance pre-first-frame")
+        XCTAssertEqual(WorkingSectionModel.liveCollapsedLabel(parts: []), "Working…",
+            "the pre-frame line already carries the inline status word")
+
+        // THE 10 s FRAME BLACKOUT: the affordance holds, the timer ticks locally.
+        try? await Task.sleep(for: .seconds(10))
+        let midParts = g.chat.messages.last?.parts ?? []
+        XCTAssertEqual(
+            MessageBubble.workingAffordanceCount(
+                isStreaming: g.chat.isStreaming, liveTurnActive: true, parts: midParts),
+            1, "spec S3/A1: still exactly one working affordance after 10 s of silence")
+        let elapsed = ThinkingDisplay.elapsedText(startedAt: g.chat.turnStartedAt, now: Date())
+        let elapsedSecs = Int(String(elapsed.prefix(while: \.isNumber))) ?? 0
+        XCTAssertGreaterThanOrEqual(elapsedSecs, 9,
+            "spec S2/A1: the per-turn timer ran locally through the whole blackout (read '\(elapsed)')")
+
+        // Release the submit ack (still no downstream frames) — send completes.
+        let submitID = try XCTUnwrap(
+            g.transport.upstreams().first { $0.method == "submit" }?.id)
+        g.transport.deliverResult(id: submitID,
+                                   result: .object(["session_id": .string(fx.sessionID)]))
+        let sent = await sendTask.value
+        XCTAssertTrue(sent, "the delayed submit resolves")
+
+        // PHASE B — first work items land: the fold IS the cursor line now;
+        // item arrival only updates the status text, never mounts a second
+        // surface (S3: build 116 stacked the spinner line + a bare caret).
+        deliver(g, fx, through: {
+            self.kind($0) == "item.started" && self.itemType($0) == "tool.generating"
+        })
+        await waitUntil { g.chat.messages.contains {
+            $0.role == .assistant && $0.isStreaming && !$0.parts.isEmpty
+        } }
+        let live = try XCTUnwrap(g.chat.messages.first {
+            $0.role == .assistant && $0.isStreaming && !$0.parts.isEmpty
+        })
+        XCTAssertFalse(hasTextPart(live.parts), "phase B: work parts, no answer text yet")
+        XCTAssertEqual(
+            MessageBubble.workingAffordanceCount(
+                isStreaming: true, liveTurnActive: true, parts: live.parts),
+            1, "spec S3/A1: one merged line in phase B — no stacked caret")
+        XCTAssertEqual(WorkingSectionModel.liveCollapsedLabel(parts: live.parts), "Working…",
+            "the raw pre-resolution tool state still reads plain 'Working…' (N2)")
+
+        // PHASE C — the answer starts flowing: the fold keeps status + timer
+        // beside the prose; the prose-tail caret owns the pulse. Still one
+        // working surface.
+        deliver(g, fx, through: {
+            self.kind($0) == "item.started" && self.itemType($0) == "agentMessage"
+        })
+        await waitUntil { g.chat.messages.contains {
+            $0.role == .assistant && self.hasTextPart($0.parts)
+        } }
+        let flowing = try XCTUnwrap(g.chat.messages.first {
+            $0.role == .assistant && self.hasTextPart($0.parts)
+        })
+        XCTAssertFalse(
+            MessageBubble.showsStandaloneWorkingLine(
+                isStreaming: true, liveTurnActive: true, parts: flowing.parts),
+            "phase C: the standalone merged line yields to the ForEach fold + prose caret")
+        XCTAssertEqual(
+            MessageBubble.workingAffordanceCount(
+                isStreaming: true, liveTurnActive: true, parts: flowing.parts),
+            1, "spec S3/A1: one working surface in phase C")
+
+        // SETTLED — no working affordance; the fold reads "Worked for Ns".
+        deliverAll(g, fx)
+        let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
+        await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
+        let settled = try XCTUnwrap(
+            g.chat.messages.first { $0.role == .assistant && $0.text == agentText })
+        XCTAssertEqual(
+            MessageBubble.workingAffordanceCount(
+                isStreaming: false, liveTurnActive: false, parts: settled.parts),
+            0, "settled: zero working affordances")
+    }
+
+    /// S3/A1 — the one-affordance contract across EVERY phase (pure pin of the
+    /// `MessageBubble` render decision). Build 116 rendered TWO surfaces in
+    /// phase B (the fold's spinner line + the standalone bare caret —
+    /// IMG_2578/2587/2591); the merged line makes two unreachable.
+    func testWorkingAffordance_ExactlyOneSurfaceAcrossAllPhases() {
+        let reasoning = ChatMessagePart.reasoning(id: "r1", text: "Thinking about it.")
+        let tool = ChatMessagePart.item(id: "t1", item: ChatItem(
+            itemID: "t1", type: .toolCall, status: .inProgress, ord: 1,
+            body: ["name": "read", "args": ["path": "auth.py"]]))
+        let text = ChatMessagePart.text(id: "x1", text: "The answer is…")
+        let phaseB: [ChatMessagePart] = [reasoning, tool]
+        let phaseC: [ChatMessagePart] = [reasoning, tool, text]
+
+        // Phase A — send → first frame: zero parts, the merged line renders.
+        XCTAssertTrue(MessageBubble.showsStandaloneWorkingLine(
+            isStreaming: true, liveTurnActive: true, parts: []))
+        XCTAssertEqual(MessageBubble.workingAffordanceCount(
+            isStreaming: true, liveTurnActive: true, parts: []), 1)
+
+        // Phase B — work parts, no answer text: still exactly ONE surface.
+        XCTAssertTrue(MessageBubble.showsStandaloneWorkingLine(
+            isStreaming: true, liveTurnActive: true, parts: phaseB),
+            "the merged line carries the work parts (the fold IS the cursor line)")
+        XCTAssertEqual(MessageBubble.workingAffordanceCount(
+            isStreaming: true, liveTurnActive: true, parts: phaseB), 1,
+            "spec S3: phase B is one surface — build 116 rendered two")
+
+        // Phase C — answer text flows: the fold rides beside the prose.
+        XCTAssertFalse(MessageBubble.showsStandaloneWorkingLine(
+            isStreaming: true, liveTurnActive: true, parts: phaseC))
+        XCTAssertEqual(MessageBubble.workingAffordanceCount(
+            isStreaming: true, liveTurnActive: true, parts: phaseC), 1)
+
+        // A pure-text live turn: the prose-tail caret is the only signal —
+        // zero working LINES (the caret is the text's insertion point).
+        XCTAssertEqual(MessageBubble.workingAffordanceCount(
+            isStreaming: true, liveTurnActive: true, parts: [text]), 0)
+
+        // Settled: zero working affordances in every shape.
+        for parts in [[], phaseB, phaseC, [text]] as [[ChatMessagePart]] {
+            XCTAssertEqual(MessageBubble.workingAffordanceCount(
+                isStreaming: false, liveTurnActive: false, parts: parts), 0)
+        }
+    }
+
+    /// S2/S3/A1 render proof (fail-before/pass-after — compiles + FAILS on
+    /// qa3/base): the optimistic caret bubble (phase A, zero parts) and the
+    /// first-item bubble (phase B, work parts) render the SAME single line —
+    /// item arrival updates the status text, it does not grow a second row.
+    /// Build 116 rendered a bare ~22 pt glyph at A and a STACKED spinner line
+    /// + bare caret (~64 pt) at B; the merged line is one ~32 pt row in both.
+    @MainActor
+    func testMergedLine_PhaseAAndBRenderOneSurface() throws {
+        // `MessageBubble` reads the stores off the environment — supply a
+        // disconnected graph (the geometry never touches the socket).
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+
+        func bubbleHeight(_ message: ChatMessage) throws -> CGFloat {
+            let renderer = ImageRenderer(content:
+                MessageBubble(
+                    message: message,
+                    liveTurnStartedAt: Date(),
+                    liveTurnActive: true
+                )
+                .frame(width: 360)
+                .environment(\.hermesTheme, HermesThemePresets.nousLight)
+                .environment(connection)
+                .environment(sessions)
+                .environment(chat)
+            )
+            renderer.scale = 2
+            return try XCTUnwrap(renderer.uiImage?.size.height,
+                "the streaming bubble must render")
+        }
+
+        // Phase A: the optimistic empty streaming bubble exactly as `send`
+        // appends it (zero parts, frames delayed).
+        let phaseA = ChatMessage(id: UUID(), role: .assistant,
+                                 isStreaming: true, relayProjected: true)
+        // Phase B: the same bubble once reasoning + a tool item have landed.
+        let phaseB = ChatMessage(id: UUID(), role: .assistant, parts: [
+            .reasoning(id: "r1", text: "Thinking about it."),
+            .item(id: "t1", item: ChatItem(
+                itemID: "t1", type: .toolCall, status: .inProgress, ord: 1,
+                body: ["name": "read", "args": ["path": "auth.py"]])),
+        ], isStreaming: true, relayProjected: true)
+
+        let heightA = try bubbleHeight(phaseA)
+        let heightB = try bubbleHeight(phaseB)
+        print("=== QA-3 S2/S3 merged working line: phaseA=\(heightA)pt phaseB=\(heightB)pt (build 116: bare glyph ≈22pt → spinner line + caret ≈64pt) ===")
+
+        XCTAssertLessThan(heightB, 50,
+            "spec S3/A1: phase B is ONE line — build 116 stacked the spinner line + the bare caret (≈64 pt; IMG_2578)")
+        XCTAssertEqual(heightA, heightB, accuracy: 8,
+            "spec S2/S3: the affordance at send and after first items is the SAME single line — item arrival only updates the status text, never mounts a second surface")
+        XCTAssertGreaterThan(heightA, 26,
+            "spec S2/A1: the send-time affordance is the labeled+timer line, not a bare textless glyph")
+    }
+
+    /// S1/A10 render proof (fail-before/pass-after — compiles + FAILS on
+    /// qa3/base): the streaming cursor's breathe is a pure function of
+    /// wall-clock time, so two renders 350 ms apart (~0.3 of the 1.2 s breathe
+    /// period) differ. Build 116's `@State` + `onAppear` repeatForever pulse
+    /// rendered a STEADY glyph off-screen (the animation only runs inside a
+    /// live SwiftUI transaction; any row remount stranded it static — the
+    /// motionless bar of IMG_2577/2585/2587).
+    @MainActor
+    func testStreamingCursor_PulseNeverStrandedStatic() throws {
+        func cursorPNG() throws -> Data {
+            let renderer = ImageRenderer(content:
+                StreamingCursor(isStreaming: true)
+                    .environment(\.hermesTheme, HermesThemePresets.nousLight)
+            )
+            renderer.scale = 2
+            return try XCTUnwrap(renderer.uiImage?.pngData(),
+                "the streaming cursor must render")
+        }
+        let first = try cursorPNG()
+        Thread.sleep(forTimeInterval: 0.35)   // ~0.29 of the 1.2 s breathe period
+        let second = try cursorPNG()
+        XCTAssertNotEqual(first, second,
+            "spec S1/A10: the cursor breathes off wall-clock time — a remount can never strand it static (build 116's @State pulse rendered steady here)")
+    }
+
+    /// S1/A10 — the breathe curve itself (pure, deterministic): the approved
+    /// StreamingCursor spec — soft opacity 1.0 → 0.25, 1.2 s period, steady
+    /// full opacity settled or under Reduce Motion.
+    func testCursorBreathe_SoftOpacityCurve() {
+        // Settled / Reduce Motion: steady full opacity (honest presence).
+        XCTAssertEqual(CursorBreathe.opacity(at: Date(), streaming: false), 1.0)
+        XCTAssertEqual(CursorBreathe.opacity(at: Date(), reduceMotion: true), 1.0)
+
+        // Phase 0 (period boundary): the 1.0 peak.
+        let peak = Date(timeIntervalSinceReferenceDate: CursorBreathe.period * 100)
+        XCTAssertEqual(CursorBreathe.opacity(at: peak), 1.0, accuracy: 1e-9)
+        // Phase 0.5: the 0.25 trough.
+        let trough = Date(timeIntervalSinceReferenceDate: CursorBreathe.period * 100
+                          + CursorBreathe.period / 2)
+        XCTAssertEqual(CursorBreathe.opacity(at: trough), CursorBreathe.minOpacity,
+                       accuracy: 1e-9)
+        XCTAssertEqual(CursorBreathe.minOpacity, 0.25, "the ratified trough")
+        XCTAssertEqual(CursorBreathe.period, 1.2,
+                       "the ratified period (easeInOut 0.6 s × 2 autoreverse)")
+
+        // Bounded + periodic everywhere.
+        var t = Date(timeIntervalSinceReferenceDate: 0)
+        for _ in 0..<240 {
+            let o = CursorBreathe.opacity(at: t)
+            XCTAssertGreaterThanOrEqual(o, 0.25)
+            XCTAssertLessThanOrEqual(o, 1.0)
+            XCTAssertEqual(o, CursorBreathe.opacity(
+                at: Date(timeIntervalSinceReferenceDate:
+                    t.timeIntervalSinceReferenceDate + CursorBreathe.period)),
+                accuracy: 1e-9)
+            t = Date(timeIntervalSinceReferenceDate: t.timeIntervalSinceReferenceDate + 0.05)
+        }
+    }
+
+    /// S2/A1 — SETTLE RECONCILIATION: the per-turn timer starts locally at
+    /// send and reconciles to the relay's authoritative `turn.completed`
+    /// `duration_s`. FAILS on qa3/base (the frame's `duration_s` was ignored;
+    /// the settled label read the phone's own ~0 s measurement).
+    func testReplay_SettledDurationReconcilesToServerTurnTime() async throws {
+        let fx = try loadFixture("render_live_fold")
+        let g = try await makeGraph()
+        defer { Task { await g.coordinator.stop() } }
+        _ = try await g.coordinator.open(fx.sessionID)
+        _ = await g.chat.send(text: fx.submitText)
+
+        // Through the last item (usage) — stop BEFORE the fixture's own
+        // turn.completed so the settle rides a hand-crafted one carrying the
+        // relay's authoritative duration.
+        deliver(g, fx, through: {
+            self.kind($0) == "item.completed" && self.itemType($0) == "usage"
+        })
+        let settleFrame: [String: Any] = [
+            "seq": 13, "sid": fx.sessionID, "turn": NSNull(),
+            "kind": "turn.completed",
+            "body": ["usage": [String: Any](), "duration_s": 42.0,
+                     "started_at": 1_700_000_000.0],
+        ]
+        g.transport.deliver(frameText(settleFrame))
+
+        let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
+        await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
+        let settledRow = try XCTUnwrap(
+            g.chat.messages.first { $0.role == .assistant && $0.text == agentText })
+        let stamped = try XCTUnwrap(settledRow.reasoningElapsed,
+            "the settle edge stamps the turn duration")
+        XCTAssertEqual(stamped, 42.0, accuracy: 0.001,
+            "spec S2/A1: the settled duration reconciles to the relay's turn.completed duration_s — not the phone's local measurement")
+        XCTAssertEqual(WorkingSectionModel.workedLabel(seconds: stamped), "Worked for 42s")
+    }
+
+    // MARK: - QA-3 renderjury-lane pins (retained at integration)
+    // The renderjury lane pinned the SAME single-affordance contract (A1/A10)
+    // through its own seams (`WorkingSectionModel.preItemWorkingLineVisible`,
+    // fold geometry, the fixture-loader shape contract). Kept alongside the
+    // working lane's `showsStandaloneWorkingLine` pins — complementary coverage,
+    // both green on the merged architecture.
+
     // MARK: - QA-3 S2/S3/S1 — the single merged breathing-cursor working line
 
     /// S2/A1: send → the SINGLE merged working affordance (breathing cursor +

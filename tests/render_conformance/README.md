@@ -102,6 +102,11 @@ exercises the full echo↔item path.
 | render_submit_stream + hand-authored resync snapshot (QA-3) | reconnect resync re-projection over cache-painted turns: single copy per row, strict chronological order, answer never before prompt | S4/A2 | FAILS on qa3/base (untagged assistant twins never consumed — orphan answers above rebuilt prompts, IMG_2579-2582) |
 | — (QA-3, warm-snapshot paint) | optimistic echo durable across session switch + store rebuild until the `userMessage` adoption reconciles it | S6/A2 | FAILS on qa3/base (echo in-memory only — lost on switch, IMG_2585/2591) |
 | — (QA-3, cache-first repaint) | same-session repaint never truncates the transcript to the cached tail window (backward-paged scrollback survives; void impossible) | S7/A3 | FAILS on qa3/base (`.replace` paint of the 50-row suffix evicts loaded history, IMG_2589/2590) |
+| render_live_fold (QA-3) | merged labeled+timer working line present ≤100 ms from send with relay frames held 10 s; per-turn timer ticks locally through the blackout | S2/A1 | FAILS on qa3/base (line gated on the first relay item frame — appeared ~35 s late, IMG_2578) |
+| — (QA-3) | ONE working affordance in every phase (send / work-parts / text-streaming); phase B never stacks a second surface | S3/A1 | FAILS (fold spinner line + bare caret stacked, IMG_2578/2587/2591) |
+| — (QA-3) | phase A and phase B bubbles render the SAME single line (item arrival only updates the status text) | S2/S3 | FAILS (bare glyph → stacked lines, ~22 pt → ~64 pt) |
+| — (QA-3) | cursor breathe is a pure function of time — two renders 350 ms apart differ; never stranded static by a remount | S1/A10 | FAILS (@State + repeatForever rendered steady off-transaction) |
+| hand-authored frame (QA-3) | settled duration reconciles to the relay's `turn.completed` `duration_s` | S2/A1 | FAILS (frame duration ignored; local ~0 s stamped) |
 
 ## Running
 
