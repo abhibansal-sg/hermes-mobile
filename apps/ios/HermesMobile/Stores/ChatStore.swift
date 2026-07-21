@@ -2666,6 +2666,15 @@ final class ChatStore {
             // the relay item will carry, so adoption never pops the bubble.
             let outgoing = trimmed.isEmpty ? "Please look at the attached image." : trimmed
             let clientMessageID = UUID().uuidString
+            // R2 / contract I5 — PIN the submit target at send-intent, sync,
+            // before any await: the selected stored id, or nil for a true draft.
+            // Re-checked after the submit await (amendment S4) so a mid-await
+            // navigation splits deterministically: an EXISTING-session pin whose
+            // submit fails converts to a durable queue row against THIS pinned
+            // id (never the drifted-to session); a DRAFT/nil pin drops its echo
+            // and closes the just-created orphan. There is no fallback to a
+            // previously-driven session (the deleted `?? activeSessionID`, D2).
+            let pinnedTarget = sessions?.activeStoredId
             sessions?.resetComposerHistoryBrowse(for: sessions?.activeComposerDraftKey)
             let userMessage = ChatMessage(
                 role: .user, clientMessageID: clientMessageID, text: outgoing
@@ -2751,20 +2760,40 @@ final class ChatStore {
             do {
                 let result = try await coordinator.submit(
                     prompt: outgoing,
-                    sessionID: sessions?.activeStoredId,
+                    sessionID: pinnedTarget,
                     clientMessageID: clientMessageID
                 )
-                // Land the new-chat bookkeeping (QA-1 B13): the relay SUBMIT
-                // created/owns the session — adopt its id so the draft becomes
-                // a real row (drawer listing, second send, outbox routing).
-                // Guarded inside to never clobber an already-bound session.
+                // R2 / contract I5 + amendment S4 — re-check the PINNED target
+                // after the submit await; a mid-await navigation splits.
+                let drifted = sessions?.activeStoredId != pinnedTarget
                 if let sid = result["session_id"]?.stringValue {
-                    sessions?.landRelayCreatedSession(storedID: sid)
-                    // QA-3 S6/A2: the draft send's echo had no stored session
-                    // to key under at append time — bind it now that the
-                    // relay-created session id has landed, so a switch-away
-                    // and back repaints the prompt here too.
-                    sessions?.persistDurableEcho(storedId: sid, echo: userMessage)
+                    if drifted, pinnedTarget == nil {
+                        // Nil-target (DRAFT) pin, user navigated away mid-create:
+                        // the minted session is NOT where they went — drop the
+                        // optimistic echo, never redirect, and close the orphan
+                        // LOCALLY (no wire close RPC; the relay GCs the empty
+                        // session). Nothing is attributed to any session
+                        // (desktop submit.ts:262-270; I5/I11 nil-pin branch).
+                        removeLocalEcho(clientMessageID: clientMessageID)
+                        abandonRelayTurnAffordance()
+                        setStreaming(false, reason: "relay.send.driftNilPin")
+                        turnStartedAt = nil
+                        return true
+                    }
+                    if pinnedTarget == nil {
+                        // Draft create, no drift: the relay MINTED the session —
+                        // adopt it atomically (store re-bind + write-gate move +
+                        // foreground) so the draft surface becomes a real entry
+                        // and the immediately-following send targets the new id
+                        // (contract A4/I6).
+                        coordinator.adoptCreatedSession(sid)
+                    }
+                    // Land the new-chat bookkeeping (QA-1 B13) AND re-home the
+                    // draft's echo onto the created session in the SAME atomic
+                    // step (R2 / I8-G4: one identity persisted once at adoption,
+                    // never re-keyed by a separate call after the fact). No-op
+                    // for an existing session — its echo was keyed at append.
+                    sessions?.landRelayCreatedSession(storedID: sid, echo: userMessage)
                 }
                 return true
             } catch {
@@ -2792,15 +2821,27 @@ final class ChatStore {
                 abandonRelayTurnAffordance()
                 setStreaming(false, reason: "relay.sendError")
                 turnStartedAt = nil
+                // R2 / S4 nil-pin drift: the user abandoned a DRAFT whose submit
+                // never reached the relay — drop, never redirect (no orphan was
+                // minted, no durable row against a session the user left).
+                if sessions?.activeStoredId != pinnedTarget, pinnedTarget == nil {
+                    return false
+                }
                 if !hasAttachments, let queueStore {
                     // Thread the ORIGINAL client message id into the outbox row
                     // (its jobID): if this failure was an AMBIGUOUS transport
                     // loss — the relay may already have driven the turn — the
                     // drain resubmits the same id and the relay's §5a dedup
                     // folds it into one turn (never a double-send).
+                    //
+                    // R2 / S4 existing-pin branch: enqueue against the PINNED id
+                    // captured at intent — NEVER the drifted-to session — so a
+                    // send whose target moved mid-pipeline drains once against
+                    // its original destination (I11; was `sessions?.activeStoredId`,
+                    // which redirected the row to wherever the user navigated).
                     if let queued = await queueStore.enqueue(
                         trimmed,
-                        storedSessionId: sessions?.activeStoredId,
+                        storedSessionId: pinnedTarget,
                         wake: false,
                         clientMessageID: clientMessageID
                     ) {
@@ -2986,6 +3027,15 @@ final class ChatStore {
            connection?.transportPath == .relay {
             prepareOutboxSubmission(job: job, remotePaths: remotePaths)
             lastSendReachedServer = true
+            // R2 / D10: an EMPTY runtime id is a relay new-session row — submit
+            // with a NIL target so the relay CREATE-on-nil-SUBMIT mints the
+            // session (downstream.py:759-763) instead of the dead gateway
+            // `session.create`. Deliberately NOT adopted as the active session —
+            // this is a background drain and must not move the write-gate to the
+            // minted session; the relay runs the turn there and the user sees it
+            // on open. The relay's cmid dedup makes a retry of the same row
+            // idempotent (one turn on the minted session).
+            let target: String? = runtimeSessionID.isEmpty ? nil : runtimeSessionID
             // Thread the durable row's stable id so an ambiguous-flap retry (the
             // submit threw after the relay already ran `prompt_submit`, so the
             // outbox retains the row and the next wake resubmits the SAME job) is
@@ -2993,7 +3043,7 @@ final class ChatStore {
             // the gateway path's `client_message_id` (see below).
             _ = try await coordinator.submit(
                 prompt: job.submissionText,
-                sessionID: runtimeSessionID,
+                sessionID: target,
                 clientMessageID: job.clientMessageID
             )
             return OutboxSubmitResult(

@@ -639,36 +639,56 @@ final class RelaySessionCoordinator {
         return client
     }
 
-    /// Start a new turn (or send into `activeSessionID`) and, on success, adopt
-    /// the returned session id so subsequent ops target it. `clientMessageID`
-    /// carries the durable outbox row's stable id so the relay SUBMIT handler can
-    /// dedupe a retry that follows a socket-flap-ambiguous submit (the RPC result
-    /// was lost after the relay already ran `prompt_submit`) instead of running a
-    /// second turn.
+    /// Start a new turn (or send into `activeSessionID`) and, on success, return
+    /// the relay's result (its `session_id` is the created/echoed id).
+    /// `clientMessageID` carries the durable outbox row's stable id so the relay
+    /// SUBMIT handler can dedupe a retry that follows a socket-flap-ambiguous
+    /// submit (the RPC result was lost after the relay already ran
+    /// `prompt_submit`) instead of running a second turn.
+    ///
+    /// R2 / contract I5 — the wire target is EXACTLY the pinned stored id the
+    /// caller passes: **nil when nothing is selected** (a true draft). There is
+    /// NO fallback to a previously-driven session — the deleted
+    /// `?? activeSessionID` submitted a draft into the PREVIOUS session (D2). A
+    /// nil target makes the relay CREATE the session (downstream.py:759-763);
+    /// the caller adopts the returned id via ``adoptCreatedSession(_:)`` AFTER
+    /// its drift re-check (amendment S4), so a mid-await navigation never binds
+    /// the minted session to a surface the user already left.
     @discardableResult
     func submit(
         prompt: String,
         sessionID: String? = nil,
         clientMessageID: String? = nil
     ) async throws -> JSONValue {
-        let target = sessionID ?? activeSessionID
+        let target = sessionID
         let result = try await requireClient().submit(
             sessionID: target, prompt: prompt, clientMessageID: clientMessageID
         )
         if let sid = result["session_id"]?.stringValue {
             activeSessionID = sid
-            // A submit with NO target creates the session at the relay (QA-1
-            // B13): the returned id is BOTH the stored and the live id, so adopt
-            // it as the stored identity too — otherwise `outboxRuntimeID(forStored:)`
-            // never maps the new session and a queued prompt for it would hold
-            // forever instead of draining over the relay. Guarded so a submit
-            // into an open session (stored id bound by start/open/resume) never
-            // clobbers its stable identity with a possibly-distinct live id.
-            if target == nil, activeStoredSessionID == nil { activeStoredSessionID = sid }
         } else if activeSessionID == nil, let target {
             activeSessionID = target
         }
         return result
+    }
+
+    /// R2 / contract A4 + I6 — atomic adoption of a session the relay CREATED on
+    /// a nil-target SUBMIT (downstream.py:759-763). The draft surface has NO
+    /// entry; this makes it a real one in a single code path (not a suppression
+    /// flag plus a patch): re-bind the item store to the minted id so the
+    /// previous session's parked items never project into it (I6 isolation),
+    /// adopt it as both the stored and the live identity (so
+    /// ``outboxRuntimeID(forStored:)`` maps it and the immediately-following
+    /// send targets it), move the write-gate to it (projection resumes), and
+    /// foreground it so the relay forwards its frames and push suppresses while
+    /// the phone holds it.
+    func adoptCreatedSession(_ sessionID: String) {
+        store = RelayItemStore()
+        chatStore.syncRelayTaskList(from: store)
+        activeSessionID = sessionID
+        activeStoredSessionID = sessionID
+        resumeProjection()
+        if let client { Task { await client.setForeground(sessionID) } }
     }
 
     /// The relay runtime id a durable-outbox row destined for `storedID` must
