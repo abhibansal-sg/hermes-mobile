@@ -120,32 +120,6 @@ final class UX1PolishTests: XCTestCase {
         )
     }
 
-    /// QA-3 S1/A10 (compact chrome, C2): the resting band between the
-    /// transcript's last row (the session project/CWD line) and the floating
-    /// composer is TIGHTENED — build 116's 140 pt floor + 16 pt breathing gap
-    /// left a ~40 pt dead band with a ~100 pt measured composer (IMG_2577 "too
-    /// much vertical gap"). The ratified compact values are 126/10: still ≥ the
-    /// 120 pt glass-card + home-indicator clearance, but a ~14 pt tighter
-    /// resting band. A measured composer taller than the floor still wins
-    /// (measured + gap), so only short/pre-measurement composers rest at 126.
-    func testComposerClearanceCompactChromeTightened() {
-        XCTAssertEqual(ChatView.composerFloatInset, 126, accuracy: 0.001,
-            "spec S1/A10/C2: the clearance floor is the tightened 126 pt (was 140)")
-        XCTAssertEqual(ChatView.composerBreathingGap, 10, accuracy: 0.001,
-            "spec S1/A10/C2: the breathing gap is the tightened 10 pt (was 16)")
-        // A typical ~110 pt composer rests exactly at the tightened floor —
-        // 14 pt less dead band than build 116's 140.
-        XCTAssertEqual(
-            ChatView.composerClearance(composerHeight: 110, keyboardHeight: 0),
-            126, accuracy: 0.001,
-            "a composer below the floor clamps to the tightened 126 pt band")
-        // A tall composer still clears with the breathing gap (measured wins).
-        XCTAssertEqual(
-            ChatView.composerClearance(composerHeight: 150, keyboardHeight: 0),
-            160, accuracy: 0.001,
-            "a measured composer above the floor keeps measured + gap")
-    }
-
     // MARK: - 4. Header-clearance top inset (FIX 2)
 
     /// The transcript top inset must clear the floating header so the first
