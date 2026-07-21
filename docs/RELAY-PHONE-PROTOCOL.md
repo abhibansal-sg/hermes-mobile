@@ -90,7 +90,13 @@ a partial merge preview and is never treated as authoritative.
   not an append — the phone repaints `body.tasks` from it.
 - `item.completed` — `body` = the FULL authoritative item (status completed/failed).
   For a `taskList` this frame is emitted ONLY when every task is done/cancelled.
-- `turn.started` / `turn.completed` — turn boundaries (`turn.completed` carries `usage`).
+- `turn.started` / `turn.completed` — turn boundaries (`turn.completed` carries
+  `usage`). Since QA-3 (S2/A1) `turn.completed` additionally carries the relay's
+  authoritative per-turn wall-clock — `duration_s` (seconds, reframer-measured
+  from the turn open) and `started_at` (epoch). The phone's per-turn timer
+  starts LOCALLY at send and reconciles its settled "Worked for Ns" label onto
+  `duration_s`; absent on older relays → the phone falls back to its own
+  measurement (additive keys, §2 forward-compat).
 - `approval.request` / `clarify.request` — interactive gates (phone replies via RPC).
 - `status` — `{ kind, text }` (lifecycle/compacting/etc., non-item chatter).
 - `title` — session title changed.
@@ -108,6 +114,34 @@ a partial merge preview and is never treated as authoritative.
     (full current items) + resumes live. The phone reconciles by item_id.
 - `completed`-is-authoritative means even a dropped delta is harmless: the phone
   paints optimistically and self-heals on `item.completed` / `snapshot`.
+
+### 4a. Turn liveness fallback (QA-3 S8/A4)
+
+A dead turn (gateway turn died, relay lost the terminal frame, or the submit
+never ran) must NEVER strand the phone in an eternal "Working…" — the phone
+runs a per-turn liveness fallback on top of the §4 spine:
+
+- The silence clock refreshes ONLY on frames of the CURRENT turn (items at or
+  after the last `userMessage` item, turn boundaries, snapshots, active gates).
+  Late frames of a SUPERSEDED turn never refresh it.
+- **Stage 1 — 45 s of silence:** the phone sends one `resync{last_seq: <n>}`
+  (the ordinary §4 replay; a `snapshot` when the gap exceeds the ring). Silent
+  and idempotent: a dropped `item.completed` / `turn.completed` heals here and
+  the turn settles NATURALLY. The user sees nothing.
+- **Stage 2 — 180 s of silence:** the turn is dead (the resync recovered
+  nothing, so the authority has nothing more). The phone locally terminals the
+  stuck `.inProgress` items and folds them as a muted "Interrupted" section —
+  never an error banner (C3). The local settle is PROVISIONAL: any later
+  authoritative frame (item.completed / snapshot) replaces the item by id and
+  heals it.
+- Deterministic prior-turn settle, independent of the clock: a still-inProgress
+  item BEFORE the last `userMessage` belongs to a turn a newer turn superseded
+  — the projection folds it as Interrupted on every pass (this is what kills
+  the double-working the instant the next turn's `userMessage` lands).
+
+The relay needs no new frame kinds for this — `resync`/`snapshot` are the
+mechanism. (Owner QA-3 IMG_2591: turn 1 "Working… · ToolCall 5s" + turn 2 live
+forever; fixed by the above.)
 
 ## 5. Session operations (phone → relay → gateway mapping)
 
@@ -252,6 +286,28 @@ fired from is the only wiring that is correct by construction.
   matching the gateway's. Without those the Notifier is a documented no-op —
   the mock-APNs E2E exercises the DECISION logic; the live send additionally
   requires these creds (owner-provided `.p8` + Key/Team IDs).
+
+### 6b. No raw error codes — terminal-text sanitizer (QA-3 S5/C3)
+
+A turn can COMPLETE carrying an upstream provider failure as its final message
+TEXT (the gateway surfaces e.g. `HTTP 403: {"code":"unauthenticated:bad-
+credentials",...}` verbatim as the last agentMessage) — the reframer emits a
+normal `agentMessage` completion for it, NOT an `error` item. The notifier's
+`turn_complete` branch must therefore classify terminal text:
+
+- raw shapes — an `HTTP 4xx/5xx:` prefix (a success code like `HTTP 200:` in
+  prose is NOT an error) or a `{...}` first line carrying a `"code"`/`"error"`
+  key — are mapped to ONE honest human line (auth-shaped → an auth-expired
+  line; otherwise a generic provider-error line) and take the `turn_error`
+  treatment (title "Hermes hit an error"). NEVER verbatim.
+- ordinary prose is forwarded unchanged (no false positives).
+
+The phone implements the IDENTICAL rules (`RawErrorSanitizer`, mirror of the
+relay's `_humanize_raw_error`) for the surfaces it renders itself — the
+in-transcript `error` item card and the relay RPC error descriptions feeding
+`lastError` banners (the relay's RPC error frames interpolate `str(exc)`, so a
+provider failure can ride an RPC error). Rule: no raw error codes ever reach
+the user; one honest human line instead.
 
 ## 7. What the two build tracks own (against THIS contract)
 

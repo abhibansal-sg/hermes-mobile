@@ -151,6 +151,10 @@ class _OwningGateway:
     def owns(self, sid: str) -> bool:
         return True
 
+    def origin_id_for(self, sid: str):
+        # QA-3 S12: no live↔origin divergence in this scenario.
+        return None
+
 
 def _write_throwaway_p8(path: Path) -> None:
     from cryptography.hazmat.primitives import serialization

@@ -120,6 +120,51 @@ def test_message_lifecycle_completed_is_authoritative():
     assert turn_done.body["usage"]["total"] == 42
 
 
+def test_turn_completed_carries_authoritative_duration():
+    """QA-3 S2/A1: ``turn.completed`` carries the relay-measured per-turn
+    wall-clock (``duration_s`` from the turn open + ``started_at`` epoch) so
+    the phone's per-turn timer — which starts LOCALLY at send — reconciles its
+    settled "Worked for Ns" onto the authoritative value (a mid-turn resume
+    the phone did not send still settles honest). Additive keys (protocol §2
+    forward-compat): ``usage`` is preserved.
+    """
+    import time
+
+    rf = _rf()
+    frames = _drive(rf, [_ev("message.start"), _ev("message.delta", text="Par")])
+    time.sleep(0.05)  # a measurable turn
+    frames.extend(
+        _drive(rf, [_ev("message.complete", text="Paris.", usage={"total": 3})])
+    )
+
+    turn_done = _first(frames, FrameKind.TURN_COMPLETED)
+    assert turn_done.body["usage"]["total"] == 3, "usage preserved (additive keys)"
+    duration = turn_done.body["duration_s"]
+    assert isinstance(duration, float)
+    assert 0.04 <= duration <= 5.0, f"turn wall-clock measured from the turn open: {duration}"
+    assert abs(time.time() - turn_done.body["started_at"]) < 10.0
+
+
+def test_turn_duration_resets_per_turn():
+    """A second turn's ``duration_s`` measures from ITS OWN open — the close
+    of turn one resets the clock (never cumulative across turns).
+    """
+    import time
+
+    rf = _rf()
+    _drive(rf, [_ev("message.start")])
+    time.sleep(0.05)
+    frames1 = _drive(rf, [_ev("message.complete", text="a1")])
+    frames2 = _drive(
+        rf, [_ev("message.start"), _ev("message.complete", text="a2")]
+    )
+
+    d1 = _first(frames1, FrameKind.TURN_COMPLETED).body["duration_s"]
+    d2 = _first(frames2, FrameKind.TURN_COMPLETED).body["duration_s"]
+    assert d1 >= 0.04, "turn 1 includes the sleep"
+    assert d2 < d1, f"turn 2 measures from its own open ({d2} < {d1})"
+
+
 def test_usage_emitted_as_footer_item():
     rf = _rf()
     frames = _drive(

@@ -138,7 +138,9 @@
           "input": 1,
           "output": 2,
           "total": 3
-        }
+        },
+        "duration_s": 0.027,
+        "started_at": 1784625075.454784
       }
     }
   ],

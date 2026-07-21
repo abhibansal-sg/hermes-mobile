@@ -512,6 +512,35 @@ final class TranscriptChromeGlowTests: XCTestCase {
         XCTAssertEqual(withDock, rest + 120 + ChatView.bottomStackSpacing, accuracy: 0.001)
     }
 
+    // MARK: - QA-3 S1/A10: CWD-row → composer gap tightened
+
+    /// QA-3 S1/A10 — the project/CWD row sat in a dead band above the composer
+    /// (owner: "too much vertical gap"). The resting clearance floor drops from
+    /// build-116's 140 to the ratified UX1 floor (120 — exactly clears the glass
+    /// composer) and the breathing pad from 16 to 8: ~20-28 pt of void removed
+    /// at rest (compact chrome, C2), keyboard + dock composition UNCHANGED.
+    func testQA3S1_ComposerClearanceTightened() {
+        XCTAssertEqual(ChatView.composerFloatInset, 120, accuracy: 0.001,
+            "spec S1/A10: the resting floor is the UX1 minimum (120), not the 140 dead band")
+        XCTAssertEqual(ChatView.composerBreathingGap, 8, accuracy: 0.001,
+            "spec S1/A10: the breathing pad is 8 pt (was 16)")
+        // A typical measured composer (~100 pt): clearance clamps to the floor —
+        // 20 pt tighter than build 116's 140.
+        XCTAssertEqual(ChatView.composerClearance(composerHeight: 100, keyboardHeight: 0),
+                       120, accuracy: 0.001)
+        // A tall measured composer: measured + 8 breathing (was + 16).
+        XCTAssertEqual(ChatView.composerClearance(composerHeight: 180, keyboardHeight: 0),
+                       188, accuracy: 0.001)
+        // Keyboard + dock composition is byte-identical to the approved formula.
+        let composed = ChatView.composerClearance(
+            composerHeight: 100, keyboardHeight: 336, dockHeight: 64)
+        XCTAssertEqual(
+            composed,
+            120 + 64 + ChatView.bottomStackSpacing + max(0, 336 - HermesLayoutConstants.controlBottomBaseline),
+            accuracy: 0.001,
+            "keyboard + dock clearance composition is unchanged by the gap tightening")
+    }
+
     // MARK: - Helpers
 
     private func makeSummary(

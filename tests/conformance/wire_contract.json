@@ -582,7 +582,9 @@
       "turn.completed": {
         "required": [],
         "optional": [
-          "usage"
+          "usage",
+          "duration_s",
+          "started_at"
         ],
         "closed": true
       },

@@ -153,6 +153,38 @@ struct RelayItemStore: Sendable, Equatable {
         if let cursor = snapshot.cursor, cursor > lastSeq { lastSeq = cursor }
     }
 
+    // MARK: - Liveness settle (QA-3 S8/A4)
+
+    /// Force-settle every still-`.inProgress` item to terminal, marked
+    /// ``ChatItem/locallyInterrupted`` so the render lane folds them as muted
+    /// "Interrupted" sections (never an error banner — C3). Called by the
+    /// coordinator when the per-turn liveness watchdog concludes a turn is
+    /// DEAD (no frames + no completion past the settle window, and the silent
+    /// `resync` recovered nothing — so the authority has nothing more either).
+    ///
+    /// PROVISIONAL, not destructive: the settle is local render state. Any
+    /// later authoritative frame heals it — `applyCompleted` and
+    /// `reconcile(snapshot:)` REPLACE the item by id (clearing the marker), and
+    /// a delta against a locally-settled item RESURRECTS it (clears the marker,
+    /// re-opens `.inProgress`, merges the patch — `applyDelta`): a settle that
+    /// false-positived on a healthy-but-frame-silent turn is lossless, the
+    /// first late frame re-materializes the item and streaming resumes. Only a
+    /// REAL `completed`/`failed` from the wire is an authoritative terminal
+    /// that drops late deltas. Returns `true` when at least one item was
+    /// settled (the caller re-projects only then).
+    @discardableResult
+    mutating func settleInProgressLocally() -> Bool {
+        var settled = false
+        for (id, item) in itemsByID where item.status == .inProgress {
+            var updated = item
+            updated.status = .completed
+            updated.locallyInterrupted = true
+            itemsByID[id] = updated
+            settled = true
+        }
+        return settled
+    }
+
     // MARK: - Lifecycle folds
 
     private mutating func track(_ id: String) {
@@ -169,12 +201,32 @@ struct RelayItemStore: Sendable, Equatable {
     }
 
     /// `item.delta`: merge the patch into the item body (append streaming `text`,
-    /// overwrite other fields). A delta after `completed` is ignored (authoritative).
+    /// overwrite other fields). A delta after an AUTHORITATIVE terminal
+    /// (`completed`/`failed` landed from the wire) is ignored (authoritative).
     /// A delta for an unseen item materializes an in-progress placeholder so a
     /// dropped `started` still streams; a later `completed`/`snapshot` heals it.
+    ///
+    /// REPLACE-NOT-DROP (fix-round 1, Gate-3): a delta against a PROVISIONAL
+    /// local liveness settle (``ChatItem/locallyInterrupted``) proves the turn
+    /// was ALIVE after all — the stage-2 watchdog false-positived on a healthy
+    /// but frame-silent slow turn (one long opaque tool with no incremental
+    /// output outran the settle window). The delta RESURRECTS the item: the
+    /// marker clears, the item re-opens to `.inProgress`, and the patch merges
+    /// onto the pre-settle body so the streamed content re-materializes instead
+    /// of being silently lost. The re-projection then re-derives streaming from
+    /// the live row and the turn continues to its authoritative end (a later
+    /// `completed`/`snapshot` still replaces the item wholesale by id).
     private mutating func applyDelta(_ delta: RelayItemDelta) {
         if let existing = itemsByID[delta.itemID] {
-            guard !existing.isTerminal else { return }
+            if existing.isTerminal {
+                guard existing.locallyInterrupted else { return }   // authoritative terminal: stale delta
+                var resurrected = existing
+                resurrected.status = .inProgress
+                resurrected.locallyInterrupted = false
+                resurrected.body = Self.mergePatch(delta.patch, into: existing.body)
+                itemsByID[delta.itemID] = resurrected
+                return
+            }
             var updated = existing
             updated.body = Self.mergePatch(delta.patch, into: existing.body)
             itemsByID[delta.itemID] = updated

@@ -67,6 +67,12 @@ class FakeGateway:
     def owns(self, sid: str) -> bool:
         return True
 
+    def origin_id_for(self, sid: str):
+        # QA-3 S12: the notifier resolves the stored (origin) id at fire time.
+        # These scenarios never diverge live↔origin, so None ⇒ no
+        # stored_session_id in the payload (sid and origin coincide).
+        return None
+
 
 async def drive_script_through_notifier(
     mock_gateway,

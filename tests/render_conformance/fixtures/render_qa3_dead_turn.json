@@ -1,0 +1,119 @@
+{
+  "name": "render_qa3_dead_turn",
+  "description": "S8 incident: submit -> userMessage -> turn.started -> toolCall item.started -> SILENCE (the turn dies mid-tool; no tool.complete, no message.complete — none in this fixture, asserted) -> resync redelivers the SAME in-progress items (the relay store never saw a terminal frame). This is the eternal double-working of IMG_2591: per-row isStreaming derives from item terminality, and the per-store watchdog re-arms on every redelivery. The liveness lane asserts a per-turn watchdog self-heals within N s (silent resync + settle, never an error banner — C3).",
+  "recorded_by": "tests/e2e_daily_driver/test_z_record_render_fixtures.py",
+  "replayed_by": "apps/ios/HermesMobileTests/RenderConformanceTests.swift",
+  "protocol": "docs/RELAY-PHONE-PROTOCOL.md",
+  "session_id": "render-sess-qa3-dead",
+  "submit": {
+    "text": "Run the test suite.",
+    "session_id": "render-sess-qa3-dead",
+    "client_message_id": "render-cmid-qa3-dead"
+  },
+  "cached_history": [],
+  "open_result_messages": [],
+  "frames": [
+    {
+      "seq": 1,
+      "sid": "render-sess-qa3-dead",
+      "turn": null,
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-qa3-dead:u-c77ef3643715508a",
+        "type": "userMessage",
+        "status": "completed",
+        "ord": 0,
+        "summary": "",
+        "body": {
+          "text": "Run the test suite.",
+          "client_message_id": "render-cmid-qa3-dead"
+        }
+      },
+      "t_ms": 0
+    },
+    {
+      "seq": 2,
+      "sid": "render-sess-qa3-dead",
+      "turn": "render-sess-qa3-dead:t1",
+      "kind": "turn.started",
+      "body": {},
+      "t_ms": 2
+    },
+    {
+      "seq": 3,
+      "sid": "render-sess-qa3-dead",
+      "turn": "render-sess-qa3-dead:t1",
+      "kind": "item.started",
+      "body": {
+        "item_id": "tool-deadturn-1",
+        "type": "toolCall",
+        "status": "in_progress",
+        "ord": 1,
+        "summary": "bash",
+        "body": {
+          "name": "bash",
+          "args": {
+            "command": "pytest tests/ -x"
+          }
+        }
+      },
+      "t_ms": 2
+    },
+    {
+      "seq": 1,
+      "sid": "render-sess-qa3-dead",
+      "turn": null,
+      "kind": "item.completed",
+      "body": {
+        "item_id": "render-sess-qa3-dead:u-c77ef3643715508a",
+        "type": "userMessage",
+        "status": "completed",
+        "ord": 0,
+        "summary": "",
+        "body": {
+          "text": "Run the test suite.",
+          "client_message_id": "render-cmid-qa3-dead"
+        }
+      },
+      "t_ms": 2831
+    },
+    {
+      "seq": 2,
+      "sid": "render-sess-qa3-dead",
+      "turn": "render-sess-qa3-dead:t1",
+      "kind": "turn.started",
+      "body": {},
+      "t_ms": 2831
+    },
+    {
+      "seq": 3,
+      "sid": "render-sess-qa3-dead",
+      "turn": "render-sess-qa3-dead:t1",
+      "kind": "item.started",
+      "body": {
+        "item_id": "tool-deadturn-1",
+        "type": "toolCall",
+        "status": "in_progress",
+        "ord": 1,
+        "summary": "bash",
+        "body": {
+          "name": "bash",
+          "args": {
+            "command": "pytest tests/ -x"
+          }
+        }
+      },
+      "t_ms": 2831
+    }
+  ],
+  "settled": {
+    "completed": false,
+    "user_prompt": "Run the test suite."
+  },
+  "script": [
+    {
+      "action": "resync",
+      "last_seq": 0
+    }
+  ]
+}

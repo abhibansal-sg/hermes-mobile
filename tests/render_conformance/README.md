@@ -22,11 +22,49 @@ lane, and render-model invariants are asserted against the spec contract.
   `render_live_fold.json` (QA-2 R5/R6/A3) is HAND-AUTHORED to the same wire
   format (the harness's mock gateway has no deterministic reasoning+tool
   script yet); it carries its provenance in its `recorded_by` field.
+  `render_dead_turn_liveness.json` (QA-3 S8/A4) is HAND-AUTHORED from the
+  round-3 forensics chronology (IMG_2591: dead turn 1 + live turn 2 — the
+  eternal double-working set piece); a dead turn is not deterministically
+  recordable against the isolated gateway without fault injection, so its
+  `recorded_by` carries that provenance.
 - The XCTest suite itself lives in the iOS test target (XCTest requirement):
   `apps/ios/HermesMobileTests/RenderConformanceTests.swift`, with the fixtures
   bundled into that target via `apps/ios/project.yml`. It replays the frames
   byte-for-byte through the production decoders (no live network — the
   coordinator's `RelayClient` runs over the in-process fake relay).
+
+### QA-3 incident fixtures (round-3 device QA, build 116)
+
+The round-3 bugs are ORDERING / LIVENESS / SCOPING shaped — they live in the
+frames' ARRIVAL TIMES and the driver's local actions, which the raw
+arrival-ordered envelopes discarded. `test_z_record_render_fixtures.py`
+records five more fixtures with BACKWARD-COMPATIBLE additive extensions to
+the same wire format (`render_fixture(..., timing=True, script_steps=...,
+extra_sessions=...)`); the pre-QA-3 fixtures re-record byte-identically and
+the loader ignores absent keys:
+
+| Fixture | Incident | New keys | Consumed by |
+|---|---|---|---|
+| render_qa3_delayed_start | S2: submit → userMessage → ~1.5 s silence → late first frame (IMG_2578's 35 s; the merged working line must render at SEND) | per-frame `t_ms` | renderjury lane (A1, `testRelaySend_MergedWorkingAffordanceBeforeAnyFrame`) |
+| render_qa3_reconnect_reorder | S4: reconnect socket resyncs a persisted watermark → cumulative `snapshot` of two settled turns + live turn 3 (the answer-above-prompt duplicate of IMG_2579-2582) | `t_ms`, `script` (open/resync/submit) | ordering lane (A2) |
+| render_qa3_session_switch | S6: turn live in A → switch to B mid-stream → return (IMG_2585's vanished prompt) | `t_ms`, `script` (switch_to ×2), `extra_sessions` (B's paint) | ordering lane (A2) |
+| render_qa3_dead_turn | S8: tool starts, turn dies, NO completion; resync redelivers the same in-progress items (IMG_2591's eternal double-working) | `t_ms`, `script` (resync); `settled.completed=false` | liveness lane (A4) |
+| render_qa3_draft_interleave | S11: A streams while New Chat is entered mid-stream — `enter_draft` is a `script` step, NO wire frame (IMG_2594's leaked rows) | `t_ms`, `script` (enter_draft) | S11 lane (A7) |
+
+The XCTest loader exposes the extensions via `Fixture.scriptSteps` /
+`Fixture.extraSessions` / `frameTMs(_:)`, plus a scaled `deliverTimed(_:)`
+replay helper (a real-time watchdog lane passes `scale: 1`).
+`testQA3IncidentFixtures_LoadWithExtensions_ShapesPinned` pins both the
+loader's backward-compat (pre-QA-3 fixtures load with the extensions empty)
+and the recorded incident SHAPES (the silence gap, the snapshot redelivery,
+the absence of `turn.completed`, the markers).
+
+`t_ms` is MEASURED wall-clock (ms since the first recorded frame on the
+shared clock) — the QA-1/QA-2 fixtures were byte-stable across re-recordings
+because they carried no timing; the QA-3 fixtures' `t_ms` values drift by the
+run's scheduling jitter on re-record (the frame SEQUENCES are deterministic).
+The XCTest pins are inequalities over the timing (gap ≥ 900 ms, marker
+ordering), never exact values, so a refreshed recording still passes.
 
 ## Recording (extend, don't fork)
 
@@ -66,6 +104,14 @@ exercises the full echo↔item path.
 | render_live_fold (QA-2) | resolved tool rides inline: "Working… · ‹tool›" | R5/A3 | FAILS |
 | — (QA-2) | live working section measures one line (< 60pt), never the 172pt window | R6/A3 | FAILS (172pt ThinkingView) |
 | render_live_fold (QA-2) | settled relay turn stamps "Worked for Ns"; survives the next turn's re-projection | R5/A3 | FAILS (bare "Worked"; relay items carry no timestamps) |
+| render_submit_stream + hand-authored resync snapshot (QA-3) | reconnect resync re-projection over cache-painted turns: single copy per row, strict chronological order, answer never before prompt | S4/A2 | FAILS on qa3/base (untagged assistant twins never consumed — orphan answers above rebuilt prompts, IMG_2579-2582) |
+| — (QA-3, warm-snapshot paint) | optimistic echo durable across session switch + store rebuild until the `userMessage` adoption reconciles it | S6/A2 | FAILS on qa3/base (echo in-memory only — lost on switch, IMG_2585/2591) |
+| — (QA-3, cache-first repaint) | same-session repaint never truncates the transcript to the cached tail window (backward-paged scrollback survives; void impossible) | S7/A3 | FAILS on qa3/base (`.replace` paint of the 50-row suffix evicts loaded history, IMG_2589/2590) |
+| render_live_fold (QA-3) | merged labeled+timer working line present ≤100 ms from send with relay frames held 10 s; per-turn timer ticks locally through the blackout | S2/A1 | FAILS on qa3/base (line gated on the first relay item frame — appeared ~35 s late, IMG_2578) |
+| — (QA-3) | ONE working affordance in every phase (send / work-parts / text-streaming); phase B never stacks a second surface | S3/A1 | FAILS (fold spinner line + bare caret stacked, IMG_2578/2587/2591) |
+| — (QA-3) | phase A and phase B bubbles render the SAME single line (item arrival only updates the status text) | S2/S3 | FAILS (bare glyph → stacked lines, ~22 pt → ~64 pt) |
+| — (QA-3) | cursor breathe is a pure function of time — two renders 350 ms apart differ; never stranded static by a remount | S1/A10 | FAILS (@State + repeatForever rendered steady off-transaction) |
+| hand-authored frame (QA-3) | settled duration reconciles to the relay's `turn.completed` `duration_s` | S2/A1 | FAILS (frame duration ignored; local ~0 s stamped) |
 
 ## Running
 
