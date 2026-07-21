@@ -303,6 +303,159 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         await coordinator.stop()
     }
 
+    // MARK: - S11 (QA-3): New-Chat draft surface must not leak the previous session's in-flight turn
+
+    /// S11: when the user enters a New Chat (startDraft →
+    /// `suppressProjectionForDraft`), the coordinator keeps driving the previous
+    /// session for reconnect/outbox routing BUT the item→transcript projection
+    /// is parked. Frames that arrive for the previous session's in-flight turn
+    /// MUST NOT paint onto the now-empty draft surface (IMG_2594: another
+    /// session's "Working… · ToolCall 7s" row rendered in a brand-new chat that
+    /// made zero backend requests — pure client-state leak). The draft surface
+    /// is provably empty for the duration of the suppression.
+    func testSuppressProjectionForDraftKeepsTranscriptEmptyWhileForeignTurnStreams() async throws {
+        let transport = MockRelayTransport()
+        let chat = ChatStore()
+        let coordinator = RelaySessionCoordinator(
+            chatStore: chat,
+            clientFactory: { RelayClient { _ in transport } }
+        )
+        try await coordinator.start(url: url)
+
+        // Drive a turn for session "A" so the store has items + the transcript
+        // is non-empty (the prior chat state).
+        transport.deliverFrames(sampleTurn())
+        await waitUntil { chat.messages.count >= 2 }
+        let preDraftCount = chat.messages.count
+        XCTAssertGreaterThan(preDraftCount, 0, "session A's turn must paint before the draft")
+        XCTAssertFalse(coordinator.projectionSuppressed)
+
+        // Enter a New Chat: park the projection. The previous session's
+        // in-flight turn is still streaming (more frames below).
+        coordinator.suppressProjectionForDraft()
+        XCTAssertTrue(coordinator.projectionSuppressed)
+        // Clear the chat surface the way `startDraft` does — a draft is empty.
+        chat.reset()
+        XCTAssertEqual(chat.messages.count, 0, "draft surface starts empty")
+
+        // More frames for session A's in-flight turn arrive (the pump is
+        // session-agnostic; the coordinator's store is still scoped to A).
+        transport.deliverFrames(sampleTurn())
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(
+            chat.messages.count,
+            0,
+            "S11: the previous session's in-flight frames must NOT leak onto the draft surface"
+        )
+        XCTAssertGreaterThan(
+            coordinator.store.items.count,
+            0,
+            "S11: the store still accumulates the foreign session's items for fast resume"
+        )
+        XCTAssertEqual(coordinator.activeSessionID, "s", "activeSessionID retained for reconnect/outbox routing")
+
+        await coordinator.stop()
+    }
+
+    /// S11: a real-session bind (resume/open) MUST clear the suppression flag so
+    /// the resumed session's items paint again. Covers the same-session re-open
+    /// after a draft (resetItemStoreForSessionSwitch is id-guarded, so without
+    /// the explicit re-projection in `resumeProjection` the items in the store
+    /// would never paint until the next frame).
+    func testResumeProjectionRepaintsAfterDraft() async throws {
+        let transport = MockRelayTransport(script: { upstream, relay in
+            // open(A) → deliver A's snapshot, then ack.
+            if upstream.method == "open",
+               let id = upstream.id,
+               let sid = upstream.params["session_id"] as? String {
+                let snapshot = RelayFrame(
+                    seq: 1, sid: sid, turn: nil, kind: .snapshot,
+                    body: .object([
+                        "items": .array([.object([
+                            "item_id": .string("\(sid)-item"),
+                            "type": .string(ChatItemType.userMessage.rawValue),
+                            "status": .string("completed"),
+                            "ord": .number(0),
+                            "body": .object(["text": .string("hello from \(sid)")]),
+                        ])]),
+                        "cursor": .number(1),
+                    ]))
+                relay.deliverFrame(snapshot)
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+                return
+            }
+            // resume(A) → ack only. The store already holds A's items from the
+            // initial open; resumeProjection() re-applies them. (Production
+            // resume re-delivers a snapshot via the pump; for THIS test we
+            // prove the explicit re-projection closes the same-session
+            // re-open gap that resetItemStoreForSessionSwitch's id-guard
+            // leaves open.)
+            if upstream.method == "resume", let id = upstream.id {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+            }
+        })
+        let chat = ChatStore()
+        let coordinator = RelaySessionCoordinator(
+            chatStore: chat,
+            clientFactory: { RelayClient { _ in transport } }
+        )
+        try await coordinator.start(url: url)
+
+        // Open A so the store has its snapshot, then park for a draft.
+        _ = try await coordinator.open("A")
+        await waitUntil { coordinator.store.items.map(\.itemID) == ["A-item"] }
+        await waitUntil { chat.messages.contains { $0.text.contains("hello from A") } }
+
+        coordinator.suppressProjectionForDraft()
+        chat.reset()
+        XCTAssertEqual(chat.messages.count, 0)
+
+        // resume(A) is what SessionStore.bindRelayRuntime calls after a draft
+        // when the user re-opens the same session. It MUST clear the flag and
+        // re-project.
+        _ = try await coordinator.resume("A")
+        XCTAssertFalse(coordinator.projectionSuppressed, "resume must clear the draft-suppression flag")
+        await waitUntil { chat.messages.contains { $0.text.contains("hello from A") } }
+        XCTAssertGreaterThan(
+            chat.messages.count,
+            0,
+            "S11: resume after a draft must repaint the session's accumulated items"
+        )
+
+        await coordinator.stop()
+    }
+
+    /// S11: frames that arrive WHILE suppressed must still update the store —
+    /// when the user later opens the SAME session, those items must already be
+    /// there (no gap in the timeline). Suppression is projection-only, not a
+    /// store freeze.
+    func testSuppressedFramesStillAccumulateInStoreForFastResume() async throws {
+        let transport = MockRelayTransport()
+        let chat = ChatStore()
+        let coordinator = RelaySessionCoordinator(
+            chatStore: chat,
+            clientFactory: { RelayClient { _ in transport } }
+        )
+        try await coordinator.start(url: url)
+
+        coordinator.suppressProjectionForDraft()
+        chat.reset()
+
+        // Deliver frames WHILE suppressed.
+        transport.deliverFrames(sampleTurn())
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(chat.messages.count, 0, "no projection while suppressed")
+        XCTAssertEqual(
+            coordinator.store.items.map(\.itemID),
+            ["user-1", "msg-1", "tool-1"],
+            "S11: suppressed frames still accumulate in the store for fast resume"
+        )
+
+        await coordinator.stop()
+    }
+
     // MARK: - (4) Relay reliability: drain-on-(re)connect
 
     /// Thread-safe vendor of fresh mock transports, one per `connect` — a

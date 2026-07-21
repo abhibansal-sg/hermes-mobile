@@ -356,6 +356,180 @@ final class AppIntentWorkRepositoryTests: XCTestCase {
         XCTAssertTrue(sessions.isDraft)
     }
 
+    // MARK: - S9 (QA-3, 3rd recurrence): drawer race — programmatic open-intent
+    // dropped when the user has navigated into a session since the intent queued
+
+    /// A parked `.openSessions` App Intent queued BEFORE the user's most recent
+    /// drawer-row tap must NOT re-open the drawer when `drainDurable` re-drains
+    /// it on a foreground transition. This is the tap-during-in-flight-load
+    /// race (S9): the user taps a drawer row, the drawer closes on first paint
+    /// / 300ms deadline, then the foreground re-drain fires `closeActive` +
+    /// posts `hermesOpenSessionsIntent` → the drawer snaps back open over the
+    /// load the user just chose. The fix gates the open-intent on a monotonic
+    /// gesture epoch + the user's most recent gesture timestamp.
+    @MainActor
+    func testOpenSessionsDroppedWhenUserGesturedSinceQueue() async throws {
+        let test = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: test.directory) }
+        let observation = WorkRepositoryObservation()
+        let repository = try WorkRepository(configuration: test.configuration, observation: observation)
+        let scope = try workTestScope()
+        let queue = QueueStore(
+            repository: repository,
+            observation: observation,
+            scopeProvider: { scope }
+        )
+        let sessions = SessionStore()
+
+        // 1. Park an .openSessions job in the PAST (queued before the user gestured).
+        let queueTime = Date().addingTimeInterval(-60)
+        let parked = try await repository.enqueueAppIntent(
+            kind: .openSessions, now: queueTime
+        )
+
+        // 2. The user taps a drawer row to navigate into a session MORE RECENTLY
+        //    (in-flight load). The drawer row tap stamps the gesture epoch + time.
+        sessions.recordDrawerUserGesture(now: queueTime.addingTimeInterval(60))
+
+        // 3. Foreground transition fires drainDurable.
+        let openedSessions = expectation(
+            forNotification: .hermesOpenSessionsIntent,
+            object: nil
+        )
+        openedSessions.isInverted = true
+
+        let suite = "S9-race-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        await PendingIntentRouter.drainDurable(
+            repository: repository,
+            scope: scope,
+            sessions: sessions,
+            queue: queue,
+            defaults: defaults
+        )
+
+        // 4. The drawer must NOT re-open: no hermesOpenSessionsIntent posted.
+        await fulfillment(of: [openedSessions], timeout: 0.3)
+
+        // 5. The job is still marked complete — it was handled by deliberately
+        //    not re-opening, so it doesn't re-drain next foreground.
+        let completed = try await repository.job(id: parked.jobID)
+        XCTAssertEqual(completed?.state, .completed)
+    }
+
+    /// The wall-clock path resolves ties conservatively for the user: when the
+    /// gesture timestamp EQUALS the job's queue time (same timestamp tick —
+    /// possible when the gesture and the queue happen within the same
+    /// `Date()` resolution), the open is still dropped. `>=` (not `>`) is
+    /// intentional: a same-instant gesture is treated as "the user acted" — the
+    /// alternative (fire) would re-open the drawer over an in-flight load the
+    /// user just chose. The legitimate widget-tap path has its queue time
+    /// strictly AFTER any prior in-app gesture, so it still fires (proven by
+    /// the next test).
+    @MainActor
+    func testOpenSessionsDroppedWhenGestureTiesQueueTimestamp() async throws {
+        let test = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: test.directory) }
+        let observation = WorkRepositoryObservation()
+        let repository = try WorkRepository(configuration: test.configuration, observation: observation)
+        let scope = try workTestScope()
+        let queue = QueueStore(
+            repository: repository,
+            observation: observation,
+            scopeProvider: { scope }
+        )
+        let sessions = SessionStore()
+
+        // Park a job "now" so the wall-clock comparison cannot tell it apart
+        // from a user gesture that happens "now" too.
+        let now = Date()
+        let parked = try await repository.enqueueAppIntent(
+            kind: .openSessions, now: now
+        )
+        // No gesture yet — epoch is 0, gesture timestamp is distantPast.
+
+        let openedSessions = expectation(
+            forNotification: .hermesOpenSessionsIntent,
+            object: nil
+        )
+        openedSessions.isInverted = true
+
+        // Inject the user's gesture IMMEDIATELY before drainDurable so it lands
+        // synchronously on the main actor while the drain is between its
+        // capture and the post (closeActive awaits on the main actor, yielding
+        // the executor; the gesture bumps the epoch on that yield).
+        let suite = "S9-epoch-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        // Bump BEFORE drainDurable's openSessions branch runs but AFTER the
+        // job was queued. The wall-clock comparison ties (both `now`); the
+        // epoch comparison catches it: epoch captured by drainDurable (0) is
+        // strictly less than the gestured epoch (1).
+        sessions.recordDrawerUserGesture(now: now)
+
+        await PendingIntentRouter.drainDurable(
+            repository: repository,
+            scope: scope,
+            sessions: sessions,
+            queue: queue,
+            defaults: defaults
+        )
+
+        await fulfillment(of: [openedSessions], timeout: 0.3)
+        let completed = try await repository.job(id: parked.jobID)
+        XCTAssertEqual(completed?.state, .completed)
+    }
+
+    /// Sanity: a fresh `.openSessions` App Intent whose queue time is at-or-after
+    /// the user's most recent gesture (the widget tap that queued it IS the most
+    /// recent user action) MUST still open the drawer. The gate is precise, not
+    /// a blanket suppression — the legitimate "tap widget to open drawer" path
+    /// continues to work.
+    @MainActor
+    func testOpenSessionsFiresWhenIntentIsNewerThanUserGesture() async throws {
+        let test = try makeWorkRepositoryTestConfiguration()
+        defer { try? FileManager.default.removeItem(at: test.directory) }
+        let observation = WorkRepositoryObservation()
+        let repository = try WorkRepository(configuration: test.configuration, observation: observation)
+        let scope = try workTestScope()
+        let queue = QueueStore(
+            repository: repository,
+            observation: observation,
+            scopeProvider: { scope }
+        )
+        let sessions = SessionStore()
+
+        // An older in-app gesture (the user opened a session 5 minutes ago).
+        sessions.recordDrawerUserGesture(now: Date().addingTimeInterval(-300))
+
+        // The widget tap is MORE RECENT (just now) — it queued the openSessions.
+        let parked = try await repository.enqueueAppIntent(kind: .openSessions)
+
+        let openedSessions = expectation(
+            forNotification: .hermesOpenSessionsIntent,
+            object: nil
+        )
+
+        let suite = "S9-fresh-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        await PendingIntentRouter.drainDurable(
+            repository: repository,
+            scope: scope,
+            sessions: sessions,
+            queue: queue,
+            defaults: defaults
+        )
+
+        await fulfillment(of: [openedSessions], timeout: 1.0)
+        let completed = try await repository.job(id: parked.jobID)
+        XCTAssertEqual(completed?.state, .completed)
+    }
+
     @MainActor
     func testOfflineAskRemainsVisibleInQueueProjection() async throws {
         let test = try makeWorkRepositoryTestConfiguration()
