@@ -366,22 +366,34 @@ final class RelaySessionCoordinatorTests: XCTestCase {
     func testResumeProjectionRepaintsAfterDraft() async throws {
         let transport = MockRelayTransport(script: { upstream, relay in
             // open(A) → deliver A's snapshot, then ack.
-            guard let id = upstream.id, upstream.method == "open",
-                  let sid = upstream.params["session_id"] as? String else { return }
-            let snapshot = RelayFrame(
-                seq: 1, sid: sid, turn: nil, kind: .snapshot,
-                body: .object([
-                    "items": .array([.object([
-                        "item_id": .string("\(sid)-item"),
-                        "type": .string(ChatItemType.userMessage.rawValue),
-                        "status": .string("completed"),
-                        "ord": .number(0),
-                        "body": .object(["text": .string("hello from \(sid)")]),
-                    ])]),
-                    "cursor": .number(1),
-                ]))
-            relay.deliverFrame(snapshot)
-            relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+            if upstream.method == "open",
+               let id = upstream.id,
+               let sid = upstream.params["session_id"] as? String {
+                let snapshot = RelayFrame(
+                    seq: 1, sid: sid, turn: nil, kind: .snapshot,
+                    body: .object([
+                        "items": .array([.object([
+                            "item_id": .string("\(sid)-item"),
+                            "type": .string(ChatItemType.userMessage.rawValue),
+                            "status": .string("completed"),
+                            "ord": .number(0),
+                            "body": .object(["text": .string("hello from \(sid)")]),
+                        ])]),
+                        "cursor": .number(1),
+                    ]))
+                relay.deliverFrame(snapshot)
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+                return
+            }
+            // resume(A) → ack only. The store already holds A's items from the
+            // initial open; resumeProjection() re-applies them. (Production
+            // resume re-delivers a snapshot via the pump; for THIS test we
+            // prove the explicit re-projection closes the same-session
+            // re-open gap that resetItemStoreForSessionSwitch's id-guard
+            // leaves open.)
+            if upstream.method == "resume", let id = upstream.id {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+            }
         })
         let chat = ChatStore()
         let coordinator = RelaySessionCoordinator(
