@@ -104,7 +104,7 @@ def alloc_isolated_port(reserved: set[int]) -> int:
     )
 
 
-def _wait_port(host: str, port: int, timeout: float = 15.0) -> None:
+def _wait_port(host: str, port: int, timeout: float = 45.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -203,7 +203,7 @@ class SoakGatewayProc:
             stdin=subprocess.DEVNULL, start_new_session=True,
         )
         self.start_count += 1
-        _wait_port("127.0.0.1", self.port, timeout=20.0)
+        _wait_port("127.0.0.1", self.port, timeout=45.0)
         _log.info("soak gateway up (pid=%s) port=%d home=%s",
                   self.proc.pid, self.port, self.home)
 

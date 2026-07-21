@@ -227,11 +227,23 @@ class DedupChecker:
     def __init__(self) -> None:
         self._submit_groups: dict[str, list[dict]] = {}  # cmid -> responses
         self._user_ids: dict[str, set[str]] = {}         # sid -> userMessage ids
+        self._expected: dict[str, int] = {}              # sid -> expected prompts
         self._violations: list[str] = []
 
     def record_submit(self, cmid: str, response: dict) -> None:
         if cmid:
             self._submit_groups.setdefault(cmid, []).append(response or {})
+
+    def expect_user_messages(self, sid: str, count: int) -> None:
+        """Declare that ``sid`` legitimately carries ``count`` distinct prompts.
+
+        Multi-turn sessions (sustained T3) have one userMessage item_id PER
+        TURN; the default single-prompt expectation (>1 == double-apply) would
+        false-positive there. The violation fires when the distinct id count
+        EXCEEDS the expectation — replay double-apply still detected.
+        """
+        if sid:
+            self._expected[sid] = max(self._expected.get(sid, 1), max(1, count))
 
     def fold_frames(self, frames) -> "DedupChecker":
         for f in frames:
@@ -259,13 +271,16 @@ class DedupChecker:
                     f"I4: cmid {cmid} re-submitted {len(resps)}× but no retry was "
                     f"marked deduplicated — dedup path not engaged"
                 )
-        # Replayed frames: one prompt == one userMessage item_id.
+        # Replayed frames: one prompt == one userMessage item_id (per expected
+        # prompt count — multi-turn sessions legitimately carry several).
         for sid, ids in self._user_ids.items():
             ids.discard("")
-            if len(ids) > 1:
+            expected = self._expected.get(sid, 1)
+            if len(ids) > expected:
                 self._violations.append(
                     f"I4: session {sid} has {len(ids)} distinct userMessage ids "
-                    f"{sorted(ids)[:5]} — replay double-applied the prompt"
+                    f"(expected {expected}): {sorted(ids)[:5]} — replay "
+                    f"double-applied a prompt"
                 )
         return self
 

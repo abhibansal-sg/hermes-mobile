@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from typing import Any, Callable, Optional
 
 import websockets
@@ -99,6 +100,48 @@ class SoakPhoneDriver(PhoneDriver):
         for frame, gen in zip(self.frames, self._frame_gen):
             segs.setdefault(gen, []).append(frame)
         return [segs[g] for g in sorted(segs)]
+
+    # -- watermark-aware waiting ------------------------------------------
+    async def wait_for_after(
+        self, kind: str, after_index: int, *, sid: Optional[str] = None,
+        timeout: float = 30.0, predicate: Optional[Any] = None,
+    ) -> PhoneFrame:
+        """Like ``PhoneDriver.wait_for`` but only considers frames appended
+        AT/AFTER ``after_index`` in the log.
+
+        The base ``wait_for`` scans the WHOLE log — on a session that already
+        completed an earlier turn it matches that STALE ``turn.completed``
+        instantly, making multi-turn waits vacuous (T3 repeated batches, T4
+        post-restart drains). Capture ``wm = len(phone.frames)`` just before
+        the submit and pass it here to wait for THIS turn's terminal frame.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for idx in range(len(self.frames) - 1, after_index - 1, -1):
+                f = self.frames[idx]
+                if f.kind != kind:
+                    continue
+                if sid is not None and f.sid != sid:
+                    continue
+                if predicate is not None and not predicate(f):
+                    continue
+                return f
+            await asyncio.sleep(0.02)
+        raise asyncio.TimeoutError(
+            f"phone: no frame kind={kind} sid={sid} after index {after_index} "
+            f"within {timeout}s (have {len(self.frames)} frames;"
+            f" kinds={sorted({f.kind for f in self.frames[after_index:]})})"
+        )
+
+    def count_kind_after(self, kind: str, after_index: int, *,
+                         sid: Optional[str] = None) -> int:
+        """Number of frames of ``kind`` (optionally for ``sid``) at/after
+        ``after_index`` — cheap terminal-evidence probe for kill cycles."""
+        n = 0
+        for f in self.frames[after_index:]:
+            if f.kind == kind and (sid is None or f.sid == sid):
+                n += 1
+        return n
 
     # -- raw upstream (fuzzing — bypass the typed helpers) ----------------
     async def send_raw(self, data: str) -> None:

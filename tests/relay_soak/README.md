@@ -137,3 +137,18 @@ inspect. This is the "drop a frame in a test shim and show I2 fails" proof.
 * `SOAK_SCALE` multiplies every duration (default 1.0; proof runs use ~0.1).
 * `SOAK_SEED` drives every randomized behavior (reproducible; each scenario
   derives `random.Random(seed ^ salt)`).
+
+### Scenario / lane knobs
+
+* `SOAK_PORT_LO` / `SOAK_PORT_HI` — pin isolated-port allocation to a lane's
+  4-port slice of 9140-9160 (churn-flap 9140-43, interleave-kill 9144-47,
+  gateway-abuse 9148-51, fuzz-ring 9152-55, marathon 9156-59) so concurrently
+  running lanes never reach into each other's band. Default: the whole band.
+* `SOAK_T3_SESSIONS` — T3 concurrent session count (default 6, clamped 5-10;
+  the interleave-kill soak lane runs 8). T3 drives batches of one concurrent
+  turn per session, with randomized foreground switching, for the FULL scenario
+  duration (not a single batch).
+* `SOAK_T4_KILL_MIN_S` / `SOAK_T4_KILL_MAX_S` — T4 kill cadence in REAL
+  seconds (not scaled by SOAK_SCALE — duration scales, cadence is the
+  parameter): each SIGTERM-to-SIGTERM interval is uniform(min,max). Default
+  unset keeps the original denser derived schedule (short/CI).

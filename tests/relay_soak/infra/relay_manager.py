@@ -31,7 +31,7 @@ from typing import Optional
 _log = logging.getLogger("soak.relay_manager")
 
 
-def wait_for_port(host: str, port: int, timeout: float = 20.0) -> None:
+def wait_for_port(host: str, port: int, timeout: float = 45.0) -> None:
     """Block until ``host:port`` accepts a TCP connection (relay is listening)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -106,7 +106,9 @@ class RelayManager:
              "log": str(log_path)}
         )
         if wait_ready:
-            wait_for_port(self.host, self.downstream_port, timeout=25.0)
+            # Generous: python import + bind can be slow when the QA-3 swarm
+            # pins the box (everything here runs niced).
+            wait_for_port(self.host, self.downstream_port, timeout=45.0)
         _log.info("relay up (pid=%s, start#%d) downstream=%d home=%s",
                   self.proc.pid, self.start_count, self.downstream_port, self.home)
 

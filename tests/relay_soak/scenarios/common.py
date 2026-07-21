@@ -116,18 +116,33 @@ async def drive(
     return {"sid": resolved, "cmid": client_message_id, "submit_response": result}
 
 
-async def wait_terminal(phone: Any, sid: str, *, timeout: float = 30.0) -> None:
-    """Block until a ``turn.completed`` (or error item) lands for ``sid``."""
+async def wait_terminal(phone: Any, sid: str, *, timeout: float = 30.0,
+                        after_index: Optional[int] = None) -> None:
+    """Block until a ``turn.completed`` (or error item) lands for ``sid``.
+
+    ``after_index`` (a ``len(phone.frames)`` watermark captured BEFORE the
+    submit) restricts the wait to frames from THIS turn — without it a session
+    that completed an earlier turn matches the stale ``turn.completed`` in the
+    log instantly and the wait is vacuous (multi-turn T3/T4).
+    """
+    def _is_error(f: Any) -> bool:
+        return (f.body or {}).get("type") == "error"
+
     try:
-        await phone.wait_for(
-            "turn.completed", sid=sid, timeout=timeout,
-        )
+        if after_index is None:
+            await phone.wait_for("turn.completed", sid=sid, timeout=timeout)
+        else:
+            await phone.wait_for_after("turn.completed", after_index,
+                                       sid=sid, timeout=timeout)
     except asyncio.TimeoutError:
         # A turn that errors completes via an error item, not turn.completed.
-        await phone.wait_for(
-            "item.completed", sid=sid, timeout=2.0,
-            predicate=lambda f: (f.body or {}).get("type") == "error",
-        )
+        if after_index is None:
+            await phone.wait_for(
+                "item.completed", sid=sid, timeout=2.0, predicate=_is_error)
+        else:
+            await phone.wait_for_after(
+                "item.completed", after_index, sid=sid, timeout=2.0,
+                predicate=_is_error)
 
 
 async def reconcile_after_settle(
@@ -155,3 +170,29 @@ async def run_reference(
     info = await drive(phone, gateway, script=script, text=text,
                        create_kwargs=create_kwargs)
     return await reconcile_after_settle(phone, info["sid"], resync_from=None)
+
+
+async def run_reference_multi(
+    phone: Any, gateway: Any, *, script: str = "simple",
+    text: Optional[str] = None, turns: int = 1, cmid_prefix: str = "ref-multi",
+    create_kwargs: Optional[dict[str, Any]] = None,
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    """A CLEAN run of ``turns`` sequential turns on ONE fresh session.
+
+    Returns ``(sid, reconciled_transcript)``. Used by multi-turn scenarios
+    (T3 sustained interleave) whose tortured sessions carry many turns: the
+    reference must drive the SAME turn count on the same deterministic script
+    so the reconciled transcripts are comparable. Each turn waits on a
+    watermark so earlier turns' terminals never satisfy a later wait.
+    """
+    kw = dict(create_kwargs or {})
+    if text is not None:
+        kw.setdefault("text", text)
+    sid = await gateway.create_session(script=script, **kw)
+    prompt = text or DEFAULT_TEXT.get(script, "soak turn")
+    for j in range(turns):
+        wm = len(phone.frames)
+        await phone.submit(text=prompt, session_id=sid,
+                           client_message_id=f"{cmid_prefix}-{j}")
+        await wait_terminal(phone, sid, timeout=60.0, after_index=wm)
+    return sid, await reconcile_after_settle(phone, sid, resync_from=None)

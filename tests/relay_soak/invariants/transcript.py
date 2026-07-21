@@ -74,9 +74,18 @@ def transcript_hash(items: dict[str, dict[str, Any]]) -> str:
     return hashlib.sha256("|".join(hashes).encode("utf-8")).hexdigest()
 
 
-def agent_messages(items: dict[str, dict[str, Any]]) -> list[str]:
-    """The authoritative agentMessage texts, in ``ord`` order."""
+def agent_messages(items: dict[str, dict[str, Any]], *,
+                   completed_only: bool = False) -> list[str]:
+    """The authoritative agentMessage texts, in ``ord`` order.
+
+    ``completed_only`` keeps just items with ``status == "completed"`` — a
+    turn mid-stream when a relay dies leaves a NON-completed agentMessage
+    skeleton (the S8 class); I2's byte-identity contract covers COMPLETED
+    turns, so kill scenarios count partials separately as evidence.
+    """
     msgs = [it for it in items.values() if it.get("type") == "agentMessage"]
+    if completed_only:
+        msgs = [it for it in msgs if it.get("status") == "completed"]
     msgs.sort(key=lambda it: it.get("ord", 0))
     return [str((it.get("body") or {}).get("text", "")) for it in msgs]
 
