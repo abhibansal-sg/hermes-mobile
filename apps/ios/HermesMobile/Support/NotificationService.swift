@@ -631,8 +631,13 @@ enum NotificationService {
         // that id directly (SessionStore.open is keyed by the stored id) instead
         // of relying on the inbox's runtime→stored map, which is empty for an
         // ordinary (non-attention) turn_complete of a compressed/old session.
-        let storedSessionId = (custom["stored_session_id"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // NOTE: the parens END the optional chain BEFORE `.flatMap` — without
+        // them Swift resolves `.flatMap` on the unwrapped `String` (a Sequence
+        // of Character), not `Optional<String>` (integration fix; the lane's
+        // un-parenthesized form compiled nowhere — String.Element has no
+        // `isEmpty`).
+        let storedSessionId = ((custom["stored_session_id"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines))
             .flatMap { $0.isEmpty ? nil : $0 }
 
         let eventType = (custom["event_type"] as? String)?.lowercased() ?? ""
