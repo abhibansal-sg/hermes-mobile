@@ -140,6 +140,27 @@ final class RelaySessionCoordinator {
     /// grows unbounded nor resurrects stale entries).
     private static let maxEntries = 8
 
+    /// R3 (ROUND-4 W2d): the session already established (open/resume/adopt
+    /// RPC issued) on the CURRENT connection. The `.open`-edge re-establishment
+    /// in `applyState` exists to rebind the session on a FRESH PhoneConnection
+    /// after a reconnect (the relay's new connection has no foreground) — it
+    /// must NOT fire a duplicate `open` when the buffered `.connecting → .open`
+    /// state replay re-crosses the edge after the bind RPC already ran (the
+    /// third read of the D6 cold-open triple-fetch). Cleared on every
+    /// non-`.open` transition + teardown, so a genuine reconnect re-establishes
+    /// exactly once.
+    private var establishedSessionID: String?
+
+    /// R3 (I14) gap-fill-once: whether the CURRENT turn delivered any payload
+    /// through the stream (reset at `turn.started`, set on item frames and on a
+    /// non-empty snapshot baseline). A `turn.completed` with NO delivered
+    /// payload fires exactly ONE relay-local `resync{last_seq}` — the desktop
+    /// `shouldHydrate` rule; a turn end with a payload costs zero refetches.
+    private var currentTurnDeliveredPayload = false
+    // (R1 deleted the S11 `projectionSuppressed` flag here — a draft is the
+    // ABSENCE of an entry (I6): with no active entry nothing can project,
+    // structurally. There is nothing to suppress or resume.)
+
     /// The render-lane reconciled item view, reconciled to the entry map
     /// (R1; RR7): the UNION of every parked entry's items — the read-only
     /// observation surface (tests, the resync watermark). The REDUCER unit is
@@ -245,6 +266,7 @@ final class RelaySessionCoordinator {
         touchEntry(sessionID)
         moveWriteGate(to: sessionID)
         if phase == .open, let client {
+            establishedSessionID = sessionID   // R3: this adopt IS the rebind
             Task {
                 await client.setForeground(sessionID)
                 _ = try? await client.open(sessionID)
@@ -400,6 +422,8 @@ final class RelaySessionCoordinator {
         entries.removeAll(); lruClock = 0
         activeSessionID = nil
         activeStoredSessionID = nil
+        establishedSessionID = nil          // R3: establishment is per-connection
+        currentTurnDeliveredPayload = false // R3: gap-fill-once state dies with the store
         phase = .idle
         if !preservingOpenWaiters {
             resolveAllOpenWaiters(opened: false)
@@ -557,6 +581,7 @@ final class RelaySessionCoordinator {
         // abandoned must not linger inviting a reply against a dead runtime).
         switch frame.kind {
         case .turnStarted:
+            currentTurnDeliveredPayload = false   // R3 (I14): new turn, fresh budget
             // QA-2 R12/R13: a new turn is the authoritative "clear the dock for
             // a fresh seed" edge — the relay item store accumulates the prior
             // turn's `taskList` item (stable `<sid>:tasks` id, replaced in
@@ -566,6 +591,15 @@ final class RelaySessionCoordinator {
             // turn starts streaming.
             chatStore.handleRelayTurnStarted()
         case .turnCompleted:
+            // R3 (I14) — GAP-FILL-ONCE (desktop `shouldHydrate`): the stream is
+            // the authority on relay. A turn that delivered payload costs ZERO
+            // refetches; a turn end with NO payload gets exactly ONE reconcile
+            // — and it is relay-LOCAL: a `resync{last_seq}` the relay answers
+            // from its ring/store snapshot, never a gateway transcript read.
+            if !currentTurnDeliveredPayload {
+                Task { [weak self] in await self?.requestLivenessResync() }
+            }
+            currentTurnDeliveredPayload = false
             chatStore.expireRelayPendingGates(sessionID: frame.sid)
             // R16 (Live Activity lifecycle): the relay wire's EXPLICIT turn
             // boundary. The direct path ends the lock-screen Live Activity
@@ -576,6 +610,17 @@ final class RelaySessionCoordinator {
             // `LiveActivityManager.end()` (no-op when nothing is live) + the
             // queue-drain pipeline (no-op when no turn was live).
             chatStore.notifyRelayTurnCompleted()
+            // (R1 deleted the `handleRelayTurnCompleted` no-op here — task-list
+            // dismissal at turn end rides the write-gate record, I15.)
+        case .itemStarted, .itemDelta, .itemCompleted:
+            currentTurnDeliveredPayload = true   // R3 (I14): the stream delivered payload
+        case .snapshot:
+            // A non-empty snapshot baseline counts as delivered payload — a
+            // turn.completed that immediately follows a resume/open snapshot
+            // must not fire a redundant gap-fill resync (shouldHydrate false).
+            if frame.snapshot.map({ !$0.items.isEmpty }) == true {
+                currentTurnDeliveredPayload = true
+            }
         default: break
         }
         // R16: a failed `.error` item is a turn TERMINAL on the relay wire
@@ -709,6 +754,13 @@ final class RelaySessionCoordinator {
             // coarse app-level trigger.
             scheduleReconnect()
         }
+        // R3 (I14): any non-`.open` transition starts a fresh connection cycle
+        // — invalidate the establishment marker so the NEXT `.open` edge
+        // re-establishes the session exactly once (a genuine reconnect), while
+        // the buffered initial-connect state replay can never fire a duplicate
+        // `open` over a bind RPC that already ran (the third read of the D6
+        // cold-open triple-fetch).
+        if phase != .open { establishedSessionID = nil }
         // Mirror EVERY relay transition to the app's connection state so the
         // banner + composer reflect the real socket, not a stale startup stamp.
         onPhaseChange?(phase)
@@ -731,7 +783,13 @@ final class RelaySessionCoordinator {
             // and no seen_sids, so without this the Notifier fires spurious APNs
             // and the resync snapshot is empty. Best-effort: a failure here is
             // non-fatal — the resync already ran inside client.reconnect.
-            if let sid = activeStoredSessionID ?? activeSessionID, let client {
+            // R3 (I14): EXACTLY ONCE per connection — skip when this session
+            // was already established on the current connection (the bind RPC
+            // or a prior edge fired it); the marker resets on every non-`.open`
+            // transition, so a genuine reconnect still re-establishes.
+            if let sid = activeStoredSessionID ?? activeSessionID, let client,
+               establishedSessionID != sid {
+                establishedSessionID = sid
                 Task {
                     await client.setForeground(sid)
                     _ = try? await client.open(sid)
@@ -813,6 +871,7 @@ final class RelaySessionCoordinator {
         touchEntry(sessionID)
         activeSessionID = sessionID
         activeStoredSessionID = sessionID
+        establishedSessionID = sessionID   // R3: this adopt IS the rebind — the `.open` edge must not re-open it
         chatStore.relayCreatedSessionAdopted(sessionID)
         if let client { Task { await client.setForeground(sessionID) } }
     }
@@ -842,9 +901,19 @@ final class RelaySessionCoordinator {
     @discardableResult
     func resume(_ sessionID: String) async throws -> JSONValue {
         let client = try requireClient()
+        // R3 (I14/A12): re-opening a session whose entry is ALREADY warm and
+        // gate-holding is a cheap re-focus — ZERO RPCs (the relay's foreground
+        // binding is already this session; the warm entry re-projects). Post-R1
+        // the entry persists across switches, so a warm switch-back also never
+        // needs the rebind RPC — this shortcut is the tap-active budget (A12).
+        if sessionID == activeSessionID,
+           let entry = entries[sessionID], !entry.store.items.isEmpty {
+            return .object(["session_id": .string(sessionID)])
+        }
         touchEntry(sessionID)
         moveWriteGate(to: sessionID)
         let result = try await client.resumeSession(sessionID)
+        establishedSessionID = sessionID   // R3: the `.open` edge must not re-open it
         return result
     }
 
@@ -853,9 +922,16 @@ final class RelaySessionCoordinator {
     @discardableResult
     func open(_ sessionID: String) async throws -> JSONValue {
         let client = try requireClient()
+        // R3 (I14/A12): warm rebind of the driven session — zero RPCs (see
+        // `resume(_:)` above for the budget rationale).
+        if sessionID == activeSessionID,
+           let entry = entries[sessionID], !entry.store.items.isEmpty {
+            return .object(["session_id": .string(sessionID)])
+        }
         touchEntry(sessionID)
         moveWriteGate(to: sessionID)
         let result = try await client.open(sessionID)
+        establishedSessionID = sessionID   // R3: the `.open` edge must not re-open it
         return result
     }
 

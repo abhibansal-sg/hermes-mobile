@@ -4901,6 +4901,19 @@ final class ChatStore {
     /// this runs (see `teardownForeignStream`), so by the time we get here
     /// `isStreaming` reflects only a local turn.
     func backfill() async {
+        // R3 (ROUND-4 W2d): on relay the STREAM is the authority — the
+        // foreground/reconnect reconcile is a relay-LOCAL `resync{last_seq}`
+        // (seq watermark; the coordinator owns it), never a transcript
+        // refetch (contract I14/A11). This turns the backfill() storm triggers
+        // (foreground, reconnect, watchdog) into a silent resync on relay and
+        // deletes the relay `history` RPC they used to fire. The REST backfill
+        // below is direct-mode recovery, unchanged until Wave 4 folds the fork
+        // (amendment S1).
+        if connection?.transportPath == .relay {
+            guard !isStreaming else { return }
+            await connection?.relayCoordinator?.requestLivenessResync()
+            return
+        }
         guard !isStreaming else { return }
         guard let storedId = sessions?.activeStoredId else { return }
         let fetch = resolvedBackfillFetch
@@ -4999,30 +5012,13 @@ final class ChatStore {
     /// override `backfillFetch` directly.
     private var resolvedBackfillFetch: ((String) async throws -> [StoredMessage])? {
         if let backfillFetch { return backfillFetch }
-        // QA-2 R15/R3: on the relay transport the gateway REST socket is idle
-        // (relay-only reach — an off-LAN tailnet relay), so a REST backfill
-        // fails or hangs to the RestClient timeout and the post-flap reconcile
-        // NEVER LANDS — the recovery path was dead exactly when the stuck
-        // episode flapped the connection. Run it over the transport that IS
-        // up: the relay `history` RPC proxies `GET /api/sessions/{id}/messages`
-        // verbatim (`relay/hermes_relay/downstream.py` → `rest_history`) — the
-        // SAME gateway store rows the phase-2 open seed already uses
-        // (`SessionStore.resolvedTranscriptFetch`'s relay branch). One data
-        // source, two transports; the caller's union policy keeps the known-
-        // partial tail window from evicting settled history.
-        if connection?.transportPath == .relay,
-           let coordinator = connection?.relayCoordinator {
-            return { sessionId in
-                guard await coordinator.waitUntilOpen(timeout: .seconds(10)) else {
-                    throw RelayError.notConnected
-                }
-                let result = try await coordinator.history(
-                    sessionID: sessionId,
-                    limit: ChatStore.transcriptOpenWindowLimit
-                )
-                return SessionStore.relayHistoryMessages(from: result)
-            }
-        }
+        // R3 (ROUND-4 W2d): the relay `history` backfill branch DELETES — on
+        // relay, `backfill()` itself is a relay-local resync now (above); no
+        // transcript refetch ever resolves here. (Its QA-2 R15 purpose — a
+        // post-flap reconcile over the transport that IS up — is served by the
+        // coordinator's resync{last_seq} replay, which is gap-free by
+        // construction and costs the gateway zero reads.) The REST fetcher
+        // below serves direct mode until Wave 4 folds the fork (amendment S1).
         guard let rest = connection?.rest else { return nil }
         // ABH-400: plugin gateways serve only the recent tail window on
         // foreground/reconnect; legacy gateways keep the existing full/delta path.
