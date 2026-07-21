@@ -550,11 +550,37 @@ final class RelaySessionCoordinator {
     /// body of the old session-agnostic ingest, now scoped to the one session
     /// the write-gate admits (contract I2).
     private func projectActiveEntry(_ frame: RelayFrame, items: [ChatItem]) {
+        // R5/W2e (contract I9/B1): a local STOP settled the current turn — its
+        // LATE ITEM frames (crossed the interrupt in flight; a resync ring
+        // replay) keep the seq spine honest (folded in `route` above) but
+        // project NOTHING and never refresh the liveness clock: the local
+        // settlement is the render truth until the authoritative boundary
+        // arrives. Everything else falls through: a snapshot is an
+        // authoritative re-baseline (clears the mark — server truth wins, I3);
+        // `turn.started` / `turn.completed` drive the turn state machine
+        // below; a gate that arrives in the stop→completion window still
+        // parks and is expired (and resolved-marked — I12/I23) by the turn
+        // boundary as usual.
+        if chatStore.relayTurnSettling {
+            switch frame.kind {
+            case .snapshot:
+                chatStore.noteAuthoritativeRebaseline()
+            case .itemStarted, .itemDelta, .itemCompleted:
+                return
+            default:
+                break
+            }
+        }
         // QA-3 S8/A4 — per-turn liveness: refresh the silence clock ONLY for
         // frames of the CURRENT turn. Frames of a superseded turn (late tool
         // results) must never mask a dead current turn's silence, nor keep a
         // dead prior turn's rows "live" — the IMG_2591 re-arm-by-other-turn
-        // bug that left "Working… · ToolCall 5s" up forever.
+        // bug that left "Working… · ToolCall 5s" up forever. Relay-native for
+        // EVERY owner: the clock baselines off the relay frames themselves
+        // (`turn.started` / snapshot-with-in-progress classify current-turn
+        // here), so a foreign or cold-resumed turn is watched exactly like a
+        // send-started local one (contract I10/A3 — the send-only baseline
+        // was the D11 arming gap).
         chatStore.noteTurnLivenessFrame(isCurrentTurn: frameBelongsToCurrentTurn(frame, items: items))
         // QA-2 R4/A2: `turn.completed` is the authoritative settle the
         // turn-scoped `relayTurnLive` flag clears on — plumbed through so the
@@ -601,15 +627,16 @@ final class RelaySessionCoordinator {
             }
             currentTurnDeliveredPayload = false
             chatStore.expireRelayPendingGates(sessionID: frame.sid)
-            // R16 (Live Activity lifecycle): the relay wire's EXPLICIT turn
-            // boundary. The direct path ends the lock-screen Live Activity
-            // from `handleMessageComplete`; the relay path never flows
-            // through it, so without this firing the activity's `startedAt`
-            // drove the elapsed timer ENDLESSLY (owner's "timer runs forever
-            // on the lock screen" complaint). Idempotent: routes to
-            // `LiveActivityManager.end()` (no-op when nothing is live) + the
-            // queue-drain pipeline (no-op when no turn was live).
-            chatStore.notifyRelayTurnCompleted()
+            // R5 (contract I9, lane L3): the relay wire's EXPLICIT turn
+            // boundary, split on its wire-truth `reason` (reframer-stamped,
+            // L3): `completed` ⇒ Live Activity end + queue drain; `interrupted`
+            // (user stop) / `error` ⇒ Live Activity end, queue HOLD — stopped
+            // ≠ completed. The turn id latches the seam once per turn (I21:
+            // a resync replay of the settled turn fires zero extra seams).
+            chatStore.notifyRelayTurnCompleted(
+                turnID: frame.turn,
+                reason: frame.body["reason"]?.stringValue
+            )
             // (R1 deleted the `handleRelayTurnCompleted` no-op here — task-list
             // dismissal at turn end rides the write-gate record, I15.)
         case .itemStarted, .itemDelta, .itemCompleted:
@@ -623,13 +650,15 @@ final class RelaySessionCoordinator {
             }
         default: break
         }
-        // R16: a failed `.error` item is a turn TERMINAL on the relay wire
+        // R5: a failed `.error` item is a turn TERMINAL on the relay wire
         // (parity with the direct path's `error` event → `handleGatewayError`).
         // Fire the DISCARD seam — not a completion, so the queue does NOT
-        // auto-drain into a session that just errored. Only item-bearing
-        // frames carry a `ChatItem`; delta/approval/etc. frames have `nil`.
+        // auto-drain into a session that just errored; the trailing
+        // `turn.completed` is suppressed by the once-per-turn latch (I21).
+        // Only item-bearing frames carry a `ChatItem`; delta/approval/etc.
+        // frames have `nil`.
         if let item = frame.item, item.type == .error, item.status == .failed {
-            chatStore.notifyRelayTurnDiscarded()
+            chatStore.notifyRelayTurnDiscarded(turnID: frame.turn)
         }
     }
 
