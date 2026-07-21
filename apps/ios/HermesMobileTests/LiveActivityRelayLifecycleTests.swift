@@ -97,8 +97,9 @@ final class LiveActivityRelayLifecycleTests: XCTestCase {
         XCTAssertTrue(chat.isStreaming)
         XCTAssertEqual(starts, 1, "the first streaming projection starts the Live Activity")
 
-        // The relay's .turnCompleted frame → coordinator → notifyRelayTurnCompleted.
-        chat.notifyRelayTurnCompleted()
+        // The relay's .turnCompleted frame → coordinator → notifyRelayTurnCompleted
+        // (R5/W2e: wire-truth `reason` from lane L3; `completed` ⇒ drain).
+        chat.notifyRelayTurnCompleted(turnID: "la-t1", reason: "completed")
 
         XCTAssertEqual(completions, 1,
                        "relay .turnCompleted must fire onTurnComplete (R16) — the direct path's handleMessageComplete is never called on relay")
@@ -119,15 +120,16 @@ final class LiveActivityRelayLifecycleTests: XCTestCase {
         XCTAssertTrue(chat.isStreaming)
 
         // A failed .error item arrives (coordinator → notifyRelayTurnDiscarded).
-        chat.notifyRelayTurnDiscarded()
+        chat.notifyRelayTurnDiscarded(turnID: "la-t1")
         XCTAssertEqual(discards, 1,
                        "an errored relay turn is a discard (parity with handleGatewayError)")
         XCTAssertEqual(completions, 0,
                        "the queue must not auto-drain into a session that just errored")
 
-        // The relay emits .turnCompleted even for errored turns. It MUST NOT
-        // fire a spurious completion (the latch suppresses it).
-        chat.notifyRelayTurnCompleted()
+        // The relay emits .turnCompleted even for errored turns (L3 stamps
+        // reason:error). It MUST NOT fire a spurious completion — the
+        // once-per-turn latch (I21) suppresses it, reason aside.
+        chat.notifyRelayTurnCompleted(turnID: "la-t1", reason: "error")
         XCTAssertEqual(completions, 0,
                        "the trailing .turnCompleted after an error must NOT fire onTurnComplete")
         XCTAssertEqual(discards, 1)
@@ -141,19 +143,21 @@ final class LiveActivityRelayLifecycleTests: XCTestCase {
         chat.onTurnComplete = { completions += 1 }
 
         seedStreamingTurn(chat)
-        chat.notifyRelayTurnDiscarded()    // errored turn latches the suppression
-        chat.notifyRelayTurnCompleted()    // suppressed
+        chat.notifyRelayTurnDiscarded(turnID: "la-t1")            // errored turn latches (once per turn, I21)
+        chat.notifyRelayTurnCompleted(turnID: "la-t1", reason: "error")   // suppressed
         XCTAssertEqual(completions, 0)
 
         // The errored turn settles (projection finalizes), clearing
         // `turnStartedAt` so the next turn's first streaming projection
-        // re-fires `markTurnStartedIfNeeded` — which resets the latch.
+        // re-fires `markTurnStartedIfNeeded` — which resets the compat
+        // settle state. The once-per-turn latch (I21) is turn-ID-scoped,
+        // so the NEW turn's id is unlatched by construction.
         settleCurrentTurn(chat)
         // A NEW turn starts and completes normally.
         seedStreamingTurn(chat)
-        chat.notifyRelayTurnCompleted()
+        chat.notifyRelayTurnCompleted(turnID: "la-t2", reason: "completed")
         XCTAssertEqual(completions, 1,
-                       "the next (healthy) turn's completion fires normally — the error latch cleared on turn start")
+                       "the next (healthy) turn's completion fires normally — the suppression never leaks past its turn")
     }
 
     // MARK: - Session switch mid-turn discards the outgoing activity

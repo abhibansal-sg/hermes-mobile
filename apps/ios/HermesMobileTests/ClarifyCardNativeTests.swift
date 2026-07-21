@@ -29,6 +29,14 @@ import SwiftUI
 @MainActor
 final class ClarifyCardNativeTests: XCTestCase {
 
+    override func tearDown() {
+        // W2e/I23 hygiene: the DURABLE answered-gate record persists across
+        // stores by design — clear it so a rid this suite answered ("clr-1"
+        // etc.) never suppresses another suite's re-delivery in the same run.
+        ChatStore._debugClearDurableResolvedGates()
+        super.tearDown()
+    }
+
     // MARK: - R8 / N3 — clarify answer is echoed into the transcript
 
     /// Answering a clarify (choice tap or free text) MUST leave a user row in
