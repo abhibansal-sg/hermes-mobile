@@ -48,6 +48,12 @@ class _FakeGateway:
     def owns(self, sid: str) -> bool:
         return sid in self._owned
 
+    def origin_id_for(self, sid: str):
+        # QA-3 S12: the live-send harness drives never-compressed sessions, so
+        # origin == live (no stored_id stamped on the payload). Implemented so
+        # the notifier's origin resolver is exercised against the real shape.
+        return None
+
 
 def _agent_completed(sid="s1", turn="t1", text="Paris is the capital."):
     return Frame.with_item(

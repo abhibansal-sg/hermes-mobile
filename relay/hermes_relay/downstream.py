@@ -652,16 +652,32 @@ class DownstreamServer:
             except OSError:  # pragma: no cover - best-effort dir hygiene
                 _log.debug("push.register: registry dir create failed", exc_info=True)
             events = p.get("events")
+            presented_device_id = p.get("device_id")
             ok = push.register_token(
                 str(p.get("token") or ""),
                 platform=str(p.get("platform") or "ios"),
                 env=str(p.get("env") or ""),
                 events=list(events) if isinstance(events, list) else None,
-                device_id=p.get("device_id"),
+                device_id=presented_device_id,
             )
             if not ok:
                 raise ValueError("invalid device token")
-            _log.info("push.register: device token registered over relay")
+            # QA-3 S13: log the presented device_id (masked) so a missing/null
+            # id — the root cause of non-converging fan-out — is visible without
+            # exposing the id (non-secret, but masked for log hygiene).
+            masked = (
+                "…" + str(presented_device_id)[-6:]
+                if isinstance(presented_device_id, str)
+                and presented_device_id.strip()
+                else "<none>"
+            )
+            _log.info(
+                "push.register: device token registered over relay "
+                "(platform=%s env=%s device_id=%s)",
+                str(p.get("platform") or "ios"),
+                str(p.get("env") or "") or "<default>",
+                masked,
+            )
             return {"registered": True}
         if method == UpstreamMethod.PUSH_UNREGISTER:
             removed = self._push_engine().unregister_token(str(p.get("token") or ""))

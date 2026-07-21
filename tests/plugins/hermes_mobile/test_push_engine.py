@@ -1598,6 +1598,93 @@ def test_register_without_device_id_keeps_legacy_token_only_dedup(isolated_home)
     assert len(pn.registered_tokens()) == 2
 
 
+def test_device_id_registration_evicts_null_device_id_legacy_rows(isolated_home):
+    """QA-3 S13: a device_id-keyed registration converges the registry by
+    evicting legacy null-device_id rows for the platform. The build-116 registry
+    held 3 null-id iOS rows (2 production + 1 sandbox) that QA-2's device-keyed
+    eviction could never reach (no device_id to match); Apple 200s the stale
+    tokens into the void so they never aged out. Once build 117 registers with
+    a real device_id, fan-out must post to exactly ONE token."""
+    legacy_prod_a = "11" * 32
+    legacy_prod_b = "22" * 32
+    legacy_sandbox = "33" * 32
+    registry = isolated_home / "push_tokens.json"
+    registry.write_text(json.dumps([
+        {"token": legacy_prod_a, "platform": "ios", "env": "production"},
+        {"token": legacy_prod_b, "platform": "ios", "env": "production"},
+        {"token": legacy_sandbox, "platform": "ios", "env": "sandbox"},
+    ]))
+
+    phone_token = "ee" * 32
+    assert pn.register_token(
+        phone_token, platform="ios", env="sandbox", device_id="phone-install-1"
+    ) is True
+
+    entries = pn.registry_entries()
+    # Exactly one entry for the phone; the three legacy null-id rows are gone.
+    assert len(entries) == 1, f"expected registry to converge to 1, got {entries}"
+    assert entries[0]["token"] == phone_token
+    assert entries[0]["device_id"] == "phone-install-1"
+    assert pn.registered_tokens() == [phone_token]
+
+
+def test_device_id_registration_eviction_is_platform_scoped(isolated_home):
+    """A device_id-keyed iOS registration must NOT evict null-id rows for other
+    platforms (an android null-id row stays put — it belongs to a different
+    device population with its own pending upgrade)."""
+    registry = isolated_home / "push_tokens.json"
+    registry.write_text(json.dumps([
+        {"token": "11" * 32, "platform": "ios", "env": "production"},
+        {"token": "22" * 32, "platform": "android", "env": "production"},
+    ]))
+    assert pn.register_token(
+        "ee" * 32, platform="ios", env="sandbox", device_id="ios-install-1"
+    ) is True
+    entries = pn.registry_entries()
+    platforms = {e["platform"] for e in entries}
+    assert "android" in platforms, "android null-id row must survive an iOS registration"
+    ios_entries = [e for e in entries if e["platform"] == "ios"]
+    assert len(ios_entries) == 1
+    assert ios_entries[0]["device_id"] == "ios-install-1"
+
+
+def test_device_id_refresh_in_place_also_evicts_null_legacy(isolated_home):
+    """The refresh-in-place branch (exact-token match) also converges the
+    registry: re-registering the SAME token WITH a device_id evicts the
+    null-id rows that a prior legacy register of that token wrote."""
+    token = "aa" * 32
+    legacy_other = "bb" * 32
+    # Legacy registers (no device_id): two null-id rows.
+    assert pn.register_token(token, env="production") is True
+    assert pn.register_token(legacy_other, env="production") is True
+    # Build 117 re-registers the same token, now with a device_id.
+    assert pn.register_token(token, env="sandbox", device_id="phone-1") is True
+    entries = pn.registry_entries()
+    # The other null-id legacy row is evicted too (one phone → one row).
+    assert len(entries) == 1
+    assert entries[0]["token"] == token
+    assert entries[0]["device_id"] == "phone-1"
+
+
+def test_distinct_device_ids_preserved_after_null_eviction(isolated_home):
+    """Eviction only kills NULL-id rows; entries stamped with OTHER device_ids
+    (other phones) stay — the registry keeps one row per device, not one row
+    globally."""
+    registry = isolated_home / "push_tokens.json"
+    registry.write_text(json.dumps([
+        {"token": "11" * 32, "platform": "ios", "env": "production"},            # null-id legacy
+        {"token": "22" * 32, "platform": "ios", "env": "sandbox",
+         "device_id": "other-phone"},                                            # a real other phone
+    ]))
+    assert pn.register_token(
+        "ee" * 32, platform="ios", env="sandbox", device_id="this-phone"
+    ) is True
+    entries = pn.registry_entries()
+    ids = {e.get("device_id") for e in entries}
+    assert ids == {"other-phone", "this-phone"}, f"got {ids}"
+    assert all(e.get("device_id") for e in entries), "no null-id rows may survive"
+
+
 @requires_crypto
 def test_live_activity_evicts_400_bad_device_token(monkeypatch, isolated_home):
     """QA-2 R1: the Live Activity send path prunes on 400 BadDeviceToken too
