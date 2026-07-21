@@ -7,10 +7,13 @@
 #                          and plugins/hermes-mobile). The harness re-soaks ANY
 #                          source tree: the QA-3 tip, origin/main, a PR branch.
 #     <mode>               short (2-5 min/scenario, CI) | soak (spec durations).
-#     [scenario ...]       optional filter, by short name without the test_
-#                          prefix: smoke t1_churn t2_flap t3_multi t4_kill
-#                          t5_gateway t6_fuzz t7_marathon t8_ring
-#                          z_injected_fault. Omit to run the whole matrix.
+#     [scenario ...]       optional filter — a glob token matched uniquely
+#                          against scenarios/test_*.py (full suffix, unique
+#                          prefix, or infix): smoke t1_connect_churn
+#                          t2_foreground_flap t3_multi_session t4_kill_loop
+#                          t5_gateway_abuse t6_fuzz t7_marathon t8_replay_ring
+#                          z_injected_fault. 't6' / 't8' work too (unique
+#                          prefixes). Omit to run the whole matrix.
 #
 # Provisions an isolated python3.13 venv on /Volumes/MainData from THAT source
 # (relay deps + harness extras), runs the scenarios against a relay imported
@@ -72,13 +75,32 @@ if ! "$VENV/bin/pip" install -q -e "$RELAY_SRC/relay" 2>/dev/null; then
 fi
 
 # --- scenario selection ----------------------------------------------------
+# Resolve each scenario token to its test file by GLOB (unique match required):
+# the committed file suffixes don't all equal the documented short names
+# (test_t1_connect_churn.py vs 't1_churn', test_t8_replay_ring.py vs 't8_ring'),
+# so a literal test_${s}.py lookup fails for 6 of 10 scenarios. A token may be
+# the full suffix (t8_replay_ring), a unique prefix (t8 -> test_t8_replay_ring),
+# or an infix (connect_churn). Ambiguous / unmatched tokens are rejected loudly.
 ARGS=()
 if [[ ${#SCENARIOS[@]} -gt 0 ]]; then
+  shopt -s nullglob
   for s in "${SCENARIOS[@]}"; do
-    f="$SCRIPT_DIR/scenarios/test_${s}.py"
-    if [[ ! -f "$f" ]]; then echo "error: no scenario test_${s}.py" >&2; exit 2; fi
-    ARGS+=("$f")
+    matches=( "$SCRIPT_DIR/scenarios/test_${s}"*.py )           # prefix: t6_fuzz, t8
+    if [[ ${#matches[@]} -eq 0 ]]; then
+      matches=( "$SCRIPT_DIR/scenarios"/test_*"${s}"*.py )      # infix: connect_churn
+    fi
+    if [[ ${#matches[@]} -eq 0 ]]; then
+      echo "error: no scenario matching '${s}' in $SCRIPT_DIR/scenarios/" >&2
+      exit 2
+    fi
+    if [[ ${#matches[@]} -gt 1 ]]; then
+      echo "error: scenario '${s}' is ambiguous:" >&2
+      printf '  %s\n' "${matches[@]##*/}" >&2
+      exit 2
+    fi
+    ARGS+=( "${matches[0]}" )
   done
+  shopt -u nullglob
 else
   ARGS+=("$SCRIPT_DIR/scenarios")
 fi
