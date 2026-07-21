@@ -47,12 +47,19 @@ the loader ignores absent keys:
 | render_qa3_draft_interleave | S11: A streams while New Chat is entered mid-stream — `enter_draft` is a `script` step, NO wire frame (IMG_2594's leaked rows) | `t_ms`, `script` (enter_draft) | S11 lane (A7) |
 
 The XCTest loader exposes the extensions via `Fixture.scriptSteps` /
-`Fixture.extraSessions` / `frameTMs(_:)`, plus a scaled `deliverTimed(_:)_`
+`Fixture.extraSessions` / `frameTMs(_:)`, plus a scaled `deliverTimed(_:)`
 replay helper (a real-time watchdog lane passes `scale: 1`).
 `testQA3IncidentFixtures_LoadWithExtensions_ShapesPinned` pins both the
 loader's backward-compat (pre-QA-3 fixtures load with the extensions empty)
 and the recorded incident SHAPES (the silence gap, the snapshot redelivery,
 the absence of `turn.completed`, the markers).
+
+`t_ms` is MEASURED wall-clock (ms since the first recorded frame on the
+shared clock) — the QA-1/QA-2 fixtures were byte-stable across re-recordings
+because they carried no timing; the QA-3 fixtures' `t_ms` values drift by the
+run's scheduling jitter on re-record (the frame SEQUENCES are deterministic).
+The XCTest pins are inequalities over the timing (gap ≥ 900 ms, marker
+ordering), never exact values, so a refreshed recording still passes.
 
 ## Recording (extend, don't fork)
 
