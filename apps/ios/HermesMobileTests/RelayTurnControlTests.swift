@@ -140,7 +140,20 @@ final class RelayTurnControlTests: XCTestCase {
             RelaySessionCoordinator(chatStore: chat, clientFactory: { RelayClient { _ in transport } })
         }
         let coordinator = connection.ensureRelayCoordinator()
+        let edgesBefore = coordinator.readinessEdgeCount
         try await coordinator.start(url: url)
+        // A9/W0a determinism: await the readiness EDGE (the crossing INTO .open)
+        // before returning, so the observer's buffered `.connecting → .open`
+        // replay has settled. Under bundle load a send that races the replay's
+        // transient `.connecting` blip sees `isOpen == false` and the relay send
+        // path is skipped (the relay-vs-direct fork reads `isOpen`) — the exact
+        // race `readinessEdgeCount` exists to close (mirrors `ContractInvariants
+        // W0aTests.makeGraph`). Bounded; never a hard fail (a genuinely dead
+        // transport surfaces in the test's own assertions).
+        let openDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while coordinator.readinessEdgeCount <= edgesBefore, ContinuousClock.now < openDeadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
         return (transport, chat, coordinator)
     }
 
