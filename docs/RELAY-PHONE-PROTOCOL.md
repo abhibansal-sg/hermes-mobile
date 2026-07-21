@@ -90,7 +90,13 @@ a partial merge preview and is never treated as authoritative.
   not an append — the phone repaints `body.tasks` from it.
 - `item.completed` — `body` = the FULL authoritative item (status completed/failed).
   For a `taskList` this frame is emitted ONLY when every task is done/cancelled.
-- `turn.started` / `turn.completed` — turn boundaries (`turn.completed` carries `usage`).
+- `turn.started` / `turn.completed` — turn boundaries (`turn.completed` carries
+  `usage`). Since QA-3 (S2/A1) `turn.completed` additionally carries the relay's
+  authoritative per-turn wall-clock — `duration_s` (seconds, reframer-measured
+  from the turn open) and `started_at` (epoch). The phone's per-turn timer
+  starts LOCALLY at send and reconciles its settled "Worked for Ns" label onto
+  `duration_s`; absent on older relays → the phone falls back to its own
+  measurement (additive keys, §2 forward-compat).
 - `approval.request` / `clarify.request` — interactive gates (phone replies via RPC).
 - `status` — `{ kind, text }` (lifecycle/compacting/etc., non-item chatter).
 - `title` — session title changed.
