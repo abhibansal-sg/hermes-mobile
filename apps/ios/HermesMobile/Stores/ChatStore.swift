@@ -4952,7 +4952,17 @@ final class ChatStore {
     private func adoptRelayEcho(
         for item: ChatItem, consuming: inout Set<UUID>
     ) -> RelayEchoAdoption? {
-        if let adopted = relayEchoAdoptions[item.itemID] { return adopted }
+        if let adopted = relayEchoAdoptions[item.itemID] {
+            // QA-3 S4: the sticky contract assumed the echo row was gone from
+            // `messages` after the pass that first adopted it — true until the
+            // R15 union backfill FOLDED the gateway wire row onto the echo's
+            // slot as an UNTAGGED row, resurrecting an unconsumed twin. Re-mark
+            // it consumed on EVERY pass so the twin (and its assistant run, in
+            // `applyRelayItems`) never survives beside the rebuilt copy — the
+            // second half of the IMG_2579 orphan-answer duplication.
+            consuming.insert(adopted.id)
+            return adopted
+        }
         let itemCMID = item.body["client_message_id"]?.stringValue
         // QA-3 S6/A2: a cmid-carrying item matches its echo by cmid FIRST
         // (deterministic, so identical texts never collapse), then falls back
