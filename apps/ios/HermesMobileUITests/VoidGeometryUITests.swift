@@ -63,7 +63,7 @@ final class VoidGeometryUITests: XCTestCase {
         XCTAssertTrue(newest.waitForExistence(timeout: 20), "tall transcript tail did not paint")
 
         var violations: [String] = []
-        var bandsSeen: [[String]: Int] = [:]
+        var bandsPerStep: [String: Int] = [:]
         for step in 0..<7 {
             // GEOMETRY: the invariant under test.
             let shot = XCUIScreen.main.screenshot()
@@ -77,7 +77,7 @@ final class VoidGeometryUITests: XCTestCase {
                     violations.append("step \(step): void band rows \(band.rows) (\(band.points)pt tall)")
                 }
             }
-            bandsSeen[["step": "\(step)"]] = bands.count
+            bandsPerStep["step\(step)"] = bands.count
 
             // SCROLL toward older content (bottom-anchored chat: swipe down).
             app.swipeDown()
@@ -105,7 +105,7 @@ final class VoidGeometryUITests: XCTestCase {
             "I7/I19 VOID GEOMETRY violated — blank viewport band(s) rendered:\n"
             + violations.joined(separator: "\n")
         )
-        NSLog("R4-VOID-EVIDENCE: tall transcript 7 scroll steps, \(bandsSeen.count) sampled, 0 void bands")
+        NSLog("R4-VOID-EVIDENCE: tall transcript 7 scroll steps, \(bandsPerStep.count) sampled, 0 void bands")
     }
 
     // MARK: - I7/I19: mid-turn scroll-up — tail append never voids or moves the reader
@@ -178,7 +178,7 @@ final class VoidGeometryUITests: XCTestCase {
     func testVoidScannerDetectsSyntheticBand() {
         // A viewport with a 200px void band SANDWICHED between content.
         let voided = Self.syntheticViewport(heightPx: 600, bandRows: 150...349)!
-        let bands = Self.voidBands(in: voided)
+        let bands = Self.voidBands(in: voided.cgImage!)
         XCTAssertEqual(bands.count, 1, "the detector must see an injected void band")
         let band = bands[0]
         XCTAssertTrue(band.rows.overlaps(150...349), "band rows \(band.rows) miss the injected 150...349")
@@ -187,12 +187,12 @@ final class VoidGeometryUITests: XCTestCase {
         // A clean viewport (content everywhere) reports nothing — the detector
         // never false-positives on a healthy render.
         let clean = Self.syntheticViewport(heightPx: 600, bandRows: nil)!
-        XCTAssertTrue(Self.voidBands(in: clean).isEmpty, "clean viewport flagged as void")
+        XCTAssertTrue(Self.voidBands(in: clean.cgImage!).isEmpty, "clean viewport flagged as void")
 
         // Edge blankness (top OR bottom only — e.g. the legitimate tail space
         // below the last message) is NOT a sandwiched void.
         let topBlank = Self.syntheticViewport(heightPx: 600, bandRows: 0...120)!
-        XCTAssertTrue(Self.voidBands(in: topBlank).isEmpty, "top-edge blank must not count (not sandwiched)")
+        XCTAssertTrue(Self.voidBands(in: topBlank.cgImage!).isEmpty, "top-edge blank must not count (not sandwiched)")
     }
 
     // MARK: - Void-band detector (pure function of a screenshot)
@@ -298,10 +298,10 @@ final class VoidGeometryUITests: XCTestCase {
 
     /// The label of the topmost visible transcript text (reader-offset proxy).
     private func topVisibleLabel(_ app: XCUIApplication) -> String? {
-        let screen = XCUIScreen.main.bounds
+        let window = app.windows.firstMatch.frame
         // Inside the transcript band: below the header, above the composer.
-        let bandTop = screen.height * 0.14
-        let bandBottom = screen.height * 0.80
+        let bandTop = window.minY + window.height * 0.14
+        let bandBottom = window.minY + window.height * 0.80
         return app.staticTexts.allElementsBoundByIndex
             .filter {
                 $0.frame.minY >= bandTop && $0.frame.maxY <= bandBottom
