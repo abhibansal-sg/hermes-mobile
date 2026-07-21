@@ -301,6 +301,42 @@ async def test_resume_remaps_origin_to_distinct_live_id():
     await client.close()
 
 
+async def test_origin_id_for_resolves_live_back_to_origin():
+    """QA-3 S12: a push tap needs the STORED (origin) id for a frame's LIVE sid.
+    ``origin_id_for`` reverses the resume-time map: the live id resolves back to
+    the origin the phone sent; an in-place resume (origin == live) returns the
+    id itself; an unknown id returns ``None`` (no claim it is an origin)."""
+    def remap_responder(frame):
+        method = frame["method"]
+        params = frame.get("params") or {}
+        if method == "session.resume":
+            # Compressed origin -> fresh live id (origin != live).
+            if params.get("session_id") == "tgsess001":
+                result = {"session_id": "livesess99",
+                          "resumed": "tgsess001", "message_count": 5}
+            else:
+                # In-place resume (origin == live, the common case).
+                result = {"session_id": params.get("session_id"),
+                          "resumed": params.get("session_id"), "message_count": 0}
+        else:
+            result = {"ok": True}
+        return {"jsonrpc": "2.0", "id": frame["id"], "result": result}
+
+    client, _ = make_client(responder=remap_responder)
+    await client.connect()
+
+    await client.session_resume("tgsess001")     # divergent live id
+    await client.session_resume("inplacesess")   # in-place resume
+
+    # Live id resolves back to the origin the phone sent.
+    assert client.origin_id_for("livesess99") == "tgsess001"
+    # An in-place resume has no divergent origin → the id is its own origin.
+    assert client.origin_id_for("inplacesess") == "inplacesess"
+    # An unknown id is not in the map → None (do not claim it as stored id).
+    assert client.origin_id_for("neverseen") is None
+    await client.close()
+
+
 async def test_approval_respond_sends_choice_not_decision():
     """The stock gateway reads ``choice`` (approve->once) + ``all``; a relay that
     sent ``decision`` silently defaulted every approval to a DENY (wire-shape fix)."""

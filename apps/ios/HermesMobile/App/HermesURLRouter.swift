@@ -466,17 +466,19 @@ enum HermesURLRouter {
     ) {
         Task { await inbox.refresh() }
         switch tap {
-        case .attention(let sessionId):
+        case .attention(let sessionId, let storedSessionId):
             openForPush(
                 runtimeSessionId: sessionId,
+                storedSessionId: storedSessionId,
                 sessions: sessions,
                 inbox: inbox,
                 connection: connection,
                 surfaceInboxIfMissing: true
             )
-        case .turnComplete(let sessionId):
+        case .turnComplete(let sessionId, let storedSessionId):
             openForPush(
                 runtimeSessionId: sessionId,
+                storedSessionId: storedSessionId,
                 sessions: sessions,
                 inbox: inbox,
                 connection: connection,
@@ -519,15 +521,28 @@ enum HermesURLRouter {
     /// Resolve a runtime session id to a stored session and open it. When the
     /// session can't be found and `surfaceInboxIfMissing` is set, request the
     /// inbox instead so the user can still reach the prompt.
+    ///
+    /// QA-3 S12: when the push payload carried an explicit `stored_session_id`
+    /// (the relay resolved the live→stored mapping at drive time), prefer it
+    /// directly — `SessionStore.open(_:)` is keyed by the stored id, and the
+    /// inbox's runtime→stored map is empty for an ordinary (non-attention)
+    /// `turn_complete` of a compressed/old session, so the prior path always
+    /// fell through to the Inbox. The runtime id + inbox map remain as
+    /// fallbacks for legacy payloads without `stored_session_id`.
     private static func openForPush(
         runtimeSessionId: String,
+        storedSessionId: String? = nil,
         sessions: SessionStore,
         inbox: InboxStore,
         connection: ConnectionStore?,
         surfaceInboxIfMissing: Bool
     ) {
-        // Prefer the inbox's runtime→stored mapping; fall back to the raw id.
-        let storedId = inbox.storedSessionId(forRuntime: runtimeSessionId) ?? runtimeSessionId
+        // Prefer the push-carried stored id; then the inbox's runtime→stored
+        // mapping; finally fall back to the raw runtime id (the two coincide for
+        // fresh sessions that were never compressed).
+        let storedId = storedSessionId
+            ?? inbox.storedSessionId(forRuntime: runtimeSessionId)
+            ?? runtimeSessionId
 
         if let summary = sessions.sessions.first(where: { $0.id == storedId }) {
             sessions.open(summary)

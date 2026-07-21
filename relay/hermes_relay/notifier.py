@@ -293,6 +293,16 @@ class Notifier:
         item_id = (frame.body or {}).get("item_id")
         if item_id:
             payload["item_id"] = item_id
+        # QA-3 S12: deep-link fix. The gateway emits this frame on the LIVE id
+        # it assigned at resume time; iOS keys SessionStore.open by the STORED
+        # (origin) id, so the tap routing needs it. Resolve the origin here and
+        # carry it in the payload; the inbox's runtime→stored map is empty for
+        # an ordinary (non-attention) turn_complete, which is why a tap
+        # otherwise lands on the Inbox instead of the owning chat. ``sid`` and
+        # the origin coincide for never-compressed sessions.
+        origin_id = self._gateway.origin_id_for(sid)
+        if origin_id and origin_id != sid:
+            payload["stored_session_id"] = origin_id
         # Stable collapse id so a re-fire (or APNs-side coalescing) folds onto
         # the same banner rather than stacking.
         collapse_id = f"{sid}:{event_type}:{self._identity(event_type, frame)[2]}"

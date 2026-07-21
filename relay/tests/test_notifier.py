@@ -55,12 +55,22 @@ class FakeGateway:
 
     def __init__(self, owned: set[str] | None = None) -> None:
         self._owned = set(owned or ())
+        # QA-3 S12: live id -> origin (stored) id, standing in for
+        # GatewayClient.origin_id_for (the relay's resume-time map).
+        self._origin_by_live: dict[str, str] = {}
 
     def own(self, sid: str) -> None:
         self._owned.add(sid)
 
     def owns(self, sid: str) -> bool:
         return sid in self._owned
+
+    def set_origin(self, live: str, origin: str) -> None:
+        """Record a live→origin (stored) mapping for origin_id_for()."""
+        self._origin_by_live[live] = origin
+
+    def origin_id_for(self, sid: str):
+        return self._origin_by_live.get(sid)
 
 
 # --------------------------------------------------------------------------- #
@@ -129,6 +139,39 @@ def test_turn_complete_fires_when_phone_absent():
     assert call["category"] == "HERMES_TURN"
     assert call["expiration"] == 14400
     assert notifier.metrics.fired == 1
+
+
+def test_payload_omits_stored_session_id_when_no_remap():
+    """A session the gateway never remapped (origin == live) carries no
+    stored_session_id — iOS falls back to its inbox/runtime-id resolution."""
+    notifier, push, _, _ = _make(owned=("s1",), foreground=())
+    desc = notifier.observe(_agent_completed("s1"))
+    assert desc is not None
+    assert "stored_session_id" not in desc["payload"]
+
+
+def test_payload_carries_stored_session_id_for_compressed_session():
+    """QA-3 S12: a turn on a compressed session's LIVE id must carry the ORIGIN
+    (stored) id in the payload so iOS taps deep-link to the owning chat instead
+    of the Inbox."""
+    notifier, push, gw, _ = _make(owned=("live-9",), foreground=())
+    gw.set_origin("live-9", "origin-stored-9")
+    desc = notifier.observe(_agent_completed("live-9", text="Done."))
+    assert desc is not None
+    assert desc["payload"]["session_id"] == "live-9"
+    assert desc["payload"]["stored_session_id"] == "origin-stored-9"
+    # The stored id rides the wire to APNs unchanged.
+    assert push.calls[0]["payload"]["stored_session_id"] == "origin-stored-9"
+
+
+def test_approval_payload_carries_stored_session_id():
+    """Approval (blocking) pushes also need the stored id — they bypass the
+    foreground gate and the user taps them cold more often than turn_complete."""
+    notifier, push, gw, _ = _make(owned=("live-appr",), foreground=("live-appr",))
+    gw.set_origin("live-appr", "origin-appr")
+    desc = notifier.observe(_approval("live-appr"))
+    assert desc is not None
+    assert desc["payload"]["stored_session_id"] == "origin-appr"
 
 
 def test_durable_outbox_prevents_refire_after_restart(tmp_path: Path):

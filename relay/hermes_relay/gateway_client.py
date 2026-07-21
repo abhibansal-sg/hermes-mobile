@@ -598,6 +598,32 @@ class GatewayClient:
         """
         return self._live_by_origin.get(session_id, session_id)
 
+    def origin_id_for(self, session_id: str) -> Optional[str]:
+        """Resolve a live/runtime id back to the STABLE origin (stored) id the
+        phone sent to drive the session (QA-3 S12).
+
+        The gateway emits item/turn frames on the LIVE id it assigned at resume
+        time, which may differ from the origin id the phone used in its SUBMIT.
+        Push tap routing on iOS keys ``SessionStore.open`` by the stored id, so
+        the notifier needs the ORIGIN id in the payload. Returns the origin key
+        whose mapped live id equals ``session_id`` (preferring a key distinct
+        from ``session_id`` so an in-place resume does not shadow a real
+        divergence); ``None`` when no known resume introduced this id.
+        """
+        # No lock: ``_live_by_origin`` is mutated only on the relay's main
+        # event loop (``session_resume``) and read here from the notifier's
+        # ``observe`` on the same loop — matching ``live_id_for`` / ``owns``.
+        # Prefer a divergent origin (origin != live); else echo the id when it
+        # is itself recorded as an origin mapping to itself.
+        origin: Optional[str] = None
+        for origin_key, live in self._live_by_origin.items():
+            if live != session_id:
+                continue
+            if origin_key != session_id:
+                return origin_key
+            origin = origin_key
+        return origin
+
     @property
     def owned_sessions(self) -> frozenset[str]:
         return frozenset(self._owned)
