@@ -311,6 +311,17 @@ struct StoredMessage: Sendable {
     /// not emit it, where the producer falls back to the positional key (unchanged).
     let wireId: Int?
 
+    /// R4b (contract I5 draft-born write-local-first / I8 one echo identity):
+    /// the durable outbox cmid a WRITE-LOCAL-FIRST cache row carries so a
+    /// force-close→reopen paint re-presents the optimistic user row with its
+    /// STABLE identity — the relay `userMessage` item (which carries the SAME
+    /// `client_message_id`, downstream.py `_emit_user_message_item`) then
+    /// ADOPTS the painted row IN PLACE by cmid instead of projecting a second
+    /// bubble beside it. ADDITIVE: `nil` on gateway REST rows (the wire never
+    /// emits it there) and on pre-R4b cached rows — adoption then falls back
+    /// to the cmid-less same-text branch (unchanged behavior).
+    let clientMessageID: String?
+
     // MARK: - ABH-87 Batch B (§2.3) — fields the seed producer reconstructs from
     //
     // The live REST payload (`/api/sessions/{id}/messages`, re-verified against
@@ -346,6 +357,8 @@ struct StoredMessage: Sendable {
         self.timestamp = json["timestamp"]?.doubleValue
         // ARCH37 STEP 4 — stable per-row wire id (additive; nil on stock gateways).
         self.wireId = json["id"]?.intValue
+        // R4b — the write-local-first echo identity (additive; nil on REST rows).
+        self.clientMessageID = Self.nonEmpty(json["client_message_id"]?.stringValue)
 
         // tool_calls[]: keep only well-formed calls; an empty/absent array → nil.
         let calls = (json["tool_calls"]?.arrayValue ?? []).compactMap(WireToolCall.init(json:))
@@ -367,6 +380,7 @@ struct StoredMessage: Sendable {
         content: JSONValue,
         timestamp: Double? = nil,
         wireId: Int? = nil,
+        clientMessageID: String? = nil,
         toolCalls: [WireToolCall]? = nil,
         toolCallId: String? = nil,
         toolName: String? = nil,
@@ -377,6 +391,7 @@ struct StoredMessage: Sendable {
         self.content = content
         self.timestamp = timestamp
         self.wireId = wireId
+        self.clientMessageID = clientMessageID
         self.toolCalls = toolCalls
         self.toolCallId = toolCallId
         self.toolName = toolName

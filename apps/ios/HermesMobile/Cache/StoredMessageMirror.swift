@@ -24,6 +24,12 @@ struct StoredMessageMirror: Codable, Sendable {
     /// rows (encoded before this field existed) decode with `wireId == nil` and fall
     /// back to the positional key — no cache migration needed.
     var wireId: Int? = nil
+    /// R4b — the write-local-first echo identity persisted through the cache so
+    /// a force-close→reopen paint carries the cmid the relay `userMessage`
+    /// adoption matches on (I8 in-place, no second bubble). Optional + defaulted
+    /// so rows encoded before this field existed decode with `nil` (fallback to
+    /// the cmid-less same-text adoption) — no cache migration needed.
+    var clientMessageID: String? = nil
     var toolCalls: [WireToolCallMirror]?
     var toolCallId: String?
     var toolName: String?
@@ -40,6 +46,7 @@ struct StoredMessageMirror: Codable, Sendable {
             content: content,
             timestamp: timestamp,
             wireId: wireId,
+            clientMessageID: clientMessageID,
             toolCalls: wireCalls?.isEmpty == false ? wireCalls : nil,
             toolCallId: toolCallId,
             toolName: toolName,
@@ -73,6 +80,7 @@ extension StoredMessage {
             content: content,
             timestamp: timestamp,
             wireId: wireId,
+            clientMessageID: clientMessageID,
             toolCalls: callMirrors?.isEmpty == false ? callMirrors : nil,
             toolCallId: toolCallId,
             toolName: toolName,
