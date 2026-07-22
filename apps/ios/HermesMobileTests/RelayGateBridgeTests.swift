@@ -141,6 +141,11 @@ final class RelayGateBridgeTests: XCTestCase {
         let sessions = SessionStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
         chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        // Production establishes the stored-session owner before its prompt
+        // frames are projected. This mock stack bypasses `SessionStore.open`,
+        // so establish the recorded fixture's owner explicitly instead of
+        // relying on the removed nil-owner fallback.
+        chat.pendingGateOwnerMoved(toStoredSession: "sess-1")
         restoreTransportFlagAfterTest()
         UserDefaults.standard.set(TransportPath.relay.rawValue, forKey: DefaultsKeys.transportPath)
         XCTAssertEqual(connection.transportPath, .relay, "precondition: flag forces the relay transport")
