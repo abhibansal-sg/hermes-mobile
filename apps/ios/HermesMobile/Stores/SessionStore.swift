@@ -4492,9 +4492,62 @@ final class SessionStore {
         lastError = nil
         sessionActionError = nil
         if let echo { persistDurableEcho(storedId: storedID, echo: echo) }
+        // R4b (contract I5 second half — DRAFT-BORN PAINTS WRITE-LOCAL-FIRST):
+        // the transcript now holds THIS session (the send appended the echo +
+        // caret rows) — stamp the paint provenance so a same-session re-open
+        // (the drawer row the refresh below reveals) takes the same-session
+        // skip instead of re-running the first-frame paint over the live turn
+        // (QA-3 S7 — the known-partial window truncation).
+        transcriptPaintedStoredId = storedID
+        persistDraftBornCacheSeed(storedID: storedID, echo: echo)
         // Surface the new row in the drawer; never block the turn on it
         // (mirrors `createDraftSession`'s background refresh).
         Task { [weak self] in await self?.refresh() }
+    }
+
+    /// R4b — WRITE-LOCAL-FIRST cache seed for a draft-born session (contract I5
+    /// second half; the Telegram/WhatsApp invariant: the store is the render
+    /// authority, a new chat writes to the store FIRST, the network heals behind
+    /// it). A session the relay CREATES on a nil-target SUBMIT is born AFTER any
+    /// OPEN edge, so pre-R4b NOTHING ever wrote a cache row for it: the relay
+    /// transport has no phase-2 network seed (`resolvedTranscriptFetch` returns
+    /// nil — R3) and the only GRDB writers are the open path's write-through
+    /// (never runs for a session nobody `open()`ed) and the LRU-eviction
+    /// write-through. Every later open therefore logged `cache-miss(reset)` and
+    /// painted BLANK (device-log proven 2026-07-22: session 85320f, zero relay
+    /// history fetches). Write the session row + the optimistic user message
+    /// NOW — through the EXISTING ``CacheStore`` write path (`upsertSession`
+    /// then `saveTranscript`, i.e. ``MessageRowRecord/make`` inside; no new
+    /// persistence path) — carrying the send's cmid on the row so a
+    /// force-close→reopen paints the user row from disk and the relay
+    /// `userMessage` item (same cmid, downstream.py `_emit_user_message_item`)
+    /// adopts it IN PLACE (I8 — one identity, never re-keyed, no second fetch,
+    /// no duplicate). Fire-and-forget OFF the turn's path: the in-memory echo
+    /// (`persistDurableEcho`) owns the live paint; this owns the durable one.
+    private func persistDraftBornCacheSeed(storedID: String, echo: ChatMessage?) {
+        guard let cacheStore, let identity = cacheIdentity(storedID),
+              let echo, !echo.text.isEmpty else { return }
+        let scope = CacheScope(serverId: identity.serverId, profileId: identity.profileId)
+        let now = Date().timeIntervalSince1970
+        let summary = SessionSummary(
+            id: storedID,
+            title: echo.text.split(separator: "\n", maxSplits: 1).first.map(String.init),
+            preview: echo.text,
+            startedAt: now,
+            messageCount: 1,
+            source: nil,
+            lastActive: now,
+            cwd: draftCwd
+        )
+        let userRow = StoredMessage(
+            role: "user", content: .string(echo.text),
+            timestamp: now, wireId: nil, clientMessageID: echo.clientMessageID)
+        Task {
+            // Ordered on the CacheStore actor: the session row must exist before
+            // the transcript write (saveTranscript no-ops without the FK parent).
+            try? await cacheStore.upsertSession(summary, scope: scope)
+            try? await cacheStore.saveTranscript(identity: identity, messages: [userRow])
+        }
     }
 
     /// Eagerly create a brand-new session **now** and activate it with an empty

@@ -4724,7 +4724,12 @@ final class ChatStore {
             // Emit a fresh message.
             let presentation = Self.seedPresentation(role: role, stored: row, display: display)
             let message = ChatMessage(
-                id: ChatMessage.deterministicID(seedKey: baseID), role: role, parts: rowParts,
+                id: ChatMessage.deterministicID(seedKey: baseID), role: role,
+                // R4b (I5 write-local-first / I8): a write-local-first cache row
+                // carries the send's cmid — thread it onto the painted row so the
+                // relay `userMessage` item (same cmid) adopts it IN PLACE after a
+                // force-close→reopen paint, instead of projecting a twin bubble.
+                clientMessageID: row.clientMessageID, parts: rowParts,
                 timestamp: row.timestamp.map { Date(timeIntervalSince1970: $0) } ?? Date(),
                 presentation: presentation
             )
