@@ -2906,11 +2906,10 @@ final class ConnectionStore {
     /// shared token today; after the server gains device routes, the FIRST
     /// connect silently issues a device token, persists it to the Keychain
     /// (overwriting the shared token IN THE KEYCHAIN ITEM for this server) and the
-    /// non-secret `device_id` to UserDefaults, and re-points `currentToken` — all
-    /// WITHOUT `configure()`/`disconnect()`/`connect()` (no socket rebuild, no
-    /// capability reset). The swap is transparent because the server accepts BOTH
-    /// tokens; the live WS keeps running on the (still-valid) old token until the
-    /// next request naturally uses the new one.
+    /// non-secret `device_id` to UserDefaults, and re-points `currentToken`. The
+    /// existing reconnect loop then reopens the live socket with that device token
+    /// so the gateway can bind foreground/watch state to this phone. No second
+    /// connection path or capability reset is introduced.
     ///
     /// Gating (ALL must hold, else this is a no-op):
     ///   - `devices == .available` (stock server / flaky probe ⇒ keep shared token,
@@ -2918,15 +2917,10 @@ final class ConnectionStore {
     ///   - no `device_id` already recorded for this server (already upgraded, or a
     ///     v2 QR handed us a device token — don't re-issue);
     ///   - we are still configured against `serverURL` with a live token;
-    ///   - the server's live `GET /api/status` reports `auth_required == true`
-    ///     (STR-1568). A loopback/insecure dev-gateway runs `auth_required ==
-    ///     false`; there, the legacy shared-token-only `auth_middleware` is the
-    ///     ONLY active gate on `/api/*` — it has no device-token branch (that
-    ///     lives in `gated_auth_middleware`, which never engages on loopback) —
-    ///     so a device-upgraded phone would 401 on every request, app-wide, with
-    ///     no way back to the shared token short of a re-pair. Fail-safe on a
-    ///     missing/unreachable status (`nil`): keep the shared token, which the
-    ///     loopback gate always accepts.
+    /// Device-token support is established by the capability probe itself. The
+    /// stock loopback and gated auth paths now both consult the plugin token-auth
+    /// seam, so `auth_required == false` is not a reason to keep the phone on the
+    /// anonymous shared credential.
     ///
     /// FAILURE IS SILENT (binding) for transient/status failures: if `issueDevice`
     /// throws (500 persist failure, 401, transport), the app KEEPS the shared
@@ -2954,12 +2948,6 @@ final class ConnectionStore {
         guard !deviceIssueLimitReachedServers.contains(serverURL) else { return }
         // Must still be the active configuration with a live token + REST client.
         guard serverURLString == serverURL, let rest else { return }
-
-        // STR-1568: only issue a device token when the server's own auth gate
-        // would actually accept one — see the gating note above. `try?` folds a
-        // transport/decode failure into the same fail-safe as `nil`: keep the
-        // shared token, retry on the next connect.
-        guard let status = try? await rest.status(), status.authRequired == true else { return }
 
         // STR-546/STR-512: single-flight the actual issue call per server.
         // Overlapping auto-upgrade attempts for the same server (e.g. the
@@ -3011,8 +2999,7 @@ final class ConnectionStore {
               DefaultsKeys.deviceId(server: serverURL) == nil else { return }
 
         // Persist the device token to the Keychain (overwrites the shared token in
-        // the per-server item) and re-point the in-memory token. No reconfigure:
-        // the server accepts both, so the live socket is undisturbed.
+        // the per-server item) and re-point the in-memory token before reconnecting.
         do {
             try KeychainService.saveToken(issued.token, server: serverURL)
         } catch {
@@ -3022,6 +3009,12 @@ final class ConnectionStore {
         }
         currentToken = issued.token
         DefaultsKeys.setDeviceId(issued.deviceId, server: serverURL)
+        // The live socket authenticated with the old shared token. Close it so
+        // the existing reconnect loop immediately reopens with the device token;
+        // foreground push suppression is intentionally tied to that live socket.
+        if transportPath == .gatewayDirect {
+            await client.disconnect()
+        }
     }
 
     #if DEBUG
