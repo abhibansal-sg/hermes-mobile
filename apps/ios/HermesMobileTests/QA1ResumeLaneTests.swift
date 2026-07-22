@@ -497,44 +497,46 @@ final class QA1ResumeLaneTests: XCTestCase {
     // MARK: - B2 — cache-miss switch seeds over the relay, not gateway REST
 
     /// REGRESSION (B2): a cache-miss open in relay mode must seed from the
-    /// relay `history` RPC (the transport that is UP) instead of gateway REST
-    /// (unreachable in relay-only mode → 15s timeout → skeleton "forever",
-    /// IMG_2511/2512). On qa1/base the fetch went to `connection.rest` and the
-    /// transcript stayed empty/errored.
+    /// relay resume/open snapshot instead of gateway REST. The snapshot is the
+    /// one I14 transcript read; a parallel history fetch is a double-read.
     #if DEBUG
-    func testRelayCacheMissOpenFetchesHistoryExactlyOnce() async throws {
-        // No cache is attached and RESUME deliberately emits no snapshot — the
-        // physical-device cold shape. Correctness comes from exactly one relay
-        // history result, never gateway REST and never another session's rows.
+    func testRelayCacheMissOpenSeedsOverRelaySnapshot() async throws {
         let (_, sessions, chat, coordinator, transport) = makeRelayGraph()
-        let history = [storedRow("assistant", "RELAY-HISTORY-A", id: 1)]
+        let fallback = defaultScript()
         transport.script = { up, relay in
             guard let id = up.id else { return }
-            let sid = (up.params["session_id"] as? String) ?? ""
-            if up.method == "history" {
-                relay.deliverResult(id: id, result: .object([
-                    "session_id": .string(sid), "messages": .array(history),
-                ]))
+            if up.method == "resume" || up.method == "open" {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+                let sid = (up.params["session_id"] as? String) ?? "stored-miss"
+                let item: [String: Any] = [
+                    "item_id": "\(sid):a1", "type": "agentMessage",
+                    "status": "completed", "ord": 1, "summary": "",
+                    "body": ["text": "RELAY-SEEDED"],
+                ]
+                let body: [String: Any] = ["items": [item]]
+                let frame: [String: Any] = [
+                    "seq": 1, "sid": sid, "kind": "snapshot", "body": body,
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: frame) {
+                    relay.deliver(String(decoding: data, as: UTF8.self))
+                }
             } else {
-                relay.deliverResult(id: id, result: .object([
-                    "session_id": .string(sid),
-                ]))
+                fallback(up, relay)
             }
         }
         try await coordinator.start(url: relayURL)
 
         sessions.open(summary("stored-miss"))  // no cache attached → cache-miss path
         await sessions.waitForPendingOpenForTesting()
-        await waitUntil { chat.messages.map(\.text).contains("RELAY-HISTORY-A") }
+        await waitUntil { chat.messages.map(\.text).contains("RELAY-SEEDED") }
 
         XCTAssertTrue(
-            chat.messages.map(\.text).contains("RELAY-HISTORY-A"),
-            "the unavailable-cache seed must come from relay history"
+            chat.messages.map(\.text).contains("RELAY-SEEDED"),
+            "the cache-miss seed must come from the relay resume/open snapshot"
         )
-        XCTAssertFalse(chat.messages.map(\.text).contains("OTHER-SESSION"))
-        XCTAssertEqual(
-            transport.upstreams().filter { $0.method == "history" }.count, 1,
-            "I14: a genuine cache miss gets exactly one history fetch"
+        XCTAssertFalse(
+            transport.upstreams().contains { $0.method == "history" },
+            "R3 deletes the phase-2 history fetch; the snapshot supersedes it"
         )
     }
     #endif
