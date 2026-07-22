@@ -67,6 +67,11 @@ persistence, translation, transcript, or session state.
   69.36 seconds; gateway logs contain zero `4007`. Log:
   `/tmp/abh519-phase3-device-live-follow-final-head.log`; result bundle:
   `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_01-39-01-+0800.xcresult`.
+- Force-close repaint: the phone opened the same unique stored session, verified its second
+  settled turn, terminated the app, relaunched, reopened that session, and repainted the
+  same marker within the 10-second disk-paint budget. The focused test passed in 19.13
+  seconds. Log: `/tmp/abh519-phase3-device-force-close-repaint-2.log`; result bundle:
+  `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_01-42-33-+0800.xcresult`.
 
 ### Still required
 
@@ -79,7 +84,7 @@ Capture the remaining checks on physical hardware:
 3. ~~a foreign turn live-follows without stealing ownership or producing a 4007;~~ captured
    above;
 4. **Load Earlier** works during an active streamed turn and preserves the live placeholder;
-5. force-close/reopen still paints the same stored transcript from disk.
+5. ~~force-close/reopen still paints the same stored transcript from disk.~~ captured above.
 
 Only after those observations and the corresponding device log are committed is the Phase 3
 gate complete.
