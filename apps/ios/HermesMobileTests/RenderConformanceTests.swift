@@ -1097,46 +1097,29 @@ final class RenderConformanceTests: XCTestCase {
                        "switching back paints the entire cached transcript instantly (R3 residue / R15 recovery path)")
     }
 
-    /// QA-2 R3 residue — the relay recovery backfill must run over the RELAY
-    /// transport (the gateway REST socket is idle/unreachable in relay mode —
-    /// a REST-only `backfill()` fails or hangs to the 15s timeout, so the
-    /// post-flap reconcile never lands). FAILS on qa2/base
-    /// (`resolvedBackfillFetch` resolves only `connection?.rest` — nil here →
-    /// the backfill no-ops and the snapshot never seeds).
+    /// QA-2 R3 residue — CONTRACT-UPDATED (ROUND-4 R3 / I14): the relay
+    /// recovery reconcile still rides the RELAY transport (the gateway REST
+    /// socket is idle/unreachable in relay mode — the QA-2 bug this gate was
+    /// written for), but as a relay-LOCAL `resync{last_seq}`, NOT a transcript
+    /// `history` refetch. R3/W2d deleted the blanket backfill storm (contract
+    /// I14: paint + ≤1 snapshot per open; reconnect = resync replay + ≤1
+    /// snapshot; `history` reads ONLY on cold cache-miss or an explicit
+    /// scrollback page) — the stream IS the authority, and the resync ring
+    /// replay is gap-free by construction at zero gateway reads. The OLD
+    /// assertion (backfill fires a `history` RPC that seeds the transcript)
+    /// pinned the deleted storm path; this pin asserts the contract shape:
+    /// recovery ⇒ `resync` upstream, never `history`.
     func testBackfill_RelayTransportRunsOverRelayHistory() async throws {
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open("render-relay-backfill")
-        g.sessions.activeStoredId = "render-relay-backfill"
+        try await openDriven(g, "render-relay-backfill")
 
-        // The relay answers `history` with the gateway store rows (proxied
-        // verbatim — the same shape `rest_history` returns downstream).
-        g.transport.script = { upstream, relay in
-            guard let id = upstream.id else { return }
-            if upstream.method == "history" {
-                relay.deliverResult(id: id, result: .object([
-                    "session_id": .string("render-relay-backfill"),
-                    "messages": .array([
-                        .object(["role": .string("user"), "content": .string("rh-q1"),
-                                 "timestamp": .number(1_700_000_000), "id": .number(1)]),
-                        .object(["role": .string("assistant"), "content": .string("rh-a1"),
-                                 "timestamp": .number(1_700_000_001), "id": .number(2)]),
-                    ]),
-                ]))
-            } else {
-                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
-            }
-        }
-
-        // NO `backfillFetch` injection: the store must resolve the relay
-        // `history` RPC itself (the production relay wiring under test).
         await g.chat.backfill()
 
-        let history = g.transport.upstreams().first { $0.method == "history" }
-        XCTAssertNotNil(history, "the recovery backfill must travel over the relay transport in relay mode")
-        XCTAssertEqual(history?.params["session_id"] as? String, "render-relay-backfill")
-        XCTAssertEqual(g.chat.messages.map(\.text), ["rh-q1", "rh-a1"],
-                       "the relay history rows seed the transcript over the up transport")
+        XCTAssertNotNil(g.transport.upstreams().first { $0.method == "resync" },
+            "contract I14/R3: the relay recovery reconcile rides the relay transport — a relay-local resync{last_seq}")
+        XCTAssertNil(g.transport.upstreams().first { $0.method == "history" },
+            "contract I14: no blanket history refetch on relay recovery — the stream is the authority, resync replays gap-free")
     }
 
     /// PIN (green on qa1/base — B15 regression guard): a cold-open transcript
