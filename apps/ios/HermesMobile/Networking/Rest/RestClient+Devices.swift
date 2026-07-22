@@ -115,6 +115,22 @@ extension RestClient {
         ).devices
     }
 
+    /// Best-effort phone selection used only to suppress this device's redundant
+    /// push while it is actively displaying a stored session.
+    func setDeviceForeground(storedSessionId: String?) async throws {
+        var request = makeRequest(
+            path: "\(mobileAPIPrefix)/devices/foreground", method: "POST"
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try encodeBody(
+            .object([
+                "stored_session_id": storedSessionId.map(JSONValue.string) ?? .null,
+            ]),
+            context: "devices.foreground"
+        )
+        _ = try await perform(request)
+    }
+
     // MARK: - Issue a device token (the ONE-TIME grant — auto-upgrade + re-pair)
 
     /// `POST /api/devices/issue {"device_name","platform"}` → mint a device token

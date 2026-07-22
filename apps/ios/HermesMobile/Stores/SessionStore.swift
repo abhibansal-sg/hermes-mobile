@@ -4090,6 +4090,7 @@ final class SessionStore {
         }
         activeStoredProfile = selectedProfileID(for: summary)
         activeStoredId = summary.id
+        connection?.updatePhoneForeground(summary.id)
         if let cacheStore, let scope = currentCacheScope,
            let identity = cacheIdentity(summary.id, profile: summary.profile) {
             let previousPersistence = lastOpenPersistenceTask
@@ -4522,6 +4523,7 @@ final class SessionStore {
         activeStoredId = nil
         activeStoredProfile = nil
         resetComposerHistoryBrowse()
+        connection?.updatePhoneForeground(nil)
         chat?.reset()
         chat?.seed(from: [])  // empty IS the (draft) transcript
         transcriptPaintedStoredId = nil   // a draft holds no stored session
@@ -4583,6 +4585,7 @@ final class SessionStore {
                 mode: .drive,
                 generation: connection?.transportEpoch
             )
+            connection?.updatePhoneForeground(activeStoredId)
             let echoedProfile = result.info?.profileName
             activeStoredProfile = Self.normalizedProfileID(
                 echoedProfile ?? (activeProfile == CacheScope.allProfilesKey

@@ -48,6 +48,7 @@ final class ConnectionStore {
     /// production path calls ``SpotlightIndexer.clearAll`` directly.
     static var spotlightClearAllForTesting: (() -> Void)?
     #endif
+    private var phoneForegroundUpdateTask: Task<Void, Never>?
 
     /// UI-facing connection lifecycle.
     enum Phase: Equatable {
@@ -696,6 +697,18 @@ final class ConnectionStore {
             baseURL: baseURL, token: token, pathStyle: capabilities.resolvedPathStyle,
             relayControlBaseURL: relayControlURL(forGateway: url)
         )
+    }
+
+    /// Declare which stored session this phone is visibly watching. The plugin
+    /// keeps this ephemeral and clears it when the authenticated socket drops.
+    func updatePhoneForeground(_ storedSessionId: String?) {
+        guard transportPath == .gatewayDirect, let rest else { return }
+        let previous = phoneForegroundUpdateTask
+        phoneForegroundUpdateTask = Task {
+            await previous?.value
+            guard !Task.isCancelled else { return }
+            try? await rest.setDeviceForeground(storedSessionId: storedSessionId)
+        }
     }
 
     /// Wait until session-list refresh has a usable transport, or until the
@@ -1674,6 +1687,7 @@ final class ConnectionStore {
             startLongLivedTasks()
         }
         hasConnected = true
+        updatePhoneForeground(sessionStore.activeStoredId)
         // A verified connection clears any prior re-pair flag and failure tally.
         reauthRequired = false
         consecutiveReconnectFailures = 0
@@ -3106,6 +3120,7 @@ final class ConnectionStore {
     @discardableResult
     private func recoverActiveSession(generation: UInt64) async -> Bool {
         guard isActiveGeneration(generation) else { return false }
+        updatePhoneForeground(sessionStore.activeStoredId)
         // Re-probe capabilities after a reconnect — FORCED (R1 #57): this path
         // only runs after the socket genuinely dropped, and a restart on the
         // same URL may have swapped a stock↔patched gateway; the same-URL
@@ -3245,6 +3260,8 @@ final class ConnectionStore {
                 Task { [weak self] in
                     await self?.relayCoordinator?.clearForeground()
                 }
+            } else {
+                updatePhoneForeground(nil)
             }
             return
         }
@@ -3267,6 +3284,7 @@ final class ConnectionStore {
                     await self.relayCoordinator?.reassertForeground()
                 }
             } else {
+                self.updatePhoneForeground(self.sessionStore.activeStoredId)
                 #if DEBUG
                 let _liveState = await self.client.state
                 let socketState = self.clientStateOverrideForScenePhase ?? _liveState

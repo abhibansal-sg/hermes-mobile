@@ -58,6 +58,46 @@ func fetchTranscriptPage(
     }
 }
 
+/// Stock gateway transcript page used by the transparent relay path.
+func fetchStockTranscriptPage(
+    rest: RestClient,
+    sessionId: String,
+    profile: String?,
+    limit: Int,
+    offset: Int
+) async -> TranscriptPageFetch? {
+    let encodedId = sessionId.addingPercentEncoding(
+        withAllowedCharacters: .urlPathAllowed
+    ) ?? sessionId
+    var query = [
+        URLQueryItem(name: "limit", value: String(max(1, limit))),
+        URLQueryItem(name: "offset", value: String(max(0, offset))),
+    ]
+    if let profile, !profile.isEmpty {
+        query.append(URLQueryItem(name: "profile", value: profile))
+    }
+    var components = URLComponents()
+    components.queryItems = query
+    let encodedQuery = (components.percentEncodedQuery ?? "")
+        .replacingOccurrences(of: "+", with: "%2B")
+    do {
+        let data = try await rest.get(
+            path: "/api/sessions/\(encodedId)/messages?\(encodedQuery)"
+        )
+        let root = try rest.decodeJSONValue(from: data, context: "stockMessagesPage")
+        guard let array = root["messages"]?.arrayValue else { return nil }
+        let pageOffset = root["pagination"]?["offset"]?.intValue ?? max(0, offset)
+        let messages = array.compactMap(StoredMessage.init(json:))
+        return TranscriptPageFetch(
+            messages: messages,
+            oldestId: messages.first?.wireId,
+            hasMoreBefore: pageOffset > 0 && !messages.isEmpty
+        )
+    } catch {
+        return nil
+    }
+}
+
 /// Plugin-only target-centered transcript fetch for jump/search/artifact opens.
 /// Returns the target ± radius without forcing a full transcript load.
 func fetchTranscriptAround(
@@ -702,6 +742,7 @@ final class ChatStore {
     private(set) var isLoadingJumpTarget = false
     private(set) var jumpTargetLoadError: String?
     private var oldestLoadedTranscriptWireId: Int?
+    private var oldestLoadedTranscriptOffset: Int?
     private var jumpWindowFetchAttemptedMessageIds: Set<Int> = []
 
     /// Runtime sessions whose gateway status currently reports a mid-turn
@@ -4088,8 +4129,11 @@ final class ChatStore {
     /// Update the backward-paging cursor carried by the latest authoritative
     /// transcript seed. ``stored`` may be only the recent tail window; the server
     /// page metadata tells us whether older rows exist beyond the first loaded id.
-    func noteTranscriptPaging(oldestId: Int?, hasMoreBefore: Bool) {
+    func noteTranscriptPaging(
+        oldestId: Int?, hasMoreBefore: Bool, oldestOffset: Int? = nil
+    ) {
         oldestLoadedTranscriptWireId = oldestId
+        oldestLoadedTranscriptOffset = oldestOffset
         transcriptHasMoreBefore = hasMoreBefore
     }
 
@@ -4097,6 +4141,16 @@ final class ChatStore {
     /// fallback). A full 50-row tail may have older rows; clicking once verifies
     /// against the server and clears the affordance if not.
     func noteTranscriptSeedWindow(_ stored: [StoredMessage]) {
+        if connection?.transportPath == .gatewayDirect,
+           let total = sessions?.activeSummary?.messageCount {
+            let offset = max(0, total - stored.count)
+            noteTranscriptPaging(
+                oldestId: stored.first?.wireId,
+                hasMoreBefore: offset > 0,
+                oldestOffset: offset
+            )
+            return
+        }
         noteTranscriptPaging(
             oldestId: stored.first?.wireId,
             hasMoreBefore: stored.count >= Self.transcriptOpenWindowLimit
@@ -4106,29 +4160,41 @@ final class ChatStore {
     /// Fetch and prepend one older server page. Used by ChatView's top affordance
     /// once the locally-loaded rows no longer have hidden in-memory rows above.
     ///
-    /// ABH-401 CONFLICT GUARD: also bails while a `loadTranscriptAround` jump fetch
-    /// is in flight (`isLoadingJumpTarget`). Both methods build their prepended
-    /// seed from a synchronous snapshot of `messages` taken before their async
-    /// fetch resolves; if the two ran concurrently the loser's `seed(normalized:)`
-    /// would be built from a now-stale snapshot and silently drop whatever the
-    /// winner just prepended (a lost update — not just a redundant fetch). Mutual
-    /// exclusion between the two async prepend paths prevents that clobber.
+    /// It remains mutually exclusive with target-centered jump loading, but it
+    /// may run during a live turn: older settled rows are inserted into the
+    /// current array without reseeding or cancelling the streaming placeholder.
     func loadEarlierTranscript() async {
-        guard !isStreaming,
-              !isLoadingEarlierTranscript,
+        let usesStockPaging = connection?.transportPath == .gatewayDirect
+            && transcriptPageFetch == nil
+        let cursor = usesStockPaging
+            ? oldestLoadedTranscriptOffset
+            : oldestLoadedTranscriptWireId
+        guard !isLoadingEarlierTranscript,
               !isLoadingJumpTarget,
               transcriptHasMoreBefore,
               let storedId = sessions?.activeStoredId,
-              let before = oldestLoadedTranscriptWireId,
+              let cursor,
               let fetch = resolvedTranscriptPageFetch else { return }
+        let limit = usesStockPaging
+            ? min(Self.transcriptOpenWindowLimit, cursor)
+            : Self.transcriptOpenWindowLimit
+        let pageCursor = usesStockPaging ? max(0, cursor - limit) : cursor
+        guard limit > 0 else { return }
         isLoadingEarlierTranscript = true
         defer { isLoadingEarlierTranscript = false }
-        guard let page = await fetch(storedId, Self.transcriptOpenWindowLimit, before) else { return }
+        guard let page = await fetch(storedId, limit, pageCursor) else { return }
         if !page.messages.isEmpty {
             let older = Self.toChatMessages(page.messages)
-            seed(normalized: older + messages)
+            let existing = Set(messages.map(\.id))
+            messages.insert(contentsOf: older.filter { !existing.contains($0.id) }, at: 0)
+            rebuildUserOrdinals()
+            transcriptGeneration += 1
         }
-        noteTranscriptPaging(oldestId: page.oldestId, hasMoreBefore: page.hasMoreBefore)
+        noteTranscriptPaging(
+            oldestId: page.oldestId,
+            hasMoreBefore: page.hasMoreBefore,
+            oldestOffset: usesStockPaging ? pageCursor : nil
+        )
     }
 
     /// Whether the jump resolver may try the server's target-centered page. Also
@@ -5089,13 +5155,26 @@ final class ChatStore {
     }
 
     /// The injected `transcriptPageFetch` test seam, or the default that
-    /// resolves the live `connection?.rest` and calls the module-level
-    /// ``fetchTranscriptPage``. Mirrors ``resolvedTranscriptAroundFetch``'s
+    /// resolves the live `connection?.rest` and uses stock offset pagination on
+    /// the transparent path (legacy relay keeps its existing plugin cursor).
+    /// Mirrors ``resolvedTranscriptAroundFetch``'s
     /// injected-seam-first pattern so tests can control `loadEarlierTranscript`'s
     /// fetch timing without a live REST client.
     private var resolvedTranscriptPageFetch: ((String, Int, Int?) async -> TranscriptPageFetch?)? {
         if let transcriptPageFetch { return transcriptPageFetch }
         guard let rest = connection?.rest else { return nil }
+        if connection?.transportPath == .gatewayDirect {
+            let profile = sessions?.activeSummary?.profile
+            return { sessionId, limit, offset in
+                await fetchStockTranscriptPage(
+                    rest: rest,
+                    sessionId: sessionId,
+                    profile: profile,
+                    limit: limit,
+                    offset: offset ?? 0
+                )
+            }
+        }
         return { sessionId, limit, before in
             await fetchTranscriptPage(rest: rest, sessionId: sessionId, limit: limit, before: before)
         }
@@ -5230,6 +5309,7 @@ final class ChatStore {
         isLoadingJumpTarget = false
         jumpTargetLoadError = nil
         oldestLoadedTranscriptWireId = nil
+        oldestLoadedTranscriptOffset = nil
         jumpWindowFetchAttemptedMessageIds = []
         // A pending foreign-reconcile adoption belongs to the session being torn
         // down (§3.7); never let it bleed into the next session's first seed.
