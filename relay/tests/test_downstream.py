@@ -246,7 +246,9 @@ async def test_dropped_then_replayed_reconciles_gap_free():
 def _server(push_engine=None):
     gw = MagicMock()
     gw.session_list = AsyncMock(return_value=[{"id": "s1"}, {"id": "s2"}])
-    gw.session_create = AsyncMock(return_value="sNew")
+    gw.session_create = AsyncMock(
+        return_value={"session_id": "sNew", "stored_session_id": "storedNew"}
+    )
     gw.session_resume = AsyncMock(return_value={"ok": True})
     gw.rest_history = AsyncMock(return_value=[{"role": "user", "text": "hi"}])
     gw.prompt_submit = AsyncMock(return_value={"turn": "t1"})
@@ -300,7 +302,7 @@ async def test_submit_new_chat_creates_then_submits():
     gw.session_create.assert_awaited_once()
     gw.prompt_submit.assert_awaited_once_with("sNew", "hello")
     gw.session_resume.assert_not_awaited()
-    assert res == {"session_id": "sNew"}
+    assert res == {"session_id": "sNew", "stored_session_id": "storedNew"}
 
 
 async def test_submit_into_existing_resumes_to_own_then_submits():
@@ -1057,7 +1059,9 @@ def _submit_env():
     bus = EventBus()
     store = SessionStore()
     gw = MagicMock()
-    gw.session_create = AsyncMock(return_value="sNew")
+    gw.session_create = AsyncMock(
+        return_value={"session_id": "sNew", "stored_session_id": "storedNew"}
+    )
     gw.session_resume = AsyncMock(return_value={"ok": True})
     gw.prompt_submit = AsyncMock(return_value={"turn": "t1"})
     gw.owns = MagicMock(return_value=False)

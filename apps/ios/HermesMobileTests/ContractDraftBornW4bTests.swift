@@ -11,33 +11,19 @@ import GRDB
 /// actual GRDB write path (`upsertSession` → `saveTranscript` →
 /// ``MessageRowRecord/make``).
 ///
-/// **The device bug (log-proven 2026-07-22):** a new-chat send CREATES the
-/// session on the relay (gateway shows it, 2 msgs) but the phone shows BLANK —
-/// the device log repeats `open-latency cache-miss(reset) session=…85320f`
-/// forever and the relay log shows ZERO history fetches. Root cause: R3 made
-/// the relay open/resume snapshot the SOLE seed (no phase-2 network seed,
-/// `resolvedTranscriptFetch` returns nil on relay), but a draft-born session is
-/// created AFTER any open edge — `adoptCreatedSession` fired no open
-/// (`RelaySessionCoordinator.swift:932-946` on base) and NOTHING ever wrote a
-/// cache row for the new sid (`landRelayCreatedSession` persisted only the
-/// in-memory warm echo; the GRDB writers are the open path's write-through —
-/// never runs for a session nobody opened — and LRU eviction). Every later open
-/// was cache-miss(reset) with nothing to paint and no fetch trigger.
+/// **The device bug (log-proven 2026-07-22):** the gateway created live runtime
+/// id `684b5489` and durable stored id `20260722_140236_f61148`, but the relay
+/// discarded the latter. iOS consequently cached the optimistic row under the
+/// ephemeral runtime id while the drawer/relaunch used the durable id. The write
+/// succeeded, yet every real open missed it. Simulator fixtures used one id for
+/// both sides and could not reproduce the mismatch.
 ///
-/// **The fix (write-local-first — the Telegram/WhatsApp invariant: the store is
-/// the render authority, a new chat writes to the store FIRST, the network
-/// heals behind it):** on create-land, write the session_cache row + the
-/// optimistic user message row to GRDB immediately (carrying the send's cmid so
-/// the relay `userMessage` item adopts the painted row IN PLACE after a
-/// force-close→reopen — I8); treat the created sid as an OPEN edge (the one-shot
-/// seed/bind the R3 wiring keys off open).
+/// **The fix:** preserve both ids through the relay; stream on runtime, cache and
+/// relaunch on stored; await the write-local-first seed; and use one relay
+/// history read only when that cache genuinely misses.
 ///
-/// **FAIL-BEFORE on 3130b9539 (the r4 landing):** the open-edge + GRDB-write
-/// asserts RED (nothing opens the created sid; `loadTranscript` nil); the
-/// force-close-survival test RED (blank — cache miss, resume answers WITHOUT a
-/// snapshot exactly like the real relay `RESUME` handler, downstream.py). The
-/// RED evidence is `hermes-tmp/evidence/round4b/red-*.log`; GREEN after the fix
-/// (`green-*.log`).
+/// The distinct-id regression is the device-shaped gap; the force-close case
+/// proves the durable key survives a process boundary.
 @MainActor
 final class ContractDraftBornW4bTests: XCTestCase {
 
@@ -89,6 +75,7 @@ final class ContractDraftBornW4bTests: XCTestCase {
     private func makeStores(
         cache: CacheStore,
         createdSessionID: String,
+        createdStoredSessionID: String? = nil,
         snapshotFor: @escaping @Sendable (String, String) -> Bool = { _, _ in false }
     ) async throws -> Stores {
         let chat = ChatStore()
@@ -103,7 +90,11 @@ final class ContractDraftBornW4bTests: XCTestCase {
             guard let id = upstream.id else { return }
             if upstream.method == "submit" {
                 let sid = (upstream.params["session_id"] as? String) ?? createdSessionID
-                relay.deliverResult(id: id, result: .object(["session_id": .string(sid)]))
+                var result: [String: JSONValue] = ["session_id": .string(sid)]
+                if upstream.params["session_id"] == nil {
+                    result["stored_session_id"] = .string(createdStoredSessionID ?? sid)
+                }
+                relay.deliverResult(id: id, result: .object(result))
                 return
             }
             relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
@@ -257,20 +248,6 @@ final class ContractDraftBornW4bTests: XCTestCase {
         let cmid = submittedCMID(s)
         XCTAssertNotNil(cmid, "the submit carries the durable cmid on the wire")
 
-        // R4b: the created sid IS an open edge — the one-shot seed/bind fires.
-        // RED on base (adoptCreatedSession issued setForeground ONLY).
-        await waitUntil {
-            s.transport.upstreams().contains {
-                $0.method == "open" && ($0.params["session_id"] as? String) == sid
-            }
-        }
-        XCTAssertTrue(
-            s.transport.upstreams().contains {
-                $0.method == "open" && ($0.params["session_id"] as? String) == sid
-            },
-            "I5/A4: adopting the created session must fire the one-shot OPEN " +
-            "seed/bind (the missing R3 case); got \(s.transport.upstreams().map(\.method))")
-
         // The turn streams in (relay SUBMIT-synthesized userMessage carries the
         // SAME cmid — downstream.py:692 — so adoption is in-place).
         var userBody: [String: Any] = ["text": "Simple greeting hello"]
@@ -304,14 +281,14 @@ final class ContractDraftBornW4bTests: XCTestCase {
             },
             "the reply paints from the session's entry (stream is the authority)")
 
-        // I14 budget: ZERO `history` reads; the lone transcript read is the
-        // created sid's one-shot open (paint + ≤1 snapshot).
+        // I14 budget: live creation needs no transcript read. A later genuine
+        // cold cache miss has its own exactly-once history fallback.
         let methods = s.transport.upstreams().map(\.method)
         XCTAssertEqual(methods.filter { $0 == "history" }.count, 0,
                        "I14: the draft-born session costs ZERO history fetches; got \(methods)")
         XCTAssertEqual(
-            methods.filter { $0 == "open" || $0 == "resume" }.count, 1,
-            "I14: exactly one transcript read (the created sid's open); got \(methods)")
+            methods.filter { $0 == "open" || $0 == "resume" }.count, 0,
+            "I14: creation needs no follow-up transcript read; got \(methods)")
 
         // WRITE-LOCAL-FIRST: the GRDB cache holds the session row + the user
         // message row, cmid intact. RED on base (nothing ever wrote them).
@@ -325,6 +302,47 @@ final class ContractDraftBornW4bTests: XCTestCase {
         XCTAssertEqual(cached?.first?.text, "Simple greeting hello")
         XCTAssertEqual(cached?.first?.clientMessageID, cmid,
                        "I8: the cached row carries the send's cmid (reopen adoption identity)")
+    }
+
+    /// The stock gateway assigns a short live runtime id and a different durable
+    /// stored id on create. The phone must stream on the former while every
+    /// drawer/cache/relaunch identity uses the latter.
+    func testDraftBorn_DistinctRuntimeAndStoredIDsStaySeparated() async throws {
+        let cache = try makeCache()
+        let runtimeID = "684b5489"
+        let storedID = "20260722_140236_f61148"
+        let s = try await makeStores(
+            cache: cache,
+            createdSessionID: runtimeID,
+            createdStoredSessionID: storedID
+        )
+
+        s.sessions.startDraft()
+        let accepted = await s.chat.send(text: "Identity split regression")
+        XCTAssertTrue(accepted)
+
+        XCTAssertEqual(s.sessions.activeRuntimeId, runtimeID)
+        XCTAssertEqual(s.sessions.activeStoredId, storedID)
+        XCTAssertEqual(s.coordinator.activeSessionID, runtimeID)
+        XCTAssertEqual(s.coordinator.activeStoredSessionID, storedID)
+        XCTAssertEqual(s.coordinator.outboxRuntimeID(forStored: storedID), runtimeID)
+
+        let durableHasTranscript = try await cache.hasTranscript(identity(for: storedID))
+        let runtimeHasTranscript = try await cache.hasTranscript(identity(for: runtimeID))
+        XCTAssertTrue(durableHasTranscript)
+        XCTAssertFalse(runtimeHasTranscript)
+
+        s.transport.deliver(Self.itemFrame(
+            "item.completed", sid: runtimeID, seq: 2, turn: "t-split",
+            itemID: "\(runtimeID)-a1", type: "agentMessage", status: "completed",
+            ord: 2, body: ["text": "Reply on the runtime stream"]
+        ))
+        await waitUntil {
+            s.chat.messages.contains { $0.text.contains("Reply on the runtime stream") }
+        }
+        XCTAssertTrue(s.chat.messages.contains {
+            $0.text.contains("Reply on the runtime stream")
+        })
     }
 
     // MARK: - 2. Force-close immediately after the new-chat send → reopen paints from disk

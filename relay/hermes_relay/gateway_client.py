@@ -416,8 +416,8 @@ class GatewayClient:
     async def session_create(
         self, *, title: str, model: Optional[str] = None, provider: Optional[str] = None,
         cols: Optional[int] = None, cwd: Optional[str] = None,
-    ) -> str:
-        """``session.create`` — new owned session; returns its session_id.
+    ) -> dict[str, Any]:
+        """``session.create`` — new owned session; returns both gateway ids.
 
         R4 L2 (B10 projects gap): ``cwd`` threads a project working directory
         into the created session so a new-session-in-a-project binds to that
@@ -440,8 +440,14 @@ class GatewayClient:
         sid = result.get("session_id")
         if not sid:
             raise GatewayRPCError("session.create", {"code": -1, "message": "no session_id in result"})
-        self._mark_owned(sid)
-        return sid
+        stored_sid = result.get("stored_session_id") or sid
+        # The stored id is the reconnect/durable identity; the runtime id is
+        # what prompt.submit and gateway events use for this live process.
+        self._mark_owned(stored_sid)
+        self._owned.add(sid)
+        self._live_by_origin[stored_sid] = sid
+        self._live_by_origin[sid] = sid
+        return result
 
     async def session_resume(self, session_id: str, *, cols: Optional[int] = None) -> dict[str, Any]:
         """``session.resume`` — own an idle/foreign session (REACTIVATES it).

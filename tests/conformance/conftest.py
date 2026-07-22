@@ -62,9 +62,9 @@ class FakeGateway:
         self.calls.append(("rest_history", {"session_id": session_id}))
         return list(self._history)
 
-    async def session_create(self, **kwargs: Any) -> str:
+    async def session_create(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("session.create", dict(kwargs)))
-        return "sess-new"
+        return {"session_id": "sess-new", "stored_session_id": "stored-new"}
 
     async def session_resume(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("session.resume", {"session_id": session_id, **kwargs}))

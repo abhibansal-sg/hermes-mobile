@@ -41,7 +41,9 @@ class FakeWS:
 
 def _server():
     gw = MagicMock()
-    gw.session_create = AsyncMock(return_value="sNew")
+    gw.session_create = AsyncMock(
+        return_value={"session_id": "sNew", "stored_session_id": "storedNew"}
+    )
     gw.session_resume = AsyncMock(return_value={"ok": True})
     gw.file_attach = AsyncMock(return_value={
         "attached": True,
