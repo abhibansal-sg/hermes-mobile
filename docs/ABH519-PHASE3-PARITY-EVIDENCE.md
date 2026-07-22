@@ -1,14 +1,13 @@
 # ABH-519 Phase 3 — retained-seam parity evidence
 
-**Captured:** 2026-07-22 +08:00
+**Captured:** 2026-07-22–23 +08:00
 
 **Branch:** `codex/abh-519-v019-phase3-parity`
 
 **Base:** Phase 2 merge `565f357d8c29af744eadb34c24c76108e902bfbe`
 
-**Status:** non-device verification is green. Physical verification is in progress on the
-owner-approved, USB-connected iPhone 16 Pro Max. This phase must not merge until every
-device check below is captured.
+**Status:** Phase 3 gate green. All device checks below ran on the owner-approved,
+USB-connected iPhone 16 Pro Max. No simulator was booted or used.
 
 ## Retained seams
 
@@ -49,7 +48,7 @@ persistence, translation, transcript, or session state.
 - Gateway-core diff audit: no files under `gateway/`, `tui_gateway/`, or `hermes_cli/`
   changed. The stock seam ledger is unchanged.
 
-## Physical-device gate still required
+## Physical-device gate
 
 ### Captured on physical hardware
 
@@ -73,18 +72,54 @@ persistence, translation, transcript, or session state.
   seconds. Log: `/tmp/abh519-phase3-device-force-close-repaint-2.log`; result bundle:
   `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_01-42-33-+0800.xcresult`.
 
-### Still required
+- Clarification continuation: the owning card survived switch/cache reset, answering it
+  resumed the same turn, and the exact final response `ABH519 owner answered` rendered in
+  that transcript. Focused test passed in 58.399 seconds. Log:
+  `/private/tmp/abh519-phase3-device-owned-clarification-answer.log`; result bundle:
+  `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_03-48-58-+0800.xcresult`.
+- Background clarification push: a desktop-driven clarification produced one notification;
+  tapping it opened the owning stored session and real question/choices, and answering
+  resumed the blocked turn. Focused test passed in 32.959 seconds. Log:
+  `/private/tmp/abh519-phase3-device-clarification-push-final2.log`; result bundle:
+  `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_03-23-43-+0800.xcresult`.
+- Background completion push: a desktop-driven completion produced one notification and
+  tapping it opened the owning transcript. The exactly-once check passed in 27.582 seconds.
+  Log: `/private/tmp/abh519-phase3-device-completion-push-exactly-once-final.log`; result
+  bundle:
+  `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_03-01-41-+0800.xcresult`.
+- Foreground suppression: while the phone watched the stored session, the foreign turn
+  live-followed into that transcript and SpringBoard exposed no redundant completion push.
+  Focused test passed in 36.107 seconds. Log:
+  `/private/tmp/abh519-phase3-device-foreground-suppression-final.log`; result bundle:
+  `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_02-55-06-+0800.xcresult`.
+- Stock pagination during an active turn: **Load Earlier** crossed the first 50-row window,
+  fetched the older stock page, rendered `pagination fixture message 070`, and retained the
+  live Interrupt control. Focused test passed in 69.811 seconds. Log:
+  `/tmp/hermes-ios-build-8723.log`; result bundle:
+  `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_04-56-43-+0800.xcresult`.
+- Approval push and continuation: the stock approval hook produced an actionable push.
+  Because Do Not Disturb was active, iOS grouped it under Notification Center; opening that
+  group and tapping the notification landed on the owning gate. The phone sent
+  `approval.respond` for the same runtime and received an ACK:
 
-Capture the remaining checks on physical hardware:
+  ```text
+  ABH519_APPROVAL_RESPOND_ENTRY approvalSession=6a338c54 activeSession=6a338c54 connection=true
+  ABH519_APPROVAL_RESPOND_SEND session=6a338c54
+  ABH519_APPROVAL_RESPOND_OK
+  ```
 
-1. background/locked turn completion, clarification, and approval each produce one
-   actionable push;
-2. the phone receives completion push when a desktop drives the session, but receives no
-   redundant push while that same phone is foregrounded on the session;
-3. ~~a foreign turn live-follows without stealing ownership or producing a 4007;~~ captured
-   above;
-4. **Load Earlier** works during an active streamed turn and preserves the live placeholder;
-5. ~~force-close/reopen still paints the same stored transcript from disk.~~ captured above.
+  The gate cleared and `ABH519 APPROVAL RESUMED` rendered as a standalone assistant text
+  view below the work row. After removing all diagnostic signposts and restarting the
+  isolated gateway, the same test passed again in 56.054 seconds. Clean-code log:
+  `/private/tmp/abh519-phase3-approval-clean-device.log`; result bundle:
+  `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_05-30-17-+0800.xcresult`.
+  The raw USB signpost capture is
+  `/private/tmp/abh519-phase3-approval-device-syslog.log`.
+- The two ownership/backfill invariants also ran against the physical arm64 test bundle:
+  2 passed, 0 failed. Log: `/private/tmp/abh519-phase3-focused-unit-device.log`; result
+  bundle:
+  `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_05-31-35-+0800.xcresult`.
 
-Only after those observations and the corresponding device log are committed is the Phase 3
-gate complete.
+The focused plugin seam slice was rerun after cleanup: 5 passed. `git diff --check` passes,
+and the final product diff contains none of the temporary `ABH519_APPROVAL_*`,
+`ABH519_STOCK_PAGE*`, or relay HTTP diagnostic signposts.
