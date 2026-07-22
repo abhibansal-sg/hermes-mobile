@@ -269,7 +269,10 @@ final class AppEnvironment {
         // The inbox accumulates broadcast approval/clarify prompts and answers
         // them against each prompt's own runtime via the gateway client.
         inboxStore.attach(connection: connectionStore)
-        inboxStore.onCommittedSnapshot = { snapshot in
+        inboxStore.onCommittedSnapshot = { [weak chatStore, weak inboxStore] snapshot in
+            if let items = inboxStore?.pendingItems {
+                chatStore?.reconcilePendingAttention(items)
+            }
             var patch = WidgetSnapshotWriter.Patch()
             patch.pendingAttentionCount = .set(snapshot.pendingCount)
             if let metadata = snapshot.metadata {

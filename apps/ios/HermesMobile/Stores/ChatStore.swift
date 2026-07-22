@@ -2,8 +2,6 @@ import Foundation
 import SwiftUI  // A2: withTransaction(Transaction(animation: nil)) on the finalize flip
 import UIKit
 import os
-#if DEBUG
-#endif
 
 struct TranscriptPageFetch: Sendable {
     let messages: [StoredMessage]
@@ -1673,7 +1671,7 @@ final class ChatStore {
         let sessionId = event.sessionId ?? activeSessionId ?? ""
         let storedId = event.storedSessionId ?? sessions?.activeStoredId ?? sessionId
         let gate = PendingApproval(id: request.id, sessionId: sessionId, request: request)
-        if storedId == relayWriteGateSessionID || relayWriteGateSessionID == nil {
+        if storedId == relayWriteGateSessionID {
             relayWriteGateSessionID = storedId
             pendingApproval = gate
             onApprovalChange?(true)
@@ -1689,7 +1687,7 @@ final class ChatStore {
         let sessionId = event.sessionId ?? activeSessionId ?? ""
         let storedId = event.storedSessionId ?? sessions?.activeStoredId ?? sessionId
         let gate = PendingClarification(sessionId: sessionId, request: request)
-        if storedId == relayWriteGateSessionID || relayWriteGateSessionID == nil {
+        if storedId == relayWriteGateSessionID {
             relayWriteGateSessionID = storedId
             pendingClarification = gate
         } else {
@@ -1776,7 +1774,7 @@ final class ChatStore {
         // I12: the active session's gate takes the slot the views read; a
         // background session's gate PARKS until its session holds the
         // write-gate — never dropped because the session is unfocused.
-        if frame.sid == relayWriteGateSessionID || relayWriteGateSessionID == nil {
+        if frame.sid == relayWriteGateSessionID {
             pendingApproval = gate
             onApprovalChange?(true)
         } else {
@@ -1794,7 +1792,7 @@ final class ChatStore {
         let request = ClarifyRequestPayload(payload: frame.body)
         if let rid = request.requestId, resolvedRelayGateIDs.contains(rid) { return }
         let gate = PendingClarification(sessionId: frame.sid, request: request)
-        if frame.sid == relayWriteGateSessionID || relayWriteGateSessionID == nil {
+        if frame.sid == relayWriteGateSessionID {
             pendingClarification = gate
         } else {
             parkedRelayClarifications[frame.sid] = gate
@@ -1855,6 +1853,40 @@ final class ChatStore {
             }
             pendingClarification = parkedRelayClarifications.removeValue(forKey: storedSessionID)
         }
+    }
+
+    /// Rebuild the existing per-session gate slots from the server-authoritative
+    /// pending-attention snapshot. This is the cold/background counterpart to
+    /// the live WebSocket handlers above: a push can wake the app after the gate
+    /// frame was missed, but the plugin snapshot still carries the same runtime
+    /// id, stored id, request id, and payload.
+    func reconcilePendingAttention(_ items: [InboxStore.Item]) {
+        var approvals: [String: PendingApproval] = [:]
+        var clarifications: [String: PendingClarification] = [:]
+
+        for item in items {
+            let storedID = item.storedSessionId ?? item.sessionId
+            switch item.payload {
+            case .approval(let request):
+                guard !resolvedRelayGateIDs.contains(request.id) else { continue }
+                approvals[storedID] = PendingApproval(
+                    id: request.id, sessionId: item.sessionId, request: request
+                )
+            case .clarify(let request):
+                if let requestID = request.requestId,
+                   resolvedRelayGateIDs.contains(requestID) { continue }
+                clarifications[storedID] = PendingClarification(
+                    sessionId: item.sessionId, request: request
+                )
+            }
+        }
+
+        let owner = relayWriteGateSessionID
+        pendingApproval = owner.flatMap { approvals.removeValue(forKey: $0) }
+        pendingClarification = owner.flatMap { clarifications.removeValue(forKey: $0) }
+        parkedRelayApprovals = approvals
+        parkedRelayClarifications = clarifications
+        onApprovalChange?(pendingApproval != nil)
     }
 
     func discardPendingGates() {
@@ -5140,19 +5172,6 @@ final class ChatStore {
                     Task { try? await cacheStore.saveTranscript(identity: identity, messages: stored) }
                 }
             }
-            // The seed is the authoritative post-reconnect/post-restart
-            // reconcile: any approval/clarify card still up belongs to a turn
-            // that is no longer in flight (a live turn's `guard !isStreaming`
-            // would have no-op'd us), so answering it would mis-resolve
-            // against a stale — possibly dead — runtime (R1 #51). The inbox
-            // remains the durable surface for prompts that are genuinely
-            // pending. The SECURE prompt is deliberately excluded: it has NO
-            // inbox fallback, and this path also runs on live-socket
-            // reconciles (`broadcast_gap`) where the agent may genuinely
-            // still be waiting on it — its expiry belongs to the transport
-            // drop (`handleConnectionDrop`) and the `error` terminal, never
-            // to a reconcile that proves nothing about its turn.
-            expireTurnScopedPrompts(includeSecure: false)
             lastBackfillError = nil
         } catch {
             // Backfill is best-effort for the transcript (we keep what we have),
