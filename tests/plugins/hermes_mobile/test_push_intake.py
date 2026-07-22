@@ -669,9 +669,9 @@ def test_push_hook_turn_complete_short_turn_pushes_when_unfocused(monkeypatch, p
     assert calls[0]["expiration"] == 14400
 
 
-def test_push_hook_turn_complete_suppressed_when_foregrounded(monkeypatch, push_engine):
-    # STR-987 attention gate: a live client WS holding the session foregrounded
-    # means the user is watching — no banner, regardless of turn duration.
+def test_push_hook_desktop_transport_does_not_suppress_phone(monkeypatch, push_engine):
+    # A desktop owns this runtime transport, but that is not evidence the phone
+    # is displaying it. Device-specific foreground selection owns suppression.
     calls = _capture_notify(monkeypatch, push_engine)
 
     class _LiveWS:
@@ -686,7 +686,7 @@ def test_push_hook_turn_complete_suppressed_when_foregrounded(monkeypatch, push_
         push_engine._process_push_event("message.complete", "sid_fg", {"text": "watched"})
     finally:
         server._sessions.pop("sid_fg", None)
-    assert calls == []
+    assert len(calls) == 1
 
 
 def test_process_push_event_does_not_clear_newer_turn_start(monkeypatch, push_engine):

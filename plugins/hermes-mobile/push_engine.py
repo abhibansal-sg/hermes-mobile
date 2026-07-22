@@ -761,7 +761,9 @@ def registered_tokens_by_env() -> Dict[str, List[str]]:
     return grouped
 
 
-def recipients_for_event(event_kind: str) -> Dict[str, List[str]]:
+def recipients_for_event(
+    event_kind: str, excluding_device_ids: set[str] | None = None
+) -> Dict[str, List[str]]:
     """Tokens grouped by APNs env, filtered to those wanting ``event_kind``.
 
     Mirrors :func:`registered_tokens_by_env` but drops entries whose per-event
@@ -771,9 +773,12 @@ def recipients_for_event(event_kind: str) -> Dict[str, List[str]]:
     fallback = _default_env()
     grouped: Dict[str, List[str]] = {}
     known = event_kind in PUSH_EVENT_KINDS
+    excluded = excluding_device_ids or set()
     for entry in _load_registry():
         n = _normalize_token(entry.get("token", ""))
         if not n:
+            continue
+        if entry.get("device_id") in excluded:
             continue
         if known and not _entry_wants_event(entry, event_kind):
             continue
@@ -1113,6 +1118,7 @@ def _notify_direct_apns(
     category: Optional[str] = None,
     expiration: int = 0,
     collapse_id: Optional[str] = None,
+    excluding_device_ids: set[str] | None = None,
 ) -> int:
     """Send an alert push through direct APNs to registered tokens.
 
@@ -1126,7 +1132,7 @@ def _notify_direct_apns(
         return 0
 
     # Filter recipients by per-event preference before doing any work.
-    recipients = recipients_for_event(event_type)
+    recipients = recipients_for_event(event_type, excluding_device_ids)
     if not any(recipients.values()):
         return 0
 
@@ -1299,6 +1305,7 @@ def notify(
     category: Optional[str] = None,
     expiration: int = 0,
     collapse_id: Optional[str] = None,
+    excluding_device_ids: set[str] | None = None,
 ) -> int:
     """Send an alert push to every registered device token.
 
@@ -1329,7 +1336,7 @@ def notify(
         # otherwise we skip the relay enqueue and return 0. Unknown event
         # types fall open to the legacy unconditional relay delivery.
         if event_type in PUSH_EVENT_KINDS and not any(
-            recipients_for_event(event_type).values()
+            recipients_for_event(event_type, excluding_device_ids).values()
         ):
             return 0
         try:
@@ -1365,6 +1372,7 @@ def notify(
         category=category,
         expiration=expiration,
         collapse_id=collapse_id,
+        excluding_device_ids=excluding_device_ids,
     )
 
 
@@ -1494,15 +1502,16 @@ def _gw_sessions() -> dict:
         return {}
 
 
-def _session_holds_foreground(session) -> bool:
-    """True iff a live client WS still holds this session foregrounded.
+def _foreground_phone_devices(sid: str, session: dict | None = None) -> set[str]:
+    """Phone devices actively displaying this stored session, never desktops."""
+    try:
+        from . import device_tokens
 
-    A locked/off/killed/backgrounded phone uses a background URLSession with
-    NO WS attached (dashboard/api.py:334 + relay.register_device_background),
-    so it returns False and turn_complete pushes.
-    """
-    t = (session or {}).get("transport")
-    return t is not None and not getattr(t, "_closed", False)
+        stored = str((session or {}).get("session_key") or sid)
+        return device_tokens.foreground_device_ids_for_session(stored)
+    except Exception:
+        _log.debug("foreground device lookup failed", exc_info=True)
+        return set()
 
 
 # Minimum seconds between routine Live Activity remote updates for one session.
@@ -1663,7 +1672,7 @@ def _push_approval_enrichment(sid: str, data: dict) -> dict:
         if data.get(key):
             enriched[key] = data[key]
     session = _gw_sessions().get(sid)
-    stored = (session or {}).get("session_key")
+    stored = data.get("stored_session_id") or (session or {}).get("session_key")
     if stored:
         enriched["stored_session_id"] = stored
     # Gateway approvals are dangerous-command gated, so a pattern match means a
@@ -2033,6 +2042,7 @@ def _process_push_event(
         # Keep the worker safe for direct callers as well as the normal
         # pre_emit_event path. This is idempotent for already enriched data.
         data = enrich_correlated_event(event, sid, payload) or {}
+        excluded_devices = _foreground_phone_devices(sid, _gw_sessions().get(sid))
         if event == "approval.request":
             title = _push_safe_text(data.get("title"), "Approval required", max_chars=80)
             body = _push_safe_text(
@@ -2047,6 +2057,7 @@ def _process_push_event(
                 alert_payload,
                 category="HERMES_APPROVAL",
                 collapse_id=alert_payload.get("event_id"),
+                excluding_device_ids=excluded_devices,
             )
         elif event == "clarify.request":
             clarify_payload = _push_route_context(sid, data)
@@ -2062,6 +2073,7 @@ def _process_push_event(
                 clarify_payload,
                 category="HERMES_CLARIFY",
                 collapse_id=clarify_payload.get("event_id"),
+                excluding_device_ids=excluded_devices,
             )
         elif event == "error":
             if _is_kanban_worker():
@@ -2078,6 +2090,7 @@ def _process_push_event(
                 preview,
                 {"session_id": sid},
                 category="HERMES_ERROR",
+                excluding_device_ids=excluded_devices,
             )
         elif event == "background.complete":
             if _is_kanban_worker():
@@ -2094,6 +2107,7 @@ def _process_push_event(
                 preview,
                 {"session_id": sid, "task_id": data.get("task_id")},
                 category="HERMES_TURN",
+                excluding_device_ids=excluded_devices,
             )
         else:  # message.complete — push unless the user is watching live
             session = _gw_sessions().get(sid)
@@ -2105,14 +2119,9 @@ def _process_push_event(
                 started = (session or {}).get("_push_turn_started")
             if session is not None and session.get("_push_turn_started") == started:
                 session.pop("_push_turn_started", None)
-            # STR-987 attention gate: only push turn-complete when NO live
-            # client WS holds this session foregrounded. A locked/off/killed/
-            # backgrounded phone drops its WS (background URLSession, no
-            # transport), so the banner is wanted — independent of duration.
-            # Replaces the old 30s duration heuristic, which suppressed the
-            # quick-turn-then-phone-off scenario the Board cares about.
-            if _session_holds_foreground(session):
-                return
+            # Suppress only the authenticated phone device actively displaying
+            # this stored session. A desktop owning the runtime is not a phone
+            # foreground signal and must never suppress the phone's completion.
             # ABH-204: a dispatched kanban worker's internal turns must not
             # spam the phone with a turn-complete alert. Approval requests
             # still push (their own branch above); Live Activity is unaffected.
@@ -2136,6 +2145,7 @@ def _process_push_event(
                 category="HERMES_TURN",
                 expiration=14400,
                 collapse_id=turn_payload.get("event_id"),
+                excluding_device_ids=excluded_devices,
             )
     except Exception:
         _log.debug("push hook failed", exc_info=True)
@@ -2179,7 +2189,64 @@ def handle_gateway_event(event: str, sid: str, payload: dict | None = None) -> N
     if event == "session.deleted":
         end_live_activity_sessions(sid)
         return
+    # Approval alerts originate at the stock pre_approval_request hook below.
+    # The emitted frame still reaches live clients and manifest invalidation,
+    # but must not enqueue a second APNs alert.
+    if event == "approval.request":
+        return
     _push_hook(event, sid, payload)
+
+
+def handle_approval_request(
+    *,
+    session_key: str = "",
+    surface: str = "",
+    command: str = "",
+    description: str = "",
+    **_kwargs,
+) -> None:
+    """Turn the stock approval hook into one actionable mobile push."""
+    if surface != "gateway" or not session_key:
+        return
+    sid = next(
+        (
+            runtime_id
+            for runtime_id, session in _gw_sessions().items()
+            if isinstance(session, dict) and session.get("session_key") == session_key
+        ),
+        session_key,
+    )
+    request_id = ""
+    choices: list[str] = []
+    try:
+        from tools.approval import pending_approval_snapshot
+
+        pending = [
+            item
+            for item in pending_approval_snapshot()
+            if item.get("stored_session_id") == session_key
+        ]
+        if pending:
+            latest = pending[-1]
+            request_id = str(latest.get("request_id") or "")
+            detail = latest.get("detail") or {}
+            choices = list(detail.get("choices") or [])
+            safe_description = str(detail.get("description") or "Approval required")
+        else:
+            safe_description = "Approval required"
+    except Exception:
+        _log.debug("approval snapshot lookup failed", exc_info=True)
+        safe_description = "Approval required"
+    payload = {
+        "title": "Approval required",
+        "description": safe_description,
+        "stored_session_id": session_key,
+        "request_id": request_id,
+        "approval_id": request_id,
+        "event_id": request_id,
+        "choices": choices,
+    }
+    _push_hook("approval.request", sid, payload)
 
 
 def handle_session_finalize(
@@ -2226,6 +2293,7 @@ def activate(ctx=None) -> None:
 
                 ctx.register_hook("pre_emit_event", _hook_pre_emit)
                 ctx.register_hook("post_emit_event", _hook_emit)
+                ctx.register_hook("pre_approval_request", handle_approval_request)
                 ctx.register_hook("on_session_finalize", handle_session_finalize)
                 sweep_dead_live_activity_tokens()
                 return

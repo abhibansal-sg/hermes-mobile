@@ -181,3 +181,25 @@ def test_bearer_token_authenticated_flag_accepted(api):
     """The additive ``token_authenticated`` branch admits bearer-auth requests."""
     req = _make_request(auth_required=True, token_authenticated=True)
     assert api._has_dashboard_api_auth(req) is True
+
+
+@pytest.mark.asyncio
+async def test_device_foreground_route_uses_authenticated_device(api, monkeypatch):
+    calls = []
+    fake_tokens = types.SimpleNamespace(
+        set_device_foreground=lambda device_id, stored_id: calls.append(
+            (device_id, stored_id)
+        )
+    )
+    monkeypatch.setattr(api, "_plugin_module", lambda _name: fake_tokens)
+    req = _make_request(
+        auth_required=True,
+        device={"device_id": "phone-1", "scopes": ["chat"]},
+    )
+
+    result = await api.set_device_foreground(
+        req, api._DeviceForegroundBody(stored_session_id="stored-1")
+    )
+
+    assert calls == [("phone-1", "stored-1")]
+    assert result["foreground"] is True
