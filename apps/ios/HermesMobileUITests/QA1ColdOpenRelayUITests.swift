@@ -1,7 +1,7 @@
 import XCTest
 
-/// QA-1 resume-lane evidence (A1/A7): FIVE consecutive COLD opens in relay mode
-/// against the isolated (9130+) mock gateway + worktree relay — never the live
+/// FIVE consecutive cold opens through the transparent stock proxy
+/// against the isolated (9130+) mock gateway — never the live
 /// 9119 gateway. Asserts:
 ///   - zero modal alerts on every cold open (B1 north-star: the relay resume
 ///     queues on transport readiness and self-heals silently; the build-114
@@ -38,8 +38,7 @@ final class QA1ColdOpenRelayUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchEnvironment["HERMES_URL"] = url
         app.launchEnvironment["HERMES_TOKEN"] = token
-        // Relay transport (DEBUG env override) + the isolated relay to dial.
-        app.launchEnvironment["HERMES_TRANSPORT"] = "relay"
+        // The single stock HTTP/WS path uses this transparent proxy address.
         app.launchEnvironment["HERMES_RELAY_URL"] = relayURL
         app.launchEnvironment["HERMES_UITEST_SIZE_CLASS"] = "compact"
         app.launchArguments += ["--uitest-mute-audio", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
@@ -84,13 +83,18 @@ final class QA1ColdOpenRelayUITests: XCTestCase {
                 let send = app.buttons["Send"]
                 XCTAssertTrue(send.waitForExistence(timeout: 5), "Send button missing")
                 send.tap()
-                let reply = app.staticTexts.containing(
+                let reply = app.descendants(matching: .any).matching(
                     NSPredicate(format: "label CONTAINS[c] %@", "Paris")
                 ).firstMatch
-                XCTAssertTrue(
-                    reply.waitForExistence(timeout: 45),
-                    "scripted echo reply did not land on the relay path"
-                )
+                let replyLanded = reply.waitForExistence(timeout: 45)
+                if !replyLanded {
+                    let attachment = XCTAttachment(screenshot: app.screenshot())
+                    attachment.name = "missing-stock-reply"
+                    attachment.lifetime = .keepAlways
+                    add(attachment)
+                    NSLog("QA1-MISSING-REPLY-HIERARCHY: \(app.debugDescription)")
+                }
+                XCTAssertTrue(replyLanded, "scripted stock reply did not paint")
                 // Open the new session from the drawer so the cold cache
                 // restore on the next launches PRE-SELECTS it (the exact
                 // condition that tripped the build-114 cold-start resume
@@ -98,7 +102,7 @@ final class QA1ColdOpenRelayUITests: XCTestCase {
                 // transcript cache via the relay history fetch.
                 drawerToggle.tap()
                 let row = app.buttons.matching(
-                    NSPredicate(format: "identifier BEGINSWITH %@", "sessionRow.")
+                    NSPredicate(format: "identifier BEGINSWITH %@", "sessionRow")
                 ).firstMatch
                 XCTAssertTrue(
                     row.waitForExistence(timeout: 45),
@@ -116,7 +120,7 @@ final class QA1ColdOpenRelayUITests: XCTestCase {
             } else {
                 // 4. Cache paint: the settled transcript must be visible quickly
                 //    (B4 — no blank screen; B2 — no skeleton-forever).
-                let cached = app.staticTexts.containing(
+                let cached = app.descendants(matching: .any).matching(
                     NSPredicate(format: "label CONTAINS[c] %@", "Paris")
                 ).firstMatch
                 let cachePainted = cached.waitForExistence(timeout: 3)
@@ -128,7 +132,7 @@ final class QA1ColdOpenRelayUITests: XCTestCase {
                 // 5. Drawer closes on session tap (B3/A7).
                 drawerToggle.tap()
                 let row = app.buttons.matching(
-                    NSPredicate(format: "identifier BEGINSWITH %@", "sessionRow.")
+                    NSPredicate(format: "identifier BEGINSWITH %@", "sessionRow")
                 ).firstMatch
                 XCTAssertTrue(row.waitForExistence(timeout: 5), "cold open \(iteration): no session row in drawer")
                 row.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()

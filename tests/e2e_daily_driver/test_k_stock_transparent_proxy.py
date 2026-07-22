@@ -12,6 +12,8 @@ import pytest
 from mock_gateway.server import E2E_TOKEN
 from phone_driver import PhoneDriver
 
+pytestmark = pytest.mark.asyncio
+
 
 async def test_stock_frames_round_trip_unchanged(
     mock_gateway, relay_subprocess, evidence

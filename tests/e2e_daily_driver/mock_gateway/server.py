@@ -75,6 +75,9 @@ class MockSession:
     interrupts: list[dict[str, Any]] = field(default_factory=list)
     steers: list[dict[str, Any]] = field(default_factory=list)
     interrupt_event: Optional[asyncio.Event] = None
+    # Fork S11 receipt seam: the mock mirrors the gateway's durable
+    # client_message_id disposition so a redrain cannot execute a second turn.
+    prompt_receipts: dict[str, tuple[str, str, dict[str, Any]]] = field(default_factory=dict)
 
 
 # A script step is a callable that, given the session + a "send event" closure,
@@ -441,6 +444,11 @@ class MockGateway:
             self.rest_reads.append({"t": time.monotonic(), "session_id": sid})
             body = json.dumps({"session_id": sid, "messages": msgs}) + "\n"
             return conn.respond(HTTPStatus.OK, body)
+        if path == "/api/status":
+            return conn.respond(
+                HTTPStatus.OK,
+                '{"version":"mock","gateway_running":true,"auth_required":true}\n',
+            )
         if path == "/healthz":
             return conn.respond(HTTPStatus.OK, '{"ok": true}\n')
         return None  # proceed to WS handshake
@@ -529,6 +537,12 @@ class MockGateway:
             sess = self.sessions.get(sid)
             if sess is None:
                 error = {"code": -32602, "message": f"unknown session {sid}"}
+            elif (client_message_id := params.get("client_message_id")) in sess.prompt_receipts:
+                prior_sid, prior_text, prior_result = sess.prompt_receipts[client_message_id]
+                if (prior_sid, prior_text) != (sid, params.get("text", "")):
+                    error = {"code": 4091, "message": "client_message_id was already used for a different prompt"}
+                else:
+                    result = {**prior_result, "deduplicated": True}
             elif sess.running:
                 # QA-2 R11 E2E: the stock gateway rejects a second prompt while
                 # a turn runs (4009 "session busy"). The phone's relay-mode send
@@ -538,7 +552,16 @@ class MockGateway:
                 if sess.script is not None:
                     sess.script.kwargs["last_prompt"] = params.get("text", "")
                 # Ack the RPC fast; the stream is pushed asynchronously.
-                result = {"ok": True, "session_id": sid}
+                result = {"status": "streaming"}
+                if client_message_id := params.get("client_message_id"):
+                    result.update({
+                        "accepted": True,
+                        "client_message_id": client_message_id,
+                        "deduplicated": False,
+                    })
+                    sess.prompt_receipts[client_message_id] = (
+                        sid, params.get("text", ""), dict(result)
+                    )
                 asyncio.create_task(self._run_script(sess))
         elif method == "approval.respond":
             sid = params.get("session_id", "")

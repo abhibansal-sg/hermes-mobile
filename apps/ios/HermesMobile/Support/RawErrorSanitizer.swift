@@ -1,19 +1,14 @@
 import Foundation
 
-/// QA-3 S5/C3 — raw-error classifier, the iOS twin of the relay notifier's
-/// `_humanize_raw_error` (relay/hermes_relay/notifier.py). The two implement
-/// IDENTICAL rules so a push body and the in-transcript render of the same
-/// failure agree word-for-word.
+/// Raw-error classifier shared by gateway RPC and transcript error surfaces.
 ///
 /// Why: a turn can complete carrying an upstream provider failure as its final
 /// message TEXT rather than as an `error` item (owner forensics IMG_2583:
 /// `HTTP 403: {"code":"unauthenticated:bad-credentials","error":"The OAuth2
-/// access token could not be validated."}`). The relay now humanizes push
-/// bodies at the source; this type does the same for the surfaces the phone
-/// renders itself — the in-transcript `ErrorItemView` and the `RelayError`
-/// descriptions that feed `ChatStore.lastError` banners (the relay's RPC error
-/// frames interpolate `str(exc)` verbatim, downstream.py, so a failed RPC can
-/// carry the provider's raw text). C3: no raw error codes ever reach the user;
+/// access token could not be validated."}`). This type does the same for the
+/// surfaces the phone renders itself — the in-transcript `ErrorItemView` and
+/// `GatewayError` descriptions that feed `ChatStore.lastError` banners. C3:
+/// no raw error codes ever reach the user;
 /// one honest human line instead.
 enum RawErrorSanitizer {
     /// One honest line for an auth-shaped raw failure.

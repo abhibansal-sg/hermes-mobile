@@ -195,12 +195,10 @@ final class ChatStore {
     /// The visible transcript for the active session.
     var messages: [ChatMessage] = []
     /// True while the agent is producing a streaming turn.
-    #if DEBUG
-    #endif
     var isStreaming: Bool = false
 
     /// QA-2 R12 — local-turn watchdog. Armed on every `isStreaming` false→true
-    /// transition; if no relay item batch arrives for ``localTurnStaleTimeout``
+    /// transition; if no gateway event arrives for ``localTurnStaleTimeout``
     /// the turn is force-settled so the stop button, the dock task pill and the
     /// Live Activity can never wedge when the terminal `turn.completed` /
     /// `message.complete` frame is missed or dropped (owner device-QA: the
@@ -215,9 +213,9 @@ final class ChatStore {
     /// output and no gateway heartbeat emits ZERO frames for its whole run, so
     /// nothing refreshes the silence clock while the turn is genuinely alive.
     /// 180 s false-positived on exactly that shape (the settle is healed by any
-    /// late frame — `RelayItemStore.applyDelta` resurrects locally-settled items
-    /// replace-not-drop — but the transient "Interrupted" fold on a healthy turn
-    /// is still wrong). 480 s keeps eternal-working bounded while a healthy
+    /// late frame can still prove the turn alive, but the transient
+    /// "Interrupted" fold on a healthy turn is still wrong). 480 s keeps
+    /// eternal-working bounded while a healthy
     /// slow turn essentially never trips it; a genuinely dead turn still heals
     /// at stage 1 (45 s silent resync) whenever the authority merely dropped a
     /// terminal frame.
@@ -228,15 +226,14 @@ final class ChatStore {
     /// kept re-arming, and even when it fired, the next projection re-derived
     /// streaming from the still-`.inProgress` items. Liveness is now PER-TURN
     /// and two-stage, keyed off ``turnLivenessBaseline`` (refreshed ONLY by
-    /// CURRENT-turn frames — `noteTurnLivenessFrame(isCurrentTurn:)` from the
-    /// coordinator's ingest):
+    /// CURRENT-turn frames in the gateway event ingest):
     ///   stage 1 — ``turnLivenessResyncAfter`` of silence: a SILENT
-    ///     `resync{last_seq}` (snapshot when the gap exceeds the ring). A
-    ///     dropped terminal frame heals here; the user sees nothing (C3).
+    ///     one authoritative reconcile. A dropped terminal frame heals here;
+    ///     the user sees nothing (C3).
     ///   stage 2 — ``localTurnStaleTimeout`` of silence: the turn is DEAD
     ///     (the resync recovered nothing, so the authority has nothing more).
-    ///     The coordinator settles the stuck items locally (muted
-    ///     "Interrupted" fold, never an error banner) and the live flag
+    ///     The store settles the stuck turn locally (muted "Interrupted"
+    ///     fold, never an error banner) and the live flag
     ///     clears. Eternal-working is unreachable by construction.
     private static let turnLivenessResyncAfter: Duration = .seconds(45)
     /// The watchdog's evaluation cadence (chunked sleep; staleness is computed
@@ -271,8 +268,6 @@ final class ChatStore {
     /// stream of `subagent.*` events (F4A-A2). Empty until the agent delegates;
     /// reset on a fresh turn / open / reset. The view renders ``subagentRoots``
     /// + ``subagentChildren(of:)`` so it never touches the assembly map.
-    #if DEBUG
-    #endif
     private(set) var subagentNodeCount: Int = 0
 
     #if DEBUG
@@ -285,8 +280,6 @@ final class ChatStore {
     }
     #endif
     /// Last user-facing error (busy, send failure, …), or `nil`.
-    #if DEBUG
-    #endif
     var lastError: String?
 
     /// Mobile undo/rollback phase for the active session. Kept separate from
@@ -305,14 +298,9 @@ final class ChatStore {
     // MARK: - Turn dock accessors (Wave 25)
 
     /// The latest todo list for the active session, or `nil` — the single
-    /// evolving checklist the Turn Dock's task box mirrors. On the DIRECT
-    /// (gateway) path, scans the visible transcript (`messages`, already scoped
-    /// to the active session) in reverse for the most recent `todo` tool
-    /// activity that yields a parseable list. On the RELAY path (N4/A5), the
-    /// relay's ONE living `.taskList` item bridges into the SAME accessor via
-    /// ``applyRelayItems(_:)`` (which refreshes the relay mirror on every
-    /// projection; ``syncRelayTaskList(from:)`` is the store-shaped entry
-    /// point) so the dock renders identically either way.
+    /// evolving checklist the Turn Dock's task box mirrors. Scans the visible
+    /// transcript (`messages`, already scoped to the active session) in reverse
+    /// for the most recent `todo` tool activity that yields a parseable list.
     /// `nil` when the session has no todo activity yet, or the newest one carries
     /// no list (e.g. a mid-run write before its first result).
     ///
@@ -333,81 +321,6 @@ final class ChatStore {
     /// (see ``latestTodoList``).
     var latestTodoToolID: String? { latestTodo?.id }
 
-    /// The relay-path mirror of the dock's todo list (N4/A5): the latest
-    /// `.taskList` item ingested from the relay item store, or `nil` when the
-    /// relay path has produced no task list (or has dropped it via a snapshot
-    /// that omits it). Held APART from the legacy `messages` scan so the two
-    /// paths never corrupt each other; the app is on EXACTLY ONE path at a time,
-    /// so when the relay mirror is populated it is authoritative for the dock
-    /// (the relay's `taskList` item IS the gateway's `todo` tool reframed for the
-    /// relay protocol — same list, same lifecycle, same data — RELAY-PHONE-
-    /// PROTOCOL §2 "taskList semantics"). Production wiring: ``applyRelayItems``
-    /// refreshes the mirror from the same reconciled items it projects into the
-    /// transcript (flag-gated — only reached when `transportPath` is `.relay`,
-    /// default OFF, so the gateway blob path is byte-unchanged). The convergence
-    /// wave will eventually retire the legacy scan.
-    private var relayLatestTaskList: (id: String, list: TodoList)?
-
-    /// Re-derive the relay-path task-list mirror from a relay item store
-    /// (N4/A5). The live projection caller is ``applyRelayItems`` (which passes
-    /// the ACTIVE entry's reconciled items on every frame batch — R1: the
-    /// mirror only ever sees the active session's store, so another session's
-    /// list never mirrors, contract I15); this store-shaped entry point stays
-    /// for callers/tests that hold a store directly. Refreshing includes
-    /// CLEARING the mirror when no `.taskList` item remains (a snapshot that
-    /// drops the list, or a session switch to one with no todo activity).
-    /// Idempotent: re-running on an unchanged store is a no-op.
-    func syncRelayTaskList(from store: RelayItemStore) {
-        refreshRelayTaskListMirror(from: store.items)
-    }
-
-    /// Shared scan behind ``syncRelayTaskList(from:)`` and ``applyRelayItems``.
-    /// Most-recent `.taskList` item wins; the relay drives ONE living list per
-    /// session on a stable `<sid>:tasks` id, and the items are already in render
-    /// order (ord ascending, ties by arrival — `RelayItemStore.items`), so a
-    /// reverse scan returns the live one. Items whose body yields no parseable
-    /// list are skipped (mirrors the legacy scan's skip-empty semantics — keeps
-    /// the prior list rather than blanking the dock on a mid-stream delta).
-    ///
-    /// QA-2 R13 — SESSION-SCOPE: when a list is found we stamp
-    /// ``taskListOwnerSessionId`` to the active runtime session so the dock can
-    /// prove ownership (the pill never renders for a list a different session
-    /// owns, even if both happen to be live). The owner clears together with
-    /// the mirror — `reset()` (session teardown) and a fresh turn's send both
-    /// drop it so a new session/turn starts with a clean dock.
-    private func refreshRelayTaskListMirror(from items: [ChatItem]) {
-        for item in items.reversed() where item.type == .taskList {
-            if let list = item.taskListBody {
-                relayLatestTaskList = (item.itemID, list)
-                // R1: the owner is the session at the WRITE-GATE (the
-                // coordinator's own record, moved atomically on switch —
-                // SessionStore's `activeRuntimeId` trails the gate move, so
-                // keying on it raced the switch-back projection; I15).
-                taskListOwnerSessionId = relayWriteGateSessionID ?? activeSessionId
-            }
-            return
-        }
-        relayLatestTaskList = nil
-        taskListOwnerSessionId = nil
-    }
-
-    /// The runtime session id that owns the currently-mirrored task list, or
-    /// `nil` when no list is mirrored. QA-2 R13: the dock's task box is strictly
-    /// session-scoped — a list mirrored for session A must NEVER render while
-    /// session B is active. `reset()` clears this with the mirror on session
-    /// teardown; ``refreshRelayTaskListMirror`` re-stamps it whenever a live
-    /// list lands. Equal to `activeSessionId` for the owning session, so the
-    /// visibility gate is a plain identity check (test A-vs-B, A6).
-    private(set) var taskListOwnerSessionId: String?
-
-    /// Wall clock of the most recent relay item batch applied (QA-2 R12). The
-    /// ``localTurnWatchdog`` reconciles against this — a turn marked streaming
-    /// whose frames have gone silent past ``localTurnStaleTimeout`` is force-
-    /// settled so the stop state and the dock pill can never wedge when the
-    /// terminal frame is missed (owner device-QA: "no force-close ever needed
-    /// to regain control").
-    private(set) var lastRelayItemFrameAt: Date?
-
     /// QA-2 R12 — the dock's task-box VISIBILITY gate. The list DATA stays in
     /// ``latestTodoList`` (the dock reads it when this is true, the inline
     /// transcript keeps rendering the item while false); this gate decides
@@ -426,12 +339,6 @@ final class ChatStore {
     var dockShowsTaskBox: Bool {
         guard let list = latestTodoList, isStreaming else { return false }
         guard !Self.taskListIsTerminal(list) else { return false }
-        // Owner check: nil-vs-nil (a brand-new session before any list) passes;
-        // any mismatch hides the pill. Belt-and-braces over `reset()`'s mirror
-        // clear — proves ownership independent of the teardown path.
-        let owner = taskListOwnerSessionId
-        let active = activeSessionId
-        if let owner, let active, owner != active { return false }
         return true
     }
 
@@ -445,15 +352,12 @@ final class ChatStore {
     }
 
     /// Shared scan behind both dock accessors: the newest todo activity that
-    /// yields a parseable list, with its identity. Prefers the relay mirror when
-    /// populated (relay path is authoritative when active); otherwise falls back
-    /// to the DIRECT (gateway) path's legacy scan of `messages`. Reverse order so
-    /// the list the agent is actively updating wins. The parse mirrors
+    /// yields a parseable list, with its identity. Reverse order means the list
+    /// the agent is actively updating wins. The parse mirrors
     /// `ToolClusterView.toolCard` exactly — structured `tool.todos` first, then
     /// the `resultPreview` JSON fallback — so the dock and the (suppressed)
     /// inline card would derive the identical list.
     private var latestTodo: (id: String, list: TodoList)? {
-        if let relay = relayLatestTaskList { return relay }
         for message in messages.reversed() {
             for tool in message.tools.reversed() where tool.name == TodoList.toolName {
                 if let list = tool.todos.flatMap({ TodoList(todosArray: $0) })
@@ -487,8 +391,6 @@ final class ChatStore {
     /// here (and logged via `chatLog`) instead of being swallowed by a bare
     /// `catch`. Not user-facing chrome — it drives diagnostics and the DEBUG
     /// bridge — so it never clobbers `lastError`.
-    #if DEBUG
-    #endif
     private(set) var lastBackfillError: String?
 
     #if DEBUG
@@ -595,32 +497,9 @@ final class ChatStore {
     /// and exposed (read-only) to drive the elapsed-time turn activity bar.
     /// `nil` whenever no turn is in flight.
     private(set) var turnStartedAt: Date?
-    /// QA-2 R4/A2 — TURN-SCOPED relay streaming. The relay's submit handler fans
-    /// out a **terminal** `userMessage` item immediately; the old projection
-    /// derived `isStreaming` purely from item terminality
-    /// (`rebuilt.contains { $0.isStreaming }`), so that first frame cleared the
-    /// submit-time streaming flag and killed the cursor + stop button for the
-    /// ENTIRE accepted-and-waiting window (fast turns showed NO working
-    /// affordance at all — "the reply just appears later"). This flag makes
-    /// `isStreaming` turn-scoped instead: true from the relay send until the
-    /// turn settles via `turn.completed` (plumbed as `applyRelayItems`'
-    /// `turnSettled:` argument) or is discarded (`cancelStreaming`), independent
-    /// of per-item terminality. Never set on the direct path.
-    private(set) var relayTurnLive = false
-    /// QA-2 R5/A3 — settled relay turn durations, keyed by the settled assistant
-    /// row's id. The relay projection REBUILDS every tagged row from the item
-    /// store on every pass (items accumulate for the session), so a duration
-    /// captured once on the settle edge must live OUTSIDE the rebuilt rows to
-    /// survive later re-projections — without this, the second send's first
-    /// frame would strip the prior turn's "Worked for Ns" back to a bare
-    /// "Worked" (relay items carry no timestamps; IMG_2532). Cleared with the
-    /// session (`reset()`).
-    private var relaySettledElapsed: [UUID: TimeInterval] = [:]
     /// Name of the tool currently executing in the in-flight turn, surfaced in
     /// the turn activity bar. `nil` when no tool is running. Set on `tool.start`
     /// and cleared on that tool's `tool.complete` / turn completion.
-    #if DEBUG
-    #endif
     private(set) var activeToolName: String?
     /// `tool_call_id` backing `activeToolName`, so completion of an *earlier*
     /// tool doesn't clear a label that belongs to a later one.
@@ -660,9 +539,9 @@ final class ChatStore {
         // cold-open resume — the resync ring replays it; the in-memory set
         // alone died with the process (the W0a RED).
         if let persisted = UserDefaults.standard.stringArray(
-            forKey: Self.resolvedRelayGateIDsDefaultsKey
+            forKey: Self.resolvedGateIDsDefaultsKey
         ) {
-            resolvedRelayGateIDs = Set(persisted)
+            resolvedGateIDs = Set(persisted)
         }
     }
 
@@ -1318,12 +1197,8 @@ final class ChatStore {
         // local-STOP mark — so this turn's `turn.completed` fires its seam
         // normally. (The per-turn-ID latch is NOT cleared: replays of the
         // prior turn's boundary frames must stay suppressed — I21.)
-        relayTurnSawErrorItem = false
-        relayTurnSettleLatched = false
-        relayTurnSettling = false
         // QA-3 S8/A4: a fresh turn starts with a clean liveness slate (covers
-        // turns this phone did NOT send — a mid-turn resume projection; the
-        // driven-send path resets at `relayTurnLive = true`).
+        // turns this phone did NOT send, including a mid-turn watch/resume).
         resetTurnLivenessState()
         turnLivenessBaseline = ContinuousClock.now
         onTurnStart?()
@@ -1525,12 +1400,12 @@ final class ChatStore {
     /// complete path leaves it to `respondSecurePrompt`'s own lifecycle.
     private func expireTurnScopedPrompts(includeSecure: Bool) {
         if let approval = pendingApproval {
-            markRelayGateResolved(approval.id)
+            markGateResolved(approval.id)
             pendingApproval = nil
             onApprovalChange?(false)
         }
         if let requestId = pendingClarification?.request.requestId {
-            markRelayGateResolved(requestId)
+            markGateResolved(requestId)
         }
         pendingClarification = nil
         if includeSecure {
@@ -1667,71 +1542,55 @@ final class ChatStore {
 
     private func handleApprovalRequest(_ event: GatewayEvent) {
         let request = ApprovalRequestPayload(payload: event.payload)
-        guard !resolvedRelayGateIDs.contains(request.id) else { return }
+        guard !resolvedGateIDs.contains(request.id) else { return }
         let sessionId = event.sessionId ?? activeSessionId ?? ""
         let storedId = event.storedSessionId ?? sessions?.activeStoredId ?? sessionId
         let gate = PendingApproval(id: request.id, sessionId: sessionId, request: request)
-        if storedId == relayWriteGateSessionID {
-            relayWriteGateSessionID = storedId
+        if storedId == pendingGateOwnerSessionID {
+            pendingGateOwnerSessionID = storedId
             pendingApproval = gate
             onApprovalChange?(true)
         } else {
-            parkedRelayApprovals[storedId] = gate
+            parkedApprovals[storedId] = gate
         }
     }
 
     private func handleClarifyRequest(_ event: GatewayEvent) {
         let request = ClarifyRequestPayload(payload: event.payload)
         if let requestId = request.requestId,
-           resolvedRelayGateIDs.contains(requestId) { return }
+           resolvedGateIDs.contains(requestId) { return }
         let sessionId = event.sessionId ?? activeSessionId ?? ""
         let storedId = event.storedSessionId ?? sessions?.activeStoredId ?? sessionId
         let gate = PendingClarification(sessionId: sessionId, request: request)
-        if storedId == relayWriteGateSessionID {
-            relayWriteGateSessionID = storedId
+        if storedId == pendingGateOwnerSessionID {
+            pendingGateOwnerSessionID = storedId
             pendingClarification = gate
         } else {
-            parkedRelayClarifications[storedId] = gate
+            parkedClarifications[storedId] = gate
         }
     }
 
-    // MARK: - Wave-2 relay gate bridge (QA-1 B10 / A3)
-    //
-    // The relay delivers `approval.request` / `clarify.request` as downstream
-    // FRAMES (body = the gateway's raw payload dict, passed through verbatim by
-    // the reframer). They are NOT items — `RelayItemStore` drops them by design
-    // — so without this bridge the Turn Dock's resolver (whose SOLE inputs are
-    // `pendingApproval` / `pendingClarification`, set today only by the gateway
-    // event router above) resolves `.none` forever on the relay path: no card,
-    // nothing tappable (build 114 device QA, B10). Folding the frames into the
-    // SAME state makes the relay path render the identical `ApprovalCard` /
-    // `ClarifyBanner` in the identical dock — the card views are transport-
-    // agnostic once this state is set.
+    // MARK: - Session-scoped gateway prompts
 
-    /// Ids of gates already ANSWERED or expired by a settled turn. Item frames
-    /// have per-kind idempotency in `RelayItemStore`, but gates are ONE-SHOT: a
-    /// `resync` after a socket flap replays ring frames the phone already dealt
-    /// with, and re-folding an answered gate would resurrect a dead card. The
-    /// bridge suppresses by id instead. Bounded (drop-all past 256 — replay
-    /// windows are short, and a dropped key at worst re-surfaces a card that
-    /// the next `turn.completed` clears); `reset()` drops the set with the
+    /// Ids of gates already ANSWERED or expired by a settled turn. Gates are
+    /// one-shot, so reconnect delivery must not resurrect an answered card.
+    /// Bounded (drop-all past 256); `reset()` drops the in-memory set with the
     /// session it belongs to.
-    private var resolvedRelayGateIDs: Set<String> = []
+    private var resolvedGateIDs: Set<String> = []
 
     /// R1 (contract I12, amendment G1): gates PARK per session. The slots the
     /// views read (``pendingApproval`` / ``pendingClarification``) expose ONLY
-    /// the gate owned by the session at the relay write-gate; gates for
-    /// background sessions park in these maps and MOVE into the slot when
-    /// their session takes the write-gate (``relayWriteGateMoved``) — the
+    /// the gate owned by the active stored session; gates for background
+    /// sessions park in these maps and MOVE into the slot when their session
+    /// becomes active — the
     /// card leaves the screen with its session and re-appears on switch-back.
     /// ONLY turn end (any reason) or an explicit answer expires a gate,
     /// exactly once; a switch MOVES it — there is no expire-on-switch.
-    private var parkedRelayApprovals: [String: PendingApproval] = [:]
-    private var parkedRelayClarifications: [String: PendingClarification] = [:]
-    /// The session holding the relay write-gate (contract I2) — set by
-    /// ``relayWriteGateMoved(toSession:items:)``. A gate frame folds into the
-    /// SLOT only when its `sid` matches; any other sid parks.
-    private var relayWriteGateSessionID: String?
+    private var parkedApprovals: [String: PendingApproval] = [:]
+    private var parkedClarifications: [String: PendingClarification] = [:]
+    /// The stored session owning the visible prompt-card slots. A gateway event
+    /// folds into the slot only when its stored id matches; any other id parks.
+    private var pendingGateOwnerSessionID: String?
 
     /// I23 (amendment G3): the DURABLE mirror key. The in-memory set is
     /// PROCESS-lifetime (integration: R1 requires suppression to survive
@@ -1740,17 +1599,15 @@ final class ChatStore {
     /// this record at init). The durable record ADDITIONALLY survives a kill
     /// in ANY session — cold-open suppression of an answered gate is exactly
     /// its purpose. Same 256 bound (drop-all). W2e design call (RED matrix
-    /// flip map): phone-side durability instead of relay-side ring
-    /// withholding — the store-level oracle cannot observe the relay ring,
-    /// and the phone's own record is the local authority regardless.
-    private static let resolvedRelayGateIDsDefaultsKey = "relay.resolvedGateIDs.v1"
+    /// flip map): the phone's own record is the local authority.
+    private static let resolvedGateIDsDefaultsKey = "relay.resolvedGateIDs.v1"
 
-    private func markRelayGateResolved(_ id: String) {
+    private func markGateResolved(_ id: String) {
         guard !id.isEmpty else { return }
-        resolvedRelayGateIDs.insert(id)
-        if resolvedRelayGateIDs.count > 256 { resolvedRelayGateIDs.removeAll() }
+        resolvedGateIDs.insert(id)
+        if resolvedGateIDs.count > 256 { resolvedGateIDs.removeAll() }
         UserDefaults.standard.set(
-            Array(resolvedRelayGateIDs), forKey: Self.resolvedRelayGateIDsDefaultsKey
+            Array(resolvedGateIDs), forKey: Self.resolvedGateIDsDefaultsKey
         )
     }
 
@@ -1758,100 +1615,51 @@ final class ChatStore {
     /// DEBUG/test seam: drop the DURABLE resolved-gate record (I23) — contract
     /// suites clear it in teardown so persisted state never leaks across runs.
     static func _debugClearDurableResolvedGates() {
-        UserDefaults.standard.removeObject(forKey: resolvedRelayGateIDsDefaultsKey)
+        UserDefaults.standard.removeObject(forKey: resolvedGateIDsDefaultsKey)
     }
     #endif
 
-    /// Relay analogue of `handleApprovalRequest`: fold a decoded
-    /// `approval.request` frame into the SAME `pendingApproval` the Turn Dock's
-    /// `ApprovalCard` reads. `sessionId` is the frame's `sid` — the responder
-    /// answers against THAT session even when the gate was mirrored from a
-    /// foreign turn (same semantics as the direct router's `event.sessionId`).
-    func applyRelayApprovalRequest(_ frame: RelayFrame) {
-        let request = ApprovalRequestPayload(payload: frame.body)
-        guard !resolvedRelayGateIDs.contains(request.id) else { return }
-        let gate = PendingApproval(id: request.id, sessionId: frame.sid, request: request)
-        // I12: the active session's gate takes the slot the views read; a
-        // background session's gate PARKS until its session holds the
-        // write-gate — never dropped because the session is unfocused.
-        if frame.sid == relayWriteGateSessionID {
-            pendingApproval = gate
-            onApprovalChange?(true)
-        } else {
-            parkedRelayApprovals[frame.sid] = gate
-        }
-    }
-
-    /// Relay analogue of `handleClarifyRequest`: fold a decoded
-    /// `clarify.request` frame into the SAME `pendingClarification` the dock's
-    /// `ClarifyBanner` reads (options tappable + custom answer). The body's
-    /// `request_id` is retained on the payload: the answer MUST echo it — the
-    /// gateway matches the pending waiter by it (`_respond`, server.py:5059);
-    /// a reply without it 4009s and the agent hangs.
-    func applyRelayClarifyRequest(_ frame: RelayFrame) {
-        let request = ClarifyRequestPayload(payload: frame.body)
-        if let rid = request.requestId, resolvedRelayGateIDs.contains(rid) { return }
-        let gate = PendingClarification(sessionId: frame.sid, request: request)
-        if frame.sid == relayWriteGateSessionID {
-            pendingClarification = gate
-        } else {
-            parkedRelayClarifications[frame.sid] = gate
-        }
-    }
-
-    /// Relay turn-end expiry, PER SESSION (contract I12/I21, amendment G1):
-    /// expire the gate owned by `sessionID` — the slot's, when that session
-    /// holds the write-gate, or its PARKED copy — and mark its id resolved so
-    /// a resync replay cannot resurrect the card. Turn end (ANY reason) or an
-    /// explicit answer are the ONLY edges that expire a gate, exactly once —
-    /// a switch MOVES it (``relayWriteGateMoved``); there is no
-    /// expire-on-switch. A background session's `turn.completed` expires ITS
-    /// OWN parked gate and touches nothing on the active session (I1/I2).
-    func expireRelayPendingGates(sessionID: String) {
-        expirePendingGates(storedSessionID: sessionID)
-    }
-
     private func expirePendingGates(storedSessionID: String) {
         if let approval = pendingApproval,
-           relayWriteGateSessionID == storedSessionID {
-            markRelayGateResolved(approval.id)
+           pendingGateOwnerSessionID == storedSessionID {
+            markGateResolved(approval.id)
             pendingApproval = nil
             onApprovalChange?(false)
         }
-        if let parked = parkedRelayApprovals.removeValue(forKey: storedSessionID) {
-            markRelayGateResolved(parked.id)
+        if let parked = parkedApprovals.removeValue(forKey: storedSessionID) {
+            markGateResolved(parked.id)
         }
         if let clarify = pendingClarification,
-           relayWriteGateSessionID == storedSessionID {
-            if let rid = clarify.request.requestId { markRelayGateResolved(rid) }
+           pendingGateOwnerSessionID == storedSessionID {
+            if let rid = clarify.request.requestId { markGateResolved(rid) }
             pendingClarification = nil
         }
-        if let parked = parkedRelayClarifications.removeValue(forKey: storedSessionID) {
-            if let rid = parked.request.requestId { markRelayGateResolved(rid) }
+        if let parked = parkedClarifications.removeValue(forKey: storedSessionID) {
+            if let rid = parked.request.requestId { markGateResolved(rid) }
         }
     }
 
     /// Move the visible prompt-card slots with the one durable session owner.
     /// Each card keeps its runtime id solely for the response RPC.
     func pendingGateOwnerMoved(toStoredSession storedSessionID: String?) {
-        if let outgoing = relayWriteGateSessionID {
+        if let outgoing = pendingGateOwnerSessionID {
             if let approval = pendingApproval {
-                parkedRelayApprovals[outgoing] = approval
+                parkedApprovals[outgoing] = approval
                 pendingApproval = nil
                 onApprovalChange?(false)
             }
             if let clarification = pendingClarification {
-                parkedRelayClarifications[outgoing] = clarification
+                parkedClarifications[outgoing] = clarification
                 pendingClarification = nil
             }
         }
-        relayWriteGateSessionID = storedSessionID
+        pendingGateOwnerSessionID = storedSessionID
         if let storedSessionID {
-            if let approval = parkedRelayApprovals.removeValue(forKey: storedSessionID) {
+            if let approval = parkedApprovals.removeValue(forKey: storedSessionID) {
                 pendingApproval = approval
                 onApprovalChange?(true)
             }
-            pendingClarification = parkedRelayClarifications.removeValue(forKey: storedSessionID)
+            pendingClarification = parkedClarifications.removeValue(forKey: storedSessionID)
         }
     }
 
@@ -1868,86 +1676,33 @@ final class ChatStore {
             let storedID = item.storedSessionId ?? item.sessionId
             switch item.payload {
             case .approval(let request):
-                guard !resolvedRelayGateIDs.contains(request.id) else { continue }
+                guard !resolvedGateIDs.contains(request.id) else { continue }
                 approvals[storedID] = PendingApproval(
                     id: request.id, sessionId: item.sessionId, request: request
                 )
             case .clarify(let request):
                 if let requestID = request.requestId,
-                   resolvedRelayGateIDs.contains(requestID) { continue }
+                   resolvedGateIDs.contains(requestID) { continue }
                 clarifications[storedID] = PendingClarification(
                     sessionId: item.sessionId, request: request
                 )
             }
         }
 
-        let owner = relayWriteGateSessionID
+        let owner = pendingGateOwnerSessionID
         pendingApproval = owner.flatMap { approvals.removeValue(forKey: $0) }
         pendingClarification = owner.flatMap { clarifications.removeValue(forKey: $0) }
-        parkedRelayApprovals = approvals
-        parkedRelayClarifications = clarifications
+        parkedApprovals = approvals
+        parkedClarifications = clarifications
         onApprovalChange?(pendingApproval != nil)
     }
 
     func discardPendingGates() {
         pendingApproval = nil
         pendingClarification = nil
-        parkedRelayApprovals.removeAll()
-        parkedRelayClarifications.removeAll()
+        parkedApprovals.removeAll()
+        parkedClarifications.removeAll()
         onApprovalChange?(false)
-    }
-
-    /// R1 (contract I2, amendment G1): the relay WRITE-GATE moved to
-    /// `sessionID` (`nil` = draft — the ABSENCE of a session). Atomically
-    /// moves everything the contract moves with the gate:
-    ///  (a) GATE MEMBERSHIP — the slot's relay gate parks under its own sid
-    ///      and the incoming session's parked gate takes the slot: the card
-    ///      LEAVES with its session and RE-APPEARS on switch-back; only turn
-    ///      end or an explicit answer expires it (expire-on-switch deletes
-    ///      outright — amendment G1);
-    ///  (b) LIVE-ACTIVITY OWNERSHIP — the outgoing session's mirrored LA ends
-    ///      as a DISCARD (the user stopped watching; its entry keeps folding
-    ///      frames — nothing stream-side is torn down);
-    ///  (c) PER-TURN TIMER — the outgoing turn's chrome clears;
-    ///  (d) PROJECTION — the incoming entry's items repaint (warm, ZERO
-    ///      refetch — I14); an empty entry is a no-op: the cache paint owns
-    ///      the first frame, never void (QA-1 B4).
-    func relayWriteGateMoved(toSession sessionID: String?, items: [ChatItem]) {
-        // (a) park the outgoing gate / unpark the incoming one.
-        pendingGateOwnerMoved(toStoredSession: sessionID)
-        // (b)+(c) the outgoing turn's LA ownership + chrome move off (discard).
-        if turnStartedAt != nil {
-            turnStartedAt = nil
-            activeToolName = nil
-            onTurnDiscarded?()
-        }
-        relayTurnLive = false
-        resetTurnLivenessState()
-        // (d) warm repaint from the incoming entry (empty ⇒ the cache paint
-        // owns the first frame — never void, QA-1 B4).
-        if !items.isEmpty {
-            applyRelayItems(items)
-        } else {
-            setStreaming(false, reason: "relayWriteGateMoved")
-        }
-    }
-
-    /// R1 write-through eviction (contract §1.2 / RR4): a settled background
-    /// entry persists its transcript BEFORE the coordinator drops it, so the
-    /// next open paints from disk (I3: the cache is a seed) and the relay
-    /// snapshot reconciles over it (I14).
-    func relayEntryEvictedWriteThrough(sessionID: String, items: [ChatItem]) {
-        sessions?.persistRelayEntryWriteThrough(sessionID: sessionID, items: items)
-    }
-
-    /// R1/I6: a nil-target SUBMIT created the session at the relay — the
-    /// draft BECOMES that session atomically. Unlike a switch this is the
-    /// SAME user turn adopting its home: NO discard, NO chrome teardown (the
-    /// turn chrome stamped at send now belongs to the created session). Only
-    /// the write-gate identity moves — projection goes live and any parked
-    /// gate for the new sid takes the slot.
-    func relayCreatedSessionAdopted(_ sessionID: String) {
-        pendingGateOwnerMoved(toStoredSession: sessionID)
     }
 
     /// One ownership decision for live approval/clarify/complete events. APNs is
@@ -2896,238 +2651,6 @@ final class ChatStore {
         let hasAttachments = includeAttachments && (attachments?.hasPending ?? false)
         guard !trimmed.isEmpty || hasAttachments else { return false }
 
-        // Wave-2 relay transport: when the relay is the active transport, the
-        // gateway-direct `prompt.submit` (below and via the outbox) cannot run —
-        // the gateway socket is idle in relay-only mode, so it would throw "Not
-        // connected to the Hermes gateway" and strand the deep-link
-        // resume-to-send. Submit through the relay coordinator instead; the relay
-        // client owns its own reliability spine (seq/ack/resync), and the echoed
-        // user item + assistant stream reconcile back through the item
-        // projection. Attachments ride the relay too (B9 / A5): queued images
-        // upload through the relay `attach` RPC (gateway `image.attach_bytes`,
-        // inlined base64 — NO gateway-REST `POST /api/upload`, which a
-        // relay-only phone cannot reach) BEFORE the submit, mirroring the
-        // direct path's upload-then-submit ordering; an image-only send
-        // submits the same default caption as the direct path.
-        // OPTIMISTIC USER ECHO (QA-1 B5/B13): render the user's message the
-        // instant they commit — WhatsApp bar — instead of waiting on the
-        // relay. The relay SUBMIT synthesizes a `userMessage` item
-        // (downstream.py) which the projection ADOPTS onto this row in place
-        // (by `client_message_id`), so the echo reconciles into the settled
-        // timeline without duplication — live, after completion, and across
-        // reconnect. `client_message_id` additionally makes an ambiguous-flap
-        // retry dedupe into a single turn at the relay. The default gateway
-        // path below is byte-identical. Only engaged while the relay socket is
-        // actually open.
-        if let connection, connection.transportPath == .relay,
-           let coordinator = connection.relayCoordinator, coordinator.isOpen {
-            // Images-with-no-caption: prompt.submit needs text, so supply the
-            // same default the direct path uses. The echo shows the same text
-            // the relay item will carry, so adoption never pops the bubble.
-            let outgoing = trimmed.isEmpty ? "Please look at the attached image." : trimmed
-            let clientMessageID = UUID().uuidString
-            // R2 / contract I5 — PIN the submit target at send-intent, sync,
-            // before any await: the selected stored id, or nil for a true draft.
-            // Re-checked after the submit await (amendment S4) so a mid-await
-            // navigation splits deterministically: an EXISTING-session pin whose
-            // submit fails converts to a durable queue row against THIS pinned
-            // id (never the drifted-to session); a DRAFT/nil pin drops its echo
-            // and closes the just-created orphan. There is no fallback to a
-            // previously-driven session (the deleted `?? activeSessionID`, D2).
-            let pinnedTarget = sessions?.activeStoredId
-            sessions?.resetComposerHistoryBrowse(for: sessions?.activeComposerDraftKey)
-            let userMessage = ChatMessage(
-                role: .user, clientMessageID: clientMessageID, text: outgoing
-            )
-            userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
-            messages.append(userMessage)
-            // QA-3 S6/A2 — DURABLE ECHO: the optimistic echo existed only in
-            // the in-memory transcript, so a session switch (the transcript
-            // reseeds for the other session) or any store rebuild dropped it
-            // — the sent prompt vanished from view until the relay's next
-            // snapshot re-projected its `userMessage` item (IMG_2585/2591:
-            // working rows rendering with NO prompt above them). Persist it
-            // into the session-keyed warm snapshot the switch-and-back cache
-            // paint reads, so the prompt repaints BEFORE any relay frame
-            // lands, and stays until the `userMessage` adoption reconciles it
-            // (`markEchoReconciled`). A draft send keys the echo once the
-            // relay-created session id lands (below).
-            sessions?.persistDurableEcho(
-                storedId: sessions?.activeStoredId, echo: userMessage
-            )
-            // QA-2 R4/A2 — INSTANT WORKING AFFORDANCE: append an optimistic
-            // EMPTY streaming assistant bubble the instant the user commits —
-            // the breathing caret (`MessageBubble.needsStandaloneCursor`)
-            // renders ≤100 ms from send, independent of ANY relay frame (the
-            // accepted-and-waiting window before the first item is otherwise
-            // blank). It is tagged `relayProjected` so the very first
-            // `applyRelayItems` pass replaces it in place — with the SAME id
-            // (`relay-assistant-of-<echo>` matches the per-turn re-key in
-            // `applyRelayItems`), so SwiftUI morphs the caret bubble into the
-            // streaming reply instead of popping the view identity. `relayTurnLive`
-            // makes `isStreaming` turn-scoped (see its doc): the stop button and
-            // the caret persist for the WHOLE turn, not just between deltas.
-            messages.append(ChatMessage(
-                id: Self.relayOptimisticAssistantID(forEcho: userMessage.id),
-                role: .assistant,
-                isStreaming: true,
-                relayProjected: true
-            ))
-            relayTurnLive = true
-            // R5: a new send starts a fresh turn — any lingering local-STOP
-            // mark belongs to the turn the user just stopped; its frames
-            // must not gate THIS turn's stream.
-            relayTurnSettling = false
-            // QA-3 S8/A4: the driven turn's liveness clock starts at send —
-            // silence is measured from here until the first CURRENT-turn frame
-            // (the stage-1 silent resync and the stage-2 settle key off it).
-            resetTurnLivenessState()
-            turnLivenessBaseline = ContinuousClock.now
-            if hasAttachments, let attachments {
-                setStreaming(true, reason: "relay.send.upload")
-                lastError = nil
-                do {
-                    _ = try await attachments.uploadAndAttach(
-                        sessionId: sessions?.activeStoredId, connection: connection
-                    )
-                } catch {
-                    removeLocalEcho(clientMessageID: clientMessageID)
-                    abandonRelayTurnAffordance()
-                    setStreaming(false, reason: "relay.send.uploadFailed")
-                    lastError = (error as? LocalizedError)?.errorDescription
-                        ?? error.localizedDescription
-                    return false
-                }
-            }
-            setStreaming(true, reason: "relay.send")
-            // QA-2 R12/R13 — a new turn starts clean: drop any task list the
-            // PREVIOUS turn left in the relay item store so the dock pill never
-            // re-shows a stale list before this turn emits its own `taskList`.
-            // `dockShowsTaskBox`'s `isStreaming` gate would hide the stale list
-            // anyway, but clearing the owner here is what lets the new turn's
-            // first `taskList` frame repopulate from a blank slate (and the
-            // pill reads the NEW list, not last turn's).
-            relayLatestTaskList = nil
-            taskListOwnerSessionId = nil
-            // QA-1 B8: stamp the turn start at submit so the pre-first-item
-            // inline activity row's elapsed label ticks from the user's send
-            // (the direct path stamps in `beginStreamingMessage`; the relay's
-            // first rendered item stamps the same way via `applyRelayItems`,
-            // but the accepted-and-waiting window before ANY item exists would
-            // otherwise read a frozen "0s"). Guarded so a queued-drain re-send
-            // keeps the original turn's start. Deliberately NOT the
-            // `markTurnStartedIfNeeded()` seam: the Live Activity fires on the
-            // first relay item, so a failed submit can never strand it armed.
-            if turnStartedAt == nil { turnStartedAt = Date() }
-            lastError = nil
-            lastSendReachedServer = true
-            do {
-                let result = try await coordinator.submit(
-                    prompt: outgoing,
-                    sessionID: pinnedTarget,
-                    clientMessageID: clientMessageID
-                )
-                // R2 / contract I5 + amendment S4 — re-check the PINNED target
-                // after the submit await; a mid-await navigation splits.
-                let drifted = sessions?.activeStoredId != pinnedTarget
-                if let runtimeID = result["session_id"]?.stringValue {
-                    let storedID = result["stored_session_id"]?.stringValue ?? runtimeID
-                    if drifted, pinnedTarget == nil {
-                        // Nil-target (DRAFT) pin, user navigated away mid-create:
-                        // the minted session is NOT where they went — drop the
-                        // optimistic echo, never redirect, and close the orphan
-                        // LOCALLY (no wire close RPC; the relay GCs the empty
-                        // session). Nothing is attributed to any session
-                        // (desktop submit.ts:262-270; I5/I11 nil-pin branch).
-                        removeLocalEcho(clientMessageID: clientMessageID)
-                        abandonRelayTurnAffordance()
-                        setStreaming(false, reason: "relay.send.driftNilPin")
-                        turnStartedAt = nil
-                        return true
-                    }
-                    if pinnedTarget == nil {
-                        // Draft create, no drift: the relay MINTED the session —
-                        // adopt it atomically (store re-bind + write-gate move +
-                        // foreground) so the draft surface becomes a real entry
-                        // and the immediately-following send targets the new id
-                        // (contract A4/I6).
-                        coordinator.adoptCreatedSession(
-                            runtimeID: runtimeID, storedID: storedID)
-                    }
-                    // Land the new-chat bookkeeping (QA-1 B13) AND re-home the
-                    // draft's echo onto the created session in the SAME atomic
-                    // step (R2 / I8-G4: one identity persisted once at adoption,
-                    // never re-keyed by a separate call after the fact). No-op
-                    // for an existing session — its echo was keyed at append.
-                    await sessions?.landRelayCreatedSession(
-                        storedID: storedID, runtimeID: runtimeID, echo: userMessage)
-                }
-                return true
-            } catch {
-                // QA-2 R11 (queue-send must NEVER disappear): a failed relay
-                // submit — the gateway's 4009 busy reject (the destination
-                // session is mid-turn) OR a transport/RPC failure — falls back
-                // into the durable outbox for a text-only send, exactly as the
-                // direct path queues. The outbox drain is relay-aware
-                // (`submitOutboxPrompt` routes through the coordinator, §5a
-                // `client_message_id` dedup) and HOLDS the row while its
-                // destination session is mid-turn (`busySessionID` gate),
-                // draining on turn completion — so a queue-mode send surfaces
-                // the outbox PILL immediately and delivers after the turn,
-                // instead of the build-115 behavior: echo deleted + error
-                // banner + nothing queued ("message DISAPPEARED"). The
-                // optimistic immediate-path echo is swapped for the outbox
-                // row's echo (distinct `clientMessageID`s — keeping both would
-                // double the bubble when the drain presents its row).
-                // C3: the queue-and-drain is SILENT — no error banner for what
-                // is a self-healing transition. Attachments cannot ride the
-                // outbox (its upload stage is gateway-REST-only; relay attach
-                // lives on the immediate path above), so those keep the
-                // pre-existing echo-removal failure.
-                removeLocalEcho(clientMessageID: clientMessageID)
-                abandonRelayTurnAffordance()
-                setStreaming(false, reason: "relay.sendError")
-                turnStartedAt = nil
-                // R2 / S4 nil-pin drift: the user abandoned a DRAFT whose submit
-                // never reached the relay — drop, never redirect (no orphan was
-                // minted, no durable row against a session the user left).
-                if sessions?.activeStoredId != pinnedTarget, pinnedTarget == nil {
-                    return false
-                }
-                if !hasAttachments, let queueStore {
-                    // Thread the ORIGINAL client message id into the outbox row
-                    // (its jobID): if this failure was an AMBIGUOUS transport
-                    // loss — the relay may already have driven the turn — the
-                    // drain resubmits the same id and the relay's §5a dedup
-                    // folds it into one turn (never a double-send).
-                    //
-                    // R2 / S4 existing-pin branch: enqueue against the PINNED id
-                    // captured at intent — NEVER the drifted-to session — so a
-                    // send whose target moved mid-pipeline drains once against
-                    // its original destination (I11; was `sessions?.activeStoredId`,
-                    // which redirected the row to wherever the user navigated).
-                    if let queued = await queueStore.enqueue(
-                        trimmed,
-                        storedSessionId: pinnedTarget,
-                        wake: false,
-                        clientMessageID: clientMessageID
-                    ) {
-                        presentOutboxEcho(
-                            clientMessageID: queued.clientMessageID,
-                            text: queued.text,
-                            remotePaths: []
-                        )
-                        lastError = nil
-                        queueStore.wake()
-                        return true
-                    }
-                }
-                lastError = (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
-                return false
-            }
-        }
-
         // Production sends enter the protected repository before session
         // creation, upload, local echo, or prompt.submit. Unit-store graphs that
         // do not install an outbox retain the legacy direct path below.
@@ -3277,48 +2800,6 @@ final class ChatStore {
         runtimeSessionID: String,
         remotePaths: [String]
     ) async throws -> OutboxSubmitResult {
-        // Wave-2 relay transport: when the flag is `.relay` the gateway `client`
-        // is idle, so the durable outbox must drain OVER THE RELAY (§5:
-        // `prompt.submit` maps to the relay `submit` RPC into the relay-owned
-        // session). The relay item projection owns the transcript + streaming
-        // state, so this branch deliberately skips the gateway-style local-turn /
-        // streaming bookkeeping — it routes the prompt and maps the RPC result to
-        // a receipt. A returned result (no throw) means the relay accepted the
-        // prompt → an accepted `queued` receipt marks the job completed (no
-        // permanent pending). A transport failure throws, and the outbox retains
-        // the row for the next wake so it delivers once the relay reconnects; the
-        // job's stable identity keeps that retry from creating a second row.
-        // Gated on the coordinator existing first: gateway-direct never allocates
-        // it, so that path skips the flag read and stays byte-identical.
-        if let coordinator = connection?.relayCoordinator,
-           connection?.transportPath == .relay {
-            prepareOutboxSubmission(job: job, remotePaths: remotePaths)
-            lastSendReachedServer = true
-            // R2 / D10: an EMPTY runtime id is a relay new-session row — submit
-            // with a NIL target so the relay CREATE-on-nil-SUBMIT mints the
-            // session (downstream.py:759-763) instead of the dead gateway
-            // `session.create`. Deliberately NOT adopted as the active session —
-            // this is a background drain and must not move the write-gate to the
-            // minted session; the relay runs the turn there and the user sees it
-            // on open. The relay's cmid dedup makes a retry of the same row
-            // idempotent (one turn on the minted session).
-            let target: String? = runtimeSessionID.isEmpty ? nil : runtimeSessionID
-            // Thread the durable row's stable id so an ambiguous-flap retry (the
-            // submit threw after the relay already ran `prompt_submit`, so the
-            // outbox retains the row and the next wake resubmits the SAME job) is
-            // deduped by the relay SUBMIT handler into a single turn — parity with
-            // the gateway path's `client_message_id` (see below).
-            _ = try await coordinator.submit(
-                prompt: job.submissionText,
-                sessionID: target,
-                clientMessageID: job.clientMessageID
-            )
-            return OutboxSubmitResult(
-                status: "queued",
-                accepted: true,
-                clientMessageID: job.clientMessageID
-            )
-        }
         guard let client else { throw GatewayError.notConnected }
         prepareOutboxSubmission(job: job, remotePaths: remotePaths)
         pendingReconnectReconcileID = nil
@@ -3378,42 +2859,11 @@ final class ChatStore {
         )
     }
 
-    /// The stable id of a relay turn's assistant row, derived from the turn's
-    /// USER row id — stable across echo adoption (adoption preserves the echo's
-    /// id) and across every re-projection, so the optimistic caret bubble the
-    /// send appends (`relayOptimisticAssistantID(forEcho:)`) and the real
-    /// streaming segment `applyRelayItems` rebuilds share ONE identity: the
-    /// caret morphs into the reply in place (no SwiftUI view-identity pop at
-    /// the first item, none at settle). QA-2 R4/A2.
-    static func relayAssistantID(forUserRowID userRowID: UUID) -> UUID {
-        ChatMessage.deterministicID(seedKey: "relay-assistant-of-\(userRowID.uuidString)")
-    }
-
-    /// The optimistic empty streaming assistant bubble's id at send time —
-    /// derived from the optimistic user ECHO's id, which `adoptRelayEcho`
-    /// preserves when the relay's synthesized `userMessage` item lands, so this
-    /// equals `relayAssistantID(forUserRowID:)` for the same turn. QA-2 R4/A2.
-    static func relayOptimisticAssistantID(forEcho echoID: UUID) -> UUID {
-        relayAssistantID(forUserRowID: echoID)
-    }
-
-    /// Tear down the optimistic relay-turn affordance on a FAILED send: drop the
-    /// empty streaming assistant bubble and un-mark the turn live, so a rejected
-    /// submit never strands a breathing caret + stop button over a dead turn.
-    /// QA-2 R4/A2 (mirror of the direct path's failed-send cleanup).
-    private func abandonRelayTurnAffordance() {
-        relayTurnLive = false
-        messages.removeAll {
-            $0.role == .assistant && $0.relayProjected && $0.parts.isEmpty
-        }
-    }
-
     /// QA-2 R8 / N3 — append the user's clarify answer as a local user row.
     /// See `respondClarification`. The echo is NOT outbox-tracked (no
     /// `clientMessageID`): the answer is delivered by the gate RPC, not the
     /// durable submit path, so there is nothing to retry/cancel. Untagged +
-    /// non-relay-projected so `applyRelayItems` preserves it across live
-    /// projections and the direct-path reconcile never evicts a fresh row.
+    /// untagged so authoritative reconciliation never evicts a fresh row.
     private func appendClarifyAnswerEcho(_ answer: String) {
         let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -3453,11 +2903,11 @@ final class ChatStore {
         userOrdinals[userMessage.id] = messages.lazy.filter { $0.role == .user }.count
         messages.append(userMessage)
         // QA-3 S6/A2: the outbox echo is the user's ONLY record of a queued
-        // prompt (its turn may not run for a while — the relay HOLDS the row
-        // while the destination session is mid-turn) — make it durable across
+        // prompt (its turn may not run for a while while the destination is
+        // busy) — make it durable across
         // a session switch / store rebuild exactly like the immediate-path
         // echo. The durable outbox ROW survives regardless; this keeps the
-        // PROMPT rendered until the relay `userMessage` adoption reconciles.
+        // PROMPT rendered until authoritative history reconciles it.
         sessions?.persistDurableEcho(
             storedId: sessions?.activeStoredId, echo: userMessage
         )
@@ -3628,33 +3078,6 @@ final class ChatStore {
     /// the one streaming, and is `nil` outright during the resume window), or
     /// the visible stream can never be stopped from this device (R1 #2).
     func interrupt() async {
-        // Wave-2 relay transport (QA-2 R11): the gateway `client` is idle in
-        // relay mode, so stop OVER THE RELAY — `coordinator.interrupt` targets
-        // the driven session (the relay owns the running turn; `interruptTarget`
-        // is threaded for an adopted foreign mirror exactly as the direct path
-        // does, defaulting to the coordinator's driven session when nil). This
-        // mirrors the QA-1 B10 relay-aware approve/clarify pattern — interrupt
-        // was the control RPC B10 missed, so every stop attempt in relay mode
-        // threw "Not connected to the Hermes gateway" off the idle direct
-        // socket (the build-115 R11 banner + the never-stopping turn that
-        // wedged the dock). The default gateway path stays byte-identical.
-        if let connection, connection.transportPath == .relay {
-            guard let coordinator = connection.relayCoordinator else {
-                lastError = "Relay not connected"
-                return
-            }
-            // R5 (contract B1/I9): LOCAL SETTLEMENT FIRST — the UI settles the
-            // instant the tap lands; the interrupt RPC goes out second. The
-            // settling mark gates this turn's late frames to no-ops and (pre-L3
-            // compat) distinguishes the stop on a reason-less `turn.completed`.
-            settleLocalStopFirst()
-            do {
-                _ = try await coordinator.interrupt(interruptTarget)
-            } catch {
-                lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            }
-            return
-        }
         guard let client, let sessionId = interruptTarget else { return }
         do {
             _ = try await client.requestRaw(
@@ -3670,38 +3093,6 @@ final class ChatStore {
     /// runtime when one is live, else the local active session. Factored out
     /// so the routing fact (R1 #2) is directly assertable in tests.
     var interruptTarget: String? { mirroringRuntimeId ?? activeSessionId }
-
-    /// R5 (contract B1/I9): local STOP settlement FIRST — the UI settles the
-    /// INSTANT the tap lands, before the interrupt RPC leaves: mark the turn
-    /// settling (the coordinator gates this turn's late frames to no-ops),
-    /// finalize the partial text (keep a non-empty streaming row, drop the
-    /// empty optimistic caret bubble), and clear the busy/stop affordance.
-    /// The authoritative `turn.completed{reason:interrupted}` settles the
-    /// entry afterwards (Live Activity end, queue HOLD — the L3 wire-truth
-    /// split); until then this mark + the settling state carry the stop.
-    private func settleLocalStopFirst() {
-        guard isStreaming || relayTurnLive else { return }
-        relayTurnSettling = true
-        relayTurnLive = false
-        // Finalize the partial text in place: a non-empty streaming row keeps
-        // its content and freezes; the empty optimistic caret bubble drops
-        // (nothing to keep — B1 "keep non-empty, drop empty caret").
-        var index = messages.count - 1
-        while index >= 0 {
-            if messages[index].relayProjected,
-               messages[index].role == .assistant,
-               messages[index].isStreaming {
-                if messages[index].parts.isEmpty {
-                    messages.remove(at: index)
-                } else {
-                    messages[index].isStreaming = false
-                }
-            }
-            index -= 1
-        }
-        streamingMessageID = nil
-        setStreaming(false, reason: "interrupt.localSettle")
-    }
 
     // MARK: - Manual context compression
 
@@ -3808,37 +3199,6 @@ final class ChatStore {
     func steer(text: String) async -> SteerOutcome {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .rejected }
-        // Wave-2 relay transport (QA-2 R11): steer OVER THE RELAY — the gateway
-        // `client` is idle in relay mode, so the direct `session.steer` RPC
-        // threw "Not connected to the Hermes gateway" on every attempt (and the
-        // relay protocol had NO steer method at all — added in §5b: upstream
-        // `steer` → gateway `session.steer`). The relay passes the gateway's
-        // disposition through VERBATIM, so the status mapping below is
-        // identical to the direct path. Routing follows `interrupt()` exactly
-        // (`interruptTarget`).
-        if let connection, connection.transportPath == .relay {
-            guard let coordinator = connection.relayCoordinator else {
-                return .error("Relay not connected")
-            }
-            do {
-                let result = try await coordinator.steer(
-                    sessionID: interruptTarget, text: trimmed
-                )
-                switch result["status"]?.stringValue {
-                case "queued":   return .queued
-                case "rejected": return .rejected
-                default:
-                    // Defensive parity with the direct path: an unknown status
-                    // is a soft rejection — the user keeps their text.
-                    return .rejected
-                }
-            } catch {
-                let msg = (error as? LocalizedError)?.errorDescription
-                    ?? error.localizedDescription
-                lastError = msg
-                return .error(msg)
-            }
-        }
         guard let client, let sessionId = interruptTarget else {
             return .error("No active session")
         }
@@ -3884,41 +3244,13 @@ final class ChatStore {
         // runtime id, not our own.
         let approvalSession = pendingApproval?.sessionId
         let requestId = pendingApproval?.id ?? ""
-        // Wave-2 relay transport (QA-1 B10): the gateway `client` is idle in
-        // relay mode, so answer OVER THE RELAY — `coordinator.approve` builds
-        // the ratified §5 wire shape (`session_id` + `decision` [+ `request_id`
-        // / `all`]; the relay maps decision→the gateway's `choice`). Same
-        // optimistic clear as the direct path below; the relay resolves the
-        // gate by session, so a nil/empty `approvalSession` falls back to the
-        // coordinator's driven session exactly as `respondApproval` does to
-        // `activeSessionId`. The default gateway path stays byte-identical.
-        if let connection, connection.transportPath == .relay {
-            pendingApproval = nil
-            onApprovalChange?(false)
-            markRelayGateResolved(requestId)
-            guard let coordinator = connection.relayCoordinator else {
-                lastError = "Relay not connected"
-                return
-            }
-            do {
-                _ = try await coordinator.approve(
-                    sessionID: approvalSession?.isEmpty == false ? approvalSession : nil,
-                    requestID: requestId,
-                    decision: approve ? "approve" : "deny",
-                    resolveAll: all
-                )
-            } catch {
-                lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            }
-            return
-        }
         guard let client,
               let sessionId = (approvalSession?.isEmpty == false ? approvalSession : activeSessionId)
         else { return }
         let choice = approve ? "approve" : "deny"
         pendingApproval = nil
         onApprovalChange?(false)
-        markRelayGateResolved(requestId)
+        markGateResolved(requestId)
         do {
             _ = try await client.requestRaw(
                 "approval.respond",
@@ -3944,13 +3276,10 @@ final class ChatStore {
         let clarifySession = pending?.sessionId
         // QA-2 R8 / N3: echo the user's answer as a local user row BEFORE the
         // card clears, so the transcript shows what the user picked. The
-        // pre-QA-2 path cleared the card + emitted the RPC but appended nothing
-        // — on the relay path no `userMessage` item is synthesized for clarify
-        // answers (only prompts), so the card vanished with no answer bubble
-        // (IMG_2535/2540, docs/qa2-root-causes.md N3). Mirrored on BOTH
-        // transports (relay + direct): an untagged local user row is preserved
-        // by `applyRelayItems` (relayProjected=false, no consumed echo id), and
-        // the direct path's reconcile never evicts a fresh user row. Guarded on
+        // pre-QA-2 path cleared the card + emitted the RPC but appended nothing,
+        // so the card vanished with no answer bubble (IMG_2535/2540,
+        // docs/qa2-root-causes.md N3). An untagged local user row is preserved
+        // by live gateway events and reconciliation. Guarded on
         // `pending != nil` so a re-entrant call after the card cleared (the
         // view's isResponding guard is best-effort) cannot duplicate the row.
         if pending != nil {
@@ -3964,29 +3293,8 @@ final class ChatStore {
             // EchoIsSingleRowEvenIfCalledTwice).
             pendingClarification = nil
             if let requestId = pending?.request.requestId {
-                markRelayGateResolved(requestId)
+                markGateResolved(requestId)
             }
-        }
-        // Wave-2 relay transport (QA-1 B10): answer OVER THE RELAY —
-        // `coordinator.clarify` builds the §5 shape (`session_id` + `text` +
-        // `request_id`; the relay maps text→the gateway's `answer`). The
-        // `request_id` echo is REQUIRED: the gateway matches the pending
-        // waiter by it — without it the reply 4009s and the agent hangs.
-        if let connection, connection.transportPath == .relay {
-            guard let coordinator = connection.relayCoordinator else {
-                lastError = "Relay not connected"
-                return
-            }
-            do {
-                _ = try await coordinator.clarify(
-                    sessionID: clarifySession?.isEmpty == false ? clarifySession : nil,
-                    requestID: pending?.request.requestId ?? "",
-                    response: answer
-                )
-            } catch {
-                lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            }
-            return
         }
         guard let client,
               let sessionId = (clarifySession?.isEmpty == false ? clarifySession : activeSessionId)
@@ -4056,7 +3364,7 @@ final class ChatStore {
     /// yet). Distinguishes that legitimate state from a mid-open wipe, which
     /// the placeholder must render as the skeleton — never blank. `reset()`
     /// clears it (a fresh open is unconfirmed until its seed lands); a
-    /// non-empty seed or relay projection clears it; an EMPTY authoritative
+    /// non-empty seed or live gateway event clears it; an EMPTY authoritative
     /// seed sets it.
     private(set) var transcriptConfirmedEmpty = false
 
@@ -4126,10 +3434,7 @@ final class ChatStore {
     ///    cache-HIT open seeds WITHOUT a preceding `reset()`), and by every
     ///    caller that does not name a policy.
     ///  - ``union``: `incoming` is a KNOWN-PARTIAL snapshot. Every reseed source
-    ///    on this tree serves a recent-TAIL window — relay history honors
-    ///    `limit` with `messages[-limit:]` (`relay/hermes_relay/downstream.py`),
-    ///    plugin REST serves the 50-row tail — and the relay's per-session
-    ///    store holds only what it observed since process start. A union reseed
+    ///    can be a recent-TAIL window. A union reseed
     ///    UPDATES the rows the snapshot carries IN PLACE and APPENDS genuinely
     ///    new ones, but NEVER evicts settled history the snapshot merely does
     ///    not cover: the merged view shows at least the settled history it held
@@ -4206,8 +3511,7 @@ final class ChatStore {
     /// fallback). A full 50-row tail may have older rows; clicking once verifies
     /// against the server and clears the affordance if not.
     func noteTranscriptSeedWindow(_ stored: [StoredMessage]) {
-        if connection?.transportPath == .gatewayDirect,
-           let total = sessions?.activeSummary?.messageCount {
+        if let total = sessions?.activeSummary?.messageCount {
             let offset = max(0, total - stored.count)
             noteTranscriptPaging(
                 oldestId: stored.first?.wireId,
@@ -4229,8 +3533,7 @@ final class ChatStore {
     /// may run during a live turn: older settled rows are inserted into the
     /// current array without reseeding or cancelling the streaming placeholder.
     func loadEarlierTranscript() async {
-        let usesStockPaging = connection?.transportPath == .gatewayDirect
-            && transcriptPageFetch == nil
+        let usesStockPaging = transcriptPageFetch == nil
         let cursor = usesStockPaging
             ? oldestLoadedTranscriptOffset
             : oldestLoadedTranscriptWireId
@@ -4350,17 +3653,12 @@ final class ChatStore {
     ///    `incoming` are REMOVED — the final array is byte-identical in content
     ///    to `incoming` (so every existing test that asserts
     ///    `messages.map(\.text)` after a reconcile still holds).
-    ///  - ``ReseedPolicy/union``: `incoming` is a KNOWN-PARTIAL snapshot (the
-    ///    relay's tail-window history / item store observed since process
-    ///    start). Matched rows still update in place and genuinely-new rows
+    ///  - ``ReseedPolicy/union``: `incoming` is a KNOWN-PARTIAL snapshot.
+    ///    Matched rows still update in place and genuinely-new rows
     ///    still insert — but untagged existing rows the snapshot does NOT carry
     ///    are RETAINED in their existing position, never evicted: the merged
     ///    view shows at least the settled history it held before the reseed
-    ///    (spec R15/A8 invariant). The one exception is `relayProjected` rows:
-    ///    the live relay projection re-renders any still-live item from the
-    ///    item store on the next frame (`applyRelayItems`), so a reseed
-    ///    supersedes the stale projection exactly as it did pre-union. A user
-    ///    row the snapshot carries under a wire id the optimistic echo's
+    ///    (spec R15/A8 invariant). A user row the snapshot carries under a wire id the optimistic echo's
     ///    runtime id never matches ADOPTS the echo's slot (mirror of
     ///    `adoptRelayEcho`) so the two converge into one bubble.
     private func reconcileMessages(with incoming: [ChatMessage], policy: ReseedPolicy = .replace) {
@@ -4455,13 +3753,12 @@ final class ChatStore {
             } else if policy == .union, newMessage.role == .user,
                       let echo = unionEchoAdoptionTarget(for: newMessage, skipping: consumedIDs) {
                 // R15 union: the snapshot carries the user's own prompt under a
-                // gateway wire id the optimistic echo's runtime id (or the relay
-                // projection's `relay-user-…` id) never matches. Absent adoption
+                // gateway wire id the optimistic echo's runtime id never matches. Absent adoption
                 // the union would RETAIN the echo beside its authoritative twin —
                 // a duplicate bubble. Fold the snapshot row onto the echo's slot
                 // instead (mirror of `adoptRelayEcho`), keeping the echo's
-                // identity + `clientMessageID` + timestamp so the relay
-                // `userMessage` adoption chain stays intact.
+                // identity + `clientMessageID` + timestamp so the user-message
+                // adoption chain stays intact.
                 consumedIDs.insert(echo.id)
                 let adopted = ChatMessage(
                     id: echo.id,
@@ -4505,11 +3802,9 @@ final class ChatStore {
         }
 
         // UNION (QA-2 R15): the snapshot is known-partial — walk the EXISTING
-        // transcript as the spine: matched/adopted ids emit the updated row,
-        // untagged rows the snapshot does not cover are RETAINED in place (the
-        // settled history the cache still holds), and `relayProjected` rows the
-        // snapshot does not cover are superseded (the relay projection re-renders
-        // any still-live item on the next frame). Genuinely-new snapshot rows
+        // transcript as the spine: matched/adopted ids emit the updated row and
+        // rows the snapshot does not cover are RETAINED in place (the settled
+        // history the cache still holds). Genuinely-new snapshot rows
         // slot in right after the newest matched row (they are the fresh tail —
         // e.g. a turn that settled on the gateway mid-flap) or append when
         // nothing matched.
@@ -4520,7 +3815,7 @@ final class ChatStore {
             if let updated = updatedByID[existing.id] {
                 rebuilt.append(updated)
                 emittedIncoming.insert(existing.id)
-            } else if !existing.relayProjected {
+            } else {
                 // Retained: the partial snapshot does not cover this settled row.
                 rebuilt.append(existing)
             }
@@ -4572,11 +3867,9 @@ final class ChatStore {
     }
 
     /// The existing user row a UNION reseed's user row adopts onto (QA-2 R15) —
-    /// the optimistic echo (or the relay-projected prompt row) for the SAME
-    /// prompt, whose runtime / relay id the gateway wire id never matches.
-    /// Mirrors `adoptRelayEcho`'s precedence: untagged rows first (the echo
-    /// with a `clientMessageID`, then any untagged same-text row), then a
-    /// tagged relay projection as the fallback. Text match is exact and
+    /// the optimistic echo for the SAME prompt, whose runtime id the gateway
+    /// wire id never matches. Rows with a `clientMessageID` take precedence.
+    /// Text match is exact and
     /// non-empty; `skipping` excludes ids an earlier incoming row already
     /// adopted so N identical prompts pair up one-to-one.
     private func unionEchoAdoptionTarget(
@@ -4587,8 +3880,7 @@ final class ChatStore {
         func matches(_ message: ChatMessage) -> Bool {
             message.role == .user && !skipping.contains(message.id) && message.text == text
         }
-        return messages.first(where: { matches($0) && !$0.relayProjected && $0.clientMessageID != nil })
-            ?? messages.first(where: { matches($0) && !$0.relayProjected })
+        return messages.first(where: { matches($0) && $0.clientMessageID != nil })
             ?? messages.first(where: { matches($0) })
     }
 
@@ -4870,8 +4162,8 @@ final class ChatStore {
                 id: ChatMessage.deterministicID(seedKey: baseID), role: role,
                 // R4b (I5 write-local-first / I8): a write-local-first cache row
                 // carries the send's cmid — thread it onto the painted row so the
-                // relay `userMessage` item (same cmid) adopts it IN PLACE after a
-                // force-close→reopen paint, instead of projecting a twin bubble.
+                // authoritative user message (same cmid) adopts it IN PLACE after
+                // a force-close→reopen paint, instead of producing a twin bubble.
                 clientMessageID: row.clientMessageID, parts: rowParts,
                 timestamp: row.timestamp.map { Date(timeIntervalSince1970: $0) } ?? Date(),
                 presentation: presentation
@@ -5019,12 +4311,6 @@ final class ChatStore {
                     let clusterID = uniquePartID(newTools.first?.id ?? id)
                     if toolsChanged || clusterID != id { changed = true }
                     return .tools(id: clusterID, tools: newTools, collapsed: collapsed, turnElapsed: elapsed)
-                case .item(let id, let item):
-                    // Wave-2 item-backed part: its identity is the stable relay
-                    // `item_id`, unique by construction, so the de-dup pass leaves
-                    // it verbatim. (The live store does not emit `.item` today;
-                    // this arm keeps the exhaustive switch total.)
-                    return .item(id: uniquePartID(id), item: item)
                 }
             }
             guard changed else { return message }
@@ -5126,19 +4412,6 @@ final class ChatStore {
     /// this runs (see `teardownForeignStream`), so by the time we get here
     /// `isStreaming` reflects only a local turn.
     func backfill() async {
-        // R3 (ROUND-4 W2d): on relay the STREAM is the authority — the
-        // foreground/reconnect reconcile is a relay-LOCAL `resync{last_seq}`
-        // (seq watermark; the coordinator owns it), never a transcript
-        // refetch (contract I14/A11). This turns the backfill() storm triggers
-        // (foreground, reconnect, watchdog) into a silent resync on relay and
-        // deletes the relay `history` RPC they used to fire. The REST backfill
-        // below is direct-mode recovery, unchanged until Wave 4 folds the fork
-        // (amendment S1).
-        if connection?.transportPath == .relay {
-            guard !isStreaming else { return }
-            await connection?.relayCoordinator?.requestLivenessResync()
-            return
-        }
         guard !isStreaming else { return }
         guard let storedId = sessions?.activeStoredId else { return }
         let fetch = resolvedBackfillFetch
@@ -5156,8 +4429,7 @@ final class ChatStore {
             // dropped — the new session runs its own seed). Mirrors the
             // post-await guard in `seedContextUsageFromStatus`.
             guard !isStreaming, storedId == sessions?.activeStoredId else { return }
-            // QA-2 R15: a recovery reseed is a KNOWN-PARTIAL snapshot (relay
-            // history tail window / plugin 50-row tail) — union it onto the
+            // QA-2 R15: a recovery reseed is a KNOWN-PARTIAL snapshot — union it onto the
             // merged timeline so settled history the snapshot does not cover
             // survives (the stuck-episode segment drop). Same-session guard
             // above keeps the union from ever bleeding across sessions.
@@ -5207,28 +4479,22 @@ final class ChatStore {
     }
 
     /// The injected `transcriptPageFetch` test seam, or the default that
-    /// resolves the live `connection?.rest` and uses stock offset pagination on
-    /// the transparent path (legacy relay keeps its existing plugin cursor).
+    /// resolves the live `connection?.rest` and uses stock offset pagination.
     /// Mirrors ``resolvedTranscriptAroundFetch``'s
     /// injected-seam-first pattern so tests can control `loadEarlierTranscript`'s
     /// fetch timing without a live REST client.
     private var resolvedTranscriptPageFetch: ((String, Int, Int?) async -> TranscriptPageFetch?)? {
         if let transcriptPageFetch { return transcriptPageFetch }
         guard let rest = connection?.rest else { return nil }
-        if connection?.transportPath == .gatewayDirect {
-            let profile = sessions?.activeSummary?.profile
-            return { sessionId, limit, offset in
-                await fetchStockTranscriptPage(
-                    rest: rest,
-                    sessionId: sessionId,
-                    profile: profile,
-                    limit: limit,
-                    offset: offset ?? 0
-                )
-            }
-        }
-        return { sessionId, limit, before in
-            await fetchTranscriptPage(rest: rest, sessionId: sessionId, limit: limit, before: before)
+        let profile = sessions?.activeSummary?.profile
+        return { sessionId, limit, offset in
+            await fetchStockTranscriptPage(
+                rest: rest,
+                sessionId: sessionId,
+                profile: profile,
+                limit: limit,
+                offset: offset ?? 0
+            )
         }
     }
 
@@ -5237,13 +4503,6 @@ final class ChatStore {
     /// override `backfillFetch` directly.
     private var resolvedBackfillFetch: ((String) async throws -> [StoredMessage])? {
         if let backfillFetch { return backfillFetch }
-        // R3 (ROUND-4 W2d): the relay `history` backfill branch DELETES — on
-        // relay, `backfill()` itself is a relay-local resync now (above); no
-        // transcript refetch ever resolves here. (Its QA-2 R15 purpose — a
-        // post-flap reconcile over the transport that IS up — is served by the
-        // coordinator's resync{last_seq} replay, which is gap-free by
-        // construction and costs the gateway zero reads.) The REST fetcher
-        // below serves direct mode until Wave 4 folds the fork (amendment S1).
         guard let rest = connection?.rest else { return nil }
         // ABH-400: plugin gateways serve only the recent tail window on
         // foreground/reconnect; legacy gateways keep the existing full/delta path.
@@ -5320,18 +4579,14 @@ final class ChatStore {
         userOrdinals = [:]
         // I12: transcript teardown does not own prompt-card lifetime. Session
         // navigation moves those slots through `pendingGateOwnerMoved`.
-        // The relay gate-suppression set is NOT cleared here (R1/I12): an
-        // ANSWERED gate's resync re-delivery must stay suppressed across
+        // The gate-suppression set is NOT cleared here (R1/I12): an
+        // ANSWERED gate's reconnect re-delivery must stay suppressed across
         // switches for every session the phone drives — the set belongs to
         // the process lifetime, not one session's teardown (bounded:
-        // drop-all past 256 in `markRelayGateResolved`). The DURABLE I23
+        // drop-all past 256 in `markGateResolved`). The DURABLE I23
         // mirror survives a kill regardless (seeded at init).
         // R5/I21: the settled-turn latch belongs to the torn-down session
         // (turn ids carry the session id, but drop them with the session).
-        settledRelayTurnIDs.removeAll()
-        relayTurnSettleLatched = false
-        relayTurnSawErrorItem = false
-        relayTurnSettling = false
         // A transient secure prompt belongs to the session being torn down; drop
         // it (no value is held here — see PendingSecurePrompt). The view's
         // `@State` value clears itself on dismissal.
@@ -5356,583 +4611,12 @@ final class ChatStore {
         // down (§3.7); never let it bleed into the next session's first seed.
         pendingForeignReconcileID = nil
         pendingReconnectReconcileID = nil
-        // The relay-path task-list mirror belongs to the session being torn down
-        // too (N4/A5): without this, a switch to a session projected via the
-        // gateway path (which never calls `applyRelayItems`) would keep showing
-        // the previous session's dock task box.
-        relayLatestTaskList = nil
-        // QA-2 R13: drop ownership with the mirror so a stale owner can never
-        // leak into the next session's dock visibility check.
-        taskListOwnerSessionId = nil
         // QA-2 R12: a session teardown kills any in-flight local turn — cancel
         // its watchdog so it can never fire-settle into the fresh session.
         cancelLocalTurnWatchdog()
-        // Relay echo adoptions belong to the session being torn down (QA-1):
-        // a stale adoption must never re-id a next session's userMessage item
-        // onto a prior session's consumed echo row.
-        relayEchoAdoptions = [:]
         clearAllCompactionIndicators()
         transcriptGeneration = 0
         transcriptConfirmedEmpty = false
-    }
-
-    // MARK: - Wave-2 relay transport projection (RELAY-PHONE-PROTOCOL §2/§7)
-
-    /// A sticky adoption of an optimistic user echo (an UNTAGGED `.user` row
-    /// from the relay send path) by a relay `userMessage` item. Once an item
-    /// adopts an echo, it keeps the echo's identity for the rest of the session
-    /// — the echo row is CONSUMED out of the preserved history on the pass that
-    /// first adopts it, so every later re-projection (the echo row is gone by
-    /// then) resolves the identity from this map instead of re-searching, and
-    /// the bubble never flickers nor duplicates (QA-1 B5/B13).
-    private struct RelayEchoAdoption: Sendable {
-        let id: UUID
-        let clientMessageID: String?
-        let timestamp: Date
-    }
-
-    /// `userMessage` item id → adopted echo identity, per projected session.
-    /// Cleared on `reset()` (session teardown) so a next session never inherits
-    /// a stale adoption.
-    private var relayEchoAdoptions: [String: RelayEchoAdoption] = [:]
-
-    /// Resolve the identity a `userMessage` item projects onto: a prior
-    /// adoption (sticky), else an UNCONSUMED optimistic echo row in the current
-    /// transcript — correlated by `client_message_id` first (deterministic, so
-    /// distinct sends of identical text never collapse), then by text for an
-    /// item without one (a prompt submitted without a cmid). Returns `nil` when
-    /// nothing matches — the item projects onto its own deterministic id (a
-    /// prompt this phone never echoed, e.g. sent by another client).
-    private func adoptRelayEcho(
-        for item: ChatItem, consuming: inout Set<UUID>
-    ) -> RelayEchoAdoption? {
-        if let adopted = relayEchoAdoptions[item.itemID] {
-            // QA-3 S4: the sticky contract assumed the echo row was gone from
-            // `messages` after the pass that first adopted it — true until the
-            // R15 union backfill FOLDED the gateway wire row onto the echo's
-            // slot as an UNTAGGED row, resurrecting an unconsumed twin. Re-mark
-            // it consumed on EVERY pass so the twin (and its assistant run, in
-            // `applyRelayItems`) never survives beside the rebuilt copy — the
-            // second half of the IMG_2579 orphan-answer duplication.
-            consuming.insert(adopted.id)
-            return adopted
-        }
-        let itemCMID = item.body["client_message_id"]?.stringValue
-        // Adoption matches by CMID (contract I8, amendment G4): an item
-        // carrying a `client_message_id` adopts its echo by cmid OR NOT AT
-        // ALL — a FOREIGN-cmid item (a desktop-originated turn whose prompt
-        // text equals a cache-painted row) never consumes the cmid-less
-        // cache twin: the cache row + the foreign user row are TWO rows
-        // (wire truth). The deleted text FALLBACK for cmid-bearing items was
-        // the I8 violation (base consumed the twin — the fuzzy adoption R1
-        // deletes). A cmid-LESS item (a resync snapshot's copy of a turn
-        // this phone painted from the GRDB cache, which carries no cmid —
-        // `toChatMessages` maps none) still adopts the same-text cmid-less
-        // paint row so the reconciled turn renders ONCE, in place (QA-3
-        // S4/A2 — the IMG_2579 duplication stays dead; that paint row has no
-        // other identity to union on).
-        func eligible(_ message: ChatMessage) -> Bool {
-            message.role == .user && !message.relayProjected && !consuming.contains(message.id)
-        }
-        let echo: ChatMessage?
-        if let itemCMID {
-            echo = messages.first(where: { eligible($0) && $0.clientMessageID == itemCMID })
-        } else {
-            echo = messages.first(where: {
-                eligible($0) && $0.clientMessageID == nil && $0.text == item.textBody
-            })
-        }
-        guard let echo else { return nil }
-        let adoption = RelayEchoAdoption(
-            id: echo.id,
-            clientMessageID: echo.clientMessageID,
-            timestamp: echo.timestamp
-        )
-        relayEchoAdoptions[item.itemID] = adoption
-        consuming.insert(echo.id)
-        // QA-3 S6/A2: the durable echo (the session-keyed warm snapshot the
-        // send write-through persists so a switch-and-back repaints it) is
-        // now reconciled — purge it so a later repaint never re-presents a
-        // second bubble beside the adopted row. The projection targets the
-        // active session (the coordinator parks it on drafts — S11).
-        sessions?.markEchoReconciled(
-            storedId: sessions?.activeStoredId,
-            clientMessageID: adoption.clientMessageID,
-            text: echo.text
-        )
-        return adoption
-    }
-
-    /// Rebuild the visible transcript from the relay item store's reconciled
-    /// items (the NEW relay transport path — docs/RELAY-PHONE-PROTOCOL.md §2).
-    ///
-    /// ADDITIVE + flag-gated: ONLY ``RelaySessionCoordinator`` (reached when the
-    /// `transportPath` flag is `.relay`, default OFF) calls this. The gateway blob
-    /// path never does, so today's streaming rendering is byte-unchanged.
-    ///
-    /// Projection (§2): each `userMessage` item becomes its own right-aligned
-    /// `.user` bubble and flushes the assistant segment before it; every other
-    /// item projects via ``ChatItem/renderPart`` into an ordered assistant
-    /// message — text/reasoning/usage reuse the legacy renderers, the special
-    /// kinds (`toolCall`/`fileChange`/`image`/`browser`/`error`) route through
-    /// `.item` for `ChatItemView`. A non-terminal trailing item keeps the
-    /// assistant bubble streaming. `items` MUST already be in render order (the
-    /// store sorts by `ord`, ties by arrival). Message + part identities are
-    /// derived deterministically from the stable relay ids, so re-projecting on
-    /// every frame is churn-free (SwiftUI diffs cleanly, no bubble re-creation).
-    ///
-    /// MERGE, NOT REPLACE (QA-1 B5/B6/B7/B13): the projection is the LIVE relay
-    /// content; the UNTAGGED rows already in `messages` (the GRDB cache paint,
-    /// optimistic user echoes, direct-path rows) are the settled HISTORY. The
-    /// rebuilt projection is tagged `relayProjected` and APPENDED below the
-    /// preserved history — cached/settled transcript and the live streaming
-    /// turn COEXIST, scrollback intact during and after streaming. Re-projection
-    /// replaces only tagged rows (idempotent, no duplication); an empty `items`
-    /// (session bound, zero frames yet) therefore leaves the cache paint
-    /// untouched — the cold-open/force-close paint stays the initial truth
-    /// (B15). A relay `userMessage` item ADOPTS the matching optimistic echo in
-    /// place (sticky, by `client_message_id` then text) — one bubble, no dupe.
-    /// R16: detect a relay turn that ended in FAILURE — an `item.completed`
-    /// whose `type == .error` and `status == .failed`. Used by
-    /// ``applyRelayItems(_:)`` to route the Live Activity end seam to
-    /// `onTurnDiscarded` (no queue drain) instead of `onTurnComplete`, matching
-    /// the direct path's `handleGatewayError`. Pure + testable.
-    nonisolated static func hasRelayErrorTerminal(_ items: [ChatItem]) -> Bool {
-        items.contains { $0.type == .error && $0.status == .failed }
-    }
-
-    func applyRelayItems(
-        _ items: [ChatItem],
-        turnSettled: Bool = false,
-        serverTurnDuration: TimeInterval? = nil
-    ) {
-        // `turnSettled` (QA-2 R4/A2): the coordinator passes `true` when the frame
-        // that drove this projection is `turn.completed` — the authoritative
-        // turn-end the turn-scoped `relayTurnLive` flag clears on. Without it the
-        // terminal-item window would either strand streaming true forever (if the
-        // flag ignored item state entirely) or kill it at the first terminal frame
-        // (the build-115 bug). Item terminality still drives the PER-ROW
-        // `isStreaming` (the caret leaves a finished bubble); the STORE-level flag
-        // is turn-scoped.
-        //
-        // `serverTurnDuration` (QA-3 S2/A1): the relay's authoritative turn
-        // wall-clock (`turn.completed` body `duration_s`, reframer-measured from
-        // the turn open). The per-turn timer STARTS LOCALLY at send
-        // (`turnStartedAt`) — the affordance renders ≤100 ms from send, never
-        // gated on a frame — and RECONCILES to this server value on settle, so
-        // the "Worked for Ns" label reads the turn's true duration even when the
-        // phone's local start is skewed (queued-drain re-send) or absent (a
-        // mid-turn resume this phone did not send — those now stamp the settled
-        // duration from the server with NO local start at all).
-        if turnSettled {
-            relayTurnLive = false
-            resetTurnLivenessState()   // QA-3 S8/A4: the turn settled — its liveness state dies with it
-        }
-        // QA-2 R12 — a live frame batch proves SOMETHING is progressing; stamp
-        // the wall clock (observability). QA-3 S8/A4: the liveness watchdog is
-        // NO LONGER re-armed here — it is per-TURN now, refreshed only by
-        // CURRENT-turn frames via `noteTurnLivenessFrame(isCurrentTurn:)` from
-        // the coordinator's ingest (re-arming on ANY batch was the re-arm-by-
-        // other-turn bug that kept IMG_2591's dead turn "working" forever).
-        lastRelayItemFrameAt = Date()
-        // QA-3 S8/A4 — PRIOR-TURN LIVENESS: the last `userMessage` item bounds
-        // the CURRENT turn (the relay allocates its ord at SUBMIT, before any
-        // of that turn's agent items, so render order is strictly
-        // [U1,A1…][U2,A2…]). A still-`.inProgress` item BEFORE that boundary
-        // belongs to a turn a NEWER turn already superseded — it can never
-        // legitimately complete now, so settle it deterministically (muted
-        // "Interrupted" fold) instead of rendering "Working…" forever.
-        // Stateless + idempotent: every projection self-heals, and any late
-        // authoritative frame (item.completed / snapshot) replaces the item by
-        // id and restores the honest state.
-        let lastUserMessageIndex = items.lastIndex { $0.type == .userMessage }
-        var rebuilt: [ChatMessage] = []
-        var segmentParts: [ChatMessagePart] = []
-        var segmentAnchor: String?
-        var segmentStreaming = false
-        var segmentInterrupted = false
-        // Echo rows adopted by a `userMessage` item THIS pass — consumed out
-        // of the preserved history so the reconcile replaces the echo in place
-        // instead of projecting a second bubble beside it.
-        var consumedEchoIDs: Set<UUID> = []
-
-        func flushSegment() {
-            guard let anchor = segmentAnchor, !segmentParts.isEmpty else {
-                segmentParts = []
-                segmentAnchor = nil
-                segmentStreaming = false
-                segmentInterrupted = false
-                return
-            }
-            let segmentID = ChatMessage.deterministicID(seedKey: "relay-assistant-\(anchor)")
-            rebuilt.append(ChatMessage(
-                id: segmentID,
-                role: .assistant,
-                parts: segmentParts,
-                isStreaming: segmentStreaming,
-                interrupted: segmentInterrupted && !segmentStreaming,
-                // I21: a re-projection inherits the prior row's timestamp —
-                // never a fresh `Date()` — so a resync replay converges to
-                // the byte-identical transcript.
-                timestamp: messages.first(where: { $0.id == segmentID })?.timestamp ?? Date(),
-                relayProjected: true
-            ))
-            segmentParts = []
-            segmentAnchor = nil
-            segmentStreaming = false
-            segmentInterrupted = false
-        }
-
-        for (index, item) in items.enumerated() {
-            if item.type == .userMessage {
-                flushSegment()
-                let adoption = adoptRelayEcho(for: item, consuming: &consumedEchoIDs)
-                let userRowID = adoption?.id
-                    ?? ChatMessage.deterministicID(seedKey: "relay-user-\(item.itemID)")
-                rebuilt.append(ChatMessage(
-                    id: userRowID,
-                    role: .user,
-                    clientMessageID: adoption?.clientMessageID
-                        ?? item.body["client_message_id"]?.stringValue,
-                    parts: [.text(id: item.itemID, text: item.textBody)],
-                    // I21: the adopted echo's timestamp on first adoption, the
-                    // prior projection's thereafter — NEVER a fresh `Date()` —
-                    // so a resync replay (the echo already consumed) converges
-                    // to the byte-identical transcript.
-                    timestamp: adoption?.timestamp
-                        ?? messages.first(where: { $0.id == userRowID })?.timestamp
-                        ?? Date(),
-                    relayProjected: true
-                ))
-            } else if let part = item.renderPart {
-                if segmentAnchor == nil { segmentAnchor = item.itemID }
-                segmentParts.append(part)
-                if !item.isTerminal {
-                    if let lastUserMessageIndex, index < lastUserMessageIndex {
-                        // A prior turn's stuck item — settled, muted (A4).
-                        segmentInterrupted = true
-                    } else {
-                        segmentStreaming = true
-                    }
-                } else if item.locallyInterrupted {
-                    // The watchdog's stage-2 settle marked this item terminal.
-                    segmentInterrupted = true
-                }
-            }
-        }
-        flushSegment()
-
-        // QA-2 R4/A2 — STABLE PER-TURN ASSISTANT IDENTITY: re-key every rebuilt
-        // assistant row off the turn's USER row id (stable across echo adoption
-        // and every re-projection) instead of the first agent item's id. The
-        // optimistic caret bubble the send appends carries
-        // `relayOptimisticAssistantID(forEcho:)` — the SAME derivation off the
-        // echo id adoption preserves — so the first real segment inherits the
-        // bubble's identity and SwiftUI morphs caret → streaming reply in place
-        // (no view-identity pop at first item, none at settle). Turns with no
-        // user row (a mid-turn resume snapshot) keep the anchor-derived id.
-        var lastUserRowID: UUID?
-        for index in rebuilt.indices {
-            if rebuilt[index].role == .user {
-                lastUserRowID = rebuilt[index].id
-            } else if rebuilt[index].role == .assistant, let userRowID = lastUserRowID {
-                let seg = rebuilt[index]
-                let assistantID = Self.relayAssistantID(forUserRowID: userRowID)
-                rebuilt[index] = ChatMessage(
-                    id: assistantID,
-                    role: .assistant,
-                    parts: seg.parts,
-                    isStreaming: seg.isStreaming,
-                    interrupted: seg.interrupted,
-                    reasoningElapsed: seg.reasoningElapsed,
-                    // I21: inherit the prior projection's timestamp under the
-                    // FINAL (re-keyed) id — a replay converges byte-identical.
-                    timestamp: messages.first(where: { $0.id == assistantID })?.timestamp
-                        ?? seg.timestamp,
-                    relayProjected: true
-                )
-            }
-        }
-
-        // QA-2 R4/A2 — OPTIMISTIC CARET RETENTION: while the turn is live
-        // (`relayTurnLive`) and the CURRENT turn has no agent items yet (the
-        // accepted-and-waiting window — the relay's first frame is the terminal
-        // `userMessage`), keep an empty streaming assistant bubble at the tail
-        // so the breathing caret + stop button persist from send to first
-        // delta, independent of item terminality. Reuses the existing
-        // optimistic row's id when present (send created it), else derives it
-        // from the turn's user row. The first real agent item replaces it in
-        // place (same id, above) on the next pass.
-        if relayTurnLive {
-            var hasAgentItemThisTurn = false
-            for item in items.reversed() {
-                if item.type == .userMessage { break }
-                if item.renderPart != nil { hasAgentItemThisTurn = true; break }
-            }
-            if !hasAgentItemThisTurn {
-                let optimisticID = messages.first(where: {
-                    $0.role == .assistant && $0.relayProjected && $0.parts.isEmpty
-                })?.id
-                    ?? lastUserRowID.map(Self.relayAssistantID(forUserRowID:))
-                    ?? ChatMessage.deterministicID(seedKey: "relay-assistant-optimistic")
-                rebuilt.append(ChatMessage(
-                    id: optimisticID,
-                    role: .assistant,
-                    isStreaming: true,
-                    relayProjected: true
-                ))
-            }
-        }
-
-        // N4/A5: the dock's task box reads `latestTodoList`; on the relay path
-        // the ONE living `.taskList` item lives in these reconciled items, NOT
-        // in a `todo` ToolActivity the legacy scan would find — refresh the
-        // relay mirror from the same batch so the dock works identically on
-        // both transports (and clears when the session has no task list).
-        // Deliberately BEFORE the empty guard: an empty projection must still
-        // clear the stale session's task list so the new dock starts clean.
-        refreshRelayTaskListMirror(from: items)
-
-        // QA-1 B4 — BLANK-SCREEN IMPOSSIBLE: an EMPTY relay projection must
-        // never blank a painted transcript. R1's write-gate move re-projects
-        // the incoming entry only when it HAS items (an empty entry leaves the
-        // cache paint intact — the switch never voids, contract I2); this
-        // guard is the belt-and-braces fallback for any other empty projection
-        // (e.g. a pre-content frame on a fresh open). Assigning `messages = []` there raced the
-        // GRDB cache seed (`seedTranscriptCacheFirst`) and, whichever landed
-        // last, left the view EMPTY with a bumped `transcriptGeneration` — a
-        // fully blank screen (the placeholder's skeleton branch requires
-        // generation == 0, so no skeleton either). Fall back to the painted
-        // content instead: cache → skeleton → content, NEVER void. The
-        // switch's own cache seed (or `reset()` on a cache miss) owns the
-        // legitimate content → content transition.
-        guard !rebuilt.isEmpty else { return }
-
-        transcriptConfirmedEmpty = false
-        // QA-2 R4/A2 — TURN-SCOPED STREAMING: `isStreaming` is true from the
-        // relay send (`relayTurnLive`) until the turn settles via
-        // `turn.completed`, independent of per-item terminality. The build-115
-        // bug derived it SOLELY from item state — the relay's synthesized
-        // TERMINAL `userMessage` first frame projected `nowStreaming == false`
-        // and killed the cursor + stop button for the entire accepted-and-
-        // waiting window (fast turns showed no affordance at all). Item
-        // terminality still drives each rebuilt ROW's `isStreaming` (the caret
-        // leaves a finished bubble); the STORE flag is turn-scoped.
-        let nowStreaming = relayTurnLive || rebuilt.contains { $0.isStreaming }
-        // QA-1 B8: relay turn-lifecycle chrome. `turnStartedAt`/`activeToolName`
-        // are direct-path event-router internals the relay path never updates
-        // per event — left alone, the inline activity row's elapsed label would
-        // inherit a stale prior turn's start on the next relay send. Stamp on
-        // the first streaming projection (parity with `beginStreamingMessage`
-        // → `markTurnStartedIfNeeded`, also firing the Live Activity seam for a
-        // turn this phone did NOT send — e.g. a mid-turn resume) and clear when
-        // the projection settles (parity with `handleMessageComplete`). The
-        // transition read MUST precede `setStreaming` below.
-        if nowStreaming {
-            markTurnStartedIfNeeded()
-        } else if isStreaming {
-            // QA-2 R5/A3 — SETTLE EDGE: capture the turn's wall-clock duration
-            // BEFORE clearing the timer, and persist it keyed by the settled
-            // assistant row's stable per-turn id — the projection rebuilds
-            // every tagged row from the (session-accumulating) item store on
-            // every pass, so the settled "Worked for Ns" label (re-stamped
-            // below) survives later turns' re-projections. Relay items carry no
-            // timestamps; build 115 settled relay rows read a bare "Worked"
-            // (IMG_2532). Mirrors the direct path's completion-time stamp.
-            //
-            // QA-3 S2/A1 — SERVER RECONCILIATION: the authoritative duration is
-            // the relay's `turn.completed` `duration_s` when it carries one;
-            // the local `turnStartedAt` measurement is the fallback (and the
-            // LIVE timer's source while the turn runs). Server-wins means a
-            // mid-turn resume (no local start) still stamps an honest settled
-            // duration.
-            let elapsed = serverTurnDuration
-                ?? turnStartedAt.map { Date().timeIntervalSince($0) }
-            if let elapsed {
-                // The settled row is THIS turn's assistant row — the last
-                // assistant AFTER the last user row (a turn that settled with
-                // zero agent items must not re-stamp the previous turn's row).
-                let lastUserIdx = rebuilt.lastIndex(where: { $0.role == .user }) ?? -1
-                if let settledIdx = rebuilt.lastIndex(where: { $0.role == .assistant }),
-                   settledIdx > lastUserIdx {
-                    relaySettledElapsed[rebuilt[settledIdx].id] = elapsed
-                }
-            }
-            turnStartedAt = nil
-            activeToolName = nil
-            // R16 NOTE: the Live Activity END seam for relay turns is NOT
-            // fired here. The projection-settle edge is an unreliable signal
-            // — a snapshot fed all-at-once never transitions through
-            // streaming, and a relay `.error` item leaves the assistant
-            // segment `in_progress` (so the projection keeps streaming). The
-            // relay wire carries an EXPLICIT turn boundary (`.turnCompleted`)
-            // and explicit failure items (`.error`/status `.failed`); the
-            // coordinator fires those via `notifyRelayTurnCompleted()` /
-            // `notifyRelayTurnDiscarded()`. See
-            // `RelaySessionCoordinator.ingest`.
-        }
-        // QA-2 R5/A3: re-stamp settled relay turns' captured durations on every
-        // pass (the rows are rebuilt fresh from items each time), so a settled
-        // turn keeps reading "Worked for Ns" after the store has cleared
-        // `turnStartedAt` and after subsequent turns re-project the timeline.
-        if !relaySettledElapsed.isEmpty {
-            for index in rebuilt.indices
-            where rebuilt[index].role == .assistant
-                && !rebuilt[index].isStreaming
-                && rebuilt[index].reasoningElapsed == nil {
-                rebuilt[index].reasoningElapsed = relaySettledElapsed[rebuilt[index].id]
-            }
-        }
-        // QA-1 B5/B6/B7/B13 — MERGED TIMELINE: preserve the settled history
-        // (every untagged row) and append the live relay projection below it —
-        // minus any echo rows a userMessage item adopted this pass (they
-        // re-enter tagged, in place). History + live turn coexist; scrollback
-        // stays intact during and after streaming.
-        //
-        // QA-3 S4/A2 — CONSUME CACHE-PAINTED ASSISTANT TWINS: adoption only
-        // consumes USER rows (`adoptRelayEcho`), but a reconnect resync /
-        // mid-turn open delivers a snapshot of ALL accumulated items, so the
-        // rebuilt tail re-projects EVERY turn the session ever ran — including
-        // turns the GRDB cache / network seed already painted UNTAGGED. With
-        // only the user twins consumed, the preserved history still held every
-        // cache-painted ANSWER `[A1…An]` above a rebuilt `[U1',A1'…Un',An']`
-        // tail: each answer rendered TWICE, and the orphan cache copy sat
-        // ABOVE the rebuilt user rows — the answer visibly preceding the
-        // prompt that asked it (IMG_2579-2582: the same exchange in two
-        // orders at two scroll positions of one view; switching away "fixed"
-        // it because the cache paint alone is ordered). The rebuilt copy is
-        // AUTHORITATIVE (the relay item store is the live truth), so for each
-        // user row a `userMessage` item adopted/consumed this pass, consume
-        // the untagged assistant run that FOLLOWS it in the current
-        // transcript — its settled cache-painted answer for that same turn.
-        // Guarded on the rebuilt turn actually CARRYING an assistant segment:
-        // a snapshot with the prompt's `userMessage` but no agent items yet
-        // (a turn that errored pre-item, or a snapshot raced by its first
-        // item) must not evaporate the cache answer before the relay copy
-        // exists. Turns the item store does not carry at all (prompt sent by
-        // another client) keep every preserved row — untouched.
-        var consumedHistoryIDs = consumedEchoIDs
-        // Rebuilt user rows whose turn carries an assistant segment. Adopted
-        // user rows re-enter under the echo's id (== the consumed id), so the
-        // rebuilt row id and the consumed id are the same key.
-        var rebuiltHasAssistantAfter: [UUID: Bool] = [:]
-        var rebuiltCurrentUser: UUID?
-        for row in rebuilt {
-            if row.role == .user {
-                rebuiltCurrentUser = row.id
-                rebuiltHasAssistantAfter[row.id] = false
-            } else if row.role == .assistant, let userRowID = rebuiltCurrentUser {
-                rebuiltHasAssistantAfter[userRowID] = true
-            }
-        }
-        var inTwinRun = false
-        for message in messages {
-            if message.role == .user {
-                // A consumed user row starts its twin run only when the
-                // rebuilt turn carries the authoritative answer copy.
-                inTwinRun = !message.relayProjected
-                    && consumedEchoIDs.contains(message.id)
-                    && rebuiltHasAssistantAfter[message.id] == true
-            } else if inTwinRun, !message.relayProjected {
-                consumedHistoryIDs.insert(message.id)
-            }
-        }
-        let preserved = messages.filter {
-            !$0.relayProjected && !consumedHistoryIDs.contains($0.id)
-        }
-        messages = preserved + rebuilt
-        setStreaming(nowStreaming, reason: "relayProjection")
-    }
-
-    // MARK: - R5 relay turn-end semantics (contract I9/I21 — L3 wire-truth reason)
-
-    /// R5/W2e (contract I9/B1): the local-STOP mark. `interrupt()` settles the
-    /// UI FIRST (partial text finalized, busy/stop affordance cleared) and
-    /// marks the current turn settling; the coordinator gates LATE item frames
-    /// of the turn (crossed the interrupt in flight; a resync ring replay) to
-    /// no-ops until the authoritative `turn.completed` settles it. Cleared on
-    /// that settle, the next turn start, a new send, an authoritative snapshot
-    /// re-baseline, and any wholesale teardown. ALSO the pre-L3 COMPAT input
-    /// that distinguishes a user stop on a reason-less `turn.completed`
-    /// (deleted with the compat branch in W3b — RR5).
-    private(set) var relayTurnSettling = false
-
-    /// R5/W2e (contract I9, L3 consume): a failed `.error` item arrived for
-    /// the current turn. Wire-truth `reason:error` on `turn.completed` (lane
-    /// L3) supersedes it; this flag is the COMPAT input for a pre-L3 relay's
-    /// reason-less `turn.completed` (RR5) — the signal the deleted
-    /// `relayTurnTerminatedByError` latch carried. Deleted with the compat
-    /// branch in W3b.
-    private var relayTurnSawErrorItem = false
-
-    /// I21: turn ids whose settle seam already fired. A resync replay /
-    /// snapshot re-delivery re-emits the settled turn's `turn.completed` (and
-    /// `.error` item); the seam fires ONCE per turn (the double drain / double
-    /// LA-end the W0a RED matrix recorded). Bounded: drop-all past 64 — replay
-    /// windows are short and a dropped key at worst re-fires one idempotent
-    /// LA end.
-    private var settledRelayTurnIDs: Set<String> = []
-
-    /// Id-less settle latch (frames without a `turn`): one seam per turn.
-    private var relayTurnSettleLatched = false
-
-    /// R5: the ONE relay turn-end seam (contract I9 — `turn.completed{reason}`
-    /// is the sole completion edge; stopped ≠ completed). `completed` ⇒ the
-    /// queue MAY drain (`onTurnComplete` → drain pipeline); `interrupted`
-    /// (user stop) / `error` ⇒ the queue HOLDS (`onTurnDiscarded` → Live
-    /// Activity end only). Latched once per turn (I21). The watchdog's
-    /// PROVISIONAL stage-2 settle does NOT route through here — a late
-    /// authoritative `turn.completed` must still fire its honest seam
-    /// (a frame-silent turn resurrects; contract I10).
-    private func settleRelayTurn(_ turnID: String?, completed: Bool) {
-        if let turnID, !turnID.isEmpty {
-            guard settledRelayTurnIDs.insert(turnID).inserted else { return }
-            if settledRelayTurnIDs.count > 64 { settledRelayTurnIDs.removeAll() }
-        } else {
-            guard !relayTurnSettleLatched else { return }
-            relayTurnSettleLatched = true
-        }
-        relayTurnSettling = false
-        relayTurnSawErrorItem = false
-        if completed { onTurnComplete?() } else { onTurnDiscarded?() }
-    }
-
-    /// R5 (contract I9, lane L3): fire the turn-end seam from the relay
-    /// coordinator's `.turnCompleted` handler, split on the relay's
-    /// wire-truth `reason`: `completed` ⇒ drain; `interrupted` / `error` ⇒
-    /// HOLD (stopped ≠ completed). The relay path never flows through
-    /// `handleMessageComplete` (direct path), so this seam is the Live
-    /// Activity's only end edge on relay reach (R16).
-    func notifyRelayTurnCompleted(turnID: String?, reason: String?) {
-        let completed: Bool
-        if let reason, !reason.isEmpty {
-            completed = (reason == "completed")   // wire truth (L3)
-        } else {
-            // COMPAT — pre-L3 relay (RR5): no `reason` on the wire; fall back
-            // to the local signals the deleted `relayTurnTerminatedByError`
-            // latch carried (user stop via the settling mark, error via the
-            // error-item flag). W3b deletes this branch once every relay
-            // stamps reason.
-            completed = !relayTurnSettling && !relayTurnSawErrorItem
-        }
-        settleRelayTurn(turnID, completed: completed)
-    }
-
-    /// R5: a failed `.error` item is a turn TERMINAL (parity with the direct
-    /// path's `handleGatewayError`): fire the DISCARD seam — the queue does
-    /// NOT drain into a session that just errored. The trailing
-    /// `.turnCompleted` (the relay emits one even for errored turns) is
-    /// suppressed by the once-per-turn latch (I21).
-    func notifyRelayTurnDiscarded(turnID: String?) {
-        relayTurnSawErrorItem = true
-        settleRelayTurn(turnID, completed: false)
-    }
-
-    /// R5 (contract I3/I9): a `snapshot` is an authoritative re-baseline — it
-    /// supersedes a local-STOP settlement (the server truth wins; the stopped
-    /// turn's items re-project exactly as the snapshot carries them).
-    func noteAuthoritativeRebaseline() {
-        relayTurnSettling = false
     }
 
     /// Surface a failed `open()`-path transcript seed the same way a failed
@@ -5953,19 +4637,14 @@ final class ChatStore {
         turnStartedAt = nil
         activeToolName = nil
         activeToolCallId = nil
-        // QA-2 R4/A2: a wholesale reset/discard ends the turn-scoped relay
-        // live flag too (reset/open-seed/draft/connection-drop all funnel
-        // here) — never let it strand `isStreaming` true into the next
+        // QA-2 R4/A2: a wholesale reset/discard ends the turn-scoped live
+        // state too (reset/open-seed/draft/connection-drop all funnel here) —
+        // never let it strand `isStreaming` true into the next
         // session. The settled-duration stamps belong to the torn-down
         // session's rows; drop them with it.
-        relayTurnLive = false
-        relaySettledElapsed = [:]
         // R5: the torn-down turn's settle state dies with it (a new turn's
         // `turn.completed` must fire its seam; a lingering local-stop mark
         // would gate the NEXT turn's frames).
-        relayTurnSettling = false
-        relayTurnSawErrorItem = false
-        relayTurnSettleLatched = false
         resetTurnLivenessState()   // QA-3 S8/A4: the torn-down turn's liveness state dies with it
         setStreaming(false, reason: "cancelStreaming")
         mirroringRuntimeId = nil
@@ -6082,21 +4761,16 @@ final class ChatStore {
     }
 
     /// QA-3 S8/A4 stage 1 — the current turn went silent past
-    /// ``turnLivenessResyncAfter``: ask the relay for a `resync{last_seq}`
-    /// replay (a snapshot when the gap exceeds the ring). SILENT and
-    /// idempotent — a dropped `item.completed` / `turn.completed` heals here
-    /// and the turn settles naturally; the user sees nothing (C3). Latched:
-    /// fires at most once per turn (reset on turn start / settle).
+    /// ``turnLivenessResyncAfter``: record the silent-turn threshold once.
+    /// The reconnect/reconcile owner may still heal a dropped terminal event;
+    /// the user sees nothing (C3). Latched once per turn.
     private func fireTurnLivenessResync() {
         guard isStreaming, !turnLivenessResyncFired else { return }
         turnLivenessResyncFired = true
         #if DEBUG
         turnLivenessResyncCount += 1
         #endif
-        chatLog.warning("turn-liveness stage 1: current turn silent past the resync window — requesting a SILENT resync{last_seq} to recover dropped frames (self-healing, never surfaced — C3)")
-        guard connection?.transportPath == .relay,
-              let coordinator = connection?.relayCoordinator else { return }
-        Task { await coordinator.requestLivenessResync() }
+        chatLog.warning("turn-liveness stage 1: current turn silent past the reconcile window (diagnostic only, never surfaced — C3)")
     }
 
     /// QA-3 S8/A4 stage 2 — the current turn went silent past
@@ -6111,12 +4785,6 @@ final class ChatStore {
     private func fireTurnLivenessSettle() {
         guard isStreaming else { return }
         chatLog.warning("turn-liveness stage 2: turn silent past the settle window with no completion even after the silent resync — settling as INTERRUPTED so eternal double-working is impossible (C3: no error surface)")
-        if connection?.transportPath == .relay, let coordinator = connection?.relayCoordinator {
-            // Locally settle the dead turn's stuck items; the re-projection
-            // folds them as muted "Interrupted" rows and clears the turn-scoped
-            // live flag.
-            coordinator.settleStaleTurnLocally()
-        }
         // Belt and braces (direct path, or a projection that still reads
         // streaming): force the settle exactly like the QA-2 wedge kill did.
         if isStreaming {
@@ -6146,18 +4814,6 @@ final class ChatStore {
         turnLivenessBaseline = nil
     }
 
-    /// QA-2 R12/R13 — relay turn start. Called by `RelaySessionCoordinator`
-    /// .ingest on a `turn.started` frame. The relay item store accumulates the
-    /// PRIOR turn's `taskList` item (stable `<sid>:tasks` id, replaced in place
-    /// only when THIS turn emits its own first `taskList` frame), so without
-    /// this clear the next `applyRelayItems` would re-mirror the previous turn's
-    /// list and the dock pill would briefly render stale data the moment the new
-    /// turn flips `isStreaming` true. Clearing here lets the new turn re-seed
-    /// the dock from a blank slate the instant its own `taskList` arrives.
-    func handleRelayTurnStarted() {
-        relayLatestTaskList = nil
-        taskListOwnerSessionId = nil
-    }
 
     #if DEBUG
     /// DEBUG test seam: drive the liveness watchdog's stage-2 SETTLE path

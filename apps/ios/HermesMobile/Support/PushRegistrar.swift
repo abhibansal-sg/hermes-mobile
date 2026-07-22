@@ -47,14 +47,6 @@ final class PushRegistrar {
     var remoteNotificationsRegistrar: (@MainActor () -> Void)?
     @ObservationIgnored
     var tokenRegisterOverride: (@MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome)?
-    /// Relay-mode (§6a) test seam: when the transport is `.relay` the token is
-    /// registered OVER THE RELAY SOCKET (the relay's Notifier reads the relay's
-    /// own registry — gateway-direct REST never reaches it). Tests replace this
-    /// edge exactly like ``tokenRegisterOverride`` for the direct path.
-    @ObservationIgnored
-    var relayTokenRegisterOverride: (@MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome)?
-    @ObservationIgnored
-    var relayTokenUnregisterOverride: (@MainActor @Sendable (String) async -> PushTokenPoster.Outcome)?
     @ObservationIgnored
     private var registrationInFlight = false
     @ObservationIgnored
@@ -110,12 +102,7 @@ final class PushRegistrar {
     private var currentRegistrationScope: String? {
         guard let endpoint = resolveEndpoint(), let connection else { return nil }
         let deviceId = DefaultsKeys.deviceId(server: connection.serverURLString) ?? "shared"
-        // QA-2 R1: the transport is part of the registration identity — a
-        // successful DIRECT-mode register does NOT prove the RELAY registry
-        // (a different process/registry) and vice versa, so a transport flip
-        // must invalidate the scope and force a re-POST down the new path.
-        let transport = connection.transportPath == .relay ? "relay" : "direct"
-        let raw = "\(endpoint.url.absoluteString)|\(deviceId)|\(endpoint.token)|\(transport)"
+        let raw = "\(endpoint.url.absoluteString)|\(deviceId)|\(endpoint.token)"
         let digest = SHA256.hash(data: Data(raw.utf8)).map {
             String(format: "%02x", $0)
         }.joined()
@@ -138,18 +125,9 @@ final class PushRegistrar {
                 forKey: DefaultsKeys.pushLastDeviceToken
             )
             if let lastDeviceToken, !lastDeviceToken.isEmpty {
-                // Relay mode (§6a): unregister over the relay socket; direct
-                // mode: the gateway REST poster.
-                let relayUnregister = makeRelayUnregisterClosure()
-                let poster = relayUnregister == nil ? makePoster() : nil
-                if relayUnregister != nil || poster != nil {
+                if let poster = makePoster() {
                     Task { @MainActor in
-                        let outcome: PushTokenPoster.Outcome
-                        if let relayUnregister {
-                            outcome = await relayUnregister(lastDeviceToken)
-                        } else {
-                            outcome = await poster!.unregister(token: lastDeviceToken)
-                        }
+                        let outcome = await poster.unregister(token: lastDeviceToken)
                         switch outcome {
                         case .success, .softFail, .validationRejected:
                             connection?.capabilities.notePushRegistry(
@@ -254,12 +232,7 @@ final class PushRegistrar {
         }
 
         let registerToken: @MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome
-        // Relay mode OWNS registration (§6a): the relay branch wins over the
-        // direct-path seams so a relay-mode token can never leak onto the
-        // gateway REST poster (the registry the relay Notifier never reads).
-        if let relayRegister = makeRelayRegisterClosure() {
-            registerToken = relayRegister
-        } else if let tokenRegisterOverride {
+        if let tokenRegisterOverride {
             registerToken = tokenRegisterOverride
         } else {
             guard let poster = makePoster() else { return }  // not configured yet
@@ -342,9 +315,7 @@ final class PushRegistrar {
             return
         }
         let registerToken: @MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome
-        if let relayRegister = makeRelayRegisterClosure() {
-            registerToken = relayRegister
-        } else if let tokenRegisterOverride {
+        if let tokenRegisterOverride {
             registerToken = tokenRegisterOverride
         } else {
             guard let poster = makePoster() else { return }
@@ -416,64 +387,6 @@ final class PushRegistrar {
             // row that QA-2's eviction can never reach.
             deviceID: DefaultsKeys.pushRegistrationDeviceId(server: connection.serverURLString)
         )
-    }
-
-    /// The relay-mode (§6a) register closure, or `nil` when NOT in relay mode.
-    ///
-    /// In relay mode the token is registered OVER THE RELAY SOCKET: the relay's
-    /// Notifier reads the relay process's own push registry, so the gateway-
-    /// direct REST register is structurally wrong here (unreachable off-LAN, and
-    /// on-LAN it writes a registry the relay never reads — a different
-    /// HERMES_HOME). A failed relay register (socket down) maps to `.hardFail`
-    /// so the next `enableIfAllowed()` retries — the same retry contract as the
-    /// direct path.
-    private func makeRelayRegisterClosure()
-        -> (@MainActor @Sendable (String, [String]?) async -> PushTokenPoster.Outcome)? {
-        guard connection?.transportPath == .relay else { return nil }
-        if let relayTokenRegisterOverride { return relayTokenRegisterOverride }
-        // Relay mode ALWAYS owns registration: never fall through to the
-        // gateway-direct poster (its registry is not the one the relay Notifier
-        // reads). A not-yet-created/connected coordinator maps to `.hardFail`
-        // so the next `enableIfAllowed()` retries instead of silently
-        // registering against the wrong registry and being deduped forever.
-        return { [weak connection] token, events in
-            guard let connection, let coordinator = connection.relayCoordinator else {
-                return .hardFail
-            }
-            do {
-                // QA-2 R1c + QA-3 S13: the stable device id lets the relay
-                // registry keep ONE entry per device (rotated tokens replace,
-                // null-id legacy rows evict). The v2 issued id wins when
-                // present; otherwise the per-install fallback keys the row so
-                // build 117 never writes the null-id entry that broke fan-out.
-                let deviceID = DefaultsKeys.pushRegistrationDeviceId(
-                    server: connection.serverURLString
-                )
-                _ = try await coordinator.registerPushToken(
-                    token, env: PushTokenPoster.apnsEnvironment, events: events,
-                    deviceID: deviceID
-                )
-                return .success
-            } catch {
-                return .hardFail
-            }
-        }
-    }
-
-    /// The relay-mode (§6a) UNregister closure, or `nil` when not in relay mode.
-    private func makeRelayUnregisterClosure()
-        -> (@MainActor @Sendable (String) async -> PushTokenPoster.Outcome)? {
-        guard connection?.transportPath == .relay else { return nil }
-        if let relayTokenUnregisterOverride { return relayTokenUnregisterOverride }
-        return { [weak connection] token in
-            guard let coordinator = connection?.relayCoordinator else { return .hardFail }
-            do {
-                _ = try await coordinator.unregisterPushToken(token)
-                return .success
-            } catch {
-                return .hardFail
-            }
-        }
     }
 
     /// The current gateway base URL + session token + REST path family, or

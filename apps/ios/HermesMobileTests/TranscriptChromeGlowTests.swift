@@ -384,93 +384,23 @@ final class TranscriptChromeGlowTests: XCTestCase {
         ChatMessage(role: .user, parts: [.text(id: "u1", text: "hello")])
     }
 
-    /// Direct transport: the approved behavior is unchanged — the tail indicator
-    /// shows for the whole active turn, including beside the streaming bubble
-    /// (desktop-parity "Still thinking" / tool-name row). This is the regression
-    /// guard that the relay fix did NOT touch the approved direct path.
-    func testInlineActivityGateDirectTransportUnchangedDuringStreaming() {
+    func testInlineActivityGateShowsDuringStreaming() {
         XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
-            isStreaming: true, hasPendingGate: false, isRelayTransport: false,
-            lastMessage: streamingAssistantBubble()),
-            "direct path keeps the tail indicator beside the streaming bubble")
+            isStreaming: true, hasPendingGate: false))
         XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
-            isStreaming: true, hasPendingGate: false, isRelayTransport: false,
-            lastMessage: userEcho()),
-            "direct path shows the pre-first-token indicator above the user echo")
+            isStreaming: true, hasPendingGate: false))
         XCTAssertTrue(ChatView.shouldShowInlineTurnActivity(
-            isStreaming: true, hasPendingGate: false, isRelayTransport: false,
-            lastMessage: nil))
+            isStreaming: true, hasPendingGate: false))
     }
 
-    /// B8 regression (FAILS on qa1/base — the old gate was transport-blind and
-    /// returned `true` here): on the relay transport the row is suppressed while
-    /// the streaming assistant bubble renders the working cursor.
-    func testInlineActivityGateRelaySuppressedWhileCursorRenders() {
+    func testInlineActivityGatePendingGateSuppresses() {
         XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
-            isStreaming: true, hasPendingGate: false, isRelayTransport: true,
-            lastMessage: streamingAssistantBubble()),
-            "relay: the streaming bubble's cursor IS the working signal — no redundant pill (A4)")
+            isStreaming: true, hasPendingGate: true))
     }
 
-    /// A freshly-created streaming bubble with NO parts yet still renders the
-    /// standalone cursor (`MessageBubble.needsStandaloneCursor`), so the row is
-    /// suppressed for it too — the relay's first `item.started` projects exactly
-    /// such a bubble.
-    func testInlineActivityGateRelaySuppressedForPartlessStreamingBubble() {
-        let partless = ChatMessage(role: .assistant, parts: [], isStreaming: true)
-        XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
-            isStreaming: true, hasPendingGate: false, isRelayTransport: true,
-            lastMessage: partless))
-    }
-
-    /// QA-2 R4/A2 (supersedes the QA-1 B8 pre-first-item clause): the Working
-    /// pill is IMPOSSIBLE on the relay path in EVERY phase — pre-first-item
-    /// included. The relay send appends an optimistic empty streaming assistant
-    /// bubble, so the breathing caret is the accepted-and-waiting affordance;
-    /// the state that could still flash the pill (the old pre-first-item
-    /// branch) is deleted, not hidden. Direct transport above is unchanged.
-    func testInlineActivityGateRelayNeverShowsWorkingPill() {
-        XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
-            isStreaming: true, hasPendingGate: false, isRelayTransport: true,
-            lastMessage: userEcho()),
-            "relay pre-first-item above the user echo → no pill (caret bubble affordance)")
-        XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
-            isStreaming: true, hasPendingGate: false, isRelayTransport: true,
-            lastMessage: nil),
-            "relay pre-first-item with no painted rows → no pill")
-        // A SETTLED assistant tail (prior turn's history) — no pill either.
-        let settled = ChatMessage(role: .assistant,
-                                  parts: [.text(id: "old", text: "Earlier answer.")],
-                                  isStreaming: false)
-        XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
-            isStreaming: true, hasPendingGate: false, isRelayTransport: true,
-            lastMessage: settled))
-    }
-
-    /// Dock priority wins on BOTH transports: a turn paused on an approval /
-    /// clarification / secure prompt shows its user-action UI in the dock, never
-    /// the busy row (the row would lie about progress while waiting on a human).
-    func testInlineActivityGatePendingGatesSuppressBothTransports() {
-        for relay in [false, true] {
-            XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
-                isStreaming: true, hasPendingGate: true, isRelayTransport: relay,
-                lastMessage: streamingAssistantBubble()))
-            XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
-                isStreaming: true, hasPendingGate: true, isRelayTransport: relay,
-                lastMessage: userEcho()))
-        }
-    }
-
-    /// Not streaming → never shows, on either transport, regardless of tail.
     func testInlineActivityGateIdleNeverShows() {
-        for relay in [false, true] {
-            XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
-                isStreaming: false, hasPendingGate: false, isRelayTransport: relay,
-                lastMessage: streamingAssistantBubble()))
-            XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
-                isStreaming: false, hasPendingGate: false, isRelayTransport: relay,
-                lastMessage: nil))
-        }
+        XCTAssertFalse(ChatView.shouldShowInlineTurnActivity(
+            isStreaming: false, hasPendingGate: false))
     }
 
     // MARK: - QA-1 B12/A4: no reserved space for empty dock / suppressed pill

@@ -5,7 +5,7 @@ extension RestClient {
     /// Legacy gateways intentionally fall through as 404 so live-event Inbox
     /// behavior remains available without claiming durable reconciliation.
     func pendingAttention(cursor: String?) async throws -> PendingAttentionEnvelope {
-        guard relayControlBaseURL != nil || pathStyle == .plugin else {
+        guard pathStyle == .plugin else {
             throw RestError.badStatus(404, body: "pending attention unavailable")
         }
         var components = URLComponents()
@@ -13,9 +13,7 @@ extension RestClient {
             components.queryItems = [URLQueryItem(name: "cursor", value: cursor)]
         }
         let suffix = components.percentEncodedQuery.map { "?\($0)" } ?? ""
-        let data = try await relayControlBaseURL == nil
-            ? get(path: "\(mobileAPIPrefix)/attention/pending\(suffix)")
-            : getRelayControl(path: "/attention/pending\(suffix)")
+        let data = try await get(path: "\(mobileAPIPrefix)/attention/pending\(suffix)")
         return try decode(PendingAttentionEnvelope.self, from: data, context: "pendingAttention")
     }
 }
