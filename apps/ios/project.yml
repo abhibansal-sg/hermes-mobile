@@ -350,6 +350,9 @@ schemes:
         - variable: HERMES_LIVE_FOLLOW_MARKER
           value: $(TEST_RUNNER_HERMES_LIVE_FOLLOW_MARKER)
           isEnabled: true
+        - variable: HERMES_PAGINATION_TITLE
+          value: $(TEST_RUNNER_HERMES_PAGINATION_TITLE)
+          isEnabled: true
   WorkRepositoryTests:
     build:
       targets:
