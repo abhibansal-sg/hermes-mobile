@@ -24,7 +24,8 @@ final class CrossClientSyncUITests: XCTestCase {
         XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
         drawerToggle.tap()
 
-        let ownedSession = app.staticTexts[marker]
+        let ownedSession = app.buttons.matching(identifier: "sessionRow")
+            .matching(NSPredicate(format: "label BEGINSWITH %@", marker)).firstMatch
         XCTAssertTrue(ownedSession.waitForExistence(timeout: 20))
         ownedSession.tap()
 
@@ -45,6 +46,49 @@ final class CrossClientSyncUITests: XCTestCase {
 
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = "cross-client-mirror-physical"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    func testExternallyDrivenSessionRepaintsAfterForceClose() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let base = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+              let marker = env["HERMES_LIVE_FOLLOW_MARKER"],
+              !base.isEmpty, !token.isEmpty, !marker.isEmpty else {
+            throw XCTSkip("live gateway credentials/marker not provided; skipping live test")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_URL"] = base
+        app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchArguments += ["--uitest-mute-audio"]
+
+        func openSeededSession() {
+            app.launch()
+            let drawerToggle = app.buttons["drawerToggle"]
+            XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+            drawerToggle.tap()
+            let ownedSession = app.buttons.matching(identifier: "sessionRow")
+                .matching(NSPredicate(format: "label BEGINSWITH %@", marker)).firstMatch
+            XCTAssertTrue(ownedSession.waitForExistence(timeout: 20))
+            ownedSession.tap()
+        }
+
+        let secondMarker = app.staticTexts.containing(
+            NSPredicate(format: "label CONTAINS %@", marker + "-SECOND")
+        ).firstMatch
+        openSeededSession()
+        XCTAssertTrue(secondMarker.waitForExistence(timeout: 30))
+
+        app.terminate()
+        openSeededSession()
+        XCTAssertTrue(
+            secondMarker.waitForExistence(timeout: 10),
+            "Force-close/reopen did not repaint the stored transcript"
+        )
+
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "stored-transcript-force-close-repaint"
         attachment.lifetime = .keepAlways
         add(attachment)
     }
