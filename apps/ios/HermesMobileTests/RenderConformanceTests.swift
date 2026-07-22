@@ -205,6 +205,24 @@ final class RenderConformanceTests: XCTestCase {
                      transport: transport, coordinator: coordinator)
     }
 
+    /// A faithful session-open drive for the R2 submit pin (contract I5 /
+    /// §1.3): `ChatStore.send` pins the submit target off
+    /// `sessions.activeStoredId` at intent — there is NO fallback to the
+    /// coordinator's driven session (the deleted `?? activeSessionID`, D2).
+    /// A coordinator-only open leaves the pin nil, so the send becomes a
+    /// DRAFT create: the relay mints `render-new-1`, the write-gate MOVES to
+    /// the minted id (R2 adoption), and the fixture's stamped-sid frames fold
+    /// into a BACKGROUND entry that never projects (I1/I2) — every downstream
+    /// `waitUntil` starves. Production opens through SessionStore, which sets
+    /// the selection AND binds the coordinator at intent (§1.3); the harness
+    /// mirrors that binding. (Same pattern the reseed/switch tests below
+    /// already pin inline, and `testReplay_EchoDurableAcrossSessionSwitchAndBack`
+    /// drives via the real `SessionStore.open`.)
+    private func openDriven(_ g: Graph, _ sessionID: String) async throws {
+        _ = try await g.coordinator.open(sessionID)
+        g.sessions.activeStoredId = sessionID
+    }
+
     override func tearDown() {
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.transportPath)
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
@@ -323,7 +341,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         let ok = await g.chat.send(text: fx.submitText)
         XCTAssertTrue(ok, "relay submit must be accepted")
@@ -342,7 +360,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         // The GRDB cache painted the settled transcript before any relay frame.
         g.chat.messages = cachedRows(fx)
@@ -378,7 +396,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         let ok = await g.chat.send(text: fx.submitText)
         XCTAssertTrue(ok)
@@ -475,7 +493,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_approval_gate")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         g.chat.messages = cachedRows(fx)
         _ = await g.chat.send(text: fx.submitText)
 
@@ -496,7 +514,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_approval_gate")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliver(g, fx, through: { self.kind($0) == "approval.request" })
         await waitUntil(timeout: .seconds(2)) { g.chat.pendingApproval != nil }
@@ -517,7 +535,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_approval_gate")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliver(g, fx, through: { self.kind($0) == "approval.request" })
         await waitUntil(timeout: .seconds(2)) { g.chat.pendingApproval != nil }
@@ -542,7 +560,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_clarify_gate")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
 
         deliver(g, fx, through: { self.kind($0) == "clarify.request" })
@@ -562,7 +580,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_clarify_gate")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliver(g, fx, through: { self.kind($0) == "clarify.request" })
         await waitUntil(timeout: .seconds(2)) { g.chat.pendingClarification != nil }
@@ -583,7 +601,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_clarify_gate")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliver(g, fx, through: { self.kind($0) == "clarify.request" })
         await waitUntil(timeout: .seconds(2)) { g.chat.pendingClarification != nil }
@@ -608,7 +626,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_tasklist")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliverAll(g, fx)
 
@@ -625,7 +643,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_tasklist")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliverAll(g, fx)
 
@@ -654,7 +672,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         g.chat.messages = cachedRows(fx)
         _ = await g.chat.send(text: fx.submitText)
 
@@ -1404,7 +1422,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         let ok = await g.chat.send(text: fx.submitText)
         XCTAssertTrue(ok)
@@ -1429,7 +1447,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         _ = await g.chat.send(text: fx.submitText)
         deliver(g, fx, through: {
@@ -1453,7 +1471,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         g.chat.messages = cachedRows(fx)
         _ = await g.chat.send(text: fx.submitText)
 
@@ -1482,7 +1500,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_live_fold")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
 
         // Through the raw-name tool start: reasoning done, tool in progress,
@@ -1518,7 +1536,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_live_fold")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
 
         // Through the agentMessage start (the tool completed friendly just
@@ -1609,7 +1627,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_live_fold")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         g.chat.messages = cachedRows(fx)
         _ = await g.chat.send(text: fx.submitText)
         deliverAll(g, fx)
@@ -1635,7 +1653,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_live_fold")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliverAll(g, fx)
         let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
@@ -1692,7 +1710,7 @@ final class RenderConformanceTests: XCTestCase {
             if upstream.method == "submit" { return }   // answered after the blackout
             relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
         }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         let t0 = ContinuousClock.now
         let sendTask = Task { await g.chat.send(text: fx.submitText) }
@@ -1963,7 +1981,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_live_fold")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
 
         // Through the last item (usage) — stop BEFORE the fixture's own
@@ -2012,7 +2030,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_qa3_delayed_start")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         let ok = await g.chat.send(text: fx.submitText)
         XCTAssertTrue(ok)
@@ -2075,7 +2093,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_live_fold")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
 
         // Through the raw-name tool start: reasoning + in-progress tool, NO
@@ -2242,7 +2260,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_dead_turn_liveness")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         g.chat.messages = cachedRows(fx)
         let ok = await g.chat.send(text: fx.submitText)
         XCTAssertTrue(ok, "relay submit must be accepted")
