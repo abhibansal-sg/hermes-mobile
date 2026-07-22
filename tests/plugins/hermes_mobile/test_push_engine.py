@@ -1299,12 +1299,13 @@ def test_attention_gate_pushes_when_transport_closed(monkeypatch):
     assert calls[0][0][0] == "turn_complete"
 
 
-def test_attention_gate_suppresses_when_ws_foregrounded(monkeypatch):
-    # (b) A live WS (_closed=False) means the user is watching — no push.
+def test_attention_gate_pushes_when_only_desktop_ws_foregrounded(monkeypatch):
+    # (b) A live desktop WS is not evidence that the phone is watching.
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     session = {"transport": _LiveTransport(closed=False)}
     calls = _drive_message_complete(monkeypatch, session)
-    assert calls == []
+    assert len(calls) == 1
+    assert calls[0][1]["excluding_device_ids"] == set()
 
 
 def test_attention_gate_suppresses_for_kanban_worker(monkeypatch):
@@ -1315,13 +1316,13 @@ def test_attention_gate_suppresses_for_kanban_worker(monkeypatch):
 
 
 def test_attention_gate_clears_turn_start_stamp_regardless_of_push(monkeypatch):
-    # Registry hygiene: a foregrounded turn still drops its own start stamp so
+    # Registry hygiene: a desktop-driven turn still drops its own start stamp so
     # the session table doesn't leak stale timers.
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     session = {"transport": _LiveTransport(closed=False), "_push_turn_started": 995.0}
     calls = _drive_message_complete(monkeypatch, session, turn_started=995.0)
-    assert calls == []  # foregrounded → suppressed
-    assert "_push_turn_started" not in session  # …but stamp was still popped
+    assert len(calls) == 1
+    assert "_push_turn_started" not in session
 
 
 def test_turn_complete_notify_sets_4h_apns_expiration(monkeypatch, isolated_home):

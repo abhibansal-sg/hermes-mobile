@@ -1109,6 +1109,42 @@ final class JumpAndLoadEarlierConflictGuardTests: XCTestCase {
         await gate.release()
         await earlierTask.value
     }
+
+    func testLoadEarlierPrependsWithoutDisturbingLiveStream() async throws {
+        let (chat, sessions) = makeChat()
+        sessions.activeRuntimeId = "runtime-s1"
+        let tail = (51...60).map { id in
+            stored(role: id % 2 == 0 ? "assistant" : "user", text: "message \(id)", wireId: id)
+        }
+        let older = (41...50).map { id in
+            stored(role: id % 2 == 0 ? "assistant" : "user", text: "message \(id)", wireId: id)
+        }
+        chat.seed(from: tail)
+        chat.noteTranscriptPaging(oldestId: 51, hasMoreBefore: true)
+        chat.transcriptPageFetch = { _, limit, before in
+            XCTAssertEqual(limit, ChatStore.transcriptOpenWindowLimit)
+            XCTAssertEqual(before, 51)
+            return TranscriptPageFetch(
+                messages: older,
+                oldestId: 41,
+                hasMoreBefore: true
+            )
+        }
+        let start = try XCTUnwrap(GatewayEvent(params: .object([
+            "type": .string("message.start"),
+            "session_id": .string("runtime-s1"),
+            "payload": .object(["role": .string("assistant")]),
+        ])))
+        chat.handle(event: start)
+        XCTAssertTrue(chat.isStreaming)
+        let streamingID = try XCTUnwrap(chat.messages.last(where: \.isStreaming)?.id)
+
+        await chat.loadEarlierTranscript()
+
+        XCTAssertEqual(chat.messages.first?.text, "message 41")
+        XCTAssertTrue(chat.isStreaming)
+        XCTAssertEqual(chat.messages.last(where: \.isStreaming)?.id, streamingID)
+    }
 }
 
 /// Minimal async coordination helper for the interleaving test above: lets the

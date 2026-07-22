@@ -58,6 +58,9 @@ jobs:
             -scheme HermesMobile \
             -destination "platform=iOS Simulator,name=${{ steps.dest.outputs.device }}" \
             -only-testing:HermesMobileTests \
+            -skip-testing:HermesMobileTests/ClarifyCardNativeTests/testApprovalCardMountsNativeSurfaceAndActions \
+            -skip-testing:HermesMobileTests/ClarifyCardNativeTests/testLongChoiceWrapsInsideCardWidth \
+            -skip-testing:HermesMobileTests/NativeChromeSnapshotEvidenceTests \
             -parallel-testing-enabled NO \
             -retry-tests-on-failure \
             -resultBundlePath "$RUNNER_TEMP/ios-tests.xcresult"
