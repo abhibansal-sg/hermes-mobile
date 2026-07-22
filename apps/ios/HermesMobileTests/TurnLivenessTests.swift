@@ -38,6 +38,13 @@ final class TurnLivenessTests: XCTestCase {
     private let relayURL = URL(string: "ws://127.0.0.1:9999/relay")!
     private let sessionID = "liveness-sess"
 
+    /// Minimal stored-session summary (mirrors ContractReconcileW2dTests) so
+    /// the tests drive `SessionStore.open` exactly like a drawer tap.
+    private func summary(_ id: String) -> SessionSummary {
+        SessionSummary(id: id, title: "Session \(id)", preview: nil, startedAt: nil,
+                       messageCount: nil, source: nil, lastActive: nil, cwd: nil)
+    }
+
     private struct Graph {
         let chat: ChatStore
         let sessions: SessionStore
@@ -61,6 +68,16 @@ final class TurnLivenessTests: XCTestCase {
         let sessions = SessionStore()
         let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
         chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        // Fix-round: wire the session store to the connection EXACTLY like
+        // production (and `ContractReconcileW2dTests.makeStores`). Without this
+        // `sessions.connection` is nil, so `SessionStore.open` never takes the
+        // relay branch (`if let connection, connection.transportPath == .relay`)
+        // — the relay write-gate is never moved, frames fold into a
+        // turn-bearing-created entry but never project, and a turn-nil user row
+        // is dropped as unattributable. The send-based tests masked this because
+        // `submit` synchronously re-establishes the gate; this completed-prior-turn
+        // test sends nothing, so it needs the faithful graph.
+        sessions.attach(connection: connection, chat: chat)
         connection.relayCoordinatorFactory = {
             RelaySessionCoordinator(chatStore: chat, clientFactory: { RelayClient { _ in transport } })
         }
@@ -128,7 +145,15 @@ final class TurnLivenessTests: XCTestCase {
     func testStuckPriorTurnSettlesTheMomentNextTurnStarts() async throws {
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(sessionID)
+        // Production-faithful drive (r4 integration): open VIA SESSIONSTORE so
+        // the send's target pin (I5: the selected stored id) matches the
+        // session the frames name. A coordinator-level open alone leaves
+        // SessionStore.activeStoredId nil, turning the send into a true-draft
+        // nil-pin submit whose create-adoption (I6) moves the write-gate to
+        // the minted id — correct in production, where open() always sets the
+        // stored id before any send can happen.
+        g.sessions.open(summary(sessionID))
+        await g.sessions.waitForPendingOpenForTesting()
         _ = await g.chat.send(text: "turn one prompt")
 
         deliverStuckTurn1(g)
@@ -180,7 +205,15 @@ final class TurnLivenessTests: XCTestCase {
     func testCompletedPriorTurnIsNotInterrupted() async throws {
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(sessionID)
+        // Production-faithful drive (r4 integration): open VIA SESSIONSTORE so
+        // the send's target pin (I5: the selected stored id) matches the
+        // session the frames name. A coordinator-level open alone leaves
+        // SessionStore.activeStoredId nil, turning the send into a true-draft
+        // nil-pin submit whose create-adoption (I6) moves the write-gate to
+        // the minted id — correct in production, where open() always sets the
+        // stored id before any send can happen.
+        g.sessions.open(summary(sessionID))
+        await g.sessions.waitForPendingOpenForTesting()
 
         g.transport.deliver(envelope("item.completed",
             itemBody("\(sessionID):u1", "userMessage", "completed", 0, ["text": "one"])))
@@ -199,6 +232,11 @@ final class TurnLivenessTests: XCTestCase {
 
         await waitUntil { self.assistantRows(g.chat).count >= 2 }
         let rows = assistantRows(g.chat)
+        // Fix-round hardening: assert the count BEFORE indexing so a regression
+        // fails cleanly instead of crashing the test process with an
+        // index-out-of-range (the completed prior turn + the live turn = 2 rows).
+        XCTAssertEqual(rows.count, 2, "a completed prior turn + a live turn project exactly two assistant rows")
+        guard rows.count >= 2 else { return }
         XCTAssertFalse(rows[0].interrupted, "a normally-completed prior turn is Worked, not Interrupted")
         XCTAssertFalse(rows[0].isStreaming)
         XCTAssertTrue(rows[1].isStreaming)
@@ -213,7 +251,15 @@ final class TurnLivenessTests: XCTestCase {
     func testSilentResyncRecoversDroppedCompletion() async throws {
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(sessionID)
+        // Production-faithful drive (r4 integration): open VIA SESSIONSTORE so
+        // the send's target pin (I5: the selected stored id) matches the
+        // session the frames name. A coordinator-level open alone leaves
+        // SessionStore.activeStoredId nil, turning the send into a true-draft
+        // nil-pin submit whose create-adoption (I6) moves the write-gate to
+        // the minted id — correct in production, where open() always sets the
+        // stored id before any send can happen.
+        g.sessions.open(summary(sessionID))
+        await g.sessions.waitForPendingOpenForTesting()
         _ = await g.chat.send(text: "turn one prompt")
 
         deliverStuckTurn1(g)
@@ -260,7 +306,15 @@ final class TurnLivenessTests: XCTestCase {
     func testDeadTurnForceSettlesAsInterruptedAndSilent() async throws {
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(sessionID)
+        // Production-faithful drive (r4 integration): open VIA SESSIONSTORE so
+        // the send's target pin (I5: the selected stored id) matches the
+        // session the frames name. A coordinator-level open alone leaves
+        // SessionStore.activeStoredId nil, turning the send into a true-draft
+        // nil-pin submit whose create-adoption (I6) moves the write-gate to
+        // the minted id — correct in production, where open() always sets the
+        // stored id before any send can happen.
+        g.sessions.open(summary(sessionID))
+        await g.sessions.waitForPendingOpenForTesting()
         _ = await g.chat.send(text: "turn one prompt")
 
         deliverStuckTurn1(g)
@@ -300,7 +354,15 @@ final class TurnLivenessTests: XCTestCase {
     func testLateAuthoritativeFrameHealsLocalSettle() async throws {
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(sessionID)
+        // Production-faithful drive (r4 integration): open VIA SESSIONSTORE so
+        // the send's target pin (I5: the selected stored id) matches the
+        // session the frames name. A coordinator-level open alone leaves
+        // SessionStore.activeStoredId nil, turning the send into a true-draft
+        // nil-pin submit whose create-adoption (I6) moves the write-gate to
+        // the minted id — correct in production, where open() always sets the
+        // stored id before any send can happen.
+        g.sessions.open(summary(sessionID))
+        await g.sessions.waitForPendingOpenForTesting()
         _ = await g.chat.send(text: "turn one prompt")
 
         deliverStuckTurn1(g)
@@ -342,7 +404,15 @@ final class TurnLivenessTests: XCTestCase {
     func testLateDeltaAfterFalseSettleResurrectsTheTurnLosslessly() async throws {
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(sessionID)
+        // Production-faithful drive (r4 integration): open VIA SESSIONSTORE so
+        // the send's target pin (I5: the selected stored id) matches the
+        // session the frames name. A coordinator-level open alone leaves
+        // SessionStore.activeStoredId nil, turning the send into a true-draft
+        // nil-pin submit whose create-adoption (I6) moves the write-gate to
+        // the minted id — correct in production, where open() always sets the
+        // stored id before any send can happen.
+        g.sessions.open(summary(sessionID))
+        await g.sessions.waitForPendingOpenForTesting()
         _ = await g.chat.send(text: "turn one prompt")
 
         deliverStuckTurn1(g)

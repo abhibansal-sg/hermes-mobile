@@ -247,6 +247,7 @@ final class SessionStore {
     /// carry an old stored-session intent into the newly configured server.
     func invalidateGatewayScopeWork() {
         openToken = UUID()
+        cancelSupersededOpenWork()   // R3 (I4): scope teardown cancels in-flight opens
         // A scope teardown replaces the drawer content: drop any pending
         // dismissal intent from a row that no longer exists (QA-1 B3).
         pendingDrawerReveal = nil
@@ -1266,6 +1267,24 @@ final class SessionStore {
         runtimeBindingTask?.cancel()
         runtimeBindingTask = nil
         runtimeBindingKey = nil
+    }
+
+    /// R3 (ROUND-4 W2d) — contract **I4**: the monotonic epoch bump now
+    /// RPC-CANCELS the superseded open's in-flight work, not merely
+    /// result-fences it after completion. Called at EVERY `openToken` bump
+    /// (open/draft/scope-invalidations) — the intent tick, sync, pre-await.
+    /// Cancelling the resume task propagates through `RelayClient.request`'s
+    /// `withTaskCancellationHandler`: the pending continuation fails with
+    /// `CancellationError`, and the relay's late answer (the relay is
+    /// stateless — it always replies) is observed on the wire and discarded,
+    /// never applied. The seed task's phase-2 fetch is gone the same way (on
+    /// relay it no longer exists at all; on direct the stale seed is cancelled
+    /// instead of landing fenced).
+    private func cancelSupersededOpenWork() {
+        lastOpenSeedTask?.cancel()
+        lastOpenSeedTask = nil
+        lastOpenResumeTask?.cancel()
+        lastOpenResumeTask = nil
     }
 
     /// Test seams historically run without a configured `ConnectionStore`. Once
@@ -3730,7 +3749,43 @@ final class SessionStore {
         }
     }
 
-    private func rememberWarmOpenSnapshot(_ normalized: [ChatMessage], for storedId: String) {
+    /// R1 write-through eviction (contract §1.2 / RR4): persist a SETTLED
+    /// background entry's transcript before the coordinator drops it from the
+    /// bounded LRU map — the next open paints from disk (I3: the cache is a
+    /// seed) and the relay snapshot reconciles over it (I14). Text rows only
+    /// (user + agent): the cache paints a seed the stream supersedes by
+    /// item-id union, never a co-author. Fire-and-forget, off the UI path;
+    /// `CacheStore` no-ops cron sessions (never transcript-cached).
+    func persistRelayEntryWriteThrough(sessionID: String, items: [ChatItem]) {
+        guard let cacheStore, let identity = cacheIdentity(sessionID) else { return }
+        var wireId = 0
+        let now = Date().timeIntervalSince1970
+        let stored: [StoredMessage] = items.compactMap { item in
+            let role: String
+            switch item.type {
+            case .userMessage:   role = "user"
+            case .agentMessage:  role = "assistant"
+            default: return nil
+            }
+            let text = item.textBody
+            guard !text.isEmpty else { return nil }
+            wireId += 1
+            return StoredMessage(role: role, content: .string(text),
+                                 timestamp: now, wireId: wireId)
+        }
+        guard !stored.isEmpty else { return }
+        Task { try? await cacheStore.saveTranscript(identity: identity, messages: stored) }
+    }
+
+    /// Record the normalized rows of a session this process has already seen,
+    /// so a re-open paints from warm memory (ABH-372) before touching disk.
+    /// Internal (not private) as a contract-suite seam: store-level tests
+    /// simulate a cache paint by registering it here — the paint provenance
+    /// (`transcriptPaintedStoredId`) is stamped only by paints this store
+    /// drives, so a test that seeds ChatStore directly must also register the
+    /// warm snapshot for `open()`'s phase-1 to see the HIT (a paint+miss
+    /// co-existence is impossible in production — paint only comes from HITs).
+    func rememberWarmOpenSnapshot(_ normalized: [ChatMessage], for storedId: String) {
         warmOpenSnapshots[storedId] = mergedWarmSnapshot(normalized, for: storedId)
         warmOpenSnapshotOrder.removeAll { $0 == storedId }
         warmOpenSnapshotOrder.append(storedId)
@@ -3789,21 +3844,34 @@ final class SessionStore {
         return merged
     }
 
-    #if DEBUG
-    /// DEBUG-only handle to the most recent open-seed Task. Stored so tests can
-    /// `await` it without depending on wall-clock `settle()`. Set by `open()`
-    /// before the seed Task is spawned; `nil` when no open is in flight.
-    /// Never compiled into Release.
+    /// Handle to the most recent open-seed Task. R3 (ROUND-4 W2d): held
+    /// ALWAYS-ON (not just DEBUG) so a superseding open/draft can RPC-CANCEL
+    /// the previous open's in-flight work at the intent tick (contract I4 —
+    /// cancel, not merely result-fence after completion). Also still serves the
+    /// DEBUG test-await seam below.
     private(set) var lastOpenSeedTask: Task<Void, Never>?
 
-    /// DEBUG-only handle to the most recent open-resume Task. Stored so live
-    /// re-entry tests can await the resume → status reconciliation path without a
-    /// wall-clock settle.
+    /// Handle to the most recent open-resume Task — the RPC-cancel half of R3
+    /// (contract I4): a newer open/draft cancels this task at the intent tick,
+    /// which propagates through `RelayClient.request`'s cancellation handler
+    /// (the pending continuation fails with `CancellationError`; a late answer
+    /// is observed on the wire and discarded, never applied).
     private(set) var lastOpenResumeTask: Task<Void, Never>?
+
+    #if DEBUG
 
     /// DEBUG-only hook for tests that need to hold the first-paint path while
     /// exercising the drawer reveal deadline.
     var beforeOpenSeedForTesting: (() async -> Void)?
+
+    /// DEBUG-only cancel-spy for contract **I4** (ROUND-4 W2d / R3): the number
+    /// of in-flight relay session-bind RPCs (resume/open) that were
+    /// RPC-CANCELLED because a newer `open()`/draft superseded them at the
+    /// intent tick — the XCTest analogue of the W0b e2e cancel-spy
+    /// (`phone.cancelled`). A superseded op that merely RESULT-FENCES (the old
+    /// `openToken` guard after the RPC runs to completion) never increments
+    /// this. Zero release-build footprint.
+    private(set) var supersededRelayRPCCancellations = 0
 
     /// DEBUG-only: await the most recently spawned open-seed Task, then yield
     /// once so any main-actor mutations it enqueued have a chance to propagate.
@@ -3892,6 +3960,10 @@ final class SessionStore {
         let token = UUID()
         cancelRuntimeBinding()
         openToken = token
+        // R3 (I4): RPC-cancel the superseded open's in-flight seed + resume at
+        // the intent tick (sync, pre-await) — the epoch bump is a CANCEL, not
+        // just a result fence.
+        cancelSupersededOpenWork()
         // QA-1 B3: a drawer row tap hands its close here — record the intent.
         // A reveal-LESS open (cold cache restore, cross-session review, the
         // recovery path) leaves any pending intent ALIVE: the drawer is still
@@ -4006,9 +4078,7 @@ final class SessionStore {
                 onFirstPaint: firstPaintReveal
             )
         }
-        #if DEBUG
-        lastOpenSeedTask = seedTask
-        #endif
+        lastOpenSeedTask = seedTask   // R3 (I4): always-on — cancellable at the next epoch bump
 
         // Cache restoration intentionally stops after local selection/paint.
         // Connection recovery invokes `resumeActiveAfterReconnect()` once the
@@ -4168,9 +4238,7 @@ final class SessionStore {
                 self.sessionActionError = SessionActionError(action: "Open Session", message: message)
             }
         }
-        #if DEBUG
-        lastOpenResumeTask = resumeTask
-        #endif
+        lastOpenResumeTask = resumeTask   // R3 (I4): always-on — cancellable at the next epoch bump
     }
 
     /// Resume + own `summary` over the Wave-2 relay coordinator when the relay is
@@ -4219,6 +4287,17 @@ final class SessionStore {
                 self.ensureRuntimeAttempts = 0
                 self.onActiveRuntimeBound?()
             } catch {
+                // R3 (I4) cancel-spy: a newer open/draft cancelled THIS bind at
+                // the intent tick — the RPC died with `CancellationError`
+                // mid-flight (its late answer is observed-and-discarded by the
+                // client, never applied here). Counted for the contract's
+                // cancel-spy; never an error, never surfaced.
+                if error is CancellationError {
+                    #if DEBUG
+                    self.supersededRelayRPCCancellations += 1
+                    #endif
+                    return
+                }
                 // A superseded open (the user tapped another session) is not an
                 // actionable failure — never surface it.
                 guard self.openToken == token,
@@ -4239,9 +4318,7 @@ final class SessionStore {
                 )
             }
         }
-        #if DEBUG
-        lastOpenResumeTask = resumeTask
-        #endif
+        lastOpenResumeTask = resumeTask   // R3 (I4): always-on — cancellable at the next epoch bump
     }
 
     /// Transport-readiness failures of a relay session op (QA-1 B1). These are
@@ -4279,6 +4356,9 @@ final class SessionStore {
         // Supersede any in-flight `open()` so its resume can't reactivate, and any
         // on-demand re-resume so its result can't bind into this fresh draft.
         openToken = UUID()
+        // R3 (I4): a draft is a superseding intent — RPC-cancel the in-flight
+        // open's resume/seed, not merely fence their results.
+        cancelSupersededOpenWork()
         // QA-1 B3: a fresh draft is a NEW navigation — drop any pending drawer
         // dismissal from a prior tap (the drawer row that starts a draft fires
         // `onNavigate` itself; a programmatic draft must not inherit a stale
@@ -4304,16 +4384,14 @@ final class SessionStore {
         // A draft has NO session: drop the previous session's hot-swap state
         // (else the pill shows the LAST chat's model) and any stale draft pick.
         connection?.clearSessionState()
-        // S11 (QA-3): park the relay coordinator's item→transcript projection
-        // so the previous session's in-flight turn does NOT leak onto the empty
-        // draft surface. startDraft does not touch the coordinator's
-        // activeSessionID (a draft has no session id), so without this park the
-        // pump's next applyRelayItems would paint the previous session's live
-        // "Working… · ToolCall Ns" rows onto the draft chat (IMG_2594). The
-        // coordinator keeps driving the previous session for reconnect-resync
-        // and durable-outbox routing; only the projection onto the chat surface
-        // is suspended until a real session binds (resume/open/start clear it).
-        connection?.relayCoordinator?.suppressProjectionForDraft()
+        // R1 (contract I6): a draft is the ABSENCE of a session — the relay
+        // write-gate moves OFF. No entry is active, so no frame from any
+        // session can project onto the draft surface (structural: the S11
+        // `projectionSuppressed` flag this replaces cannot exist to fail —
+        // IMG_2594 is unreachable by construction). The previous session's
+        // parked entry keeps folding its own frames for a fast re-open (I14);
+        // the durable outbox re-routes the moment a real session binds.
+        connection?.relayCoordinator?.enterDraft()
         // ABH-351: capture the cwd for the new-session-in-project flow. An
         // explicit non-empty path seeds the draft so the materializing
         // session.create carries it; nil/empty = the gateway default.
@@ -4399,7 +4477,12 @@ final class SessionStore {
     /// overwritten with (the relay may echo a DISTINCT live id after a
     /// resume-remap — the stored id stays the phone's identity), and a deduped
     /// retry (`deduplicated: true`) must not churn the pointers.
-    func landRelayCreatedSession(storedID: String) {
+    ///
+    /// R2 (contract I8/G4): the draft send's optimistic echo had no stored
+    /// session to key under at append time (a draft has no id), so it is
+    /// RE-HOMED onto the created session HERE, at adoption — one identity,
+    /// persisted once, never re-keyed by a second call after the fact.
+    func landRelayCreatedSession(storedID: String, echo: ChatMessage? = nil) {
         guard isDraft || activeStoredId == nil else { return }
         isDraft = false
         activeStoredId = storedID
@@ -4408,6 +4491,7 @@ final class SessionStore {
         ensureRuntimeAttempts = 0
         lastError = nil
         sessionActionError = nil
+        if let echo { persistDurableEcho(storedId: storedID, echo: echo) }
         // Surface the new row in the drawer; never block the turn on it
         // (mirrors `createDraftSession`'s background refresh).
         Task { [weak self] in await self?.refresh() }
@@ -4788,49 +4872,45 @@ final class SessionStore {
         // the socket is open adopts the session (the `.open` edge re-opens it)
         // and waits — bounded — for readiness, instead of throwing
         // `notConnected` into the alert channel.
+        // R3 (ROUND-4 W2d): the coordinator is the SINGLE reconcile owner on
+        // relay. Its `.open`-edge re-establishment (setForeground + open) and
+        // `adoptPendingSession` are the ONE resume per reconnect — this path
+        // must not run a SECOND `resume` RPC over them (the D6 double-resume).
+        // The relay keys its runtime on the STORED session id, so the bind is
+        // LOCAL: no RPC result is needed to stamp `activeRuntimeId`.
         if !coordinator.isOpen {
+            // Socket down: adopt + wait on the phase bridge. The `.open` edge
+            // re-establishes the session (the single reconcile, owned by the
+            // coordinator) — bounded wait, never an alert.
             coordinator.adoptPendingSession(storedId)
             guard await coordinator.waitUntilOpen(timeout: .seconds(10)) else {
-                // Still down: the adopted session re-establishes on the next
-                // `.open` edge. Silent by design — never an alert.
                 return nil
             }
-        }
-        do {
-            _ = try await coordinator.resume(storedId)
-            // SUPERSESSION GUARD: the active session may have changed across the
-            // readiness wait / resume RPC — do not bind a stale resume over a
-            // session the user has since navigated away from (mirrors the
-            // gateway path's `isCurrentRuntimeBinding`).
-            guard openToken == token,
-                  activeStoredId == storedId,
-                  self.connectionWorkGeneration == connectionWorkGeneration else { return nil }
-            // The relay keys its runtime on the STORED session id, so a
-            // successful resume binds `storedId` itself.
-            activeRuntimeId = storedId
-            activeRuntimeEpoch = connection?.transportEpoch
-            ReliabilityDiagnostics.shared.sessionBound(
-                identifier: "\(activeStoredProfile ?? "default")\u{1F}\(storedId)",
-                epoch: activeRuntimeEpoch ?? 0
-            )
-            lastError = nil
-            sessionActionError = nil
-            ensureRuntimeAttempts = 0
-            // Flush anything the composer queued while the runtime was nil
-            // (mirrors the gateway path's `onActiveRuntimeBound`).
-            onActiveRuntimeBound?()
-            return storedId
-        } catch {
-            // Superseded: not an error, never surface.
-            guard openToken == token, activeStoredId == storedId else { return nil }
-            // Retryable transport failures self-heal on the next ready edge:
-            // adopt so the `.open` re-establishment re-opens the session, record
-            // for diagnostics, and NEVER stamp `sessionActionError` (no modal
-            // alert for self-healing conditions — north-star rule).
+        } else if coordinator.activeStoredSessionID != storedId {
+            // Socket up but driving another/no session: the adopt's
+            // setForeground+open IS the single rebind (fired synchronously by
+            // `adoptPendingSession` when open) — never a duplicate resume here.
             coordinator.adoptPendingSession(storedId)
-            lastError = errorMessage(from: error)
-            return nil
         }
+        // SUPERSESSION GUARD: the active session may have changed across the
+        // readiness wait — do not bind over a session the user has since
+        // navigated away from (mirrors the gateway path's fencing).
+        guard openToken == token,
+              activeStoredId == storedId,
+              self.connectionWorkGeneration == connectionWorkGeneration else { return nil }
+        activeRuntimeId = storedId
+        activeRuntimeEpoch = connection?.transportEpoch
+        ReliabilityDiagnostics.shared.sessionBound(
+            identifier: "\(activeStoredProfile ?? "default")\u{1F}\(storedId)",
+            epoch: activeRuntimeEpoch ?? 0
+        )
+        lastError = nil
+        sessionActionError = nil
+        ensureRuntimeAttempts = 0
+        // Flush anything the composer queued while the runtime was nil
+        // (mirrors the gateway path's `onActiveRuntimeBound`).
+        onActiveRuntimeBound?()
+        return storedId
     }
 
     /// Ensure the active session has a live runtime id, re-resuming on demand when
@@ -5770,11 +5850,23 @@ final class SessionStore {
         if !paintedFromCache, isCurrentTranscriptOpen(token: token) {
             // Cache miss (or no cache): empty the transcript so ChatView shows the
             // skeleton, not a stale prior session's rows, while the network loads.
-            chat.reset()
-            // QA-3 S7: the honest empty state belongs to THIS session (the
-            // skeleton, not a stale provenance) — a re-tap of it must not
-            // re-run the miss-reset over whatever phase 2 paints next.
-            transcriptPaintedStoredId = storedId
+            // R3 (ROUND-4 W2d): NOT on relay when the coordinator's store is
+            // already warm — there the stream has ALREADY spoken (contract I3:
+            // the cache paint is the sole writer only UNTIL the first
+            // snapshot/stream application). The open path's seed task and the
+            // relay bind task race; when the resume snapshot landed first, this
+            // reset wiped the stream's own projection — a blank transcript over
+            // a warm store. The skeleton-on-miss exists for the direct network
+            // seed, which no longer runs on relay.
+            let relayWarm = connection?.transportPath == .relay
+                && connection?.relayCoordinator?.store.items.isEmpty == false
+            if !relayWarm {
+                chat.reset()
+                // QA-3 S7: the honest empty state belongs to THIS session (the
+                // skeleton, not a stale provenance) — a re-tap of it must not
+                // re-run the miss-reset over whatever phase 2 paints next.
+                transcriptPaintedStoredId = storedId
+            }
         }
         paintFinished = true
         #if DEBUG
@@ -6154,41 +6246,21 @@ final class SessionStore {
             if let transcriptFetchWithProfile { return transcriptFetchWithProfile }
             if let transcriptFetch { return { sessionId, _ in try await transcriptFetch(sessionId) } }
         }
-        // QA-1 B2: on the relay transport the gateway REST URL may be
-        // unreachable from the phone (relay-only reach — off-LAN tailnet relay),
-        // so a cache-miss switch that seeds over `connection.rest` hangs to the
-        // 15s RestClient timeout — skeleton rows "forever". The relay `history`
-        // RPC returns the SAME gateway store rows over the transport that IS up
-        // (relay/hermes_relay/downstream.py: OPEN/HISTORY → rest_history →
-        // `GET /api/sessions/{id}/messages` verbatim). Seed over the relay
-        // instead: the switch paints the moment the relay answers, independent
-        // of gateway-REST reachability. The relay path carries no `shape` tier
-        // (the relay proxies full rows), which only forgoes the skeleton
-        // optimization — never correctness. Test seams above keep precedence.
-        if connection?.transportPath == .relay,
-           let coordinator = connection?.relayCoordinator {
-            let relayRest = connection?.rest
-            return { sessionId, profile in
-                if let profile, !profile.isEmpty {
-                    // The relay history route has no profile-scoped variant yet;
-                    // non-default profile rows keep today's gateway-REST read.
-                    guard let relayRest else { throw RelayError.notConnected }
-                    return try await relayRest.messages(
-                        sessionId: sessionId, profile: profile, shape: shape
-                    )
-                }
-                // Queue on the relay phase bridge (bounded) instead of failing a
-                // cold cache-miss open the instant the socket is mid-connect.
-                guard await coordinator.waitUntilOpen(timeout: .seconds(10)) else {
-                    throw RelayError.notConnected
-                }
-                let result = try await coordinator.history(
-                    sessionID: sessionId,
-                    limit: ChatStore.transcriptOpenWindowLimit
-                )
-                return Self.relayHistoryMessages(from: result)
-            }
-        }
+        // R3 (ROUND-4 W2d): the relay transport has NO phase-2 network seed.
+        // The resume/open snapshot the coordinator streams on bind IS the
+        // authoritative seed (contract I3/I14: paint + ≤1 snapshot; the stream
+        // is the authority — the gap-3 rewire: the render lane is seeded by the
+        // relay's open/snapshot frames, not by a parallel transcript fetch).
+        // The old relay branch here ran a `history` RPC on EVERY open on top of
+        // the resume snapshot — the D6 double-fetch (two gateway REST reads per
+        // cold open, three with the `.open`-edge re-establishment). Returning
+        // nil skips phase 2 entirely on relay; the caller's `guard let fetch
+        // else { return }` is the whole deletion. The profile-scoped REST
+        // fallback that shared this branch is dead on relay-only reach by
+        // construction (GW-UNREACH is the daily-driver topology). Direct mode
+        // keeps its REST seed below, unchanged, until Wave 4 folds the fork
+        // (amendment S1). Test seams above keep precedence.
+        if connection?.transportPath == .relay { return nil }
         guard let rest = connection?.rest else { return nil }
         // ABH-408: a non-default row opened from the All-profiles rail must use
         // RestClient+Profiles.messages(sessionId:profile:) so the backend reads
@@ -6224,6 +6296,13 @@ final class SessionStore {
     /// ``skeletonColdOpenForced``.
     private var skeletonColdOpenEligible: Bool {
         if let forced = skeletonColdOpenForced { return forced }
+        // R3 (ROUND-4 W2d): TRANSPORT-AWARE. The relay carries no skeleton
+        // tier — and on relay the phase-2 network seed does not run at all
+        // (the resume/open snapshot is the sole seed; `resolvedTranscriptFetch`
+        // returns nil there). Eligibility staying true on relay marked the
+        // (nonexistent) seed "skeleton" and fired the background hydrate fetch
+        // — the relay double-fetch. Direct mode keeps plugin-tier behavior.
+        if connection?.transportPath == .relay { return false }
         return connection?.rest?.pathStyle == .plugin
     }
 

@@ -159,7 +159,7 @@
           "client_message_id": "render-cmid-qa3-reorder-3"
         }
       },
-      "t_ms": 24
+      "t_ms": 23
     },
     {
       "seq": 3,
@@ -167,7 +167,7 @@
       "turn": "render-sess-qa3-reorder:t3",
       "kind": "turn.started",
       "body": {},
-      "t_ms": 25
+      "t_ms": 24
     },
     {
       "seq": 4,
@@ -184,7 +184,7 @@
           "text": ""
         }
       },
-      "t_ms": 25
+      "t_ms": 24
     },
     {
       "seq": 5,
@@ -197,7 +197,7 @@
           "text": "Third "
         }
       },
-      "t_ms": 25
+      "t_ms": 24
     },
     {
       "seq": 6,
@@ -210,7 +210,7 @@
           "text": "answer, "
         }
       },
-      "t_ms": 37
+      "t_ms": 35
     },
     {
       "seq": 7,
@@ -223,7 +223,7 @@
           "text": "third "
         }
       },
-      "t_ms": 63
+      "t_ms": 45
     },
     {
       "seq": 8,
@@ -236,7 +236,7 @@
           "text": "turn."
         }
       },
-      "t_ms": 68
+      "t_ms": 57
     },
     {
       "seq": 9,
@@ -253,7 +253,7 @@
           "text": "Third answer, third turn."
         }
       },
-      "t_ms": 80
+      "t_ms": 68
     },
     {
       "seq": 10,
@@ -273,7 +273,7 @@
           "total": 5
         }
       },
-      "t_ms": 80
+      "t_ms": 68
     },
     {
       "seq": 11,
@@ -281,16 +281,17 @@
       "turn": "render-sess-qa3-reorder:t3",
       "kind": "turn.completed",
       "body": {
+        "reason": "completed",
         "usage": {
           "model": "mock-model",
           "input": 1,
           "output": 4,
           "total": 5
         },
-        "duration_s": 0.055,
-        "started_at": 1784625078.1455529
+        "duration_s": 0.044,
+        "started_at": 1784670732.91267
       },
-      "t_ms": 82
+      "t_ms": 69
     }
   ],
   "settled": {

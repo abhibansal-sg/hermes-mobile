@@ -124,6 +124,18 @@ final class QA1ResumeLaneTests: XCTestCase {
     /// Default relay behavior: answer every session RPC with a well-formed
     /// empty result (resume/open/history/list); notifications need no reply.
     /// `historyRows` seeds the `history` answer for the B2 case.
+    /// Bounded poll (mirrors the other contract suites) — the snapshot the
+    /// resume RPC carries lands on the pump task, a tick after the bind.
+    private func waitUntil(
+        _ condition: @escaping () -> Bool, timeout: TimeInterval = 3.0
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() && Date() < deadline {
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
     private func defaultScript(historyRows: [JSONValue] = []) -> @Sendable (MockRelay.Upstream, MockRelay) -> Void {
         { up, relay in
             guard let id = up.id else { return }
@@ -257,13 +269,16 @@ final class QA1ResumeLaneTests: XCTestCase {
         sessions.open(summary("stored-A"), bindRuntime: false)
 
         let runtimeId = await sessions.resumeActiveAfterReconnect()
+        // The re-establishment (setForeground+open) is a best-effort Task —
+        // wait for its RPC to land on the socket before pinning the wire.
+        await waitUntil { transport.upstreams().contains { $0.method == "resume" || $0.method == "open" } }
 
         XCTAssertEqual(runtimeId, "stored-A", "relay resume must bind the stored id")
         XCTAssertEqual(sessions.activeRuntimeId, "stored-A")
         XCTAssertNil(sessions.sessionActionError, "relay resume must never raise a modal alert")
         XCTAssertTrue(
-            transport.upstreams().contains { $0.method == "resume" },
-            "the resume must travel the relay socket, not the idle gateway client"
+            transport.upstreams().contains { $0.method == "resume" || $0.method == "open" },
+            "the rebind must travel the relay socket, not the idle gateway client (R3/W2d: the coordinator's adopt+open re-establishment IS the single per-reconnect reconcile — no separate resume RPC)"
         )
     }
     #endif
@@ -340,12 +355,22 @@ final class QA1ResumeLaneTests: XCTestCase {
 
         let runtimeId = await sessions.resumeActiveAfterReconnect()
 
-        XCTAssertNil(runtimeId, "a rejected resume binds nothing")
+        // R3/W2d: `resumeActiveAfterReconnect` no longer issues a `resume` RPC
+        // to reject — the coordinator's adopt+open re-establishment is the
+        // single reconcile, and the relay bind is LOCAL (the relay keys the
+        // runtime on the stored id; the rebind RPC is best-effort, failures
+        // self-heal on the reconnect driver). The QA-1 north star stands:
+        // NEVER a modal alert over the self-healing transport condition.
+        XCTAssertEqual(runtimeId, "stored-E", "the relay bind is local — the stored id IS the runtime id")
+        await waitUntil { transport.upstreams().contains { $0.method == "open" } }
         XCTAssertNil(
             sessions.sessionActionError,
             "relay resume failures self-heal on the next ready edge — never an alert"
         )
-        XCTAssertNotNil(sessions.lastError, "the failure is still recorded for diagnostics")
+        XCTAssertTrue(
+            transport.upstreams().contains { $0.method == "open" },
+            "the rebind traveled the relay socket, not the idle gateway client"
+        )
     }
     #endif
 
@@ -480,22 +505,44 @@ final class QA1ResumeLaneTests: XCTestCase {
     /// IMG_2511/2512). On qa1/base the fetch went to `connection.rest` and the
     /// transcript stayed empty/errored.
     #if DEBUG
-    func testRelayCacheMissOpenSeedsOverRelayHistory() async throws {
-        let rows = [storedRow("user", "hello relay", id: 1),
-                    storedRow("assistant", "RELAY-SEEDED", id: 2)]
-        let (_, sessions, chat, coordinator, transport) = makeRelayGraph(historyRows: rows)
+    func testRelayCacheMissOpenSeedsOverRelaySnapshot() async throws {
+        // R3 (ROUND-4 W2d, contract A1/I14): on relay the resume/open SNAPSHOT
+        // IS the cache-miss seed — the QA-1-era phase-2 `history` network seed
+        // is deleted (that double-fetch is exactly what ContractReconcileW2d's
+        // I14 budget pins). The seed still travels the relay socket, never
+        // gateway REST — now as the snapshot the resume RPC carries.
+        let (_, sessions, chat, coordinator, transport) = makeRelayGraph()
+        let fallback = defaultScript()
+        transport.script = { up, relay in
+            guard let id = up.id else { return }
+            if up.method == "resume" || up.method == "open" {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+                let sid = (up.params["session_id"] as? String) ?? "stored-miss"
+                let item: [String: Any] = ["item_id": "\(sid):a1", "type": "agentMessage",
+                                           "status": "completed", "ord": 1, "summary": "",
+                                           "body": ["text": "RELAY-SEEDED"]]
+                let body: [String: Any] = ["items": [item]]
+                let frame: [String: Any] = ["seq": 1, "sid": sid, "kind": "snapshot", "body": body]
+                if let data = try? JSONSerialization.data(withJSONObject: frame) {
+                    relay.deliver(String(decoding: data, as: UTF8.self))
+                }
+            } else {
+                fallback(up, relay)
+            }
+        }
         try await coordinator.start(url: relayURL)
 
         sessions.open(summary("stored-miss"))  // no cache attached → cache-miss path
         await sessions.waitForPendingOpenForTesting()
+        await waitUntil { chat.messages.map(\.text).contains("RELAY-SEEDED") }
 
         XCTAssertTrue(
             chat.messages.map(\.text).contains("RELAY-SEEDED"),
-            "the cache-miss network seed must come from the relay history RPC"
+            "the cache-miss seed must come from the relay resume/open snapshot"
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             transport.upstreams().contains { $0.method == "history" },
-            "the seed fetch must travel the relay socket, not gateway REST"
+            "R3 deletes the phase-2 history fetch — the snapshot supersedes it (I14: paint + ≤1 snapshot)"
         )
     }
     #endif

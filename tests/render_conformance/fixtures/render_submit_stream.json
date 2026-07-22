@@ -56,7 +56,7 @@
         "item_id": "render-sess-stream:u-eedb3e9107255ca5",
         "type": "userMessage",
         "status": "completed",
-        "ord": 0,
+        "ord": 2,
         "summary": "",
         "body": {
           "text": "What is the capital of France?",
@@ -80,7 +80,7 @@
         "item_id": "render-sess-stream:i1",
         "type": "agentMessage",
         "status": "in_progress",
-        "ord": 1,
+        "ord": 3,
         "summary": "",
         "body": {
           "text": ""
@@ -168,7 +168,7 @@
         "item_id": "render-sess-stream:i1",
         "type": "agentMessage",
         "status": "completed",
-        "ord": 1,
+        "ord": 3,
         "summary": "Paris is the capital of France.",
         "body": {
           "text": "Paris is the capital of France."
@@ -184,7 +184,7 @@
         "item_id": "render-sess-stream:i2",
         "type": "usage",
         "status": "completed",
-        "ord": 2,
+        "ord": 4,
         "summary": "7 tokens",
         "body": {
           "model": "mock-model",
@@ -200,14 +200,15 @@
       "turn": "render-sess-stream:t1",
       "kind": "turn.completed",
       "body": {
+        "reason": "completed",
         "usage": {
           "model": "mock-model",
           "input": 1,
           "output": 6,
           "total": 7
         },
-        "duration_s": 0.069,
-        "started_at": 1784625074.870979
+        "duration_s": 0.064,
+        "started_at": 1784670730.122456
       }
     }
   ],

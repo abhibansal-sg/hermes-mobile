@@ -40,7 +40,7 @@
         "item_id": "render-sess-qa3-delay:u-d46571d065bb5b61",
         "type": "userMessage",
         "status": "completed",
-        "ord": 0,
+        "ord": 1,
         "summary": "",
         "body": {
           "text": "Review how the proxy transforms messages.",
@@ -66,13 +66,13 @@
         "item_id": "render-sess-qa3-delay:i1",
         "type": "agentMessage",
         "status": "in_progress",
-        "ord": 1,
+        "ord": 2,
         "summary": "",
         "body": {
           "text": ""
         }
       },
-      "t_ms": 1503
+      "t_ms": 1502
     },
     {
       "seq": 4,
@@ -85,7 +85,7 @@
           "text": "The "
         }
       },
-      "t_ms": 1503
+      "t_ms": 1502
     },
     {
       "seq": 5,
@@ -111,7 +111,7 @@
           "text": "transform "
         }
       },
-      "t_ms": 1525
+      "t_ms": 1524
     },
     {
       "seq": 7,
@@ -137,7 +137,7 @@
           "text": "optimal "
         }
       },
-      "t_ms": 1549
+      "t_ms": 1548
     },
     {
       "seq": 9,
@@ -163,7 +163,7 @@
           "text": "its "
         }
       },
-      "t_ms": 1570
+      "t_ms": 1569
     },
     {
       "seq": 11,
@@ -176,7 +176,7 @@
           "text": "inputs."
         }
       },
-      "t_ms": 1581
+      "t_ms": 1580
     },
     {
       "seq": 12,
@@ -187,13 +187,13 @@
         "item_id": "render-sess-qa3-delay:i1",
         "type": "agentMessage",
         "status": "completed",
-        "ord": 1,
+        "ord": 2,
         "summary": "The proxy transform is optimal given its inputs.",
         "body": {
           "text": "The proxy transform is optimal given its inputs."
         }
       },
-      "t_ms": 1595
+      "t_ms": 1591
     },
     {
       "seq": 13,
@@ -204,7 +204,7 @@
         "item_id": "render-sess-qa3-delay:i2",
         "type": "usage",
         "status": "completed",
-        "ord": 2,
+        "ord": 3,
         "summary": "9 tokens",
         "body": {
           "model": "mock-model",
@@ -213,7 +213,7 @@
           "total": 9
         }
       },
-      "t_ms": 1595
+      "t_ms": 1591
     },
     {
       "seq": 14,
@@ -221,16 +221,17 @@
       "turn": "render-sess-qa3-delay:t1",
       "kind": "turn.completed",
       "body": {
+        "reason": "completed",
         "usage": {
           "model": "mock-model",
           "input": 1,
           "output": 8,
           "total": 9
         },
-        "duration_s": 0.092,
-        "started_at": 1784625077.6602082
+        "duration_s": 0.09,
+        "started_at": 1784670732.439877
       },
-      "t_ms": 1602
+      "t_ms": 1599
     }
   ],
   "settled": {

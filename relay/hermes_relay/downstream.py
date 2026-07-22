@@ -370,10 +370,114 @@ class DownstreamServer:
                     query.get("cursor", [None])[0], sessions,
                 )) + "\n"
                 return connection.respond(HTTPStatus.OK, body)
+            if path in ("/approve", "/clarify"):
+                # R4 L4 (GAP-10, B6/B7): one-shot gate answer over the HTTP
+                # control sibling — the cold notification banner action path.
+                return await self._answer_gate_http(connection, request, raw_path, path)
             return None
         except Exception:  # pragma: no cover - a broken probe must not stall serve
             _log.debug("health probe failed", exc_info=True)
             return None
+
+    async def _answer_gate_http(
+        self, connection: Any, request: Any, raw_path: str, path: str
+    ) -> Any:
+        """One-shot ``/approve`` / ``/clarify`` answer on the phone-facing port.
+
+        R4 L4 — the cold-tap gap (GAP-10, B6/B7): a notification banner
+        APPROVE/DENY/REPLY action fires while the phone holds NO relay socket,
+        and on the daily-driver's GW-UNREACH topology the gateway REST answer
+        is unreachable too — the agent stays blocked until the user opens the
+        app. The relay already owns these sessions and holds a live gateway
+        RPC path: answer through it (the same ``approval_respond`` /
+        ``clarify_respond`` translation as the WS methods, durable-resolution
+        included, §5).
+
+        Wire shape: params ride the QUERY STRING
+        (``/approve?session_id=…&request_id=…&decision=…``,
+        ``/clarify?session_id=…&request_id=…&text=…`` — URL-encoded). This
+        port's websockets handshake parser rejects non-GET methods BEFORE
+        ``process_request`` runs (a POST never reaches here on the deployed
+        websockets>=14), so the query string — this port's existing
+        ``/attention/pending`` + ``/sync/manifest`` house style — is the
+        transport that actually survives to this handler. A JSON body is
+        ALSO honored when the request object exposes one (harness fakes;
+        forward-compat if a websockets version grows body support): query
+        keys win on conflict. Same bearer auth as every route on this port.
+        Responses are JSON: ``{"ok": true, "result": …}`` on success;
+        ``{"ok": false, "error": …}`` with 400 (missing/invalid params), 502
+        (gateway answer failed — sanitized, §6b: no raw codes) or 503 (relay
+        gateway not ready). A probe here must never stall the accept loop.
+        """
+        from http import HTTPStatus
+        from urllib.parse import parse_qs, urlsplit
+
+        params: dict[str, Any] = {
+            key: values[0] for key, values in parse_qs(urlsplit(raw_path).query).items()
+        }
+        body = getattr(request, "body", None)
+        if isinstance(body, (bytes, bytearray)):
+            body = bytes(body).decode("utf-8", errors="replace")
+        if isinstance(body, str) and body.strip():
+            try:
+                parsed = json.loads(body)
+            except ValueError:
+                return connection.respond(
+                    HTTPStatus.BAD_REQUEST,
+                    json.dumps({"ok": False, "error": "invalid JSON body"}) + "\n",
+                )
+            if isinstance(parsed, dict):
+                params.update(parsed)
+
+        if not await self._gateway.wait_ready(timeout=5.0):
+            return connection.respond(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                json.dumps({"ok": False, "error": "relay gateway not ready"}) + "\n",
+            )
+        try:
+            if path == "/approve":
+                sid = str(params["session_id"])
+                request_id = str(params.get("request_id") or "")
+                decision = str(params["decision"])
+                raw_all = params.get("all", False)
+                resolve_all = (
+                    raw_all
+                    if isinstance(raw_all, bool)
+                    else str(raw_all).lower() in ("1", "true", "yes")
+                )
+                result = await self._gateway.approval_respond(
+                    sid, request_id, decision, resolve_all=resolve_all
+                )
+                if self._durable is not None:
+                    self._durable.resolve_attention(
+                        request_id=None if resolve_all else request_id or None,
+                        session_id=sid, kind="approval",
+                    )
+            else:  # /clarify
+                sid = str(params["session_id"])
+                request_id = str(params.get("request_id") or "")
+                text = str(params.get("text") or "")
+                result = await self._gateway.clarify_respond(sid, request_id, text)
+                if self._durable is not None:
+                    self._durable.resolve_attention(
+                        request_id=request_id or None,
+                        session_id=sid, kind="clarify",
+                    )
+        except KeyError as exc:
+            return connection.respond(
+                HTTPStatus.BAD_REQUEST,
+                json.dumps({"ok": False, "error": f"missing required param {exc}"}) + "\n",
+            )
+        except Exception:
+            _log.warning("HTTP gate answer (%s) failed", path, exc_info=True)
+            return connection.respond(
+                HTTPStatus.BAD_GATEWAY,
+                json.dumps({"ok": False, "error": "gateway answer failed"}) + "\n",
+            )
+        return connection.respond(
+            HTTPStatus.OK,
+            json.dumps({"ok": True, "result": result}, ensure_ascii=False) + "\n",
+        )
 
     def status(self) -> dict[str, Any]:
         """A JSON-serialisable snapshot of the phone-facing server's live state."""
@@ -597,13 +701,66 @@ class DownstreamServer:
         state.apply(frame)
         self._bus.publish(TOPIC_RELAY_FRAMES, frame)
 
+    def _seed_history_user_rows(self, sid: str, messages: list) -> None:
+        """R4 L6 — fold ``rest_history`` USER rows into the store as completed
+        ``userMessage`` items when seeding an EMPTY store (OPEN/HISTORY on a
+        session the stream has not touched since relay startup).
+
+        The reframer maps agent events only, so a foreign turn's prompt has no
+        item in the accumulated state — a resync FALLBACK snapshot would drop
+        it (the phone's cold-open paint has it from its own read; the snapshot
+        fallback did not). Seeding closes that hole: the snapshot now carries
+        foreign prompts in the same item shape as the SUBMIT-synthesized rows.
+
+        Seed, never co-author (contract I3): a NON-empty store is never
+        reseeded — once the stream has spoken, it alone writes. Item ids are
+        deterministic per ``(sid, nth-user-row, text)`` so a repeated seed of
+        the same batch converges on the same ids (contract I21); the
+        empty-store gate means a store is seeded at most once per relay
+        lifetime anyway. A history with NO user rows creates no store entry
+        at all (RR4: the store must not grow for sessions with nothing to
+        seed — a snapshot set is keyed by store membership).
+        """
+        rows: list[str] = []
+        for row in messages:
+            if not isinstance(row, dict) or row.get("role") != "user":
+                continue
+            content = row.get("content")
+            if not isinstance(content, str) or not content:
+                content = row.get("text")  # some REST shapes key the text field
+            if isinstance(content, str) and content:
+                rows.append(content)
+        if not rows:
+            return
+        state = self._store.get(sid)
+        if state.items:
+            return  # the stream already owns this session — cache is seed only
+        for nth, content in enumerate(rows):
+            item_id = (
+                f"{sid}:h-"
+                f"{uuid.uuid5(uuid.NAMESPACE_URL, f'hermes-relay:hist:{sid}:{nth}:{content}').hex[:16]}"
+            )
+            stripped = content.strip()
+            item = Item(
+                item_id=item_id,
+                type=ItemType.USER_MESSAGE,
+                status=ItemStatus.COMPLETED,
+                ord=state.allocate_ord(),
+                summary=stripped.splitlines()[0][:120] if stripped else "",
+                body={"text": content},
+            )
+            state.apply(Frame.with_item(sid=sid, kind=FrameKind.ITEM_COMPLETED, item=item))
+
     # -- upstream (phone -> relay -> gateway), protocol §5 ---------------
     async def handle_upstream(self, conn: PhoneConnection, req: UpstreamRequest) -> Any:
         """Translate one phone JSON-RPC request and return its JSON-RPC result.
 
-        * ``list``      -> gateway.session_list
+        * ``list``      -> gateway.session_list (L1: +order/cwd_prefix/
+          exclude_source/min_messages pass-through)
         * ``open``/``history`` -> gateway.rest_history (store-read; R0 correction)
         * ``submit``    -> session_create/resume (+own) -> prompt_submit
+          (L2: +truncate_before_user_ordinal, +cwd on create)
+        * ``branch``    -> session_create (+cwd) -> prompt_submit seed (L2, B13)
         * ``resume``    -> session_resume (own idle/foreign)
         * ``approve``   -> approval_respond
         * ``clarify``   -> clarify_respond
@@ -696,7 +853,33 @@ class DownstreamServer:
 
         # -- reads -----------------------------------------------------------
         if method == UpstreamMethod.LIST:
-            return {"sessions": await self._gateway.session_list(int(p.get("limit", 200)))}
+            # R4 L1 (GAP-1, the central blocker): the phone's drawer / project
+            # session list rides THIS RPC, so the gateway REST list's filters
+            # must pass through — recency order (the drawer default), a cwd
+            # prefix (project-scoped list, B10), a source exclusion and a
+            # minimum-message bound. Each is OPTIONAL: absent params are never
+            # sent, so a pre-L1 phone (limit only) drives the byte-identical
+            # pre-L1 gateway call.
+            # Explicit per-key reads (the conformance AST extractor keys off
+            # literal ``p.get("…")`` sites — the contract mirrors live code).
+            filters: dict[str, Any] = {}
+            order = p.get("order")
+            if isinstance(order, str) and order:
+                filters["order"] = order
+            cwd_prefix = p.get("cwd_prefix")
+            if isinstance(cwd_prefix, str) and cwd_prefix:
+                filters["cwd_prefix"] = cwd_prefix
+            exclude_source = p.get("exclude_source")
+            if isinstance(exclude_source, str) and exclude_source:
+                filters["exclude_source"] = exclude_source
+            min_messages = p.get("min_messages")
+            if isinstance(min_messages, int) and not isinstance(min_messages, bool):
+                filters["min_messages"] = min_messages
+            return {
+                "sessions": await self._gateway.session_list(
+                    int(p.get("limit", 200)), **filters
+                )
+            }
 
         if method in (UpstreamMethod.OPEN, UpstreamMethod.HISTORY):
             sid = p["session_id"]
@@ -714,6 +897,10 @@ class DownstreamServer:
                 limit = p.get("limit")
                 if isinstance(limit, int) and limit >= 0:
                     messages = messages[-limit:] if limit else []
+            # R4 L6: fold the history's USER rows into the store (seed, not
+            # co-author — empty store only) so a resync snapshot carries
+            # foreign prompts.
+            self._seed_history_user_rows(sid, messages)
             return {"session_id": sid, "messages": messages}
 
         # -- drive (become owner) --------------------------------------------
@@ -722,6 +909,13 @@ class DownstreamServer:
             text = p.get("prompt") or p.get("text") or ""
             sid = p.get("session_id")
             cmid = p.get("client_message_id")
+            # R4 L2 (B13): regenerate/edit-and-resend rides SUBMIT with the
+            # gateway's own truncate point — forwarded only when the phone
+            # sends it, so an ordinary send is the byte-identical pre-L2 call.
+            submit_kwargs: dict[str, Any] = {}
+            truncate = p.get("truncate_before_user_ordinal")
+            if isinstance(truncate, int) and not isinstance(truncate, bool):
+                submit_kwargs["truncate_before_user_ordinal"] = truncate
             # Idempotent re-drive: a prior submit with this client_message_id
             # already ran ``prompt_submit`` but its RPC result was lost to a
             # socket flap, so the outbox is resubmitting the SAME job. Replay the
@@ -753,15 +947,27 @@ class DownstreamServer:
                     # id to a live id — resolve so a repeat submit to the origin
                     # id still drives the live turn.
                     sid = self._gateway.live_id_for(sid)
-                await self._gateway.prompt_submit(sid, text)
+                # R4 L6: mark the prompt phone-origin BEFORE the await so the
+                # reframer's message.start emission skips it under either
+                # ordering (the SUBMIT synthesis below is this turn's user row).
+                if text:
+                    self._store.mark_local_prompt(sid, text)
+                await self._gateway.prompt_submit(sid, text, **submit_kwargs)
             else:
-                # Brand-new chat: create + own, then drive (§5).
+                # Brand-new chat: create + own, then drive (§5). R4 L2 (B10):
+                # ``cwd`` threads a project working directory into the created
+                # session (the surviving projects fix — L5-lean dropped the
+                # relay projects path; projects stay on the control REST).
+                cwd = p.get("cwd")
                 sid = await self._gateway.session_create(
                     title=p.get("title", "New chat"),
                     model=p.get("model"),
                     provider=p.get("provider"),
+                    cwd=cwd if isinstance(cwd, str) and cwd else None,
                 )
-                await self._gateway.prompt_submit(sid, text)
+                if text:
+                    self._store.mark_local_prompt(sid, text)  # R4 L6 (see above)
+                await self._gateway.prompt_submit(sid, text, **submit_kwargs)
             # Emit the prompt itself as a completed ``userMessage`` item (QA-1
             # B5/B13): the Reframer maps only AGENT events, so without this the
             # phone has no wire item to reconcile its optimistic echo against
@@ -775,6 +981,37 @@ class DownstreamServer:
                 self._remember_submit(cmid, sid)
             conn.set_foreground(sid)  # driving a chat brings it on screen (§6)
             return {"session_id": sid}
+
+        if method == UpstreamMethod.BRANCH:
+            # R4 L2 (B13): conversation BRANCH = a SEEDED create. Before L2 this
+            # was DEAD in relay mode (handle_upstream raised unknown-method) — a
+            # silent functional regression vs the gateway-direct seam, which the
+            # contract deletes in X4/X7. Create the new session (optionally in
+            # the origin's project via ``cwd``), drive the seed prompt into it
+            # with the same userMessage synthesis as SUBMIT, and return the new
+            # id. Optional params ride through exactly like SUBMIT's (truncate
+            # for branch-from-a-point, title/model/provider/cwd on create).
+            origin = p.get("session_id")
+            text = p.get("prompt") or p.get("text") or ""
+            cwd = p.get("cwd")
+            submit_kwargs: dict[str, Any] = {}
+            truncate = p.get("truncate_before_user_ordinal")
+            if isinstance(truncate, int) and not isinstance(truncate, bool):
+                submit_kwargs["truncate_before_user_ordinal"] = truncate
+            sid = await self._gateway.session_create(
+                title=p.get("title") or f"Branch — {origin or 'new chat'}",
+                model=p.get("model"),
+                provider=p.get("provider"),
+                cwd=cwd if isinstance(cwd, str) and cwd else None,
+            )
+            if text:
+                self._store.mark_local_prompt(sid, text)  # R4 L6 (see SUBMIT)
+            await self._gateway.prompt_submit(sid, text, **submit_kwargs)
+            self._emit_user_message_item(
+                conn, sid, p.get("client_message_id"), text
+            )
+            conn.set_foreground(sid)  # the branched chat comes on screen (§6)
+            return {"session_id": sid, "origin": origin}
 
         if method == UpstreamMethod.RESUME:
             origin = p["session_id"]

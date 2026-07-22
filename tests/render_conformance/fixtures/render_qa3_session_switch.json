@@ -80,7 +80,7 @@
           "text": "two "
         }
       },
-      "t_ms": 252
+      "t_ms": 254
     },
     {
       "seq": 6,
@@ -106,7 +106,7 @@
           "text": "four "
         }
       },
-      "t_ms": 769
+      "t_ms": 756
     },
     {
       "seq": 8,
@@ -119,7 +119,7 @@
           "text": "five "
         }
       },
-      "t_ms": 1013
+      "t_ms": 1007
     },
     {
       "seq": 9,
@@ -132,7 +132,7 @@
           "text": "six "
         }
       },
-      "t_ms": 1266
+      "t_ms": 1258
     },
     {
       "seq": 10,
@@ -145,7 +145,7 @@
           "text": "seven "
         }
       },
-      "t_ms": 1517
+      "t_ms": 1510
     },
     {
       "seq": 11,
@@ -158,7 +158,7 @@
           "text": "eight."
         }
       },
-      "t_ms": 1768
+      "t_ms": 1763
     },
     {
       "seq": 12,
@@ -175,7 +175,7 @@
           "text": "One two three four five six seven eight."
         }
       },
-      "t_ms": 2021
+      "t_ms": 2015
     },
     {
       "seq": 13,
@@ -195,7 +195,7 @@
           "total": 9
         }
       },
-      "t_ms": 2021
+      "t_ms": 2015
     },
     {
       "seq": 14,
@@ -203,16 +203,17 @@
       "turn": "render-sess-qa3-switch-a:t1",
       "kind": "turn.completed",
       "body": {
+        "reason": "completed",
         "usage": {
           "model": "mock-model",
           "input": 1,
           "output": 8,
           "total": 9
         },
-        "duration_s": 2.021,
-        "started_at": 1784625078.5188942
+        "duration_s": 2.014,
+        "started_at": 1784670733.1598961
       },
-      "t_ms": 2024
+      "t_ms": 2020
     }
   ],
   "settled": {
@@ -228,12 +229,12 @@
     {
       "action": "switch_to",
       "session_id": "render-sess-qa3-switch-b",
-      "at_t_ms": 530
+      "at_t_ms": 523
     },
     {
       "action": "switch_to",
       "session_id": "render-sess-qa3-switch-a",
-      "at_t_ms": 936
+      "at_t_ms": 928
     }
   ],
   "extra_sessions": {

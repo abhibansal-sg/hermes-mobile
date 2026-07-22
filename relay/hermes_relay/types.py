@@ -127,6 +127,7 @@ class UpstreamMethod:
     INTERRUPT = "interrupt"    # -> session.interrupt (pass-through)
     STEER = "steer"            # -> session.steer (pass-through; QA-2 R11: live-turn steering over relay)
     ATTACH = "attach"         # -> file.attach / image.attach_bytes (bytes inlined as a data: URL; REST-free attach, B9/A5)
+    BRANCH = "branch"         # -> session.create (+seed prompt.submit) — conversation branching, R4 L2 (B13)
     ACK = "ack"               # local: ring.drop acked frames {through}
     RESYNC = "resync"         # local: ring.decide {last_seq} -> replay or snapshot
     FOREGROUND = "foreground"  # local: phone declares the session it now holds foregrounded (§6 gate); null clears
@@ -134,8 +135,8 @@ class UpstreamMethod:
     PUSH_UNREGISTER = "push.unregister"  # local: remove the APNs device token from the relay's push registry (§6)
 
     ALL = frozenset(
-        {SUBMIT, RESUME, OPEN, LIST, HISTORY, APPROVE, CLARIFY, INTERRUPT, STEER, ATTACH, ACK, RESYNC, FOREGROUND,
-         PUSH_REGISTER, PUSH_UNREGISTER}
+        {SUBMIT, RESUME, OPEN, LIST, HISTORY, APPROVE, CLARIFY, INTERRUPT, STEER, ATTACH, BRANCH, ACK, RESYNC,
+         FOREGROUND, PUSH_REGISTER, PUSH_UNREGISTER}
     )
 
 

@@ -22,10 +22,18 @@ keep the Reframer and DownstreamServer lanes from colliding on item bookkeeping.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .types import Frame, FrameKind, Item, ItemStatus
+
+# R4 L6 — how long a phone-origin prompt marker stays armed (see
+# ``SessionStore.mark_local_prompt``). A turn that never STARTS (the submit
+# errored at the gateway) leaves its marker unconsumed; the TTL bounds how
+# long it could mask a foreign turn carrying the identical text. message.start
+# arrives seconds after a successful submit, so 120 s is wide and safe.
+_LOCAL_PROMPT_TTL_S = 120.0
 
 
 @dataclass
@@ -127,6 +135,18 @@ class SessionStore:
 
     def __init__(self) -> None:
         self._states: dict[str, SessionState] = {}
+        # R4 L6 — phone-origin prompt markers: sid -> [(text, expiry_mono)].
+        # Transient mapping state (never snapshotted, never folded): it
+        # coordinates the two ``userMessage`` emitters so a turn gets exactly
+        # ONE user row regardless of origin. The DownstreamServer already
+        # synthesizes the user row for a turn THIS phone drove (cmid-keyed —
+        # the optimistic-echo adopter, contract I8); the Reframer emits one
+        # from ``message.start{prompt}`` for FOREIGN turns (amendment G2).
+        # Downstream marks the prompt it is about to drive (BEFORE the
+        # prompt.submit await); the Reframer consumes the marker on
+        # message.start and skips its emission — correct under BOTH orderings
+        # (the marker lands before either the RPC result or the event can).
+        self._local_prompts: dict[str, list[tuple[str, float]]] = {}
 
     def get(self, sid: str) -> SessionState:
         st = self._states.get(sid)
@@ -152,7 +172,44 @@ class SessionStore:
         return list(self._states.keys())
 
     def drop(self, sid: str) -> bool:
+        self._local_prompts.pop(sid, None)
         return self._states.pop(sid, None) is not None
 
     def __contains__(self, sid: str) -> bool:
         return sid in self._states
+
+    # -- R4 L6: phone-origin prompt markers -------------------------------
+    def mark_local_prompt(self, sid: str, text: str) -> None:
+        """Arm the L6 marker: ``text`` is a prompt THIS phone is driving.
+
+        Called by the DownstreamServer BEFORE its ``prompt_submit`` await, so
+        the marker is in place whichever lands first — the RPC result (and the
+        SUBMIT-synthesized user row) or the gateway's ``message.start`` event.
+        TTL-bounded + lazily swept so a submit that never starts a turn (the
+        gateway errored the RPC) cannot mask a later foreign turn carrying the
+        same text forever. One live turn per session bounds the list size;
+        the sweep keeps it honest.
+        """
+        now = time.monotonic()
+        entries = self._local_prompts.setdefault(sid, [])
+        entries[:] = [(t, exp) for (t, exp) in entries if exp > now]
+        entries.append((text, now + _LOCAL_PROMPT_TTL_S))
+
+    def take_local_prompt(self, sid: str, text: str) -> bool:
+        """True (consuming the marker) iff ``text`` was marked phone-origin.
+
+        Called by the Reframer on ``message.start{prompt}``: a hit means the
+        turn belongs to this phone and the DownstreamServer's cmid-keyed
+        synthesis is the user row — skip the foreign emission. A miss means a
+        genuinely foreign turn — emit. Expired entries are swept on the way.
+        """
+        entries = self._local_prompts.get(sid)
+        if not entries:
+            return False
+        now = time.monotonic()
+        for i, (marked_text, expiry) in enumerate(entries):
+            if expiry > now and marked_text == text:
+                entries.pop(i)
+                return True
+        entries[:] = [(t, exp) for (t, exp) in entries if exp > now]
+        return False
