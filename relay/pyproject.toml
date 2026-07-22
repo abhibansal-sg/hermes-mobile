@@ -4,34 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-relay"
-version = "0.1.0"
-description = "Mobile relay-client for the stock Hermes gateway (Wave 2): reframes the gateway event stream into the ratified item-lifecycle envelope and serves it to the iOS app over a reliable seq/ack/replay WS, with owned-session APNs."
+version = "0.2.0"
+description = "Authenticated byte-transparent WS/HTTP proxy for Hermes Mobile."
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "Proprietary" }
 authors = [{ name = "Hermes Mobile" }]
 
-# Runtime deps mirror the R0 spike (relay_client.py): a WS client + an async
-# HTTP client for the REST store-read path. The reused plumbing
-# (replay_ring / push_engine / device_tokens) is imported from
-# plugins/hermes-mobile via hermes_relay.plugin_bridge (NOT a PyPI dep) so the
-# relay stays a zero-core-patch client of the same tree.
 dependencies = [
     "aiohttp>=3.11",
     "websockets>=12",
     "httpx>=0.27",
-    # The reused notifier plumbing (push_engine -> utils) reads YAML config, so a
-    # runnable relay needs pyyaml even though the relay itself parses no YAML.
-    "pyyaml>=6",
-    # The relay's Notifier REUSES plugins/hermes-mobile/push_engine for APNs
-    # (protocol §6). push_engine mints an ES256 provider JWT per send and is a
-    # hard no-op (PushDependencyError swallowed -> 0 pushes) without PyJWT +
-    # cryptography in THIS venv — the installed launchd service runs the relay
-    # non-editable from this package, so the push deps must be declared here,
-    # not assumed from the gateway's venv. http2 covers the APNs HTTP/2 sender.
-    "pyjwt[crypto]>=2.8",
-    "cryptography>=42",
-    "httpx[http2]>=0.27",
 ]
 
 [project.optional-dependencies]

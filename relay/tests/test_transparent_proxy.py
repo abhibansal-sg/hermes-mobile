@@ -3,18 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
-
 import httpx
 import pytest
 import websockets
 from aiohttp import web
 
-from hermes_relay.bus import EventBus
 from hermes_relay.downstream import DownstreamConfig, DownstreamServer
 from hermes_relay.gateway_client import GatewayConfig
 from hermes_relay import plugin_bridge
-from hermes_relay.session_state import SessionStore
 
 
 async def _bound_port(server) -> int:
@@ -57,14 +53,9 @@ async def transparent_pair():
     await upstream_site.start()
     upstream_port = upstream_site._server.sockets[0].getsockname()[1]
 
-    gateway = MagicMock()
-    gateway.owned_sessions = frozenset()
     relay = DownstreamServer(
         DownstreamConfig(port=0, auth_token="phone-secret"),
-        EventBus(),
-        gateway,
-        SessionStore(),
-        upstream=GatewayConfig(port=upstream_port, token="gateway-secret"),
+        GatewayConfig(port=upstream_port, token="gateway-secret"),
     )
     relay_task = asyncio.create_task(relay.serve())
     relay_port = await _bound_port(relay)

@@ -8,9 +8,8 @@
 #   relay    ws://$LISTEN                       (downstream, phone-facing)
 #   health   http://$LISTEN$HEALTH_PATH         (GET -> JSON status)
 #
-# The iOS app (relay flag ON) connects to the DOWNSTREAM listen address; the
-# relay dials the gateway UP, reframes raw events into the ratified item
-# envelope (docs/RELAY-PHONE-PROTOCOL.md), and serves seq/ack/replay frames.
+# The iOS app connects to the DOWNSTREAM address; the relay authenticates and
+# forwards stock WS/HTTP traffic without parsing or translating it.
 #
 # SAFETY: the live production gateway on port 9119 is refused by the entrypoint.
 # Point this at an isolated/stock gateway only (e.g. launch_isolated_gateway.sh,

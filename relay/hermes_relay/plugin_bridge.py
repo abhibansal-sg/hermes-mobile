@@ -1,17 +1,13 @@
-"""Bridge to the ``plugins/hermes-mobile`` plumbing the relay reuses.
+"""Bridge to the ``plugins/hermes-mobile`` device-token authority.
 
-The relay is a ZERO-CORE-PATCH client that REUSES (never forks) four existing
-plugin modules:
-
-* ``replay_ring``   — the seq/ack/replay ring (protocol §4), used verbatim.
-* ``push_engine``   — APNs alert push + registry (Notifier, protocol §6).
-* ``device_tokens`` — device registry / session-transport map.
-* ``relay_client``  — the existing APNs relay-mode delivery path.
+The transparent proxy reuses the plugin's ``device_tokens`` registry to
+authenticate scoped phone credentials. Push and conversation behavior remain
+inside the gateway/plugin; the relay owns neither.
 
 The plugin directory is named ``hermes-mobile`` (a hyphen), so it is NOT
 importable by dotted name; the stock gateway loads it by file path. The relay
-does the same: it locates the plugin dir and puts it on ``sys.path`` so the four
-modules import as top-level names. This function is the ONLY place that reaches
+does the same: it locates the plugin dir and puts it on ``sys.path``. This is
+the ONLY place that reaches
 across into the plugin tree, keeping the coupling auditable.
 
 Locating the plugin dir (in priority order):
@@ -86,22 +82,6 @@ def ensure_on_path() -> Path:
         if p not in sys.path:
             sys.path.insert(0, p)
     return plugin_dir
-
-
-def import_replay_ring():
-    """Import and return the reused ``replay_ring`` module."""
-    ensure_on_path()
-    import replay_ring  # type: ignore
-
-    return replay_ring
-
-
-def import_push_engine():
-    """Import and return the reused ``push_engine`` module."""
-    ensure_on_path()
-    import push_engine  # type: ignore
-
-    return push_engine
 
 
 def import_device_tokens():
