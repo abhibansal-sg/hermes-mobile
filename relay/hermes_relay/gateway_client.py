@@ -70,7 +70,7 @@ RELAY_SOURCE = "mobile-relay"
 # whenever ``owns()`` is False (downstream.py), which re-marks — a released
 # session simply re-owns on next use. Reversible: constants only, no wire or
 # schema change.
-_OWNED_RELEASE_IDLE_S = 12 * 3600.0   # release anything idle >= 12 h
+_OWNED_RELEASE_IDLE_S = 72 * 3600.0   # release anything idle >= 72 h (3 days)
 _OWNED_CAP = 4096                     # churn backstop (soft)...
 _OWNED_MIN_IDLE_S = 30 * 60.0         # ...never evict an entry younger than this
 

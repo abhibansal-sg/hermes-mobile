@@ -7,7 +7,7 @@ Notifier's owned-session set never shrank — the accumulating
 ``owned_sessions`` observed on the live relay.
 
 The fix (gateway_client.py ``_trim_owned``) releases idle ownership: a TTL
-(12 h) is the primary bound, a soft cap (4096) backstops churn storms but
+(72 h) is the primary bound, a soft cap (4096) backstops churn storms but
 never evicts an entry younger than the min-idle floor (30 min) — every
 create/resume/submit re-marks, so a live turn's ownership is always fresh.
 Eviction downgrades SAFELY to resume: the downstream SUBMIT path re-resumes
@@ -58,15 +58,16 @@ def _age(client: GatewayClient, sid: str, seconds: float) -> None:
 
 
 def test_idle_ownership_released_past_ttl() -> None:
-    """Sessions idle past the 12 h TTL drop out of the owned set; fresh ones
-    survive (fail-before: AttributeError — no _owned_at, nothing releases)."""
+    """Sessions idle past the TTL drop out of the owned set; fresh ones
+    survive (fail-before: AttributeError — no _owned_at, nothing releases).
+    TTL-relative (reads the constant) so a TTL bump never breaks this."""
     c = _client()
     for i in range(3):
         c._mark_owned(f"s{i}")
-    _age(c, "s0", 13 * 3600)
-    _age(c, "s1", 13 * 3600)
+    _age(c, "s0", gc._OWNED_RELEASE_IDLE_S + 3600)
+    _age(c, "s1", gc._OWNED_RELEASE_IDLE_S + 3600)
     c._mark_owned("s3")  # a mark runs the release pass
-    assert c.owns("s0") is False, "a 13 h-idle session is still owned"
+    assert c.owns("s0") is False, "a past-TTL idle session is still owned"
     assert c.owns("s1") is False
     assert c.owns("s2") and c.owns("s3")
     assert "s0" not in c.owned_sessions
@@ -78,7 +79,7 @@ def test_release_mirrors_to_durable() -> None:
     d = RecordingDurable()
     c = _client(d)
     c._mark_owned("s0")
-    _age(c, "s0", 13 * 3600)
+    _age(c, "s0", gc._OWNED_RELEASE_IDLE_S + 3600)
     c._mark_owned("s1")
     assert "s0" in d.removed
     assert c.owns("s0") is False
@@ -115,8 +116,8 @@ def test_release_prunes_live_id_remap() -> None:
     c._owned_at["live-1"] = c._owned_at["origin-1"]
     c._live_by_origin["origin-1"] = "live-1"
     c._live_by_origin["live-1"] = "live-1"
-    _age(c, "origin-1", 13 * 3600)
-    _age(c, "live-1", 13 * 3600)
+    _age(c, "origin-1", gc._OWNED_RELEASE_IDLE_S + 3600)
+    _age(c, "live-1", gc._OWNED_RELEASE_IDLE_S + 3600)
     c._mark_owned("other")
     assert not c.owns("origin-1") and not c.owns("live-1")
     assert "origin-1" not in c._live_by_origin
@@ -140,7 +141,7 @@ def test_released_session_reowns_on_next_drive() -> None:
     re-drive (what session_resume/prompt_submit do) re-marks it owned."""
     c = _client()
     c._mark_owned("s0")
-    _age(c, "s0", 13 * 3600)
+    _age(c, "s0", gc._OWNED_RELEASE_IDLE_S + 3600)
     c._mark_owned("s1")
     assert c.owns("s0") is False  # downstream.py would session_resume here
     c._mark_owned("s0")           # ...and the resume/submit re-marks
