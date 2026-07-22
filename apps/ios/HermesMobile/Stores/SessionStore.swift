@@ -2368,6 +2368,7 @@ final class SessionStore {
     /// purely additive coverage, never a correctness dependency. At most one sweep
     /// runs at a time; a new call supersedes any in-flight sweep.
     func prefetchRecentTranscripts() {
+        guard connection?.transportPath != .gatewayDirect else { return }
         guard let cacheStore, let fetch = resolvedPrefetchFetch else { return }
 
         // Snapshot the prefetch targets on the main actor (newest-first human
@@ -6593,6 +6594,23 @@ final class SessionStore {
         // history read here races that snapshot and violates I14's one-read budget.
         if connection?.transportPath == .relay { return nil }
         guard let rest = connection?.rest else { return nil }
+        if connection?.transportPath == .gatewayDirect {
+            return { [weak self] sessionId, profile in
+                let limit = ChatStore.transcriptOpenWindowLimit
+                let total = self?.sessions.first(where: { $0.id == sessionId })?.messageCount ?? 0
+                let offset = max(0, total - limit)
+                if let page = await fetchStockTranscriptPage(
+                    rest: rest,
+                    sessionId: sessionId,
+                    profile: profile,
+                    limit: limit,
+                    offset: offset
+                ) {
+                    return page.messages
+                }
+                return try await rest.messages(sessionId: sessionId, profile: profile)
+            }
+        }
         // ABH-408: a non-default row opened from the All-profiles rail must use
         // RestClient+Profiles.messages(sessionId:profile:) so the backend reads
         // that profile's store. The plugin transcript-page route currently has no
@@ -6627,12 +6645,9 @@ final class SessionStore {
     /// ``skeletonColdOpenForced``.
     private var skeletonColdOpenEligible: Bool {
         if let forced = skeletonColdOpenForced { return forced }
-        // R3 (ROUND-4 W2d): TRANSPORT-AWARE. The relay carries no skeleton
-        // tier — and on relay the phase-2 network seed does not run at all
-        // (the resume/open snapshot is the sole seed; `resolvedTranscriptFetch`
-        // returns nil there). Eligibility staying true on relay marked the
-        // (nonexistent) seed "skeleton" and fired the background hydrate fetch
-        // — the relay double-fetch. Direct mode keeps plugin-tier behavior.
+        // The transparent path reads the stock paginated transcript; `shape`
+        // belongs only to the legacy plugin transcript route.
+        if connection?.transportPath == .gatewayDirect { return false }
         if connection?.transportPath == .relay { return false }
         return connection?.rest?.pathStyle == .plugin
     }
