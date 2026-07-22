@@ -6,7 +6,7 @@ import SwiftUI
 ///
 /// These tests pin the rebuild contract for the docked gate cards:
 ///  • R8/N3 — answering a clarify ECHOES the user's answer into the transcript
-///    (today `respondClarification` clears the card and emits the relay RPC but
+///    (`respondClarification` clears the card and emits the gateway RPC but
 ///    drops the answer on the floor — IMG_2535/2540 show the card gone with no
 ///    answer bubble). RED on qa2/base: `chat.messages` gains no user row.
 ///  • R10 — long choice text WRAPS inside the card instead of hard-clipping off
@@ -23,9 +23,8 @@ import SwiftUI
 ///    the pure-black `.roundedBorder`. Asserted structurally.
 ///
 /// RED on qa2/base; green after the R7–R10 fix lane. Deterministic — no live
-/// network. The relay gate-frame wiring (B10) stays intact: these tests never
-/// touch the responder relay branches (`respondClarification` still emits the
-/// §5 `clarify` upstream unchanged).
+/// network. The gateway-event wiring stays intact: these tests never touch the
+/// responder transport.
 @MainActor
 final class ClarifyCardNativeTests: XCTestCase {
 
@@ -64,8 +63,6 @@ final class ClarifyCardNativeTests: XCTestCase {
         XCTAssertEqual(echoed.role, .user)
         XCTAssertEqual(echoed.text, "yes",
                        "the echoed row carries the exact answer text")
-        XCTAssertFalse(echoed.relayProjected,
-                       "the echo is an untagged local row so the relay projection preserves it")
     }
 
     /// Free-text answers echo too — the free-text path is the same responder.

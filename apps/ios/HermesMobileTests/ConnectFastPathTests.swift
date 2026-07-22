@@ -8,12 +8,8 @@ import XCTest
 ///  1. ``ConnectTrace`` measures the cold-open → cache paint → socket open →
 ///     transport ready → composer interactive sequence correctly (delta math,
 ///     first-occurrence semantics, reset).
-///  2. On the RELAY transport, `configure()` does NOT gate the socket open (and
-///     therefore composer interactivity) behind the gateway REST `status()` probe
-///     — the blocking status round-trip is demoted to a background auth check.
-///     The gateway-direct path is asserted to STILL block on the probe (byte-for-
-///     byte behaviour preserved), and the D3 re-pair flow (401/403 → reauth) is
-///     preserved on the relay path via the background check.
+///  2. `configure()` validates the stock HTTP lane before opening the stock
+///     WebSocket lane through the same transparent proxy address.
 @MainActor
 final class ConnectFastPathTests: XCTestCase {
 
@@ -142,94 +138,12 @@ final class ConnectFastPathTests: XCTestCase {
         XCTAssertNil(trace.deltaMs(from: .socketOpen, to: .transportReady))
     }
 
-    // MARK: - Relay fast-path: connect is NOT gated by the REST probe
+    // MARK: - Stock proxy connect ordering
 
     #if DEBUG
-    /// The relay transport must reach `transportReady` (socket dialed + accepted)
-    /// while the gateway REST `status()` probe is STILL suspended — proving the
-    /// probe no longer sits on the interactivity critical path.
-    func testRelayConfigureDoesNotBlockOnStatusProbe() async {
-        let (connection, _, _) = makeStore()
-        let serverURL = "http://127.0.0.1:9131"
-        UserDefaults.standard.set(TransportPath.relay.rawValue, forKey: DefaultsKeys.transportPath)
-        UserDefaults.standard.set("ws://127.0.0.1:9999/relay", forKey: DefaultsKeys.relayURLOverride)
-        let priorServer = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
-        defer {
-            UserDefaults.standard.removeObject(forKey: DefaultsKeys.transportPath)
-            UserDefaults.standard.removeObject(forKey: DefaultsKeys.relayURLOverride)
-            if let priorServer { UserDefaults.standard.set(priorServer, forKey: DefaultsKeys.serverURL) }
-            else { UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL) }
-            KeychainService.deleteToken(server: serverURL)
-        }
-
-        // The probe hangs forever; if configure awaited it, this test would stall.
-        let gate = SuspensionGate()
-        connection.statusRPC = { _, _ in await gate.suspend() }
-        var relayDialed = false
-        connection.relayConnectHook = { _, _ in relayDialed = true }
-
-        var returned = false
-        var configureResult: String? = "sentinel"
-        let task = Task { @MainActor () -> String? in
-            let r = await connection.configure(urlString: serverURL, token: "tok")
-            returned = true
-            return r
-        }
-        // Bound the wait: if the relay path wrongly blocks on the probe, we hit the
-        // deadline, fail, and release the gate rather than hanging CI.
-        let deadline = ContinuousClock.now + .seconds(3)
-        while !returned, ContinuousClock.now < deadline {
-            try? await Task.sleep(for: .milliseconds(20))
-        }
-        XCTAssertTrue(returned, "relay configure must NOT block on the REST status probe")
-        configureResult = await task.value
-        XCTAssertNil(configureResult)
-        XCTAssertTrue(relayDialed, "relay socket must be dialed")
-        XCTAssertTrue(connection.isTransportReady, "transport must be ready without the probe")
-        // The probe was never awaited — release it so the background task can exit.
-        await gate.release()
-    }
-
-    /// The D3 re-pair flow survives the demotion: a 401 on the background probe
-    /// still flips `reauthRequired` + `.needsSetup` on the relay path.
-    func testRelayBackgroundProbeStillRoutesAuthFailureToReauth() async {
-        let (connection, _, _) = makeStore()
-        let serverURL = "http://127.0.0.1:9131"
-        UserDefaults.standard.set(TransportPath.relay.rawValue, forKey: DefaultsKeys.transportPath)
-        UserDefaults.standard.set("ws://127.0.0.1:9999/relay", forKey: DefaultsKeys.relayURLOverride)
-        let priorServer = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
-        defer {
-            UserDefaults.standard.removeObject(forKey: DefaultsKeys.transportPath)
-            UserDefaults.standard.removeObject(forKey: DefaultsKeys.relayURLOverride)
-            if let priorServer { UserDefaults.standard.set(priorServer, forKey: DefaultsKeys.serverURL) }
-            else { UserDefaults.standard.removeObject(forKey: DefaultsKeys.serverURL) }
-            KeychainService.deleteToken(server: serverURL)
-        }
-
-        connection.statusRPC = { _, _ in throw RestError.badStatus(401, body: "unauthorized") }
-        connection.relayConnectHook = { _, _ in }
-
-        let result = await connection.configure(urlString: serverURL, token: "tok")
-        XCTAssertNil(result, "relay connect itself succeeds; auth is checked in the background")
-
-        // The background probe lands asynchronously; poll (bounded) for the reauth flip.
-        let deadline = ContinuousClock.now + .seconds(3)
-        while !connection.reauthRequired, ContinuousClock.now < deadline {
-            try? await Task.sleep(for: .milliseconds(20))
-        }
-        XCTAssertTrue(connection.reauthRequired, "a 401 on the background probe must trigger re-pair")
-        if case .needsSetup = connection.phase {} else {
-            XCTFail("expected .needsSetup after auth rejection, got \(connection.phase)")
-        }
-    }
-
-    /// Contrast: the gateway-direct path STILL gates the socket behind the REST
-    /// probe (its behaviour is deliberately unchanged). The socket must not be
-    /// dialed until the probe returns.
-    func testGatewayDirectConfigureStillGatesOnProbe() async {
+    func testConfigureGatesSocketOnHTTPProbe() async {
         let (connection, _, _) = makeStore()
         let serverURL = "https://gw.example:9119"
-        UserDefaults.standard.removeObject(forKey: DefaultsKeys.transportPath)   // gateway-direct
         let priorServer = UserDefaults.standard.string(forKey: DefaultsKeys.serverURL)
         defer {
             if let priorServer { UserDefaults.standard.set(priorServer, forKey: DefaultsKeys.serverURL) }
@@ -250,7 +164,7 @@ final class ConnectFastPathTests: XCTestCase {
         }
         // Let configure reach the probe and block.
         try? await Task.sleep(for: .milliseconds(300))
-        XCTAssertFalse(returned, "gateway-direct configure must block on the REST probe")
+        XCTAssertFalse(returned, "configure must block on the HTTP probe")
         XCTAssertFalse(connectDialed, "gateway socket must not be dialed before the probe completes")
 
         await gate.release()
