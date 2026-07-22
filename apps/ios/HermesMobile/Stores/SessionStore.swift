@@ -482,6 +482,7 @@ final class SessionStore {
     var activeStoredId: String? {
         get { sessionBinding?.storedID }
         set {
+            let previous = sessionBinding?.storedID
             if sessionBinding == nil, newValue == nil { return }
             if sessionBinding == nil {
                 sessionBinding = SessionBinding(
@@ -491,6 +492,9 @@ final class SessionStore {
             }
             if sessionBinding?.storedID == nil, sessionBinding?.runtimeID == nil {
                 sessionBinding = nil
+            }
+            if previous != sessionBinding?.storedID {
+                chat?.pendingGateOwnerMoved(toStoredSession: sessionBinding?.storedID)
             }
         }
     }
@@ -3678,12 +3682,16 @@ final class SessionStore {
         mode: SessionBindingMode,
         generation: UInt64?
     ) {
+        let previous = sessionBinding?.storedID
         sessionBinding = SessionBinding(
             storedID: storedID,
             runtimeID: runtimeID,
             mode: mode,
             generation: generation
         )
+        if previous != storedID {
+            chat?.pendingGateOwnerMoved(toStoredSession: storedID)
+        }
     }
     /// The drawer's pending DISMISSAL INTENT (QA-1 B3). A drawer row tap hands
     /// its close here (`open(_:revealOnFirstPaint:)`); it fires on first paint
@@ -5941,6 +5949,7 @@ final class SessionStore {
         activeStoredId = nil
         activeStoredProfile = nil
         chat?.reset()
+        chat?.discardPendingGates()
         transcriptPaintedStoredId = nil
     }
 

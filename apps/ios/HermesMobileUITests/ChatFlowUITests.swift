@@ -174,6 +174,80 @@ final class ChatFlowUITests: XCTestCase {
         add(attachment)
     }
 
+    /// ABH-519 / I12 physical regression: a stock clarify request belongs to
+    /// its STORED session across a cache/reset navigation, while its runtime id
+    /// remains the response target. This is deliberately one narrow workflow,
+    /// matching the device failure instead of replaying the full UI suite.
+    func testClarificationStaysWithOwningSessionAcrossSwitch() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+              !url.isEmpty, !token.isEmpty else {
+            throw XCTSkip("HERMES_URL/HERMES_TOKEN not provided; skipping live test")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_URL"] = url
+        app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchArguments += ["--uitest-mute-audio"]
+        app.launch()
+
+        let drawerToggle = app.buttons["drawerToggle"]
+        XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        drawerToggle.tap()
+        let initialNewChat = app.buttons["drawerNewChat"]
+        XCTAssertTrue(initialNewChat.waitForExistence(timeout: 15))
+        initialNewChat.tap()
+        let field = app.textFields["Message Hermes…"]
+        let textView = app.textViews["Message Hermes…"]
+        XCTAssertTrue(field.waitForExistence(timeout: 20) || textView.waitForExistence(timeout: 5))
+        let composer = field.exists ? field : textView
+        composer.tap()
+        composer.typeText(
+            "ABH519 physical owner check. Use the clarify tool now to ask exactly "
+                + "'ABH519 owner check?' with choices Left and Right. Do not answer it yourself."
+        )
+        app.buttons["Send"].tap()
+
+        let clarifyCard = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "Clarification request")
+        ).firstMatch
+        XCTAssertTrue(
+            clarifyCard.waitForExistence(timeout: 180),
+            "The owning session never rendered its clarification card"
+        )
+
+        drawerToggle.tap()
+        let newChat = app.buttons["drawerNewChat"]
+        XCTAssertTrue(newChat.waitForExistence(timeout: 15))
+        newChat.tap()
+        XCTAssertFalse(
+            clarifyCard.waitForExistence(timeout: 3),
+            "Session A's clarification rendered inline on the draft/B surface"
+        )
+
+        drawerToggle.tap()
+        let newestSession = app.buttons["sessionRow"].firstMatch
+        XCTAssertTrue(newestSession.waitForExistence(timeout: 20))
+        newestSession.tap()
+        XCTAssertTrue(
+            clarifyCard.waitForExistence(timeout: 20),
+            "The clarification did not return when its owning session reopened"
+        )
+
+        let answer = app.buttons["Left"]
+        XCTAssertTrue(answer.waitForExistence(timeout: 10))
+        answer.tap()
+        XCTAssertFalse(
+            clarifyCard.waitForExistence(timeout: 20),
+            "The answered clarification card did not clear"
+        )
+
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "abh519-clarification-owner-restored"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     /// BUG 1 (hotfix): the Settings Appearance row is a real full-width tap
     /// target. Open Settings via the avatar, tap the Appearance row
     /// (`settingsAppearanceRow`), and confirm the theme picker pushed in (its
