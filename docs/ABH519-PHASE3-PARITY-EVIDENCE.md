@@ -6,9 +6,9 @@
 
 **Base:** Phase 2 merge `565f357d8c29af744eadb34c24c76108e902bfbe`
 
-**Status:** non-device verification is green. The physical-device gate is intentionally
-open because the owner and iPhone Air are away. This phase must not merge until the device
-checks below are captured.
+**Status:** non-device verification is green. Physical verification is in progress on the
+owner-approved, USB-connected iPhone 16 Pro Max. This phase must not merge until every
+device check below is captured.
 
 ## Retained seams
 
@@ -51,13 +51,33 @@ persistence, translation, transcript, or session state.
 
 ## Physical-device gate still required
 
-When the iPhone Air is available, install this exact branch build and capture:
+### Captured on physical hardware
+
+- Device: iPhone 16 Pro Max, iOS 26.5, UDID
+  `00008140-000648640A33001C`, controlled through Xcode/XCUITest.
+- Stock clarification ownership: `testClarificationStaysWithOwningSessionAcrossSwitch`
+  passed against the isolated relay/gateway. The card rendered only in its owning stored
+  session, survived a switch plus cache reset, returned on reopen, and cleared after its
+  answer. Log: `/tmp/abh519-phase3-device-clarify-owner-lean.log`; result bundle:
+  `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_01-35-08-+0800.xcresult`.
+- Foreign-turn live follow: a Mac-side stock client retained runtime `2beee0d5`; the phone
+  opened unique stored session `ABH519-LIVE-014300` read-only, painted `-FIRST`, then
+  rendered the independently submitted `-SECOND` turn. The phone was already watching
+  for about 57 seconds before the second marker arrived. The focused XCUITest passed in
+  69.36 seconds; gateway logs contain zero `4007`. Log:
+  `/tmp/abh519-phase3-device-live-follow-final-head.log`; result bundle:
+  `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_01-39-01-+0800.xcresult`.
+
+### Still required
+
+Capture the remaining checks on physical hardware:
 
 1. background/locked turn completion, clarification, and approval each produce one
    actionable push;
 2. the phone receives completion push when a desktop drives the session, but receives no
    redundant push while that same phone is foregrounded on the session;
-3. a foreign turn live-follows without stealing ownership or producing a 4007;
+3. ~~a foreign turn live-follows without stealing ownership or producing a 4007;~~ captured
+   above;
 4. **Load Earlier** works during an active streamed turn and preserves the live placeholder;
 5. force-close/reopen still paints the same stored transcript from disk.
 
