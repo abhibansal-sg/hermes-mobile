@@ -567,11 +567,36 @@ final class ConnectionStore {
     var transportPath: TransportPath {
         #if DEBUG
         let env = ProcessInfo.processInfo.environment
-        if env["HERMES_TRANSPORT"]?.lowercased() == "relay" || env["HERMES_RELAY_URL"] != nil {
+        if let requested = env["HERMES_TRANSPORT"]?.lowercased() {
+            if requested == "relay" { return .relay }
+            if requested == "gatewaydirect" || requested == "direct" { return .gatewayDirect }
+        }
+        if env["HERMES_RELAY_URL"] != nil {
             return .relay
         }
         #endif
         return DefaultsKeys.transportPathValue()
+    }
+
+    /// Base address for the transparent stock-protocol lane. The existing relay
+    /// override selects the proxy host; without one, direct gateway behavior is
+    /// preserved during the Phase 2 rollout.
+    func stockProxyURL(forGateway gatewayURL: URL) -> URL {
+        let rawOverride: String?
+        #if DEBUG
+        rawOverride = ProcessInfo.processInfo.environment["HERMES_RELAY_URL"]
+            ?? DefaultsKeys.relayURLOverrideValue()
+        #else
+        rawOverride = DefaultsKeys.relayURLOverrideValue()
+        #endif
+        guard let rawOverride,
+              let override = URL(string: rawOverride),
+              var components = URLComponents(url: override, resolvingAgainstBaseURL: false)
+        else { return gatewayURL }
+        components.scheme = override.scheme == "wss" ? "https" : "http"
+        components.path = ""
+        components.queryItems = nil
+        return components.url ?? gatewayURL
     }
 
     /// The relay WS URL to dial when ``transportPath`` is `.relay`. Precedence:
@@ -666,8 +691,9 @@ final class ConnectionStore {
         if let _restOverrideForTesting { return _restOverrideForTesting }
         #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
+        let baseURL = transportPath == .gatewayDirect ? stockProxyURL(forGateway: url) : url
         return RestClient(
-            baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle,
+            baseURL: baseURL, token: token, pathStyle: capabilities.resolvedPathStyle,
             relayControlBaseURL: relayControlURL(forGateway: url)
         )
     }
@@ -739,8 +765,9 @@ final class ConnectionStore {
         if let _restOverrideForTesting { return _restOverrideForTesting }
         #endif
         guard let url = URL(string: serverURLString), let token = currentToken else { return nil }
+        let baseURL = transportPath == .gatewayDirect ? stockProxyURL(forGateway: url) : url
         return RestClient(
-            baseURL: url, token: token, pathStyle: capabilities.resolvedPathStyle
+            baseURL: baseURL, token: token, pathStyle: capabilities.resolvedPathStyle
         )
     }
 
@@ -1462,6 +1489,7 @@ final class ConnectionStore {
             phase = .offline("Missing token")
             return "A session token is required."
         }
+        let stockTransportURL = stockProxyURL(forGateway: url)
 
         // Cancel any reconnect loop tied to a previous configuration.
         reconnectTask?.cancel()
@@ -1510,13 +1538,13 @@ final class ConnectionStore {
             do {
                 #if DEBUG
                 if let statusRPC {
-                    try await statusRPC(url, trimmedToken)
+                    try await statusRPC(stockTransportURL, trimmedToken)
                 } else {
-                    let probe = RestClient(baseURL: url, token: trimmedToken)
+                    let probe = RestClient(baseURL: stockTransportURL, token: trimmedToken)
                     _ = try await probe.status()
                 }
                 #else
-                let probe = RestClient(baseURL: url, token: trimmedToken)
+                let probe = RestClient(baseURL: stockTransportURL, token: trimmedToken)
                 _ = try await probe.status()
                 #endif
             } catch {
@@ -1559,9 +1587,13 @@ final class ConnectionStore {
                 try await ensureRelayCoordinator().start(url: relayURL, token: trimmedToken)
                 #endif
             } else if let connectRPC {
-                try await connectRPC(url, trimmedToken, connectionMode)
+                try await connectRPC(stockTransportURL, trimmedToken, connectionMode)
             } else {
-                try await client.connect(baseURL: url, token: trimmedToken, mode: connectionMode)
+                try await client.connect(
+                    baseURL: stockTransportURL,
+                    token: trimmedToken,
+                    mode: connectionMode
+                )
             }
         } catch {
             guard isCurrentGeneration(generation) else { return nil }
@@ -2664,13 +2696,18 @@ final class ConnectionStore {
                     self.reconnectTask = nil
                     return
                 }
+                let stockTransportURL = self.stockProxyURL(forGateway: url)
 
                 do {
                     self.beginTransportAttempt()
                     if let hook = self.connectRPC {
-                        try await hook(url, token, self.connectionMode)
+                        try await hook(stockTransportURL, token, self.connectionMode)
                     } else {
-                        try await self.client.connect(baseURL: url, token: token, mode: self.connectionMode)
+                        try await self.client.connect(
+                            baseURL: stockTransportURL,
+                            token: token,
+                            mode: self.connectionMode
+                        )
                     }
                     guard !Task.isCancelled,
                           self.isActiveGeneration(generation) else { return }
@@ -2761,7 +2798,9 @@ final class ConnectionStore {
         if let hook = probeIsAuthRevokedRPC { return await hook() }
         #endif
         do {
-            _ = try await RestClient(baseURL: url, token: token).status()
+            _ = try await RestClient(
+                baseURL: stockProxyURL(forGateway: url), token: token
+            ).status()
             return false
         } catch {
             return Self.isAuthFailure(error)

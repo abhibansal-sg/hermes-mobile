@@ -62,6 +62,20 @@ enum ComposerPromptHistory {
     }
 }
 
+enum SessionBindingMode: Sendable, Equatable {
+    case drive
+    case watch
+}
+
+/// The phone's sole stored/runtime identity value. Partial values exist only
+/// while legacy call sites update the two compatibility properties below.
+struct SessionBinding: Sendable, Equatable {
+    var storedID: String?
+    var runtimeID: String?
+    var mode: SessionBindingMode
+    var generation: UInt64?
+}
+
 /// Observable owner of the session list and the active-session pointers.
 ///
 /// Talks to the gateway via `ConnectionStore.client` and seeds the transcript
@@ -444,12 +458,42 @@ final class SessionStore {
         }
         _ = defaults.synchronize()
     }
-    /// Runtime `session_id` for the session bound to the current connection.
-    var activeRuntimeId: String?
-    /// Persistent `stored_session_id` for the active session (survives reconnects).
-    #if DEBUG
-    #endif
-    var activeStoredId: String?
+    /// One owner for durable identity, live identity, ownership mode, and the
+    /// socket generation that made a drive claim. The computed properties keep
+    /// existing callers source-compatible while this value remains authoritative.
+    private(set) var sessionBinding: SessionBinding?
+
+    /// Runtime `session_id` for live RPCs and event routing only.
+    var activeRuntimeId: String? {
+        get { sessionBinding?.runtimeID }
+        set {
+            if sessionBinding == nil, newValue == nil { return }
+            if sessionBinding == nil {
+                sessionBinding = SessionBinding(
+                    storedID: nil, runtimeID: newValue, mode: .drive, generation: nil)
+            } else {
+                sessionBinding?.runtimeID = newValue
+                if newValue == nil { sessionBinding?.generation = nil }
+            }
+        }
+    }
+
+    /// Persistent `stored_session_id` for cache, drawer, deep links, and outbox.
+    var activeStoredId: String? {
+        get { sessionBinding?.storedID }
+        set {
+            if sessionBinding == nil, newValue == nil { return }
+            if sessionBinding == nil {
+                sessionBinding = SessionBinding(
+                    storedID: newValue, runtimeID: nil, mode: .drive, generation: nil)
+            } else {
+                sessionBinding?.storedID = newValue
+            }
+            if sessionBinding?.storedID == nil, sessionBinding?.runtimeID == nil {
+                sessionBinding = nil
+            }
+        }
+    }
     /// Profile component of the durable selection identity. Stored session ids
     /// are not globally unique across an aggregate multi-profile drawer.
     private(set) var activeStoredProfile: String?
@@ -1247,6 +1291,40 @@ final class SessionStore {
     /// request; tests stage a `SessionOpenResult` or failure so `open()` and
     /// ``resumeActiveAfterReconnect()`` are exercisable without a network.
     var resumeRPC: ((_ storedId: String, _ params: [String: JSONValue]) async throws -> SessionOpenResult)?
+
+    /// Read-only `session.active_list` preflight. Injected by ownership tests;
+    /// production uses the existing gateway client. A missing method is the
+    /// version guard for older gateways and falls back to the legacy resume.
+    var activeListRPC: (() async throws -> SessionActiveListResult)?
+
+    private enum LiveSessionInspection {
+        case found(SessionActiveItem)
+        case absent
+        case unsupported
+    }
+
+    private func inspectLiveSession(storedID: String) async throws -> LiveSessionInspection {
+        let result: SessionActiveListResult
+        do {
+            if let activeListRPC {
+                result = try await activeListRPC()
+            } else {
+                // Existing resume-only unit graphs intentionally model an older
+                // gateway. They keep their legacy behavior unless they install
+                // the explicit active-list seam.
+                if resumeRPC != nil { return .unsupported }
+                guard let client else { throw GatewayError.notConnected }
+                result = try await client.request(
+                    "session.active_list", params: .object([:]))
+            }
+        } catch let GatewayError.rpc(code, _) where code == -32601 {
+            return .unsupported
+        }
+        guard let live = result.sessions.first(where: { $0.sessionKey == storedID }) else {
+            return .absent
+        }
+        return .found(live)
+    }
 
     /// Identity of the one raw `session.resume` permitted for a selected session
     /// on a particular accepted transport. Both `open()` and reconnect recovery
@@ -3586,7 +3664,27 @@ final class SessionStore {
     private var openToken = UUID()
     /// The accepted transport generation that created `activeRuntimeId`.
     /// Runtime ids are ephemeral and cannot be reused after a reconnect.
-    private var activeRuntimeEpoch: UInt64?
+    private var activeRuntimeEpoch: UInt64? {
+        get { sessionBinding?.generation }
+        set {
+            guard sessionBinding != nil else { return }
+            sessionBinding?.generation = newValue
+        }
+    }
+
+    private func bindSession(
+        storedID: String,
+        runtimeID: String,
+        mode: SessionBindingMode,
+        generation: UInt64?
+    ) {
+        sessionBinding = SessionBinding(
+            storedID: storedID,
+            runtimeID: runtimeID,
+            mode: mode,
+            generation: generation
+        )
+    }
     /// The drawer's pending DISMISSAL INTENT (QA-1 B3). A drawer row tap hands
     /// its close here (`open(_:revealOnFirstPaint:)`); it fires on first paint
     /// or on the 300ms liveness deadline — whichever lands first — EXACTLY
@@ -3908,6 +4006,11 @@ final class SessionStore {
         bindRuntime: Bool = true
     ) {
         let wasAlreadyActive = isActive(summary)
+        let reusableDrive = sessionBinding?.storedID == summary.id
+            && sessionBinding?.mode == .drive
+            && sessionBinding?.generation == connection?.transportEpoch
+            && sessionBinding?.runtimeID != nil
+            && connection?.isTransportReady == true
         if let previous = activeSummary,
            previous.scopedIdentity != summary.scopedIdentity {
             ReliabilityDiagnostics.shared.sessionSuperseded(identifier: previous.scopedIdentity)
@@ -3981,8 +4084,10 @@ final class SessionStore {
             recordDrawerUserGesture()
         }
         let drawerIntentPending = pendingDrawerReveal != nil
-        activeRuntimeId = nil          // gates the composer until resume lands
-        activeRuntimeEpoch = nil
+        if !reusableDrive {
+            activeRuntimeId = nil      // gates the composer until inspect/resume lands
+            activeRuntimeEpoch = nil
+        }
         activeStoredProfile = selectedProfileID(for: summary)
         activeStoredId = summary.id
         if let cacheStore, let scope = currentCacheScope,
@@ -4101,6 +4206,10 @@ final class SessionStore {
             return
         }
 
+        // A drive claim minted on this exact socket generation is already the
+        // correct live target. Reopening the same row must not inspect or resume.
+        if reusableDrive { return }
+
         // Slow path: gateway resume — spins up the agent server-side; only
         // prompt submission depends on it.
         let resumeTask = Task { [weak self] in
@@ -4111,6 +4220,36 @@ final class SessionStore {
                 usingResumeTestSeam: usingResumeTestSeam
             ) else { return }
             do {
+                switch try await self.inspectLiveSession(storedID: summary.id) {
+                case .found(let live):
+                    guard self.isCurrentRuntimeBinding(
+                        token: token,
+                        storedId: summary.id,
+                        profileId: cacheProfile,
+                        connectionWorkGeneration: connectionWorkGeneration,
+                        transportEpoch: bindingEpoch,
+                        usingResumeTestSeam: usingResumeTestSeam
+                    ) else { return }
+                    // Read-only watch: never session.resume an already-live row,
+                    // because resume rebinds that session's transport to the phone.
+                    self.bindSession(
+                        storedID: summary.id,
+                        runtimeID: live.id,
+                        mode: .watch,
+                        generation: nil
+                    )
+                    await seedTask.value
+                    guard self.openToken == token,
+                          self.activeStoredId == summary.id,
+                          self.activeRuntimeId == live.id else { return }
+                    self.ensureRuntimeAttempts = 0
+                    self.onActiveRuntimeBound?()
+                    self.lastError = nil
+                    self.sessionActionError = nil
+                    return
+                case .absent, .unsupported:
+                    break
+                }
                 // Thread the row's profile scope so an All-profiles tap resumes in
                 // the row's owning profile home. Omitted for default/all/dormant
                 // cases — byte-for-byte the shipped resume.
@@ -4145,8 +4284,12 @@ final class SessionStore {
                     }
                     return
                 }  // superseded or an older transport
-                self.activeRuntimeId = result.sessionId
-                self.activeRuntimeEpoch = bindingEpoch
+                self.bindSession(
+                    storedID: result.storedSessionId ?? summary.id,
+                    runtimeID: result.sessionId,
+                    mode: .drive,
+                    generation: bindingEpoch
+                )
                 ReliabilityDiagnostics.shared.sessionBound(
                     identifier: summary.scopedIdentity, epoch: bindingEpoch
                 )
@@ -4434,9 +4577,12 @@ final class SessionStore {
                 params: .object(createParams),
                 timeout: .seconds(120)
             )
-            activeRuntimeId = result.sessionId
-            activeRuntimeEpoch = connection?.transportEpoch
-            activeStoredId = result.storedSessionId ?? result.sessionId
+            bindSession(
+                storedID: result.storedSessionId ?? result.sessionId,
+                runtimeID: result.sessionId,
+                mode: .drive,
+                generation: connection?.transportEpoch
+            )
             let echoedProfile = result.info?.profileName
             activeStoredProfile = Self.normalizedProfileID(
                 echoedProfile ?? (activeProfile == CacheScope.allProfilesKey
@@ -4616,12 +4762,22 @@ final class SessionStore {
     /// Materialize the destination for one durable new-session prompt. The
     /// processor persists `storedSessionID` immediately after this returns and
     /// therefore retries/resumes that destination instead of creating another.
-    func createOutboxDestination() async throws -> OutboxDestination {
+    func createOutboxDestination(job: WorkJob? = nil) async throws -> OutboxDestination {
         if !isDraft { startDraft() }
         try await createDraftSession()
         guard let runtimeSessionID = activeRuntimeId,
               let storedSessionID = activeStoredId else {
             throw OutboxProcessorError.destinationUnavailable
+        }
+        if let job {
+            let echo = ChatMessage(
+                role: .user,
+                clientMessageID: job.clientMessageID,
+                text: job.submissionText
+            )
+            persistDurableEcho(storedId: storedSessionID, echo: echo)
+            transcriptPaintedStoredId = storedSessionID
+            await persistDraftBornCacheSeed(storedID: storedSessionID, echo: echo)
         }
         return OutboxDestination(
             runtimeSessionID: runtimeSessionID,
@@ -4634,6 +4790,37 @@ final class SessionStore {
     func runtimeForOutboxDestination(_ storedSessionID: String) async -> String? {
         guard activeStoredId == storedSessionID else { return nil }
         return await ensureActiveRuntime()
+    }
+
+    /// `prompt.submit` is the deliberate watch -> drive ownership edge. Claim
+    /// it before awaiting the receipt so an immediate `message.start` is routed
+    /// as this phone's local turn.
+    func beginPromptSubmission(runtimeID: String) -> SessionBindingMode? {
+        guard let storedID = activeStoredId,
+              activeRuntimeId == runtimeID else { return nil }
+        let prior = sessionBinding?.mode
+        bindSession(
+            storedID: storedID,
+            runtimeID: runtimeID,
+            mode: .drive,
+            generation: connection?.transportEpoch
+        )
+        return prior
+    }
+
+    func restoreWatchAfterRejectedSubmission(
+        runtimeID: String,
+        priorMode: SessionBindingMode?
+    ) {
+        guard priorMode == .watch,
+              let storedID = activeStoredId,
+              activeRuntimeId == runtimeID else { return }
+        bindSession(
+            storedID: storedID,
+            runtimeID: runtimeID,
+            mode: .watch,
+            generation: nil
+        )
     }
 
     /// Branch-in-new-chat (F4A-A2): create a brand-new session SEEDED with the
@@ -4868,6 +5055,28 @@ final class SessionStore {
             usingResumeTestSeam: usingResumeTestSeam
         ) else { return nil }
         do {
+            switch try await inspectLiveSession(storedID: storedId) {
+            case .found(let live):
+                guard isCurrentRuntimeBinding(
+                    token: token,
+                    storedId: storedId,
+                    profileId: bindingProfile,
+                    connectionWorkGeneration: myConnectionWorkGeneration,
+                    transportEpoch: bindingEpoch,
+                    usingResumeTestSeam: usingResumeTestSeam
+                ) else { return nil }
+                bindSession(
+                    storedID: storedId,
+                    runtimeID: live.id,
+                    mode: .watch,
+                    generation: nil
+                )
+                lastError = nil
+                sessionActionError = nil
+                return live.id
+            case .absent, .unsupported:
+                break
+            }
             // Re-resume into the same profile scope so a reconnect keeps the
             // session in its per-profile home. Omitted for the default/all scope.
             var resumeParams: [String: JSONValue] = ["session_id": .string(storedId)]
@@ -4906,8 +5115,12 @@ final class SessionStore {
                 }
                 return nil
             }
-            activeRuntimeId = result.sessionId
-            activeRuntimeEpoch = bindingEpoch
+            bindSession(
+                storedID: result.storedSessionId ?? storedId,
+                runtimeID: result.sessionId,
+                mode: .drive,
+                generation: bindingEpoch
+            )
             ReliabilityDiagnostics.shared.sessionBound(
                 identifier: "\(activeStoredProfile ?? "default")\u{1F}\(storedId)",
                 epoch: bindingEpoch
@@ -5030,6 +5243,15 @@ final class SessionStore {
     /// attempt budget is exhausted.
     @discardableResult
     func ensureActiveRuntime() async -> String? {
+        // A watched runtime is an explicit submit target but not a phone-owned
+        // drive claim. Returning it lets WorkRepository's prompt.submit perform
+        // the deliberate ownership transition without a resume-steal first.
+        if let binding = sessionBinding,
+           binding.mode == .watch,
+           let rid = binding.runtimeID,
+           connection?.isTransportReady == true {
+            return rid
+        }
         if let rid = activeRuntimeId,
            activeRuntimeEpoch == connection?.transportEpoch,
            connection?.isTransportReady == true {
