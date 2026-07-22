@@ -514,6 +514,7 @@ class GatewayClient:
         # what prompt.submit and gateway events use for this live process.
         self._mark_owned(stored_sid)
         self._owned.add(sid)
+        self._owned_at[sid] = time.monotonic()  # O1: track the runtime partner too
         self._live_by_origin[stored_sid] = sid
         self._live_by_origin[sid] = sid
         return result

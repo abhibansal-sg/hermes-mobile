@@ -292,6 +292,38 @@ async def test_create_preserves_distinct_runtime_and_stored_ids():
     await client.close()
 
 
+async def test_created_distinct_ids_release_together_past_ttl():
+    """O1 x ABH-519 reconciliation: session_create with a DISTINCT runtime/
+    stored id pair stamps BOTH ids in ``_owned_at`` (not just the stored
+    origin), so the O1 TTL trim can release them together. Regression: the
+    runtime partner was added to ``_owned`` without a timestamp, invisible to
+    ``_trim_owned`` (would leak until its origin happened to be released)."""
+    import time
+    import hermes_relay.gateway_client as gc
+
+    def distinct_create(frame):
+        result = {"session_id": "runtime-abc", "stored_session_id": "stored-xyz"}
+        return {"jsonrpc": "2.0", "id": frame["id"], "result": result}
+
+    client, _ = make_client(responder=distinct_create)
+    await client.connect()
+    created = await client.session_create(title="new chat")
+    runtime, stored = created["session_id"], created["stored_session_id"]
+
+    # Invariant: BOTH ids carry an idle timestamp, not just the stored origin.
+    assert runtime in client._owned_at and stored in client._owned_at
+
+    # Age both past the TTL; a fresh mark runs the trim pass.
+    old = time.monotonic() - (gc._OWNED_RELEASE_IDLE_S + 3600)
+    client._owned_at[runtime] = old
+    client._owned_at[stored] = old
+    client._mark_owned("later")
+
+    assert not client.owns(runtime) and not client.owns(stored)
+    assert client.live_id_for(stored) == stored  # remap forgotten
+    await client.close()
+
+
 async def test_resume_remaps_origin_to_distinct_live_id():
     """When the gateway assigns a resumed session a DISTINCT live id, the client
     owns BOTH ids and ``live_id_for`` resolves the origin (and the live id) to the
