@@ -174,6 +174,173 @@ final class ChatFlowUITests: XCTestCase {
         add(attachment)
     }
 
+    /// ABH-519 / I12 physical regression: a stock clarify request belongs to
+    /// its STORED session across a cache/reset navigation, while its runtime id
+    /// remains the response target. This is deliberately one narrow workflow,
+    /// matching the device failure instead of replaying the full UI suite.
+    func testClarificationStaysWithOwningSessionAcrossSwitch() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+              !url.isEmpty, !token.isEmpty else {
+            throw XCTSkip("HERMES_URL/HERMES_TOKEN not provided; skipping live test")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_URL"] = url
+        app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchArguments += ["--uitest-mute-audio"]
+        app.launch()
+
+        let drawerToggle = app.buttons["drawerToggle"]
+        XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        drawerToggle.tap()
+        let initialNewChat = app.buttons["drawerNewChat"]
+        XCTAssertTrue(initialNewChat.waitForExistence(timeout: 15))
+        initialNewChat.tap()
+        let field = app.textFields["Message Hermes…"]
+        let textView = app.textViews["Message Hermes…"]
+        XCTAssertTrue(field.waitForExistence(timeout: 20) || textView.waitForExistence(timeout: 5))
+        let composer = field.exists ? field : textView
+        composer.tap()
+        composer.typeText(
+            "ABH519 physical owner check. Use the clarify tool now to ask exactly "
+                + "'ABH519 owner check?' with choices Left and Right. After I answer, reply "
+                + "with exactly 'ABH519 owner answered'."
+        )
+        app.buttons["Send"].tap()
+
+        let clarifyCard = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", "Clarification request")
+        ).firstMatch
+        XCTAssertTrue(
+            clarifyCard.waitForExistence(timeout: 180),
+            "The owning session never rendered its clarification card"
+        )
+
+        drawerToggle.tap()
+        let newChat = app.buttons["drawerNewChat"]
+        XCTAssertTrue(newChat.waitForExistence(timeout: 15))
+        newChat.tap()
+        XCTAssertFalse(
+            clarifyCard.waitForExistence(timeout: 3),
+            "Session A's clarification rendered inline on the draft/B surface"
+        )
+
+        drawerToggle.tap()
+        let newestSession = app.buttons["sessionRow"].firstMatch
+        XCTAssertTrue(newestSession.waitForExistence(timeout: 20))
+        newestSession.tap()
+        XCTAssertTrue(
+            clarifyCard.waitForExistence(timeout: 20),
+            "The clarification did not return when its owning session reopened"
+        )
+
+        let answer = app.buttons["Left"]
+        XCTAssertTrue(answer.waitForExistence(timeout: 10))
+        answer.tap()
+        XCTAssertFalse(
+            clarifyCard.waitForExistence(timeout: 20),
+            "The answered clarification card did not clear"
+        )
+        XCTAssertTrue(
+            app.staticTexts.containing(
+                NSPredicate(format: "label CONTAINS %@", "ABH519 owner answered")
+            ).firstMatch.waitForExistence(timeout: 180),
+            "The clarification answer did not resume and complete the owning turn"
+        )
+
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "abh519-clarification-owner-restored"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    @MainActor
+    func testApprovalPushOpensOwningGateAndResumesTurn() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+              !url.isEmpty, !token.isEmpty else {
+            throw XCTSkip("HERMES_URL/HERMES_TOKEN not provided; skipping live test")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_URL"] = url
+        app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchEnvironment["HERMES_TRANSPORT"] = "gatewayDirect"
+        app.launchArguments += ["-hermes.transportPath", "gatewayDirect"]
+        app.launchArguments += ["-hermes.connectionMode", "remoteURL"]
+        app.launchArguments += ["--uitest-mute-audio"]
+        app.launch()
+
+        let drawerToggle = app.buttons["drawerToggle"]
+        XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        drawerToggle.tap()
+        let newChat = app.buttons["drawerNewChat"]
+        XCTAssertTrue(newChat.waitForExistence(timeout: 15))
+        newChat.tap()
+
+        let field = app.textFields["Message Hermes…"]
+        let textView = app.textViews["Message Hermes…"]
+        XCTAssertTrue(field.waitForExistence(timeout: 20) || textView.waitForExistence(timeout: 5))
+        let composer = field.exists ? field : textView
+        composer.tap()
+        composer.typeText(
+            "Use the terminal exactly once to run: rm -f /private/tmp/abh519-approval-gate-physical. "
+                + "After it succeeds, reply with the uppercase form of 'abh519 approval resumed' "
+                + "and nothing else."
+        )
+        app.buttons["Send"].tap()
+        XCTAssertTrue(app.buttons["Interrupt"].waitForExistence(timeout: 30))
+
+        XCUIDevice.shared.press(.home)
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let notification = springboard.buttons.containing(
+            NSPredicate(format: "label CONTAINS[c] %@", "approval")
+        ).firstMatch
+        if !notification.waitForExistence(timeout: 15) {
+            springboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.01))
+                .press(
+                    forDuration: 0.1,
+                    thenDragTo: springboard.coordinate(
+                        withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8)
+                    )
+                )
+            let focusGroup = springboard.buttons.containing(
+                NSPredicate(format: "label CONTAINS[c] %@", "While in Do Not Disturb, Hermes Agent")
+            ).firstMatch
+            if focusGroup.waitForExistence(timeout: 5) {
+                focusGroup.tap()
+            }
+        }
+        XCTAssertTrue(notification.waitForExistence(timeout: 20), "stock approval hook sent no push")
+        notification.tap()
+        app.activate()
+
+        let approvalCard = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Tool approval request:")
+        ).firstMatch
+        XCTAssertTrue(approvalCard.waitForExistence(timeout: 30), "approval push opened no gate")
+        XCTAssertTrue(
+            app.staticTexts.containing(
+                NSPredicate(format: "label CONTAINS %@", "abh519-approval-gate-physical")
+            ).firstMatch.waitForExistence(timeout: 10),
+            "approval push opened a foreign gate"
+        )
+        app.buttons["Approve"].tap()
+        XCTAssertTrue(approvalCard.waitForNonExistence(timeout: 30), "approved gate did not clear")
+        XCTAssertTrue(
+            app.textViews.containing(
+                NSPredicate(format: "label CONTAINS %@", "ABH519 APPROVAL RESUMED")
+            ).firstMatch.waitForExistence(timeout: 180),
+            "approval response did not resume the blocked turn"
+        )
+
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "stock-approval-push-opened-owning-gate"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     /// BUG 1 (hotfix): the Settings Appearance row is a real full-width tap
     /// target. Open Settings via the avatar, tap the Appearance row
     /// (`settingsAppearanceRow`), and confirm the theme picker pushed in (its

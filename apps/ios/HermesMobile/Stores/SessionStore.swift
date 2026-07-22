@@ -482,6 +482,7 @@ final class SessionStore {
     var activeStoredId: String? {
         get { sessionBinding?.storedID }
         set {
+            let previous = sessionBinding?.storedID
             if sessionBinding == nil, newValue == nil { return }
             if sessionBinding == nil {
                 sessionBinding = SessionBinding(
@@ -491,6 +492,9 @@ final class SessionStore {
             }
             if sessionBinding?.storedID == nil, sessionBinding?.runtimeID == nil {
                 sessionBinding = nil
+            }
+            if previous != sessionBinding?.storedID {
+                chat?.pendingGateOwnerMoved(toStoredSession: sessionBinding?.storedID)
             }
         }
     }
@@ -2364,6 +2368,7 @@ final class SessionStore {
     /// purely additive coverage, never a correctness dependency. At most one sweep
     /// runs at a time; a new call supersedes any in-flight sweep.
     func prefetchRecentTranscripts() {
+        guard connection?.transportPath != .gatewayDirect else { return }
         guard let cacheStore, let fetch = resolvedPrefetchFetch else { return }
 
         // Snapshot the prefetch targets on the main actor (newest-first human
@@ -3678,12 +3683,16 @@ final class SessionStore {
         mode: SessionBindingMode,
         generation: UInt64?
     ) {
+        let previous = sessionBinding?.storedID
         sessionBinding = SessionBinding(
             storedID: storedID,
             runtimeID: runtimeID,
             mode: mode,
             generation: generation
         )
+        if previous != storedID {
+            chat?.pendingGateOwnerMoved(toStoredSession: storedID)
+        }
     }
     /// The drawer's pending DISMISSAL INTENT (QA-1 B3). A drawer row tap hands
     /// its close here (`open(_:revealOnFirstPaint:)`); it fires on first paint
@@ -4090,6 +4099,7 @@ final class SessionStore {
         }
         activeStoredProfile = selectedProfileID(for: summary)
         activeStoredId = summary.id
+        connection?.updatePhoneForeground(summary.id)
         if let cacheStore, let scope = currentCacheScope,
            let identity = cacheIdentity(summary.id, profile: summary.profile) {
             let previousPersistence = lastOpenPersistenceTask
@@ -4522,6 +4532,7 @@ final class SessionStore {
         activeStoredId = nil
         activeStoredProfile = nil
         resetComposerHistoryBrowse()
+        connection?.updatePhoneForeground(nil)
         chat?.reset()
         chat?.seed(from: [])  // empty IS the (draft) transcript
         transcriptPaintedStoredId = nil   // a draft holds no stored session
@@ -4583,6 +4594,7 @@ final class SessionStore {
                 mode: .drive,
                 generation: connection?.transportEpoch
             )
+            connection?.updatePhoneForeground(activeStoredId)
             let echoedProfile = result.info?.profileName
             activeStoredProfile = Self.normalizedProfileID(
                 echoedProfile ?? (activeProfile == CacheScope.allProfilesKey
@@ -5938,6 +5950,7 @@ final class SessionStore {
         activeStoredId = nil
         activeStoredProfile = nil
         chat?.reset()
+        chat?.discardPendingGates()
         transcriptPaintedStoredId = nil
     }
 
@@ -6577,22 +6590,27 @@ final class SessionStore {
             if let transcriptFetchWithProfile { return transcriptFetchWithProfile }
             if let transcriptFetch { return { sessionId, _ in try await transcriptFetch(sessionId) } }
         }
-        // Relay cache misses need one correctness fallback. OPEN/HISTORY already
-        // returns the gateway's persisted messages; consume that result instead
-        // of assuming a snapshot will arrive on every bind. The caller returns
-        // before reaching this closure on a cache hit, so warm opens stay zero
-        // network reads (I14).
-        if connection?.transportPath == .relay,
-           let coordinator = connection?.relayCoordinator {
-            return { sessionId, _ in
-                let result = try await coordinator.history(
-                    sessionID: sessionId,
-                    limit: ChatStore.transcriptOpenWindowLimit
-                )
-                return Self.relayHistoryMessages(from: result)
+        // Relay open/resume already streams the authoritative snapshot. A second
+        // history read here races that snapshot and violates I14's one-read budget.
+        if connection?.transportPath == .relay { return nil }
+        guard let rest = connection?.rest else { return nil }
+        if connection?.transportPath == .gatewayDirect {
+            return { [weak self] sessionId, profile in
+                let limit = ChatStore.transcriptOpenWindowLimit
+                let total = self?.sessions.first(where: { $0.id == sessionId })?.messageCount ?? 0
+                let offset = max(0, total - limit)
+                if let page = await fetchStockTranscriptPage(
+                    rest: rest,
+                    sessionId: sessionId,
+                    profile: profile,
+                    limit: limit,
+                    offset: offset
+                ) {
+                    return page.messages
+                }
+                return try await rest.messages(sessionId: sessionId, profile: profile)
             }
         }
-        guard let rest = connection?.rest else { return nil }
         // ABH-408: a non-default row opened from the All-profiles rail must use
         // RestClient+Profiles.messages(sessionId:profile:) so the backend reads
         // that profile's store. The plugin transcript-page route currently has no
@@ -6627,12 +6645,9 @@ final class SessionStore {
     /// ``skeletonColdOpenForced``.
     private var skeletonColdOpenEligible: Bool {
         if let forced = skeletonColdOpenForced { return forced }
-        // R3 (ROUND-4 W2d): TRANSPORT-AWARE. The relay carries no skeleton
-        // tier — and on relay the phase-2 network seed does not run at all
-        // (the resume/open snapshot is the sole seed; `resolvedTranscriptFetch`
-        // returns nil there). Eligibility staying true on relay marked the
-        // (nonexistent) seed "skeleton" and fired the background hydrate fetch
-        // — the relay double-fetch. Direct mode keeps plugin-tier behavior.
+        // The transparent path reads the stock paginated transcript; `shape`
+        // belongs only to the legacy plugin transcript route.
+        if connection?.transportPath == .gatewayDirect { return false }
         if connection?.transportPath == .relay { return false }
         return connection?.rest?.pathStyle == .plugin
     }

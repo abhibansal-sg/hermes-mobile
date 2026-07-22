@@ -10,7 +10,7 @@ settings:
     SWIFT_STRICT_CONCURRENCY: complete
     DEVELOPMENT_TEAM: 6J4Y9NKRQ2
     CODE_SIGN_STYLE: Automatic
-    CURRENT_PROJECT_VERSION: 120
+    CURRENT_PROJECT_VERSION: 126
     MARKETING_VERSION: 1.0.1
 packages:
   # Offline-first cache plus the protected app-group WorkRepository. The share
@@ -346,6 +346,12 @@ schemes:
           isEnabled: true
         - variable: HERMES_TOKEN
           value: $(TEST_RUNNER_HERMES_TOKEN)
+          isEnabled: true
+        - variable: HERMES_LIVE_FOLLOW_MARKER
+          value: $(TEST_RUNNER_HERMES_LIVE_FOLLOW_MARKER)
+          isEnabled: true
+        - variable: HERMES_PAGINATION_TITLE
+          value: $(TEST_RUNNER_HERMES_PAGINATION_TITLE)
           isEnabled: true
   WorkRepositoryTests:
     build:

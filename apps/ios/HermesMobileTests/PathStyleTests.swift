@@ -112,6 +112,10 @@ final class PathStyleTests: XCTestCase {
             _ = try await client.devicesList()
             XCTAssertEqual(recordedPaths, ["\(prefix)/devices"])
 
+            client = makeClient(style: style, script: [(ok, 200)])
+            try await client.setDeviceForeground(storedSessionId: "s")
+            XCTAssertEqual(recordedPaths, ["\(prefix)/devices/foreground"])
+
             client = makeClient(style: style, script: [(issued, 200)])
             _ = try await client.issueDevice(name: "n")
             XCTAssertEqual(recordedPaths, ["\(prefix)/devices/issue"])

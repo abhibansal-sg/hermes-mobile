@@ -532,7 +532,7 @@ final class InboxStore {
                 requestId: requestId,
                 sessionId: item.sessionId, storedSessionId: item.storedSessionId,
                 kind: "clarify", safeTitle: "Clarification required",
-                detail: .init(question: "The agent needs input"),
+                detail: .init(question: request.question, choices: request.choices),
                 createdAt: item.receivedAt.timeIntervalSince1970
             )
         }

@@ -2,8 +2,6 @@ import Foundation
 import SwiftUI  // A2: withTransaction(Transaction(animation: nil)) on the finalize flip
 import UIKit
 import os
-#if DEBUG
-#endif
 
 struct TranscriptPageFetch: Sendable {
     let messages: [StoredMessage]
@@ -52,6 +50,46 @@ func fetchTranscriptPage(
             messages: array.compactMap(StoredMessage.init(json:)),
             oldestId: page?["oldest_id"]?.intValue,
             hasMoreBefore: page?["has_more_before"]?.boolValue ?? false
+        )
+    } catch {
+        return nil
+    }
+}
+
+/// Stock gateway transcript page used by the transparent relay path.
+func fetchStockTranscriptPage(
+    rest: RestClient,
+    sessionId: String,
+    profile: String?,
+    limit: Int,
+    offset: Int
+) async -> TranscriptPageFetch? {
+    let encodedId = sessionId.addingPercentEncoding(
+        withAllowedCharacters: .urlPathAllowed
+    ) ?? sessionId
+    var query = [
+        URLQueryItem(name: "limit", value: String(max(1, limit))),
+        URLQueryItem(name: "offset", value: String(max(0, offset))),
+    ]
+    if let profile, !profile.isEmpty {
+        query.append(URLQueryItem(name: "profile", value: profile))
+    }
+    var components = URLComponents()
+    components.queryItems = query
+    let encodedQuery = (components.percentEncodedQuery ?? "")
+        .replacingOccurrences(of: "+", with: "%2B")
+    do {
+        let data = try await rest.get(
+            path: "/api/sessions/\(encodedId)/messages?\(encodedQuery)"
+        )
+        let root = try rest.decodeJSONValue(from: data, context: "stockMessagesPage")
+        guard let array = root["messages"]?.arrayValue else { return nil }
+        let pageOffset = root["pagination"]?["offset"]?.intValue ?? max(0, offset)
+        let messages = array.compactMap(StoredMessage.init(json:))
+        return TranscriptPageFetch(
+            messages: messages,
+            oldestId: messages.first?.wireId,
+            hasMoreBefore: pageOffset > 0 && !messages.isEmpty
         )
     } catch {
         return nil
@@ -702,6 +740,7 @@ final class ChatStore {
     private(set) var isLoadingJumpTarget = false
     private(set) var jumpTargetLoadError: String?
     private var oldestLoadedTranscriptWireId: Int?
+    private var oldestLoadedTranscriptOffset: Int?
     private var jumpWindowFetchAttemptedMessageIds: Set<Int> = []
 
     /// Runtime sessions whose gateway status currently reports a mid-turn
@@ -923,7 +962,14 @@ final class ChatStore {
 
         switch ownership(of: event) {
         case .unrelated:
-            // Not ours and not a mirror of our open session — drop it.
+            if event.type == .approvalRequest, event.storedSessionId != nil {
+                handleApprovalRequest(event)
+            } else if event.type == .clarifyRequest, event.storedSessionId != nil {
+                handleClarifyRequest(event)
+            } else if (event.type == .messageComplete || event.type == .error),
+                      let storedSessionId = event.storedSessionId {
+                expirePendingGates(storedSessionID: storedSessionId)
+            }
             return
         case .foreign:
             handleForeignFrame(event)
@@ -1478,9 +1524,13 @@ final class ChatStore {
     /// live-socket `broadcast_gap` backfill) must leave it alone. The
     /// complete path leaves it to `respondSecurePrompt`'s own lifecycle.
     private func expireTurnScopedPrompts(includeSecure: Bool) {
-        if pendingApproval != nil {
+        if let approval = pendingApproval {
+            markRelayGateResolved(approval.id)
             pendingApproval = nil
             onApprovalChange?(false)
+        }
+        if let requestId = pendingClarification?.request.requestId {
+            markRelayGateResolved(requestId)
         }
         pendingClarification = nil
         if includeSecure {
@@ -1617,15 +1667,32 @@ final class ChatStore {
 
     private func handleApprovalRequest(_ event: GatewayEvent) {
         let request = ApprovalRequestPayload(payload: event.payload)
+        guard !resolvedRelayGateIDs.contains(request.id) else { return }
         let sessionId = event.sessionId ?? activeSessionId ?? ""
-        pendingApproval = PendingApproval(id: request.id, sessionId: sessionId, request: request)
-        onApprovalChange?(true)
+        let storedId = event.storedSessionId ?? sessions?.activeStoredId ?? sessionId
+        let gate = PendingApproval(id: request.id, sessionId: sessionId, request: request)
+        if storedId == relayWriteGateSessionID {
+            relayWriteGateSessionID = storedId
+            pendingApproval = gate
+            onApprovalChange?(true)
+        } else {
+            parkedRelayApprovals[storedId] = gate
+        }
     }
 
     private func handleClarifyRequest(_ event: GatewayEvent) {
         let request = ClarifyRequestPayload(payload: event.payload)
+        if let requestId = request.requestId,
+           resolvedRelayGateIDs.contains(requestId) { return }
         let sessionId = event.sessionId ?? activeSessionId ?? ""
-        pendingClarification = PendingClarification(sessionId: sessionId, request: request)
+        let storedId = event.storedSessionId ?? sessions?.activeStoredId ?? sessionId
+        let gate = PendingClarification(sessionId: sessionId, request: request)
+        if storedId == relayWriteGateSessionID {
+            relayWriteGateSessionID = storedId
+            pendingClarification = gate
+        } else {
+            parkedRelayClarifications[storedId] = gate
+        }
     }
 
     // MARK: - Wave-2 relay gate bridge (QA-1 B10 / A3)
@@ -1661,10 +1728,6 @@ final class ChatStore {
     /// exactly once; a switch MOVES it — there is no expire-on-switch.
     private var parkedRelayApprovals: [String: PendingApproval] = [:]
     private var parkedRelayClarifications: [String: PendingClarification] = [:]
-    /// Ids of gates folded in from the relay wire (slot OR parked) — what
-    /// distinguishes a relay gate the write-gate MOVES from a direct-path
-    /// gate (whose slot lifetime — cleared on `reset()` — is unchanged).
-    private var relayOwnedGateIDs: Set<String> = []
     /// The session holding the relay write-gate (contract I2) — set by
     /// ``relayWriteGateMoved(toSession:items:)``. A gate frame folds into the
     /// SLOT only when its `sid` matches; any other sid parks.
@@ -1685,9 +1748,7 @@ final class ChatStore {
     private func markRelayGateResolved(_ id: String) {
         guard !id.isEmpty else { return }
         resolvedRelayGateIDs.insert(id)
-        relayOwnedGateIDs.remove(id)
         if resolvedRelayGateIDs.count > 256 { resolvedRelayGateIDs.removeAll() }
-        if relayOwnedGateIDs.count > 256 { relayOwnedGateIDs.removeAll() }
         UserDefaults.standard.set(
             Array(resolvedRelayGateIDs), forKey: Self.resolvedRelayGateIDsDefaultsKey
         )
@@ -1710,11 +1771,10 @@ final class ChatStore {
         let request = ApprovalRequestPayload(payload: frame.body)
         guard !resolvedRelayGateIDs.contains(request.id) else { return }
         let gate = PendingApproval(id: request.id, sessionId: frame.sid, request: request)
-        relayOwnedGateIDs.insert(request.id)
         // I12: the active session's gate takes the slot the views read; a
         // background session's gate PARKS until its session holds the
         // write-gate — never dropped because the session is unfocused.
-        if frame.sid == relayWriteGateSessionID || relayWriteGateSessionID == nil {
+        if frame.sid == relayWriteGateSessionID {
             pendingApproval = gate
             onApprovalChange?(true)
         } else {
@@ -1732,8 +1792,7 @@ final class ChatStore {
         let request = ClarifyRequestPayload(payload: frame.body)
         if let rid = request.requestId, resolvedRelayGateIDs.contains(rid) { return }
         let gate = PendingClarification(sessionId: frame.sid, request: request)
-        if let rid = request.requestId { relayOwnedGateIDs.insert(rid) }
-        if frame.sid == relayWriteGateSessionID || relayWriteGateSessionID == nil {
+        if frame.sid == relayWriteGateSessionID {
             pendingClarification = gate
         } else {
             parkedRelayClarifications[frame.sid] = gate
@@ -1749,21 +1808,93 @@ final class ChatStore {
     /// expire-on-switch. A background session's `turn.completed` expires ITS
     /// OWN parked gate and touches nothing on the active session (I1/I2).
     func expireRelayPendingGates(sessionID: String) {
-        if let approval = pendingApproval, approval.sessionId == sessionID {
+        expirePendingGates(storedSessionID: sessionID)
+    }
+
+    private func expirePendingGates(storedSessionID: String) {
+        if let approval = pendingApproval,
+           relayWriteGateSessionID == storedSessionID {
             markRelayGateResolved(approval.id)
             pendingApproval = nil
             onApprovalChange?(false)
         }
-        if let parked = parkedRelayApprovals.removeValue(forKey: sessionID) {
+        if let parked = parkedRelayApprovals.removeValue(forKey: storedSessionID) {
             markRelayGateResolved(parked.id)
         }
-        if let clarify = pendingClarification, clarify.sessionId == sessionID {
+        if let clarify = pendingClarification,
+           relayWriteGateSessionID == storedSessionID {
             if let rid = clarify.request.requestId { markRelayGateResolved(rid) }
             pendingClarification = nil
         }
-        if let parked = parkedRelayClarifications.removeValue(forKey: sessionID) {
+        if let parked = parkedRelayClarifications.removeValue(forKey: storedSessionID) {
             if let rid = parked.request.requestId { markRelayGateResolved(rid) }
         }
+    }
+
+    /// Move the visible prompt-card slots with the one durable session owner.
+    /// Each card keeps its runtime id solely for the response RPC.
+    func pendingGateOwnerMoved(toStoredSession storedSessionID: String?) {
+        if let outgoing = relayWriteGateSessionID {
+            if let approval = pendingApproval {
+                parkedRelayApprovals[outgoing] = approval
+                pendingApproval = nil
+                onApprovalChange?(false)
+            }
+            if let clarification = pendingClarification {
+                parkedRelayClarifications[outgoing] = clarification
+                pendingClarification = nil
+            }
+        }
+        relayWriteGateSessionID = storedSessionID
+        if let storedSessionID {
+            if let approval = parkedRelayApprovals.removeValue(forKey: storedSessionID) {
+                pendingApproval = approval
+                onApprovalChange?(true)
+            }
+            pendingClarification = parkedRelayClarifications.removeValue(forKey: storedSessionID)
+        }
+    }
+
+    /// Rebuild the existing per-session gate slots from the server-authoritative
+    /// pending-attention snapshot. This is the cold/background counterpart to
+    /// the live WebSocket handlers above: a push can wake the app after the gate
+    /// frame was missed, but the plugin snapshot still carries the same runtime
+    /// id, stored id, request id, and payload.
+    func reconcilePendingAttention(_ items: [InboxStore.Item]) {
+        var approvals: [String: PendingApproval] = [:]
+        var clarifications: [String: PendingClarification] = [:]
+
+        for item in items {
+            let storedID = item.storedSessionId ?? item.sessionId
+            switch item.payload {
+            case .approval(let request):
+                guard !resolvedRelayGateIDs.contains(request.id) else { continue }
+                approvals[storedID] = PendingApproval(
+                    id: request.id, sessionId: item.sessionId, request: request
+                )
+            case .clarify(let request):
+                if let requestID = request.requestId,
+                   resolvedRelayGateIDs.contains(requestID) { continue }
+                clarifications[storedID] = PendingClarification(
+                    sessionId: item.sessionId, request: request
+                )
+            }
+        }
+
+        let owner = relayWriteGateSessionID
+        pendingApproval = owner.flatMap { approvals.removeValue(forKey: $0) }
+        pendingClarification = owner.flatMap { clarifications.removeValue(forKey: $0) }
+        parkedRelayApprovals = approvals
+        parkedRelayClarifications = clarifications
+        onApprovalChange?(pendingApproval != nil)
+    }
+
+    func discardPendingGates() {
+        pendingApproval = nil
+        pendingClarification = nil
+        parkedRelayApprovals.removeAll()
+        parkedRelayClarifications.removeAll()
+        onApprovalChange?(false)
     }
 
     /// R1 (contract I2, amendment G1): the relay WRITE-GATE moved to
@@ -1782,29 +1913,8 @@ final class ChatStore {
     ///      refetch — I14); an empty entry is a no-op: the cache paint owns
     ///      the first frame, never void (QA-1 B4).
     func relayWriteGateMoved(toSession sessionID: String?, items: [ChatItem]) {
-        relayWriteGateSessionID = sessionID
-        // (a) park the outgoing relay gate / unpark the incoming one.
-        if let approval = pendingApproval, relayOwnedGateIDs.contains(approval.id),
-           approval.sessionId != sessionID {
-            parkedRelayApprovals[approval.sessionId] = approval
-            pendingApproval = nil
-            onApprovalChange?(false)
-        }
-        if let clarify = pendingClarification,
-           let rid = clarify.request.requestId, relayOwnedGateIDs.contains(rid),
-           clarify.sessionId != sessionID {
-            parkedRelayClarifications[clarify.sessionId] = clarify
-            pendingClarification = nil
-        }
-        if let sessionID {
-            if let parked = parkedRelayApprovals.removeValue(forKey: sessionID) {
-                pendingApproval = parked
-                onApprovalChange?(true)
-            }
-            if let parked = parkedRelayClarifications.removeValue(forKey: sessionID) {
-                pendingClarification = parked
-            }
-        }
+        // (a) park the outgoing gate / unpark the incoming one.
+        pendingGateOwnerMoved(toStoredSession: sessionID)
         // (b)+(c) the outgoing turn's LA ownership + chrome move off (discard).
         if turnStartedAt != nil {
             turnStartedAt = nil
@@ -1837,14 +1947,7 @@ final class ChatStore {
     /// the write-gate identity moves — projection goes live and any parked
     /// gate for the new sid takes the slot.
     func relayCreatedSessionAdopted(_ sessionID: String) {
-        relayWriteGateSessionID = sessionID
-        if let parked = parkedRelayApprovals.removeValue(forKey: sessionID) {
-            pendingApproval = parked
-            onApprovalChange?(true)
-        }
-        if let parked = parkedRelayClarifications.removeValue(forKey: sessionID) {
-            pendingClarification = parked
-        }
+        pendingGateOwnerMoved(toStoredSession: sessionID)
     }
 
     /// One ownership decision for live approval/clarify/complete events. APNs is
@@ -3780,6 +3883,7 @@ final class ChatStore {
         // approvals (broadcast from another client's turn) that is a foreign
         // runtime id, not our own.
         let approvalSession = pendingApproval?.sessionId
+        let requestId = pendingApproval?.id ?? ""
         // Wave-2 relay transport (QA-1 B10): the gateway `client` is idle in
         // relay mode, so answer OVER THE RELAY — `coordinator.approve` builds
         // the ratified §5 wire shape (`session_id` + `decision` [+ `request_id`
@@ -3789,7 +3893,6 @@ final class ChatStore {
         // coordinator's driven session exactly as `respondApproval` does to
         // `activeSessionId`. The default gateway path stays byte-identical.
         if let connection, connection.transportPath == .relay {
-            let requestId = pendingApproval?.id ?? ""
             pendingApproval = nil
             onApprovalChange?(false)
             markRelayGateResolved(requestId)
@@ -3815,6 +3918,7 @@ final class ChatStore {
         let choice = approve ? "approve" : "deny"
         pendingApproval = nil
         onApprovalChange?(false)
+        markRelayGateResolved(requestId)
         do {
             _ = try await client.requestRaw(
                 "approval.respond",
@@ -3859,6 +3963,9 @@ final class ChatStore {
             // testRespondClarificationEchoesAnswerAsUserMessage /
             // EchoIsSingleRowEvenIfCalledTwice).
             pendingClarification = nil
+            if let requestId = pending?.request.requestId {
+                markRelayGateResolved(requestId)
+            }
         }
         // Wave-2 relay transport (QA-1 B10): answer OVER THE RELAY —
         // `coordinator.clarify` builds the §5 shape (`session_id` + `text` +
@@ -3866,7 +3973,6 @@ final class ChatStore {
         // `request_id` echo is REQUIRED: the gateway matches the pending
         // waiter by it — without it the reply 4009s and the agent hangs.
         if let connection, connection.transportPath == .relay {
-            if let rid = pending?.request.requestId { markRelayGateResolved(rid) }
             guard let coordinator = connection.relayCoordinator else {
                 lastError = "Relay not connected"
                 return
@@ -4088,8 +4194,11 @@ final class ChatStore {
     /// Update the backward-paging cursor carried by the latest authoritative
     /// transcript seed. ``stored`` may be only the recent tail window; the server
     /// page metadata tells us whether older rows exist beyond the first loaded id.
-    func noteTranscriptPaging(oldestId: Int?, hasMoreBefore: Bool) {
+    func noteTranscriptPaging(
+        oldestId: Int?, hasMoreBefore: Bool, oldestOffset: Int? = nil
+    ) {
         oldestLoadedTranscriptWireId = oldestId
+        oldestLoadedTranscriptOffset = oldestOffset
         transcriptHasMoreBefore = hasMoreBefore
     }
 
@@ -4097,6 +4206,16 @@ final class ChatStore {
     /// fallback). A full 50-row tail may have older rows; clicking once verifies
     /// against the server and clears the affordance if not.
     func noteTranscriptSeedWindow(_ stored: [StoredMessage]) {
+        if connection?.transportPath == .gatewayDirect,
+           let total = sessions?.activeSummary?.messageCount {
+            let offset = max(0, total - stored.count)
+            noteTranscriptPaging(
+                oldestId: stored.first?.wireId,
+                hasMoreBefore: offset > 0,
+                oldestOffset: offset
+            )
+            return
+        }
         noteTranscriptPaging(
             oldestId: stored.first?.wireId,
             hasMoreBefore: stored.count >= Self.transcriptOpenWindowLimit
@@ -4106,29 +4225,41 @@ final class ChatStore {
     /// Fetch and prepend one older server page. Used by ChatView's top affordance
     /// once the locally-loaded rows no longer have hidden in-memory rows above.
     ///
-    /// ABH-401 CONFLICT GUARD: also bails while a `loadTranscriptAround` jump fetch
-    /// is in flight (`isLoadingJumpTarget`). Both methods build their prepended
-    /// seed from a synchronous snapshot of `messages` taken before their async
-    /// fetch resolves; if the two ran concurrently the loser's `seed(normalized:)`
-    /// would be built from a now-stale snapshot and silently drop whatever the
-    /// winner just prepended (a lost update — not just a redundant fetch). Mutual
-    /// exclusion between the two async prepend paths prevents that clobber.
+    /// It remains mutually exclusive with target-centered jump loading, but it
+    /// may run during a live turn: older settled rows are inserted into the
+    /// current array without reseeding or cancelling the streaming placeholder.
     func loadEarlierTranscript() async {
-        guard !isStreaming,
-              !isLoadingEarlierTranscript,
+        let usesStockPaging = connection?.transportPath == .gatewayDirect
+            && transcriptPageFetch == nil
+        let cursor = usesStockPaging
+            ? oldestLoadedTranscriptOffset
+            : oldestLoadedTranscriptWireId
+        guard !isLoadingEarlierTranscript,
               !isLoadingJumpTarget,
               transcriptHasMoreBefore,
               let storedId = sessions?.activeStoredId,
-              let before = oldestLoadedTranscriptWireId,
+              let cursor,
               let fetch = resolvedTranscriptPageFetch else { return }
+        let limit = usesStockPaging
+            ? min(Self.transcriptOpenWindowLimit, cursor)
+            : Self.transcriptOpenWindowLimit
+        let pageCursor = usesStockPaging ? max(0, cursor - limit) : cursor
+        guard limit > 0 else { return }
         isLoadingEarlierTranscript = true
         defer { isLoadingEarlierTranscript = false }
-        guard let page = await fetch(storedId, Self.transcriptOpenWindowLimit, before) else { return }
+        guard let page = await fetch(storedId, limit, pageCursor) else { return }
         if !page.messages.isEmpty {
             let older = Self.toChatMessages(page.messages)
-            seed(normalized: older + messages)
+            let existing = Set(messages.map(\.id))
+            messages.insert(contentsOf: older.filter { !existing.contains($0.id) }, at: 0)
+            rebuildUserOrdinals()
+            transcriptGeneration += 1
         }
-        noteTranscriptPaging(oldestId: page.oldestId, hasMoreBefore: page.hasMoreBefore)
+        noteTranscriptPaging(
+            oldestId: page.oldestId,
+            hasMoreBefore: page.hasMoreBefore,
+            oldestOffset: usesStockPaging ? pageCursor : nil
+        )
     }
 
     /// Whether the jump resolver may try the server's target-centered page. Also
@@ -5041,19 +5172,6 @@ final class ChatStore {
                     Task { try? await cacheStore.saveTranscript(identity: identity, messages: stored) }
                 }
             }
-            // The seed is the authoritative post-reconnect/post-restart
-            // reconcile: any approval/clarify card still up belongs to a turn
-            // that is no longer in flight (a live turn's `guard !isStreaming`
-            // would have no-op'd us), so answering it would mis-resolve
-            // against a stale — possibly dead — runtime (R1 #51). The inbox
-            // remains the durable surface for prompts that are genuinely
-            // pending. The SECURE prompt is deliberately excluded: it has NO
-            // inbox fallback, and this path also runs on live-socket
-            // reconciles (`broadcast_gap`) where the agent may genuinely
-            // still be waiting on it — its expiry belongs to the transport
-            // drop (`handleConnectionDrop`) and the `error` terminal, never
-            // to a reconcile that proves nothing about its turn.
-            expireTurnScopedPrompts(includeSecure: false)
             lastBackfillError = nil
         } catch {
             // Backfill is best-effort for the transcript (we keep what we have),
@@ -5089,13 +5207,26 @@ final class ChatStore {
     }
 
     /// The injected `transcriptPageFetch` test seam, or the default that
-    /// resolves the live `connection?.rest` and calls the module-level
-    /// ``fetchTranscriptPage``. Mirrors ``resolvedTranscriptAroundFetch``'s
+    /// resolves the live `connection?.rest` and uses stock offset pagination on
+    /// the transparent path (legacy relay keeps its existing plugin cursor).
+    /// Mirrors ``resolvedTranscriptAroundFetch``'s
     /// injected-seam-first pattern so tests can control `loadEarlierTranscript`'s
     /// fetch timing without a live REST client.
     private var resolvedTranscriptPageFetch: ((String, Int, Int?) async -> TranscriptPageFetch?)? {
         if let transcriptPageFetch { return transcriptPageFetch }
         guard let rest = connection?.rest else { return nil }
+        if connection?.transportPath == .gatewayDirect {
+            let profile = sessions?.activeSummary?.profile
+            return { sessionId, limit, offset in
+                await fetchStockTranscriptPage(
+                    rest: rest,
+                    sessionId: sessionId,
+                    profile: profile,
+                    limit: limit,
+                    offset: offset ?? 0
+                )
+            }
+        }
         return { sessionId, limit, before in
             await fetchTranscriptPage(rest: rest, sessionId: sessionId, limit: limit, before: before)
         }
@@ -5187,19 +5318,8 @@ final class ChatStore {
         cancelStreaming()
         messages = []
         userOrdinals = [:]
-        // R1/I12 (amendment G1): relay gates MOVE with their session — park
-        // them before the wholesale clear so a switch-back re-shows the card
-        // (the direct-path gate keeps its reset lifetime — this branch only
-        // touches relay-owned gates).
-        if let approval = pendingApproval, relayOwnedGateIDs.contains(approval.id) {
-            parkedRelayApprovals[approval.sessionId] = approval
-        }
-        if let clarify = pendingClarification,
-           let rid = clarify.request.requestId, relayOwnedGateIDs.contains(rid) {
-            parkedRelayClarifications[clarify.sessionId] = clarify
-        }
-        pendingApproval = nil
-        pendingClarification = nil
+        // I12: transcript teardown does not own prompt-card lifetime. Session
+        // navigation moves those slots through `pendingGateOwnerMoved`.
         // The relay gate-suppression set is NOT cleared here (R1/I12): an
         // ANSWERED gate's resync re-delivery must stay suppressed across
         // switches for every session the phone drives — the set belongs to
@@ -5230,6 +5350,7 @@ final class ChatStore {
         isLoadingJumpTarget = false
         jumpTargetLoadError = nil
         oldestLoadedTranscriptWireId = nil
+        oldestLoadedTranscriptOffset = nil
         jumpWindowFetchAttemptedMessageIds = []
         // A pending foreign-reconcile adoption belongs to the session being torn
         // down (§3.7); never let it bleed into the next session's first seed.

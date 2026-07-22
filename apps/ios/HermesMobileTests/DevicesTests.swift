@@ -587,26 +587,22 @@ final class DevicesTests: XCTestCase {
         )
     }
 
-    // MARK: - Auto-upgrade auth gating (STR-1568)
+    // MARK: - Auto-upgrade auth compatibility (STR-1568)
 
-    /// Routes stub responses by URL path so one session answers both the live
-    /// `GET /api/status` auth-gate check and the `POST /api/devices/issue` call
-    /// the real `autoUpgradeToDeviceTokenIfNeeded` makes — exercising the actual
-    /// method end-to-end (not a mirrored decision function) via the STR-1417
-    /// `_restOverrideForTesting` seam.
+    /// Routes the `POST /api/devices/issue` call the real
+    /// `autoUpgradeToDeviceTokenIfNeeded` makes, exercising the actual method
+    /// end-to-end via the STR-1417 `_restOverrideForTesting` seam.
     final class AutoUpgradeRoutingProtocol: URLProtocol, @unchecked Sendable {
-        nonisolated(unsafe) static var statusBody = Data(#"{"auth_required":true}"#.utf8)
-        nonisolated(unsafe) static var statusCode = 200
         nonisolated(unsafe) static var issueBody = Data()
         nonisolated(unsafe) static var issueCode = 200
         nonisolated(unsafe) static var issueCallCount = 0
+        nonisolated(unsafe) static var unexpectedCallCount = 0
 
         static func reset() {
-            statusBody = Data(#"{"auth_required":true}"#.utf8)
-            statusCode = 200
             issueBody = Data()
             issueCode = 200
             issueCallCount = 0
+            unexpectedCallCount = 0
         }
 
         override class func canInit(with request: URLRequest) -> Bool { true }
@@ -619,7 +615,8 @@ final class DevicesTests: XCTestCase {
                 Self.issueCallCount += 1
                 (body, status) = (Self.issueBody, Self.issueCode)
             } else {
-                (body, status) = (Self.statusBody, Self.statusCode)
+                Self.unexpectedCallCount += 1
+                (body, status) = (Data(#"{"error":"unexpected request"}"#.utf8), 404)
             }
             let response = HTTPURLResponse(
                 url: request.url!,
@@ -654,50 +651,22 @@ final class DevicesTests: XCTestCase {
         return connection
     }
 
-    func testAutoUpgradeSkipsIssueWhenAuthNotRequiredOnLoopback() async {
-        // A loopback dev-gateway (`auth_required: false`) runs ONLY the legacy
-        // shared-token-only middleware on `/api/*` — a device token 401s there
-        // (the root cause STR-1568 traced). The auto-upgrade must see the live
-        // status and skip the issue call entirely, keeping the shared token.
+    func testAutoUpgradeUsesCapabilityWithoutStatusGateOnLoopback() async {
+        // The stock loopback gate now accepts plugin device tokens on both REST
+        // and WebSocket. `auth_required: false` must therefore not strand a
+        // shared-token phone without the device identity used for push gating.
         let server = "http://127.0.0.1:9119"
         let connection = makeAutoUpgradeConnection(server: server)
-        AutoUpgradeRoutingProtocol.statusBody = Data(#"{"auth_required":false}"#.utf8)
-
-        await connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
-
-        XCTAssertEqual(AutoUpgradeRoutingProtocol.issueCallCount, 0)
-        XCTAssertNil(DefaultsKeys.deviceId(server: server))
-    }
-
-    func testAutoUpgradeIssuesWhenAuthRequiredTrue() async {
-        // The gated (non-loopback / OAuth) path is unchanged: `auth_required:
-        // true` ⇒ proceed to issue + record the device token exactly as before.
-        let server = "https://gw.example:9119"
-        let connection = makeAutoUpgradeConnection(server: server)
-        AutoUpgradeRoutingProtocol.statusBody = Data(#"{"auth_required":true}"#.utf8)
         AutoUpgradeRoutingProtocol.issueBody = Data("""
-        {"device_id":"dev_gated001","token":"tok_new_device","device_name":"iPhone",
+        {"device_id":"dev_loopback001","token":"tok_loopback_device","device_name":"iPhone",
          "created_at":1700001234.0}
         """.utf8)
 
         await connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
 
         XCTAssertEqual(AutoUpgradeRoutingProtocol.issueCallCount, 1)
-        XCTAssertEqual(DefaultsKeys.deviceId(server: server), "dev_gated001")
-    }
-
-    func testAutoUpgradeFailSafeSkipsIssueWhenStatusUnreachable() async {
-        // A transport/decode failure on the status check must fail SAFE — same
-        // outcome as `auth_required == false` — never fail open and let an issue
-        // call slip through blind because the gate itself couldn't be read.
-        let server = "https://flaky:9119"
-        let connection = makeAutoUpgradeConnection(server: server)
-        AutoUpgradeRoutingProtocol.statusBody = Data("not json".utf8)
-
-        await connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
-
-        XCTAssertEqual(AutoUpgradeRoutingProtocol.issueCallCount, 0)
-        XCTAssertNil(DefaultsKeys.deviceId(server: server))
+        XCTAssertEqual(AutoUpgradeRoutingProtocol.unexpectedCallCount, 0)
+        XCTAssertEqual(DefaultsKeys.deviceId(server: server), "dev_loopback001")
     }
 
     func testDeviceNameHintIsNonEmpty() {
@@ -744,7 +713,6 @@ final class DevicesTests: XCTestCase {
         // same server (STR-512's orphan-token / 64-device-cap bug).
         let server = "https://gw.example:9119"
         let connection = makeAutoUpgradeConnection(server: server)
-        AutoUpgradeRoutingProtocol.statusBody = Data(#"{"auth_required":true}"#.utf8)
 
         let gate = IssueCallGate()
         let issued = try decodeIssuedDevice(deviceId: "dev_single_flight", token: "tok_single_flight")
@@ -779,7 +747,6 @@ final class DevicesTests: XCTestCase {
         // permanently stuck behind a dead in-flight entry.
         let server = "https://gw.example:9119"
         let connection = makeAutoUpgradeConnection(server: server)
-        AutoUpgradeRoutingProtocol.statusBody = Data(#"{"auth_required":true}"#.utf8)
         AutoUpgradeRoutingProtocol.issueCode = 500
 
         await connection.autoUpgradeToDeviceTokenIfNeeded(serverURL: server)
