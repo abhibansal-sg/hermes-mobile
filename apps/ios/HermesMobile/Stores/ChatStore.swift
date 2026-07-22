@@ -872,7 +872,7 @@ final class ChatStore {
         let active = activeSessionId
         // A frame on our own active runtime is unambiguously local.
         if let sid = event.sessionId, let active, sid == active {
-            return .local
+            return sessions?.sessionBinding?.mode == .watch ? .foreign : .local
         }
         // Correlate the broadcast stored id with the session we have open (H3:
         // trim both sides; the wire id is already trimmed in `GatewayEvent`).
@@ -3223,6 +3223,7 @@ final class ChatStore {
         setStreaming(true, reason: "outbox.submit")
         lastError = nil
         lastSendReachedServer = true
+        let priorBindingMode = sessions?.beginPromptSubmission(runtimeID: runtimeSessionID)
         do {
             let result = try await client.requestRaw(
                 "prompt.submit",
@@ -3234,11 +3235,19 @@ final class ChatStore {
             )
             let receipt = OutboxSubmitResult(json: result)
             if !(receipt.accepted && OutboxProcessor.acceptedDispositions.contains(receipt.status)) {
+                sessions?.restoreWatchAfterRejectedSubmission(
+                    runtimeID: runtimeSessionID,
+                    priorMode: priorBindingMode
+                )
                 endLocalTurn()
                 setStreaming(false, reason: "outbox.pendingReceipt")
             }
             return receipt
         } catch {
+            sessions?.restoreWatchAfterRejectedSubmission(
+                runtimeID: runtimeSessionID,
+                priorMode: priorBindingMode
+            )
             endLocalTurn()
             setStreaming(false, reason: "outbox.transportError")
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
