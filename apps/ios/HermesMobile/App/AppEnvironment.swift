@@ -130,9 +130,9 @@ final class AppEnvironment {
                     }
                     return chatStore.activeStoredSessionId
                 },
-                createDestination: { [weak sessionStore] _ in
+                createDestination: { [weak sessionStore] job in
                     guard let sessionStore else { throw OutboxProcessorError.destinationUnavailable }
-                    return try await sessionStore.createOutboxDestination()
+                    return try await sessionStore.createOutboxDestination(job: job)
                 },
                 resolveRuntime: { [weak sessionStore, weak connectionStore] storedID in
                     // Wave-2 relay transport: the durable outbox drains into the
