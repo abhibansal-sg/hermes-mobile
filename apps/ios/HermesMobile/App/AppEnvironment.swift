@@ -1,4 +1,10 @@
 import Foundation
+import os
+
+private let appEnvironmentLog = Logger(
+    subsystem: "ai.hermes.HermesMobile",
+    category: "AppEnvironment"
+)
 
 enum UITestAudioGuard {
 #if DEBUG
@@ -238,7 +244,16 @@ final class AppEnvironment {
         // which makes every store fall back to the network-only path verbatim —
         // the cache is a pure accelerator, never a correctness dependency, so a
         // dead cache degrades to today's behavior rather than breaking the app.
-        let cacheStore = try? CacheStore()
+        let cacheStore: CacheStore?
+        do {
+            cacheStore = try CacheStore()
+            appEnvironmentLog.notice("[ABH-519] CacheStore.init success")
+        } catch {
+            cacheStore = nil
+            appEnvironmentLog.error(
+                "[ABH-519] CacheStore.init error=\(String(reflecting: error), privacy: .public)"
+            )
+        }
         if let cacheStore {
             sessionStore.attachCache(cacheStore)
             chatStore.attachCache(cacheStore)

@@ -1,11 +1,10 @@
 import Foundation
-#if DEBUG
 import os
 
-/// DEBUG-only logger for SessionStore open→painted latency instrumentation
-/// (WhatsApp bar). Absent in Release.
+/// Session/cache diagnostics, including the temporary ABH-519 device trace.
 private let sessionLog = Logger(subsystem: "ai.hermes.HermesMobile", category: "SessionStore")
 
+#if DEBUG
 /// DEBUG-only signpost log for the open→paint fallback chain (QA-1 A7/B2).
 private let sessionSignposts = OSLog(subsystem: "ai.hermes.HermesMobile", category: "SessionStore")
 #endif
@@ -4525,8 +4524,33 @@ final class SessionStore {
     /// no duplicate). Fire-and-forget OFF the turn's path: the in-memory echo
     /// (`persistDurableEcho`) owns the live paint; this owns the durable one.
     private func persistDraftBornCacheSeed(storedID: String, echo: ChatMessage?) {
-        guard let cacheStore, let identity = cacheIdentity(storedID),
-              let echo, !echo.text.isEmpty else { return }
+        sessionLog.notice(
+            "[ABH-519] persistDraftBornCacheSeed entry session=\(storedID, privacy: .public)"
+        )
+        guard let cacheStore else {
+            sessionLog.error(
+                "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=cacheStore-nil"
+            )
+            return
+        }
+        guard let identity = cacheIdentity(storedID) else {
+            sessionLog.error(
+                "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=cacheIdentity-nil"
+            )
+            return
+        }
+        guard let echo else {
+            sessionLog.error(
+                "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=echo-nil"
+            )
+            return
+        }
+        guard !echo.text.isEmpty else {
+            sessionLog.error(
+                "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=echo-empty"
+            )
+            return
+        }
         let scope = CacheScope(serverId: identity.serverId, profileId: identity.profileId)
         let now = Date().timeIntervalSince1970
         let summary = SessionSummary(
@@ -4545,8 +4569,26 @@ final class SessionStore {
         Task {
             // Ordered on the CacheStore actor: the session row must exist before
             // the transcript write (saveTranscript no-ops without the FK parent).
-            try? await cacheStore.upsertSession(summary, scope: scope)
-            try? await cacheStore.saveTranscript(identity: identity, messages: [userRow])
+            do {
+                try await cacheStore.upsertSession(summary, scope: scope)
+                sessionLog.notice(
+                    "[ABH-519] persistDraftBornCacheSeed upsertSession success session=\(storedID, privacy: .public) server=\(identity.serverId, privacy: .public) profile=\(identity.profileId, privacy: .public)"
+                )
+            } catch {
+                sessionLog.error(
+                    "[ABH-519] persistDraftBornCacheSeed upsertSession error session=\(storedID, privacy: .public) error=\(String(reflecting: error), privacy: .public)"
+                )
+            }
+            do {
+                try await cacheStore.saveTranscript(identity: identity, messages: [userRow])
+                sessionLog.notice(
+                    "[ABH-519] persistDraftBornCacheSeed saveTranscript success session=\(storedID, privacy: .public)"
+                )
+            } catch {
+                sessionLog.error(
+                    "[ABH-519] persistDraftBornCacheSeed saveTranscript error session=\(storedID, privacy: .public) error=\(String(reflecting: error), privacy: .public)"
+                )
+            }
         }
     }
 
@@ -5829,6 +5871,7 @@ final class SessionStore {
         // reconciles any tail/delta afterward.
         var paintedFromCache = false
         var paintedFromDisk = false
+        var probedCacheHasTranscript: Bool?
         // QA-3 S7/A3 — VOID SCROLLBACK IMPOSSIBLE: when the transcript ALREADY
         // holds THIS session (a row re-tap, a notification deep-link onto the
         // active chat, a re-open of the same session), its in-memory rows ARE
@@ -5881,8 +5924,10 @@ final class SessionStore {
                 return
             }
             try? await cacheStore.touchSession(identity)
+            let hasTranscript = try? await cacheStore.hasTranscript(identity)
+            probedCacheHasTranscript = hasTranscript
             if isCurrentTranscriptOpen(token: token),
-               (try? await cacheStore.hasTranscript(identity)) == true,
+               hasTranscript == true,
                isCurrentTranscriptOpen(token: token),
                let cached = try? await cacheStore.loadTranscript(identity),
                isCurrentTranscriptOpen(token: token) {
@@ -5901,6 +5946,13 @@ final class SessionStore {
             }
         }
         if !paintedFromCache, isCurrentTranscriptOpen(token: token) {
+            let identityServer = capturedIdentity?.serverId ?? "<nil>"
+            let identityProfile = capturedIdentity?.profileId ?? "<nil>"
+            let hasTranscript = probedCacheHasTranscript.map(String.init)
+                ?? "<not-probed-or-error>"
+            sessionLog.notice(
+                "[ABH-519] cache-miss(reset) session=\(storedId, privacy: .public) cacheStore=\(self.cacheStore == nil ? "nil" : "present", privacy: .public) identity.server=\(identityServer, privacy: .public) identity.profile=\(identityProfile, privacy: .public) hasTranscript=\(hasTranscript, privacy: .public)"
+            )
             // Cache miss (or no cache): empty the transcript so ChatView shows the
             // skeleton, not a stale prior session's rows, while the network loads.
             // R3 (ROUND-4 W2d): NOT on relay when the coordinator's store is
