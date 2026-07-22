@@ -347,6 +347,9 @@ schemes:
         - variable: HERMES_TOKEN
           value: $(TEST_RUNNER_HERMES_TOKEN)
           isEnabled: true
+        - variable: HERMES_LIVE_FOLLOW_MARKER
+          value: $(TEST_RUNNER_HERMES_LIVE_FOLLOW_MARKER)
+          isEnabled: true
   WorkRepositoryTests:
     build:
       targets:
