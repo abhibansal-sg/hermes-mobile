@@ -48,7 +48,7 @@ from typing import Any, Optional
 
 from . import plugin_bridge
 from .bus import TOPIC_RELAY_FRAMES, EventBus
-from .gateway_client import GatewayClient
+from .gateway_client import GatewayClient, GatewayConfig
 from .durable_state import DurableState
 from .session_state import SessionStore
 from .types import (
@@ -62,6 +62,57 @@ from .types import (
 )
 
 _log = logging.getLogger(__name__)
+
+_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+
+class _AiohttpResponder:
+    """Expose the tiny ``respond`` surface used by the legacy HTTP handlers."""
+
+    @staticmethod
+    def respond(status: Any, body: str) -> Any:
+        from aiohttp import web
+
+        return web.Response(status=int(status), text=body)
+
+
+class _AiohttpWebSocket:
+    """Match aiohttp's socket to the legacy lane's ``send``/iteration surface."""
+
+    def __init__(self, socket: Any) -> None:
+        self._socket = socket
+
+    async def send(self, message: Any) -> None:
+        if isinstance(message, bytes):
+            await self._socket.send_bytes(message)
+        else:
+            await self._socket.send_str(str(message))
+
+    async def close(self) -> None:
+        await self._socket.close()
+
+    async def _messages(self):
+        from aiohttp import WSMsgType
+
+        async for message in self._socket:
+            if message.type in (WSMsgType.TEXT, WSMsgType.BINARY):
+                yield message.data
+            elif message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
+                break
+
+    def __aiter__(self):
+        return self._messages()
 
 
 @dataclass
@@ -271,12 +322,14 @@ class DownstreamServer:
         store: SessionStore,
         durable: Optional[DurableState] = None,
         push_engine: Any = None,
+        upstream: Optional[GatewayConfig] = None,
     ) -> None:
         self._cfg = config
         self._bus = bus
         self._gateway = gateway
         self._store = store
         self._durable = durable
+        self._upstream = upstream
         # Injected push_engine module (plugin_bridge.import_push_engine()); the
         # ``push.register``/``push.unregister`` token registry RPCs (§6) write
         # into it. Resolved lazily on first use when not injected; tests inject
@@ -285,6 +338,8 @@ class DownstreamServer:
         self._ring = None  # set in start(): reused ReplayRingManager
         self._conns: dict[str, PhoneConnection] = {}
         self._server = None
+        self._runner = None
+        self._proxy_client = None
         self._sub = None
         self._fanout_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
@@ -310,23 +365,123 @@ class DownstreamServer:
         Also starts the fan-out task that reads ``TOPIC_RELAY_FRAMES`` and
         forwards each frame to every connection's :meth:`PhoneConnection.send_frame`.
         """
-        import websockets  # lazy: unit tests exercise the pieces without a socket
+        from aiohttp import ClientSession, web
 
         await self.start()
         self._stop.clear()
         self._sub = self._bus.subscribe(TOPIC_RELAY_FRAMES)
         self._fanout_task = asyncio.create_task(self._fanout_loop())
-        self._server = await websockets.serve(
-            self._serve_conn,
-            self._cfg.host,
-            self._cfg.port,
-            max_size=self._cfg.max_message_bytes,
-            process_request=self._process_request,
-        )
+        self._proxy_client = ClientSession(auto_decompress=False)
+        app = web.Application(client_max_size=self._cfg.max_message_bytes)
+        app.router.add_route("*", "/{path:.*}", self._serve_request)
+        self._runner = web.AppRunner(app, access_log=None)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, self._cfg.host, self._cfg.port)
+        await site.start()
+        self._server = site._server
         try:
             await self._stop.wait()
         finally:
             await self.close()
+
+    async def _serve_request(self, request: Any) -> Any:
+        """Authenticate, then select the legacy lane or the stock proxy lane."""
+        from aiohttp import web
+
+        response = await self._process_request(_AiohttpResponder(), request)
+        if response is not None:
+            return response
+
+        if request.path == "/api/ws":
+            return await self._serve_stock_ws(request)
+
+        legacy_ws = web.WebSocketResponse(max_msg_size=self._cfg.max_message_bytes)
+        if legacy_ws.can_prepare(request).ok:
+            await legacy_ws.prepare(request)
+            await self._serve_conn(_AiohttpWebSocket(legacy_ws))
+            return legacy_ws
+
+        if self._upstream is None:
+            return web.Response(status=503, text="Upstream unavailable\n")
+        return await self._proxy_stock_http(request)
+
+    async def _serve_stock_ws(self, request: Any) -> Any:
+        """Copy stock WebSocket messages in both directions without decoding."""
+        from aiohttp import WSMsgType, web
+
+        if self._upstream is None or self._proxy_client is None:
+            return web.Response(status=503, text="Upstream unavailable\n")
+
+        phone = web.WebSocketResponse(max_msg_size=self._cfg.max_message_bytes)
+        await phone.prepare(request)
+        try:
+            gateway = await self._proxy_client.ws_connect(
+                self._upstream.ws_url(), max_msg_size=self._cfg.max_message_bytes
+            )
+        except Exception:
+            await phone.close(code=1011, message=b"upstream unavailable")
+            return phone
+
+        async def copy(source: Any, target: Any) -> None:
+            async for message in source:
+                if message.type == WSMsgType.TEXT:
+                    await target.send_str(message.data)
+                elif message.type == WSMsgType.BINARY:
+                    await target.send_bytes(message.data)
+                elif message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
+                    break
+
+        tasks = {
+            asyncio.create_task(copy(phone, gateway)),
+            asyncio.create_task(copy(gateway, phone)),
+        }
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await gateway.close()
+            await phone.close()
+        return phone
+
+    async def _proxy_stock_http(self, request: Any) -> Any:
+        """Forward one HTTP request and response body without semantic handling."""
+        from aiohttp import web
+
+        assert self._upstream is not None and self._proxy_client is not None
+        request_headers = {
+            name: value
+            for name, value in request.headers.items()
+            if name.lower() not in _HOP_BY_HOP_HEADERS
+            and name.lower() not in {"host", "authorization", "x-hermes-session-token"}
+        }
+        request_headers.update(self._upstream.rest_headers())
+        body = await request.read()
+        url = f"{self._upstream.http_base}{request.raw_path}"
+        async with self._proxy_client.request(
+            request.method,
+            url,
+            headers=request_headers,
+            data=body or None,
+            allow_redirects=False,
+        ) as upstream:
+            response_headers = [
+                (name.decode("latin-1"), value.decode("latin-1"))
+                for name, value in upstream.raw_headers
+                if name.decode("latin-1").lower() not in _HOP_BY_HOP_HEADERS
+            ]
+            response = web.StreamResponse(
+                status=upstream.status,
+                reason=upstream.reason,
+                headers=response_headers,
+            )
+            await response.prepare(request)
+            async for chunk in upstream.content.iter_chunked(64 * 1024):
+                await response.write(chunk)
+            await response.write_eof()
+            return response
 
     async def _process_request(self, connection: Any, request: Any) -> Any:
         """Serve a plain-HTTP health/status probe on the phone-facing port.
@@ -341,11 +496,14 @@ class DownstreamServer:
         try:
             from http import HTTPStatus
 
-            raw_path = getattr(request, "path", "") or ""
+            raw_path = (
+                getattr(request, "raw_path", None)
+                or getattr(request, "path", "")
+                or ""
+            )
             path = raw_path.split("?", 1)[0]
             token = self._cfg.auth_token
-            supplied = (getattr(request, "headers", {}) or {}).get("Authorization", "")
-            if token and not hmac.compare_digest(supplied, f"Bearer {token}"):
+            if token and not self._request_is_authorized(raw_path, request):
                 return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
             if health and path == health:
                 body = json.dumps(self.status(), ensure_ascii=False) + "\n"
@@ -378,6 +536,22 @@ class DownstreamServer:
         except Exception:  # pragma: no cover - a broken probe must not stall serve
             _log.debug("health probe failed", exc_info=True)
             return None
+
+    def _request_is_authorized(self, raw_path: str, request: Any) -> bool:
+        """Accept the existing bearer form and the stock WS/HTTP token forms."""
+        from urllib.parse import parse_qs, urlsplit
+
+        token = self._cfg.auth_token
+        headers = getattr(request, "headers", {}) or {}
+        parsed = urlsplit(raw_path)
+        supplied = [
+            headers.get("Authorization", "").removeprefix("Bearer "),
+            headers.get("X-Hermes-Session-Token", ""),
+            parse_qs(parsed.query).get("token", [""])[0]
+            if parsed.path == "/api/ws"
+            else "",
+        ]
+        return any(value and hmac.compare_digest(value, token) for value in supplied)
 
     async def _answer_gate_http(
         self, connection: Any, request: Any, raw_path: str, path: str
@@ -612,10 +786,13 @@ class DownstreamServer:
         if self._sub is not None:
             self._bus.unsubscribe(self._sub)
             self._sub = None
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
+        self._server = None
+        runner, self._runner = self._runner, None
+        if runner is not None:
+            await runner.cleanup()
+        proxy_client, self._proxy_client = self._proxy_client, None
+        if proxy_client is not None:
+            await proxy_client.close()
 
     def _push_engine(self) -> Any:
         """The reused ``push_engine`` module (lazily resolved, cached).
