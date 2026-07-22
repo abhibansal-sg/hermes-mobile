@@ -996,38 +996,66 @@ final class RenderConformanceTests: XCTestCase {
                        "the overlapping window rows update in place — no duplicates, no eviction")
     }
 
-    /// QA-2 R15 guard — the optimistic user echo (runtime id + clientMessageID,
-    /// untagged) must CONVERGE with its own gateway row on a union reseed,
-    /// never double-render. The reseed row adopts the echo's slot exactly like
-    /// `adoptRelayEcho` folds the relay `userMessage` item onto it.
+    /// QA-2 R15 guard — CONTRACT-UPDATED (ROUND-4 amendments G4 + I14): the
+    /// optimistic user echo CONVERGES with its relay `userMessage` row IN
+    /// PLACE — cmid adoption assumes the SERVER item's `ord` (amendment G4:
+    /// the echo IS the user row; there is no twin to consume — R1 deleted the
+    /// fuzzy text twin-consumption the old reseed union leaned on). The OLD
+    /// convergence rode a REST reseed's union merge — DELETED on relay by
+    /// R3/W2d (contract I14: the recovery reconcile is a relay-LOCAL
+    /// `resync{last_seq}`, never a transcript refetch; the injected
+    /// `backfillFetch` is never resolved on relay). This drive reconstructs
+    /// the production identity chain (live, the SUBMIT's cmid folds into the
+    /// relay-synthesized `userMessage` item — re-stamped here because a
+    /// static replay cannot join the live submit's fresh UUID; the same
+    /// reconstruction `testReplay_UserBubbleExactlyOnceAfterTurnCompletes`
+    /// performs), then proves the recovery reconcile (backfill → resync, I14)
+    /// and a resync-ring replay of the SAME frames (I21) leave EXACTLY ONE
+    /// prompt bubble.
     func testReseed_OptimisticEchoConvergesWithItsGatewayRow() async throws {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
-        g.sessions.activeStoredId = fx.sessionID
+        try await openDriven(g, fx.sessionID)
 
         _ = await g.chat.send(text: fx.submitText)
+        // PRODUCTION IDENTITY REPLAY (G4/I8): re-stamp the echo with the
+        // fixture's recorded cmid so the `userMessage` item's adoption folds
+        // it onto the echo row in place (row id unchanged, the server item's
+        // `ord` assumed).
+        let cmid = try XCTUnwrap(fx.submitClientMessageID,
+            "the recording harness records the SUBMIT cmid the relay folds into the userMessage item")
+        if let idx = g.chat.messages.firstIndex(where: {
+            $0.role == .user && $0.text == fx.submitText && $0.clientMessageID != nil
+        }) {
+            let echo = g.chat.messages[idx]
+            g.chat.messages[idx] = ChatMessage(
+                id: echo.id, role: .user, clientMessageID: cmid,
+                parts: echo.parts, timestamp: echo.timestamp
+            )
+        }
         deliverAll(g, fx)
         let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
         await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
 
-        // The gateway has persisted the turn; the backfill snapshot carries the
-        // authoritative user + assistant rows under their WIRE ids — the echo's
-        // runtime id never matches them.
-        g.chat.backfillFetch = { _ in
-            [
-                StoredMessage(role: "user", content: .string(fx.submitText),
-                              timestamp: 1_700_000_100, wireId: 100),
-                StoredMessage(role: "assistant", content: .string(agentText),
-                              timestamp: 1_700_000_101, wireId: 101),
-            ]
-        }
+        // R3/I14: the relay recovery reconcile rides the relay-LOCAL resync —
+        // assert backfill takes that path and NEVER the deleted blanket
+        // `history` refetch.
         await g.chat.backfill()
+        XCTAssertNotNil(g.transport.upstreams().first { $0.method == "resync" },
+            "contract I14: the relay recovery reconcile rides the relay-local resync")
+        XCTAssertNil(g.transport.upstreams().first { $0.method == "history" },
+            "contract I14/R3: no blanket history refetch on relay recovery — the stream is the authority")
+
+        // I21: the resync ring replays the SAME frames — re-applying them
+        // converges: still exactly one prompt bubble (the adopted echo IS the
+        // user row) and the reply intact.
+        deliverAll(g, fx)
+        await waitUntil { g.chat.messages.last?.text == agentText }
 
         let promptBubbles = g.chat.messages.filter { $0.role == .user && $0.text == fx.submitText }
         XCTAssertEqual(promptBubbles.count, 1,
-                       "the optimistic echo adopts its gateway row's content in place — exactly one prompt bubble")
+                       "the optimistic echo adopts its relay userMessage row in place (G4) — exactly one prompt bubble, stable under resync replay (I21)")
         XCTAssertTrue(g.chat.messages.contains { $0.text == agentText },
                       "the authoritative reply renders")
     }
