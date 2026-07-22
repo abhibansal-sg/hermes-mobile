@@ -41,6 +41,35 @@ final class RestClientLiveTests: XCTestCase {
         XCTAssertNil(TranscriptPageStubProtocol.requestedPath)
     }
 
+    func testStockTranscriptPageUsesOffsetAndProfile() async {
+        TranscriptPageStubProtocol.nextResponse = (
+            #"{"session_id":"s 1","messages":[{"id":11,"role":"user","content":"older"}],"pagination":{"limit":10,"offset":10,"returned":1}}"#.data(using: .utf8)!,
+            200
+        )
+        TranscriptPageStubProtocol.requestedPath = nil
+        TranscriptPageStubProtocol.requestedQuery = nil
+        let rest = transcriptPageStubClient(pathStyle: .plugin)
+
+        let page = await fetchStockTranscriptPage(
+            rest: rest,
+            sessionId: "s 1",
+            profile: "work profile",
+            limit: 10,
+            offset: 10
+        )
+
+        XCTAssertEqual(
+            TranscriptPageStubProtocol.requestedPath,
+            "/api/sessions/s%201/messages"
+        )
+        XCTAssertEqual(
+            TranscriptPageStubProtocol.requestedQuery,
+            "limit=10&offset=10&profile=work%20profile"
+        )
+        XCTAssertEqual(page?.messages.map(\.wireId), [11])
+        XCTAssertEqual(page?.hasMoreBefore, true)
+    }
+
     /// `GET /api/sessions?order=recent` must round-trip with its query string
     /// intact (regression: appendingPathComponent percent-encoded the "?" and
     /// the server 404'd, silently degrading the app to creation-ordered
