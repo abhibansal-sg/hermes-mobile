@@ -463,8 +463,8 @@ struct ProseSelectionContainer: UIViewRepresentable {
     /// The flattened prose payload (inline markdown + block styling baked in).
     let text: NSAttributedString
 
-    func makeUIView(context: Context) -> SelfSizingTextView {
-        let view = SelfSizingTextView()
+    func makeUIView(context: Context) -> ProseTextView {
+        let view = ProseTextView()
         view.isEditable = false
         view.isSelectable = true
         view.isScrollEnabled = false
@@ -482,7 +482,7 @@ struct ProseSelectionContainer: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ uiView: SelfSizingTextView, context: Context) {
+    func updateUIView(_ uiView: ProseTextView, context: Context) {
         if uiView.delegate !== context.coordinator {
             uiView.delegate = context.coordinator
         }
@@ -495,7 +495,7 @@ struct ProseSelectionContainer: UIViewRepresentable {
 
     /// Self-size to the proposed width, like the `Text` this replaces. Never
     /// reads `UIScreen.main` (STR-695).
-    func sizeThatFits(_ proposal: ProposedViewSize, uiView: SelfSizingTextView, context: Context) -> CGSize? {
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: ProseTextView, context: Context) -> CGSize? {
         let width = proposal.width ?? 320
         let fit = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
         return CGSize(width: width, height: ceil(fit.height))
@@ -513,6 +513,56 @@ struct ProseSelectionContainer: UIViewRepresentable {
             interaction: UITextItemInteraction
         ) -> Bool {
             true
+        }
+    }
+}
+
+/// The prose container's text view (QA-2 B11 contract: word-level long-press
+/// selection, NO select-all / caret-on-mount). iOS 26 can make a selectable
+/// text view first responder when it attaches to a key window, which parks the
+/// caret at the document end — a mount-time "selection" the contract forbids
+/// (the reader starts from a word-level long-press at THEIR touch point, never
+/// a whole-block selection). Structurally impossible here: the view refuses
+/// first-responder until it has actually been touched. The system long-press
+/// gesture is unaffected — its hit-test lands BEFORE the gesture-driven
+/// `becomeFirstResponder`, so word selection + handles still begin at the
+/// touch point. Programmatic focus (opt-in on-screen evidence capture) flips
+/// ``suppressFocusUntilTouch`` off.
+final class ProseTextView: SelfSizingTextView {
+    /// Suppress system/programmatic first-responder grabs until the view is
+    /// touched (the mount-selection gate). Evidence capture disables it to
+    /// drive a selection programmatically.
+    var suppressFocusUntilTouch = true
+    private var touched = false
+    /// One-shot mount clamp fired on first window attach.
+    private var mountSelectionCleared = false
+
+    /// Tests drive selection programmatically as a stand-in for the user
+    /// gesture — mark the view interacted so the mount gate stands down.
+    func noteInteractionForTesting() { touched = true }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        touched = true   // a real interaction begins — focus may follow
+        return super.hitTest(point, with: event)
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        if suppressFocusUntilTouch && !touched { return false }
+        return super.becomeFirstResponder()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        guard window != nil, suppressFocusUntilTouch, !mountSelectionCleared else { return }
+        mountSelectionCleared = true
+        // iOS 26 parks the caret at the document end when a selectable text
+        // view attaches to a key window — the mount-selection the QA-2 B11
+        // contract forbids. Clear it once, asynchronously (after the attach
+        // layout pass places it); a user gesture has hit-tested first, so a
+        // real interaction is never clamped.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.touched, !self.isFirstResponder else { return }
+            self.selectedRange = NSRange(location: 0, length: 0)
         }
     }
 }

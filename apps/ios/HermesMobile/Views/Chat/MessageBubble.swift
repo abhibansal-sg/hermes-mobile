@@ -2718,8 +2718,9 @@ struct SelectableTextView: UIViewRepresentable {
 }
 
 /// A `UITextView` that reports its content size so SwiftUI's `sizeThatFits` path
-/// lays it out at the correct height with scrolling disabled.
-final class SelfSizingTextView: UITextView {
+/// lays it out at the correct height with scrolling disabled. Subclassed by
+/// `ProseTextView` (the QA-2 B11 mount-selection gate).
+class SelfSizingTextView: UITextView {
     override var intrinsicContentSize: CGSize {
         let width = bounds.width > 0 ? bounds.width : UIView.layoutFittingCompressedSize.width
         let fit = sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
