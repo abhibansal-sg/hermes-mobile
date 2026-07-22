@@ -388,12 +388,16 @@ class DownstreamServer:
         """Authenticate, then select the legacy lane or the stock proxy lane."""
         from aiohttp import web
 
-        response = await self._process_request(_AiohttpResponder(), request)
+        auth_context: dict[str, str] = {}
+        response = await self._process_request(
+            _AiohttpResponder(), request, auth_context=auth_context
+        )
         if response is not None:
             return response
+        upstream_token = auth_context.get("upstream_token")
 
         if request.path == "/api/ws":
-            return await self._serve_stock_ws(request)
+            return await self._serve_stock_ws(request, upstream_token)
 
         legacy_ws = web.WebSocketResponse(max_msg_size=self._cfg.max_message_bytes)
         if legacy_ws.can_prepare(request).ok:
@@ -403,9 +407,11 @@ class DownstreamServer:
 
         if self._upstream is None:
             return web.Response(status=503, text="Upstream unavailable\n")
-        return await self._proxy_stock_http(request)
+        return await self._proxy_stock_http(request, upstream_token)
 
-    async def _serve_stock_ws(self, request: Any) -> Any:
+    async def _serve_stock_ws(
+        self, request: Any, upstream_token: Optional[str] = None
+    ) -> Any:
         """Copy stock WebSocket messages in both directions without decoding."""
         from aiohttp import WSMsgType, web
 
@@ -416,7 +422,8 @@ class DownstreamServer:
         await phone.prepare(request)
         try:
             gateway = await self._proxy_client.ws_connect(
-                self._upstream.ws_url(), max_msg_size=self._cfg.max_message_bytes
+                self._upstream.ws_url(upstream_token or self._upstream.token),
+                max_msg_size=self._cfg.max_message_bytes,
             )
         except Exception:
             await phone.close(code=1011, message=b"upstream unavailable")
@@ -446,7 +453,9 @@ class DownstreamServer:
             await phone.close()
         return phone
 
-    async def _proxy_stock_http(self, request: Any) -> Any:
+    async def _proxy_stock_http(
+        self, request: Any, upstream_token: Optional[str] = None
+    ) -> Any:
         """Forward one HTTP request and response body without semantic handling."""
         from aiohttp import web
 
@@ -457,7 +466,9 @@ class DownstreamServer:
             if name.lower() not in _HOP_BY_HOP_HEADERS
             and name.lower() not in {"host", "authorization", "x-hermes-session-token"}
         }
-        request_headers.update(self._upstream.rest_headers())
+        request_headers.update(
+            self._upstream.rest_headers(upstream_token or self._upstream.token)
+        )
         body = await request.read()
         url = f"{self._upstream.http_base}{request.raw_path}"
         async with self._proxy_client.request(
@@ -483,7 +494,12 @@ class DownstreamServer:
             await response.write_eof()
             return response
 
-    async def _process_request(self, connection: Any, request: Any) -> Any:
+    async def _process_request(
+        self,
+        connection: Any,
+        request: Any,
+        auth_context: Optional[dict[str, str]] = None,
+    ) -> Any:
         """Serve a plain-HTTP health/status probe on the phone-facing port.
 
         websockets calls this before the WS handshake for every inbound request.
@@ -503,8 +519,11 @@ class DownstreamServer:
             )
             path = raw_path.split("?", 1)[0]
             token = self._cfg.auth_token
-            if token and not self._request_is_authorized(raw_path, request):
+            upstream_token = self._authorized_upstream_token(raw_path, request)
+            if token and upstream_token is None:
                 return connection.respond(HTTPStatus.UNAUTHORIZED, "Unauthorized\n")
+            if upstream_token is not None and auth_context is not None:
+                auth_context["upstream_token"] = upstream_token
             if health and path == health:
                 body = json.dumps(self.status(), ensure_ascii=False) + "\n"
                 return connection.respond(HTTPStatus.OK, body)
@@ -539,6 +558,10 @@ class DownstreamServer:
 
     def _request_is_authorized(self, raw_path: str, request: Any) -> bool:
         """Accept the existing bearer form and the stock WS/HTTP token forms."""
+        return self._authorized_upstream_token(raw_path, request) is not None
+
+    def _authorized_upstream_token(self, raw_path: str, request: Any) -> Optional[str]:
+        """Authenticate locally and preserve a validated device identity upstream."""
         from urllib.parse import parse_qs, urlsplit
 
         token = self._cfg.auth_token
@@ -551,7 +574,17 @@ class DownstreamServer:
             if parsed.path == "/api/ws"
             else "",
         ]
-        return any(value and hmac.compare_digest(value, token) for value in supplied)
+        if any(value and hmac.compare_digest(value, token) for value in supplied):
+            return self._upstream.token if self._upstream is not None else token
+
+        try:
+            device_tokens = plugin_bridge.import_device_tokens()
+            for value in supplied:
+                if value and device_tokens.match(value) is not None:
+                    return value
+        except Exception:
+            _log.debug("device-token relay auth unavailable", exc_info=True)
+        return None
 
     async def _answer_gate_http(
         self, connection: Any, request: Any, raw_path: str, path: str

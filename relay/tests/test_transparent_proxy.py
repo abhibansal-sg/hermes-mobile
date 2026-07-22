@@ -13,6 +13,7 @@ from aiohttp import web
 from hermes_relay.bus import EventBus
 from hermes_relay.downstream import DownstreamConfig, DownstreamServer
 from hermes_relay.gateway_client import GatewayConfig
+from hermes_relay import plugin_bridge
 from hermes_relay.session_state import SessionStore
 
 
@@ -126,3 +127,31 @@ async def test_stock_proxy_rejects_bad_phone_credentials(transparent_pair):
         async with websockets.connect(f"ws://127.0.0.1:{port}/api/ws?token=wrong"):
             pass
     assert exc.value.response.status_code == 401
+
+
+async def test_stock_proxy_preserves_validated_device_identity(
+    transparent_pair, monkeypatch
+):
+    port, observed, event_wire = transparent_pair
+
+    class DeviceTokens:
+        @staticmethod
+        def match(token):
+            return {"device_id": "phone-1"} if token == "device-secret" else None
+
+    monkeypatch.setattr(plugin_bridge, "import_device_tokens", lambda: DeviceTokens)
+
+    async with websockets.connect(
+        f"ws://127.0.0.1:{port}/api/ws?token=device-secret"
+    ) as phone:
+        assert await phone.recv() == event_wire
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"http://127.0.0.1:{port}/api/status",
+            headers={"X-Hermes-Session-Token": "device-secret"},
+        )
+
+    assert response.status_code == 207
+    assert observed["ws_token"] == "device-secret"
+    assert observed["http_token"] == "device-secret"

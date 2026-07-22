@@ -158,7 +158,9 @@ def test_register_late_wires_every_core_seam_after_attrs_restore(
             "method": "event",
             "params": {"type": "message.delta", "session_id": "late-wire-sid"},
         }
-        assert server.write_json(frame) is True
+        assert owner.write(frame) is True
+        for subscriber in server._EVENT_FANOUT_SUBSCRIBERS:
+            subscriber(frame, "late-wire-sid", owner)
     finally:
         server._sessions.pop("late-wire-sid", None)
 

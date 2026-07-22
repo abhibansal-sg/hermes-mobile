@@ -57,6 +57,9 @@ _registry_lock = threading.Lock()
 # by its own lock so WS register/deregister never blocks on a registry write.
 _ws_index_lock = threading.Lock()
 _ws_device_sockets: Dict[str, Set[Any]] = {}
+# Ephemeral selection state for push suppression. It is meaningful only while
+# that device still has a live authenticated socket and is cleared on disconnect.
+_device_foreground_sessions: Dict[str, str] = {}
 
 # Runtime-session attribution for mobile WS turns. A token-authenticated WS is
 # first indexed in ``_ws_device_sockets`` by the auth seam. Separately, the TUI
@@ -432,6 +435,7 @@ def deregister_ws_socket(device_id: str, ws: Any) -> None:
         socks.discard(ws)
         if not socks:
             _ws_device_sockets.pop(device_id, None)
+            _device_foreground_sessions.pop(device_id, None)
     _clear_session_mappings_for_ws(ws)
 
 
@@ -441,6 +445,31 @@ def get_device_sockets(device_id: str) -> List[Any]:
         return []
     with _ws_index_lock:
         return list(_ws_device_sockets.get(device_id, ()))
+
+
+def set_device_foreground(device_id: str, stored_session_id: Any = None) -> None:
+    """Replace one authenticated phone's foreground stored-session selection."""
+    if not device_id:
+        return
+    stored = _normalize_session_id(stored_session_id)
+    with _ws_index_lock:
+        if stored and _ws_device_sockets.get(device_id):
+            _device_foreground_sessions[device_id] = stored
+        else:
+            _device_foreground_sessions.pop(device_id, None)
+
+
+def foreground_device_ids_for_session(stored_session_id: Any) -> Set[str]:
+    """Return live phone devices actively displaying this stored session."""
+    stored = _normalize_session_id(stored_session_id)
+    if not stored:
+        return set()
+    with _ws_index_lock:
+        return {
+            device_id
+            for device_id, selected in _device_foreground_sessions.items()
+            if selected == stored and _ws_device_sockets.get(device_id)
+        }
 
 
 def _normalize_session_id(session_id: Any) -> str:
@@ -509,6 +538,8 @@ def _clear_session_mappings_for_ws(ws: Any) -> None:
 
 
 def _clear_session_mappings_for_device(device_id: str) -> None:
+    with _ws_index_lock:
+        _device_foreground_sessions.pop(device_id, None)
     with _session_index_lock:
         stale = [
             session_id
@@ -595,6 +626,7 @@ def _reset_for_tests() -> None:
     lives on disk per HERMES_HOME)."""
     with _ws_index_lock:
         _ws_device_sockets.clear()
+        _device_foreground_sessions.clear()
     with _session_index_lock:
         _session_device_sockets.clear()
     with _deny_lock:

@@ -736,6 +736,10 @@ class _DeviceIssueBody(BaseModel):
     platform: Optional[str] = "ios"
 
 
+class _DeviceForegroundBody(BaseModel):
+    stored_session_id: Optional[str] = None
+
+
 @router.post("/devices/issue")
 async def issue_device_token(request: Request, body: _DeviceIssueBody):
     """Mint a per-device token. Returns the token EXACTLY ONCE; the registry
@@ -800,6 +804,25 @@ async def list_device_tokens(request: Request):
     device_tokens = _plugin_module("device_tokens")
 
     return {"devices": device_tokens.list_devices()}
+
+
+@router.post("/devices/foreground")
+async def set_device_foreground(request: Request, body: _DeviceForegroundBody):
+    """Declare the stored session this authenticated phone is displaying."""
+    if not _has_dashboard_api_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not _device_has_scope(request, "chat"):
+        raise HTTPException(status_code=403, detail="Device token lacks chat scope")
+
+    device_id = _request_device_id(request)
+    if device_id is None:
+        return {"foreground": False}
+    device_tokens = _plugin_module("device_tokens")
+    device_tokens.set_device_foreground(device_id, body.stored_session_id)
+    return {
+        "foreground": bool(body.stored_session_id),
+        "stored_session_id": body.stored_session_id,
+    }
 
 
 @router.delete("/devices/{device_id}")

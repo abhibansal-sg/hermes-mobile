@@ -243,3 +243,31 @@ def test_session_device_index_prunes_expired_entries(home, monkeypatch):
     now[0] = 111.0
     assert device_tokens.device_identity_for_session("runtime-sid") is None
     assert "runtime-sid" not in device_tokens._session_device_sockets
+
+
+def test_foreground_session_requires_a_live_device_socket(home):
+    issued = device_tokens.issue(device_name="Abhi's iPhone")
+
+    device_tokens.set_device_foreground(issued["device_id"], "stored-1")
+
+    assert device_tokens.foreground_device_ids_for_session("stored-1") == set()
+
+
+def test_foreground_session_tracks_selection_and_clears_on_disconnect(home):
+    issued = device_tokens.issue(device_name="Abhi's iPhone")
+    ws = object()
+    device_tokens.register_ws_socket(issued["device_id"], ws)
+
+    device_tokens.set_device_foreground(issued["device_id"], "stored-1")
+    assert device_tokens.foreground_device_ids_for_session("stored-1") == {
+        issued["device_id"]
+    }
+
+    device_tokens.set_device_foreground(issued["device_id"], "stored-2")
+    assert device_tokens.foreground_device_ids_for_session("stored-1") == set()
+    assert device_tokens.foreground_device_ids_for_session("stored-2") == {
+        issued["device_id"]
+    }
+
+    device_tokens.deregister_ws_socket(issued["device_id"], ws)
+    assert device_tokens.foreground_device_ids_for_session("stored-2") == set()

@@ -94,6 +94,7 @@ def test_register_populates_every_seam_registry(plugin_and_ctx):
     assert any(cb for cb in hooks.get("post_frame_write", [])), "post_frame_write not registered"
     assert any(cb for cb in hooks.get("on_ws_transport_change", [])), "on_ws_transport_change not registered"
     assert any(cb for cb in hooks.get("post_emit_event", [])), "post_emit_event not registered"
+    assert push_engine.handle_approval_request in hooks.get("pre_approval_request", [])
     assert push_engine.handle_session_finalize in hooks.get("on_session_finalize", [])
     # CLI command registered on the manager facade
     cmd = manager._cli_commands.get("mobile-pair")
