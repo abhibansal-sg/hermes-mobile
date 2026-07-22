@@ -142,6 +142,113 @@ final class ProtocolParityTests: XCTestCase {
         XCTAssertEqual(result.storedSessionId, "stored-explicit")
     }
 
+    func testSessionOpenResultDecodesStockHistoryAndSessionKey() throws {
+        let json: JSONValue = .object([
+            "session_id": .string("runtime-stock"),
+            "session_key": .string("stored-stock"),
+            "messages": .array([
+                .object(["role": .string("user"), "content": .string("hello")]),
+                .object(["role": .string("assistant"), "content": .string("hi")]),
+            ]),
+            "queued": .array([.object(["text": .string("later")])]),
+        ])
+        let result = try XCTUnwrap(json.decoded(as: SessionOpenResult.self))
+        XCTAssertEqual(result.storedSessionId, "stored-stock")
+        XCTAssertEqual(result.messages.count, 2)
+        XCTAssertEqual(result.messages.first?.role, "user")
+        XCTAssertEqual(result.queued.count, 1)
+    }
+
+    func testSessionActiveListDecodesStructuredStockShape() throws {
+        let json: JSONValue = .object([
+            "sessions": .array([
+                .object([
+                    "id": .string("runtime-watch"),
+                    "session_key": .string("stored-watch"),
+                    "status": .string("working"),
+                ]),
+            ]),
+        ])
+        let result = try XCTUnwrap(json.decoded(as: SessionActiveListResult.self))
+        XCTAssertEqual(result.sessions, [
+            SessionActiveItem(id: "runtime-watch", sessionKey: "stored-watch", status: .working)
+        ])
+    }
+
+    func testPassiveOpenWatchesLiveSessionWithoutResume() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.transcriptFetch = { _ in [] }
+        sessions.activeListRPC = {
+            SessionActiveListResult(sessions: [
+                SessionActiveItem(id: "runtime-desktop", sessionKey: "stored-desktop", status: .working)
+            ])
+        }
+        var resumeCalls = 0
+        sessions.resumeRPC = { _, _ in
+            resumeCalls += 1
+            return JSONValue.object([
+                "session_id": .string("must-not-resume"),
+                "resumed": .string("stored-desktop"),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+
+        sessions.open(SessionSummary(
+            id: "stored-desktop", title: "Desktop", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil,
+            lastActive: 1, cwd: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(resumeCalls, 0)
+        XCTAssertEqual(sessions.sessionBinding?.storedID, "stored-desktop")
+        XCTAssertEqual(sessions.sessionBinding?.runtimeID, "runtime-desktop")
+        XCTAssertEqual(sessions.sessionBinding?.mode, .watch)
+
+        chat.handle(event: GatewayEvent(params: .object([
+            "type": .string("message.start"),
+            "session_id": .string("runtime-desktop"),
+            "stored_session_id": .string("stored-desktop"),
+            "payload": .object([:]),
+        ]))!)
+        XCTAssertEqual(chat.foreignMirrorTelemetry.foreignAdopted, 1)
+        XCTAssertFalse(chat.localTurnInFlight)
+    }
+
+    func testOpenResumesOnceWhenSessionIsNotLive() async {
+        let chat = ChatStore()
+        let sessions = SessionStore()
+        let connection = ConnectionStore(sessionStore: sessions, chatStore: chat)
+        chat.attach(connection: connection, sessions: sessions, attachments: AttachmentStore())
+        sessions.attach(connection: connection, chat: chat)
+        sessions.transcriptFetch = { _ in [] }
+        sessions.activeListRPC = { SessionActiveListResult(sessions: []) }
+        var resumeCalls = 0
+        sessions.resumeRPC = { _, _ in
+            resumeCalls += 1
+            return JSONValue.object([
+                "session_id": .string("runtime-phone"),
+                "session_key": .string("stored-idle"),
+                "messages": .array([]),
+            ]).decoded(as: SessionOpenResult.self)!
+        }
+
+        sessions.open(SessionSummary(
+            id: "stored-idle", title: "Idle", preview: nil,
+            startedAt: 1, messageCount: 1, source: nil,
+            lastActive: 1, cwd: nil
+        ))
+        await sessions.waitForPendingOpenForTesting()
+
+        XCTAssertEqual(resumeCalls, 1)
+        XCTAssertEqual(sessions.sessionBinding?.runtimeID, "runtime-phone")
+        XCTAssertEqual(sessions.sessionBinding?.mode, .drive)
+        XCTAssertEqual(sessions.sessionBinding?.generation, 0)
+    }
+
     // MARK: - Item 8: broadcast_gap parsing
 
     func testBroadcastGapParsesFromFrameTopLevel() throws {

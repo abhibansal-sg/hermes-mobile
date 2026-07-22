@@ -202,6 +202,7 @@ struct SessionOpenResult: Decodable, Sendable {
     let sessionId: String
     let storedSessionId: String?
     let messageCount: Int?
+    let messages: [StoredMessage]
     let info: SessionRuntimeInfo?
     /// Root-level live truth returned by current gateway resume/activate paths.
     /// Older gateways omit these fields, in which case the client falls back to
@@ -209,6 +210,8 @@ struct SessionOpenResult: Decodable, Sendable {
     let running: Bool?
     let status: String?
     let inflight: SessionInflightTurn?
+    /// Optional v0.19 resume snapshot. Fork main currently omits it.
+    let queued: [JSONValue]
 
     var snapshotRunning: Bool? {
         if let running { return running }
@@ -227,11 +230,14 @@ struct SessionOpenResult: Decodable, Sendable {
         case sessionId
         case storedSessionId
         case resumed
+        case sessionKey
         case messageCount
+        case messages
         case info
         case running
         case status
         case inflight
+        case queued
     }
 
     init(from decoder: Decoder) throws {
@@ -244,11 +250,33 @@ struct SessionOpenResult: Decodable, Sendable {
         // the compression-chain projection + transcript seeding).
         self.storedSessionId = try c.decodeIfPresent(String.self, forKey: .storedSessionId)
             ?? c.decodeIfPresent(String.self, forKey: .resumed)
+            ?? c.decodeIfPresent(String.self, forKey: .sessionKey)
         self.messageCount = try c.decodeIfPresent(Int.self, forKey: .messageCount)
+        self.messages = try c.decodeIfPresent([JSONValue].self, forKey: .messages)?
+            .compactMap(StoredMessage.init(json:)) ?? []
         self.info = try c.decodeIfPresent(SessionRuntimeInfo.self, forKey: .info)
         self.running = try c.decodeIfPresent(Bool.self, forKey: .running)
         self.status = try c.decodeIfPresent(String.self, forKey: .status)
         self.inflight = try c.decodeIfPresent(SessionInflightTurn.self, forKey: .inflight)
+        self.queued = try c.decodeIfPresent([JSONValue].self, forKey: .queued) ?? []
+    }
+}
+
+/// Read-only live-session inventory returned by `session.active_list`.
+struct SessionActiveListResult: Decodable, Sendable, Equatable {
+    let sessions: [SessionActiveItem]
+}
+
+struct SessionActiveItem: Decodable, Sendable, Equatable {
+    let id: String
+    let sessionKey: String
+    let status: Status
+
+    enum Status: String, Decodable, Sendable {
+        case idle
+        case starting
+        case waiting
+        case working
     }
 }
 
