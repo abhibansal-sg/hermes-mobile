@@ -205,9 +205,31 @@ final class RenderConformanceTests: XCTestCase {
                      transport: transport, coordinator: coordinator)
     }
 
+    /// A faithful session-open drive for the R2 submit pin (contract I5 /
+    /// §1.3): `ChatStore.send` pins the submit target off
+    /// `sessions.activeStoredId` at intent — there is NO fallback to the
+    /// coordinator's driven session (the deleted `?? activeSessionID`, D2).
+    /// A coordinator-only open leaves the pin nil, so the send becomes a
+    /// DRAFT create: the relay mints `render-new-1`, the write-gate MOVES to
+    /// the minted id (R2 adoption), and the fixture's stamped-sid frames fold
+    /// into a BACKGROUND entry that never projects (I1/I2) — every downstream
+    /// `waitUntil` starves. Production opens through SessionStore, which sets
+    /// the selection AND binds the coordinator at intent (§1.3); the harness
+    /// mirrors that binding. (Same pattern the reseed/switch tests below
+    /// already pin inline, and `testReplay_EchoDurableAcrossSessionSwitchAndBack`
+    /// drives via the real `SessionStore.open`.)
+    private func openDriven(_ g: Graph, _ sessionID: String) async throws {
+        _ = try await g.coordinator.open(sessionID)
+        g.sessions.activeStoredId = sessionID
+    }
+
     override func tearDown() {
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.transportPath)
         UserDefaults.standard.removeObject(forKey: DefaultsKeys.activeProfile)
+        // W2e/I23 hygiene: the DURABLE answered-gate record persists across
+        // stores by design — clear it so a rid this suite answered (the
+        // fixture gates) never suppresses the next test's re-delivery.
+        ChatStore._debugClearDurableResolvedGates()
         super.tearDown()
     }
 
@@ -319,7 +341,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         let ok = await g.chat.send(text: fx.submitText)
         XCTAssertTrue(ok, "relay submit must be accepted")
@@ -338,7 +360,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         // The GRDB cache painted the settled transcript before any relay frame.
         g.chat.messages = cachedRows(fx)
@@ -374,7 +396,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         let ok = await g.chat.send(text: fx.submitText)
         XCTAssertTrue(ok)
@@ -429,7 +451,20 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")   // reuse the reply stream
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        // No open/resume: a fresh chat has no session yet.
+        // No open/resume: a fresh chat has no session yet. The relay CREATES
+        // it on the nil-target SUBMIT — mint the fixture's session id so the
+        // recorded reply stream carries the stamped sid of the session the
+        // send created (R1/I1: frames route by the stamped sid).
+        let createdSid = fx.sessionID
+        g.transport.script = { upstream, relay in
+            guard let id = upstream.id else { return }
+            if upstream.method == "submit" {
+                let sid = (upstream.params["session_id"] as? String) ?? createdSid
+                relay.deliverResult(id: id, result: .object(["session_id": .string(sid)]))
+            } else {
+                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
+            }
+        }
 
         let ok = await g.chat.send(text: "hello")
         XCTAssertTrue(ok, "a new-chat relay send must be accepted")
@@ -458,7 +493,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_approval_gate")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         g.chat.messages = cachedRows(fx)
         _ = await g.chat.send(text: fx.submitText)
 
@@ -479,7 +514,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_approval_gate")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliver(g, fx, through: { self.kind($0) == "approval.request" })
         await waitUntil(timeout: .seconds(2)) { g.chat.pendingApproval != nil }
@@ -500,7 +535,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_approval_gate")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliver(g, fx, through: { self.kind($0) == "approval.request" })
         await waitUntil(timeout: .seconds(2)) { g.chat.pendingApproval != nil }
@@ -525,7 +560,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_clarify_gate")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
 
         deliver(g, fx, through: { self.kind($0) == "clarify.request" })
@@ -545,7 +580,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_clarify_gate")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliver(g, fx, through: { self.kind($0) == "clarify.request" })
         await waitUntil(timeout: .seconds(2)) { g.chat.pendingClarification != nil }
@@ -566,7 +601,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_clarify_gate")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliver(g, fx, through: { self.kind($0) == "clarify.request" })
         await waitUntil(timeout: .seconds(2)) { g.chat.pendingClarification != nil }
@@ -591,7 +626,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_tasklist")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliverAll(g, fx)
 
@@ -608,7 +643,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_tasklist")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliverAll(g, fx)
 
@@ -637,7 +672,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         g.chat.messages = cachedRows(fx)
         _ = await g.chat.send(text: fx.submitText)
 
@@ -961,38 +996,66 @@ final class RenderConformanceTests: XCTestCase {
                        "the overlapping window rows update in place — no duplicates, no eviction")
     }
 
-    /// QA-2 R15 guard — the optimistic user echo (runtime id + clientMessageID,
-    /// untagged) must CONVERGE with its own gateway row on a union reseed,
-    /// never double-render. The reseed row adopts the echo's slot exactly like
-    /// `adoptRelayEcho` folds the relay `userMessage` item onto it.
+    /// QA-2 R15 guard — CONTRACT-UPDATED (ROUND-4 amendments G4 + I14): the
+    /// optimistic user echo CONVERGES with its relay `userMessage` row IN
+    /// PLACE — cmid adoption assumes the SERVER item's `ord` (amendment G4:
+    /// the echo IS the user row; there is no twin to consume — R1 deleted the
+    /// fuzzy text twin-consumption the old reseed union leaned on). The OLD
+    /// convergence rode a REST reseed's union merge — DELETED on relay by
+    /// R3/W2d (contract I14: the recovery reconcile is a relay-LOCAL
+    /// `resync{last_seq}`, never a transcript refetch; the injected
+    /// `backfillFetch` is never resolved on relay). This drive reconstructs
+    /// the production identity chain (live, the SUBMIT's cmid folds into the
+    /// relay-synthesized `userMessage` item — re-stamped here because a
+    /// static replay cannot join the live submit's fresh UUID; the same
+    /// reconstruction `testReplay_UserBubbleExactlyOnceAfterTurnCompletes`
+    /// performs), then proves the recovery reconcile (backfill → resync, I14)
+    /// and a resync-ring replay of the SAME frames (I21) leave EXACTLY ONE
+    /// prompt bubble.
     func testReseed_OptimisticEchoConvergesWithItsGatewayRow() async throws {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
-        g.sessions.activeStoredId = fx.sessionID
+        try await openDriven(g, fx.sessionID)
 
         _ = await g.chat.send(text: fx.submitText)
+        // PRODUCTION IDENTITY REPLAY (G4/I8): re-stamp the echo with the
+        // fixture's recorded cmid so the `userMessage` item's adoption folds
+        // it onto the echo row in place (row id unchanged, the server item's
+        // `ord` assumed).
+        let cmid = try XCTUnwrap(fx.submitClientMessageID,
+            "the recording harness records the SUBMIT cmid the relay folds into the userMessage item")
+        if let idx = g.chat.messages.firstIndex(where: {
+            $0.role == .user && $0.text == fx.submitText && $0.clientMessageID != nil
+        }) {
+            let echo = g.chat.messages[idx]
+            g.chat.messages[idx] = ChatMessage(
+                id: echo.id, role: .user, clientMessageID: cmid,
+                parts: echo.parts, timestamp: echo.timestamp
+            )
+        }
         deliverAll(g, fx)
         let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
         await waitUntil { !g.chat.isStreaming && g.chat.messages.last?.text == agentText }
 
-        // The gateway has persisted the turn; the backfill snapshot carries the
-        // authoritative user + assistant rows under their WIRE ids — the echo's
-        // runtime id never matches them.
-        g.chat.backfillFetch = { _ in
-            [
-                StoredMessage(role: "user", content: .string(fx.submitText),
-                              timestamp: 1_700_000_100, wireId: 100),
-                StoredMessage(role: "assistant", content: .string(agentText),
-                              timestamp: 1_700_000_101, wireId: 101),
-            ]
-        }
+        // R3/I14: the relay recovery reconcile rides the relay-LOCAL resync —
+        // assert backfill takes that path and NEVER the deleted blanket
+        // `history` refetch.
         await g.chat.backfill()
+        XCTAssertNotNil(g.transport.upstreams().first { $0.method == "resync" },
+            "contract I14: the relay recovery reconcile rides the relay-local resync")
+        XCTAssertNil(g.transport.upstreams().first { $0.method == "history" },
+            "contract I14/R3: no blanket history refetch on relay recovery — the stream is the authority")
+
+        // I21: the resync ring replays the SAME frames — re-applying them
+        // converges: still exactly one prompt bubble (the adopted echo IS the
+        // user row) and the reply intact.
+        deliverAll(g, fx)
+        await waitUntil { g.chat.messages.last?.text == agentText }
 
         let promptBubbles = g.chat.messages.filter { $0.role == .user && $0.text == fx.submitText }
         XCTAssertEqual(promptBubbles.count, 1,
-                       "the optimistic echo adopts its gateway row's content in place — exactly one prompt bubble")
+                       "the optimistic echo adopts its relay userMessage row in place (G4) — exactly one prompt bubble, stable under resync replay (I21)")
         XCTAssertTrue(g.chat.messages.contains { $0.text == agentText },
                       "the authoritative reply renders")
     }
@@ -1034,46 +1097,29 @@ final class RenderConformanceTests: XCTestCase {
                        "switching back paints the entire cached transcript instantly (R3 residue / R15 recovery path)")
     }
 
-    /// QA-2 R3 residue — the relay recovery backfill must run over the RELAY
-    /// transport (the gateway REST socket is idle/unreachable in relay mode —
-    /// a REST-only `backfill()` fails or hangs to the 15s timeout, so the
-    /// post-flap reconcile never lands). FAILS on qa2/base
-    /// (`resolvedBackfillFetch` resolves only `connection?.rest` — nil here →
-    /// the backfill no-ops and the snapshot never seeds).
+    /// QA-2 R3 residue — CONTRACT-UPDATED (ROUND-4 R3 / I14): the relay
+    /// recovery reconcile still rides the RELAY transport (the gateway REST
+    /// socket is idle/unreachable in relay mode — the QA-2 bug this gate was
+    /// written for), but as a relay-LOCAL `resync{last_seq}`, NOT a transcript
+    /// `history` refetch. R3/W2d deleted the blanket backfill storm (contract
+    /// I14: paint + ≤1 snapshot per open; reconnect = resync replay + ≤1
+    /// snapshot; `history` reads ONLY on cold cache-miss or an explicit
+    /// scrollback page) — the stream IS the authority, and the resync ring
+    /// replay is gap-free by construction at zero gateway reads. The OLD
+    /// assertion (backfill fires a `history` RPC that seeds the transcript)
+    /// pinned the deleted storm path; this pin asserts the contract shape:
+    /// recovery ⇒ `resync` upstream, never `history`.
     func testBackfill_RelayTransportRunsOverRelayHistory() async throws {
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open("render-relay-backfill")
-        g.sessions.activeStoredId = "render-relay-backfill"
+        try await openDriven(g, "render-relay-backfill")
 
-        // The relay answers `history` with the gateway store rows (proxied
-        // verbatim — the same shape `rest_history` returns downstream).
-        g.transport.script = { upstream, relay in
-            guard let id = upstream.id else { return }
-            if upstream.method == "history" {
-                relay.deliverResult(id: id, result: .object([
-                    "session_id": .string("render-relay-backfill"),
-                    "messages": .array([
-                        .object(["role": .string("user"), "content": .string("rh-q1"),
-                                 "timestamp": .number(1_700_000_000), "id": .number(1)]),
-                        .object(["role": .string("assistant"), "content": .string("rh-a1"),
-                                 "timestamp": .number(1_700_000_001), "id": .number(2)]),
-                    ]),
-                ]))
-            } else {
-                relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
-            }
-        }
-
-        // NO `backfillFetch` injection: the store must resolve the relay
-        // `history` RPC itself (the production relay wiring under test).
         await g.chat.backfill()
 
-        let history = g.transport.upstreams().first { $0.method == "history" }
-        XCTAssertNotNil(history, "the recovery backfill must travel over the relay transport in relay mode")
-        XCTAssertEqual(history?.params["session_id"] as? String, "render-relay-backfill")
-        XCTAssertEqual(g.chat.messages.map(\.text), ["rh-q1", "rh-a1"],
-                       "the relay history rows seed the transcript over the up transport")
+        XCTAssertNotNil(g.transport.upstreams().first { $0.method == "resync" },
+            "contract I14/R3: the relay recovery reconcile rides the relay transport — a relay-local resync{last_seq}")
+        XCTAssertNil(g.transport.upstreams().first { $0.method == "history" },
+            "contract I14: no blanket history refetch on relay recovery — the stream is the authority, resync replays gap-free")
     }
 
     /// PIN (green on qa1/base — B15 regression guard): a cold-open transcript
@@ -1387,7 +1433,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         let ok = await g.chat.send(text: fx.submitText)
         XCTAssertTrue(ok)
@@ -1412,7 +1458,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         _ = await g.chat.send(text: fx.submitText)
         deliver(g, fx, through: {
@@ -1436,7 +1482,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_submit_stream")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         g.chat.messages = cachedRows(fx)
         _ = await g.chat.send(text: fx.submitText)
 
@@ -1465,7 +1511,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_live_fold")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
 
         // Through the raw-name tool start: reasoning done, tool in progress,
@@ -1501,7 +1547,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_live_fold")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
 
         // Through the agentMessage start (the tool completed friendly just
@@ -1592,7 +1638,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_live_fold")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         g.chat.messages = cachedRows(fx)
         _ = await g.chat.send(text: fx.submitText)
         deliverAll(g, fx)
@@ -1618,7 +1664,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_live_fold")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
         deliverAll(g, fx)
         let agentText = try XCTUnwrap(fx.settled["agent_text"] as? String)
@@ -1675,7 +1721,7 @@ final class RenderConformanceTests: XCTestCase {
             if upstream.method == "submit" { return }   // answered after the blackout
             relay.deliverResult(id: id, result: .object(["ok": .bool(true)]))
         }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         let t0 = ContinuousClock.now
         let sendTask = Task { await g.chat.send(text: fx.submitText) }
@@ -1946,7 +1992,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_live_fold")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
 
         // Through the last item (usage) — stop BEFORE the fixture's own
@@ -1995,7 +2041,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_qa3_delayed_start")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
 
         let ok = await g.chat.send(text: fx.submitText)
         XCTAssertTrue(ok)
@@ -2058,7 +2104,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_live_fold")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         _ = await g.chat.send(text: fx.submitText)
 
         // Through the raw-name tool start: reasoning + in-progress tool, NO
@@ -2225,7 +2271,7 @@ final class RenderConformanceTests: XCTestCase {
         let fx = try loadFixture("render_dead_turn_liveness")
         let g = try await makeGraph()
         defer { Task { await g.coordinator.stop() } }
-        _ = try await g.coordinator.open(fx.sessionID)
+        try await openDriven(g, fx.sessionID)
         g.chat.messages = cachedRows(fx)
         let ok = await g.chat.send(text: fx.submitText)
         XCTAssertTrue(ok, "relay submit must be accepted")

@@ -177,8 +177,17 @@ private final class TranscriptPageStubProtocol: URLProtocol, @unchecked Sendable
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        Self.requestedPath = request.url?.path
-        Self.requestedQuery = request.url?.query
+        // Record the WIRE path (percent-encoded). iOS 17+ Foundation's
+        // `URL.path`/`URL.query` return the percent-DECODED form (`s 1`),
+        // which masks the exact property this gate protects: session ids
+        // percent-encode onto the wire (`s%201` — a raw space is an invalid
+        // request line; the sibling recency test pins the `?`-encoding twin
+        // of this regression). `URLComponents` exposes the encoded form.
+        let components = request.url.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)
+        }
+        Self.requestedPath = components?.percentEncodedPath ?? request.url?.path
+        Self.requestedQuery = components?.percentEncodedQuery ?? request.url?.query
         guard let (data, status) = Self.nextResponse else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return

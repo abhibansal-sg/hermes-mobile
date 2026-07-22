@@ -1632,7 +1632,15 @@ final class ConnectionStore {
             Self.applyTombstoneDecision(decision, for: tombstone, defaults: .standard)
         }
 
-        startLongLivedTasks()
+        // R4/W2a (contract I13): the gateway event-router + state-observer tasks
+        // consume `client.events` / `client.stateChanges` — gateway-direct machinery
+        // that must stay idle in relay mode (the relay coordinator owns the live
+        // transport; the gateway `client` never connects on this path). The whole
+        // startLongLivedTasks/startReconnectLoop/probeLiveness family deletes in
+        // Wave 4; this gate is the transitional day-1 guard.
+        if transportPath != .relay {
+            startLongLivedTasks()
+        }
         hasConnected = true
         // A verified connection clears any prior re-pair flag and failure tally.
         reauthRequired = false
@@ -2555,6 +2563,12 @@ final class ConnectionStore {
     /// Trailing-edge of the debounce: re-check state and route into the EXISTING
     /// reconnect seam. Never a new connect path.
     private func fireNetworkReconnect() {
+        // R4/W2a (contract I13): NWPathMonitor kicks route into the gateway-direct
+        // `startReconnectLoop`. In relay mode the coordinator's auto-driver
+        // (RSC §4) is the sole reconnect owner, so this kick is a no-op — the
+        // coordinator re-dials the relay on its own socket. Wave 4 deletes this
+        // whole kick path; this guard is the transitional day-1 no-op.
+        guard transportPath != .relay else { return }
         // Re-check at fire time — the window may have healed us, or the user may
         // have just chosen offline.
         if UserDefaults.standard.bool(forKey: DefaultsKeys.connectionOffline) { return }
@@ -3260,7 +3274,13 @@ final class ConnectionStore {
                 let grace = Self.coldOpenGraceWindow
                 #endif
                 self.startGraceWindow(duration: grace, generation: generation)
-            } else if case .connected = self.phase {
+            } else if case .connected = self.phase, self.transportPath != .relay {
+                // R4/W2a (contract I13): the gateway-direct liveness probe +
+                // REST backfill (`probeLiveness` on `client`, then
+                // `chatStore.backfill()`) must no-op in relay mode — a healthy
+                // relay foreground already re-asserted foreground above; the
+                // coordinator owns resync/reconcile. Wave 4 deletes this whole
+                // probe branch; this guard is the transitional day-1 no-op.
                 // ABH-177: verify the socket is still alive with a read-only ping
                 // before attempting the REST backfill. A silent-dead socket that
                 // reports `.connected` at the transport level would otherwise pass

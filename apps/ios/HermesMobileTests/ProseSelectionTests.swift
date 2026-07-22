@@ -92,7 +92,10 @@ final class ProseSelectionTests: XCTestCase {
         XCTAssertNotEqual(tailAnchor, NSNotFound)
         XCTAssertNotEqual(headAnchor, NSNotFound)
 
-        // Select from mid-paragraph-1 across the boundary into paragraph 2.
+        // Select from mid-paragraph-1 across the boundary into paragraph 2
+        // (the programmatic drive stands in for the user's long-press —
+        // mark the interaction so the QA-2 B11 mount gate stands down).
+        (textView as? ProseTextView)?.noteInteractionForTesting()
         let end = headAnchor + ("Beta starts" as NSString).length
         textView.selectedRange = NSRange(location: tailAnchor, length: end - tailAnchor)
 
@@ -337,7 +340,10 @@ final class ProseSelectionTests: XCTestCase {
             return XCTFail("container must mount its UITextView")
         }
 
-        // The reader narrows to one word.
+        // The reader narrows to one word (the programmatic drive stands in
+        // for the user's long-press — mark the interaction so the QA-2 B11
+        // mount gate stands down).
+        (textView as? ProseTextView)?.noteInteractionForTesting()
         let word = (textView.attributedText.string as NSString).range(of: "beta")
         textView.selectedRange = word
         XCTAssertEqual(textView.selectedRange, word)
@@ -391,6 +397,9 @@ final class ProseSelectionTests: XCTestCase {
 
         // Word-level selection: a single word of paragraph one.
         let word = (textView.attributedText.string as NSString).range(of: "granularity")
+        // Evidence capture drives selection PROGRAMMATICALLY — opt out of the
+        // QA-2 B11 mount-selection gate (no touch precedes the drive).
+        (textView as? ProseTextView)?.suppressFocusUntilTouch = false
         textView.becomeFirstResponder()
         textView.selectedRange = word
         RunLoop.current.run(until: Date(timeIntervalSinceNow: 1.0))
