@@ -6,6 +6,49 @@ import XCTest
 /// app must render the streamed reply it never asked for.
 final class CrossClientSyncUITests: XCTestCase {
 
+    func testExternallyDrivenForeignTurnIsMirroredLive() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let base = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
+              let marker = env["HERMES_LIVE_FOLLOW_MARKER"],
+              !base.isEmpty, !token.isEmpty, !marker.isEmpty else {
+            throw XCTSkip("live gateway credentials/marker not provided; skipping live test")
+        }
+
+        let app = XCUIApplication()
+        app.launchEnvironment["HERMES_URL"] = base
+        app.launchEnvironment["HERMES_TOKEN"] = token
+        app.launchArguments += ["--uitest-mute-audio"]
+        app.launch()
+
+        let drawerToggle = app.buttons["drawerToggle"]
+        XCTAssertTrue(drawerToggle.waitForExistence(timeout: 30))
+        drawerToggle.tap()
+
+        let ownedSession = app.staticTexts[marker]
+        XCTAssertTrue(ownedSession.waitForExistence(timeout: 20))
+        ownedSession.tap()
+
+        XCTAssertTrue(
+            app.staticTexts.containing(
+                NSPredicate(format: "label CONTAINS %@", marker + "-FIRST")
+            ).firstMatch.waitForExistence(timeout: 60),
+            "Externally owned session did not paint its first turn"
+        )
+        print("ABH519_WATCH_READY")
+
+        XCTAssertTrue(
+            app.staticTexts.containing(
+                NSPredicate(format: "label CONTAINS %@", marker + "-SECOND")
+            ).firstMatch.waitForExistence(timeout: 120),
+            "Foreign turn completed but was not mirrored into the watching phone"
+        )
+
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = "cross-client-mirror-physical"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
     func testForeignTurnIsMirroredLive() throws {
         let env = ProcessInfo.processInfo.environment
         guard let base = env["HERMES_URL"], let token = env["HERMES_TOKEN"],
@@ -145,7 +188,14 @@ private final class ForeignClient {
 
     func connect() throws {
         wsTask.resume()
-        _ = try receiveFrame(timeout: 15) // gateway.ready
+        guard let ready = try receiveFrame(timeout: 15),
+              ready["method"] as? String == "event",
+              let params = ready["params"] as? [String: Any],
+              params["type"] as? String == "gateway.ready" else {
+            throw NSError(domain: "ForeignClient", code: 5, userInfo: [
+                NSLocalizedDescriptionKey: "gateway.ready not received",
+            ])
+        }
     }
 
     func close() {

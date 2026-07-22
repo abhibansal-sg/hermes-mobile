@@ -122,6 +122,11 @@
             value = "$(TEST_RUNNER_HERMES_TOKEN)"
             isEnabled = "YES">
          </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "HERMES_LIVE_FOLLOW_MARKER"
+            value = "$(TEST_RUNNER_HERMES_LIVE_FOLLOW_MARKER)"
+            isEnabled = "YES">
+         </EnvironmentVariable>
       </EnvironmentVariables>
    </TestAction>
    <LaunchAction
