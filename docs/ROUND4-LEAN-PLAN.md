@@ -1,5 +1,11 @@
 # ROUND-4 LEAN PLAN — relay-only rewire + deletion, revised
 
+> **SUPERSEDED HOLD (ABH-519, 2026-07-22):** Do not execute Wave 3 or Wave 4.
+> In particular, do not delete `HermesGatewayClient.swift`, `GatewayEvent.swift`, or the raw
+> GatewayEvent ingestors. The amended v0.19 plan reuses them to delete the relay's second
+> transcript protocol instead. Earlier waves and this document remain historical evidence; the
+> active architecture plan is `docs/CODEX-ABH519-V019-SIMPLIFICATION-PROPOSAL.md`.
+
 **Inputs:** INTERACTION-CONTRACT.md (I1–I23), Matrix A/B, desktop study, plugin-route audit.
 **Mandate:** LESS code. Every addition justifies itself against a deletion; every rewire
 lane deletes its own compensation in the same lane; the app is never broken mid-migration.
