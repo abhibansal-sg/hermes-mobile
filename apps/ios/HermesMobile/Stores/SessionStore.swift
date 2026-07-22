@@ -6580,21 +6580,9 @@ final class SessionStore {
             if let transcriptFetchWithProfile { return transcriptFetchWithProfile }
             if let transcriptFetch { return { sessionId, _ in try await transcriptFetch(sessionId) } }
         }
-        // Relay cache misses need one correctness fallback. OPEN/HISTORY already
-        // returns the gateway's persisted messages; consume that result instead
-        // of assuming a snapshot will arrive on every bind. The caller returns
-        // before reaching this closure on a cache hit, so warm opens stay zero
-        // network reads (I14).
-        if connection?.transportPath == .relay,
-           let coordinator = connection?.relayCoordinator {
-            return { sessionId, _ in
-                let result = try await coordinator.history(
-                    sessionID: sessionId,
-                    limit: ChatStore.transcriptOpenWindowLimit
-                )
-                return Self.relayHistoryMessages(from: result)
-            }
-        }
+        // Relay open/resume already streams the authoritative snapshot. A second
+        // history read here races that snapshot and violates I14's one-read budget.
+        if connection?.transportPath == .relay { return nil }
         guard let rest = connection?.rest else { return nil }
         // ABH-408: a non-default row opened from the All-profiles rail must use
         // RestClient+Profiles.messages(sessionId:profile:) so the backend reads
