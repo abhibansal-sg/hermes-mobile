@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional, Protocol, runtime_checkable
 
@@ -52,6 +53,26 @@ from .types import GatewayEvent, RawEvent
 
 # Origin tag stamped on sessions the relay creates/resumes (matches R0 spike).
 RELAY_SOURCE = "mobile-relay"
+
+
+# O1 — bounded owned-session release (soak handoff finding). ``_owned`` grew
+# once per unique driven session forever in-process (``_unmark_owned`` had
+# zero callers): reconnect re-resume fanned out over every session the relay
+# had EVER driven and the Notifier's owned set never shrank — the
+# accumulating ``owned_sessions`` observed on the live relay. Release idle
+# ownership instead:
+# * the TTL is the primary bound — steady state is the sessions driven within
+#   the window (a one-phone relay: a few hundred at most);
+# * the cap backstops churn storms, but never evicts an entry younger than
+#   the min-idle floor: every interaction (create/resume/submit) re-marks, so
+#   a live turn's ownership is always fresh and never dropped mid-turn.
+# Eviction downgrades SAFELY to resume: the downstream SUBMIT path re-resumes
+# whenever ``owns()`` is False (downstream.py), which re-marks — a released
+# session simply re-owns on next use. Reversible: constants only, no wire or
+# schema change.
+_OWNED_RELEASE_IDLE_S = 12 * 3600.0   # release anything idle >= 12 h
+_OWNED_CAP = 4096                     # churn backstop (soft)...
+_OWNED_MIN_IDLE_S = 30 * 60.0         # ...never evict an entry younger than this
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +161,10 @@ class GatewayClient:
         # from durable storage so a relay restart re-resumes the phone's sessions
         # instead of dropping them (the "destination session not active" failure).
         self._owned: set[str] = set(self._durable.load_owned_sessions()) if self._durable else set()
+        # O1 — per-session last-mark timestamps for the idle-release bound
+        # (see :meth:`_trim_owned`). Durable-seeded sessions start fresh at
+        # boot, i.e. they get a full TTL before the first release pass.
+        self._owned_at: dict[str, float] = {sid: time.monotonic() for sid in self._owned}
 
         # Origin/requested id -> live id learned at resume time. A stock gateway
         # may hand a resumed session a DISTINCT live id (echoing the requested id
@@ -168,16 +193,60 @@ class GatewayClient:
         if not session_id:
             return
         self._owned.add(session_id)
+        self._owned_at[session_id] = time.monotonic()
         if self._durable is not None:
             self._durable.add_owned_session(session_id)
+        self._trim_owned()
 
     def _unmark_owned(self, session_id: str) -> None:
         """Remove ``session_id`` from the owned set and durable storage."""
         if not session_id:
             return
         self._owned.discard(session_id)
+        self._owned_at.pop(session_id, None)
         if self._durable is not None:
             self._durable.remove_owned_session(session_id)
+
+    # -- O1: bounded owned-session release (soak handoff) ------------------
+    def _trim_owned(self) -> None:
+        """Bound ``_owned``: release sessions idle past the TTL, and (when the
+        set is over the cap) the oldest entries idle past the min-idle floor.
+
+        Runs on every mark (create/resume/submit); eviction downgrades safely
+        to resume — the next SUBMIT sees ``owns() == False`` and re-resumes,
+        which re-marks (downstream.py fast-path gate). Pushes only matter
+        while a turn is live, and the mark is fresh exactly then.
+        """
+        now = time.monotonic()
+        drop = [
+            sid for sid, marked in self._owned_at.items()
+            if now - marked >= _OWNED_RELEASE_IDLE_S
+        ]
+        if len(self._owned) - len(drop) > _OWNED_CAP:
+            for sid, marked in sorted(self._owned_at.items(), key=lambda kv: kv[1]):
+                if len(self._owned) - len(drop) <= _OWNED_CAP:
+                    break
+                if sid in drop or now - marked < _OWNED_MIN_IDLE_S:
+                    continue  # pinned: marked too recently (a live turn)
+                drop.append(sid)
+        for sid in drop:
+            self._release_owned(sid)
+
+    def _release_owned(self, sid: str) -> None:
+        """Drop ownership of ``sid`` and its live-id partner everywhere: the
+        in-memory set, the mark timestamps, the origin->live remap and the
+        durable mirror (only ORIGIN ids are persisted there)."""
+        self._owned.discard(sid)
+        self._owned_at.pop(sid, None)
+        live = self._live_by_origin.pop(sid, None)
+        if live is not None and live != sid:
+            # sid was an ORIGIN key: release its connection-local live id too
+            # (in-memory-only — never persisted — so no durable remove).
+            self._live_by_origin.pop(live, None)
+            self._owned.discard(live)
+            self._owned_at.pop(live, None)
+        if self._durable is not None:
+            self._durable.remove_owned_session(sid)
 
     # -- lifecycle --------------------------------------------------------
     async def connect(self) -> None:
@@ -468,6 +537,7 @@ class GatewayClient:
         live = result.get("session_id")
         if live:
             self._owned.add(live)
+            self._owned_at[live] = time.monotonic()  # O1: live ids trim too
             self._live_by_origin[session_id] = live
             self._live_by_origin[live] = live
         return result
