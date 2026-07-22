@@ -119,6 +119,11 @@ persistence, translation, transcript, or session state.
   2 passed, 0 failed. Log: `/private/tmp/abh519-phase3-focused-unit-device.log`; result
   bundle:
   `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_05-31-35-+0800.xcresult`.
+- The legacy relay gate harness now establishes the stored-session owner that production open
+  establishes, rather than depending on the removed nil-owner fallback. Its complete focused
+  suite ran on the physical arm64 bundle: 10 passed, 0 failed. Log:
+  `/private/tmp/abh519-phase3-relay-gate-bridge-device.log`; result bundle:
+  `apps/ios/.derivedData/Logs/Test/Test-HermesMobile-2026.07.23_06-09-34-+0800.xcresult`.
 
 The focused plugin seam slice was rerun after cleanup: 5 passed. `git diff --check` passes,
 and the final product diff contains none of the temporary `ABH519_APPROVAL_*`,
