@@ -22,8 +22,8 @@ used.
 - The transport toggle is gone. An optional proxy address only changes the host
   used by the same stock HTTP/WebSocket protocol.
 
-Complete staged Phase 4 diff, including this evidence and the stock render
-fixture: **648 insertions, 20,288 deletions**. `git diff --check` passes.
+Complete Phase 4 branch diff, including this evidence and the stock render
+fixture: **786 insertions, 41,961 deletions**. `git diff --check` passes.
 Searches find no product references to
 `RelayClient`, `RelayItemStore`, `RelaySessionCoordinator`, `RelayProtocol`,
 `Reframer`, `session_state`, or `applyRelayItems`.
@@ -34,6 +34,9 @@ Searches find no product references to
 - Python phone driver using stock frames through the transparent relay:
   `1 passed`; no legacy item-stream frame was observed. Evidence:
   `hermes-tmp/evidence/daily-driver/e2e/test_stock_frames_round_trip_unchanged-stock-proxy.json`.
+- The obsolete custom wire-conformance parser, item-stream recordings, and
+  simulator render replay were deleted. Render conformance now drives the
+  production `GatewayEvent` decoder directly from stock JSON-RPC events.
 - No relay persistence, translation, transcript, or session-state implementation
   was added.
 

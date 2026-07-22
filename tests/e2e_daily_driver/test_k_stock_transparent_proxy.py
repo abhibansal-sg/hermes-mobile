@@ -55,9 +55,9 @@ async def test_stock_frames_round_trip_unchanged(
             "rpc_methods": [entry["method"] for entry in phone.sent],
             "event_types": [entry["params"]["type"] for entry in phone.events],
             "history_messages": len(history.json()["messages"]),
-            "legacy_frames_seen": len(phone.frames),
+            "legacy_frames_seen": phone.legacy_frames_seen,
         })
-        assert phone.frames == []
+        assert phone.legacy_frames_seen == 0
     finally:
         await phone.close()
 
@@ -98,8 +98,8 @@ async def test_external_stock_gateway_9130_plus(evidence):
             "created_runtime_id": result["session_id"],
             "created_stored_id": stored_id,
             "http_status": status.status_code,
-            "legacy_frames_seen": len(phone.frames),
+            "legacy_frames_seen": phone.legacy_frames_seen,
         })
-        assert phone.frames == []
+        assert phone.legacy_frames_seen == 0
     finally:
         await phone.close()
