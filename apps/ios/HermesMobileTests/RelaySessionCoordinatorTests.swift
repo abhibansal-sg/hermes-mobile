@@ -621,8 +621,8 @@ final class RelaySessionCoordinatorTests: XCTestCase {
         // routing for A's own follow-up drain must survive that remap.
         _ = try await coordinator.submit(prompt: "hi", sessionID: "A")
         XCTAssertEqual(coordinator.activeSessionID, "A-live")
-        XCTAssertEqual(coordinator.outboxRuntimeID(forStored: "A"), "A",
-                       "the remapped live id must not strand A's next queued prompt")
+        XCTAssertEqual(coordinator.outboxRuntimeID(forStored: "A"), "A-live",
+                       "A's next queued prompt must target its remapped live runtime")
 
         // Opening B moves the driven session ⇒ A now holds, B resolves.
         _ = try await coordinator.open("B")

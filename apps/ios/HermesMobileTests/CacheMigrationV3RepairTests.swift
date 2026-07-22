@@ -23,6 +23,68 @@ import GRDB
 
 final class CacheMigrationV3RepairTests: XCTestCase {
 
+    /// A build-116 phone did not start from an empty database: it reopened a
+    /// populated, fully-migrated cache. Recreate that on-disk shape, close the
+    /// queue (process boundary), open it as build 119, and prove a draft-born
+    /// durable-id row can still be written and read alongside the old rows.
+    func testBuild116PopulatedDeviceDBReopensAndAcceptsDraftBornWrite() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("abh519-build116-\(UUID().uuidString).sqlite")
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(atPath: url.path + "-wal")
+            try? FileManager.default.removeItem(atPath: url.path + "-shm")
+        }
+        var config = Configuration()
+        config.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+        }
+        let scope = CacheScope(serverId: "https://device.example", profileId: "default")
+        func identity(_ sessionID: String) -> CacheIdentity {
+            CacheIdentity(
+                serverId: scope.serverId, profileId: scope.profileId, sessionId: sessionID)
+        }
+        let oldID = "20260721_120000_build116"
+
+        do {
+            let queue = try DatabaseQueue(path: url.path, configuration: config)
+            try CacheSchema.makeMigrator().migrate(queue)
+            let cache = try CacheStore(testDB: queue)
+            let old = SessionSummary(
+                id: oldID, title: "Existing device chat", preview: "before upgrade",
+                startedAt: 1, messageCount: 1, source: nil, lastActive: 1, cwd: nil
+            )
+            try await cache.upsertSession(old, scope: scope)
+            try await cache.saveTranscript(
+                identity: identity(oldID),
+                messages: [StoredMessage(role: "user", content: .string("before upgrade"))]
+            )
+        }
+
+        let queue119 = try DatabaseQueue(path: url.path, configuration: config)
+        try CacheSchema.migrateResiliently(queue119)
+        let cache119 = try CacheStore(testDB: queue119)
+        let newID = "20260722_140236_f61148"
+        let draftBorn = SessionSummary(
+            id: newID, title: "New device chat", preview: "after upgrade",
+            startedAt: 2, messageCount: 1, source: nil, lastActive: 2, cwd: nil
+        )
+        try await cache119.upsertSession(draftBorn, scope: scope)
+        try await cache119.saveTranscript(
+            identity: identity(newID),
+            messages: [StoredMessage(
+                role: "user", content: .string("after upgrade"),
+                clientMessageID: "cmid-device"
+            )]
+        )
+
+        let oldRows = try await cache119.loadTranscript(identity(oldID))
+        let newRows = try await cache119.loadTranscript(identity(newID))
+        XCTAssertEqual(oldRows?.first?.text, "before upgrade")
+        XCTAssertEqual(newRows?.first?.text, "after upgrade")
+        XCTAssertEqual(newRows?.first?.clientMessageID, "cmid-device")
+    }
+
     /// Build an in-memory database in the exact "stuck" shape: the migrator run
     /// only up to `v3-offline-search` (so v1 + v2 + the mirror migration are
     /// recorded but `v3` is not), then seeded with `sessions` session rows and
