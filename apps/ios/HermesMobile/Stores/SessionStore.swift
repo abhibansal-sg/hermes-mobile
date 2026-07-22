@@ -1,11 +1,10 @@
 import Foundation
-#if DEBUG
 import os
 
-/// DEBUG-only logger for SessionStore open→painted latency instrumentation
-/// (WhatsApp bar). Absent in Release.
+/// Session/cache diagnostics, including the temporary ABH-519 device trace.
 private let sessionLog = Logger(subsystem: "ai.hermes.HermesMobile", category: "SessionStore")
 
+#if DEBUG
 /// DEBUG-only signpost log for the open→paint fallback chain (QA-1 A7/B2).
 private let sessionSignposts = OSLog(subsystem: "ai.hermes.HermesMobile", category: "SessionStore")
 #endif
@@ -4245,8 +4244,8 @@ final class SessionStore {
     /// the active transport (the gateway-direct `session.resume` in ``open`` is
     /// skipped — the gateway socket is idle in relay-only mode). Binds the runtime
     /// id so the composer unlocks and prompt submission routes through the relay,
-    /// exactly as the gateway resume does on the direct path. The relay keys the
-    /// runtime on the stored session id, so a successful resume binds `summary.id`.
+    /// exactly as the gateway resume does on the direct path. The returned live
+    /// id may differ from `summary.id`, which remains the durable identity.
     /// Supersession is guarded by `openToken` (a newer open()/draft cancels the
     /// stale bind) so a slow relay resume cannot bind into a session the user has
     /// since navigated away from.
@@ -4273,14 +4272,16 @@ final class SessionStore {
                         return
                     }
                 }
-                _ = try await coordinator.resume(summary.id)
+                let result = try await coordinator.resume(summary.id)
                 guard self.openToken == token,
                       self.connectionWorkGeneration == connectionWorkGeneration,
                       self.activeStoredId == summary.id else { return }
-                // Relay runtime bound: the relay keys the live turn on the stored
-                // session id. Unlock the composer and flush anything queued during
-                // the resume window (mirrors the gateway `onActiveRuntimeBound`).
-                self.activeRuntimeId = summary.id
+                // The relay may reactivate the durable session under a distinct
+                // live runtime id. Keep both identities instead of collapsing
+                // the cache/drawer key onto the ephemeral runtime.
+                self.activeRuntimeId = result["session_id"]?.stringValue
+                    ?? coordinator.activeSessionID
+                    ?? summary.id
                 self.activeRuntimeEpoch = self.connection?.transportEpoch
                 self.lastError = nil
                 self.sessionActionError = nil
@@ -4482,11 +4483,13 @@ final class SessionStore {
     /// session to key under at append time (a draft has no id), so it is
     /// RE-HOMED onto the created session HERE, at adoption — one identity,
     /// persisted once, never re-keyed by a second call after the fact.
-    func landRelayCreatedSession(storedID: String, echo: ChatMessage? = nil) {
+    func landRelayCreatedSession(
+        storedID: String, runtimeID: String, echo: ChatMessage? = nil
+    ) async {
         guard isDraft || activeStoredId == nil else { return }
         isDraft = false
         activeStoredId = storedID
-        activeRuntimeId = storedID
+        activeRuntimeId = runtimeID
         activeRuntimeEpoch = connection?.transportEpoch
         ensureRuntimeAttempts = 0
         lastError = nil
@@ -4499,7 +4502,7 @@ final class SessionStore {
         // skip instead of re-running the first-frame paint over the live turn
         // (QA-3 S7 — the known-partial window truncation).
         transcriptPaintedStoredId = storedID
-        persistDraftBornCacheSeed(storedID: storedID, echo: echo)
+        await persistDraftBornCacheSeed(storedID: storedID, echo: echo)
         // Surface the new row in the drawer; never block the turn on it
         // (mirrors `createDraftSession`'s background refresh).
         Task { [weak self] in await self?.refresh() }
@@ -4522,11 +4525,38 @@ final class SessionStore {
     /// force-close→reopen paints the user row from disk and the relay
     /// `userMessage` item (same cmid, downstream.py `_emit_user_message_item`)
     /// adopts it IN PLACE (I8 — one identity, never re-keyed, no second fetch,
-    /// no duplicate). Fire-and-forget OFF the turn's path: the in-memory echo
-    /// (`persistDurableEcho`) owns the live paint; this owns the durable one.
-    private func persistDraftBornCacheSeed(storedID: String, echo: ChatMessage?) {
-        guard let cacheStore, let identity = cacheIdentity(storedID),
-              let echo, !echo.text.isEmpty else { return }
+    /// no duplicate). The in-memory echo (`persistDurableEcho`) owns the live
+    /// paint; this ordered, awaited write owns the durable one.
+    private func persistDraftBornCacheSeed(
+        storedID: String, echo: ChatMessage?
+    ) async {
+        sessionLog.notice(
+            "[ABH-519] persistDraftBornCacheSeed entry session=\(storedID, privacy: .public)"
+        )
+        guard let cacheStore else {
+            sessionLog.error(
+                "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=cacheStore-nil"
+            )
+            return
+        }
+        guard let identity = cacheIdentity(storedID) else {
+            sessionLog.error(
+                "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=cacheIdentity-nil"
+            )
+            return
+        }
+        guard let echo else {
+            sessionLog.error(
+                "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=echo-nil"
+            )
+            return
+        }
+        guard !echo.text.isEmpty else {
+            sessionLog.error(
+                "[ABH-519] persistDraftBornCacheSeed guard-exit session=\(storedID, privacy: .public) reason=echo-empty"
+            )
+            return
+        }
         let scope = CacheScope(serverId: identity.serverId, profileId: identity.profileId)
         let now = Date().timeIntervalSince1970
         let summary = SessionSummary(
@@ -4542,11 +4572,28 @@ final class SessionStore {
         let userRow = StoredMessage(
             role: "user", content: .string(echo.text),
             timestamp: now, wireId: nil, clientMessageID: echo.clientMessageID)
-        Task {
-            // Ordered on the CacheStore actor: the session row must exist before
-            // the transcript write (saveTranscript no-ops without the FK parent).
-            try? await cacheStore.upsertSession(summary, scope: scope)
-            try? await cacheStore.saveTranscript(identity: identity, messages: [userRow])
+        // Ordered on the CacheStore actor and awaited before the submit returns:
+        // a force-close cannot outrun the parent row + transcript seed.
+        do {
+            try await cacheStore.upsertSession(summary, scope: scope)
+            sessionLog.notice(
+                "[ABH-519] persistDraftBornCacheSeed upsertSession success session=\(storedID, privacy: .public) server=\(identity.serverId, privacy: .public) profile=\(identity.profileId, privacy: .public)"
+            )
+        } catch {
+            sessionLog.error(
+                "[ABH-519] persistDraftBornCacheSeed upsertSession error session=\(storedID, privacy: .public) error=\(String(reflecting: error), privacy: .public)"
+            )
+            return
+        }
+        do {
+            try await cacheStore.saveTranscript(identity: identity, messages: [userRow])
+            sessionLog.notice(
+                "[ABH-519] persistDraftBornCacheSeed saveTranscript success session=\(storedID, privacy: .public)"
+            )
+        } catch {
+            sessionLog.error(
+                "[ABH-519] persistDraftBornCacheSeed saveTranscript error session=\(storedID, privacy: .public) error=\(String(reflecting: error), privacy: .public)"
+            )
         }
     }
 
@@ -4925,12 +4972,9 @@ final class SessionStore {
         // the socket is open adopts the session (the `.open` edge re-opens it)
         // and waits — bounded — for readiness, instead of throwing
         // `notConnected` into the alert channel.
-        // R3 (ROUND-4 W2d): the coordinator is the SINGLE reconcile owner on
-        // relay. Its `.open`-edge re-establishment (setForeground + open) and
-        // `adoptPendingSession` are the ONE resume per reconnect — this path
-        // must not run a SECOND `resume` RPC over them (the D6 double-resume).
-        // The relay keys its runtime on the STORED session id, so the bind is
-        // LOCAL: no RPC result is needed to stamp `activeRuntimeId`.
+        // The pending adoption moves the render gate/foreground only. Resume
+        // once after readiness to learn the current live runtime id; it may be
+        // different after every gateway reactivation.
         if !coordinator.isOpen {
             // Socket down: adopt + wait on the phase bridge. The `.open` edge
             // re-establishes the session (the single reconcile, owned by the
@@ -4940,10 +4984,15 @@ final class SessionStore {
                 return nil
             }
         } else if coordinator.activeStoredSessionID != storedId {
-            // Socket up but driving another/no session: the adopt's
-            // setForeground+open IS the single rebind (fired synchronously by
-            // `adoptPendingSession` when open) — never a duplicate resume here.
+            // Socket up but driving another/no session: move the gate and
+            // foreground now; the single resume below learns the live id.
             coordinator.adoptPendingSession(storedId)
+        }
+        let result: JSONValue
+        do {
+            result = try await coordinator.resume(storedId)
+        } catch {
+            return nil
         }
         // SUPERSESSION GUARD: the active session may have changed across the
         // readiness wait — do not bind over a session the user has since
@@ -4951,7 +5000,9 @@ final class SessionStore {
         guard openToken == token,
               activeStoredId == storedId,
               self.connectionWorkGeneration == connectionWorkGeneration else { return nil }
-        activeRuntimeId = storedId
+        activeRuntimeId = result["session_id"]?.stringValue
+            ?? coordinator.activeSessionID
+            ?? storedId
         activeRuntimeEpoch = connection?.transportEpoch
         ReliabilityDiagnostics.shared.sessionBound(
             identifier: "\(activeStoredProfile ?? "default")\u{1F}\(storedId)",
@@ -4963,7 +5014,7 @@ final class SessionStore {
         // Flush anything the composer queued while the runtime was nil
         // (mirrors the gateway path's `onActiveRuntimeBound`).
         onActiveRuntimeBound?()
-        return storedId
+        return activeRuntimeId
     }
 
     /// Ensure the active session has a live runtime id, re-resuming on demand when
@@ -5829,6 +5880,7 @@ final class SessionStore {
         // reconciles any tail/delta afterward.
         var paintedFromCache = false
         var paintedFromDisk = false
+        var probedCacheHasTranscript: Bool?
         // QA-3 S7/A3 — VOID SCROLLBACK IMPOSSIBLE: when the transcript ALREADY
         // holds THIS session (a row re-tap, a notification deep-link onto the
         // active chat, a re-open of the same session), its in-memory rows ARE
@@ -5868,21 +5920,14 @@ final class SessionStore {
         // the write), so this misses for them and the network fetch is the sole
         // seed. No cache (tests/previews) ⇒ treated as a miss (reset),
         // network-only path preserved.
-        if !paintedFromCache, let cacheStore {
+        if !paintedFromCache, let cacheStore, let identity = capturedIdentity {
             // `touchSession` bumps `lastAccessedAt` so an actively-opened session
             // never ages out of the eviction horizon.
-            guard let identity = capturedIdentity else {
-                // QA-1 B3: an identity-less early-out cannot paint, but it must
-                // still signal — the old silent return left the drawer reveal to
-                // the deadline alone (and when that was token-gated, a rotation
-                // stranded the drawer open).
-                paintFinished = true
-                signalFirstPaint()
-                return
-            }
             try? await cacheStore.touchSession(identity)
+            let hasTranscript = try? await cacheStore.hasTranscript(identity)
+            probedCacheHasTranscript = hasTranscript
             if isCurrentTranscriptOpen(token: token),
-               (try? await cacheStore.hasTranscript(identity)) == true,
+               hasTranscript == true,
                isCurrentTranscriptOpen(token: token),
                let cached = try? await cacheStore.loadTranscript(identity),
                isCurrentTranscriptOpen(token: token) {
@@ -5901,6 +5946,13 @@ final class SessionStore {
             }
         }
         if !paintedFromCache, isCurrentTranscriptOpen(token: token) {
+            let identityServer = capturedIdentity?.serverId ?? "<nil>"
+            let identityProfile = capturedIdentity?.profileId ?? "<nil>"
+            let hasTranscript = probedCacheHasTranscript.map(String.init)
+                ?? "<not-probed-or-error>"
+            sessionLog.notice(
+                "[ABH-519] cache-miss(reset) session=\(storedId, privacy: .public) cacheStore=\(self.cacheStore == nil ? "nil" : "present", privacy: .public) identity.server=\(identityServer, privacy: .public) identity.profile=\(identityProfile, privacy: .public) hasTranscript=\(hasTranscript, privacy: .public)"
+            )
             // Cache miss (or no cache): empty the transcript so ChatView shows the
             // skeleton, not a stale prior session's rows, while the network loads.
             // R3 (ROUND-4 W2d): NOT on relay when the coordinator's store is
@@ -5950,6 +6002,10 @@ final class SessionStore {
         // in place. Stock gateways ignore `shape` and keep the single full fetch.
         let seedShape: String? = skeletonColdOpenEligible ? "skeleton" : nil
         let seedWasSkeleton = seedShape != nil
+        // Relay streams are authoritative after the first paint. A cache hit
+        // therefore costs zero history reads; only a genuine cold miss uses the
+        // one I14 fallback below.
+        if connection?.transportPath == .relay, paintedFromCache { return }
         guard let fetch = resolvedTranscriptFetch(shape: seedShape) else { return }
         do {
             // ARCH37 STEP 3 — skip the redundant network seed only when the SAME
@@ -6299,21 +6355,21 @@ final class SessionStore {
             if let transcriptFetchWithProfile { return transcriptFetchWithProfile }
             if let transcriptFetch { return { sessionId, _ in try await transcriptFetch(sessionId) } }
         }
-        // R3 (ROUND-4 W2d): the relay transport has NO phase-2 network seed.
-        // The resume/open snapshot the coordinator streams on bind IS the
-        // authoritative seed (contract I3/I14: paint + ≤1 snapshot; the stream
-        // is the authority — the gap-3 rewire: the render lane is seeded by the
-        // relay's open/snapshot frames, not by a parallel transcript fetch).
-        // The old relay branch here ran a `history` RPC on EVERY open on top of
-        // the resume snapshot — the D6 double-fetch (two gateway REST reads per
-        // cold open, three with the `.open`-edge re-establishment). Returning
-        // nil skips phase 2 entirely on relay; the caller's `guard let fetch
-        // else { return }` is the whole deletion. The profile-scoped REST
-        // fallback that shared this branch is dead on relay-only reach by
-        // construction (GW-UNREACH is the daily-driver topology). Direct mode
-        // keeps its REST seed below, unchanged, until Wave 4 folds the fork
-        // (amendment S1). Test seams above keep precedence.
-        if connection?.transportPath == .relay { return nil }
+        // Relay cache misses need one correctness fallback. OPEN/HISTORY already
+        // returns the gateway's persisted messages; consume that result instead
+        // of assuming a snapshot will arrive on every bind. The caller returns
+        // before reaching this closure on a cache hit, so warm opens stay zero
+        // network reads (I14).
+        if connection?.transportPath == .relay,
+           let coordinator = connection?.relayCoordinator {
+            return { sessionId, _ in
+                let result = try await coordinator.history(
+                    sessionID: sessionId,
+                    limit: ChatStore.transcriptOpenWindowLimit
+                )
+                return Self.relayHistoryMessages(from: result)
+            }
+        }
         guard let rest = connection?.rest else { return nil }
         // ABH-408: a non-default row opened from the All-profiles rail must use
         // RestClient+Profiles.messages(sessionId:profile:) so the backend reads

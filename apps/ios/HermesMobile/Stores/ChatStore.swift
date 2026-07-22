@@ -2927,7 +2927,8 @@ final class ChatStore {
                 // R2 / contract I5 + amendment S4 — re-check the PINNED target
                 // after the submit await; a mid-await navigation splits.
                 let drifted = sessions?.activeStoredId != pinnedTarget
-                if let sid = result["session_id"]?.stringValue {
+                if let runtimeID = result["session_id"]?.stringValue {
+                    let storedID = result["stored_session_id"]?.stringValue ?? runtimeID
                     if drifted, pinnedTarget == nil {
                         // Nil-target (DRAFT) pin, user navigated away mid-create:
                         // the minted session is NOT where they went — drop the
@@ -2947,14 +2948,16 @@ final class ChatStore {
                         // foreground) so the draft surface becomes a real entry
                         // and the immediately-following send targets the new id
                         // (contract A4/I6).
-                        coordinator.adoptCreatedSession(sid)
+                        coordinator.adoptCreatedSession(
+                            runtimeID: runtimeID, storedID: storedID)
                     }
                     // Land the new-chat bookkeeping (QA-1 B13) AND re-home the
                     // draft's echo onto the created session in the SAME atomic
                     // step (R2 / I8-G4: one identity persisted once at adoption,
                     // never re-keyed by a separate call after the fact). No-op
                     // for an existing session — its echo was keyed at append.
-                    sessions?.landRelayCreatedSession(storedID: sid, echo: userMessage)
+                    await sessions?.landRelayCreatedSession(
+                        storedID: storedID, runtimeID: runtimeID, echo: userMessage)
                 }
                 return true
             } catch {

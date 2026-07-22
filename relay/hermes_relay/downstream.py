@@ -288,7 +288,7 @@ class DownstreamServer:
         self._sub = None
         self._fanout_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
-        # SUBMIT idempotency: client_message_id -> resolved (live) session_id.
+        # SUBMIT idempotency: client_message_id -> resolved live + stored ids.
         # The durable outbox retries a submit whose RPC result was lost to a
         # socket flap AFTER the relay already ran ``prompt_submit`` (the phone
         # marks the row ``transport_ambiguous`` and the next wake resubmits the
@@ -296,7 +296,7 @@ class DownstreamServer:
         # the retry — which arrives on a FRESH PhoneConnection after reconnect —
         # is recognized here and replays the prior result instead of driving a
         # second turn. Bounded (LRU) so it can never grow without limit.
-        self._submit_dedup: "OrderedDict[str, str]" = OrderedDict()
+        self._submit_dedup: "OrderedDict[str, tuple[str, Optional[str]]]" = OrderedDict()
         self._submit_dedup_cap = 1024
 
     async def start(self) -> None:
@@ -629,10 +629,12 @@ class DownstreamServer:
             self._push = plugin_bridge.import_push_engine()
         return self._push
 
-    def _remember_submit(self, cmid: str, sid: str) -> None:
-        """Record ``client_message_id -> resolved session_id`` for SUBMIT dedup,
+    def _remember_submit(
+        self, cmid: str, sid: str, stored_sid: Optional[str] = None
+    ) -> None:
+        """Record ``client_message_id -> resolved identities`` for SUBMIT dedup,
         evicting the oldest entry once the bounded LRU is full."""
-        self._submit_dedup[cmid] = sid
+        self._submit_dedup[cmid] = (sid, stored_sid)
         self._submit_dedup.move_to_end(cmid)
         while len(self._submit_dedup) > self._submit_dedup_cap:
             self._submit_dedup.popitem(last=False)
@@ -922,14 +924,18 @@ class DownstreamServer:
             # resolved session id WITHOUT driving a second turn (§5 dedup).
             if cmid is not None and cmid in self._submit_dedup:
                 self._submit_dedup.move_to_end(cmid)
-                prior = self._submit_dedup[cmid]
+                prior, prior_stored = self._submit_dedup[cmid]
                 conn.set_foreground(prior)  # still the chat on screen (§6)
                 # Re-emit the userMessage item: the retry arrives on a FRESH
                 # phone connection whose render store may lack it (the original
                 # frame was lost to the flap). Idempotent — same item_id folds
                 # onto the same row (no second bubble, no second ord).
                 self._emit_user_message_item(conn, prior, cmid, text)
-                return {"session_id": prior, "deduplicated": True}
+                result = {"session_id": prior, "deduplicated": True}
+                if prior_stored:
+                    result["stored_session_id"] = prior_stored
+                return result
+            stored_sid: Optional[str] = None
             if sid:
                 # Drive an existing (idle / foreign / terminal) session. Resuming
                 # REACTIVATES it, and the stock gateway may hand back a DISTINCT
@@ -959,12 +965,14 @@ class DownstreamServer:
                 # session (the surviving projects fix — L5-lean dropped the
                 # relay projects path; projects stay on the control REST).
                 cwd = p.get("cwd")
-                sid = await self._gateway.session_create(
+                created = await self._gateway.session_create(
                     title=p.get("title", "New chat"),
                     model=p.get("model"),
                     provider=p.get("provider"),
                     cwd=cwd if isinstance(cwd, str) and cwd else None,
                 )
+                sid = created["session_id"]
+                stored_sid = created.get("stored_session_id") or sid
                 if text:
                     self._store.mark_local_prompt(sid, text)  # R4 L6 (see above)
                 await self._gateway.prompt_submit(sid, text, **submit_kwargs)
@@ -978,9 +986,12 @@ class DownstreamServer:
             # returning, so a retry that races the RPC result back over a flapped
             # socket is deduped rather than driving a second turn.
             if cmid is not None:
-                self._remember_submit(cmid, sid)
+                self._remember_submit(cmid, sid, stored_sid)
             conn.set_foreground(sid)  # driving a chat brings it on screen (§6)
-            return {"session_id": sid}
+            result = {"session_id": sid}
+            if stored_sid:
+                result["stored_session_id"] = stored_sid
+            return result
 
         if method == UpstreamMethod.BRANCH:
             # R4 L2 (B13): conversation BRANCH = a SEEDED create. Before L2 this
@@ -998,12 +1009,14 @@ class DownstreamServer:
             truncate = p.get("truncate_before_user_ordinal")
             if isinstance(truncate, int) and not isinstance(truncate, bool):
                 submit_kwargs["truncate_before_user_ordinal"] = truncate
-            sid = await self._gateway.session_create(
+            created = await self._gateway.session_create(
                 title=p.get("title") or f"Branch — {origin or 'new chat'}",
                 model=p.get("model"),
                 provider=p.get("provider"),
                 cwd=cwd if isinstance(cwd, str) and cwd else None,
             )
+            sid = created["session_id"]
+            stored_sid = created.get("stored_session_id") or sid
             if text:
                 self._store.mark_local_prompt(sid, text)  # R4 L6 (see SUBMIT)
             await self._gateway.prompt_submit(sid, text, **submit_kwargs)
@@ -1011,7 +1024,7 @@ class DownstreamServer:
                 conn, sid, p.get("client_message_id"), text
             )
             conn.set_foreground(sid)  # the branched chat comes on screen (§6)
-            return {"session_id": sid, "origin": origin}
+            return {"session_id": sid, "stored_session_id": stored_sid, "origin": origin}
 
         if method == UpstreamMethod.RESUME:
             origin = p["session_id"]
@@ -1090,7 +1103,9 @@ class DownstreamServer:
                 else:
                     sid = self._gateway.live_id_for(sid)
             else:
-                sid = await self._gateway.session_create(title=p.get("title", "New chat"))
+                created = await self._gateway.session_create(title=p.get("title", "New chat"))
+                sid = created["session_id"]
+                stored_sid = created.get("stored_session_id") or sid
             name = p.get("name") or ""
             if kind == "file":
                 result = await self._gateway.file_attach(sid, name=name, data_url=data_url)
@@ -1102,8 +1117,12 @@ class DownstreamServer:
             # foreground the chat (§6) exactly like SUBMIT/OPEN do.
             conn.set_foreground(sid)
             if isinstance(result, dict):
-                return {"session_id": sid, "kind": kind, **result}
-            return {"session_id": sid, "kind": kind, "attached": True}
+                response = {"session_id": sid, "kind": kind, **result}
+            else:
+                response = {"session_id": sid, "kind": kind, "attached": True}
+            if not p.get("session_id"):
+                response["stored_session_id"] = stored_sid
+            return response
 
         raise ValueError(f"unknown upstream method: {method!r}")
 

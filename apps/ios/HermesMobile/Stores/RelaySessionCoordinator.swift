@@ -113,9 +113,8 @@ final class RelaySessionCoordinator {
     /// The STORED (durable/origin) id of the session the coordinator is currently
     /// driving — set whenever a session is opened/resumed/started by its stored
     /// id, and (unlike ``activeSessionID``) never remapped to the live id a
-    /// `submit` returns. The relay keys its runtime on the stored session id
-    /// (`SessionStore.bindRelayRuntime`), so this is the stable identity the
-    /// durable-outbox drain routes against: a queued prompt may drain over the
+    /// `submit` returns. This is the stable identity the durable-outbox drain
+    /// resolves to ``activeSessionID``: a queued prompt may drain over the
     /// relay only when its destination IS the session the relay is driving, so a
     /// prompt queued for A never leaks into B just because B is now on screen.
     private(set) var activeStoredSessionID: String?
@@ -176,12 +175,9 @@ final class RelaySessionCoordinator {
         entries[sessionID]?.store
     }
 
-    /// The session holding the write-gate: the stable STORED id when bound
-    /// (the relay keys its runtime on the stored session id, which may differ
-    /// from the live id a `submit` remaps ``activeSessionID`` to), else the
-    /// live id. Frames whose `sid` matches fold into the active entry and
-    /// project; every other sid folds into its own entry in silence.
-    private var activeWriteGateSessionID: String? { activeStoredSessionID ?? activeSessionID }
+    /// The live runtime id holding the write-gate. Relay frames are stamped with
+    /// this id; the separate stored id is only the durable drawer/cache key.
+    private var activeWriteGateSessionID: String? { activeSessionID }
 
     private let chatStore: ChatStore
     private let clientFactory: @Sendable () -> RelayClient
@@ -262,12 +258,12 @@ final class RelaySessionCoordinator {
     /// or by the first rebind; invalidated at every genuine connection-cycle
     /// start). Best-effort: a failure is non-fatal.
     private func reestablishDrivenSession() {
-        guard let sid = activeStoredSessionID ?? activeSessionID, let client,
-              establishedSessionID != sid else { return }
-        establishedSessionID = sid
+        guard let runtimeID = activeSessionID, let client else { return }
+        let storedID = activeStoredSessionID ?? runtimeID
+        guard establishedSessionID != storedID else { return }
+        establishedSessionID = storedID
         Task {
-            await client.setForeground(sid)
-            _ = try? await client.open(sid)
+            await client.setForeground(runtimeID)
         }
     }
 
@@ -286,7 +282,6 @@ final class RelaySessionCoordinator {
             establishedSessionID = sessionID   // R3: this adopt IS the rebind
             Task {
                 await client.setForeground(sessionID)
-                _ = try? await client.open(sessionID)
             }
         }
     }
@@ -904,7 +899,11 @@ final class RelaySessionCoordinator {
             sessionID: target, prompt: prompt, clientMessageID: clientMessageID
         )
         if let sid = result["session_id"]?.stringValue {
+            touchEntry(sid)
             activeSessionID = sid
+            if activeStoredSessionID != nil {
+                chatStore.relayCreatedSessionAdopted(sid)
+            }
             // A nil-target submit created the session at the relay (QA-1 B13 /
             // contract I6). Adoption is NOT inline here (integration, R1×R2):
             // amendment S4 gates it on the CALLER's drift re-check — ChatStore
@@ -924,12 +923,12 @@ final class RelaySessionCoordinator {
     /// entry; this makes it a real one in a single code path (not a suppression
     /// flag plus a patch): re-bind the item store to the minted id so the
     /// previous session's parked items never project into it (I6 isolation),
-    /// adopt it as both the stored and the live identity (so
+    /// adopt its distinct stored and live identities (so
     /// ``outboxRuntimeID(forStored:)`` maps it and the immediately-following
     /// send targets it), move the write-gate to it (projection resumes), and
     /// foreground it so the relay forwards its frames and push suppresses while
     /// the phone holds it.
-    func adoptCreatedSession(_ sessionID: String) {
+    func adoptCreatedSession(runtimeID: String, storedID: String) {
         // R1 machinery (integration): the draft had NO entry — first-touch
         // creates a fresh one, so the previous session's parked items stay in
         // THEIR entry and can never project here (I6 isolation, structural).
@@ -937,40 +936,29 @@ final class RelaySessionCoordinator {
         // map it and the immediately-following send target it; the write-gate
         // MOVES via the R1 seam (projection is live for the gate session —
         // R1 deleted the suppression flag R2 originally resumed here).
-        touchEntry(sessionID)
-        activeSessionID = sessionID
-        activeStoredSessionID = sessionID
-        establishedSessionID = sessionID   // R3: this adopt IS the rebind — the `.open` edge must not re-open it
-        chatStore.relayCreatedSessionAdopted(sessionID)
-        // R4b (contract I5 second half / A4): the created sid IS an OPEN edge —
-        // the draft-born session was born AFTER any open, so without this the
-        // R3 one-shot seed/bind never fires for it (the missing R3 case: the
-        // relay's open seeds the store — `rest_history` + the L6 user-row fold
-        // that makes every later resync snapshot carry the prompt — and binds
-        // the connection's foreground). Reuse the EXACT open seam the
-        // `.open`-edge re-establishment + `adoptPendingSession` already run
-        // (setForeground + open) — one code path, one read (the ≤1 snapshot of
-        // the session's open budget, I14). `establishedSessionID` above guards
-        // the connection-edge re-establishment from re-opening it. Best-effort:
-        // the write-local-first cache seed (`landRelayCreatedSession`) already
-        // made the session paintable; this heals the stream behind it.
+        touchEntry(runtimeID)
+        activeSessionID = runtimeID
+        activeStoredSessionID = storedID
+        establishedSessionID = storedID
+        chatStore.relayCreatedSessionAdopted(runtimeID)
+        // Creation already owns the runtime at the relay. Foreground that live
+        // id; transcript persistence is awaited by SessionStore, and a later
+        // genuine cache miss uses the single relay-history fallback.
         guard let client else { return }
         Task {
-            await client.setForeground(sessionID)
-            _ = try? await client.open(sessionID)
+            await client.setForeground(runtimeID)
         }
     }
 
     /// The relay runtime id a durable-outbox row destined for `storedID` must
-    /// drain to, or `nil` to HOLD the row for a later wake. The relay keys its
-    /// runtime on the stored session id, so the runtime id is the destination id
-    /// itself — but only when that destination IS the session the relay is
-    /// currently driving. Returning a runtime for any other destination would
+    /// drain to, or `nil` to HOLD the row for a later wake. It resolves only
+    /// when that durable destination IS the session the relay is currently
+    /// driving. Returning a runtime for any other destination would
     /// mis-route the prompt into the active session (drain-into-wrong-session);
     /// holding instead defers the drain until that session is on the relay,
     /// mirroring the gateway path's "no runtime mapped ⇒ hold".
     func outboxRuntimeID(forStored storedID: String) -> String? {
-        activeStoredSessionID == storedID ? storedID : nil
+        activeStoredSessionID == storedID ? activeSessionID : nil
     }
 
     /// Resume + own an idle/terminal session: the write-gate MOVES to its
@@ -999,6 +987,12 @@ final class RelaySessionCoordinator {
         moveWriteGate(to: sessionID)
         let result = try await client.resumeSession(sessionID)
         establishedSessionID = sessionID   // R3: the `.open` edge must not re-open it
+        if let runtimeID = result["session_id"]?.stringValue {
+            touchEntry(runtimeID)
+            activeSessionID = runtimeID
+            activeStoredSessionID = sessionID
+            chatStore.relayCreatedSessionAdopted(runtimeID)
+        }
         return result
     }
 

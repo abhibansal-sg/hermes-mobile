@@ -256,8 +256,8 @@ async def test_create_resume_submit_take_ownership_open_does_not():
     client, _ = make_client(responder=echo_responder)
     await client.connect()
 
-    sid = await client.session_create(title="new chat", model="glm-4.6", provider="zai")
-    assert sid == "owned-new" and client.owns("owned-new")
+    created = await client.session_create(title="new chat", model="glm-4.6", provider="zai")
+    assert created["session_id"] == "owned-new" and client.owns("owned-new")
 
     await client.session_resume("clisess01")
     assert client.owns("clisess01")
@@ -268,6 +268,27 @@ async def test_create_resume_submit_take_ownership_open_does_not():
     # session.list is a pure read: no ownership.
     await client.session_list()
     assert client.owned_sessions == frozenset({"owned-new", "clisess01"})
+    await client.close()
+
+
+async def test_create_preserves_distinct_runtime_and_stored_ids():
+    def distinct_create(frame):
+        result = {
+            "session_id": "runtime-684b5489",
+            "stored_session_id": "20260722_140236_f61148",
+        }
+        return {"jsonrpc": "2.0", "id": frame["id"], "result": result}
+
+    client, _ = make_client(responder=distinct_create)
+    await client.connect()
+    created = await client.session_create(title="new chat")
+
+    assert created["session_id"] == "runtime-684b5489"
+    assert created["stored_session_id"] == "20260722_140236_f61148"
+    assert client.live_id_for("20260722_140236_f61148") == "runtime-684b5489"
+    assert client.origin_id_for("runtime-684b5489") == "20260722_140236_f61148"
+    assert client.owns("runtime-684b5489")
+    assert client.owns("20260722_140236_f61148")
     await client.close()
 
 
