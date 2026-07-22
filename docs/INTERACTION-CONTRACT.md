@@ -172,7 +172,11 @@ Draft surface = no entry, no id: renders ONLY its empty timeline — structurall
 suppression flag [I2,I6]. Send → pin `(storedID=nil, draftToken)` [I5] → echo + caret ≤100 ms
 from LOCAL state (QA-2 A2 rule) [I8] → submit with **nil** target → relay creates (`DS:759-763`)
 → returned id adopted atomically: entry created, write-gate moves to it, projection live,
-drawer row appears, outbox affinity maps, `foreground` set [I6] → a second send targets the
+drawer row appears, outbox affinity maps, `foreground` set [I6], **the created sid is
+OPEN-treated at adoption — the user row + session row written to the local cache FIRST
+(write-local-first) and the one-shot relay open/seed-bind fired (amendment R4b) — so the
+new chat is paintable from the store the instant it exists and survives a force-close at any
+point after the send** [I5 second half] → a second send targets the
 NEW id [I5]. If the user switches away mid-create, the just-created orphan session is closed
 (desktop `submit.ts:262-270`) and the optimistic echo dropped — the nil-target branch of the
 drift split [I5,I11].
@@ -434,12 +438,32 @@ pin (storedID ≠ nil) ⇒ the send converts to a durable queue row against the 
 (never redirected, never lost — I11 asserts the drain); **drift on a draft / nil-target pin
 ⇒ the optimistic echo drops and the just-created orphan closes** (the minted session is not
 where the user is — desktop `submit.ts:262-270`). One in-flight submit per session
-(per-session lock). *Assert:* with `activeSessionID=P` retained from a prior session, draft
+(per-session lock). **Draft-born paints write-local-first (amendment R4b, second half — the
+Telegram/WhatsApp invariant: the store is the render authority; a new chat writes to the
+store FIRST, the network heals behind it):** a session the relay CREATES on a nil-target
+submit is born AFTER any open edge, so it gets the open treatment atomically at adoption —
+(a) WRITE-LOCAL-FIRST: the created session's `session_cache` row + a `message_row_cache`
+row for the optimistic user message (carrying the send's cmid) are written through the
+existing `CacheStore` path the INSTANT the created sid lands (`landRelayCreatedSession`),
+so a force-close at any point after the send reopens to a cache-HIT paint of the user row
+(I3/I20) — never the base-tree `cache-miss(reset)`-forever blank (device-proven 2026-07-22:
+the relay shows the session, the phone shows nothing); (b) the created sid IS an OPEN edge:
+adoption fires the one-shot relay open/seed-bind (`setForeground` + `open`, the same seam
+the `.open`-edge re-establishment runs — the relay's open seeds its store so every later
+resync snapshot carries the prompt), counting as the session's ≤1 snapshot read (I14); (c)
+the relay `userMessage` item (same cmid) adopts the cache-painted user row IN PLACE after
+any reopen (I8 — one identity, never re-keyed, never duplicated). An existing-session send
+never takes this path (the draft/nil-pointer guard). *Assert:* with `activeSessionID=P` retained from a prior session, draft
 send submits `session_id=nil` (relay creates NEW id, never P); switch mid-await on the draft
 (nil) pin ⇒ echo dropped, orphan closed, no turn attributed to either session; send pinned
 to an existing session + switch mid-await ⇒ row enqueued against the PINNED id, drains there
 exactly once, never the switched-to session; double-tap send ⇒ second tap blocked by the
-lock, queued, not double-submitted.
+lock, queued, not double-submitted; **draft send ⇒ the created sid gets exactly one `open`
+upstream and ZERO `history` upstreams, the cache gains the session row + the user row (cmid
+intact), and the store paints user row + streamed reply; force-close immediately after the
+send + reopen ⇒ the user row paints FROM THE CACHE with zero transcript fetches, and a late
+snapshot/resync carrying the cmid reconciles to exactly one user row; a send into an
+existing session writes no create-land cache row and submits its pinned id.**
 
 **I6 — Draft isolation.** A new-chat surface has no session entry and renders ONLY its empty
 timeline; no frame, snapshot, or parked state from any session can reach it (structurally —

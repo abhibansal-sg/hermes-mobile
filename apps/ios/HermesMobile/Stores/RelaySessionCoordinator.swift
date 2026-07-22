@@ -942,7 +942,23 @@ final class RelaySessionCoordinator {
         activeStoredSessionID = sessionID
         establishedSessionID = sessionID   // R3: this adopt IS the rebind — the `.open` edge must not re-open it
         chatStore.relayCreatedSessionAdopted(sessionID)
-        if let client { Task { await client.setForeground(sessionID) } }
+        // R4b (contract I5 second half / A4): the created sid IS an OPEN edge —
+        // the draft-born session was born AFTER any open, so without this the
+        // R3 one-shot seed/bind never fires for it (the missing R3 case: the
+        // relay's open seeds the store — `rest_history` + the L6 user-row fold
+        // that makes every later resync snapshot carry the prompt — and binds
+        // the connection's foreground). Reuse the EXACT open seam the
+        // `.open`-edge re-establishment + `adoptPendingSession` already run
+        // (setForeground + open) — one code path, one read (the ≤1 snapshot of
+        // the session's open budget, I14). `establishedSessionID` above guards
+        // the connection-edge re-establishment from re-opening it. Best-effort:
+        // the write-local-first cache seed (`landRelayCreatedSession`) already
+        // made the session paintable; this heals the stream behind it.
+        guard let client else { return }
+        Task {
+            await client.setForeground(sessionID)
+            _ = try? await client.open(sessionID)
+        }
     }
 
     /// The relay runtime id a durable-outbox row destined for `storedID` must
