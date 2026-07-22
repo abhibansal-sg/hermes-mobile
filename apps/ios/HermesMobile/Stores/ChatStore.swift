@@ -964,7 +964,14 @@ final class ChatStore {
 
         switch ownership(of: event) {
         case .unrelated:
-            // Not ours and not a mirror of our open session — drop it.
+            if event.type == .approvalRequest, event.storedSessionId != nil {
+                handleApprovalRequest(event)
+            } else if event.type == .clarifyRequest, event.storedSessionId != nil {
+                handleClarifyRequest(event)
+            } else if (event.type == .messageComplete || event.type == .error),
+                      let storedSessionId = event.storedSessionId {
+                expirePendingGates(storedSessionID: storedSessionId)
+            }
             return
         case .foreign:
             handleForeignFrame(event)
@@ -1519,9 +1526,13 @@ final class ChatStore {
     /// live-socket `broadcast_gap` backfill) must leave it alone. The
     /// complete path leaves it to `respondSecurePrompt`'s own lifecycle.
     private func expireTurnScopedPrompts(includeSecure: Bool) {
-        if pendingApproval != nil {
+        if let approval = pendingApproval {
+            markRelayGateResolved(approval.id)
             pendingApproval = nil
             onApprovalChange?(false)
+        }
+        if let requestId = pendingClarification?.request.requestId {
+            markRelayGateResolved(requestId)
         }
         pendingClarification = nil
         if includeSecure {
@@ -1658,15 +1669,32 @@ final class ChatStore {
 
     private func handleApprovalRequest(_ event: GatewayEvent) {
         let request = ApprovalRequestPayload(payload: event.payload)
+        guard !resolvedRelayGateIDs.contains(request.id) else { return }
         let sessionId = event.sessionId ?? activeSessionId ?? ""
-        pendingApproval = PendingApproval(id: request.id, sessionId: sessionId, request: request)
-        onApprovalChange?(true)
+        let storedId = event.storedSessionId ?? sessions?.activeStoredId ?? sessionId
+        let gate = PendingApproval(id: request.id, sessionId: sessionId, request: request)
+        if storedId == relayWriteGateSessionID || relayWriteGateSessionID == nil {
+            relayWriteGateSessionID = storedId
+            pendingApproval = gate
+            onApprovalChange?(true)
+        } else {
+            parkedRelayApprovals[storedId] = gate
+        }
     }
 
     private func handleClarifyRequest(_ event: GatewayEvent) {
         let request = ClarifyRequestPayload(payload: event.payload)
+        if let requestId = request.requestId,
+           resolvedRelayGateIDs.contains(requestId) { return }
         let sessionId = event.sessionId ?? activeSessionId ?? ""
-        pendingClarification = PendingClarification(sessionId: sessionId, request: request)
+        let storedId = event.storedSessionId ?? sessions?.activeStoredId ?? sessionId
+        let gate = PendingClarification(sessionId: sessionId, request: request)
+        if storedId == relayWriteGateSessionID || relayWriteGateSessionID == nil {
+            relayWriteGateSessionID = storedId
+            pendingClarification = gate
+        } else {
+            parkedRelayClarifications[storedId] = gate
+        }
     }
 
     // MARK: - Wave-2 relay gate bridge (QA-1 B10 / A3)
@@ -1702,10 +1730,6 @@ final class ChatStore {
     /// exactly once; a switch MOVES it — there is no expire-on-switch.
     private var parkedRelayApprovals: [String: PendingApproval] = [:]
     private var parkedRelayClarifications: [String: PendingClarification] = [:]
-    /// Ids of gates folded in from the relay wire (slot OR parked) — what
-    /// distinguishes a relay gate the write-gate MOVES from a direct-path
-    /// gate (whose slot lifetime — cleared on `reset()` — is unchanged).
-    private var relayOwnedGateIDs: Set<String> = []
     /// The session holding the relay write-gate (contract I2) — set by
     /// ``relayWriteGateMoved(toSession:items:)``. A gate frame folds into the
     /// SLOT only when its `sid` matches; any other sid parks.
@@ -1726,9 +1750,7 @@ final class ChatStore {
     private func markRelayGateResolved(_ id: String) {
         guard !id.isEmpty else { return }
         resolvedRelayGateIDs.insert(id)
-        relayOwnedGateIDs.remove(id)
         if resolvedRelayGateIDs.count > 256 { resolvedRelayGateIDs.removeAll() }
-        if relayOwnedGateIDs.count > 256 { relayOwnedGateIDs.removeAll() }
         UserDefaults.standard.set(
             Array(resolvedRelayGateIDs), forKey: Self.resolvedRelayGateIDsDefaultsKey
         )
@@ -1751,7 +1773,6 @@ final class ChatStore {
         let request = ApprovalRequestPayload(payload: frame.body)
         guard !resolvedRelayGateIDs.contains(request.id) else { return }
         let gate = PendingApproval(id: request.id, sessionId: frame.sid, request: request)
-        relayOwnedGateIDs.insert(request.id)
         // I12: the active session's gate takes the slot the views read; a
         // background session's gate PARKS until its session holds the
         // write-gate — never dropped because the session is unfocused.
@@ -1773,7 +1794,6 @@ final class ChatStore {
         let request = ClarifyRequestPayload(payload: frame.body)
         if let rid = request.requestId, resolvedRelayGateIDs.contains(rid) { return }
         let gate = PendingClarification(sessionId: frame.sid, request: request)
-        if let rid = request.requestId { relayOwnedGateIDs.insert(rid) }
         if frame.sid == relayWriteGateSessionID || relayWriteGateSessionID == nil {
             pendingClarification = gate
         } else {
@@ -1790,21 +1810,59 @@ final class ChatStore {
     /// expire-on-switch. A background session's `turn.completed` expires ITS
     /// OWN parked gate and touches nothing on the active session (I1/I2).
     func expireRelayPendingGates(sessionID: String) {
-        if let approval = pendingApproval, approval.sessionId == sessionID {
+        expirePendingGates(storedSessionID: sessionID)
+    }
+
+    private func expirePendingGates(storedSessionID: String) {
+        if let approval = pendingApproval,
+           relayWriteGateSessionID == storedSessionID {
             markRelayGateResolved(approval.id)
             pendingApproval = nil
             onApprovalChange?(false)
         }
-        if let parked = parkedRelayApprovals.removeValue(forKey: sessionID) {
+        if let parked = parkedRelayApprovals.removeValue(forKey: storedSessionID) {
             markRelayGateResolved(parked.id)
         }
-        if let clarify = pendingClarification, clarify.sessionId == sessionID {
+        if let clarify = pendingClarification,
+           relayWriteGateSessionID == storedSessionID {
             if let rid = clarify.request.requestId { markRelayGateResolved(rid) }
             pendingClarification = nil
         }
-        if let parked = parkedRelayClarifications.removeValue(forKey: sessionID) {
+        if let parked = parkedRelayClarifications.removeValue(forKey: storedSessionID) {
             if let rid = parked.request.requestId { markRelayGateResolved(rid) }
         }
+    }
+
+    /// Move the visible prompt-card slots with the one durable session owner.
+    /// Each card keeps its runtime id solely for the response RPC.
+    func pendingGateOwnerMoved(toStoredSession storedSessionID: String?) {
+        if let outgoing = relayWriteGateSessionID {
+            if let approval = pendingApproval {
+                parkedRelayApprovals[outgoing] = approval
+                pendingApproval = nil
+                onApprovalChange?(false)
+            }
+            if let clarification = pendingClarification {
+                parkedRelayClarifications[outgoing] = clarification
+                pendingClarification = nil
+            }
+        }
+        relayWriteGateSessionID = storedSessionID
+        if let storedSessionID {
+            if let approval = parkedRelayApprovals.removeValue(forKey: storedSessionID) {
+                pendingApproval = approval
+                onApprovalChange?(true)
+            }
+            pendingClarification = parkedRelayClarifications.removeValue(forKey: storedSessionID)
+        }
+    }
+
+    func discardPendingGates() {
+        pendingApproval = nil
+        pendingClarification = nil
+        parkedRelayApprovals.removeAll()
+        parkedRelayClarifications.removeAll()
+        onApprovalChange?(false)
     }
 
     /// R1 (contract I2, amendment G1): the relay WRITE-GATE moved to
@@ -1823,29 +1881,8 @@ final class ChatStore {
     ///      refetch — I14); an empty entry is a no-op: the cache paint owns
     ///      the first frame, never void (QA-1 B4).
     func relayWriteGateMoved(toSession sessionID: String?, items: [ChatItem]) {
-        relayWriteGateSessionID = sessionID
-        // (a) park the outgoing relay gate / unpark the incoming one.
-        if let approval = pendingApproval, relayOwnedGateIDs.contains(approval.id),
-           approval.sessionId != sessionID {
-            parkedRelayApprovals[approval.sessionId] = approval
-            pendingApproval = nil
-            onApprovalChange?(false)
-        }
-        if let clarify = pendingClarification,
-           let rid = clarify.request.requestId, relayOwnedGateIDs.contains(rid),
-           clarify.sessionId != sessionID {
-            parkedRelayClarifications[clarify.sessionId] = clarify
-            pendingClarification = nil
-        }
-        if let sessionID {
-            if let parked = parkedRelayApprovals.removeValue(forKey: sessionID) {
-                pendingApproval = parked
-                onApprovalChange?(true)
-            }
-            if let parked = parkedRelayClarifications.removeValue(forKey: sessionID) {
-                pendingClarification = parked
-            }
-        }
+        // (a) park the outgoing gate / unpark the incoming one.
+        pendingGateOwnerMoved(toStoredSession: sessionID)
         // (b)+(c) the outgoing turn's LA ownership + chrome move off (discard).
         if turnStartedAt != nil {
             turnStartedAt = nil
@@ -1878,14 +1915,7 @@ final class ChatStore {
     /// the write-gate identity moves — projection goes live and any parked
     /// gate for the new sid takes the slot.
     func relayCreatedSessionAdopted(_ sessionID: String) {
-        relayWriteGateSessionID = sessionID
-        if let parked = parkedRelayApprovals.removeValue(forKey: sessionID) {
-            pendingApproval = parked
-            onApprovalChange?(true)
-        }
-        if let parked = parkedRelayClarifications.removeValue(forKey: sessionID) {
-            pendingClarification = parked
-        }
+        pendingGateOwnerMoved(toStoredSession: sessionID)
     }
 
     /// One ownership decision for live approval/clarify/complete events. APNs is
@@ -3821,6 +3851,7 @@ final class ChatStore {
         // approvals (broadcast from another client's turn) that is a foreign
         // runtime id, not our own.
         let approvalSession = pendingApproval?.sessionId
+        let requestId = pendingApproval?.id ?? ""
         // Wave-2 relay transport (QA-1 B10): the gateway `client` is idle in
         // relay mode, so answer OVER THE RELAY — `coordinator.approve` builds
         // the ratified §5 wire shape (`session_id` + `decision` [+ `request_id`
@@ -3830,7 +3861,6 @@ final class ChatStore {
         // coordinator's driven session exactly as `respondApproval` does to
         // `activeSessionId`. The default gateway path stays byte-identical.
         if let connection, connection.transportPath == .relay {
-            let requestId = pendingApproval?.id ?? ""
             pendingApproval = nil
             onApprovalChange?(false)
             markRelayGateResolved(requestId)
@@ -3856,6 +3886,7 @@ final class ChatStore {
         let choice = approve ? "approve" : "deny"
         pendingApproval = nil
         onApprovalChange?(false)
+        markRelayGateResolved(requestId)
         do {
             _ = try await client.requestRaw(
                 "approval.respond",
@@ -3900,6 +3931,9 @@ final class ChatStore {
             // testRespondClarificationEchoesAnswerAsUserMessage /
             // EchoIsSingleRowEvenIfCalledTwice).
             pendingClarification = nil
+            if let requestId = pending?.request.requestId {
+                markRelayGateResolved(requestId)
+            }
         }
         // Wave-2 relay transport (QA-1 B10): answer OVER THE RELAY —
         // `coordinator.clarify` builds the §5 shape (`session_id` + `text` +
@@ -3907,7 +3941,6 @@ final class ChatStore {
         // `request_id` echo is REQUIRED: the gateway matches the pending
         // waiter by it — without it the reply 4009s and the agent hangs.
         if let connection, connection.transportPath == .relay {
-            if let rid = pending?.request.requestId { markRelayGateResolved(rid) }
             guard let coordinator = connection.relayCoordinator else {
                 lastError = "Relay not connected"
                 return
@@ -5266,19 +5299,8 @@ final class ChatStore {
         cancelStreaming()
         messages = []
         userOrdinals = [:]
-        // R1/I12 (amendment G1): relay gates MOVE with their session — park
-        // them before the wholesale clear so a switch-back re-shows the card
-        // (the direct-path gate keeps its reset lifetime — this branch only
-        // touches relay-owned gates).
-        if let approval = pendingApproval, relayOwnedGateIDs.contains(approval.id) {
-            parkedRelayApprovals[approval.sessionId] = approval
-        }
-        if let clarify = pendingClarification,
-           let rid = clarify.request.requestId, relayOwnedGateIDs.contains(rid) {
-            parkedRelayClarifications[clarify.sessionId] = clarify
-        }
-        pendingApproval = nil
-        pendingClarification = nil
+        // I12: transcript teardown does not own prompt-card lifetime. Session
+        // navigation moves those slots through `pendingGateOwnerMoved`.
         // The relay gate-suppression set is NOT cleared here (R1/I12): an
         // ANSWERED gate's resync re-delivery must stay suppressed across
         // switches for every session the phone drives — the set belongs to

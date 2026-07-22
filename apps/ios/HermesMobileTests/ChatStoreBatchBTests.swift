@@ -807,6 +807,53 @@ final class ChatStoreBatchBTests: XCTestCase {
         XCTAssertEqual(chat.transcriptGeneration, 1)
     }
 
+    /// I12 on the stock gateway path: the UI owner is the durable stored id,
+    /// while the runtime id remains the response target. Cache-miss resets may
+    /// clear transcript rows, but never the owning session's prompt card.
+    func testStockPromptGatesMoveByStoredIdentityAcrossSessionOpens() async throws {
+        let (chat, sessions) = makeStore()
+        let approvalID = "approval-\(UUID().uuidString)"
+        let clarifyID = "clarify-\(UUID().uuidString)"
+
+        chat.handle(event: frame(
+            type: "approval.request",
+            runtime: activeRuntime,
+            payload: .object([
+                "approval_id": .string(approvalID),
+                "command": .string("pwd"),
+            ])
+        ))
+        XCTAssertEqual(chat.pendingApproval?.sessionId, activeRuntime)
+
+        sessions.transcriptFetch = { _ in [] }
+        sessions.open(summary("stored-session-2"), bindRuntime: false)
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #endif
+        XCTAssertNil(chat.pendingApproval, "A's approval must not render on B")
+
+        // A stock event observed while B is selected carries both identities:
+        // it parks under stored A and answers against runtime A.
+        chat.handle(event: frame(
+            type: "clarify.request",
+            runtime: activeRuntime,
+            stored: storedId,
+            payload: .object([
+                "request_id": .string(clarifyID),
+                "question": .string("Which path?"),
+            ])
+        ))
+        XCTAssertNil(chat.pendingClarification, "A's clarification must not render on B")
+
+        sessions.open(summary(storedId), bindRuntime: false)
+        #if DEBUG
+        await sessions.waitForPendingOpenForTesting()
+        #endif
+        XCTAssertEqual(chat.pendingApproval?.id, approvalID)
+        XCTAssertEqual(chat.pendingClarification?.request.requestId, clarifyID)
+        XCTAssertEqual(chat.pendingClarification?.sessionId, activeRuntime)
+    }
+
     /// A fresh session must never render the previous session's seed failure.
     func testResetClearsStaleBackfillError() async {
         let (chat, sessions) = makeStore()
