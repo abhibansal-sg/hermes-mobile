@@ -17,6 +17,7 @@ authors = [{ name = "Hermes Mobile" }]
 # plugins/hermes-mobile via hermes_relay.plugin_bridge (NOT a PyPI dep) so the
 # relay stays a zero-core-patch client of the same tree.
 dependencies = [
+    "aiohttp>=3.11",
     "websockets>=12",
     "httpx>=0.27",
     # The reused notifier plumbing (push_engine -> utils) reads YAML config, so a

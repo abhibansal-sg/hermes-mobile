@@ -59,6 +59,7 @@ _DEFAULT_ROOTS = ["tests"]
 # image, etc.) and are run in their own dedicated CI jobs:
 #
 #   tests/e2e/         — .github/workflows/tests.yml :: e2e job
+#   tests/e2e_daily_driver/ — physical-device gate; run via its run_gate.sh
 #   tests/integration/ — historical; legacy --ignore flags
 #   tests/docker/      — .github/workflows/docker.yml ::
 #                        build-amd64 job (runs against the freshly-loaded
@@ -70,7 +71,7 @@ _DEFAULT_ROOTS = ["tests"]
 #                        ``docker build``,
 #                        so the build is guaranteed to die in fixture
 #                        setup. The dedicated job sidesteps both costs.
-_SKIP_PARTS = {"integration", "e2e", "docker"}
+_SKIP_PARTS = {"integration", "e2e", "e2e_daily_driver", "docker"}
 
 # Per-file wall-clock cap. Override
 # via --file-timeout or HERMES_TEST_FILE_TIMEOUT.

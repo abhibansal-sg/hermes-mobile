@@ -168,6 +168,7 @@ def test_service_shape_resolves_to_relay_config(monkeypatch):
     assert cfg.gateway.token == "dashboard"
     assert cfg.downstream.host == "0.0.0.0"
     assert cfg.downstream.port == 8788
+    assert cfg.downstream.auth_token == "dashboard"
 
 
 def test_missing_token_raises(monkeypatch):

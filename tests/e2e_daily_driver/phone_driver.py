@@ -66,6 +66,9 @@ class PhoneDriver:
         self._id = 0
         self._pending: dict[int, "asyncio.Future[dict[str, Any]]"] = {}
         self.frames: list[PhoneFrame] = []
+        self.events: list[dict[str, Any]] = []
+        self.raw_received: list[str] = []
+        self.raw_sent: list[str] = []
         self.sent: list[dict[str, Any]] = []
         # R4 W0b (contract RPC-spy scenarios): EVERY RPC response observed on the
         # wire (success OR error), and the ids this driver locally CANCELLED —
@@ -108,6 +111,7 @@ class PhoneDriver:
                     line = line.strip()
                     if not line:
                         continue
+                    self.raw_received.append(line)
                     try:
                         msg = json.loads(line)
                     except json.JSONDecodeError:
@@ -123,6 +127,8 @@ class PhoneDriver:
                     elif "kind" in msg:
                         # downstream frame
                         self.frames.append(PhoneFrame.from_wire(msg))
+                    elif msg.get("method") == "event":
+                        self.events.append(msg)
         except Exception as e:  # noqa: BLE001
             _log.debug("phone reader stopped: %r", e)
 
@@ -135,8 +141,16 @@ class PhoneDriver:
         fut: "asyncio.Future[dict[str, Any]]" = asyncio.get_event_loop().create_future()
         self._pending[rid] = fut
         self.sent.append({"method": method, "params": params, "id": rid})
-        await self._ws.send(json.dumps(frame))
+        wire = json.dumps(frame)
+        self.raw_sent.append(wire)
+        await self._ws.send(wire)
         return await asyncio.wait_for(fut, timeout=timeout)
+
+    async def call(
+        self, method: str, params: dict[str, Any], *, timeout: float = 30.0
+    ) -> dict[str, Any]:
+        """Send an unmodified stock JSON-RPC call over the same driver socket."""
+        return await self._call(method, params, timeout=timeout)
 
     # -- detached RPCs + cancel-spy (R4 W0b, contract I4) --------------------
     def send_request(self, method: str, params: dict[str, Any]) -> int:
@@ -368,6 +382,20 @@ class PhoneDriver:
             await asyncio.sleep(0.02)
         raise asyncio.TimeoutError(
             f"phone: wanted {n} frames kind={kind} sid={sid}, have {len(self.frames_of_kind(kind, sid=sid))}"
+        )
+
+    async def wait_for_event(
+        self, event_type: str, *, timeout: float = 30.0
+    ) -> dict[str, Any]:
+        """Wait for one unchanged stock ``method:event`` gateway frame."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for event in reversed(self.events):
+                if (event.get("params") or {}).get("type") == event_type:
+                    return event
+            await asyncio.sleep(0.02)
+        raise asyncio.TimeoutError(
+            f"phone: no stock event type={event_type} within {timeout}s"
         )
 
 

@@ -60,7 +60,12 @@ class RelayApp:
         self.gateway = GatewayClient(config.gateway, self.bus, durable=self.durable)
         self.reframer = Reframer(self.bus, self.store)
         self.downstream = DownstreamServer(
-            config.downstream, self.bus, self.gateway, self.store, self.durable
+            config.downstream,
+            self.bus,
+            self.gateway,
+            self.store,
+            self.durable,
+            upstream=config.gateway,
         )
         self.notifier = Notifier(
             config.notifier,
@@ -185,7 +190,10 @@ def build_default_config(
     return RelayConfig(
         gateway=GatewayConfig(host=gateway_host, token=gateway_token, port=gateway_port),
         downstream=DownstreamConfig(
-            host=downstream_host, port=downstream_port, health_path=health_path
+            host=downstream_host,
+            port=downstream_port,
+            health_path=health_path,
+            auth_token=gateway_token,
         ),
         notifier=NotifierConfig(),
     )

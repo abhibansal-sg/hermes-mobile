@@ -210,7 +210,10 @@ if [ "$CMD" = "status" ]; then
   # Read-only health curl (explicitly allowed by the spec). Never fatal.
   if command -v curl >/dev/null 2>&1; then
     health="http://127.0.0.1:${LISTEN##*:}/healthz"
-    if body="$(curl -fsS --max-time 3 "$health" 2>/dev/null)"; then
+    relay_health_token=""
+    [ ! -s "$TOKEN_FILE" ] || IFS= read -r relay_health_token < "$TOKEN_FILE"
+    if body="$(curl -fsS --max-time 3 \
+        -H "X-Hermes-Session-Token: $relay_health_token" "$health" 2>/dev/null)"; then
       say "health $health -> $body"
     else
       say "health $health -> no/failed response (service down or starting)"
