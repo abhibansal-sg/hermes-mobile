@@ -856,6 +856,7 @@ struct ComposerView: View {
                         Capsule().strokeBorder(theme.border, lineWidth: 1)
                     }
                 }
+                .contentShape(Rectangle())
                 .opacity(yoloTogglePending ? 0.55 : 1)
                 .contentTransition(.symbolEffect(.replace))
         }
